@@ -2094,6 +2094,7 @@ fn activate_row_target(
                         pane_cwds: Default::default(),
                         pane_cmds: Default::default(),
                         pane_sessions: Default::default(),
+                        pane_scrollback: Default::default(),
                     }],
                     active_tab: 0,
                 });
@@ -6845,78 +6846,10 @@ fn session_cancel_key(
     palette_cancel_key(&session.palette, key, modifiers)
 }
 
-/// Capture each live pane's current working directory into its tab's
-/// `pane_cwds` so the next resurrect respawns panes where they were. Only
-/// materialized (live) leaves are updated; tabs that were never opened keep the
-/// cwd hints they resurrected with. Cheap: a `/proc/<pid>/cwd` readlink per live
-/// pane, run only at persist time.
-fn capture_pane_cwds(session: &mut crate::session::Session, panes: &Panes) {
-    for g in &mut session.worktrees {
-        for tab in &mut g.tabs {
-            for id in tab.center.pane_ids() {
-                if let Some(p) = panes.table.get(&id)
-                    && let Some(cwd) = p.cwd()
-                {
-                    tab.pane_cwds.insert(id, cwd.to_string_lossy().into_owned());
-                }
-            }
-        }
-    }
-}
-
-/// Capture each live pane's foreground command into its tab's `pane_cmds` so a
-/// resurrected or crashed pane can offer to relaunch it. An idle shell prompt
-/// clears any stale entry, so the hint always reflects what was last running.
-/// Same cost profile as [`capture_pane_cwds`]: a small `/proc` scan per pane at
-/// persist time.
-fn capture_pane_cmds(session: &mut crate::session::Session, panes: &Panes) {
-    for g in &mut session.worktrees {
-        for tab in &mut g.tabs {
-            for id in tab.center.pane_ids() {
-                let Some(p) = panes.table.get(&id) else {
-                    continue;
-                };
-                match p.foreground_command() {
-                    Some(cmd) => {
-                        tab.pane_cmds.insert(id, cmd);
-                    }
-                    None => {
-                        tab.pane_cmds.remove(&id);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Capture each live `Stream` pane's provider session into its tab's
-/// `pane_sessions` so a restart reattaches the live remote session (replaying
-/// scrollback) instead of opening a fresh shell. A pane that isn't a native-exec
-/// stream — or whose session id hasn't been announced — clears any stale entry.
-fn capture_pane_sessions(session: &mut crate::session::Session, panes: &Panes) {
-    for g in &mut session.worktrees {
-        for tab in &mut g.tabs {
-            for id in tab.center.pane_ids() {
-                let Some(p) = panes.table.get(&id) else {
-                    continue;
-                };
-                match p.provider_session() {
-                    Some(ps) => {
-                        tab.pane_sessions.insert(id, ps);
-                    }
-                    None => {
-                        tab.pane_sessions.remove(&id);
-                    }
-                }
-            }
-        }
-    }
-}
-
 pub(crate) fn persist_session_layout(session: &mut crate::session::Session, panes: &Panes) {
-    capture_pane_cwds(session, panes);
-    capture_pane_cmds(session, panes);
-    capture_pane_sessions(session, panes);
+    // Capture live pane state (cwd / cmd / provider session / scrollback tail)
+    // into the session model — see `crate::snapshot`.
+    crate::snapshot::capture_pane_state(session, panes);
     if let Ok(db) = superzej_core::db::Db::open() {
         let _ = session.persist(&db, &session.id, now_secs());
     }
@@ -13755,6 +13688,7 @@ async fn event_loop<T: Terminal>(
                                                     pane_cwds: Default::default(),
                                                     pane_cmds: Default::default(),
                                                     pane_sessions: Default::default(),
+                                                    pane_scrollback: Default::default(),
                                                 }],
                                                 active_tab: 0,
                                             });
@@ -21692,6 +21626,7 @@ mod tests {
                 pane_cwds: String::new(),
                 pane_cmds: String::new(),
                 pane_sessions: String::new(),
+                scrollback_snapshot: String::new(),
             },
         )
         .unwrap();

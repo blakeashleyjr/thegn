@@ -1138,6 +1138,18 @@ pub(crate) fn build_model(
         .collect();
     let sidebar_db_worktrees = db_worktree_list(db);
     let sidebar_db_terminals = db.terminals().unwrap_or_default();
+    // One-shot at process start: collapse any stale running/active activity dot
+    // (a session killed mid-run) to a settled state before the sidebar first
+    // paints, so a phantom forever-running dot never survives resurrection. The
+    // live FSM re-derives the true state from fresh CPU deltas on the next poll.
+    {
+        use std::sync::Once;
+        static RESTORE_COERCE: Once = Once::new();
+        RESTORE_COERCE.call_once(|| {
+            let grace_ms = app_cfg.session.restore_grace_secs.saturating_mul(1000);
+            superzej_core::activity::coerce_stale_states(grace_ms);
+        });
+    }
     let sidebar_status = collect_sidebar_status(
         session,
         db,

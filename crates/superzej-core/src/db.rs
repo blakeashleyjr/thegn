@@ -56,7 +56,10 @@ use std::path::PathBuf;
 /// v28: re-keys `my_work_cache` from a single global row to per-scope rows
 /// (`scope` = repo root for the default repo-scoped feed, `"*"` for the "all
 /// repos" toggle) so the "My Work" panel shows only the active repo's work.
-const SCHEMA_VERSION: i64 = 28;
+/// v29: adds `group_tabs.scrollback_snapshot` (per-leaf captured scrollback tail,
+/// JSON `pane id → text`) so a resurrected pane repaints its recent history
+/// instead of a blank screen. Additive; absent/NULL on pre-v29 rows = no history.
+const SCHEMA_VERSION: i64 = 29;
 
 pub struct Db {
     conn: Connection,
@@ -374,6 +377,7 @@ impl Db {
               pane_cwds    TEXT,
               pane_cmds    TEXT,
               pane_sessions TEXT,
+              scrollback_snapshot TEXT,
               PRIMARY KEY (session_name, group_name, ordinal)
             );
             -- v4: which tab (v6: which worktree group) was active at exit.
@@ -648,6 +652,12 @@ impl Db {
         // {provider, id, session}) so a native-exec pane reattaches to its live
         // remote session on restart. Additive; absent/NULL on pre-v23 rows = none.
         let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_sessions TEXT", []);
+        // v29: per-leaf captured scrollback tail (JSON map of pane id → text) so a
+        // resurrected pane repaints its recent history. Additive; NULL pre-v29.
+        let _ = conn.execute(
+            "ALTER TABLE group_tabs ADD COLUMN scrollback_snapshot TEXT",
+            [],
+        );
         // v26: warm spare-sandbox pool. `pool_spares` tracks pre-provisioned,
         // UNCLAIMED sandboxes per (repo, env) so a new worktree opens instantly by
         // claiming one; `pool_targets` is the runtime +/- override of the configured
@@ -1449,6 +1459,22 @@ impl Db {
         Ok(self.conn
             .query_row(
                 "SELECT id FROM agent_dispatches WHERE worktree_path=?1 ORDER BY dispatched_at_ms DESC, id DESC LIMIT 1",
+                params![worktree_path],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
+    /// The dispatch timestamp (`dispatched_at_ms`) of a worktree's most recent
+    /// agent dispatch, if any. Read at resurrection to age a persisted
+    /// running/active agent signal through [`crate::activity::coerce_stale`], so a
+    /// phantom forever-running dot from a session killed mid-run is downgraded.
+    pub fn dispatch_dispatched_at_ms(&self, worktree_path: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT dispatched_at_ms FROM agent_dispatches WHERE worktree_path=?1 \
+                 ORDER BY dispatched_at_ms DESC, id DESC LIMIT 1",
                 params![worktree_path],
                 |r| r.get::<_, i64>(0),
             )
@@ -2855,10 +2881,10 @@ impl Db {
     pub fn put_group_tab(&self, session: &str, row: &crate::models::GroupTabRow) -> Result<()> {
         self.conn.execute(
             "INSERT INTO group_tabs
-               (session_name, group_name, ordinal, title, pane_tree, focused_pane, pane_cwds, pane_cmds, pane_sessions)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+               (session_name, group_name, ordinal, title, pane_tree, focused_pane, pane_cwds, pane_cmds, pane_sessions, scrollback_snapshot)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(session_name, group_name, ordinal) DO UPDATE SET
-               title=?4, pane_tree=?5, focused_pane=?6, pane_cwds=?7, pane_cmds=?8, pane_sessions=?9",
+               title=?4, pane_tree=?5, focused_pane=?6, pane_cwds=?7, pane_cmds=?8, pane_sessions=?9, scrollback_snapshot=?10",
             params![
                 session,
                 row.group_name,
@@ -2869,6 +2895,7 @@ impl Db {
                 row.pane_cwds,
                 row.pane_cmds,
                 row.pane_sessions,
+                row.scrollback_snapshot,
             ],
         )?;
         Ok(())
@@ -2895,7 +2922,7 @@ impl Db {
     /// All persisted tabs for every group in a session, ordered (group, tab).
     pub fn group_tabs_for_session(&self, session: &str) -> Result<Vec<crate::models::GroupTabRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT group_name, ordinal, title, pane_tree, focused_pane, pane_cwds, pane_cmds, pane_sessions
+            "SELECT group_name, ordinal, title, pane_tree, focused_pane, pane_cwds, pane_cmds, pane_sessions, scrollback_snapshot
                FROM group_tabs WHERE session_name=?1 ORDER BY group_name, ordinal",
         )?;
         let rows = stmt.query_map(params![session], |r| {
@@ -2908,6 +2935,7 @@ impl Db {
                 pane_cwds: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
                 pane_cmds: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 pane_sessions: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                scrollback_snapshot: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -3581,6 +3609,7 @@ mod tests {
             pane_cwds: String::new(),
             pane_cmds: String::new(),
             pane_sessions: String::new(),
+            scrollback_snapshot: String::new(),
         };
         // Insert out of order; expect ordinal ordering back.
         db.put_tab_group(sess, &mk("app/feat", 1)).unwrap();
@@ -3639,6 +3668,7 @@ mod tests {
                 pane_cwds: r#"{"0":"/home/u/repo"}"#.into(),
                 pane_cmds: r#"{"0":{"argv":["nvim"],"cwd":"/home/u/repo"}}"#.into(),
                 pane_sessions: r#"{"0":{"provider":"sprites","id":"dev","session":"s-9"}}"#.into(),
+                scrollback_snapshot: r#"{"0":"$ echo hi\nhi"}"#.into(),
             },
         )
         .unwrap();
@@ -3653,6 +3683,7 @@ mod tests {
             tabs[0].pane_sessions,
             r#"{"0":{"provider":"sprites","id":"dev","session":"s-9"}}"#
         );
+        assert_eq!(tabs[0].scrollback_snapshot, r#"{"0":"$ echo hi\nhi"}"#);
 
         // An upsert overwrites the cwd + cmd + session maps (no stale merge).
         db.put_group_tab(
@@ -3666,6 +3697,7 @@ mod tests {
                 pane_cwds: String::new(),
                 pane_cmds: String::new(),
                 pane_sessions: String::new(),
+                scrollback_snapshot: String::new(),
             },
         )
         .unwrap();
@@ -3673,6 +3705,7 @@ mod tests {
         assert_eq!(back[0].pane_cwds, "");
         assert_eq!(back[0].pane_cmds, "");
         assert_eq!(back[0].pane_sessions, "");
+        assert_eq!(back[0].scrollback_snapshot, "");
     }
 
     #[test]
@@ -4610,6 +4643,18 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_dispatched_at_ms_reads_latest_timestamp() {
+        let db = db();
+        // No dispatch → no timestamp (the age computation falls back to the
+        // activity snapshot at restore).
+        assert!(db.dispatch_dispatched_at_ms("/wt/issue").unwrap().is_none());
+        db.put_agent_dispatch("linear:A-1", "/wt/issue", "claude")
+            .unwrap();
+        let at = db.dispatch_dispatched_at_ms("/wt/issue").unwrap();
+        assert!(at.is_some_and(|t| t > 0), "dispatched_at_ms is populated");
+    }
+
+    #[test]
     fn dispatch_info_for_worktree_returns_id_and_issue_id() {
         let db = db();
         // No result for unknown path.
@@ -5373,10 +5418,11 @@ mod tests {
 
     #[test]
     fn ladder_v13_group_tabs_gain_pane_columns() {
-        // Pre-v14 group_tabs: the current CREATE minus the three additive
-        // columns (`pane_cwds` v14, `pane_cmds` v15, `pane_sessions` v23) —
-        // each ALTER comment documents that the column is absent on older
-        // rows. Legacy rows must survive with the new columns reading empty.
+        // Pre-v14 group_tabs: the current CREATE minus the four additive
+        // columns (`pane_cwds` v14, `pane_cmds` v15, `pane_sessions` v23,
+        // `scrollback_snapshot` v29) — each ALTER comment documents that the
+        // column is absent on older rows. Legacy rows must survive with the new
+        // columns reading empty (the "old snapshot restores unchanged" path).
         let (dir, db) = open_ladder_fixture(
             "v13",
             r#"
@@ -5406,6 +5452,7 @@ mod tests {
         assert_eq!(tabs[0].pane_cwds, "");
         assert_eq!(tabs[0].pane_cmds, "");
         assert_eq!(tabs[0].pane_sessions, "");
+        assert_eq!(tabs[0].scrollback_snapshot, "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

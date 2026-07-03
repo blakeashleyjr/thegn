@@ -153,6 +153,61 @@ pub fn ack_at(path: &Path, tab: &str) {
     }
 }
 
+/// The settled state a stale running/active dot collapses to at resurrection
+/// (no live work; no dot).
+pub const SETTLED_STATE: &str = "none";
+
+/// Restore-time stale-state guard (pure). A `"running"`/`"active"` state whose
+/// last live signal is older than `grace_ms` collapses to [`SETTLED_STATE`], so a
+/// session killed mid-run never resurrects a phantom forever-running dot. Fresh
+/// running states and already-settled states (`"waiting"`/`"read"`/`"none"`) pass
+/// through unchanged. This is the age-based generalization of the live
+/// `RESUME_GRACE_SECS` sticky logic, applied **once** at resurrection; the live
+/// [`poll`] FSM is untouched. Boundary: an age of exactly `grace_ms` is treated
+/// as stale (`>=`), matching the `RESUME_GRACE_SECS` convention above.
+pub fn coerce_stale(state: &str, age_ms: u64, grace_ms: u64) -> String {
+    let running = matches!(state, "active" | "running");
+    if running && age_ms >= grace_ms {
+        SETTLED_STATE.to_string()
+    } else {
+        state.to_string()
+    }
+}
+
+/// Apply [`coerce_stale`] to every persisted entry once at resurrection, so a
+/// crash mid-run doesn't resurrect a phantom running/stuck dot. Each entry's age
+/// is `now - last_active_at` (falling back to the snapshot's `polled_at` when the
+/// entry never recorded an active timestamp). A coerced entry also clears its
+/// streak bookkeeping so the next [`poll`] starts clean; the live FSM then
+/// re-derives the true state from fresh CPU deltas. Best-effort: a missing or
+/// garbled snapshot is a no-op, and nothing is written unless a state changed.
+pub fn coerce_stale_states_at(path: &Path, grace_ms: u64, now: f64) {
+    let mut snap = load(path);
+    if snap.worktrees.is_empty() {
+        return;
+    }
+    let mut changed = false;
+    for e in snap.worktrees.values_mut() {
+        let ref_secs = e.last_active_at.unwrap_or(snap.polled_at);
+        let age_ms = ((now - ref_secs).max(0.0) * 1000.0) as u64;
+        let coerced = coerce_stale(&e.state, age_ms, grace_ms);
+        if coerced != e.state {
+            e.state = coerced;
+            e.quiet_since = None;
+            e.busy_since = None;
+            changed = true;
+        }
+    }
+    if changed {
+        save(path, &snap);
+    }
+}
+
+/// [`coerce_stale_states_at`] against the default snapshot path + wall clock.
+pub fn coerce_stale_states(grace_ms: u64) {
+    coerce_stale_states_at(&state_path(), grace_ms, unix_now());
+}
+
 /// One scan + state-machine step over every managed worktree. `extra` supplies
 /// pre-fetched jiffies (e.g. from a remote env's bridge) that override the local
 /// `/proc` scan for those worktree paths.
@@ -707,5 +762,68 @@ mod tests {
         ack("definitely-not-a-real-tab");
         // unix_now returns a positive, monotonic-ish wall clock.
         assert!(unix_now() > 0.0);
+        // coerce_stale_states against the default path: a no-op unless a stale
+        // dot exists — never panics.
+        coerce_stale_states(600_000);
+    }
+
+    // ── restore-time stale-state guard ────────────────────────────────────────
+
+    #[test]
+    fn coerce_stale_downgrades_only_stale_running() {
+        // Fresh running stays running.
+        assert_eq!(coerce_stale("active", 100, 1000), "active");
+        assert_eq!(coerce_stale("running", 100, 1000), "running");
+        // Stale running downgrades to the settled state.
+        assert_eq!(coerce_stale("active", 5000, 1000), SETTLED_STATE);
+        assert_eq!(coerce_stale("running", 5000, 1000), SETTLED_STATE);
+    }
+
+    #[test]
+    fn coerce_stale_passes_non_running_through() {
+        // Non-running states are never coerced, however old.
+        for st in ["waiting", "read", "none", "quiet", "weird"] {
+            assert_eq!(coerce_stale(st, 10_000_000, 1000), st);
+        }
+    }
+
+    #[test]
+    fn coerce_stale_boundary_is_inclusive() {
+        // Exactly at the grace threshold counts as stale (>=).
+        assert_eq!(coerce_stale("active", 1000, 1000), SETTLED_STATE);
+        // One ms under is still fresh.
+        assert_eq!(coerce_stale("active", 999, 1000), "active");
+    }
+
+    #[test]
+    fn coerce_stale_states_downgrades_phantom_but_keeps_fresh() {
+        let path = tmp("coerce");
+        let _ = std::fs::remove_file(&path);
+        // Two worktrees left "active" by a killed session, plus a genuinely-stuck
+        // "waiting" dot. polled_at 1000; one entry was last active long ago, the
+        // other just before the (simulated) restart.
+        let json = r#"{"polled_at":1000.0,"worktrees":{
+            "/wt/phantom":{"tab":"app/phantom","state":"active","cpu_jiffies":0,"last_active_at":1000.0},
+            "/wt/fresh":{"tab":"app/fresh","state":"active","cpu_jiffies":0,"last_active_at":1990.0},
+            "/wt/stuck":{"tab":"app/stuck","state":"waiting","cpu_jiffies":0}
+        }}"#;
+        std::fs::write(&path, json).unwrap();
+
+        // Restart at now=2000 with a 600s grace: the phantom (1000s old) collapses;
+        // the fresh one (10s old) survives; the stuck red dot is never touched.
+        coerce_stale_states_at(&path, 600_000, 2000.0);
+        let st = read_states_at(&path);
+        assert_eq!(st.get("app/phantom").map(String::as_str), Some("none"));
+        assert_eq!(st.get("app/fresh").map(String::as_str), Some("active"));
+        assert_eq!(st.get("app/stuck").map(String::as_str), Some("waiting"));
+    }
+
+    #[test]
+    fn coerce_stale_states_no_snapshot_is_noop() {
+        let path = tmp("coerce-missing");
+        let _ = std::fs::remove_file(&path);
+        // Missing file: no write, no panic.
+        coerce_stale_states_at(&path, 600_000, 2000.0);
+        assert!(!path.exists());
     }
 }

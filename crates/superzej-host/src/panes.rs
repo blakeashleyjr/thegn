@@ -517,6 +517,16 @@ impl Panes {
                 .or(cwd.as_deref());
             match self.spawn_argv_env(&spec.argv, spawn_cwd, &spec.env, center) {
                 Ok(fresh) => {
+                    // Repaint this leaf's captured scrollback so the restored pane
+                    // shows its recent history before the fresh shell produces new
+                    // output. Host panes only: a stream pane replays its scrollback
+                    // server-side, and a sandbox pane's host-side tail isn't stored.
+                    if spec.backend == "host"
+                        && let Some(text) = tab.pane_scrollback.get(old)
+                        && let Some(p) = self.table.get_mut(&fresh)
+                    {
+                        p.repaint_scrollback(text);
+                    }
                     // Offer to relaunch the program this leaf was last running.
                     // Host panes only: a sandbox/remote pane's captured command
                     // isn't host-runnable, and its cwd wasn't restored either.

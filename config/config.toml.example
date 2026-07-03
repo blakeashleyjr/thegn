@@ -812,6 +812,17 @@ command = "git diff"
 #                              #   SERIALIZES concurrent builds across worktrees — opt-in.
 #                              #   "" = off; ~ expands to home; relative paths resolve to the repo root.
 
+# Session snapshot/restore hardening. Two knobs on the resurrection path: how
+# much per-pane scrollback is captured and repainted so a restored pane shows its
+# recent history instead of a blank screen, and how long a persisted running/
+# active agent dot may age before it is coerced to a settled state at restore —
+# so a session killed mid-run never resurrects a phantom forever-running dot.
+[session]
+# scrollback_lines = 500       # max plain-text scrollback lines captured per pane on
+#                              #   snapshot and repainted on restore; 0 = disable (blank restore)
+# restore_grace_secs = 600     # a persisted active/running activity dot older than this at
+#                              #   restore is downgraded to a settled state; live FSM untouched
+
 # Aggregated notification bus. Events (PR state, agent done/failed, test
 # failures, log errors, worktree created) surface as sidebar badges + the
 # in-app inbox, and optionally as OS desktop notifications.

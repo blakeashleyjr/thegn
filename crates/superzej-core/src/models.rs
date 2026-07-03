@@ -238,6 +238,11 @@ pub struct GroupTabRow {
     /// remote session on restart. Empty string when unset (pre-v22 rows / no
     /// native-exec panes).
     pub pane_sessions: String,
+    /// Per-leaf captured scrollback tail: a JSON map of `pane id → text` (opaque
+    /// to core), repainted into the pane on restore so a resurrected pane shows
+    /// its recent history instead of a blank screen. Empty string when unset
+    /// (pre-v28 rows / no captured scrollback).
+    pub scrollback_snapshot: String,
 }
 
 /// A worktree enriched with live git status, for `list` / `dashboard` output.
