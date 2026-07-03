@@ -993,6 +993,8 @@ notifications inbox (428)._
 - [ ] 442. Log redaction
 - [x] 443. Sandbox-by-default for agents
 - [ ] 444. Tor/hidden-service option
+- [ ] 754. Sandbox `env_overrides` off the cmdline — exports ride the wrapper script (an argv element, /proc-visible); move to a 0600 env-file transport sourced by the wrapper (local bwrap `--setenv` passthrough already fixed)
+- [ ] 755. OCI env passthrough off the cmdline — `podman/docker create -e K=V` leaks values; use value-less `-e KEY` (inherit from client env)
 
 ### AK. API surface
 

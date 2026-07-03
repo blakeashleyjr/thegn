@@ -506,27 +506,6 @@ pub fn prepare_sandbox_env(
     })
 }
 
-/// ssh-config ownership shim: unprivileged bwrap maps the nix store to `nobody`
-/// (the userns overflow uid), so ssh rejects the store-resident `~/.ssh/config`
-/// ("Bad owner or permissions") and ssh-based git fails in the sandbox. Point
-/// sandboxed git at a user-owned, include-flattened copy materialized on the
-/// host (visible via the rw `$HOME` bind). Bwrap only, and only when `$HOME`
-/// (or `/`) is mounted so the copy is reachable. Shared by the pane launch path
-/// and the embedded `agent` tab's tool sandbox. See [`sandbox::prepare_ssh_config`].
-pub(crate) fn apply_ssh_config_shim(spec: &mut sandbox::SandboxSpec) {
-    if spec.backend != sandbox::Backend::Bwrap || spec.env_overrides.contains_key("GIT_SSH_COMMAND")
-    {
-        return;
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let home_mounted =
-        !home.is_empty() && spec.mounts.iter().any(|m| m.dest == home || m.dest == "/");
-    if home_mounted && let Some(path) = sandbox::prepare_ssh_config() {
-        spec.env_overrides
-            .insert("GIT_SSH_COMMAND".to_string(), format!("ssh -F {path}"));
-    }
-}
-
 /// Bring up the worktree's VPN tunnel (if `[sandbox.vpn]` requested one) before
 /// the sandbox container is created, and splice the result into `spec`:
 /// userspace (proxy) tunnels get their `ALL_PROXY`/`HTTPS_PROXY` exports added
@@ -3270,13 +3249,21 @@ pub fn compose_spec(
         .cwd_override
         .clone()
         .or_else(|| (!loc.is_remote() && !sb.is_remote).then(|| PathBuf::from(worktree)));
-    let env = vec![
+    let mut env = vec![
         ("SUPERZEJ_WORKTREE".to_string(), worktree.to_string()),
         (
             "SUPERZEJ_BRANCH".to_string(),
             branch.unwrap_or_default().to_string(),
         ),
     ];
+    // Local bwrap gets its passthrough env (tokens, API keys) via the pane's
+    // process env, not world-readable `--setenv` argv (enter_argv skips those).
+    if let Some(spec) = &sb.spec
+        && spec.backend == sandbox::Backend::Bwrap
+        && spec.placement.is_local()
+    {
+        env.extend(spec.env.iter().cloned());
+    }
     let argv = match &sb.spec {
         Some(spec) => sandbox::enter_argv(spec, &cmd),
         // Host fallback: run the command through a login shell so PATH/env expand.
@@ -3447,7 +3434,7 @@ pub fn launch_spec_with_key(
     let build_env = build_env_vars(cfg, &repo_root);
 
     if let Some(spec) = outcome.spec.as_mut() {
-        apply_ssh_config_shim(spec);
+        crate::ssh_shim::apply(spec);
         // `env_overrides` exports these inside the sandbox shell (env_block would
         // *unset* them — wrong direction).
         for (k, v) in &build_env {
