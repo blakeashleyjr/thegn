@@ -22,6 +22,7 @@ mod copymode;
 mod desktop_notify;
 mod detail;
 mod emulator;
+mod escape;
 mod focus;
 mod font;
 mod forward;

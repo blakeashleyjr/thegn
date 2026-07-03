@@ -4334,35 +4334,11 @@ fn handle_git_msg(
     match msg {
         // ---- navigation -------------------------------------------------
         GitMsg::CursorDown | GitMsg::CursorUp => {
-            let down = msg == GitMsg::CursorDown;
-            match panel_ui.git.focus {
-                GitView::RebaseTodo => {
-                    if let GitFlow::Rebase(r) = &mut panel_ui.git.flow {
-                        let max = r.todos.len().saturating_sub(1);
-                        r.cursor = if down {
-                            (r.cursor + 1).min(max)
-                        } else {
-                            r.cursor.saturating_sub(1)
-                        };
-                    }
-                }
-                GitView::Staging | GitView::PatchBuilding => {
-                    let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
-                    let next = active_line_doc(&panel_ui.git)
-                        .map(|d| gitui::step_cursor(&d.doc, cur, down));
-                    if let (Some(next), Some(s)) = (next, panel_ui.git.staging.as_mut()) {
-                        s.cursor = next;
-                    }
-                }
-                GitView::Blame => {
-                    let max = panel_ui.git.blame_rows.len().saturating_sub(1);
-                    panel_ui.git.blame_cursor = if down {
-                        (panel_ui.git.blame_cursor + 1).min(max)
-                    } else {
-                        panel_ui.git.blame_cursor.saturating_sub(1)
-                    };
-                }
-                _ => {}
+            panel_ui.git.step_view_cursor(msg == GitMsg::CursorDown);
+        }
+        GitMsg::OpenFile => {
+            if let Some((path, ..)) = panel_ui.git.commit_files.get(panel_ui.git.cur.commit_files) {
+                return GitAfter::OpenEditor(path.clone());
             }
         }
         GitMsg::ToggleRangeMode => match panel_ui.git.focus {
@@ -6662,7 +6638,7 @@ fn show_yazi_drawer(
 /// it was opened for (`home`; `fallback` covers pre-tracking drawers). The
 /// stash honors `[drawer].pool_limit`, evicting/tearing down older drawers.
 #[allow(clippy::too_many_arguments)]
-fn hide_drawer_into_pool(
+pub(crate) fn hide_drawer_into_pool(
     drawer: &mut Option<u32>,
     pool: &mut DrawerPool,
     home: &mut Option<std::path::PathBuf>,
@@ -15363,23 +15339,20 @@ async fn event_loop<T: Terminal>(
                 // Esc / q close the drawer — but only while it owns focus, so
                 // the same keys keep their meaning in the center/sidebar/panel.
                 if drawer.is_some() && focus.drawer() && drawer_cancel_key(&k.key, k.modifiers) {
-                    if let Some(cwd) = active_cwd(&session) {
-                        hide_drawer_into_pool(
-                            &mut drawer,
-                            &mut drawer_pool,
-                            &mut drawer_home,
-                            &cwd,
-                            keymap.config(),
-                            &mut panes,
-                        );
-                        let key = superzej_core::util::slugify(&cwd.to_string_lossy());
-                        let dir = superzej_core::util::superzej_dir().join("drawer");
-                        let _ = std::fs::create_dir_all(&dir);
-                        let _ = std::fs::write(dir.join(key), "false");
-                    } else if let Some(id) = drawer.take() {
-                        panes.table.remove(&id);
+                    // Drawer dismiss always closes it; the opt-in adds the snap.
+                    crate::escape::close_drawer_to_pool(
+                        &mut drawer,
+                        &mut drawer_pool,
+                        &mut drawer_home,
+                        &session,
+                        &mut panes,
+                        keymap.config(),
+                    );
+                    if keymap.config().panel.collapse_on_escape {
+                        panel_ui.width = crate::layout::PanelWidth::Normal;
                     }
                     focus.zone = crate::focus::Zone::Center;
+                    need_relayout = true;
                     dirty = true;
                     continue;
                 }
@@ -15406,7 +15379,16 @@ async fn event_loop<T: Terminal>(
                     && !k.modifiers.contains(Modifiers::ALT)
                 {
                     if crate::input::is_escape_key(&k.key) {
-                        focus.zone = crate::focus::Zone::Center;
+                        need_relayout |= crate::escape::escape_to_center(
+                            &mut focus,
+                            &mut panel_ui,
+                            &mut drawer,
+                            &mut drawer_pool,
+                            &mut drawer_home,
+                            &session,
+                            &mut panes,
+                            keymap.config(),
+                        );
                     } else if k.key == KeyCode::Enter {
                         let hit = if focus.masthead() {
                             crate::chrome::masthead_item_spans(&model, &chrome)
@@ -15453,7 +15435,16 @@ async fn event_loop<T: Terminal>(
                             continue;
                         }
                         SidebarOutcome::Defocus => {
-                            focus.zone = crate::focus::Zone::Center;
+                            need_relayout |= crate::escape::escape_to_center(
+                                &mut focus,
+                                &mut panel_ui,
+                                &mut drawer,
+                                &mut drawer_pool,
+                                &mut drawer_home,
+                                &session,
+                                &mut panes,
+                                keymap.config(),
+                            );
                             sb.focused = false;
                             sb.menu = None;
                             sb.sync(&mut model);
@@ -15959,15 +15950,24 @@ async fn event_loop<T: Terminal>(
                             // Handled above; kept to keep the match exhaustive.
                             PanelMsg::Open(_) | PanelMsg::NextSection | PanelMsg::PrevSection => {}
                             PanelMsg::LeaveRows => {
-                                // Esc peels one layer at a time: expanded
-                                // change preview → row mode → section mode →
-                                // leave the panel zone.
+                                // Esc peels one layer at a time: expanded change
+                                // preview → row mode → section mode → leave the
+                                // panel zone (the final leave collapses to defaults).
                                 if panel_ui.chg_sel.is_some() {
                                     panel_ui.chg_sel = None;
                                 } else if panel_ui.row_mode {
                                     panel_ui.row_mode = false;
                                 } else {
-                                    focus.zone = crate::focus::Zone::Center;
+                                    need_relayout |= crate::escape::escape_to_center(
+                                        &mut focus,
+                                        &mut panel_ui,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        &session,
+                                        &mut panes,
+                                        keymap.config(),
+                                    );
                                 }
                             }
                             PanelMsg::CursorDown | PanelMsg::CursorUp => {

@@ -921,6 +921,10 @@ visible = true
 # Unknown keys are ignored; reloads apply live.
 [panel]
 # sections = ["changes", "pr", "files", "tests", "telemetry", "keys"]
+# When Esc returns focus to the center terminal from any chrome zone (sidebar,
+# panel, a bar, the drawer), snap the right panel back to its default width and
+# close the bottom file drawer. Set false to leave sizes exactly as you left them.
+# collapse_on_escape = true
 
 # In-pane scrollback / copy-mode search (distinct from the palette below).
 [search]
