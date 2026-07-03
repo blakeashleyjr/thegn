@@ -1047,7 +1047,13 @@ enabled = true
 #              (fetch/clone/build, debuggers, ping) keeps working. The default.
 #   sealed   — full lockdown: network=none, read-only root, drop ALL caps,
 #              no-new-privileges, tighter pids cap. For untrusted workloads.
-# (Writable under read-only root: the worktree, build caches, and a tmpfs /tmp.)
+# Under a read-only-root profile (hardened/sealed, the default), everything
+# OUTSIDE the worktree is read-only — including your $HOME — so a sandboxed
+# agent can't `cd` out and modify/delete host files. Writable: the worktree, its
+# git dir, build caches, /tmp, and a narrow set of $HOME carve-outs for shell
+# state (~/tmp, ~/.local/state, ~/.local/share). `profile = "open"` restores a
+# fully-writable $HOME (zsh history/zoxide/keychain) as the escape hatch; add
+# more writable paths under `mounts` below.
 profile = "hardened"
 
 # Hardening preset for the embedded agent's tool container. When it differs from
@@ -1113,6 +1119,11 @@ network_audit = false
 #   all / host          — entire host filesystem (read-write, least isolated).
 #   none                — no filesystem access beyond the container root.
 #   custom              — only the explicit mounts list below.
+# Note: regardless of file_access, the default `hardened` profile makes
+# everything outside the worktree/caches READ-ONLY (see `profile` above). To get
+# a fully writable host filesystem use `file_access = "all"`; for the strictest
+# scoping use `"custom"`/`"none"`. Both file_access and profile are overridable
+# per-repo via a `.superzej.toml` overlay.
 file_access = "worktree_plus_caches"
 
 # Mount common language build caches from the host when file_access is
@@ -1126,6 +1137,12 @@ auto_caches = true
 #          "host_path:dest:ro"      → read-only at dest
 #          "host_path:dest:cache"   → read-write cache (shown in sandbox summary)
 # ~ is expanded to $HOME.
+# This is also the extension point for extra writable carve-outs under the
+# read-only $HOME: a read-write DIRECTORY under $HOME (e.g. "~/.gnupg") is kept
+# and overmounts the read-only parent. A single read-only FILE (e.g.
+# "~/.gitconfig:ro") is served read-only by the $HOME bind; a writable single
+# file under $HOME isn't carved (bwrap can't create the mount-point) — use a
+# writable directory instead.
 # This is the GLOBAL ("all workspaces") scope for default bind dirs. For a
 # single workspace, add `sandbox_mounts` under `[workspace.<slug>]` (see above);
 # those extend this list. A repo-root `.superzej.toml` `[sandbox] mounts` can
