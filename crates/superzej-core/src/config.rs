@@ -3788,6 +3788,10 @@ struct RepoConfigFile {
     /// profile (see [`Config::effective_notifications`]).
     #[serde(default)]
     notifications: NotificationsOverlay,
+    /// Per-repo issue-tracker overlay (Linear team / Jira project) that scopes
+    /// this repo's "My Work" feed (see [`Config::repo_issues`]).
+    #[serde(default)]
+    issues: crate::config_issues::IssuesOverlay,
     /// Selects a named `[env.<name>]` for every worktree of this repo (the
     /// repo-level layer of env selection). Empty ⇒ inherit the global default.
     #[serde(default)]
@@ -5241,6 +5245,22 @@ impl Config {
             overlay.notifications.apply(&mut n);
         }
         n
+    }
+
+    /// The effective `[issues]` config for a worktree's repo: the global
+    /// `[issues]` with a repo-root `.superzej.*` `[issues]` overlay applied on
+    /// top, so each repo's "My Work" feed can pin its Linear team / Jira project
+    /// (GitHub is auto-scoped to the repo's remote). `repo_root` is `None`
+    /// outside a workspace, in which case the global config is returned verbatim.
+    pub fn repo_issues(&self, repo_root: Option<&std::path::Path>) -> IssuesConfig {
+        let mut issues = self.issues.clone();
+        if let Some(root) = repo_root
+            && let Some(overlay) = load_repo_overlay(root)
+            && !overlay.issues.is_empty()
+        {
+            overlay.issues.apply(&mut issues);
+        }
+        issues
     }
 
     /// The effective sandbox config for a worktree's repo: the global `[sandbox]`

@@ -165,6 +165,14 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("R", "all"),
         ("d", "del"),
         ("A", "show read"),
+        (
+            "g",
+            if crate::panel::scope::system_all() {
+                "this repo"
+            } else {
+                "all worktrees"
+            },
+        ),
     ]));
     rows
 }
@@ -254,6 +262,14 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("R", "all"),
         ("d", "del"),
         ("A", "show read"),
+        (
+            "g",
+            if crate::panel::scope::system_all() {
+                "this repo"
+            } else {
+                "all worktrees"
+            },
+        ),
     ]));
     rows
 }

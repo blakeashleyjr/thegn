@@ -18,6 +18,7 @@ pub mod bundle;
 pub mod capabilities;
 pub mod ci;
 pub mod config;
+pub mod config_issues;
 pub mod custom_cmd;
 pub mod db;
 pub mod debug;

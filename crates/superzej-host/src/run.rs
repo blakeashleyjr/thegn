@@ -9425,7 +9425,8 @@ async fn event_loop<T: Terminal>(
             );
             crate::hydrate::spawn_my_work_refresh(
                 session.clone(),
-                current_config.issues.clone(),
+                current_config.clone(),
+                crate::panel::scope::mine_all(),
                 Some(waker.clone()),
             );
             crate::hydrate::spawn_ci_cache_refresh(
@@ -12026,7 +12027,8 @@ async fn event_loop<T: Terminal>(
             );
             crate::hydrate::spawn_my_work_refresh(
                 session.clone(),
-                current_config.issues.clone(),
+                current_config.clone(),
+                crate::panel::scope::mine_all(),
                 Some(waker.clone()),
             );
         }
@@ -17352,10 +17354,21 @@ async fn event_loop<T: Terminal>(
                         (Section::Mine, KeyCode::Char('R')) => {
                             crate::hydrate::spawn_my_work_refresh(
                                 session.clone(),
-                                current_config.issues.clone(),
+                                current_config.clone(),
+                                crate::panel::scope::mine_all(),
                                 Some(waker.clone()),
                             );
                             model.status = "Refreshing your work…".into();
+                            true
+                        }
+                        // Toggle the Mine feed between the active repo (default)
+                        // and every repo you touch (the escape hatch).
+                        (Section::Mine, KeyCode::Char('a')) => {
+                            model.status = crate::hydrate::toggle_mine_scope(
+                                &session,
+                                &current_config,
+                                &waker,
+                            );
                             true
                         }
                         // Branch-a-worktree-from-this-issue: the keystone that turns
@@ -17704,6 +17717,25 @@ async fn event_loop<T: Terminal>(
                             panel_ui.notifications_show_read = !panel_ui.notifications_show_read;
                             panel_ui.notifications_cursor = 0;
                             panel_ui.cursor = 0;
+                            true
+                        }
+                        // Toggle the System tab between this repo (default) and
+                        // platform-wide: notifications + containers + logs from
+                        // every worktree/host. Rehydrate so the scoped
+                        // notification list (built in `build_panel`) refreshes.
+                        (
+                            Section::Notifications | Section::Sandbox | Section::Logs,
+                            KeyCode::Char('g'),
+                        ) => {
+                            hydration_gen += 1;
+                            model.status = crate::hydrate::toggle_system_scope(
+                                &model_tx,
+                                hydration_gen,
+                                &session,
+                                &waker,
+                                panel_ui.open,
+                                panel_ui.width.is_expanded(),
+                            );
                             true
                         }
                         (Section::Notifications, KeyCode::Char('/')) => {

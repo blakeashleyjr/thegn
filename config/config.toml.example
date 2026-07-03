@@ -252,6 +252,16 @@ move_on_merge = false        # when a worktree's PR merges, move its linked issu
 # api_token = "env:JIRA_API_TOKEN"
 # project_key = ""                # restrict to one project ("" = all)
 
+# The "My Work" (Mine) panel is scoped to the ACTIVE worktree's repo by default:
+# GitHub issues/PRs are auto-filtered to the repo's `origin` remote, so no config
+# is needed. To scope Linear/Jira per repo, put an `[issues]` overlay in that
+# repo's root `.superzej.toml` — only the keys you set override the global config:
+#   [issues.linear]
+#   team_id = "TEAM-123"          # this repo's Linear team
+#   [issues.jira]
+#   project_key = "ACME"          # this repo's Jira project
+# Press `a` in the Mine section to toggle between this-repo and all-repos views.
+
 # Cross-provider CI/CD inspection — run history, jobs/steps, logs (AV group).
 # GitHub Actions reuses the existing `gh`/GH_TOKEN auth (no sub-table needed).
 [ci]
