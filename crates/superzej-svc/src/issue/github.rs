@@ -124,6 +124,12 @@ impl IssueBackend for GitHubIssuesBackend {
         if filter.assignee_me {
             args.extend(["--assignee", "@me"]);
         }
+        // Scope to a single repo (the repo-scoped "My Work" feed). Without this,
+        // `gh issue list` falls back to the process cwd's repo, which is not the
+        // active worktree — so unscoped fetches leak issues from other repos.
+        if let Some(repo) = filter.repo.as_deref().filter(|r| !r.is_empty()) {
+            args.extend(["--repo", repo]);
+        }
         // Include extra flags configured by the user.
         let extra: Vec<&str> = self.extra_flags.iter().map(|s| s.as_str()).collect();
         args.extend(extra);
