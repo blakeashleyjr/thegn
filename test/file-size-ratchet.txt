@@ -4,4 +4,4 @@
 4549 crates/superzej-host/src/agent.rs
 4815 crates/superzej-host/src/chrome.rs
 3028 crates/superzej-host/src/keymap.rs
-22976 crates/superzej-host/src/run.rs
+22911 crates/superzej-host/src/run.rs

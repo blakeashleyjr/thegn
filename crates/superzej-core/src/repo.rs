@@ -12,6 +12,20 @@ pub fn toplevel(dir: &Path) -> Option<PathBuf> {
     util::git_out(dir, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
 }
 
+/// The worktree root owning `cwd` — the "connect to root" resolver: from any
+/// nested directory (a shell pane deep in a subdir), find the git worktree it
+/// belongs to (`rev-parse --show-toplevel` from that dir). The result is
+/// canonicalized so it compares equal to registered workspace/worktree paths
+/// even when `cwd` came from a `/proc/<pid>/cwd` readlink or a symlinked
+/// checkout. `None` when `cwd` is not inside any git worktree.
+pub fn worktree_root_for_cwd(cwd: &Path) -> Option<PathBuf> {
+    if !cwd.is_dir() {
+        return None;
+    }
+    let root = toplevel(cwd)?;
+    Some(std::fs::canonicalize(&root).unwrap_or(root))
+}
+
 /// The MAIN worktree root for `dir`'s repo — climb out of any linked worktree
 /// so we never create worktrees-of-worktrees. None if `dir` isn't in a repo.
 pub fn main_worktree(dir: &Path) -> Option<PathBuf> {
@@ -156,4 +170,37 @@ pub fn discover_repos_in(root: &Path, max_depth: usize) -> Vec<String> {
     found.sort();
     found.dedup();
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("sj-repo-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn worktree_root_for_cwd_resolves_nested_dir_to_root() {
+        let root = tmp("root-resolve");
+        let _ = std::fs::remove_dir_all(&root);
+        let nested = root.join("src/deep/inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(util::git_cmd(&root).arg("init").status().unwrap().success());
+        let resolved = worktree_root_for_cwd(&nested).expect("nested cwd resolves");
+        assert_eq!(resolved, std::fs::canonicalize(&root).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktree_root_for_cwd_outside_any_worktree_is_none() {
+        let dir = tmp("root-none");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // /tmp is not a git repo; a plain dir resolves to nothing.
+        assert_eq!(worktree_root_for_cwd(&dir), None);
+        // A missing path resolves to nothing (no panic).
+        assert_eq!(worktree_root_for_cwd(&dir.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

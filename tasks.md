@@ -321,7 +321,7 @@ close, `<`/`>` width, digits quick-jump._
 - [x] 37. Non-git directory as workspace _(workspace `kind` repo|dir; insert-only; folder glyph in sidebar)_
 - [ ] 38. Workspace-level env vars _(subsumed by env bundles — AU 735–748; a workspace binds a bundle via `[workspace.<slug>].env_bundle`)_
 - [ ] 39. Workspace icon/color label
-- [x] 40. Recent/favorite workspaces
+- [x] 40. Recent/favorite workspaces _(upgraded to a frecency-ranked `~` palette opener + connect-to-root + clone-and-open + tmuxinator/sesh layout import — openspec `2026-07-03-add-frecency-navigation`)_
 
 ### D. Worktrees
 

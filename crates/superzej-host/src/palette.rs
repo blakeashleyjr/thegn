@@ -32,18 +32,28 @@ impl PaletteItem {
 }
 
 /// Order palette items by frecency for the empty-query view: items seen in
-/// `usage` (`(key, count, last_used)`) float to the top by most-recent then
-/// most-frequent; unseen items keep their original relative order below. Pure →
-/// unit-tested. (This is the host port of the old engine's frecency source.)
+/// `usage` (`(key, count, last_used)`) float to the top by their frecency
+/// score (`superzej_core::frecency` — frequency × recency decay, so a place
+/// used often *and* recently outranks a stale heavy-hitter); unseen items keep
+/// their original relative order below. Pure → unit-tested.
 pub fn order_by_frecency(
     items: Vec<PaletteItem>,
     usage: &[(String, i64, i64)],
 ) -> Vec<PaletteItem> {
+    order_by_frecency_at(items, usage, superzej_core::util::now())
+}
+
+/// [`order_by_frecency`] with an explicit `now` (epoch seconds) for testing.
+fn order_by_frecency_at(
+    items: Vec<PaletteItem>,
+    usage: &[(String, i64, i64)],
+    now: i64,
+) -> Vec<PaletteItem> {
     use std::cmp::Ordering;
     use std::collections::HashMap;
-    let rank: HashMap<&str, (i64, i64)> = usage
+    let rank: HashMap<&str, f64> = usage
         .iter()
-        .map(|(k, c, l)| (k.as_str(), (*l, *c)))
+        .map(|(k, c, l)| (k.as_str(), superzej_core::frecency::score(*c, *l, now)))
         .collect();
     let mut idx: Vec<usize> = (0..items.len()).collect();
     idx.sort_by(|&a, &b| {
@@ -51,7 +61,7 @@ pub fn order_by_frecency(
             rank.get(items[a].key.as_str()),
             rank.get(items[b].key.as_str()),
         ) {
-            (Some(x), Some(y)) => y.cmp(x), // higher (last_used, count) first
+            (Some(x), Some(y)) => y.partial_cmp(x).unwrap_or(Ordering::Equal),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
             (None, None) => a.cmp(&b), // stable: original order
@@ -91,6 +101,12 @@ impl Palette {
     #[allow(dead_code)] // accessor used by tests; live loop reads via render/selected_item
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// All items in insertion (frecency) order — the candidate source for the
+    /// palette's Worktrees mode, which filters this list by key prefix.
+    pub fn items(&self) -> &[PaletteItem] {
+        &self.items
     }
 
     /// Visible rows (resolved items), best match first.
@@ -324,6 +340,18 @@ pub(crate) fn build_command_palette_items(
         };
         items.push(crate::palette::PaletteItem::new(action.name.clone(), label));
     }
+
+    // Navigation verbs (frecency-navigation change): connect-to-root (the
+    // sesh-`root` jump) and clone-and-open. Palette-dispatched (`run.rs`
+    // Enter arm), not host Actions — no default chord.
+    items.push(crate::palette::PaletteItem::new(
+        "connect-root",
+        "⇱ Connect to root — jump to this pane's worktree",
+    ));
+    items.push(crate::palette::PaletteItem::new(
+        "clone-open",
+        "⇓ Clone and open — paste a git URL",
+    ));
 
     items
 }
@@ -876,18 +904,37 @@ mod tests {
 
     #[test]
     fn frecency_floats_recent_then_frequent_to_the_top() {
+        const DAY: i64 = 24 * 3600;
+        let now = 100 * DAY;
         let items = vec![
             PaletteItem::new("a", "A"),
             PaletteItem::new("b", "B"),
             PaletteItem::new("c", "C"),
             PaletteItem::new("d", "D"),
         ];
-        // c used most recently; a used earlier; b/d never.
-        let usage = vec![("a".to_string(), 5, 100), ("c".to_string(), 2, 200)];
-        let ordered = order_by_frecency(items, &usage);
+        // a is a stale heavy-hitter (5 uses, a month ago); c is light but
+        // fresh (2 uses, yesterday). The frecency score puts c first; unseen
+        // b/d keep their original order below.
+        let usage = vec![
+            ("a".to_string(), 5, now - 30 * DAY),
+            ("c".to_string(), 2, now - DAY),
+        ];
+        let ordered = order_by_frecency_at(items, &usage, now);
         let out: Vec<&str> = ordered.iter().map(|i| i.key.as_str()).collect();
-        // c (last=200) then a (last=100), then unseen b, d in original order.
         assert_eq!(out, vec!["c", "a", "b", "d"]);
+    }
+
+    #[test]
+    fn frecency_more_recent_wins_at_equal_count() {
+        const DAY: i64 = 24 * 3600;
+        let now = 100 * DAY;
+        let items = vec![PaletteItem::new("old", "O"), PaletteItem::new("new", "N")];
+        let usage = vec![
+            ("old".to_string(), 3, now - 20 * DAY),
+            ("new".to_string(), 3, now - DAY),
+        ];
+        let out = order_by_frecency_at(items, &usage, now);
+        assert_eq!(out[0].key, "new");
     }
 
     #[test]
