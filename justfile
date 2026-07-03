@@ -219,7 +219,8 @@ deps-audit:
 e2e: build
     #!/usr/bin/env bash
     {{_e2e_env}}
-    PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/ \
+    # muse takes spec FILES (a bare directory is "Is a directory" — os error 21).
+    PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
         --reporter pretty --workers 4 --deadline-ms 12000
 
 # Run only the glitch-hunt specs (18–28) — slower, more thorough.
@@ -234,7 +235,7 @@ e2e-glitch: build
 e2e-update: build
     #!/usr/bin/env bash
     {{_e2e_env}}
-    PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/ \
+    PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
         --update-snapshots --workers 4 --deadline-ms 12000
 
 # (e2e/stress/perf harnesses drove the old zellij CLI's worktree-creation
