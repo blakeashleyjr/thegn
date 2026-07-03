@@ -522,7 +522,7 @@ pub fn resolve_placed(
     // Only when $HOME was actually injected read-only: `all`/`host` are already
     // fully writable, and `custom`/`none` withhold $HOME entirely.
     if inject_host_toolchain && home_ro {
-        for cv in default_writable_carveouts() {
+        for cv in default_writable_carveouts(profile) {
             if keep_cfg_mount(&mounts, &cv) {
                 mounts.push(cv);
             }
@@ -1539,8 +1539,19 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                     }
                 }
                 // $HOME is otherwise read-only; carve the same narrow writable
-                // state dirs as bwrap so shell history/zoxide keep working.
-                for cv in default_writable_carveouts() {
+                // state dirs as bwrap so shell history/zoxide keep working. The
+                // sealed agent drops ALL caps — mirror bwrap's keychain gating so
+                // the sealed profile doesn't get a writable ~/.keychain.
+                let sealed = spec
+                    .drop_capabilities
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case("ALL"));
+                let carve_profile = if sealed {
+                    SandboxProfile::Sealed
+                } else {
+                    SandboxProfile::Hardened
+                };
+                for cv in default_writable_carveouts(carve_profile) {
                     v.extend(["-p".into(), format!("ReadWritePaths={}", cv.dest)]);
                 }
             }

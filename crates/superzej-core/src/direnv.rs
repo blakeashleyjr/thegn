@@ -25,7 +25,13 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
+
+/// How long a synchronous [`warm_now`] blocks waiting for a cold flake devShell
+/// to build/link before giving up and letting the async warm finish for the
+/// next launch. The host store is usually already realized, so real waits are a
+/// few seconds; this bound just caps a pathological cold build.
+pub const WARM_NOW_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Does this worktree have a flake-backed `.envrc` whose `nix-direnv` cache is
 /// cold or stale — i.e. would the in-sandbox direnv try (and fail) to rebuild
@@ -111,6 +117,69 @@ pub fn warm(worktree: &Path, allow: bool) {
     });
 }
 
+/// Synchronously warm `worktree`'s `direnv` cache, bounded by `timeout`, and
+/// report whether a fresh `.direnv/*.rc` now exists (so the in-sandbox direnv
+/// replays it read-only instead of failing against the read-only `/nix/store`).
+///
+/// **Never call on the event loop** — a cold flake build blocks for seconds.
+/// This is for the guaranteed-off-loop pane-materialize path (spawn_blocking).
+///
+/// Coordinates with the async [`warm`]: if a warm for this worktree is already
+/// in flight (startup pre-warm, a prior launch, a sibling prewarm), it WAITS for
+/// that one rather than double-spawning `direnv`. On timeout it returns `false`
+/// and leaves the owning thread running — the cache warms for the next launch,
+/// exactly today's fallback behavior.
+///
+/// Subprocess/thread orchestration seam: excluded from coverage (justfile
+/// `cov_ignore`); the pure decision logic lives in [`warm_now_plan`] /
+/// [`cache_is_fresh`], which are unit-tested.
+pub fn warm_now(worktree: &Path, allow: bool, timeout: Duration) -> bool {
+    // Nothing flake-backed to warm (or already fresh) ⇒ the pane replays as-is.
+    if !needs_warm(worktree) {
+        return true;
+    }
+    if !crate::util::have("direnv") {
+        return false;
+    }
+    let wt = worktree.to_path_buf();
+    // Ensure exactly one warm is in flight: ours, or an async one already
+    // running for this worktree. If we win the slot, drive the (blocking) warm
+    // on a helper thread so `timeout` actually caps our wait even when the
+    // subprocess overruns it.
+    let we_own = in_flight().lock().unwrap().insert(wt.clone());
+    if we_own {
+        let wt2 = wt.clone();
+        std::thread::spawn(move || {
+            warm_blocking(&wt2, allow);
+            in_flight().lock().unwrap().remove(&wt2);
+        });
+    }
+    // Poll the pure, cheap freshness stat until the rc lands or we time out.
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !needs_warm(&wt) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Pure config→action mapping for a synchronous warm, split out so callers can
+/// be unit-tested without a subprocess. `None` ⇒ warming disabled (leave the
+/// pane on today's fallback); `Some(allow)` ⇒ warm, running `direnv allow`
+/// first iff `allow`.
+pub fn warm_now_plan(mode: crate::config::WarmDirenv) -> Option<bool> {
+    use crate::config::WarmDirenv;
+    match mode {
+        WarmDirenv::Off => None,
+        WarmDirenv::AllowedOnly => Some(false),
+        WarmDirenv::Auto => Some(true),
+    }
+}
+
 /// Run the `direnv` warm synchronously. Subprocess seam: excluded from coverage
 /// (see the justfile `cov_ignore`), exercised by smoke.
 fn warm_blocking(worktree: &Path, allow: bool) {
@@ -171,6 +240,27 @@ mod tests {
         // No `.direnv` cache yet ⇒ cold ⇒ needs warming.
         assert!(needs_warm(&dir));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_now_plan_maps_config_to_action() {
+        use crate::config::WarmDirenv;
+        assert_eq!(warm_now_plan(WarmDirenv::Off), None);
+        assert_eq!(warm_now_plan(WarmDirenv::AllowedOnly), Some(false));
+        assert_eq!(warm_now_plan(WarmDirenv::Auto), Some(true));
+    }
+
+    #[test]
+    fn in_flight_dedupes_concurrent_warms() {
+        // The wait-don't-double-warm contract: a second insert for the same
+        // worktree returns false, so `warm_now` waits on the in-flight warm
+        // instead of spawning a second `direnv`.
+        let wt = tmp("in-flight").join("wt");
+        assert!(in_flight().lock().unwrap().insert(wt.clone()));
+        assert!(!in_flight().lock().unwrap().insert(wt.clone()));
+        in_flight().lock().unwrap().remove(&wt);
+        assert!(in_flight().lock().unwrap().insert(wt.clone()));
+        in_flight().lock().unwrap().remove(&wt);
     }
 
     #[test]
