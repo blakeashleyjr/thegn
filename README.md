@@ -48,7 +48,14 @@ never a session change.
 
 Context-relevant keys are shown in the bottom **status bar**, and
 **Ctrl-Space** opens a fuzzy **command palette** of every action — the palette
-is the complete, always-current reference. Defaults (override via `[keybinds]`):
+is the complete, always-current reference. A leading `~` switches it to the
+**frecency opener**: workspaces + worktrees ranked by how often _and_ how
+recently you use them — type a fragment, Enter lands in that worktree's tab.
+The palette also carries **Connect to root** (jump from a shell nested deep in
+a subdir straight to the owning worktree's tab) and **Clone and open** (paste
+a git URL; it clones off-loop and opens as a workspace). Existing
+tmuxinator/sesh project files show up automatically as new-worktree templates.
+Defaults (override via `[keybinds]`):
 
 | Key                           | Action                                                |
 | ----------------------------- | ----------------------------------------------------- |
