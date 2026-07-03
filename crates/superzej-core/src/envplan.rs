@@ -1188,6 +1188,33 @@ pub fn agent_config_paths(agent: &str) -> (Vec<String>, Vec<String>) {
     }
 }
 
+/// The minimal set of files (relative to `$HOME`) that are **sufficient** for
+/// an agent to be authenticated and functional in a sandbox — i.e. what must be
+/// uploaded even when the full config tree walk runs out of time. This is an
+/// explicit allowlist (not a blocklist) so it stays correct regardless of how
+/// large the rest of the agent config directory gets.
+pub fn agent_auth_critical_files(agent: &str) -> Vec<String> {
+    match agent.trim() {
+        "claude" | "claude-code" => vec![
+            ".claude.json".into(),
+            ".claude/.credentials.json".into(),
+            ".claude/settings.json".into(),
+            ".claude/settings.local.json".into(),
+            ".config/claude/mcp-needs-auth-cache.json".into(),
+        ],
+        "codex" => vec![
+            ".codex/config.json".into(),
+            ".config/codex/config.json".into(),
+        ],
+        "pi" => vec![".pi.json".into()],
+        other => vec![
+            format!(".{other}.json"),
+            format!(".{other}/config.json"),
+            format!(".config/{other}/config.json"),
+        ],
+    }
+}
+
 /// Install known coding-agent CLIs (best-effort, idempotent). Known agents get a
 /// real installer; unknown ones are left to the user's `setup`/`tools` (their
 /// config is still uploaded). Per-agent failures are non-fatal.

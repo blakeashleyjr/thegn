@@ -230,6 +230,7 @@ fn map_gh_error(e: GhError) -> ForgeError {
         GhError::NotAuthenticated => ForgeError::NotAuthenticated,
         GhError::NoPr => ForgeError::NotFound, // Similar enough for our purposes
         GhError::RateLimited => ForgeError::RateLimited,
+        GhError::Offline => ForgeError::Other("GitHub unreachable".into()),
         GhError::Other(msg) => {
             if msg.contains("No issue") || msg.contains("issue not found") {
                 ForgeError::NotFound

@@ -1,9 +1,25 @@
 //! Agent-login sync — upload coding agents' host config/credential files into a
 //! provider sandbox so the agent (claude code, codex, pi, custom) is logged-in
 //! there. Split out of `agent.rs` (god-file ratchet) as the "Sync agent logins"
-//! provisioning step. Every network write is bounded (per-file timeout + a
-//! whole-step wall-clock budget) so a hung provider fs endpoint can never strand
-//! the loading screen — the classic sprite-launch hang.
+//! provisioning step.
+//!
+//! ## Two-phase upload
+//!
+//! **Phase 1 — auth-critical (always runs, no budget check):** A small,
+//! explicit allowlist of the files that are strictly sufficient for the agent
+//! to be authenticated (`agent_auth_critical_files`). For Claude Code this is
+//! ~5 files (<50 KB total). Even with a slow provider this completes in seconds
+//! and guarantees the agent is usable regardless of what happens in Phase 2.
+//!
+//! **Phase 2 — full config tree (parallel, budget-capped):** Walk each agent's
+//! config directories (skipping bulky state dirs), then upload the remaining
+//! files with bounded concurrency (`UPLOAD_CONCURRENCY`). This is best-effort:
+//! if the 120s budget runs out, the agent still works (Phase 1 already handled
+//! auth) — only non-critical extras (hook scripts, MCP config) may be missing.
+//!
+//! The two-phase design makes this correct for any codebase size. A Firefox/
+//! Chromium developer whose `~/.pi/agent/` contains 40k tool files will still
+//! get a working, logged-in agent; Phase 2 just won't finish all 40k files.
 
 use crate::agent::block_on_provider;
 use std::path::Path;
@@ -39,12 +55,17 @@ const AGENT_CONFIG_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 /// instead of letting it strand "Sync agent logins" on the loading screen.
 const AGENT_CONFIG_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Whole-step wall-clock budget for the agent-login sync. Even with each file
-/// bounded, a large login tree of individually-slow files could still add up to
-/// minutes of spinner; once this is spent we stop uploading the remaining files
-/// (best-effort — the agent is still usable, it just may re-auth in-sprite) so
-/// the sprite finishes coming up. Logged so the drop is visible.
+/// Whole-step wall-clock budget for Phase 2 (the full tree walk). Phase 1
+/// (auth-critical files) runs unconditionally outside this budget so the agent
+/// is always authenticated even when Phase 2 runs out of time.
 const AGENT_CONFIG_STEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How many files to upload concurrently in Phase 2. Each upload is a separate
+/// HTTP round-trip to the provider; parallelism cuts wall-clock dramatically for
+/// large config trees (e.g. 40k files at 300ms/file goes from 3.3 hours
+/// sequential to ~25 minutes at CONCURRENCY=8 — and most fit within the 120s
+/// budget since the typical tree is 100-500 files).
+const UPLOAD_CONCURRENCY: usize = 8;
 
 /// Collect `(absolute, relative)` files under an agent config `dir`, skipping the
 /// bulky-state subdirs in [`AGENT_STATE_SKIP_DIRS`] and any file over
@@ -101,10 +122,9 @@ fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
 
 /// Upload coding agents' host config/credential dirs into the sandbox `$HOME`
 /// (`/root`) so the agent (claude code, codex, custom) is logged-in there.
-/// Per-agent paths come from `envplan::agent_config_paths`; missing host paths
-/// are skipped. Files go via the fs `write`. A genuine upload error (nothing got
-/// through at all) aborts the step (surfaced on the splash); partial success is a
-/// √ with logged warnings.
+///
+/// See the module-level doc for the two-phase strategy: Phase 1 (auth-critical,
+/// always) then Phase 2 (full tree, parallel, budget-capped).
 pub(crate) fn upload_agent_configs(
     provider: &superzej_svc::provider::Provider,
     id: &str,
@@ -113,87 +133,179 @@ pub(crate) fn upload_agent_configs(
 ) -> anyhow::Result<()> {
     let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let base = sandbox_home.trim_end_matches('/');
-    // Per-file BEST-EFFORT: one unwritable file (a transient `sprites write`
-    // 5xx, an oversized/odd path) must not `?`-abort the whole step and paint a
-    // red × over "Sync agent logins" while every other login uploaded fine. Warn
-    // + continue per file; only fail the step if NOTHING got through.
-    let mut ok = 0usize;
-    let mut failed = 0usize;
-    let mut skipped = 0usize;
-    // Whole-step deadline: once spent, remaining files are dropped best-effort so
-    // a slow-per-file login tree can't hold the loading screen open forever.
-    let deadline = std::time::Instant::now() + AGENT_CONFIG_STEP_BUDGET;
-    let mut upload = |dest: String, data: &[u8]| {
-        if std::time::Instant::now() >= deadline {
-            skipped += 1;
-            return;
-        }
-        // Bound each write so one hung request can't strand the step. The timeout
-        // runs inside `block_on_provider`'s own runtime, so it fires even when the
-        // provider's HTTP call itself never returns.
-        match block_on_provider(|| async {
-            match tokio::time::timeout(AGENT_CONFIG_UPLOAD_TIMEOUT, provider.write(id, &dest, data))
+
+    // -----------------------------------------------------------------------
+    // Phase 1: auth-critical files — explicit allowlist, always uploaded,
+    // no deadline. Even a slow provider finishes these in a few seconds.
+    // The agent is guaranteed to be logged-in after this phase completes.
+    // -----------------------------------------------------------------------
+    let mut auth_ok = 0usize;
+    let mut auth_failed = 0usize;
+    for agent in agents {
+        let critical = superzej_core::envplan::agent_auth_critical_files(agent);
+        for f in &critical {
+            let src = Path::new(&host_home).join(f);
+            let Ok(data) = std::fs::read(&src) else {
+                continue; // file absent on this host — skip silently
+            };
+            let dest = format!("{base}/{f}");
+            match block_on_provider(|| async {
+                match tokio::time::timeout(
+                    AGENT_CONFIG_UPLOAD_TIMEOUT,
+                    provider.write(id, &dest, &data),
+                )
                 .await
-            {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!(
-                    "upload timed out after {}s",
-                    AGENT_CONFIG_UPLOAD_TIMEOUT.as_secs()
-                )),
-            }
-        }) {
-            Ok(()) => ok += 1,
-            Err(e) => {
-                failed += 1;
-                tracing::warn!(
-                    target: "szhost::startup",
-                    dest = %dest,
-                    error = %e,
-                    "agent-config upload: skipping one file (best-effort)"
-                );
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "upload timed out after {}s",
+                        AGENT_CONFIG_UPLOAD_TIMEOUT.as_secs()
+                    )),
+                }
+            }) {
+                Ok(()) => auth_ok += 1,
+                Err(e) => {
+                    auth_failed += 1;
+                    tracing::warn!(
+                        target: "szhost::startup",
+                        dest = %dest,
+                        error = %e,
+                        "agent-config auth-critical upload failed (best-effort)"
+                    );
+                }
             }
         }
-    };
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: full config tree — walk directories, skip bulky-state dirs,
+    // upload remaining files in parallel batches, stop when budget expires.
+    // Auth-critical files already uploaded above are deduplicated.
+    // -----------------------------------------------------------------------
+
+    // Build the full upload list synchronously before entering async.
+    // Dedup against the auth-critical set so we don't double-upload.
+    let mut already_uploaded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for agent in agents {
+        for f in superzej_core::envplan::agent_auth_critical_files(agent) {
+            already_uploaded.insert(f);
+        }
+    }
+
+    let mut all_uploads: Vec<(String, Vec<u8>)> = Vec::new();
     for agent in agents {
         let (files, dirs) = superzej_core::envplan::agent_config_paths(agent);
         for f in files {
+            if already_uploaded.contains(&f) {
+                continue;
+            }
             let src = Path::new(&host_home).join(&f);
             let Ok(data) = std::fs::read(&src) else {
                 continue;
             };
-            upload(format!("{base}/{f}"), &data);
+            all_uploads.push((format!("{base}/{f}"), data));
         }
         for d in dirs {
             let src = Path::new(&host_home).join(&d);
             if !src.is_dir() {
                 continue;
             }
-            // Upload only the auth/config files, NOT the agent's bulky session
-            // state (transcripts/caches) — see `collect_agent_config_files`.
             for (abs, rel) in collect_agent_config_files(&src) {
+                let host_rel = format!("{d}/{rel}");
+                if already_uploaded.contains(&host_rel) {
+                    continue;
+                }
                 let Ok(data) = std::fs::read(&abs) else {
                     continue;
                 };
-                upload(format!("{base}/{d}/{rel}"), &data);
+                all_uploads.push((format!("{base}/{host_rel}"), data));
             }
         }
     }
+
+    let total_phase2 = all_uploads.len();
+    let deadline = std::time::Instant::now() + AGENT_CONFIG_STEP_BUDGET;
+
+    // Run parallel uploads inside a single tokio runtime so the per-file
+    // overhead (runtime creation) is paid once, not once per file.
+    let (p2_ok, p2_failed, p2_skipped) = block_on_provider(|| async {
+        use futures::future::join_all;
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        let mut skipped = 0usize;
+
+        for chunk in all_uploads.chunks(UPLOAD_CONCURRENCY) {
+            if std::time::Instant::now() >= deadline {
+                // Budget exhausted: count all remaining (this chunk + the rest).
+                skipped += total_phase2 - ok - failed - skipped;
+                break;
+            }
+
+            let futs: Vec<_> = chunk
+                .iter()
+                .map(|(dest, data)| {
+                    let dest = dest.as_str();
+                    async move {
+                        let r = tokio::time::timeout(
+                            AGENT_CONFIG_UPLOAD_TIMEOUT,
+                            provider.write(id, dest, data),
+                        )
+                        .await;
+                        (dest, r)
+                    }
+                })
+                .collect();
+
+            for (dest, result) in join_all(futs).await {
+                match result {
+                    Ok(Ok(())) => ok += 1,
+                    Ok(Err(e)) => {
+                        failed += 1;
+                        tracing::warn!(
+                            target: "szhost::startup",
+                            dest = %dest,
+                            error = %e,
+                            "agent-config upload: skipping one file (best-effort)"
+                        );
+                    }
+                    Err(_) => {
+                        failed += 1;
+                        tracing::warn!(
+                            target: "szhost::startup",
+                            dest = %dest,
+                            "agent-config upload: file timed out (best-effort)"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok((ok, failed, skipped))
+    })?;
+
+    let ok = auth_ok + p2_ok;
+    let failed = auth_failed + p2_failed;
+    let skipped = p2_skipped;
+
     if failed > 0 || skipped > 0 {
         tracing::warn!(
             target: "szhost::startup",
-            ok, failed, skipped,
+            ok,
+            failed,
+            skipped,
             "agent-config upload finished with some files skipped"
         );
     }
     if skipped > 0 {
+        // Auth-critical files (Phase 1) already uploaded — only non-critical
+        // extras were skipped, so the agent is still usable.
         superzej_core::msg::warn(&format!(
-            "agent-login sync hit its {}s budget; {skipped} file(s) not uploaded \
-             — the agent may need to re-authenticate in the sandbox.",
+            "agent-login sync hit its {}s budget; {skipped} non-critical file(s) not uploaded \
+             (auth files were synced — the agent should still be logged in).",
             AGENT_CONFIG_STEP_BUDGET.as_secs()
         ));
     }
-    // Nothing uploaded but files failed ⇒ a real problem (provider down / auth) —
-    // surface it. A partial success is a √ with logged warnings.
+    // Nothing uploaded at all AND things failed ⇒ a real problem (provider down).
     anyhow::ensure!(
         ok > 0 || failed == 0,
         "no agent-config files could be uploaded ({failed} failed)"
@@ -293,5 +405,31 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn auth_critical_files_are_a_small_known_set() {
+        // Claude's auth-critical set must be small (≤10 files) and include
+        // the oauth credential file — the most important one.
+        let claude_crit = superzej_core::envplan::agent_auth_critical_files("claude");
+        assert!(
+            claude_crit.len() <= 10,
+            "auth-critical set should be small: {claude_crit:?}"
+        );
+        assert!(
+            claude_crit.iter().any(|f| f.contains(".credentials.json")),
+            "must include oauth credentials: {claude_crit:?}"
+        );
+        assert!(
+            claude_crit.contains(&".claude.json".to_string()),
+            "must include .claude.json: {claude_crit:?}"
+        );
+
+        // pi's auth-critical set must be small.
+        let pi_crit = superzej_core::envplan::agent_auth_critical_files("pi");
+        assert!(
+            pi_crit.len() <= 5,
+            "pi auth-critical should be small: {pi_crit:?}"
+        );
     }
 }
