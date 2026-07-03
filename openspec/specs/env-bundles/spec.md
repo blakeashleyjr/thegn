@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-env-bundles. Update Purpose after archive.
+Named env bundles bound at any scope and resolved through one pane-spawn compose seam: config-dir redirection, opt-in allowlisted .env, off-loop secret resolvers, and dotfile / synthetic-HOME tiers.
 
 ## Requirements
 

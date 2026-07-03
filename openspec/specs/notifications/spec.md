@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-notification-routing. Update Purpose after archive.
+The aggregated notification and event bus: user-defined routing rules, DND / quiet-hours, per-profile routing, sound/bell tiers, desktop notifications, and the in-app inbox.
 
 ## Requirements
 

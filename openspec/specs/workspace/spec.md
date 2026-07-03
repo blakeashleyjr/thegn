@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-workspace-create-delete. Update Purpose after archive.
+Adding, discovering, and removing workspaces (git repos and plain directories): discovery-first creation, the fuzzy new-workspace picker, and orphan-aware non-destructive deletion.
 
 ## Requirements
 
