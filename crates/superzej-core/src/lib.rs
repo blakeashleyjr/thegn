@@ -28,6 +28,7 @@ pub mod direnv;
 pub mod disk;
 pub mod dns_filter;
 pub mod env;
+pub mod envbuild;
 pub mod envplan;
 pub mod event_bus;
 pub mod fold;

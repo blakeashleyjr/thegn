@@ -682,10 +682,10 @@ fn provider_for(
 /// `ensure_exists()`, which name the new sandbox from the provider's own baked
 /// name (not a call argument): the raw `pc.id` may be a per-worktree template
 /// (`{worktree}`) or empty, so the caller must pass the resolved
-/// [`effective_provider_id`](superzej_core::config::effective_provider_id) to
+/// [`effective_provider_id`](superzej_core::envbuild::effective_provider_id) to
 /// create the correctly-named sandbox. Exec/read/write/destroy take the id as an
 /// argument, so for those `provider_for` is equivalent.
-fn provider_for_named(
+pub(crate) fn provider_for_named(
     pc: &superzej_core::config::EnvProviderConfig,
     name: &str,
 ) -> Option<superzej_svc::provider::Provider> {
@@ -722,7 +722,11 @@ fn provider_for_named(
 /// checkpoint, and teardown all compute the SAME name (the id embeds a stable
 /// path-hash; deriving it inconsistently would orphan/leak sandboxes). `None` for
 /// a non-provider env. Mirrors how the other launch paths resolve `repo_root`.
-fn provider_sandbox_name(cfg: &Config, worktree: &str, env_name: &str) -> Option<String> {
+pub(crate) fn provider_sandbox_name(
+    cfg: &Config,
+    worktree: &str,
+    env_name: &str,
+) -> Option<String> {
     let loc = GitLoc::for_worktree(Path::new(worktree));
     let repo_root: PathBuf = Db::open()
         .ok()
@@ -1247,10 +1251,16 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
     }
     env.push(("SUPERZEJ_WORKTREE".to_string(), worktree.to_string()));
     env.push(("SUPERZEJ_BRANCH".to_string(), String::new()));
+    // A claimed warm-pool spare overrides the derived id (same rule as
+    // `provider_sandbox_name`): the pane must attach to the sandbox the
+    // worktree is actually bound to, not the derived husk.
+    let bound = Db::open()
+        .ok()
+        .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten());
     Some(NativeShell {
         provider,
         provider_name: pc.provider.clone(),
-        sandbox_id: p.id.clone(),
+        sandbox_id: bound.unwrap_or_else(|| p.id.clone()),
         inner,
         workdir: pc.sync_workdir(),
         env,
@@ -1410,100 +1420,6 @@ pub fn provision_worktree(
     // spare (and clear the splash) under this run — see `provision_gate`.
     let _live = crate::provision_gate::worktree_live_guard(worktree);
     provision_provider_env(cfg, worktree, &environment.name, progress)
-}
-
-/// Mint + fully provision a NEW warm-pool spare for `(repo, env)`: a generically-
-/// named sandbox, cloned + devShell-seeded + tooled + checkpointed (so it suspends
-/// for free), recorded `ready` so a worktree can claim it. Returns the spare name.
-/// On failure the half-built sandbox + DB row are torn down.
-pub fn provision_spare(
-    cfg: &Config,
-    repo_root: &Path,
-    env_name: &str,
-    mut progress: impl FnMut(&[ProvisionStepView]),
-) -> anyhow::Result<String> {
-    let repo = repo_root.to_string_lossy().to_string();
-    let name = crate::provision_gate::mint_spare_name(&repo);
-    if let Ok(db) = Db::open() {
-        let _ = db.insert_pool_spare(&name, &repo, env_name);
-    }
-    // The repo's main worktree gives env-resolution + origin context; the name is
-    // overridden to the generic spare name (the clone is branch-less either way).
-    let ctx = repo::main_worktree(repo_root)
-        .unwrap_or_else(|| repo_root.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
-    match provision_provider_env_named(cfg, &ctx, env_name, Some(&name), &mut progress) {
-        Ok(_) => {
-            let lock = crate::provision_gate::flake_lock_hash(repo_root);
-            if let Ok(db) = Db::open() {
-                let _ = db.set_pool_spare_ready(&name, None, &lock);
-            }
-            Ok(name)
-        }
-        Err(e) => {
-            let _ = destroy_spare(cfg, env_name, &name);
-            Err(e)
-        }
-    }
-}
-
-/// Claim a `ready` spare for `(repo, env)` and hand it to `worktree`: bind it (DB,
-/// atomic) then check out the worktree's branch in the spare's workdir. Returns the
-/// claimed sandbox name, or `None` when no spare is ready (caller provisions fresh).
-pub fn claim_spare(
-    cfg: &Config,
-    worktree: &str,
-    repo_root: &Path,
-    env_name: &str,
-    branch: Option<&str>,
-) -> Option<String> {
-    let repo = repo_root.to_string_lossy().into_owned();
-    let db = Db::open().ok()?;
-    let (name, _checkpoint) = db.claim_pool_spare(&repo, env_name, worktree).ok()??;
-    // Per-worktree work: settle the branch in the spare's existing clone (the
-    // sandbox auto-resumes when the exec opens). Best-effort — the bind already
-    // succeeded, so the pane opens against the spare regardless.
-    if let Some(env) = cfg.env.get(env_name)
-        && let Some(provider) = provider_for_named(&env.provider, &name)
-    {
-        let workdir = env.provider.sync_workdir();
-        if let Some(b) = branch.map(str::trim).filter(|b| !b.is_empty()) {
-            let wd = superzej_core::util::sh_quote(&workdir);
-            let bq = superzej_core::util::sh_quote(b);
-            let script = format!(
-                "cd {wd} 2>/dev/null && (git checkout {bq} 2>/dev/null || git checkout -b {bq}) 2>&1"
-            );
-            let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script];
-            let _ =
-                block_on_provider(|| async { provider.run_exec(&name, &argv, None, &[]).await });
-        }
-        // Bring the claimed spare to full parity with the local worktree, same as
-        // a fresh provision (only for an `in_env` provider — a projected data mode
-        // mirrors the tree by other means). Best-effort.
-        if env.data == superzej_core::config::DataMode::InEnv
-            && let Err(e) = apply_local_parity(&provider, &name, worktree, &workdir, &[])
-        {
-            superzej_core::msg::warn(&format!(
-                "local parity on claimed spare {name}: {e}; using the origin checkout."
-            ));
-        }
-    }
-    superzej_core::msg::info(&format!("claimed warm spare {name} for {worktree}"));
-    Some(name)
-}
-
-/// Destroy a spare sandbox + drop its DB row. Best-effort (idempotent).
-pub fn destroy_spare(cfg: &Config, env_name: &str, name: &str) -> anyhow::Result<()> {
-    if let Some(env) = cfg.env.get(env_name)
-        && let Some(provider) = provider_for_named(&env.provider, name)
-    {
-        let _ = block_on_provider(|| async { provider.destroy(name).await });
-    }
-    if let Ok(db) = Db::open() {
-        let _ = db.delete_pool_spare(name);
-    }
-    Ok(())
 }
 
 /// Make a sandbox/remote env "just work" like local, by reproducing the repo's
@@ -2391,7 +2307,7 @@ fn run_host_nix_timeout(secs: u32, argv: &[String]) -> anyhow::Result<std::proce
 /// or apply failure leaves the pristine origin checkout intact.
 // off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
 #[expect(clippy::disallowed_methods)]
-fn apply_local_parity(
+pub(crate) fn apply_local_parity(
     provider: &superzej_svc::provider::Provider,
     id: &str,
     wt_host: &str,
@@ -3081,6 +2997,25 @@ fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyho
     else {
         return Ok(());
     };
+    // Pool-aware: an UNBOUND worktree with a ready spare waiting will claim it
+    // in the materialize fast path — creating the derived sandbox now would
+    // just mint a bare, billed orphan (destroyed again on claim). A worktree
+    // that ends up claiming nothing provisions via the full pipeline, whose own
+    // `ensure_exists` recreates the sandbox.
+    if let Ok(db) = Db::open()
+        && db
+            .worktree_provider_sandbox(worktree)
+            .ok()
+            .flatten()
+            .is_none()
+        && let Some(root) = db.repo_root_for(worktree).ok().flatten()
+        && db
+            .pool_spares_for(&root, env_name)
+            .map(|v| v.iter().any(|s| s.state == "ready"))
+            .unwrap_or(false)
+    {
+        return Ok(());
+    }
     // Bake the RESOLVED name so `ensure_exists`→`create` names the new sandbox
     // correctly (the raw `pc.id` is a template + embeds a path-hash).
     let Some(provider) = provider_for_named(pc, &name) else {

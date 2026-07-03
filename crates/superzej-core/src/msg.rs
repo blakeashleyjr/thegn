@@ -22,13 +22,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// writes to stderr — a fatal must be seen even if it scars the frame on exit.
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Toggle the alt-screen guard (see [`TUI_ACTIVE`]). The compositor sets it true
+/// Toggle the alt-screen guard (see `TUI_ACTIVE`). The compositor sets it true
 /// right after entering the alternate screen and false on teardown.
 pub fn set_tui_active(active: bool) {
     TUI_ACTIVE.store(active, Ordering::Relaxed);
 }
 
-/// Whether the compositor owns the raw/alternate screen (see [`TUI_ACTIVE`]).
+/// Whether the compositor owns the raw/alternate screen (see `TUI_ACTIVE`).
 /// Callers that spawn subprocesses with inheritable stdio consult this to
 /// capture their output instead of letting it paint over the frame.
 pub fn tui_active() -> bool {
