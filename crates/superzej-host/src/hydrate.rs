@@ -2135,7 +2135,8 @@ pub(crate) fn spawn_my_work_refresh(
                 .enable_all()
                 .build()
         {
-            let mut filter = superzej_core::issue::IssueFilter::my_open(issues_cfg.max_issues.max(1));
+            let mut filter =
+                superzej_core::issue::IssueFilter::my_open(issues_cfg.max_issues.max(1));
             filter.repo = nwo.clone(); // GitHub repo scope; other providers ignore it.
             if let Ok(issues) = rt.block_on(router.list_issues(&filter)) {
                 for i in issues {

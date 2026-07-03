@@ -1215,9 +1215,8 @@ pub fn provision_worktree(
     // Tag every log line this (blocking) provisioning run emits with the
     // worktree, so a sprite/remote failure is attributable and the Logs panel
     // keeps it out of *other* worktrees' views.
-    let _wt_log = superzej_core::log_trace::enter_wt(superzej_core::log_trace::wt_slug(
-        Path::new(worktree),
-    ));
+    let _wt_log =
+        superzej_core::log_trace::enter_wt(superzej_core::log_trace::wt_slug(Path::new(worktree)));
     let loc = GitLoc::for_worktree(Path::new(worktree));
     let repo_root: PathBuf = Db::open()
         .ok()

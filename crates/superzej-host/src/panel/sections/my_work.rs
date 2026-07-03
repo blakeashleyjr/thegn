@@ -57,7 +57,11 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     // The full view leads with a count banner (also makes it visually distinct
     // from the half view, which is otherwise identical at wide column counts).
     if ctx.full() {
-        let scope = if all { " · all repos" } else { " · this repo" };
+        let scope = if all {
+            " · all repos"
+        } else {
+            " · this repo"
+        };
         out.push(PanelRow::plain(Line::segs(vec![
             seg(d(), format!("MY WORK — {} items", rows_data.len())),
             seg(g2(), scope.to_string()),
@@ -155,7 +159,10 @@ fn empty_rows(ctx: &SectionCtx) -> Vec<PanelRow> {
             g2(),
             "Assigned issues, review requests, and your open ".to_string(),
         )])));
-        rows.push(PanelRow::plain(Line::segs(vec![seg(g2(), where_.to_string())])));
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            g2(),
+            where_.to_string(),
+        )])));
         rows.push(PanelRow::plain(Line::Blank));
     }
     if ctx.full() {

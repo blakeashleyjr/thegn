@@ -128,7 +128,11 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     let mut rows = Vec::new();
 
     let total = items.len();
-    let scope = if all { " · all worktrees" } else { " · this repo" };
+    let scope = if all {
+        " · all worktrees"
+    } else {
+        " · this repo"
+    };
     rows.push(PanelRow::plain(Line::segs(vec![
         seg(d(), "LOGS (Structured)"),
         seg(g2(), format!(" · {total} lines")),
