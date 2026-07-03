@@ -75,6 +75,7 @@ mod sequence;
 mod session;
 mod share;
 mod sidebar;
+mod ssh_shim;
 mod subsystem;
 mod tabbar_env;
 mod task;

@@ -546,10 +546,27 @@ pub fn resolve_placed(
         }
     }
 
+    // SSH identity keys: secret managers (agenix, sops-nix) keep private keys
+    // on a tmpfs outside $HOME — `~/.ssh/id_*` are symlinks into trees we
+    // deliberately do NOT bind wholesale. Bind just the referenced key files
+    // read-only at their symlink-target paths so the $HOME-mounted symlinks
+    // resolve in-sandbox. Local placements only (paths are probed on this
+    // host); gated exactly like the toolchain mounts that expose $HOME.
+    if inject_host_toolchain && placement.is_local() {
+        let mut covered: Vec<String> = mounts.iter().map(|m| m.dest.clone()).collect();
+        if backend == Backend::Bwrap {
+            covered.extend(BWRAP_SUBSTRATE.iter().map(|s| s.to_string()));
+        }
+        mounts.extend(crate::ssh_creds::identity_mounts(&covered));
+    }
+
     let mut env: Vec<(String, String)> = cfg
         .env_passthrough
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
+        // A dead agent socket is worse than none: every in-sandbox ssh would
+        // waste a connect on it (and `AddKeysToAgent` errors per connection).
+        .filter(|(k, v)| k != "SSH_AUTH_SOCK" || crate::ssh_creds::unix_socket_alive(v))
         .collect();
 
     // Marker so a pane's shell rc / tooling can tell it's running inside a
@@ -1420,15 +1437,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             } else {
                 // Do not expose host / wholesale. Bind the runtime substrate read-only,
                 // then add the explicit worktree/cache mounts below.
-                for path in [
-                    "/nix/store",
-                    "/run/current-system",
-                    "/bin",
-                    "/usr",
-                    "/lib",
-                    "/lib64",
-                    "/etc",
-                ] {
+                for path in BWRAP_SUBSTRATE.iter().copied() {
                     if std::path::Path::new(path).exists() {
                         v.extend(["--ro-bind".into(), path.into(), path.into()]);
                         hardcoded_parents.push(path);
@@ -1479,6 +1488,17 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 v.extend(["--cap-add".into(), cap.clone()]);
             }
             for (k, val) in &spec.env {
+                // Keep host-sourced passthrough values (tokens, API keys) off
+                // the argv — `--setenv K V` is world-readable in /proc/*/cmdline.
+                // Local bwrap inherits the launcher's process env (the pane
+                // spawn path injects spec.env there), so pairs matching the
+                // host env can simply be omitted. Synthetic pairs
+                // (SUPERZEJ_SANDBOX, NIX_REMOTE) don't match and still ride
+                // --setenv; remote-wrapped bwrap keeps it for everything, as
+                // the argv is the only env carrier through ssh.
+                if spec.placement.is_local() && std::env::var(k).ok().as_deref() == Some(val) {
+                    continue;
+                }
                 v.extend(["--setenv".into(), k.clone(), val.clone()]);
             }
             v.extend([
@@ -1861,125 +1881,22 @@ fn local_uid_gid() -> Option<(u32, u32)> {
     Some((u, g))
 }
 
-/// ssh refuses a config file — or any file it `Include`s — unless it is owned
-/// by the invoking user or root. Under unprivileged bwrap the whole nix store
-/// (where home-manager keeps `~/.ssh/config` and its includes) is owned by
-/// `nobody` (the user-namespace overflow uid), so ssh rejects it with "Bad
-/// owner or permissions" and every ssh-based git op fails inside the sandbox.
-///
-/// superzej-host runs UNSANDBOXED, so it can read the resolved config and every
-/// file it includes — even agenix-backed ones under `/run/agenix`, which we
-/// deliberately do not bind — and flatten them into a single user-owned `0600`
-/// file under the state dir. The caller points sandboxed git at it via
-/// `GIT_SSH_COMMAND='ssh -F <file>'`. (We cannot bind it over `~/.ssh/config`:
-/// when `$HOME` is rw-bound and that path is a symlink, bwrap dereferences the
-/// symlink onto the read-only store and fails with "Can't create file".)
-///
-/// Returns the path of the materialized config (which is also its in-sandbox
-/// path, since it lives under the rw-bound `$HOME`), or `None` if there is no
-/// usable `~/.ssh/config`.
-pub fn prepare_ssh_config() -> Option<String> {
-    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
-    let ssh_dir = std::path::Path::new(&home).join(".ssh");
-    let content = std::fs::read_to_string(ssh_dir.join("config")).ok()?;
-    let flattened = flatten_ssh_config(&content, &|tok| read_ssh_include(&ssh_dir, &home, tok), 0);
-    let state = std::env::var("XDG_STATE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::Path::new(&home).join(".local/state"));
-    let dir = state.join("superzej/sandbox");
-    std::fs::create_dir_all(&dir).ok()?;
-    let out = dir.join("ssh_config");
-    std::fs::write(&out, flattened).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600));
-    }
-    Some(out.to_string_lossy().into_owned())
-}
+/// Runtime substrate the bwrap backend hardcodes into its argv (read-only).
+/// Anything covered here must be skipped when emitting `spec.mounts`, and
+/// counts as "already reachable in-sandbox" for identity-key resolution.
+pub const BWRAP_SUBSTRATE: &[&str] = &[
+    "/nix/store",
+    "/run/current-system",
+    "/bin",
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/etc",
+];
 
-/// Read the contents of every file an ssh `Include` token expands to (host
-/// side), honoring `~`, absolute paths, paths relative to `~/.ssh`, and simple
-/// `*`/`?` globs.
-fn read_ssh_include(ssh_dir: &std::path::Path, home: &str, token: &str) -> Vec<String> {
-    let path = if let Some(rest) = token.strip_prefix("~/") {
-        std::path::Path::new(home).join(rest)
-    } else if token.starts_with('/') {
-        std::path::PathBuf::from(token)
-    } else {
-        ssh_dir.join(token)
-    };
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_string();
-    if name.contains('*') || name.contains('?') {
-        let parent = path
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| ssh_dir.to_path_buf());
-        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&parent)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| wildcard_match(&name, &e.file_name().to_string_lossy()))
-            .map(|e| e.path())
-            .collect();
-        paths.sort();
-        paths
-            .iter()
-            .filter_map(|p| std::fs::read_to_string(p).ok())
-            .collect()
-    } else {
-        std::fs::read_to_string(&path).ok().into_iter().collect()
-    }
-}
-
-/// Inline ssh `Include` directives so the output is a single self-contained
-/// config. `read` returns the contents of every file an include token expands
-/// to. Depth-guarded against include cycles.
-fn flatten_ssh_config(content: &str, read: &dyn Fn(&str) -> Vec<String>, depth: u8) -> String {
-    let mut out = String::new();
-    for line in content.lines() {
-        let t = line.trim_start();
-        let is_include = t
-            .get(..7)
-            .is_some_and(|h| h.eq_ignore_ascii_case("include"))
-            && t[7..].starts_with(char::is_whitespace);
-        if is_include && depth < 16 {
-            let args = t[7..].trim();
-            out.push_str(&format!("# superzej: inlined `Include {args}`\n"));
-            for token in args.split_whitespace() {
-                for body in read(token) {
-                    out.push_str(&flatten_ssh_config(&body, read, depth + 1));
-                    if !out.ends_with('\n') {
-                        out.push('\n');
-                    }
-                }
-            }
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Minimal shell-style glob matcher supporting `*` and `?` (no char classes).
-fn wildcard_match(pat: &str, name: &str) -> bool {
-    fn helper(p: &[u8], n: &[u8]) -> bool {
-        match p.first() {
-            None => n.is_empty(),
-            Some(b'*') => helper(&p[1..], n) || (!n.is_empty() && helper(p, &n[1..])),
-            Some(b'?') => !n.is_empty() && helper(&p[1..], &n[1..]),
-            Some(&c) => n.first() == Some(&c) && helper(&p[1..], &n[1..]),
-        }
-    }
-    helper(pat.as_bytes(), name.as_bytes())
-}
+// SSH credential plumbing (flattened-config materialization, identity-key
+// mounts) lives in `crate::ssh_creds`; re-exported here for existing callers.
+pub use crate::ssh_creds::prepare_ssh_config;
 
 fn parse_mount(spec: &str) -> Mount {
     // "host", "host:ro", or "host:dest" / "host:dest:ro".
@@ -2379,49 +2296,6 @@ mod tests {
     }
 
     #[test]
-    fn flatten_ssh_inlines_includes_and_guards() {
-        let read = |tok: &str| -> Vec<String> {
-            match tok {
-                "inc" => vec!["Host foo\n  User bar\n".to_string()],
-                "multi" => vec!["A\n".to_string(), "B\n".to_string()],
-                _ => vec![],
-            }
-        };
-        let out = flatten_ssh_config("Host *\n  AddKeysToAgent yes\n  Include inc\n", &read, 0);
-        assert!(out.contains("AddKeysToAgent yes"));
-        assert!(out.contains("Host foo") && out.contains("User bar"));
-        // No live (non-comment) Include directive should remain.
-        assert!(!out.lines().any(|l| {
-            let t = l.trim_start();
-            !t.starts_with('#')
-                && t.get(..8)
-                    .is_some_and(|h| h.eq_ignore_ascii_case("include "))
-        }));
-        // Multiple expansions of one token are concatenated.
-        let multi = flatten_ssh_config("Include multi\n", &read, 0);
-        assert!(multi.contains("A") && multi.contains("B"));
-        // Unknown include leaves only the marker comment (no panic).
-        assert!(flatten_ssh_config("Include missing\n", &read, 0).contains("inlined"));
-    }
-
-    #[test]
-    fn flatten_ssh_ignores_include_substrings() {
-        let read = |_: &str| Vec::new();
-        let out = flatten_ssh_config("  IncludeFoo bar\n  Includes x\n", &read, 0);
-        assert!(out.contains("IncludeFoo bar"));
-        assert!(out.contains("Includes x"));
-    }
-
-    #[test]
-    fn wildcard_match_handles_star_and_question() {
-        assert!(wildcard_match("*.conf", "a.conf"));
-        assert!(wildcard_match("h?st", "host"));
-        assert!(wildcard_match("*", "anything"));
-        assert!(!wildcard_match("*.conf", "a.txt"));
-        assert!(!wildcard_match("h?st", "ht"));
-    }
-
-    #[test]
     fn bwrap_binds_worktree_and_gitdir() {
         let mut s = spec(Backend::Bwrap);
         s.image = None;
@@ -2495,6 +2369,34 @@ mod tests {
         assert_eq!(argv[0], "ssh");
         assert!(argv.contains(&"-t".to_string()));
         assert!(argv.last().unwrap().contains("bwrap"));
+    }
+
+    #[test]
+    fn bwrap_local_keeps_host_matching_env_off_argv() {
+        let mut s = spec(Backend::Bwrap);
+        s.image = None;
+        // A pair mirroring the host env (PATH always exists) rides the
+        // launcher's process env, never the world-readable --setenv argv;
+        // synthetic pairs (values absent from the host env) keep --setenv.
+        s.env = vec![
+            ("PATH".into(), std::env::var("PATH").unwrap()),
+            ("SUPERZEJ_SANDBOX".into(), "1".into()),
+        ];
+        let argv = enter_argv(&s, "true");
+        assert!(!argv.contains(&"PATH".to_string()));
+        let i = argv.iter().position(|a| a == "--setenv").unwrap();
+        assert_eq!(argv[i + 1], "SUPERZEJ_SANDBOX");
+
+        // Remote-wrapped bwrap keeps --setenv for everything: the argv is the
+        // only env carrier through ssh.
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "box".into(),
+            22,
+            false,
+            TransportKind::Ssh,
+        ));
+        let remote = enter_argv(&s, "true").join(" ");
+        assert!(remote.contains("--setenv PATH"));
     }
 
     #[test]

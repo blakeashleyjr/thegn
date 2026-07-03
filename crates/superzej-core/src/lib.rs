@@ -74,6 +74,7 @@ pub mod sandbox_mounts;
 pub mod search;
 pub mod semantic;
 pub mod share;
+pub mod ssh_creds;
 pub mod startup;
 pub mod termcaps;
 pub mod theme;
