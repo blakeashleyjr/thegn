@@ -702,8 +702,19 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
             ])));
         }
     }
-    // Full: every container on the machine, one table row each.
-    if full && !model.containers.is_empty() {
+    // Full: every container on the machine — but only under the System-tab "all"
+    // toggle (`g`). By default the Sandbox section is scoped to this worktree's
+    // own sandbox (the health block above), so a sibling worktree's / another
+    // host's containers don't clutter the view. A hint advertises the toggle.
+    let show_all = crate::panel::scope::system_all();
+    if full && !show_all && !model.containers.is_empty() {
+        rows.push(PanelRow::blank());
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            g2(),
+            format!("g: show all {} containers", model.containers.len()),
+        )])));
+    }
+    if full && show_all && !model.containers.is_empty() {
         rows.push(PanelRow::blank());
         rows.push(PanelRow::plain(Line::segs(vec![
             seg(g2(), "ALL CONTAINERS").bold(),

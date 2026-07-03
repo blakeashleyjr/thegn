@@ -415,30 +415,74 @@ pub fn parse_pr_search(json: &str) -> Vec<PrSearchRow> {
     serde_json::from_str(json).unwrap_or_default()
 }
 
-/// Cross-repo PR search for the unified work feed. `role_flag` is a single
-/// `gh search prs` selector such as `"--review-requested=@me"` or
-/// `"--author=@me"`; results are restricted to open PRs. Repo-agnostic (uses
-/// `loc` only for the `gh` invocation context).
+/// PR search for the unified work feed. `role_flag` is a single `gh search prs`
+/// selector such as `"--review-requested=@me"` or `"--author=@me"`; results are
+/// restricted to open PRs. When `repo` is `Some("owner/repo")` the search is
+/// scoped to that repository (the default, repo-scoped feed); `None` searches
+/// across every repo the user touches (the "all" toggle). `loc` supplies the
+/// `gh` invocation context.
 pub fn search_prs(
     loc: &GitLoc,
     role_flag: &str,
+    repo: Option<&str>,
     limit: usize,
 ) -> Result<Vec<PrSearchRow>, GhError> {
     let limit = limit.to_string();
-    let json = gh_out(
-        loc,
-        &[
-            "search",
-            "prs",
-            role_flag,
-            "--state=open",
-            "--json",
-            "number,title,url,state,repository",
-            "--limit",
-            &limit,
-        ],
-    )?;
+    let mut args: Vec<String> = vec![
+        "search".into(),
+        "prs".into(),
+        role_flag.into(),
+        "--state=open".into(),
+        "--json".into(),
+        "number,title,url,state,repository".into(),
+        "--limit".into(),
+        limit,
+    ];
+    if let Some(nwo) = repo.filter(|r| !r.is_empty()) {
+        args.push(format!("--repo={nwo}"));
+    }
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let json = gh_out(loc, &argv)?;
     Ok(parse_pr_search(&json))
+}
+
+/// The `owner/repo` (nameWithOwner) of a worktree's `origin` remote, or `None`
+/// when there is no origin or it is not a recognizable forge URL. Used to scope
+/// the "My Work" feed / PR search to the current repository.
+pub fn origin_nwo(loc: &GitLoc) -> Option<String> {
+    let out = loc
+        .git_command(&["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    nwo_from_remote_url(&url)
+}
+
+/// Parse `owner/repo` from any git remote URL form: `https://host/owner/repo`,
+/// `ssh://git@host/owner/repo`, or the scp-like `git@host:owner/repo` — with an
+/// optional trailing `.git`. Forge-host agnostic (mirrors [`owner_repo_from_url`]).
+pub fn nwo_from_remote_url(url: &str) -> Option<String> {
+    let s = url.trim().trim_end_matches('/');
+    let s = s.strip_suffix(".git").unwrap_or(s);
+    // Drop the scheme+host (`scheme://host/…`) or the scp `git@host:` prefix,
+    // leaving the `owner/repo[/…]` path.
+    let path = if let Some((_, rest)) = s.split_once("://") {
+        rest.split_once('/').map(|(_, p)| p)?
+    } else if let Some((_, rest)) = s.split_once(':') {
+        rest
+    } else {
+        return None;
+    };
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
 }
 
 /// Open the PR belonging to `branch` in the browser
@@ -801,6 +845,33 @@ mod tests {
         assert_eq!(owner_repo_from_url("https://github.com/onlyowner"), None);
         assert_eq!(owner_repo_from_url("not a url"), None);
         assert_eq!(owner_repo_from_url(""), None);
+    }
+
+    #[test]
+    fn nwo_from_remote_url_handles_https_ssh_and_scp_forms() {
+        assert_eq!(
+            nwo_from_remote_url("https://github.com/acme/superzej.git").as_deref(),
+            Some("acme/superzej")
+        );
+        assert_eq!(
+            nwo_from_remote_url("https://github.com/acme/superzej").as_deref(),
+            Some("acme/superzej")
+        );
+        assert_eq!(
+            nwo_from_remote_url("ssh://git@github.com/acme/superzej.git").as_deref(),
+            Some("acme/superzej")
+        );
+        assert_eq!(
+            nwo_from_remote_url("git@github.com:acme/superzej.git").as_deref(),
+            Some("acme/superzej")
+        );
+        assert_eq!(
+            nwo_from_remote_url("git@ghe.corp.example:org/repo").as_deref(),
+            Some("org/repo")
+        );
+        assert_eq!(nwo_from_remote_url("git@github.com:onlyowner").as_deref(), None);
+        assert_eq!(nwo_from_remote_url("not a url"), None);
+        assert_eq!(nwo_from_remote_url(""), None);
     }
 
     #[test]

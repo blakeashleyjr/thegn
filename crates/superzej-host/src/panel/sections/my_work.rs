@@ -52,14 +52,16 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         return empty_rows(ctx);
     }
 
+    let all = crate::panel::scope::mine_all();
     let mut out = Vec::new();
     // The full view leads with a count banner (also makes it visually distinct
     // from the half view, which is otherwise identical at wide column counts).
     if ctx.full() {
-        out.push(PanelRow::plain(Line::segs(vec![seg(
-            d(),
-            format!("MY WORK — {} items", rows_data.len()),
-        )])));
+        let scope = if all { " · all repos" } else { " · this repo" };
+        out.push(PanelRow::plain(Line::segs(vec![
+            seg(d(), format!("MY WORK — {} items", rows_data.len())),
+            seg(g2(), scope.to_string()),
+        ])));
         out.push(rule());
     }
     let mut last_group: Option<WorkGroup> = None;
@@ -124,6 +126,7 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("↵", "open"),
         ("b", "branch"),
         ("o", "browser"),
+        ("a", if all { "this repo" } else { "all repos" }),
         ("R", "refresh"),
     ]));
     out
@@ -143,14 +146,16 @@ fn empty_rows(ctx: &SectionCtx) -> Vec<PanelRow> {
         PanelRow::plain(Line::Blank),
     ];
     if ctx.deep() {
+        let where_ = if crate::panel::scope::mine_all() {
+            "PRs across every repo show up here."
+        } else {
+            "PRs for this repo show up here (a = all repos)."
+        };
         rows.push(PanelRow::plain(Line::segs(vec![seg(
             g2(),
             "Assigned issues, review requests, and your open ".to_string(),
         )])));
-        rows.push(PanelRow::plain(Line::segs(vec![seg(
-            g2(),
-            "PRs across every repo show up here.".to_string(),
-        )])));
+        rows.push(PanelRow::plain(Line::segs(vec![seg(g2(), where_.to_string())])));
         rows.push(PanelRow::plain(Line::Blank));
     }
     if ctx.full() {
