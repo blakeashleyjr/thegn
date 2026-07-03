@@ -8,6 +8,7 @@
 //! under a read-only `$HOME` (the default hardened profile) — a narrow set of
 //! read-write carve-outs so shell/tool state keeps working.
 
+use crate::config::SandboxProfile;
 use crate::sandbox::Mount;
 
 /// Mounts that bring the host toolchain into an OCI container so the user's
@@ -180,26 +181,49 @@ pub fn auto_cache_mounts() -> Vec<Mount> {
 
 /// Narrow read-write paths carved back into an otherwise read-only `$HOME` so
 /// shell/tool state keeps persisting under the default hardened profile. Only
-/// existing directories are returned (bwrap needs the mountpoint to exist).
+/// paths that **exist** on the host are returned — directories *and* files
+/// (bwrap needs the mountpoint to exist so it overmounts the ro `$HOME` inode
+/// rather than trying to create it).
 ///
 /// `/tmp` is intentionally absent — it is already writable on every backend
 /// (bwrap `--tmpfs /tmp`, OCI `--tmpfs /tmp`, systemd `PrivateTmp=yes`). Users
-/// extend this via `[sandbox] mounts` (e.g. `~/.gnupg`, a custom history dir);
+/// extend this via `[sandbox] mounts` (e.g. `~/.gnupg`, a custom history file);
 /// the resolve-time covered-check ([`keep_cfg_mount`]) lets a read-write
-/// directory overmount the read-only `$HOME`.
-pub fn default_writable_carveouts() -> Vec<Mount> {
+/// directory *or* existing file overmount the read-only `$HOME`.
+///
+/// `~/.keychain` (which stores shell scripts your host login shells later
+/// *source*) is carved only for non-sealed profiles: a writable `~/.keychain`
+/// from the sealed agent profile would be a persistence vector into the host
+/// session — exactly what the read-only `$HOME` exists to prevent.
+pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
     let home = std::env::var("HOME").unwrap_or_default();
     if home.is_empty() {
         return Vec::new();
     }
     // Personal scratch + the XDG state/data dirs where shell history, zoxide,
-    // and atuin keep their databases. Deliberately narrow: source trees,
-    // ~/.ssh, ~/.config, and the rest of $HOME stay read-only.
-    let rels = ["tmp", ".local/state", ".local/share"];
+    // and atuin keep their databases, plus the legacy `$HOME`-root history files
+    // many shells still write. Deliberately narrow: source trees, ~/.ssh,
+    // ~/.config, and the rest of $HOME stay read-only.
+    let mut rels: Vec<&str> = vec![
+        "tmp",
+        ".local/state",
+        ".local/share",
+        ".zsh_history",
+        ".bash_history",
+    ];
+    // `~/.keychain`: interactive/hardened only — never for the sealed agent.
+    if !matches!(
+        profile,
+        SandboxProfile::Sealed | SandboxProfile::SealedTunnel
+    ) {
+        rels.push(".keychain");
+    }
     rels.iter()
         .filter_map(|rel| {
             let p = std::path::Path::new(&home).join(rel);
-            p.is_dir().then(|| {
+            // Dir or file — but must exist so bwrap overmounts an existing
+            // inode (skips dangling symlinks, which `is_dir`/`is_file` reject).
+            (p.is_dir() || p.is_file()).then(|| {
                 let s = p.to_string_lossy().into_owned();
                 Mount {
                     host: s.clone(),
@@ -218,12 +242,15 @@ pub fn default_writable_carveouts() -> Vec<Mount> {
 /// The tightest already-mounted parent wins:
 /// - not covered by any parent → keep;
 /// - exact duplicate of an existing mount → drop;
-/// - a read-write **directory** strictly under a **read-only** parent → keep:
-///   it overmounts the parent read-write (e.g. `~/tmp` or `~/.gnupg` under a
-///   read-only `$HOME`). This is what makes the writable carve-outs work;
+/// - a read-write **directory or existing file** strictly under a **read-only**
+///   parent → keep: it overmounts the parent read-write (e.g. `~/tmp` or
+///   `~/.gnupg`, or a history *file* like `~/.zsh_history`, under a read-only
+///   `$HOME`). The mountpoint already exists inside the ro parent bind, so bwrap
+///   binds over the existing inode without creating anything. This is what makes
+///   the writable carve-outs work;
 /// - anything else already covered (a read-only entry, a read-write path under
-///   a read-write parent, or a **file** mountpoint inside a bound dir which
-///   bwrap cannot create) → drop.
+///   a read-write parent, or a mountpoint that doesn't exist on the host so
+///   bwrap can't create it inside the ro parent) → drop.
 pub fn keep_cfg_mount(existing: &[Mount], m: &Mount) -> bool {
     let mpath = std::path::Path::new(&m.host);
     let parent = existing
@@ -233,7 +260,7 @@ pub fn keep_cfg_mount(existing: &[Mount], m: &Mount) -> bool {
     match parent {
         None => true,
         Some(p) if p.host == m.host => false,
-        Some(p) => !m.ro && p.ro && mpath.is_dir(),
+        Some(p) => !m.ro && p.ro && (mpath.is_dir() || mpath.is_file()),
     }
 }
 
@@ -242,14 +269,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn carveouts_are_rw_dirs_under_home() {
-        // Every carve-out is a read-write, non-cache directory that exists.
-        for m in default_writable_carveouts() {
+    fn carveouts_are_rw_existing_paths_under_home() {
+        // Every carve-out is a read-write, non-cache path (dir or file) that
+        // exists — bwrap needs the mountpoint present to overmount it.
+        for m in default_writable_carveouts(SandboxProfile::Hardened) {
             assert!(!m.ro, "carve-out must be writable: {}", m.host);
+            let p = std::path::Path::new(&m.host);
             assert!(
-                std::path::Path::new(&m.host).is_dir(),
-                "carve-out must be an existing dir: {}",
+                p.is_dir() || p.is_file(),
+                "carve-out must be an existing dir or file: {}",
                 m.host
+            );
+        }
+    }
+
+    #[test]
+    fn keychain_carved_for_hardened_not_sealed() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        // Only meaningful when ~/.keychain actually exists on this host.
+        if home.is_empty() || !std::path::Path::new(&home).join(".keychain").exists() {
+            return;
+        }
+        let has_keychain = |profile| {
+            default_writable_carveouts(profile)
+                .iter()
+                .any(|m| m.host.ends_with("/.keychain"))
+        };
+        assert!(
+            has_keychain(SandboxProfile::Hardened),
+            "hardened profile should carve ~/.keychain writable"
+        );
+        assert!(
+            !has_keychain(SandboxProfile::Sealed),
+            "sealed agent profile must NOT carve ~/.keychain (persistence vector)"
+        );
+        assert!(
+            !has_keychain(SandboxProfile::SealedTunnel),
+            "sealed-tunnel profile must NOT carve ~/.keychain"
+        );
+    }
+
+    #[test]
+    fn history_files_carved_for_all_ro_profiles() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        let hist = std::path::Path::new(&home).join(".zsh_history");
+        // Only assert when the file exists (carve-outs skip absent paths).
+        if !hist.is_file() {
+            return;
+        }
+        for profile in [
+            SandboxProfile::Hardened,
+            SandboxProfile::Sealed,
+            SandboxProfile::SealedTunnel,
+        ] {
+            assert!(
+                default_writable_carveouts(profile)
+                    .iter()
+                    .any(|m| m.host.ends_with("/.zsh_history") && !m.ro),
+                "history file must be carved writable for every read-only-root profile"
             );
         }
     }
@@ -300,5 +380,41 @@ mod tests {
             cache: false,
         };
         assert!(keep_cfg_mount(existing, &elsewhere));
+    }
+
+    #[test]
+    fn keep_cfg_mount_rw_file_overmounts_ro_parent() {
+        // A read-write *existing file* strictly under a read-only parent is kept
+        // (bwrap overmounts the existing inode). Use a real file under a
+        // synthetic ro parent so the test doesn't couple to $HOME.
+        let hostname = "/etc/hostname";
+        if !std::path::Path::new(hostname).is_file() {
+            return; // portability guard
+        }
+        let etc = Mount {
+            host: "/etc".into(),
+            dest: "/etc".into(),
+            ro: true,
+            cache: false,
+        };
+        let existing = std::slice::from_ref(&etc);
+        let hist = Mount {
+            host: hostname.into(),
+            dest: hostname.into(),
+            ro: false,
+            cache: false,
+        };
+        assert!(
+            keep_cfg_mount(existing, &hist),
+            "a rw existing file under a ro parent must overmount it"
+        );
+        // A non-existent file mountpoint under the ro parent → dropped.
+        let ghost = Mount {
+            host: "/etc/sz-nonexistent-xyz".into(),
+            dest: "/etc/sz-nonexistent-xyz".into(),
+            ro: false,
+            cache: false,
+        };
+        assert!(!keep_cfg_mount(existing, &ghost));
     }
 }

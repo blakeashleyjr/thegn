@@ -614,7 +614,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // the read-only `/nix/store`. No-op when `warm_direnv = off` or there's no
     // cold flake-backed `.envrc`. See `superzej_core::direnv`.
     if !session.id.is_empty() {
-        crate::agent::warm_direnv(&cfg, std::path::Path::new(&session.id));
+        crate::direnv_warm::warm_direnv(&cfg, std::path::Path::new(&session.id));
     }
     // Install/refresh the in-sandbox merge guard into the shared hooks dir
     // (`core.hooksPath` → the canonical `.git/hooks`). On by default; it refuses
@@ -9156,7 +9156,7 @@ async fn event_loop<T: Terminal>(
                                 );
                                 let _ = ptx.send((gname.clone(), ti, Vec::new()));
                                 let _ = wk.wake();
-                                crate::agent::launch_spec(&cfg, &wt, None, "shell")
+                                crate::direnv_warm::launch_spec_synced(&cfg, &wt, None, "shell")
                                     .map(|spec| {
                                         missing.into_iter().map(|id| (id, spec.clone())).collect()
                                     })
@@ -9184,14 +9184,13 @@ async fn event_loop<T: Terminal>(
                                     hui.as_ref(),
                                 );
                                 match prov {
-                                    Ok(_) => crate::agent::launch_spec(&cfg, &wt, None, "shell")
-                                        .map(|spec| {
-                                            missing
-                                                .into_iter()
-                                                .map(|id| (id, spec.clone()))
-                                                .collect()
-                                        })
-                                        .map_err(spec_err),
+                                    Ok(_) => crate::direnv_warm::launch_spec_synced(
+                                        &cfg, &wt, None, "shell",
+                                    )
+                                    .map(|spec| {
+                                        missing.into_iter().map(|id| (id, spec.clone())).collect()
+                                    })
+                                    .map_err(spec_err),
                                     Err(e) => Err(match sandbox_halt_in(&e) {
                                         Some(h) => SpecError::Halt(h.clone()),
                                         None => SpecError::Other(format!(

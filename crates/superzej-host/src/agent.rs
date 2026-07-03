@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
-use superzej_core::{bundle, devenv, direnv, repo, sandbox};
+use superzej_core::{bundle, devenv, repo, sandbox};
 use superzej_svc::projection::ProjectionBackend;
 use superzej_svc::vpn::VpnProvider;
 
@@ -3074,16 +3074,22 @@ pub fn launch_spec(
     branch: Option<&str>,
     choice: &str,
 ) -> anyhow::Result<LaunchSpec> {
-    launch_spec_with_key(cfg, worktree, branch, choice, None)
+    launch_spec_with_key(cfg, worktree, branch, choice, None, false)
 }
 
 /// Like [`launch_spec`] but injects a scoped API key for the sandbox.
+///
+/// `sync_warm` gates the `direnv` cache warm: `false` kicks the async
+/// background warm (the first launch of a cold worktree falls back), `true`
+/// warms synchronously + bounded before composing the spec (off-loop callers
+/// only — see [`crate::direnv_warm::launch_spec_synced`]).
 pub fn launch_spec_with_key(
     cfg: &Config,
     worktree: &str,
     branch: Option<&str>,
     choice: &str,
     scoped_key: Option<String>,
+    sync_warm: bool,
 ) -> anyhow::Result<LaunchSpec> {
     let loc = GitLoc::for_worktree(Path::new(worktree));
 
@@ -3248,7 +3254,7 @@ pub fn launch_spec_with_key(
     // `/nix/store`. Off-loop, gated by `needs_warm`; local worktrees only (a
     // remote worktree's `.envrc` isn't on this host's filesystem).
     if !loc.is_remote() && !outcome.is_remote {
-        warm_direnv(cfg, Path::new(worktree));
+        crate::direnv_warm::warm_for_launch(cfg, Path::new(worktree), sync_warm);
     }
 
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome);
@@ -3490,19 +3496,6 @@ pub fn apply_bouncer_launch(
         };
     }
     BouncerLaunch::default()
-}
-
-/// Map `[sandbox] warm_direnv` to a host-side `direnv` cache warm for
-/// `worktree`. Off-loop and self-gating (`direnv::warm` is a no-op without a
-/// cold flake-backed `.envrc`); no-op when warming is disabled.
-pub(crate) fn warm_direnv(cfg: &Config, worktree: &Path) {
-    use superzej_core::config::WarmDirenv;
-    let allow = match cfg.sandbox.warm_direnv {
-        WarmDirenv::Off => return,
-        WarmDirenv::AllowedOnly => false,
-        WarmDirenv::Auto => true,
-    };
-    direnv::warm(worktree, allow);
 }
 
 /// Tier A inject for a sandboxed pane: prepend the devShell `PATH` via a raw
@@ -4206,6 +4199,7 @@ mod tests {
                 None,
                 "shell",
                 Some("sk-test-scoped".into()),
+                false,
             )
             .unwrap();
             // On the host path there's no OCI spec to mutate, so scoped key

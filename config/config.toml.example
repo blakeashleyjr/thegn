@@ -1115,13 +1115,16 @@ enabled = true
 # OUTSIDE the worktree is read-only — including your $HOME — so a sandboxed
 # agent can't `cd` out and modify/delete host files. Writable: the worktree, its
 # git dir, build caches, /tmp, and a narrow set of $HOME carve-outs for shell
-# state (~/tmp, ~/.local/state, ~/.local/share). The launched agent's own config
-# dir (CLAUDE_CONFIG_DIR / CODEX_HOME, or its ~/.claude / ~/.codex default) is
-# also carved writable so the CLI can persist its runtime state (session-env,
-# todos, shell snapshots) — otherwise its startup hooks die "read-only file
-# system". `profile = "open"` restores a fully-writable $HOME (zsh
-# history/zoxide/keychain) as the escape hatch; add more writable paths under
-# `mounts` below.
+# state (~/tmp, ~/.local/state, ~/.local/share, plus the legacy history files
+# ~/.zsh_history and ~/.bash_history). ~/.keychain is carved for interactive
+# (hardened) panes but NOT the sealed agent — it stores scripts your host login
+# shells later *source*, so a writable ~/.keychain from a sealed sandbox would
+# be a persistence vector. The launched agent's own config dir
+# (CLAUDE_CONFIG_DIR / CODEX_HOME, or its ~/.claude / ~/.codex default) is also
+# carved writable so the CLI can persist its runtime state (session-env, todos,
+# shell snapshots) — otherwise its startup hooks die "read-only file system".
+# `profile = "open"` restores a fully-writable $HOME (zsh history/zoxide/
+# keychain) as the escape hatch; add more writable paths under `mounts` below.
 profile = "hardened"
 
 # Hardening preset for the embedded agent's tool container. When it differs from
@@ -1207,10 +1210,11 @@ auto_caches = true
 # ~ is expanded to $HOME.
 # This is also the extension point for extra writable carve-outs under the
 # read-only $HOME: a read-write DIRECTORY under $HOME (e.g. "~/.gnupg") is kept
-# and overmounts the read-only parent. A single read-only FILE (e.g.
-# "~/.gitconfig:ro") is served read-only by the $HOME bind; a writable single
-# file under $HOME isn't carved (bwrap can't create the mount-point) — use a
-# writable directory instead.
+# and overmounts the read-only parent. An EXISTING FILE is carved the same way
+# (e.g. "~/.histfile" for a custom history path) — bwrap overmounts the existing
+# inode. Only a NON-existent path can't be carved (bwrap can't create the
+# mount-point under the read-only $HOME). A read-only FILE (e.g.
+# "~/.gitconfig:ro") is served read-only by the $HOME bind.
 # This is the GLOBAL ("all workspaces") scope for default bind dirs. For a
 # single workspace, add `sandbox_mounts` under `[workspace.<slug>]` (see above);
 # those extend this list. A repo-root `.superzej.toml` `[sandbox] mounts` can

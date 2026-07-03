@@ -1255,7 +1255,7 @@ pub fn run_worker(
     // `direnv` cache so the first pane's in-sandbox direnv replays it read-only
     // instead of failing on the read-only store. Both off-loop and self-gating.
     superzej_core::sandbox::run_prepare(&path, &cfg.sandbox.prepare);
-    crate::agent::warm_direnv(cfg, &path);
+    crate::direnv_warm::warm_direnv(cfg, &path);
 
     // --- compose the launch spec (pure); the loop does the openpty+exec.
     // Bouncer env (proxy + tool override) rides the sandbox's env_overrides; a

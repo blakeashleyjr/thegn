@@ -24,6 +24,7 @@ mod compositor;
 mod copymode;
 mod desktop_notify;
 mod detail;
+mod direnv_warm;
 mod emulator;
 mod escape;
 mod focus;
