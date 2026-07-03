@@ -7341,8 +7341,12 @@ async fn connect_agent_channel(
     use superzej_svc::acp::client::AcpClient;
     match channel {
         AgentChannel::Tcp(port) => {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            AcpClient::connect(*port).await
+            // A freshly-spawned agent may not have bound its ACP port yet; retry on
+            // a fixed cadence (like the unix path's boot wait) rather than racing a
+            // single connect against the spawn — a lost race left the agent showing
+            // `Error` permanently despite coming up moments later (ECONNREFUSED).
+            // ~10s total (40 × 250ms); connects immediately once the port is up.
+            AcpClient::connect_retry(*port, 40, std::time::Duration::from_millis(250)).await
         }
         AgentChannel::Unix(path) => {
             let path_s = path.to_string_lossy().into_owned();
@@ -9940,50 +9944,43 @@ async fn event_loop<T: Terminal>(
                     match ev {
                         PaneEvent::Output(id, b) => {
                             if let Some(p) = panes.table.get_mut(&id) {
-                                // First real output from a pane ⇒ that worktree's
-                                // shell is live; drop its loading-splash entry. By
-                                // owner (not just the visible pane) so a background
-                                // worktree that finished while you were away shows
-                                // no stale splash when you return. `model.load_steps`
-                                // is re-derived from `loading_state` below, so the
-                                // active splash disappears on this same frame.
-                                if !loading_state.is_empty()
+                                // First real output ⇒ this worktree's shell is live;
+                                // drop its loading splash (by owner, so a background
+                                // worktree that finished while away shows no stale splash
+                                // on return). Held while provisioning is still live (the
+                                // premature-shell guard); only the shell-wait shape clears.
+                                // `any_clearable_splash` pre-gates the tab scan: the
+                                // lingering empty markers parked by eager/warm-spare success
+                                // keep the map non-empty, so gating on `!is_empty()` rescanned
+                                // + re-logged per output chunk forever (the log storm). See
+                                // `loading::{any_clearable_splash, should_clear_splash_on_output}`.
+                                if crate::loading::any_clearable_splash(&loading_state)
                                     && let Some((gi, ti)) = session
                                         .iter_tabs()
                                         .find(|(_, _, t)| t.center.pane_ids().contains(&id))
                                         .map(|(gi, ti, _)| (gi, ti))
                                 {
                                     let key = (session.worktrees[gi].name.clone(), ti);
-                                    // E2: clear the splash on first output ONLY when
-                                    // provisioning is DONE and we're merely waiting on
-                                    // the shell (terminal [sandbox,container,shell]
-                                    // shape). While live provisioning steps are still
-                                    // present (workspace/clone/nix/direnv/devshell/
-                                    // agents/atuin/…), the shell's first byte (prompt or
-                                    // reattach scrollback) must NOT drop the splash —
-                                    // that exposes a not-ready shell mid-provision (the
-                                    // premature-shell bug). The eager/materialize
-                                    // provision clears the splash itself (empty steps)
-                                    // when it completes.
-                                    let ready =
-                                        loading_state.get(&key).is_some_and(|s| is_shell_wait(s));
-                                    if tracing::enabled!(target: "szhost::loading", tracing::Level::DEBUG)
-                                    {
-                                        let g = &session.worktrees[gi];
-                                        let remote = superzej_core::remote::GitLoc::for_worktree(
-                                            std::path::Path::new(&g.path),
-                                        )
-                                        .is_remote();
-                                        tracing::debug!(
-                                            target: "szhost::loading",
-                                            worktree = %g.name,
-                                            remote,
-                                            cleared = ready,
-                                            "first pane output (cleared ⇒ provisioning done; \
-                                             else splash held until provision completes)"
-                                        );
-                                    }
-                                    if ready {
+                                    if crate::loading::should_clear_splash_on_output(
+                                        &loading_state,
+                                        &key,
+                                    ) {
+                                        if tracing::enabled!(target: "szhost::loading", tracing::Level::DEBUG)
+                                        {
+                                            let g = &session.worktrees[gi];
+                                            let remote =
+                                                superzej_core::remote::GitLoc::for_worktree(
+                                                    std::path::Path::new(&g.path),
+                                                )
+                                                .is_remote();
+                                            tracing::debug!(
+                                                target: "szhost::loading",
+                                                worktree = %g.name,
+                                                remote,
+                                                "first pane output cleared the loading splash \
+                                                 (provisioning done, shell live)"
+                                            );
+                                        }
                                         loading_state.remove(&key);
                                         loading_remote.remove(&key);
                                     }

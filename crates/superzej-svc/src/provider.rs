@@ -204,6 +204,17 @@ pub struct SpritesProvider {
     client: reqwest::Client,
 }
 
+/// Whether a non-OK sprites-destroy HTTP status is worth retrying: transient
+/// server/overload conditions (any 5xx, 429 Too Many Requests, 408 Request
+/// Timeout) can clear on a retry and leaving them unretried leaks a paid sandbox;
+/// other 4xx are the caller's fault and won't change on retry. (2xx and 404 are
+/// treated as success/already-gone before this is consulted.)
+fn destroy_retryable(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
 impl SpritesProvider {
     /// `api_base` like `https://api.sprites.dev/v1` (empty ⇒ that default);
     /// `token` is the resolved `SPRITES_TOKEN`; `name` is the sprite to manage.
@@ -295,19 +306,40 @@ impl RemoteProvider for SpritesProvider {
     }
 
     async fn destroy(&self, id: &str) -> Result<()> {
-        let resp = self
-            .client
-            .delete(self.sprite_name_url(id))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .context("sprites: DELETE /sprites/{name}")?;
-        // 404 = already gone — idempotent teardown.
-        if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
-            Ok(())
-        } else {
-            Err(anyhow!("sprites destroy failed ({})", resp.status()))
+        // A deleted worktree must not keep billing, so a transient 5xx/429/408 on
+        // teardown (the observed "sprites destroy failed (500)") is retried a few
+        // times with a short backoff rather than immediately leaking a paid
+        // sandbox. 404 (already gone) and 2xx are terminal-OK; other 4xx are the
+        // caller's fault and won't change on retry, so we stop early.
+        const ATTEMPTS: u32 = 3;
+        let mut last_status = None;
+        for attempt in 0..ATTEMPTS {
+            let resp = self
+                .client
+                .delete(self.sprite_name_url(id))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .context("sprites: DELETE /sprites/{name}")?;
+            let status = resp.status();
+            // 404 = already gone — idempotent teardown.
+            if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(());
+            }
+            last_status = Some(status);
+            if !destroy_retryable(status) {
+                break;
+            }
+            if attempt + 1 < ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
         }
+        Err(anyhow!(
+            "sprites destroy failed ({})",
+            last_status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "no response".into())
+        ))
     }
 
     async fn list(&self) -> Result<Vec<String>> {
@@ -1598,6 +1630,26 @@ mod tests {
     fn sprites_has_native_exec_capability() {
         assert!(Provider::Sprites(sprites()).caps().exec_api);
         assert!(!Provider::Daytona(provider()).caps().exec_api);
+    }
+
+    #[test]
+    fn destroy_retries_transient_server_errors_only() {
+        use reqwest::StatusCode;
+        // Transient: teardown should retry rather than leak a paid sandbox.
+        assert!(destroy_retryable(StatusCode::INTERNAL_SERVER_ERROR)); // the observed 500
+        assert!(destroy_retryable(StatusCode::BAD_GATEWAY));
+        assert!(destroy_retryable(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(destroy_retryable(StatusCode::GATEWAY_TIMEOUT));
+        assert!(destroy_retryable(StatusCode::TOO_MANY_REQUESTS));
+        assert!(destroy_retryable(StatusCode::REQUEST_TIMEOUT));
+        // Terminal client errors: retrying won't help, stop early.
+        assert!(!destroy_retryable(StatusCode::UNAUTHORIZED));
+        assert!(!destroy_retryable(StatusCode::FORBIDDEN));
+        assert!(!destroy_retryable(StatusCode::BAD_REQUEST));
+        assert!(!destroy_retryable(StatusCode::CONFLICT));
+        // 404 is handled as already-gone before this is consulted, but for safety
+        // it is not itself "retryable".
+        assert!(!destroy_retryable(StatusCode::NOT_FOUND));
     }
 
     #[test]

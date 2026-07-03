@@ -120,6 +120,36 @@ pub(crate) fn apply_spec_batch(
     origin == SpecOrigin::Materialize || !provision_owns_tab(materialize_inflight, loading_steps)
 }
 
+/// Cheap pre-gate for the per-PTY-output splash-clear on the hot output-drain
+/// path: is there ANY splash currently in the clearable *shell-wait* shape?
+///
+/// The eager-success / warm-spare paths park a lingering EMPTY Vec in
+/// `loading_state` for the whole session (see [`provision_owns_tab`]), so
+/// `!loading_state.is_empty()` stays true forever — gating the drain on the raw
+/// map emptiness made it rescan every tab (and re-log "first pane output") on
+/// *every* output chunk of *every* pane for the rest of the session. Only a
+/// shell-wait entry is ever clearable here (empty markers and live-provision
+/// steps are not), so when this returns `false` the drain can skip the tab scan
+/// entirely.
+pub(crate) fn any_clearable_splash(
+    loading_state: &std::collections::HashMap<(String, usize), Vec<LoadStep>>,
+) -> bool {
+    loading_state.values().any(|s| is_shell_wait(s))
+}
+
+/// Whether a pane's PTY output should clear its worktree/tab's loading splash:
+/// true ONLY when this exact key holds a splash in the terminal shell-wait shape
+/// (provisioning DONE, merely waiting on the login shell to speak). A missing
+/// key, a lingering empty marker, or live-provision steps all return `false` —
+/// so mid-provision output never drops the splash (the premature-shell guard),
+/// and the clear (with its diagnostic log) fires once, not per output chunk.
+pub(crate) fn should_clear_splash_on_output(
+    loading_state: &std::collections::HashMap<(String, usize), Vec<LoadStep>>,
+    key: &(String, usize),
+) -> bool {
+    loading_state.get(key).is_some_and(|s| is_shell_wait(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +294,75 @@ mod tests {
             SpecOrigin::Materialize,
             true,
             Some(&[LoadStep::active("direnv")])
+        ));
+    }
+
+    fn shell_wait() -> Vec<LoadStep> {
+        vec![
+            LoadStep::done("sandbox"),
+            LoadStep::done("container"),
+            LoadStep::active("shell"),
+        ]
+    }
+
+    #[test]
+    fn any_clearable_splash_ignores_empty_and_live_provision_entries() {
+        use std::collections::HashMap;
+        let mut ls: HashMap<(String, usize), Vec<LoadStep>> = HashMap::new();
+        // Empty map ⇒ nothing to clear ⇒ the output drain skips the tab scan.
+        assert!(!any_clearable_splash(&ls));
+        // The lingering EMPTY marker the eager-success / warm-spare paths park
+        // must NOT keep the drain rescanning + re-logging for the whole session
+        // (the "first pane output" log-storm root cause).
+        ls.insert(("wt-parked".into(), 0), Vec::new());
+        assert!(
+            !any_clearable_splash(&ls),
+            "an empty marker is not clearable"
+        );
+        // Live provisioning steps are not clearable either (premature-shell guard).
+        ls.insert(
+            ("wt-provisioning".into(), 0),
+            vec![LoadStep::done("nix"), LoadStep::active("direnv")],
+        );
+        assert!(
+            !any_clearable_splash(&ls),
+            "live-provision steps are held, not cleared, on output"
+        );
+        // A single shell-wait entry flips the pre-gate on.
+        ls.insert(("wt-ready".into(), 0), shell_wait());
+        assert!(
+            any_clearable_splash(&ls),
+            "a shell-wait splash makes the drain look for the owning pane"
+        );
+    }
+
+    #[test]
+    fn should_clear_splash_on_output_is_keyed_and_shell_wait_only() {
+        use std::collections::HashMap;
+        let mut ls: HashMap<(String, usize), Vec<LoadStep>> = HashMap::new();
+        let ready = ("wt-ready".to_string(), 0usize);
+        let parked = ("wt-parked".to_string(), 0usize);
+        let provisioning = ("wt-provisioning".to_string(), 1usize);
+        ls.insert(ready.clone(), shell_wait());
+        ls.insert(parked.clone(), Vec::new());
+        ls.insert(provisioning.clone(), vec![LoadStep::active("provisioning")]);
+
+        // Only the shell-wait key clears on its shell's first byte.
+        assert!(should_clear_splash_on_output(&ls, &ready));
+        // A lingering empty marker never clears (it isn't a live splash).
+        assert!(!should_clear_splash_on_output(&ls, &parked));
+        // Mid-provision output is HELD — clearing here is the premature-shell bug.
+        assert!(!should_clear_splash_on_output(&ls, &provisioning));
+        // A key with no entry (a pane whose worktree has no splash) never clears —
+        // and, crucially, never logs "first pane output" on every chunk.
+        assert!(!should_clear_splash_on_output(
+            &ls,
+            &("wt-absent".to_string(), 0usize)
+        ));
+        // The clearable key AND tab-index must both match: same name, wrong tab ⇒ no.
+        assert!(!should_clear_splash_on_output(
+            &ls,
+            &("wt-ready".to_string(), 9usize)
         ));
     }
 }
