@@ -106,14 +106,33 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         ];
     }
 
-    let items: Vec<&ParsedLog> = ctx.model.panel.log_lines_structured.iter().collect();
+    // Scope to the active worktree by default: keep its own lines (`wt=<slug>`)
+    // plus host-global lines (untagged) and hide ones tagged with a *different*
+    // worktree — so a sibling worktree's / another host's log noise doesn't bleed
+    // in. The System-tab `g` toggle shows every worktree's lines.
+    let all = crate::panel::scope::system_all();
+    let active = crate::panel::scope::active_wt_tag();
+    let items: Vec<&ParsedLog> = ctx
+        .model
+        .panel
+        .log_lines_structured
+        .iter()
+        .filter(|l| {
+            all || match l.worktree.as_deref() {
+                None => true,
+                Some(w) => w == active,
+            }
+        })
+        .collect();
 
     let mut rows = Vec::new();
 
     let total = items.len();
+    let scope = if all { " · all worktrees" } else { " · this repo" };
     rows.push(PanelRow::plain(Line::segs(vec![
         seg(d(), "LOGS (Structured)"),
         seg(g2(), format!(" · {total} lines")),
+        seg(g2(), scope.to_string()),
     ])));
     rows.push(rule());
 
@@ -148,6 +167,7 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("/ ", "filter"),
         ("l", "level"),
         ("a", "tail"),
+        ("g", if all { "this repo" } else { "all" }),
     ]));
 
     rows

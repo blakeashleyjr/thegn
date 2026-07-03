@@ -1090,6 +1090,9 @@ pub(crate) fn build_model(
     let t0 = std::time::Instant::now();
     let cwd = active_tab_path(session);
     let loc = GitLoc::for_worktree(&cwd);
+    // Record the active worktree's log tag so the Logs section can filter the
+    // shared szhost.log tail to this worktree's + host-global lines by default.
+    crate::panel::scope::set_active_wt_tag(&superzej_core::log_trace::wt_slug(&cwd));
 
     // Single layered-config load reused for notification priority + tasks below.
     let app_cfg = superzej_core::config::Config::try_load_layered(
@@ -1461,16 +1464,35 @@ pub(crate) fn build_panel(
     if let Ok(links) = db.linked_issues(&cwd.to_string_lossy()) {
         panel.tracker_links = links;
     }
-    // Unified "My Work" feed (cross-repo; single global cache row).
-    if let Ok(Some((json, _))) = db.get_my_work_cache()
+    // The active worktree's repo root — the default scoping unit for the panel's
+    // otherwise-global sections (My Work, notifications).
+    let repo_root = superzej_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    // Unified "My Work" feed. Default: the active repo's scoped cache row (keyed
+    // by repo root); under the Mine "all repos" toggle: the cross-repo
+    // `ALL_SCOPE` row.
+    let my_work_scope = if crate::panel::scope::mine_all() {
+        superzej_core::work::ALL_SCOPE.to_string()
+    } else {
+        repo_root.to_string_lossy().into_owned()
+    };
+    if let Ok(Some((json, _))) = db.get_my_work_cache(&my_work_scope)
         && let Ok(rows) = serde_json::from_str::<Vec<superzej_core::work::WorkRow>>(&json)
     {
         panel.my_work = rows;
     }
     // Full notification list for the inbox panel; badge counts are derived from it
     // by effective priority (Info kinds never count; the red flag is Alert-only).
-    if let Ok(notifications) = db.get_all_notifications(50) {
+    // Scoped to this repo's own worktrees by default (host-global notifications,
+    // with an empty `worktree_path`, always show); the System-tab "all" toggle
+    // reveals every worktree's — so a sibling repo's error doesn't leak here or
+    // light the badge.
+    if let Ok(mut notifications) = db.get_all_notifications(50) {
         use superzej_core::notification::Priority;
+        if !crate::panel::scope::system_all() {
+            let repo_paths = repo_worktree_paths(db, &repo_root);
+            notifications
+                .retain(|n| n.worktree_path.is_empty() || repo_paths.contains(&n.worktree_path));
+        }
         let unread = notifications.iter().filter(|n| !n.read);
         let (mut alert, mut counted) = (0usize, 0usize);
         for n in unread {
@@ -1995,42 +2017,93 @@ fn pr_search_row(
     }
 }
 
-/// Refresh the unified "My Work" feed: assigned issues across every configured
-/// provider, cross-repo review-requested / authored PRs (`gh search`), and
-/// high-priority unread notifications. Writes a single global `my_work_cache`
-/// row and pulses the waker. Cross-repo by design — not scoped to the active
-/// worktree's repo (it only borrows the cwd for the `gh` invocation context).
+/// The set of worktree paths belonging to a repo (`repo_root`), from the DB
+/// registry. Used to scope the "My Work" feed's notifications to the current
+/// repo — a notification for a sibling worktree of the same repo is relevant;
+/// one for an unrelated repo (often on another host) is not.
+fn repo_worktree_paths(
+    db: &superzej_core::db::Db,
+    repo_root: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    let rr = repo_root.to_string_lossy();
+    db.worktrees()
+        .map(|wts| {
+            wts.into_iter()
+                .filter(|w| w.repo_root == rr)
+                .map(|w| w.worktree)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Refresh the unified "My Work" feed for a scope: assigned issues (all
+/// configured providers), review-requested / authored PRs, and high-priority
+/// unread notifications. By default (`all == false`) everything is scoped to the
+/// **active worktree's repo** — GitHub via `--repo owner/repo`, Linear/Jira via
+/// the repo-overlaid team/project, notifications to the repo's own worktrees —
+/// and written to the `my_work_cache` row keyed by the repo root. With
+/// `all == true` the fetch is cross-repo and written to the `ALL_SCOPE` row (the
+/// panel's "all repos" toggle). Pulses the waker when done.
 pub(crate) fn spawn_my_work_refresh(
     session: crate::session::Session,
-    cfg: superzej_core::config::IssuesConfig,
+    cfg: superzej_core::config::Config,
+    all: bool,
     waker: Option<TerminalWaker>,
 ) {
     task::spawn_blocking(move || {
-        use superzej_core::work::{WorkGroup, WorkKind, WorkRow};
+        use superzej_core::work::{ALL_SCOPE, WorkGroup, WorkKind, WorkRow};
 
         let cwd = active_tab_path(&session);
         if !cwd.is_dir() {
             return;
         }
+        let loc = superzej_core::remote::GitLoc::for_worktree(&cwd);
+        let repo_root = superzej_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
+        // Repo scope (unless `all`): `owner/repo` for GitHub, the repo `[issues]`
+        // overlay for Linear/Jira, and the cache key.
+        let nwo = if all {
+            None
+        } else {
+            superzej_core::github::origin_nwo(&loc)
+        };
+        let issues_cfg = if all {
+            cfg.issues.clone()
+        } else {
+            cfg.repo_issues(Some(&repo_root))
+        };
+        let scope_key = if all {
+            ALL_SCOPE.to_string()
+        } else {
+            repo_root.to_string_lossy().into_owned()
+        };
+
         let mut rows: Vec<WorkRow> = Vec::new();
 
-        // 1) Issues assigned to me, aggregated across all configured providers.
-        let router = superzej_svc::issue::IssueRouter::from_config(&cfg);
+        // 1) Issues assigned to me, aggregated across configured providers.
+        let router = superzej_svc::issue::IssueRouter::from_config(&issues_cfg);
         if router.is_configured()
             && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
         {
-            let filter = superzej_core::issue::IssueFilter::my_open(cfg.max_issues.max(1));
+            let mut filter = superzej_core::issue::IssueFilter::my_open(issues_cfg.max_issues.max(1));
+            filter.repo = nwo.clone(); // GitHub repo scope; other providers ignore it.
             if let Ok(issues) = rt.block_on(router.list_issues(&filter)) {
                 for i in issues {
+                    // Tag GitHub issues with the repo for display; Linear/Jira
+                    // scope by team/project, so leave their repo blank.
+                    let repo = if i.provider == "github" {
+                        nwo.clone().unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     rows.push(WorkRow {
                         group: WorkGroup::Assigned,
                         kind: WorkKind::Issue,
                         provider: i.provider,
                         number: i.number,
                         title: i.title,
-                        repo: String::new(),
+                        repo,
                         url: i.url,
                         urgency: issue_urgency(i.priority),
                         issue_id: Some(i.id),
@@ -2041,54 +2114,114 @@ pub(crate) fn spawn_my_work_refresh(
             }
         }
 
-        // 2) Cross-repo PRs via `gh search`: review-requested of me, and mine.
-        let loc = superzej_core::remote::GitLoc::for_worktree(&cwd);
-        if let Ok(prs) = superzej_core::github::search_prs(&loc, "--review-requested=@me", 30) {
+        // 2) PRs via `gh search` — scoped to `nwo` unless `all`.
+        if let Ok(prs) =
+            superzej_core::github::search_prs(&loc, "--review-requested=@me", nwo.as_deref(), 30)
+        {
             rows.extend(
                 prs.into_iter()
                     .map(|p| pr_search_row(p, WorkGroup::ReviewRequested)),
             );
         }
-        if let Ok(prs) = superzej_core::github::search_prs(&loc, "--author=@me", 30) {
+        if let Ok(prs) = superzej_core::github::search_prs(&loc, "--author=@me", nwo.as_deref(), 30)
+        {
             rows.extend(
                 prs.into_iter()
                     .map(|p| pr_search_row(p, WorkGroup::NeedsAttention)),
             );
         }
 
-        // 3) High-priority unread notifications (mentions / blockers / pr-linked).
+        // 3) High-priority unread notifications (mentions / blockers / pr-linked),
+        //    scoped to this repo's own worktrees unless `all`.
         if let Ok(db) = superzej_core::db::Db::open()
             && let Ok(notes) = db.get_all_notifications(50)
         {
             use superzej_core::notification::NotificationKind as K;
+            let repo_paths = (!all).then(|| repo_worktree_paths(&db, &repo_root));
             for n in notes.into_iter().filter(|n| !n.read) {
-                if matches!(n.kind, K::Mentioned | K::BlockerResolved | K::PrLinked) {
-                    rows.push(WorkRow {
-                        group: WorkGroup::NeedsAttention,
-                        kind: WorkKind::Notification,
-                        title: n.message,
-                        urgency: 1,
-                        worktree_path: if n.worktree_path.is_empty() {
-                            None
-                        } else {
-                            Some(n.worktree_path)
-                        },
-                        ..Default::default()
-                    });
+                if !matches!(n.kind, K::Mentioned | K::BlockerResolved | K::PrLinked) {
+                    continue;
                 }
+                // Repo-scoped: drop notifications that don't belong to one of this
+                // repo's worktrees (untagged/global ones only surface under `all`).
+                if let Some(paths) = &repo_paths
+                    && (n.worktree_path.is_empty() || !paths.contains(&n.worktree_path))
+                {
+                    continue;
+                }
+                rows.push(WorkRow {
+                    group: WorkGroup::NeedsAttention,
+                    kind: WorkKind::Notification,
+                    title: n.message,
+                    urgency: 1,
+                    worktree_path: if n.worktree_path.is_empty() {
+                        None
+                    } else {
+                        Some(n.worktree_path)
+                    },
+                    ..Default::default()
+                });
             }
         }
 
-        // Always write — an emptied feed must clear the cache, not keep stale rows.
+        // Always write — an emptied feed must clear the scope's cache row, not
+        // keep stale rows.
         if let Ok(db) = superzej_core::db::Db::open()
             && let Ok(json) = serde_json::to_string(&rows)
         {
-            let _ = db.put_my_work_cache(&json);
+            let _ = db.put_my_work_cache(&scope_key, &json);
         }
         if let Some(w) = &waker {
             let _ = w.wake();
         }
     });
+}
+
+/// Toggle the Mine feed between the active repo (default) and all repos, kick off
+/// a scoped refresh, and return the status line. Extracted from the panel key
+/// handler so the god-file `run.rs` stays under the file-size ratchet.
+pub(crate) fn toggle_mine_scope(
+    session: &crate::session::Session,
+    cfg: &superzej_core::config::Config,
+    waker: &TerminalWaker,
+) -> String {
+    let all = crate::panel::scope::toggle_mine_all();
+    spawn_my_work_refresh(session.clone(), cfg.clone(), all, Some(waker.clone()));
+    if all {
+        "My Work: all repos".into()
+    } else {
+        "My Work: this repo".into()
+    }
+}
+
+/// Toggle the System tab between this repo (default) and every worktree,
+/// rehydrate the active model so the scoped notification list refreshes, and
+/// return the status line. Extracted from the panel key handler for the ratchet.
+pub(crate) fn toggle_system_scope(
+    tx: &tokio_mpsc::UnboundedSender<(u64, FrameModel)>,
+    generation: u64,
+    session: &crate::session::Session,
+    waker: &TerminalWaker,
+    open: crate::panel::Section,
+    expanded: bool,
+) -> String {
+    let all = crate::panel::scope::toggle_system_all();
+    spawn_model_hydration(
+        tx.clone(),
+        generation,
+        session.clone(),
+        Some(waker.clone()),
+        HydrateHints {
+            open,
+            expanded,
+            ..Default::default()
+        },
+    );
+    if all {
+        "System: all worktrees".into()
+    } else {
+        "System: this repo".into()
+    }
 }
 
 /// Refresh the CI run-history cache for the active worktree (AV group). Off the

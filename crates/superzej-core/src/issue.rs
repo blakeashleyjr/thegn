@@ -134,6 +134,10 @@ pub struct IssueFilter {
     pub statuses: Vec<IssueStatus>,
     /// Optional project / team scope (provider-specific id).
     pub project_id: Option<String>,
+    /// Optional repository scope as `"owner/repo"` — used by the GitHub Issues
+    /// backend to restrict to one repo (the repo-scoped "My Work" feed). Other
+    /// providers ignore it (they scope via `project_id` / config team/project).
+    pub repo: Option<String>,
     /// Free-text search query.
     pub query: Option<String>,
     /// Maximum number of issues to return (provider may impose lower cap).

@@ -53,7 +53,10 @@ use std::path::PathBuf;
 /// v24: adds `forwards` (the resurrection layer for auto port forwards, `[forward]`).
 /// v27: adds `registers` (persisted vim-style yank registers `"a`–`"z`/`"0`–`"9`;
 /// the volatile `"+` system-clipboard register is never persisted).
-const SCHEMA_VERSION: i64 = 27;
+/// v28: re-keys `my_work_cache` from a single global row to per-scope rows
+/// (`scope` = repo root for the default repo-scoped feed, `"*"` for the "all
+/// repos" toggle) so the "My Work" panel shows only the active repo's work.
+const SCHEMA_VERSION: i64 = 28;
 
 pub struct Db {
     conn: Connection,
@@ -233,6 +236,13 @@ impl Db {
             // Add the session_name column to a pre-existing repos table (no-op /
             // ignored error on a fresh DB, where the CREATE below adds it).
             let _ = conn.execute("ALTER TABLE repos ADD COLUMN session_name TEXT", []);
+        }
+        // v28: `my_work_cache` re-keyed from a single `id=0` row to per-`scope`
+        // rows. It's a pure cache (rebuilt by the background worker), so drop the
+        // old-shape table here; the CREATE below recreates it with the new shape
+        // and the next refresh repopulates it.
+        if ver < 28 {
+            let _ = conn.execute("DROP TABLE IF EXISTS my_work_cache", []);
         }
         if ver < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -438,13 +448,13 @@ impl Db {
               fetched_at INTEGER NOT NULL,
               PRIMARY KEY (repo_root, provider)
             );
-            -- v18: the unified "My Work" feed — a single global row (id=0) of
-            -- `Vec<WorkRow>` JSON aggregating assigned issues (all providers),
-            -- review-requested / authored PRs (cross-repo `gh search`), and
-            -- high-priority notifications. Not per-repo: it spans every repo the
-            -- user touches, refreshed on a background worker.
+            -- v18 / v28: the unified "My Work" feed of `Vec<WorkRow>` JSON —
+            -- assigned issues (all providers), review-requested / authored PRs,
+            -- and high-priority notifications. v28 re-keys it by `scope`: the
+            -- active repo's root path for the default (repo-scoped) feed, or `"*"`
+            -- for the cross-repo "all" toggle. Refreshed on a background worker.
             CREATE TABLE IF NOT EXISTS my_work_cache (
-              id         INTEGER PRIMARY KEY CHECK (id = 0),
+              scope      TEXT    PRIMARY KEY,
               json       TEXT    NOT NULL,
               fetched_at INTEGER NOT NULL
             );
@@ -1204,28 +1214,30 @@ impl Db {
         Ok(())
     }
 
-    // --- unified "My Work" feed (single global row) -------------------------
-    /// The cached "My Work" payload (`Vec<WorkRow>` JSON) with its fetch time,
-    /// or `None` when never refreshed.
-    pub fn get_my_work_cache(&self) -> Result<Option<(String, i64)>> {
+    // --- unified "My Work" feed (per-scope rows) ----------------------------
+    /// The cached "My Work" payload (`Vec<WorkRow>` JSON) for a `scope` with its
+    /// fetch time, or `None` when that scope was never refreshed. `scope` is the
+    /// active repo's root path (repo-scoped feed) or [`crate::work::ALL_SCOPE`]
+    /// (the "all repos" toggle).
+    pub fn get_my_work_cache(&self, scope: &str) -> Result<Option<(String, i64)>> {
         let r = self
             .conn
             .query_row(
-                "SELECT json, fetched_at FROM my_work_cache WHERE id=0",
-                [],
+                "SELECT json, fetched_at FROM my_work_cache WHERE scope=?1",
+                params![scope],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
             .ok();
         Ok(r)
     }
 
-    /// Replace the cached "My Work" payload.
-    pub fn put_my_work_cache(&self, json: &str) -> Result<()> {
+    /// Replace the cached "My Work" payload for a `scope`.
+    pub fn put_my_work_cache(&self, scope: &str, json: &str) -> Result<()> {
         self.conn.execute(
-            r#"INSERT INTO my_work_cache(id,json,fetched_at)
-               VALUES(0,?1,?2)
-               ON CONFLICT(id) DO UPDATE SET json=?1, fetched_at=?2"#,
-            params![json, util::now()],
+            r#"INSERT INTO my_work_cache(scope,json,fetched_at)
+               VALUES(?1,?2,?3)
+               ON CONFLICT(scope) DO UPDATE SET json=?2, fetched_at=?3"#,
+            params![scope, json, util::now()],
         )?;
         Ok(())
     }
@@ -3463,19 +3475,6 @@ mod tests {
         );
         // A different repo's providers are not mixed in.
         assert_eq!(db.get_all_issue_cache("/other").unwrap().len(), 1);
-    }
-
-    #[test]
-    fn my_work_cache_roundtrips_single_row() {
-        let db = db();
-        assert!(db.get_my_work_cache().unwrap().is_none());
-        db.put_my_work_cache(r#"[{"n":1}]"#).unwrap();
-        let (json, fetched) = db.get_my_work_cache().unwrap().unwrap();
-        assert_eq!(json, r#"[{"n":1}]"#);
-        assert!(fetched > 0);
-        // A second put replaces (not appends) — the table holds one global row.
-        db.put_my_work_cache(r#"[{"n":2}]"#).unwrap();
-        assert_eq!(db.get_my_work_cache().unwrap().unwrap().0, r#"[{"n":2}]"#);
     }
 
     #[test]

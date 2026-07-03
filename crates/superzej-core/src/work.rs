@@ -8,6 +8,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Cache-scope sentinel for the cross-repo "all repos" feed (the toggle view),
+/// distinct from any real repo-root path used for the default repo-scoped feed.
+pub const ALL_SCOPE: &str = "*";
+
 /// Which actionable bucket a row belongs to — the section's grouped headers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

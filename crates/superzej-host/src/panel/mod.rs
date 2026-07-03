@@ -25,6 +25,7 @@ pub mod gitfull;
 pub mod gitui;
 pub mod graph;
 pub mod rollback;
+pub mod scope;
 pub mod sections;
 pub mod staging;
 

@@ -15,9 +15,10 @@
 
 use crate::config::{LogConfig, LogFormat, LogLevel};
 use crate::theme;
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{Event, Level, Subscriber};
@@ -34,6 +35,53 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// functions fall back to direct stderr before logging is up.
 pub fn ready() -> bool {
     READY.load(Ordering::SeqCst)
+}
+
+thread_local! {
+    /// The worktree tag for the current thread — a short slug attached to every
+    /// log line the thread emits while a [`WtGuard`] is in scope. The `fmt`
+    /// subscriber formats an event on the thread that emitted it, so a
+    /// thread-local set for the duration of a worktree-scoped `spawn_blocking`
+    /// closure reliably tags all of that closure's logs. Empty ⇒ host-global.
+    static CURRENT_WT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// RAII guard that tags the current thread's log lines with a worktree slug and
+/// restores the previous tag (usually `None`) on drop. Attach it at the top of a
+/// worktree-scoped unit of work (provisioning, pane spawn, a per-worktree
+/// refresh) so its diagnostics are attributable — the Logs panel then filters to
+/// the active worktree by default. See [`enter_wt`].
+#[must_use = "the worktree log tag is cleared as soon as the guard is dropped"]
+pub struct WtGuard(Option<String>);
+
+/// Tag this thread's log lines with a worktree slug until the returned guard is
+/// dropped. Use [`wt_slug`] to derive a stable slug from a worktree path so both
+/// the emitter and the Logs-panel filter agree on the key.
+pub fn enter_wt(slug: impl Into<String>) -> WtGuard {
+    let slug = slug.into();
+    let prev = CURRENT_WT.with(|c| c.replace(if slug.is_empty() { None } else { Some(slug) }));
+    WtGuard(prev)
+}
+
+impl Drop for WtGuard {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        CURRENT_WT.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// The current thread's worktree tag, if any.
+fn current_wt() -> Option<String> {
+    CURRENT_WT.with(|c| c.borrow().clone())
+}
+
+/// A stable, short worktree tag derived from a worktree path — the directory's
+/// basename, slugified. Both the log emitter ([`enter_wt`]) and the Logs-panel
+/// filter derive the key this way so they compare equal. Empty path ⇒ `""`.
+pub fn wt_slug(path: &Path) -> String {
+    path.file_name()
+        .map(|n| crate::util::slugify(&n.to_string_lossy()))
+        .unwrap_or_default()
 }
 
 pub fn audit(event: &str) {
@@ -186,6 +234,18 @@ where
             write!(writer, "{:<5} {}  ", level.as_str(), target)?;
         }
 
+        // Worktree attribution: when the emitting thread is inside a `WtGuard`,
+        // tag the line so the Logs panel can filter to the active worktree. The
+        // ` wt=<slug>  ` token sits between target and message in a fixed spot the
+        // parser (`log::parser::parse_log`) extracts and strips from the message.
+        if let Some(wt) = current_wt() {
+            if self.ansi {
+                write!(writer, "\x1b[38;2;{}mwt={wt}\x1b[0m  ", theme::FAINT)?;
+            } else {
+                write!(writer, "wt={wt}  ")?;
+            }
+        }
+
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
     }
@@ -315,5 +375,31 @@ mod tests {
     fn env_filter_prefers_superzej_log() {
         // Just ensure construction doesn't panic for both paths.
         let _ = level_filter(LogLevel::Info);
+    }
+
+    #[test]
+    fn wt_slug_is_basename_slug() {
+        assert_eq!(wt_slug(Path::new("/home/me/wt/sz-solid-glen")), "sz-solid-glen");
+        assert_eq!(wt_slug(Path::new("/repo/app feat")), "app-feat");
+        assert_eq!(wt_slug(Path::new("")), "");
+    }
+
+    #[test]
+    fn enter_wt_sets_and_restores_thread_tag() {
+        assert!(current_wt().is_none());
+        {
+            let _g = enter_wt("wt-a");
+            assert_eq!(current_wt().as_deref(), Some("wt-a"));
+            {
+                // Nested guard overrides, then restores the outer tag on drop.
+                let _g2 = enter_wt("wt-b");
+                assert_eq!(current_wt().as_deref(), Some("wt-b"));
+            }
+            assert_eq!(current_wt().as_deref(), Some("wt-a"));
+        }
+        assert!(current_wt().is_none());
+        // An empty slug is a no-op tag (host-global).
+        let _g = enter_wt("");
+        assert!(current_wt().is_none());
     }
 }
