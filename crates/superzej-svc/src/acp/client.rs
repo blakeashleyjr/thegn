@@ -113,6 +113,35 @@ impl AcpClient {
         Ok(Self::from_transport(r, w))
     }
 
+    /// Connect over TCP loopback, retrying while the agent's listener is still
+    /// coming up. A freshly-spawned agent may not have bound its ACP port yet, so
+    /// a single connect races the spawn and fails with `ECONNREFUSED` — the agent
+    /// then shows a permanent `Error` even though it comes up moments later. Retry
+    /// on a fixed cadence (mirroring the unix-socket path's boot wait) so the
+    /// common case (agent already listening) connects on the first try with no
+    /// delay, while a slow/cold agent still gets up to `attempts * delay` to
+    /// appear. `attempts` is clamped to at least 1.
+    pub async fn connect_retry(
+        port: u16,
+        attempts: u32,
+        delay: std::time::Duration,
+    ) -> Result<(Self, mpsc::Receiver<AcpInbound>)> {
+        let attempts = attempts.max(1);
+        let mut last = None;
+        for i in 0..attempts {
+            match Self::connect(port).await {
+                Ok(conn) => return Ok(conn),
+                Err(e) => last = Some(e),
+            }
+            // Sleep between tries, but not after the final failed attempt.
+            if i + 1 < attempts {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| anyhow::anyhow!("agent ACP port {port} never became connectable")))
+    }
+
     /// Connect over a unix-domain socket (a bind-mounted socket from a sealed
     /// sandbox, or a host socket path). Same protocol; different transport.
     pub async fn connect_unix(path: &str) -> Result<(Self, mpsc::Receiver<AcpInbound>)> {
@@ -383,5 +412,74 @@ mod tests {
         assert_eq!(v["baseUrl"], "http://127.0.0.1:8383/v1");
         assert_eq!(v["apiType"], "openai");
         assert_eq!(v["headers"]["Authorization"], "Bearer szk-abc");
+    }
+
+    // A likely-free loopback port: bind, read the assigned port, release it. The
+    // window between release and re-bind is tiny and local-only, and tokio binds
+    // with SO_REUSEADDR, so re-binding the same port is race-tolerant.
+    async fn free_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    }
+
+    #[tokio::test]
+    async fn connect_retry_rides_out_a_late_listener() {
+        // The exact race the retry fixes: the agent binds its ACP port only after a
+        // boot delay, so the first connects hit ECONNREFUSED and must be retried.
+        let port = free_port().await;
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let l = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .unwrap();
+            // Accept + hold so the client's transport stays connected.
+            let _accepted = l.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+        let res = AcpClient::connect_retry(port, 40, std::time::Duration::from_millis(25)).await;
+        assert!(
+            res.is_ok(),
+            "retry should wait out the boot delay and connect"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_retry_gives_up_bounded_when_nothing_listens() {
+        let port = free_port().await; // closed and never reopened
+        let start = std::time::Instant::now();
+        let res = AcpClient::connect_retry(port, 3, std::time::Duration::from_millis(10)).await;
+        assert!(
+            res.is_err(),
+            "no listener ⇒ error once the attempt budget is spent"
+        );
+        // 3 attempts, 2 inter-attempt 10ms sleeps ⇒ bounded, never hangs.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "the retry budget is bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_retry_connects_immediately_without_wasted_backoff() {
+        // An already-listening agent must connect on the first try — no fixed sleep
+        // before the first attempt (the old 500ms warm-up penalty is gone).
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _accepted = l.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        let start = std::time::Instant::now();
+        // A 30s backoff would dominate if the loop slept before the first attempt.
+        let res = AcpClient::connect_retry(port, 5, std::time::Duration::from_secs(30)).await;
+        assert!(res.is_ok());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "first-try success must not pay any backoff"
+        );
+        server.await.unwrap();
     }
 }

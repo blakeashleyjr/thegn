@@ -219,6 +219,94 @@ fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
+/// A minimal mock that answers `DELETE` with `500` for the first `fail_first`
+/// calls, then `204` — purpose-built for the transient-teardown retry (the
+/// observed "sprites destroy failed (500)" that leaked a paid sandbox). Returns
+/// the base URL and a shared counter of DELETEs seen, so tests can assert the
+/// retry budget is exactly what the code intends (bounded, not infinite).
+fn start_delete_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let deletes = Arc::new(Mutex::new(0usize));
+    let d = deletes.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let d = d.clone();
+            thread::spawn(move || {
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if read_line(&mut reader, &mut line).is_none() {
+                    return;
+                }
+                let method = line.split_whitespace().next().unwrap_or("").to_string();
+                // Drain the headers so the client's request completes cleanly.
+                loop {
+                    let mut h = String::new();
+                    if read_line(&mut reader, &mut h).is_none() {
+                        break;
+                    }
+                    if h.trim_end().is_empty() {
+                        break;
+                    }
+                }
+                let (status, body): (&str, &[u8]) = if method == "DELETE" {
+                    let mut n = d.lock().unwrap();
+                    *n += 1;
+                    if *n <= fail_first {
+                        ("500 Internal Server Error", b"boom")
+                    } else {
+                        ("204 No Content", b"")
+                    }
+                } else {
+                    ("404 Not Found", b"no route")
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = writer.write_all(head.as_bytes());
+                let _ = writer.write_all(body);
+                let _ = writer.flush();
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}/v1"), deletes)
+}
+
+#[test]
+fn destroy_retries_transient_500_then_succeeds() {
+    // 500 twice, then 204: the teardown retry must ride out the transient errors
+    // and succeed rather than leaking the sandbox — hitting DELETE exactly 3×.
+    let (base, deletes) = start_delete_mock(2);
+    let p = SpritesProvider::new(&base, "tok", "sztest1");
+    rt().block_on(p.destroy("sztest1")).unwrap();
+    assert_eq!(
+        *deletes.lock().unwrap(),
+        3,
+        "two failures then a success = three DELETE attempts"
+    );
+}
+
+#[test]
+fn destroy_gives_up_bounded_on_persistent_500() {
+    // Always 500: teardown errors after a BOUNDED attempt budget (never loops
+    // forever, which would wedge the off-loop delete thread) and surfaces the
+    // status so the warn is actionable.
+    let (base, deletes) = start_delete_mock(usize::MAX);
+    let p = SpritesProvider::new(&base, "tok", "sztest1");
+    let err = rt().block_on(p.destroy("sztest1")).unwrap_err();
+    assert!(
+        err.to_string().contains("500"),
+        "the surfaced error names the status: {err}"
+    );
+    assert_eq!(
+        *deletes.lock().unwrap(),
+        3,
+        "exactly the bounded number of attempts, then give up"
+    );
+}
+
 #[test]
 fn full_provider_flow_against_recorded_api() {
     let mock = start_mock();
