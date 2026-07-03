@@ -4364,12 +4364,25 @@ mod tests {
             "host agent pane routes through the local proxy without bouncer"
         );
         assert!(
-            agent
+            !agent
                 .host_env
                 .iter()
                 .any(|(k, _)| k == "ANTHROPIC_BASE_URL"),
-            "claude/codex on host also get ANTHROPIC_BASE_URL"
+            "claude is NOT routed by default (route_claude off) — talks to Anthropic directly"
         );
+
+        // route_claude ON → claude/codex on host also get ANTHROPIC_BASE_URL.
+        cfg.llm_proxy.route_claude = true;
+        let mut outcome = host_outcome();
+        let claude = apply_bouncer_launch(&cfg, "/wt/x", "Agent", &mut outcome);
+        assert!(
+            claude
+                .host_env
+                .iter()
+                .any(|(k, _)| k == "ANTHROPIC_BASE_URL"),
+            "route_claude → claude/codex on host get ANTHROPIC_BASE_URL"
+        );
+        cfg.llm_proxy.route_claude = false;
 
         // A shell never routes.
         let mut outcome = host_outcome();

@@ -486,8 +486,18 @@ pub struct LlmProxyConfig {
     /// Route a launched agent's model traffic through the proxy at `listen` by
     /// injecting provider config into the agent's environment at spawn. Separate
     /// from `enabled` (which launches `szproxy`): set this to point the agent at
-    /// an already-running proxy without launching our own.
+    /// an already-running proxy without launching our own. This governs the
+    /// `SUPERZEJ_PROXY_*` vars the pi extension reads — NOT `ANTHROPIC_BASE_URL`
+    /// (see `route_claude`).
     pub route_agent: bool,
+    /// Additionally route Claude Code / the Anthropic SDK (anything honoring
+    /// `ANTHROPIC_BASE_URL`) through the proxy. Off by default: claude talks to
+    /// Anthropic directly so a proxy/tunnel hiccup can't break it (a bare
+    /// `ANTHROPIC_BASE_URL = http://127.0.0.1:<proxy>` with a down tunnel yields
+    /// `ConnectionRefused` and has no upstream fallback). Only meaningful when
+    /// `route_agent` is also on. The pi extension routes regardless via
+    /// `SUPERZEJ_PROXY_*`; this switch is specifically for the `ANTHROPIC_*` vars.
+    pub route_claude: bool,
     /// The pi-side API id for the proxy endpoint. The proxy serves the Anthropic
     /// Messages API (`/v1/messages`); pi's OpenAI client speaks the Responses API,
     /// which the proxy does not implement — so `anthropic-messages` is the default.
@@ -529,6 +539,7 @@ impl Default for LlmProxyConfig {
             token_reduction: false,
             token_reduction_level: CompressionLevel::default(),
             route_agent: false,
+            route_claude: false,
             agent_api: "anthropic-messages".to_string(),
             agent_model: "model-proxy/standard".to_string(),
             bouncer: false,
@@ -542,24 +553,30 @@ impl LlmProxyConfig {
     /// model traffic routes through `szproxy` by default. Empty unless `route_agent`
     /// is on; the loopback URL is then reachable via the reverse tunnel superzej
     /// stands up (empty/`auto` `remote_base_url`) or via an explicit external URL.
-    /// Sets the standard
-    /// `ANTHROPIC_BASE_URL` (honored by claude code / the Anthropic SDK / pi) plus
-    /// the `SUPERZEJ_PROXY_*` vars the pi extension reads. `virtual_key`, when
+    /// Sets the `SUPERZEJ_PROXY_*` vars the pi extension reads. `virtual_key`, when
     /// given, becomes the proxy auth key (else the passthrough master key is used).
+    /// Only when `route_claude` is also on does it additionally set
+    /// `ANTHROPIC_BASE_URL` (+ the virtual key as `ANTHROPIC_API_KEY`) so claude
+    /// code / the Anthropic SDK route through the proxy too; by default they talk
+    /// to Anthropic directly (a down proxy tunnel can't break claude).
     pub fn remote_agent_env(&self, virtual_key: Option<&str>) -> Vec<(String, String)> {
         let url = match self.remote_base_url() {
             Some(u) => u,
             None => return Vec::new(),
         };
         let mut v = vec![
-            ("ANTHROPIC_BASE_URL".to_string(), url.clone()),
-            ("SUPERZEJ_PROXY_BASE_URL".to_string(), url),
+            ("SUPERZEJ_PROXY_BASE_URL".to_string(), url.clone()),
             ("SUPERZEJ_PROXY_API".to_string(), self.agent_api.clone()),
             ("SUPERZEJ_PROXY_MODEL".to_string(), self.agent_model.clone()),
         ];
+        if self.route_claude {
+            v.push(("ANTHROPIC_BASE_URL".to_string(), url));
+        }
         if let Some(k) = virtual_key.map(str::trim).filter(|k| !k.is_empty()) {
-            v.push(("ANTHROPIC_API_KEY".to_string(), k.to_string()));
             v.push(("SUPERZEJ_PROXY_KEY".to_string(), k.to_string()));
+            if self.route_claude {
+                v.push(("ANTHROPIC_API_KEY".to_string(), k.to_string()));
+            }
         }
         v
     }
@@ -569,21 +586,25 @@ impl LlmProxyConfig {
     /// tunnel, no relay. Mirrors [`remote_agent_env`](Self::remote_agent_env) but
     /// always targets `http://127.0.0.1:<listen-port>`, so it stays correct even
     /// when `remote_base_url` points at an external endpoint used for *remote*
-    /// sandboxes. Sets `ANTHROPIC_BASE_URL` (claude/codex/Anthropic SDK) + the
-    /// `SUPERZEJ_PROXY_*` vars the pi extension reads. Empty unless `route_agent`;
-    /// no auth key (the pi extension falls back to its default), matching the
-    /// keyless sprite path. See [`crate::config::LlmProxyConfig`].
+    /// sandboxes. Sets the `SUPERZEJ_PROXY_*` vars the pi extension reads, and —
+    /// only when `route_claude` is also on — `ANTHROPIC_BASE_URL`
+    /// (claude/codex/Anthropic SDK). Empty unless `route_agent`; no auth key (the
+    /// pi extension falls back to its default), matching the keyless sprite path.
+    /// See [`crate::config::LlmProxyConfig`].
     pub fn local_agent_env(&self) -> Vec<(String, String)> {
         if !self.route_agent {
             return Vec::new();
         }
         let url = format!("http://127.0.0.1:{}", self.listen_port());
-        vec![
-            ("ANTHROPIC_BASE_URL".to_string(), url.clone()),
-            ("SUPERZEJ_PROXY_BASE_URL".to_string(), url),
+        let mut v = vec![
+            ("SUPERZEJ_PROXY_BASE_URL".to_string(), url.clone()),
             ("SUPERZEJ_PROXY_API".to_string(), self.agent_api.clone()),
             ("SUPERZEJ_PROXY_MODEL".to_string(), self.agent_model.clone()),
-        ]
+        ];
+        if self.route_claude {
+            v.push(("ANTHROPIC_BASE_URL".to_string(), url));
+        }
+        v
     }
 
     /// The proxy base URL an in-remote agent should use, or `None` if remote
@@ -9144,8 +9165,9 @@ min_priority = "alert"
         // Off by default (no route_agent → no injection).
         assert!(LlmProxyConfig::default().remote_agent_env(None).is_empty());
         // `route_agent` alone is the single switch: an empty remote_base_url resolves
-        // to the auto reverse-tunnel loopback, so the env IS injected and the tunnel
-        // port is signalled.
+        // to the auto reverse-tunnel loopback, so the pi (`SUPERZEJ_PROXY_*`) env IS
+        // injected and the tunnel port is signalled — but NOT `ANTHROPIC_BASE_URL`
+        // (claude talks to Anthropic directly unless `route_claude`).
         let only_route = LlmProxyConfig {
             route_agent: true,
             ..Default::default()
@@ -9153,13 +9175,18 @@ min_priority = "alert"
         let oenv = only_route.remote_agent_env(None);
         assert!(
             oenv.iter()
-                .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "http://127.0.0.1:8383"),
-            "route_agent alone → auto loopback URL injected"
+                .any(|(k, v)| k == "SUPERZEJ_PROXY_BASE_URL" && v == "http://127.0.0.1:8383"),
+            "route_agent alone → pi proxy vars injected at the auto loopback"
+        );
+        assert!(
+            !oenv.iter().any(|(k, _)| k == "ANTHROPIC_BASE_URL"),
+            "claude is NOT routed by default (route_claude off)"
         );
         assert_eq!(only_route.remote_tunnel_port(), Some(8383));
-        // Configured → inject the standard + superzej proxy vars.
+        // Configured, route_claude ON → additionally inject the ANTHROPIC_* vars.
         let lp = LlmProxyConfig {
             route_agent: true,
+            route_claude: true,
             remote_base_url: "https://proxy.example".into(),
             ..Default::default()
         };
@@ -9167,23 +9194,42 @@ min_priority = "alert"
         assert!(
             env.iter()
                 .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "https://proxy.example"),
-            "claude code / SDK honor ANTHROPIC_BASE_URL"
+            "route_claude → claude code / SDK honor ANTHROPIC_BASE_URL"
         );
         assert!(
             env.iter()
                 .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "vk-1")
         );
         assert!(env.iter().any(|(k, _)| k == "SUPERZEJ_PROXY_BASE_URL"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "SUPERZEJ_PROXY_KEY" && v == "vk-1"),
+            "pi always gets the virtual key regardless of route_claude"
+        );
         assert_eq!(
             lp.remote_tunnel_port(),
             None,
             "explicit URL needs no tunnel"
         );
+        // route_claude OFF with a virtual key: pi key present, ANTHROPIC_* absent.
+        let keyed_no_claude = LlmProxyConfig {
+            route_agent: true,
+            remote_base_url: "https://proxy.example".into(),
+            ..Default::default()
+        };
+        let kenv = keyed_no_claude.remote_agent_env(Some("vk-2"));
+        assert!(
+            kenv.iter()
+                .any(|(k, v)| k == "SUPERZEJ_PROXY_KEY" && v == "vk-2")
+        );
+        assert!(!kenv.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
+        assert!(!kenv.iter().any(|(k, _)| k == "ANTHROPIC_BASE_URL"));
 
         // "auto" → derive the in-sandbox tunnel URL from the proxy port + signal
-        // the host to stand a reverse tunnel up on that port.
+        // the host to stand a reverse tunnel up on that port (pi still needs it).
         let auto = LlmProxyConfig {
             route_agent: true,
+            route_claude: true,
             remote_base_url: "auto".into(),
             listen: "127.0.0.1:9999".into(),
             ..Default::default()
@@ -9208,6 +9254,7 @@ min_priority = "alert"
         // `remote_base_url` points at an external endpoint for remote sandboxes.
         let lp = LlmProxyConfig {
             route_agent: true,
+            route_claude: true,
             remote_base_url: "https://proxy.example.ts.net".into(),
             listen: "127.0.0.1:8383".into(),
             ..Default::default()
@@ -9217,7 +9264,7 @@ min_priority = "alert"
         assert!(
             env.iter()
                 .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == url),
-            "host agent uses the local loopback, not the external remote URL"
+            "route_claude → host agent uses the local loopback, not the external remote URL"
         );
         assert!(
             env.iter()
@@ -9229,6 +9276,18 @@ min_priority = "alert"
         // Keyless (like the sprite path) — the pi extension falls back to default.
         assert!(!env.iter().any(|(k, _)| k == "SUPERZEJ_PROXY_KEY"));
         assert!(!env.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
+        // Default (route_claude off): pi vars only, claude talks upstream directly.
+        let no_claude = LlmProxyConfig {
+            route_agent: true,
+            listen: "127.0.0.1:8383".into(),
+            ..Default::default()
+        };
+        let nenv = no_claude.local_agent_env();
+        assert!(nenv.iter().any(|(k, _)| k == "SUPERZEJ_PROXY_BASE_URL"));
+        assert!(
+            !nenv.iter().any(|(k, _)| k == "ANTHROPIC_BASE_URL"),
+            "claude not routed on the host by default"
+        );
         // Honors a custom listen port.
         let custom = LlmProxyConfig {
             route_agent: true,
