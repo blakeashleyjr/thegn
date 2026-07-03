@@ -86,6 +86,8 @@ mod testkit;
 mod toast;
 mod wire;
 mod wizard;
+mod workspace_create;
+mod workspace_picker;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
