@@ -9580,20 +9580,10 @@ async fn event_loop<T: Terminal>(
                     // the sidebar chip AND hand the resolved values to the off-loop
                     // reconcile.
                     if let Ok(db) = superzej_core::db::Db::open() {
-                        let repo_root = db
-                            .repo_root_for(&wt)
-                            .ok()
-                            .flatten()
-                            .filter(|s| !s.is_empty())
-                            .map(std::path::PathBuf::from)
-                            .or_else(|| {
-                                superzej_core::repo::main_worktree(std::path::Path::new(&wt))
-                            })
-                            .unwrap_or_else(|| std::path::PathBuf::from(&wt));
-                        let env_name = current_config
-                            .resolve_env(&repo_root, &loc, std::path::Path::new(&wt), None)
-                            .name;
-                        let repo = repo_root.to_string_lossy().into_owned();
+                        // (repo_root, repo, env) via the worktree's EFFECTIVE env —
+                        // see `lifecycle::pool_context` for why never the default.
+                        let (repo_root, repo, env_name) =
+                            crate::lifecycle::pool_context(&db, &current_config, &wt, &loc);
                         let target = crate::lifecycle::effective_pool_target(
                             &db,
                             &current_config,

@@ -102,6 +102,34 @@ pub fn reconcile(session: &crate::session::Session, cfg: &LifecycleConfig) {
     }
 }
 
+/// Resolve the `(repo_root, repo, env_name)` triple the warm pool operates on
+/// for the active worktree — using the worktree's EFFECTIVE env (its DB
+/// selection, falling back through the normal repo/global layering via
+/// `resolve_env`), never the bare ambient default: reconciling under the default
+/// while the worktree runs a picked env warms — and claims! — spares for the
+/// wrong env (the phantom-spare / bare-sprite-shell incident).
+pub fn pool_context(
+    db: &superzej_core::db::Db,
+    cfg: &Config,
+    wt: &str,
+    loc: &GitLoc,
+) -> (std::path::PathBuf, String, String) {
+    let repo_root = db
+        .repo_root_for(wt)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| superzej_core::repo::main_worktree(Path::new(wt)))
+        .unwrap_or_else(|| std::path::PathBuf::from(wt));
+    let repo = repo_root.to_string_lossy().into_owned();
+    let selected = db.effective_env(wt, &repo);
+    let env_name = cfg
+        .resolve_env(&repo_root, loc, Path::new(wt), selected.as_deref())
+        .name;
+    (repo_root, repo, env_name)
+}
+
 /// The effective warm-pool target for `(repo, env)`: the runtime +/- override in
 /// the DB (set by the hotkey, per repo+env) if present, else the configured
 /// `[lifecycle.pool] size`.
@@ -157,7 +185,7 @@ where
                  session or hung) so the pool refills",
                 s.sandbox_name
             ));
-            let _ = crate::agent::destroy_spare(cfg, env_name, &s.sandbox_name);
+            let _ = crate::provision_gate::destroy_spare(cfg, env_name, &s.sandbox_name);
             notify();
         } else {
             provisioning += 1;
@@ -169,9 +197,17 @@ where
         .map(|s| (s.sandbox_name.clone(), (now - s.updated_at).max(0) as u64))
         .collect();
 
-    let action = decide_pool(target, provisioning, &ready, max_idle);
+    let mut action = decide_pool(target, provisioning, &ready, max_idle);
+    // Only a CONFIGURED provider env can host spares — for anything else
+    // (notably the implicit "default" env) provisioning "succeeds" instantly as
+    // a no-op, minting a phantom `ready` spare whose claim then skips the real
+    // worktree provision (the bare-sprite-shell bug). Creates are refused;
+    // destroys + the stale sweep above still run so leftover rows drain.
+    if !crate::provision_gate::poolable_env(cfg, env_name) {
+        action.create = 0;
+    }
     for name in &action.destroy {
-        let _ = crate::agent::destroy_spare(cfg, env_name, name);
+        let _ = crate::provision_gate::destroy_spare(cfg, env_name, name);
         notify();
     }
     for _ in 0..action.create {
@@ -182,7 +218,7 @@ where
         // Concurrent build: provision_spare inserts a `provisioning` row first
         // (so this tick + the next don't double-count), then builds + checkpoints.
         std::thread::spawn(move || {
-            match crate::agent::provision_spare(&cfg, &repo_root, &env_name, |_| {}) {
+            match crate::provision_gate::provision_spare(&cfg, &repo_root, &env_name, |_| {}) {
                 Ok(name) => {
                     tracing::debug!(target: "szhost::lifecycle", %name, "warm spare ready");
                     notify();

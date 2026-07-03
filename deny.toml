@@ -28,6 +28,13 @@ ignore = [
   # syntect 5 (syntax highlighting) still serializes its dumps with
   # bincode 1; unmaintained-notice only. Drop when syntect moves off it.
   "RUSTSEC-2025-0141",
+  # quick-xml < 0.41 algorithmic-complexity DoS in attribute/namespace
+  # iteration, reached only via starship-battery (battery metrics), which
+  # parses the LOCAL UPower/system XML — never untrusted input. Patched only
+  # in quick-xml >= 0.41; starship-battery 0.11.0 (latest) pins 0.38. Drop
+  # both when starship-battery releases against quick-xml 0.41+.
+  "RUSTSEC-2026-0194", # quick-xml duplicate-attribute check is O(N²) (via starship-battery)
+  "RUSTSEC-2026-0195", # quick-xml unbounded namespace bindings (via starship-battery)
 ]
 
 [licenses]
