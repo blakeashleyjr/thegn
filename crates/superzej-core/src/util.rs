@@ -317,18 +317,33 @@ pub fn git_cmd(dir: &Path) -> Command {
     c
 }
 
-/// Defensive self-heal: a non-bare MAIN checkout must never carry
-/// `core.worktree`. A stray GIT_DIR/GIT_WORK_TREE in some child `git`
-/// invocation (an agent shell, a worktree op run inside a git hook) can leak it
-/// into the shared `.git/config`, after which every read — superzej's diff
-/// panel included — targets that other tree. If `root` is a main checkout (its
-/// `.git` is a directory, not a linked-worktree `.git` file, which legitimately
-/// uses core.worktree) and the key is set, strip it. Returns whether it healed.
+/// Defensive self-heal for a non-bare MAIN checkout. Two independent repairs,
+/// both no-ops on a linked worktree (its `.git` is a FILE):
+///  1. strip a stray `core.worktree` from the shared `.git/config` — a leaked
+///     GIT_DIR/GIT_WORK_TREE (agent shell, worktree op inside a git hook) can
+///     write it there, after which every read (superzej's diff panel included)
+///     retargets another tree;
+///  2. fast-forward a working tree that went stale after its branch ref moved
+///     out from under it (the fold advances `refs/heads/main` via plumbing, so
+///     the main checkout's index+tree keep the old tip while `HEAD` already
+///     points at the new one — see [`resync_ff_checkout`]).
+///
+/// Returns whether either repair did something.
 pub fn heal_main_checkout_worktree(root: &Path) -> bool {
     // Only a main checkout has `.git` as a directory; linked worktrees have a
     // `.git` FILE and their per-worktree config rightly sets core.worktree.
+    if !root.join(".git").is_dir() {
+        return false;
+    }
+    let stripped = strip_stray_core_worktree(root);
+    let resynced = resync_stale_main_checkout(root);
+    stripped || resynced
+}
+
+/// Repair (1): drop a stray `core.worktree` from `<root>/.git/config`.
+fn strip_stray_core_worktree(root: &Path) -> bool {
     let cfg_path = root.join(".git/config");
-    if !root.join(".git").is_dir() || !cfg_path.is_file() {
+    if !cfg_path.is_file() {
         return false;
     }
     let Ok(text) = std::fs::read_to_string(&cfg_path) else {
@@ -349,6 +364,114 @@ pub fn heal_main_checkout_worktree(root: &Path) -> bool {
             "stripped stray core.worktree from main checkout config (was retargeting git at another worktree)"
         );
         return true;
+    }
+    false
+}
+
+/// What [`resync_ff_checkout`] decided about a stale main checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResyncOutcome {
+    /// The working tree was fast-forwarded to `new`.
+    Healed,
+    /// Left untouched, with the reason (already coherent, real uncommitted work,
+    /// detached/other branch, not a fast-forward, …).
+    Skipped(&'static str),
+    /// The `read-tree` merge itself failed (it aborts rather than clobber).
+    Failed,
+}
+
+/// Fast-forward a MAIN checkout's index+working tree from `old` to `new` when —
+/// and only when — it's a safe no-op-for-the-user fast-forward:
+///  * `HEAD` is on `branch` (not detached, not some other branch);
+///  * `new` descends from `old` (a fast-forward, never a rewrite);
+///  * the index AND working tree still match `old` — i.e. there's no genuine
+///    uncommitted work. Compared against `old`, NOT `HEAD`: after the fold moved
+///    the ref, `HEAD` already resolves to `new`, so a `HEAD` diff would falsely
+///    report the whole fast-forward as pending.
+///
+/// The mutation is `git read-tree -m -u old new`, a two-way merge that updates
+/// the `old→new` paths, preserves untouched local edits, and ABORTS (→ `Failed`)
+/// rather than overwrite anything — so even a mis-detection can only skip, never
+/// destroy work. All git goes through [`git_cmd`].
+pub fn resync_ff_checkout(root: &Path, branch: &str, old: &str, new: &str) -> ResyncOutcome {
+    if old == new {
+        return ResyncOutcome::Skipped("unchanged");
+    }
+    match git_out(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        Some(b) if b == branch => {}
+        Some(_) => return ResyncOutcome::Skipped("checkout on a different branch"),
+        None => return ResyncOutcome::Skipped("detached HEAD"),
+    }
+    if !git_ok(root, &["merge-base", "--is-ancestor", old, new]) {
+        return ResyncOutcome::Skipped("not a fast-forward");
+    }
+    // `diff-index --quiet <tree-ish>` exits non-zero on any difference; require
+    // both the working tree and the staged index to still match `old`.
+    if !git_ok(root, &["diff-index", "--quiet", old, "--"])
+        || !git_ok(root, &["diff-index", "--quiet", "--cached", old, "--"])
+    {
+        return ResyncOutcome::Skipped("checkout has uncommitted changes");
+    }
+    if git_ok(root, &["read-tree", "-m", "-u", old, new]) {
+        ResyncOutcome::Healed
+    } else {
+        ResyncOutcome::Failed
+    }
+}
+
+/// Repair (2): a startup/switch-time coherence pass. If the main checkout's
+/// working tree drifted stale (its branch ref moved but the tree didn't — e.g. a
+/// fold in another process advanced it), fast-forward it. The working tree is
+/// "stale" when it's dirty against `HEAD` yet cleanly equals a recent ANCESTOR
+/// of `HEAD`; that ancestor is the real `old` tip to fast-forward from. Bounded
+/// to the last 50 commits, and short-circuited before the walk whenever the
+/// dirtiness is ordinary unstaged work — so a checkout with real edits costs
+/// three cheap probes and skips, never the full ancestor scan. Returns whether
+/// it healed.
+fn resync_stale_main_checkout(root: &Path) -> bool {
+    let Some(branch) = git_out(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]) else {
+        return false; // detached — nothing to fast-forward onto
+    };
+    let Some(head) = git_out(root, &["rev-parse", "HEAD"]) else {
+        return false;
+    };
+    // Fast path: already coherent (the overwhelmingly common case — two git
+    // calls and out).
+    if git_ok(root, &["diff-index", "--quiet", "HEAD", "--"]) {
+        return false;
+    }
+    // Dirty vs HEAD — but a ref-advance drift leaves the working tree byte-equal
+    // to the index (only the ref moved). If the working tree instead differs from
+    // the index, that's genuine unstaged editing, not drift → skip before the
+    // (potentially 50-probe) ancestor walk.
+    if !git_ok(root, &["diff-files", "--quiet"]) {
+        return false;
+    }
+    // Find the ancestor the tree cleanly matches (that's `old`).
+    let Some(ancestors) = git_out(root, &["rev-list", "--max-count=50", "HEAD"]) else {
+        return false;
+    };
+    for anc in ancestors.lines() {
+        if anc == head {
+            continue; // HEAD itself already ruled out as dirty above
+        }
+        if git_ok(root, &["diff-index", "--quiet", anc, "--"])
+            && git_ok(root, &["diff-index", "--quiet", "--cached", anc, "--"])
+        {
+            let healed = matches!(
+                resync_ff_checkout(root, &branch, anc, &head),
+                ResyncOutcome::Healed
+            );
+            if healed {
+                tracing::warn!(
+                    target: "szhost::startup",
+                    root = %root.display(),
+                    branch = %branch,
+                    "fast-forwarded stale main checkout working tree to its branch tip"
+                );
+            }
+            return healed;
+        }
     }
     false
 }
@@ -940,6 +1063,133 @@ mod tests {
             "a .git FILE (linked worktree) is never healed"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a real repo whose `main` ref has been advanced c0→c1 by plumbing
+    /// (`update-ref`) WITHOUT touching the working tree — the exact drift a fold
+    /// leaves behind. Returns `(dir, c0, c1)`; the tree is still at `c0`.
+    fn drifted_repo(tag: &str) -> (PathBuf, String, String) {
+        let dir = std::env::temp_dir().join(format!("sz-resync-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = |args: &[&str]| {
+            assert!(
+                git_cmd(&dir).args(args).output().unwrap().status.success(),
+                "git {} failed",
+                args.join(" ")
+            );
+        };
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "t"]);
+        g(&["config", "user.email", "t@e"]);
+        g(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        g(&["add", "base.txt"]);
+        g(&["commit", "-qm", "c0"]);
+        let c0 = git_out(&dir, &["rev-parse", "HEAD"]).unwrap();
+        // Build c1 (adds a.txt) on a side branch so `main`'s working tree stays
+        // at c0, then fast-forward the ref by plumbing — no checkout.
+        g(&["checkout", "-q", "-b", "feat"]);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        g(&["add", "a.txt"]);
+        g(&["commit", "-qm", "c1"]);
+        let c1 = git_out(&dir, &["rev-parse", "HEAD"]).unwrap();
+        g(&["checkout", "-q", "main"]);
+        std::fs::remove_file(dir.join("a.txt")).ok(); // main's tree is c0 again
+        g(&["update-ref", "refs/heads/main", &c1, &c0]);
+        (dir, c0, c1)
+    }
+
+    #[test]
+    fn resync_ff_checkout_heals_clean_drift_and_guards_the_rest() {
+        let (dir, c0, c1) = drifted_repo("guards");
+        // No movement → skip.
+        assert_eq!(
+            resync_ff_checkout(&dir, "main", &c1, &c1),
+            ResyncOutcome::Skipped("unchanged")
+        );
+        // Not a fast-forward (old/new reversed) → skip.
+        assert_eq!(
+            resync_ff_checkout(&dir, "main", &c1, &c0),
+            ResyncOutcome::Skipped("not a fast-forward")
+        );
+        // Wrong branch name → skip.
+        assert_eq!(
+            resync_ff_checkout(&dir, "other", &c0, &c1),
+            ResyncOutcome::Skipped("checkout on a different branch")
+        );
+        // The real fast-forward → healed; the folded file lands on disk.
+        assert_eq!(
+            resync_ff_checkout(&dir, "main", &c0, &c1),
+            ResyncOutcome::Healed
+        );
+        assert!(dir.join("a.txt").exists());
+        assert_eq!(git_out(&dir, &["status", "--porcelain"]), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resync_ff_checkout_skips_a_dirty_or_detached_checkout() {
+        let (dir, c0, c1) = drifted_repo("dirty");
+        // Genuine uncommitted work in the checkout → skip (never clobbered).
+        std::fs::write(dir.join("base.txt"), "MY EDIT\n").unwrap();
+        assert_eq!(
+            resync_ff_checkout(&dir, "main", &c0, &c1),
+            ResyncOutcome::Skipped("checkout has uncommitted changes")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+            "MY EDIT\n"
+        );
+        // Detached HEAD → skip.
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        assert!(
+            git_cmd(&dir)
+                .args(["checkout", "-q", "--detach"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(
+            resync_ff_checkout(&dir, "main", &c0, &c1),
+            ResyncOutcome::Skipped("detached HEAD")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resync_ff_checkout_aborts_rather_than_clobber_an_untracked_collision() {
+        let (dir, c0, c1) = drifted_repo("collision");
+        // An UNTRACKED file at a path the fast-forward wants to create. It's
+        // invisible to `diff-index` (so the guards pass) but `read-tree -m -u`
+        // refuses to overwrite it → Failed, and the file is left intact.
+        std::fs::write(dir.join("a.txt"), "MINE\n").unwrap();
+        assert_eq!(
+            resync_ff_checkout(&dir, "main", &c0, &c1),
+            ResyncOutcome::Failed
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "MINE\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heal_fast_forwards_a_stale_main_checkout() {
+        let (dir, _c0, _c1) = drifted_repo("startup");
+        // The startup/switch healer discovers the stale tree (dirty vs HEAD but
+        // clean vs an ancestor) and fast-forwards it with no `old` tip handed in.
+        assert!(
+            heal_main_checkout_worktree(&dir),
+            "stale checkout should heal"
+        );
+        assert!(dir.join("a.txt").exists());
+        assert_eq!(git_out(&dir, &["status", "--porcelain"]), None);
+        // Idempotent once coherent.
+        assert!(!heal_main_checkout_worktree(&dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

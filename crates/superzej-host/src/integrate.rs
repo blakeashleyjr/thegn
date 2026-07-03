@@ -406,8 +406,10 @@ fn build_report(
 
 /// Fold `candidates` onto the repo's target branch: merge clean branches in the
 /// object DB, gate the union, and CAS-advance the target ref. Clean branches
-/// land; conflicts and gate-offenders are deferred. The working tree is never
-/// touched except for the throwaway gate worktree.
+/// land; conflicts and gate-offenders are deferred. No working tree is touched
+/// except the throwaway gate worktree and — after a successful advance — a
+/// guarded fast-forward of the repo's own main checkout (see
+/// [`util::resync_ff_checkout`]) so `git status` there stays coherent.
 pub fn run_fold(
     cfg: &MergeQueueConfig,
     repo_root: &Path,
@@ -503,6 +505,27 @@ pub fn run_fold(
         // Green (or no gate) → atomically advance the target ref.
         cas_attempts += 1;
         if CliGit.update_ref_cas(&loc, &target_ref, &plan.final_tip, &base)? {
+            // The fold moved the ref via pure plumbing, so the repo's MAIN
+            // checkout (which is *on* this branch) now has a `HEAD` resolving to
+            // the new tip while its index+tree still hold `base` — `git status`
+            // there shows the folded files as pending, and a read-only sandbox
+            // mount of it can't self-heal. Fast-forward it host-side (a safe
+            // no-op when the checkout has real uncommitted work; see the guards).
+            match util::resync_ff_checkout(repo_root, &target_branch, &base, &plan.final_tip) {
+                util::ResyncOutcome::Healed => superzej_core::msg::info(&format!(
+                    "merge queue: synced {target_branch} checkout to {}",
+                    &plan.final_tip[..plan.final_tip.len().min(9)]
+                )),
+                util::ResyncOutcome::Skipped(why) => tracing::debug!(
+                    target: "szhost::integrate",
+                    why,
+                    "left main checkout working tree as-is"
+                ),
+                util::ResyncOutcome::Failed => tracing::warn!(
+                    target: "szhost::integrate",
+                    "could not fast-forward the main checkout; run `git -C <repo> reset --hard {target_branch}` to sync it"
+                ),
+            }
             let mut report = build_report(
                 &target_branch,
                 &original,
@@ -731,5 +754,39 @@ mod tests {
         assert_eq!(report.deferred.len(), 1);
         assert_eq!(report.deferred[0].branch, "b1");
         assert_eq!(report.deferred[0].kind, ConflictKind::Regenerable);
+    }
+
+    #[test]
+    fn advancing_main_fast_forwards_the_main_checkout_working_tree() {
+        let repo = Repo::new("resync-clean");
+        repo.feature("b1", "a.txt", "a\n");
+        repo.feature("b2", "b.txt", "b\n");
+        // Before the fold the main checkout holds only base.txt on disk.
+        assert!(!repo.dir.join("a.txt").exists());
+
+        let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
+        assert!(report.advanced);
+        // The resync fast-forwarded the working tree in place, so the folded
+        // files now exist on disk and `git status` is clean (no pending diff).
+        assert!(repo.dir.join("a.txt").exists(), "a.txt not materialized");
+        assert!(repo.dir.join("b.txt").exists(), "b.txt not materialized");
+        assert_eq!(repo.out(&["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn resync_never_clobbers_uncommitted_work_in_the_main_checkout() {
+        let repo = Repo::new("resync-dirty");
+        repo.feature("b1", "a.txt", "a\n");
+        // Genuine uncommitted edit in the main checkout.
+        std::fs::write(repo.dir.join("base.txt"), "MY LOCAL EDIT\n").unwrap();
+
+        let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
+        assert!(report.advanced, "the ref still advances");
+        // The dirty edit survived — resync detected real work and skipped rather
+        // than reset --hard over it.
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("base.txt")).unwrap(),
+            "MY LOCAL EDIT\n"
+        );
     }
 }

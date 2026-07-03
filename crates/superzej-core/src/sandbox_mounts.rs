@@ -154,6 +154,12 @@ pub fn auto_cache_mounts() -> Vec<Mount> {
         ".cache/uv",
         ".m2/repository",
         ".gradle/caches",
+        // Compile + pre-commit-hook-framework caches so `git commit` hooks run
+        // (prek/pre-commit write hook envs; sccache writes objects) instead of
+        // dying "Read-only file system" under a hardened read-only $HOME.
+        ".cache/sccache",
+        ".cache/prek",
+        ".cache/pre-commit",
     ];
     candidates
         .iter()
