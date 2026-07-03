@@ -304,6 +304,16 @@ pub fn git_cmd(dir: &Path) -> Command {
     for var in GIT_ENV_VARS {
         c.env_remove(var);
     }
+    // Read-side housekeeping must never touch `.git/index.lock`. superzej hydrates
+    // the sidebar on a recurring schedule (the ~5s model ticker plus the
+    // 500ms-debounced diff fs-watcher, which fires up to ~2 Hz during active
+    // editing) via `git status`/`git diff`, and those reads otherwise take git's
+    // *optional* lock to refresh the racy-git index stat cache — contending with
+    // any concurrent git the user runs in the same worktree. `GIT_OPTIONAL_LOCKS=0`
+    // suppresses only those optional sub-operations; operations that *require* the
+    // lock (add/commit/merge/rebase/worktree add/stash) still take it, so the write
+    // path is unchanged.
+    c.env("GIT_OPTIONAL_LOCKS", "0");
     c
 }
 
@@ -836,6 +846,24 @@ mod tests {
                 "git_cmd must scrub {var} from the child environment"
             );
         }
+    }
+
+    #[test]
+    fn git_cmd_disables_optional_locks() {
+        // Recurring read housekeeping (`git status`/`diff` hydration) must not
+        // take `.git/index.lock`; `git_cmd` sets GIT_OPTIONAL_LOCKS=0 so the
+        // optional stat-cache refresh is skipped. Required write locks are
+        // unaffected. Inspects the Command's env overrides only — thread-safe.
+        let cmd = git_cmd(std::path::Path::new("/tmp"));
+        let set: std::collections::HashMap<&std::ffi::OsStr, &std::ffi::OsStr> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect();
+        assert_eq!(
+            set.get(std::ffi::OsStr::new("GIT_OPTIONAL_LOCKS")).copied(),
+            Some(std::ffi::OsStr::new("0")),
+            "git_cmd must set GIT_OPTIONAL_LOCKS=0 so read housekeeping never locks the index"
+        );
     }
 
     #[test]
