@@ -34,7 +34,7 @@ use crate::input::key_bytes;
 use crate::layout;
 use crate::loading::{
     SpecOrigin, active_watchdog_deadline, apply_spec_batch, is_shell_wait, provision_load_steps,
-    provision_owns_tab, watchdog_deadline,
+    provision_owns_tab, seed_materialize_steps, watchdog_deadline,
 };
 use crate::menu::{self, MenuChoice, MenuOverlay};
 use crate::palette::build_palette;
@@ -9727,14 +9727,19 @@ async fn event_loop<T: Terminal>(
                         superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(&path))
                             .is_remote(),
                     );
-                    loading_state.insert(
-                        key,
-                        vec![
-                            LoadStep::active("sandbox"),
-                            LoadStep::pending("container"),
-                            LoadStep::pending("shell"),
-                        ],
-                    );
+                    // Seed the splash — but never overwrite LIVE provisioning
+                    // steps (an eager stream may already own this key; the seed's
+                    // shell-wait shape would briefly misclassify the tab).
+                    if seed_materialize_steps(loading_state.get(&key).map(Vec::as_slice)) {
+                        loading_state.insert(
+                            key,
+                            vec![
+                                LoadStep::active("sandbox"),
+                                LoadStep::pending("container"),
+                                LoadStep::pending("shell"),
+                            ],
+                        );
+                    }
                     dirty = true;
                     let cfg = keymap.config().clone();
                     let tx = spec_tx.clone();
@@ -9754,48 +9759,13 @@ async fn event_loop<T: Terminal>(
                         } else {
                             // FAST PATH: claim a pre-provisioned warm spare for this
                             // (repo, env) — an instant hand-over (bind + branch
-                            // checkout) instead of a from-scratch provision. Falls
-                            // through to a full provision when no spare is ready.
-                            let loc = superzej_core::remote::GitLoc::for_worktree(
-                                std::path::Path::new(&wt),
-                            );
-                            let claimed = loc.is_remote() && {
-                                let repo_root = superzej_core::db::Db::open()
-                                    .ok()
-                                    .and_then(|db| db.repo_root_for(&wt).ok().flatten())
-                                    .filter(|s| !s.is_empty())
-                                    .map(std::path::PathBuf::from)
-                                    .or_else(|| {
-                                        superzej_core::repo::main_worktree(std::path::Path::new(
-                                            &wt,
-                                        ))
-                                    })
-                                    .unwrap_or_else(|| std::path::PathBuf::from(&wt));
-                                let env_name = cfg
-                                    .resolve_env(&repo_root, &loc, std::path::Path::new(&wt), None)
-                                    .name;
-                                // off-loop: inside spawn_blocking
-                                #[expect(clippy::disallowed_methods)]
-                                let branch =
-                                    superzej_core::util::git_cmd(std::path::Path::new(&wt))
-                                        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                                        .output()
-                                        .ok()
-                                        .filter(|o| o.status.success())
-                                        .map(|o| {
-                                            String::from_utf8_lossy(&o.stdout).trim().to_string()
-                                        })
-                                        .filter(|b| !b.is_empty() && b != "HEAD");
-                                crate::agent::claim_spare(
-                                    &cfg,
-                                    &wt,
-                                    &repo_root,
-                                    &env_name,
-                                    branch.as_deref(),
-                                )
-                                .is_some()
-                            };
-                            if claimed {
+                            // checkout) instead of a from-scratch provision. Skipped
+                            // while a provision for this worktree is already in
+                            // flight (eager) — the claim would clear the live splash
+                            // and flip the binding under it. Falls through to a full
+                            // provision when no spare is ready (which serializes on
+                            // the per-sandbox lock and marker-short-circuits).
+                            if crate::provision_gate::try_claim_spare(&cfg, &wt) {
                                 // Bound to a ready spare — clear any loading lock and
                                 // open the pane straight against it (no provisioning).
                                 tracing::debug!(

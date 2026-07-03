@@ -68,6 +68,17 @@ pub(crate) fn provision_load_steps(views: &[crate::agent::ProvisionStepView]) ->
         .collect()
 }
 
+/// Whether the materialize path may seed its `[sandbox, container, shell]`
+/// splash over the tab's current `loading_state` entry. Seeding over LIVE
+/// provisioning steps (an eager stream that already owns the key) would
+/// briefly flip the splash into the shell-wait shape — misarming the
+/// first-output clear / watchdog and hiding the real progress until the next
+/// step lands. Absent, empty (the lingering eager-success park), or an old
+/// shell-wait entry ⇒ seed; live steps ⇒ keep them.
+pub(crate) fn seed_materialize_steps(existing: Option<&[LoadStep]>) -> bool {
+    !existing.is_some_and(|s| !s.is_empty() && !is_shell_wait(s))
+}
+
 /// Which flow requested a spec batch. Tags every `SpecBatch` so the `spec_rx`
 /// handler clears only the matching inflight set and can DROP a stale prewarm
 /// result that would otherwise attach a pane to a half-provisioned sandbox
@@ -206,6 +217,28 @@ mod tests {
                 LoadStep::active("shell"),
             ])
         ));
+    }
+
+    #[test]
+    fn materialize_seed_never_overwrites_live_provision_steps() {
+        // No entry / the lingering empty park / a stale shell-wait shape ⇒ the
+        // materialize splash may seed.
+        assert!(seed_materialize_steps(None));
+        assert!(seed_materialize_steps(Some(&[])));
+        assert!(seed_materialize_steps(Some(&[
+            LoadStep::done("sandbox"),
+            LoadStep::done("container"),
+            LoadStep::active("shell"),
+        ])));
+        // LIVE provisioning steps (eager owns the key) must be kept — seeding
+        // would flip the splash to the shell-wait shape mid-provision.
+        assert!(!seed_materialize_steps(Some(&[LoadStep::active(
+            "provisioning"
+        )])));
+        assert!(!seed_materialize_steps(Some(&[
+            LoadStep::done("nix"),
+            LoadStep::active("direnv"),
+        ])));
     }
 
     #[test]
