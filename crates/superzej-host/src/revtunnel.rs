@@ -14,14 +14,38 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use superzej_svc::provider::{ExecSpec, Provider};
 use superzej_svc::revtunnel::{TcpDialer, exec_stream, run_host};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-/// `(worktree, sandbox_port)` → its pump task.
+/// `(worktree, sandbox_port)` → its supervisor task (self-healing pump loop).
 type Tasks = Arc<Mutex<HashMap<(String, u16), JoinHandle<()>>>>;
+
+/// Reconnect backoff floor: the delay after the first failed/short-lived tunnel
+/// attempt before the supervisor dials again.
+const BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// Reconnect backoff ceiling: repeated failures cap here so a persistently-down
+/// provider is retried at a steady, cheap cadence rather than hammered.
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// A tunnel session that stayed up at least this long counts as "healthy" — the
+/// next reconnect resets to [`BACKOFF_BASE`] instead of continuing to grow, so a
+/// transient WSS blip on a long-lived tunnel doesn't push us toward the ceiling.
+const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(10);
+
+/// Next reconnect delay given how long the last attempt's session lasted and the
+/// current backoff. A session that ran at least [`BACKOFF_RESET_AFTER`] resets to
+/// the floor; anything shorter (a fast failure) doubles up to [`BACKOFF_MAX`].
+/// Pure so the policy is unit-tested without driving the async loop.
+fn next_backoff(session_lasted: Duration, current: Duration) -> Duration {
+    if session_lasted >= BACKOFF_RESET_AFTER {
+        BACKOFF_BASE
+    } else {
+        (current * 2).min(BACKOFF_MAX)
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct ReverseTunnelSupervisor {
@@ -80,16 +104,39 @@ impl ReverseTunnelSupervisor {
                 env: Vec::new(),
                 cwd: None,
             };
-            match provider.open_exec(&sandbox_id, &spec).await {
-                Ok(session) => {
-                    let stream = exec_stream(session);
-                    if let Err(e) = run_host(stream, TcpDialer { addr: host_target }).await {
-                        superzej_core::msg::warn(&format!("reverse tunnel ended: {e}"));
+            // Self-heal: keep the tunnel up for the life of the worktree. A single
+            // WSS hiccup (exec open failure, or the pump ending) previously killed
+            // the tunnel permanently — the entry stayed in the map so `start`
+            // never re-ran it — which surfaces in-sandbox as `ConnectionRefused`
+            // on the injected proxy URL. Now we reconnect with bounded backoff;
+            // the task only ends when `stop_worktree` aborts it.
+            let mut backoff = BACKOFF_BASE;
+            loop {
+                let started = Instant::now();
+                match provider.open_exec(&sandbox_id, &spec).await {
+                    Ok(session) => {
+                        let stream = exec_stream(session);
+                        if let Err(e) = run_host(
+                            stream,
+                            TcpDialer {
+                                addr: host_target.clone(),
+                            },
+                        )
+                        .await
+                        {
+                            superzej_core::msg::warn(&format!(
+                                "reverse tunnel ended: {e} (reconnecting)"
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        superzej_core::msg::warn(&format!(
+                            "reverse tunnel exec failed: {e} (reconnecting)"
+                        ));
                     }
                 }
-                Err(e) => {
-                    superzej_core::msg::warn(&format!("reverse tunnel exec failed: {e}"));
-                }
+                backoff = next_backoff(started.elapsed(), backoff);
+                tokio::time::sleep(backoff).await;
             }
         });
         tasks.insert(key, task);
@@ -113,6 +160,23 @@ impl ReverseTunnelSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_grows_on_fast_failure_and_resets_when_healthy() {
+        // A fast failure (session barely lasted) doubles the backoff …
+        let b1 = next_backoff(Duration::from_millis(50), BACKOFF_BASE);
+        assert_eq!(b1, BACKOFF_BASE * 2);
+        let b2 = next_backoff(Duration::from_millis(50), b1);
+        assert_eq!(b2, BACKOFF_BASE * 4);
+        // … but never past the ceiling.
+        let capped = next_backoff(Duration::from_millis(50), BACKOFF_MAX);
+        assert_eq!(capped, BACKOFF_MAX);
+        // A session that stayed up long enough resets to the floor.
+        let reset = next_backoff(BACKOFF_RESET_AFTER, BACKOFF_MAX);
+        assert_eq!(reset, BACKOFF_BASE);
+        let reset_longer = next_backoff(Duration::from_secs(300), b2);
+        assert_eq!(reset_longer, BACKOFF_BASE);
+    }
 
     #[test]
     fn supervisor_tracks_and_clears_by_worktree() {

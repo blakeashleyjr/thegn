@@ -1828,9 +1828,10 @@ token_reduction_level = "conservative"
 # Route a launched agent's model traffic through the proxy at `listen` by
 # injecting provider config into the agent's environment at spawn. `route_agent`
 # and `enabled` are ORTHOGONAL: `enabled` launches superzej's OWN szproxy;
-# `route_agent` only injects the env (ANTHROPIC_BASE_URL → `listen`, and for a
+# `route_agent` only injects the env — the pi extension's SUPERZEJ_PROXY_* vars
+# (NOT ANTHROPIC_BASE_URL; see `route_claude`) → `listen`, and for a
 # remote/provider sandbox an empty/"auto" `remote_base_url` stands up the reverse
-# tunnel to it). So point agents at an EXTERNAL proxy already on `listen` (e.g. a
+# tunnel to it. So point agents at an EXTERNAL proxy already on `listen` (e.g. a
 # separate model-proxy) with `route_agent = true` + `enabled = false` (superzej
 # won't try to bind the same port); run superzej's own proxy with `enabled = true`
 # (+ a `config_path` routes file, else it 404s — superzej warns at startup).
@@ -1840,6 +1841,13 @@ token_reduction_level = "conservative"
 # `agent_model` is the model id the agent requests (the proxy maps it to a real
 # backend, e.g. "model-proxy/standard" / "model-proxy/fast").
 route_agent = false
+# Additionally route Claude Code / the Anthropic SDK (anything honoring
+# ANTHROPIC_BASE_URL) through the proxy. OFF by default: claude talks to Anthropic
+# directly, so a down/racing proxy tunnel can't break it (a forced
+# ANTHROPIC_BASE_URL pointing at a dead loopback port yields ConnectionRefused with
+# no upstream fallback). pi routes regardless via SUPERZEJ_PROXY_*; flip this on
+# only if you also want claude's traffic on the proxy. Requires `route_agent`.
+route_claude = false
 agent_api = "anthropic-messages"
 agent_model = "model-proxy/standard"
 # "The bouncer" (opt-in). When true, a launched agent runs inside its sealed
@@ -1854,8 +1862,9 @@ agent_model = "model-proxy/standard"
 bouncer = false
 # Base URL an agent running INSIDE a remote/provider sandbox (a sprite VM that
 # can't reach host loopback) uses to reach szproxy — a tunnel/public endpoint.
-# With `route_agent`, superzej injects ANTHROPIC_BASE_URL + the per-worktree
-# virtual key into the sprite's shell so ANY agent there (pi, claude code, …)
+# With `route_agent`, superzej injects the SUPERZEJ_PROXY_* vars (and, when
+# `route_claude` is also on, ANTHROPIC_BASE_URL + the per-worktree virtual key)
+# into the sprite's shell so pi (and, with route_claude, claude code / the SDK)
 # routes through the proxy. (Local/OCI agents already reach the proxy via
 # loopback/gateway/unix.) EMPTY (the default) under `route_agent` ⇒ "auto": superzej
 # stands up a reverse tunnel (the in-sandbox resident bridge ⇄ host) so the sprite

@@ -48,30 +48,46 @@ const AGENT_CONFIG_STEP_BUDGET: std::time::Duration = std::time::Duration::from_
 
 /// Collect `(absolute, relative)` files under an agent config `dir`, skipping the
 /// bulky-state subdirs in [`AGENT_STATE_SKIP_DIRS`] and any file over
-/// [`AGENT_CONFIG_MAX_BYTES`]. Iterative; symlinks are not followed.
+/// [`AGENT_CONFIG_MAX_BYTES`]. Iterative.
+///
+/// Symlinks ARE followed: on a home-manager/NixOS host the whole config tree
+/// (e.g. `~/.claude/hooks/*.sh`) is symlinks into the `/nix/store`, so resolving
+/// them is what makes the login actually work in-sandbox — otherwise the synced
+/// `settings.json` references hook scripts that never got uploaded (the sandbox's
+/// "`agentmemory-*.sh`: not found" hook errors). `entry.file_type()` reports the
+/// link itself (neither file nor dir), so we resolve the target via
+/// `fs::metadata`; a `seen` set of canonical dirs guards against symlink cycles.
 fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
     while let Some(cur) = stack.pop() {
+        // Cycle guard for followed symlinked dirs: skip a dir we've already walked
+        // (by resolved identity). A canonicalize failure just means we walk it once.
+        if let Ok(canon) = std::fs::canonicalize(&cur)
+            && !seen.insert(canon)
+        {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&cur) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_dir() {
+            // Resolve THROUGH symlinks (unlike `entry.file_type()`), so a config
+            // file/dir symlinked into the nix store is classified by its target.
+            let Ok(md) = std::fs::metadata(&path) else {
+                continue; // broken/dangling link — nothing to upload
+            };
+            if md.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if AGENT_STATE_SKIP_DIRS.iter().any(|s| *s == name) {
                     continue;
                 }
                 stack.push(path);
-            } else if ft.is_file() {
-                let too_big = entry
-                    .metadata()
-                    .map(|m| m.len() > AGENT_CONFIG_MAX_BYTES)
-                    .unwrap_or(true);
-                if too_big {
+            } else if md.is_file() {
+                if md.len() > AGENT_CONFIG_MAX_BYTES {
                     continue;
                 }
                 if let Ok(rel) = path.strip_prefix(dir) {
@@ -230,5 +246,52 @@ mod tests {
             "oversized file skipped"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Home-manager/NixOS hosts symlink the whole `~/.claude` tree into the nix
+    /// store. The sync must follow those symlinks — otherwise `settings.json`
+    /// (a regular file) uploads while the hook scripts it references (symlinks)
+    /// are skipped, and the in-sandbox agent errors with `…-hook.sh: not found`.
+    #[test]
+    fn agent_config_follows_symlinked_config_files() {
+        let root = std::env::temp_dir().join(format!("sz-claude-sym-{}", std::process::id()));
+        let store = std::env::temp_dir().join(format!("sz-claude-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(root.join("hooks")).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+
+        // Real files "in the store", symlinked into the config tree like home-manager.
+        let hook_target = store.join("agentmemory-session-start.sh");
+        std::fs::write(&hook_target, b"#!/bin/sh\necho hi\n").unwrap();
+        std::os::unix::fs::symlink(
+            &hook_target,
+            root.join("hooks/agentmemory-session-start.sh"),
+        )
+        .unwrap();
+        let settings_target = store.join("settings.json");
+        std::fs::write(&settings_target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&settings_target, root.join("settings.json")).unwrap();
+        // A dangling link must be tolerated (skipped, not a panic).
+        std::os::unix::fs::symlink(store.join("gone"), root.join("dead.json")).unwrap();
+
+        let got: Vec<String> = collect_agent_config_files(&root)
+            .into_iter()
+            .map(|(_, rel)| rel)
+            .collect();
+        assert!(
+            got.contains(&"hooks/agentmemory-session-start.sh".to_string()),
+            "symlinked hook scripts are followed + uploaded: {got:?}"
+        );
+        assert!(
+            got.contains(&"settings.json".to_string()),
+            "symlinked top-level config file followed"
+        );
+        assert!(
+            !got.contains(&"dead.json".to_string()),
+            "dangling symlink skipped"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&store);
     }
 }
