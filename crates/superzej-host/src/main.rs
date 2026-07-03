@@ -57,6 +57,7 @@ mod pins;
 mod predict;
 mod probe;
 mod profile;
+mod provision_gate;
 mod proxy_daemon;
 mod queries;
 mod recorder;

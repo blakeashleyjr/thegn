@@ -1282,18 +1282,27 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
         Path::new(worktree),
         selected_env.as_deref(),
     );
-    let superzej_core::placement::Placement::Provider(p) = &environment.placement else {
+    if !matches!(
+        environment.placement,
+        superzej_core::placement::Placement::Provider(_)
+    ) {
         return false;
-    };
+    }
     let Some(envc) = cfg.env.get(&environment.name) else {
         return false;
     };
-    let Some(provider) = provider_for_named(&envc.provider, &p.id) else {
+    // Bound-aware name: a worktree that CLAIMED a pool spare is checked against
+    // the SPARE (whose marker is present ⇒ not pending), not the derived id —
+    // else eager would re-provision a sprite the worktree no longer uses.
+    let Some(id) = provider_sandbox_name(cfg, worktree, &environment.name) else {
+        return false;
+    };
+    let Some(provider) = provider_for_named(&envc.provider, &id) else {
         return false;
     };
     match block_on_provider(|| async { provider.list().await }) {
         // Missing ⇒ needs create + a full provision.
-        Ok(names) if !names.iter().any(|n| n == &p.id) => true,
+        Ok(names) if !names.iter().any(|n| n == &id) => true,
         // Exists — but is the TOOLCHAIN actually provisioned? `launch_spec`'s
         // `auto_provision` only `ensure_exists`es a BARE sprite (no nix/direnv/
         // agents), and a destroyed+recreated sprite is bare too. If we gate only on
@@ -1307,7 +1316,7 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
         Ok(_) => {
             let workdir = envc.provider.sync_workdir();
             let marker = superzej_core::envplan::EnvPlan::marker_path(&workdir);
-            block_on_provider(|| async { provider.read(&p.id, &marker).await }).is_err()
+            block_on_provider(|| async { provider.read(&id, &marker).await }).is_err()
         }
         Err(_) => false,
     }
@@ -1397,32 +1406,10 @@ pub fn provision_worktree(
     ) {
         return Ok(false);
     }
+    // Flag the in-flight provision so the warm-claim fast path won't bind a
+    // spare (and clear the splash) under this run — see `provision_gate`.
+    let _live = crate::provision_gate::worktree_live_guard(worktree);
     provision_provider_env(cfg, worktree, &environment.name, progress)
-}
-
-/// A stable-ish generic name for a new warm-pool spare: `<repo>-pool-<hash>`. The
-/// hash varies per process+counter so concurrent mints never collide.
-fn mint_spare_name(repo: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let slug = Path::new(repo)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(superzej_core::util::slugify)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "sz".to_string());
-    let h = superzej_core::util::short_hash(&format!("{repo}-{}-{n}", std::process::id()), 6);
-    format!("{slug}-pool-{h}")
-}
-
-/// Hash of the repo's `flake.lock` (staleness key for a spare's seeded devShell);
-/// empty when the repo has no lockfile.
-fn flake_lock_hash(repo_root: &Path) -> String {
-    std::fs::read(repo_root.join("flake.lock"))
-        .ok()
-        .map(|b| superzej_core::util::short_hash(&String::from_utf8_lossy(&b), 16))
-        .unwrap_or_default()
 }
 
 /// Mint + fully provision a NEW warm-pool spare for `(repo, env)`: a generically-
@@ -1436,7 +1423,7 @@ pub fn provision_spare(
     mut progress: impl FnMut(&[ProvisionStepView]),
 ) -> anyhow::Result<String> {
     let repo = repo_root.to_string_lossy().to_string();
-    let name = mint_spare_name(&repo);
+    let name = crate::provision_gate::mint_spare_name(&repo);
     if let Ok(db) = Db::open() {
         let _ = db.insert_pool_spare(&name, &repo, env_name);
     }
@@ -1448,7 +1435,7 @@ pub fn provision_spare(
         .into_owned();
     match provision_provider_env_named(cfg, &ctx, env_name, Some(&name), &mut progress) {
         Ok(_) => {
-            let lock = flake_lock_hash(repo_root);
+            let lock = crate::provision_gate::flake_lock_hash(repo_root);
             if let Ok(db) = Db::open() {
                 let _ = db.set_pool_spare_ready(&name, None, &lock);
             }
@@ -1594,6 +1581,11 @@ pub fn provision_provider_env_named(
     if !provider.caps().files {
         return Ok(false); // can't provision without the fs API
     }
+    // Serialize concurrent provisions of the same sandbox (eager vs focused
+    // materialize): the loser blocks here (off-loop by contract), then the
+    // marker short-circuit below makes its run a no-op. The marker alone only
+    // guards SEQUENTIAL re-runs — it is written at the END of the pipeline.
+    let _gate = crate::provision_gate::sandbox_lock(&id);
     let workdir = pc.sync_workdir();
     let marker = EnvPlan::marker_path(&workdir);
 
