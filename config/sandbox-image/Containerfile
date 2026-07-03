@@ -1,0 +1,46 @@
+# The superzej base sandbox image — Containerfile fallback. The canonical build
+# is nix (`nix/sandbox-image.nix`, `just image-build`); this exists for the
+# RemoteBuild delivery strategy (a host with no route to receive the image
+# builds it locally) and for users without nix. Content parity is best-effort:
+# same user model (uid-1000 `superzej`), nix + direnv + rustup, populated /nix.
+#
+#   podman build -t localhost/superzej/base:dev -f config/sandbox-image/Containerfile .
+
+FROM docker.io/library/debian:bookworm-slim
+
+LABEL superzej.managed="true" \
+      superzej.image.role="base"
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates curl git openssh-client xz-utils sudo zsh dtach rsync \
+      procps \
+ && rm -rf /var/lib/apt/lists/*
+
+# uid-1000 user matching `--userns keep-id`; owns /nix so single-user nix and
+# the copy-up volume seed both work.
+RUN useradd -m -u 1000 -s /bin/bash superzej \
+ && mkdir -p /nix /workspace \
+ && chown -R superzej:superzej /nix /workspace
+
+USER superzej
+ENV HOME=/home/superzej \
+    USER=superzej \
+    PATH=/home/superzej/.nix-profile/bin:/home/superzej/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+# Determinate installer, single-user (`--init none`: containers have no init),
+# flakes on, sig checks relaxed to match the provisioner's substitution model.
+RUN curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix \
+      | sh -s -- install linux --init none --no-confirm --extra-conf \
+        "experimental-features = nix-command flakes" --extra-conf "require-sigs = false" \
+ || curl -L https://nixos.org/nix/install | sh -s -- --no-daemon
+
+# direnv + rustup with a warmed stable toolchain (the cargo registry index
+# lands in ~/.cargo — the seed for the superzej-cargo warm volume).
+RUN . /home/superzej/.nix-profile/etc/profile.d/nix.sh 2>/dev/null || true; \
+    nix profile install nixpkgs#direnv nixpkgs#nix-direnv || true
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain stable --profile minimal
+
+WORKDIR /workspace
+CMD ["/bin/bash", "-l"]

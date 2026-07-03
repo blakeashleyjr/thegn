@@ -198,6 +198,9 @@
       packages.szhost-musl = szhostMusl;
       # The OpenSpec CLI for spec-driven development (`nix run .#openspec`).
       packages.openspec = openspec;
+      # The multi-arch base sandbox image (per-arch; `just image-build` loads it
+      # locally, CI pushes both arches + a manifest list — see hosts-as-resources).
+      packages.sandbox-image = import ./nix/sandbox-image.nix {inherit pkgs;};
 
       # `nix fmt` formats every tracked file via treefmt.toml.
       formatter = treefmtWrapper;

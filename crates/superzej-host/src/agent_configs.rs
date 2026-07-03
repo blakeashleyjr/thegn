@@ -78,7 +78,7 @@ const UPLOAD_CONCURRENCY: usize = 8;
 /// "`agentmemory-*.sh`: not found" hook errors). `entry.file_type()` reports the
 /// link itself (neither file nor dir), so we resolve the target via
 /// `fs::metadata`; a `seen` set of canonical dirs guards against symlink cycles.
-fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
+pub(crate) fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();

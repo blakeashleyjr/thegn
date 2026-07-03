@@ -1182,6 +1182,14 @@ pub(crate) fn build_model(
 
     let panel = build_panel(&cwd, db, &hints, &app_cfg);
 
+    // Decorate the tab-bar placement chip with the backing host's readiness
+    // (hosts-as-resources): `[ssh]` stays clean when the host is ready,
+    // `[ssh ~<step>]` mid-provision, `[ssh !]` when it failed.
+    let active_placement_kind = active_placement_kind.map(|kind| {
+        let status = crate::host_ui::env_host_status(&app_cfg, &active_env.name, &panel.hosts);
+        crate::host_ui::decorate_placement_kind(&kind, status.as_deref())
+    });
+
     tracing::debug!(
         target: "szhost::hydrate",
         build_model_ms = t0.elapsed().as_millis() as u64,
@@ -1384,6 +1392,12 @@ pub(crate) fn build_panel(
     // Cross-worktree attention stream (the `Across` section): every worktree's
     // failing CI, from the CI cache. Cheap DB reads only, off the event loop.
     panel.across = build_across(db);
+
+    // Hosts-as-resources: per-[host.*] display snapshots for the System ▸ Hosts
+    // section, the sidebar HOSTS block, and the wizard badges. Small DB reads;
+    // empty (and free) when no [host.*] is configured. The loop live-merges
+    // HostRuntime progress on top after each drain.
+    panel.hosts = crate::host_ui::host_snapshots(app_cfg, db);
 
     panel.files = diff_entries
         .iter()

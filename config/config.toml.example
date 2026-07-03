@@ -1055,6 +1055,29 @@ max_results = 1000
 # cwd = "~"
 # env = { RUST_LOG = "info" }
 
+# ── Batteries-included toolchain ─────────────────────────────────────────────
+# How a sandbox/remote gets its language toolchains when the repo declares
+# nothing but language manifests (package.json, pyproject.toml, go.mod, …) —
+# i.e. no flake devShell / devenv / shell.nix / .tool-versions. By default
+# superzej SYNTHESIZES a Nix devShell covering the detected languages (written
+# to $HOME/.superzej/synth/<hash> in the sandbox and warmed during
+# provisioning), instead of crude best-effort apt installs. Repos that declare
+# their own environment are untouched — this table only governs the fallback.
+[toolchain]
+# mode = "auto"   # "auto"|"nix" = synthesize a Nix devShell (default);
+#                 # "mise" = install runtimes via mise instead;
+#                 # "off"  = legacy best-effort native (apt) runtimes
+# Per-language nixpkgs package lists. An empty list (the default) uses the
+# built-in mapping shown below; a non-empty list REPLACES it for that language.
+# (Rust has no entry — rustup ships in the sandbox base image.)
+# python = ["python3", "uv"]
+# node = ["nodejs_22"]
+# deno = ["deno"]
+# jvm = ["jdk21", "sbt", "scala-cli"]
+# go = ["go"]
+# ruby = ["ruby"]
+# extra = []      # nixpkgs packages appended for every language mix
+
 # ── Sandbox / containers ──────────────────────────────────────────────────────
 # Run each worktree's interactive process (agent/shell/tools) inside a
 # container/sandbox. The git worktree stays on the host and is bind-mounted in
@@ -1682,6 +1705,69 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # and run the pane LOCALLY at the mountpoint. `superzej env up/down` still works
 # # for an explicit one-off. Intended with `backend = "none"`/host.
 #
+# ── [host.<name>] — machines as first-class resources ────────────────────────
+# A host is a machine that can run OCI containers, provisioned ONCE (connect →
+# probe podman/docker → optionally install it with consent → deliver the baked
+# multi-arch base image by digest → seed warm /nix + cargo volumes → Ready) and
+# then shared by EVERY env/worktree that lands on it — the 20-minute-class
+# setup cost is paid per host, not per sandbox. `[env.<name>] host = "<name>"`
+# binds an env to a host; several envs may share one. Hosts are GLOBAL config
+# only (a repo .superzej.toml can select a host-backed env, never define a
+# host). Inspect + drive with `superzej host list|status|provision|probe`.
+#
+# [host.gpu-box]
+# reach = "ssh"                # ssh | iroh | cloud | local
+# image = ""                   # base-image override (name[:tag][@sha256:…]);
+#                              #   empty = the built-in superzej-sandbox base
+# install_runtime = "ask"      # never | ask | auto — consent for installing
+#                              #   podman on the machine; NEVER silent. `ask`
+#                              #   raises a confirm modal (or `host provision --yes`);
+#                              #   the answer persists per host.
+# delivery = []                # preference order: "ssh-stream" (registry-less
+#                              #   resumable transfer, the default), "rsync",
+#                              #   "registry", "skopeo", "build"; empty = auto
+# volumes = ["nix-store", "cargo"]   # warm volumes seeded once and mounted into
+#                              #   every sandbox; omit for both, [] for none
+# probe_ttl_secs = 900         # Ready hosts re-verify (one cheap exec) after this
+# [host.gpu-box.ssh]           # same knobs as [env.<name>.ssh]
+# host = "user@gpu-box"
+# port = 22
+# transport = "ssh"            # the host control plane always uses plain ssh
+# forward_agent = true
+# ssh_config = "~/.ssh/work.config"   # ssh -F
+# jump_host = ""               # ssh -J bastion
+# identity = "~/.ssh/id_work"  # ssh -i
+# extra_args = []
+#
+# # A NAT'd machine over an iroh (dumbpipe) tunnel: run
+# #   dumbpipe listen-tcp --host 127.0.0.1:22
+# # on it once and paste the ticket (env:/file: secret refs supported).
+# [host.nat-laptop]
+# reach = "iroh"
+# [host.nat-laptop.iroh]
+# ticket = "env:SZ_LAPTOP_TICKET"
+# ssh_port = 22
+# user = "me"
+#
+# # Bind envs to hosts: both of these pay gpu-box's setup once, share its
+# # digest-pinned image + warm volumes, and spawn sandboxes near-instantly.
+# [env.gpu]
+# placement = "ssh"
+# host = "gpu-box"
+# [env.gpu-heavy]
+# placement = "ssh"
+# host = "gpu-box"
+#
+# # A provider-managed host (the cloud lowering: "provisioning" registers the
+# # base image as the provider's bootable template/snapshot):
+# [host.sprites-us]
+# reach = "cloud"
+# [host.sprites-us.cloud]
+# provider = "sprites"         # sprites | daytona
+# api_base = ""                # empty = the provider's default endpoint
+# api_key_env = "SPRITES_TOKEN"   # env var holding the API token
+# template = "superzej-base"   # template/snapshot the base image registers under
+#
 # Example 5 — a managed sandbox provider: Sprites (sprites.dev, Firecracker
 # microVMs with a persistent fs + ~300ms checkpoints). One-time setup:
 #   1. Generate a token at sprites.dev/account; export it (the REST API and the
@@ -1851,6 +1937,10 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 #                             #   warm-pool-increment / -decrement hotkeys (Ctrl+Alt+= /
 #                             #   Ctrl+Alt+-); the sidebar header shows `warm ready/target`.
 # max_idle_secs = 600         # reap an unclaimed pool member older than this (recycled)
+# # Recycle checkpointed spares by restoring them IN PLACE (seconds) instead of
+# # destroy+rebuild (minutes) when they go stale or their worktree is deleted;
+# # lockfile-freshness guarded, destroy on any failure. false = always destroy.
+# recycle = true
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────
 # The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
 # depends on this — AI is strictly additive — so it is OFF by default. When

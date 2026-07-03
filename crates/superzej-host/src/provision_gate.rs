@@ -99,6 +99,18 @@ impl Drop for Guard {
 static LOCKS: LazyLock<Registry> = LazyLock::new(Registry::new);
 /// Shared per-worktree "provision in flight" flags.
 static LIVE: LazyLock<Registry> = LazyLock::new(Registry::new);
+/// Exclusive per-HOST provision locks (leader election for the host state
+/// machine, `host_flow::ensure_ready`). A sibling registry so a host lock
+/// never contends with sandbox locks — and it is always released BEFORE any
+/// sandbox lock is taken (coarser gate first; no nesting).
+static HOSTS: LazyLock<Registry> = LazyLock::new(Registry::new);
+
+/// Serialize host provisioning for one host id (belt-and-braces under the
+/// host_flow flight registry — a racing same-process caller that bypassed the
+/// flight map still serializes here).
+pub(crate) fn host_lock(host_id: &str) -> Guard {
+    HOSTS.acquire(host_id, true)
+}
 
 /// Serialize provisioning of `name` (the RESOLVED sandbox name): blocks while
 /// another thread holds the lock for the same name. Take it around the whole
@@ -257,18 +269,20 @@ pub fn provision_spare(
         Some(&name),
         &mut progress,
     ) {
-        // Ok(true) ONLY: Ok(false) means the pipeline did nothing (not a
-        // provider env, no token, no files API) — marking that `ready` would
+        // Ok((true, _)) ONLY: Ok((false, _)) means the pipeline did nothing (not
+        // a provider env, no token, no files API) — marking that `ready` would
         // mint a phantom spare whose claim skips the worktree's real
-        // provisioning (the bare-sprite-shell incident).
-        Ok(true) => {
+        // provisioning (the bare-sprite-shell incident). The captured
+        // provisioned-base checkpoint id rides the spare's row so the recycle
+        // paths (stale reconcile / worktree delete) can restore from it.
+        Ok((true, checkpoint)) => {
             let lock = flake_lock_hash(repo_root);
             if let Ok(db) = superzej_core::db::Db::open() {
-                let _ = db.set_pool_spare_ready(&name, None, &lock);
+                let _ = db.set_pool_spare_ready(&name, checkpoint.as_deref(), &lock);
             }
             Ok(name)
         }
-        Ok(false) => {
+        Ok((false, _)) => {
             let _ = destroy_spare(cfg, env_name, &name);
             Err(anyhow::anyhow!(
                 "env '{env_name}' cannot host a pool spare (no configured provider)"
@@ -303,7 +317,15 @@ pub fn claim_spare(
     let derived = crate::agent::provider_sandbox_name(cfg, worktree, env_name);
     let repo = repo_root.to_string_lossy().into_owned();
     let db = superzej_core::db::Db::open().ok()?;
-    let (name, _checkpoint) = db.claim_pool_spare(&repo, env_name, worktree).ok()??;
+    let (name, checkpoint) = db.claim_pool_spare(&repo, env_name, worktree).ok()??;
+    // The claimed spare's provisioned-base checkpoint rides its pool row; the
+    // recycle paths (stale reconcile / worktree delete) restore from it.
+    tracing::debug!(
+        target: "szhost::lifecycle",
+        %name,
+        checkpoint = checkpoint.as_deref().unwrap_or("-"),
+        "claimed spare checkpoint"
+    );
     let workdir = env.provider.sync_workdir();
     // Per-worktree work: settle the branch in the spare's existing clone (the
     // sandbox auto-resumes when the exec opens). Best-effort — the bind already

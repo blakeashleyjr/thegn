@@ -1,0 +1,76 @@
+name: sandbox-image
+# Build + publish the multi-arch base sandbox image (hosts-as-resources):
+# per-arch nix builds on native runners → push per-arch tags → assemble +
+# push the manifest list → print its digest, which release commits pin as
+# DEFAULT_BASE_DIGEST (crates/superzej-core/src/image.rs).
+#
+# Registry pull is the ALTERNATE delivery route (the default is registry-less
+# transfer from the dev machine), so this publishes on demand / on tag — it is
+# deliberately not part of `just ci`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "image tag (e.g. v1)"
+        required: true
+        default: "v1"
+  push:
+    tags: ["sandbox-image-v*"]
+permissions:
+  contents: read
+  packages: write
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/superzej-sandbox
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            oci_arch: amd64
+          - runner: ubuntu-24.04-arm
+            oci_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - name: resolve tag
+        id: tag
+        run: |
+          t="${{ github.event.inputs.tag }}"
+          [ -n "$t" ] || t="${GITHUB_REF_NAME#sandbox-image-}"
+          echo "tag=$t" >> "$GITHUB_OUTPUT"
+      - name: build + load
+        run: |
+          nix build .#sandbox-image
+          ./result | podman load
+      - name: push per-arch tag
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          ref="$IMAGE:${{ steps.tag.outputs.tag }}-${{ matrix.oci_arch }}"
+          podman tag superzej-sandbox:latest "$ref"
+          podman push "$ref"
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: resolve tag
+        id: tag
+        run: |
+          t="${{ github.event.inputs.tag }}"
+          [ -n "$t" ] || t="${GITHUB_REF_NAME#sandbox-image-}"
+          echo "tag=$t" >> "$GITHUB_OUTPUT"
+      - name: assemble + push the manifest list
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          t="${{ steps.tag.outputs.tag }}"
+          podman manifest create "$IMAGE:$t" \
+            "docker://$IMAGE:$t-amd64" \
+            "docker://$IMAGE:$t-arm64"
+          podman manifest push --all "$IMAGE:$t" "docker://$IMAGE:$t"
+      - name: print the list digest (pin as DEFAULT_BASE_DIGEST)
+        run: |
+          t="${{ steps.tag.outputs.tag }}"
+          skopeo inspect --raw "docker://$IMAGE:$t" | sha256sum \
+            | awk '{print "DEFAULT_BASE_DIGEST = sha256:" $1}'

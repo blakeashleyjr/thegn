@@ -48,6 +48,17 @@ dns = "tunnel"
 
 [sandbox.vpn.tailscale]
 auth_key = "env:TS_AUTHKEY"
+
+# Hosts-as-resources: a local-reach host + a host-backed env must parse,
+# validate, and drive the superzej-host CLI (state stays in this temp HOME).
+[host.smoke-local]
+reach = "local"
+install_runtime = "never"
+volumes = []
+
+[env.smoke-hosted]
+placement = "local"
+host = "smoke-local"
 tags = ["tag:dev"]
 
 # Ingress sharing config must parse + validate (all provider sub-tables).
@@ -121,6 +132,34 @@ check "diff --stat emits without error" \
 # pr status degrades gracefully on a repo with no remote / no gh PR (exit 0).
 check "pr status degrades gracefully (exit 0)" \
   "'$SZ' pr status --worktree '$WT' >/dev/null 2>&1"
+
+# Hosts-as-resources CLI: list shows the seeded host; status renders an
+# unprovisioned host; rm-cache refuses without --force and succeeds with it.
+check "host list shows the seeded [host.*]" \
+  "'$SZ' host list | grep -q smoke-local"
+check "host status renders an unprovisioned host" \
+  "'$SZ' host status smoke-local | grep -q unprovisioned"
+check "host rm-cache refuses without --force" \
+  "! '$SZ' host rm-cache smoke-local >/dev/null 2>&1"
+check "host rm-cache --force succeeds" \
+  "'$SZ' host rm-cache smoke-local --force >/dev/null 2>&1"
+
+# GOLDEN PATH (gated: needs podman + registry egress): a first provision does
+# the work; the second must be a DB-only no-op that reports zero transfers
+# (its event trail gains no new 'deliver' rows). SZ_SMOKE_HOST_LIVE=1 enables.
+if [[ ${SZ_SMOKE_HOST_LIVE:-} == "1" ]] && command -v podman >/dev/null 2>&1; then
+  check "host provision reaches ready (live)" \
+    "'$SZ' host provision smoke-local </dev/null"
+  DBH="$XDG_STATE_HOME/superzej/superzej.db"
+  delivers_before="$(sqlite3 "$DBH" "SELECT count(*) FROM host_events WHERE step='deliver'")"
+  check "second host provision is a no-op (live)" \
+    "'$SZ' host provision smoke-local </dev/null"
+  delivers_after="$(sqlite3 "$DBH" "SELECT count(*) FROM host_events WHERE step='deliver'")"
+  check "second provision transferred nothing (golden path)" \
+    "[[ '$delivers_before' -eq '$delivers_after' ]]"
+else
+  echo "  skip live host golden-path (set SZ_SMOKE_HOST_LIVE=1 with podman + egress)"
+fi
 
 # ci (AV group): detection finds a seeded workflow file; runs/detect degrade
 # gracefully with no remote/provider (exit 0, never crash).

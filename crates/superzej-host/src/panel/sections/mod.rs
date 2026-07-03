@@ -17,6 +17,7 @@ mod changes;
 mod ci;
 pub(crate) mod commits;
 mod git;
+mod hosts;
 mod issues;
 mod keys;
 mod logs;
@@ -454,6 +455,7 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Db => vec![seg(g2(), "—")],
+        Section::Hosts => hosts::summary(model),
         Section::Telemetry => {
             let s = &model.stats;
             match (s.cpu_pct, s.mem_gib) {
@@ -677,6 +679,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Symbols => symbols::content(ctx),
         Section::Debug => misc::debug(),
         Section::Sandbox => misc::sandbox(ctx),
+        Section::Hosts => hosts::content(ctx),
         Section::Share => misc::share(ctx),
         Section::Forward => misc::forward(ctx),
         Section::Db => misc::db(),
@@ -890,6 +893,32 @@ mod spec {
             );
             h
         };
+        m.panel.hosts = vec![
+            crate::host_ui::HostSnapshot {
+                name: "build-box".into(),
+                id: "host:build-box".into(),
+                reach: "ssh".into(),
+                state: "ready".into(),
+                runtime: "podman 5.0".into(),
+                arch_os: "x86_64 linux".into(),
+                image: "ghcr.io/x/base:v1".into(),
+                consent: "granted".into(),
+                last_probe: Some(superzej_core::util::now() - 60),
+                inventory: vec!["image 11111111 ghcr.io/x/base:v1".into()],
+                events: vec!["deliver — delivered 11111111 via oci".into()],
+                ..Default::default()
+            },
+            crate::host_ui::HostSnapshot {
+                name: "flaky".into(),
+                id: "host:flaky".into(),
+                reach: "iroh".into(),
+                state: "failed".into(),
+                error: "host connect: timeout".into(),
+                consent: "unset — will ask".into(),
+                image: "ghcr.io/x/base:v1".into(),
+                ..Default::default()
+            },
+        ];
         m.panel.unread_notifications = 1;
         m.panel.log_lines = vec![
             superzej_core::log_view::parse_log_line(
@@ -1078,6 +1107,92 @@ mod spec {
         assert!(rendered.contains("superzej-active-worktree"), "{rendered}");
         assert!(rendered.contains("active-policy"), "{rendered}");
         assert!(!rendered.contains("superzej-other-worktree"), "{rendered}");
+    }
+
+    #[test]
+    fn hosts_section_lists_hosts_with_cursor_details_and_actions() {
+        let m = model();
+        let u = ui(PanelWidth::Normal, Section::Hosts); // cursor = 0
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 39,
+            rows: 28,
+        };
+        let rows = content(Section::Hosts, &ctx);
+        let rendered = text(&rows);
+        // One row per [host.*] entry: glyph + name + reach + runtime + status.
+        assert!(rendered.contains("● build-box"), "{rendered}");
+        assert!(rendered.contains("ssh · podman 5.0"), "{rendered}");
+        assert!(rendered.contains("ready"), "{rendered}");
+        assert!(rendered.contains("✗ flaky"), "{rendered}");
+        // The cursor host (index 0) expands its detail block.
+        assert!(rendered.contains("ghcr.io/x/base:v1"), "{rendered}");
+        assert!(rendered.contains("x86_64 linux"), "{rendered}");
+        assert!(rendered.contains("granted"), "{rendered}");
+        assert!(rendered.contains("ago"), "probe age: {rendered}");
+        assert!(rendered.contains("image 11111111"), "inventory: {rendered}");
+        // The non-cursor host's failure is NOT expanded in the compact view…
+        assert!(!rendered.contains("host connect: timeout"), "{rendered}");
+        // …and the action hints mirror the loop's dispatch keys.
+        for hint in ["p provision", "r re-probe", "c grant install", "x rm-cache"] {
+            assert!(rendered.contains(hint), "{hint}: {rendered}");
+        }
+        // Host rows (and only host rows) are cursor targets, aligned by index.
+        let hits: Vec<_> = rows.iter().filter_map(|r| r.hit).collect();
+        assert_eq!(
+            hits,
+            vec![
+                PanelHit::Row(Section::Hosts, 0),
+                PanelHit::Row(Section::Hosts, 1)
+            ]
+        );
+
+        // Cursor on the failed host: its error + (deep) events expand.
+        let mut u = ui(PanelWidth::Half, Section::Hosts);
+        u.cursor = 1;
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 75,
+            rows: 32,
+        };
+        let rendered = text(&content(Section::Hosts, &ctx));
+        assert!(rendered.contains("host connect: timeout"), "{rendered}");
+        // Deep view of host 0 (not cursor) hides its events; switch cursor back.
+        let mut u0 = ui(PanelWidth::Half, Section::Hosts);
+        u0.cursor = 0;
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u0,
+            cols: 75,
+            rows: 32,
+        };
+        let rendered = text(&content(Section::Hosts, &ctx));
+        assert!(rendered.contains("EVENTS"), "{rendered}");
+        assert!(rendered.contains("deliver — delivered"), "{rendered}");
+
+        // Summary rolls up ready/failed counts.
+        let s = summary(Section::Hosts, &m)
+            .iter()
+            .map(|s| s.text.clone())
+            .collect::<String>();
+        assert!(s.contains("1/2"), "{s}");
+        assert!(s.contains("✗1"), "{s}");
+        // No hosts configured ⇒ em-dash summary + a pointer body.
+        let empty = FrameModel::default();
+        let s = summary(Section::Hosts, &empty)
+            .iter()
+            .map(|s| s.text.clone())
+            .collect::<String>();
+        assert_eq!(s, "—");
+        let ctx = SectionCtx {
+            model: &empty,
+            ui: &u,
+            cols: 39,
+            rows: 28,
+        };
+        assert!(text(&content(Section::Hosts, &ctx)).contains("no hosts configured"));
     }
 
     #[test]

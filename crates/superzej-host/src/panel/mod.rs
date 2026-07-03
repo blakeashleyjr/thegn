@@ -131,6 +131,9 @@ pub enum Section {
     Notifications,
     Logs,
     Sandbox,
+    /// Configured `[host.*]` machines (hosts-as-resources): per-host state,
+    /// inventory, and provision/re-probe/consent/rm-cache actions.
+    Hosts,
     /// Active ingress shares (`[share]`): the ports this worktree exposes and
     /// their public URLs.
     Share,
@@ -153,11 +156,11 @@ pub enum Section {
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
 /// - Work (10): Mine, Across, Pr, Ci, MergeQueue, Issues, Problems, Jobs, Tests, Symbols
-/// - System (8): Notifications, Logs, Sandbox, Share, Forward, Telemetry, Media, Keys
+/// - System (9): Notifications, Logs, Sandbox, Hosts, Share, Forward, Telemetry, Media, Keys
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 23] = [
+pub const SECTION_ORDER: [Section; 24] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -179,6 +182,7 @@ pub const SECTION_ORDER: [Section; 23] = [
     Section::Notifications,
     Section::Logs,
     Section::Sandbox,
+    Section::Hosts,
     Section::Share,
     Section::Forward,
     Section::Telemetry,
@@ -206,6 +210,7 @@ impl Section {
             Section::Symbols => "symbols",
             Section::Debug => "debug",
             Section::Sandbox => "sandbox",
+            Section::Hosts => "hosts",
             Section::Db => "db",
             Section::Telemetry => "telemetry",
             Section::Keys => "keys",
@@ -239,6 +244,7 @@ impl Section {
             Section::Notifications
             | Section::Logs
             | Section::Sandbox
+            | Section::Hosts
             | Section::Share
             | Section::Forward
             | Section::Telemetry
@@ -560,6 +566,11 @@ pub struct PanelData {
     /// `file` is the repo-relative path the outline was computed for ("" = none).
     pub symbols_file: String,
     pub symbols: Vec<SymbolRow>,
+    /// Per-`[host.*]` display snapshots (hosts-as-resources): built off-loop
+    /// from the config + DB by hydration, live-merged on the loop from
+    /// `HostRuntime` after each drain. Feeds the `Hosts` section, the sidebar
+    /// HOSTS block, and the wizard readiness badges. Empty without `[host.*]`.
+    pub hosts: Vec<crate::host_ui::HostSnapshot>,
 }
 
 /// One row of the Symbols outline (or, in references mode, a reference site): a
@@ -1100,7 +1111,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 23);
+        assert_eq!(SECTION_ORDER.len(), 24);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab

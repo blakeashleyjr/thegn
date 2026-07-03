@@ -13,6 +13,7 @@ pub mod ci;
 pub mod forward;
 pub mod gh;
 pub mod git;
+pub mod host;
 pub mod issue;
 pub mod log;
 pub mod lsp;

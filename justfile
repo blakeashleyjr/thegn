@@ -359,6 +359,16 @@ test-sprite:
       [ -n "${SPRITES_TOKEN:-}" ] || { echo "SPRITES_TOKEN not set (put it in .envrc.local)" >&2; exit 1; }; \
       cargo test -p superzej-svc --test sprites_live -- --ignored --nocapture
 
+# Live sprite-recycle verification (hosts-as-resources S1/S2): checkpoint
+# capture, stale restore-in-place, claimed-delete round trip, bad-checkpoint
+# fallback. Real cloud spend; serial (the tests hold the crate env lock).
+sprites-live-recycle:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -f .envrc.local ] && . ./.envrc.local
+    [ -n "${SPRITES_TOKEN:-}" ] || { echo "SPRITES_TOKEN not set (put it in .envrc.local)" >&2; exit 1; }
+    cargo test -p superzej-host --bin szhost live_recycle -- --ignored --nocapture --test-threads=1
+
 # Hermetic end-to-end test against the debug binary.
 smoke: build
     ./test/install-plan.sh
@@ -629,3 +639,29 @@ fonts:
 font name:
     sed -i 's/^normal = { family = ".*" }$/normal = { family = "{{name}}" }/' config/alacritty.toml
     @echo "font → {{name}} (alacritty live-reloads in place)"
+
+# --- sandbox base image (hosts-as-resources) ---------------------------------
+
+# Build the base sandbox image for THIS machine's arch and load it into podman
+# (`nix/sandbox-image.nix` → streamLayeredImage). The provisioner then delivers
+# it registry-lessly to hosts (`superzej host provision <name>`).
+image-build:
+    nix build .#sandbox-image
+    ./result | podman load
+
+# Publish both arches + a manifest list to a registry, then print the list
+# digest to pin as DEFAULT_BASE_DIGEST (superzej-core/src/image.rs). Needs
+# native builders per arch (or remote builders); run on CI normally.
+#   just image-publish registry=ghcr.io/you tag=v1
+image-publish registry tag="v1":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ref="{{registry}}/superzej-sandbox:{{tag}}"
+    arch="$(uname -m)"; case "$arch" in x86_64) oci=amd64;; aarch64) oci=arm64;; *) echo "unsupported arch $arch" >&2; exit 1;; esac
+    nix build .#sandbox-image
+    ./result | podman load
+    podman tag superzej-sandbox:latest "$ref-$oci"
+    podman push "$ref-$oci"
+    echo "pushed $ref-$oci — repeat on the other arch, then:"
+    echo "  podman manifest create $ref $ref-amd64 $ref-arm64 && podman manifest push $ref"
+    echo "  (the printed manifest-list digest pins DEFAULT_BASE_DIGEST)"

@@ -25,6 +25,10 @@ use crate::actions::{CiActionCtx, open_command_pane, open_command_tab, open_url_
 use crate::chrome::{FrameModel, LoadStep, render_tab};
 use crate::compositor::Rect;
 use crate::gitmut::{GitOp, GitOpResult};
+use crate::handlers::provision::{
+    ProvisionProgress, SpecBatch, SpecDrainCtx, SpecError, drain_provision, drain_specs,
+    sandbox_halt_in, sandbox_halt_overlay, spec_err,
+};
 use crate::hydrate::{
     RefreshKind, active_tab_path, build_initial_model, load_or_seed_session,
     neighbor_worktree_paths, retarget_diff_watcher, spawn_model_hydration, spawn_panel_prefetch,
@@ -33,8 +37,8 @@ use crate::hydrate::{
 use crate::input::key_bytes;
 use crate::layout;
 use crate::loading::{
-    SpecOrigin, active_watchdog_deadline, apply_spec_batch, is_shell_wait, provision_load_steps,
-    provision_owns_tab, seed_materialize_steps, watchdog_deadline,
+    SpecOrigin, active_watchdog_deadline, is_shell_wait, provision_load_steps, provision_owns_tab,
+    seed_materialize_steps, watchdog_deadline,
 };
 use crate::menu::{self, MenuChoice, MenuOverlay};
 use crate::palette::build_palette;
@@ -586,11 +590,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         "session loaded"
     );
 
-    let cfg = superzej_core::config::Config::load_layered(
+    let mut cfg = superzej_core::config::Config::load_layered(
         &superzej_core::config::ProcessEnv,
         &cli.overrides,
         cli.config.clone(),
     );
+    superzej_core::host_config::merge_db_hosts(&mut cfg);
     superzej_core::i18n::init(&cfg.ui.language);
 
     tracing::info!(
@@ -797,7 +802,11 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                         &superzej_core::config::ProcessEnv,
                         &overrides_clone,
                         config_clone.clone(),
-                    );
+                    )
+                    .map(|mut c| {
+                        superzej_core::host_config::merge_db_hosts(&mut c);
+                        c
+                    });
                     if config_tx.send(new_cfg_res).is_ok() {
                         let _ = config_waker.wake();
                     }
@@ -1412,6 +1421,7 @@ impl SidebarState {
             &model.sidebar_db_worktrees,
             &model.sidebar_db_folders,
             &model.sidebar_db_terminals,
+            &model.panel.hosts,
         );
         let visible = Self::visible_len(model);
         // While unfocused, track the active worktree so opening the sidebar
@@ -2649,8 +2659,9 @@ fn delete_groups(
     // `env=` → global default), not just the DB — a repo-selected provider env
     // (e.g. superzej's `env = "sprites"`) isn't stored in the DB, so a DB-only
     // lookup returned None and LEAKED the sprite on delete.
-    let del_cfg =
+    let mut del_cfg =
         superzej_core::config::Config::load_layered(&superzej_core::config::ProcessEnv, &[], None);
+    superzej_core::host_config::merge_db_hosts(&mut del_cfg);
     let (mut deleted, mut skipped) = (0usize, 0usize);
     for gi in targets {
         if gi >= session.worktrees.len() {
@@ -3940,6 +3951,11 @@ enum GitInputKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HostInputKind {
     NewTerminal,
+    /// Add a `[host.*]` machine from typed input (the wizard's "+ add host…"
+    /// row); re-opens the worktree wizard for `repo_root` on success.
+    NewHost {
+        repo_root: std::path::PathBuf,
+    },
     /// Rename the worktree group at this session index from its old branch
     /// (item 53). Carries the repo root + old path/branch so the off-thread
     /// rename has everything it needs.
@@ -3972,58 +3988,9 @@ pub(crate) enum HostInputKind {
     FileWorktreeNewFolder,
 }
 
-/// Launch the new-worktree wizard + speculative-create worker against `root`.
-/// `base_override` forks from a chosen branch (item 52); `None` uses the
-/// configured/auto-resolved base. Shared by the `NewWorktree` action and the
-/// sidebar "fork worktree" outcome so both go through one launch path.
-#[allow(clippy::too_many_arguments)]
-fn begin_worktree_wizard(
-    root: std::path::PathBuf,
-    base_override: Option<String>,
-    template: Option<&superzej_core::config::WorktreeTemplate>,
-    cfg: &superzej_core::config::Config,
-    create_gen: &mut u64,
-    create_tx: &tokio_mpsc::UnboundedSender<wizard::CreateEvent>,
-    waker: &TerminalWaker,
-    creating: &mut Option<wizard::CreationProgress>,
-    wizard_cmd_tx: &mut Option<std::sync::mpsc::Sender<wizard::WizardCmd>>,
-    wizard_ui: &mut Option<wizard::NewWorktreeWizard>,
-    model: &mut FrameModel,
-) {
-    if wizard_ui.is_some() || creating.is_some() {
-        model.status = "worktree creation already in progress".into();
-        return;
-    }
-    // Open the wizard instantly (pure prefill) and start the worker, which
-    // speculatively creates the worktree under the candidate name while the
-    // user reads the form.
-    *create_gen += 1;
-    let mut w = wizard::NewWorktreeWizard::new(root.clone(), cfg);
-    // A template (item 54) seeds the prefix + sandbox/agent selection; its base
-    // branch flows through `base_override` below.
-    if let Some(tmpl) = template {
-        w.apply_template(tmpl);
-    }
-    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-    let ctx = wizard::WorkerCtx {
-        cfg: cfg.clone(),
-        repo_root: root,
-        candidate: w.candidate(),
-        generation: *create_gen,
-        db_path: None,
-        base_override,
-    };
-    let tx = create_tx.clone();
-    let wk = waker.clone();
-    task::spawn_blocking(move || {
-        wizard::run_worker(ctx, cmd_rx, tx, move || {
-            let _ = wk.wake();
-        });
-    });
-    *creating = Some(wizard::CreationProgress::new(*create_gen, w.candidate()));
-    *wizard_cmd_tx = Some(cmd_tx);
-    *wizard_ui = Some(w);
-}
+// `begin_worktree_wizard` lives in `handlers::wizard` (extracted from this
+// pinned file); it now also decorates the env rows with host-readiness badges.
+use crate::handlers::wizard::begin_worktree_wizard;
 
 /// Non-interactive worktree creation for a `[[actions]] action = "new-worktree"`
 /// keybind: spawn the same worker as the wizard, then immediately synthesize the
@@ -7367,92 +7334,6 @@ fn approval_overlay<R>(req: &crate::bouncer::ApprovalRequest<R>) -> MenuOverlay 
     menu::approval_menu(title, crate::bouncer::summary(&req.detail))
 }
 
-/// Build the warning modal for a refused sandbox bring-up (failover off). Names
-/// the placement, states the reason, and points at the `failover` knob.
-fn sandbox_halt_overlay(halt: &crate::agent::SandboxHalt) -> MenuOverlay {
-    let title = format!("⚠ {} unavailable", halt.placement);
-    let body = format!(
-        "{} — failover is off, so superzej won't drop to the host. Fix the env \
-         (e.g. set its token) then retry, or set `failover = true` under \
-         [env.{}] / [sandbox] to allow a host fallback.",
-        halt.reason, halt.env_name
-    );
-    menu::sandbox_halt_menu(title, body)
-}
-
-/// Find a [`SandboxHalt`](crate::agent::SandboxHalt) anywhere in an error's
-/// source chain (robust to `.context()` wrapping). `Some` ⇒ surface the modal
-/// instead of a plain status line.
-fn sandbox_halt_in(e: &anyhow::Error) -> Option<&crate::agent::SandboxHalt> {
-    e.chain()
-        .find_map(|src| src.downcast_ref::<crate::agent::SandboxHalt>())
-}
-
-/// Adjust the warm-spare-pool target for the ACTIVE workspace's `(repo, env)` by
-/// `delta`, persisting the override in the DB (the `+`/`-` hotkeys). Returns a
-/// status message (the new target, or why it didn't apply). The caller resets the
-/// maintainer throttle so the change takes effect immediately.
-fn pool_target_adjust(
-    session: &crate::session::Session,
-    cfg: &superzej_core::config::Config,
-    delta: i64,
-) -> Option<String> {
-    let g = session.active_group().filter(|g| !g.path.is_empty())?;
-    let wt = g.path.clone();
-    let loc = superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
-    if !loc.is_remote() {
-        return Some("warm pool: only for provider (remote) workspaces".into());
-    }
-    let db = superzej_core::db::Db::open().ok()?;
-    let repo_root = db
-        .repo_root_for(&wt)
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            superzej_core::repo::main_worktree(std::path::Path::new(&wt))
-                .map(|p| p.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| wt.clone());
-    let env_name = cfg
-        .resolve_env(
-            std::path::Path::new(&repo_root),
-            &loc,
-            std::path::Path::new(&wt),
-            None,
-        )
-        .name;
-    let cur = db
-        .pool_target(&repo_root, &env_name)
-        .ok()
-        .flatten()
-        .unwrap_or(cfg.lifecycle.pool.size as i64);
-    let new = (cur + delta).max(0);
-    db.set_pool_target(&repo_root, &env_name, new).ok()?;
-    Some(format!("warm pool target: {new} spare(s)"))
-}
-
-/// Error carried over the off-thread spec-resolution channel. Preserves a
-/// [`SandboxHalt`](crate::agent::SandboxHalt) (so the receiver can raise the
-/// warning modal) and stringifies everything else.
-enum SpecError {
-    Halt(crate::agent::SandboxHalt),
-    Other(String),
-    /// Benign pre-warm skip (provider env not provisioned yet). Clears
-    /// `prewarm_inflight` on arrival; paints NO failed splash and sets NO
-    /// failed mark — the tab is simply left for materialize to bring up.
-    PrewarmSkipped,
-}
-
-/// Lower an `anyhow::Error` from `launch_spec` into a channel-safe [`SpecError`],
-/// keeping the typed halt when present.
-fn spec_err(e: anyhow::Error) -> SpecError {
-    match sandbox_halt_in(&e) {
-        Some(h) => SpecError::Halt(h.clone()),
-        None => SpecError::Other(e.to_string()),
-    }
-}
-
 /// Ask the bouncer gate for permission to run a consequential tool call (bouncer
 /// mode only). Sends an `ApprovalRequest` to the loop, pulses the waker so the
 /// overlay is raised, and awaits the user's decision. Returns `true` to proceed;
@@ -7957,20 +7838,21 @@ async fn event_loop<T: Terminal>(
     // tab names). A path key would route a result to the wrong group and let an
     // active tab and a same-path neighbor both fire for one key. The batch also
     // carries the path so the spawn (cwd) still lands in the worktree dir.
-    type SpecBatch = (
-        String,     // group name (routing key)
-        String,     // worktree path (spawn cwd)
-        usize,      // tab index
-        SpecOrigin, // which inflight set to clear; prewarm batches may be dropped
-        std::result::Result<Vec<(u32, crate::agent::LaunchSpec)>, SpecError>,
-    );
     let (spec_tx, mut spec_rx) = tokio_mpsc::unbounded_channel::<SpecBatch>();
     // Live env-provisioning progress for the active tab: the off-loop spec task
     // streams the setup steps (clone → toolchain → tools → dotfiles → snapshot)
     // as `LoadStep`s so the splash shows a rich "setting up your environment"
     // screen while a fresh provider sandbox is built. Keyed (group name, tab).
-    type ProvisionProgress = (String, usize, Vec<LoadStep>);
     let (provision_tx, mut provision_rx) = tokio_mpsc::unbounded_channel::<ProvisionProgress>();
+    // Host-level provisioning UI events (panel/sidebar/consent), keyed by host
+    // — the per-tab splash rides `provision_tx` above (see handlers::host).
+    let (host_ui_tx, host_ui_rx) = tokio_mpsc::unbounded_channel();
+    let host_ui = crate::host_flow::HostUiTx {
+        tx: host_ui_tx,
+        waker: waker.clone(),
+    };
+    let mut host_runtime = crate::handlers::host::HostRuntime::new(host_ui_rx);
+    let mut pending_host_consent: Option<String> = None;
     // Materialize requests in flight, keyed (group name, tab). A SET (not a single
     // slot) that PERSISTS across worktree switches: switching away from a
     // provisioning worktree and back must not re-kick its (idempotent but heavy)
@@ -9025,7 +8907,9 @@ async fn event_loop<T: Terminal>(
                         // Non-local env, failover off, known-down (token unset /
                         // exec cooldown): halt rather than degrade to host.
                         Err(SpecError::Halt(halt))
-                    } else if crate::agent::provision_pending(&cfg, &wt) {
+                    } else if crate::agent::provision_pending(&cfg, &wt)
+                        || crate::host_flow::host_pending(&cfg, &wt)
+                    {
                         // Provider env not provisioned yet (sandbox missing, or
                         // bare — no provision marker): `launch_spec` would
                         // ensure_exists a BARE sprite and attach a premature raw
@@ -9043,68 +8927,15 @@ async fn event_loop<T: Terminal>(
                 });
             }
             // Eager provisioning ([lifecycle] eager): front-run the one-time
-            // provisioning (nix + devShell, minutes) for provider worktrees AHEAD
-            // of focus, in the background, so opening them is instant. Budget-safe:
-            // `provision_pending` only fires when the sandbox does NOT exist yet
-            // (a list() GET — never wakes an idle/provisioned one). Scope: active
-            // worktree only, or the whole session (workspace/all). Once per session.
-            {
-                use superzej_core::config::EagerScope;
-                let scope = current_config.lifecycle.eager;
-                if current_config.lifecycle.enabled && scope != EagerScope::Off {
-                    let active_path = session.active_group().map(|g| g.path.clone());
-                    // (path, group name, active tab) so the background provisioner
-                    // can report progress into `loading_state` under the SAME key the
-                    // splash derives from — switching to a still-provisioning worktree
-                    // then shows its live loading screen, never a premature shell.
-                    let targets: Vec<(String, String, usize)> = session
-                        .worktrees
-                        .iter()
-                        .filter(|g| !g.path.is_empty())
-                        .filter(|g| match scope {
-                            EagerScope::ActiveWorktreePlusNew => {
-                                active_path.as_deref() == Some(g.path.as_str())
-                            }
-                            _ => true, // ActiveWorkspace / All: every open worktree
-                        })
-                        .map(|g| (g.path.clone(), g.name.clone(), g.active_tab))
-                        .collect();
-                    for (wt, gname, ti) in targets {
-                        if !eager_inflight.insert(wt.clone()) {
-                            continue; // already attempted this session
-                        }
-                        let cfg = current_config.clone();
-                        let wk = waker.clone();
-                        let ptx = provision_tx.clone();
-                        task::spawn_blocking(move || {
-                            if crate::agent::provision_pending(&cfg, &wt) {
-                                // Lock the loading screen up the moment we commit to
-                                // provisioning (before the first step), so switching
-                                // here can never catch a half-ready shell — the splash
-                                // wins while `loading_state` is non-empty.
-                                let _ = ptx.send((
-                                    gname.clone(),
-                                    ti,
-                                    vec![LoadStep::active("provisioning")],
-                                ));
-                                let _ = wk.wake();
-                                let prov = crate::agent::provision_worktree(&cfg, &wt, |views| {
-                                    let _ =
-                                        ptx.send((gname.clone(), ti, provision_load_steps(views)));
-                                    let _ = wk.wake();
-                                });
-                                // On success, clear the lock so a now-ready worktree
-                                // shows no stale splash (materialize takes over on
-                                // open). On failure, leave the failed steps visible.
-                                if prov.is_ok() {
-                                    let _ = ptx.send((gname.clone(), ti, Vec::new()));
-                                }
-                                let _ = wk.wake();
-                            }
-                        });
-                    }
-                }
-            }
+            // provisioning AHEAD of focus (see handlers::provision::kick_eager).
+            crate::handlers::provision::kick_eager(
+                &current_config,
+                &session,
+                &mut eager_inflight,
+                &provision_tx,
+                &waker,
+                &host_ui,
+            );
             // Warm-spare pool maintainer: keep `[lifecycle.pool] size` spares ready
             // for the ACTIVE workspace's (repo, env) so the NEXT worktree claims one
             // (instant) instead of provisioning from scratch. Throttled (~8s); the
@@ -9296,6 +9127,7 @@ async fn event_loop<T: Terminal>(
                     let wk = waker.clone();
                     let wt = path.clone();
                     let gname = name.clone();
+                    let hui = Some(host_ui.clone());
                     task::spawn_blocking(move || {
                         let specs = if is_terminal {
                             let conn = terminal_connection_for(&gname);
@@ -9337,14 +9169,20 @@ async fn event_loop<T: Terminal>(
                                 // the pane only attaches once the env is ready.
                                 let gname_p = gname.clone();
                                 let wk_p = wk.clone();
-                                let prov = crate::agent::provision_worktree(&cfg, &wt, |views| {
-                                    let _ = ptx.send((
-                                        gname_p.clone(),
-                                        ti,
-                                        provision_load_steps(views),
-                                    ));
-                                    let _ = wk_p.wake();
-                                });
+                                let prov = crate::host_flow::provision_worktree(
+                                    &cfg,
+                                    &wt,
+                                    crate::host_flow::ConsentPolicy::Interactive,
+                                    |views| {
+                                        let _ = ptx.send((
+                                            gname_p.clone(),
+                                            ti,
+                                            provision_load_steps(views),
+                                        ));
+                                        let _ = wk_p.wake();
+                                    },
+                                    hui.as_ref(),
+                                );
                                 match prov {
                                     Ok(_) => crate::agent::launch_spec(&cfg, &wt, None, "shell")
                                         .map(|spec| {
@@ -10525,186 +10363,57 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
-        // Live env-provisioning progress for the active tab → the splash. The
-        // off-loop spec task streams setup steps while a fresh provider sandbox
-        // is built; only the active tab's stream drives the loading screen.
-        while let Ok((name, ti, steps)) = provision_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Spec);
-            // Always record this worktree's progress; the splash for whichever
-            // worktree is active is derived from `loading_state` below.
-            let active = session
-                .worktrees
-                .iter()
-                .position(|g| g.name == name)
-                .is_some_and(|gi| gi == session.active && session.worktrees[gi].active_tab == ti);
-            // Eager provisioning only runs for a provider (remote) env, so this
-            // stream is unconditionally remote — the 300s watchdog window.
-            loading_remote.insert((name.clone(), ti), true);
-            loading_state.insert((name, ti), steps);
-            if active {
-                dirty = true;
-            }
+        // Live env-provisioning progress for the active tab → the splash
+        // (see handlers::provision::drain_provision).
+        if drain_provision(
+            &mut provision_rx,
+            &session,
+            &mut loading_state,
+            &mut loading_remote,
+            &mut loop_perf,
+        ) {
+            dirty = true;
+        }
+        // Host-level events: view map for the Hosts UI + the consent modal.
+        let hout = host_runtime.drain(active_menu.is_some());
+        if hout.dirty {
+            crate::host_ui::merge_live(&mut model.panel.hosts, &host_runtime);
+            dirty = true;
+        }
+        if hout.any_ready {
+            // A host just turned Ready: let blocked tabs re-probe.
+            materialize_failed.clear();
+            prewarm_failed.clear();
+        }
+        if let Some((menu_ov, host)) = hout.consent {
+            active_menu = Some(menu_ov);
+            pending_host_consent = Some(host);
         }
 
         // Resolved launch specs: finish the deferred materialize (lazy focus
-        // path and pre-warm alike). Routed back to the requesting group by its
-        // unique name (a path can be shared by two groups); results for a group
-        // /tab that vanished mid-flight are dropped, and `materialize_with_specs`
-        // itself skips leaves that came alive some other way in the meantime.
-        while let Ok((name, wt, ti, origin, specs)) = spec_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Spec);
-            let tab_key = (name.clone(), ti);
-            match origin {
-                SpecOrigin::Materialize => {
-                    materialize_inflight.remove(&tab_key);
-                }
-                SpecOrigin::Prewarm => {
-                    prewarm_inflight.remove(&tab_key);
-                }
-            }
-            // A stale PREWARM batch that lands while a materialize/provision owns
-            // this tab (its provision is still running) must be dropped whole:
-            // applying it would flip the splash to the shell-wait shape and attach
-            // a pane to a half-provisioned sandbox — the premature-shell bug. Not
-            // gated on tab activity: the user may have already switched back.
-            if !apply_spec_batch(
-                origin,
-                materialize_inflight.contains(&tab_key),
-                loading_state.get(&tab_key).map(Vec::as_slice),
-            ) {
-                continue;
-            }
-            // Remoteness of this worktree, resolved once from its path — seeds
-            // `loading_remote` alongside every `loading_state` write below so the
-            // startup-shell watchdog reads the correct 8s/300s deadline for THIS
-            // tab regardless of its (possibly identical) step Vec.
-            let tab_remote =
-                superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt)).is_remote();
-            // A remote materialize may have just CLAIMED a warm spare (ready →
-            // claimed), so the chip's count is now stale. Force the pool
-            // maintainer to re-read on the next loop (it's otherwise throttled to
-            // ~8s) so `warm N/M` drops promptly instead of showing a phantom
-            // ready spare that was already handed off.
-            if tab_remote {
-                last_pool_reconcile = None;
-            }
-            let Some(gi) = session.worktrees.iter().position(|g| g.name == name) else {
-                continue;
-            };
-            let is_active = gi == session.active && session.worktrees[gi].active_tab == ti;
-            if is_active && center_dormant {
-                continue; // splash still up: stay lazy
-            }
-            let specs = match specs {
-                Ok(specs) => {
-                    // sandbox done → container active; label shows backend.
-                    let backend = specs
-                        .first()
-                        .map(|(_, s)| s.backend.clone())
-                        .unwrap_or_else(|| "host".into());
-                    loading_remote.insert(tab_key.clone(), tab_remote);
-                    loading_state.insert(
-                        tab_key.clone(),
-                        vec![
-                            LoadStep::done("sandbox"),
-                            LoadStep::active(format!("container  ({backend})")),
-                            LoadStep::pending("shell"),
-                        ],
-                    );
-                    if is_active {
-                        dirty = true;
-                    }
-                    specs
-                }
-                Err(e) => {
-                    // Failover off + non-local env couldn't come up: raise the
-                    // warning modal instead of just a status line. Otherwise a
-                    // plain blocked-launch status.
-                    match e {
-                        // Benign prewarm skip (provider env not provisioned yet):
-                        // no failed splash, no failed mark — the tab is left for
-                        // the focused materialize to provision + open.
-                        SpecError::PrewarmSkipped => continue,
-                        SpecError::Halt(halt) => {
-                            model.status =
-                                format!("{} unavailable: {}", halt.placement, halt.reason);
-                            if is_active {
-                                active_menu = Some(sandbox_halt_overlay(&halt));
-                            }
-                        }
-                        SpecError::Other(s) => {
-                            model.status = format!("Pane launch blocked: {s}");
-                        }
-                    }
-                    loading_remote.insert(tab_key.clone(), tab_remote);
-                    loading_state.insert(tab_key.clone(), vec![LoadStep::failed("sandbox")]);
-                    match origin {
-                        SpecOrigin::Materialize => {
-                            if is_active {
-                                center_dormant = true;
-                            }
-                            materialize_failed.insert(tab_key);
-                        }
-                        SpecOrigin::Prewarm => {
-                            prewarm_failed.insert(tab_key);
-                        }
-                    }
-                    dirty = true;
-                    continue;
-                }
-            };
-            let warnings = specs
-                .iter()
-                .filter_map(|(_, spec)| spec.warning_summary())
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            let Some(tab) = session.worktrees[gi].tabs.get_mut(ti) else {
-                continue;
-            };
-            {
-                // container done → shell active
-                let backend = specs
-                    .first()
-                    .map(|(_, s)| s.backend.clone())
-                    .unwrap_or_else(|| "host".into());
-                loading_remote.insert(tab_key.clone(), tab_remote);
-                loading_state.insert(
-                    tab_key.clone(),
-                    vec![
-                        LoadStep::done("sandbox"),
-                        LoadStep::done(format!("container  ({backend})")),
-                        LoadStep::active("shell"),
-                    ],
-                );
-            }
-            if let Err(e) =
-                panes.materialize_with_specs(&current_config, tab, &wt, &specs, chrome.center)
-            {
-                model.status = format!("Pane spawn failed: {e}");
-                loading_remote.insert(tab_key.clone(), tab_remote);
-                loading_state.insert(
-                    tab_key.clone(),
-                    vec![
-                        LoadStep::done("sandbox"),
-                        LoadStep::done("container"),
-                        LoadStep::failed("shell"),
-                    ],
-                );
-            } else {
-                // Keep the loading entry until first PTY output arrives (cleared in
-                // the PaneEvent::Output handler above) so the loading screen
-                // stays visible until the shell actually produces content —
-                // no blank flash between fork and first render.
-                if is_active && !warnings.is_empty() {
-                    model.status = format!("⚠ Sandbox fallback: {}", warnings.join("; "));
-                }
-            }
-            if is_active {
-                need_relayout = true;
-            }
-            dirty = true;
-        }
+        // path and pre-warm alike) — see handlers::provision::drain_specs.
+        drain_specs(
+            &mut spec_rx,
+            &mut SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &current_config,
+                center: chrome.center,
+                loading_state: &mut loading_state,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
 
         // Drain palette async results (file/content/git/symbol search workers).
         // FileIndexReady is special: it propagates back to `file_index` for
@@ -13521,6 +13230,22 @@ async fn event_loop<T: Terminal>(
                                 let _ = tx.send(wizard::WizardCmd::PrepChosen { env, sandbox });
                             }
                         }
+                        wizard::WizardOutcome::AddHost => {
+                            let root = w.root().clone();
+                            if let Some(tx) = wizard_cmd_tx.take() {
+                                let _ = tx.send(wizard::WizardCmd::Cancel);
+                            }
+                            wizard_ui = None;
+                            creating = None;
+                            create_gen += 1;
+                            host_input = Some((
+                                menu::InputOverlay::new(
+                                    "add host — user@host[:port], or dumbpipe:<ticket> <user>",
+                                    "",
+                                ),
+                                HostInputKind::NewHost { repo_root: root },
+                            ));
+                        }
                         wizard::WizardOutcome::Submit(choices) => {
                             if let wizard::NameChoice::Human(tail) = &choices.name
                                 && let Some(cp) = creating.as_mut()
@@ -13647,6 +13372,31 @@ async fn event_loop<T: Terminal>(
                         menu::InputOutcome::Submit(text) => {
                             if let Some((_, kind)) = host_input.take() {
                                 match kind {
+                                    HostInputKind::NewHost { repo_root } => {
+                                        match crate::handlers::wizard::add_host_from_input(
+                                            &text,
+                                            &mut current_config,
+                                        ) {
+                                            Ok(name) => {
+                                                keymap = rebuild_keymap(&current_config, &session);
+                                                model.status = format!("host {name} added");
+                                                crate::handlers::wizard::begin_worktree_wizard(
+                                                    repo_root,
+                                                    None,
+                                                    None,
+                                                    keymap.config(),
+                                                    &mut create_gen,
+                                                    &create_tx,
+                                                    &waker,
+                                                    &mut creating,
+                                                    &mut wizard_cmd_tx,
+                                                    &mut wizard_ui,
+                                                    &mut model,
+                                                );
+                                            }
+                                            Err(e) => model.status = format!("add host: {e}"),
+                                        }
+                                    }
                                     HostInputKind::NewTerminal => {
                                         let text = text.trim().to_string();
                                         if !text.is_empty()
@@ -14205,6 +13955,17 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     format!("Keymap preset: {preset}")
                                 };
+                                dirty = true;
+                                continue;
+                            }
+                            // A live host install-consent ask resolves here
+                            // (grant on confirm, decline on dismiss) before the
+                            // git dispatch could swallow the choice.
+                            if let Some(status) = crate::handlers::host::intercept_menu_choice(
+                                &choice,
+                                &mut pending_host_consent,
+                            ) {
+                                model.status = status;
                                 dirty = true;
                                 continue;
                             }
@@ -17624,6 +17385,20 @@ async fn event_loop<T: Terminal>(
                             }
                             .panel_key(key, panel_ui.cursor)
                         }
+                        // -- hosts (hosts-as-resources): provision (p), re-probe
+                        // (r), grant install (c), forget cached state (x).
+                        (Section::Hosts, key)
+                            if matches!(key, KeyCode::Char('p' | 'r' | 'c' | 'x')) =>
+                        {
+                            crate::host_ui::panel_key(
+                                key,
+                                panel_ui.cursor,
+                                &mut model,
+                                &current_config,
+                                &host_ui,
+                                &mut active_menu,
+                            )
+                        }
                         // Esc in section mode returns to the terminal (row
                         // mode's Esc is claimed by the accordion map).
                         (_, key) if crate::input::is_escape_key(&key) => {
@@ -18140,9 +17915,11 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     -1
                                 };
-                                if let Some(msg) =
-                                    pool_target_adjust(&session, &current_config, delta)
-                                {
+                                if let Some(msg) = crate::handlers::provision::pool_target_adjust(
+                                    &session,
+                                    &current_config,
+                                    delta,
+                                ) {
                                     model.status = msg;
                                     last_pool_reconcile = None; // reconcile immediately
                                 }
@@ -20741,6 +20518,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         );
         // Pinned "lib" workspace floats first; order is by repo path.
         assert_eq!(
@@ -20774,6 +20552,7 @@ mod tests {
             &workspaces,
             &view,
             &crate::sidebar::SidebarStatus::default(),
+            &[],
             &[],
             &[],
             &[],
@@ -20848,6 +20627,7 @@ mod tests {
             &[],
             &[],
             &terminals,
+            &[],
         );
         let ring = unified_ring(&rows, &terminals);
         assert_eq!(
@@ -20913,6 +20693,7 @@ mod tests {
             &[],
             &[],
             &terminals,
+            &[],
         );
         // The old path-based order drops the live fallback entirely.
         assert!(sidebar_workspace_order(&rows).is_empty());

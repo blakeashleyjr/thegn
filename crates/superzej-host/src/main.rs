@@ -7,7 +7,9 @@
 mod actions;
 mod agent;
 mod agent_configs;
+mod agent_home;
 mod agent_pi;
+mod agent_ssh;
 mod apps;
 mod borders;
 mod bouncer;
@@ -28,6 +30,10 @@ mod focus;
 mod font;
 mod forward;
 mod gitmut;
+mod handlers;
+mod host_flow;
+mod host_provision;
+mod host_ui;
 mod hover;
 mod hydrate;
 mod input;
@@ -212,6 +218,12 @@ pub enum Command {
     Env {
         #[command(subcommand)]
         action: cmd::env::Action,
+    },
+    /// Inspect and provision `[host.<name>]` machines (the once-per-host
+    /// lifecycle behind fast remote OCI sandboxes).
+    Host {
+        #[command(subcommand)]
+        action: cmd::host::Action,
     },
     /// Install + configure superzej's managed pi under `~/.superzej/pi` (the
     /// "Agent" picker entry): a pinned binary + the superzej-acp extension.
@@ -416,11 +428,13 @@ fn main() -> anyhow::Result<()> {
 /// Dispatch a non-interactive verb. Loads the layered config (the verbs that
 /// need it) and routes to the ported `cmd` module.
 fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
-    let cfg = superzej_core::config::Config::load_layered(
+    let mut cfg = superzej_core::config::Config::load_layered(
         &superzej_core::config::ProcessEnv,
         &cli.overrides,
         cli.config.clone(),
     );
+    superzej_core::host_config::merge_db_hosts(&mut cfg);
+    let cfg = cfg;
     let config_path = cli
         .config
         .clone()
@@ -453,6 +467,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Recent { count } => cmd::repos::recent(count),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
         Command::Env { action } => cmd::env::run(&cfg, action),
+        Command::Host { action } => cmd::host::run(&cfg, action),
         Command::Agent { action } => cmd::agent::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),
         Command::Mcp { action } => cmd::mcp::run(&cfg, action),
