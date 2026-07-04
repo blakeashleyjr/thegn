@@ -20,7 +20,10 @@ pub struct Notification {
     pub source_ref: String,
     /// Human-readable summary shown in the inbox.
     pub message: String,
-    /// Unix milliseconds when the notification was created.
+    /// Creation time, in Unix **seconds** (populated from [`crate::util::now`],
+    /// which returns seconds). The `_ms` suffix is a legacy misnomer kept to
+    /// avoid a DB-column rename; feed it to [`crate::util::age`] for display,
+    /// never to a millisecond clock.
     pub created_at_ms: i64,
     /// True once the user has seen/acknowledged this entry.
     pub read: bool,

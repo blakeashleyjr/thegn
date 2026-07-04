@@ -1580,12 +1580,14 @@ pub(crate) fn build_panel(
             .collect();
 
         // Surface new ERROR lines as a notification (at most once per 5 min).
-        let now_ms = superzej_core::util::now();
-        let five_min_ms: i64 = 5 * 60 * 1_000;
+        // `now()`/`created_at_ms` are epoch *seconds*, so the window is too
+        // (this was `*1000`, which stretched "5 minutes" to ~3.5 days).
+        let now_s = superzej_core::util::now();
+        let five_min_s: i64 = 5 * 60;
         let has_recent_log_error = panel
             .notifications
             .iter()
-            .any(|n| n.source_ref == "log:szhost" && now_ms - n.created_at_ms < five_min_ms);
+            .any(|n| n.source_ref == "log:szhost" && now_s - n.created_at_ms < five_min_s);
         if !has_recent_log_error {
             let error_count = all_lines
                 .iter()
@@ -1605,6 +1607,11 @@ pub(crate) fn build_panel(
             let start = all_lines.len().saturating_sub(500);
             panel.log_lines = all_lines[start..].to_vec();
         }
+
+        // Always keep a bounded tail (unlike section-gated `log_lines`) so the
+        // notification → log drilldown modal has data without new blocking I/O.
+        let tail_start = all_lines.len().saturating_sub(400);
+        panel.log_tail = all_lines[tail_start..].to_vec();
     }
     panel
 }
