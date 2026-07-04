@@ -739,7 +739,6 @@ impl Db {
         Ok(counts)
     }
 
-
     /// Run `f` inside a single SQLite transaction: commit on `Ok`, roll back
     /// on `Err` (the dropped transaction rolls back). Multi-statement writes
     /// (e.g. persisting a whole session's tab list) must use this so a crash
@@ -753,7 +752,6 @@ impl Db {
         tx.commit()?;
         Ok(out)
     }
-
 }
 
 pub(crate) use crate::db_migrate::migrate_tab_layout_v6;

@@ -1054,6 +1054,22 @@ fn direnv_install_script() -> String {
     )
 }
 
+/// The **repo-independent** provisioning prefix as `(step id, script)` pairs —
+/// what `superzej env image bake` runs on a throwaway VPS before snapshotting
+/// it into a reusable base image: the Nix install (the multi-minute step every
+/// cold provision pays) + direnv. Deliberately NO workspace/clone/dotfiles —
+/// those are per-worktree and still run at provision time (the bake never
+/// writes the provision marker).
+pub fn bake_scripts(
+    installer: crate::config::NixInstaller,
+    parallel: Option<u32>,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("nix", nix_install_script(installer, parallel, None, None)),
+        ("direnv", direnv_install_script()),
+    ]
+}
+
 /// Warm the dev environment so the first interactive shell is instant. With
 /// direnv+flake we `direnv allow` + evaluate once; otherwise build the flake
 /// devShell / devenv directly.
@@ -2576,5 +2592,20 @@ mod tests {
             EnvPlan::marker_path("/workspace/"),
             "/workspace/.superzej-provisioned"
         );
+    }
+
+    #[test]
+    fn bake_scripts_are_the_repo_independent_prefix() {
+        let steps = bake_scripts(crate::config::NixInstaller::Determinate, Some(32));
+        let ids: Vec<&str> = steps.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec!["nix", "direnv"]);
+        let nix = &steps[0].1;
+        assert!(nix.contains("determinate"), "honours the installer choice");
+        assert!(nix.contains("http-connections = 32"), "honours parallel");
+        assert!(steps[1].1.contains("direnv hook"));
+        // Nothing repo-specific may leak into a shared base image.
+        for (_, s) in &steps {
+            assert!(!s.contains("git clone"), "no clone in a base image");
+        }
     }
 }

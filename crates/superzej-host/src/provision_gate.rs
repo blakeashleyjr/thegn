@@ -378,9 +378,11 @@ pub fn claim_spare(
     // Rebind the persisted remote location: the stored control prefix embeds the
     // DERIVED sandbox id, so without this every chrome git/fs read and CLI pane
     // keeps routing into the abandoned husk instead of the claimed spare.
+    // `control_command_template` (not raw `exec_command`) so VPS envs — whose
+    // prefix is the implicit `szhost vps-ssh` self-bridge — rebind too.
     let prefix: Vec<String> = env
         .provider
-        .exec_command
+        .control_command_template()
         .iter()
         .map(|s| s.replace("{id}", &name))
         .collect();

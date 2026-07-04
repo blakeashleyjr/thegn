@@ -462,6 +462,49 @@ mod tests {
         );
     }
 
+    /// The VPS pool policy: a VPS cannot checkpoint (no suspend — a powered-off
+    /// instance still bills), so its spares record `checkpoint_id = None` and
+    /// every recycle path must fall through to DESTROY. Locks both gates: the
+    /// pure `recyclable()` input (no checkpoint) and `recycle_spare`'s
+    /// caps().checkpoints refusal even if an id were somehow present.
+    #[test]
+    fn vps_spares_destroy_instead_of_recycling() {
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "hetzner".into(),
+            superzej_core::config::EnvConfig {
+                placement: superzej_core::config::PlacementMode::Provider,
+                provider: superzej_core::config::EnvProviderConfig {
+                    provider: "hetzner".into(),
+                    // Token env deliberately unset in tests: provider_for_named
+                    // is None ⇒ recycle refuses before any network.
+                    api_key_env: "SZ_TEST_NO_SUCH_HCLOUD_TOKEN".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        // The real shape: no checkpoint ⇒ not recyclable at the pure gate.
+        let spare = superzej_core::db::PoolSpare {
+            sandbox_name: "repo-pool-vps".into(),
+            repo_path: "/repo".into(),
+            env_name: "hetzner".into(),
+            state: "ready".into(),
+            checkpoint_id: None,
+            lock_hash: Some("lock".into()),
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(!recycle_spare(&cfg, "hetzner", &spare, "lock"));
+        assert!(claimed_recycle_checkpoint(&spare, "hetzner", "lock").is_none());
+        // Even a (hypothetical) checkpoint id refuses at the provider gate.
+        let with_cp = superzej_core::db::PoolSpare {
+            checkpoint_id: Some("bogus".into()),
+            ..spare
+        };
+        assert!(!recycle_spare(&cfg, "hetzner", &with_cp, "lock"));
+    }
+
     #[test]
     fn spare_without_checkpoint_is_not_recyclable() {
         let db = Db::open_memory().unwrap();

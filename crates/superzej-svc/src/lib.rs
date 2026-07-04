@@ -24,3 +24,4 @@ pub mod revtunnel;
 pub mod share;
 pub mod ssh;
 pub mod vpn;
+pub mod vps;

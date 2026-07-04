@@ -651,53 +651,9 @@ pub(crate) fn deproject(path: &str) {
     }
 }
 
-/// Build the API [`Provider`](superzej_svc::provider::Provider) for an env's
-/// provider config (best-effort: `None` if unconfigured or the token env var is
-/// unset). Mirrors `cmd::env::api_provider` but infallible for the launch path.
-fn provider_for(
-    pc: &superzej_core::config::EnvProviderConfig,
-) -> Option<superzej_svc::provider::Provider> {
-    provider_for_named(pc, &pc.id)
-}
-
-/// Like [`provider_for`] but bakes an explicit sandbox **name** into the provider
-/// instead of the raw configured `pc.id`. This matters for `create()`/
-/// `ensure_exists()`, which name the new sandbox from the provider's own baked
-/// name (not a call argument): the raw `pc.id` may be a per-worktree template
-/// (`{worktree}`) or empty, so the caller must pass the resolved
-/// [`effective_provider_id`](superzej_core::envbuild::effective_provider_id) to
-/// create the correctly-named sandbox. Exec/read/write/destroy take the id as an
-/// argument, so for those `provider_for` is equivalent.
-pub(crate) fn provider_for_named(
-    pc: &superzej_core::config::EnvProviderConfig,
-    name: &str,
-) -> Option<superzej_svc::provider::Provider> {
-    use superzej_svc::provider::{DaytonaProvider, Provider, SpritesProvider};
-    match pc.provider.as_str() {
-        "sprites" => {
-            let key = if pc.api_key_env.trim().is_empty() {
-                "SPRITES_TOKEN"
-            } else {
-                pc.api_key_env.trim()
-            };
-            let token = std::env::var(key).ok()?;
-            Some(Provider::Sprites(SpritesProvider::new(
-                &pc.api_base,
-                &token,
-                name,
-            )))
-        }
-        "daytona" => {
-            let token = std::env::var(pc.api_key_env.trim()).ok()?;
-            Some(Provider::Daytona(DaytonaProvider::new(
-                &pc.api_base,
-                &token,
-                &pc.template,
-            )))
-        }
-        _ => None,
-    }
-}
+// Provider construction lives in `provider_factory.rs` (extracted for the
+// file-size ratchet); re-exported so call sites are unchanged.
+pub(crate) use crate::provider_factory::{provider_for, provider_for_named};
 
 /// The resolved provider sandbox NAME for a worktree's env — the single source of
 /// truth. Resolves the env exactly as the pane path does (`resolve_env` →
@@ -1454,7 +1410,9 @@ pub fn provision_provider_env_named(
             }
         },
         allow_nix: true,
-        checkpoint: pc.auto_checkpoint,
+        // Only providers that CAN checkpoint get the plan step (a VPS has no
+        // suspend — its "checkpoint" analog is the baked image, not a step).
+        checkpoint: pc.auto_checkpoint && provider.caps().checkpoints,
         // Provisioning speedups (all no-ops unless configured).
         nix_installer: pc.nix_installer,
         nix_parallel: pc.nix_parallel(),
