@@ -7013,6 +7013,13 @@ fn attach_agent_pane(
 ///
 /// Notifications (`session/update`) are handled by the caller against the
 /// rendered model; this services only requests that need a reply.
+/// Session-scoped bouncer remember-choice store: `(worktree, kind) -> allow`,
+/// shared between the loop (writer, on an "always" pick) and the off-loop gate
+/// tasks (readers, for the auto-resolve fast path).
+type AcpRemember = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<(String, crate::bouncer::ApprovalKind), bool>>,
+>;
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_acp_inbound(
     wt: &str,
@@ -7026,6 +7033,7 @@ fn dispatch_acp_inbound(
     approval_tx: &tokio_mpsc::UnboundedSender<
         crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>,
     >,
+    remember: &AcpRemember,
     waker: &TerminalWaker,
 ) {
     use superzej_svc::acp::client::AcpInbound;
@@ -7066,6 +7074,7 @@ fn dispatch_acp_inbound(
                 let wt = wt.to_string();
                 let cfg = cfg.clone();
                 let approval_tx = approval_tx.clone();
+                let remember = remember.clone();
                 let waker = waker.clone();
                 tokio::spawn(async move {
                     if !gate_approval(
@@ -7074,6 +7083,7 @@ fn dispatch_acp_inbound(
                         crate::bouncer::ApprovalKind::Shell,
                         command.clone(),
                         &approval_tx,
+                        &remember,
                         &waker,
                     )
                     .await
@@ -7107,6 +7117,7 @@ fn dispatch_acp_inbound(
             if let Some(client) = client {
                 let wt = wt.to_string();
                 let approval_tx = approval_tx.clone();
+                let remember = remember.clone();
                 let waker = waker.clone();
                 tokio::spawn(async move {
                     if !gate_approval(
@@ -7115,6 +7126,7 @@ fn dispatch_acp_inbound(
                         crate::bouncer::ApprovalKind::Write,
                         path.clone(),
                         &approval_tx,
+                        &remember,
                         &waker,
                     )
                     .await
@@ -7137,6 +7149,7 @@ fn dispatch_acp_inbound(
             if let Some(client) = client {
                 let wt = wt.to_string();
                 let approval_tx = approval_tx.clone();
+                let remember = remember.clone();
                 let waker = waker.clone();
                 tokio::spawn(async move {
                     if !gate_approval(
@@ -7145,6 +7158,7 @@ fn dispatch_acp_inbound(
                         crate::bouncer::ApprovalKind::Edit,
                         path.clone(),
                         &approval_tx,
+                        &remember,
                         &waker,
                     )
                     .await
@@ -7245,6 +7259,9 @@ fn approval_overlay<R>(req: &crate::bouncer::ApprovalRequest<R>) -> MenuOverlay 
 /// mode only). Sends an `ApprovalRequest` to the loop, pulses the waker so the
 /// overlay is raised, and awaits the user's decision. Returns `true` to proceed;
 /// a deny — or a gone loop — returns `false`. A no-op (`true`) when not gating.
+///
+/// A prior "always" pick for this `(worktree, kind)` short-circuits the overlay:
+/// the remembered decision is returned immediately without prompting.
 async fn gate_approval(
     bouncer: bool,
     wt: &str,
@@ -7253,10 +7270,20 @@ async fn gate_approval(
     approval_tx: &tokio_mpsc::UnboundedSender<
         crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>,
     >,
+    remember: &AcpRemember,
     waker: &TerminalWaker,
 ) -> bool {
     if !bouncer {
         return true;
+    }
+    // Fast path: a remembered "always" decision auto-resolves without prompting.
+    // Copy out under the lock (never held across the await below).
+    if let Some(allow) = remember
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&(wt.to_string(), kind)).copied())
+    {
+        return allow;
     }
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     if approval_tx
@@ -8242,6 +8269,13 @@ async fn event_loop<T: Terminal>(
     let (acp_approval_tx, mut acp_approval_rx) = tokio_mpsc::unbounded_channel::<AcpApproval>();
     let mut acp_approvals: crate::bouncer::ApprovalQueue<tokio::sync::oneshot::Sender<bool>> =
         crate::bouncer::ApprovalQueue::new();
+    // Session-scoped remember-choice store for the bouncer gate: an "always"
+    // pick records `(worktree, kind) -> allow` here, and the gate task consults
+    // it (off-loop) to auto-resolve matching calls without re-prompting. Shared
+    // with the gate tasks; the loop only ever writes it (on an "always" pick).
+    let acp_remember: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<(String, crate::bouncer::ApprovalKind), bool>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     // The resurrected session restored each tab's tree with pane ids the
     // PREVIOUS process allocated (numbered from 1). This process's `next_id`
@@ -10589,6 +10623,7 @@ async fn event_loop<T: Terminal>(
                         keymap.config(),
                         &event_bus,
                         &acp_approval_tx,
+                        &acp_remember,
                         &waker,
                     );
                 }
@@ -13589,10 +13624,17 @@ async fn event_loop<T: Terminal>(
                             active_menu = None;
                             // Bouncer gate: send the user's allow/deny to the
                             // waiting tool-servicing task, then raise the next
-                            // queued approval (if any).
-                            if let menu::MenuChoice::ApproveTool { allow } = choice {
+                            // queued approval (if any). An "always" pick is also
+                            // remembered for this worktree + action so future
+                            // same-kind calls auto-resolve at the gate.
+                            if let menu::MenuChoice::ApproveTool { decision } = choice {
                                 if let Some(done) = acp_approvals.resolve() {
-                                    let _ = done.reply.send(allow);
+                                    if let Some(allow) = decision.remembered()
+                                        && let Ok(mut m) = acp_remember.lock()
+                                    {
+                                        m.insert((done.worktree.clone(), done.kind), allow);
+                                    }
+                                    let _ = done.reply.send(decision.allowed());
                                 }
                                 active_menu = acp_approvals.active().map(approval_overlay);
                                 dirty = true;
