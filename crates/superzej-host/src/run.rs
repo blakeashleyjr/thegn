@@ -1962,6 +1962,19 @@ impl SidebarState {
         SidebarOutcome::Redraw
     }
 
+    /// Drop out of the Wide expand back to the resting width (mirrors the
+    /// panel's Esc collapse). Returns whether anything changed so the caller can
+    /// gate a relayout. Persists "0" so an unfocused bar doesn't re-expand on
+    /// restart, matching [`adjust_width`]'s "drops out of Wide + sticks" rule.
+    fn collapse_wide(&mut self) -> bool {
+        if !self.expanded {
+            return false;
+        }
+        self.expanded = false;
+        self.persist("sidebar_expanded", "0");
+        true
+    }
+
     fn adjust_width(&mut self, delta: i32) -> SidebarOutcome {
         // A fine nudge drops out of Wide so the change is visible and sticks.
         if self.expanded {
@@ -8089,19 +8102,29 @@ async fn event_loop<T: Terminal>(
     // Sync-panes (item 96): when true, typed input is broadcast to every pane in
     // the focused tab (tmux `synchronize-panes`).
     let mut sync_panes = false;
-    let mut chrome = compute_chrome(
-        cols,
-        rows,
-        want_sidebar,
-        want_panel,
-        panel_forced,
-        panel_width,
-        sidebar_cols,
-        zoom,
-        &supervisor,
-        drawer_rows,
-        drawer_full,
-    );
+    // Every chrome recompute funnels through the same 11 loop-owned locals
+    // (window size, want_sidebar/panel, forced/width flags, zoom, pins, drawer
+    // geometry). This macro captures them by def-site scope — same pattern as
+    // `kick_model_hydration!` below — so each call site is one line instead of a
+    // 12-line argument block, and there's a single place to keep the arg list.
+    macro_rules! recompute_chrome {
+        () => {
+            compute_chrome(
+                cols,
+                rows,
+                want_sidebar,
+                want_panel,
+                panel_forced,
+                panel_width,
+                sidebar_cols,
+                zoom,
+                &supervisor,
+                drawer_rows,
+                drawer_full,
+            )
+        };
+    }
+    let mut chrome = recompute_chrome!();
     sb.rebuild(&mut model, &session);
     // Loop-owned perf tally (wakes, renders, per-source drains, render latency).
     // Lock-free; every mutator is a no-op unless `SUPERZEJ_PERF`/`szhost::perf`
@@ -8484,19 +8507,7 @@ async fn event_loop<T: Terminal>(
             );
         }
         if supervisor.has_strip_panes() {
-            chrome = compute_chrome(
-                cols,
-                rows,
-                want_sidebar,
-                want_panel,
-                panel_forced,
-                panel_width,
-                sidebar_cols,
-                zoom,
-                &supervisor,
-                drawer_rows,
-                drawer_full,
-            );
+            chrome = recompute_chrome!();
             need_relayout = true;
         }
         persist_pin_state(&supervisor, &session.id);
@@ -8583,19 +8594,7 @@ async fn event_loop<T: Terminal>(
         if new_drawer_rows != drawer_rows || new_drawer_full != drawer_full {
             drawer_rows = new_drawer_rows;
             drawer_full = new_drawer_full;
-            chrome = compute_chrome(
-                cols,
-                rows,
-                want_sidebar,
-                want_panel,
-                panel_forced,
-                panel_width,
-                sidebar_cols,
-                zoom,
-                &supervisor,
-                drawer_rows,
-                drawer_full,
-            );
+            chrome = recompute_chrome!();
             need_relayout = true;
             full_repaint = true;
             dirty = true;
@@ -8616,19 +8615,7 @@ async fn event_loop<T: Terminal>(
             if let Some((w, f)) = panel_auto_revealed.take() {
                 want_panel = w;
                 panel_forced = f;
-                chrome = compute_chrome(
-                    cols,
-                    rows,
-                    want_sidebar,
-                    want_panel,
-                    panel_forced,
-                    panel_width,
-                    sidebar_cols,
-                    zoom,
-                    &supervisor,
-                    drawer_rows,
-                    drawer_full,
-                );
+                chrome = recompute_chrome!();
                 need_relayout = true;
                 dirty = true;
             }
@@ -8648,19 +8635,7 @@ async fn event_loop<T: Terminal>(
         {
             // Navigating to another zone un-zooms.
             zoom = None;
-            chrome = compute_chrome(
-                cols,
-                rows,
-                want_sidebar,
-                want_panel,
-                panel_forced,
-                panel_width,
-                sidebar_cols,
-                zoom,
-                &supervisor,
-                drawer_rows,
-                drawer_full,
-            );
+            chrome = recompute_chrome!();
             need_relayout = true;
             dirty = true;
         }
@@ -8965,19 +8940,7 @@ async fn event_loop<T: Terminal>(
         {
             rows = size.rows;
             cols = size.cols;
-            chrome = compute_chrome(
-                cols,
-                rows,
-                want_sidebar,
-                want_panel,
-                panel_forced,
-                panel_width,
-                sidebar_cols,
-                zoom,
-                &supervisor,
-                drawer_rows,
-                drawer_full,
-            );
+            chrome = recompute_chrome!();
             need_relayout = true;
             buf.resize(cols, rows);
             // The physical screen content is untrustworthy after a resize —
@@ -9157,19 +9120,7 @@ async fn event_loop<T: Terminal>(
         // retracts.
         if panel_ui.width != panel_width {
             panel_width = panel_ui.width;
-            chrome = compute_chrome(
-                cols,
-                rows,
-                want_sidebar,
-                want_panel,
-                panel_forced,
-                panel_width,
-                sidebar_cols,
-                zoom,
-                &supervisor,
-                drawer_rows,
-                drawer_full,
-            );
+            chrome = recompute_chrome!();
             need_relayout = true;
             dirty = true;
             // A width change is a large geometry change (Full claims/relinquishes
@@ -9178,6 +9129,20 @@ async fn event_loop<T: Terminal>(
             // panel never properly refreshes — so reset the baseline and redraw
             // it whole. The momentary flash is fine for an explicit keypress.
             full_repaint = true;
+        }
+        // Sidebar analogue of the panel-width reconciliation above: when the
+        // effective width shifts (Wide expand toggled/collapsed, `<`/`>` nudge),
+        // recompute the chrome so the bar snaps to its new width before relayout.
+        // This is what lets Esc-collapse take visual effect, exactly like the
+        // panel. (Mode flips that also toggle `want_sidebar` recompute inline.)
+        if want_sidebar {
+            let want_cols = sb.effective_cols(cols);
+            if want_cols != sidebar_cols {
+                sidebar_cols = want_cols;
+                chrome = recompute_chrome!();
+                need_relayout = true;
+                dirty = true;
+            }
         }
 
         if need_relayout {
@@ -14667,19 +14632,7 @@ async fn event_loop<T: Terminal>(
                                     ) {
                                         model.status = s;
                                     }
-                                    chrome = compute_chrome(
-                                        cols,
-                                        rows,
-                                        want_sidebar,
-                                        want_panel,
-                                        panel_forced,
-                                        panel_width,
-                                        sidebar_cols,
-                                        zoom,
-                                        &supervisor,
-                                        drawer_rows,
-                                        drawer_full,
-                                    );
+                                    chrome = recompute_chrome!();
                                     need_relayout = true;
                                 } else if let Some(issue_id) = key.strip_prefix("issue:") {
                                     // Link the issue to the current worktree and
@@ -14705,19 +14658,7 @@ async fn event_loop<T: Terminal>(
                                     model.status = format!("Linked {issue_id} to this worktree");
                                 } else if key == "toggle-strip" {
                                     supervisor.toggle_strip();
-                                    chrome = compute_chrome(
-                                        cols,
-                                        rows,
-                                        want_sidebar,
-                                        want_panel,
-                                        panel_forced,
-                                        panel_width,
-                                        sidebar_cols,
-                                        zoom,
-                                        &supervisor,
-                                        drawer_rows,
-                                        drawer_full,
-                                    );
+                                    chrome = recompute_chrome!();
                                     need_relayout = true;
                                 } else if let Some(id) = key.strip_prefix("media-playlist:") {
                                     // Activate the chosen playlist off-thread.
@@ -14960,6 +14901,12 @@ async fn event_loop<T: Terminal>(
                                 &mut panes,
                                 keymap.config(),
                             );
+                            // Collapse the Wide expand too (the sidebar analogue
+                            // of the panel width reset in escape_to_center); the
+                            // width reconciliation repaints it.
+                            if keymap.config().panel.collapse_on_escape {
+                                need_relayout |= sb.collapse_wide();
+                            }
                             sb.focused = false;
                             sb.menu = None;
                             sb.sync(&mut model);
@@ -14967,20 +14914,8 @@ async fn event_loop<T: Terminal>(
                             continue;
                         }
                         SidebarOutcome::Relayout => {
-                            sidebar_cols = sb.effective_cols(cols);
-                            chrome = compute_chrome(
-                                cols,
-                                rows,
-                                want_sidebar,
-                                want_panel,
-                                panel_forced,
-                                panel_width,
-                                sidebar_cols,
-                                zoom,
-                                &supervisor,
-                                drawer_rows,
-                                drawer_full,
-                            );
+                            // Width recompute is handled by the reconciliation
+                            // block before the relayout gate.
                             need_relayout = true;
                             dirty = true;
                             continue;
@@ -17774,19 +17709,7 @@ async fn event_loop<T: Terminal>(
                                 want_sidebar = sb.mode != crate::layout::SidebarMode::Hidden;
                                 sidebar_cols = sb.effective_cols(cols);
                                 sb.persist("sidebar_mode", sb.mode.as_key());
-                                chrome = compute_chrome(
-                                    cols,
-                                    rows,
-                                    want_sidebar,
-                                    want_panel,
-                                    panel_forced,
-                                    panel_width,
-                                    sidebar_cols,
-                                    zoom,
-                                    &supervisor,
-                                    drawer_rows,
-                                    drawer_full,
-                                );
+                                chrome = recompute_chrome!();
                                 // Only the Hidden leg surrenders keyboard focus.
                                 if !want_sidebar && focus.sidebar() {
                                     focus.zone = crate::focus::Zone::Center;
@@ -17824,19 +17747,7 @@ async fn event_loop<T: Terminal>(
                                     want_panel = true;
                                     panel_forced = cols < layout::PANEL_MIN_COLS;
                                 }
-                                chrome = compute_chrome(
-                                    cols,
-                                    rows,
-                                    want_sidebar,
-                                    want_panel,
-                                    panel_forced,
-                                    panel_width,
-                                    sidebar_cols,
-                                    zoom,
-                                    &supervisor,
-                                    drawer_rows,
-                                    drawer_full,
-                                );
+                                chrome = recompute_chrome!();
                                 if !want_panel && focus.panel() {
                                     focus.zone = crate::focus::Zone::Center;
                                 }
@@ -17850,19 +17761,7 @@ async fn event_loop<T: Terminal>(
                                     sb.persist("sidebar_mode", sb.mode.as_key());
                                     want_sidebar = true;
                                     sidebar_cols = sb.effective_cols(cols);
-                                    chrome = compute_chrome(
-                                        cols,
-                                        rows,
-                                        want_sidebar,
-                                        want_panel,
-                                        panel_forced,
-                                        panel_width,
-                                        sidebar_cols,
-                                        zoom,
-                                        &supervisor,
-                                        drawer_rows,
-                                        drawer_full,
-                                    );
+                                    chrome = recompute_chrome!();
                                     need_relayout = true;
                                 }
                                 // Take keyboard focus, land on the active worktree.
@@ -17877,19 +17776,7 @@ async fn event_loop<T: Terminal>(
                                     // forcing past the width threshold.
                                     want_panel = true;
                                     panel_forced = cols < layout::PANEL_MIN_COLS;
-                                    chrome = compute_chrome(
-                                        cols,
-                                        rows,
-                                        want_sidebar,
-                                        want_panel,
-                                        panel_forced,
-                                        panel_width,
-                                        sidebar_cols,
-                                        zoom,
-                                        &supervisor,
-                                        drawer_rows,
-                                        drawer_full,
-                                    );
+                                    chrome = recompute_chrome!();
                                     need_relayout = true;
                                 }
                                 focus.zone = crate::focus::Zone::Panel;
@@ -17906,19 +17793,7 @@ async fn event_loop<T: Terminal>(
                                     if chrome.panel.is_none() {
                                         want_panel = true;
                                         panel_forced = cols < layout::PANEL_MIN_COLS;
-                                        chrome = compute_chrome(
-                                            cols,
-                                            rows,
-                                            want_sidebar,
-                                            want_panel,
-                                            panel_forced,
-                                            panel_width,
-                                            sidebar_cols,
-                                            zoom,
-                                            &supervisor,
-                                            drawer_rows,
-                                            drawer_full,
-                                        );
+                                        chrome = recompute_chrome!();
                                         need_relayout = true;
                                     }
                                     panel_ui.switch_tab(crate::panel::PanelTab::System);
@@ -17943,19 +17818,7 @@ async fn event_loop<T: Terminal>(
                                 if chrome.panel.is_none() {
                                     want_panel = true;
                                     panel_forced = cols < layout::PANEL_MIN_COLS;
-                                    chrome = compute_chrome(
-                                        cols,
-                                        rows,
-                                        want_sidebar,
-                                        want_panel,
-                                        panel_forced,
-                                        panel_width,
-                                        sidebar_cols,
-                                        zoom,
-                                        &supervisor,
-                                        drawer_rows,
-                                        drawer_full,
-                                    );
+                                    chrome = recompute_chrome!();
                                     need_relayout = true;
                                 }
                                 panel_ui.switch_tab(crate::panel::PanelTab::Work);
@@ -17979,19 +17842,7 @@ async fn event_loop<T: Terminal>(
                                 if chrome.panel.is_none() {
                                     want_panel = true;
                                     panel_forced = cols < layout::PANEL_MIN_COLS;
-                                    chrome = compute_chrome(
-                                        cols,
-                                        rows,
-                                        want_sidebar,
-                                        want_panel,
-                                        panel_forced,
-                                        panel_width,
-                                        sidebar_cols,
-                                        zoom,
-                                        &supervisor,
-                                        drawer_rows,
-                                        drawer_full,
-                                    );
+                                    chrome = recompute_chrome!();
                                     need_relayout = true;
                                 }
                                 panel_ui.switch_tab(crate::panel::PanelTab::Work);
@@ -18050,19 +17901,7 @@ async fn event_loop<T: Terminal>(
                                 if chrome.panel.is_none() {
                                     want_panel = true;
                                     panel_forced = cols < layout::PANEL_MIN_COLS;
-                                    chrome = compute_chrome(
-                                        cols,
-                                        rows,
-                                        want_sidebar,
-                                        want_panel,
-                                        panel_forced,
-                                        panel_width,
-                                        sidebar_cols,
-                                        zoom,
-                                        &supervisor,
-                                        drawer_rows,
-                                        drawer_full,
-                                    );
+                                    chrome = recompute_chrome!();
                                     need_relayout = true;
                                 }
                                 panel_ui.switch_tab(crate::panel::PanelTab::System);
@@ -18668,19 +18507,7 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     String::new()
                                 };
-                                chrome = compute_chrome(
-                                    cols,
-                                    rows,
-                                    want_sidebar,
-                                    want_panel,
-                                    panel_forced,
-                                    panel_width,
-                                    sidebar_cols,
-                                    zoom,
-                                    &supervisor,
-                                    drawer_rows,
-                                    drawer_full,
-                                );
+                                chrome = recompute_chrome!();
                                 need_relayout = true;
                             }
                             Action::ToggleSyncPanes => {
@@ -18972,19 +18799,7 @@ async fn event_loop<T: Terminal>(
                                                     Some((want_panel, panel_forced));
                                                 want_panel = true;
                                                 panel_forced = cols < layout::PANEL_MIN_COLS;
-                                                chrome = compute_chrome(
-                                                    cols,
-                                                    rows,
-                                                    want_sidebar,
-                                                    want_panel,
-                                                    panel_forced,
-                                                    panel_width,
-                                                    sidebar_cols,
-                                                    zoom,
-                                                    &supervisor,
-                                                    drawer_rows,
-                                                    drawer_full,
-                                                );
+                                                chrome = recompute_chrome!();
                                                 need_relayout = true;
                                                 focus.zone = Zone::Panel;
                                             }
@@ -19512,36 +19327,12 @@ async fn event_loop<T: Terminal>(
                                     model.status = s;
                                 }
                                 persist_pin_state(&supervisor, &session.id);
-                                chrome = compute_chrome(
-                                    cols,
-                                    rows,
-                                    want_sidebar,
-                                    want_panel,
-                                    panel_forced,
-                                    panel_width,
-                                    sidebar_cols,
-                                    zoom,
-                                    &supervisor,
-                                    drawer_rows,
-                                    drawer_full,
-                                );
+                                chrome = recompute_chrome!();
                                 need_relayout = true;
                             }
                             Action::ToggleStrip => {
                                 supervisor.toggle_strip();
-                                chrome = compute_chrome(
-                                    cols,
-                                    rows,
-                                    want_sidebar,
-                                    want_panel,
-                                    panel_forced,
-                                    panel_width,
-                                    sidebar_cols,
-                                    zoom,
-                                    &supervisor,
-                                    drawer_rows,
-                                    drawer_full,
-                                );
+                                chrome = recompute_chrome!();
                                 need_relayout = true;
                             }
                             Action::GrowStrip | Action::ShrinkStrip => {
@@ -19551,19 +19342,7 @@ async fn event_loop<T: Terminal>(
                                     -0.05
                                 };
                                 supervisor.adjust_ratio(delta);
-                                chrome = compute_chrome(
-                                    cols,
-                                    rows,
-                                    want_sidebar,
-                                    want_panel,
-                                    panel_forced,
-                                    panel_width,
-                                    sidebar_cols,
-                                    zoom,
-                                    &supervisor,
-                                    drawer_rows,
-                                    drawer_full,
-                                );
+                                chrome = recompute_chrome!();
                                 need_relayout = true;
                             }
                             Action::PromotePin => {
@@ -19592,19 +19371,7 @@ async fn event_loop<T: Terminal>(
                                     );
                                     model.status = format!("Promoted pane to strip: {label}");
                                     persist_pin_state(&supervisor, &session.id);
-                                    chrome = compute_chrome(
-                                        cols,
-                                        rows,
-                                        want_sidebar,
-                                        want_panel,
-                                        panel_forced,
-                                        panel_width,
-                                        sidebar_cols,
-                                        zoom,
-                                        &supervisor,
-                                        drawer_rows,
-                                        drawer_full,
-                                    );
+                                    chrome = recompute_chrome!();
                                     need_relayout = true;
                                 } else {
                                     model.status =
@@ -19630,19 +19397,7 @@ async fn event_loop<T: Terminal>(
                                     }
                                     model.status = format!("Unpinned {name}");
                                     persist_pin_state(&supervisor, &session.id);
-                                    chrome = compute_chrome(
-                                        cols,
-                                        rows,
-                                        want_sidebar,
-                                        want_panel,
-                                        panel_forced,
-                                        panel_width,
-                                        sidebar_cols,
-                                        zoom,
-                                        &supervisor,
-                                        drawer_rows,
-                                        drawer_full,
-                                    );
+                                    chrome = recompute_chrome!();
                                     need_relayout = true;
                                 } else {
                                     model.status = "Unpin: no live pin".into();
@@ -19917,19 +19672,7 @@ async fn event_loop<T: Terminal>(
                 cols = c;
                 // A Wide sidebar tracks the new window width.
                 sidebar_cols = sb.effective_cols(cols);
-                chrome = compute_chrome(
-                    cols,
-                    rows,
-                    want_sidebar,
-                    want_panel,
-                    panel_forced,
-                    panel_width,
-                    sidebar_cols,
-                    zoom,
-                    &supervisor,
-                    drawer_rows,
-                    drawer_full,
-                );
+                chrome = recompute_chrome!();
                 need_relayout = true;
                 buf.resize(cols, rows);
                 let _ = buf
