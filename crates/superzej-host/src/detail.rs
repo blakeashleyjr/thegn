@@ -1175,22 +1175,52 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
             ))
         }
         BarBadge::DiskWarn => {
-            let total: u64 = model
+            use superzej_core::disk::human;
+            let ic = &model.stats_icons;
+            // Free-% → tone, matching the badge (red ≤ critical, amber ≤ warn).
+            let free_tone = |pct: u8| {
+                if pct <= ic.disk_free_critical {
+                    Tok::Hue(Hue::Red)
+                } else if pct <= ic.disk_free_warn {
+                    Tok::Hue(Hue::Amber)
+                } else {
+                    Tok::Slot(S::Text)
+                }
+            };
+            // Worktree usage on this fs + the regenerable `target/` share.
+            let (wt_total, wt_target) = model
                 .sidebar_status
                 .disk_sizes
                 .values()
-                .map(|&(t, _)| t.max(0) as u64)
-                .sum();
-            Some(keyval(
-                "Worktree disk usage",
-                vec![(
-                    "total".into(),
-                    superzej_core::disk::human(total),
-                    Tok::Hue(Hue::Amber),
-                )],
-                40,
-                near,
-            ))
+                .fold((0u64, 0u64), |(t, g), &(total, target)| {
+                    (t + total.max(0) as u64, g + target.max(0) as u64)
+                });
+            let mut pairs: Vec<(String, String, Tok)> = Vec::new();
+            match (model.stats.disk_bytes, model.stats.disk_free_pct) {
+                (Some((total, avail)), pct_opt) => {
+                    let pct = pct_opt.unwrap_or(0);
+                    pairs.push((
+                        "free".into(),
+                        format!("{} ({pct}%)", human(avail)),
+                        free_tone(pct),
+                    ));
+                    pairs.push((
+                        "used".into(),
+                        human(total.saturating_sub(avail)),
+                        Tok::Slot(S::Dim),
+                    ));
+                    pairs.push(("total".into(), human(total), Tok::Slot(S::Dim)));
+                }
+                (None, Some(pct)) => {
+                    pairs.push(("free".into(), format!("{pct}%"), free_tone(pct)));
+                }
+                (None, None) => {}
+            }
+            pairs.push(("worktrees".into(), human(wt_total), Tok::Slot(S::Dim)));
+            if wt_target > 0 {
+                pairs.push(("reclaimable".into(), human(wt_target), Tok::Slot(S::Dim)));
+            }
+            Some(keyval("Disk space", pairs, 44, near))
         }
         BarBadge::Zoom => Some(keyval(
             "Zoom",
@@ -1337,6 +1367,44 @@ mod tests {
                 assert!(!l.empty_hint.is_empty());
             }
             _ => panic!("expected a list"),
+        }
+    }
+
+    #[test]
+    fn disk_badge_shows_free_used_total_and_worktree_rows() {
+        let mut model = FrameModel::default();
+        let gib = 1024u64 * 1024 * 1024;
+        model.stats.disk_free_pct = Some(8);
+        model.stats.disk_bytes = Some((100 * gib, 8 * gib)); // 100G total, 8G free
+        let mut sizes = std::collections::HashMap::new();
+        sizes.insert("/wt/a".to_string(), ((40 * gib) as i64, (30 * gib) as i64));
+        model.sidebar_status = crate::sidebar::SidebarStatus {
+            disk_sizes: sizes,
+            ..Default::default()
+        };
+        let ov = open_detail_for(
+            &BarItemId::Badge(BarBadge::DiskWarn),
+            item_at(39),
+            screen(),
+            &model,
+            &TelemetryHistory::default(),
+        )
+        .expect("disk badge opens a modal");
+        assert_eq!(ov.title, "Disk space");
+        match ov.content {
+            DetailContent::KeyVal(kv) => {
+                let keys: Vec<&str> = kv.pairs.iter().map(|(k, _, _)| k.as_str()).collect();
+                assert_eq!(keys, ["free", "used", "total", "worktrees", "reclaimable"]);
+                let free = &kv.pairs[0];
+                assert!(free.1.contains("8%"), "free row shows %: {:?}", free.1);
+                assert!(free.1.contains("8GB"), "free row shows bytes: {:?}", free.1);
+                // 8% ≤ critical (10) → red.
+                assert_eq!(free.2, Tok::Hue(Hue::Red));
+                assert_eq!(kv.pairs[2].1, "100GB", "total bytes");
+                assert_eq!(kv.pairs[3].1, "40GB", "worktree usage sum");
+                assert_eq!(kv.pairs[4].1, "30GB", "reclaimable target/ sum");
+            }
+            _ => panic!("expected a keyval"),
         }
     }
 
