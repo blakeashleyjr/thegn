@@ -101,11 +101,23 @@ pub struct KeyValDetail {
     pub pairs: Vec<(String, String, Tok)>,
 }
 
+/// A tokei-style aligned table: a dim header row, right-aligned numeric body
+/// rows (scrollable), and a bold `Total` footer. Column 0 is left-aligned
+/// (labels); every other column is right-aligned (counts). Non-actionable —
+/// scroll only. Cells are pre-formatted strings; widths are computed by display
+/// width at render time.
+pub struct TableDetail {
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub total: Vec<String>,
+}
+
 /// What a detail overlay shows.
 pub enum DetailContent {
     Graph(GraphDetail),
     List(ListDetail),
     KeyVal(KeyValDetail),
+    Table(TableDetail),
 }
 
 /// Where the box sits relative to the originating bar item.
@@ -172,10 +184,12 @@ pub enum DetailOutcome {
 }
 
 impl DetailOverlay {
-    /// Total rows in a list (0 for non-list content), for scroll clamping.
-    fn list_len(&self) -> usize {
+    /// Total scrollable rows (list rows or table body rows; 0 otherwise), for
+    /// scroll clamping.
+    fn content_len(&self) -> usize {
         match &self.content {
             DetailContent::List(l) => l.rows.len(),
+            DetailContent::Table(t) => t.rows.len(),
             _ => 0,
         }
     }
@@ -234,7 +248,7 @@ impl DetailOverlay {
             return DetailOutcome::Close;
         }
         let actionable = self.actionable();
-        let max = self.list_len().saturating_sub(1);
+        let max = self.content_len().saturating_sub(1);
         match key {
             KeyCode::Char('q') => DetailOutcome::Close,
             KeyCode::Enter => {
@@ -319,6 +333,7 @@ impl DetailOverlay {
                 render_list(surface, inner, l, self.scroll, sel, self.hint.as_deref());
             }
             DetailContent::KeyVal(kv) => render_keyval(surface, inner, kv),
+            DetailContent::Table(t) => render_table(surface, inner, t, self.scroll),
         }
     }
 }
@@ -467,6 +482,88 @@ fn render_keyval(surface: &mut Surface, inner: Rect, kv: &KeyValDetail) {
     }
 }
 
+/// Per-column max display width over the header, every body row, and the total.
+fn table_widths(t: &TableDetail) -> Vec<usize> {
+    use unicode_width::UnicodeWidthStr;
+    let mut w = vec![0usize; t.headers.len()];
+    let all = std::iter::once(&t.headers)
+        .chain(t.rows.iter())
+        .chain(std::iter::once(&t.total));
+    for cells in all {
+        for (i, c) in cells.iter().enumerate() {
+            if let Some(slot) = w.get_mut(i) {
+                *slot = (*slot).max(c.width());
+            }
+        }
+    }
+    w
+}
+
+/// Join a row's cells into a single line: column 0 left-aligned (labels), the
+/// rest right-aligned (counts), a two-space gutter between columns. Padding is
+/// display-width aware.
+fn table_line(cells: &[String], widths: &[usize]) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let mut out = String::new();
+    for (i, cell) in cells.iter().enumerate() {
+        let w = widths.get(i).copied().unwrap_or_else(|| cell.width());
+        let pad = w.saturating_sub(cell.width());
+        if i > 0 {
+            out.push_str("  ");
+        }
+        if i == 0 {
+            out.push_str(cell);
+            out.push_str(&" ".repeat(pad));
+        } else {
+            out.push_str(&" ".repeat(pad));
+            out.push_str(cell);
+        }
+    }
+    out
+}
+
+/// A tokei-style table: dim header, scrollable body, bold `Total` footer.
+fn render_table(surface: &mut Surface, inner: Rect, t: &TableDetail, scroll: usize) {
+    let widths = table_widths(t);
+    // Header (row 0) and Total footer (last row) are fixed; the body scrolls
+    // between them.
+    seg::draw_line(
+        surface,
+        inner.x,
+        inner.y,
+        inner.cols,
+        &Line::segs(vec![seg(
+            Tok::Slot(S::Dim),
+            table_line(&t.headers, &widths),
+        )]),
+        panel(),
+    );
+    let body_rows = inner.rows.saturating_sub(2);
+    let scroll = scroll.min(t.rows.len().saturating_sub(1));
+    for (row, cells) in t.rows.iter().skip(scroll).take(body_rows).enumerate() {
+        seg::draw_line(
+            surface,
+            inner.x,
+            inner.y + 1 + row,
+            inner.cols,
+            &Line::segs(vec![seg(Tok::Slot(S::Text), table_line(cells, &widths))]),
+            panel(),
+        );
+    }
+    if inner.rows >= 2 {
+        seg::draw_line(
+            surface,
+            inner.x,
+            inner.y + inner.rows - 1,
+            inner.cols,
+            &Line::segs(vec![
+                seg(Tok::Slot(S::Text), table_line(&t.total, &widths)).bold(),
+            ]),
+            panel(),
+        );
+    }
+}
+
 // --- content builders -------------------------------------------------------
 
 /// min / avg / max of a 0..=1 series (empty → all zero).
@@ -544,6 +641,19 @@ fn keyval(
         cols,
         rows,
         placement,
+        scroll: 0,
+        sel: 0,
+        hint: None,
+    }
+}
+
+fn table(title: &str, t: TableDetail, cols: usize, height: usize) -> DetailOverlay {
+    DetailOverlay {
+        title: title.to_string(),
+        content: DetailContent::Table(t),
+        cols,
+        rows: height,
+        placement: Placement::Center,
         scroll: 0,
         sel: 0,
         hint: None,
@@ -768,12 +878,43 @@ fn widget_detail(
             Some(keyval("Disks", pairs, 48, Placement::Center))
         }
         "loc" => {
-            let n = model.loc?;
-            Some(keyval(
+            let r = model.loc.as_ref()?;
+            let headers = ["Language", "Files", "Lines", "Code", "Comments", "Blanks"]
+                .map(String::from)
+                .to_vec();
+            let rows: Vec<Vec<String>> = r
+                .langs
+                .iter()
+                .map(|l| {
+                    vec![
+                        l.name.clone(),
+                        l.files.to_string(),
+                        l.lines.to_string(),
+                        l.code.to_string(),
+                        l.comments.to_string(),
+                        l.blanks.to_string(),
+                    ]
+                })
+                .collect();
+            let total = vec![
+                "Total".into(),
+                r.total_files.to_string(),
+                r.total_lines.to_string(),
+                r.total_code.to_string(),
+                r.total_comments.to_string(),
+                r.total_blanks.to_string(),
+            ];
+            // header + N body rows + total, capped so the box stays on-screen.
+            let height = (r.langs.len() + 2).clamp(4, 18);
+            Some(table(
                 "Lines of code",
-                vec![("total".into(), format!("{n}"), Tok::Slot(S::Text))],
-                24,
-                near,
+                TableDetail {
+                    headers,
+                    rows,
+                    total,
+                },
+                58,
+                height,
             ))
         }
         "date" | "clock" => {
@@ -1163,7 +1304,7 @@ mod tests {
         let model = FrameModel::default(); // no gpu, no battery, no temp
         let hist = TelemetryHistory::default();
         for id in [
-            "gpu", "battery", "temp", "load", "swap", "freq", "uptime", "pr", "tests",
+            "gpu", "battery", "temp", "load", "swap", "freq", "uptime", "pr", "tests", "loc",
         ] {
             assert!(
                 open_detail_for(
@@ -1364,6 +1505,75 @@ mod tests {
             screen(),
             &model,
             &hist,
+        )
+        .unwrap();
+        let mut s = Surface::new(120, 40);
+        ov.render(&mut s, screen());
+        assert!(seg::text_contrast_violations(&mut s, 3.0).is_empty());
+    }
+
+    fn model_loc(n: usize) -> FrameModel {
+        use superzej_core::loc::{LocLang, LocReport};
+        let langs = (0..n)
+            .map(|i| LocLang {
+                name: format!("Lang{i:02}"),
+                files: i + 1,
+                lines: (i + 1) * 30,
+                code: (i + 1) * 20,
+                comments: (i + 1) * 6,
+                blanks: (i + 1) * 4,
+            })
+            .collect();
+        FrameModel {
+            loc: Some(LocReport::from_langs(langs)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn loc_opens_a_scrollable_tokei_table() {
+        let model = model_loc(20);
+        let mut ov = open_detail_for(
+            &BarItemId::Widget("loc".into()),
+            item_at(39),
+            screen(),
+            &model,
+            &TelemetryHistory::default(),
+        )
+        .expect("loc opens a detail overlay");
+        // A table (not a keyval), with the Total footer and the full header set.
+        let (headers, len) = match &ov.content {
+            DetailContent::Table(t) => {
+                assert_eq!(t.total[0], "Total");
+                assert_eq!(t.headers.len(), 6);
+                assert_eq!(t.headers[0], "Language");
+                (t.headers.clone(), t.rows.len())
+            }
+            _ => panic!("expected a table"),
+        };
+        assert_eq!(len, 20);
+        assert_eq!(headers[3], "Code");
+        // Non-actionable: j/k scroll and clamp at the last row; Enter closes.
+        assert!(!ov.actionable());
+        for _ in 0..50 {
+            ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+        }
+        assert_eq!(ov.scroll, len - 1);
+        assert_eq!(
+            ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            DetailOutcome::Close
+        );
+    }
+
+    #[test]
+    fn loc_table_renders_legibly() {
+        let model = model_loc(8);
+        let ov = open_detail_for(
+            &BarItemId::Widget("loc".into()),
+            item_at(39),
+            screen(),
+            &model,
+            &TelemetryHistory::default(),
         )
         .unwrap();
         let mut s = Surface::new(120, 40);

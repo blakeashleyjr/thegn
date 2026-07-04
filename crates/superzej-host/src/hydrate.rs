@@ -894,27 +894,24 @@ fn collect_sidebar_status(
 /// tokei line count for `path`, cached in `loc_cache` (hydration thread —
 /// tokei walks the whole tree). Stale cache (>5 min) refreshes in place;
 /// missing tokei yields `None` and the widget hides.
-fn worktree_loc(db: &superzej_core::db::Db, path: &std::path::Path) -> Option<u64> {
+fn worktree_loc(
+    db: &superzej_core::db::Db,
+    path: &std::path::Path,
+) -> Option<superzej_core::loc::LocReport> {
+    use superzej_core::loc::LocReport;
     const TTL_SECS: i64 = 300;
     let key = path.to_string_lossy().into_owned();
-    if let Ok(Some((loc, fetched_at))) = db.get_loc_cache_entry(&key)
+    if let Ok(Some((json, fetched_at))) = db.get_loc_cache_entry(&key)
         && now_secs() - fetched_at < TTL_SECS
+        && let Ok(report) = serde_json::from_str::<LocReport>(&json)
     {
-        return Some(loc as u64);
+        return Some(report);
     }
-
-    let mut languages = tokei::Languages::new();
-    let config = tokei::Config {
-        treat_doc_strings_as_comments: Some(true),
-        ..Default::default()
-    };
-    let paths = vec![path.to_path_buf()];
-
-    languages.get_statistics(&paths, &[], &config);
-    let code: usize = languages.values().map(|lang| lang.code).sum();
-
-    let _ = db.put_loc_cache(&key, code);
-    Some(code as u64)
+    let report = crate::loc_scan::scan(path);
+    if let Ok(json) = serde_json::to_string(&report) {
+        let _ = db.put_loc_cache(&key, report.total_code, &json);
+    }
+    Some(report)
 }
 
 /// A cheap first-frame model: no git, no diff, no DB recents. It gives the

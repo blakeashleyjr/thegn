@@ -396,7 +396,10 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Files => {
-            let loc = model.loc.map(compact_count);
+            let loc = model
+                .loc
+                .as_ref()
+                .map(|r| compact_count(r.total_code as u64));
             match (data.file_count, loc) {
                 (Some(n), Some(loc)) => vec![seg(g(), format!("{n} · {loc} loc"))],
                 (None, Some(loc)) => vec![seg(g(), format!("{loc} loc"))],

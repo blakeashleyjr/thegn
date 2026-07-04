@@ -61,7 +61,9 @@ use std::path::PathBuf;
 /// instead of a blank screen. Additive; absent/NULL on pre-v29 rows = no history.
 /// v30: adds `hosts` + `host_inventory` + `host_events` (hosts as first-class
 /// resources; see [`crate::host_db`]).
-const SCHEMA_VERSION: i64 = 30;
+/// v31: adds `loc_cache.report_json` (per-language tokei breakdown alongside the
+/// total; see [`crate::loc::LocReport`]).
+const SCHEMA_VERSION: i64 = 31;
 
 pub struct Db {
     conn: Connection,
@@ -262,6 +264,8 @@ impl Db {
         }
 
         let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN sandbox_backend TEXT", []);
+        // v31: per-language LOC report JSON alongside the total (idempotent).
+        let _ = conn.execute("ALTER TABLE loc_cache ADD COLUMN report_json TEXT", []);
 
         // One transaction for the whole schema: execute_batch otherwise
         // autocommits per statement — a dozen WAL commits where one will do.
@@ -327,9 +331,10 @@ impl Db {
               fetched_at INTEGER
             );
             CREATE TABLE IF NOT EXISTS loc_cache (
-              worktree   TEXT PRIMARY KEY,
-              loc        INTEGER,
-              fetched_at INTEGER
+              worktree    TEXT PRIMARY KEY,
+              loc         INTEGER,
+              report_json TEXT,
+              fetched_at  INTEGER
             );
             -- v20: per-worktree disk usage (bytes). `size_bytes` is the whole
             -- checkout, `target_bytes` the `target/` subtree. Populated by an
@@ -1750,38 +1755,27 @@ impl Db {
     }
 
     // --- LOC cache ---------------------------------------------------------
-    pub fn get_loc_cache(&self, worktree: &str) -> Result<Option<usize>> {
+    /// Cached report JSON + fetch timestamp; `None` if absent or pre-`report_json`.
+    pub fn get_loc_cache_entry(&self, worktree: &str) -> Result<Option<(String, i64)>> {
         let r = self
             .conn
             .query_row(
-                "SELECT loc FROM loc_cache WHERE worktree=?1",
+                "SELECT report_json, fetched_at FROM loc_cache \
+                 WHERE worktree=?1 AND report_json IS NOT NULL",
                 params![worktree],
-                // rusqlite 0.40 dropped the usize SQL impls; store/read as i64.
-                |r| r.get::<_, i64>(0).map(|n| n as usize),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
             .ok();
         Ok(r)
     }
 
-    /// As [`Db::get_loc_cache`], with the fetch timestamp (for TTL refresh).
-    pub fn get_loc_cache_entry(&self, worktree: &str) -> Result<Option<(usize, i64)>> {
-        let r = self
-            .conn
-            .query_row(
-                "SELECT loc, fetched_at FROM loc_cache WHERE worktree=?1",
-                params![worktree],
-                |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)?)),
-            )
-            .ok();
-        Ok(r)
-    }
-
-    pub fn put_loc_cache(&self, worktree: &str, loc: usize) -> Result<()> {
+    /// Cache the LOC report: `total` (the chip number, stored i64) + report JSON.
+    pub fn put_loc_cache(&self, worktree: &str, total: usize, report_json: &str) -> Result<()> {
         self.conn.execute(
-            r#"INSERT INTO loc_cache(worktree,loc,fetched_at)
-               VALUES(?1,?2,?3)
-               ON CONFLICT(worktree) DO UPDATE SET loc=?2, fetched_at=?3"#,
-            params![worktree, loc as i64, util::now()],
+            r#"INSERT INTO loc_cache(worktree,loc,report_json,fetched_at)
+               VALUES(?1,?2,?3,?4)
+               ON CONFLICT(worktree) DO UPDATE SET loc=?2, report_json=?3, fetched_at=?4"#,
+            params![worktree, total as i64, report_json, util::now()],
         )?;
         Ok(())
     }
@@ -3908,12 +3902,13 @@ mod tests {
             "[{\"id\":\"2\"}]"
         );
 
-        // loc cache: miss → insert → upsert.
-        assert!(db.get_loc_cache("/wt").unwrap().is_none());
-        db.put_loc_cache("/wt", 123).unwrap();
-        assert_eq!(db.get_loc_cache("/wt").unwrap(), Some(123));
-        db.put_loc_cache("/wt", 456).unwrap();
-        assert_eq!(db.get_loc_cache("/wt").unwrap(), Some(456));
+        // loc cache: miss → insert → upsert (the report JSON round-trips).
+        let loc_json = |db: &Db| db.get_loc_cache_entry("/wt").unwrap().map(|(j, _)| j);
+        assert!(loc_json(&db).is_none());
+        db.put_loc_cache("/wt", 123, "{\"c\":123}").unwrap();
+        assert_eq!(loc_json(&db).as_deref(), Some("{\"c\":123}"));
+        db.put_loc_cache("/wt", 456, "{\"c\":456}").unwrap();
+        assert_eq!(loc_json(&db).as_deref(), Some("{\"c\":456}"));
     }
 
     #[test]
@@ -4696,11 +4691,16 @@ mod tests {
     #[test]
     fn loc_cache_entry_returns_value_and_timestamp() {
         let db = db();
-        // Cold cache: both the bare and the timestamped accessor miss.
+        // Cold cache misses.
         assert!(db.get_loc_cache_entry("/wt").unwrap().is_none());
-        db.put_loc_cache("/wt", 4242).unwrap();
-        let (loc, fetched_at) = db.get_loc_cache_entry("/wt").unwrap().unwrap();
-        assert_eq!(loc, 4242);
+        let report = crate::loc::LocReport::total_only(4242);
+        let json = serde_json::to_string(&report).unwrap();
+        db.put_loc_cache("/wt", report.total_code, &json).unwrap();
+        let (got_json, fetched_at) = db.get_loc_cache_entry("/wt").unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::loc::LocReport>(&got_json).unwrap(),
+            report
+        );
         assert!(fetched_at > 0, "fetch timestamp is stamped for TTL refresh");
         // A different worktree is isolated.
         assert!(db.get_loc_cache_entry("/other").unwrap().is_none());

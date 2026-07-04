@@ -412,8 +412,9 @@ pub struct FrameModel {
     pub stats: superzej_metrics::StatsSnapshot,
     /// Latest Prometheus scrape state for the sidebar metrics section.
     pub metrics: crate::metrics::MetricsState,
-    /// tokei line count for the active worktree (bottom-bar widget).
-    pub loc: Option<u64>,
+    /// tokei per-language report for the active worktree (bottom-bar widget +
+    /// detail table).
+    pub loc: Option<superzej_core::loc::LocReport>,
     /// Widget-bar layout (`[bars]`) and stat icons (`[stats]`).
     pub bars: superzej_core::config::BarsConfig,
     pub stats_icons: superzej_core::config::StatsConfig,
@@ -1189,16 +1190,10 @@ pub fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> 
     match id {
         // "keyhints" is special-cased by draw_statusbar (chip + label segs).
         "keyhints" => None,
-        "loc" => model.loc.map(|n| {
-            let compact = if n >= 1_000_000 {
-                format!("{:.1}M", n as f64 / 1_000_000.0)
-            } else if n >= 1_000 {
-                format!("{:.1}k", n as f64 / 1_000.0)
-            } else {
-                n.to_string()
-            };
-            w(format!("{compact} LOC"), col(S::Dim))
-        }),
+        "loc" => model
+            .loc
+            .as_ref()
+            .map(|r| w(format!("{} LOC", r.compact_total()), col(S::Dim))),
         // Active worktree's disk usage (size of its checkout incl. target/),
         // from the off-loop scan; sits next to LOC. Hidden until first scanned.
         "disk" => model
@@ -3269,7 +3264,7 @@ mod tests {
         );
 
         let mut loc_changed = base.clone();
-        loc_changed.loc = Some(42);
+        loc_changed.loc = Some(superzej_core::loc::LocReport::total_only(42));
         assert!(!base.hydration_eq(&loc_changed), "loc change must repaint");
     }
 
@@ -3463,7 +3458,7 @@ mod tests {
                 bottom_right: vec!["loc".into()],
                 ..Default::default()
             },
-            loc: Some(1234),
+            loc: Some(superzej_core::loc::LocReport::total_only(1234)),
             panel: crate::panel::PanelData {
                 alert_notifications: 2,
                 ..Default::default()
