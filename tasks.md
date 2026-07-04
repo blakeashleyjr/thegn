@@ -92,12 +92,18 @@ started** of 725.
 
 **Notable remaining gaps (candidate next work):**
 
-- **Agent layer (Q–T) + ACP (R) + rest of MCP (AL)** — the headline AI track. Embedded
-  first-party harness path (`termite-agent` as the `agent` app tab driving `AgentRuntime`
-  on `spawn_blocking`); R is the upper control plane (ACP Client/Agent/Proxy). Substrate-
-  first sequencing landed (embedding seam → proxy model path → sandbox boundary →
-  notifications → spend observability); the agent/observability/review surfaces are
-  unstarted. See the embedded-agent + two-layer-control-plane specs.
+- **Agent layer (Q–T) + ACP (R) + rest of MCP (AL)** — the headline AI track. The
+  earlier embedded-`termite-agent`-tile path (an `agent` app tab driving `AgentRuntime`
+  on `spawn_blocking`) was **reverted** — the tab was dropped, `apps/agent.rs` is an inert
+  stub, and there is no `AgentRuntime`. The **shipping agent surface is a managed `pi`
+  driven over ACP** (R1 client committed on `main`: `crates/superzej-{svc,core}/src/acp/`,
+  `extensions/superzej-acp.ts`, host `bouncer.rs`/`relay.rs`), routed through `szproxy`
+  under per-worktree virtual keys. R is the upper control plane (ACP Client/Agent/Proxy).
+  Orchestration core **Q** (task registry → worktree → agent → review → merge pipeline +
+  queue) is **unstarted**; **S** observability and **T** review/merge are largely
+  unstarted (diff pane 260 aside). See `openspec/specs/agent/spec.md` (behavior of
+  record) and the two-layer-control-plane spec; the embedded-agent spec is SUPERSEDED
+  history.
 - **Notification polish tail** — push-to-phone (422 ntfy / 423 Telegram) and in-app
   diagnostic surfacing / toasts (749–753). The routing engine, DND, per-profile routing,
   and sound/bell (420/426/427/429) all landed.
@@ -670,35 +676,44 @@ _Reframed (2026-06-24): superzej is **one control plane in two layers** (see
 **lower** plane is `szproxy` (**U/V/W → AR**), which owns model traffic. This
 group is the **upper** plane — the **Agent Client Protocol** (ACP), which owns
 the agent conversation (sessions, tool calls, permissions, diffs, plans, config
-options). ACP is **co-primary**, not "additive/secondary": the embedded
-first-party harness `termite-agent` (the `agent` app tab) stays first-party, but
+options). ACP is **co-primary**, not "additive/secondary". (The earlier
+embedded-`termite-agent`-tile framing is **superseded** — that tile was reverted;
+the shipping harness is a **managed `pi`** driven over ACP. See the SUPERSEDED banner
+in `docs/superpowers/specs/2026-06-22-embedded-agent-integration-design.md`.)
 superzej participates in ACP in **three roles** — **Client** (R1, consume
-foreign agents), **Agent** (R2, expose termite outward), and **Proxy** (R3,
+foreign agents), **Agent** (R2, expose its own harness outward), and **Proxy** (R3,
 realize AR for any ACP agent). The two planes meet at two seams:
 `providers/set` (point any ACP agent's model traffic at `szproxy`) and
 MCP-over-ACP (advertise AR's house tools up to any agent)._
 
-_**Landed (2026-06-26, branch `sz/spicy-dragon`, uncommitted):** the R1 client +
-the two convergence seams are functionally working against a `pi` fork: ACP client
+_**Landed (committed on `main`; the real, shipping agent surface):** the R1 client +
+the two convergence seams are functionally working against a managed `pi`: ACP client
 (`initialize`), client-serviced `terminal/create` (sandboxed run-to-completion),
 `fs/read_text_file`, `superzej/edit`+`write` (worktree-scoped), `providers/set`
 routing through `szproxy` with a per-worktree minted virtual key, and a
 per-worktree `session/update` → statusbar **agent chip** (tool + ctx% + connection
-lifecycle). Transport is **TCP + newline-JSON** (the pi extension's server), not
-stdio. **UX decision: the embedded-agent surface stays MINIMAL** — pi's terminal
-pane is the conversation; the chip is the only native reflection. Consequently
-these are **intentional non-goals, not debt**: 233 (native diff/review of agent
-edits — edits AUTO-APPLY by design), 234 (plan/tool-call follow-along beyond the
-chip), a `Section::Agent` panel, the dormant `AppTile` native center surface, a
-multi-worktree fleet view, and `session/prompt` programmatic steering. Revisit
-only if the minimal model proves insufficient._
+lifecycle). Code: `crates/superzej-svc/src/acp/` (`AcpClient`),
+`crates/superzej-core/src/acp/` (data model), `extensions/superzej-acp.ts` (the
+in-pane pi bridge, pinned pi `0.80.2`), `crates/superzej-host/src/{bouncer,relay}.rs`
+(sealed-sandbox tool gate + model relay). Transport is **TCP or a bind-mounted unix
+socket + newline-JSON** (the pi extension's server), not stdio. (This work was earlier
+mis-recorded as an uncommitted `sz/spicy-dragon` branch; it is committed on `main`.)_
+
+_**Minimal-surface UX (original stance, being revisited):** the shipped surface is
+deliberately MINIMAL — pi's terminal pane is the conversation and the chip is the only
+native reflection, so 233/234, a `Section::Agent` panel, a fleet view, and
+`session/prompt` steering were scoped as **intentional non-goals** (agent edits
+AUTO-APPLY, so a review gate is not required for correctness). **The "finish ACP
+surfaces" track now takes up 232 (4-option permission gate + remember-choice), 233
+(read-only diff view of agent edits), and 230 (session lifecycle)** as additive
+surfaces on top of the minimal baseline — see the approved plan._
 
 **R1 · ACP Client — consume foreign harnesses:**
 
 - [~] 229. ACP client core — `initialize` + capability negotiation (protocolVersion; advertise `clientCapabilities` fs+terminal+`clientInfo`; parse `agentCapabilities`/`promptCapabilities`/`mcpCapabilities`/`authMethods`/`agentInfo`); `authenticate`/`logout`
 - [ ] 230. ACP session lifecycle — `session/new`, `session/load`, `session/resume` (reconnect, no replay), `session/list`, `session/close`, `session/delete`, `session/fork`, `session_info_update`; map to worktree-tabs + session resurrection + time-travel-replay
 - [~] 231. ACP streaming updates — full `session/update` set: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `usage_update`, `config_option_update`; StopReason handling + `session/cancel`
-- [ ] 232. ACP permission requests → UI — `session/request_permission` (allow_once/allow_always/reject_once/reject_always → optionId|cancelled), remember-choice persistence, native overlay
+- [~] 232. ACP permission requests → UI — `session/request_permission` (allow_once/allow_always/reject_once/reject_always → optionId|cancelled), remember-choice persistence, native overlay. Host-intercept gate exists: `bouncer.rs` `gated_kind`/`ApprovalQueue` + `menu.rs` allow/deny overlay gates shell/edit/write on the sealed path; gaps = 4-option model + remember-choice persistence; pi 0.80.2 emits no `session/request_permission`
 - [ ] 233. ACP diff rendering — `tool_call` diff content (`oldText`/`newText`/`path`) into the existing diff/review pane (T 260)
 - [ ] 234. ACP plan/tool-call events — tool kinds (read/edit/delete/move/search/execute/think/fetch/other), status (pending/in_progress/completed/failed), `locations` (path+line) → sidebar/editor follow-along
 - [ ] 235. ACP Registry integration — fetch `registry.json`, parse `agent.json` manifest + icon, one-command install/launch of authenticated agents
