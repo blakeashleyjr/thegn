@@ -1971,18 +1971,28 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             &p.lines,
             p.bg,
         );
-        // Left-edge accent bar marks the cursor only while focused, so a stale
-        // selection isn't mistaken for focus.
+        // Left-edge accent bar marks the cursor row and spans its full height
+        // (including the expanded detail line). It persists when the sidebar
+        // loses focus but dims — bright focus color while focused, a muted
+        // focus-over-panel tint otherwise — so a resting selection is still
+        // visible without being mistaken for focus.
         if p.cursor_bar {
-            draw_text(
-                surface,
-                rect.x,
-                p.y,
-                "\u{2590}",
-                col(S::Focus),
-                tok_col(p.bg),
-                1,
-            );
+            let bar_fg = if model.sidebar_focused {
+                col(S::Focus)
+            } else {
+                theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.5))
+            };
+            for dy in 0..p.height {
+                draw_text(
+                    surface,
+                    rect.x,
+                    p.y + dy,
+                    "\u{2590}",
+                    bar_fg,
+                    tok_col(p.bg),
+                    1,
+                );
+            }
         }
     }
 
@@ -2141,10 +2151,9 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
             lines.insert(0, crate::seg::Line::Blank);
         }
         let bg = row_bg(row, i, cursor, model);
-        let cursor_bar = !rail
-            && is_cursor
-            && model.sidebar_focused
-            && !matches!(row.kind, RowKind::SectionHeading);
+        // The cursor row always carries the left-edge bar; focus only changes
+        // its tint (bright vs dimmed), applied at draw time in `draw_sidebar`.
+        let cursor_bar = !rail && is_cursor && !matches!(row.kind, RowKind::SectionHeading);
         composed.push((lines, bg, cursor_bar));
     }
     let heights: Vec<usize> = composed.iter().map(|(l, _, _)| l.len().max(1)).collect();
@@ -2420,7 +2429,8 @@ fn compose_row_lines(
             if row.kind == RowKind::Workspace
                 && let Some(n) = slot
             {
-                l.push(seg(Tok::Slot(S::Faint), format!("{n} ")));
+                // Leading space keeps the digit off the cursor bar (col 0).
+                l.push(seg(Tok::Slot(S::Faint), format!(" {n} ")));
             }
             l.push(seg(Tok::Slot(S::Faint), caret(row.collapsed)));
             l.push(sp(1));
@@ -2489,7 +2499,8 @@ fn compose_row_lines(
             // the agent glyph.
             let mut left = vec![sp(1)];
             if let Some(n) = slot {
-                left.push(seg(Tok::Slot(S::Faint), format!("{n} ")));
+                // Leading space keeps the digit off the cursor bar (col 0).
+                left.push(seg(Tok::Slot(S::Faint), format!(" {n} ")));
             }
             left.extend(tree_lead(row.depth, is_last));
             if matches!(row.activity, ActivityState::None) {
@@ -3364,7 +3375,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_focus_indicator_appears_only_when_focused() {
+    fn sidebar_selection_bar_persists_dimmed_when_unfocused() {
         let rect = Rect {
             x: 0,
             y: 0,
@@ -3381,20 +3392,64 @@ mod tests {
             sidebar_focused: true,
             ..Default::default()
         };
+        // The cursor row sits at list_y (header + blank gap) + workspace row.
+        let bar_y = rect.y + 2 + 1;
         let mut s = Surface::new(24, 6);
         draw_sidebar(&mut s, rect, &model);
-        let text = s.screen_chars_to_string();
-        // The cursor's left-edge accent bar appears only while focused.
-        assert!(text.contains('\u{2590}'), "focused cursor bar: {text:?}");
+        assert!(
+            s.screen_chars_to_string().contains('\u{2590}'),
+            "focused cursor bar present"
+        );
+        let focused_fg = s.screen_cells()[bar_y][0].attrs().foreground();
 
+        // Unfocused: the bar persists so the selection stays visible...
         let mut unfocused = model.clone();
         unfocused.sidebar_focused = false;
         let mut s2 = Surface::new(24, 6);
         draw_sidebar(&mut s2, rect, &unfocused);
-        let text2 = s2.screen_chars_to_string();
         assert!(
-            !text2.contains('\u{2590}'),
-            "no cursor bar when unfocused: {text2:?}"
+            s2.screen_chars_to_string().contains('\u{2590}'),
+            "cursor bar persists when unfocused"
+        );
+        // ...but dims to a distinct tone so focus is still legible.
+        let unfocused_fg = s2.screen_cells()[bar_y][0].attrs().foreground();
+        assert_ne!(
+            focused_fg, unfocused_fg,
+            "unfocused bar dims to a different color"
+        );
+    }
+
+    #[test]
+    fn sidebar_selection_bar_spans_expanded_detail_line() {
+        use crate::sidebar::RowKind;
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 24,
+            rows: 8,
+        };
+        // A worktree with disk metadata expands the cursor row to two lines.
+        let mut wt = row(RowKind::Worktree, "home");
+        wt.disk_bytes = Some(1024);
+        let model = FrameModel {
+            sidebar_rows: vec![row(RowKind::Workspace, "app"), wt],
+            sidebar_selected: 1,
+            sidebar_focused: true,
+            ..Default::default()
+        };
+        let frame = build_sidebar(&model, rect, model.sidebar_scroll);
+        let cursor = frame.rows.iter().find(|p| p.visible_index == 1).unwrap();
+        assert_eq!(cursor.height, 2, "detail line expands the cursor row");
+
+        let mut s = Surface::new(24, 8);
+        draw_sidebar(&mut s, rect, &model);
+        let cells = s.screen_cells();
+        // The bar paints col 0 of both rows of the placement.
+        assert_eq!(cells[cursor.y][0].str(), "\u{2590}", "bar on name line");
+        assert_eq!(
+            cells[cursor.y + 1][0].str(),
+            "\u{2590}",
+            "bar on detail line"
         );
     }
 
