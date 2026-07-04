@@ -856,4 +856,37 @@ mod tests {
             .unwrap();
         assert_eq!(sel.bg, Some(Tok::SelAccent));
     }
+
+    #[test]
+    fn cursor_on_impact_footer_tints_the_row() {
+        use superzej_core::semantic::{EntityChange, EntityKind, EntitySummary, Touch};
+        let mut model = model_with(PanelData {
+            branch: "main".into(),
+            changes: vec![change("src/a.rs", Stage::Unstaged)],
+            ..Default::default()
+        });
+        model.panel.entities = Some(EntitySummary::new(vec![(
+            "src/a.rs".into(),
+            vec![EntityChange {
+                kind: EntityKind::Function,
+                name: "f".into(),
+                added: 1,
+                deleted: 0,
+                touch: Touch::Added,
+            }],
+        )]));
+        // Cursor one past the single change row lands on the impact footer.
+        let ui = PanelUi {
+            row_mode: true,
+            cursor: model.panel.changes.len(),
+            ..Default::default()
+        };
+        let frame = build_panel(&model, &ui, 44, 50, true);
+        let footer = frame
+            .rows
+            .iter()
+            .find(|r| r.hit == Some(PanelHit::Row(Section::Changes, model.panel.changes.len())))
+            .expect("impact footer row present");
+        assert_eq!(footer.bg, Some(Tok::SelAccent));
+    }
 }

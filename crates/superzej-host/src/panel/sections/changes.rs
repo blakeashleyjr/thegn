@@ -34,14 +34,6 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
         )])));
         return rows;
     }
-    // Semantic impact line (item 313): a one-line entity summary of the change.
-    if let Some(impact) = data.entities.as_ref().and_then(|e| e.impact.as_ref()) {
-        rows.push(PanelRow::plain(Line::segs(vec![
-            seg(hue(Hue::Purple), "◈ "),
-            seg(g(), impact.summary.clone()),
-        ])));
-        rows.push(PanelRow::blank());
-    }
     for (i, c) in data.changes.iter().enumerate() {
         let on = ui.chg_sel == Some(i);
         rows.push(change_row(c, i, on, deep, ctx.cols));
@@ -65,13 +57,146 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
             rows.push(PanelRow::blank());
         }
     }
+    // Semantic-impact footer (item 313): a labeled, selectable one-line entity
+    // summary at the *bottom* of the file list (the last actionable row, hit
+    // index `changes.len()`), expanding inline into a per-file / per-entity
+    // breakdown when `impact_open`.
+    if data
+        .entities
+        .as_ref()
+        .and_then(|e| e.impact.as_ref())
+        .is_some()
+    {
+        rows.push(PanelRow::blank());
+        rows.extend(impact_footer(data, ui, ctx.cols));
+    }
     rows.push(PanelRow::blank());
-    rows.push(if ui.chg_sel.is_none() {
+    rows.push(if ui.impact_open {
+        hint_row(&[("↵", "dismiss")])
+    } else if ui.chg_sel.is_none() {
         hint_row(&[("↵", "preview"), ("space", "stage")])
     } else {
         hint_row(&[("↵", "dismiss"), ("space", "stage")])
     });
     rows
+}
+
+/// The semantic-impact footer row plus, when expanded, its per-file / per-entity
+/// breakdown. The collapsed line is rebuilt from the structured per-file entity
+/// data (rather than the pre-baked `impact.summary` string) so it carries a clear
+/// `semantic` label and clips cleanly to the panel width instead of mid-word.
+fn impact_footer(data: &crate::panel::PanelData, ui: &PanelUi, cols: usize) -> Vec<PanelRow> {
+    let Some(entities) = data.entities.as_ref() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<PanelRow> = Vec::new();
+    let mut line = vec![seg(hue(Hue::Purple), "◈ "), seg(f(), "semantic")];
+    line.extend(impact_counts_segs(&entities.per_file, cols));
+    let mut footer = PanelRow::plain(Line::segs(line))
+        .with_hit(PanelHit::Row(Section::Changes, data.changes.len()));
+    if ui.impact_open {
+        footer = footer.with_bg(crate::seg::Tok::SelAccent);
+    }
+    rows.push(footer);
+    if !ui.impact_open {
+        return rows;
+    }
+    // Expanded: a one-line legend, then each file with its touched entities.
+    rows.push(PanelRow::plain(Line::segs(vec![
+        sp(2),
+        seg(f(), "entity-level changes touched by this diff"),
+    ])));
+    for (path, changes) in &entities.per_file {
+        if changes.is_empty() {
+            continue;
+        }
+        rows.push(PanelRow::plain(Line::segs(vec![
+            sp(1),
+            seg(f(), path.clone()),
+        ])));
+        for c in changes.iter().take(8) {
+            let (glyph, tok) = match c.touch {
+                superzej_core::semantic::Touch::Added => ("+", hue(Hue::Green)),
+                superzej_core::semantic::Touch::Modified => ("~", hue(Hue::Amber)),
+                superzej_core::semantic::Touch::Removed => ("−", hue(Hue::Red)),
+            };
+            let mut segs = vec![
+                sp(2),
+                seg(tok, format!("{glyph} ")),
+                seg(f(), format!("{} ", c.kind.label())),
+                seg(t(), c.name.clone()),
+                sp(1),
+            ];
+            segs.extend(diffstat(c.added, c.deleted));
+            rows.push(PanelRow::plain(Line::segs(segs)));
+        }
+        if changes.len() > 8 {
+            rows.push(PanelRow::plain(Line::segs(vec![
+                sp(2),
+                seg(f(), format!("… +{} more", changes.len() - 8)),
+            ])));
+        }
+    }
+    rows
+}
+
+/// The " · <kind counts> · N files" tail of the collapsed impact line, built from
+/// the per-file entity churn. Kinds are ordered most-frequent first and dropped
+/// (with a trailing "…") once they'd overflow `cols`, so the line never clips a
+/// word mid-glyph.
+fn impact_counts_segs(
+    per_file: &[(String, Vec<superzej_core::semantic::EntityChange>)],
+    cols: usize,
+) -> Vec<Seg> {
+    // Count entities by kind label, preserving churn order; then rank by count.
+    let mut by_kind: Vec<(&'static str, usize)> = Vec::new();
+    let mut files = 0usize;
+    for (_, changes) in per_file {
+        if changes.is_empty() {
+            continue;
+        }
+        files += 1;
+        for c in changes {
+            let label = c.kind.label();
+            match by_kind.iter_mut().find(|(k, _)| *k == label) {
+                Some((_, n)) => *n += 1,
+                None => by_kind.push((label, 1)),
+            }
+        }
+    }
+    by_kind.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+
+    let files_tail = format!("{files} file{}", if files == 1 { "" } else { "s" });
+    // Budget: total cols minus the "◈ semantic" prefix (width 10), the two " · "
+    // separators (6), and the files tail — leaving room for the kind list.
+    let budget = cols.saturating_sub(16 + files_tail.chars().count()).max(4);
+    let mut kinds = String::new();
+    let mut dropped = false;
+    for (i, (label, n)) in by_kind.iter().enumerate() {
+        let part = format!(
+            "{}{n} {label}{}",
+            if i > 0 { ", " } else { "" },
+            if *n == 1 { "" } else { "s" }
+        );
+        if kinds.chars().count() + part.chars().count() <= budget {
+            kinds.push_str(&part);
+        } else {
+            dropped = true;
+            break;
+        }
+    }
+    if dropped && kinds.chars().count() < budget {
+        kinds.push('…');
+    }
+
+    let mut segs = Vec::new();
+    if !kinds.is_empty() {
+        segs.push(seg(g2(), " · "));
+        segs.push(seg(f(), kinds));
+    }
+    segs.push(seg(g2(), " · "));
+    segs.push(seg(f(), files_tail));
+    segs
 }
 
 fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool, cols: usize) -> PanelRow {
@@ -588,6 +713,87 @@ mod tests {
                 "low-contrast text in change row (on={on}): {v:?}"
             );
         }
+    }
+
+    /// The expanded semantic-impact breakdown paints its colored touch glyphs,
+    /// kind labels and entity names legibly on the panel surface, and renders all
+    /// three touch verbs (+/~/−).
+    #[test]
+    fn impact_breakdown_rows_are_legible_on_the_panel() {
+        use superzej_core::semantic::{EntityChange, EntityKind, EntitySummary, Touch};
+        use termwiz::surface::Surface;
+        let data = crate::panel::PanelData {
+            changes: vec![ChangeRow {
+                status: "M".into(),
+                stage: Stage::Unstaged,
+                dir: "src/".into(),
+                name: "a.rs".into(),
+                path: "src/a.rs".into(),
+                added: 30,
+                deleted: 10,
+            }],
+            entities: Some(EntitySummary::new(vec![(
+                "src/a.rs".into(),
+                vec![
+                    EntityChange {
+                        kind: EntityKind::Function,
+                        name: "handle".into(),
+                        added: 12,
+                        deleted: 2,
+                        touch: Touch::Modified,
+                    },
+                    EntityChange {
+                        kind: EntityKind::Enum,
+                        name: "Verdict".into(),
+                        added: 18,
+                        deleted: 0,
+                        touch: Touch::Added,
+                    },
+                    EntityChange {
+                        kind: EntityKind::Function,
+                        name: "old".into(),
+                        added: 0,
+                        deleted: 8,
+                        touch: Touch::Removed,
+                    },
+                ],
+            )])),
+            ..Default::default()
+        };
+        let ui = PanelUi {
+            impact_open: true,
+            ..Default::default()
+        };
+        let rows = impact_footer(&data, &ui, 44);
+        for row in &rows {
+            let mut s = Surface::new(44, 1);
+            crate::seg::draw_line(
+                &mut s,
+                0,
+                0,
+                44,
+                &row.line,
+                row.bg.unwrap_or(Tok::Slot(crate::chrome::S::Panel)),
+            );
+            let v = crate::seg::text_contrast_violations(&mut s, 3.0);
+            assert!(v.is_empty(), "low-contrast breakdown row: {v:?}");
+        }
+        let all = segs_text(
+            &rows
+                .iter()
+                .flat_map(|r| match &r.line {
+                    Line::Segs(v) => v.clone(),
+                    _ => Vec::new(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert!(all.contains("+ "), "added glyph: {all}");
+        assert!(all.contains("~ "), "modified glyph: {all}");
+        assert!(all.contains("− "), "removed glyph: {all}");
+        assert!(
+            all.contains("Verdict") && all.contains("handle"),
+            "names: {all}"
+        );
     }
 
     #[test]
