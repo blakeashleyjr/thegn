@@ -12,6 +12,7 @@ mod agent_home;
 mod agent_pi;
 mod agent_ssh;
 mod apps;
+mod bar_nav;
 mod borders;
 mod bouncer;
 mod bridge_sup;

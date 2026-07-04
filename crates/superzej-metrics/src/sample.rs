@@ -11,7 +11,7 @@ use sysinfo::{
 };
 
 use crate::gpu::GpuProbe;
-use crate::{DiskInfo, DiskKind, StatsSnapshot, disk_free_pct, read_battery};
+use crate::{DiskInfo, DiskKind, StatsSnapshot, disk_space, read_battery};
 
 /// Refresh the slow tier (frequency / temperatures / disks) once every N
 /// samples. At the host's default ~1s cadence that is roughly every 5s — these
@@ -152,7 +152,10 @@ impl StatsSampler {
         // --- Battery + GPU + disk-free (every tick; all cheap) ---
         snap.battery = read_battery(std::path::Path::new("/sys/class/power_supply"));
         snap.gpu_pct = self.gpu.read();
-        snap.disk_free_pct = disk_free_pct(&self.disk_path);
+        if let Some((total, avail, pct)) = disk_space(&self.disk_path) {
+            snap.disk_free_pct = Some(pct);
+            snap.disk_bytes = Some((total, avail));
+        }
 
         // --- Slow tier (every SLOW_EVERY-th tick): frequency, temps, disks ---
         if slow {

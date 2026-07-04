@@ -48,6 +48,9 @@ pub struct StatsSnapshot {
     pub battery: Option<(u8, bool)>,
     /// Free space on the worktrees' filesystem, as a percentage 0–100.
     pub disk_free_pct: Option<u8>,
+    /// Worktrees' filesystem capacity as (total bytes, available bytes). Absent
+    /// on non-unix targets or a `statvfs` error, exactly like `disk_free_pct`.
+    pub disk_bytes: Option<(u64, u64)>,
     /// All mounted physical disks (name, mount, free %, IO rates, kind).
     pub disks: Vec<DiskInfo>,
     /// Temperature sensors as (label, °C). Drives the telemetry thermal row.
@@ -78,11 +81,12 @@ pub enum DiskKind {
     Unknown,
 }
 
-/// Free space on the filesystem containing `path`, as a percentage (0–100).
-/// Walks up to the first existing ancestor so a not-yet-created worktrees dir
-/// still reports its parent fs. `None` on a non-unix target or `statvfs` error.
+/// Capacity of the filesystem containing `path` as `(total bytes, available
+/// bytes, free percentage 0–100)`. Walks up to the first existing ancestor so a
+/// not-yet-created worktrees dir still reports its parent fs. `None` on a
+/// non-unix target or `statvfs` error.
 #[cfg(unix)]
-pub fn disk_free_pct(path: &std::path::Path) -> Option<u8> {
+pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64, u8)> {
     use std::os::unix::ffi::OsStrExt;
     let mut p = path;
     while !p.exists() {
@@ -95,25 +99,34 @@ pub fn disk_free_pct(path: &std::path::Path) -> Option<u8> {
     if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
         return None;
     }
-    let total = st.f_blocks as u64;
-    if total == 0 {
+    let blocks = st.f_blocks as u64;
+    if blocks == 0 {
         return None;
     }
     // f_bavail = blocks available to unprivileged users (the headroom you'd
-    // actually get), which is what "free %" should reflect.
-    let avail = st.f_bavail as u64;
-    Some(
-        ((avail as f64 / total as f64) * 100.0)
-            .round()
-            .clamp(0.0, 100.0) as u8,
-    )
+    // actually get), which is what "free" should reflect. f_frsize is the
+    // fundamental block size the block counts are expressed in.
+    let avail_blocks = st.f_bavail as u64;
+    let frsize = st.f_frsize as u64;
+    let total_bytes = blocks.saturating_mul(frsize);
+    let avail_bytes = avail_blocks.saturating_mul(frsize);
+    let pct = ((avail_blocks as f64 / blocks as f64) * 100.0)
+        .round()
+        .clamp(0.0, 100.0) as u8;
+    Some((total_bytes, avail_bytes, pct))
 }
 
 #[cfg(not(unix))]
-pub fn disk_free_pct(_path: &std::path::Path) -> Option<u8> {
+pub fn disk_space(_path: &std::path::Path) -> Option<(u64, u64, u8)> {
     // sysinfo's per-disk free % still populates `StatsSnapshot::disks` on
     // Windows; this convenience value is the unix-only statvfs fast path.
     None
+}
+
+/// Free space on the filesystem containing `path`, as a percentage (0–100).
+/// Thin wrapper over [`disk_space`] for callers that only need the percentage.
+pub fn disk_free_pct(path: &std::path::Path) -> Option<u8> {
+    disk_space(path).map(|(_, _, pct)| pct)
 }
 
 /// Fixed-width (6 char) bytes/sec for the NET widget — stable width so the
@@ -174,6 +187,10 @@ mod tests {
         }
         if let Some(p) = snap.disk_free_pct {
             assert!(p <= 100, "disk {p}");
+        }
+        if let Some((total, avail)) = snap.disk_bytes {
+            assert!(total > 0, "disk total {total}");
+            assert!(avail <= total, "disk avail {avail} > total {total}");
         }
         for d in &snap.disks {
             assert!(d.free_pct <= 100, "disk {} free {}", d.name, d.free_pct);

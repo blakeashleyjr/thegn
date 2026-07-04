@@ -267,19 +267,6 @@ fn toggle_recorder(
 
 /// The bottom bar's contextual keybind hints — (chord, label) pairs the
 /// statusbar renders as key chips + dim labels: what works right now, given
-/// Step a bar's selected-item index by `delta` (-1/+1), clamped to `[0, count)`.
-/// An empty bar stays at 0.
-fn step_bar_sel(sel: usize, delta: i8, count: usize) -> usize {
-    if count == 0 {
-        return 0;
-    }
-    if delta < 0 {
-        sel.saturating_sub(1)
-    } else {
-        (sel + 1).min(count - 1)
-    }
-}
-
 /// the focused zone (and the panel's view when it owns the keyboard).
 fn context_hints(
     focus: &crate::focus::FocusState,
@@ -14791,14 +14778,18 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
-                // Bar zones (masthead/statusbar): ←/→ step items (handled via the
-                // Ctrl chords above), Enter opens the focused item's detail view,
-                // Esc returns to the center; everything else is swallowed (bars
-                // never forward to a pane).
+                // Bar zones (masthead/statusbar): plain ←/→ (and h/l) step items
+                // so the alert badges past LOC are reachable, Enter opens the
+                // focused item's detail view, Esc returns to the center;
+                // everything else is swallowed (bars never forward to a pane).
                 if focus.bar()
                     && !k.modifiers.contains(Modifiers::CTRL)
                     && !k.modifiers.contains(Modifiers::ALT)
                 {
+                    if crate::bar_nav::step_focused_bar(&focus, &mut model, &chrome, &k.key) {
+                        dirty = true;
+                        continue;
+                    }
                     if crate::input::is_escape_key(&k.key) {
                         need_relayout |= crate::escape::escape_to_center(
                             &mut focus,
@@ -18716,15 +18707,21 @@ async fn event_loop<T: Terminal>(
                                             } else if focus.statusbar() {
                                                 let count =
                                                     crate::chrome::statusbar_items(&model).len();
-                                                model.statusbar_sel =
-                                                    step_bar_sel(model.statusbar_sel, delta, count);
+                                                model.statusbar_sel = crate::bar_nav::step_bar_sel(
+                                                    model.statusbar_sel,
+                                                    delta,
+                                                    count,
+                                                );
                                             } else if focus.masthead() {
                                                 let count = crate::chrome::masthead_item_spans(
                                                     &model, &chrome,
                                                 )
                                                 .len();
-                                                model.masthead_sel =
-                                                    step_bar_sel(model.masthead_sel, delta, count);
+                                                model.masthead_sel = crate::bar_nav::step_bar_sel(
+                                                    model.masthead_sel,
+                                                    delta,
+                                                    count,
+                                                );
                                             } else if focus.panel() {
                                                 // Row mode walks the open
                                                 // section's rows; section mode
