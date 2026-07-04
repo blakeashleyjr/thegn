@@ -34,8 +34,10 @@ use superzej_core::config::Network;
 use superzej_core::sandbox::{Backend, Mount};
 use superzej_svc::acp::client::AcpInbound;
 
-/// The class of a gated tool call — drives the overlay's verb + glyph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The class of a gated tool call — drives the overlay's verb + glyph. Also the
+/// remember-scope key (with the worktree): an "always" decision is remembered
+/// per `(worktree, kind)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ApprovalKind {
     /// `terminal/create` — the agent wants to run a shell command.
     Shell,
@@ -61,6 +63,46 @@ impl ApprovalKind {
             ApprovalKind::Shell => "$",
             ApprovalKind::Edit => "✎",
             ApprovalKind::Write => "✚",
+        }
+    }
+}
+
+/// The user's decision on a gated tool call. Mirrors ACP's four permission
+/// option ids (`allow_once`/`allow_always`/`reject_once`/`reject_always`): the
+/// two "always" variants are also **remembered** so subsequent same-kind calls
+/// from the same worktree auto-resolve without re-prompting. The remember scope
+/// is the running agent session (in-memory, per `(worktree, kind)`), matching
+/// ACP's session-scoped `allow_always` semantics; it is not persisted across a
+/// superzej restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    /// Permit this one call.
+    AllowOnce,
+    /// Permit this call and remember "allow" for this `(worktree, kind)`.
+    AllowAlways,
+    /// Reject this one call (also the Esc/cancel default).
+    RejectOnce,
+    /// Reject this call and remember "reject" for this `(worktree, kind)`.
+    RejectAlways,
+}
+
+impl ApprovalDecision {
+    /// Whether the call proceeds.
+    pub fn allowed(self) -> bool {
+        matches!(
+            self,
+            ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
+        )
+    }
+
+    /// The decision to remember for future same-kind calls, if any. `Some(true)`
+    /// auto-allows, `Some(false)` auto-rejects; `None` (the "once" variants) is
+    /// not remembered.
+    pub fn remembered(self) -> Option<bool> {
+        match self {
+            ApprovalDecision::AllowAlways => Some(true),
+            ApprovalDecision::RejectAlways => Some(false),
+            ApprovalDecision::AllowOnce | ApprovalDecision::RejectOnce => None,
         }
     }
 }
@@ -374,6 +416,25 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn approval_decision_allowed_and_remembered_truth_table() {
+        use ApprovalDecision::*;
+        // allowed(): the two Allow* variants proceed; the two Reject* don't.
+        assert!(AllowOnce.allowed());
+        assert!(AllowAlways.allowed());
+        assert!(!RejectOnce.allowed());
+        assert!(!RejectAlways.allowed());
+        // remembered(): only the *_Always variants are sticky, carrying their sign.
+        assert_eq!(AllowOnce.remembered(), None);
+        assert_eq!(RejectOnce.remembered(), None);
+        assert_eq!(AllowAlways.remembered(), Some(true));
+        assert_eq!(RejectAlways.remembered(), Some(false));
+        // A remembered decision's sign always matches its allowed() verdict.
+        for d in [AllowAlways, RejectAlways] {
+            assert_eq!(d.remembered(), Some(d.allowed()));
+        }
     }
 
     #[test]
