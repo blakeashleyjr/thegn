@@ -33,28 +33,37 @@ use std::time::{Duration, Instant, SystemTime};
 /// few seconds; this bound just caps a pathological cold build.
 pub const WARM_NOW_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Does this worktree have a flake-backed `.envrc` (`use flake` → `nix-direnv`)?
+/// Only that combination hits the read-only `/nix/store` in-sandbox: a plain
+/// `.envrc` re-evals harmlessly, and a repo without `.envrc`/flake has nothing
+/// to warm. Pure filesystem stat, so it's cheap enough to gate both the warm
+/// and the daemon-backstop mount ([`crate::sandbox`]); unit-tested.
+pub fn has_flake_envrc(worktree: &Path) -> bool {
+    worktree.join(".envrc").is_file() && worktree.join("flake.nix").is_file()
+}
+
 /// Does this worktree have a flake-backed `.envrc` whose `nix-direnv` cache is
 /// cold or stale — i.e. would the in-sandbox direnv try (and fail) to rebuild
 /// it against the read-only store? Pure filesystem stat (no subprocess), so
 /// it's cheap enough to gate the spawn path and is unit-tested.
-///
-/// Only `use flake` (`nix-direnv`) hits the read-only store, so we require a
-/// `flake.nix`: a plain `.envrc` re-evals harmlessly in-sandbox, and a repo
-/// without `.envrc`/flake has nothing to warm.
 pub fn needs_warm(worktree: &Path) -> bool {
-    let envrc = worktree.join(".envrc");
-    let flake = worktree.join("flake.nix");
-    if !envrc.is_file() || !flake.is_file() {
+    if !has_flake_envrc(worktree) {
         return false;
     }
-    let newest_input = [envrc, flake, worktree.join("flake.lock")]
-        .iter()
-        .filter_map(|p| mtime(p))
-        .max();
-    let Some(newest_input) = newest_input else {
+    let Some(newest_input) = newest_input_mtime(worktree) else {
         return false;
     };
     !cache_is_fresh(newest_input, newest_cache_rc_mtime(worktree))
+}
+
+/// Newest mtime among the flake inputs (`.envrc`, `flake.nix`, `flake.lock`) —
+/// the watched files whose bump `nix-direnv` compares its cache against. `None`
+/// when none exist.
+fn newest_input_mtime(worktree: &Path) -> Option<SystemTime> {
+    [".envrc", "flake.nix", "flake.lock"]
+        .iter()
+        .filter_map(|f| mtime(&worktree.join(f)))
+        .max()
 }
 
 /// Is the cached env dump new enough to replay without a rebuild? Pure — split
@@ -62,6 +71,16 @@ pub fn needs_warm(worktree: &Path) -> bool {
 /// depending on filesystem mtime granularity. A cold cache (`None`) is stale.
 fn cache_is_fresh(newest_input: SystemTime, cache_rc: Option<SystemTime>) -> bool {
     matches!(cache_rc, Some(rc) if rc >= newest_input)
+}
+
+/// After a warm, does the cache need its mtime bumped to look fresh? True when
+/// a `.rc` exists but is *older* than the newest input — i.e. a checkout bumped
+/// `.envrc`/`flake.nix`/`flake.lock` mtimes *after* (or racing) the build, so
+/// `nix-direnv`'s live mtime check would wrongly re-eval. Pure, so the decision
+/// is unit-tested without depending on filesystem mtime granularity. A cold
+/// cache (`None`) is never blessed — there's nothing to touch.
+fn cache_needs_bless(newest_input: SystemTime, cache_rc: Option<SystemTime>) -> bool {
+    matches!(cache_rc, Some(rc) if rc < newest_input)
 }
 
 fn mtime(p: &Path) -> Option<SystemTime> {
@@ -81,6 +100,41 @@ fn newest_cache_rc_mtime(worktree: &Path) -> Option<SystemTime> {
         }
     }
     newest
+}
+
+/// After a successful warm, bump every `.direnv/*.rc` mtime to *now* if the
+/// newest input is newer than the newest cache `.rc` — closing the race where a
+/// worktree materialize's `git checkout`/`reset` bumps `.envrc`/`flake.nix`/
+/// `flake.lock` mtimes *after* (or concurrently with) the build, leaving the
+/// just-built cache looking stale so the in-sandbox `nix-direnv` re-evals and
+/// dies on the read-only `/nix/store`.
+///
+/// Sound because `nix-direnv`'s staleness check is a *live* comparison (profile
+/// store path exists + `profile_rc` exists + no watched input newer than
+/// `profile_rc`): the store path was just realized by the warm, and the
+/// mtime-bumping checkout wrote byte-identical inputs (same commit), so only the
+/// mtime ordering — not the cache content — is wrong. Best-effort: a touch
+/// failure just leaves today's fallback for that launch.
+fn bless_cache_fresh(worktree: &Path) {
+    let Some(newest_input) = newest_input_mtime(worktree) else {
+        return;
+    };
+    if !cache_needs_bless(newest_input, newest_cache_rc_mtime(worktree)) {
+        return;
+    }
+    let now = SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(worktree.join(".direnv")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("rc")
+            && let Ok(f) = std::fs::File::options().write(true).open(&p)
+        {
+            // best-effort: a failed touch just leaves this launch on fallback.
+            let _ = f.set_modified(now);
+        }
+    }
 }
 
 /// Tracks worktrees with an in-flight background warm, so [`warm`] never spawns
@@ -202,6 +256,10 @@ fn warm_blocking(worktree: &Path, allow: bool) {
         .arg("true")
         .env("DIRENV_LOG_FORMAT", "")
         .output();
+    // Guard the mtime race: a materialize `git checkout`/`reset` may have bumped
+    // the flake inputs' mtimes past the freshly-built `.rc`, which would make the
+    // in-sandbox `nix-direnv` re-eval and fail on the read-only store.
+    bless_cache_fresh(worktree);
 }
 
 #[cfg(test)]
@@ -276,5 +334,54 @@ mod tests {
         assert!(!cache_is_fresh(t1, Some(t0)));
         // No cache at all ⇒ stale (cold).
         assert!(!cache_is_fresh(t0, None));
+    }
+
+    #[test]
+    fn has_flake_envrc_requires_both_files() {
+        let dir = tmp("flake-detect");
+        assert!(!has_flake_envrc(&dir));
+        std::fs::write(dir.join(".envrc"), "use flake\n").unwrap();
+        assert!(!has_flake_envrc(&dir)); // `.envrc` alone ⇒ no flake
+        std::fs::write(dir.join("flake.nix"), "{ outputs = _: {}; }").unwrap();
+        assert!(has_flake_envrc(&dir)); // both present ⇒ flake-backed
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_needs_bless_only_when_rc_older_than_input() {
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = t0 + Duration::from_secs(10);
+        // A checkout bumped inputs past the built `.rc` ⇒ bless (touch) it fresh.
+        assert!(cache_needs_bless(t1, Some(t0)));
+        // Cache already newer-or-equal ⇒ nothing to do.
+        assert!(!cache_needs_bless(t0, Some(t1)));
+        assert!(!cache_needs_bless(t0, Some(t0)));
+        // No cache at all ⇒ nothing to touch (cold ⇒ warm builds it).
+        assert!(!cache_needs_bless(t0, None));
+    }
+
+    #[test]
+    fn bless_cache_fresh_touches_stale_rc_so_needs_warm_clears() {
+        let dir = tmp("bless");
+        std::fs::write(dir.join(".envrc"), "use flake\n").unwrap();
+        std::fs::write(dir.join("flake.nix"), "{ outputs = _: {}; }").unwrap();
+        // A built cache whose `.rc` predates a later input bump (the race).
+        std::fs::create_dir_all(dir.join(".direnv")).unwrap();
+        let rc = dir.join(".direnv").join("flake-profile-x.rc");
+        std::fs::write(&rc, "export FOO=bar\n").unwrap();
+        // Force the `.rc` mtime behind the inputs so nix-direnv would re-eval.
+        std::fs::File::options()
+            .write(true)
+            .open(&rc)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert!(needs_warm(&dir), "stale-by-mtime cache should look cold");
+        bless_cache_fresh(&dir);
+        assert!(
+            !needs_warm(&dir),
+            "blessing the `.rc` mtime should make the cache look fresh"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

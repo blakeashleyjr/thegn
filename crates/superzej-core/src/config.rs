@@ -2947,10 +2947,10 @@ pub struct SandboxConfig {
     /// provisioning seed), which the repo `.envrc`'s `use flake .#${…:-default}`
     /// reads — so the sandbox builds/enters a smaller closure than full host dev.
     pub devshell: String,
-    /// Bind-mount the host Nix daemon socket into the sandbox so full
-    /// `nix develop`/`build`/`fmt` work *inside* it. Off by default: it relaxes
-    /// the isolation the hardening profiles provide (Tier A `inject_devshell`
-    /// already covers read-only tool access without this).
+    /// Bind-mount the host Nix daemon socket into the sandbox for full in-sandbox
+    /// `nix develop`/`build`/`fmt`. `true` forces it on; `false` still auto-enables
+    /// it as a backstop for a local flake `.envrc` (an in-sandbox `nix-direnv` cache
+    /// miss re-evals via the daemon, not the read-only store) — off: `warm_direnv=off`/sealed.
     pub nix_daemon: bool,
     /// Shell to use inside the sandbox. `""` = resolve from the host's `$SHELL`
     /// at pane-spawn time. Set to an absolute path or name (e.g. `"zsh"`) to
