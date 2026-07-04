@@ -1119,10 +1119,12 @@ enabled = true
 # ~/.zsh_history and ~/.bash_history). ~/.keychain is carved for interactive
 # (hardened) panes but NOT the sealed agent — it stores scripts your host login
 # shells later *source*, so a writable ~/.keychain from a sealed sandbox would
-# be a persistence vector. The launched agent's own config dir
-# (CLAUDE_CONFIG_DIR / CODEX_HOME, or its ~/.claude / ~/.codex default) is also
-# carved writable so the CLI can persist its runtime state (session-env, todos,
-# shell snapshots) — otherwise its startup hooks die "read-only file system".
+# be a persistence vector. Coding-agent config dirs (CLAUDE_CONFIG_DIR /
+# CODEX_HOME, or the ~/.claude / ~/.codex default) are also carved writable — for
+# EVERY non-sealed pane, so an agent CLI you run *manually* in a sandbox shell
+# can persist its runtime state (session-env, todos, shell snapshots) instead of
+# its startup hooks dying "read-only file system" (sealed agents are excluded:
+# an untrusted network=none agent must not write the host's real credential dir).
 # `profile = "open"` restores a fully-writable $HOME (zsh history/zoxide/
 # keychain) as the escape hatch; add more writable paths under `mounts` below.
 profile = "hardened"

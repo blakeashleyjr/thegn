@@ -218,7 +218,8 @@ pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
     ) {
         rels.push(".keychain");
     }
-    rels.iter()
+    let mut mounts: Vec<Mount> = rels
+        .iter()
         .filter_map(|rel| {
             let p = std::path::Path::new(&home).join(rel);
             // Dir or file — but must exist so bwrap overmounts an existing
@@ -233,7 +234,33 @@ pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
                 }
             })
         })
-        .collect()
+        .collect();
+    // Coding-agent config dirs (Claude Code's `CLAUDE_CONFIG_DIR` / `~/.claude`,
+    // Codex's `CODEX_HOME` / `~/.codex`) carved read-write: the agent CLI writes
+    // runtime state (`session-env`, todos, shell snapshots) here, so a plain
+    // sandbox shell where the user runs `claude`/`codex` *manually* needs it
+    // writable too — the bundle-launch path (`bundle::compose_inner`) only carves
+    // this when superzej itself recognizes the launched provider, missing the
+    // manual-in-a-shell case. `effective_config_dir` returns `Some` only for a
+    // dir that already exists (so bwrap overmounts an existing inode). Off for
+    // sealed: an untrusted network=none agent must not get write access to the
+    // host's real credential dirs (same posture as `~/.keychain` above).
+    if !matches!(
+        profile,
+        SandboxProfile::Sealed | SandboxProfile::SealedTunnel
+    ) {
+        for p in crate::account::PROVIDERS {
+            if let Some(dir) = crate::account::effective_config_dir(p) {
+                mounts.push(Mount {
+                    host: dir.clone(),
+                    dest: dir,
+                    ro: false,
+                    cache: false,
+                });
+            }
+        }
+    }
+    mounts
 }
 
 /// Decide whether a mount `m` should be added given the mounts already
@@ -332,6 +359,57 @@ mod tests {
                 "history file must be carved writable for every read-only-root profile"
             );
         }
+    }
+
+    #[test]
+    fn agent_config_dir_carved_for_hardened_not_sealed() {
+        // The launched coding-agent's config dir (`CLAUDE_CONFIG_DIR` here) must
+        // be writable so its `SessionStart` hook can create `session-env` under a
+        // read-only $HOME — but NOT for the sealed agent profile. A sibling
+        // non-existent dir must never be carved (existence check refuses to
+        // fabricate one). Mutates only `CLAUDE_CONFIG_DIR` (targeted, restored) —
+        // no `HOME` churn, matching `bundle.rs`'s unmanaged-agent test.
+        let base = std::env::temp_dir().join(format!("sz-agentcfg-{}", crate::util::now()));
+        let present = base.join("present");
+        let absent = base.join("absent"); // deliberately not created
+        std::fs::create_dir_all(&present).unwrap();
+        let present_s = present.to_string_lossy().into_owned();
+        let absent_s = absent.to_string_lossy().into_owned();
+        let prev = std::env::var("CLAUDE_CONFIG_DIR").ok();
+
+        // SAFETY: single-threaded test; `CLAUDE_CONFIG_DIR` is read only by
+        // `account::effective_config_dir`, reached via `default_writable_carveouts`.
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &present_s) };
+        let hardened = default_writable_carveouts(SandboxProfile::Hardened);
+        let sealed = default_writable_carveouts(SandboxProfile::Sealed);
+        let sealed_tunnel = default_writable_carveouts(SandboxProfile::SealedTunnel);
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &absent_s) };
+        let hardened_absent = default_writable_carveouts(SandboxProfile::Hardened);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+        }
+        std::fs::remove_dir_all(&base).ok();
+
+        assert!(
+            hardened.iter().any(|m| m.host == present_s && !m.ro),
+            "hardened profile must carve the agent config dir writable"
+        );
+        assert!(
+            !sealed.iter().any(|m| m.host == present_s),
+            "sealed agent profile must NOT carve the host config dir writable"
+        );
+        assert!(
+            !sealed_tunnel.iter().any(|m| m.host == present_s),
+            "sealed-tunnel profile must NOT carve the host config dir writable"
+        );
+        assert!(
+            !hardened_absent.iter().any(|m| m.host == absent_s),
+            "a non-existent config dir must never be carved"
+        );
     }
 
     #[test]
