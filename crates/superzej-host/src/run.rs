@@ -8917,7 +8917,7 @@ async fn event_loop<T: Terminal>(
                         // (with the loading splash) and opens it.
                         Err(SpecError::PrewarmSkipped)
                     } else {
-                        crate::agent::launch_spec(&cfg, &wt, None, "shell")
+                        crate::direnv_warm::launch_spec_synced(&cfg, &wt, None, "shell")
                             .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
                             .map_err(spec_err)
                     };
@@ -16959,7 +16959,7 @@ async fn event_loop<T: Terminal>(
                                     }
 
                                     let wt_str = path.to_string_lossy().into_owned();
-                                    let Ok(mut spec) = crate::agent::launch_spec(
+                                    let Ok(mut spec) = crate::direnv_warm::launch_spec_synced(
                                         &cfg2,
                                         &wt_str,
                                         Some(&branch),

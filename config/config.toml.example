@@ -1308,10 +1308,14 @@ inject_devshell = true
 # (`use flake ".#${SUPERZEJ_DEVSHELL:-default}"`). Missing tools are then a
 # `nix shell nixpkgs#<tool>` away in-pane.
 # devshell = "sandbox"
-# Tier B (opt-in): bind-mount the host Nix daemon socket into the sandbox so full
-# `nix develop`/`build`/`fmt` run INSIDE it. Off by default — it relaxes the
-# isolation the hardening profiles provide. `inject_devshell` already covers
-# read-only tool access without this. Ignored if the host has no Nix daemon.
+# Tier B: bind-mount the host Nix daemon socket into the sandbox so full
+# `nix develop`/`build`/`fmt` run INSIDE it. `true` forces it on for every
+# sandbox. `false` (default) does NOT fully disable it: as a backstop it is
+# auto-enabled for a local flake-backed worktree, so an in-sandbox `nix-direnv`
+# cache MISS re-evals via the daemon instead of dying on the read-only
+# `/nix/store`. The socket is a local unix socket, so this is compatible with
+# `network = none`. To suppress the auto-backstop, set `warm_direnv = off` or
+# use a `sealed` profile. Ignored if the host has no Nix daemon.
 nix_daemon = false
 
 # ── Missing backend behaviour ─────────────────────────────────────────────────

@@ -575,13 +575,22 @@ pub fn resolve_placed(
     // panes carry no spec and so stay unmarked — correct, they aren't sandboxed.
     env.push(("SUPERZEJ_SANDBOX".to_string(), "1".to_string()));
 
-    // Tier B (opt-in): expose the host Nix daemon inside the sandbox so full
+    // Tier B: expose the host Nix daemon inside the sandbox so full
     // `nix develop`/`build`/`fmt` work there (Tier A only gives read-only tools
     // on PATH). Path-preserving bind of the daemon-socket dir + `NIX_REMOTE`;
     // the daemon mediates store writes, so the read-only `/nix/store` mount is
-    // fine. Only when the host actually has a daemon — otherwise we'd wire a
-    // half-broken nix, so we warn and leave it off (Tier A still stands).
-    if cfg.nix_daemon {
+    // fine. `nix_daemon = true` forces it on for every sandbox; otherwise it's a
+    // backstop auto-enabled for a local flake-backed worktree so an in-sandbox
+    // `nix-direnv` cache MISS re-evals via the daemon instead of dying on the
+    // read-only `/nix/store` (see [`crate::direnv`]). Opt out with
+    // `warm_direnv = off` (disables the whole in-sandbox-direnv machinery) or
+    // `profile = sealed` (no-network floor). The socket is a local unix socket,
+    // so this is compatible with `network = none`.
+    let auto_daemon = placement.is_local()
+        && !profile.forces_no_network()
+        && cfg.warm_direnv != crate::config::WarmDirenv::Off
+        && crate::direnv::has_flake_envrc(&worktree);
+    if cfg.nix_daemon || auto_daemon {
         const SOCK_DIR: &str = "/nix/var/nix/daemon-socket";
         if std::path::Path::new(SOCK_DIR).join("socket").exists() {
             mounts.push(Mount {
@@ -591,7 +600,8 @@ pub fn resolve_placed(
                 cache: false,
             });
             env.push(("NIX_REMOTE".to_string(), "daemon".to_string()));
-        } else {
+        } else if cfg.nix_daemon {
+            // Only nag when explicitly requested; the auto backstop stays silent.
             msg::warn(
                 "sandbox: [sandbox] nix_daemon is on but no host Nix daemon socket was \
                  found (/nix/var/nix/daemon-socket/socket); leaving it off. Tier A \
