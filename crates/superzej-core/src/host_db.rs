@@ -13,6 +13,7 @@ use crate::host::{Arch, HostCaps, HostFailure, HostId};
 use crate::host_machine::HostState;
 use crate::image::Digest;
 use crate::inventory::{ArtifactKind, InventoryEntry, InventoryKey};
+use crate::store::HostStore;
 
 /// v30: hosts as first-class resources. Purely additive (CREATE IF NOT EXISTS),
 /// so re-running is a no-op.
@@ -123,8 +124,8 @@ const HOST_COLS: &str = "host_id, name, reach_kind, state, state_meta, caps_json
                          install_consent, heartbeat, active_step, last_probe, last_used, \
                          updated_at";
 
-impl Db {
-    pub fn host_get(&self, id: &HostId) -> Result<Option<HostRow>> {
+impl HostStore for Db {
+    fn host_get(&self, id: &HostId) -> Result<Option<HostRow>> {
         let got = self
             .conn()
             .query_row(
@@ -139,7 +140,7 @@ impl Db {
         }))
     }
 
-    pub fn hosts_all(&self) -> Result<Vec<HostRow>> {
+    fn hosts_all(&self) -> Result<Vec<HostRow>> {
         let mut stmt = self
             .conn()
             .prepare(&format!("SELECT {HOST_COLS} FROM hosts ORDER BY host_id"))?;
@@ -158,7 +159,7 @@ impl Db {
 
     /// Upsert a durable checkpoint. `caps`/`arch` refresh when provided and are
     /// preserved otherwise; a non-`failed` state clears `state_meta`.
-    pub fn host_checkpoint(
+    fn host_checkpoint(
         &self,
         id: &HostId,
         name: &str,
@@ -195,7 +196,7 @@ impl Db {
     /// Leader liveness: stamp the step being worked plus a heartbeat. Another
     /// process seeing `heartbeat` fresher than its takeover threshold attaches
     /// (renders `active_step`) instead of double-driving.
-    pub fn host_heartbeat(&self, id: &HostId, active_step: &str, now: i64) -> Result<()> {
+    fn host_heartbeat(&self, id: &HostId, active_step: &str, now: i64) -> Result<()> {
         self.conn().execute(
             "UPDATE hosts SET heartbeat=?2, active_step=?3, updated_at=?2 WHERE host_id=?1",
             params![id.as_str(), now, active_step],
@@ -204,7 +205,7 @@ impl Db {
     }
 
     /// Clear the heartbeat on terminal states so an idle row never looks driven.
-    pub fn host_heartbeat_clear(&self, id: &HostId) -> Result<()> {
+    fn host_heartbeat_clear(&self, id: &HostId) -> Result<()> {
         self.conn().execute(
             "UPDATE hosts SET heartbeat=NULL, active_step=NULL WHERE host_id=?1",
             params![id.as_str()],
@@ -212,7 +213,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn host_touch_probe(&self, id: &HostId, now: i64) -> Result<()> {
+    fn host_touch_probe(&self, id: &HostId, now: i64) -> Result<()> {
         self.conn().execute(
             "UPDATE hosts SET last_probe=?2, updated_at=?2 WHERE host_id=?1",
             params![id.as_str(), now],
@@ -220,7 +221,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn host_touch_used(&self, id: &HostId, now: i64) -> Result<()> {
+    fn host_touch_used(&self, id: &HostId, now: i64) -> Result<()> {
         self.conn().execute(
             "UPDATE hosts SET last_used=?2 WHERE host_id=?1",
             params![id.as_str(), now],
@@ -229,7 +230,7 @@ impl Db {
     }
 
     /// Persist the per-host install grant (`granted`/`declined`).
-    pub fn host_set_consent(&self, id: &HostId, granted: bool, now: i64) -> Result<()> {
+    fn host_set_consent(&self, id: &HostId, granted: bool, now: i64) -> Result<()> {
         self.conn().execute(
             "UPDATE hosts SET install_consent=?2, consented_at=?3, updated_at=?3 WHERE host_id=?1",
             params![
@@ -243,7 +244,7 @@ impl Db {
 
     /// Remove a host row + its inventory + events (the `host rm-cache` /
     /// remove action; on-host artifacts are the caller's job).
-    pub fn host_delete(&self, id: &HostId) -> Result<()> {
+    fn host_delete(&self, id: &HostId) -> Result<()> {
         self.conn().execute(
             "DELETE FROM host_inventory WHERE host_id=?1",
             params![id.as_str()],
@@ -262,7 +263,7 @@ impl Db {
     /// merged into the config catalog at load —
     /// [`crate::host_config::merge_db_hosts`]. Declarative `[host.<name>]`
     /// config SHADOWS a DB def of the same name.
-    pub fn put_host_def(
+    fn put_host_def(
         &self,
         name: &str,
         hc: &crate::host_config::HostConfig,
@@ -284,7 +285,7 @@ impl Db {
     }
 
     /// All user-added host definitions (rows carrying a config_json).
-    pub fn host_defs(&self) -> Result<Vec<(String, crate::host_config::HostConfig)>> {
+    fn host_defs(&self) -> Result<Vec<(String, crate::host_config::HostConfig)>> {
         let mut stmt = self.conn().prepare(
             "SELECT name, config_json FROM hosts
               WHERE config_json IS NOT NULL AND name != '' ORDER BY name",
@@ -301,7 +302,7 @@ impl Db {
         Ok(out)
     }
 
-    pub fn host_inventory(&self, id: &HostId) -> Result<Vec<InventoryEntry>> {
+    fn host_inventory(&self, id: &HostId) -> Result<Vec<InventoryEntry>> {
         let mut stmt = self.conn().prepare(
             "SELECT kind, digest, arch, ref_name, present_at, verified_at, size_bytes
                FROM host_inventory WHERE host_id=?1 ORDER BY present_at",
@@ -343,7 +344,7 @@ impl Db {
         Ok(out)
     }
 
-    pub fn host_inventory_put(&self, e: &InventoryEntry) -> Result<()> {
+    fn host_inventory_put(&self, e: &InventoryEntry) -> Result<()> {
         self.conn().execute(
             "INSERT OR REPLACE INTO host_inventory
                (host_id, kind, digest, arch, ref_name, present_at, verified_at, size_bytes)
@@ -363,7 +364,7 @@ impl Db {
     }
 
     /// Stamp a successful on-host verification of one artifact.
-    pub fn host_inventory_verify(&self, key: &InventoryKey, now: i64) -> Result<()> {
+    fn host_inventory_verify(&self, key: &InventoryKey, now: i64) -> Result<()> {
         self.conn().execute(
             "UPDATE host_inventory SET verified_at=?5
               WHERE host_id=?1 AND kind=?2 AND digest=?3 AND arch=?4",
@@ -379,7 +380,7 @@ impl Db {
     }
 
     /// Drop one artifact (delivery superseded / digest mismatch cleanup).
-    pub fn host_inventory_remove(&self, key: &InventoryKey) -> Result<()> {
+    fn host_inventory_remove(&self, key: &InventoryKey) -> Result<()> {
         self.conn().execute(
             "DELETE FROM host_inventory
               WHERE host_id=?1 AND kind=?2 AND digest=?3 AND arch=?4",
@@ -394,7 +395,7 @@ impl Db {
     }
 
     /// Append to the forensic step trail.
-    pub fn host_event(&self, id: &HostId, step: &str, detail: &str, now: i64) -> Result<()> {
+    fn host_event(&self, id: &HostId, step: &str, detail: &str, now: i64) -> Result<()> {
         self.conn().execute(
             "INSERT INTO host_events (host_id, at, step, detail) VALUES (?1, ?2, ?3, ?4)",
             params![id.as_str(), now, step, detail],
@@ -403,11 +404,7 @@ impl Db {
     }
 
     /// Most-recent-first slice of the event trail: `(at, step, detail)`.
-    pub fn host_events_recent(
-        &self,
-        id: &HostId,
-        limit: usize,
-    ) -> Result<Vec<(i64, String, String)>> {
+    fn host_events_recent(&self, id: &HostId, limit: usize) -> Result<Vec<(i64, String, String)>> {
         let mut stmt = self.conn().prepare(
             "SELECT at, step, detail FROM host_events
               WHERE host_id=?1 ORDER BY id DESC LIMIT ?2",
@@ -423,6 +420,7 @@ impl Db {
 mod tests {
     use super::*;
     use crate::host::HostStep;
+    use crate::store::HostStore;
 
     const D1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 

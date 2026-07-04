@@ -30,6 +30,7 @@
 use std::collections::HashMap;
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 
+use superzej_core::store::{PoolStore, WorkspaceStore};
 /// A name registry with a hold-count per name. Exclusive acquires wait for the
 /// count to reach zero; shared acquires just increment. One registry per use
 /// (locks vs live-flags) so an exclusive sandbox lock never contends with the

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use superzej_core::sandbox::CONTAINER_PREFIX;
+use superzej_core::store::{WorkspaceStore, WorktreeAuxStore};
 
 /// Update type sent to the event loop: tells it to refresh the audit panel.
 #[derive(Debug)]

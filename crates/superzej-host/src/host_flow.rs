@@ -31,6 +31,7 @@ use superzej_core::host_machine::{
 };
 use superzej_core::image::managed_tag;
 use superzej_core::inventory::ArtifactKind;
+use superzej_core::store::{HostStore, WorkspaceStore};
 use superzej_svc::host::{HostRunner, local_caps, runner_for};
 
 use crate::agent::{ProvisionState, ProvisionStepView};

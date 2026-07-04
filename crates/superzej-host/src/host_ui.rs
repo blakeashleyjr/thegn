@@ -12,6 +12,7 @@ use superzej_core::db::Db;
 use superzej_core::host::HostId;
 use superzej_core::host_config::{HostReach, InstallConsent};
 use superzej_core::host_machine::HostState;
+use superzej_core::store::HostStore;
 
 use crate::handlers::host::HostRuntime;
 

@@ -14,6 +14,7 @@ use crate::config::{
 use crate::host::{CloudReach, DeliveryCap, HostId, IrohReach, Reach, VolumeSpec};
 use crate::image::ImageRef;
 use crate::placement::{SshPlacement, TransportKind};
+use crate::store::HostStore;
 
 /// Default probe TTL: a `Ready` host older than this re-verifies (one cheap
 /// batched exec on a warm ControlMaster) before the fast path trusts it.

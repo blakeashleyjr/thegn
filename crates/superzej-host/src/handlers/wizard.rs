@@ -3,6 +3,7 @@
 //! its host rows with `[host.*]` readiness badges, and kick the speculative
 //! create worker off-loop.
 
+use superzej_core::store::HostStore;
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task;

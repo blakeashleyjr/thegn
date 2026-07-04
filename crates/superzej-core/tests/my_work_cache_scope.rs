@@ -2,6 +2,7 @@
 //! god-file `db.rs` per the file-size ratchet.
 
 use superzej_core::db::Db;
+use superzej_core::store::CacheStore;
 use superzej_core::work::ALL_SCOPE;
 
 #[test]

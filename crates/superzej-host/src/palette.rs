@@ -13,6 +13,7 @@ use crate::chrome::S;
 use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::seg::{self, Line, Tok, seg, sp};
+use superzej_core::store::WorkspaceStore;
 
 /// A selectable palette row. `key` is the stable dispatch/frecency key; `label`
 /// is what the user sees and what fuzzy matching runs against.

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
+use superzej_core::store::{PoolStore, ProxyStore, WorkspaceStore};
 use superzej_core::{bundle, devenv, repo, sandbox};
 use superzej_svc::projection::ProjectionBackend;
 use superzej_svc::vpn::VpnProvider;

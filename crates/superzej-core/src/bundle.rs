@@ -26,6 +26,7 @@ use crate::account;
 use crate::config::{Bundle, Config, expand_env_ref};
 use crate::db::Db;
 use crate::sandbox::Mount;
+use crate::store::WorkspaceStore;
 use crate::util;
 use std::collections::{BTreeMap, HashSet};
 

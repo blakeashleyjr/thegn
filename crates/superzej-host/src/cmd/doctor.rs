@@ -12,6 +12,7 @@ use superzej_core::managed_tool::{ManagedTool, Resolution};
 use superzej_core::outln;
 use superzej_core::placement::Placement;
 use superzej_core::sandbox::Backend;
+use superzej_core::store::HostStore;
 use superzej_core::termcaps::{ColorDepth, TermCaps, TermEnv, UnicodeLevel};
 
 fn color_str(d: ColorDepth) -> &'static str {

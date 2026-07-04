@@ -7,6 +7,7 @@ use crate::chrome::LoadStep;
 use crate::compositor::Rect;
 use crate::loading::{SpecOrigin, apply_spec_batch};
 use crate::menu::{self, MenuOverlay};
+use superzej_core::store::{PoolStore, WorkspaceStore};
 
 /// Resolved launch specs routed back to the requesting group by its unique
 /// NAME (a path can be shared by two groups); the batch also carries the path

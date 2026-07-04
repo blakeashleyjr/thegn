@@ -14,6 +14,7 @@ use superzej_core::ci::{self, CiJob, CiRun, CiState, RerunScope};
 use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
+use superzej_core::store::CacheStore;
 use superzej_core::{msg, outln};
 use superzej_svc::ci::{CiClient, provider_for};
 

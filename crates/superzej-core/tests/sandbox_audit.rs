@@ -4,6 +4,7 @@
 //! plus a no-panic smoke test for sandbox_events spawn without podman.
 
 use superzej_core::db::Db;
+use superzej_core::store::WorktreeAuxStore;
 
 fn db() -> Db {
     Db::open_memory().unwrap()

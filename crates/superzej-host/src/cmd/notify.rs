@@ -6,6 +6,7 @@
 #![allow(clippy::disallowed_macros)]
 
 use clap::Subcommand;
+use superzej_core::store::NotificationStore;
 
 #[derive(Subcommand, Clone)]
 pub enum Action {

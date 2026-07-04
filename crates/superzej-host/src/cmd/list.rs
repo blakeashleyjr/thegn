@@ -6,6 +6,7 @@ use std::path::Path;
 use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::models::WorktreeView;
+use superzej_core::store::WorkspaceStore;
 use superzej_core::{outln, repo, theme, util};
 
 fn is_managed(path: &str, branch: &str, cfg: &Config) -> bool {

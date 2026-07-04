@@ -14,6 +14,7 @@ use superzej_core::db::ProxyRequestRow;
 use superzej_core::proxy::classify::{FailKind, classify_response};
 use superzej_core::proxy::cost::{PriceTable, Usage, cost_usd};
 use superzej_core::proxy::transform;
+use superzej_core::store::ProxyStore;
 
 use crate::anthropic_stream::AnthropicSink;
 use crate::budget::Identity;

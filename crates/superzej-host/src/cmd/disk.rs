@@ -6,6 +6,7 @@
 use anyhow::Result;
 use superzej_core::config::Config;
 use superzej_core::db::Db;
+use superzej_core::store::{WorkspaceStore, WorktreeAuxStore};
 use superzej_core::{disk, outln, worktree};
 
 use super::{confirm, resolve_worktree};

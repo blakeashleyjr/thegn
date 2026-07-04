@@ -5,7 +5,9 @@
 //! a pre-routing check refuses (or downgrades) when a cap or the kill-switch is
 //! hit (V 292/293/296). This is net-new versus the Go proxy.
 
+#[cfg(test)]
 use superzej_core::db::Db;
+use superzej_core::store::ProxyStore;
 
 use crate::shared::{SharedDb, now_ms};
 
@@ -97,11 +99,11 @@ pub fn record_spend(db: &SharedDb, identity: &Identity, tokens: i64, cost: f64) 
     let mut killed = false;
     if let Ok(guard) = db.lock() {
         if identity.scope != "global"
-            && let Ok((_, _, k)) = Db::add_proxy_spend(&guard, &identity.scope, tokens, cost, ts)
+            && let Ok((_, _, k)) = guard.add_proxy_spend(&identity.scope, tokens, cost, ts)
         {
             killed = k;
         }
-        let _ = Db::add_proxy_spend(&guard, "global", tokens, cost, ts);
+        let _ = guard.add_proxy_spend("global", tokens, cost, ts);
     }
     killed
 }

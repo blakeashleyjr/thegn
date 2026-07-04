@@ -5,6 +5,8 @@
 
 use anyhow::{Context, Result};
 
+use superzej_core::store::WorkspaceStore;
+
 use crate::chrome::FrameModel;
 use crate::compositor::Rect;
 use crate::menu::{self, MenuOverlay};

@@ -7,6 +7,7 @@
 use crate::db::Db;
 use crate::event_bus::{Event, EventBus};
 use crate::mcp::router::McpRouter;
+use crate::store::NotificationStore;
 use serde_json::json;
 use std::sync::Arc;
 
