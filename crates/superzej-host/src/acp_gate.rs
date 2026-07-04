@@ -163,9 +163,10 @@ mod tests {
     }
 
     fn cfg_with(agents: &[(&str, &str)]) -> Config {
-        let mut cfg = Config::default();
-        cfg.agents = agents.iter().map(|(n, c)| named(n, c)).collect();
-        cfg
+        Config {
+            agents: agents.iter().map(|(n, c)| named(n, c)).collect(),
+            ..Config::default()
+        }
     }
 
     // The managed pi's command references `~/.superzej/pi` (sets PI_CODING_AGENT_DIR
