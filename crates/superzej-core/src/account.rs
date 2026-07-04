@@ -19,6 +19,7 @@
 
 use crate::config::Config;
 use crate::db::Db;
+use crate::store::{AccountStore, WorkspaceStore};
 use crate::util;
 use std::path::PathBuf;
 

@@ -8,6 +8,7 @@ use anyhow::Result;
 use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::host_machine::HostState;
+use superzej_core::store::HostStore;
 use superzej_core::{msg, outln};
 
 use crate::agent::{ProvisionState, ProvisionStepView};

@@ -6,6 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use superzej_core::host::HostFailure;
+use superzej_core::store::HostStore;
 
 use crate::agent::ProvisionStepView;
 use crate::host_flow::{HostUiEvent, failure_reason, resolve_consent};

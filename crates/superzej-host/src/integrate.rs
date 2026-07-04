@@ -18,6 +18,7 @@ use superzej_core::config::MergeQueueConfig;
 use superzej_core::db::Db;
 use superzej_core::fold::{self, Branch, ConflictKind, FoldGit, FoldPlan, MergeOutcome};
 use superzej_core::remote::GitLoc;
+use superzej_core::store::WorktreeAuxStore;
 use superzej_core::util;
 use superzej_svc::git::{CliGit, GitBackend, MergeTreeOutcome, PlumbingOps};
 

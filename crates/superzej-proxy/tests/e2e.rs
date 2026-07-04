@@ -18,6 +18,7 @@ use superzej_core::db::Db;
 use superzej_core::proxy::compress::Level;
 use superzej_core::proxy::ratelimit::RatePolicy;
 use superzej_core::proxy::transform::CompressPolicy;
+use superzej_core::store::ProxyStore;
 use superzej_proxy::model::{Backend, ProxyConfig, Route};
 use superzej_proxy::server;
 use superzej_proxy::shared::{SharedDb, now_ms};

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
+use superzej_core::store::WorkspaceStore;
 use superzej_core::{msg, outln, repo};
 use superzej_svc::projection::ProjectionBackend;
 

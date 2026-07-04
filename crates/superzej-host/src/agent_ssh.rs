@@ -10,6 +10,7 @@ use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
 use superzej_core::repo;
+use superzej_core::store::WorkspaceStore;
 
 use crate::agent::shell_inner;
 

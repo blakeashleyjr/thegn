@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use superzej_core::config::NotificationsConfig;
 use superzej_core::notification::NotificationKind;
 use superzej_core::notification_route::{RouteCtx, RouteDecision, SoundEmit, decide};
+use superzej_core::store::NotificationStore;
 use termwiz::terminal::TerminalWaker;
 
 /// Shared, thread-safe notification runtime. Cloned (as `Arc`) into the

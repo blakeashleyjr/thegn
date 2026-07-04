@@ -12,6 +12,7 @@
 //! *control plane* (always ssh, which — unlike mosh — can pipe non-interactive
 //! commands and multiplex via ControlMaster).
 
+use crate::store::WorkspaceStore;
 use crate::util;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

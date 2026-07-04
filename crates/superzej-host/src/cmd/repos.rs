@@ -3,6 +3,7 @@
 use anyhow::Result;
 use superzej_core::config::Config;
 use superzej_core::db::Db;
+use superzej_core::store::WorkspaceStore;
 use superzej_core::{outln, repo};
 
 /// Git repos discovered under `repo_roots` (what the picker offers).

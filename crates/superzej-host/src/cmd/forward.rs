@@ -8,6 +8,7 @@
 use anyhow::Result;
 use superzej_core::db::Db;
 use superzej_core::outln;
+use superzej_core::store::WorktreeAuxStore;
 
 use crate::cmd::resolve_worktree;
 

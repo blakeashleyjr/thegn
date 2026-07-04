@@ -14,6 +14,7 @@ use anyhow::Result;
 
 use superzej_core::rebase_todo::{TodoAction, TodoEntry};
 use superzej_core::remote::GitLoc;
+use superzej_core::store::WorktreeAuxStore;
 use superzej_svc::git::{
     BisectOps, BranchOps, CherryOps, CliGit, CommitOps, CustomOps, ForceMode, GitBackend, PatchOps,
     RebaseOps, RebaseOpts, RebaseOutcome, ResetMode, StageOps, StashOps, UndoOps,

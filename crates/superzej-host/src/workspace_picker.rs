@@ -19,6 +19,7 @@ use crate::chrome::S;
 use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::seg::{self, Line, Seg, Tok, seg, sp};
+use superzej_core::store::WorkspaceStore;
 
 /// Maximum visible repo rows at one time (the list scrolls past this).
 const MAX_ITEMS: usize = 10;

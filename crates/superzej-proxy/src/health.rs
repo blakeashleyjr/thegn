@@ -9,10 +9,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
+#[cfg(test)]
 use superzej_core::db::Db;
 use superzej_core::proxy::backoff::{
     ExhaustionKind, backoff_config_for, backoff_from_config, classify_exhaustion,
 };
+use superzej_core::store::ProxyStore;
 
 use crate::shared::SharedDb;
 
@@ -201,8 +203,7 @@ impl Health {
 
     fn persist(&self, backend: &str, model: &str, m: &Marker) {
         if let Ok(db) = self.db.lock() {
-            let _ = Db::put_proxy_health(
-                &db,
+            let _ = db.put_proxy_health(
                 backend,
                 model,
                 kind_str(m.kind),

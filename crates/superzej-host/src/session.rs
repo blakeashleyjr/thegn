@@ -9,6 +9,7 @@
 use anyhow::Result;
 use superzej_core::db::Db;
 use superzej_core::models::{GroupTabRow, TabGroupRow};
+use superzej_core::store::WorkspaceStore;
 
 use crate::center::CenterTree;
 

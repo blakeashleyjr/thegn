@@ -1,5 +1,6 @@
 use crate::db::Db;
 use crate::mcp::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use crate::store::{CacheStore, NotificationStore, ProxyStore};
 use serde_json::json;
 use std::sync::Arc;
 

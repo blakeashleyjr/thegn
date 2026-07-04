@@ -50,6 +50,9 @@ use crate::panes::{
 use crate::recorder::Recorder;
 use crate::wizard;
 use crate::workspace_create::complete_workspace_create;
+use superzej_core::store::{
+    AccountStore, CacheStore, NotificationStore, PoolStore, WorkspaceStore, WorktreeAuxStore,
+};
 
 /// Bounded PTY event queue depth. Reader threads use `blocking_send`, so this
 /// is the backpressure valve for chatty panes: large enough for bursts, small

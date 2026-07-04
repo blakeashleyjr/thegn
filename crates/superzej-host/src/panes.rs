@@ -10,6 +10,7 @@ use termwiz::terminal::TerminalWaker;
 
 use crate::compositor::Rect;
 use crate::pane::{PaneEvent, PtyPane};
+use superzej_core::store::WorkspaceStore;
 
 /// The shell argv used for new panes. Non-login interactive shells are the
 /// default because login startup files are expensive and can trigger user

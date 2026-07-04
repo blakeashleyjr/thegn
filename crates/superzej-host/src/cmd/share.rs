@@ -14,6 +14,7 @@ use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::outln;
 use superzej_core::share::build_share_spec;
+use superzej_core::store::WorktreeAuxStore;
 use superzej_svc::share::{self, ShareLaunch, ShareProvider};
 
 use crate::cmd::resolve_worktree;

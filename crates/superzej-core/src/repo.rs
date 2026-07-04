@@ -3,6 +3,7 @@
 //! resurrection (git is the source of truth; the DB is only a cache).
 
 use crate::config::Config;
+use crate::store::WorkspaceStore;
 use crate::util;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;

@@ -14,6 +14,7 @@ use termwiz::terminal::TerminalWaker;
 
 use crate::chrome::{FrameModel, LoadStep};
 use crate::run::now_secs;
+use superzej_core::store::{CacheStore, NotificationStore, WorkspaceStore, WorktreeAuxStore};
 
 /// Default for [`model_refresh_interval`]. Matches `bg_glyph_ttl`'s 5s default
 /// (the ticker's only job is refreshing background glyphs + the activity FSM);
@@ -1106,6 +1107,7 @@ pub(crate) fn build_model(
     hints: HydrateHints,
 ) -> FrameModel {
     use superzej_core::remote::GitLoc;
+    use superzej_core::store::ProxyStore;
 
     let t0 = std::time::Instant::now();
     let cwd = active_tab_path(session);

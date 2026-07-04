@@ -9,6 +9,7 @@ use anyhow::Result;
 use superzej_core::db::Db;
 use superzej_core::github::{self, CreateOpts, MergeMethod, PanelState, PrPanel};
 use superzej_core::remote::GitLoc;
+use superzej_core::store::CacheStore;
 use superzej_core::{msg, outln};
 
 use crate::cmd::{confirm, resolve_worktree};
