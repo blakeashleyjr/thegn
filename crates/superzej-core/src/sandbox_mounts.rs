@@ -211,12 +211,21 @@ pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
         ".zsh_history",
         ".bash_history",
     ];
-    // `~/.keychain`: interactive/hardened only — never for the sealed agent.
+    // Interactive/hardened only — never the sealed agent:
+    //   `~/.keychain` stores scripts host login shells later *source*.
+    //   `~/.claude-profiles` is where HOME-swapping coding-agent profile wrappers
+    //     (e.g. `claude-profile` / `claude-multiplex`, which `export
+    //     HOME=$HOME/.claude-profiles/<name>` then exec the agent) keep each
+    //     profile's config + session state. superzej mounts $HOME read-only and
+    //     can't predict that per-profile subdir, so the agent's `session-env`
+    //     mkdir dies EROFS without this carve. Off for sealed: a network=none
+    //     agent must not get write access to the host's real credential dirs.
     if !matches!(
         profile,
         SandboxProfile::Sealed | SandboxProfile::SealedTunnel
     ) {
         rels.push(".keychain");
+        rels.push(".claude-profiles");
     }
     let mut mounts: Vec<Mount> = rels
         .iter()
@@ -333,6 +342,39 @@ mod tests {
         assert!(
             !has_keychain(SandboxProfile::SealedTunnel),
             "sealed-tunnel profile must NOT carve ~/.keychain"
+        );
+    }
+
+    #[test]
+    fn claude_profiles_carved_for_hardened_not_sealed() {
+        // HOME-swapping profile wrappers (claude-profile / claude-multiplex) put
+        // each profile's config+session under ~/.claude-profiles/<name>; it must
+        // be writable so the agent's `session-env` mkdir doesn't EROFS — but NOT
+        // for the sealed agent. Only meaningful when the dir exists on this host.
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty()
+            || !std::path::Path::new(&home)
+                .join(".claude-profiles")
+                .is_dir()
+        {
+            return;
+        }
+        let has = |profile| {
+            default_writable_carveouts(profile)
+                .iter()
+                .any(|m| m.host.ends_with("/.claude-profiles") && !m.ro)
+        };
+        assert!(
+            has(SandboxProfile::Hardened),
+            "hardened profile should carve ~/.claude-profiles writable"
+        );
+        assert!(
+            !has(SandboxProfile::Sealed),
+            "sealed agent profile must NOT carve ~/.claude-profiles"
+        );
+        assert!(
+            !has(SandboxProfile::SealedTunnel),
+            "sealed-tunnel profile must NOT carve ~/.claude-profiles"
         );
     }
 
