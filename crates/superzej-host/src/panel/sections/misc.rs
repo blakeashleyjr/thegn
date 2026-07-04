@@ -112,7 +112,11 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     if deep {
         rows.push(PanelRow::blank());
-        let loc = model.loc.map(compact_count).unwrap_or_else(|| "—".into());
+        let loc = model
+            .loc
+            .as_ref()
+            .map(|r| compact_count(r.total_code as u64))
+            .unwrap_or_else(|| "—".into());
         let count = data
             .file_count
             .map(|n| n.to_string())

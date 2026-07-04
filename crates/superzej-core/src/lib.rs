@@ -54,6 +54,7 @@ pub mod issue;
 pub mod keymap;
 pub mod layout_import;
 pub mod lifecycle;
+pub mod loc;
 pub mod log;
 pub mod log_trace;
 pub mod log_view;
