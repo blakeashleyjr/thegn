@@ -49,7 +49,7 @@ use crate::panes::{
 };
 use crate::recorder::Recorder;
 use crate::wizard;
-use crate::workspace_create::{WorkspaceCloneOutcome, complete_workspace_create};
+use crate::workspace_create::complete_workspace_create;
 
 /// Bounded PTY event queue depth. Reader threads use `blocking_send`, so this
 /// is the backpressure valve for chatty panes: large enough for bursts, small
@@ -7962,7 +7962,7 @@ async fn event_loop<T: Terminal>(
     // Workspace create-by-URL: the `git clone` runs off the loop (it can take
     // minutes) and the create/switch completes over this channel.
     let (workspace_clone_tx, mut workspace_clone_rx) =
-        tokio_mpsc::unbounded_channel::<WorkspaceCloneOutcome>();
+        tokio_mpsc::unbounded_channel::<crate::workspace_create::CloneEvent>();
     let mut test_generation: u64 = 0;
     let mut loaded_tests_worktree = String::new();
     // Bounds concurrent test/discovery jobs across worktrees so explicit runs
@@ -9921,31 +9921,26 @@ async fn event_loop<T: Terminal>(
         {
             dirty = true;
         }
-        while let Ok(o) = workspace_clone_rx.try_recv() {
+        while let Ok(ev) = workspace_clone_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
-            match o.result {
-                Ok(()) => {
-                    let dest = o.dest.to_string_lossy().into_owned();
-                    if complete_workspace_create(
-                        &dest,
-                        &mut session,
-                        &mut panes,
-                        &mut workspace_pool,
-                        &mut active_menu,
-                        &mut focus,
-                        &mut model,
-                        &mut sb,
-                        &mut drawer,
-                        &mut drawer_pool,
-                        &mut drawer_home,
-                        &current_config,
-                        chrome.center,
-                    ) {
-                        need_relayout = true;
-                        kick_model_hydration!();
-                    }
-                }
-                Err(e) => model.status = format!("clone of {} failed: {e}", o.url),
+            if crate::workspace_create::apply_clone_event(
+                ev,
+                &mut workspace_picker,
+                &mut session,
+                &mut panes,
+                &mut workspace_pool,
+                &mut active_menu,
+                &mut focus,
+                &mut model,
+                &mut sb,
+                &mut drawer,
+                &mut drawer_pool,
+                &mut drawer_home,
+                &current_config,
+                chrome.center,
+            ) {
+                need_relayout = true;
+                kick_model_hydration!();
             }
             dirty = true;
         }
@@ -13277,79 +13272,30 @@ async fn event_loop<T: Terminal>(
                 // Modal: the new-workspace fuzzy picker captures all keys, like
                 // the wizard; outcomes route through the shared workspace_create
                 // flows (open / clone / init-offer / new-project confirm).
-                if let Some(p) = workspace_picker.as_mut() {
-                    match p.handle_key(&k.key, k.modifiers) {
-                        crate::workspace_picker::PickerOutcome::Pending => {}
-                        crate::workspace_picker::PickerOutcome::Cancel => {
-                            workspace_picker = None;
-                            model.status = "workspace creation cancelled".into();
-                        }
-                        crate::workspace_picker::PickerOutcome::OpenRepo(path) => {
-                            workspace_picker = None;
-                            if complete_workspace_create(
-                                &path,
-                                &mut session,
-                                &mut panes,
-                                &mut workspace_pool,
-                                &mut active_menu,
-                                &mut focus,
-                                &mut model,
-                                &mut sb,
-                                &mut drawer,
-                                &mut drawer_pool,
-                                &mut drawer_home,
-                                &current_config,
-                                chrome.center,
-                            ) {
-                                need_relayout = true;
-                                kick_model_hydration!();
-                            }
-                        }
-                        crate::workspace_picker::PickerOutcome::Manual(input) => {
-                            workspace_picker = None;
-                            match crate::workspace_create::plan_new_workspace_input(
-                                &input,
-                                &current_config,
-                            ) {
-                                crate::workspace_create::SubmitPlan::Clone { url, dest } => {
-                                    model.status = format!("Cloning {url}…");
-                                    crate::workspace_create::spawn_workspace_clone(
-                                        url,
-                                        dest,
-                                        workspace_clone_tx.clone(),
-                                        waker.clone(),
-                                    );
-                                }
-                                crate::workspace_create::SubmitPlan::Local(input) => {
-                                    if complete_workspace_create(
-                                        &input,
-                                        &mut session,
-                                        &mut panes,
-                                        &mut workspace_pool,
-                                        &mut active_menu,
-                                        &mut focus,
-                                        &mut model,
-                                        &mut sb,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
-                                        &current_config,
-                                        chrome.center,
-                                    ) {
-                                        need_relayout = true;
-                                        kick_model_hydration!();
-                                    }
-                                }
-                                crate::workspace_create::SubmitPlan::CreateNew { leaf } => {
-                                    active_menu = Some(menu::create_project_menu(
-                                        leaf.to_string_lossy().into_owned(),
-                                    ));
-                                }
-                                crate::workspace_create::SubmitPlan::Invalid(msg) => {
-                                    model.status = format!("workspace create failed: {msg}");
-                                }
-                            }
-                        }
+                if let Some(outcome) = workspace_picker
+                    .as_mut()
+                    .map(|p| p.handle_key(&k.key, k.modifiers))
+                {
+                    if crate::workspace_create::handle_picker_outcome(
+                        outcome,
+                        &mut workspace_picker,
+                        &workspace_clone_tx,
+                        &waker,
+                        &mut session,
+                        &mut panes,
+                        &mut workspace_pool,
+                        &mut active_menu,
+                        &mut focus,
+                        &mut model,
+                        &mut sb,
+                        &mut drawer,
+                        &mut drawer_pool,
+                        &mut drawer_home,
+                        &current_config,
+                        chrome.center,
+                    ) {
+                        need_relayout = true;
+                        kick_model_hydration!();
                     }
                     dirty = true;
                     continue;
@@ -20063,6 +20009,19 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             Ok(Some(InputEvent::Paste(s))) => {
+                // A modal that collects text owns the paste — inject it into
+                // the field (workspace picker, new-worktree wizard) rather than
+                // leaking it into the pane behind the overlay.
+                if let Some(p) = workspace_picker.as_mut() {
+                    p.handle_paste(&s);
+                    dirty = true;
+                    continue;
+                }
+                if let Some(w) = wizard_ui.as_mut() {
+                    w.handle_paste(&s);
+                    dirty = true;
+                    continue;
+                }
                 // A chrome text-input is collecting keystrokes (commit message /
                 // rename / new-branch overlay, the search palette, or the git
                 // filter line): a paste belongs to it, not the terminal. We

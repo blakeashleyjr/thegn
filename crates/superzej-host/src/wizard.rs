@@ -336,6 +336,19 @@ impl NewWorktreeWizard {
         }
     }
 
+    /// Inject bracketed-paste text. Only the Name field is a text input, so a
+    /// paste appends there (newlines stripped so it can't submit); pastes on
+    /// the cycle/list fields are ignored.
+    pub fn handle_paste(&mut self, text: &str) {
+        if self.focus != Field::Name {
+            return;
+        }
+        for c in text.chars().filter(|c| !matches!(c, '\n' | '\r')) {
+            self.tail.push(c);
+            self.name_edited = true;
+        }
+    }
+
     pub fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> WizardOutcome {
         if mods.contains(Modifiers::CTRL) {
             return match key {
