@@ -69,6 +69,10 @@ pub enum Action {
         id: String,
         worktree: Option<String>,
     },
+    /// Bake a reusable VPS base image (nix + direnv + docker preinstalled) and
+    /// print the `template = "snapshot:<id>"` to use it — the VPS stand-in for
+    /// checkpoints (~3-6 min cold provisions drop to ~30-90 s).
+    ImageBake { worktree: Option<String> },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -92,6 +96,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Snapshot { worktree, label } => snapshot(cfg, worktree, label),
         Action::Snapshots { worktree } => snapshots(cfg, worktree),
         Action::Restore { id, worktree } => restore(cfg, worktree, &id),
+        Action::ImageBake { worktree } => super::env_image::run(cfg, worktree),
     }
 }
 
@@ -145,8 +150,30 @@ fn api_provider(
                 &pc.id,
             )))
         }
+        vps if superzej_core::config::vps_provider_kind(vps) => {
+            // The per-worktree resolved sandbox id (the placement bakes it) —
+            // creates/destroys must name the same instance the panes attach to.
+            let id = match &env.placement {
+                superzej_core::placement::Placement::Provider(p) => p.id.clone(),
+                _ => String::new(),
+            };
+            crate::provider_factory::vps_provider_for(pc, &id)
+                .map(superzej_svc::provider::Provider::Vps)
+                .ok_or_else(|| {
+                    let key = if pc.api_key_env.trim().is_empty() {
+                        superzej_svc::vps::VpsKind::parse(vps)
+                            .map(|k| k.token_env_default())
+                            .unwrap_or("<token env>")
+                            .to_string()
+                    } else {
+                        pc.api_key_env.trim().to_string()
+                    };
+                    anyhow::anyhow!("the {vps} API token env var {key:?} is not set")
+                })
+        }
         other => anyhow::bail!(
-            "API provisioning supports 'daytona' and 'sprites'; env {} uses {:?}",
+            "API provisioning supports 'daytona', 'sprites', and VPS kinds \
+             (hetzner); env {} uses {:?}",
             env.name,
             other
         ),
@@ -337,7 +364,10 @@ fn forward(cfg: &Config, worktree: Option<String>, spec: &str) -> Result<()> {
 
 /// Resolve the [`Environment`](superzej_core::env::Environment) for a worktree
 /// (cwd default), honouring the DB worktree/workspace selection.
-fn resolve_for(cfg: &Config, worktree: Option<String>) -> superzej_core::env::Environment {
+pub(crate) fn resolve_for(
+    cfg: &Config,
+    worktree: Option<String>,
+) -> superzej_core::env::Environment {
     let wt = resolve_worktree(worktree);
     let loc = GitLoc::for_worktree(Path::new(&wt));
     let repo_root = repo_root_for(&wt);

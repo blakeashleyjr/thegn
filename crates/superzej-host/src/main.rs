@@ -70,6 +70,7 @@ mod pins;
 mod predict;
 mod probe;
 mod profile;
+mod provider_factory;
 mod provision_gate;
 mod proxy_daemon;
 mod queries;
@@ -98,6 +99,8 @@ mod telemetry;
 mod testenv;
 mod testkit;
 mod toast;
+mod vps_bridge;
+mod vps_reaper;
 mod wire;
 mod wizard;
 mod workspace_create;
@@ -295,6 +298,18 @@ pub enum Command {
     SpriteProxy {
         /// Worktree path (defaults to the current dir) — selects the env/sandbox.
         worktree: Option<String>,
+    },
+    /// Hidden: the VPS exec bridge (`vps-ssh <name> -- cmd…`) — the CLI prefix a
+    /// VPS provider env's panes and control-plane reads run through. Resolves
+    /// the instance IP (registry, then API) and execs `ssh` with the managed
+    /// key + per-instance known_hosts.
+    #[command(hide = true)]
+    VpsSsh {
+        /// The managed instance name (the resolved sandbox id).
+        name: String,
+        /// Command to run (empty ⇒ a login shell).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
     },
 }
 
@@ -510,6 +525,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(sprite_proxy_relay(provider, id))
         }
+        Command::VpsSsh { name, cmd } => vps_bridge::run(&cfg, &name, &cmd),
         Command::SandboxArgv { worktree } => {
             let wt = worktree
                 .or_else(|| std::env::current_dir().ok()?.to_str().map(str::to_string))

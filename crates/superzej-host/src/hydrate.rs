@@ -1156,6 +1156,8 @@ pub(crate) fn build_model(
         &counted_kinds,
         &app_cfg.lifecycle,
     );
+    // VPS leak-safety reaper (self-throttled; network runs on its own thread).
+    crate::vps_reaper::tick(&app_cfg);
     let loc_count = worktree_loc(db, &cwd);
 
     // Terse placement kind (ssh/mosh/k8s/<provider>) for the active worktree, for

@@ -26,7 +26,7 @@ use superzej_core::remote::SshTarget;
 /// so legitimately long transfers (large binary/closure pushes) still complete,
 /// but an unreachable endpoint fails fast instead of hanging. Falls back to the
 /// plain client if the builder ever fails (it won't in practice).
-fn provider_http_client() -> reqwest::Client {
+pub(crate) fn provider_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
         // Reap idle keep-alive sockets so a half-open connection to a sprite that
@@ -209,7 +209,7 @@ pub struct SpritesProvider {
 /// Timeout) can clear on a retry and leaving them unretried leaks a paid sandbox;
 /// other 4xx are the caller's fault and won't change on retry. (2xx and 404 are
 /// treated as success/already-gone before this is consulted.)
-fn destroy_retryable(status: reqwest::StatusCode) -> bool {
+pub(crate) fn destroy_retryable(status: reqwest::StatusCode) -> bool {
     status.is_server_error()
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status == reqwest::StatusCode::REQUEST_TIMEOUT
@@ -1339,6 +1339,10 @@ async fn drive_exec<S>(
 pub enum Provider {
     Daytona(DaytonaProvider),
     Sprites(SpritesProvider),
+    /// Commodity VPS vendors (Hetzner today) — lifecycle over REST, exec/files
+    /// over plain ssh. No checkpoints by construction: a powered-off VPS still
+    /// bills, so the only free state is destroyed (see `crate::vps`).
+    Vps(crate::vps::VpsProvider),
 }
 
 impl Provider {
@@ -1353,6 +1357,12 @@ impl Provider {
                 files: true,
                 exec_api: true,
             },
+            // files via the ssh shim; checkpoints deliberately absent (no
+            // suspend on a VPS — the recycle path must destroy, not restore).
+            Provider::Vps(_) => ProviderCaps {
+                files: true,
+                ..ProviderCaps::default()
+            },
         }
     }
 
@@ -1360,6 +1370,7 @@ impl Provider {
         match self {
             Provider::Daytona(p) => p.create().await,
             Provider::Sprites(p) => p.create().await,
+            Provider::Vps(p) => p.create().await,
         }
     }
 
@@ -1367,6 +1378,7 @@ impl Provider {
         match self {
             Provider::Daytona(p) => p.destroy(id).await,
             Provider::Sprites(p) => p.destroy(id).await,
+            Provider::Vps(p) => p.destroy(id).await,
         }
     }
 
@@ -1374,6 +1386,16 @@ impl Provider {
         match self {
             Provider::Daytona(p) => p.list().await,
             Provider::Sprites(p) => p.list().await,
+            Provider::Vps(p) => p.list().await,
+        }
+    }
+
+    /// The provider's short name (error messages / capability gating).
+    fn name(&self) -> &'static str {
+        match self {
+            Provider::Daytona(_) => "daytona",
+            Provider::Sprites(_) => "sprites",
+            Provider::Vps(p) => p.spec().kind.as_str(),
         }
     }
 
@@ -1397,8 +1419,9 @@ impl Provider {
     ) -> Result<()> {
         match self {
             Provider::Sprites(p) => p.set_network_policy(id, allow, block).await,
-            Provider::Daytona(_) => Err(anyhow!(
-                "provider 'daytona' does not support egress translation"
+            _ => Err(anyhow!(
+                "provider '{}' does not support egress translation",
+                self.name()
             )),
         }
     }
@@ -1407,21 +1430,30 @@ impl Provider {
     pub async fn checkpoint(&self, id: &str, label: Option<&str>) -> Result<String> {
         match self {
             Provider::Sprites(p) => p.checkpoint(id, label).await,
-            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support checkpoints")),
+            _ => Err(anyhow!(
+                "provider '{}' does not support checkpoints",
+                self.name()
+            )),
         }
     }
 
     pub async fn list_checkpoints(&self, id: &str) -> Result<Vec<CheckpointInfo>> {
         match self {
             Provider::Sprites(p) => p.list_checkpoints(id).await,
-            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support checkpoints")),
+            _ => Err(anyhow!(
+                "provider '{}' does not support checkpoints",
+                self.name()
+            )),
         }
     }
 
     pub async fn restore(&self, id: &str, checkpoint: &str) -> Result<()> {
         match self {
             Provider::Sprites(p) => p.restore(id, checkpoint).await,
-            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support checkpoints")),
+            _ => Err(anyhow!(
+                "provider '{}' does not support checkpoints",
+                self.name()
+            )),
         }
     }
 
@@ -1429,6 +1461,7 @@ impl Provider {
     pub async fn read(&self, id: &str, path: &str) -> Result<Vec<u8>> {
         match self {
             Provider::Sprites(p) => p.read(id, path).await,
+            Provider::Vps(p) => p.read(id, path).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
         }
     }
@@ -1437,6 +1470,7 @@ impl Provider {
     pub async fn write(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
         match self {
             Provider::Sprites(p) => p.write(id, path, data).await,
+            Provider::Vps(p) => p.write(id, path, data).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
         }
     }
@@ -1445,6 +1479,7 @@ impl Provider {
     pub async fn write_exec(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
         match self {
             Provider::Sprites(p) => p.write_exec(id, path, data).await,
+            Provider::Vps(p) => p.write_exec(id, path, data).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
         }
     }
@@ -1478,6 +1513,7 @@ impl Provider {
     pub async fn upload_dir(&self, id: &str, local: &Path, remote: &str) -> Result<()> {
         match self {
             Provider::Sprites(p) => p.upload_dir(id, local, remote).await,
+            Provider::Vps(p) => p.upload_dir(id, local, remote).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
         }
     }
@@ -1486,6 +1522,7 @@ impl Provider {
     pub async fn download_dir(&self, id: &str, remote: &str, local: &Path) -> Result<()> {
         match self {
             Provider::Sprites(p) => p.download_dir(id, remote, local).await,
+            Provider::Vps(p) => p.download_dir(id, remote, local).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
         }
     }
@@ -1496,7 +1533,7 @@ impl Provider {
     pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
         match self {
             Provider::Sprites(p) => p.open_exec(id, spec).await,
-            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
+            _ => Err(anyhow!("provider '{}' has no native exec API", self.name())),
         }
     }
 
@@ -1506,7 +1543,7 @@ impl Provider {
     pub async fn open_proxy(&self, id: &str, host: &str, port: u16) -> Result<ProxyStream> {
         match self {
             Provider::Sprites(p) => p.open_proxy(id, host, port).await,
-            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no TCP proxy API")),
+            _ => Err(anyhow!("provider '{}' has no TCP proxy API", self.name())),
         }
     }
 
@@ -1521,6 +1558,7 @@ impl Provider {
     ) -> Result<(i32, String)> {
         match self {
             Provider::Sprites(p) => p.run_exec(id, argv, cwd, env).await,
+            Provider::Vps(p) => p.run_exec(id, argv, cwd, env).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
         }
     }
@@ -1535,7 +1573,7 @@ impl Provider {
     ) -> Result<ExecSession> {
         match self {
             Provider::Sprites(p) => p.attach_exec(id, session, cols, rows).await,
-            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
+            _ => Err(anyhow!("provider '{}' has no native exec API", self.name())),
         }
     }
 }

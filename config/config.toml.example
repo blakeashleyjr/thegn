@@ -1919,6 +1919,54 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # #   than silently dropping to a host shell (see [sandbox] failover). To let THIS
 # #   env fall back to the local backend chain / host instead, override per-env:
 # # failover = true            # this env may degrade to host; omit/false ⇒ halt+warn
+#
+# ── Example: a cheap commodity VPS (Hetzner Cloud) ─────────────────────────
+# The budget alternative to a managed sandbox provider: superzej provisions a
+# VPS via the vendor API, reaches it over plain ssh (a `szhost vps-ssh`
+# self-bridge — no vendor CLI), and runs the same provisioning pipeline on it.
+# THE COST MODEL DIFFERS FROM SPRITES: a VPS has no suspend/checkpoint — a
+# powered-off instance still bills — so the only free state is DESTROYED.
+# superzej therefore: never offers stop-on-idle (idle pool spares are
+# destroyed, not suspended), ledgers every create before the API call, and
+# runs a label-scoped reaper that destroys orphans/over-lifetime instances.
+# Speed comes from a baked base image + (optionally) the warm pool:
+#   cold, stock image   ~2-4 min  (create ~10s + nix install + repo steps)
+#   cold, baked image   ~30-90 s  (`superzej env image-bake` → template below)
+#   warm-pool claim     ~5 s      ([lifecycle.pool] size = 1; the spare bills
+#                                  ~€4/mo while idle — the speed/budget knob)
+#
+#   1. Create an API token in the Hetzner Cloud console (project scope).
+#   2. export HCLOUD_TOKEN=...
+#   3. Optional but recommended: superzej env image-bake  → paste the template.
+#
+# [env.hetzner]
+# placement = "provider"
+# data = "in_env"              # the repo lives in the VPS (cloned from origin,
+#                              #   local-parity overlay on open)
+# [env.hetzner.provider]
+# provider = "hetzner"
+# # api_key_env = "HCLOUD_TOKEN"   # token env var (this is the default)
+# # region = "fsn1"                # Hetzner location (fsn1/nbg1/hel1/ash/hil/sin)
+# # size = "cx22"                  # server type (cx22 = 2 vCPU / 4 GB, ≈ €4/mo)
+# # template = ""                  # image: "" ⇒ ubuntu-24.04 (docker + nix
+# #                                #   prereqs installed via cloud-init on first
+# #                                #   boot), or "snapshot:<id>" from image-bake
+# # auto_provision = false         # create on first open (opt-in: real money)
+# # max_instances = 5              # hard cap on concurrently-managed instances
+# #                                #   (0 ⇒ this default) — the spend guardrail
+# # max_lifetime_secs = 0          # destroy instances older than this (0 = off);
+# #                                #   the hard ceiling for forgotten sandboxes
+# # nix_installer = "determinate"  # the faster installer is a good VPS default
+# # The workload runs directly on the VPS by default (the VPS is the isolation
+# # boundary, like a sprite). To containerize INSIDE it instead (docker is on
+# # every image superzej boots):
+# # [env.hetzner.sandbox]
+# # backend = "docker"
+# # NOT available on a VPS (no provider support): checkpoints/snapshot-restore
+# # (`auto_checkpoint` is ignored; bake an image instead), native WSS exec
+# # (`connect`/`exec` are ignored — attach is always the ssh self-bridge), and
+# # egress translation (use an in-VPS backend's network controls).
+#
 # ── Sandbox lifecycle: warm/suspend + budget ───────────────────────────────
 # Budget-governed warm policy for managed-provider sandboxes (sprites/ssh/k8s).
 # A provider sandbox only stays *running* while a live exec session into it exists

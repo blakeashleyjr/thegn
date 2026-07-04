@@ -149,7 +149,10 @@ pub(crate) fn build_env_placement(
                     .map(|s| s.replace("{id}", &id))
                     .collect::<Vec<_>>()
             };
-            let control_prefix = sub(&envc.provider.exec_command);
+            // `exec_command`, or the szhost `vps-ssh` self-bridge for VPS
+            // providers (which have no vendor CLI) — see
+            // `EnvProviderConfig::control_command_template`.
+            let control_prefix = sub(&envc.provider.control_command_template());
             let interactive_prefix = if envc.provider.interactive_command.is_empty() {
                 control_prefix.clone()
             } else {
@@ -174,6 +177,52 @@ pub(crate) fn build_env_placement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vps_provider_defaults_to_the_szhost_self_bridge() {
+        use crate::config::{EnvConfig, EnvProviderConfig, PlacementMode};
+        let envc = EnvConfig {
+            placement: PlacementMode::Provider,
+            provider: EnvProviderConfig {
+                provider: "hetzner".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let sb = crate::config::SandboxConfig::default();
+        let wt = Path::new("/home/u/code/repo/worktrees/repo/dev");
+        let loc = GitLoc::Local(wt.to_path_buf());
+        let p = build_env_placement(&envc, &sb, &loc, wt, Path::new("/home/u/code/repo"));
+        let Placement::Provider(pp) = p else {
+            panic!("provider placement expected");
+        };
+        // The control prefix is the self-bridge with the RESOLVED id baked in —
+        // panes, git reads, and the persisted location all route through it.
+        assert_eq!(pp.control_prefix.len(), 4, "{:?}", pp.control_prefix);
+        assert_eq!(pp.control_prefix[1], "vps-ssh");
+        assert_eq!(pp.control_prefix[2], pp.id);
+        assert_eq!(pp.control_prefix[3], "--");
+        assert_eq!(pp.interactive_prefix, pp.control_prefix);
+        // A configured exec_command still wins (no silent override).
+        let mut with_cli = envc.clone();
+        with_cli.provider.exec_command =
+            vec!["mycli".into(), "ssh".into(), "{id}".into(), "--".into()];
+        let Placement::Provider(pp2) =
+            build_env_placement(&with_cli, &sb, &loc, wt, Path::new("/home/u/code/repo"))
+        else {
+            panic!("provider placement expected");
+        };
+        assert_eq!(pp2.control_prefix[0], "mycli");
+        // Non-VPS providers with no exec_command keep an empty prefix.
+        let mut sprites = envc.clone();
+        sprites.provider.provider = "sprites".into();
+        let Placement::Provider(pp3) =
+            build_env_placement(&sprites, &sb, &loc, wt, Path::new("/home/u/code/repo"))
+        else {
+            panic!("provider placement expected");
+        };
+        assert!(pp3.control_prefix.is_empty());
+    }
 
     #[test]
     fn effective_provider_id_is_per_worktree() {

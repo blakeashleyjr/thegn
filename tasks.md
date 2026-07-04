@@ -977,6 +977,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [ ] 392. Image build cache
 - [ ] 393. GPU passthrough
 - [ ] 394. Base image catalog/templates
+- [x] 749. Commodity-VPS provider backend — Hetzner via native REST (`Provider::Vps`, ssh exec/files shim, `szhost vps-ssh` self-bridge, intent-ledger + label-scoped reaper, `superzej env image-bake`; DO/Vultr adapters + firewall/spend-UI follow) _(openspec `add-vps-providers`; not live-verified)_
 
 ### AF. File viewer / search
 

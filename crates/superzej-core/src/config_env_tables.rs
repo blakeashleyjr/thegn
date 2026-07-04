@@ -214,6 +214,19 @@ pub struct EnvProviderConfig {
     /// strictly more capable than `push_devshell`'s one-shot devShell upload, which
     /// it supersedes when set. Needs a provider with the resident bridge (sprites).
     pub host_cache: bool,
+    /// VPS providers only: vendor region/location (e.g. Hetzner `fsn1`).
+    /// Empty ⇒ the provider's default.
+    pub region: String,
+    /// VPS providers only: vendor size/plan/server-type (e.g. Hetzner `cx22`).
+    /// Empty ⇒ the provider's default.
+    pub size: String,
+    /// VPS providers only: hard cap on concurrently-managed instances — the
+    /// spend guardrail enforced at create. `0` ⇒ the built-in default (5).
+    pub max_instances: u32,
+    /// VPS providers only: ceiling on any instance's lifetime in seconds; the
+    /// reaper destroys older ones (a VPS bills until destroyed — there is no
+    /// free suspended state). `0` ⇒ no ceiling.
+    pub max_lifetime_secs: u64,
 }
 
 impl EnvProviderConfig {
@@ -239,6 +252,10 @@ impl EnvProviderConfig {
             && !self.push_devshell
             && !self.skip_devshell_warm
             && !self.host_cache
+            && self.region.is_empty()
+            && self.size.is_empty()
+            && self.max_instances == 0
+            && self.max_lifetime_secs == 0
     }
 
     /// `http-connections`/`max-substitution-jobs` value to use, clamped to a sane
@@ -256,6 +273,33 @@ impl EnvProviderConfig {
             w.to_string()
         }
     }
+
+    /// The control-exec argv template (`{id}` unexpanded): the configured
+    /// `exec_command`, or — for VPS providers, which have no vendor CLI — the
+    /// szhost self-bridge (`szhost vps-ssh <name> --`), so panes, chrome
+    /// git/fs reads, and the persisted worktree location all route over the
+    /// same ssh transport with zero per-env config. The single source of truth
+    /// for both `envbuild` (placement prefixes) and the warm-pool claim rebind.
+    pub fn control_command_template(&self) -> Vec<String> {
+        if !self.exec_command.is_empty() {
+            return self.exec_command.clone();
+        }
+        if vps_provider_kind(&self.provider) {
+            let exe = std::env::current_exe()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "szhost".to_string());
+            return vec![exe, "vps-ssh".into(), "{id}".into(), "--".into()];
+        }
+        Vec::new()
+    }
+}
+
+/// Whether `name` names a commodity-VPS provider kind (Hetzner today;
+/// DigitalOcean/Vultr as their adapters land). The core-side mirror of
+/// `superzej_svc::vps::is_vps_provider` — keep the two lists in sync.
+pub fn vps_provider_kind(name: &str) -> bool {
+    matches!(name.trim(), "hetzner")
 }
 
 /// `[metrics]` — Prometheus scrape targets for sidebar metrics display.

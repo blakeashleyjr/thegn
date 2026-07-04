@@ -17,6 +17,7 @@ pub mod diff;
 pub mod disk;
 pub mod doctor;
 pub mod env;
+pub mod env_image;
 pub mod forward;
 pub mod host;
 pub mod integrate;
