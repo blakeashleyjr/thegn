@@ -18,7 +18,7 @@ use termwiz::terminal::TerminalWaker;
 use crate::chrome::S;
 use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
-use crate::seg::{self, Line, Tok, seg, sp};
+use crate::seg::{self, Line, Seg, Tok, seg, sp};
 
 /// Maximum visible repo rows at one time (the list scrolls past this).
 const MAX_ITEMS: usize = 10;
@@ -69,12 +69,119 @@ pub(crate) fn seed_repos(db: &superzej_core::db::Db) -> Vec<String> {
     out
 }
 
+/// A tiny single-line editor: a text buffer plus a char-aware cursor. Enough
+/// for the picker's query and manual-entry fields — insert/delete AT the cursor
+/// and horizontal movement, so a mistyped URL can be fixed mid-string (not just
+/// backspaced from the end), plus paste. `cursor` is a byte offset into `buf`,
+/// always kept on a char boundary.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct TextField {
+    buf: String,
+    cursor: usize,
+}
+
+impl TextField {
+    fn new(s: impl Into<String>) -> Self {
+        let buf = s.into();
+        let cursor = buf.len();
+        Self { buf, cursor }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.buf
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// The cursor as a byte offset (always a char boundary) — used by the
+    /// renderer to split the buffer around the cursor bar.
+    fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    fn insert_char(&mut self, c: char) {
+        self.buf.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Insert pasted text at the cursor. Newlines are stripped — a pasted URL
+    /// must not submit or split the single line.
+    fn insert_str(&mut self, s: &str) {
+        for c in s.chars().filter(|c| !matches!(c, '\n' | '\r')) {
+            self.insert_char(c);
+        }
+    }
+
+    /// Delete the char before the cursor (Backspace). Returns whether anything
+    /// was removed.
+    fn backspace(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+        let prev = self.buf[..self.cursor]
+            .chars()
+            .next_back()
+            .expect("cursor > 0 ⇒ a preceding char");
+        self.cursor -= prev.len_utf8();
+        self.buf.remove(self.cursor);
+        true
+    }
+
+    /// Delete the char at the cursor (Delete/^D). Returns whether anything was
+    /// removed.
+    fn delete(&mut self) -> bool {
+        if self.cursor >= self.buf.len() {
+            return false;
+        }
+        self.buf.remove(self.cursor);
+        true
+    }
+
+    fn left(&mut self) {
+        if let Some(prev) = self.buf[..self.cursor].chars().next_back() {
+            self.cursor -= prev.len_utf8();
+        }
+    }
+
+    fn right(&mut self) {
+        if let Some(next) = self.buf[self.cursor..].chars().next() {
+            self.cursor += next.len_utf8();
+        }
+    }
+
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn end(&mut self) {
+        self.cursor = self.buf.len();
+    }
+}
+
+/// The picker's lifecycle. It no longer vanishes the instant you submit: a
+/// clone keeps it on screen showing live `git clone` progress, and a bad
+/// input / failed clone parks it in `Error` (visible until dismissed) instead
+/// of flashing a status line behind a dismissed modal.
+#[derive(Debug)]
+pub(crate) enum Phase {
+    /// Browsing the fuzzy list or typing in the manual field.
+    Browse,
+    /// A URL clone is running off-loop; `line` is the latest git progress line.
+    Cloning { url: String, line: Option<String> },
+    /// A validation or clone error — shown inline, input stays editable.
+    Error(String),
+}
+
 pub(crate) struct WorkspacePicker {
     mode: PickerMode,
-    /// Fuzzy-filter query (kept across Tab toggles).
-    query: String,
-    /// Manual-entry buffer (kept across Tab toggles).
-    manual: String,
+    /// Lifecycle phase (Browse / Cloning / Error).
+    phase: Phase,
+    /// Fuzzy-filter field (kept across Tab toggles).
+    query: TextField,
+    /// Manual-entry field (kept across Tab toggles).
+    manual: TextField,
     items: Vec<RepoEntry>,
     matcher: Matcher,
     /// Indices into `items`, best match first (seed order when query empty).
@@ -100,8 +207,9 @@ impl WorkspacePicker {
         let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut p = Self {
             mode: PickerMode::Fuzzy,
-            query: String::new(),
-            manual: String::new(),
+            phase: Phase::Browse,
+            query: TextField::default(),
+            manual: TextField::default(),
             items: seed.into_iter().map(entry).collect(),
             matcher: Matcher::new(MatcherConfig::DEFAULT),
             matches: Vec::new(),
@@ -120,7 +228,39 @@ impl WorkspacePicker {
     /// "add this path as a workspace" offer. Tab still flips back to fuzzy.
     pub(crate) fn start_manual(&mut self, prefill: impl Into<String>) {
         self.mode = PickerMode::Manual;
-        self.manual = prefill.into();
+        self.manual = TextField::new(prefill);
+    }
+
+    /// Enter the clone-in-flight phase (the manual `Clone` submit): the picker
+    /// stays on screen showing progress instead of being dropped.
+    pub(crate) fn begin_clone(&mut self, url: impl Into<String>) {
+        self.phase = Phase::Cloning {
+            url: url.into(),
+            line: None,
+        };
+    }
+
+    /// Feed the latest `git clone --progress` line into the cloning panel.
+    pub(crate) fn set_clone_progress(&mut self, line: impl Into<String>) {
+        if let Phase::Cloning { line: slot, .. } = &mut self.phase {
+            *slot = Some(line.into());
+        }
+    }
+
+    /// The URL currently being cloned, if any — the loop's clone-drain arm uses
+    /// this to ignore a result the user has since cancelled or moved past.
+    pub(crate) fn cloning_url(&self) -> Option<&str> {
+        match &self.phase {
+            Phase::Cloning { url, .. } => Some(url.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Park the picker in a visible, editable error state (bad input / failed
+    /// clone). Forces manual mode so the offending input is on screen to fix.
+    pub(crate) fn set_error(&mut self, msg: impl Into<String>) {
+        self.mode = PickerMode::Manual;
+        self.phase = Phase::Error(msg.into());
     }
 
     /// Kick the (potentially slow — it walks every `repo_roots` tree) repo
@@ -183,10 +323,14 @@ impl WorkspacePicker {
     }
 
     fn recompute(&mut self) {
-        if self.query.trim().is_empty() {
+        if self.query.as_str().trim().is_empty() {
             self.matches = (0..self.items.len()).collect();
         } else {
-            let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
+            let pattern = Pattern::parse(
+                self.query.as_str(),
+                CaseMatching::Smart,
+                Normalization::Smart,
+            );
             let mut buf = Vec::new();
             let mut scored: Vec<(usize, u32)> = self
                 .items
@@ -228,20 +372,64 @@ impl WorkspacePicker {
         }
     }
 
+    /// The text field the current mode is editing.
+    fn field_mut(&mut self) -> &mut TextField {
+        match self.mode {
+            PickerMode::Fuzzy => &mut self.query,
+            PickerMode::Manual => &mut self.manual,
+        }
+    }
+
+    /// Re-filter after a query edit (fuzzy mode) — resets the cursor row.
+    fn on_query_edit(&mut self) {
+        self.selected = 0;
+        self.scroll_offset = 0;
+        self.recompute();
+    }
+
+    /// Insert bracketed-paste text into the active field. Cloning ignores
+    /// paste; any other phase clears a stale error and edits.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        if matches!(self.phase, Phase::Cloning { .. }) {
+            return;
+        }
+        self.phase = Phase::Browse;
+        match self.mode {
+            PickerMode::Manual => self.manual.insert_str(text),
+            PickerMode::Fuzzy => {
+                self.query.insert_str(text);
+                self.on_query_edit();
+            }
+        }
+    }
+
     pub(crate) fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> PickerOutcome {
+        // While a clone is in flight the only meaningful key is cancel.
+        if matches!(self.phase, Phase::Cloning { .. }) {
+            let cancel = crate::input::is_escape_key(key)
+                || (mods.contains(Modifiers::CTRL)
+                    && matches!(key, KeyCode::Char('c' | 'C' | 'g' | 'G')));
+            return if cancel {
+                PickerOutcome::Cancel
+            } else {
+                PickerOutcome::Pending
+            };
+        }
         if mods.contains(Modifiers::CTRL) {
-            return match key {
-                KeyCode::Char('c' | 'C' | 'g' | 'G') => PickerOutcome::Cancel,
+            match key {
+                KeyCode::Char('c' | 'C' | 'g' | 'G') => return PickerOutcome::Cancel,
                 KeyCode::Char('j' | 'J' | 'n' | 'N') if self.mode == PickerMode::Fuzzy => {
                     self.move_down();
-                    PickerOutcome::Pending
                 }
                 KeyCode::Char('k' | 'K' | 'p' | 'P') if self.mode == PickerMode::Fuzzy => {
                     self.move_up();
-                    PickerOutcome::Pending
                 }
-                _ => PickerOutcome::Pending,
-            };
+                // readline home/end within the active field
+                KeyCode::Char('a' | 'A') => self.field_mut().home(),
+                KeyCode::Char('e' | 'E') => self.field_mut().end(),
+                _ => {}
+            }
+            return PickerOutcome::Pending;
         }
         if mods.contains(Modifiers::ALT) || mods.contains(Modifiers::SUPER) {
             return PickerOutcome::Pending;
@@ -249,6 +437,8 @@ impl WorkspacePicker {
         if crate::input::is_escape_key(key) {
             return PickerOutcome::Cancel;
         }
+        // Any interaction clears a stale inline error.
+        self.phase = Phase::Browse;
         // Tab flips fuzzy ⇄ manual; both buffers survive the round-trip.
         if matches!(key, KeyCode::Tab) {
             self.mode = match self.mode {
@@ -271,37 +461,76 @@ impl WorkspacePicker {
                     self.move_down();
                     PickerOutcome::Pending
                 }
+                KeyCode::LeftArrow => {
+                    self.query.left();
+                    PickerOutcome::Pending
+                }
+                KeyCode::RightArrow => {
+                    self.query.right();
+                    PickerOutcome::Pending
+                }
+                KeyCode::Home => {
+                    self.query.home();
+                    PickerOutcome::Pending
+                }
+                KeyCode::End => {
+                    self.query.end();
+                    PickerOutcome::Pending
+                }
                 KeyCode::Backspace => {
-                    self.query.pop();
-                    self.selected = 0;
-                    self.scroll_offset = 0;
-                    self.recompute();
+                    if self.query.backspace() {
+                        self.on_query_edit();
+                    }
+                    PickerOutcome::Pending
+                }
+                KeyCode::Delete => {
+                    if self.query.delete() {
+                        self.on_query_edit();
+                    }
                     PickerOutcome::Pending
                 }
                 KeyCode::Char(c) => {
-                    self.query.push(*c);
-                    self.selected = 0;
-                    self.scroll_offset = 0;
-                    self.recompute();
+                    self.query.insert_char(*c);
+                    self.on_query_edit();
                     PickerOutcome::Pending
                 }
                 _ => PickerOutcome::Pending,
             },
             PickerMode::Manual => match key {
                 KeyCode::Enter => {
-                    let v = self.manual.trim().to_string();
+                    let v = self.manual.as_str().trim().to_string();
                     if v.is_empty() {
                         PickerOutcome::Pending
                     } else {
                         PickerOutcome::Manual(v)
                     }
                 }
+                KeyCode::LeftArrow => {
+                    self.manual.left();
+                    PickerOutcome::Pending
+                }
+                KeyCode::RightArrow => {
+                    self.manual.right();
+                    PickerOutcome::Pending
+                }
+                KeyCode::Home => {
+                    self.manual.home();
+                    PickerOutcome::Pending
+                }
+                KeyCode::End => {
+                    self.manual.end();
+                    PickerOutcome::Pending
+                }
                 KeyCode::Backspace => {
-                    self.manual.pop();
+                    self.manual.backspace();
+                    PickerOutcome::Pending
+                }
+                KeyCode::Delete => {
+                    self.manual.delete();
                     PickerOutcome::Pending
                 }
                 KeyCode::Char(c) => {
-                    self.manual.push(*c);
+                    self.manual.insert_char(*c);
                     PickerOutcome::Pending
                 }
                 _ => PickerOutcome::Pending,
@@ -313,140 +542,262 @@ impl WorkspacePicker {
     /// repo rows (name + dim path), rule, footer hints. Manual mode is a
     /// single input row with its own footer.
     pub(crate) fn render(&self, surface: &mut Surface, screen: Rect) {
+        if let Phase::Cloning { url, line } = &self.phase {
+            self.render_cloning(surface, screen, url, line.as_deref());
+            return;
+        }
+        let err = match &self.phase {
+            Phase::Error(m) => Some(m.as_str()),
+            _ => None,
+        };
+        match self.mode {
+            PickerMode::Manual => self.render_manual(surface, screen, err),
+            PickerMode::Fuzzy => self.render_fuzzy(surface, screen),
+        }
+    }
+
+    /// The single-row manual entry (cursor-aware), with an optional inline
+    /// error line above the footer.
+    fn render_manual(&self, surface: &mut Surface, screen: Rect, err: Option<&str>) {
         const COLS: usize = 72;
         let panel = Tok::Slot(S::Panel);
         let rule = Line::Fill {
             ch: '╌',
             fg: Tok::Slot(S::Ghost3),
         };
-        match self.mode {
-            PickerMode::Manual => {
-                let spec = LayerSpec {
-                    title: "new workspace".into(),
-                    badge: Some(" tab: fuzzy ".into()),
-                    cols: COLS,
-                    rows: 3, // input + rule + footer
-                    anchor: Anchor::TopThird,
-                    ..LayerSpec::default()
+        let rows = if err.is_some() { 4 } else { 3 }; // input (+err) + rule + footer
+        let spec = LayerSpec {
+            title: "new workspace".into(),
+            badge: Some(" tab: fuzzy ".into()),
+            cols: COLS,
+            rows,
+            anchor: Anchor::TopThird,
+            ..LayerSpec::default()
+        };
+        let Some(inner) = open_layer(surface, screen, &spec) else {
+            return;
+        };
+        seg::draw_line(
+            surface,
+            inner.x,
+            inner.y,
+            inner.cols,
+            &Line::segs(input_segs(&self.manual, "path, URL, or new dir…")),
+            panel,
+        );
+        let mut y = inner.y + 1;
+        if let Some(msg) = err {
+            let line = Line::segs(vec![
+                seg(danger(), "✗ ").bold(),
+                seg(danger(), msg.to_string()),
+            ]);
+            seg::draw_line(surface, inner.x, y, inner.cols, &line, panel);
+            y += 1;
+        }
+        if y < inner.y + inner.rows.saturating_sub(1) {
+            seg::draw_line(surface, inner.x, y, inner.cols, &rule, panel);
+            let footer = Line::segs(vec![
+                seg(Tok::Slot(S::Ghost2), "↵"),
+                seg(Tok::Slot(S::Ghost), " open   "),
+                seg(Tok::Slot(S::Ghost2), "tab"),
+                seg(Tok::Slot(S::Ghost), " fuzzy   "),
+                seg(
+                    Tok::Slot(S::Ghost3),
+                    "repo · dir · URL · new dir (parent must exist)",
+                ),
+            ]);
+            seg::draw_line(surface, inner.x, y + 1, inner.cols, &footer, panel);
+        }
+    }
+
+    /// The cloning progress panel: the URL, the latest `git clone --progress`
+    /// line, and a percentage bar derived from it.
+    fn render_cloning(&self, surface: &mut Surface, screen: Rect, url: &str, line: Option<&str>) {
+        const COLS: usize = 72;
+        let panel = Tok::Slot(S::Panel);
+        let rule = Line::Fill {
+            ch: '╌',
+            fg: Tok::Slot(S::Ghost3),
+        };
+        let spec = LayerSpec {
+            title: "new workspace".into(),
+            badge: Some(" cloning ".into()),
+            cols: COLS,
+            rows: 4, // title + rule + progress + footer
+            anchor: Anchor::TopThird,
+            ..LayerSpec::default()
+        };
+        let Some(inner) = open_layer(surface, screen, &spec) else {
+            return;
+        };
+        let title = Line::segs(vec![
+            seg(Tok::Slot(S::Accent), "⟳ ").bold(),
+            seg(Tok::Slot(S::Text), "Cloning "),
+            seg(Tok::Slot(S::Dim), url.to_string()),
+            seg(Tok::Slot(S::Ghost3), "…"),
+        ]);
+        seg::draw_line(surface, inner.x, inner.y, inner.cols, &title, panel);
+        if inner.rows < 4 {
+            return;
+        }
+        seg::draw_line(surface, inner.x, inner.y + 1, inner.cols, &rule, panel);
+        let pct = line.and_then(parse_percent);
+        let status = line.unwrap_or("starting…").to_string();
+        let progress = Line::split(vec![seg(Tok::Slot(S::Ghost), status)], bar_segs(pct));
+        seg::draw_line(surface, inner.x, inner.y + 2, inner.cols, &progress, panel);
+        let footer = Line::segs(vec![
+            seg(Tok::Slot(S::Ghost2), "esc"),
+            seg(Tok::Slot(S::Ghost), " cancel"),
+        ]);
+        seg::draw_line(surface, inner.x, inner.y + 3, inner.cols, &footer, panel);
+    }
+
+    fn render_fuzzy(&self, surface: &mut Surface, screen: Rect) {
+        const COLS: usize = 72;
+        let panel = Tok::Slot(S::Panel);
+        let rule = Line::Fill {
+            ch: '╌',
+            fg: Tok::Slot(S::Ghost3),
+        };
+        {
+            let shown = self.matches.len().min(MAX_ITEMS);
+            let spec = LayerSpec {
+                title: "new workspace".into(),
+                badge: Some(" tab: manual ".into()),
+                cols: COLS,
+                rows: shown + 4, // prompt + rule + items + rule + footer
+                anchor: Anchor::TopThird,
+                ..LayerSpec::default()
+            };
+            let Some(inner) = open_layer(surface, screen, &spec) else {
+                return;
+            };
+
+            seg::draw_line(
+                surface,
+                inner.x,
+                inner.y,
+                inner.cols,
+                &Line::segs(input_segs(&self.query, "type to filter repos…")),
+                panel,
+            );
+            if inner.rows < 2 {
+                return;
+            }
+            seg::draw_line(surface, inner.x, inner.y + 1, inner.cols, &rule, panel);
+
+            let rows_avail = inner.rows.saturating_sub(4);
+            for row in 0..rows_avail {
+                let match_idx = self.scroll_offset + row;
+                let Some(&item_idx) = self.matches.get(match_idx) else {
+                    break;
                 };
-                let Some(inner) = open_layer(surface, screen, &spec) else {
-                    return;
+                let Some(item) = self.items.get(item_idx) else {
+                    continue;
                 };
-                let mut prompt = vec![seg(Tok::Slot(S::Accent), "❯ ").bold()];
-                if self.manual.is_empty() {
-                    prompt.push(seg(Tok::Slot(S::Ghost3), "path, URL, or new dir…"));
+                let selected = match_idx == self.selected;
+                let pad = if selected { Tok::SelAccent } else { panel };
+                let name = if selected {
+                    seg(Tok::Slot(S::Text), item.name.clone()).bold()
                 } else {
-                    prompt.push(seg(Tok::Slot(S::Text), self.manual.clone()));
-                    prompt.push(seg(Tok::Slot(S::Accent), "▏"));
-                }
-                seg::draw_line(
-                    surface,
-                    inner.x,
-                    inner.y,
-                    inner.cols,
-                    &Line::segs(prompt),
-                    panel,
+                    seg(Tok::Slot(S::Dim), item.name.clone())
+                };
+                let line = Line::split(
+                    vec![sp(1), name],
+                    vec![seg(Tok::Slot(S::Ghost3), item.path.clone()), sp(1)],
                 );
-                if inner.rows >= 3 {
-                    seg::draw_line(surface, inner.x, inner.y + 1, inner.cols, &rule, panel);
-                    let footer = Line::segs(vec![
+                seg::draw_line(surface, inner.x, inner.y + 2 + row, inner.cols, &line, pad);
+            }
+
+            if inner.rows >= 4 {
+                let fy = inner.y + inner.rows - 2;
+                seg::draw_line(surface, inner.x, fy, inner.cols, &rule, panel);
+                let total = self.matches.len();
+                let count_str = if self.scanning {
+                    format!("{total} · scanning repo roots…")
+                } else if total > MAX_ITEMS {
+                    let end = (self.scroll_offset + MAX_ITEMS).min(total);
+                    format!("{}-{}/{}", self.scroll_offset + 1, end, total)
+                } else {
+                    format!("{total} repos")
+                };
+                let footer = Line::split(
+                    vec![
+                        seg(Tok::Slot(S::Ghost2), "↑↓"),
+                        seg(Tok::Slot(S::Ghost), " move   "),
                         seg(Tok::Slot(S::Ghost2), "↵"),
                         seg(Tok::Slot(S::Ghost), " open   "),
                         seg(Tok::Slot(S::Ghost2), "tab"),
-                        seg(Tok::Slot(S::Ghost), " fuzzy   "),
-                        seg(
-                            Tok::Slot(S::Ghost3),
-                            "repo · dir · URL · new dir (parent must exist)",
-                        ),
-                    ]);
-                    seg::draw_line(surface, inner.x, inner.y + 2, inner.cols, &footer, panel);
-                }
-            }
-            PickerMode::Fuzzy => {
-                let shown = self.matches.len().min(MAX_ITEMS);
-                let spec = LayerSpec {
-                    title: "new workspace".into(),
-                    badge: Some(" tab: manual ".into()),
-                    cols: COLS,
-                    rows: shown + 4, // prompt + rule + items + rule + footer
-                    anchor: Anchor::TopThird,
-                    ..LayerSpec::default()
-                };
-                let Some(inner) = open_layer(surface, screen, &spec) else {
-                    return;
-                };
-
-                let mut prompt = vec![seg(Tok::Slot(S::Accent), "❯ ").bold()];
-                if self.query.is_empty() {
-                    prompt.push(seg(Tok::Slot(S::Ghost3), "type to filter repos…"));
-                } else {
-                    prompt.push(seg(Tok::Slot(S::Text), self.query.clone()));
-                }
-                seg::draw_line(
-                    surface,
-                    inner.x,
-                    inner.y,
-                    inner.cols,
-                    &Line::segs(prompt),
-                    panel,
+                        seg(Tok::Slot(S::Ghost), " manual   "),
+                        seg(Tok::Slot(S::Ghost2), "esc"),
+                        seg(Tok::Slot(S::Ghost), " dismiss"),
+                    ],
+                    vec![seg(Tok::Slot(S::Ghost3), count_str)],
                 );
-                if inner.rows < 2 {
-                    return;
-                }
-                seg::draw_line(surface, inner.x, inner.y + 1, inner.cols, &rule, panel);
-
-                let rows_avail = inner.rows.saturating_sub(4);
-                for row in 0..rows_avail {
-                    let match_idx = self.scroll_offset + row;
-                    let Some(&item_idx) = self.matches.get(match_idx) else {
-                        break;
-                    };
-                    let Some(item) = self.items.get(item_idx) else {
-                        continue;
-                    };
-                    let selected = match_idx == self.selected;
-                    let pad = if selected { Tok::SelAccent } else { panel };
-                    let name = if selected {
-                        seg(Tok::Slot(S::Text), item.name.clone()).bold()
-                    } else {
-                        seg(Tok::Slot(S::Dim), item.name.clone())
-                    };
-                    let line = Line::split(
-                        vec![sp(1), name],
-                        vec![seg(Tok::Slot(S::Ghost3), item.path.clone()), sp(1)],
-                    );
-                    seg::draw_line(surface, inner.x, inner.y + 2 + row, inner.cols, &line, pad);
-                }
-
-                if inner.rows >= 4 {
-                    let fy = inner.y + inner.rows - 2;
-                    seg::draw_line(surface, inner.x, fy, inner.cols, &rule, panel);
-                    let total = self.matches.len();
-                    let count_str = if self.scanning {
-                        format!("{total} · scanning repo roots…")
-                    } else if total > MAX_ITEMS {
-                        let end = (self.scroll_offset + MAX_ITEMS).min(total);
-                        format!("{}-{}/{}", self.scroll_offset + 1, end, total)
-                    } else {
-                        format!("{total} repos")
-                    };
-                    let footer = Line::split(
-                        vec![
-                            seg(Tok::Slot(S::Ghost2), "↑↓"),
-                            seg(Tok::Slot(S::Ghost), " move   "),
-                            seg(Tok::Slot(S::Ghost2), "↵"),
-                            seg(Tok::Slot(S::Ghost), " open   "),
-                            seg(Tok::Slot(S::Ghost2), "tab"),
-                            seg(Tok::Slot(S::Ghost), " manual   "),
-                            seg(Tok::Slot(S::Ghost2), "esc"),
-                            seg(Tok::Slot(S::Ghost), " dismiss"),
-                        ],
-                        vec![seg(Tok::Slot(S::Ghost3), count_str)],
-                    );
-                    seg::draw_line(surface, inner.x, fy + 1, inner.cols, &footer, panel);
-                }
+                seg::draw_line(surface, inner.x, fy + 1, inner.cols, &footer, panel);
             }
         }
+    }
+}
+
+/// theme::RED as a seg color — the S palette has no dedicated danger slot yet.
+fn danger() -> Tok {
+    let mut it = superzej_core::theme::RED
+        .split(';')
+        .filter_map(|s| s.trim().parse::<u8>().ok());
+    match (it.next(), it.next(), it.next()) {
+        (Some(r), Some(g), Some(b)) => Tok::Rgb(r, g, b),
+        _ => Tok::Slot(S::Text),
+    }
+}
+
+/// The `❯ ` prompt for a text field, splitting the buffer around a cursor bar
+/// so mid-string edits are visible (not just an end-of-line caret).
+fn input_segs(field: &TextField, placeholder: &str) -> Vec<Seg> {
+    let mut out = vec![seg(Tok::Slot(S::Accent), "❯ ").bold()];
+    if field.is_empty() {
+        out.push(seg(Tok::Slot(S::Accent), "▏"));
+        out.push(seg(Tok::Slot(S::Ghost3), placeholder.to_string()));
+        return out;
+    }
+    let s = field.as_str();
+    let (before, after) = s.split_at(field.cursor());
+    out.push(seg(Tok::Slot(S::Text), before.to_string()));
+    out.push(seg(Tok::Slot(S::Accent), "▏"));
+    if !after.is_empty() {
+        out.push(seg(Tok::Slot(S::Text), after.to_string()));
+    }
+    out
+}
+
+/// Pull a whole-number percentage out of a git progress line, e.g.
+/// `"Receiving objects:  47% (470/1000)"` → `47`.
+fn parse_percent(line: &str) -> Option<u8> {
+    let idx = line.find('%')?;
+    let digits: String = line[..idx]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    digits.parse::<u8>().ok().map(|p| p.min(100))
+}
+
+/// A fixed-width block bar for the clone panel (indeterminate when `pct` is
+/// unknown — git hasn't emitted a percentage yet).
+fn bar_segs(pct: Option<u8>) -> Vec<Seg> {
+    const W: usize = 12;
+    match pct {
+        Some(p) => {
+            let filled = (p as usize * W / 100).min(W);
+            vec![
+                seg(Tok::Slot(S::Accent), "▓".repeat(filled)),
+                seg(Tok::Slot(S::Ghost3), "░".repeat(W - filled)),
+            ]
+        }
+        None => vec![seg(Tok::Slot(S::Ghost3), "░".repeat(W))],
     }
 }
 
@@ -512,9 +863,9 @@ mod tests {
         type_str(&mut p, "/tmp/x");
         key(&mut p, KeyCode::Tab);
         assert_eq!(p.mode(), PickerMode::Fuzzy);
-        assert_eq!(p.query, "abc");
+        assert_eq!(p.query.as_str(), "abc");
         key(&mut p, KeyCode::Tab);
-        assert_eq!(p.manual, "/tmp/x");
+        assert_eq!(p.manual.as_str(), "/tmp/x");
         assert_eq!(
             key(&mut p, KeyCode::Enter),
             PickerOutcome::Manual("/tmp/x".into())
@@ -554,7 +905,7 @@ mod tests {
         assert_eq!(p.selected, 14);
         // Ctrl+j while a query is live must navigate, not type.
         type_str(&mut p, "r0");
-        assert!(p.query.contains("r0"));
+        assert!(p.query.as_str().contains("r0"));
     }
 
     #[test]
@@ -581,6 +932,93 @@ mod tests {
             key(&mut p, KeyCode::Backspace);
         }
         assert_eq!(p.matches().len(), 2);
+    }
+
+    #[test]
+    fn cursor_edits_the_manual_field_mid_string() {
+        let mut p = picker(&[]);
+        key(&mut p, KeyCode::Tab); // → manual
+        type_str(&mut p, "htps://x"); // typo: missing 't'
+        // Move the cursor back to just after "ht" and insert the missing 't'.
+        for _ in 0.."ps://x".len() {
+            key(&mut p, KeyCode::LeftArrow);
+        }
+        key(&mut p, KeyCode::Char('t'));
+        assert_eq!(p.manual.as_str(), "https://x");
+        // Home + Delete removes the first char; End appends.
+        key(&mut p, KeyCode::Home);
+        key(&mut p, KeyCode::Delete);
+        assert_eq!(p.manual.as_str(), "ttps://x");
+        key(&mut p, KeyCode::End);
+        type_str(&mut p, "y");
+        assert_eq!(p.manual.as_str(), "ttps://xy");
+    }
+
+    #[test]
+    fn backspace_and_delete_respect_the_cursor() {
+        let mut p = picker(&[]);
+        key(&mut p, KeyCode::Tab);
+        type_str(&mut p, "abc");
+        key(&mut p, KeyCode::LeftArrow); // cursor between b and c
+        key(&mut p, KeyCode::Backspace); // deletes 'b'
+        assert_eq!(p.manual.as_str(), "ac");
+        key(&mut p, KeyCode::Delete); // deletes 'c'
+        assert_eq!(p.manual.as_str(), "a");
+    }
+
+    #[test]
+    fn paste_inserts_at_cursor_and_strips_newlines() {
+        let mut p = picker(&[]);
+        key(&mut p, KeyCode::Tab);
+        type_str(&mut p, "ab");
+        key(&mut p, KeyCode::LeftArrow); // between a and b
+        p.handle_paste("XY\nZ");
+        assert_eq!(p.manual.as_str(), "aXYZb");
+    }
+
+    #[test]
+    fn paste_into_fuzzy_refilters() {
+        let mut p = picker(&["/code/superzej", "/code/other"]);
+        p.handle_paste("zej");
+        assert_eq!(p.query.as_str(), "zej");
+        let paths: Vec<&str> = p.matches().iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["/code/superzej"]);
+    }
+
+    #[test]
+    fn clone_phase_shows_progress_and_ignores_typing() {
+        let mut p = picker(&[]);
+        p.begin_clone("https://github.com/acme/x.git");
+        assert_eq!(p.cloning_url(), Some("https://github.com/acme/x.git"));
+        p.set_clone_progress("Receiving objects:  42%");
+        // Typing during a clone is inert (only esc cancels).
+        assert_eq!(key(&mut p, KeyCode::Char('z')), PickerOutcome::Pending);
+        assert_eq!(key(&mut p, KeyCode::Escape), PickerOutcome::Cancel);
+    }
+
+    #[test]
+    fn error_phase_clears_on_next_edit() {
+        let mut p = picker(&[]);
+        p.set_error("path does not exist: /nope");
+        assert!(matches!(p.phase, Phase::Error(_)));
+        // The manual input stays editable; the first keystroke clears the error.
+        key(&mut p, KeyCode::Char('x'));
+        assert!(matches!(p.phase, Phase::Browse));
+    }
+
+    #[test]
+    fn parse_percent_extracts_trailing_number() {
+        assert_eq!(
+            parse_percent("Receiving objects:  47% (470/1000)"),
+            Some(47)
+        );
+        assert_eq!(
+            parse_percent("Resolving deltas: 100% (5/5), done."),
+            Some(100)
+        );
+        assert_eq!(parse_percent("remote: Counting objects"), None);
+        // Guards against a >100 reading.
+        assert_eq!(parse_percent("bogus 250%"), Some(100));
     }
 
     #[test]

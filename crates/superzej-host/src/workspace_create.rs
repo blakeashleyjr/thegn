@@ -51,26 +51,68 @@ pub(crate) fn workspace_clone_dest(
     })
 }
 
-/// Clone `url` into `dest`. BLOCKING (a clone can take minutes) — only call
-/// inside `spawn_blocking`; the NewWorkspace flow completes over
-/// `workspace_clone_rx`.
-pub(crate) fn clone_workspace_repo(url: &str, dest: &std::path::Path) -> Result<()> {
+/// Clone `url` into `dest`, forwarding each `git clone --progress` line to
+/// `on_progress`. BLOCKING (a clone can take minutes) — only call inside
+/// `spawn_blocking`; the NewWorkspace flow completes over `workspace_clone_rx`.
+pub(crate) fn clone_workspace_repo(
+    url: &str,
+    dest: &std::path::Path,
+    on_progress: impl FnMut(String),
+) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     // Via the scrubbed git_cmd so a stray GIT_DIR can't redirect the
     // clone; dest is absolute, so the `-C` only sets the working dir.
     let cwd = dest.parent().unwrap_or(std::path::Path::new("."));
-    // off-loop: documented blocking helper, called inside spawn_blocking only
-    #[expect(clippy::disallowed_methods)]
-    let status = superzej_core::util::git_cmd(cwd)
+    // `--progress` forces git to emit its transfer counters even though stderr
+    // is a pipe, not a TTY; we stream them to the picker's cloning panel.
+    let mut child = superzej_core::util::git_cmd(cwd)
         .arg("clone")
+        .arg("--progress")
         .arg(url)
         .arg(dest)
-        .status()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("git clone {url} {}", dest.display()))?;
+    if let Some(stderr) = child.stderr.take() {
+        stream_progress_lines(std::io::BufReader::new(stderr), on_progress);
+    }
+    // off-loop: this blocks until the clone finishes, but the whole helper only
+    // runs inside spawn_blocking (see spawn_workspace_clone).
+    #[expect(clippy::disallowed_methods)]
+    let status = child
+        .wait()
         .with_context(|| format!("git clone {url} {}", dest.display()))?;
     anyhow::ensure!(status.success(), "git clone failed for {url}");
     Ok(())
+}
+
+/// Read `git`'s progress stream, calling `on_line` with each finished segment.
+/// git rewrites its progress counter in place with a carriage return, so we
+/// break on `\r` *and* `\n` (trimming, dropping empties) rather than by line.
+pub(crate) fn stream_progress_lines<R: std::io::BufRead>(
+    reader: R,
+    mut on_line: impl FnMut(String),
+) {
+    let mut buf: Vec<u8> = Vec::new();
+    let flush = |buf: &mut Vec<u8>, on_line: &mut dyn FnMut(String)| {
+        let s = String::from_utf8_lossy(buf).trim().to_string();
+        buf.clear();
+        if !s.is_empty() {
+            on_line(s);
+        }
+    };
+    for byte in reader.bytes() {
+        let Ok(b) = byte else { break };
+        if b == b'\r' || b == b'\n' {
+            flush(&mut buf, &mut on_line);
+        } else {
+            buf.push(b);
+        }
+    }
+    flush(&mut buf, &mut on_line);
 }
 
 /// Result of a background workspace clone, delivered to the loop's
@@ -79,6 +121,13 @@ pub(crate) struct WorkspaceCloneOutcome {
     pub(crate) url: String,
     pub(crate) dest: std::path::PathBuf,
     pub(crate) result: Result<()>,
+}
+
+/// What the background clone sends over `workspace_clone_rx`: streamed progress
+/// lines while it runs, then a terminal `Done`.
+pub(crate) enum CloneEvent {
+    Progress { url: String, line: String },
+    Done(WorkspaceCloneOutcome),
 }
 
 /// What a manual new-workspace input resolves to. Pure classification — the
@@ -165,12 +214,26 @@ pub(crate) fn init_new_project(leaf: &std::path::Path) -> Result<()> {
 pub(crate) fn spawn_workspace_clone(
     url: String,
     dest: std::path::PathBuf,
-    tx: tokio::sync::mpsc::UnboundedSender<WorkspaceCloneOutcome>,
+    tx: tokio::sync::mpsc::UnboundedSender<CloneEvent>,
     waker: termwiz::terminal::TerminalWaker,
 ) {
     tokio::task::spawn_blocking(move || {
-        let result = clone_workspace_repo(&url, &dest);
-        let _ = tx.send(WorkspaceCloneOutcome { url, dest, result });
+        let progress_url = url.clone();
+        let progress_tx = tx.clone();
+        let progress_waker = waker.clone();
+        let result = clone_workspace_repo(&url, &dest, |line| {
+            // best-effort: the picker may have been cancelled
+            let _ = progress_tx.send(CloneEvent::Progress {
+                url: progress_url.clone(),
+                line,
+            });
+            let _ = progress_waker.wake();
+        });
+        let _ = tx.send(CloneEvent::Done(WorkspaceCloneOutcome {
+            url,
+            dest,
+            result,
+        }));
         let _ = waker.wake();
     });
 }
@@ -282,12 +345,232 @@ pub(crate) fn complete_workspace_create(
     }
 }
 
+/// Apply one `CloneEvent` from the off-loop clone to the picker: stream a
+/// progress line into its cloning panel, or on `Done` complete+switch (closing
+/// the picker) / park it in a visible error. Ignores results for a clone the
+/// user has since cancelled or moved past. Returns whether the loop should
+/// relayout + re-hydrate (a workspace was created).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_clone_event(
+    ev: CloneEvent,
+    picker: &mut Option<crate::workspace_picker::WorkspacePicker>,
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    workspace_pool: &mut WorkspacePool,
+    active_menu: &mut Option<MenuOverlay>,
+    focus: &mut crate::focus::FocusState,
+    model: &mut FrameModel,
+    sb: &mut SidebarState,
+    drawer: &mut Option<u32>,
+    drawer_pool: &mut DrawerPool,
+    drawer_home: &mut Option<std::path::PathBuf>,
+    cfg: &superzej_core::config::Config,
+    center: Rect,
+) -> bool {
+    match ev {
+        CloneEvent::Progress { url, line } => {
+            if let Some(p) = picker.as_mut()
+                && p.cloning_url() == Some(url.as_str())
+            {
+                p.set_clone_progress(line);
+            }
+            false
+        }
+        CloneEvent::Done(o) => {
+            // Only honor a result the picker is still awaiting — a cancel (or a
+            // move to another clone) abandons it rather than yanking the user
+            // into a workspace they dismissed.
+            let awaited = picker
+                .as_ref()
+                .is_some_and(|p| p.cloning_url() == Some(o.url.as_str()));
+            if !awaited {
+                return false;
+            }
+            match o.result {
+                Ok(()) => {
+                    *picker = None;
+                    let dest = o.dest.to_string_lossy().into_owned();
+                    complete_workspace_create(
+                        &dest,
+                        session,
+                        panes,
+                        workspace_pool,
+                        active_menu,
+                        focus,
+                        model,
+                        sb,
+                        drawer,
+                        drawer_pool,
+                        drawer_home,
+                        cfg,
+                        center,
+                    )
+                }
+                Err(e) => {
+                    if let Some(p) = picker.as_mut() {
+                        p.set_error(format!("clone failed: {e}"));
+                    }
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Map a [`crate::workspace_picker::PickerOutcome`] onto the shared workspace
+/// flows: cancel, open a browsed repo, or classify+dispatch a manual input
+/// (off-loop clone / local create+switch / new-project confirm / inline error).
+/// Owns the picker's lifecycle so it stays on screen through a clone or a bad
+/// input instead of vanishing. Returns whether the loop should relayout +
+/// re-hydrate (a workspace was created).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_picker_outcome(
+    outcome: crate::workspace_picker::PickerOutcome,
+    picker: &mut Option<crate::workspace_picker::WorkspacePicker>,
+    clone_tx: &tokio::sync::mpsc::UnboundedSender<CloneEvent>,
+    waker: &termwiz::terminal::TerminalWaker,
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    workspace_pool: &mut WorkspacePool,
+    active_menu: &mut Option<MenuOverlay>,
+    focus: &mut crate::focus::FocusState,
+    model: &mut FrameModel,
+    sb: &mut SidebarState,
+    drawer: &mut Option<u32>,
+    drawer_pool: &mut DrawerPool,
+    drawer_home: &mut Option<std::path::PathBuf>,
+    cfg: &superzej_core::config::Config,
+    center: Rect,
+) -> bool {
+    use crate::workspace_picker::PickerOutcome;
+    let create = |input: &str,
+                  picker: &mut Option<crate::workspace_picker::WorkspacePicker>,
+                  session: &mut crate::session::Session,
+                  panes: &mut Panes,
+                  workspace_pool: &mut WorkspacePool,
+                  active_menu: &mut Option<MenuOverlay>,
+                  focus: &mut crate::focus::FocusState,
+                  model: &mut FrameModel,
+                  sb: &mut SidebarState,
+                  drawer: &mut Option<u32>,
+                  drawer_pool: &mut DrawerPool,
+                  drawer_home: &mut Option<std::path::PathBuf>| {
+        *picker = None;
+        complete_workspace_create(
+            input,
+            session,
+            panes,
+            workspace_pool,
+            active_menu,
+            focus,
+            model,
+            sb,
+            drawer,
+            drawer_pool,
+            drawer_home,
+            cfg,
+            center,
+        )
+    };
+    match outcome {
+        PickerOutcome::Pending => false,
+        PickerOutcome::Cancel => {
+            *picker = None;
+            model.status = "workspace creation cancelled".into();
+            false
+        }
+        PickerOutcome::OpenRepo(path) => create(
+            &path,
+            picker,
+            session,
+            panes,
+            workspace_pool,
+            active_menu,
+            focus,
+            model,
+            sb,
+            drawer,
+            drawer_pool,
+            drawer_home,
+        ),
+        PickerOutcome::Manual(input) => match plan_new_workspace_input(&input, cfg) {
+            SubmitPlan::Clone { url, dest } => {
+                // Keep the picker on screen in its cloning phase — apply_clone_event
+                // streams progress and closes it (or shows an error) on done.
+                model.status = format!("Cloning {url}…");
+                if let Some(p) = picker.as_mut() {
+                    p.begin_clone(url.clone());
+                }
+                spawn_workspace_clone(url, dest, clone_tx.clone(), waker.clone());
+                false
+            }
+            SubmitPlan::Local(input) => create(
+                &input,
+                picker,
+                session,
+                panes,
+                workspace_pool,
+                active_menu,
+                focus,
+                model,
+                sb,
+                drawer,
+                drawer_pool,
+                drawer_home,
+            ),
+            SubmitPlan::CreateNew { leaf } => {
+                *picker = None;
+                *active_menu = Some(menu::create_project_menu(
+                    leaf.to_string_lossy().into_owned(),
+                ));
+                false
+            }
+            SubmitPlan::Invalid(msg) => {
+                // Stay open with the error inline so the input can be fixed.
+                if let Some(p) = picker.as_mut() {
+                    p.set_error(msg);
+                }
+                false
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn tmp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("sj-wscreate-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn progress_lines_split_on_cr_and_lf() {
+        // git rewrites the transfer counter in place with '\r', then ends the
+        // final line with '\n'. Each rewrite is a distinct segment; blanks and
+        // whitespace are dropped/trimmed.
+        let data = b"Cloning into 'x'...\nReceiving objects:  10% (1/10)\r\
+Receiving objects: 100% (10/10)\rdone.\n";
+        let mut lines = Vec::new();
+        stream_progress_lines(std::io::Cursor::new(&data[..]), |l| lines.push(l));
+        assert_eq!(
+            lines,
+            vec![
+                "Cloning into 'x'...",
+                "Receiving objects:  10% (1/10)",
+                "Receiving objects: 100% (10/10)",
+                "done.",
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_lines_flush_trailing_without_terminator() {
+        let mut lines = Vec::new();
+        stream_progress_lines(std::io::Cursor::new(b"no newline".as_slice()), |l| {
+            lines.push(l)
+        });
+        assert_eq!(lines, vec!["no newline"]);
     }
 
     #[test]
