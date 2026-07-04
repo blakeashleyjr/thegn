@@ -1047,7 +1047,100 @@ mod spec {
         };
         let rendered = text(&content(Section::Changes, &ctx));
         assert!(rendered.contains('◈'), "impact line: {rendered}");
+        assert!(rendered.contains("semantic"), "relabeled line: {rendered}");
         assert!(rendered.contains("fn go"), "entity header: {rendered}");
+        // The impact footer is the last actionable row: hit index == changes.len().
+        let rows = content(Section::Changes, &ctx);
+        let footer = rows
+            .iter()
+            .find(|r| r.hit == Some(PanelHit::Row(Section::Changes, m.panel.changes.len())))
+            .expect("impact footer carries a hit at index changes.len()");
+        assert!(
+            text(std::slice::from_ref(footer)).contains('◈'),
+            "footer is the impact row"
+        );
+        // It renders *after* the change row (footer, not header).
+        let impact_pos = rendered.find('◈').unwrap();
+        let file_pos = rendered.find("lib.rs").unwrap();
+        assert!(impact_pos > file_pos, "impact is a footer: {rendered}");
+
+        // Expanded: the per-file / per-entity breakdown + legend appears.
+        let mut u = ui(PanelWidth::Normal, Section::Changes);
+        u.impact_open = true;
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 39,
+            rows: 28,
+        };
+        let rows = content(Section::Changes, &ctx);
+        let rendered = text(&rows);
+        assert!(
+            rendered.contains("entity-level changes"),
+            "legend: {rendered}"
+        );
+        assert!(rendered.contains("src/lib.rs"), "file header: {rendered}");
+        assert!(
+            rendered.contains("~ "),
+            "touch glyph (modified): {rendered}"
+        );
+        assert!(rendered.contains("+3"), "churn added: {rendered}");
+        // The footer row is tinted when expanded.
+        let footer = rows
+            .iter()
+            .find(|r| r.hit == Some(PanelHit::Row(Section::Changes, m.panel.changes.len())))
+            .unwrap();
+        assert_eq!(
+            footer.bg,
+            Some(crate::seg::Tok::SelAccent),
+            "expanded footer tint"
+        );
+    }
+
+    #[test]
+    fn changes_impact_footer_is_one_actionable_row_past_the_files() {
+        use crate::layout::PanelWidth;
+        use superzej_core::semantic::{EntityChange, EntityKind, EntitySummary, Touch};
+        let mut m = model(); // one change row at src/lib.rs
+        m.panel.entities = Some(EntitySummary::new(vec![(
+            "src/lib.rs".into(),
+            vec![EntityChange {
+                kind: EntityKind::Enum,
+                name: "V".into(),
+                added: 8,
+                deleted: 0,
+                touch: Touch::Added,
+            }],
+        )]));
+        let n = m.panel.changes.len();
+        // Even with the change row expanded (inline plain rows injected), the
+        // actionable-row count is files + 1 and the footer's hit index stays
+        // pinned at changes.len() — decoupled from screen position.
+        for chg_sel in [None, Some(0)] {
+            let mut u = ui(PanelWidth::Normal, Section::Changes);
+            u.chg_sel = chg_sel;
+            let ctx = SectionCtx {
+                model: &m,
+                ui: &u,
+                cols: 39,
+                rows: 40,
+            };
+            let rows = content(Section::Changes, &ctx);
+            let actionable = rows
+                .iter()
+                .filter(|r| matches!(r.hit, Some(PanelHit::Row(_, _))))
+                .count();
+            assert_eq!(
+                actionable,
+                n + 1,
+                "files + impact footer (chg_sel={chg_sel:?})"
+            );
+            assert!(
+                rows.iter()
+                    .any(|r| r.hit == Some(PanelHit::Row(Section::Changes, n))),
+                "footer hit pinned at changes.len() (chg_sel={chg_sel:?})"
+            );
+        }
     }
 
     #[test]

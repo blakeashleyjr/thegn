@@ -3443,6 +3443,7 @@ fn open_panel_section(
     panel_ui.cursor = 0;
     panel_ui.symbols_show_refs = false;
     panel_ui.chg_sel = None;
+    panel_ui.impact_open = false;
     panel_ui.file_preview = None;
     panel_ui.scroll = 0;
     panel_ui.diff_hunk = 0;
@@ -3513,7 +3514,7 @@ fn toggle_panel_expand(
 /// the banked previews and the in-flight set; the result rides `hunk_tx` back
 /// with a waker pulse.
 #[allow(clippy::too_many_arguments)]
-fn spawn_hunk_fetch(
+pub(crate) fn spawn_hunk_fetch(
     path: &str,
     session: &crate::session::Session,
     panel_ui: &crate::panel::PanelUi,
@@ -3560,43 +3561,6 @@ fn spawn_fold(
             let _ = waker.wake();
         }
     });
-}
-
-/// Toggle the changes-section selection onto row `i` (re-selecting dismisses
-/// the preview), kicking the background hunk fetch for newly-selected paths.
-#[allow(clippy::too_many_arguments)]
-fn toggle_change_selection(
-    i: usize,
-    panel_ui: &mut crate::panel::PanelUi,
-    model: &FrameModel,
-    session: &crate::session::Session,
-    hunk_inflight: &mut std::collections::HashSet<String>,
-    hunk_tx: &tokio_mpsc::UnboundedSender<(u64, String, Vec<superzej_svc::git::Hunk>)>,
-    waker: &TerminalWaker,
-    generation: u64,
-) {
-    if panel_ui.chg_sel == Some(i) {
-        panel_ui.chg_sel = None;
-        return;
-    }
-    panel_ui.chg_sel = Some(i);
-    // Untracked rows have no diff: the preview renders a static note.
-    if let Some(row) = model
-        .panel
-        .changes
-        .get(i)
-        .filter(|c| c.stage != crate::panel::Stage::Untracked)
-    {
-        spawn_hunk_fetch(
-            &row.path,
-            session,
-            panel_ui,
-            hunk_inflight,
-            hunk_tx,
-            waker,
-            generation,
-        );
-    }
 }
 
 /// Kick a `gh` PR action off the loop; a PR-cache + model refresh follows so
@@ -8714,6 +8678,7 @@ async fn event_loop<T: Terminal>(
             // materialise immediately without requiring a key-press to dismiss.
             center_dormant = false;
             panel_ui.chg_sel = None;
+            panel_ui.impact_open = false;
             // The preview is per-worktree (paths don't carry over).
             panel_ui.file_preview = None;
             panel_ui.hunks_gen = hydration_gen;
@@ -12815,7 +12780,7 @@ async fn event_loop<T: Terminal>(
                                 panel_ui.row_mode = true;
                                 panel_ui.cursor = i;
                                 if sec == crate::panel::Section::Changes {
-                                    toggle_change_selection(
+                                    crate::handlers::panel_changes::toggle_change_selection(
                                         i,
                                         &mut panel_ui,
                                         &model,
@@ -15405,6 +15370,8 @@ async fn event_loop<T: Terminal>(
                                 // panel zone (the final leave collapses to defaults).
                                 if panel_ui.chg_sel.is_some() {
                                     panel_ui.chg_sel = None;
+                                } else if panel_ui.impact_open {
+                                    panel_ui.impact_open = false;
                                 } else if panel_ui.row_mode {
                                     panel_ui.row_mode = false;
                                 } else {
@@ -15609,7 +15576,7 @@ async fn event_loop<T: Terminal>(
                                                     need_relayout = true;
                                                 }
                                             } else {
-                                                toggle_change_selection(
+                                                crate::handlers::panel_changes::toggle_change_selection(
                                                     panel_ui.cursor,
                                                     &mut panel_ui,
                                                     &model,

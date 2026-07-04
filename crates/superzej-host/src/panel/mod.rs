@@ -756,6 +756,10 @@ pub struct PanelUi {
     pub cursor: usize,
     /// Highlighted change row (inlines its hunk preview), changes section.
     pub chg_sel: Option<usize>,
+    /// True while the changes section's semantic-impact footer is expanded into
+    /// its per-file / per-entity breakdown. Kept separate from `chg_sel` so that
+    /// stays a pure, always-in-range change index.
+    pub impact_open: bool,
     /// Inline hunk previews by path, filled by the background hunk fetch.
     pub hunks: std::collections::HashMap<String, Vec<superzej_svc::git::Hunk>>,
     /// Acceptance cutoff for arriving hunk fetches: results tagged with an
@@ -824,6 +828,7 @@ impl Default for PanelUi {
             row_mode: false,
             cursor: 0,
             chg_sel: None,
+            impact_open: false,
             hunks: std::collections::HashMap::new(),
             hunks_gen: 0,
             scroll: 0,
@@ -859,6 +864,7 @@ impl PanelUi {
     pub fn reset_on_leave(&mut self) {
         self.row_mode = false;
         self.chg_sel = None;
+        self.impact_open = false;
     }
 
     /// Adopt a config-resolved order; the open section snaps to the first
