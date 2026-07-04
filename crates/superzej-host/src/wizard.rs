@@ -1267,8 +1267,17 @@ pub fn run_worker(
     // rename/move): run the one-time `[sandbox] prepare` hooks and warm the
     // `direnv` cache so the first pane's in-sandbox direnv replays it read-only
     // instead of failing on the read-only store. Both off-loop and self-gating.
+    //
+    // The warm is BOUNDED-SYNCHRONOUS here (not the async kick): we're on the
+    // off-loop create worker, right before the pane's spec is composed and the
+    // shell fires. An async warm races the pane — a freshly-materialized worktree
+    // whose warm hasn't finished lets the in-sandbox direnv re-eval and (pre-carve)
+    // die on the read-only store / ~/.cache/nix. Waiting here means the common case
+    // (devShell already realized ⇒ warm is a fast store-hit) opens on a warm cache
+    // and replays instantly; a genuinely cold build that overruns the timeout falls
+    // through to the in-pane eval, which the ~/.cache/nix carve now makes succeed.
     superzej_core::sandbox::run_prepare(&path, &cfg.sandbox.prepare);
-    crate::direnv_warm::warm_direnv(cfg, &path);
+    crate::direnv_warm::warm_direnv_now(cfg, &path);
 
     // --- compose the launch spec (pure); the loop does the openpty+exec.
     // Bouncer env (proxy + tool override) rides the sandbox's env_overrides; a
