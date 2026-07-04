@@ -161,6 +161,14 @@ pub fn auto_cache_mounts() -> Vec<Mount> {
         ".cache/sccache",
         ".cache/prek",
         ".cache/pre-commit",
+        // Nix's CLIENT-SIDE caches (flake tarball fetches, eval/fetcher sqlite).
+        // On an in-sandbox nix-direnv cache MISS the flake re-evaluates here and
+        // must fetch inputs into ~/.cache/nix/tarball-cache-v2; the daemon
+        // backstop (NIX_REMOTE=daemon) mediates /nix/store writes but NOT this
+        // client cache, so without it the fetch dies "Read-only file system" and
+        // direnv falls back to the previous env. Shared with the host cache
+        // (sqlite-WAL / git-safe), same as the compile caches above.
+        ".cache/nix",
     ];
     candidates
         .iter()
@@ -342,6 +350,23 @@ mod tests {
         assert!(
             !has_keychain(SandboxProfile::SealedTunnel),
             "sealed-tunnel profile must NOT carve ~/.keychain"
+        );
+    }
+
+    #[test]
+    fn nix_client_cache_carved_writable() {
+        // ~/.cache/nix (flake tarball + eval caches) must be writable so an
+        // in-sandbox nix-direnv cache-miss re-eval can fetch flake inputs instead
+        // of dying "Read-only file system". Only meaningful when it exists.
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() || !std::path::Path::new(&home).join(".cache/nix").is_dir() {
+            return;
+        }
+        assert!(
+            auto_cache_mounts()
+                .iter()
+                .any(|m| m.host.ends_with("/.cache/nix") && !m.ro),
+            "~/.cache/nix must be carved writable for in-sandbox flake re-eval"
         );
     }
 
