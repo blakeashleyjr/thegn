@@ -1,8 +1,31 @@
 # Embedded agent integration — design
 
 Date: 2026-06-22
-Status: Phases A–D landed (embedding seam, proxy model path + virtual keys,
-sandbox tool boundary, notifications + spend observability)
+Status: **SUPERSEDED (2026-07-03)** — historical. The embedded `termite-agent`
+tile described below (Phases A–D) was implemented and then **reverted**: the
+`agent` app tab was dropped (`crates/superzej-host/src/apps/mod.rs` registers no
+tabs — `work` is the only tab; `apps/agent.rs` is now an inert stub), the
+`apps/termite-agent` submodule is not populated in-tree, and there is no
+`AgentRuntime`. The shipping agent path is **ACP + a managed `pi`**, not an
+embedded termite tile.
+
+> **Read this first.** The current design of record is
+> `docs/superpowers/specs/2026-06-24-acp-two-layer-control-plane-design.md` (the
+> two-layer control plane: `szproxy` lower plane + ACP upper plane) and the
+> behavior-of-record is `openspec/specs/agent/spec.md`. The real, committed agent
+> surface lives in `crates/superzej-svc/src/acp/` (`AcpClient`),
+> `crates/superzej-core/src/acp/` (protocol data model),
+> `extensions/superzej-acp.ts` (the in-pane pi bridge, pinned pi `0.80.2`), and
+> `crates/superzej-host/src/{bouncer,relay}.rs` (the sealed-sandbox tool gate +
+> model-traffic relay). superzej launches a managed `pi` into a worktree pane and
+> talks ACP to it; it does **not** host a first-party Rust harness tile.
+>
+> **What carried over:** the _substrate-first_ decisions here still hold for the
+> pi path — model traffic routes through `szproxy` under a per-worktree virtual
+> key (Decision 3), and the sandbox is the policy boundary (Decision 4, now the
+> `bouncer`). Those concepts survived the pivot; the termite tile that originally
+> hosted them did not. Everything below is retained as history of the abandoned
+> embedded-tile approach.
 
 ## Context
 
