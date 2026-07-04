@@ -6822,21 +6822,7 @@ pub(crate) fn persist_session_layout(session: &mut crate::session::Session, pane
     }
 }
 
-/// Attach a freshly-created worktree's agent pane: spawn the pre-resolved
-/// launch spec (openpty+exec — fast, the blocking sandbox/compose work already
-/// ran on the wizard worker) into the tab named `tab_name` and point that
-/// tab's center at the live pane so `materialize` won't also spawn a plain
-/// shell. No-op (returns false) if the tab is gone.
-#[allow(clippy::too_many_arguments)]
-/// How superzej reaches a launched agent's ACP server: a TCP loopback port (the
-/// non-sandboxed path) or a bind-mounted unix socket (the sealed-bouncer path,
-/// which crosses the container netns without network). `None` ⇒ no channel was
-/// reserved (the agent runs without ACP servicing).
-enum AgentChannel {
-    Tcp(u16),
-    Unix(std::path::PathBuf),
-    None,
-}
+use crate::acp_gate::AgentChannel;
 
 /// Connect to the agent's ACP server over the resolved channel. TCP connects
 /// after a fixed warm-up; the unix socket is created by the in-container pi
@@ -6854,8 +6840,10 @@ async fn connect_agent_channel(
             // a fixed cadence (like the unix path's boot wait) rather than racing a
             // single connect against the spawn — a lost race left the agent showing
             // `Error` permanently despite coming up moments later (ECONNREFUSED).
-            // ~10s total (40 × 250ms); connects immediately once the port is up.
-            AcpClient::connect_retry(*port, 40, std::time::Duration::from_millis(250)).await
+            // ~15s total (60 × 250ms); connects immediately once the port is up.
+            // Covers a cold managed pi that binds ACP_PORT ~12s after launch, so a
+            // healthy agent connects on attempt 1 (no transient error/backoff).
+            AcpClient::connect_retry(*port, 60, std::time::Duration::from_millis(250)).await
         }
         AgentChannel::Unix(path) => {
             let path_s = path.to_string_lossy().into_owned();
@@ -6877,12 +6865,22 @@ async fn connect_agent_channel(
     }
 }
 
+/// Attach a freshly-created worktree's agent pane: spawn the pre-resolved
+/// launch spec (openpty+exec — fast, the blocking sandbox/compose work already
+/// ran on the wizard worker) into the tab named `tab_name` and point that
+/// tab's center at the live pane so `materialize` won't also spawn a plain
+/// shell. No-op (returns false) if the tab is gone.
+///
+/// ACP is armed only when `agent_name` is the managed pi (see
+/// [`crate::acp_gate::resolve_agent_channel`]); a plain shell spawns the pane and
+/// nothing more (no phantom `⚠ agent error`).
 #[allow(clippy::too_many_arguments)]
 fn attach_agent_pane(
     session: &mut crate::session::Session,
     panes: &mut Panes,
     tab_name: &str,
     spec: &crate::agent::LaunchSpec,
+    agent_name: &str,
     center: Rect,
     cfg: &superzej_core::config::Config,
     acp_inbound_tx: &tokio_mpsc::UnboundedSender<(String, superzej_svc::acp::client::AcpInbound)>,
@@ -6900,81 +6898,15 @@ fn attach_agent_pane(
     let mut env = spec.env.clone();
     let wt_path = session.worktrees[gi].path.clone();
 
-    // "The bouncer": when on and the agent is sandboxed, the launch path already
-    // injected the proxy + tool-override env (and ACP_SOCKET) into the container's
-    // `env_overrides`, and superzej reaches the agent over a bind-mounted unix
-    // socket (TCP can't cross the sealed netns). Otherwise: the legacy TCP path,
-    // wiring ACP_PORT + the proxy env onto the pane process env here.
-    let bouncer = cfg.llm_proxy.bouncer && spec.backend != "host";
-
-    let acp_channel: AgentChannel = if bouncer {
-        AgentChannel::Unix(crate::bouncer::acp_socket_path(&wt_path))
-    } else {
-        // Reserve a free localhost port and hand it to the agent via `ACP_PORT`.
-        // The brief bind-then-drop is the standard ephemeral-port reservation; pi
-        // re-binds it. Env is the reliable channel: it crosses `sh -lc` wrapping.
-        match std::net::TcpListener::bind("127.0.0.1:0")
-            .ok()
-            .and_then(|l| l.local_addr().ok())
-            .map(|a| a.port())
-            .filter(|p| *p != 0)
-        {
-            Some(port) => {
-                env.push(("ACP_PORT".to_string(), port.to_string()));
-                AgentChannel::Tcp(port)
-            }
-            None => AgentChannel::None,
-        }
-    };
-
-    // Lower plane: route the agent's model through the proxy. In bouncer mode the
-    // proxy env rides `env_overrides` (set at launch) and the key is the stable
-    // per-worktree id; here (TCP path) we mint a fresh key + push the proxy env
-    // onto the pane env. Either way the key is revoked when the agent disconnects.
-    let revoke_key: Option<String> = if bouncer {
-        // Stable id derived deterministically — matches what the launch path minted.
-        cfg.llm_proxy
-            .route_agent
-            .then(|| crate::agent::agent_proxy_key_id(&wt_path))
-    } else if cfg.llm_proxy.route_agent {
-        let key = crate::agent::mint_agent_proxy_key(&wt_path);
-        env.push((
-            "SUPERZEJ_PROXY_BASE_URL".to_string(),
-            format!("http://{}", cfg.llm_proxy.listen),
-        ));
-        env.push((
-            "SUPERZEJ_PROXY_API".to_string(),
-            cfg.llm_proxy.agent_api.clone(),
-        ));
-        env.push((
-            "SUPERZEJ_PROXY_MODEL".to_string(),
-            cfg.llm_proxy.agent_model.clone(),
-        ));
-        if let Some(k) = &key {
-            env.push(("SUPERZEJ_PROXY_KEY".to_string(), k.clone()));
-        }
-        key
-    } else {
-        None
-    };
-
-    // Full network seal (sealed `agent_profile` → `network=none`): the agent's
-    // only egress is a unix-socket relay to the host proxy, bind-mounted into the
-    // container. Started here; torn down when the connection task ends.
-    let relay = (bouncer
-        && cfg.llm_proxy.route_agent
-        && cfg.sandbox.agent_profile.forces_no_network())
-    .then(|| {
-        let sock = crate::bouncer::proxy_socket_path(&wt_path);
-        match crate::relay::spawn(sock, cfg.llm_proxy.listen.clone()) {
-            Ok(h) => Some(h),
-            Err(e) => {
-                tracing::error!(target: "szhost::relay", "proxy relay failed to start: {e}");
-                None
-            }
-        }
-    })
-    .flatten();
+    // Resolve the ACP reach-back channel + proxy side effects, gated on whether
+    // this agent actually speaks ACP (the managed pi). For a shell / claude / etc.
+    // this returns `None` — no port, no env, no supervisor — so the pane spawns
+    // clean without a phantom `⚠ agent error`. See `crate::acp_gate`.
+    let crate::acp_gate::AcpArming {
+        channel: acp_channel,
+        revoke_key,
+        relay,
+    } = crate::acp_gate::resolve_agent_channel(cfg, agent_name, &wt_path, &spec.backend, &mut env);
 
     let argv = spec.argv.clone();
     match panes.spawn_argv_env(&argv, cwd.as_deref(), &env, center) {
@@ -7036,12 +6968,17 @@ fn attach_agent_pane(
                                 backoff = std::time::Duration::from_millis(500);
                                 let client = std::sync::Arc::new(client);
                                 if let Err(e) = client.initialize().await {
-                                    tracing::error!(target: "szhost::acp", "ACP initialize failed: {e}");
                                     failures += 1;
+                                    // Transient warmup failures stay at WARN so a
+                                    // slow-but-successful agent never trips the
+                                    // "error in szhost.log" badge; ERROR is reserved
+                                    // for the final give-up.
                                     if failures >= 5 {
+                                        tracing::error!(target: "szhost::acp", attempt = failures, "ACP initialize failed, giving up: {e}");
                                         finish(crate::chrome::AgentConn::Error);
                                         return;
                                     }
+                                    tracing::warn!(target: "szhost::acp", attempt = failures, "ACP initialize failed (retrying): {e}");
                                     emit(crate::chrome::AgentConn::Connecting);
                                 } else {
                                     if let Err(e) = client.connect_mcp("superzej-house").await {
@@ -7064,11 +7001,14 @@ fn attach_agent_pane(
                             }
                             Err(e) => {
                                 failures += 1;
-                                tracing::error!(target: "szhost::acp", attempt = failures, "failed to connect to agent ACP channel: {e}");
+                                // Transient warmup failures stay at WARN; ERROR only
+                                // on the final give-up (see the initialize arm).
                                 if failures >= 5 {
+                                    tracing::error!(target: "szhost::acp", attempt = failures, "failed to connect to agent ACP channel, giving up: {e}");
                                     finish(crate::chrome::AgentConn::Error);
                                     return;
                                 }
+                                tracing::warn!(target: "szhost::acp", attempt = failures, "failed to connect to agent ACP channel (retrying): {e}");
                                 emit(crate::chrome::AgentConn::Connecting);
                             }
                         }
@@ -10907,6 +10847,7 @@ async fn event_loop<T: Terminal>(
                             &mut panes,
                             &payload.tab,
                             &payload.spec,
+                            &payload.agent,
                             chrome.center,
                             keymap.config(),
                             &acp_inbound_tx,
