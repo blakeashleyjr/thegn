@@ -20,6 +20,7 @@ use crate::compositor::Rect;
 use crate::layer::{self, Anchor, LayerSpec};
 use crate::seg::{self, Line, Tok, seg};
 use crate::telemetry::TelemetryHistory;
+use superzej_core::log_view::{LogLevel, LogLine};
 use superzej_core::theme::Hue;
 use superzej_core::viz;
 
@@ -48,6 +49,21 @@ pub enum DetailAction {
     CiRerun { run_id: String, failed: bool },
     /// Cancel an in-flight CI run, off the loop.
     CiCancel { run_id: String },
+    /// Drill the notification overlay into the log viewer *in place*, carrying a
+    /// snapshot of the log tail so no model re-borrow / loop round-trip is needed
+    /// (handled inside [`DetailOverlay::handle_key`]).
+    ShowLog(Vec<LogLine>),
+    /// Switch to the worktree at this path (a notification's `worktree_path`).
+    FocusWorktree(String),
+    /// Mark a single notification read (dismiss from the inbox + badge), off the
+    /// loop, then refresh.
+    DismissNotification { id: i64 },
+    /// Mark every notification read (empty the inbox + red flag), off the loop.
+    ClearNotifications,
+    /// Open the raw szhost.log in a pager pane (fuller scrollback than the tail).
+    OpenLogPager,
+    /// Copy a single log line's raw text to the system clipboard.
+    CopyLine(String),
 }
 
 /// One scrollable list row: a colored marker glyph, the body text, and an
@@ -112,12 +128,49 @@ pub struct TableDetail {
     pub total: Vec<String>,
 }
 
+/// A scrollable, filterable log viewer (the notification → log drilldown). Holds
+/// a snapshot of parsed lines plus live view state (level gate, text filter,
+/// tail-follow); the overlay's `sel`/`scroll` cursor indexes the *filtered* view.
+pub struct LogDetail {
+    pub lines: Vec<LogLine>,
+    /// Level gate: `Some(lvl)` shows entries `<= lvl` (Error is most severe);
+    /// `None` shows all levels.
+    pub level: Option<LogLevel>,
+    /// Case-insensitive substring filter over each line's raw text.
+    pub filter: String,
+    /// True while typing into the filter (keys edit the query, not navigate).
+    pub filter_edit: bool,
+    /// Keep the cursor pinned to the most-recent matching line on view changes.
+    pub tail: bool,
+}
+
+impl LogDetail {
+    /// Indices into `lines` that pass the level gate + text filter, oldest first.
+    fn matches(&self) -> Vec<usize> {
+        let needle = self.filter.to_lowercase();
+        self.lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                self.level.is_none_or(|lvl| l.level <= lvl)
+                    && (needle.is_empty() || l.raw.to_lowercase().contains(&needle))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn match_count(&self) -> usize {
+        self.matches().len()
+    }
+}
+
 /// What a detail overlay shows.
 pub enum DetailContent {
     Graph(GraphDetail),
     List(ListDetail),
     KeyVal(KeyValDetail),
     Table(TableDetail),
+    Log(LogDetail),
 }
 
 /// Where the box sits relative to the originating bar item.
@@ -184,12 +237,13 @@ pub enum DetailOutcome {
 }
 
 impl DetailOverlay {
-    /// Total scrollable rows (list rows or table body rows; 0 otherwise), for
-    /// scroll clamping.
+    /// Total scrollable rows (list rows, table body rows, or filtered log lines;
+    /// 0 otherwise), for scroll clamping.
     fn content_len(&self) -> usize {
         match &self.content {
             DetailContent::List(l) => l.rows.len(),
             DetailContent::Table(t) => t.rows.len(),
+            DetailContent::Log(lg) => lg.match_count(),
             _ => 0,
         }
     }
@@ -202,9 +256,10 @@ impl DetailOverlay {
     }
 
     /// Visible body rows for a list (one row is reserved for the hint footer
-    /// when present).
+    /// when present; the log viewer always reserves its footer row).
     fn visible_rows(&self) -> usize {
-        self.rows.saturating_sub(self.hint.is_some() as usize)
+        let reserve = self.hint.is_some() || matches!(self.content, DetailContent::Log(_));
+        self.rows.saturating_sub(reserve as usize)
     }
 
     /// Keep the selected row inside the scroll window.
@@ -235,6 +290,12 @@ impl DetailOverlay {
     /// row cursor with j/k, fires the selected row's `enter` action on Enter,
     /// and its char-keyed actions on the bound key (all as `Act`).
     pub fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> DetailOutcome {
+        // The log viewer owns every key (it has a text-filter edit sub-mode where
+        // Esc/letters must not close/navigate), so it dispatches before the shared
+        // guards below.
+        if matches!(self.content, DetailContent::Log(_)) {
+            return self.handle_log_key(key, mods);
+        }
         if mods.contains(Modifiers::CTRL) {
             return match key {
                 KeyCode::Char('c' | 'C' | 'g' | 'G') => DetailOutcome::Close,
@@ -254,6 +315,12 @@ impl DetailOverlay {
             KeyCode::Enter => {
                 if actionable {
                     match self.selected_enter() {
+                        // ShowLog drills in place: swap this overlay's content for
+                        // the log viewer (no loop round-trip), keeping the snapshot.
+                        Some(DetailAction::ShowLog(lines)) => {
+                            self.enter_log_view(lines);
+                            DetailOutcome::Pending
+                        }
                         Some(a) => DetailOutcome::Act(a),
                         None => DetailOutcome::Pending,
                     }
@@ -313,6 +380,169 @@ impl DetailOverlay {
         l.rows.get(self.sel).and_then(|r| r.enter.clone())
     }
 
+    /// Key handling for the log viewer (`DetailContent::Log`). `l` cycles the
+    /// level gate, `/` toggles a text-filter edit sub-mode, `a` re-pins to the
+    /// tail, `y`/Enter copies the selected line, `F` expands into the side Logs
+    /// panel; j/k/arrows/PageUp/Down move the cursor. Esc/q/Ctrl-C close.
+    fn handle_log_key(&mut self, key: &KeyCode, mods: Modifiers) -> DetailOutcome {
+        // Filter-edit sub-mode: keys build the query rather than navigate.
+        if matches!(&self.content, DetailContent::Log(l) if l.filter_edit) {
+            match key {
+                KeyCode::Enter | KeyCode::Escape => {
+                    if let DetailContent::Log(l) = &mut self.content {
+                        l.filter_edit = false;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let DetailContent::Log(l) = &mut self.content {
+                        l.filter.pop();
+                    }
+                    self.log_reclamp();
+                }
+                KeyCode::Char(c)
+                    if !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER) =>
+                {
+                    if let DetailContent::Log(l) = &mut self.content {
+                        l.filter.push(*c);
+                    }
+                    self.log_reclamp();
+                }
+                _ => {}
+            }
+            return DetailOutcome::Pending;
+        }
+        if mods.contains(Modifiers::CTRL) {
+            return match key {
+                KeyCode::Char('c' | 'C' | 'g' | 'G') => DetailOutcome::Close,
+                _ => DetailOutcome::Pending,
+            };
+        }
+        if mods.intersects(Modifiers::ALT | Modifiers::SUPER) {
+            return DetailOutcome::Pending;
+        }
+        if crate::input::is_escape_key(key) {
+            return DetailOutcome::Close;
+        }
+        let max = self.content_len().saturating_sub(1);
+        match key {
+            KeyCode::Char('q') => DetailOutcome::Close,
+            KeyCode::Char('l') => {
+                self.log_cycle_level();
+                DetailOutcome::Pending
+            }
+            KeyCode::Char('/') => {
+                if let DetailContent::Log(l) = &mut self.content {
+                    l.filter_edit = true;
+                }
+                DetailOutcome::Pending
+            }
+            KeyCode::Char('a') => {
+                if let DetailContent::Log(l) = &mut self.content {
+                    l.tail = true;
+                }
+                self.log_reclamp();
+                DetailOutcome::Pending
+            }
+            KeyCode::Char('F') => DetailOutcome::Act(DetailAction::OpenLogPager),
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => match self.log_selected_raw() {
+                Some(raw) => DetailOutcome::Act(DetailAction::CopyLine(raw)),
+                None => DetailOutcome::Pending,
+            },
+            KeyCode::DownArrow | KeyCode::Char('j') => {
+                self.sel = (self.sel + 1).min(max);
+                self.log_untail();
+                self.scroll_to_sel();
+                DetailOutcome::Pending
+            }
+            KeyCode::UpArrow | KeyCode::Char('k') => {
+                self.sel = self.sel.saturating_sub(1);
+                self.log_untail();
+                self.scroll_to_sel();
+                DetailOutcome::Pending
+            }
+            KeyCode::PageDown => {
+                self.sel = (self.sel + 8).min(max);
+                self.log_untail();
+                self.scroll_to_sel();
+                DetailOutcome::Pending
+            }
+            KeyCode::PageUp => {
+                self.sel = self.sel.saturating_sub(8);
+                self.log_untail();
+                self.scroll_to_sel();
+                DetailOutcome::Pending
+            }
+            _ => DetailOutcome::Pending,
+        }
+    }
+
+    /// A manual move breaks tail-follow (the cursor stops sticking to the end).
+    fn log_untail(&mut self) {
+        if let DetailContent::Log(l) = &mut self.content {
+            l.tail = false;
+        }
+    }
+
+    /// Cycle the level gate (Error→Warn→…→Trace→all→Error), retitle, and reclamp.
+    fn log_cycle_level(&mut self) {
+        let next = match &self.content {
+            DetailContent::Log(l) => match l.level {
+                Some(lvl) => lvl.next_cycle(),
+                None => Some(LogLevel::Error),
+            },
+            _ => return,
+        };
+        if let DetailContent::Log(l) = &mut self.content {
+            l.level = next;
+        }
+        self.title = log_title(next);
+        self.log_reclamp();
+    }
+
+    /// Keep the cursor valid after the filtered set changes; tail-follow pins it
+    /// to the most-recent matching line.
+    fn log_reclamp(&mut self) {
+        let n = self.content_len();
+        if n == 0 {
+            self.sel = 0;
+            self.scroll = 0;
+            return;
+        }
+        let tail = matches!(&self.content, DetailContent::Log(l) if l.tail);
+        self.sel = if tail { n - 1 } else { self.sel.min(n - 1) };
+        self.scroll_to_sel();
+    }
+
+    /// The raw text of the line at the cursor (over the filtered view).
+    fn log_selected_raw(&self) -> Option<String> {
+        let DetailContent::Log(l) = &self.content else {
+            return None;
+        };
+        let idx = *l.matches().get(self.sel)?;
+        l.lines.get(idx).map(|ln| ln.raw.clone())
+    }
+
+    /// Swap this overlay's content in place for the log viewer over `lines`
+    /// (the notification → log drilldown). Opens error-gated and pinned to the
+    /// most-recent matching line; grows the box to the log size.
+    fn enter_log_view(&mut self, lines: Vec<LogLine>) {
+        let level = Some(LogLevel::Error);
+        self.content = DetailContent::Log(LogDetail {
+            lines,
+            level,
+            filter: String::new(),
+            filter_edit: false,
+            tail: true,
+        });
+        self.title = log_title(level);
+        self.cols = 72;
+        self.rows = 18;
+        self.hint = None;
+        self.scroll = 0;
+        self.sel = self.content_len().saturating_sub(1);
+        self.scroll_to_sel();
+    }
+
     /// Paint the overlay as a summoned layer over the composed frame.
     pub fn render(&self, surface: &mut Surface, screen: Rect) {
         let mut spec = LayerSpec {
@@ -334,6 +564,7 @@ impl DetailOverlay {
             }
             DetailContent::KeyVal(kv) => render_keyval(surface, inner, kv),
             DetailContent::Table(t) => render_table(surface, inner, t, self.scroll),
+            DetailContent::Log(lg) => render_log(surface, inner, lg, self.scroll, self.sel),
         }
     }
 }
@@ -562,6 +793,110 @@ fn render_table(surface: &mut Surface, inner: Rect, t: &TableDetail, scroll: usi
             panel(),
         );
     }
+}
+
+/// Color tone for a log level (error red, warn amber, then a text→ghost ramp).
+fn level_hue(l: LogLevel) -> Tok {
+    match l {
+        LogLevel::Error => Tok::Hue(Hue::Red),
+        LogLevel::Warn => Tok::Hue(Hue::Amber),
+        LogLevel::Info => Tok::Slot(S::Text),
+        LogLevel::Debug => Tok::Slot(S::Dim),
+        LogLevel::Trace => Tok::Slot(S::Ghost),
+    }
+}
+
+/// The overlay title for a level gate (`Log · errors`, `Log · warn+`, …).
+fn log_title(level: Option<LogLevel>) -> String {
+    match level {
+        None => "Log · all".into(),
+        Some(LogLevel::Error) => "Log · errors".into(),
+        Some(LogLevel::Warn) => "Log · warn+".into(),
+        Some(LogLevel::Info) => "Log · info+".into(),
+        Some(LogLevel::Debug) => "Log · debug+".into(),
+        Some(LogLevel::Trace) => "Log · trace".into(),
+    }
+}
+
+/// Drop the `YYYY-MM-DDT` date prefix so the right-hand note shows just the time.
+fn short_time(ts: &str) -> String {
+    ts.split_once('T')
+        .map(|(_, t)| t.to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
+fn render_log(surface: &mut Surface, inner: Rect, lg: &LogDetail, scroll: usize, sel: usize) {
+    // Last inner row is the footer (key hints, or the filter prompt while editing).
+    let body_rows = inner.rows.saturating_sub(1);
+    let idxs = lg.matches();
+    if idxs.is_empty() {
+        let empty = if lg.lines.is_empty() {
+            "no log data (set SUPERZEJ_LOG to enable)"
+        } else {
+            "no matching log lines"
+        };
+        seg::draw_line(
+            surface,
+            inner.x,
+            inner.y,
+            inner.cols,
+            &Line::segs(vec![seg(Tok::Slot(S::Ghost), empty.to_string())]),
+            panel(),
+        );
+    } else {
+        let scroll = scroll.min(idxs.len().saturating_sub(1));
+        for (row, &li) in idxs.iter().skip(scroll).take(body_rows).enumerate() {
+            let Some(line) = lg.lines.get(li) else {
+                continue;
+            };
+            let selected = scroll + row == sel;
+            // A leading `❯` marks the cursor (like the actionable list) — every
+            // tone stays on the panel background it's designed for, so there's no
+            // faint-on-accent contrast pitfall.
+            let cursor = if selected {
+                seg(Tok::Slot(S::Accent), "❯ ").bold()
+            } else {
+                seg(panel(), "  ")
+            };
+            let tone = level_hue(line.level);
+            let left = vec![
+                cursor,
+                seg(tone, format!("{} ", line.level.glyph())),
+                seg(Tok::Slot(S::Text), line.message.clone()),
+            ];
+            let l = Line::split(
+                left,
+                vec![seg(Tok::Slot(S::Dim), short_time(&line.timestamp))],
+            );
+            seg::draw_line(surface, inner.x, inner.y + row, inner.cols, &l, panel());
+        }
+    }
+    // Footer.
+    if inner.rows == 0 {
+        return;
+    }
+    let footer = if lg.filter_edit {
+        Line::segs(vec![
+            seg(Tok::Slot(S::Accent), "❯ "),
+            seg(Tok::Slot(S::Text), lg.filter.clone()),
+            seg(Tok::Slot(S::Accent), "▏"),
+        ])
+    } else {
+        let hint = if lg.filter.is_empty() {
+            "↵/y copy · l level · / filter · a end · F full log".to_string()
+        } else {
+            format!("filter: {} · / edit · l level · F full log", lg.filter)
+        };
+        Line::segs(vec![seg(Tok::Slot(S::Faint), hint)])
+    };
+    seg::draw_line(
+        surface,
+        inner.x,
+        inner.y + inner.rows - 1,
+        inner.cols,
+        &footer,
+        panel(),
+    );
 }
 
 // --- content builders -------------------------------------------------------
@@ -987,17 +1322,34 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
         BarBadge::Notifications => {
             let mut notes: Vec<_> = model.panel.notifications.clone();
             notes.sort_by_key(|n| std::cmp::Reverse(n.created_at_ms));
-            let now_ms = chrono::Local::now().timestamp_millis();
             let rows: Vec<DetailRow> = notes
                 .iter()
                 .map(|n| {
                     let (glyph, marker) = notif_glyph(n.kind);
                     let marker = if n.read { Tok::Slot(S::Ghost) } else { marker };
-                    DetailRow::new(marker, glyph, n.message.clone())
-                        .note(rel_time(now_ms - n.created_at_ms))
+                    // `created_at_ms` is epoch *seconds* (legacy misnomer), so
+                    // `util::age` — not a millisecond clock — gives the real age.
+                    let mut row = DetailRow::new(marker, glyph, n.message.clone())
+                        .note(format!("{} ago", superzej_core::util::age(n.created_at_ms)));
+                    // Enter drills in: a log error opens the log modal in place;
+                    // anything tied to a worktree jumps to that worktree's tab.
+                    if n.source_ref == "log:szhost" {
+                        row = row
+                            .on_enter(DetailAction::ShowLog(model.panel.log_tail.clone()))
+                            .action('o', DetailAction::OpenLogPager);
+                    } else if !n.worktree_path.is_empty() {
+                        row = row.on_enter(DetailAction::FocusWorktree(n.worktree_path.clone()));
+                    }
+                    // Inbox management on any row: x dismisses this one, X clears all.
+                    if n.id != 0 {
+                        row = row.action('x', DetailAction::DismissNotification { id: n.id });
+                    }
+                    row.action('X', DetailAction::ClearNotifications)
                 })
                 .collect();
-            Some(list("Notifications", rows, "no notifications", 60, 16))
+            let mut ov = list("Notifications", rows, "no notifications", 60, 16);
+            ov.hint = Some("↵ open · x dismiss · X clear · o log".into());
+            Some(ov)
         }
         BarBadge::Agent => {
             let a = model.agent_activity.as_ref()?;
@@ -1262,20 +1614,6 @@ fn notif_glyph(kind: superzej_core::notification::NotificationKind) -> (&'static
         K::AgentAttention | K::Overdue => ("⚑", Tok::Hue(Hue::Amber)),
         K::AgentDone | K::ProcessExited | K::WorktreeCreated => ("✓", Tok::Hue(Hue::Green)),
         _ => ("•", Tok::Hue(Hue::Blue)),
-    }
-}
-
-/// A compact relative-time string from a millisecond delta ("3m", "2h", "5d").
-fn rel_time(delta_ms: i64) -> String {
-    let s = (delta_ms / 1000).max(0);
-    if s < 60 {
-        format!("{s}s")
-    } else if s < 3600 {
-        format!("{}m", s / 60)
-    } else if s < 86_400 {
-        format!("{}h", s / 3600)
-    } else {
-        format!("{}d", s / 86_400)
     }
 }
 
@@ -1644,6 +1982,197 @@ mod tests {
             &TelemetryHistory::default(),
         )
         .unwrap();
+        let mut s = Surface::new(120, 40);
+        ov.render(&mut s, screen());
+        assert!(seg::text_contrast_violations(&mut s, 3.0).is_empty());
+    }
+
+    // --- notifications + log viewer ---------------------------------------
+
+    use superzej_core::notification::{Notification, NotificationKind};
+
+    fn notif(kind: NotificationKind, source_ref: &str, msg: &str, age_secs: i64) -> Notification {
+        Notification {
+            id: 1,
+            kind,
+            source_ref: source_ref.into(),
+            message: msg.into(),
+            created_at_ms: superzej_core::util::now() - age_secs,
+            read: false,
+            worktree_path: String::new(),
+        }
+    }
+
+    fn err_line(msg: &str) -> LogLine {
+        LogLine {
+            timestamp: "2026-06-05T12:00:00".into(),
+            level: LogLevel::Error,
+            target: "szhost".into(),
+            message: msg.into(),
+            raw: format!("2026-06-05T12:00:00  ERROR szhost  {msg}"),
+        }
+    }
+
+    fn info_line(msg: &str) -> LogLine {
+        LogLine {
+            timestamp: "2026-06-05T12:00:01".into(),
+            level: LogLevel::Info,
+            target: "szhost".into(),
+            message: msg.into(),
+            raw: format!("2026-06-05T12:00:01  INFO  szhost  {msg}"),
+        }
+    }
+
+    fn notif_model(notifications: Vec<Notification>, log_tail: Vec<LogLine>) -> FrameModel {
+        FrameModel {
+            panel: crate::panel::PanelData {
+                notifications,
+                log_tail,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn open_notifications(model: &FrameModel) -> DetailOverlay {
+        open_detail_for(
+            &BarItemId::Badge(BarBadge::Notifications),
+            item_at(39),
+            screen(),
+            model,
+            &TelemetryHistory::default(),
+        )
+        .expect("notifications always opens")
+    }
+
+    #[test]
+    fn notification_note_is_a_real_age_not_a_millisecond_bug() {
+        // Regression: `created_at_ms` is epoch *seconds*, so the note must go
+        // through `util::age` — a 3-minute-old entry reads "3m ago", never the
+        // "20617d" a ms-vs-s mixup produced.
+        let model = notif_model(
+            vec![notif(NotificationKind::WorktreeCreated, "wt", "ready", 180)],
+            vec![],
+        );
+        let ov = open_notifications(&model);
+        let DetailContent::List(l) = &ov.content else {
+            panic!("expected a list");
+        };
+        let note = l.rows[0].note.as_deref().unwrap();
+        assert!(note.ends_with("ago"), "note: {note}");
+        assert!(!note.contains("20617"), "note: {note}");
+        assert!(note.starts_with('3'), "note: {note}");
+    }
+
+    #[test]
+    fn notifications_are_actionable_with_dismiss_clear_keys() {
+        let model = notif_model(
+            vec![notif(NotificationKind::WorktreeCreated, "wt", "ready", 5)],
+            vec![],
+        );
+        let mut ov = open_notifications(&model);
+        assert!(ov.actionable());
+        assert!(ov.hint.is_some());
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('x'), Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::DismissNotification { id: 1 })
+        );
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('X'), Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::ClearNotifications)
+        );
+    }
+
+    #[test]
+    fn log_error_notification_drills_into_the_log_view_in_place() {
+        let model = notif_model(
+            vec![notif(
+                NotificationKind::LogError,
+                "log:szhost",
+                "1 error in szhost.log",
+                5,
+            )],
+            vec![info_line("started"), err_line("boom"), info_line("more")],
+        );
+        let mut ov = open_notifications(&model);
+        // `o` on the log row opens the full-log pager.
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('o'), Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::OpenLogPager)
+        );
+        // Enter drills in place: content becomes the (error-gated) log view.
+        assert_eq!(
+            ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            DetailOutcome::Pending
+        );
+        let DetailContent::Log(l) = &ov.content else {
+            panic!("expected the log view");
+        };
+        assert_eq!(l.level, Some(LogLevel::Error));
+        assert_eq!(l.matches().len(), 1, "only the ERROR line matches");
+        // `l` widens the gate to warn+, which now also admits the INFO lines…
+        ov.handle_key(&KeyCode::Char('l'), Modifiers::NONE);
+        // …cycle all the way to "all" and every line is visible.
+        for _ in 0..4 {
+            ov.handle_key(&KeyCode::Char('l'), Modifiers::NONE);
+        }
+        let DetailContent::Log(l) = &ov.content else {
+            panic!("expected the log view");
+        };
+        assert_eq!(l.level, None, "cycled to all levels");
+        assert_eq!(l.matches().len(), 3);
+        // `F` opens the full log; Enter copies the selected line; Esc closes.
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('F'), Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::OpenLogPager)
+        );
+        assert!(matches!(
+            ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::CopyLine(_))
+        ));
+        assert_eq!(
+            ov.handle_key(&KeyCode::Escape, Modifiers::NONE),
+            DetailOutcome::Close
+        );
+    }
+
+    #[test]
+    fn log_view_text_filter_narrows_and_reclamps() {
+        let model = notif_model(
+            vec![notif(NotificationKind::LogError, "log:szhost", "errs", 5)],
+            vec![err_line("connection refused"), err_line("disk full")],
+        );
+        let mut ov = open_notifications(&model);
+        ov.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        // `/` enters filter-edit; typing narrows the view; letters don't close.
+        ov.handle_key(&KeyCode::Char('/'), Modifiers::NONE);
+        for c in "disk".chars() {
+            assert_eq!(
+                ov.handle_key(&KeyCode::Char(c), Modifiers::NONE),
+                DetailOutcome::Pending
+            );
+        }
+        let DetailContent::Log(l) = &ov.content else {
+            panic!("expected the log view");
+        };
+        assert!(l.filter_edit);
+        assert_eq!(l.matches().len(), 1);
+        // Enter leaves edit mode (does not copy while editing).
+        assert_eq!(
+            ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            DetailOutcome::Pending
+        );
+        assert!(matches!(&ov.content, DetailContent::Log(l) if !l.filter_edit));
+    }
+
+    #[test]
+    fn log_view_renders_legibly() {
+        let model = notif_model(
+            vec![notif(NotificationKind::LogError, "log:szhost", "errs", 5)],
+            vec![err_line("boom"), info_line("ok"), err_line("kaboom")],
+        );
+        let mut ov = open_notifications(&model);
+        ov.handle_key(&KeyCode::Enter, Modifiers::NONE);
         let mut s = Surface::new(120, 40);
         ov.render(&mut s, screen());
         assert!(seg::text_contrast_violations(&mut s, 3.0).is_empty());

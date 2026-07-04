@@ -17,6 +17,7 @@ use crate::hydrate::{RefreshKind, active_tab_path};
 use crate::panes::{Panes, tool_drawer_argv};
 use crate::run::SidebarState;
 use crate::session::Session;
+use superzej_core::store::NotificationStore;
 
 /// Spawn `command` into a brand-new tab in the active group.
 pub(crate) fn open_command_tab(
@@ -213,7 +214,9 @@ impl CiActionCtx<'_> {
         );
     }
 
-    /// Execute a CI badge-overlay row action (the overlay is already closed).
+    /// Execute a detail-overlay row action (the overlay is already closed).
+    /// Covers the CI badge (`OpenUrl`/`RunCommand`/rerun/cancel) and the
+    /// notifications badge (worktree focus, inbox management, log pager, copy).
     pub(crate) fn run_detail_action(&mut self, action: DetailAction) {
         match action {
             DetailAction::OpenUrl(u) => {
@@ -227,7 +230,80 @@ impl CiActionCtx<'_> {
             DetailAction::CiRerun { .. } | DetailAction::CiCancel { .. } => {
                 self.spawn_mutation(action)
             }
+            DetailAction::FocusWorktree(path) => self.focus_worktree(&path),
+            DetailAction::DismissNotification { id } => self.mutate_notifications(Some(id)),
+            DetailAction::ClearNotifications => self.mutate_notifications(None),
+            DetailAction::OpenLogPager => self.open_log_pager(),
+            DetailAction::CopyLine(line) => {
+                crate::clipboard::copy(&line);
+                self.model.status = "Copied log line".into();
+            }
+            // ShowLog drills in place inside the overlay and never reaches the loop.
+            DetailAction::ShowLog(_) => {}
         }
+    }
+
+    /// Switch to the open worktree tab at `path` (the common case for a
+    /// "worktree ready" notification, which was just created + opened). If it
+    /// isn't an open group, say so rather than silently doing nothing.
+    fn focus_worktree(&mut self, path: &str) {
+        let idx = self.session.worktrees.iter().position(|g| g.path == path);
+        match idx {
+            Some(i) => {
+                self.session.switch_to(i);
+                self.focus.zone = Zone::Center;
+                crate::run::refresh_tab_model(self.model, self.session, self.sb);
+                *self.need_relayout = true;
+            }
+            None => self.model.status = "That worktree isn't open".into(),
+        }
+    }
+
+    /// Mark one (`Some(id)`) or every (`None`) notification read, off the loop,
+    /// then pulse a model refresh so the inbox list + badge counts repaint.
+    fn mutate_notifications(&mut self, id: Option<i64>) {
+        let tx = self.refresh_tx.clone();
+        let waker = self.waker.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(db) = superzej_core::db::Db::open() {
+                let _ = match id {
+                    Some(id) => db.mark_notification_read(id),
+                    None => db.mark_all_notifications_read(),
+                };
+            }
+            if tx.send(RefreshKind::Model).is_ok() {
+                let _ = waker.wake();
+            }
+        });
+        self.model.status = if id.is_some() {
+            "Dismissed notification".into()
+        } else {
+            "Cleared notifications".into()
+        };
+    }
+
+    /// Open the raw szhost.log in a pager pane (`$PAGER`, else `less`), scrolled
+    /// to the end — fuller scrollback than the modal's bounded tail.
+    fn open_log_pager(&mut self) {
+        let path = superzej_core::util::xdg_state_home().join("superzej/logs/szhost.log");
+        let cmd = format!("${{PAGER:-less}} +G \"{}\"", path.display());
+        let focused = self
+            .session
+            .active_tab()
+            .map(|t| t.focused_pane)
+            .unwrap_or(0);
+        let cwd = crate::run::active_cwd(self.session);
+        open_command_pane(
+            self.session,
+            self.panes,
+            focused,
+            &cmd,
+            cwd.as_deref(),
+            self.center,
+        );
+        self.focus.zone = Zone::Center;
+        crate::run::refresh_tab_model(self.model, self.session, self.sb);
+        *self.need_relayout = true;
     }
 
     /// Enter on a panel `Section::Ci` row: drill into the selected run.
