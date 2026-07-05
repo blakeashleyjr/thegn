@@ -9,8 +9,6 @@
 //! shared `workspace_create` flows. The discovery channel is owned here (like
 //! `search_everywhere::PaletteSession`) so the loop only adds a one-line drain.
 
-use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config as MatcherConfig, Matcher, Utf32Str};
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 use termwiz::terminal::TerminalWaker;
@@ -184,7 +182,6 @@ pub(crate) struct WorkspacePicker {
     /// Manual-entry field (kept across Tab toggles).
     manual: TextField,
     items: Vec<RepoEntry>,
-    matcher: Matcher,
     /// Indices into `items`, best match first (seed order when query empty).
     matches: Vec<usize>,
     selected: usize,
@@ -212,7 +209,6 @@ impl WorkspacePicker {
             query: TextField::default(),
             manual: TextField::default(),
             items: seed.into_iter().map(entry).collect(),
-            matcher: Matcher::new(MatcherConfig::DEFAULT),
             matches: Vec::new(),
             selected: 0,
             scroll_offset: 0,
@@ -327,25 +323,17 @@ impl WorkspacePicker {
         if self.query.as_str().trim().is_empty() {
             self.matches = (0..self.items.len()).collect();
         } else {
-            let pattern = Pattern::parse(
-                self.query.as_str(),
-                CaseMatching::Smart,
-                Normalization::Smart,
-            );
-            let mut buf = Vec::new();
-            let mut scored: Vec<(usize, u32)> = self
+            // Fuzzy over "name path" so a path fragment narrows like a basename.
+            let hay: Vec<String> = self
                 .items
                 .iter()
-                .enumerate()
-                .filter_map(|(i, it)| {
-                    let hay = format!("{} {}", it.name, it.path);
-                    pattern
-                        .score(Utf32Str::new(&hay, &mut buf), &mut self.matcher)
-                        .map(|s| (i, s))
-                })
+                .map(|it| format!("{} {}", it.name, it.path))
                 .collect();
-            scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
-            self.matches = scored.into_iter().map(|(i, _)| i).collect();
+            let refs: Vec<&str> = hay.iter().map(|s| s.as_str()).collect();
+            self.matches = crate::fff_backend::fuzzy_rank(self.query.as_str(), &refs)
+                .into_iter()
+                .map(|(i, _)| i)
+                .collect();
         }
         if self.selected >= self.matches.len() {
             self.selected = self.matches.len().saturating_sub(1);

@@ -182,6 +182,33 @@ pub struct PoolAction {
     pub destroy: Vec<(String, DestroyReason)>,
 }
 
+/// How the pool treats an *idle* ready spare — the axis that differs by provider
+/// billing model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolPolicy {
+    /// Scale-to-zero provider (sprites): an idle spare self-suspends for free, so
+    /// idle time is **never** a release reason. A parked spare is only released
+    /// when it is surplus (over target) or its base went stale (flake.lock drift).
+    ParkIdle,
+    /// Billed-while-stopped provider (VPS): a stopped instance still costs money,
+    /// so a ready spare idle past `max_idle_secs` is aged out (recycled/destroyed)
+    /// to reclaim spend.
+    AgeOut,
+}
+
+/// One READY (unclaimed, provisioned) pool spare, as seen by [`decide_pool`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadySpare {
+    /// The spare sandbox's name.
+    pub name: String,
+    /// Seconds since it was last touched (freshness rank + the `AgeOut` TTL check).
+    pub idle_secs: u64,
+    /// Its provisioned base was built against a **different** `flake.lock` than the
+    /// repo's current one — so it must rotate regardless of idle time (the host
+    /// applies the release as recycle-or-rebuild via [`recyclable`]).
+    pub lock_stale: bool,
+}
+
 /// Whether a released spare can be RECYCLED by an in-place provider restore
 /// instead of destroyed: it must carry a provisioned-base checkpoint AND have
 /// been built against the current `flake.lock` (a changed lockfile invalidates
@@ -202,31 +229,38 @@ pub fn recyclable(
 /// - `target`: desired ready spares (resolved size; `0` ⇒ disabled, tear all down).
 /// - `provisioning`: spares currently being built (counted toward the target so we
 ///   don't over-provision while one is in flight).
-/// - `ready`: `(name, idle_secs)` for each READY (unclaimed, provisioned) spare.
-/// - `max_idle_secs`: destroy a ready spare idle longer than this (`0` ⇒ never).
+/// - `ready`: each READY (unclaimed, provisioned) spare ([`ReadySpare`]).
+/// - `policy`: [`PoolPolicy::ParkIdle`] (scale-to-zero: keep idle spares) vs
+///   [`PoolPolicy::AgeOut`] (billed-when-stopped: age idle spares out).
+/// - `max_idle_secs`: under `AgeOut`, release a spare idle longer than this
+///   (`0` ⇒ never). Ignored under `ParkIdle`.
 ///
-/// Keeps the `target` freshest ready spares; destroys the rest (over-target) plus
-/// any ready spare past the idle TTL (recycled). `create` fills toward the target,
-/// counting in-flight provisions; if a stale one is destroyed the next tick refills.
+/// Keeps the `target` freshest ready spares; destroys the rest (over-target). A
+/// within-target spare is released (tagged `Stale`, a recycle candidate) when its
+/// base is `lock_stale` (flake.lock drift — always, both policies) or — only under
+/// `AgeOut` — it is idle past `max_idle_secs`. `create` fills toward the target,
+/// counting in-flight provisions; if a stale one is released the next tick refills.
 /// A spare that is BOTH over target and stale is tagged `OverTarget` (surplus
 /// wins: recycling it would still leave the pool over target).
 pub fn decide_pool(
     target: usize,
     provisioning: usize,
-    ready: &[(String, u64)],
+    ready: &[ReadySpare],
+    policy: PoolPolicy,
     max_idle_secs: u64,
 ) -> PoolAction {
     let create = target.saturating_sub(ready.len().saturating_add(provisioning));
-    let mut by_fresh: Vec<&(String, u64)> = ready.iter().collect();
-    by_fresh.sort_by_key(|(_, idle)| *idle); // freshest (smallest idle) first
+    let mut by_fresh: Vec<&ReadySpare> = ready.iter().collect();
+    by_fresh.sort_by_key(|s| s.idle_secs); // freshest (smallest idle) first
+    let age_out = matches!(policy, PoolPolicy::AgeOut) && max_idle_secs > 0;
     let destroy = by_fresh
         .iter()
         .enumerate()
-        .filter_map(|(i, (name, idle))| {
+        .filter_map(|(i, s)| {
             if i >= target {
-                Some((name.clone(), DestroyReason::OverTarget))
-            } else if max_idle_secs > 0 && *idle >= max_idle_secs {
-                Some((name.clone(), DestroyReason::Stale))
+                Some((s.name.clone(), DestroyReason::OverTarget))
+            } else if s.lock_stale || (age_out && s.idle_secs >= max_idle_secs) {
+                Some((s.name.clone(), DestroyReason::Stale))
             } else {
                 None
             }
@@ -261,38 +295,55 @@ mod tests {
         }
     }
 
-    fn ready(specs: &[(&str, u64)]) -> Vec<(String, u64)> {
-        specs.iter().map(|(n, i)| (n.to_string(), *i)).collect()
+    /// READY spares with fresh locks (lock_stale = false) — the common case.
+    fn ready(specs: &[(&str, u64)]) -> Vec<ReadySpare> {
+        specs
+            .iter()
+            .map(|(n, i)| ReadySpare {
+                name: n.to_string(),
+                idle_secs: *i,
+                lock_stale: false,
+            })
+            .collect()
     }
 
     #[test]
     fn decide_pool_fills_toward_target() {
         // Empty pool, target 2 ⇒ create 2.
-        assert_eq!(decide_pool(2, 0, &[], 600).create, 2);
+        assert_eq!(decide_pool(2, 0, &[], PoolPolicy::AgeOut, 600).create, 2);
         // One ready + one provisioning ⇒ at target, create 0.
-        let d = decide_pool(2, 1, &ready(&[("a", 5)]), 600);
+        let d = decide_pool(2, 1, &ready(&[("a", 5)]), PoolPolicy::AgeOut, 600);
         assert_eq!(d.create, 0);
         assert!(d.destroy.is_empty());
         // Two provisioning toward target 2 ⇒ create 0 (don't over-provision).
-        assert_eq!(decide_pool(2, 2, &[], 600).create, 0);
+        assert_eq!(decide_pool(2, 2, &[], PoolPolicy::AgeOut, 600).create, 0);
     }
 
     #[test]
     fn decide_pool_destroys_over_target_keeping_freshest() {
         // 3 ready, target 2 ⇒ destroy the most-idle (c, idle 30); keep a,b.
-        let d = decide_pool(2, 0, &ready(&[("a", 5), ("b", 10), ("c", 30)]), 600);
-        assert_eq!(d.create, 0);
-        assert_eq!(
-            d.destroy,
-            vec![("c".to_string(), DestroyReason::OverTarget)]
-        );
+        // Over-target is billing-agnostic: holds under ParkIdle too.
+        for policy in [PoolPolicy::AgeOut, PoolPolicy::ParkIdle] {
+            let d = decide_pool(2, 0, &ready(&[("a", 5), ("b", 10), ("c", 30)]), policy, 600);
+            assert_eq!(d.create, 0);
+            assert_eq!(
+                d.destroy,
+                vec![("c".to_string(), DestroyReason::OverTarget)]
+            );
+        }
     }
 
     #[test]
-    fn decide_pool_recycles_idle_expired() {
-        // Within target but past the idle TTL ⇒ destroy it (next tick refills),
-        // tagged Stale so the host may recycle it by restore-in-place.
-        let d = decide_pool(2, 0, &ready(&[("a", 5), ("stale", 999)]), 600);
+    fn decide_pool_ageout_recycles_idle_expired() {
+        // AgeOut (VPS): within target but past the idle TTL ⇒ release it (next tick
+        // refills), tagged Stale so the host may recycle it by restore-in-place.
+        let d = decide_pool(
+            2,
+            0,
+            &ready(&[("a", 5), ("stale", 999)]),
+            PoolPolicy::AgeOut,
+            600,
+        );
         assert!(
             d.destroy
                 .contains(&("stale".to_string(), DestroyReason::Stale))
@@ -300,17 +351,71 @@ mod tests {
         assert!(!d.destroy.iter().any(|(n, _)| n == "a"));
         // max_idle_secs = 0 disables idle recycling.
         assert!(
-            decide_pool(2, 0, &ready(&[("a", 99999)]), 0)
+            decide_pool(2, 0, &ready(&[("a", 99999)]), PoolPolicy::AgeOut, 0)
                 .destroy
                 .is_empty()
         );
     }
 
     #[test]
+    fn decide_pool_parkidle_keeps_idle_spares() {
+        // ParkIdle (sprites): a within-target spare idle FAR past any TTL is KEPT —
+        // it self-suspends for free, so aging it out would throw away provisioning
+        // for $0. This is the core scale-to-zero correction.
+        let d = decide_pool(
+            2,
+            0,
+            &ready(&[("a", 5), ("old", 99999)]),
+            PoolPolicy::ParkIdle,
+            600,
+        );
+        assert_eq!(d.create, 0);
+        assert!(
+            d.destroy.is_empty(),
+            "idle spares are parked, not aged out: {:?}",
+            d.destroy
+        );
+    }
+
+    #[test]
+    fn decide_pool_lock_stale_rotates_under_both_policies() {
+        // A within-target spare whose base drifted (flake.lock changed) must rotate
+        // regardless of idle time OR policy — else a ParkIdle pool would serve a
+        // stale toolchain forever. Tagged Stale; the host recycles-or-rebuilds it.
+        let spares = vec![
+            ReadySpare {
+                name: "fresh".into(),
+                idle_secs: 1,
+                lock_stale: false,
+            },
+            ReadySpare {
+                name: "drifted".into(),
+                idle_secs: 1,
+                lock_stale: true,
+            },
+        ];
+        for policy in [PoolPolicy::AgeOut, PoolPolicy::ParkIdle] {
+            let d = decide_pool(2, 0, &spares, policy, 600);
+            assert!(
+                d.destroy
+                    .contains(&("drifted".to_string(), DestroyReason::Stale)),
+                "{policy:?}"
+            );
+            assert!(!d.destroy.iter().any(|(n, _)| n == "fresh"), "{policy:?}");
+        }
+    }
+
+    #[test]
     fn decide_pool_over_target_wins_over_stale() {
         // A spare BOTH surplus and past the TTL is tagged OverTarget (recycling
         // it would still leave the pool over target ⇒ it must be destroyed).
-        let d = decide_pool(1, 0, &ready(&[("a", 5), ("old", 999)]), 600);
+        let d = decide_pool(
+            1,
+            0,
+            &ready(&[("a", 5), ("old", 999)]),
+            PoolPolicy::AgeOut,
+            600,
+        );
         assert_eq!(
             d.destroy,
             vec![("old".to_string(), DestroyReason::OverTarget)]
@@ -319,14 +424,18 @@ mod tests {
 
     #[test]
     fn decide_pool_target_zero_tears_down() {
-        let d = decide_pool(0, 0, &ready(&[("a", 1), ("b", 2)]), 600);
-        assert_eq!(d.create, 0);
-        assert_eq!(d.destroy.len(), 2);
-        assert!(
-            d.destroy
-                .iter()
-                .all(|(_, r)| *r == DestroyReason::OverTarget)
-        );
+        // Target 0 tears everything down as surplus — under BOTH policies (a
+        // disabled/over-cap pool must drain even scale-to-zero spares).
+        for policy in [PoolPolicy::AgeOut, PoolPolicy::ParkIdle] {
+            let d = decide_pool(0, 0, &ready(&[("a", 1), ("b", 2)]), policy, 600);
+            assert_eq!(d.create, 0);
+            assert_eq!(d.destroy.len(), 2);
+            assert!(
+                d.destroy
+                    .iter()
+                    .all(|(_, r)| *r == DestroyReason::OverTarget)
+            );
+        }
     }
 
     #[test]
