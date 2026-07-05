@@ -41,9 +41,7 @@ tree-sitter-go.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# fff's pure-Rust SIMD fuzzy matcher (no C deps, cross-compilable) — replaces
-# nucleo-matcher for scrollback/list fuzzy search in the substrate crate.
-neo_frizbee.workspace = true
+nucleo-matcher.workspace = true
 # Word-level / intra-line diff for the diff view (item 601): pure-Rust,
 # `TextDiff::from_words` tokenizes on word boundaries.
 similar = "2"

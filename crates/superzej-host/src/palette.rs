@@ -5,6 +5,8 @@
 //!
 //! This is the native view + matcher the host drives, populated from host state.
 
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 use termwiz::surface::Surface;
 
 use crate::chrome::S;
@@ -74,6 +76,7 @@ const MAX_ITEMS: usize = 10;
 
 pub struct Palette {
     items: Vec<PaletteItem>,
+    matcher: Matcher,
     query: String,
     selected: usize,
     /// Scroll offset: index of the first visible match row.
@@ -86,6 +89,7 @@ impl Palette {
     pub fn new(items: Vec<PaletteItem>) -> Self {
         let mut p = Self {
             items,
+            matcher: Matcher::new(Config::DEFAULT),
             query: String::new(),
             selected: 0,
             scroll_offset: 0,
@@ -182,12 +186,20 @@ impl Palette {
             self.matches = (0..self.items.len()).collect();
             return;
         }
-        let labels: Vec<&str> = self.items.iter().map(|it| it.label.as_str()).collect();
-        // neo_frizbee fuzzy rank (best-first); indices map straight back to items.
-        self.matches = crate::fff_backend::fuzzy_rank(&self.query, &labels)
-            .into_iter()
-            .map(|(i, _)| i)
+        let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
+        let mut buf = Vec::new();
+        let mut scored: Vec<(usize, u32)> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| {
+                pattern
+                    .score(Utf32Str::new(&it.label, &mut buf), &mut self.matcher)
+                    .map(|s| (i, s))
+            })
             .collect();
+        scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+        self.matches = scored.into_iter().map(|(i, _)| i).collect();
         if self.selected >= self.matches.len() {
             self.selected = self.matches.len().saturating_sub(1);
         }

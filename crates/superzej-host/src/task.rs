@@ -953,23 +953,9 @@ pub fn discover_tests(
     let slot = format!("{}:disc", worktree.display());
     let timeout = secs_to_timeout(limits.discover_timeout_secs);
 
-    // Source-scan ecosystems (no compile, no build lock): grep source for test
-    // declarations. Local worktrees scan in-process via fff (no subprocess);
-    // remote/provider worktrees keep the rg/grep-over-transport path since their
-    // files are not on this host.
+    // Source-scan ecosystems (no compile, no build lock): ripgrep for test
+    // declarations. rg/grep exit 1 on "no matches" — not an error here.
     if let Some(rule) = scan_rule(task.matcher.as_str()) {
-        if matches!(loc, GitLoc::Local(_)) {
-            // ~parity with the old `--max-count`-less scan: cap generously.
-            const SCAN_LIMIT: usize = 10_000;
-            let text = crate::fff_backend::scan(&worktree, rule.globs, rule.patterns, SCAN_LIMIT);
-            return DiscoveryOutcome {
-                worktree: wt,
-                generation,
-                task,
-                nodes: parse_scan_output(&text),
-                error: None,
-            };
-        }
         let argv = build_scan_argv(&rule);
         let out = run_capped_argv(&argv, loc, &worktree, limits, &slot, generation, timeout);
         if out.timed_out {
@@ -1938,11 +1924,14 @@ mod tests {
     }
 
     /// End-to-end source-scan discovery against a REAL Go module: no `go`
-    /// invocation, no compile — just an in-process fff grep over `*_test.go`.
-    /// Verifies the generalized (cargo-metadata-style) instant discovery on
-    /// another toolchain. No `rg`/`grep` binary needed (local `GitLoc` → fff).
+    /// invocation, no compile — just ripgrep/grep over `*_test.go`. Verifies the
+    /// generalized (cargo-metadata-style) instant discovery on another
+    /// toolchain. Skipped if neither rg nor grep is present.
     #[test]
     fn e2e_go_scan_discovers_without_compiling() {
+        if !on_path("rg") && !on_path("grep") {
+            return;
+        }
         let wt = temp_dir("e2e-go-scan");
         std::fs::write(wt.join("go.mod"), "module demo\n\ngo 1.21\n").unwrap();
         std::fs::write(

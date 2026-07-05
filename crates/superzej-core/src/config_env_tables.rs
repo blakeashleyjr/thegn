@@ -258,14 +258,6 @@ impl EnvProviderConfig {
             && self.max_lifetime_secs == 0
     }
 
-    /// Whether this env's provider is scale-to-zero (an idle sandbox self-suspends
-    /// for free — see [`provider_scale_to_zero`]). Drives the warm-pool idle policy:
-    /// scale-to-zero spares are parked indefinitely, others are aged out to reclaim
-    /// spend.
-    pub fn scale_to_zero(&self) -> bool {
-        provider_scale_to_zero(&self.provider)
-    }
-
     /// `http-connections`/`max-substitution-jobs` value to use, clamped to a sane
     /// range; `None` when unset (leave Nix's defaults).
     pub fn nix_parallel(&self) -> Option<u32> {
@@ -308,20 +300,6 @@ impl EnvProviderConfig {
 /// `superzej_svc::vps::is_vps_provider` — keep the two lists in sync.
 pub fn vps_provider_kind(name: &str) -> bool {
     matches!(name.trim(), "hetzner")
-}
-
-/// Whether a provider *kind* is **scale-to-zero**: an idle sandbox self-suspends
-/// for effectively free (compute billed only while awake; the filesystem
-/// persists). This is the single source of truth the warm-pool policy consults
-/// (`superzej_svc::provider::ProviderCaps::scale_to_zero` mirrors it by kind).
-///
-/// Only `sprites` qualifies today (Fly's scale-to-zero Firecracker microVMs: a
-/// ~30s idle timeout, zero idle compute charge). Everything else — VPS (a
-/// powered-off instance still bills), Daytona (no confirmed free idle), unknown
-/// kinds — is **false** on purpose: a wrong `false` merely keeps the safe
-/// age-out behavior, while a wrong `true` would park billed instances forever.
-pub fn provider_scale_to_zero(name: &str) -> bool {
-    matches!(name.trim(), "sprites")
 }
 
 /// `[metrics]` — Prometheus scrape targets for sidebar metrics display.
@@ -369,22 +347,14 @@ pub struct MetricsTarget {
 }
 
 /// `[lifecycle.pool]` — an optional pool of pre-provisioned, unclaimed sandboxes
-/// per (repo, env) so a brand-new worktree opens instantly. `size = 0` leaves it
-/// to the auto default (one parked spare for a scale-to-zero provider the user
-/// already opted into via `auto_provision`; off otherwise — see
-/// `effective_pool_target`); a non-zero `size` sets it explicitly.
+/// per (repo, env) so a brand-new worktree opens instantly. `size = 0` disables
+/// it (the default); enabling it requires the DB worktree→sandbox mapping.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct PoolConfig {
-    /// Pre-provisioned spare sandboxes to keep ready per (repo, env). `0` = the
-    /// provider-aware auto default; a non-zero value overrides it (clamped to a
-    /// runaway ceiling). The `+`/`-` hotkey persists a per-repo+env override that
-    /// wins over both (including `0` to force the pool off).
+    /// Pre-provisioned spare sandboxes to keep ready per (repo, env). `0` = off.
     pub size: usize,
-    /// AgeOut (billed-when-stopped, e.g. VPS) providers only: destroy an unclaimed
-    /// pool member idle longer than this (seconds). Ignored for scale-to-zero
-    /// providers, whose idle spares self-suspend for free and are parked, not
-    /// aged out (they still rotate on flake.lock drift).
+    /// Destroy an unclaimed pool member older than this (seconds).
     pub max_idle_secs: u64,
     /// Recycle checkpointed spares by restoring them IN PLACE (seconds) instead
     /// of destroy+rebuild (minutes) when they go stale or their worktree is
