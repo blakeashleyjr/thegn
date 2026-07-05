@@ -1,14 +1,11 @@
 //! Scope-aware fuzzy search over pane history buffers.
 //!
-//! [`SearchEngine`] drives the nucleo fuzzy matcher over one or more
-//! [`HistoryBuffer`]s, selected by [`SearchScope`]. The engine is pure data —
-//! it holds query + ranked matches; the host layer owns the overlay UI and
-//! feeds the engine sources on each keystroke.
+//! [`SearchEngine`] drives the neo_frizbee SIMD fuzzy matcher (fff's matcher
+//! core) over one or more [`HistoryBuffer`]s, selected by [`SearchScope`]. The
+//! engine is pure data — it holds query + ranked matches; the host layer owns
+//! the overlay UI and feeds the engine sources on each keystroke.
 
-use nucleo_matcher::{
-    Config, Matcher, Utf32Str,
-    pattern::{CaseMatching, Normalization, Pattern},
-};
+use neo_frizbee::{Config, match_list};
 
 use crate::history::HistoryBuffer;
 
@@ -78,7 +75,7 @@ pub struct SearchMatch {
     pub line_idx: usize,
     /// The plain-text line content (already ANSI-stripped by the buffer).
     pub line: String,
-    /// Nucleo score (higher = better match). `0` when query is empty.
+    /// Fuzzy match score (higher = better match). `0` when query is empty.
     pub score: u32,
     /// Human-readable pane label (e.g. `"tab 2 · feat/auth"`) for the result row.
     pub pane_label: String,
@@ -101,7 +98,6 @@ pub struct SearchEngine {
     pub scope: SearchScope,
     matches: Vec<SearchMatch>,
     selected: usize,
-    matcher: Matcher,
     max_results: usize,
 }
 
@@ -112,7 +108,6 @@ impl SearchEngine {
             scope,
             matches: Vec::new(),
             selected: 0,
-            matcher: Matcher::new(Config::DEFAULT),
             max_results: max_results.max(1),
         }
     }
@@ -200,30 +195,33 @@ impl SearchEngine {
             return;
         }
 
-        let pattern = Pattern::parse(trimmed, CaseMatching::Smart, Normalization::Smart);
-        let mut char_buf: Vec<char> = Vec::new();
+        // Flatten every source line into one batch, keeping a back-reference to
+        // its (pane, index, label). neo_frizbee scores the whole batch with SIMD
+        // in one call and returns matches best-first (`Config.sort = true`);
+        // ties fall back to input order, i.e. source order.
+        let flat: Vec<(u32, usize, &str, &str)> = sources
+            .iter()
+            .flat_map(|&(pane_id, label, buf)| {
+                buf.iter()
+                    .enumerate()
+                    .map(move |(idx, line)| (pane_id, idx, line, label))
+            })
+            .collect();
+        let hay: Vec<&str> = flat.iter().map(|(_, _, line, _)| *line).collect();
 
-        for &(pane_id, label, buf) in sources {
-            for (idx, line) in buf.iter().enumerate() {
-                if let Some(score) =
-                    pattern.score(Utf32Str::new(line, &mut char_buf), &mut self.matcher)
-                {
-                    self.matches.push(SearchMatch {
-                        pane_id,
-                        line_idx: idx,
-                        line: line.to_string(),
-                        score,
-                        pane_label: label.to_string(),
-                    });
-                }
+        for m in match_list(trimmed, &hay, &Config::default()) {
+            let (pane_id, line_idx, line, label) = flat[m.index as usize];
+            self.matches.push(SearchMatch {
+                pane_id,
+                line_idx,
+                line: line.to_string(),
+                score: m.score as u32,
+                pane_label: label.to_string(),
+            });
+            if self.matches.len() >= self.max_results {
+                break;
             }
         }
-
-        // Sort by score descending; for equal scores, prefer earlier matches
-        // (lower line_idx = older, but same pane). Stable sort preserves
-        // source order within equal scores.
-        self.matches.sort_by_key(|m| std::cmp::Reverse(m.score));
-        self.matches.truncate(self.max_results);
     }
 }
 
