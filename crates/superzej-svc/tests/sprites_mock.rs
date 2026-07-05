@@ -13,6 +13,7 @@ use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use superzej_svc::provider::{
     Provider, ProviderCheckpoints, ProviderEgress, ProviderFiles, RemoteProvider, SpritesProvider,
@@ -272,6 +273,196 @@ fn start_delete_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
         }
     });
     (format!("http://127.0.0.1:{port}/v1"), deletes)
+}
+
+/// A mock that answers `POST /sprites` (create) with `500` for the first
+/// `fail_first` calls, then a valid create body — the create analogue of
+/// [`start_delete_mock`], for the transient-create retry (a cold-booting control
+/// plane can 5xx before it settles; an unretried create strands provisioning).
+/// Returns the base URL and a shared counter of create POSTs seen.
+fn start_create_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let posts = Arc::new(Mutex::new(0usize));
+    let p = posts.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let p = p.clone();
+            thread::spawn(move || {
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if read_line(&mut reader, &mut line).is_none() {
+                    return;
+                }
+                let method = line.split_whitespace().next().unwrap_or("").to_string();
+                let mut content_length = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if read_line(&mut reader, &mut h).is_none() {
+                        break;
+                    }
+                    let t = h.trim_end();
+                    if t.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = t.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+                let (status, resp): (&str, &[u8]) = if method == "POST" {
+                    let mut n = p.lock().unwrap();
+                    *n += 1;
+                    if *n <= fail_first {
+                        ("500 Internal Server Error", b"boom")
+                    } else {
+                        ("200 OK", br#"{"id":"x","name":"newone","status":"cold"}"#)
+                    }
+                } else {
+                    ("404 Not Found", b"no route")
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp.len()
+                );
+                let _ = writer.write_all(head.as_bytes());
+                let _ = writer.write_all(resp);
+                let _ = writer.flush();
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}/v1"), posts)
+}
+
+/// A mock that answers `GET /fs/list` with `404` for the first `fail_first`
+/// calls, then a valid listing — for the post-create readiness probe
+/// ([`Provider::wait_ready`]): a cold-booting sprite's guest fs API is absent for
+/// a beat, and `wait_ready` must poll past that rather than fail on the first miss.
+fn start_flaky_list_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let lists = Arc::new(Mutex::new(0usize));
+    let l = lists.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let l = l.clone();
+            thread::spawn(move || {
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if read_line(&mut reader, &mut line).is_none() {
+                    return;
+                }
+                let target = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                loop {
+                    let mut h = String::new();
+                    if read_line(&mut reader, &mut h).is_none() {
+                        break;
+                    }
+                    if h.trim_end().is_empty() {
+                        break;
+                    }
+                }
+                let (status, ctype, resp): (&str, &str, Vec<u8>) = if target.contains("/fs/list") {
+                    let mut n = l.lock().unwrap();
+                    *n += 1;
+                    if *n <= fail_first {
+                        ("404 Not Found", "text/plain", b"booting".to_vec())
+                    } else {
+                        (
+                            "200 OK",
+                            "application/json",
+                            br#"{"path":"/","entries":[],"count":0}"#.to_vec(),
+                        )
+                    }
+                } else {
+                    ("404 Not Found", "text/plain", b"no route".to_vec())
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp.len()
+                );
+                let _ = writer.write_all(head.as_bytes());
+                let _ = writer.write_all(&resp);
+                let _ = writer.flush();
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}/v1"), lists)
+}
+
+#[test]
+fn create_retries_transient_500_then_succeeds() {
+    // 500 twice, then 200: create must ride out the transient errors (a cold
+    // control plane) and succeed — hitting POST /sprites exactly 3×.
+    let (base, posts) = start_create_mock(2);
+    let p = SpritesProvider::new(&base, "tok", "newone");
+    let h = rt().block_on(p.create()).unwrap();
+    assert_eq!(h.id, "newone");
+    assert_eq!(
+        *posts.lock().unwrap(),
+        3,
+        "two failures then a success = three create attempts"
+    );
+}
+
+#[test]
+fn create_gives_up_bounded_on_persistent_500() {
+    // Always 500: create errors after a BOUNDED attempt budget (never hangs the
+    // provisioning thread) and surfaces the status.
+    let (base, posts) = start_create_mock(usize::MAX);
+    let p = SpritesProvider::new(&base, "tok", "newone");
+    let err = rt().block_on(p.create()).unwrap_err();
+    assert!(err.to_string().contains("500"), "surfaced status: {err}");
+    assert_eq!(
+        *posts.lock().unwrap(),
+        3,
+        "exactly the bounded number of attempts, then give up"
+    );
+}
+
+#[test]
+fn wait_ready_returns_ok_when_fs_answers() {
+    // The recorded mock answers GET /fs/list with a listing ⇒ the guest fs API is
+    // up ⇒ readiness resolves on the first probe.
+    let mock = start_mock();
+    let prov = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "sztest1"));
+    rt().block_on(prov.wait_ready("sztest1", Duration::from_secs(5)))
+        .expect("fs answering ⇒ ready");
+}
+
+#[test]
+fn wait_ready_errors_on_deadline() {
+    // An unknown sprite name never resolves a listing (404) ⇒ with a zero budget,
+    // readiness does exactly one probe then fails with a clear deadline message —
+    // bounded, never an infinite wait.
+    let mock = start_mock();
+    let prov = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "ghost"));
+    let err = rt()
+        .block_on(prov.wait_ready("ghost", Duration::ZERO))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("did not become ready"),
+        "clear deadline error: {err}"
+    );
+}
+
+#[test]
+fn wait_ready_polls_past_a_transient_failure() {
+    // 404 once (still booting) then a listing: readiness must poll past the miss
+    // and succeed, hitting GET /fs/list at least twice.
+    let (base, lists) = start_flaky_list_mock(1);
+    let prov = Provider::Sprites(SpritesProvider::new(&base, "tok", "sztest1"));
+    rt().block_on(prov.wait_ready("sztest1", Duration::from_secs(10)))
+        .expect("polls past the transient miss");
+    assert!(
+        *lists.lock().unwrap() >= 2,
+        "probed again after the first failure"
+    );
 }
 
 #[test]
