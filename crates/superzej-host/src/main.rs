@@ -174,50 +174,61 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::forward::Action,
     },
-    /// Emit a syntax-highlighted diff of a worktree against its branch point.
-    Diff {
-        #[arg(long)]
-        worktree: Option<String>,
-        /// Diff against this base ref (default: the repo's default branch).
-        #[arg(long)]
-        base: Option<String>,
-        /// Summary (--stat) only.
-        #[arg(long)]
-        stat: bool,
-        /// Full diff of a single file.
-        #[arg(long)]
-        file: Option<String>,
+    /// Worktree lifecycle + inspection (`wt list|diff|disk|clean`).
+    Wt {
+        #[command(subcommand)]
+        action: cmd::wt::Action,
     },
-    /// List managed worktrees.
-    List,
+    /// Repo discovery + history (`repo list|recent`).
+    Repo {
+        #[command(subcommand)]
+        action: cmd::repos::Action,
+    },
+    /// Hidden legacy spelling of `wt diff` (kept working forever).
+    #[command(hide = true)]
+    Diff {
+        #[command(flatten)]
+        args: cmd::wt::DiffArgs,
+    },
+    /// Hidden legacy spelling of `wt list` (kept working forever).
+    #[command(hide = true)]
+    List {
+        #[command(flatten)]
+        args: cmd::wt::ListArgs,
+    },
     /// Drain the local merge queue: fold eligible worktree branches into the
     /// repo's target branch, landing clean ones and deferring conflicts
     /// (`[merge_queue]`, the fold-actor).
     Integrate,
-    /// Report per-worktree disk usage (checkout + reclaimable `target/`).
+    /// Hidden legacy spelling of `wt disk` (kept working forever).
+    #[command(hide = true)]
     Disk {
-        /// Scan only this worktree (defaults to all known worktrees).
-        #[arg(long)]
-        worktree: Option<String>,
-        /// Scan every known worktree (the default when no `--worktree` is given).
-        #[arg(long)]
-        all: bool,
+        #[command(flatten)]
+        args: cmd::wt::DiskArgs,
     },
-    /// Reclaim a worktree's `target/` build artifacts (keeps the checkout).
+    /// Hidden legacy spelling of `wt clean` (kept working forever).
+    #[command(hide = true)]
     Clean {
-        /// Clean this worktree (defaults to the current one).
-        #[arg(long)]
-        worktree: Option<String>,
-        /// Clean every known worktree (except the active one).
-        #[arg(long)]
-        all: bool,
-        /// Skip the confirmation prompt.
-        #[arg(long)]
-        force: bool,
+        #[command(flatten)]
+        args: cmd::wt::CleanArgs,
     },
-    /// List git repos discovered under repo_roots.
-    Repos,
-    /// Review/approve a repo `.superzej.*` overlay's gated sandbox requests (TOFU).
+    /// Hidden legacy spelling of `repo list` (kept working forever).
+    #[command(hide = true)]
+    Repos {
+        /// Emit one JSON array of paths instead of plain lines.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Hidden legacy spelling of `repo recent` (kept working forever).
+    #[command(hide = true)]
+    Recent {
+        count: Option<i64>,
+        /// Emit one JSON array of paths instead of plain lines.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Hidden legacy spelling of `repo trust` (kept working forever).
+    #[command(hide = true)]
     RepoTrust {
         /// Repo path (default: current directory).
         path: Option<String>,
@@ -228,8 +239,6 @@ pub enum Command {
         #[arg(long)]
         revoke: Option<String>,
     },
-    /// List recently opened repos (history).
-    Recent { count: Option<i64> },
     /// Inspect the effective (layered) configuration.
     Config {
         #[command(subcommand)]
@@ -412,7 +421,15 @@ fn main() -> anyhow::Result<()> {
     // A subcommand runs synchronously and exits; no subcommand launches the
     // interactive compositor (the default).
     if let Some(command) = cli.command.take() {
-        return run_subcommand(&cli, command);
+        return match run_subcommand(&cli, command) {
+            // Typed not-found errors map to the scripting exit-code contract
+            // (cmd::EXIT_NOT_FOUND); everything else keeps anyhow's exit 1.
+            Err(e) if e.downcast_ref::<cmd::NotFound>().is_some() => {
+                superzej_core::msg::error(&format!("{e:#}"));
+                std::process::exit(cmd::EXIT_NOT_FOUND);
+            }
+            other => other,
+        };
     }
 
     // Per-profile advisory singleton (H): one interactive window per named
@@ -457,8 +474,8 @@ fn main() -> anyhow::Result<()> {
     // from seeing EOF. process::exit is the correct terminal-emulator exit: it
     // kills the whole process group atomically, matching what alacritty/kitty do.
     let code: i32 = match &result {
-        Ok(()) => 0,
-        Err(_) => 1,
+        Ok(()) => cmd::EXIT_OK,
+        Err(_) => cmd::EXIT_ERROR,
     };
     std::process::exit(code);
 }
@@ -487,27 +504,20 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         }
         Command::Share { action } => cmd::share::run(&cfg, action),
         Command::Forward { action } => cmd::forward::run(action),
-        Command::Diff {
-            worktree,
-            base,
-            stat,
-            file,
-        } => cmd::diff::run(worktree, base, stat, file),
-        Command::List => cmd::list::run(&cfg),
+        Command::Wt { action } => cmd::wt::run(&cfg, action),
+        Command::Repo { action } => cmd::repos::run(&cfg, action),
+        Command::Diff { args } => cmd::wt::run(&cfg, cmd::wt::Action::Diff(args)),
+        Command::List { args } => cmd::wt::run(&cfg, cmd::wt::Action::List(args)),
         Command::Integrate => cmd::integrate::run(&cfg),
-        Command::Disk { worktree, all } => cmd::disk::disk(&cfg, worktree, all),
-        Command::Clean {
-            worktree,
-            all,
-            force,
-        } => cmd::disk::clean(&cfg, worktree, all, force),
-        Command::Repos => cmd::repos::repos(&cfg),
+        Command::Disk { args } => cmd::wt::run(&cfg, cmd::wt::Action::Disk(args)),
+        Command::Clean { args } => cmd::wt::run(&cfg, cmd::wt::Action::Clean(args)),
+        Command::Repos { json } => cmd::repos::repos(&cfg, json),
         Command::RepoTrust {
             path,
             approve,
             revoke,
         } => cmd::repos::trust(&cfg, path, approve, revoke),
-        Command::Recent { count } => cmd::repos::recent(count),
+        Command::Recent { count, json } => cmd::repos::recent(count, json),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
         Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Zone { action } => cmd::zone::run(&cfg, action),

@@ -339,7 +339,11 @@ fn provision(cfg: &Config, name: &str, mut yes: bool) -> Result<()> {
         }
         Err(f) => {
             msg::error(&format!("{name}: {}", failure_reason(&f)));
-            std::process::exit(if f.retryable { 2 } else { 1 });
+            std::process::exit(if f.retryable {
+                super::EXIT_RETRYABLE
+            } else {
+                super::EXIT_ERROR
+            });
         }
     }
 }
