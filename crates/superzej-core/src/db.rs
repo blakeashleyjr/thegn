@@ -52,9 +52,7 @@ use std::path::PathBuf;
 /// v24: adds `forwards` (the resurrection layer for auto port forwards, `[forward]`).
 /// v27: adds `registers` (persisted vim-style yank registers `"a`–`"z`/`"0`–`"9`;
 /// the volatile `"+` system-clipboard register is never persisted).
-/// v28: re-keys `my_work_cache` from a single global row to per-scope rows
-/// (`scope` = repo root for the default repo-scoped feed, `"*"` for the "all
-/// repos" toggle) so the "My Work" panel shows only the active repo's work.
+/// v28: re-keys `my_work_cache` to per-scope rows (repo root, or `"*"` for all).
 /// v29: adds `group_tabs.scrollback_snapshot` (per-leaf captured scrollback tail,
 /// JSON `pane id → text`) so a resurrected pane repaints its recent history
 /// instead of a blank screen. Additive; absent/NULL on pre-v29 rows = no history.
@@ -65,16 +63,18 @@ use std::path::PathBuf;
 /// v32: adds `repo_trust` (trust-on-first-use approvals for a repo overlay's
 /// gated sandbox requests; see [`crate::repo_trust`]).
 /// v33: adds `zones` + `workspaces.zone_id` (per-profile workspace grouping with
-/// credential/egress/budget sub-scoping; see [`crate::zone`]).
-const SCHEMA_VERSION: i64 = 33;
+/// credential/egress/budget sub-scoping; see [`crate::zone`]). `pub` for host-side
+/// schema-mismatch messaging.
+pub const SCHEMA_VERSION: i64 = 33;
 
 pub struct Db {
     conn: Connection,
+    /// On-disk `user_version` when newer than [`SCHEMA_VERSION`] (a newer build wrote this shared file), else `None`.
+    pub(crate) schema_mismatch: Option<i64>,
 }
 
 impl Db {
-    /// Connection accessor for sibling `impl Db` query modules (host_db) —
-    /// `conn` stays private so all SQL lives in this crate.
+    /// Connection accessor for sibling `impl Db` query modules (`conn` stays private).
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -265,6 +265,8 @@ impl Db {
         if ver < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
+        // A newer-schema DB (different branch sharing this file): warn + tolerate.
+        let schema_mismatch = crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION);
 
         let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN sandbox_backend TEXT", []);
         // v31: per-language LOC report JSON alongside the total (idempotent).
@@ -643,12 +645,13 @@ impl Db {
             "#,
         )?;
         crate::db_migrate::additive_schema(&conn);
-        // v6: transform any remaining flat v4/v5 `tab_layout` into worktree
-        // groups. Keyed on the legacy table's existence (not the version) so
-        // it is idempotent and a failed earlier attempt retries next open.
+        // v6: flat v4/v5 `tab_layout` → worktree groups (idempotent).
         migrate_tab_layout_v6(&conn);
         crate::host_db::migrate_v30(&conn)?;
-        Ok(Db { conn })
+        Ok(Db {
+            conn,
+            schema_mismatch,
+        })
     }
 
     pub(crate) fn map_share_row(r: &rusqlite::Row) -> rusqlite::Result<ShareRow> {

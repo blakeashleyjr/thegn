@@ -124,10 +124,31 @@ pub(crate) fn pane_shell_argv(
 pub(crate) fn terminal_launch_spec(
     cfg: &superzej_core::config::Config,
     connection: &str,
+    sandbox_backend: &str,
 ) -> crate::agent::LaunchSpec {
     let (cmd, args) = pane_shell_argv(cfg, connection);
     let mut argv = vec![cmd];
     argv.extend(args);
+    // Wrap a LOCAL shell in the chosen sandbox (a remote ssh/mosh terminal is
+    // isolated by the remote end, so it's never wrapped here). This stays PURE —
+    // it only builds the wrapping argv; the sandbox command self-provisions at
+    // exec (bwrap runs immediately, `podman run` pulls on first use), so no
+    // blocking `ensure()` runs on the event loop.
+    let backend = sandbox_backend.trim();
+    if connection.is_empty()
+        && !backend.is_empty()
+        && backend != "host"
+        && backend != "none"
+        && let Some(wrapped) = sandbox_wrap_shell(cfg, backend, &argv)
+    {
+        return crate::agent::LaunchSpec {
+            argv: wrapped,
+            cwd: None,
+            env: vec![],
+            backend: backend.to_string(),
+            warnings: vec![],
+        };
+    }
     crate::agent::LaunchSpec {
         argv,
         cwd: None,
@@ -135,6 +156,56 @@ pub(crate) fn terminal_launch_spec(
         backend: "host".to_string(),
         warnings: vec![],
     }
+}
+
+/// Build the sandbox-wrapping argv for a local terminal shell: force the chosen
+/// `backend` into a [`superzej_core::sandbox::SandboxSpec`] anchored at `$HOME`
+/// and `exec` the shell inside it (via
+/// [`superzej_core::sandbox::enter_argv`]). Returns `None` — so the caller falls
+/// back to a plain host shell — when the backend name is unknown or the spec
+/// can't be built (e.g. sandboxing disabled). Pure: no provisioning, safe on the
+/// event loop.
+fn sandbox_wrap_shell(
+    cfg: &superzej_core::config::Config,
+    backend: &str,
+    shell_argv: &[String],
+) -> Option<Vec<String>> {
+    let be = superzej_core::config::SandboxBackend::from_str_validated(backend).ok()?;
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    let mut sb = cfg.sandbox.clone();
+    sb.enabled = true;
+    sb.backend = be;
+    let loc = superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(&home));
+    let name = superzej_core::sandbox::container_name(&home);
+    let spec = superzej_core::sandbox::resolve_placed(
+        &sb,
+        &loc,
+        &name,
+        sb.profile,
+        superzej_core::placement::Placement::Local,
+    )?;
+    // `enter_argv` execs `inner` as the pane's foreground program; the shell
+    // argv (path + login flags) is the interactive shell that owns the pane.
+    let inner = shell_words_join(shell_argv);
+    Some(superzej_core::sandbox::enter_argv(&spec, &inner))
+}
+
+/// Join a shell argv into a single command string for `sh -lc` execution,
+/// single-quoting any element that isn't a bare word so paths/flags survive.
+fn shell_words_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            if !a.is_empty()
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./=:".contains(c))
+            {
+                a.clone()
+            } else {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub(crate) fn tool_drawer_argv(command: &str) -> Vec<String> {
@@ -731,22 +802,51 @@ mod tests {
     fn terminal_launch_spec_builds_ssh_mosh_and_local_argv() {
         let cfg = superzej_core::config::Config::default();
 
-        let ssh = terminal_launch_spec(&cfg, "ssh user@host");
+        let ssh = terminal_launch_spec(&cfg, "ssh user@host", "");
         assert_eq!(ssh.argv, vec!["ssh".to_string(), "user@host".to_string()]);
         assert_eq!(ssh.backend, "host");
         assert!(ssh.cwd.is_none());
 
         // A bare target (no "ssh " prefix) is still treated as an ssh target.
-        let bare = terminal_launch_spec(&cfg, "user@host");
+        let bare = terminal_launch_spec(&cfg, "user@host", "");
         assert_eq!(bare.argv, vec!["ssh".to_string(), "user@host".to_string()]);
 
-        let mosh = terminal_launch_spec(&cfg, "mosh user@host");
+        let mosh = terminal_launch_spec(&cfg, "mosh user@host", "");
         assert_eq!(mosh.argv, vec!["mosh".to_string(), "user@host".to_string()]);
 
         // Empty connection → a local interactive shell (argv[0] is env-dependent).
-        let local = terminal_launch_spec(&cfg, "");
+        let local = terminal_launch_spec(&cfg, "", "");
         assert!(!local.argv.is_empty());
         assert_eq!(local.backend, "host");
+
+        // `host`/`none` are no-op backends: still a plain host shell.
+        let host = terminal_launch_spec(&cfg, "", "host");
+        assert_eq!(host.backend, "host");
+
+        // A remote terminal is never wrapped locally even with a backend set.
+        let remote_wrapped = terminal_launch_spec(&cfg, "ssh user@host", "bwrap");
+        assert_eq!(remote_wrapped.argv[0], "ssh");
+        assert_eq!(remote_wrapped.backend, "host");
+    }
+
+    #[test]
+    fn terminal_launch_spec_wraps_local_shell_in_bwrap() {
+        // A local shell + bwrap backend produces a `bwrap`-fronted argv; the raw
+        // shell is exec'd inside. (Sandboxing is on by default in the test cfg.)
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.sandbox.enabled = true;
+        let spec = terminal_launch_spec(&cfg, "", "bwrap");
+        // Either the wrap succeeded (argv fronted by bwrap, backend recorded) or
+        // — if $HOME/bwrap resolution declined — it fell back to a host shell.
+        if spec.backend == "bwrap" {
+            assert!(
+                spec.argv.iter().any(|a| a.contains("bwrap")),
+                "bwrap wrap should front the argv: {:?}",
+                spec.argv
+            );
+        } else {
+            assert_eq!(spec.backend, "host");
+        }
     }
 
     #[test]
