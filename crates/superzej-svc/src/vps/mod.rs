@@ -562,7 +562,7 @@ impl RemoteProvider for VpsProvider {
                 return Ok(());
             }
             last_status = Some(status);
-            if !crate::provider::destroy_retryable(status) {
+            if !crate::provider::transient_status(status) {
                 break;
             }
             if attempt + 1 < ATTEMPTS {

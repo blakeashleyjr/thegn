@@ -36,6 +36,21 @@ pub(crate) fn provider_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Per-request deadline for the small JSON **control-plane** calls (create,
+/// list, destroy, fs read/list, network policy, checkpoint metadata). The shared
+/// client (above) bounds only *connection* setup so genuinely long transfers
+/// (large binary/closure pushes via `write_with_mode`) can still run; but a
+/// control call whose response the server withholds while a sprite cold-boots
+/// would otherwise hang the caller **forever** — the "hung on startup" failure.
+/// Capping each such call turns an infinite stall into a fast, retryable error.
+pub(crate) const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Control-plane retry budget for the idempotent create/list calls: a transient
+/// 5xx/429/408 or a request timeout (our [`CONTROL_TIMEOUT`] firing) can clear on
+/// a retry; other 4xx are terminal (see [`transient_status`]/[`transient_err`]).
+const CONTROL_ATTEMPTS: u32 = 3;
+const CONTROL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// How to exec into a provider sandbox once it exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecKind {
@@ -204,15 +219,22 @@ pub struct SpritesProvider {
     client: reqwest::Client,
 }
 
-/// Whether a non-OK sprites-destroy HTTP status is worth retrying: transient
+/// Whether a non-OK control-plane HTTP status is worth retrying: transient
 /// server/overload conditions (any 5xx, 429 Too Many Requests, 408 Request
-/// Timeout) can clear on a retry and leaving them unretried leaks a paid sandbox;
-/// other 4xx are the caller's fault and won't change on retry. (2xx and 404 are
-/// treated as success/already-gone before this is consulted.)
-pub(crate) fn destroy_retryable(status: reqwest::StatusCode) -> bool {
+/// Timeout) can clear on a retry; other 4xx are the caller's fault and won't
+/// change on retry. Shared by destroy (a stuck teardown leaks a paid sandbox)
+/// and the idempotent create/list calls. (2xx and 404 are handled as
+/// success/already-gone before this is consulted.)
+pub(crate) fn transient_status(status: reqwest::StatusCode) -> bool {
     status.is_server_error()
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
+/// Whether a reqwest **transport** error (no HTTP status — e.g. our
+/// [`CONTROL_TIMEOUT`] fired, or the connection dropped) is worth retrying.
+pub(crate) fn transient_err(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect()
 }
 
 impl SpritesProvider {
@@ -286,23 +308,50 @@ impl RemoteProvider for SpritesProvider {
                 "sprites: set `[env.<name>.provider] id = \"<sprite-name>\"` — sprites are named"
             ));
         }
-        let resp = self
-            .client
-            .post(self.sprites_url())
-            .bearer_auth(&self.token)
-            .json(&Self::create_body(&self.name))
-            .send()
-            .await
-            .context("sprites: POST /sprites")?;
-        let status = resp.status();
-        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-        if !status.is_success() {
-            return Err(anyhow!("sprites create failed ({status}): {body}"));
+        // Bounded per-request timeout + a small retry budget: a cold-booting
+        // control plane can stall or transiently 5xx, and an untimed create is
+        // exactly what hung provisioning "forever" on startup.
+        let mut last: Option<String> = None;
+        for attempt in 0..CONTROL_ATTEMPTS {
+            match self
+                .client
+                .post(self.sprites_url())
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .json(&Self::create_body(&self.name))
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body: serde_json::Value =
+                        resp.json().await.unwrap_or(serde_json::Value::Null);
+                    if status.is_success() {
+                        // The server echoes the name; fall back to the requested one.
+                        let name = Self::parse_name(&body).unwrap_or_else(|| self.name.clone());
+                        let exec = Self::exec_for(&name);
+                        return Ok(SandboxHandle { id: name, exec });
+                    }
+                    last = Some(format!("{status}: {body}"));
+                    if !transient_status(status) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    last = Some(e.to_string());
+                    if !transient_err(&e) {
+                        break;
+                    }
+                }
+            }
+            if attempt + 1 < CONTROL_ATTEMPTS {
+                tokio::time::sleep(CONTROL_BACKOFF).await;
+            }
         }
-        // The server echoes the name; fall back to the requested one.
-        let name = Self::parse_name(&body).unwrap_or_else(|| self.name.clone());
-        let exec = Self::exec_for(&name);
-        Ok(SandboxHandle { id: name, exec })
+        Err(anyhow!(
+            "sprites create failed ({})",
+            last.unwrap_or_else(|| "no response".into())
+        ))
     }
 
     async fn destroy(&self, id: &str) -> Result<()> {
@@ -318,6 +367,7 @@ impl RemoteProvider for SpritesProvider {
                 .client
                 .delete(self.sprite_name_url(id))
                 .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
                 .send()
                 .await
                 .context("sprites: DELETE /sprites/{name}")?;
@@ -327,7 +377,7 @@ impl RemoteProvider for SpritesProvider {
                 return Ok(());
             }
             last_status = Some(status);
-            if !destroy_retryable(status) {
+            if !transient_status(status) {
                 break;
             }
             if attempt + 1 < ATTEMPTS {
@@ -343,15 +393,45 @@ impl RemoteProvider for SpritesProvider {
     }
 
     async fn list(&self) -> Result<Vec<String>> {
-        let resp = self
-            .client
-            .get(self.sprites_url())
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .context("sprites: GET /sprites")?;
-        let body: serde_json::Value = resp.json().await.context("sprites: decode list")?;
-        Ok(Self::parse_list(&body))
+        // Bounded + retried like `create`: `ensure_exists` calls this first, so an
+        // untimed list would strand provisioning on a stalled control plane.
+        let mut last: Option<String> = None;
+        for attempt in 0..CONTROL_ATTEMPTS {
+            match self
+                .client
+                .get(self.sprites_url())
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        let body: serde_json::Value =
+                            resp.json().await.context("sprites: decode list")?;
+                        return Ok(Self::parse_list(&body));
+                    }
+                    last = Some(status.to_string());
+                    if !transient_status(status) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    last = Some(e.to_string());
+                    if !transient_err(&e) {
+                        break;
+                    }
+                }
+            }
+            if attempt + 1 < CONTROL_ATTEMPTS {
+                tokio::time::sleep(CONTROL_BACKOFF).await;
+            }
+        }
+        Err(anyhow!(
+            "sprites list failed ({})",
+            last.unwrap_or_else(|| "no response".into())
+        ))
     }
 }
 
@@ -431,6 +511,7 @@ impl ProviderEgress for SpritesProvider {
             .client
             .post(self.policy_network_url(id))
             .bearer_auth(&self.token)
+            .timeout(CONTROL_TIMEOUT)
             .json(&body)
             .send()
             .await
@@ -449,6 +530,7 @@ impl ProviderEgress for SpritesProvider {
             .client
             .get(self.policy_network_url(id))
             .bearer_auth(&self.token)
+            .timeout(CONTROL_TIMEOUT)
             .send()
             .await
             .context("sprites: GET /policy/network")?;
@@ -547,6 +629,7 @@ impl ProviderCheckpoints for SpritesProvider {
             .client
             .post(self.checkpoint_create_url(id))
             .bearer_auth(&self.token)
+            .timeout(CONTROL_TIMEOUT)
             .json(&serde_json::Value::Object(body))
             .send()
             .await
@@ -565,6 +648,7 @@ impl ProviderCheckpoints for SpritesProvider {
             .client
             .get(self.checkpoints_url(id))
             .bearer_auth(&self.token)
+            .timeout(CONTROL_TIMEOUT)
             .send()
             .await
             .context("sprites: GET /checkpoints")?;
@@ -582,6 +666,7 @@ impl ProviderCheckpoints for SpritesProvider {
             .client
             .post(self.restore_url(id, checkpoint))
             .bearer_auth(&self.token)
+            .timeout(CONTROL_TIMEOUT)
             .send()
             .await
             .context("sprites: POST /checkpoints/{id}/restore")?;
@@ -717,6 +802,32 @@ impl SpritesProvider {
     fn fs_op_url(&self, name: &str, op: &str) -> String {
         format!("{}/sprites/{name}/fs/{op}", self.api_base)
     }
+
+    /// Poll a cheap liveness probe until the freshly-created sprite's guest
+    /// filesystem API answers, or `budget` elapses. A brand-new sprite cold-boots
+    /// (Firecracker microVM) for a few seconds; without this gate the first
+    /// marker `read` / provisioning exec raced the boot and — before per-request
+    /// timeouts — hung the whole open **forever**. `list_dir("/")` makes no
+    /// assumption about the (undocumented) sprite-status JSON: it succeeds only
+    /// once the in-guest fs service is up. Bounded by construction: each probe is
+    /// itself capped by [`CONTROL_TIMEOUT`], and the loop stops at `budget`.
+    async fn wait_ready(&self, id: &str, budget: std::time::Duration) -> Result<()> {
+        const PROBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+        let start = std::time::Instant::now();
+        loop {
+            let err = match self.list_dir(id, "/").await {
+                Ok(_) => return Ok(()),
+                Err(e) => e,
+            };
+            if start.elapsed() >= budget {
+                return Err(anyhow!(
+                    "sprite {id} did not become ready within {}s: {err}",
+                    budget.as_secs()
+                ));
+            }
+            tokio::time::sleep(PROBE_BACKOFF).await;
+        }
+    }
     /// PUT `/fs/write` with an explicit unix `mode` (octal string). `write`
     /// uses `0644`; `write_exec` uses `0755` so a pushed binary is runnable.
     async fn write_with_mode(&self, id: &str, path: &str, data: &[u8], mode: &str) -> Result<()> {
@@ -762,6 +873,7 @@ impl ProviderFiles for SpritesProvider {
             .client
             .get(self.fs_op_url(id, "read"))
             .bearer_auth(&self.token)
+            .timeout(CONTROL_TIMEOUT)
             .query(&[("path", path), ("workingDir", "/")])
             .send()
             .await
@@ -785,6 +897,7 @@ impl ProviderFiles for SpritesProvider {
             .client
             .get(self.fs_op_url(id, "list"))
             .bearer_auth(&self.token)
+            .timeout(CONTROL_TIMEOUT)
             .query(&[("path", path), ("workingDir", "/")])
             .send()
             .await
@@ -807,6 +920,7 @@ impl ProviderFiles for SpritesProvider {
             .client
             .delete(self.fs_op_url(id, "delete"))
             .bearer_auth(&self.token)
+            .timeout(CONTROL_TIMEOUT)
             .query(&[("path", path), ("workingDir", "/"), ("recursive", "true")])
             .send()
             .await
@@ -1422,6 +1536,18 @@ impl Provider {
         Ok(true)
     }
 
+    /// Wait (bounded by `budget`) until a freshly-created sandbox is booted enough
+    /// to accept fs/exec calls. No-op for providers without a readiness notion (or
+    /// without the fs API used to probe). Call this once after a create returns
+    /// `true` from [`ensure_exists`], before the first `read`/exec — it prevents
+    /// the post-create boot race that stranded sprite provisioning on startup.
+    pub async fn wait_ready(&self, id: &str, budget: std::time::Duration) -> Result<()> {
+        match self {
+            Provider::Sprites(p) => p.wait_ready(id, budget).await,
+            _ => Ok(()),
+        }
+    }
+
     /// Lower allow/block lists to the provider's network policy (egress translate).
     pub async fn set_network_policy(
         &self,
@@ -1694,20 +1820,20 @@ mod tests {
     fn destroy_retries_transient_server_errors_only() {
         use reqwest::StatusCode;
         // Transient: teardown should retry rather than leak a paid sandbox.
-        assert!(destroy_retryable(StatusCode::INTERNAL_SERVER_ERROR)); // the observed 500
-        assert!(destroy_retryable(StatusCode::BAD_GATEWAY));
-        assert!(destroy_retryable(StatusCode::SERVICE_UNAVAILABLE));
-        assert!(destroy_retryable(StatusCode::GATEWAY_TIMEOUT));
-        assert!(destroy_retryable(StatusCode::TOO_MANY_REQUESTS));
-        assert!(destroy_retryable(StatusCode::REQUEST_TIMEOUT));
+        assert!(transient_status(StatusCode::INTERNAL_SERVER_ERROR)); // the observed 500
+        assert!(transient_status(StatusCode::BAD_GATEWAY));
+        assert!(transient_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(transient_status(StatusCode::GATEWAY_TIMEOUT));
+        assert!(transient_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(transient_status(StatusCode::REQUEST_TIMEOUT));
         // Terminal client errors: retrying won't help, stop early.
-        assert!(!destroy_retryable(StatusCode::UNAUTHORIZED));
-        assert!(!destroy_retryable(StatusCode::FORBIDDEN));
-        assert!(!destroy_retryable(StatusCode::BAD_REQUEST));
-        assert!(!destroy_retryable(StatusCode::CONFLICT));
+        assert!(!transient_status(StatusCode::UNAUTHORIZED));
+        assert!(!transient_status(StatusCode::FORBIDDEN));
+        assert!(!transient_status(StatusCode::BAD_REQUEST));
+        assert!(!transient_status(StatusCode::CONFLICT));
         // 404 is handled as already-gone before this is consulted, but for safety
         // it is not itself "retryable".
-        assert!(!destroy_retryable(StatusCode::NOT_FOUND));
+        assert!(!transient_status(StatusCode::NOT_FOUND));
     }
 
     #[test]

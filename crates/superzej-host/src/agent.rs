@@ -1294,8 +1294,43 @@ pub fn provision_provider_env_named(
     // marker / run any exec, so provisioning can't fail against a dead sandbox.
     // A freshly recreated sandbox has no marker ⇒ a full re-provision runs below.
     // (No-op when it already exists; cheap list+maybe-create.)
-    if let Err(e) = block_on_provider(|| async { provider.ensure_exists(&id).await }) {
-        return Err(anyhow::anyhow!("ensure sandbox {id}: {e}"));
+    // Surface the create/list phase (which precedes the step plan below) as a
+    // labeled active step + a log breadcrumb — this is the phase that, untimed,
+    // hung provisioning on startup, so make it observable rather than a blank.
+    progress(&[ProvisionStepView {
+        label: "Preparing sandbox".to_string(),
+        state: ProvisionState::Active,
+        detail: None,
+    }]);
+    tracing::debug!(target: "szhost::startup", %id, "provider ensure_exists (create/list)");
+    let created = match block_on_provider(|| async { provider.ensure_exists(&id).await }) {
+        Ok(created) => created,
+        Err(e) => return Err(anyhow::anyhow!("ensure sandbox {id}: {e}")),
+    };
+    tracing::debug!(target: "szhost::startup", %id, created, "sandbox ensured");
+
+    // A freshly created sprite cold-boots (Firecracker) for a few seconds; gate the
+    // first fs/exec on a bounded readiness probe so we don't race the boot — the
+    // pre-timeout race is exactly what hung provisioning "forever" on startup — and
+    // surface a labeled active step so the loading screen isn't a frozen blank
+    // during the wait. No-op for providers without a readiness notion.
+    if created {
+        const READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+        let mut boot = vec![ProvisionStepView {
+            label: "Waiting for sandbox to boot".to_string(),
+            state: ProvisionState::Active,
+            detail: None,
+        }];
+        progress(&boot);
+        if let Err(e) = block_on_provider(|| async { provider.wait_ready(&id, READY_BUDGET).await })
+        {
+            boot[0].state = ProvisionState::Failed;
+            boot[0].detail = Some(e.to_string());
+            progress(&boot);
+            return Err(anyhow::anyhow!("sandbox {id} not ready: {e}"));
+        }
+        boot[0].state = ProvisionState::Done;
+        progress(&boot);
     }
 
     // Idempotent: already provisioned ⇒ nothing to do (no new checkpoint).
