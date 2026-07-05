@@ -9,4 +9,6 @@ pub(crate) mod overlay;
 pub(crate) mod panel_changes;
 pub(crate) mod provision;
 pub(crate) mod repo_trust;
+pub(crate) mod startup;
+pub(crate) mod terminal;
 pub(crate) mod wizard;

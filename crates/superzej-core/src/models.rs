@@ -281,6 +281,12 @@ pub struct TerminalRow {
     pub created_at: i64,
     pub last_active: i64,
     pub position: i64,
+    /// Sandbox backend label for a local terminal ("bwrap"/"podman"/…), or
+    /// "host"/empty for an un-sandboxed shell. Ignored for remote (ssh/mosh)
+    /// terminals, whose isolation is owned by the remote end.
+    pub sandbox_backend: String,
+    /// Named execution environment this terminal launches under, if any.
+    pub env_name: String,
 }
 
 #[cfg(test)]
