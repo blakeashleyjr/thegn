@@ -191,6 +191,12 @@ pub trait WorkspaceStore {
     /// Forget one worktree group and its tabs (on worktree close).
     fn delete_tab_group(&self, session: &str, name: &str) -> Result<()>;
 
+    /// Forget every group (and its tabs) of `session` whose `worktree` column
+    /// equals `worktree` — the headless-removal path (`wt rm`), which knows the
+    /// worktree path but not the display group name. A stale `tab_groups` row
+    /// resurrects the worktree at next launch, so removal must key on the path.
+    fn delete_tab_groups_for_worktree(&self, session: &str, worktree: &str) -> Result<()>;
+
     /// Wipe a session's whole persisted layout (groups + tabs). The host
     /// persists snapshots as clear-then-insert inside one transaction so
     /// closed/renamed entries can't linger.

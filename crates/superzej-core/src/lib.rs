@@ -27,6 +27,7 @@ pub mod db;
 mod db_account;
 mod db_aux;
 mod db_cache;
+mod db_intent;
 pub mod db_migrate;
 mod db_notification;
 mod db_pool;

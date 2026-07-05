@@ -2,6 +2,15 @@
 
 use serde::Serialize;
 
+/// Payload of a `focus_workspace` intent (the `superzej open` mailbox row):
+/// the CLI writes it, the compositor's model refresh consumes it. One shared
+/// type so producer and consumer can't drift.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct FocusIntent {
+    /// Canonical repo path of the workspace to focus.
+    pub repo: String,
+}
+
 /// A sandbox audit event from the `container_events` table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContainerEvent {
