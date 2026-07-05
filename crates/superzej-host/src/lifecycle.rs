@@ -18,7 +18,8 @@ use std::time::Instant;
 use superzej_core::config::{Config, LifecycleConfig};
 use superzej_core::db::PoolSpare;
 use superzej_core::lifecycle::{
-    DestroyReason, WarmBudget, WarmCandidate, WarmInputs, decide, decide_pool, recyclable,
+    DestroyReason, PoolPolicy, ReadySpare, WarmBudget, WarmCandidate, WarmInputs, decide,
+    decide_pool, recyclable,
 };
 use superzej_core::remote::GitLoc;
 use superzej_core::store::{PoolStore, WorkspaceStore};
@@ -133,20 +134,66 @@ pub fn pool_context(
     (repo_root, repo, env_name)
 }
 
-/// The effective warm-pool target for `(repo, env)`: the runtime +/- override in
-/// the DB (set by the hotkey, per repo+env) if present, else the configured
-/// `[lifecycle.pool] size`.
+/// Hard ceiling on the resolved pool target — a runaway guard so no config typo or
+/// stuck hotkey can spin up an unbounded fleet. Idle scale-to-zero spares are
+/// ~free, but PROVISIONING them is not (compute + the subscription's active-sprite
+/// cap), so the pool is bounded no matter how it was configured.
+pub const POOL_TARGET_CEILING: usize = 8;
+
+/// The effective warm-pool target for `(repo, env)`, resolved in precedence order
+/// and clamped to [`POOL_TARGET_CEILING`]:
+///
+/// 1. An explicit runtime override in the DB (the `+`/`-` hotkey, per repo+env) —
+///    including a deliberate `0` to turn the pool off.
+/// 2. An explicit `[lifecycle.pool] size`.
+/// 3. **Auto (scale-to-zero):** an env whose provider hibernates for free
+///    ([`EnvProviderConfig::scale_to_zero`]) AND that the user already opted to pay
+///    into (`auto_provision`) parks ONE idle spare, so the first open is instant.
+///    Gated on `auto_provision` so merely *configuring* a sprites env never spends;
+///    never applied to a billed-while-stopped VPS.
+/// 4. Otherwise off (`0`).
 pub fn effective_pool_target(
     db: &superzej_core::db::Db,
     cfg: &Config,
     repo: &str,
     env: &str,
 ) -> usize {
-    db.pool_target(repo, env)
-        .ok()
-        .flatten()
-        .map(|t| t.max(0) as usize)
-        .unwrap_or(cfg.lifecycle.pool.size)
+    let target = if let Some(t) = db.pool_target(repo, env).ok().flatten() {
+        t.max(0) as usize
+    } else if cfg.lifecycle.pool.size > 0 {
+        cfg.lifecycle.pool.size
+    } else if cfg
+        .env
+        .get(env)
+        .is_some_and(|e| e.provider.scale_to_zero() && e.provider.auto_provision)
+    {
+        1
+    } else {
+        0
+    };
+    target.min(POOL_TARGET_CEILING)
+}
+
+/// Immediately refill the pool after a claim consumed a spare: re-run the
+/// reconcile for `worktree`'s `(repo, env)` right now instead of waiting for the
+/// next ~8s maintainer tick, so a parked spare is ready again for the next open.
+/// Runs on its own thread (DB + provider work) and is a no-op for a local
+/// worktree. The UI pool chip refreshes on the next maintainer tick (the refill
+/// itself is a minutes-long provision), so no waker is threaded here.
+pub fn refill_pool_after_claim(cfg: &Config, worktree: &str) {
+    let cfg = cfg.clone();
+    let worktree = worktree.to_string();
+    std::thread::spawn(move || {
+        let loc = GitLoc::for_worktree(Path::new(&worktree));
+        if !loc.is_remote() {
+            return;
+        }
+        let Ok(db) = superzej_core::db::Db::open() else {
+            return;
+        };
+        let (repo_root, _repo, env_name) = pool_context(&db, &cfg, &worktree, &loc);
+        reconcile_pool(&cfg, &repo_root, &env_name, || {});
+    });
 }
 
 /// Reconcile the warm-spare POOL for one `(repo, env)`: create spares toward the
@@ -171,6 +218,22 @@ where
     if target == 0 && spares.is_empty() {
         return;
     }
+    // Idle policy by provider billing model: a scale-to-zero provider (sprites)
+    // parks idle spares for free — aging them out just discards provisioning for
+    // $0 — while a billed-when-stopped provider (VPS) must age them out to reclaim
+    // spend. Unknown/unconfigured ⇒ the safe AgeOut default (never leak).
+    let policy = if cfg
+        .env
+        .get(env_name)
+        .is_some_and(|e| e.provider.scale_to_zero())
+    {
+        PoolPolicy::ParkIdle
+    } else {
+        PoolPolicy::AgeOut
+    };
+    // The current lockfile: keys both the per-spare staleness flag below and the
+    // recycle-vs-destroy decision in the destroy loop.
+    let current_lock = crate::provision_gate::flake_lock_hash(repo_root);
     let now = superzej_core::util::now();
     // A spare stuck in `provisioning` past this is ORPHANED — its provision task
     // died with a previous szhost session (a restart drops the in-flight thread),
@@ -194,13 +257,22 @@ where
             provisioning += 1;
         }
     }
-    let ready: Vec<(String, u64)> = spares
+    let ready: Vec<ReadySpare> = spares
         .iter()
         .filter(|s| s.state == "ready")
-        .map(|s| (s.sandbox_name.clone(), (now - s.updated_at).max(0) as u64))
+        .map(|s| ReadySpare {
+            name: s.sandbox_name.clone(),
+            idle_secs: (now - s.updated_at).max(0) as u64,
+            // A ready spare whose base was built against a different flake.lock
+            // than the repo's current one must rotate even while parked — else a
+            // ParkIdle pool serves a stale toolchain forever. Only meaningful once
+            // the repo HAS a lockfile (empty current ⇒ nothing to compare).
+            lock_stale: !current_lock.is_empty()
+                && s.lock_hash.as_deref().unwrap_or("") != current_lock,
+        })
         .collect();
 
-    let mut action = decide_pool(target, provisioning, &ready, max_idle);
+    let mut action = decide_pool(target, provisioning, &ready, policy, max_idle);
     // Only a CONFIGURED provider env can host spares — for anything else
     // (notably the implicit "default" env) provisioning "succeeds" instantly as
     // a no-op, minting a phantom `ready` spare whose claim then skips the real
@@ -209,7 +281,6 @@ where
     if !crate::provision_gate::poolable_env(cfg, env_name) {
         action.create = 0;
     }
-    let current_lock = crate::provision_gate::flake_lock_hash(repo_root);
     for (name, reason) in &action.destroy {
         // A STALE spare (aged past max_idle) whose provisioned-base checkpoint is
         // still fresh (same flake.lock) is RECYCLED: an in-place restore resets it
@@ -438,6 +509,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(again.0, "repo-pool-1");
+    }
+
+    /// The pre-warm defaults: a scale-to-zero env the user pays into (auto_provision)
+    /// auto-parks one idle spare; a bare config, a non-auto env, or a VPS stays off;
+    /// explicit config/hotkey wins; the ceiling clamps a runaway value.
+    #[test]
+    fn pool_target_auto_defaults_for_scale_to_zero_and_clamps() {
+        use superzej_core::config::{EnvConfig, EnvProviderConfig, PlacementMode};
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        let sprites = |auto: bool| EnvConfig {
+            placement: PlacementMode::Provider,
+            provider: EnvProviderConfig {
+                provider: "sprites".into(),
+                auto_provision: auto,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // No env table at all ⇒ off.
+        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 0);
+        // Scale-to-zero + auto_provision ⇒ auto-park one.
+        cfg.env.insert("sprites".into(), sprites(true));
+        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 1);
+        // …but without auto_provision ⇒ off (no surprise spend from mere config).
+        cfg.env.insert("sprites".into(), sprites(false));
+        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 0);
+        // VPS (not scale-to-zero) even with auto_provision ⇒ off (billed when stopped).
+        cfg.env.insert(
+            "vps".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                provider: EnvProviderConfig {
+                    provider: "hetzner".into(),
+                    auto_provision: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "vps"), 0);
+        // Explicit config size wins over the auto default…
+        cfg.env.insert("sprites".into(), sprites(true));
+        cfg.lifecycle.pool.size = 3;
+        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 3);
+        // …and the ceiling clamps a runaway value.
+        cfg.lifecycle.pool.size = 999;
+        assert_eq!(
+            effective_pool_target(&db, &cfg, "/repo", "sprites"),
+            POOL_TARGET_CEILING
+        );
     }
 
     /// A spare that never captured a checkpoint (or predates S1) is not
