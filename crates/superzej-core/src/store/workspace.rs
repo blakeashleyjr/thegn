@@ -255,7 +255,7 @@ pub trait WorkspaceStore {
     ) -> Result<i64>;
 
     /// Record the sandbox backend a local terminal launches under (keyed by the
-    /// terminal's unique name). Mirrors [`set_worktree_sandbox`].
+    /// terminal's unique name). Mirrors [`Self::set_worktree_sandbox`].
     fn set_terminal_sandbox(&self, name: &str, backend: &str) -> Result<()>;
 
     /// Record the named execution environment a terminal launches under.

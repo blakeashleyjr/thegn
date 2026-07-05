@@ -1539,7 +1539,7 @@ impl Provider {
     /// Wait (bounded by `budget`) until a freshly-created sandbox is booted enough
     /// to accept fs/exec calls. No-op for providers without a readiness notion (or
     /// without the fs API used to probe). Call this once after a create returns
-    /// `true` from [`ensure_exists`], before the first `read`/exec — it prevents
+    /// `true` from [`Self::ensure_exists`], before the first `read`/exec — it prevents
     /// the post-create boot race that stranded sprite provisioning on startup.
     pub async fn wait_ready(&self, id: &str, budget: std::time::Duration) -> Result<()> {
         match self {

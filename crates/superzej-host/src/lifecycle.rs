@@ -147,7 +147,7 @@ pub const POOL_TARGET_CEILING: usize = 8;
 ///    including a deliberate `0` to turn the pool off.
 /// 2. An explicit `[lifecycle.pool] size`.
 /// 3. **Auto (scale-to-zero):** an env whose provider hibernates for free
-///    ([`EnvProviderConfig::scale_to_zero`]) AND that the user already opted to pay
+///    (`EnvProviderConfig::scale_to_zero`) AND that the user already opted to pay
 ///    into (`auto_provision`) parks ONE idle spare, so the first open is instant.
 ///    Gated on `auto_provision` so merely *configuring* a sprites env never spends;
 ///    never applied to a billed-while-stopped VPS.
