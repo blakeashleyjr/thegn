@@ -12,3 +12,4 @@ pub(crate) mod repo_trust;
 pub(crate) mod startup;
 pub(crate) mod terminal;
 pub(crate) mod wizard;
+pub(crate) mod worktree_delete;

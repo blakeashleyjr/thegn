@@ -398,6 +398,41 @@ pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
     .with_body(names_csv)
 }
 
+/// The dirty-tree variant of [`delete_worktree_menu`], shown whenever one or
+/// more targets have uncommitted changes. It is raised EVEN when
+/// `confirm_delete` is off — a destructive delete of unsaved work must never be
+/// silent. Same three choices resolving to the same `ConfirmDeleteWorktrees` /
+/// `Dismiss` as the clean menu (so the loop's Pick handler is reused untouched),
+/// but the title/body shout that uncommitted work will be LOST and name the
+/// dirty worktree(s), and the pre-selected default is the SAFE `cancel` (index
+/// 2) rather than the destructive row — a dirty delete is never a single-Enter
+/// mistake.
+pub fn delete_worktree_menu_dirty(dirty: usize, dirty_csv: &str) -> MenuOverlay {
+    let title = format!("Delete {dirty} worktree(s) with UNCOMMITTED changes?");
+    MenuOverlay::new_with_default(
+        MenuKindTag::Confirm,
+        title,
+        vec![
+            item(
+                Some('y'),
+                "delete from disk (discard changes)",
+                MenuChoice::ConfirmDeleteWorktrees { keep_files: false },
+            )
+            .danger(),
+            item(
+                // 'k' is a reserved nav key (cursor-up); use 'f' (files), matching
+                // the clean menu and keeping new_with_default's debug-assert happy.
+                Some('f'),
+                "keep files (safe)",
+                MenuChoice::ConfirmDeleteWorktrees { keep_files: true },
+            ),
+            item(Some('n'), "cancel", MenuChoice::Dismiss),
+        ],
+        2,
+    )
+    .with_body(format!("uncommitted work will be LOST in: {dirty_csv}"))
+}
+
 /// Confirm removing a workspace. Like `delete_worktree_menu`, the default
 /// (pre-selected, index 0) choice is the destructive "delete from disk", which
 /// removes every worktree directory of the workspace. `[f]` removes the
@@ -1299,6 +1334,7 @@ mod tests {
                 true,
             ),
             delete_worktree_menu(2, "a, b"),
+            delete_worktree_menu_dirty(2, "a, b"),
             delete_workspace_menu("myrepo"),
         ];
         for m in &menus {
@@ -1334,6 +1370,42 @@ mod tests {
         );
         assert_eq!(m.items()[2].choice, MenuChoice::Dismiss);
         assert_eq!(hotkeys(&m), vec!['y', 'f', 'n']);
+    }
+
+    #[test]
+    fn delete_worktree_menu_dirty_defaults_to_cancel_and_reuses_choices() {
+        let mut m = delete_worktree_menu_dirty(2, "alpha, beta");
+        // The SAFE option (cancel) is pre-selected on a dirty tree — a
+        // destructive delete of unsaved work is never a single-Enter mistake.
+        assert_eq!(m.selected(), 2);
+        // Same hotkeys + same choice types as the clean menu, so the loop's
+        // Pick handler is reused untouched.
+        assert_eq!(hotkeys(&m), vec!['y', 'f', 'n']);
+        assert_eq!(
+            m.items()[0].choice,
+            MenuChoice::ConfirmDeleteWorktrees { keep_files: false }
+        );
+        assert!(
+            m.items()[0].danger,
+            "delete-from-disk row stays danger-marked"
+        );
+        assert_eq!(
+            m.items()[1].choice,
+            MenuChoice::ConfirmDeleteWorktrees { keep_files: true }
+        );
+        assert!(!m.items()[1].danger, "keep-files row is not danger");
+        assert_eq!(m.items()[2].choice, MenuChoice::Dismiss);
+        // Hotkey 'y' picks the destructive delete; 'n' dismisses.
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('y'), NONE),
+            MenuOutcome::Pick(MenuChoice::ConfirmDeleteWorktrees { keep_files: false })
+        );
+        assert_eq!(
+            delete_worktree_menu_dirty(1, "x").handle_key(&KeyCode::Char('n'), NONE),
+            MenuOutcome::Pick(MenuChoice::Dismiss)
+        );
+        // The clean menu is unchanged: it still defaults to delete-from-disk.
+        assert_eq!(delete_worktree_menu(1, "x").selected(), 0);
     }
 
     #[test]
