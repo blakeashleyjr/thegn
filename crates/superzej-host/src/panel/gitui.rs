@@ -592,27 +592,16 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
 }
 
 /// Fuzzy-filter `labels` by `query`, returning matching source indices in
-/// score order (nucleo, same engine as the palette). Empty query → identity.
+/// score order (neo_frizbee, same engine as the palette). Empty query → identity.
 pub fn fuzzy_filter(labels: &[String], query: &str) -> Vec<usize> {
-    use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-    use nucleo_matcher::{Config, Matcher, Utf32Str};
     if query.is_empty() {
         return (0..labels.len()).collect();
     }
-    let mut matcher = Matcher::new(Config::DEFAULT);
-    let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
-    let mut scored: Vec<(u32, usize)> = labels
-        .iter()
-        .enumerate()
-        .filter_map(|(i, l)| {
-            let mut buf = Vec::new();
-            pattern
-                .score(Utf32Str::new(l, &mut buf), &mut matcher)
-                .map(|s| (s, i))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, i)| i).collect()
+    let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    crate::fff_backend::fuzzy_rank(query, &refs)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// A flow-specific hint pair `(chord, label)` to prepend to the help bar when

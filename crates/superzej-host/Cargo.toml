@@ -46,11 +46,11 @@ portable-pty.workspace = true
 termwiz.workspace = true
 libc.workspace = true
 chrono.workspace = true
-nucleo-matcher.workspace = true
 ignore.workspace = true
-grep-searcher.workspace = true
-grep-regex.workspace = true
-grep-matcher.workspace = true
+# fff file-search engine (src/fff_backend.rs) + its pure-Rust SIMD matcher for
+# in-memory list fuzzing (palette/gitui/workspace picker).
+fff-search.workspace = true
+neo_frizbee.workspace = true
 notify = "6"
 reqwest = { version = "0.12", default-features = false, features = [
   "blocking",
@@ -64,6 +64,9 @@ pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 # `sz_kit::ratatui` so the Buffer type is identical to what the apps produce.
 sz-kit = { path = "../sz-kit" }
 tokei.workspace = true
+# Symbol-declaration regex (search_everywhere symbol sweep) — extracts the
+# identifier from a definition line returned by fff grep.
+regex.workspace = true
 alacritty_terminal = "0.26"
 toml_edit = "0.25.12"
 # Display-width math: chrome layout (CJK/wide/emoji-aware truncation, so a line

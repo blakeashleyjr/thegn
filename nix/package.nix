@@ -3,6 +3,11 @@
   rustPlatform,
   makeWrapper,
   installShellFiles,
+  # Native build inputs for fff-search's vendored C deps: `pkg-config` + `zlib`
+  # are needed by libgit2-sys → libz-sys (git2 `vendored-libgit2`); lmdb-master-sys
+  # builds its C via the `cc` crate (stdenv compiler, no extra input).
+  pkg-config,
+  zlib,
   # runtime tools superzej shells out to
   git,
   fzf,
@@ -38,9 +43,11 @@ in
 
     cargoLock.lockFile = ../Cargo.lock;
 
-    nativeBuildInputs = [makeWrapper installShellFiles];
+    nativeBuildInputs = [makeWrapper installShellFiles pkg-config];
+    buildInputs = [zlib];
 
     # rusqlite is vendored with the `bundled` feature → no system sqlite needed.
+    # fff-search links vendored libgit2 + LMDB (built from source in-sandbox).
 
     # The host's PTY/pane tests spawn a real `/bin/sh` on a pseudo-terminal,
     # which the hermetic Nix sandbox has neither — they pass under `just test`
