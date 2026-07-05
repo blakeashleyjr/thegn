@@ -48,6 +48,10 @@ language = "auto"
 confirm_delete_workspace = true
 # Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
 full_mode_chip = true
+# Left-click outside an open detail popup (a stat/badge overlay, e.g. the
+# disk-usage popup) to dismiss it, just like pressing Escape. Set false to
+# require Esc.
+dismiss_overlay_on_click_outside = true
 
 # Visual tuning. The focus accent recolors every superzej surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused

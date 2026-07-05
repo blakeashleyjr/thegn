@@ -13,6 +13,7 @@
 //! default (the strict check lives in `superzej config validate`). The
 //! home-manager module renders the file; keys match the serde field names.
 
+use crate::config_defaults::{default_git_context, default_prompt_kind, default_true};
 use crate::env::Environment;
 use crate::remote::GitLoc;
 use crate::util;
@@ -1128,10 +1129,6 @@ pub struct WorktreeTemplate {
     pub commands: Vec<String>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 /// A user-defined keybind action (`[[actions]]`): a chord bound to either a
 /// shell command (`run`) or a built-in composite operation (`action` +
 /// `params`), optionally surfaced in the Cmd+K menu. Exactly one of `run` /
@@ -1187,14 +1184,6 @@ pub struct GitPrompt {
     pub kind: String,
 }
 
-fn default_prompt_kind() -> String {
-    "input".into()
-}
-
-fn default_git_context() -> String {
-    "global".into()
-}
-
 /// A user-defined git custom command (`[[git_commands]]`), lazygit-style: a
 /// key reachable from the git panel's custom-commands menu, whose command
 /// line expands `{{ .SelectedCommit.Sha }}`-style template variables against
@@ -1228,6 +1217,8 @@ pub struct UiConfig {
     pub confirm_delete_workspace: bool,
     /// Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
     pub full_mode_chip: bool,
+    /// Dismiss a detail popup when the user left-clicks outside it, like Escape.
+    pub dismiss_overlay_on_click_outside: bool,
 }
 
 impl Default for UiConfig {
@@ -1236,6 +1227,7 @@ impl Default for UiConfig {
             language: "auto".to_string(),
             confirm_delete_workspace: true,
             full_mode_chip: true,
+            dismiss_overlay_on_click_outside: true,
         }
     }
 }

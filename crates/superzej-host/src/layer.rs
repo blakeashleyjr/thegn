@@ -259,17 +259,15 @@ pub fn clamp_origin(x: usize, y: usize, bw: usize, bh: usize, screen: Rect) -> (
     (x.clamp(screen.x, max_x), y.clamp(screen.y, max_y))
 }
 
-/// Compose a layer onto `surface`: dim → shadow → fill → rounded border +
-/// title + badge. Returns the interior content rect for the caller's
-/// `seg::draw_lines`. `None` when the screen is too small for any box.
-pub fn open_layer(surface: &mut Surface, screen: Rect, spec: &LayerSpec) -> Option<Rect> {
+/// The on-screen OUTER box rect a `spec` occupies after clamping its content to
+/// `screen`, or `None` when the screen is too small for any box. Single source
+/// of truth for `open_layer`'s placement and for mouse hit-testing an open
+/// overlay (only `spec.cols`/`rows`/`anchor` affect the rect).
+pub fn box_rect(spec: &LayerSpec, screen: Rect) -> Option<Rect> {
     if screen.cols < 8 || screen.rows < 4 {
         return None;
     }
-    let cols = spec.cols.min(screen.cols.saturating_sub(6));
-    let rows = spec.rows.min(screen.rows.saturating_sub(3));
-    let bw = cols + 4; // border + 1 pad each side
-    let bh = rows + 2; // top/bottom border
+    let (bw, bh) = box_dims(spec, screen); // border + 1 pad each side / top+bottom
     let center_x = screen.x + (screen.cols - bw) / 2;
     let (bx, by) = match spec.anchor {
         Anchor::Center => (center_x, screen.y + (screen.rows - bh) / 2),
@@ -281,12 +279,22 @@ pub fn open_layer(surface: &mut Surface, screen: Rect, spec: &LayerSpec) -> Opti
         // the box never overflows the screen.
         Anchor::At { x, y } => clamp_origin(x, y, bw, bh, screen),
     };
-    let boxr = Rect {
+    Some(Rect {
         x: bx,
         y: by,
         cols: bw,
         rows: bh,
-    };
+    })
+}
+
+/// Compose a layer onto `surface`: dim → shadow → fill → rounded border +
+/// title + badge. Returns the interior content rect for the caller's
+/// `seg::draw_lines`. `None` when the screen is too small for any box.
+pub fn open_layer(surface: &mut Surface, screen: Rect, spec: &LayerSpec) -> Option<Rect> {
+    let boxr = box_rect(spec, screen)?;
+    let (bx, by, bw) = (boxr.x, boxr.y, boxr.cols);
+    let cols = boxr.cols - 4; // strip border + 1 pad each side
+    let rows = boxr.rows - 2; // strip top/bottom border
 
     if spec.dim {
         dim_rect(surface, screen);
@@ -567,6 +575,58 @@ mod tests {
         let (bw, bh) = box_dims(&spec, screen);
         assert_eq!(bw, (30 - 6) + 4);
         assert_eq!(bh, (8 - 3) + 2);
+    }
+
+    #[test]
+    fn box_rect_matches_open_layer_interior() {
+        let mut s = surface_with_text(40, 12, &" ".repeat(40));
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 12,
+        };
+        for anchor in [Anchor::Center, Anchor::At { x: 5, y: 3 }] {
+            let spec = LayerSpec {
+                cols: 20,
+                rows: 4,
+                anchor,
+                ..LayerSpec::default()
+            };
+            let outer = box_rect(&spec, screen).expect("box fits");
+            let inner = open_layer(&mut s, screen, &spec).expect("layer fits");
+            // Interior is the outer box inset by the border + 1-col pad.
+            assert_eq!(inner.x, outer.x + 2);
+            assert_eq!(inner.y, outer.y + 1);
+            assert_eq!(inner.cols, outer.cols - 4);
+            assert_eq!(inner.rows, outer.rows - 2);
+        }
+    }
+
+    #[test]
+    fn box_rect_at_positions_origin_and_refuses_tiny() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 60,
+            rows: 20,
+        };
+        let spec = LayerSpec {
+            cols: 10,
+            rows: 3,
+            anchor: Anchor::At { x: 7, y: 4 },
+            ..LayerSpec::default()
+        };
+        let outer = box_rect(&spec, screen).expect("fits");
+        assert_eq!((outer.x, outer.y), (7, 4));
+        // Tiny screens have no room for any box.
+        let tiny = Rect {
+            x: 0,
+            y: 0,
+            cols: 6,
+            rows: 3,
+        };
+        assert!(box_rect(&spec, tiny).is_none());
     }
 
     #[test]

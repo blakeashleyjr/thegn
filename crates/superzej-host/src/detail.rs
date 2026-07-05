@@ -644,6 +644,19 @@ impl DetailOverlay {
         self.scroll_to_sel();
     }
 
+    /// The outer box rect this overlay will draw, for outside-click
+    /// hit-testing. Mirrors `render`'s spec geometry exactly (title/badge don't
+    /// affect layout — only cols/rows/placement do).
+    pub fn box_rect(&self, screen: Rect) -> Option<Rect> {
+        let mut spec = LayerSpec {
+            cols: self.cols,
+            rows: self.rows,
+            ..LayerSpec::default()
+        };
+        spec.anchor = self.placement.anchor(&spec, screen);
+        layer::box_rect(&spec, screen)
+    }
+
     /// Paint the overlay as a summoned layer over the composed frame.
     pub fn render(&self, surface: &mut Surface, screen: Rect) {
         let mut spec = LayerSpec {
@@ -2148,6 +2161,30 @@ mod tests {
         assert_eq!((ov.cols, ov.rows), (40, 12));
         // Item in the top half → drops below.
         assert!(matches!(ov.placement, Placement::NearBelow(_)));
+    }
+
+    #[test]
+    fn box_rect_encloses_the_drawn_box() {
+        let model = model_cpu(42);
+        let hist = TelemetryHistory::default();
+        let item = item_at(0);
+        let ov = open_detail_for(
+            &BarItemId::Widget("cpu".into()),
+            item,
+            screen(),
+            &model,
+            &hist,
+        )
+        .expect("cpu has a detail view");
+        let b = ov.box_rect(screen()).expect("box fits");
+        // A NearBelow popup drops beneath its anchor item.
+        assert!(b.y >= item.y + item.rows, "box should sit below the item");
+        let contains = |r: Rect, x: usize, y: usize| {
+            x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows
+        };
+        // A point just inside the box is contained; a far corner is not.
+        assert!(contains(b, b.x + 1, b.y + 1));
+        assert!(!contains(b, 0, 0));
     }
 
     #[test]

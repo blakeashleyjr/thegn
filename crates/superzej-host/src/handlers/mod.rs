@@ -5,6 +5,7 @@
 //! ON the loop and must stay I/O-free.
 
 pub(crate) mod host;
+pub(crate) mod overlay;
 pub(crate) mod panel_changes;
 pub(crate) mod provision;
 pub(crate) mod wizard;

@@ -12416,74 +12416,32 @@ async fn event_loop<T: Terminal>(
                 let mx = (m.x as usize).saturating_sub(1);
                 let my = (m.y as usize).saturating_sub(1);
                 let left = m.mouse_buttons.contains(MouseButtons::LEFT);
-                let contains = |r: Rect, x: usize, y: usize| {
-                    x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows
+                // Front-matter: modal detail-popup capture (outside-click
+                // dismiss), hit-test, and forward into a mouse-reporting pane
+                // app. Consumes the event or hands back the resolved pane.
+                let (hit_pane, frames) = match crate::handlers::overlay::pre_dispatch(
+                    current_config.ui.dismiss_overlay_on_click_outside,
+                    &mut bar_detail,
+                    &m,
+                    mx,
+                    my,
+                    left,
+                    cols,
+                    rows,
+                    &chrome,
+                    &mut app_host,
+                    drawer,
+                    &mut panes,
+                    &mut focus,
+                    &mut session,
+                    &mut mouse_left_down,
+                    &mut mouse_selecting,
+                    &mut mouse_sel,
+                    &mut dirty,
+                ) {
+                    crate::handlers::overlay::MousePre::Consumed => continue,
+                    crate::handlers::overlay::MousePre::Fall(h, f) => (h, f),
                 };
-                let frames = session
-                    .active_tab()
-                    .map(|t| t.center.layout_framed(chrome.center))
-                    .unwrap_or_default();
-                let hit_pane = if app_host.active_tile_mut().is_none()
-                    && let Some(drawer_id) = drawer
-                    && let Some(rect) = chrome.drawer
-                    && contains(rect, mx, my)
-                {
-                    Some((drawer_id, rect))
-                } else {
-                    frames
-                        .iter()
-                        .find(|(_, _, c)| contains(*c, mx, my))
-                        .map(|(id, _, c)| (*id, *c))
-                };
-
-                // Full terminal support: when the app inside the pane asked
-                // for mouse reporting (htop, lazygit, …), forward the event
-                // into the pane instead of handling it ourselves. Holding
-                // Shift bypasses the app and forces host selection — the
-                // convention every terminal uses.
-                if let Some((id, content)) = hit_pane
-                    && !m.modifiers.contains(Modifiers::SHIFT)
-                {
-                    let proto = panes.table.get(&id).map(|p| p.emulator().mouse_mode());
-                    if let Some((mode, sgr)) = proto
-                        && mode != crate::emulator::MouseMode::None
-                    {
-                        use crate::input::{PaneMouse, encode_mouse};
-                        let col = (mx - content.x) as u16;
-                        let row = (my - content.y) as u16;
-                        let ev = if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
-                            if m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) {
-                                Some(PaneMouse::WheelUp)
-                            } else {
-                                Some(PaneMouse::WheelDown)
-                            }
-                        } else if left && !mouse_left_down {
-                            // A press also focuses the pane.
-                            focus.zone = crate::focus::Zone::Center;
-                            if let Some(tab) = session.active_tab_mut() {
-                                tab.focused_pane = id;
-                            }
-                            mouse_sel = None;
-                            dirty = true;
-                            Some(PaneMouse::Press(0))
-                        } else if left && mouse_left_down {
-                            Some(PaneMouse::Drag(0))
-                        } else if !left && mouse_left_down {
-                            Some(PaneMouse::Release(0))
-                        } else {
-                            Some(PaneMouse::Move)
-                        };
-                        if let Some(ev) = ev
-                            && let Some(bytes) = encode_mouse(ev, mode, sgr, col, row)
-                            && let Some(p) = panes.table.get_mut(&id)
-                        {
-                            let _ = p.write_input(&bytes);
-                        }
-                        mouse_left_down = left;
-                        mouse_selecting = false;
-                        continue;
-                    }
-                }
 
                 // Wheel over a pane scrolls its scrollback; over the panel /
                 // sidebar it scrolls THAT widget (never the terminal behind).
@@ -12517,7 +12475,7 @@ async fn event_loop<T: Terminal>(
                             scroll_only = true;
                             scroll_pane = Some(id);
                         }
-                    } else if chrome.panel.is_some_and(|r| contains(r, mx, my)) {
+                    } else if chrome.panel.is_some_and(|r| r.contains(mx, my)) {
                         // The inline file preview owns the wheel while open:
                         // scroll its viewport instead of walking the tree /
                         // accordion behind it. Coalesce the whole gesture's
@@ -12576,7 +12534,7 @@ async fn event_loop<T: Terminal>(
                             );
                         }
                         dirty = true;
-                    } else if let Some(r) = chrome.sidebar.filter(|r| contains(*r, mx, my)) {
+                    } else if let Some(r) = chrome.sidebar.filter(|r| r.contains(mx, my)) {
                         let visible = SidebarState::visible_len(&model);
                         if up {
                             sb.cursor = sb.cursor.saturating_sub(3);
@@ -12593,7 +12551,7 @@ async fn event_loop<T: Terminal>(
                 } else if left && !mouse_left_down {
                     // Press: focus whatever is under the cursor. A click on
                     // the dormant center dismisses the launch splash.
-                    if center_dormant && contains(chrome.center, mx, my) {
+                    if center_dormant && chrome.center.contains(mx, my) {
                         center_dormant = false;
                         need_relayout = true;
                     }
@@ -12612,13 +12570,13 @@ async fn event_loop<T: Terminal>(
                         let cell = ((my - content.y) as u16, (mx - content.x) as u16);
                         mouse_sel = Some((id, crate::copymode::Selection::new(cell)));
                         mouse_selecting = true;
-                    } else if contains(chrome.masthead_stats_row(), mx, my) {
+                    } else if chrome.masthead_stats_row().contains(mx, my) {
                         // Click a masthead stat item to focus it + open its
                         // detail view (CPU graph, etc.).
                         let hit = crate::chrome::masthead_item_spans(&model, &chrome)
                             .into_iter()
                             .enumerate()
-                            .find(|(_, (_, r))| contains(*r, mx, my));
+                            .find(|(_, (_, r))| r.contains(mx, my));
                         if let Some((idx, (id, rect))) = hit {
                             focus.zone = crate::focus::Zone::Masthead;
                             model.masthead_sel = idx;
@@ -12658,13 +12616,13 @@ async fn event_loop<T: Terminal>(
                                 schedule_toast_clear(&waker);
                             }
                         }
-                    } else if contains(chrome.statusbar, mx, my) {
+                    } else if chrome.statusbar.contains(mx, my) {
                         // Click a statusbar item/badge to focus it + open its
                         // detail (notifications list, agent detail, …).
                         let hit = crate::chrome::statusbar_item_spans(&model, chrome.statusbar)
                             .into_iter()
                             .enumerate()
-                            .find(|(_, (_, r))| contains(*r, mx, my));
+                            .find(|(_, (_, r))| r.contains(mx, my));
                         if let Some((idx, (id, rect))) = hit {
                             focus.zone = crate::focus::Zone::Statusbar;
                             model.statusbar_sel = idx;
@@ -12684,7 +12642,7 @@ async fn event_loop<T: Terminal>(
                                 );
                             }
                         }
-                    } else if contains(chrome.center_tabs, mx, my) {
+                    } else if chrome.center_tabs.contains(mx, my) {
                         // Click a tab chip to switch tabs within the worktree.
                         if let Some(i) =
                             crate::chrome::center_tab_hit(&model, chrome.center_tabs, mx)
@@ -12705,7 +12663,7 @@ async fn event_loop<T: Terminal>(
                                 chrome.center,
                             );
                         }
-                    } else if let Some(r) = chrome.sidebar.filter(|r| contains(*r, mx, my)) {
+                    } else if let Some(r) = chrome.sidebar.filter(|r| r.contains(mx, my)) {
                         focus.zone = crate::focus::Zone::Sidebar;
                         sb.focused = true;
                         sb.sync(&mut model);
@@ -12751,7 +12709,7 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                         }
-                    } else if let Some(r) = chrome.panel.filter(|r| contains(*r, mx, my)) {
+                    } else if let Some(r) = chrome.panel.filter(|r| r.contains(mx, my)) {
                         focus.zone = crate::focus::Zone::Panel;
                         // Resolve the click against the same frame the
                         // renderer painted — placement can never drift.

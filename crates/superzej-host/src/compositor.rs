@@ -18,6 +18,13 @@ pub struct Rect {
     pub rows: usize,
 }
 
+impl Rect {
+    /// Whether cell `(x, y)` falls inside this rect.
+    pub fn contains(&self, x: usize, y: usize) -> bool {
+        x >= self.x && x < self.x + self.cols && y >= self.y && y < self.y + self.rows
+    }
+}
+
 fn color_attr(c: CellColor) -> ColorAttribute {
     match c {
         CellColor::Default => ColorAttribute::Default,
