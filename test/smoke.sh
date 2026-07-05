@@ -231,6 +231,16 @@ check "repo list --json parses" \
 check "ci runs --json degrades gracefully" \
   "'$SZ' ci runs --worktree '$WT' --json >/dev/null 2>&1"
 
+# Grouped help + shell completions.
+check "--help shows the Workspace group" "'$SZ' --help | grep -q 'Workspace:'"
+check "--help shows the Forge group" "'$SZ' --help | grep -q 'Forge:'"
+check "--help hides the legacy verbs" \
+  "! '$SZ' --help | grep -qE '^  (repos|recent) '"
+check "completions bash emits a script" \
+  "'$SZ' completions bash | grep -qi complete"
+check "completions zsh emits a compdef" \
+  "'$SZ' completions zsh | grep -q compdef"
+
 # Named execution environments: list the library and resolve one for a worktree.
 check "env list reports the default env" \
   "'$SZ' env list | grep -q 'default env:'"

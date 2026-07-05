@@ -20,6 +20,7 @@ mod build_cache;
 mod caps;
 mod center;
 mod chrome;
+mod cli_help;
 mod clipboard;
 mod cmd;
 mod compositor;
@@ -301,6 +302,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Generate shell completions (bash/zsh/fish/elvish/powershell) for the
+    /// invoked binary name — `superzej completions zsh > …/_superzej`.
+    Completions { shell: clap_complete::Shell },
     /// Hidden: run the resident bridge agent over stdio. The host spawns this
     /// *inside* a remote env (`ssh … szhost bridge`, `sprite exec … szhost
     /// bridge`); it speaks the framed bridge protocol (git/fs/proc) on stdin/
@@ -404,7 +408,14 @@ fn main() -> anyhow::Result<()> {
     // worktree add` leak `core.worktree` into the shared main `.git/config`.
     superzej_core::util::scrub_git_env();
 
-    let mut cli = Cli::parse();
+    // Parse through the grouped-help wrapper (cli_help) so top-level --help
+    // renders commands under semantic headings; behavior is otherwise
+    // identical to `Cli::parse()`.
+    let matches = cli_help::attach(<Cli as clap::CommandFactory>::command())
+        .try_get_matches()
+        .unwrap_or_else(|e| e.exit());
+    let mut cli =
+        <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     if let Some(lvl) = cli.log_level.as_deref() {
         cli.overrides.push(format!("log.level={lvl}"));
     }
@@ -528,6 +539,21 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Doctor { json } => cmd::doctor::run(&cfg, json),
+        Command::Completions { shell } => {
+            // Generate against the same grouped command tree the parser uses,
+            // named for the invoked alias (szhost / superzej / sj).
+            let mut tree = cli_help::attach(<Cli as clap::CommandFactory>::command());
+            let bin = std::env::args()
+                .next()
+                .and_then(|p| {
+                    std::path::Path::new(&p)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "szhost".into());
+            clap_complete::generate(shell, &mut tree, bin, &mut std::io::stdout());
+            Ok(())
+        }
         Command::Bridge => {
             // The resident agent: framed protocol over stdio until EOF. stdout is
             // the protocol channel — nothing else may write to it.
