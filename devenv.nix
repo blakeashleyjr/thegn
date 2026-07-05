@@ -5,6 +5,11 @@
   packages = with pkgs; [
     # task runner
     just
+    # faster test runner (`just test` → `cargo nextest run`) + faster linker
+    # (mold, wired via CARGO_TARGET_*_RUSTFLAGS below). Both cut the pre-push
+    # + CI compile/test cost.
+    cargo-nextest
+    mold
     # coverage gate (`just coverage`) + visual-regression harness
     cargo-llvm-cov
     python3
@@ -42,6 +47,15 @@
   env.OPENSPEC_TELEMETRY = "0";
   env.DO_NOT_TRACK = "1";
 
+  # Link with mold on the linux-gnu host triple — a large cut to incremental
+  # link time for every cargo invocation (build/clippy/test/coverage). Scoped
+  # to THIS triple via the CARGO_TARGET_<triple>_RUSTFLAGS env var (not
+  # .cargo/config.toml) so it never touches the `check-cross` macOS/Windows/wasm
+  # targets and never leaks into the `nix build .#default` package derivation
+  # (which doesn't enter this shell — so it needs no mold build input). Requires
+  # mold on PATH (added to `packages` above); gcc's `-fuse-ld=mold` picks it up.
+  env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
+
   # Use the nixpkgs toolchain (no channel/rust-overlay) so rustfmt/clippy match
   # the flake's treefmt + checks exactly — avoids formatter version skew.
   languages.rust.enable = true;
@@ -73,28 +87,51 @@
         prettier
       ];
     };
-    # linters — these are checks, not formatters; kept as separate hooks
-    clippy.enable = true;
+    # linters — these are checks, not formatters; kept as separate hooks.
+    # shellcheck/yamllint are cheap + staged-file, so they stay on pre-commit.
+    # clippy compiles the whole workspace, so it moves to pre-push (see below).
+    clippy = {
+      enable = true;
+      stages = ["pre-push"];
+    };
     shellcheck.enable = true;
     yamllint.enable = true;
 
+    # god-file ratchet: legacy oversized files may only shrink, new files are
+    # hard-capped at 3000 lines (test/file-size-ratchet.sh, also in `just lint`).
+    # ~1s and reads the tree, not staged files — cheap enough to catch growth at
+    # commit time rather than only in CI.
+    file-size-ratchet = {
+      enable = true;
+      name = "god-file ratchet";
+      entry = "bash test/file-size-ratchet.sh";
+      language = "system";
+      pass_filenames = false;
+      stages = ["pre-commit"];
+    };
+
     # ── Tiered gates ──────────────────────────────────────────────────────
-    # pre-commit stays fast (formatting + lint + unit tests); the heavier
-    # coverage gate runs on pre-push (and in CI via `just ci`).
+    # pre-commit stays CHEAP (formatting + shell/yaml lint + the god-file
+    # ratchet) so commits are near-instant. The correctness gates — clippy, the
+    # full test suite, coverage, and smoke — run on pre-push (before code leaves
+    # the machine) and in CI via `just ci`. This defers the semantic-merge check
+    # (a stale call site across a clean auto-merge) from merge time to push time;
+    # it is still caught before the merge is pushed, and always by CI.
     #
     # git hooks run with GIT_DIR and GIT_INDEX_FILE set. This leaks into the
     # git subprocesses spawned by `cargo test`, causing spurious failures in
     # repository manipulation tests. Strip them via `env -u` so tests run in a
     # clean git environment. Likewise drop SUPERZEJ_SANDBOX: committing from a
     # shell running inside a live superzej bwrap sandbox leaks the =1 marker
-    # into the runner and false-fails the sandbox argv tests.
+    # into the runner and false-fails the sandbox argv tests. `just test` runs
+    # cargo-nextest (faster) + a doctest pass — one source of truth with CI.
     cargo-test = {
       enable = true;
       name = "cargo test";
-      entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u SUPERZEJ_SANDBOX cargo test --workspace";
+      entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u SUPERZEJ_SANDBOX just test";
       language = "system";
       pass_filenames = false;
-      stages = ["pre-commit"];
+      stages = ["pre-push"];
     };
     coverage = {
       enable = true;
