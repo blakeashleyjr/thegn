@@ -20,6 +20,7 @@ use superzej_core::capacity::{HostCapacity, HostOwnership, MeasuredLoad};
 use superzej_core::config::{Config, EnvConfig, PlacementMode};
 use superzej_core::config_placement::{OnExhaustion, ResolvedPlacement, resolve_placement};
 use superzej_core::db::Db;
+use superzej_core::db_compute::{ComputeVerdict, check_compute_budget};
 use superzej_core::host::{HostFailure, HostId, HostStep};
 use superzej_core::host_config::{HostBinding, HostConfig, HostReach};
 use superzej_core::host_machine::HostState;
@@ -28,8 +29,8 @@ use superzej_core::scheduler::{
     PlacementRequest, decide_placement,
 };
 use superzej_core::store::{
-    HostStore, PlacementEventRow, PlacementStore, ReserveOutcome, TenancyMode, TenancyRow,
-    TenancyState, ZoneStore,
+    HealthMarker, HostStore, PlacementEventRow, PlacementStore, ReserveOutcome, TenancyMode,
+    TenancyRow, TenancyState, WorkspaceStore, ZoneStore,
 };
 use superzej_core::trust_class::{TrustClass, effective_class, required_class};
 
@@ -466,6 +467,39 @@ pub(crate) fn place(
                 continue;
             }
             PlacementDecision::Provision { template } => {
+                // Autoscale is a PAID lane: the compute ledger gates it.
+                match budget_verdict(&db, &zone, resolved.on_exhaustion) {
+                    ComputeVerdict::Allow => {}
+                    verdict => {
+                        if try_spillover(cfg, &db, worktree, &zone, resolved.on_exhaustion, &trace)
+                        {
+                            return Ok(None);
+                        }
+                        record_event(&db, worktree, "queued", "budget", &trace);
+                        return match verdict {
+                            ComputeVerdict::Refuse(why)
+                                if resolved.on_exhaustion == OnExhaustion::Error =>
+                            {
+                                Err(HostFailure {
+                                    step: HostStep::Connect,
+                                    error: format!("placement: {why}"),
+                                    retryable: true,
+                                })
+                            }
+                            ComputeVerdict::Refuse(why) => {
+                                superzej_core::msg::warn(&format!("placement: {why}"));
+                                Ok(None)
+                            }
+                            _ => {
+                                superzej_core::msg::warn(
+                                    "placement: compute cap reached; queued (paid lanes paused)",
+                                );
+                                crate::autoscale::queue_worktree(worktree);
+                                Ok(None)
+                            }
+                        };
+                    }
+                }
                 record_event(&db, worktree, "provision", &template.lane_key(), &trace);
                 match crate::autoscale::provision_managed(cfg, &db, &template) {
                     Ok(host_name) => {
@@ -499,18 +533,27 @@ pub(crate) fn place(
                 }
             }
             PlacementDecision::Queue => {
+                if try_spillover(cfg, &db, worktree, &zone, resolved.on_exhaustion, &trace) {
+                    return Ok(None);
+                }
                 record_event(&db, worktree, "queued", "", &trace);
                 superzej_core::msg::warn(
-                    "placement: no eligible host; queued — retrying on the next maintainer tick",
+                    "placement: no eligible host; queued — re-open to place once capacity frees",
                 );
                 crate::autoscale::queue_worktree(worktree);
                 return Ok(None);
             }
             PlacementDecision::Reject => {
+                if try_spillover(cfg, &db, worktree, &zone, resolved.on_exhaustion, &trace) {
+                    return Ok(None);
+                }
                 record_event(&db, worktree, "rejected", "", &trace);
                 return Ok(None);
             }
             PlacementDecision::Halt => {
+                if try_spillover(cfg, &db, worktree, &zone, resolved.on_exhaustion, &trace) {
+                    return Ok(None);
+                }
                 record_event(&db, worktree, "error", "", &trace);
                 return Err(HostFailure {
                     step: HostStep::Connect,
@@ -639,6 +682,96 @@ pub(crate) fn plan(cfg: &Config, worktree: &str) -> Option<PlanOutput> {
     })
 }
 
+/// The paid-lane budget verdict for this worktree's zone.
+fn budget_verdict(db: &Db, zone: &str, on_exhaustion: OnExhaustion) -> ComputeVerdict {
+    check_compute_budget(
+        db,
+        (!zone.is_empty()).then_some(zone),
+        on_exhaustion == OnExhaustion::Queue,
+    )
+}
+
+/// The spillover lane: pick the first healthy, budget-clear entry of
+/// `[placement] spillover_envs` (provider-placement envs riding the existing
+/// pipeline), persist it as the worktree's env selection, and let the
+/// materialize continue — downstream provisioning re-resolves the env and
+/// lands on the vendor. Sticky: the selection persists for the worktree's
+/// life; fail-back affects new placements only.
+fn try_spillover(
+    cfg: &Config,
+    db: &Db,
+    worktree: &str,
+    zone: &str,
+    on_exhaustion: OnExhaustion,
+    trace: &str,
+) -> bool {
+    let order = &cfg.placement.spillover_envs;
+    if order.is_empty() {
+        return false;
+    }
+    let now_ms = unix_now() * 1000;
+    let marker_for = |env: &str| -> Option<superzej_core::spillover::SpillState> {
+        let m = db.health_get(&format!("provider:{env}")).ok().flatten()?;
+        Some(superzej_core::spillover::SpillState {
+            kind: superzej_core::spillover::SpillKind::parse(&m.kind)
+                .unwrap_or(superzej_core::spillover::SpillKind::CreateFailure),
+            retry_at_ms: m.retry_at_ms,
+        })
+    };
+    let budget_ok = |_env: &str| budget_verdict(db, zone, on_exhaustion) == ComputeVerdict::Allow;
+    let picked = superzej_core::spillover::pick_spillover(order, &marker_for, &budget_ok, now_ms)
+        .map(str::to_string);
+    let Some(env) = picked else { return false };
+    // A spillover env must actually exist with a provider placement.
+    if !cfg
+        .env
+        .get(&env)
+        .is_some_and(|e| matches!(e.placement, PlacementMode::Provider))
+    {
+        superzej_core::msg::warn(&format!(
+            "placement: spillover env {env:?} is not a [env.*] provider placement; skipping"
+        ));
+        return false;
+    }
+    if db.set_worktree_env(worktree, &env).is_err() {
+        return false;
+    }
+    record_event(db, worktree, "spillover", &format!("env:{env}"), trace);
+    superzej_core::msg::info(&format!(
+        "placement: pool exhausted — spilling {worktree} to provider env {env}"
+    ));
+    true
+}
+
+/// Record a spillover env's provisioning failure so the picker cools it down
+/// (or parks it budget-dead) — called from the provision error path.
+pub(crate) fn note_spillover_failure(cfg: &Config, worktree: &str, error: &str) {
+    let Ok(db) = Db::open() else { return };
+    let env = db.effective_env(worktree, "").unwrap_or_default();
+    if !cfg.placement.spillover_envs.contains(&env) {
+        return;
+    }
+    let kind = superzej_core::spillover::classify_spill(None, error);
+    let key = format!("provider:{env}");
+    let consecutive = db
+        .health_get(&key)
+        .ok()
+        .flatten()
+        .map(|m| m.consecutive + 1)
+        .unwrap_or(1);
+    let now_ms = unix_now() * 1000;
+    let cooldown = superzej_core::spillover::spill_cooldown_ms(kind, consecutive, None);
+    // best-effort: health is advisory, provisioning already surfaced the error
+    let _ = db.health_mark(&HealthMarker {
+        key,
+        kind: kind.as_str().to_string(),
+        reason: error.chars().take(200).collect(),
+        since_ms: now_ms,
+        retry_at_ms: now_ms + cooldown,
+        consecutive,
+    });
+}
+
 /// Mark this worktree's tenancy `active` (provision reached its marker).
 pub(crate) fn mark_active(worktree: &str) {
     if let Ok(db) = Db::open() {
@@ -687,6 +820,16 @@ pub(crate) fn maintain_tick(cfg: &Config) {
     let cfg = cfg.clone();
     std::thread::spawn(move || {
         sweep_stale();
+        if let Ok(db) = Db::open() {
+            use superzej_core::store::ComputeLedgerStore;
+            superzej_core::zone::sync_compute_budget_caps(&cfg, &db);
+            // Watermark accrual: idempotent, catch-up-correct — cadence only
+            // affects display freshness, never totals.
+            let now_ms = unix_now() * 1000;
+            for m in db.live_compute_meters().unwrap_or_default() {
+                let _ = db.accrue_compute_meter(&m.resource, now_ms);
+            }
+        }
         crate::autoscale::scaledown_tick(&cfg);
         for wt in crate::autoscale::nudge_queued() {
             superzej_core::msg::info(&format!(

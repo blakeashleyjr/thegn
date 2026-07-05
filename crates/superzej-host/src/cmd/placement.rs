@@ -39,6 +39,21 @@ pub enum Action {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Compute spend ledger: show scopes, set caps, kill/unkill paid lanes.
+    Budget {
+        /// Scope (`global`, `zone:<name>`, `provider:<name>`); default global.
+        #[arg(long, default_value = "global")]
+        scope: String,
+        /// Set the monthly USD cap for the scope (0 clears it).
+        #[arg(long)]
+        set_limit: Option<f64>,
+        /// Kill-switch: refuse ALL paid lanes for the scope.
+        #[arg(long)]
+        kill: bool,
+        /// Release the kill-switch.
+        #[arg(long)]
+        unkill: bool,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -47,7 +62,70 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Plan { worktree, json } => plan(cfg, worktree, json),
         Action::Explain { worktree, json } => explain(worktree, json),
         Action::Events { limit } => events(limit),
+        Action::Budget {
+            scope,
+            set_limit,
+            kill,
+            unkill,
+        } => budget(cfg, &scope, set_limit, kill, unkill),
     }
+}
+
+fn budget(
+    cfg: &Config,
+    scope: &str,
+    set_limit: Option<f64>,
+    kill: bool,
+    unkill: bool,
+) -> Result<()> {
+    use superzej_core::store::ComputeLedgerStore;
+    let db = Db::open()?;
+    // Config-declared caps land first (the zone-CLI idiom), so `show` is live.
+    superzej_core::zone::sync_compute_budget_caps(cfg, &db);
+    if let Some(limit) = set_limit {
+        let cap = (limit > 0.0).then_some(limit);
+        db.set_compute_budget_limits(scope, "monthly", cap, 0)?;
+        outln!(
+            "{scope}: cap {}",
+            cap.map(|c| format!("{c:.2} USD/mo"))
+                .unwrap_or("cleared".into())
+        );
+    }
+    if kill {
+        db.set_compute_kill_switch(scope, true)?;
+        outln!("{scope}: kill-switch ON (all paid lanes refused)");
+    }
+    if unkill {
+        db.set_compute_kill_switch(scope, false)?;
+        outln!("{scope}: kill-switch off");
+    }
+    match db.compute_budget(scope)? {
+        Some(b) => outln!(
+            "{}: spent {:.2} USD / cap {}  killed: {}",
+            b.scope,
+            b.spent_cost,
+            b.limit_cost
+                .map(|l| format!("{l:.2}"))
+                .unwrap_or("none".into()),
+            b.killed,
+        ),
+        None => outln!("{scope}: no spend recorded"),
+    }
+    // Live meters give the "what is billing right now" answer.
+    for m in db.live_compute_meters()? {
+        outln!(
+            "  meter {}  {}  {:.4} USD/h  ({})",
+            m.resource,
+            m.category,
+            m.rate_hourly,
+            if m.rate_hourly == 0.0 {
+                "unpriced"
+            } else {
+                &m.provider
+            },
+        );
+    }
+    Ok(())
 }
 
 fn cwd_worktree(explicit: Option<String>) -> String {

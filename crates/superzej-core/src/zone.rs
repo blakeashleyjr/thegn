@@ -56,6 +56,10 @@ pub struct ZoneBudget {
     /// Cost ceiling in USD for the period (`0`/absent ⇒ none).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_cost: Option<f64>,
+    /// COMPUTE cost ceiling in USD for the period (the placement engine's
+    /// ledger — separate from the model-spend caps above).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_compute_cost: Option<f64>,
 }
 
 /// The rank used by the sandbox-profile floor (higher = stricter). Kept in sync
@@ -162,6 +166,29 @@ pub fn sync_budget_caps<S: crate::store::ProxyStore>(
     }
 }
 
+/// Push each zone's COMPUTE cap (+ the global `[placement] max_monthly_spend`)
+/// into the compute ledger — spend preserved, same contract as
+/// [`sync_budget_caps`]. Best-effort; call at startup + placement CLI.
+pub fn sync_compute_budget_caps<S: crate::store::ComputeLedgerStore>(
+    cfg: &crate::config::Config,
+    db: &S,
+) {
+    if cfg.placement.max_monthly_spend > 0.0 {
+        let _ = db.set_compute_budget_limits(
+            "global",
+            "monthly",
+            Some(cfg.placement.max_monthly_spend),
+            0,
+        );
+    }
+    for (name, zc) in &cfg.zone {
+        if let Some(limit) = zc.budget.as_ref().and_then(|b| b.limit_compute_cost) {
+            let _ =
+                db.set_compute_budget_limits(&format!("zone:{name}"), "monthly", Some(limit), 0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +291,7 @@ mod tests {
                 budget: Some(ZoneBudget {
                     limit_tokens: Some(10_000),
                     limit_cost: Some(50.0),
+                    limit_compute_cost: None,
                 }),
                 ..Default::default()
             },

@@ -44,12 +44,10 @@ use std::path::PathBuf;
 /// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
 /// v20: adds `worktree_disk` (size caches: disk badges, warning, `superzej disk`).
 /// v22: adds `merge_queue` (fold-actor queue/results; `superzej integrate`).
-/// v23: adds `group_tabs.pane_sessions` (per-leaf provider exec session, JSON
-/// `pane id → {provider, id, session}`) so a native-exec (provider WSS) pane
-/// reattaches to its live remote session — replaying scrollback — on restart.
+/// v23: adds `group_tabs.pane_sessions` (per-leaf provider exec session JSON,
+/// so native-exec panes reattach to their live remote session on restart).
 /// v24: adds `forwards` (the resurrection layer for auto port forwards, `[forward]`).
-/// v27: adds `registers` (persisted vim-style yank registers `"a`–`"z`/`"0`–`"9`;
-/// the volatile `"+` system-clipboard register is never persisted).
+/// v27: adds `registers` (persisted vim yank registers; `"+` never persisted).
 /// v28: re-keys `my_work_cache` to per-scope rows (repo root, or `"*"` for all).
 /// v29: adds `group_tabs.scrollback_snapshot` (per-leaf captured scrollback tail,
 /// JSON `pane id → text`) so a resurrected pane repaints its recent history
@@ -62,7 +60,7 @@ use std::path::PathBuf;
 /// v34: adds `host_capacity`/`host_tenancy`/`placement_health`/`placement_events`
 /// (the placement engine; see [`crate::db_placement`]).
 /// v35: `hosts` gains `headroom_json`/`last_headroom` (the measured layer).
-/// v36: reserved for the placement branch's compute ledger.
+/// v36: adds `compute_budgets`/`compute_meters` (see [`crate::db_compute`]).
 /// v37: adds `intents` (the CLI→compositor mailbox behind `superzej open`;
 /// see [`crate::store::IntentStore`]).
 pub const SCHEMA_VERSION: i64 = 37;
@@ -641,6 +639,7 @@ impl Db {
         crate::host_db::migrate_v30(&conn)?;
         crate::db_placement::migrate_v34(&conn)?;
         crate::host_db::migrate_v35(&conn);
+        crate::db_compute::migrate_v36(&conn)?;
         Ok(Db {
             conn,
             schema_mismatch,

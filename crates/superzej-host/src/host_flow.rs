@@ -285,15 +285,23 @@ pub(crate) fn provision_worktree(
                 set_ready_init(worktree, init);
             }
             let out = crate::agent::provision_worktree(cfg, worktree, progress);
-            if out.is_ok() {
-                // Engine tenancy (if any) is now backed by a live sandbox.
-                crate::placement_flow::mark_active(worktree);
-            } else {
-                crate::placement_flow::release(worktree);
+            match &out {
+                Ok(_) => crate::placement_flow::mark_active(worktree),
+                Err(e) => {
+                    crate::placement_flow::release(worktree);
+                    crate::placement_flow::note_spillover_failure(cfg, worktree, &e.to_string());
+                }
             }
             out
         }
-        Ok(_) => crate::agent::provision_worktree(cfg, worktree, progress),
+        Ok(_) => {
+            let out = crate::agent::provision_worktree(cfg, worktree, progress);
+            if let Err(e) = &out {
+                // A spilled-over worktree's provider failure cools its lane.
+                crate::placement_flow::note_spillover_failure(cfg, worktree, &e.to_string());
+            }
+            out
+        }
         Err(f) => {
             // The reservation must not outlive a failed provision.
             crate::placement_flow::release(worktree);
