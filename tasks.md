@@ -351,7 +351,7 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 - [x] 3. ~~Thin zellij WASM plugins~~ — **REMOVED**: chrome (sidebar/panel/tabbar/statusbar) is in-process in `superzej-host`
 - [ ] 4. ~~Daemon↔plugin IPC~~ — **N/A after strip**: no separate plugin process; the future native plugin API contract lives in `core/plugin_api.rs` (unwired)
 - [x] 5. Single-binary distribution — one `superzej`(=`szhost`); no side artifacts
-- [~] 6. One core, many front doors — TUI (host) + CLI verbs share `superzej-core`; API/MCP still aspirational (AK/AL)
+- [~] 6. One core, many front doors — TUI (host) + CLI verbs share `superzej-core`; API/MCP still aspirational (AK/AL) _(CLI surface v2 — `wt`/`repo` namespaces, headless `wt new`/`rm`, blanket `--json`, grouped help, completions, `open` remote control: `openspec/changes/add-cli-namespaces-and-remote-open/`)_
 - [ ] 7. Headless daemon — UI attaches/detaches _(not yet; host is a foreground compositor, state resurrects from SQLite)_
 - [ ] 8. Daemon supervision — crash recovery _(state resurrection only; no supervisor)_
 - [x] 9. Internal event bus — normalized events _(first-class `EventBus` in `superzej-core`: subscribe/publish, urgency ranking, desktop-notification derivation)_
@@ -1093,7 +1093,7 @@ notifications inbox (428)._
 - [ ] 451. SSE/WebSocket event feed
 - [ ] 452. Auth scopes/tokens
 - [ ] 453. Pagination/filtering
-- [~] 454. Headless CLI over the API
+- [~] 454. Headless CLI over the API _(headless seams landing CLI-first: `wt new`/`rm`, `open --no-launch`, blanket `--json` + exit-code contract — `openspec/changes/add-cli-namespaces-and-remote-open/`)_
 
 ### AL. MCP server
 
