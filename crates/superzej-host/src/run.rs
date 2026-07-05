@@ -1333,7 +1333,7 @@ pub(crate) struct SidebarState {
     cursor: usize,
     filtering: bool,
     /// Marked visible-row indices for bulk actions (item 26).
-    marked: std::collections::HashSet<usize>,
+    pub(crate) marked: std::collections::HashSet<usize>,
     /// Open context menu, if any (item 27).
     menu: Option<crate::chrome::RowMenu>,
     /// Adjustable bar width in columns (item 25); `None` = layout default.
@@ -1437,7 +1437,7 @@ impl SidebarState {
         model.sidebar_rail = self.mode == crate::layout::SidebarMode::Rail;
     }
 
-    fn focus_active_row(&mut self, model: &mut FrameModel) {
+    pub(crate) fn focus_active_row(&mut self, model: &mut FrameModel) {
         self.cursor = visible_index_of_active(model);
         self.sync(model);
     }
@@ -2483,7 +2483,7 @@ fn file_active_worktree(session: &crate::session::Session, folder: &str) -> Resu
 /// DELETE these worktree groups from disk (`git worktree remove`, branch
 /// kept) and close them. Home groups are never deletable. Returns the status
 /// line summarizing what happened.
-fn deletable_group_targets(
+pub(crate) fn deletable_group_targets(
     session: &crate::session::Session,
     targets: Vec<usize>,
 ) -> (Vec<usize>, usize) {
@@ -2644,7 +2644,7 @@ fn connect_worktree_bridge(
     });
 }
 
-fn delete_groups(
+pub(crate) fn delete_groups(
     session: &mut crate::session::Session,
     panes: &mut Panes,
     mut targets: Vec<usize>,
@@ -14889,66 +14889,25 @@ async fn event_loop<T: Terminal>(
                             continue;
                         }
                         SidebarOutcome::DeleteGroups(targets) => {
-                            let (mut targets, skipped_home) =
-                                deletable_group_targets(&session, targets);
-                            let names: Vec<String> = targets
-                                .iter()
-                                .filter_map(|&g| session.worktrees.get(g))
-                                .map(|g| g.name.clone())
-                                .collect();
-                            if targets.is_empty() {
-                                model.status = if skipped_home > 0 {
-                                    "Root workspace cannot be deleted".into()
-                                } else {
-                                    "No worktree selected".into()
-                                };
-                                dirty = true;
-                                continue;
-                            }
-                            if current_config.confirm_delete {
-                                active_menu = Some(menu::delete_worktree_menu(
-                                    names.len(),
-                                    &names.join(", "),
-                                ));
-                                pending_confirm_delete_worktrees = Some(targets);
-                            } else {
-                                // Capture the active group name to restore focus after indices shift
-                                let active_group_name =
-                                    session.active_group().map(|g| g.name.clone());
-
-                                // Sort targets descending so deletion doesn't shift upcoming indices
-                                targets.sort_unstable_by(|a, b| b.cmp(a));
-
-                                model.status = delete_groups(
-                                    &mut session,
-                                    &mut panes,
-                                    targets,
-                                    false,
-                                    Some(waker.clone()),
-                                );
-
-                                // Restore focus based on stable name
-                                if let Some(target_name) = active_group_name
-                                    && let Some(new_idx) =
-                                        session.worktrees.iter().position(|g| g.name == target_name)
-                                {
-                                    session.switch_to(new_idx);
-                                }
-
-                                sb.marked.clear();
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                sb.focus_active_row(&mut model);
-                                need_relayout = true;
-                                sync_drawer_persistence(
-                                    &session,
-                                    &mut panes,
-                                    &mut drawer,
-                                    &mut drawer_pool,
-                                    &mut drawer_home,
-                                    keymap.config(),
-                                    chrome.center,
-                                );
-                            }
+                            crate::handlers::worktree_delete::request_group_delete(
+                                crate::handlers::worktree_delete::DeleteCtx {
+                                    session: &mut session,
+                                    panes: &mut panes,
+                                    model: &mut model,
+                                    sb: &mut sb,
+                                    drawer: &mut drawer,
+                                    drawer_pool: &mut drawer_pool,
+                                    drawer_home: &mut drawer_home,
+                                    active_menu: &mut active_menu,
+                                    pending: &mut pending_confirm_delete_worktrees,
+                                    need_relayout: &mut need_relayout,
+                                    waker: &waker,
+                                    cfg: keymap.config(),
+                                    center: chrome.center,
+                                    confirm_delete: current_config.confirm_delete,
+                                },
+                                targets,
+                            );
                             dirty = true;
                             continue;
                         }
@@ -19065,49 +19024,31 @@ async fn event_loop<T: Terminal>(
                                 need_relayout = true;
                             }
                             Action::CloseWorktree => {
-                                // Remove the active worktree group via the same menu +
-                                // disk-removal path as the sidebar `D` delete: the menu
-                                // defaults to "delete from disk" (keep-files / cancel are
-                                // reachable by moving). Never remove the root/home checkout.
-                                let (targets, _skipped) =
-                                    deletable_group_targets(&session, vec![session.active]);
-                                if targets.is_empty() {
-                                    model.status = "Root workspace cannot be removed".into();
-                                    dirty = true;
-                                    continue;
-                                }
-                                let name = session
-                                    .active_group()
-                                    .map(|g| g.name.clone())
-                                    .unwrap_or_else(|| "worktree".into());
-                                if current_config.confirm_delete {
-                                    active_menu =
-                                        Some(menu::delete_worktree_menu(targets.len(), &name));
-                                    pending_confirm_delete_worktrees = Some(targets);
-                                } else {
-                                    // confirm disabled — remove from disk immediately,
-                                    // mirroring the sidebar's no-confirm branch.
-                                    model.status = delete_groups(
-                                        &mut session,
-                                        &mut panes,
-                                        targets,
-                                        false,
-                                        Some(waker.clone()),
-                                    );
-                                    sb.marked.clear();
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    sb.focus_active_row(&mut model);
-                                    need_relayout = true;
-                                    sync_drawer_persistence(
-                                        &session,
-                                        &mut panes,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
-                                        keymap.config(),
-                                        chrome.center,
-                                    );
-                                }
+                                // Remove the active worktree group via the shared
+                                // confirm+delete path: the menu follows confirm_delete,
+                                // a dirty tree forces a warning, and the root/home
+                                // checkout is never removed. `req` is built before the
+                                // ctx takes `&mut session`.
+                                let req = vec![session.active];
+                                crate::handlers::worktree_delete::request_group_delete(
+                                    crate::handlers::worktree_delete::DeleteCtx {
+                                        session: &mut session,
+                                        panes: &mut panes,
+                                        model: &mut model,
+                                        sb: &mut sb,
+                                        drawer: &mut drawer,
+                                        drawer_pool: &mut drawer_pool,
+                                        drawer_home: &mut drawer_home,
+                                        active_menu: &mut active_menu,
+                                        pending: &mut pending_confirm_delete_worktrees,
+                                        need_relayout: &mut need_relayout,
+                                        waker: &waker,
+                                        cfg: keymap.config(),
+                                        center: chrome.center,
+                                        confirm_delete: current_config.confirm_delete,
+                                    },
+                                    req,
+                                );
                                 dirty = true;
                                 continue;
                             }
