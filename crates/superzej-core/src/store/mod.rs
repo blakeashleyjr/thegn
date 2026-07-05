@@ -36,7 +36,9 @@ mod host;
 mod notification;
 mod pool;
 mod proxy;
+mod trust;
 mod workspace;
+mod zone;
 
 pub use account::AccountStore;
 pub use aux::WorktreeAuxStore;
@@ -45,4 +47,6 @@ pub use host::HostStore;
 pub use notification::NotificationStore;
 pub use pool::PoolStore;
 pub use proxy::ProxyStore;
+pub use trust::{RepoTrustRow, RepoTrustStore};
 pub use workspace::WorkspaceStore;
+pub use zone::{ZoneDeleteOutcome, ZoneRow, ZoneStore};

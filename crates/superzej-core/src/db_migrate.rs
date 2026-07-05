@@ -328,4 +328,35 @@ pub(crate) fn additive_schema(conn: &Connection) {
         "ALTER TABLE group_tabs ADD COLUMN scrollback_snapshot TEXT",
         [],
     );
+    // v32: trust-on-first-use approvals for a repo `.superzej.*` overlay's
+    // gated sandbox requests (mounts/scripts/image/…). One row per approved
+    // request, keyed by (repo_root, canonical request JSON) — the canonical
+    // string is the security match key, so a later edit to the requested set
+    // re-prompts. `request_id` is a short display handle only. See
+    // `crate::config_resolve` / `crate::repo_trust`.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS repo_trust (
+          repo_root    TEXT NOT NULL,
+          request_id   TEXT NOT NULL,
+          request_json TEXT NOT NULL,
+          decision     TEXT NOT NULL,
+          decided_at   INTEGER NOT NULL,
+          PRIMARY KEY (repo_root, request_json)
+        )",
+        [],
+    );
+    // v33: zones — a named group of workspaces inside a profile providing a
+    // soft, concurrent firewall (credential sub-vault + egress/budget ceilings).
+    // Membership is a nullable `workspaces.zone_id` (NULL = unzoned); exclusive
+    // by construction (one column, not a join table). Policy lives in config
+    // (`[zone.<name>]`); the DB owns existence + membership. See `crate::zone`.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS zones (
+          zone_id    INTEGER PRIMARY KEY,
+          name       TEXT NOT NULL UNIQUE,
+          created_at INTEGER NOT NULL
+        )",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN zone_id INTEGER", []);
 }

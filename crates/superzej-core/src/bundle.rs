@@ -26,7 +26,7 @@ use crate::account;
 use crate::config::{Bundle, Config, expand_env_ref};
 use crate::db::Db;
 use crate::sandbox::Mount;
-use crate::store::WorkspaceStore;
+use crate::store::{WorkspaceStore, ZoneStore};
 use crate::util;
 use std::collections::{BTreeMap, HashSet};
 
@@ -45,6 +45,10 @@ pub struct ResolvedEnv {
     /// agent CLI writes tokens/history there). Distinct from `config_dirs`, which
     /// are user-owned and only mounted when they already exist.
     pub ensure_dirs: Vec<String>,
+    /// Zone-owned bundles skipped because this worktree isn't in their zone (the
+    /// credential sub-vault firewall). Each entry is `(bundle_name, owner_zone)`.
+    /// The launch continues without them; the caller surfaces the denial.
+    pub denied: Vec<(String, String)>,
 }
 
 impl ResolvedEnv {
@@ -348,11 +352,31 @@ fn compose_inner(
     let mut overrides: BTreeMap<String, String> = BTreeMap::new();
     let mut mounts: Vec<Mount> = Vec::new();
     let mut ensure_dirs: Vec<String> = Vec::new();
+    let mut denied: Vec<(String, String)> = Vec::new();
+
+    // The worktree's zone (DB-tracked). A zone-owned bundle is a credential
+    // sub-vault: only worktrees in that zone may compose it. Checked at fold
+    // time so it covers direct, workspace, global, AND `extends`-reachable
+    // bindings uniformly. See [`crate::zone`].
+    let worktree_zone = db
+        .zone_of_worktree(worktree)
+        .ok()
+        .flatten()
+        .map(|z| z.name)
+        .unwrap_or_default();
 
     for name in &order {
         let Some(b) = cfg.bundle.get(name) else {
             continue;
         };
+        if !crate::zone::bundle_visible(&b.zone, &worktree_zone) {
+            crate::msg::warn(&format!(
+                "bundle: {name:?} is owned by zone {:?}; skipped for this worktree (zone {:?})",
+                b.zone, worktree_zone
+            ));
+            denied.push((name.clone(), b.zone.clone()));
+            continue;
+        }
         fold_bundle(
             cfg,
             db,
@@ -403,7 +427,7 @@ fn compose_inner(
     // override a bundle-set value. Fills gaps only.
     if order
         .iter()
-        .any(|n| cfg.bundle.get(n).is_some_and(|b| b.dotenv))
+        .any(|n| !denied.iter().any(|(d, _)| d == n) && cfg.bundle.get(n).is_some_and(|b| b.dotenv))
     {
         fold_dotenv(db, worktree, &mut overrides);
     }
@@ -413,6 +437,7 @@ fn compose_inner(
         block: Vec::new(),
         mounts,
         ensure_dirs,
+        denied,
     }
 }
 
@@ -1063,5 +1088,124 @@ mod tests {
         );
         clear_active(&db, Bind::Worktree, "/wt", Some("repo")).unwrap();
         assert_eq!(active_name(&cfg, &db, "/wt", Some("repo")), None);
+    }
+
+    // --- zone sub-vault: a zone-owned bundle only composes inside its zone ----
+
+    fn zoned_bundle(zone: &str, k: &str, v: &str) -> Bundle {
+        let mut b = bundle_with_env(&[(k, v)]);
+        b.zone = zone.to_string();
+        b
+    }
+
+    /// Put `repo` in `zone`, register a worktree under it, return `(db, cfg)`.
+    fn zoned_setup(
+        bundles: &[(&str, Bundle)],
+        repo: &str,
+        wt: &str,
+        zone: Option<&str>,
+    ) -> (Db, Config) {
+        use crate::store::{WorkspaceStore, ZoneStore};
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        for (n, b) in bundles {
+            cfg.bundle.insert((*n).to_string(), b.clone());
+        }
+        db.put_workspace(repo, "ws", "repo").unwrap();
+        db.put_worktree("t", repo, wt, "main", None, None).unwrap();
+        if let Some(z) = zone {
+            let id = db.create_zone(z, 1).unwrap();
+            db.assign_workspace_zone(repo, Some(id)).unwrap();
+        }
+        (db, cfg)
+    }
+
+    #[test]
+    fn zone_owned_bundle_denied_to_foreign_worktree() {
+        // A bundle owned by clientA, a worktree in clientB (direct binding).
+        let (db, cfg) = zoned_setup(
+            &[("a-secrets", zoned_bundle("clientA", "A_KEY", "secret"))],
+            "/repo",
+            "/repo/wt",
+            Some("clientB"),
+        );
+        set_active(&db, Bind::Worktree, "/repo/wt", Some("repo"), "a-secrets").unwrap();
+        let r = compose(&cfg, &db, "/repo/wt", Some("repo"), None);
+        assert!(
+            get(&r.overrides, "A_KEY").is_none(),
+            "foreign zone bundle skipped"
+        );
+        assert_eq!(
+            r.denied,
+            vec![("a-secrets".to_string(), "clientA".to_string())]
+        );
+    }
+
+    #[test]
+    fn zone_owned_bundle_composes_in_own_zone() {
+        let (db, cfg) = zoned_setup(
+            &[("a-secrets", zoned_bundle("clientA", "A_KEY", "secret"))],
+            "/repo",
+            "/repo/wt",
+            Some("clientA"),
+        );
+        set_active(&db, Bind::Worktree, "/repo/wt", Some("repo"), "a-secrets").unwrap();
+        let r = compose(&cfg, &db, "/repo/wt", Some("repo"), None);
+        assert_eq!(get(&r.overrides, "A_KEY"), Some("secret"));
+        assert!(r.denied.is_empty());
+    }
+
+    #[test]
+    fn unzoned_worktree_denied_zoned_bundle() {
+        let (db, cfg) = zoned_setup(
+            &[("a-secrets", zoned_bundle("clientA", "A_KEY", "secret"))],
+            "/repo",
+            "/repo/wt",
+            None, // unzoned
+        );
+        set_active(&db, Bind::Worktree, "/repo/wt", Some("repo"), "a-secrets").unwrap();
+        let r = compose(&cfg, &db, "/repo/wt", Some("repo"), None);
+        assert!(get(&r.overrides, "A_KEY").is_none());
+        assert_eq!(r.denied.len(), 1);
+    }
+
+    #[test]
+    fn global_bundle_composes_for_zoned_worktree() {
+        // A global (unzoned) bundle stays usable inside a zone.
+        let (db, cfg) = zoned_setup(
+            &[("shared", bundle_with_env(&[("EDITOR", "vim")]))],
+            "/repo",
+            "/repo/wt",
+            Some("clientA"),
+        );
+        set_active(&db, Bind::Worktree, "/repo/wt", Some("repo"), "shared").unwrap();
+        let r = compose(&cfg, &db, "/repo/wt", Some("repo"), None);
+        assert_eq!(get(&r.overrides, "EDITOR"), Some("vim"));
+        assert!(r.denied.is_empty());
+    }
+
+    #[test]
+    fn zone_deny_covers_extends_reachability() {
+        // A visible bundle `extends` a foreign zone-owned one → the parent is
+        // denied at fold time (extends expands the chain, deny catches it).
+        let mut child = bundle_with_env(&[("CHILD", "1")]);
+        child.extends = vec!["a-secrets".into()];
+        let (db, cfg) = zoned_setup(
+            &[
+                ("a-secrets", zoned_bundle("clientA", "A_KEY", "secret")),
+                ("child", child),
+            ],
+            "/repo",
+            "/repo/wt",
+            Some("clientB"),
+        );
+        set_active(&db, Bind::Worktree, "/repo/wt", Some("repo"), "child").unwrap();
+        let r = compose(&cfg, &db, "/repo/wt", Some("repo"), None);
+        assert_eq!(get(&r.overrides, "CHILD"), Some("1"), "visible child folds");
+        assert!(
+            get(&r.overrides, "A_KEY").is_none(),
+            "foreign parent denied"
+        );
+        assert!(r.denied.iter().any(|(n, _)| n == "a-secrets"));
     }
 }

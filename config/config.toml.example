@@ -681,6 +681,7 @@ command = "git diff"
 # config_dirs  = { GIT_CONFIG_GLOBAL = "~/.config/git/work" }  # Tier-1 redirection
 # dotenv       = true                           # opt into the worktree .env (below)
 # home         = "managed"                       # Tier-3 synthetic HOME (opt-in)
+# zone         = "clientA"                       # owning zone (credential sub-vault)
 # [bundle.work.dotfiles]                          # Tier-2 materialized dotfiles
 # source = "~/dotfiles/work"
 # mode   = "symlink"                              # "symlink" | "template"
@@ -697,6 +698,41 @@ command = "git diff"
 # precedence (never overrides a bundle value), only after you allow-list it (the
 # switcher prompts), and credential-shaped keys (*_TOKEN/*_KEY/*_SECRET/
 # *_PASSWORD) are always dropped — a repo `.env` can never inject a token.
+
+# ── Zones ───────────────────────────────────────────────────────────────────
+# A zone is a named group of workspaces INSIDE one profile that provides a soft,
+# concurrent firewall — the two-freelance-clients case: both open side by side
+# in the same window, each worktree's panes/agents scoped to its zone. Zones sit
+# between per-profile process firewalls ([profiles.*]) and per-workspace config.
+#
+# Split: POLICY lives here in config; MEMBERSHIP lives in the DB (assign with
+# `superzej zone assign <zone> [repo]`, never inferred from a filesystem path).
+# A zone CLAMPS its members — it never widens: egress intersects down, blocks
+# union, sandbox hardening only rises, budget caps roll up. A zone-owned bundle
+# (`[bundle.<n>] zone = "..."`) is a credential sub-vault only its members compose.
+#
+# [zone.clientA]
+# env_bundles   = ["clientA-secrets"]           # bundles bound at the zone scope
+# network_allow = ["*.clienta.com", "github.com"]  # egress CEILING (members narrow within)
+# network_block = ["telemetry.example.com"]     # appended to every member (deny wins)
+# sandbox_floor = "hardened"                     # members may only be >= this hardening
+# [zone.clientA.budget]
+# limit_tokens = 5000000                         # rolled up as the `zone:clientA` proxy scope
+# limit_cost   = 100.0                           # USD ceiling for the period
+#
+# Manage zones from the CLI: `superzej zone list|create <name>|rm <name> [--force]|
+# assign <zone> [repo]`. Reassignment takes effect on the next worktree launch.
+
+# ── Repo overlay trust ──────────────────────────────────────────────────────
+# A repo-root `.superzej.{toml,yaml,yml,json}` is checked into a repository you
+# may have cloned, so its `[sandbox]` block is treated as a CLAMPED REQUEST, not
+# an override: it may only tighten constraints (network, profile, file_access —
+# toward stricter), never widen them (backend/network=host/env_passthrough/
+# remote/vpn are denied). Additive requests (mounts, init_script, image, ports)
+# are trust-on-first-use gated: review with `superzej repo-trust [path]` and
+# approve with `--approve <id>`. Denials/pending are surfaced, never silent, and
+# the worktree still opens. `superzej config explain sandbox.<key> --repo <path>`
+# shows the full resolution + clamp trace.
 
 # General tasks: surfaced in the Tests panel and, later, Problems/Timeline/Search
 # Everywhere. `kind = "test"` makes a task eligible for test discovery/runs.

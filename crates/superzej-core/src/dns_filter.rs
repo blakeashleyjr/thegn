@@ -52,8 +52,15 @@ impl DnsPolicy {
     }
 }
 
-fn name_matches(name: &str, pattern: &str) -> bool {
+pub(crate) fn name_matches(name: &str, pattern: &str) -> bool {
     let pattern = pattern.trim_end_matches('.');
+    // Universal block: `*` matches every name. Used by the config-resolution
+    // engine to encode a repo overlay's "deny-all egress" request (an empty
+    // `network_allow` at the repo layer) as `network_block += ["*"]` — a
+    // DNS-level deny that needs no change to `SandboxConfig`'s shape.
+    if pattern == "*" {
+        return true;
+    }
     if let Some(suffix) = pattern.strip_prefix("*.") {
         // Wildcard matches only strict subdomains: *.example.com matches
         // foo.example.com but NOT example.com itself.
@@ -345,6 +352,22 @@ mod tests {
         assert!(name_matches("a.b.example.com", "example.com"));
         // suffix must be on a label boundary
         assert!(!name_matches("fooexample.com", "example.com"));
+    }
+
+    #[test]
+    fn name_matches_universal_star() {
+        // `*` is the deny-all pattern the resolution engine emits.
+        assert!(name_matches("example.com", "*"));
+        assert!(name_matches("anything.internal", "*"));
+        assert!(name_matches("a.b.c.d", "*"));
+        // Blocking `*` denies every query even against an allow list.
+        let p = DnsPolicy {
+            allow: vec!["example.com".into()],
+            block: vec!["*".into()],
+            upstream: None,
+        };
+        assert!(!p.allows("example.com"));
+        assert!(!p.allows("sub.example.com"));
     }
 
     #[test]
