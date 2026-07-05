@@ -214,6 +214,17 @@ pub enum Command {
     },
     /// List git repos discovered under repo_roots.
     Repos,
+    /// Review/approve a repo `.superzej.*` overlay's gated sandbox requests (TOFU).
+    RepoTrust {
+        /// Repo path (default: current directory).
+        path: Option<String>,
+        /// Approve a pending request by its id.
+        #[arg(long)]
+        approve: Option<String>,
+        /// Revoke a recorded decision by its id.
+        #[arg(long)]
+        revoke: Option<String>,
+    },
     /// List recently opened repos (history).
     Recent { count: Option<i64> },
     /// Inspect the effective (layered) configuration.
@@ -225,6 +236,11 @@ pub enum Command {
     Env {
         #[command(subcommand)]
         action: cmd::env::Action,
+    },
+    /// Manage zones (workspace groups with credential/egress/budget sub-scoping).
+    Zone {
+        #[command(subcommand)]
+        action: cmd::zone::Action,
     },
     /// Inspect and provision `[host.<name>]` machines (the once-per-host
     /// lifecycle behind fast remote OCI sandboxes).
@@ -483,9 +499,15 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             force,
         } => cmd::disk::clean(&cfg, worktree, all, force),
         Command::Repos => cmd::repos::repos(&cfg),
+        Command::RepoTrust {
+            path,
+            approve,
+            revoke,
+        } => cmd::repos::trust(&cfg, path, approve, revoke),
         Command::Recent { count } => cmd::repos::recent(count),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
         Command::Env { action } => cmd::env::run(&cfg, action),
+        Command::Zone { action } => cmd::zone::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),
         Command::Agent { action } => cmd::agent::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),

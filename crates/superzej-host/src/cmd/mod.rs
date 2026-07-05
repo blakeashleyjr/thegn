@@ -30,6 +30,7 @@ pub mod pr;
 pub mod repos;
 pub mod share;
 pub mod theme;
+pub mod zone;
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -62,7 +62,11 @@ use std::path::PathBuf;
 /// resources; see [`crate::host_db`]).
 /// v31: adds `loc_cache.report_json` (per-language tokei breakdown alongside the
 /// total; see [`crate::loc::LocReport`]).
-const SCHEMA_VERSION: i64 = 31;
+/// v32: adds `repo_trust` (trust-on-first-use approvals for a repo overlay's
+/// gated sandbox requests; see [`crate::repo_trust`]).
+/// v33: adds `zones` + `workspaces.zone_id` (per-profile workspace grouping with
+/// credential/egress/budget sub-scoping; see [`crate::zone`]).
+const SCHEMA_VERSION: i64 = 33;
 
 pub struct Db {
     conn: Connection,

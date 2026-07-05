@@ -31,6 +31,16 @@ pub enum Action {
     Validate,
     /// Print the JSON schema for editor autocomplete and validation.
     Schema,
+    /// Explain how a key resolves: effective value, which layer set it, and (for
+    /// `sandbox.*` with `--repo`) the trust clamp trace (denials + pending).
+    Explain {
+        key: String,
+        /// Also show the repo `.superzej.*` clamp trace for this repo path.
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
@@ -44,8 +54,74 @@ pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
             let schema = schemars::schema_for!(Config);
             outln!("{}", serde_json::to_string_pretty(&schema).unwrap());
         }
+        Action::Explain { key, repo, json } => explain(cfg, &key, repo, json, path)?,
     }
     Ok(())
+}
+
+fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: PathBuf) -> Result<()> {
+    use superzej_core::config::ProcessEnv;
+    use superzej_core::config_resolve;
+    let origin = config_resolve::explain(&ProcessEnv, &[], Some(path), key);
+    if json {
+        let mut obj = serde_json::json!({
+            "key": origin.key,
+            "value": origin.value,
+            "origin": origin.origin.as_str(),
+        });
+        if let Some(repo) = &repo {
+            let (events, pending) = repo_clamp(cfg, repo, key);
+            obj["clamped"] = serde_json::json!(events);
+            obj["pending"] = serde_json::json!(pending);
+        }
+        outln!("{}", serde_json::to_string_pretty(&obj)?);
+        return Ok(());
+    }
+    outln!("{} = {}", origin.key, origin.value);
+    outln!("  set by: {}", origin.origin.as_str());
+    for (layer, val) in &origin.trace {
+        outln!("    {}: {val}", layer.as_str());
+    }
+    if let Some(repo) = &repo {
+        let (events, pending) = repo_clamp(cfg, repo, key);
+        if !events.is_empty() || !pending.is_empty() {
+            outln!("  repo `.superzej.*` clamp ({repo}):");
+            for line in events {
+                outln!("    {line}");
+            }
+            for p in pending {
+                outln!("    pending: {p}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Repo-overlay clamp events + pending summaries filtered to a key prefix, using
+/// the persisted trust approvals.
+fn repo_clamp(cfg: &Config, repo: &str, key: &str) -> (Vec<String>, Vec<String>) {
+    use superzej_core::config_resolve::{Approvals, summarize_events};
+    use superzej_core::db::Db;
+    use superzej_core::store::RepoTrustStore;
+    let root = superzej_core::repo::main_worktree(std::path::Path::new(repo))
+        .unwrap_or_else(|| PathBuf::from(repo));
+    let approvals = Db::open()
+        .ok()
+        .and_then(|db| db.repo_trust_approved(&root.to_string_lossy()).ok())
+        .map(Approvals::from_canonical)
+        .unwrap_or_else(Approvals::deny_all);
+    let resolved = cfg.repo_sandbox_resolved(&root, &approvals);
+    let events = summarize_events(&resolved.events)
+        .into_iter()
+        .filter(|l| l.contains(key) || key == "sandbox")
+        .collect();
+    let pending = resolved
+        .pending
+        .into_iter()
+        .filter(|p| p.key.contains(key) || key == "sandbox")
+        .map(|p| format!("{}: {}", p.key, p.summary))
+        .collect();
+    (events, pending)
 }
 
 fn show(cfg: &Config, json: bool) -> Result<()> {

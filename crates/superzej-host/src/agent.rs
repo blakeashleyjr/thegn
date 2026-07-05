@@ -224,9 +224,8 @@ pub enum SandboxScope {
 }
 
 /// Prepare the sandbox for a worktree with an explicitly-selected execution
-/// environment name (the DB worktree/workspace `env_name`, or a `--env` flag).
-/// `None` lets [`Config::resolve_env`] fall through to repo/global selection.
-/// No DB access — the caller resolves the name (which needs the DB).
+/// environment name (or `None` to fall through to repo/global selection).
+/// Resolves via [`crate::handlers::repo_trust`] (honours TOFU approvals).
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_sandbox_env(
     cfg: &Config,
@@ -237,7 +236,8 @@ pub fn prepare_sandbox_env(
     scope: SandboxScope,
     selected_env: Option<&str>,
 ) -> anyhow::Result<SandboxOutcome> {
-    let environment = cfg.resolve_env(repo_root, loc, Path::new(worktree), selected_env);
+    use crate::handlers::repo_trust::resolve_env_trusted;
+    let environment = resolve_env_trusted(cfg, repo_root, loc, worktree, selected_env);
     let placement = environment.placement.clone();
     let env_shell = environment.sandbox.shell.clone();
     // The worktree-projection plan (sshfs/sync) for this env's `data` mode, or

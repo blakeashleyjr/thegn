@@ -1411,6 +1411,10 @@ pub struct Bundle {
     /// (allowlisted + credential-key-filtered; see [`crate::bundle`]).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dotenv: bool,
+    /// Owning zone (`[bundle.<n>] zone = "clientA"`): a credential sub-vault only
+    /// worktrees in that zone may compose. Empty ⇒ global. See [`crate::zone`].
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub zone: String,
 }
 
 /// Tier-2 dotfile materialization spec (`[bundle.<n>.dotfiles]`).
@@ -2928,36 +2932,28 @@ pub struct SandboxConfig {
     pub warm_direnv: WarmDirenv,
     pub devenv: bool, // wrap inner cmd with `devenv shell --`
     /// Inject the repo's Nix flake `devShell` toolchain (its `PATH` + safe
-    /// exported vars) into worktree panes — resolved on the host (writable
-    /// store + daemon) and cached, so a sandboxed pane that can't reach the Nix
-    /// daemon still gets the project linters/formatters/tools out of the box.
-    /// No-op for repos without a flake `devShell`. See [`crate::devenv`].
+    /// exported vars) into worktree panes — resolved on the host and cached, so a
+    /// sandboxed pane that can't reach the Nix daemon still gets the project
+    /// tools. No-op without a flake `devShell`. See [`crate::devenv`].
     pub inject_devshell: bool,
     /// Which flake devShell attribute a sandbox/sprite enters, e.g. `"sandbox"`
-    /// for a lean build-only shell (`.#devShells.sandbox`). Empty ⇒ `default`
-    /// (unchanged). Exported as `SUPERZEJ_DEVSHELL` into the sandbox (pane + the
-    /// provisioning seed), which the repo `.envrc`'s `use flake .#${…:-default}`
-    /// reads — so the sandbox builds/enters a smaller closure than full host dev.
+    /// for a lean build-only shell (`.#devShells.sandbox`). Empty ⇒ `default`.
+    /// Exported as `SUPERZEJ_DEVSHELL` into the sandbox, which the repo `.envrc`'s
+    /// `use flake .#${…:-default}` reads — a smaller closure than full host dev.
     pub devshell: String,
     /// Bind-mount the host Nix daemon socket into the sandbox for full in-sandbox
     /// `nix develop`/`build`/`fmt`. `true` forces it on; `false` still auto-enables
-    /// it as a backstop for a local flake `.envrc` (an in-sandbox `nix-direnv` cache
-    /// miss re-evals via the daemon, not the read-only store) — off: `warm_direnv=off`/sealed.
+    /// it as a backstop for a local flake `.envrc` — off: `warm_direnv=off`/sealed.
     pub nix_daemon: bool,
     /// Shell to use inside the sandbox. `""` = resolve from the host's `$SHELL`
-    /// at pane-spawn time. Set to an absolute path or name (e.g. `"zsh"`) to
-    /// override per workspace via `.superzej.toml`.
+    /// at pane-spawn time; else an absolute path or name (e.g. `"zsh"`).
     pub shell: String,
     pub on_missing: OnMissing,
-    /// When the *selected* environment (a named `[env.<name>]` or an explicit
-    /// non-local placement — provider/k8s/ssh) cannot be brought up, may superzej
-    /// silently fall back to another backend or the host? Default `false`: a
-    /// bring-up failure **halts** that worktree's pane and shows a warning,
-    /// because a remote/managed env is often required for correctness or safety
-    /// and a quiet drop to the host would violate that. Set `true` (globally
-    /// here, or per-env via `[env.<name>] failover`) to allow walking the
-    /// `backend_chain` down to the host on failure (the historical behavior).
-    /// Independent of `on_missing`, which only governs the local `Auto` chain.
+    /// When a *selected* non-local env (named `[env.<name>]`, or provider/k8s/ssh)
+    /// can't be brought up, may superzej fall back to another backend/host?
+    /// Default `false`: halt + warn (a remote/managed env is often required, so a
+    /// quiet host drop is refused). `true` (here or per-env `[env.<name>]
+    /// failover`) walks `backend_chain` → host. Independent of `on_missing`.
     pub failover: bool,
     /// Drive the OCI runtime against a **remote daemon** instead of SSH-wrapping
     /// the whole backend argv: a podman connection URL/name or a docker host
@@ -3363,7 +3359,7 @@ pub struct RemoteOverlay {
 }
 
 impl SandboxOverlay {
-    fn apply(self, base: &mut SandboxConfig) {
+    pub(crate) fn apply(self, base: &mut SandboxConfig) {
         if let Some(v) = self.enabled {
             base.enabled = v;
         }
@@ -3517,8 +3513,8 @@ impl RemoteOverlay {
 /// plus an optional `[keybinds]` table (the most-specific keybind layer).
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
-struct RepoConfigFile {
-    sandbox: SandboxOverlay,
+pub(crate) struct RepoConfigFile {
+    pub(crate) sandbox: SandboxOverlay,
     keybinds: KeybindConfig,
     /// Per-repo notification routing overlay, applied on top of global +
     /// profile (see [`Config::effective_notifications`]).
@@ -4243,6 +4239,9 @@ pub struct Config {
     /// [`crate::bundle`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub bundle: std::collections::BTreeMap<String, Bundle>,
+    /// Zone policy (`[zone.<name>]`) — egress/budget ceilings + bundle binding.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub zone: std::collections::BTreeMap<String, crate::zone::ZoneConfig>,
     /// Per-tool binary overrides (`[managed_tools.<name>]`) for the managed-tool
     /// resolver: an explicit `path` (highest-priority tier) + optional `args`,
     /// consulted before PATH lookup and the managed download. See
@@ -4340,6 +4339,7 @@ impl Default for Config {
             env: std::collections::BTreeMap::new(),
             host: std::collections::BTreeMap::new(),
             bundle: std::collections::BTreeMap::new(),
+            zone: std::collections::BTreeMap::new(),
             managed_tools: std::collections::BTreeMap::new(),
             mcp_servers: std::collections::BTreeMap::new(),
             secrets: SecretsConfig::default(),
@@ -4420,7 +4420,7 @@ pub struct ConfigOverlay {
 }
 
 impl ConfigOverlay {
-    fn apply(self, base: &mut Config) {
+    pub(crate) fn apply(self, base: &mut Config) {
         macro_rules! set {
             ($field:expr, $val:expr) => {
                 if let Some(v) = $val {
@@ -4738,7 +4738,7 @@ impl Config {
     /// (`<real XDG_CONFIG_HOME>/superzej/profiles/<name>/config.toml`), or `None`
     /// for the default profile. Uses `xdg_config_home()` directly (the shared
     /// config home is never rerooted).
-    fn profile_overlay_path(env: &dyn EnvSource) -> Option<PathBuf> {
+    pub(crate) fn profile_overlay_path(env: &dyn EnvSource) -> Option<PathBuf> {
         let name = crate::profile::normalize_name(&env.get("SUPERZEJ_PROFILE").unwrap_or_default());
         (name != "default").then(|| {
             util::xdg_config_home()
@@ -4760,7 +4760,7 @@ impl Config {
         Ok(())
     }
 
-    fn apply_override_str(cfg: &mut Config, key: &str, val: &str) -> Result<(), String> {
+    pub(crate) fn apply_override_str(cfg: &mut Config, key: &str, val: &str) -> Result<(), String> {
         if key == "apps.tab_order" {
             cfg.apps.tab_order = val
                 .split(',')
@@ -4805,7 +4805,7 @@ impl Config {
         Ok(())
     }
 
-    fn post_process(&mut self) {
+    pub(crate) fn post_process(&mut self) {
         if self.agents.is_empty() {
             self.agents = vec![
                 NamedCommand {
@@ -5007,44 +5007,28 @@ impl Config {
         issues
     }
 
-    /// The effective sandbox config for a worktree's repo: the global `[sandbox]`
-    /// with a repo-root `.superzej.{toml,yaml,yml,json}` overlay applied on top.
-    /// Tilde-expands path-bearing fields (mounts, remote_dir).
+    /// The effective sandbox config for a worktree's repo: global `[sandbox]` +
+    /// profile overlay, with the repo `.superzej.*` overlay **clamped** and
+    /// `[workspace.<slug>]` mounts extended. Fail-closed (gated requests denied);
+    /// see [`crate::config_resolve`] / [`Config::repo_sandbox_resolved`].
     pub fn repo_sandbox(&self, repo_root: &std::path::Path) -> SandboxConfig {
-        let mut sb = self.sandbox.clone();
-        // Profile sandbox overlay (network policy isolation per profile).
-        if let Some(profile) = self.active_profile() {
-            profile.sandbox.clone().apply(&mut sb);
-        }
-        if let Some(overlay) = load_repo_overlay(repo_root) {
-            overlay.sandbox.apply(&mut sb);
-        }
-        // Per-workspace bind dirs ([workspace.<slug>] sandbox_mounts) extend the
-        // global/profile/overlay mounts. Keyed by the repo's base slug — the
-        // same slugify(repo_name) used for [workspace.<slug>] keybinds/accounts
-        // (sans the DB collision suffix; we avoid a DB write on the launch path).
-        if !self.workspace.is_empty() {
-            let base = util::slugify(&crate::repo::repo_name(repo_root));
-            let slug = if base.is_empty() {
-                "repo".to_string()
-            } else {
-                base
-            };
-            if let Some(ws) = self.workspace.get(&slug) {
-                sb.mounts.extend(ws.sandbox_mounts.iter().cloned());
-            }
-        }
-        sb.mounts = sb
-            .mounts
-            .iter()
-            .map(|m| match m.split_once(':') {
-                Some((host, opt)) => format!("{}:{opt}", util::expand_tilde(host)),
-                None => util::expand_tilde(m),
-            })
-            .collect();
-        // NB: remote.remote_dir is a *remote* path — its `~` is expanded on the
-        // remote host (see new_worktree::create_remote), not against the local HOME.
-        sb
+        crate::config_resolve::resolve_repo_sandbox(
+            self,
+            repo_root,
+            &crate::config_resolve::Approvals::deny_all(),
+        )
+        .sandbox
+    }
+
+    /// Like [`Config::repo_sandbox`] but honours `approvals` (trust-on-first-use)
+    /// and returns the full [`crate::config_resolve::ResolvedRepoSandbox`] with
+    /// clamp denials + pending gated requests for the host to surface.
+    pub fn repo_sandbox_resolved(
+        &self,
+        repo_root: &std::path::Path,
+        approvals: &crate::config_resolve::Approvals,
+    ) -> crate::config_resolve::ResolvedRepoSandbox {
+        crate::config_resolve::resolve_repo_sandbox(self, repo_root, approvals)
     }
 
     /// The name of the env a repo's `.superzej.*` overlay selects (`env = "…"`),
@@ -5073,43 +5057,31 @@ impl Config {
         worktree: &Path,
         selected: Option<&str>,
     ) -> Environment {
-        let base = self.repo_sandbox(repo_root);
-        let pick = |s: &str| {
-            let t = s.trim();
-            (!t.is_empty()).then(|| t.to_string())
-        };
-        let name = selected
-            .and_then(pick)
-            .or_else(|| pick(&self.repo_env_name(repo_root)))
-            .or_else(|| pick(&base.default_env))
-            .unwrap_or_else(|| "default".to_string());
+        crate::config_resolve::resolve_environment(
+            self,
+            repo_root,
+            loc,
+            worktree,
+            selected,
+            &crate::config_resolve::Approvals::deny_all(),
+        )
+        .0
+    }
 
-        let Some(envc) = self.env.get(&name) else {
-            // Implicit default env, or a typo'd selection: today's behavior.
-            if name != "default" {
-                config_warn(&format!(
-                    "execution environment {name:?} is not defined under [env.{name}]; using the default"
-                ));
-            }
-            let data = data_mode_from_remote(base.remote.mode);
-            return Environment {
-                name: "default".into(),
-                placement: crate::sandbox::placement_from_loc(&base, loc),
-                sandbox: base,
-                data,
-            };
-        };
-
-        // Named env: overlay its isolation onto the base, build its placement.
-        let mut sb = base;
-        envc.sandbox.clone().apply(&mut sb);
-        let placement = crate::envbuild::build_env_placement(envc, &sb, loc, worktree, repo_root);
-        Environment {
-            name,
-            placement,
-            sandbox: sb,
-            data: envc.data,
-        }
+    /// Like [`Config::resolve_env`] but honours `approvals` and also returns the
+    /// [`crate::config_resolve::ResolvedRepoSandbox`] (denials + pending) for a
+    /// launch path to surface.
+    pub fn resolve_env_with(
+        &self,
+        repo_root: &Path,
+        loc: &GitLoc,
+        worktree: &Path,
+        selected: Option<&str>,
+        approvals: &crate::config_resolve::Approvals,
+    ) -> (Environment, crate::config_resolve::ResolvedRepoSandbox) {
+        crate::config_resolve::resolve_environment(
+            self, repo_root, loc, worktree, selected, approvals,
+        )
     }
 
     /// Effective failover policy for the environment named `env_name`: the env's
@@ -5368,7 +5340,7 @@ pub fn validate_str(body: &str) -> Vec<String> {
 /// Load and parse a repo-root `.superzej.*` overlay, if present. Tries TOML,
 /// YAML, then JSON (first existing file wins); parse errors warn and are ignored
 /// so a malformed repo file never blocks opening a worktree.
-fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
+pub(crate) fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
     for (ext, kind) in [
         ("toml", "toml"),
         ("yaml", "yaml"),
@@ -5469,7 +5441,7 @@ fn lenient_env_selector(text: &str) -> String {
 
 /// Map the legacy `[sandbox.remote] mode` onto the env [`DataMode`], so the
 /// default env honours an existing `mode = "sshfs"`/`"local_exec"` config.
-fn data_mode_from_remote(mode: RemoteMode) -> DataMode {
+pub(crate) fn data_mode_from_remote(mode: RemoteMode) -> DataMode {
     match mode {
         RemoteMode::Remote => DataMode::InEnv,
         RemoteMode::LocalExec => DataMode::LocalExec,
@@ -6028,17 +6000,27 @@ name = "minimal"
         for (tag, file, body) in cases {
             let dir = tmpdir(tag);
             std::fs::write(dir.join(file), body).unwrap();
-            let sb = cfg.repo_sandbox(&dir);
-            assert_eq!(sb.image, "img:1", "{tag}: image overridden");
-            assert_eq!(sb.init_script, "echo hi", "{tag}: init overridden");
-            assert_eq!(sb.remote.host, "user@box", "{tag}: remote host overridden");
-            // Untouched keys keep their defaults.
-            assert!(sb.enabled, "{tag}: enabled keeps default");
-            assert_eq!(
-                sb.backend,
-                SandboxBackend::Auto,
-                "{tag}: backend keeps default"
+            // All three formats must parse to the *same clamped* result: image +
+            // init_script are TOFU-gated (surfaced as pending, not applied) and
+            // remote is forbidden (denied). Format agreement is the point.
+            let r = cfg.repo_sandbox_resolved(&dir, &crate::config_resolve::Approvals::deny_all());
+            assert_eq!(r.sandbox.image, "", "{tag}: image gated, keeps default");
+            assert_eq!(r.sandbox.init_script, "", "{tag}: init_script gated");
+            assert_eq!(r.sandbox.remote.host, "", "{tag}: remote host denied");
+            assert!(
+                r.pending.iter().any(|p| p.key == "sandbox.image"),
+                "{tag}: image request surfaced"
             );
+            assert!(
+                r.pending.iter().any(|p| p.key == "sandbox.init_script"),
+                "{tag}: init_script request surfaced"
+            );
+            assert!(
+                r.events.iter().any(|e| e.key == "sandbox.remote"),
+                "{tag}: remote denial surfaced"
+            );
+            assert!(r.sandbox.enabled, "{tag}: enabled keeps default");
+            assert_eq!(r.sandbox.backend, SandboxBackend::Auto);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -7010,21 +6992,33 @@ forward_agent = false
 ",
         )
         .unwrap();
-        let sb = cfg.repo_sandbox(&dir);
-        assert!(!sb.enabled);
-        assert_eq!(sb.backend, SandboxBackend::Docker);
-        assert_eq!(sb.backend_chain, vec!["docker", "none"]);
-        assert_eq!(sb.image, "img:2");
-        assert_eq!(sb.network, Network::None);
-        assert_eq!(sb.env_passthrough, vec!["FOO"]);
-        assert!(sb.devenv);
-        assert_eq!(sb.on_missing, OnMissing::Fail);
-        assert_eq!(sb.remote.host, "u@h");
-        assert_eq!(sb.remote.port, 2200);
-        assert_eq!(sb.remote.transport, RemoteTransport::Ssh);
-        assert_eq!(sb.remote.mode, RemoteMode::Sshfs);
-        assert_eq!(sb.remote.remote_dir, "/srv/wt");
-        assert!(!sb.remote.forward_agent);
+        // Post-clamp (the security fix): a repo overlay is a *clamped request*.
+        // Weakenings denied; tightenings granted; additive fields gated.
+        let resolved =
+            cfg.repo_sandbox_resolved(&dir, &crate::config_resolve::Approvals::deny_all());
+        let sb = &resolved.sandbox;
+        // Denied (stay at trusted defaults):
+        assert!(sb.enabled, "repo may not disable the sandbox");
+        assert_eq!(sb.backend, cfg.sandbox.backend, "repo may not set backend");
+        assert_eq!(sb.backend_chain, cfg.sandbox.backend_chain);
+        assert_eq!(sb.env_passthrough, cfg.sandbox.env_passthrough);
+        assert_eq!(sb.remote.host, "", "repo may not set a remote host");
+        // Gated (not applied without approval):
+        assert_eq!(sb.image, cfg.sandbox.image, "image is TOFU-gated");
+        assert!(
+            !sb.mounts.iter().any(|m| m == "/a:/b"),
+            "requested mount is TOFU-gated, not applied"
+        );
+        // Granted (tightening / preference):
+        assert_eq!(sb.network, Network::None, "tightening egress is granted");
+        assert_eq!(sb.on_missing, OnMissing::Fail, "on_missing may tighten");
+        assert!(sb.devenv, "in-sandbox preference passes through");
+        // Denials + pending are surfaced, never silent.
+        assert!(resolved.events.iter().any(|e| e.key == "sandbox.enabled"));
+        assert!(resolved.events.iter().any(|e| e.key == "sandbox.backend"));
+        assert!(resolved.events.iter().any(|e| e.key == "sandbox.remote"));
+        assert!(resolved.pending.iter().any(|p| p.key == "sandbox.image"));
+        assert!(resolved.pending.iter().any(|p| p.key == "sandbox.mounts"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9043,10 +9037,16 @@ min_priority = "alert"
             r#"{"sandbox":{"backend":"docker","ports":["1:1"],"file_access":"all"}}"#,
         )
         .unwrap();
-        let sb = Config::default().repo_sandbox(&dir);
-        assert_eq!(sb.backend, SandboxBackend::Docker);
-        assert_eq!(sb.ports, vec!["1:1"]);
-        assert_eq!(sb.file_access, FileAccess::All);
+        // JSON parses, then clamps: backend forbidden, file_access=all denied
+        // (widening), ports gated (surfaced, not applied).
+        let cfg = Config::default();
+        let r = cfg.repo_sandbox_resolved(&dir, &crate::config_resolve::Approvals::deny_all());
+        assert_eq!(r.sandbox.backend, SandboxBackend::Auto, "backend denied");
+        assert_eq!(r.sandbox.file_access, cfg.sandbox.file_access, "all denied");
+        assert!(r.sandbox.ports.is_empty(), "ports gated, not applied");
+        assert!(r.pending.iter().any(|p| p.key == "sandbox.ports"));
+        assert!(r.events.iter().any(|e| e.key == "sandbox.backend"));
+        assert!(r.events.iter().any(|e| e.key == "sandbox.file_access"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

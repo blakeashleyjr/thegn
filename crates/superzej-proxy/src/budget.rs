@@ -7,7 +7,7 @@
 
 #[cfg(test)]
 use superzej_core::db::Db;
-use superzej_core::store::ProxyStore;
+use superzej_core::store::{ProxyStore, ZoneStore};
 
 use crate::shared::{SharedDb, now_ms};
 
@@ -17,6 +17,10 @@ pub struct Identity {
     pub virtual_key: Option<String>,
     /// Budget scope, e.g. `global`, `agent:<name>`, `worktree:<path>`.
     pub scope: String,
+    /// The worktree's zone scope (`zone:<name>`), when the worktree belongs to
+    /// one. Budget rolls up scope → zone → global. Resolved per-request from the
+    /// shared DB (no push/sync — szproxy opens the same per-profile DB).
+    pub zone: Option<String>,
 }
 
 impl Identity {
@@ -25,6 +29,7 @@ impl Identity {
         Self {
             virtual_key: None,
             scope: "global".to_string(),
+            zone: None,
         }
     }
 
@@ -46,9 +51,17 @@ pub fn resolve_identity(db: &SharedDb, virtual_key: Option<&str>) -> Identity {
         && let Ok(guard) = db.lock()
         && let Ok(Some((scope, _upstream))) = guard.proxy_virtual_key(key)
     {
+        // Roll the worktree's zone into the identity (scope → zone → global).
+        // Derive the worktree from a `worktree:<path>` scope; other scopes
+        // (`agent:<name>`) carry no path, so no zone.
+        let zone = scope
+            .strip_prefix("worktree:")
+            .and_then(|wt| guard.zone_of_worktree(wt).ok().flatten())
+            .map(|z| format!("zone:{}", z.name));
         return Identity {
             virtual_key: Some(key.to_string()),
             scope,
+            zone,
         };
     }
     Identity::global()
@@ -69,7 +82,17 @@ pub enum BudgetVerdict {
 /// `refuse_on_breach` selects refuse (true) vs. downgrade (false) when a cap is
 /// exceeded; the kill-switch always refuses.
 pub fn check_budget(db: &SharedDb, identity: &Identity, refuse_on_breach: bool) -> BudgetVerdict {
-    for scope in [identity.scope.as_str(), "global"] {
+    // scope → zone (if any) → global. A member request refused by its zone cap
+    // even when under its own cap.
+    let scopes: Vec<&str> = [
+        Some(identity.scope.as_str()),
+        identity.zone.as_deref(),
+        Some("global"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for scope in scopes {
         let row = match db.lock() {
             Ok(g) => g.proxy_budget(scope).ok().flatten(),
             Err(_) => None,
@@ -102,6 +125,12 @@ pub fn record_spend(db: &SharedDb, identity: &Identity, tokens: i64, cost: f64) 
             && let Ok((_, _, k)) = guard.add_proxy_spend(&identity.scope, tokens, cost, ts)
         {
             killed = k;
+        }
+        // Roll up to the zone scope (if any), then global.
+        if let Some(zone) = identity.zone.as_deref()
+            && zone != identity.scope
+        {
+            let _ = guard.add_proxy_spend(zone, tokens, cost, ts);
         }
         let _ = guard.add_proxy_spend("global", tokens, cost, ts);
     }
@@ -160,6 +189,7 @@ mod tests {
         let id = Identity {
             virtual_key: None,
             scope: "agent:x".into(),
+            zone: None,
         };
         assert!(matches!(
             check_budget(&db, &id, true),
@@ -174,6 +204,7 @@ mod tests {
         let id = Identity {
             virtual_key: None,
             scope: "agent:y".into(),
+            zone: None,
         };
         record_spend(&db, &id, 100, 0.5);
         let g = db.lock().unwrap();
@@ -182,5 +213,72 @@ mod tests {
             100
         );
         assert_eq!(g.proxy_budget("global").unwrap().unwrap().spent_tokens, 100);
+    }
+
+    #[test]
+    fn resolve_identity_rolls_in_worktree_zone() {
+        use superzej_core::store::{WorkspaceStore, ZoneStore};
+        let db = db();
+        {
+            let g = db.lock().unwrap();
+            g.put_workspace("/repo", "ws", "repo").unwrap();
+            g.put_worktree("t", "/repo", "/repo/wt", "main", None, None)
+                .unwrap();
+            let z = g.create_zone("clientA", 1).unwrap();
+            g.assign_workspace_zone("/repo", Some(z)).unwrap();
+            g.put_proxy_virtual_key("vk", "h", "rev", "worktree:/repo/wt", None, 1)
+                .unwrap();
+        }
+        let id = resolve_identity(&db, Some("vk"));
+        assert_eq!(id.scope, "worktree:/repo/wt");
+        assert_eq!(id.zone.as_deref(), Some("zone:clientA"));
+    }
+
+    #[test]
+    fn zone_cap_refuses_member_under_own_cap() {
+        let db = db();
+        {
+            let g = db.lock().unwrap();
+            // Member has no cap; the zone cap is $1 and already spent.
+            g.set_proxy_budget_limits("zone:clientA", "monthly", None, Some(1.0), 0)
+                .unwrap();
+            g.add_proxy_spend("zone:clientA", 0, 2.0, 1).unwrap();
+        }
+        let id = Identity {
+            virtual_key: None,
+            scope: "worktree:/repo/wt".into(),
+            zone: Some("zone:clientA".into()),
+        };
+        assert!(matches!(
+            check_budget(&db, &id, true),
+            BudgetVerdict::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn spend_triple_attribution_scope_zone_global() {
+        let db = db();
+        let id = Identity {
+            virtual_key: None,
+            scope: "worktree:/repo/wt".into(),
+            zone: Some("zone:clientA".into()),
+        };
+        record_spend(&db, &id, 50, 0.25);
+        let g = db.lock().unwrap();
+        assert_eq!(
+            g.proxy_budget("worktree:/repo/wt")
+                .unwrap()
+                .unwrap()
+                .spent_tokens,
+            50
+        );
+        assert_eq!(
+            g.proxy_budget("zone:clientA")
+                .unwrap()
+                .unwrap()
+                .spent_tokens,
+            50
+        );
+        assert_eq!(g.proxy_budget("global").unwrap().unwrap().spent_tokens, 50);
     }
 }
