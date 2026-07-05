@@ -48,6 +48,9 @@ pub enum HostState {
     },
     /// Durable: everything a sandbox spawn needs is on the host.
     Ready,
+    /// Durable: being de-registered — existing sandboxes run to completion,
+    /// no new placements land, and the machine never re-provisions it.
+    Draining,
     /// Durable: what died, why, and whether a plain retry can succeed.
     Failed(HostFailure),
 }
@@ -61,6 +64,7 @@ impl HostState {
             HostState::RuntimeReady => Some("runtime_ready"),
             HostState::ImageReady => Some("image_ready"),
             HostState::Ready => Some("ready"),
+            HostState::Draining => Some("draining"),
             HostState::Failed(_) => Some("failed"),
             _ => None,
         }
@@ -73,6 +77,7 @@ impl HostState {
             "runtime_ready" => HostState::RuntimeReady,
             "image_ready" => HostState::ImageReady,
             "ready" => HostState::Ready,
+            "draining" => HostState::Draining,
             "failed" => HostState::Failed(failure.unwrap_or(HostFailure {
                 step: HostStep::Connect,
                 error: "unknown failure".into(),
@@ -92,7 +97,7 @@ impl HostState {
             HostState::RuntimeReady | HostState::ImageResolving => HostStep::ResolveImage,
             HostState::Delivering { .. } => HostStep::Deliver,
             HostState::ImageReady | HostState::VolumeSeeding { .. } => HostStep::SeedVolume,
-            HostState::Ready | HostState::Failed(_) => HostStep::Verify,
+            HostState::Ready | HostState::Draining | HostState::Failed(_) => HostStep::Verify,
         }
     }
 }
@@ -309,6 +314,14 @@ fn enter_image(ctx: &MachineCtx) -> Transition {
 /// stale event must never wedge a host forever).
 pub fn step(state: &HostState, ctx: &mut MachineCtx, ev: HostEvent) -> Transition {
     match (state, ev) {
+        // ── draining ───────────────────────────────────────────────────────
+        // A draining host absorbs every event without moving: totality holds,
+        // nothing re-provisions it, and only the explicit finalize path
+        // (host rm) leaves this state (by deleting the row).
+        (HostState::Draining, _) => Transition {
+            next: HostState::Draining,
+            effects: vec![],
+        },
         // ── connect ────────────────────────────────────────────────────────
         (HostState::Unknown, HostEvent::Start) | (HostState::Connecting, HostEvent::Start) => {
             Transition {
@@ -622,6 +635,7 @@ pub fn resume(
                 )
             }
         }
+        HostState::Draining => (HostState::Draining, vec![]),
         HostState::Failed(f) if !f.retryable => (HostState::Failed(f), vec![]),
         // Every other durable state (Unknown / RuntimeReady / ImageReady /
         // retryable Failed) — and, defensively, any transient that leaked —
@@ -1093,12 +1107,33 @@ mod tests {
     }
 
     #[test]
+    fn draining_absorbs_every_event_and_never_resumes() {
+        // Totality: a draining host moves for NOTHING (nothing re-provisions
+        // it; only the explicit finalize path deletes the row).
+        let mut ctx = ctx(InstallConsent::Ask, Vec::new());
+        for ev in [
+            HostEvent::Start,
+            HostEvent::Connected,
+            HostEvent::ConnectFailed { error: "x".into() },
+        ] {
+            let t = step(&HostState::Draining, &mut ctx, ev);
+            assert_eq!(t.next, HostState::Draining);
+            assert!(t.effects.is_empty());
+        }
+        // Resume parks too — a restart never revives a draining host.
+        let (st, fx) = resume(HostState::Draining, None, 1_000, 900);
+        assert_eq!(st, HostState::Draining);
+        assert!(fx.is_empty());
+    }
+
+    #[test]
     fn durable_tags_round_trip() {
         for st in [
             HostState::Unknown,
             HostState::RuntimeReady,
             HostState::ImageReady,
             HostState::Ready,
+            HostState::Draining,
         ] {
             let tag = st.durable_tag().unwrap();
             assert_eq!(HostState::from_durable_tag(tag, None), st);

@@ -293,6 +293,11 @@ check "placement plan explains every candidate" \
 # The dry-run must be side-effect free: no reservation, no event.
 check "placement plan writes no decision events" \
   "'$SZ' placement events | grep -q 'no placement decisions'"
+# Draining parks a host out of every lane: the plan flips to the other box.
+check "host drain excludes the host from placement candidates" \
+  "'$SZ' host drain pool-box >/dev/null 2>&1 && '$SZ' placement plan '$R' --json | grep -q 'draining'"
+check "drained host refuses new provisioning" \
+  "! '$SZ' host provision pool-box </dev/null >/dev/null 2>&1"
 
 # ── ingress sharing (`[share]`) ──────────────────────────────────────────────
 # The config parses (all provider sub-tables, exercised by validate above).

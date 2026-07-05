@@ -42,10 +42,8 @@ use std::path::PathBuf;
 /// source of truth for sidebar workspace order (was recency). Backfilled from
 /// the prior `last_active DESC` order so the first launch after upgrade looks
 /// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
-/// v20: adds `worktree_disk` (per-worktree size + target/ size cache) backing
-/// the disk-usage badges, the statusbar threshold warning, and `superzej disk`.
-/// v22: adds `merge_queue` (the local fold-actor's per-worktree queue + result
-/// cache) backing `superzej integrate`, the merge-queue panel, and auto-drain.
+/// v20: adds `worktree_disk` (size caches: disk badges, warning, `superzej disk`).
+/// v22: adds `merge_queue` (fold-actor queue/results; `superzej integrate`).
 /// v23: adds `group_tabs.pane_sessions` (per-leaf provider exec session, JSON
 /// `pane id → {provider, id, session}`) so a native-exec (provider WSS) pane
 /// reattaches to its live remote session — replaying scrollback — on restart.
@@ -62,8 +60,9 @@ use std::path::PathBuf;
 /// v33: adds `zones` + `workspaces.zone_id` ([`crate::zone`]). `pub` for host-side
 /// schema-mismatch messaging.
 /// v34: adds `host_capacity`/`host_tenancy`/`placement_health`/`placement_events`
-/// (the placement engine; see [`crate::db_placement`]). v35–v36: reserved for
-/// the rest of the placement branch (headroom cols, compute ledger).
+/// (the placement engine; see [`crate::db_placement`]).
+/// v35: `hosts` gains `headroom_json`/`last_headroom` (the measured layer).
+/// v36: reserved for the placement branch's compute ledger.
 /// v37: adds `intents` (the CLI→compositor mailbox behind `superzej open`;
 /// see [`crate::store::IntentStore`]).
 pub const SCHEMA_VERSION: i64 = 37;
@@ -641,6 +640,7 @@ impl Db {
         migrate_tab_layout_v6(&conn);
         crate::host_db::migrate_v30(&conn)?;
         crate::db_placement::migrate_v34(&conn)?;
+        crate::host_db::migrate_v35(&conn);
         Ok(Db {
             conn,
             schema_mismatch,

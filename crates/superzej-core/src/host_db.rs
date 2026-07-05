@@ -64,6 +64,13 @@ pub(crate) fn migrate_v30(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v35: the measured resource layer rides the host row (placement engine).
+/// Tolerated ALTERs — a no-op when the columns exist.
+pub(crate) fn migrate_v35(conn: &Connection) {
+    let _ = conn.execute("ALTER TABLE hosts ADD COLUMN headroom_json TEXT", []);
+    let _ = conn.execute("ALTER TABLE hosts ADD COLUMN last_headroom INTEGER", []);
+}
+
 /// One persisted host. `state` is always a durable checkpoint.
 #[derive(Debug, Clone)]
 pub struct HostRow {
@@ -83,6 +90,9 @@ pub struct HostRow {
     pub last_probe: Option<i64>,
     pub last_used: Option<i64>,
     pub updated_at: i64,
+    /// Latest headroom sample (the measured layer) + when it was taken.
+    pub headroom: Option<crate::host_probe::Headroom>,
+    pub last_headroom: Option<i64>,
 }
 
 fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, HostRow)> {
@@ -116,13 +126,18 @@ fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, HostRow)> {
         last_probe: r.get(10)?,
         last_used: r.get(11)?,
         updated_at: r.get(12)?,
+        headroom: r
+            .get::<_, Option<String>>(13)?
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok()),
+        last_headroom: r.get(14)?,
     };
     Ok((id_raw, row))
 }
 
 const HOST_COLS: &str = "host_id, name, reach_kind, state, state_meta, caps_json, arch, \
                          install_consent, heartbeat, active_step, last_probe, last_used, \
-                         updated_at";
+                         updated_at, headroom_json, last_headroom";
 
 impl HostStore for Db {
     fn host_get(&self, id: &HostId) -> Result<Option<HostRow>> {
@@ -209,6 +224,19 @@ impl HostStore for Db {
         self.conn().execute(
             "UPDATE hosts SET heartbeat=NULL, active_step=NULL WHERE host_id=?1",
             params![id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    fn host_set_headroom(
+        &self,
+        id: &HostId,
+        h: &crate::host_probe::Headroom,
+        now: i64,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE hosts SET headroom_json=?2, last_headroom=?3 WHERE host_id=?1",
+            params![id.as_str(), serde_json::to_string(h)?, now],
         )?;
         Ok(())
     }
@@ -587,6 +615,25 @@ mod tests {
         assert!(db.host_get(&a).unwrap().is_none());
         assert!(db.host_events_recent(&a, 10).unwrap().is_empty());
         assert_eq!(db.hosts_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn headroom_persists_and_reads_back() {
+        let db = db();
+        let id = HostId::named("box");
+        db.host_checkpoint(&id, "box", "ssh", &HostState::Ready, None, 1)
+            .unwrap();
+        assert!(db.host_get(&id).unwrap().unwrap().headroom.is_none());
+        let h = crate::host_probe::parse_headroom(
+            "NPROC=8\nMEM_TOTAL_KB=32768000\nMEM_AVAIL_KB=16384000\n",
+        )
+        .unwrap();
+        db.host_set_headroom(&id, &h, 42).unwrap();
+        let row = db.host_get(&id).unwrap().unwrap();
+        assert_eq!(row.headroom, Some(h));
+        assert_eq!(row.last_headroom, Some(42));
+        migrate_v35(db.conn()); // idempotent on existing columns
+        assert_eq!(db.host_get(&id).unwrap().unwrap().last_headroom, Some(42));
     }
 
     #[test]

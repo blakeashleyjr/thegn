@@ -1800,7 +1800,16 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 #                              #   [placement] engine's capacity index; omitted =
 #                              #   unknown size (dedicated placements only, never
 #                              #   packed). Engine-created hosts get their spec
-#                              #   from the autoscale template instead.
+#                              #   from the autoscale template instead. For a
+#                              #   user-owned host the probe caps this claim:
+#                              #   ceiling = min(declared, probed) x overcommit
+#                              #   x independent_safety_pct.
+# trust_egress_enforced = false # ATTESTATION (taken on faith, never verified):
+#                              #   this box enforces the posture a superzej-built
+#                              #   image guarantees, restoring the one-notch
+#                              #   trust drop unattested user-owned hosts get
+#                              #   for packing (a probe proves PRESENCE of
+#                              #   podman/userns, never ENFORCEMENT).
 # [host.gpu-box.ssh]           # same knobs as [env.<name>.ssh]
 # host = "user@gpu-box"
 # port = 22
@@ -2101,6 +2110,11 @@ enabled = false
 # overcommit = 2.0            # cpu packing ceiling = spec × this (floors are
 #                             #   declared asks, not live usage)
 # mem_overcommit = 1.0        # memory is not compressible: default no overcommit
+# independent_safety_pct = 85 # haircut on user-owned hosts' packing ceilings
+#                             #   (their size is a claim, not a spec — see
+#                             #   [host.<n>] capacity)
+# headroom_ttl_secs = 60      # measured-sample max age before a placement
+#                             #   decision re-probes (lazy; never idle polling)
 # [placement.default_resources] # fallback ask when an env declares none
 # cpu = "1"                   #   cpu floor ("2", "0.5", "500m")
 # memory = "2g"               #   memory floor ("4g", "512m", bare = MiB)

@@ -251,6 +251,18 @@ pub struct HostCaps {
     /// Free bytes on the container-storage partition, when probed.
     pub disk_free_bytes: Option<u64>,
     pub has_nix: bool,
+    /// cgroup v2 unified hierarchy present (resource-limit fidelity).
+    #[serde(default)]
+    pub cgroup_v2: bool,
+    /// Unprivileged user namespaces enabled (rootless-container viability).
+    #[serde(default)]
+    pub userns: bool,
+    /// Logical CPU count, when probed (the machine-size hint).
+    #[serde(default)]
+    pub nproc: Option<u32>,
+    /// MemTotal in KiB, when probed.
+    #[serde(default)]
+    pub mem_total_kb: Option<u64>,
 }
 
 impl HostCaps {
@@ -345,6 +357,10 @@ impl HostCaps {
             can_install_runtime,
             disk_free_bytes: kv.get("DISK_FREE").and_then(|v| v.parse().ok()),
             has_nix: truthy("NIX"),
+            cgroup_v2: truthy("CGROUPV2"),
+            userns: truthy("USERNS"),
+            nproc: kv.get("NPROC").and_then(|v| v.parse().ok()),
+            mem_total_kb: kv.get("MEM_TOTAL_KB").and_then(|v| v.parse().ok()),
         })
     }
 
@@ -365,6 +381,10 @@ impl HostCaps {
             can_install_runtime: false,
             disk_free_bytes: None,
             has_nix: false,
+            cgroup_v2: false,
+            userns: false,
+            nproc: None,
+            mem_total_kb: None,
         }
     }
 }
