@@ -98,6 +98,43 @@ pub(crate) fn vps_provider_for(
     ))
 }
 
+/// The resolved provider sandbox NAME for a worktree's env — the single source of
+/// truth. Resolves the env exactly as the pane path does (`resolve_env` →
+/// `ProviderPlacement.id`) so provisioning, attach (`native_shell_exec`),
+/// checkpoint, and teardown all compute the SAME name (the id embeds a stable
+/// path-hash; deriving it inconsistently would orphan/leak sandboxes). `None` for
+/// a non-provider env. Mirrors how the other launch paths resolve `repo_root`.
+pub(crate) fn provider_sandbox_name(
+    cfg: &superzej_core::config::Config,
+    worktree: &str,
+    env_name: &str,
+) -> Option<String> {
+    use std::path::{Path, PathBuf};
+    use superzej_core::store::{PoolStore, WorkspaceStore};
+    let loc = superzej_core::remote::GitLoc::for_worktree(Path::new(worktree));
+    let repo_root: PathBuf = superzej_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| superzej_core::repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
+    match env.placement {
+        superzej_core::placement::Placement::Provider(p) => {
+            // If this worktree CLAIMED a warm-pool spare, its sandbox is that
+            // spare's name (a DB binding), which overrides the derived id — so all
+            // lifecycle/exec calls target the handed-over sandbox. Else the derived
+            // `effective_provider_id`.
+            let bound = superzej_core::db::Db::open()
+                .ok()
+                .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten());
+            Some(bound.unwrap_or(p.id))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

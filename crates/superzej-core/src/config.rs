@@ -2333,6 +2333,14 @@ pub struct EnvConfig {
     /// global default allows failover. Resolved by [`Config::env_failover`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failover: Option<bool>,
+    /// Requested placement class for the engine (`None` ⇒ inherit
+    /// `[placement] mode`). Clamped by the resolved mode floor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_mode: Option<PlacementModePref>,
+    /// `[env.<name>.resources]` — the declared resource ask the placement
+    /// engine reserves (fields fall back to `[placement.default_resources]`).
+    #[serde(skip_serializing_if = "ResourcesDecl::is_empty")]
+    pub resources: ResourcesDecl,
 }
 
 pub use crate::config_env_tables::{
@@ -4061,68 +4069,10 @@ fn is_default_preset(s: &str) -> bool {
     s.is_empty() || s == "default"
 }
 
-config_enum! {
-    /// How far ahead of focus to eagerly provision provider sandboxes (so the
-    /// minutes-long one-time provisioning happens in the background, not on the
-    /// hot path). Non-provider worktrees are always a no-op.
-    pub enum EagerScope: "eager scope" {
-        Off = "off" | "none",
-        ActiveWorktreePlusNew = "active" | "active_plus_new" | "focus",
-        ActiveWorkspace = "workspace",
-        All = "all",
-    } default = ActiveWorktreePlusNew;
-}
-
-pub use crate::config_env_tables::PoolConfig;
-
-/// `[lifecycle]` — budget-governed warm/suspend policy for managed-provider
-/// sandboxes. The defaults are budget-safe: superzej's background sidebar/activity
-/// polling never wakes a suspended sandbox, and idle sandboxes suspend after the
-/// TTL while the few most-recently-used (and any busy/pane-held) stay warm.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct LifecycleConfig {
-    /// Master switch. When off, the policy is inert (no suspend, no gating) —
-    /// today's behavior. On by default (the default settings only *reduce* cost).
-    pub enabled: bool,
-    /// Max managed-provider sandboxes kept warm at once (bounds discretionary
-    /// keeps; active/busy/pane-held worktrees are always kept).
-    pub max_warm: usize,
-    /// Idle seconds before a non-essential warm sandbox may suspend.
-    pub idle_ttl_secs: u64,
-    /// How far ahead of focus to eagerly provision (hide the provisioning cost).
-    pub eager: EagerScope,
-    /// Always keep the active worktree's sandbox warm.
-    pub keep_active_warm: bool,
-    /// Keep a busy worktree (live in-sandbox process) warm past the idle TTL.
-    pub keep_busy_warm: bool,
-    /// Serve cached git glyphs/activity for non-warm provider worktrees instead of
-    /// running an in-sandbox query that would wake them (the core budget fix).
-    pub serve_cached_glyphs: bool,
-    /// Optional spend guardrail: est. $/warm-sandbox-hour for the ceiling math.
-    pub cost_per_warm_hour: f64,
-    /// Trim the warm set so estimated warm spend stays under this $/hour. `0` ⇒ off.
-    pub cost_ceiling_per_hour: f64,
-    /// Optional warm pool of pre-provisioned spares (`[lifecycle.pool]`).
-    pub pool: PoolConfig,
-}
-
-impl Default for LifecycleConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_warm: 2,
-            idle_ttl_secs: 300,
-            eager: EagerScope::ActiveWorktreePlusNew,
-            keep_active_warm: true,
-            keep_busy_warm: true,
-            serve_cached_glyphs: true,
-            cost_per_warm_hour: 0.0,
-            cost_ceiling_per_hour: 0.0,
-            pool: PoolConfig::default(),
-        }
-    }
-}
+pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
+pub use crate::config_placement::{
+    OnExhaustion, PackStrategy, PlacementConfig, PlacementModePref, ResourcesDecl,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -4216,6 +4166,10 @@ pub struct Config {
     /// sandboxes (keep recently-used ones warm for fast resume; let idle ones
     /// suspend; provision ahead of focus). Budget-safe defaults.
     pub lifecycle: LifecycleConfig,
+    /// `[placement]` — the multi-host placement engine (dedicated / packed /
+    /// autoscale). Off by default; strictly additive. See
+    /// [`crate::config_placement`].
+    pub placement: PlacementConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -4330,6 +4284,7 @@ impl Default for Config {
             share: ShareConfig::default(),
             forward: ForwardConfig::default(),
             lifecycle: LifecycleConfig::default(),
+            placement: PlacementConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),

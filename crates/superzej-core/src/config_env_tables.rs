@@ -368,6 +368,67 @@ pub struct MetricsTarget {
     pub labels: std::collections::BTreeMap<String, String>,
 }
 
+config_enum! {
+    /// How far ahead of focus to eagerly provision provider sandboxes (so the
+    /// minutes-long one-time provisioning happens in the background, not on the
+    /// hot path). Non-provider worktrees are always a no-op.
+    pub enum EagerScope: "eager scope" {
+        Off = "off" | "none",
+        ActiveWorktreePlusNew = "active" | "active_plus_new" | "focus",
+        ActiveWorkspace = "workspace",
+        All = "all",
+    } default = ActiveWorktreePlusNew;
+}
+
+/// `[lifecycle]` — budget-governed warm/suspend policy for managed-provider
+/// sandboxes. The defaults are budget-safe: superzej's background sidebar/activity
+/// polling never wakes a suspended sandbox, and idle sandboxes suspend after the
+/// TTL while the few most-recently-used (and any busy/pane-held) stay warm.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct LifecycleConfig {
+    /// Master switch. When off, the policy is inert (no suspend, no gating) —
+    /// today's behavior. On by default (the default settings only *reduce* cost).
+    pub enabled: bool,
+    /// Max managed-provider sandboxes kept warm at once (bounds discretionary
+    /// keeps; active/busy/pane-held worktrees are always kept).
+    pub max_warm: usize,
+    /// Idle seconds before a non-essential warm sandbox may suspend.
+    pub idle_ttl_secs: u64,
+    /// How far ahead of focus to eagerly provision (hide the provisioning cost).
+    pub eager: EagerScope,
+    /// Always keep the active worktree's sandbox warm.
+    pub keep_active_warm: bool,
+    /// Keep a busy worktree (live in-sandbox process) warm past the idle TTL.
+    pub keep_busy_warm: bool,
+    /// Serve cached git glyphs/activity for non-warm provider worktrees instead of
+    /// running an in-sandbox query that would wake them (the core budget fix).
+    pub serve_cached_glyphs: bool,
+    /// Optional spend guardrail: est. $/warm-sandbox-hour for the ceiling math.
+    pub cost_per_warm_hour: f64,
+    /// Trim the warm set so estimated warm spend stays under this $/hour. `0` ⇒ off.
+    pub cost_ceiling_per_hour: f64,
+    /// Optional warm pool of pre-provisioned spares (`[lifecycle.pool]`).
+    pub pool: PoolConfig,
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_warm: 2,
+            idle_ttl_secs: 300,
+            eager: EagerScope::ActiveWorktreePlusNew,
+            keep_active_warm: true,
+            keep_busy_warm: true,
+            serve_cached_glyphs: true,
+            cost_per_warm_hour: 0.0,
+            cost_ceiling_per_hour: 0.0,
+            pool: PoolConfig::default(),
+        }
+    }
+}
+
 /// `[lifecycle.pool]` — an optional pool of pre-provisioned, unclaimed sandboxes
 /// per (repo, env) so a brand-new worktree opens instantly. `size = 0` leaves it
 /// to the auto default (one parked spare for a scale-to-zero provider the user

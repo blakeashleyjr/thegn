@@ -1158,14 +1158,14 @@ pub(crate) fn build_model(
         &counted_kinds,
         &app_cfg.lifecycle,
     );
-    // VPS leak-safety reaper (self-throttled; network runs on its own thread).
+    // Self-throttled housekeeping (network/DB on own threads): VPS leak
+    // reaper + placement engine (sweep, scale-down, queue nudges).
     crate::vps_reaper::tick(&app_cfg);
+    crate::placement_flow::maintain_tick(&app_cfg);
     let loc_count = worktree_loc(db, &cwd);
 
-    // Terse placement kind (ssh/mosh/k8s/<provider>) for the active worktree, for
-    // the center tab bar. Resolved from config (pure, no I/O); `None` when local.
-    // Reuse the canonical repo_root from the sidebar list so the kind matches the
-    // full label shown in the sidebar detail line.
+    // Terse placement kind (ssh/mosh/k8s/<provider>) for the active worktree's
+    // tab bar; pure config resolve, canonical repo_root from the sidebar list.
     let active_path = loc.path();
     let active_repo = sidebar_db_worktrees
         .iter()

@@ -716,6 +716,10 @@ command = "git diff"
 # network_allow = ["*.clienta.com", "github.com"]  # egress CEILING (members narrow within)
 # network_block = ["telemetry.example.com"]     # appended to every member (deny wins)
 # sandbox_floor = "hardened"                     # members may only be >= this hardening
+# placement_floor = "dedicated"                  # placement-mode FLOOR for members: a
+#                                                #   member's requested mode may only be
+#                                                #   equal-or-stricter (auto < packed <
+#                                                #   dedicated). See [placement].
 # [zone.clientA.budget]
 # limit_tokens = 5000000                         # rolled up as the `zone:clientA` proxy scope
 # limit_cost   = 100.0                           # USD ceiling for the period
@@ -1745,6 +1749,13 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # data = "in_env"            # in_env (files on the remote) | sshfs | sync | local_exec
 # failover = false           # per-env override of [sandbox] failover: true = this env
 #                            #   may degrade to the local chain / host; false = halt+warn
+# placement_mode = "auto"    # placement-engine class for this env (auto | packed |
+#                            #   dedicated); omit ⇒ inherit [placement] mode
+# [env.gpu-box.resources]    # declared ask the placement engine RESERVES (falls
+# cpu = "2"                  #   back per-field to [placement.default_resources])
+# memory = "4g"
+# cpu_max = "4"              # optional container limits: feed --cpus/--memory when
+# memory_max = "8g"          #   the resolved sandbox declares none of its own
 # [env.gpu-box.ssh]
 # host = "user@gpu-box"      # empty ⇒ inherit the worktree's own target / [sandbox.remote]
 # port = 22
@@ -1785,6 +1796,11 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # volumes = ["nix-store", "cargo"]   # warm volumes seeded once and mounted into
 #                              #   every sandbox; omit for both, [] for none
 # probe_ttl_secs = 900         # Ready hosts re-verify (one cheap exec) after this
+# capacity = { cpu = "8", memory = "16g" }  # declared machine size for the
+#                              #   [placement] engine's capacity index; omitted =
+#                              #   unknown size (dedicated placements only, never
+#                              #   packed). Engine-created hosts get their spec
+#                              #   from the autoscale template instead.
 # [host.gpu-box.ssh]           # same knobs as [env.<name>.ssh]
 # host = "user@gpu-box"
 # port = 22
@@ -2052,6 +2068,61 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # destroy+rebuild (minutes) when they go stale or their worktree is deleted;
 # # lockfile-freshness guarded, destroy on any failure. false = always destroy.
 # recycle = true
+
+# ── Placement engine ─────────────────────────────────────────────────────────
+# WHERE each worktree sandbox runs: Dedicated (one sandbox, exclusive host),
+# Packed (bin-packed with others onto a shared Ready [host.*] via superzej's own
+# container engine), or a freshly autoscaled Managed VPS. OFF by default — with
+# `enabled = false` every existing spawn path is byte-identical. Explicit
+# `[env.<n>] host = "..."` pins always bypass the broker (but are still
+# accounted in the capacity ledger). Decisions are pure + deterministic; ask
+# `superzej placement plan --json` why a spawn would land where.
+#
+# RESOURCE VIEW: every host — managed and independent — carries three layers:
+# the DECLARED spec (authoritative for managed hosts), the RESERVED totals
+# (Σ of live tenants' declared floors), and the latest MEASURED sample
+# (observational; display + ranking hints, never a capacity source where a
+# spec exists). `superzej placement list` renders all three.
+[placement]
+enabled = false
+# mode = "auto"               # auto (broker chooses; packed when trust+capacity
+#                             #   allow, else an empty host) | packed | dedicated.
+#                             #   Per-env override: `[env.<n>] placement_mode`.
+# strictest_allowed_mode = "auto"  # CONSTRAINT floor (trusted layers only):
+#                             #   requests may be stricter, never looser
+#                             #   (auto < packed < dedicated).
+# pack_strategy = "bin-pack"  # bin-pack (consolidate: most-utilized first, idle
+#                             #   hosts drain + scale down) | spread (least-
+#                             #   utilized first: latency headroom, blast radius)
+# on_exhaustion = "queue"     # queue (fall through this once; superzej nudges
+#                             #   when capacity frees — re-open to place) |
+#                             #   reject (silently use the env's non-engine
+#                             #   path) | error (halt loudly)
+# overcommit = 2.0            # cpu packing ceiling = spec × this (floors are
+#                             #   declared asks, not live usage)
+# mem_overcommit = 1.0        # memory is not compressible: default no overcommit
+# [placement.default_resources] # fallback ask when an env declares none
+# cpu = "1"                   #   cpu floor ("2", "0.5", "500m")
+# memory = "2g"               #   memory floor ("4g", "512m", bare = MiB)
+# cpu_max = ""                #   optional container --cpus limit (see
+# memory_max = ""             #   [env.<n>.resources] cpu_max/memory_max)
+# [placement.autoscale]       # create Managed VPS hosts on pool exhaustion.
+# enabled = false             #   Enabling this IS the create+install consent for
+#                             #   engine-created hosts (superzej owns those boxes).
+# max_hosts = 3               #   ceiling on engine-created hosts (0 ⇒ default 3)
+# min_hosts = 0               #   floor kept alive by scale-down (warm capacity)
+# scale_down_idle_secs = 900  #   a Managed host with zero tenants this long is
+#                             #   destroyed (a parked pool spare counts as a
+#                             #   tenant, so it keeps its host warm on purpose)
+# cooldown_secs = 60          #   base cooldown after a lane's create failure
+#                             #   (escalates per consecutive failure)
+# [[placement.autoscale.managed]] # ORDERED failover lanes (first viable wins;
+# provider = "hetzner"        #   a failed lane cools down and the next spawn
+# region = "fsn1"             #   tries the next lane; fail-back on expiry)
+# size = "cx32"               #   vendor plan — the lane's identity
+# cpu = "4"                   #   declared spec of the plan (authoritative for
+# memory = "8g"               #   the capacity index from create time)
+# max = 2                     #   per-lane ceiling (0 ⇒ 1)
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────
 # The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
 # depends on this — AI is strictly additive — so it is OFF by default. When

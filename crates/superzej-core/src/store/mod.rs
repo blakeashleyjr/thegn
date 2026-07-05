@@ -35,6 +35,7 @@ mod cache;
 mod host;
 mod intent;
 mod notification;
+mod placement;
 mod pool;
 mod proxy;
 mod trust;
@@ -47,6 +48,10 @@ pub use cache::CacheStore;
 pub use host::HostStore;
 pub use intent::{IntentRow, IntentStore};
 pub use notification::NotificationStore;
+pub use placement::{
+    HealthMarker, HostCapacityRow, PlacementEventRow, PlacementStore, ReserveOutcome, TenancyMode,
+    TenancyRow, TenancyState,
+};
 pub use pool::PoolStore;
 pub use proxy::ProxyStore;
 pub use trust::{RepoTrustRow, RepoTrustStore};

@@ -400,6 +400,13 @@ pub fn claim_spare(
             None,
         );
     }
+    // Placement-engine accounting: if this spare holds a tenancy row (spares
+    // minted onto engine-managed hosts), rebind it to the claiming worktree —
+    // same sandbox, same host, amounts unchanged. No-op otherwise.
+    {
+        use superzej_core::store::PlacementStore;
+        let _ = db.tenancy_rebind(&name, worktree);
+    }
     superzej_core::msg::info(&format!("claimed warm spare {name} for {worktree}"));
     // The claim consumed this spare — refill the pool now rather than waiting for
     // the next ~8s maintainer tick to notice the gap (off-loop, its own thread).
@@ -420,8 +427,18 @@ pub fn destroy_spare(
     }
     if let Ok(db) = superzej_core::db::Db::open() {
         let _ = db.delete_pool_spare(name);
+        // Free any placement-engine slot the spare held (no-op otherwise).
+        use superzej_core::store::PlacementStore;
+        let _ = db.tenancy_release(name, unix_now_secs());
     }
     Ok(())
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

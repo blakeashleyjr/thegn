@@ -654,44 +654,9 @@ pub(crate) fn deproject(path: &str) {
     }
 }
 
-// Provider construction lives in `provider_factory.rs` (extracted for the
-// file-size ratchet); re-exported so call sites are unchanged.
-pub(crate) use crate::provider_factory::{provider_for, provider_for_named};
-
-/// The resolved provider sandbox NAME for a worktree's env — the single source of
-/// truth. Resolves the env exactly as the pane path does (`resolve_env` →
-/// `ProviderPlacement.id`) so provisioning, attach (`native_shell_exec`),
-/// checkpoint, and teardown all compute the SAME name (the id embeds a stable
-/// path-hash; deriving it inconsistently would orphan/leak sandboxes). `None` for
-/// a non-provider env. Mirrors how the other launch paths resolve `repo_root`.
-pub(crate) fn provider_sandbox_name(
-    cfg: &Config,
-    worktree: &str,
-    env_name: &str,
-) -> Option<String> {
-    let loc = GitLoc::for_worktree(Path::new(worktree));
-    let repo_root: PathBuf = Db::open()
-        .ok()
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| repo::main_worktree(Path::new(worktree)))
-        .unwrap_or_else(|| PathBuf::from(worktree));
-    let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
-    match env.placement {
-        superzej_core::placement::Placement::Provider(p) => {
-            // If this worktree CLAIMED a warm-pool spare, its sandbox is that
-            // spare's name (a DB binding), which overrides the derived id — so all
-            // lifecycle/exec calls target the handed-over sandbox. Else the derived
-            // `effective_provider_id`.
-            let bound = Db::open()
-                .ok()
-                .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten());
-            Some(bound.unwrap_or(p.id))
-        }
-        _ => None,
-    }
-}
+// Provider construction + name resolution live in `provider_factory.rs`
+// (extracted for the file-size ratchet); re-exported so call sites are unchanged.
+pub(crate) use crate::provider_factory::{provider_for, provider_for_named, provider_sandbox_name};
 
 /// Per-provider native-exec health: after a connect/exec failure, `exec = "auto"`
 /// spawns skip the native path (use the CLI) for a cooldown, then retry — so one

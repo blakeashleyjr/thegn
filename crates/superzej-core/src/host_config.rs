@@ -54,6 +54,14 @@ pub struct HostConfig {
     pub volumes: Option<Vec<String>>,
     /// Probe TTL in seconds (0 ⇒ [`DEFAULT_PROBE_TTL_SECS`]).
     pub probe_ttl_secs: u64,
+    /// Declared machine size for the placement engine's capacity index
+    /// (`capacity = { cpu = "8", memory = "16g" }`). Only `cpu`/`memory` are
+    /// consulted; empty ⇒ unknown size ⇒ the host serves dedicated placements
+    /// but is never packed (an overcommit ceiling over an unknown base is
+    /// meaningless). Engine-created hosts get an authoritative spec from
+    /// their create template instead.
+    #[serde(skip_serializing_if = "crate::config_placement::ResourcesDecl::is_empty")]
+    pub capacity: crate::config_placement::ResourcesDecl,
     /// `[host.<n>.ssh]` (reach = ssh) — same knobs as `[env.<n>.ssh]`.
     #[serde(skip_serializing_if = "EnvSshConfig::is_default")]
     pub ssh: EnvSshConfig,
@@ -127,6 +135,9 @@ pub struct HostBinding {
     pub volumes: Vec<VolumeSpec>,
     pub delivery_prefs: Vec<DeliveryCap>,
     pub probe_ttl_secs: i64,
+    /// Declared machine size (`[host.<n>] capacity`) for the placement
+    /// engine's capacity index; `None` = unknown (never packed).
+    pub declared_spec: Option<crate::capacity::HostSpec>,
 }
 
 /// Default warm-volume set when `[host.<n>] volumes` is absent.
@@ -160,6 +171,32 @@ fn parse_delivery(name: &str, prefs: &[String]) -> Vec<DeliveryCap> {
         }
     }
     out
+}
+
+/// Lower a `[host.<n>] capacity` declaration to a spec; partial/unparseable
+/// declarations warn and read as unknown (never a half-spec).
+fn parse_capacity(
+    name: &str,
+    decl: &crate::config_placement::ResourcesDecl,
+) -> Option<crate::capacity::HostSpec> {
+    if decl.is_empty() {
+        return None;
+    }
+    let cpu = crate::capacity::parse_cpu_milli(&decl.cpu);
+    let mem = crate::capacity::parse_mem_mb(&decl.memory);
+    match (cpu, mem) {
+        (Some(c), Some(m)) => Some(crate::capacity::HostSpec {
+            cpu_milli: c,
+            mem_mb: m,
+        }),
+        _ => {
+            config_warn(&format!(
+                "[host.{name}] capacity: needs parseable cpu + memory (e.g. \
+                 cpu = \"8\", memory = \"16g\"); treating the size as unknown"
+            ));
+            None
+        }
+    }
 }
 
 fn parse_volumes(name: &str, volumes: &Option<Vec<String>>) -> Vec<VolumeSpec> {
@@ -373,6 +410,7 @@ impl Config {
             } else {
                 hc.probe_ttl_secs as i64
             },
+            declared_spec: parse_capacity(name, &hc.capacity),
         })
     }
 
@@ -412,6 +450,7 @@ impl Config {
                     volumes: default_volumes(),
                     delivery_prefs: Vec::new(),
                     probe_ttl_secs: DEFAULT_PROBE_TTL_SECS,
+                    declared_spec: None,
                 })
             }
             PlacementMode::Provider => {
@@ -437,6 +476,7 @@ impl Config {
                     volumes: Vec::new(), // cloud folds volumes into the checkpoint
                     delivery_prefs: Vec::new(),
                     probe_ttl_secs: DEFAULT_PROBE_TTL_SECS,
+                    declared_spec: None,
                 })
             }
             PlacementMode::Local | PlacementMode::K8s => None,

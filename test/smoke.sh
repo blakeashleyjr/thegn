@@ -263,6 +263,37 @@ check "env show resolves an environment for a worktree" \
 check "env set/show round-trips a selection" \
   "'$SZ' env set company-k8s '$WT' >/dev/null 2>&1 && '$SZ' env show '$WT' >/dev/null 2>&1"
 
+# ── placement engine ─────────────────────────────────────────────────────────
+# Engine OFF (the default): the dry-run reports passthrough and no state is
+# written — the byte-compatibility invariant's shell-visible face.
+check "placement plan reports passthrough while the engine is off" \
+  "'$SZ' placement plan '$R' | grep -q 'engine off'"
+check "placement list renders the seeded host (unknown size)" \
+  "'$SZ' placement list | grep -q 'smoke-local'"
+check "placement events is empty while the engine is off" \
+  "'$SZ' placement events | grep -q 'no placement decisions'"
+# Engine ON with a declared-capacity host: the broker's dry-run is
+# deterministic — an unprobed host can't pack (no known runtime), so `auto`
+# falls back to a dedicated placement on the empty box.
+cat >>"$XDG_CONFIG_HOME/superzej/config.toml" <<EOF
+
+[host.pool-box]
+reach = "local"
+install_runtime = "never"
+volumes = []
+capacity = { cpu = "8", memory = "16g" }
+
+[placement]
+enabled = true
+EOF
+check "placement plan decides deterministically with the engine on" \
+  "'$SZ' placement plan '$R' --json | grep -q '\"decision\": \"dedicated\"'"
+check "placement plan explains every candidate" \
+  "'$SZ' placement plan '$R' --json | grep -q 'trust_class'"
+# The dry-run must be side-effect free: no reservation, no event.
+check "placement plan writes no decision events" \
+  "'$SZ' placement events | grep -q 'no placement decisions'"
+
 # ── ingress sharing (`[share]`) ──────────────────────────────────────────────
 # The config parses (all provider sub-tables, exercised by validate above).
 check "share config round-trips through config show" \

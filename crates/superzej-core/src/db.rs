@@ -56,18 +56,14 @@ use std::path::PathBuf;
 /// v29: adds `group_tabs.scrollback_snapshot` (per-leaf captured scrollback tail,
 /// JSON `pane id → text`) so a resurrected pane repaints its recent history
 /// instead of a blank screen. Additive; absent/NULL on pre-v29 rows = no history.
-/// v30: adds `hosts` + `host_inventory` + `host_events` (hosts as first-class
-/// resources; see [`crate::host_db`]).
-/// v31: adds `loc_cache.report_json` (per-language tokei breakdown alongside the
-/// total; see [`crate::loc::LocReport`]).
-/// v32: adds `repo_trust` (trust-on-first-use approvals for a repo overlay's
-/// gated sandbox requests; see [`crate::repo_trust`]).
-/// v33: adds `zones` + `workspaces.zone_id` (per-profile workspace grouping with
-/// credential/egress/budget sub-scoping; see [`crate::zone`]). `pub` for host-side
+/// v30: adds `hosts` + `host_inventory` + `host_events` (see [`crate::host_db`]).
+/// v31: adds `loc_cache.report_json` (per-language tokei breakdown; [`crate::loc`]).
+/// v32: adds `repo_trust` (TOFU approvals for repo overlays; [`crate::repo_trust`]).
+/// v33: adds `zones` + `workspaces.zone_id` ([`crate::zone`]). `pub` for host-side
 /// schema-mismatch messaging.
-/// v34–v36: reserved — claimed by the unmerged multi-host placement-engine
-/// branch; skipped here so ITS merge needs no renumbering (all migrations are
-/// additive `IF NOT EXISTS`, so the stamp is bookkeeping, not a data guard).
+/// v34: adds `host_capacity`/`host_tenancy`/`placement_health`/`placement_events`
+/// (the placement engine; see [`crate::db_placement`]). v35–v36: reserved for
+/// the rest of the placement branch (headroom cols, compute ledger).
 /// v37: adds `intents` (the CLI→compositor mailbox behind `superzej open`;
 /// see [`crate::store::IntentStore`]).
 pub const SCHEMA_VERSION: i64 = 37;
@@ -644,6 +640,7 @@ impl Db {
         // v6: flat v4/v5 `tab_layout` → worktree groups (idempotent).
         migrate_tab_layout_v6(&conn);
         crate::host_db::migrate_v30(&conn)?;
+        crate::db_placement::migrate_v34(&conn)?;
         Ok(Db {
             conn,
             schema_mismatch,
