@@ -72,6 +72,9 @@ struct HostView {
     measured: Option<serde_json::Value>,
     /// Engine lane (`provider/template`) for engine-created hosts, else "".
     lane: String,
+    /// Effective co-tenancy trust class (one notch down for unattested
+    /// user-owned hosts; "unprobed" until a runtime probe ran).
+    trust: String,
 }
 
 fn list(cfg: &Config, json: bool) -> Result<()> {
@@ -90,6 +93,19 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
         let reserved = db.reserved_totals(&id).unwrap_or_default();
         let tenants = db.tenants_of(&id).unwrap_or_default();
         let spec = cap.as_ref().and_then(|c| c.spec).or(binding.declared_spec);
+        let ownership = cap
+            .as_ref()
+            .map(|c| c.ownership)
+            .unwrap_or(superzej_core::capacity::HostOwnership::Independent);
+        let trust = match row.as_ref().and_then(|r| r.caps.as_ref()) {
+            Some(caps) => superzej_core::trust_class::effective_class(
+                caps,
+                ownership,
+                hc.trust_egress_enforced,
+            )
+            .to_string(),
+            None => "unprobed".to_string(),
+        };
         views.push(HostView {
             host: id.to_string(),
             ownership: cap
@@ -117,6 +133,7 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
                     "cpu_milli": m.cpu_milli, "mem_mb": m.mem_mb, "at": m.at
                 })
             }),
+            trust,
             lane: cap
                 .map(|c| {
                     if c.template.is_empty() {
@@ -153,10 +170,11 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
             format!("  [{}]", v.lane)
         };
         outln!(
-            "{}  {}  {}  spec: {}  reserved: {:.1} cpu / {} MiB ({} tenant(s)){}",
+            "{}  {}  {}  trust: {}  spec: {}  reserved: {:.1} cpu / {} MiB ({} tenant(s)){}",
             v.host,
             v.ownership,
             v.state,
+            v.trust,
             spec,
             v.reserved["cpu_milli"].as_u64().unwrap_or(0) as f64 / 1000.0,
             v.reserved["mem_mb"].as_u64().unwrap_or(0),

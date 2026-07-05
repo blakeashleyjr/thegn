@@ -25,8 +25,8 @@ never a forced kill, never an implicit cleanup of someone else's machine.
   exclusion). `[placement]` gains `independent_safety_pct` (the haircut) and
   `headroom_ttl_secs`.
 - **DB** — `user_version` bump to **35**: `hosts` gains `headroom_json` /
-  `last_headroom` / `trust_json` (additive ALTERs, the `config_json`
-  precedent).
+  `last_headroom` (additive ALTERs, the `config_json` precedent; the trust
+  class is recomputed from caps + attestation, never persisted).
 - **Core** — new `trust_class.rs` (the ladder + one-notch-down + attestation
   raise, projected over the probed `HostCaps`), new `host_probe.rs`
   (`Headroom` KEY=VALUE parser + `independent_effective_ceiling`); the

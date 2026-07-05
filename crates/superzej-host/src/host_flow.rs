@@ -375,6 +375,17 @@ pub(crate) fn ensure_host_ready_with(
     make_runner: RunnerFactory<'_>,
 ) -> Result<HostOutcome, HostFailure> {
     let key = binding.id.to_string();
+    // A draining host accepts no new placements/provisions — only its
+    // existing sandboxes run out (finalized by `host rm` at zero tenants).
+    if let Ok(Some(row)) = db.host_get(&binding.id)
+        && row.state == HostState::Draining
+    {
+        return Err(HostFailure {
+            step: HostStep::Connect,
+            error: "host is draining (de-registration in progress)".into(),
+            retryable: false,
+        });
+    }
     // Golden fast path: one SQLite read, zero network.
     if ready_fresh(db, binding) {
         let _ = db.host_touch_used(&binding.id, unix_now());

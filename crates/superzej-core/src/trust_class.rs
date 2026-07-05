@@ -23,17 +23,20 @@ use crate::host::{HostCaps, RuntimeKind};
 /// Boundary strength between co-tenants, weakest to strongest. `Ord` follows
 /// declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
 pub enum TrustClass {
     /// No container boundary at all (plain host shell).
     #[default]
+    #[serde(rename = "host-shell")]
     T0HostShell,
     /// A rootful container: namespaces + cgroups on a shared kernel.
+    #[serde(rename = "container")]
     T1Container,
     /// A rootless container: the userns layer means even a container escape
     /// lands in an unprivileged user, not root.
+    #[serde(rename = "rootless-container")]
     T2RootlessContainer,
     /// A hardware-virtualized guest kernel (microVM / Apple container).
+    #[serde(rename = "guest-kernel")]
     T3GuestKernel,
 }
 

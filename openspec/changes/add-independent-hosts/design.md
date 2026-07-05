@@ -62,8 +62,10 @@ the user owns.
 
 ## Schema / invariants
 
-v35: three additive `hosts` ALTERs (`headroom_json`, `last_headroom`,
-`trust_json`), the tolerated-ALTER precedent. No event-loop change: probes run
+v35: two additive `hosts` ALTERs (`headroom_json`, `last_headroom`), the
+tolerated-ALTER precedent. The trust class is never persisted — it is a
+cheap pure projection of probed caps + config attestation, recomputed at
+snapshot time so it can't go stale. No event-loop change: probes run
 in the same blocking placement/CLI contexts as everything else; the idle loop
 never polls. `db.rs` stays at its cap via comment compression (the v30
 pattern).

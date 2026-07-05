@@ -16,12 +16,12 @@
 
 use std::collections::BTreeSet;
 
-use superzej_core::capacity::{HostCapacity, HostOwnership};
+use superzej_core::capacity::{HostCapacity, HostOwnership, MeasuredLoad};
 use superzej_core::config::{Config, EnvConfig, PlacementMode};
 use superzej_core::config_placement::{OnExhaustion, ResolvedPlacement, resolve_placement};
 use superzej_core::db::Db;
 use superzej_core::host::{HostFailure, HostId, HostStep};
-use superzej_core::host_config::{HostBinding, HostReach};
+use superzej_core::host_config::{HostBinding, HostConfig, HostReach};
 use superzej_core::host_machine::HostState;
 use superzej_core::scheduler::{
     AutoscaleSnapshot, DecisionOutput, HostSnapshot, PlacementDecision, PlacementInputs,
@@ -31,6 +31,7 @@ use superzej_core::store::{
     HostStore, PlacementEventRow, PlacementStore, ReserveOutcome, TenancyMode, TenancyRow,
     TenancyState, ZoneStore,
 };
+use superzej_core::trust_class::{TrustClass, effective_class, required_class};
 
 /// Reservations older than this in `reserved` (never activated) are released
 /// by the maintainer sweep — a crashed driver must not hold capacity forever.
@@ -120,61 +121,129 @@ pub(crate) fn note_pin(
 }
 
 /// Build the broker's view of one candidate host. Every resource layer the
-/// user asked for lives here: DECLARED spec (capacity row, else the
-/// `[host.<n>] capacity` config decl), RESERVED floors (tenancy ledger), and
-/// the latest MEASURED sample (display + ranking; a capacity source only
-/// where no spec exists — not yet, that lands with independent-host probing).
+/// user asked for lives here: DECLARED spec (capacity row / template, else
+/// the `[host.<n>] capacity` decl — probe-capped with the safety haircut for
+/// independent hosts), RESERVED floors (tenancy ledger), the latest MEASURED
+/// sample (refreshed lazily under `headroom_ttl_secs`), and the EFFECTIVE
+/// trust class (one notch down for unattested independent hosts).
 fn snapshot_host(
     db: &Db,
-    name: &str,
+    hc: &HostConfig,
     binding: &HostBinding,
     resolved: &ResolvedPlacement,
+    safety_pct: u32,
+    headroom_ttl_secs: u64,
+    refresh: bool,
 ) -> HostSnapshot {
     let id = binding.id.clone();
-    let row = db.host_get(&id).ok().flatten();
+    let mut row = db.host_get(&id).ok().flatten();
     let cap = db.capacity_get(&id).ok().flatten();
     let reserved = db.reserved_totals(&id).unwrap_or_default();
     let tenants = db.tenants_of(&id).unwrap_or_default();
-    let (ready, failed) = match row.as_ref().map(|r| &r.state) {
-        Some(HostState::Ready) => (true, false),
-        Some(HostState::Failed(f)) => (false, !f.retryable),
-        _ => (false, false),
+    let ownership = cap
+        .as_ref()
+        .map(|c| c.ownership)
+        .unwrap_or(HostOwnership::Independent);
+
+    // Lazy measured-layer refresh: one cheap exec when the stored sample is
+    // stale (never from the idle loop — this runs in blocking placement/CLI
+    // contexts only). A failed probe fails CLOSED for packing below.
+    let mut probe_failed = false;
+    if refresh {
+        let stale = row
+            .as_ref()
+            .and_then(|r| r.last_headroom)
+            .is_none_or(|t| unix_now().saturating_sub(t) > headroom_ttl_secs as i64);
+        if stale {
+            match superzej_svc::host::runner_for(&binding.reach)
+                .and_then(|mut r| r.probe_headroom())
+            {
+                Ok(h) => {
+                    let now = unix_now();
+                    let _ = db.host_set_headroom(&id, &h, now);
+                    // Mirror into the capacity index so every surface
+                    // (placement list, panel, ranking) reads one table.
+                    let _ = db.capacity_set_measured(
+                        &id,
+                        &MeasuredLoad {
+                            cpu_milli: u64::from(h.load1_milli),
+                            mem_mb: (h.mem_total_kb.saturating_sub(h.mem_available_kb)) / 1024,
+                            at: now,
+                        },
+                        now,
+                    );
+                    row = db.host_get(&id).ok().flatten();
+                }
+                Err(_) => probe_failed = true,
+            }
+        }
+    }
+
+    let (ready, failed, draining) = match row.as_ref().map(|r| &r.state) {
+        Some(HostState::Ready) => (true, false, false),
+        Some(HostState::Draining) => (false, false, true),
+        Some(HostState::Failed(f)) => (false, !f.retryable, false),
+        _ => (false, false, false),
     };
     let caps = row.as_ref().and_then(|r| r.caps.clone());
-    let spec = cap.as_ref().and_then(|c| c.spec).or(binding.declared_spec);
+    let declared = cap.as_ref().and_then(|c| c.spec).or(binding.declared_spec);
+    let headroom = row.as_ref().and_then(|r| r.headroom);
     let pct = |over: u32, fallback: u32| if over == 0 { fallback } else { over };
-    let _ = name; // name is implicit in the id; kept for future labels
+    let oc_cpu = pct(
+        cap.as_ref().map(|c| c.overcommit_cpu_pct).unwrap_or(0),
+        resolved.overcommit_cpu_pct,
+    );
+    let oc_mem = pct(
+        cap.as_ref().map(|c| c.overcommit_mem_pct).unwrap_or(0),
+        resolved.overcommit_mem_pct,
+    );
+    // Independent hosts: the ceiling compounds the claims conservatively
+    // (min(declared, probed) × overcommit × safety) and the live MemAvailable
+    // gate dominates the static arithmetic; overcommit is FOLDED into the
+    // synthetic spec, so the capacity math runs at 100%. A failed probe means
+    // no packing this round (spec None ⇒ UnknownSpec), dedicated unaffected.
+    let (spec, eff_oc_cpu, eff_oc_mem) = match ownership {
+        HostOwnership::Managed => (declared, oc_cpu, oc_mem),
+        HostOwnership::Independent if probe_failed => (None, 100, 100),
+        HostOwnership::Independent => {
+            let ceiling = superzej_core::host_probe::independent_effective_ceiling(
+                declared,
+                headroom.as_ref(),
+                oc_cpu,
+                oc_mem,
+                safety_pct,
+            )
+            .map(|mut c| {
+                if let Some(h) = headroom.as_ref() {
+                    // Live gate: ceiling' = reserved + available×safety.
+                    let allowance =
+                        (h.mem_available_kb / 1024) * u64::from(safety_pct.clamp(1, 100)) / 100;
+                    c.mem_mb = c.mem_mb.min(reserved.mem_mb + allowance);
+                }
+                c
+            });
+            (ceiling, 100, 100)
+        }
+    };
+    let trust = match caps.as_ref() {
+        Some(c) => effective_class(c, ownership, hc.trust_egress_enforced),
+        None => TrustClass::T0HostShell, // unprobed: no known boundary yet
+    };
     HostSnapshot {
         host: id,
-        ownership: cap
-            .as_ref()
-            .map(|c| c.ownership)
-            .unwrap_or(HostOwnership::Independent),
+        ownership,
         capacity: HostCapacity {
-            ownership: cap
-                .as_ref()
-                .map(|c| c.ownership)
-                .unwrap_or(HostOwnership::Independent),
+            ownership,
             spec,
-            overcommit_cpu_pct: pct(
-                cap.as_ref().map(|c| c.overcommit_cpu_pct).unwrap_or(0),
-                resolved.overcommit_cpu_pct,
-            ),
-            overcommit_mem_pct: pct(
-                cap.as_ref().map(|c| c.overcommit_mem_pct).unwrap_or(0),
-                resolved.overcommit_mem_pct,
-            ),
+            overcommit_cpu_pct: eff_oc_cpu,
+            overcommit_mem_pct: eff_oc_mem,
             reserved,
             measured: cap.as_ref().and_then(|c| c.measured),
         },
         ready,
         failed,
-        draining: false, // de-registration drain lands with independent hosts
-        oci_runtime: caps.as_ref().is_some_and(|c| c.runtime.is_some()),
-        rootless: caps
-            .as_ref()
-            .and_then(|c| c.runtime.as_ref())
-            .is_some_and(|r| r.rootless),
+        draining,
+        trust,
         arch: row.as_ref().and_then(|r| r.arch),
         tenant_zones: tenants
             .iter()
@@ -187,8 +256,14 @@ fn snapshot_host(
 
 /// Snapshot every engine-visible host: all `[host.*]` entries (config +
 /// DB-added, cloud reaches excluded — provider templates are spillover, not
-/// machines) with their capacity/tenancy/probe state.
-fn build_snapshot(cfg: &Config, db: &Db, resolved: &ResolvedPlacement) -> Vec<HostSnapshot> {
+/// machines) with their capacity/tenancy/probe state. `refresh` runs the
+/// lazy TTL'd headroom probe (Commit + plan paths; never bare queries).
+fn build_snapshot(
+    cfg: &Config,
+    db: &Db,
+    resolved: &ResolvedPlacement,
+    refresh: bool,
+) -> Vec<HostSnapshot> {
     let mut out = Vec::new();
     for (name, hc) in &cfg.host {
         if hc.reach == HostReach::Cloud {
@@ -197,7 +272,15 @@ fn build_snapshot(cfg: &Config, db: &Db, resolved: &ResolvedPlacement) -> Vec<Ho
         let Some(binding) = cfg.host_binding(name) else {
             continue; // misconfigured: warned by host_binding
         };
-        out.push(snapshot_host(db, name, &binding, resolved));
+        out.push(snapshot_host(
+            db,
+            hc,
+            &binding,
+            resolved,
+            cfg.placement.independent_safety_pct,
+            cfg.placement.headroom_ttl_secs,
+            refresh,
+        ));
     }
     out
 }
@@ -337,12 +420,12 @@ pub(crate) fn place(
         req: resolved.req,
         mode: resolved.mode,
         zone: zone.clone(),
-        sealed: sealed_profile(cfg, envc),
+        required_trust: required_class(profile_of(cfg, envc)),
         arch: None,
     };
 
     for _round in 0..RESERVE_ROUNDS {
-        let hosts = build_snapshot(cfg, &db, &resolved);
+        let hosts = build_snapshot(cfg, &db, &resolved, true);
         let inputs = PlacementInputs {
             hosts: hosts.clone(),
             pack_strategy: resolved.pack_strategy,
@@ -388,7 +471,7 @@ pub(crate) fn place(
                     Ok(host_name) => {
                         // Reserve on the fresh host, then let ensure_ready
                         // drive it (Unknown → Ready) like any other host.
-                        let hosts = build_snapshot(cfg, &db, &resolved);
+                        let hosts = build_snapshot(cfg, &db, &resolved, false);
                         let id = HostId::named(&host_name);
                         if try_reserve(
                             &db,
@@ -461,16 +544,11 @@ fn mode_tag(mode: TenancyMode) -> &'static str {
     }
 }
 
-/// Whether the env's resolved sandbox hardening is sealed-class (multi-tenant
-/// packing then requires a rootless runtime).
-fn sealed_profile(cfg: &Config, envc: Option<&EnvConfig>) -> bool {
-    use superzej_core::config::SandboxProfile;
-    let base = cfg.sandbox.profile;
-    let overlaid = envc.and_then(|e| e.sandbox.profile).unwrap_or(base);
-    matches!(
-        overlaid,
-        SandboxProfile::Sealed | SandboxProfile::SealedTunnel
-    )
+/// The env's resolved hardening profile (base `[sandbox]` + env overlay) —
+/// the input to the pack gate's required trust class.
+fn profile_of(cfg: &Config, envc: Option<&EnvConfig>) -> superzej_core::config::SandboxProfile {
+    envc.and_then(|e| e.sandbox.profile)
+        .unwrap_or(cfg.sandbox.profile)
 }
 
 /// One candidate row of a dry-run plan (JSON-shaped for the CLI/smoke).
@@ -523,10 +601,10 @@ pub(crate) fn plan(cfg: &Config, worktree: &str) -> Option<PlanOutput> {
         req: resolved.req,
         mode: resolved.mode,
         zone,
-        sealed: sealed_profile(cfg, envc),
+        required_trust: required_class(profile_of(cfg, envc)),
         arch: None,
     };
-    let hosts = build_snapshot(cfg, &db, &resolved);
+    let hosts = build_snapshot(cfg, &db, &resolved, true);
     let inputs = PlacementInputs {
         hosts,
         pack_strategy: resolved.pack_strategy,

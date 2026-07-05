@@ -277,6 +277,14 @@ pub struct PlacementConfig {
     pub mem_overcommit: f64,
     /// Fallback resource ask when an env declares none.
     pub default_resources: ResourcesDecl,
+    /// Compounding-uncertainty haircut for INDEPENDENT hosts (percent,
+    /// clamped 1..=100): their packing ceiling is
+    /// `min(declared, probed) × overcommit × this` — an uncontrolled box
+    /// carries invisible co-workloads and superzej has no eviction lever.
+    pub independent_safety_pct: u32,
+    /// Max age of a host's measured headroom sample before a placement
+    /// decision refreshes it (lazily — never the idle ticker).
+    pub headroom_ttl_secs: u64,
     pub autoscale: AutoscaleConfig,
 }
 
@@ -291,6 +299,8 @@ impl Default for PlacementConfig {
             overcommit: 2.0,
             mem_overcommit: 1.0,
             default_resources: ResourcesDecl::default(),
+            independent_safety_pct: 85,
+            headroom_ttl_secs: 60,
             autoscale: AutoscaleConfig::default(),
         }
     }

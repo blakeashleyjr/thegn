@@ -21,6 +21,7 @@ use crate::config_placement::{
     AutoscaleConfig, ManagedTemplate, OnExhaustion, PackStrategy, PlacementModePref,
 };
 use crate::host::{Arch, HostId};
+use crate::trust_class::TrustClass;
 
 /// One sandbox spawn's placement ask (already resolved + clamped — the broker
 /// never re-derives config or trust).
@@ -34,9 +35,9 @@ pub struct PlacementRequest {
     pub mode: PlacementModePref,
     /// Zone co-tenancy key; empty = unzoned (its own class).
     pub zone: String,
-    /// The resolved sandbox profile is sealed-class — multi-tenant packing
-    /// then requires a rootless runtime on the host.
-    pub sealed: bool,
+    /// Minimum co-tenancy boundary for packing
+    /// ([`crate::trust_class::required_class`] of the resolved profile).
+    pub required_trust: TrustClass,
     /// Required architecture (`None` = any).
     pub arch: Option<Arch>,
 }
@@ -55,10 +56,10 @@ pub struct HostSnapshot {
     pub failed: bool,
     /// Being drained (de-registration in a later change) — no new placements.
     pub draining: bool,
-    /// A probed (or image-built) OCI runtime exists — packing IS remote OCI.
-    pub oci_runtime: bool,
-    /// The runtime is rootless (sealed-class co-tenancy requirement).
-    pub rootless: bool,
+    /// The host's EFFECTIVE co-tenancy class
+    /// ([`crate::trust_class::effective_class`]: derived from the probed
+    /// runtime, one notch down for unattested independent hosts).
+    pub trust: TrustClass,
     pub arch: Option<Arch>,
     /// Distinct zones of live tenants ("" = an unzoned tenant).
     pub tenant_zones: BTreeSet<String>,
@@ -119,9 +120,9 @@ fn base_eligible(h: &HostSnapshot, r: &PlacementRequest) -> Result<(), Ineligibl
 /// reads `NoCapacity` while an empty-but-untrusted one reads `TrustClass`.
 pub fn pack_eligible(h: &HostSnapshot, r: &PlacementRequest) -> Result<(), Ineligible> {
     base_eligible(h, r)?;
-    // Packing is remote-OCI by construction; sealed-class tenants additionally
-    // require a rootless runtime as the co-tenancy boundary.
-    if !h.oci_runtime || (r.sealed && !h.rootless) {
+    // The trust ladder: the host's effective co-tenancy boundary must meet
+    // the request's floor (sealed-class asks need rootless-container+).
+    if h.trust < r.required_trust {
         return Err(Ineligible::TrustClass);
     }
     if h.has_dedicated_tenant {
@@ -458,8 +459,7 @@ mod tests {
             ready: true,
             failed: false,
             draining: false,
-            oci_runtime: true,
-            rootless: true,
+            trust: TrustClass::T2RootlessContainer,
             arch: Some(Arch::Amd64),
             tenant_zones: BTreeSet::new(),
             tenants: 0,
@@ -479,7 +479,7 @@ mod tests {
             },
             mode: PlacementModePref::Auto,
             zone: String::new(),
-            sealed: false,
+            required_trust: TrustClass::T1Container,
             arch: None,
         }
     }
@@ -509,15 +509,15 @@ mod tests {
         draining.draining = true;
         assert_eq!(pack_eligible(&draining, &r), Err(Ineligible::Draining));
 
-        let mut no_oci = snap("n");
-        no_oci.oci_runtime = false;
-        assert_eq!(pack_eligible(&no_oci, &r), Err(Ineligible::TrustClass));
+        let mut no_boundary = snap("n");
+        no_boundary.trust = TrustClass::T0HostShell;
+        assert_eq!(pack_eligible(&no_boundary, &r), Err(Ineligible::TrustClass));
 
         let mut rootful = snap("rf");
-        rootful.rootless = false;
+        rootful.trust = TrustClass::T1Container;
         assert_eq!(pack_eligible(&rootful, &r), Ok(()), "unsealed: rootful ok");
         let mut sealed = r.clone();
-        sealed.sealed = true;
+        sealed.required_trust = TrustClass::T2RootlessContainer;
         assert_eq!(
             pack_eligible(&rootful, &sealed),
             Err(Ineligible::TrustClass)
@@ -566,7 +566,7 @@ mod tests {
         // the reasons must not swap.
         let r = req();
         let mut untrusted_empty = snap("u");
-        untrusted_empty.oci_runtime = false;
+        untrusted_empty.trust = TrustClass::T0HostShell;
         assert_eq!(
             pack_eligible(&untrusted_empty, &r),
             Err(Ineligible::TrustClass)
@@ -587,10 +587,10 @@ mod tests {
         let mut occupied = snap("o");
         occupied.tenants = 1;
         assert_eq!(dedicated_eligible(&occupied, &r), Err(Ineligible::Occupied));
-        // No OCI runtime is fine for dedicated (exclusive host, no co-tenancy).
-        let mut no_oci = snap("n");
-        no_oci.oci_runtime = false;
-        assert_eq!(dedicated_eligible(&no_oci, &r), Ok(()));
+        // No boundary at all is fine for dedicated (exclusive, no co-tenancy).
+        let mut bare = snap("n");
+        bare.trust = TrustClass::T0HostShell;
+        assert_eq!(dedicated_eligible(&bare, &r), Ok(()));
     }
 
     // ── ranking ─────────────────────────────────────────────────────────────
@@ -653,9 +653,9 @@ mod tests {
 
     #[test]
     fn auto_falls_back_to_dedicated_on_empty_untrusted_host() {
-        // No OCI runtime ⇒ not packable, but empty ⇒ dedicated-usable.
+        // No co-tenancy boundary ⇒ not packable, but empty ⇒ dedicated-usable.
         let mut h = snap("bare");
-        h.oci_runtime = false;
+        h.trust = TrustClass::T0HostShell;
         let out = decide_placement(&req(), &inputs(vec![h]), 100, 100);
         assert!(
             matches!(out.decision, PlacementDecision::Dedicated { ref host, .. } if *host == HostId::named("bare")),
@@ -697,7 +697,7 @@ mod tests {
     #[test]
     fn packed_mode_never_takes_a_dedicated_fallback() {
         let mut bare = snap("bare");
-        bare.oci_runtime = false;
+        bare.trust = TrustClass::T0HostShell;
         let mut r = req();
         r.mode = PlacementModePref::Packed;
         let out = decide_placement(&r, &inputs(vec![bare]), 100, 100);

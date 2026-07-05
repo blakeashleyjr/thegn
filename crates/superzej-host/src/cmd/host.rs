@@ -37,8 +37,17 @@ pub enum Action {
         image: Option<String>,
     },
     /// Remove a DB-added host definition (config-defined hosts are read-only
-    /// here) plus its recorded state + inventory.
-    Rm { name: String },
+    /// here) plus its recorded state + inventory. With live placement tenants
+    /// this DRAINS instead (see `drain`); `--force` releases them first.
+    Rm {
+        name: String,
+        /// Release live placement tenants and remove anyway.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Park the host out of every placement lane (existing sandboxes run to
+    /// completion; `rm` finalizes once the last tenant releases).
+    Drain { name: String },
     /// List `[host.*]` hosts with reach, state, runtime, and probe age.
     List {
         /// Emit one JSON array instead of the human table.
@@ -83,7 +92,8 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             &install,
             image.as_deref(),
         ),
-        Action::Rm { name } => rm(cfg, &name),
+        Action::Rm { name, force } => rm(cfg, &name, force),
+        Action::Drain { name } => drain(cfg, &name),
         Action::List { json } => list(cfg, json),
         Action::Status { name } => status(cfg, &name),
         Action::Provision { name, yes } => provision(cfg, &name, yes),
@@ -176,7 +186,7 @@ fn is_db_host(name: &str) -> bool {
         .is_some_and(|defs| defs.iter().any(|(n, _)| n == name))
 }
 
-fn rm(cfg: &Config, name: &str) -> Result<()> {
+fn rm(cfg: &Config, name: &str, force: bool) -> Result<()> {
     if !is_db_host(name) {
         if cfg.host.contains_key(name) {
             anyhow::bail!("[host.{name}] is config-defined — remove it from config.toml");
@@ -184,8 +194,61 @@ fn rm(cfg: &Config, name: &str) -> Result<()> {
         anyhow::bail!("no DB-added host named {name}");
     }
     let db = Db::open()?;
-    db.host_delete(&superzej_core::host::HostId::named(name))?;
+    let id = superzej_core::host::HostId::named(name);
+    // Live placement tenants: never kill someone's running sandboxes on a
+    // machine superzej is a guest on — drain (park out of every lane) and
+    // finalize once they release. `--force` releases the ledger rows first
+    // (the sandboxes themselves are the owner's to stop).
+    let tenants = {
+        use superzej_core::store::PlacementStore;
+        db.tenants_of(&id).unwrap_or_default()
+    };
+    if !tenants.is_empty() && !force {
+        drain(cfg, name)?;
+        outln!(
+            "host {name} still has {} live placement tenant(s): {}",
+            tenants.len(),
+            tenants
+                .iter()
+                .map(|t| t.sandbox.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        outln!("draining instead — re-run `superzej host rm {name}` once they release,");
+        outln!("or `--force` to release the ledger rows now (sandboxes keep running).");
+        return Ok(());
+    }
+    if force {
+        use superzej_core::store::PlacementStore;
+        for t in &tenants {
+            let _ = db.tenancy_release(&t.sandbox, now());
+        }
+    }
+    {
+        use superzej_core::store::PlacementStore;
+        let _ = db.capacity_delete(&id);
+    }
+    db.host_delete(&id)?;
     outln!("host {name} removed (definition + recorded state + inventory)");
+    outln!("on-host images/volumes are labelled superzej.managed — prune them there if wanted");
+    Ok(())
+}
+
+/// Park a host out of every placement lane (durable `draining` state):
+/// existing sandboxes run to completion, nothing new lands, provisioning
+/// refuses it. Works for config- and DB-defined hosts alike.
+fn drain(cfg: &Config, name: &str) -> Result<()> {
+    let binding = binding_for(cfg, name)?;
+    let db = Db::open()?;
+    db.host_checkpoint(
+        &binding.id,
+        name,
+        binding.reach.kind(),
+        &superzej_core::host_machine::HostState::Draining,
+        None,
+        now(),
+    )?;
+    outln!("host {name} is draining: no new placements; existing sandboxes run out");
     Ok(())
 }
 

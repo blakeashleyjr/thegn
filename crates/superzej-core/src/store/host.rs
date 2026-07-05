@@ -45,6 +45,13 @@ pub trait HostStore {
 
     /// Stamp the last successful probe time.
     fn host_touch_probe(&self, id: &HostId, now: i64) -> Result<()>;
+    /// Persist the latest headroom sample (the measured resource layer).
+    fn host_set_headroom(
+        &self,
+        id: &HostId,
+        h: &crate::host_probe::Headroom,
+        now: i64,
+    ) -> Result<()>;
 
     /// Stamp the last used time.
     fn host_touch_used(&self, id: &HostId, now: i64) -> Result<()>;

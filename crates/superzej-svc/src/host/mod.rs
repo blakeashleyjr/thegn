@@ -61,6 +61,11 @@ pub trait HostRunner: Send {
     /// The remote OCI daemon URL sandbox spawn should pin (`None` ⇒ the
     /// placement transport wraps the whole argv, as today).
     fn oci_url(&self) -> Option<String>;
+    /// One cheap live-resources sample (the placement engine's measured
+    /// layer). Default: unsupported — cloud runners have no shell to ask.
+    fn probe_headroom(&mut self) -> Result<superzej_core::host_probe::Headroom, String> {
+        Err("headroom probe unsupported for this reach".into())
+    }
 }
 
 /// Build the runner for a reach. `Reach::Iroh` LOWERS to ssh over a local
@@ -216,6 +221,10 @@ fi
 for pm in apt dnf apk pacman; do
   if command -v "$pm" >/dev/null 2>&1; then echo "PKGMGR=$pm"; break; fi
 done
+echo "NPROC=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+awk '/MemTotal/ {print "MEM_TOTAL_KB=" $2}' /proc/meminfo 2>/dev/null
+[ -f /sys/fs/cgroup/cgroup.controllers ] && echo "CGROUPV2=1"
+[ "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo 1)" = "1" ] && echo "USERNS=1"
 command -v skopeo >/dev/null 2>&1 && echo "SKOPEO=1"
 command -v rsync  >/dev/null 2>&1 && echo "RSYNC=1"
 command -v nix    >/dev/null 2>&1 && echo "NIX=1"
@@ -225,6 +234,20 @@ if command -v curl >/dev/null 2>&1; then
   # 0 = reachable; 22 = HTTP error (reachable, auth-gated) — both mean egress.
   if [ "$rc" = "0" ] || [ "$rc" = "22" ]; then echo "EGRESS=full"; else echo "EGRESS=none"; fi
 fi
+true
+"#;
+
+/// The live-resources sample (the placement engine's measured layer): one
+/// cheap exec, parsed by the pure `superzej_core::host_probe::parse_headroom`
+/// (extend BOTH together — the contract test below pins agreement).
+const HEADROOM_SCRIPT: &str = r#"
+set -u
+echo "NPROC=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+awk '/MemTotal/ {print "MEM_TOTAL_KB=" $2} /MemAvailable/ {print "MEM_AVAIL_KB=" $2}' /proc/meminfo 2>/dev/null
+awk '{printf "LOAD1_MILLI=%d
+", $1 * 1000}' /proc/loadavg 2>/dev/null
+df -kP "${HOME:-/}" 2>/dev/null | awk 'NR==2 {print "DISK_FREE=" $4 * 1024}'
+command -v podman >/dev/null 2>&1 && echo "CONTAINERS=$(podman ps -q 2>/dev/null | wc -l | tr -d ' ')"
 true
 "#;
 
@@ -602,6 +625,16 @@ impl HostRunner for OciRunner {
         Ok(caps)
     }
 
+    fn probe_headroom(&mut self) -> Result<superzej_core::host_probe::Headroom, String> {
+        let (ok, out, err) = self
+            .exec(HEADROOM_SCRIPT, Duration::from_secs(15))
+            .map_err(|e| format!("headroom: {e}"))?;
+        if !ok {
+            return Err(format!("headroom: {}", err_tail(&err)));
+        }
+        superzej_core::host_probe::parse_headroom(&out).map_err(|e| format!("headroom: {e}"))
+    }
+
     fn install_runtime(
         &mut self,
         kind: RuntimeKind,
@@ -796,6 +829,25 @@ mod tests {
         assert_eq!(caps.os, "linux");
         // Local hosts never stream to themselves.
         assert!(!caps.delivery.contains(&DeliveryCap::SshStream));
+    }
+
+    #[test]
+    fn headroom_script_contract_matches_core_parser_on_this_machine() {
+        // Runs LOCALLY: keeps HEADROOM_SCRIPT and the core parser in lockstep.
+        let mut r = OciRunner::new(Placement::Local);
+        let h = r.probe_headroom().expect("local headroom parses");
+        assert!(h.cpus >= 1);
+        assert!(h.mem_total_kb > 0);
+        assert!(h.mem_available_kb > 0);
+    }
+
+    #[test]
+    fn probe_script_reports_machine_size_keys() {
+        // The extended probe carries the size hints the capacity layer reads.
+        let mut r = OciRunner::new(Placement::Local);
+        let caps = r.probe().expect("local probe parses");
+        assert!(caps.nproc.unwrap_or(0) >= 1);
+        assert!(caps.mem_total_kb.unwrap_or(0) > 0);
     }
 
     #[test]

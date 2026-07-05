@@ -484,6 +484,10 @@ mod tests {
             can_install_runtime: false,
             disk_free_bytes: None,
             has_nix: false,
+            cgroup_v2: false,
+            userns: false,
+            nproc: None,
+            mem_total_kb: None,
         }
     }
 
