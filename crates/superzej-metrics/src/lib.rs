@@ -15,7 +15,7 @@ mod battery;
 mod gpu;
 mod sample;
 
-pub use battery::read_battery;
+pub use battery::{read_battery, read_battery_power};
 pub use sample::{StatsSampler, SystemInfo};
 
 /// One sampled reading; `None`/empty fields render as absent widgets, so a
@@ -38,6 +38,13 @@ pub struct StatsSnapshot {
     pub swap_gib: Option<(f32, f32)>,
     /// GPU utilization 0–100 (Linux sysfs / NVIDIA only; absent otherwise).
     pub gpu_pct: Option<u8>,
+    /// GPU memory as (used MiB, total MiB). NVIDIA (`nvidia-smi`) and AMD/Intel
+    /// sysfs (`mem_info_vram_*`) where exposed; absent otherwise.
+    pub gpu_mem_mib: Option<(u64, u64)>,
+    /// GPU temperature in °C (NVIDIA only today; absent otherwise).
+    pub gpu_temp_c: Option<f32>,
+    /// GPU board power draw in watts (NVIDIA only today; absent otherwise).
+    pub gpu_power_w: Option<f32>,
     /// Network as (rx, tx) bytes/sec summed across non-loopback interfaces.
     pub net_bps: Option<(u64, u64)>,
     /// Per-interface (name, rx bytes/sec, tx bytes/sec), non-loopback.
@@ -46,6 +53,13 @@ pub struct StatsSnapshot {
     /// "actively charging", so a charge-capped battery still reads as on AC.
     /// Absent on desktops / machines without a battery.
     pub battery: Option<(u8, bool)>,
+    /// Battery power flow in watts (magnitude; discharging or charging rate).
+    /// Absent when the platform exposes no power/current reading.
+    pub battery_power_w: Option<f32>,
+    /// Estimated seconds to empty (discharging) or to full (charging), computed
+    /// from the native energy/charge and power counters. Absent when idle or
+    /// unavailable.
+    pub battery_eta_secs: Option<u64>,
     /// Free space on the worktrees' filesystem, as a percentage 0–100.
     pub disk_free_pct: Option<u8>,
     /// Worktrees' filesystem capacity as (total bytes, available bytes). Absent
