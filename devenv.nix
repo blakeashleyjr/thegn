@@ -85,11 +85,13 @@
     # git hooks run with GIT_DIR and GIT_INDEX_FILE set. This leaks into the
     # git subprocesses spawned by `cargo test`, causing spurious failures in
     # repository manipulation tests. Strip them via `env -u` so tests run in a
-    # clean git environment.
+    # clean git environment. Likewise drop SUPERZEJ_SANDBOX: committing from a
+    # shell running inside a live superzej bwrap sandbox leaks the =1 marker
+    # into the runner and false-fails the sandbox argv tests.
     cargo-test = {
       enable = true;
       name = "cargo test";
-      entry = "env -u GIT_DIR -u GIT_INDEX_FILE cargo test --workspace";
+      entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u SUPERZEJ_SANDBOX cargo test --workspace";
       language = "system";
       pass_filenames = false;
       stages = ["pre-commit"];
