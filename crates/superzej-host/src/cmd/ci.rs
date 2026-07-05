@@ -30,6 +30,9 @@ pub enum Action {
         branch: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
+        /// Emit one JSON array instead of the human summary.
+        #[arg(long)]
+        json: bool,
     },
     /// One run's jobs and steps.
     View {
@@ -81,7 +84,8 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             worktree,
             branch,
             limit,
-        } => runs(cfg, worktree, branch, limit),
+            json,
+        } => runs(cfg, worktree, branch, limit, json),
         Action::View { run_id, worktree } => view(cfg, worktree, &run_id),
         Action::Log {
             run_id,
@@ -151,6 +155,7 @@ fn runs(
     worktree: Option<String>,
     branch: Option<String>,
     limit: Option<usize>,
+    json_out: bool,
 ) -> Result<()> {
     let Some((loc, client)) = client(cfg, worktree) else {
         return Ok(());
@@ -159,6 +164,14 @@ fn runs(
     let branch_q = branch.as_deref();
     match block(client.runs(&loc, branch_q, limit)) {
         Ok(runs) => {
+            if json_out {
+                // Still warm the cache the native panel reads — same fetch.
+                if let Ok(db) = Db::open() {
+                    let json = serde_json::to_string(&runs).unwrap_or_default();
+                    let _ = db.put_ci_cache(&loc.path(), branch_q.unwrap_or(""), &json);
+                }
+                return super::emit_json(&runs);
+            }
             if runs.is_empty() {
                 outln!("no CI runs found");
                 return Ok(());

@@ -40,7 +40,11 @@ pub enum Action {
     /// here) plus its recorded state + inventory.
     Rm { name: String },
     /// List `[host.*]` hosts with reach, state, runtime, and probe age.
-    List,
+    List {
+        /// Emit one JSON array instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Full status for one host: state, runtime, inventory, recent events.
     Status { name: String },
     /// Drive the host to Ready (resumes a failed/partial provision).
@@ -80,7 +84,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             image.as_deref(),
         ),
         Action::Rm { name } => rm(cfg, &name),
-        Action::List => list(cfg),
+        Action::List { json } => list(cfg, json),
         Action::Status { name } => status(cfg, &name),
         Action::Provision { name, yes } => provision(cfg, &name, yes),
         Action::Probe { name } => {
@@ -185,13 +189,17 @@ fn rm(cfg: &Config, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn list(cfg: &Config) -> Result<()> {
+fn list(cfg: &Config, json: bool) -> Result<()> {
     if cfg.host.is_empty() {
+        if json {
+            return super::emit_json(&Vec::<()>::new());
+        }
         outln!("no [host.*] hosts defined");
         return Ok(());
     }
     let db = Db::open()?;
     let t = now();
+    let mut rows_out = Vec::new();
     for (name, hc) in &cfg.host {
         let row = cfg
             .host_binding(name)
@@ -208,10 +216,31 @@ fn list(cfg: &Config) -> Result<()> {
             ),
             None => ("unprovisioned".into(), "-".into(), "never".into()),
         };
+        if json {
+            #[derive(serde::Serialize)]
+            struct HostJson<'a> {
+                name: &'a str,
+                reach: &'a str,
+                state: String,
+                runtime: String,
+                probed: String,
+            }
+            rows_out.push(serde_json::json!(HostJson {
+                name,
+                reach: hc.reach.as_str(),
+                state,
+                runtime,
+                probed,
+            }));
+            continue;
+        }
         outln!(
             "{name:<20} {:<6} {state:<22} {runtime:<16} probed {probed}",
             hc.reach.as_str()
         );
+    }
+    if json {
+        return super::emit_json(&rows_out);
     }
     Ok(())
 }

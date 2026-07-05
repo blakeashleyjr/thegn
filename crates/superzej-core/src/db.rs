@@ -103,7 +103,7 @@ pub struct MergeQueueRow {
 
 /// A persisted ingress share (`[share]`) — the resurrection record for a tunnel
 /// the host respawns on restart.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ShareRow {
     pub worktree: String,
     pub local_port: u16,
@@ -115,7 +115,7 @@ pub struct ShareRow {
 
 /// A persisted auto port forward (`[forward]`) — the resurrection record for a
 /// forward the host re-detects on restart. Keyed by `(worktree, container_port)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ForwardRow {
     pub worktree: String,
     pub container_port: u16,

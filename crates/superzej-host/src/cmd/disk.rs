@@ -14,7 +14,7 @@ use super::{confirm, resolve_worktree};
 /// `superzej disk [--worktree P] [--all]` — measure and print worktree sizes,
 /// largest first, with a grand total and a threshold note. Also refreshes the
 /// `worktree_disk` cache so a running host paints fresh sizes immediately.
-pub fn disk(cfg: &Config, worktree_arg: Option<String>, all: bool) -> Result<()> {
+pub fn disk(cfg: &Config, worktree_arg: Option<String>, all: bool, json: bool) -> Result<()> {
     let db = Db::open()?;
 
     // Target set: every known worktree (default / --all), or just the resolved one.
@@ -50,6 +50,26 @@ pub fn disk(cfg: &Config, worktree_arg: Option<String>, all: bool) -> Result<()>
         })
         .collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.2.total_bytes));
+
+    if json {
+        #[derive(serde::Serialize)]
+        struct DiskJson<'a> {
+            worktree: &'a str,
+            branch: &'a str,
+            total_bytes: u64,
+            target_bytes: u64,
+        }
+        let out: Vec<DiskJson> = rows
+            .iter()
+            .map(|(path, branch, u)| DiskJson {
+                worktree: path,
+                branch,
+                total_bytes: u.total_bytes,
+                target_bytes: u.target_bytes,
+            })
+            .collect();
+        return super::emit_json(&out);
+    }
 
     if rows.is_empty() {
         outln!("No worktrees found.");
