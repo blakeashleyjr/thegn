@@ -164,6 +164,81 @@ impl LogDetail {
     }
 }
 
+/// A stack of heterogeneous blocks (timeline graph + breakdown table/keyval),
+/// drawn top → bottom. The richer disk/mem/net/gpu/power popups are built from
+/// these so a glance shows both trend and composition. Scrolls (by row) when the
+/// stacked height exceeds the box.
+pub struct SectionsDetail {
+    pub sections: Vec<Section>,
+}
+
+/// One block within a [`SectionsDetail`].
+pub enum Section {
+    /// A one-row dim label with an optional right-aligned note (a group header).
+    Heading { label: String, note: Option<String> },
+    /// A timeline graph block (header + `height`-row plot + optional footer).
+    Graph(GraphSection),
+    /// A columnar breakdown (optional dim header row + body rows).
+    Table(TableSection),
+    /// A `key … value` block (same shape as [`KeyValDetail`]).
+    KeyVal(Vec<(String, String, Tok)>),
+    /// A one-row `label … sparkline value` (a compact inline trend).
+    Sparkrow {
+        label: String,
+        spark: Vec<f32>,
+        cur: String,
+        tone: Tok,
+    },
+}
+
+/// A graph block inside a [`SectionsDetail`]: like [`GraphDetail`] but with an
+/// explicit plot `height` (so the section knows its own row count) and an
+/// optional footer.
+pub struct GraphSection {
+    pub label: String,
+    pub cur: String,
+    pub footer: Option<String>,
+    pub series: Vec<f32>,
+    pub tone: Tok,
+    pub height: usize,
+    pub series2: Option<(Vec<f32>, Tok)>,
+}
+
+/// A table cell: left-aligned text, or a filled bar (`frac` of `width` cells,
+/// drawn with [`viz::bar_track`]).
+pub enum Cell {
+    Text(String, Tok),
+    Bar(f32, usize, Tok),
+}
+
+impl Cell {
+    /// Display width the cell occupies in its column.
+    fn width(&self) -> usize {
+        match self {
+            Cell::Text(s, _) => s.chars().count(),
+            Cell::Bar(_, w, _) => *w,
+        }
+    }
+}
+
+/// A columnar breakdown: an optional header row plus body rows of [`Cell`]s.
+pub struct TableSection {
+    pub header: Vec<String>,
+    pub rows: Vec<Vec<Cell>>,
+}
+
+impl Section {
+    /// Row count this section occupies when stacked.
+    fn height(&self) -> usize {
+        match self {
+            Section::Heading { .. } | Section::Sparkrow { .. } => 1,
+            Section::Graph(g) => 1 + g.height + g.footer.is_some() as usize,
+            Section::Table(t) => (!t.header.is_empty()) as usize + t.rows.len(),
+            Section::KeyVal(rows) => rows.len(),
+        }
+    }
+}
+
 /// What a detail overlay shows.
 pub enum DetailContent {
     Graph(GraphDetail),
@@ -171,6 +246,7 @@ pub enum DetailContent {
     KeyVal(KeyValDetail),
     Table(TableDetail),
     Log(LogDetail),
+    Sections(SectionsDetail),
 }
 
 /// Where the box sits relative to the originating bar item.
@@ -248,6 +324,24 @@ impl DetailOverlay {
         }
     }
 
+    /// Total stacked row height of a Sections popup (0 otherwise).
+    fn content_rows(&self) -> usize {
+        match &self.content {
+            DetailContent::Sections(d) => d.sections.iter().map(Section::height).sum(),
+            _ => 0,
+        }
+    }
+
+    /// Largest valid scroll offset: a list/table/log scrolls to its last row; a
+    /// Sections popup scrolls until its final row is visible (only when it
+    /// overflows the box).
+    fn scroll_max(&self) -> usize {
+        match &self.content {
+            DetailContent::Sections(_) => self.content_rows().saturating_sub(self.rows),
+            _ => self.content_len().saturating_sub(1),
+        }
+    }
+
     /// A list is actionable (row-cursor, not just scroll) when any row carries an
     /// `enter` or char-keyed action. Non-actionable lists keep pure scroll.
     fn actionable(&self) -> bool {
@@ -309,7 +403,14 @@ impl DetailOverlay {
             return DetailOutcome::Close;
         }
         let actionable = self.actionable();
-        let max = self.content_len().saturating_sub(1);
+        // Row-cursor max for actionable lists; scroll-offset max otherwise
+        // (a plain list/table/log clamps to its last row, a Sections popup to
+        // its overflow).
+        let max = if actionable {
+            self.content_len().saturating_sub(1)
+        } else {
+            self.scroll_max()
+        };
         match key {
             KeyCode::Char('q') => DetailOutcome::Close,
             KeyCode::Enter => {
@@ -565,6 +666,7 @@ impl DetailOverlay {
             DetailContent::KeyVal(kv) => render_keyval(surface, inner, kv),
             DetailContent::Table(t) => render_table(surface, inner, t, self.scroll),
             DetailContent::Log(lg) => render_log(surface, inner, lg, self.scroll, self.sel),
+            DetailContent::Sections(d) => render_sections(surface, inner, self.scroll, d),
         }
     }
 }
@@ -573,67 +675,213 @@ fn panel() -> Tok {
     Tok::Slot(S::Panel)
 }
 
+/// Draw `line` at row `y` only when it falls inside the clip rect's rows — the
+/// bounds check that makes a stacked/scrolled Sections popup clip cleanly at its
+/// top and bottom edges (rows above/below the box are simply skipped).
+fn put_line(surface: &mut Surface, clip: Rect, x: usize, y: i64, w: usize, line: &Line, pad: Tok) {
+    if y < clip.y as i64 || y >= (clip.y + clip.rows) as i64 {
+        return;
+    }
+    seg::draw_line(surface, x, y as usize, w, line, pad);
+}
+
+/// The standalone graph popup: fill the whole box (header, plot, footer).
 fn render_graph(surface: &mut Surface, inner: Rect, g: &GraphDetail) {
+    let sec = GraphSection {
+        label: g.label.clone(),
+        cur: g.cur.clone(),
+        footer: Some(g.footer.clone()),
+        series: g.series.clone(),
+        tone: g.tone,
+        // Plot fills the box between the header (row 0) and footer (last row).
+        height: inner.rows.saturating_sub(2),
+        series2: g.series2.as_ref().map(|(s, t, _)| (s.clone(), *t)),
+    };
+    draw_graph_block(surface, inner, inner.x, inner.y as i64, inner.cols, &sec);
+}
+
+/// Draw a graph block (header + `g.height`-row plot + optional footer) at row
+/// `y0`, clipped to `clip`. Shared by the standalone graph popup and the graph
+/// section of a stacked popup.
+fn draw_graph_block(
+    surface: &mut Surface,
+    clip: Rect,
+    x: usize,
+    y0: i64,
+    w: usize,
+    g: &GraphSection,
+) {
     // Header: label (dim) … current value (toned).
-    seg::draw_line(
+    put_line(
         surface,
-        inner.x,
-        inner.y,
-        inner.cols,
+        clip,
+        x,
+        y0,
+        w,
         &Line::split(
             vec![seg(Tok::Slot(S::Dim), g.label.clone())],
             vec![seg(g.tone, g.cur.clone()).bold()],
         ),
         panel(),
     );
-    // Plot area sits between the header (row 0) and the footer (last row).
-    let plot_top = inner.y + 1;
-    let plot_h = inner.rows.saturating_sub(2);
-    let w = inner.cols;
-    if plot_h > 0 && w > 0 {
+    let plot_top = y0 + 1;
+    if g.height > 0 && w > 0 {
         match &g.series2 {
-            None => draw_series(surface, inner.x, plot_top, w, plot_h, &g.series, g.tone),
-            Some((s2, tone2, _)) => {
-                let top_h = plot_h.div_ceil(2);
-                let bot_h = plot_h - top_h;
-                draw_series(surface, inner.x, plot_top, w, top_h, &g.series, g.tone);
+            None => draw_series(surface, clip, plot_top, g.height, &g.series, g.tone),
+            Some((s2, tone2)) => {
+                let top_h = g.height.div_ceil(2);
+                let bot_h = g.height - top_h;
+                draw_series(surface, clip, plot_top, top_h, &g.series, g.tone);
                 if bot_h > 0 {
-                    draw_series(surface, inner.x, plot_top + top_h, w, bot_h, s2, *tone2);
+                    draw_series(surface, clip, plot_top + top_h as i64, bot_h, s2, *tone2);
                 }
             }
         }
     }
-    // Footer: min/avg/max (or a per-graph summary), ghost.
-    if inner.rows >= 2 {
-        seg::draw_line(
+    if let Some(f) = &g.footer {
+        put_line(
             surface,
-            inner.x,
-            inner.y + inner.rows - 1,
-            inner.cols,
-            &Line::segs(vec![seg(Tok::Slot(S::Ghost), g.footer.clone())]),
+            clip,
+            x,
+            y0 + 1 + g.height as i64,
+            w,
+            &Line::segs(vec![seg(Tok::Slot(S::Ghost), f.clone())]),
             panel(),
         );
     }
 }
 
-fn draw_series(
-    surface: &mut Surface,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    vals: &[f32],
-    tone: Tok,
-) {
-    for (i, row) in viz::braille_graph(vals, w, h).into_iter().enumerate() {
-        seg::draw_line(
+/// Draw an `h`-row braille plot at row `y`, spanning the clip's full width.
+fn draw_series(surface: &mut Surface, clip: Rect, y: i64, h: usize, vals: &[f32], tone: Tok) {
+    for (i, row) in viz::braille_graph(vals, clip.cols, h)
+        .into_iter()
+        .enumerate()
+    {
+        put_line(
             surface,
-            x,
-            y + i,
-            w,
+            clip,
+            clip.x,
+            y + i as i64,
+            clip.cols,
             &Line::segs(vec![seg(tone, row)]),
             panel(),
         );
+    }
+}
+
+/// Paint a stacked Sections popup: walk sections top → bottom from a `scroll`-
+/// shifted origin; each block bounds-checks its own rows via [`put_line`], so
+/// rows scrolled above the box or spilling past its bottom are simply dropped.
+fn render_sections(surface: &mut Surface, inner: Rect, scroll: usize, d: &SectionsDetail) {
+    let mut y = inner.y as i64 - scroll as i64;
+    for sec in &d.sections {
+        draw_section(surface, inner, inner.x, y, inner.cols, sec);
+        y += sec.height() as i64;
+    }
+}
+
+fn draw_section(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, sec: &Section) {
+    match sec {
+        Section::Heading { label, note } => {
+            let line = match note {
+                Some(n) => Line::split(
+                    vec![seg(Tok::Slot(S::Dim), label.clone())],
+                    vec![seg(Tok::Slot(S::Ghost), n.clone())],
+                ),
+                None => Line::segs(vec![seg(Tok::Slot(S::Dim), label.clone())]),
+            };
+            put_line(surface, clip, x, y0, w, &line, panel());
+        }
+        Section::Graph(g) => draw_graph_block(surface, clip, x, y0, w, g),
+        Section::Table(t) => draw_table(surface, clip, x, y0, w, t),
+        Section::KeyVal(rows) => {
+            for (i, (k, v, tone)) in rows.iter().enumerate() {
+                put_line(
+                    surface,
+                    clip,
+                    x,
+                    y0 + i as i64,
+                    w,
+                    &Line::split(
+                        vec![seg(Tok::Slot(S::Dim), k.clone())],
+                        vec![seg(*tone, v.clone())],
+                    ),
+                    panel(),
+                );
+            }
+        }
+        Section::Sparkrow {
+            label,
+            spark,
+            cur,
+            tone,
+        } => {
+            put_line(
+                surface,
+                clip,
+                x,
+                y0,
+                w,
+                &Line::split(
+                    vec![seg(Tok::Slot(S::Dim), label.clone())],
+                    vec![
+                        seg(*tone, viz::sparkline(spark)),
+                        seg(*tone, format!(" {cur}")).bold(),
+                    ],
+                ),
+                panel(),
+            );
+        }
+    }
+}
+
+/// Draw a table: per-column widths sized to the widest cell (a `Bar` counts as
+/// its cell width), a dim header row when present, then body rows. Columns are
+/// packed left → right with a one-space gap; a `Cell::Bar` renders as a filled
+/// bar plus its `░` track.
+fn draw_table(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, t: &TableSection) {
+    let ncol = t
+        .rows
+        .iter()
+        .map(|r| r.len())
+        .chain(std::iter::once(t.header.len()))
+        .max()
+        .unwrap_or(0);
+    let mut colw = vec![0usize; ncol];
+    for (i, h) in t.header.iter().enumerate() {
+        colw[i] = colw[i].max(h.chars().count());
+    }
+    for row in &t.rows {
+        for (i, c) in row.iter().enumerate() {
+            colw[i] = colw[i].max(c.width());
+        }
+    }
+    let mut y = y0;
+    if !t.header.is_empty() {
+        let mut segs = Vec::new();
+        for (i, h) in t.header.iter().enumerate() {
+            segs.push(seg(Tok::Slot(S::Ghost), format!("{:<w$} ", h, w = colw[i])));
+        }
+        put_line(surface, clip, x, y, w, &Line::segs(segs), panel());
+        y += 1;
+    }
+    for row in &t.rows {
+        let mut segs = Vec::new();
+        for (i, cell) in row.iter().enumerate() {
+            let cw = colw[i];
+            match cell {
+                Cell::Text(s, tone) => {
+                    segs.push(seg(*tone, format!("{s:<cw$} ")));
+                }
+                Cell::Bar(frac, bw, tone) => {
+                    let (bar, track) = viz::bar_track(*frac, *bw);
+                    segs.push(seg(*tone, bar));
+                    segs.push(seg(Tok::Slot(S::Ghost), format!("{track} ")));
+                }
+            }
+        }
+        put_line(surface, clip, x, y, w, &Line::segs(segs), panel());
+        y += 1;
     }
 }
 
@@ -917,6 +1165,81 @@ fn plot_cols(cols: usize) -> usize {
     cols.saturating_sub(0) * 2
 }
 
+/// A trimmed (no fixed-width padding) bytes/sec string for table cells.
+fn rate(bps: u64) -> String {
+    superzej_metrics::fmt_rate(bps).trim().to_string()
+}
+
+/// Free-space tone: red under 5%, amber under 15%, else normal text.
+fn free_tone(pct: u8) -> Tok {
+    if pct <= 5 {
+        Tok::Hue(Hue::Red)
+    } else if pct <= 15 {
+        Tok::Hue(Hue::Amber)
+    } else {
+        Tok::Slot(S::Text)
+    }
+}
+
+/// Short label for a storage medium.
+fn kind_str(kind: superzej_metrics::DiskKind) -> &'static str {
+    match kind {
+        superzej_metrics::DiskKind::Hdd => "HDD",
+        superzej_metrics::DiskKind::Ssd => "SSD",
+        superzej_metrics::DiskKind::Unknown => "—",
+    }
+}
+
+/// Truncate `s` to `max` display cells, ellipsizing when it overflows.
+fn trunc(s: String, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s;
+    }
+    let keep = max.saturating_sub(1);
+    format!("{}…", s.chars().take(keep).collect::<String>())
+}
+
+/// Format a duration in seconds as `Nh Mm` (or `Mm` under an hour).
+fn fmt_eta(secs: u64) -> String {
+    let (h, m) = (secs / 3600, (secs % 3600) / 60);
+    if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// Assumed sample cadence (seconds) for the slope-projected battery ETA. The
+/// stats ticker defaults to ~2s; this is only used as a fallback when the OS
+/// exposes no native time-to-empty/full, so an approximate base is acceptable.
+const EST_SAMPLE_SECS: f32 = 2.0;
+
+/// Estimate time-to-empty (discharging) or time-to-full (charging) from the
+/// charge series' slope, as an `~Nh Mm` string. Returns `None` when there is too
+/// little history, the charge is flat, or the slope contradicts the AC state
+/// (so a noisy reading never contradicts the plainly-shown source). Pure and
+/// unit-tested; the native `battery_eta_secs` is preferred when present.
+fn battery_eta(series: &[f32], on_ac: bool) -> Option<String> {
+    // Drop the leading zero padding that a short history front-loads.
+    let vals: Vec<f32> = series.iter().copied().skip_while(|v| *v <= 0.0).collect();
+    if vals.len() < 3 {
+        return None;
+    }
+    let first = *vals.first()?;
+    let last = *vals.last()?;
+    let per = (last - first) / (vals.len() - 1) as f32; // charge fraction per sample
+    if per.abs() < 1e-4 {
+        return None; // flat — no meaningful projection
+    }
+    let discharging = per < 0.0;
+    if discharging == on_ac {
+        return None; // slope disagrees with the source; don't guess
+    }
+    let remaining = if discharging { last } else { 1.0 - last };
+    let samples = remaining / per.abs();
+    Some(format!("~{}", fmt_eta((samples * EST_SAMPLE_SECS) as u64)))
+}
+
 /// Build the detail overlay for a focused bar item, or `None` when the item has
 /// no data to show (so Enter is a no-op rather than an empty modal). `anchor` is
 /// the item's on-screen rect (for popup placement); `hist` is the rolling
@@ -995,6 +1318,22 @@ fn table(title: &str, t: TableDetail, cols: usize, height: usize) -> DetailOverl
     }
 }
 
+/// A stacked multi-section popup, sized to its content height (clamped on-screen
+/// by the layer). Placement is near the originating item like the other widgets.
+fn sections(title: &str, cols: usize, secs: Vec<Section>, placement: Placement) -> DetailOverlay {
+    let rows = secs.iter().map(Section::height).sum::<usize>().max(1);
+    DetailOverlay {
+        title: title.to_string(),
+        content: DetailContent::Sections(SectionsDetail { sections: secs }),
+        cols,
+        rows,
+        placement,
+        scroll: 0,
+        sel: 0,
+        hint: None,
+    }
+}
+
 fn list(
     title: &str,
     rows: Vec<DetailRow>,
@@ -1058,15 +1397,41 @@ fn widget_detail(
                 av * 100.0,
                 mx * 100.0
             );
-            Some(graph(
-                "Memory history",
-                "MEM",
-                cur,
-                footer,
-                series,
-                Tok::Hue(Hue::Purple),
-                near,
-            ))
+            let mut secs = vec![
+                Section::Graph(GraphSection {
+                    label: "MEM".into(),
+                    cur,
+                    footer: Some(footer),
+                    series,
+                    tone: Tok::Hue(Hue::Purple),
+                    height: 5,
+                    series2: None,
+                }),
+                Section::Heading {
+                    label: "Breakdown".into(),
+                    note: None,
+                },
+            ];
+            if let Some((u, t)) = s.mem_gib {
+                secs.push(Section::KeyVal(vec![
+                    ("used".into(), format!("{u:.1}G"), Tok::Slot(S::Text)),
+                    ("total".into(), format!("{t:.0}G"), Tok::Slot(S::Dim)),
+                    (
+                        "free".into(),
+                        format!("{:.1}G", (t - u).max(0.0)),
+                        Tok::Slot(S::Dim),
+                    ),
+                ]));
+            }
+            if let Some((u, t)) = s.swap_gib {
+                secs.push(Section::Sparkrow {
+                    label: "swap".into(),
+                    spark: hist.swap_series(16),
+                    cur: format!("{u:.1}/{t:.0}G"),
+                    tone: Tok::Hue(Hue::Blue),
+                });
+            }
+            Some(sections("Memory", 40, secs, near))
         }
         "temp" => {
             s.cpu_temp_c?;
@@ -1106,24 +1471,45 @@ fn widget_detail(
         }
         "net" => {
             let (rx, tx) = hist.last_rates();
-            let mut ov = graph(
-                "Network history",
-                "NET",
-                format!(
-                    "↓{} ↑{}",
-                    superzej_metrics::fmt_rate(rx).trim(),
-                    superzej_metrics::fmt_rate(tx).trim()
-                ),
-                "↓ rx (top) · ↑ tx (bottom)".into(),
-                hist.rx_series(n),
-                Tok::Hue(Hue::Green),
-                near,
-            );
-            if let DetailContent::Graph(g) = &mut ov.content {
-                g.series2 = Some((hist.tx_series(n), Tok::Hue(Hue::Blue), "tx".into()));
+            let mut secs = vec![
+                Section::Graph(GraphSection {
+                    label: "NET".into(),
+                    cur: format!("↓{} ↑{}", rate(rx), rate(tx)),
+                    footer: Some("↓ rx (top) · ↑ tx (bottom)".into()),
+                    series: hist.rx_series(n),
+                    tone: Tok::Hue(Hue::Green),
+                    height: 6,
+                    series2: Some((hist.tx_series(n), Tok::Hue(Hue::Blue))),
+                }),
+                Section::Heading {
+                    label: "Interfaces".into(),
+                    note: None,
+                },
+            ];
+            if s.net_ifaces.is_empty() {
+                secs.push(Section::KeyVal(vec![(
+                    "interfaces".into(),
+                    "idle".into(),
+                    Tok::Slot(S::Ghost),
+                )]));
+            } else {
+                let rows: Vec<Vec<Cell>> = s
+                    .net_ifaces
+                    .iter()
+                    .map(|(name, r, t)| {
+                        vec![
+                            Cell::Text(trunc(name.clone(), 14), Tok::Slot(S::Text)),
+                            Cell::Text(format!("↓{}", rate(*r)), Tok::Hue(Hue::Green)),
+                            Cell::Text(format!("↑{}", rate(*t)), Tok::Hue(Hue::Blue)),
+                        ]
+                    })
+                    .collect();
+                secs.push(Section::Table(TableSection {
+                    header: vec!["iface".into(), "rx".into(), "tx".into()],
+                    rows,
+                }));
             }
-            ov.cols = 44;
-            Some(ov)
+            Some(sections("Network", 44, secs, near))
         }
         "swap" => {
             let (u, t) = s.swap_gib?;
@@ -1139,10 +1525,39 @@ fn widget_detail(
         }
         "gpu" => {
             let p = s.gpu_pct?;
-            Some(keyval(
+            let series = hist.gpu_series(n);
+            let (mn, av, mx) = stats01(&series);
+            let footer = format!(
+                "min {:.0}%  avg {:.0}%  max {:.0}%",
+                mn * 100.0,
+                av * 100.0,
+                mx * 100.0
+            );
+            let mut kv = vec![("utilization".into(), format!("{p}%"), Tok::Hue(Hue::Teal))];
+            if let Some((u, t)) = s.gpu_mem_mib {
+                kv.push(("vram".into(), format!("{u}/{t} MiB"), Tok::Slot(S::Text)));
+            }
+            if let Some(c) = s.gpu_temp_c {
+                kv.push(("temp".into(), format!("{c:.0}°C"), Tok::Slot(S::Dim)));
+            }
+            if let Some(w) = s.gpu_power_w {
+                kv.push(("power".into(), format!("{w:.0} W"), Tok::Slot(S::Dim)));
+            }
+            Some(sections(
                 "GPU",
-                vec![("utilization".into(), format!("{p}%"), Tok::Hue(Hue::Teal))],
-                28,
+                36,
+                vec![
+                    Section::Graph(GraphSection {
+                        label: "GPU".into(),
+                        cur: format!("{p}%"),
+                        footer: Some(footer),
+                        series,
+                        tone: Tok::Hue(Hue::Teal),
+                        height: 6,
+                        series2: None,
+                    }),
+                    Section::KeyVal(kv),
+                ],
                 near,
             ))
         }
@@ -1178,17 +1593,53 @@ fn widget_detail(
         }
         "battery" => {
             let (p, on_ac) = s.battery?;
-            Some(keyval(
+            let series = hist.battery_series(n);
+            let tone = if on_ac {
+                Tok::Hue(Hue::Green)
+            } else if p <= 15 {
+                Tok::Hue(Hue::Amber)
+            } else {
+                Tok::Hue(Hue::Blue)
+            };
+            let mut kv = vec![
+                ("charge".into(), format!("{p}%"), Tok::Slot(S::Text)),
+                (
+                    "source".into(),
+                    if on_ac { "AC".into() } else { "battery".into() },
+                    Tok::Slot(S::Dim),
+                ),
+            ];
+            if let Some(w) = s.battery_power_w {
+                kv.push(("power".into(), format!("{w:.1} W"), Tok::Slot(S::Dim)));
+            }
+            // Native OS estimate wins; else project from the charge slope.
+            let eta = s
+                .battery_eta_secs
+                .map(fmt_eta)
+                .or_else(|| battery_eta(&series, on_ac));
+            if let Some(e) = eta {
+                let label = if on_ac { "to full" } else { "to empty" };
+                kv.push((label.into(), e, Tok::Slot(S::Dim)));
+            }
+            Some(sections(
                 "Battery",
+                34,
                 vec![
-                    ("charge".into(), format!("{p}%"), Tok::Slot(S::Text)),
-                    (
-                        "power".into(),
-                        if on_ac { "AC".into() } else { "battery".into() },
-                        Tok::Slot(S::Dim),
-                    ),
+                    Section::Graph(GraphSection {
+                        label: "BATTERY".into(),
+                        cur: format!("{p}%"),
+                        footer: Some(if on_ac {
+                            "on AC".into()
+                        } else {
+                            "on battery".into()
+                        }),
+                        series,
+                        tone,
+                        height: 5,
+                        series2: None,
+                    }),
+                    Section::KeyVal(kv),
                 ],
-                28,
                 near,
             ))
         }
@@ -1196,21 +1647,53 @@ fn widget_detail(
             if s.disks.is_empty() {
                 return None;
             }
-            let pairs: Vec<(String, String, Tok)> = s
+            let series = hist.disk_io_series(n);
+            let rows: Vec<Vec<Cell>> = s
                 .disks
                 .iter()
                 .map(|d| {
-                    let tone = if d.free_pct <= 5 {
-                        Tok::Hue(Hue::Red)
-                    } else if d.free_pct <= 15 {
-                        Tok::Hue(Hue::Amber)
-                    } else {
-                        Tok::Slot(S::Text)
-                    };
-                    (d.mount.clone(), format!("{}% free", d.free_pct), tone)
+                    let tone = free_tone(d.free_pct);
+                    vec![
+                        Cell::Text(trunc(d.mount.clone(), 18), Tok::Slot(S::Text)),
+                        Cell::Text(kind_str(d.kind).into(), Tok::Slot(S::Dim)),
+                        Cell::Bar(d.free_pct as f32 / 100.0, 8, tone),
+                        Cell::Text(format!("{}%", d.free_pct), tone),
+                        Cell::Text(format!("↓{}", rate(d.read_bps)), Tok::Slot(S::Dim)),
+                        Cell::Text(format!("↑{}", rate(d.write_bps)), Tok::Slot(S::Dim)),
+                    ]
                 })
                 .collect();
-            Some(keyval("Disks", pairs, 48, Placement::Center))
+            Some(sections(
+                "Disks",
+                60,
+                vec![
+                    Section::Graph(GraphSection {
+                        label: "DISK IO".into(),
+                        cur: rate(hist.last_disk_io()),
+                        footer: Some("read + write, window-scaled".into()),
+                        series,
+                        tone: Tok::Hue(Hue::Blue),
+                        height: 5,
+                        series2: None,
+                    }),
+                    Section::Heading {
+                        label: "Volumes".into(),
+                        note: None,
+                    },
+                    Section::Table(TableSection {
+                        header: vec![
+                            "mount".into(),
+                            "kind".into(),
+                            "free".into(),
+                            "".into(),
+                            "read".into(),
+                            "write".into(),
+                        ],
+                        rows,
+                    }),
+                ],
+                Placement::Center,
+            ))
         }
         "loc" => {
             let r = model.loc.as_ref()?;
@@ -2176,5 +2659,176 @@ mod tests {
         let mut s = Surface::new(120, 40);
         ov.render(&mut s, screen());
         assert!(seg::text_contrast_violations(&mut s, 3.0).is_empty());
+    }
+
+    /// A model with disk + network + gpu + battery populated, for the sectioned
+    /// widget popups.
+    fn model_full() -> FrameModel {
+        FrameModel {
+            stats: superzej_metrics::StatsSnapshot {
+                mem_gib: Some((6.0, 16.0)),
+                swap_gib: Some((0.5, 8.0)),
+                gpu_pct: Some(40),
+                gpu_mem_mib: Some((2048, 8192)),
+                gpu_temp_c: Some(55.0),
+                gpu_power_w: Some(60.0),
+                net_bps: Some((1024, 2048)),
+                net_ifaces: vec![("eth0".into(), 1024, 2048), ("wlan0".into(), 512, 256)],
+                battery: Some((72, false)),
+                battery_power_w: Some(12.5),
+                disks: vec![
+                    superzej_metrics::DiskInfo {
+                        name: "nvme0n1p2".into(),
+                        mount: "/".into(),
+                        free_pct: 42,
+                        read_bps: 1_500_000,
+                        write_bps: 200_000,
+                        kind: superzej_metrics::DiskKind::Ssd,
+                    },
+                    superzej_metrics::DiskInfo {
+                        name: "sda1".into(),
+                        mount: "/mnt/data".into(),
+                        free_pct: 8,
+                        read_bps: 0,
+                        write_bps: 0,
+                        kind: superzej_metrics::DiskKind::Hdd,
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rich_widgets_map_to_sections() {
+        let model = model_full();
+        let hist = TelemetryHistory::default();
+        for w in ["disk", "mem", "net", "gpu", "battery"] {
+            let ov = open_detail_for(
+                &BarItemId::Widget(w.into()),
+                item_at(0),
+                screen(),
+                &model,
+                &hist,
+            )
+            .unwrap_or_else(|| panic!("{w} should open a detail"));
+            assert!(
+                matches!(ov.content, DetailContent::Sections(_)),
+                "{w} should be a sectioned popup"
+            );
+        }
+    }
+
+    #[test]
+    fn section_height_sums_its_rows() {
+        assert_eq!(
+            Section::Heading {
+                label: "h".into(),
+                note: None
+            }
+            .height(),
+            1
+        );
+        assert_eq!(
+            Section::Sparkrow {
+                label: "s".into(),
+                spark: vec![0.1, 0.2],
+                cur: "x".into(),
+                tone: Tok::Slot(S::Text),
+            }
+            .height(),
+            1
+        );
+        let g = |height, footer: Option<&str>| {
+            Section::Graph(GraphSection {
+                label: "g".into(),
+                cur: "c".into(),
+                footer: footer.map(str::to_string),
+                series: vec![],
+                tone: Tok::Slot(S::Text),
+                height,
+                series2: None,
+            })
+        };
+        assert_eq!(g(5, Some("f")).height(), 7); // header + 5 + footer
+        assert_eq!(g(5, None).height(), 6); // header + 5
+        assert_eq!(Section::KeyVal(vec![]).height(), 0);
+        let tbl = |header: Vec<String>, n: usize| {
+            Section::Table(TableSection {
+                header,
+                rows: (0..n)
+                    .map(|_| vec![Cell::Text("x".into(), Tok::Slot(S::Text))])
+                    .collect(),
+            })
+        };
+        assert_eq!(tbl(vec!["h".into()], 2).height(), 3); // header + 2
+        assert_eq!(tbl(vec![], 2).height(), 2); // no header
+    }
+
+    #[test]
+    fn battery_eta_projects_from_slope() {
+        // Discharging on battery → a projected time (leading zeros ignored).
+        assert!(
+            battery_eta(&[0.0, 0.0, 0.9, 0.8, 0.7, 0.6], false)
+                .unwrap()
+                .starts_with('~')
+        );
+        // Charging on AC → time-to-full.
+        assert!(battery_eta(&[0.4, 0.5, 0.6, 0.7], true).is_some());
+        // Flat charge → no projection.
+        assert_eq!(battery_eta(&[0.5, 0.5, 0.5], false), None);
+        // Slope contradicts the source (falling while "on AC") → no guess.
+        assert_eq!(battery_eta(&[0.9, 0.8, 0.7], true), None);
+        // Too little history → None.
+        assert_eq!(battery_eta(&[0.8], false), None);
+    }
+
+    #[test]
+    fn sections_popup_renders_legibly() {
+        let model = model_full();
+        let mut hist = TelemetryHistory::default();
+        for i in 0..60 {
+            hist.push(&model.stats);
+            let _ = i;
+        }
+        for w in ["disk", "net", "gpu", "battery", "mem"] {
+            let ov = open_detail_for(
+                &BarItemId::Widget(w.into()),
+                item_at(0),
+                screen(),
+                &model,
+                &hist,
+            )
+            .unwrap();
+            let mut s = Surface::new(120, 40);
+            ov.render(&mut s, screen());
+            assert!(
+                seg::text_contrast_violations(&mut s, 3.0).is_empty(),
+                "{w} popup has an unreadable cell"
+            );
+        }
+    }
+
+    #[test]
+    fn tall_sections_popup_scrolls() {
+        // A popup whose stacked height exceeds its box scrolls by row.
+        let secs = vec![Section::KeyVal(
+            (0..30)
+                .map(|i| (format!("k{i}"), format!("v{i}"), Tok::Slot(S::Text)))
+                .collect(),
+        )];
+        let mut ov = sections("Tall", 30, secs, Placement::Center);
+        // Cap the visible rows so it overflows.
+        ov.rows = 10;
+        assert!(ov.content_rows() > ov.rows);
+        for _ in 0..100 {
+            ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+        }
+        assert_eq!(ov.scroll, ov.content_rows() - ov.rows);
+        for _ in 0..100 {
+            ov.handle_key(&KeyCode::UpArrow, Modifiers::NONE);
+        }
+        assert_eq!(ov.scroll, 0);
     }
 }

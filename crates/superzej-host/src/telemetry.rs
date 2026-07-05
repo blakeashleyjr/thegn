@@ -58,6 +58,12 @@ pub struct TelemetryHistory {
     disk_io: VecDeque<f32>,
     /// 1-minute load average, raw.
     load: VecDeque<f32>,
+    /// GPU utilization 0..=1. Fixed scale (not window-normalized) so an idle
+    /// GPU reads flat rather than rescaling to noise, same as `temp`.
+    gpu: VecDeque<f32>,
+    /// Battery charge 0..=1. Fixed scale so a slow drain reads as a gentle
+    /// downward slope rather than a rescaled sawtooth.
+    battery: VecDeque<f32>,
 }
 
 impl TelemetryHistory {
@@ -89,6 +95,14 @@ impl TelemetryHistory {
         push_cap(
             &mut self.load,
             snap.load_avg.map(|(one, _, _)| one).unwrap_or(0.0),
+        );
+        push_cap(
+            &mut self.gpu,
+            snap.gpu_pct.map(|p| p as f32 / 100.0).unwrap_or(0.0),
+        );
+        push_cap(
+            &mut self.battery,
+            snap.battery.map(|(p, _)| p as f32 / 100.0).unwrap_or(0.0),
         );
     }
 
@@ -146,6 +160,16 @@ impl TelemetryHistory {
     /// Latest aggregate disk-IO rate in bytes/s, for the headline.
     pub fn last_disk_io(&self) -> u64 {
         self.disk_io.back().copied().unwrap_or(0.0) as u64
+    }
+
+    /// GPU utilization series (0..=1, fixed scale), right-aligned to `n`.
+    pub fn gpu_series(&self, n: usize) -> Vec<f32> {
+        series(&self.gpu, n)
+    }
+
+    /// Battery charge series (0..=1, fixed scale), right-aligned to `n`.
+    pub fn battery_series(&self, n: usize) -> Vec<f32> {
+        series(&self.battery, n)
     }
 }
 
@@ -257,7 +281,26 @@ mod tests {
         h.push(&StatsSnapshot::default());
         assert_eq!(h.cpu_series(1), vec![0.0]);
         assert_eq!(h.mem_series(1), vec![0.0]);
+        assert_eq!(h.gpu_series(1), vec![0.0]);
+        assert_eq!(h.battery_series(1), vec![0.0]);
         assert_eq!(h.last_rates(), (0, 0));
+    }
+
+    #[test]
+    fn gpu_and_battery_use_fixed_scale() {
+        let mut h = TelemetryHistory::default();
+        let mut s = StatsSnapshot {
+            gpu_pct: Some(25),
+            battery: Some((80, false)),
+            ..Default::default()
+        };
+        h.push(&s);
+        s.gpu_pct = Some(50);
+        s.battery = Some((40, false));
+        h.push(&s);
+        // Fixed 0..=100 scale: 25%→0.25, 50%→0.5 (NOT window-normalized to 1.0).
+        assert_eq!(h.gpu_series(2), vec![0.25, 0.5]);
+        assert_eq!(h.battery_series(2), vec![0.8, 0.4]);
     }
 
     #[test]
