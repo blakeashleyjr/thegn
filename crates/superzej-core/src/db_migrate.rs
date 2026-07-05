@@ -5,6 +5,33 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
+impl crate::db::Db {
+    /// The on-disk schema version when it is newer than this build understands,
+    /// else `None`. Data the newer build wrote under tables/columns this build
+    /// doesn't know about may be invisible; the host surfaces a warning once.
+    pub fn schema_mismatch(&self) -> Option<i64> {
+        self.schema_mismatch
+    }
+}
+
+/// Classify the on-disk `user_version` against `current` (this build's
+/// [`crate::db::SCHEMA_VERSION`]): `Some(on_disk)` when the DB was written by a
+/// newer-schema build (a different branch sharing the file), else `None`. We
+/// warn and keep opening — the multi-branch-one-DB dev workflow is intentional
+/// and the additive schema is forward-compatible — but record it so the host
+/// can surface the mismatch once at startup.
+pub(crate) fn detect_newer_schema(on_disk: i64, current: i64) -> Option<i64> {
+    let newer = (on_disk > current).then_some(on_disk)?;
+    tracing::warn!(
+        target: "szhost::db",
+        on_disk = newer,
+        build = current,
+        "database schema v{newer} is newer than this build (v{current}); \
+         data written by the newer build may be invisible"
+    );
+    Some(newer)
+}
+
 /// Split a legacy v4/v5 tab name into its worktree-group base and page number:
 /// `"app/feat ·3"` → `("app/feat", Some(3))`, `"app/feat"` → `("app/feat", None, None)`.
 pub(crate) fn split_page_suffix(name: &str) -> (&str, Option<u32>) {
@@ -272,10 +299,18 @@ pub(crate) fn additive_schema(conn: &Connection) {
           folder_id         INTEGER,
           created_at        INTEGER NOT NULL,
           last_active       INTEGER NOT NULL,
-          position          INTEGER NOT NULL DEFAULT 0
+          position          INTEGER NOT NULL DEFAULT 0,
+          sandbox_backend   TEXT,
+          env_name          TEXT
         )",
         [],
     );
+    // Per-terminal sandbox + env for DBs created before these columns existed
+    // (additive, branch-merge-safe — no version bump; the ALTER is a no-op once
+    // the column exists). A local terminal can launch wrapped in a sandbox /
+    // named env just like a worktree pane.
+    let _ = conn.execute("ALTER TABLE terminals ADD COLUMN sandbox_backend TEXT", []);
+    let _ = conn.execute("ALTER TABLE terminals ADD COLUMN env_name TEXT", []);
     let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN folder_id INTEGER", []);
     // v21: per-worktree ingress shares (`[share]`). A worktree can expose
     // several ports, so the key is (worktree, local_port). Additive; a row
@@ -328,4 +363,53 @@ pub(crate) fn additive_schema(conn: &Connection) {
         "ALTER TABLE group_tabs ADD COLUMN scrollback_snapshot TEXT",
         [],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::Db;
+    use crate::store::WorkspaceStore;
+
+    #[test]
+    fn detect_newer_schema_flags_only_a_newer_db() {
+        // Older / equal on-disk versions are fine; only a strictly-newer DB
+        // (written by a different-schema branch build) is flagged.
+        assert_eq!(super::detect_newer_schema(5, 10), None);
+        assert_eq!(super::detect_newer_schema(10, 10), None);
+        assert_eq!(super::detect_newer_schema(12, 10), Some(12));
+    }
+
+    #[test]
+    fn a_fresh_db_reports_no_schema_mismatch() {
+        // A DB this build just created is at its own version — never a mismatch.
+        assert_eq!(Db::open_memory().unwrap().schema_mismatch(), None);
+    }
+
+    #[test]
+    fn terminal_row_roundtrips_sandbox_and_env() {
+        let db = Db::open_memory().unwrap();
+        db.put_terminal("local", "local", "", None).unwrap();
+        db.set_terminal_sandbox("local", "bwrap").unwrap();
+        db.set_terminal_env("local", "dev").unwrap();
+        let t = db
+            .terminals()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.name == "local")
+            .unwrap();
+        assert_eq!(t.sandbox_backend, "bwrap");
+        assert_eq!(t.env_name, "dev");
+
+        // A fresh terminal has empty sandbox/env (COALESCE default), so the
+        // sidebar/chip render as an uncontained local shell.
+        db.put_terminal("plain", "local", "", None).unwrap();
+        let p = db
+            .terminals()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.name == "plain")
+            .unwrap();
+        assert_eq!(p.sandbox_backend, "");
+        assert_eq!(p.env_name, "");
+    }
 }

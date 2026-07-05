@@ -39,6 +39,7 @@ mod host_provision;
 mod host_ui;
 mod hover;
 mod hydrate;
+mod hydrate_terminal;
 mod input;
 mod integrate;
 mod keyhint;
@@ -95,6 +96,7 @@ mod subsystem;
 mod tabbar_env;
 mod task;
 mod telemetry;
+mod terminal_wizard;
 #[cfg(test)]
 mod testenv;
 mod testkit;

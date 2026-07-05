@@ -852,7 +852,8 @@ impl WorkspaceStore for Db {
 
     fn terminals(&self) -> Result<Vec<crate::models::TerminalRow>> {
         let mut stmt = self.conn().prepare(
-            "SELECT id, name, kind, connection_string, folder_id, created_at, last_active, position
+            "SELECT id, name, kind, connection_string, folder_id, created_at, last_active, position,
+                    COALESCE(sandbox_backend, ''), COALESCE(env_name, '')
              FROM terminals ORDER BY position, last_active DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -865,6 +866,8 @@ impl WorkspaceStore for Db {
                 created_at: r.get(5)?,
                 last_active: r.get(6)?,
                 position: r.get(7)?,
+                sandbox_backend: r.get(8)?,
+                env_name: r.get(9)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -891,6 +894,22 @@ impl WorkspaceStore for Db {
             |r| r.get(0),
         )?;
         Ok(id)
+    }
+
+    fn set_terminal_sandbox(&self, name: &str, backend: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE terminals SET sandbox_backend=?2 WHERE name=?1",
+            params![name, backend],
+        )?;
+        Ok(())
+    }
+
+    fn set_terminal_env(&self, name: &str, env: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE terminals SET env_name=?2 WHERE name=?1",
+            params![name, env],
+        )?;
+        Ok(())
     }
 
     fn del_terminal(&self, id: i64) -> Result<()> {

@@ -708,22 +708,19 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // WAL) and we already touched it in load_or_seed_session — this is a
     // second handle, not a new migration. None falls back gracefully.
     let startup_db = superzej_core::db::Db::open().ok();
-    // Ensure a default "local" terminal exists so the sidebar's Terminals
-    // section is always present (it's hidden when the table is empty). Seeding
-    // only on an empty table keeps it a one-time default the user can rename or
-    // delete; a deliberately-emptied list is reseeded on the next launch, which
-    // matches "there is always a local terminal".
-    if let Some(db) = startup_db.as_ref()
-        && db.terminals().map(|t| t.is_empty()).unwrap_or(false)
-    {
-        let _ = db.put_terminal("local", "local", "", None);
-    }
+    // Keep a default "local" terminal so the sidebar section stays populated.
+    crate::handlers::startup::reseed_default_terminal(startup_db.as_ref());
     let mut model = build_initial_model(&session, startup_db.as_ref());
     model.accent = cfg.accent_rgb();
     apply_mode_status(&mut model, mode, &cfg);
     // Surface keybind conflicts at launch (non-fatal — the shell always opens).
     if let Some(summary) = keybind_conflict_summary(&cfg) {
         model.status = summary;
+    }
+    // Surface a newer-schema DB (a different-branch build wrote this shared DB):
+    // we open it anyway, but some data may be invisible to this build.
+    if let Some(note) = crate::handlers::startup::schema_mismatch_status(startup_db.as_ref()) {
+        model.status = note;
     }
     model.bars = cfg.bars.clone();
     model.stats_icons = cfg.stats.clone();
@@ -3917,12 +3914,9 @@ enum GitInputKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HostInputKind {
-    NewTerminal,
     /// Add a `[host.*]` machine from typed input (the wizard's "+ add host…"
     /// row); re-opens the worktree wizard for `repo_root` on success.
-    NewHost {
-        repo_root: std::path::PathBuf,
-    },
+    NewHost { repo_root: std::path::PathBuf },
     /// Rename the worktree group at this session index from its old branch
     /// (item 53). Carries the repo root + old path/branch so the off-thread
     /// rename has everything it needs.
@@ -3942,9 +3936,7 @@ pub(crate) enum HostInputKind {
     ImportLayout,
     /// Create a worktree from the `[[worktree_templates]]` preset named by the
     /// typed value (item 54). Carries the resolved repo root.
-    NewWorktreeFromTemplate {
-        repo_root: String,
-    },
+    NewWorktreeFromTemplate { repo_root: String },
     /// Expose the typed port from the active worktree (`[share]`). `reach`
     /// carries the picked public/team/peer intent (`None` ⇒ `[share] provider`).
     ShareWorktreePort {
@@ -6258,16 +6250,18 @@ fn contain_yazi_argv(
     wrapped
 }
 
-/// Resolve a terminal group's connection string (ssh/mosh target, or "" for a
-/// local shell) by its unique name from the `terminals` table. Returns "" when
-/// the row is gone or the DB can't be opened — a safe fall back to a local
-/// shell. Call this off the event loop (it opens the DB).
-fn terminal_connection_for(name: &str) -> String {
+/// Resolve a terminal group's `(connection, sandbox_backend)` by its unique name
+/// from the `terminals` table: the connection is the ssh/mosh target ("" for a
+/// local shell) and the sandbox backend wraps a local shell ("" = uncontained).
+/// Returns `("", "")` when the row is gone or the DB can't be opened — a safe
+/// fall back to a local, uncontained shell. Call this off the event loop (it
+/// opens the DB).
+fn terminal_launch_for(name: &str) -> (String, String) {
     superzej_core::db::Db::open()
         .ok()
         .and_then(|db| db.terminals().ok())
         .and_then(|ts| ts.into_iter().find(|t| t.name == name))
-        .map(|t| t.connection_string)
+        .map(|t| (t.connection_string, t.sandbox_backend))
         .unwrap_or_default()
 }
 
@@ -6295,9 +6289,14 @@ fn spawn_worktree_shell_pane(
     center: Rect,
     is_terminal: bool,
     terminal_connection: Option<&str>,
+    terminal_sandbox: &str,
 ) -> Result<u32> {
     if is_terminal {
-        let spec = crate::panes::terminal_launch_spec(cfg, terminal_connection.unwrap_or(""));
+        let spec = crate::panes::terminal_launch_spec(
+            cfg,
+            terminal_connection.unwrap_or(""),
+            terminal_sandbox,
+        );
         return panes.spawn_argv_env(&spec.argv, dir, &spec.env, center);
     }
 
@@ -6419,7 +6418,8 @@ fn apply_layout_to_active_tab(
         .unwrap_or_default();
     // Spawn a shell per leaf; a leaf carrying a command runs it in that shell.
     let mut spawn = |cmd: Option<&str>| -> Option<u32> {
-        let id = spawn_worktree_shell_pane(panes, cfg, dir.as_deref(), center, false, None).ok()?;
+        let id =
+            spawn_worktree_shell_pane(panes, cfg, dir.as_deref(), center, false, None, "").ok()?;
         if let Some(c) = cmd
             && let Some(p) = panes.table.get_mut(&id)
         {
@@ -6539,7 +6539,7 @@ fn spawn_yazi_pane(
             .spawn_argv_env(&argv, spec.cwd.as_deref().or(Some(dir)), &yenv, center)
             .ok();
     }
-    spawn_worktree_shell_pane(panes, cfg, dir, center, false, None).ok()
+    spawn_worktree_shell_pane(panes, cfg, dir, center, false, None, "").ok()
 }
 
 /// Show the worktree's drawer: pooled pane if alive (instant, position
@@ -7839,6 +7839,8 @@ async fn event_loop<T: Terminal>(
     // `create_gen` kills a cancelled run's stragglers on arrival.
     let (create_tx, mut create_rx) = tokio_mpsc::unbounded_channel::<wizard::CreateEvent>();
     let mut wizard_ui: Option<wizard::NewWorktreeWizard> = None;
+    // The new-terminal wizard (Alt T / palette); no creation worker (synchronous).
+    let mut terminal_wizard_ui: Option<crate::terminal_wizard::TerminalWizard> = None;
     let mut wizard_cmd_tx: Option<std::sync::mpsc::Sender<wizard::WizardCmd>> = None;
     let mut creating: Option<wizard::CreationProgress> = None;
     // When a worktree is created from a template (item 54), the template is held
@@ -8770,8 +8772,8 @@ async fn event_loop<T: Terminal>(
                 let wk = waker.clone();
                 task::spawn_blocking(move || {
                     let specs = if is_terminal {
-                        let conn = terminal_connection_for(&name);
-                        let spec = crate::panes::terminal_launch_spec(&cfg, &conn);
+                        let (conn, sandbox) = terminal_launch_for(&name);
+                        let spec = crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox);
                         Ok(missing.into_iter().map(|id| (id, spec.clone())).collect())
                     } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
                         // Non-local env, failover off, known-down (token unset /
@@ -8988,8 +8990,8 @@ async fn event_loop<T: Terminal>(
                     let hui = Some(host_ui.clone());
                     task::spawn_blocking(move || {
                         let specs = if is_terminal {
-                            let conn = terminal_connection_for(&gname);
-                            let spec = crate::panes::terminal_launch_spec(&cfg, &conn);
+                            let (conn, sandbox) = terminal_launch_for(&gname);
+                            let spec = crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox);
                             Ok(missing.into_iter().map(|id| (id, spec.clone())).collect())
                         } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
                             // Non-local env, failover off, known-down (token unset
@@ -9636,6 +9638,7 @@ async fn event_loop<T: Terminal>(
                                                 chrome.center,
                                                 false,
                                                 None,
+                                                "",
                                             ) {
                                                 Ok(fresh) => {
                                                     if let Some(tab) = session.tab_mut(gi, ti) {
@@ -12035,6 +12038,9 @@ async fn event_loop<T: Terminal>(
             if let Some(w) = &wizard_ui {
                 w.render(&mut scratch, screen);
             }
+            if let Some(w) = &terminal_wizard_ui {
+                w.render(&mut scratch, screen);
+            }
             if let Some(p) = &workspace_picker {
                 p.render(&mut scratch, screen);
             }
@@ -13066,6 +13072,62 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // Modal: the new-terminal wizard captures all keys; submit is
+                // synchronous (DB upsert + pane spawn), handled inline below.
+                if let Some(w) = terminal_wizard_ui.as_mut() {
+                    match w.handle_key(&k.key, k.modifiers) {
+                        crate::terminal_wizard::Outcome::Pending => {}
+                        crate::terminal_wizard::Outcome::Cancel => {
+                            terminal_wizard_ui = None;
+                            model.status = "new terminal cancelled".into();
+                        }
+                        crate::terminal_wizard::Outcome::Submit(choice) => {
+                            terminal_wizard_ui = None;
+                            crate::handlers::terminal::persist(&choice);
+                            session.worktrees.push(crate::session::WorktreeGroup {
+                                name: choice.name.clone(),
+                                kind: crate::session::GroupKind::Terminal,
+                                path: String::new(), // not backed by a local path
+                                tabs: vec![crate::session::Tab {
+                                    title: "main".to_string(),
+                                    center: crate::center::CenterTree::Leaf(0),
+                                    focused_pane: 0,
+                                    pane_cwds: Default::default(),
+                                    pane_cmds: Default::default(),
+                                    pane_sessions: Default::default(),
+                                    pane_scrollback: Default::default(),
+                                }],
+                                active_tab: 0,
+                            });
+                            session.active = session.worktrees.len() - 1;
+                            let cwd = active_cwd(&session);
+                            let new = match spawn_worktree_shell_pane(
+                                &mut panes,
+                                keymap.config(),
+                                cwd.as_deref(),
+                                chrome.center,
+                                true,
+                                Some(&choice.connection),
+                                &choice.sandbox,
+                            ) {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    model.status = format!("Terminal spawn failed: {e}");
+                                    continue;
+                                }
+                            };
+                            if let Some(tab) = session.active_tab_mut() {
+                                tab.center = crate::center::CenterTree::Leaf(new);
+                                tab.focused_pane = new;
+                            }
+                            focus.zone = crate::focus::Zone::Center;
+                            refresh_tab_model(&mut model, &session, &mut sb);
+                            need_relayout = true;
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Modal: the new-worktree wizard captures all keys; its
                 // decisions stream to the creation worker as they happen.
                 if let Some(w) = wizard_ui.as_mut() {
@@ -13201,80 +13263,6 @@ async fn event_loop<T: Terminal>(
                                                 );
                                             }
                                             Err(e) => model.status = format!("add host: {e}"),
-                                        }
-                                    }
-                                    HostInputKind::NewTerminal => {
-                                        let text = text.trim().to_string();
-                                        if !text.is_empty()
-                                            && let Ok(db) = superzej_core::db::Db::open()
-                                        {
-                                            // Create a stable name for it
-                                            let name = if text == "local" || text == "shell" {
-                                                "local".to_string()
-                                            } else {
-                                                // use the connection string as name, but sanitize
-                                                let n = text.replace(' ', "-");
-                                                format!("term-{}", n)
-                                            };
-                                            // Check if it already exists, if not create
-                                            let mut exists = false;
-                                            if let Ok(terms) = db.terminals()
-                                                && terms.iter().any(|t| t.name == name)
-                                            {
-                                                exists = true;
-                                            }
-                                            if !exists {
-                                                let kind = if text == "local" || text == "shell" {
-                                                    "local"
-                                                } else {
-                                                    "remote"
-                                                };
-                                                let _ = db.put_terminal(&name, kind, &text, None);
-                                            }
-
-                                            // Push the new terminal and make it active
-                                            session.worktrees.push(crate::session::WorktreeGroup {
-                                                name: name.clone(),
-                                                kind: crate::session::GroupKind::Terminal,
-                                                path: "".to_string(), // not backed by a local path
-                                                tabs: vec![crate::session::Tab {
-                                                    title: "main".to_string(),
-                                                    center: crate::center::CenterTree::Leaf(0),
-                                                    focused_pane: 0,
-                                                    pane_cwds: Default::default(),
-                                                    pane_cmds: Default::default(),
-                                                    pane_sessions: Default::default(),
-                                                    pane_scrollback: Default::default(),
-                                                }],
-                                                active_tab: 0,
-                                            });
-                                            session.active = session.worktrees.len() - 1;
-
-                                            // Spawn it immediately
-                                            let cwd = active_cwd(&session);
-                                            let new = match spawn_worktree_shell_pane(
-                                                &mut panes,
-                                                keymap.config(),
-                                                cwd.as_deref(),
-                                                chrome.center,
-                                                true,
-                                                Some(&text),
-                                            ) {
-                                                Ok(id) => id,
-                                                Err(e) => {
-                                                    model.status =
-                                                        format!("Terminal spawn failed: {e}");
-                                                    continue;
-                                                }
-                                            };
-                                            if let Some(tab) = session.active_tab_mut() {
-                                                // Terminal tabs can only have 1 pane to start, and we want to replace the placeholder
-                                                tab.center = crate::center::CenterTree::Leaf(new);
-                                                tab.focused_pane = new;
-                                            }
-                                            focus.zone = crate::focus::Zone::Center;
-                                            refresh_tab_model(&mut model, &session, &mut sb);
-                                            need_relayout = true;
                                         }
                                     }
                                     HostInputKind::RenameWorktree {
@@ -17385,6 +17373,7 @@ async fn event_loop<T: Terminal>(
                                                     chrome.center,
                                                     false,
                                                     None,
+                                                    "",
                                                 ),
                                             };
                                             match spawned {
@@ -18416,6 +18405,7 @@ async fn event_loop<T: Terminal>(
                                     chrome.center,
                                     false,
                                     None,
+                                    "",
                                 ) {
                                     Ok(new) => {
                                         if let Some(tab) = session.active_tab_mut() {
@@ -18606,6 +18596,7 @@ async fn event_loop<T: Terminal>(
                                     chrome.center,
                                     false,
                                     None,
+                                    "",
                                 ) {
                                     Ok(id) => id,
                                     Err(e) => {
@@ -18792,13 +18783,10 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::NewTerminal => {
-                                host_input = Some((
-                                    menu::InputOverlay::new(
-                                        "Terminal connection (ssh user@host or empty for local)",
-                                        "",
-                                    ),
-                                    HostInputKind::NewTerminal,
-                                ));
+                                // Open the new-terminal wizard (name/connection/sandbox).
+                                terminal_wizard_ui = Some(
+                                    crate::terminal_wizard::TerminalWizard::new(keymap.config()),
+                                );
                             }
                             Action::NewWorkspace => {
                                 // Fuzzy picker, seeded instantly from the DB;
@@ -18975,6 +18963,7 @@ async fn event_loop<T: Terminal>(
                                     chrome.center,
                                     false,
                                     None,
+                                    "",
                                 ) {
                                     Ok(id) => {
                                         if let Some(tab) = session
@@ -19673,6 +19662,11 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                if let Some(w) = terminal_wizard_ui.as_mut() {
+                    w.handle_paste(&s);
+                    dirty = true;
+                    continue;
+                }
                 // A chrome text-input is collecting keystrokes (commit message /
                 // rename / new-branch overlay, the search palette, or the git
                 // filter line): a paste belongs to it, not the terminal. We
@@ -20198,6 +20192,8 @@ mod tests {
             created_at: 0,
             last_active: 0,
             position: 0,
+            sandbox_backend: String::new(),
+            env_name: String::new(),
         }
     }
 

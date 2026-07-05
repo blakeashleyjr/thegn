@@ -1136,7 +1136,7 @@ pub(crate) fn build_model(
         .flat_map(|(_, _, _, repo)| db.folders_for_workspace(repo).unwrap_or_default())
         .collect();
     let sidebar_db_worktrees = db_worktree_list(db);
-    let sidebar_db_terminals = db.terminals().unwrap_or_default();
+    let sidebar_db_terminals = crate::hydrate_terminal::sidebar_terminals(db);
     // One-shot at process start: collapse any stale running/active activity dot
     // (a session killed mid-run) to a settled state before the sidebar first
     // paints, so a phantom forever-running dot never survives resurrection. The
@@ -1191,6 +1191,10 @@ pub(crate) fn build_model(
         crate::host_ui::decorate_placement_kind(&kind, status.as_deref())
     });
 
+    // Sandbox backend for the tab-bar `(backend)` chip; see `hydrate_terminal`.
+    let active_sandbox_backend =
+        crate::hydrate_terminal::active_backend(db, &loc.path(), active_env.sandbox.backend);
+
     tracing::debug!(
         target: "szhost::hydrate",
         build_model_ms = t0.elapsed().as_millis() as u64,
@@ -1224,11 +1228,7 @@ pub(crate) fn build_model(
                 Some(&hints.profile)
             },
         ),
-        active_sandbox_backend: db
-            .worktree_sandbox(&loc.path())
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
+        active_sandbox_backend,
         active_placement_kind,
         active_placement_label,
         // containers is populated by the dedicated container refresh ticker
