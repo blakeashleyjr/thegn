@@ -2035,19 +2035,12 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # [lifecycle.pool]            # WARM SPARE POOL: keep N pre-provisioned, unclaimed
 # size = 0                    #   sandboxes ready per (repo, env) so the NEXT worktree
 #                             #   CLAIMS one instantly (bind + branch checkout) instead
-#                             #   of provisioning from scratch. 0 ⇒ the AUTO default: one
-#                             #   parked spare for a SCALE-TO-ZERO provider (sprites — an
-#                             #   idle spare hibernates for free) that you already opted to
-#                             #   pay into via provider `auto_provision`; off otherwise. A
-#                             #   non-zero value overrides it (clamped to a runaway ceiling
-#                             #   of 8). Refills in the background right after a claim.
-#                             #   Adjust live with the warm-pool-increment / -decrement
-#                             #   hotkeys (Ctrl+Alt+= / Ctrl+Alt+-), which persist a per-
-#                             #   repo+env override (incl. 0 to force off); the sidebar
-#                             #   header shows `warm ready/target`.
-# max_idle_secs = 600         # AgeOut providers (VPS) only: reap an unclaimed member idle
-#                             #   longer than this. Scale-to-zero spares are PARKED, not
-#                             #   aged out (they still rotate when flake.lock changes).
+#                             #   of provisioning from scratch. 0 ⇒ disabled (default).
+#                             #   Spares are checkpointed (suspend for free) + refill in
+#                             #   the background after a claim. Adjust live with the
+#                             #   warm-pool-increment / -decrement hotkeys (Ctrl+Alt+= /
+#                             #   Ctrl+Alt+-); the sidebar header shows `warm ready/target`.
+# max_idle_secs = 600         # reap an unclaimed pool member older than this (recycled)
 # # Recycle checkpointed spares by restoring them IN PLACE (seconds) instead of
 # # destroy+rebuild (minutes) when they go stale or their worktree is deleted;
 # # lockfile-freshness guarded, destroy on any failure. false = always destroy.

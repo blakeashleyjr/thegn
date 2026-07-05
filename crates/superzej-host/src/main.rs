@@ -29,7 +29,6 @@ mod detail;
 mod direnv_warm;
 mod emulator;
 mod escape;
-mod fff_backend;
 mod focus;
 mod font;
 mod forward;

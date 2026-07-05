@@ -942,10 +942,6 @@ pub struct ProviderCaps {
     pub checkpoints: bool,
     pub egress: bool,
     pub exec_api: bool,
-    /// An idle sandbox self-suspends for free (billed only while awake). Mirrors
-    /// `superzej_core::config::provider_scale_to_zero` by kind — the warm pool
-    /// parks scale-to-zero spares indefinitely instead of aging them out.
-    pub scale_to_zero: bool,
 }
 
 /// Whether the named provider has a native exec API (PTY-over-WebSocket), so an
@@ -1466,27 +1462,19 @@ pub enum Provider {
 impl Provider {
     /// What this provider supports beyond lifecycle.
     pub fn caps(&self) -> ProviderCaps {
-        // Single source of truth for the scale-to-zero classification (core), so
-        // the runtime caps and the warm-pool policy can never disagree.
-        let scale_to_zero = superzej_core::config::provider_scale_to_zero(self.name());
         match self {
-            Provider::Daytona(_) => ProviderCaps {
-                scale_to_zero,
-                ..ProviderCaps::default()
-            },
+            Provider::Daytona(_) => ProviderCaps::default(),
             // Flags flip on as each Sprites axis lands.
             Provider::Sprites(_) => ProviderCaps {
                 egress: true,
                 checkpoints: true,
                 files: true,
                 exec_api: true,
-                scale_to_zero,
             },
             // files via the ssh shim; checkpoints deliberately absent (no
             // suspend on a VPS — the recycle path must destroy, not restore).
             Provider::Vps(_) => ProviderCaps {
                 files: true,
-                scale_to_zero,
                 ..ProviderCaps::default()
             },
         }
@@ -1806,14 +1794,6 @@ mod tests {
     fn sprites_has_native_exec_capability() {
         assert!(Provider::Sprites(sprites()).caps().exec_api);
         assert!(!Provider::Daytona(provider()).caps().exec_api);
-    }
-
-    #[test]
-    fn only_sprites_is_scale_to_zero() {
-        // Sprites hibernate for free (idle-park the pool); Daytona has no confirmed
-        // free idle. Sourced from the core classifier, so caps + pool policy agree.
-        assert!(Provider::Sprites(sprites()).caps().scale_to_zero);
-        assert!(!Provider::Daytona(provider()).caps().scale_to_zero);
     }
 
     #[test]

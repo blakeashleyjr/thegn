@@ -401,9 +401,6 @@ pub fn claim_spare(
         );
     }
     superzej_core::msg::info(&format!("claimed warm spare {name} for {worktree}"));
-    // The claim consumed this spare — refill the pool now rather than waiting for
-    // the next ~8s maintainer tick to notice the gap (off-loop, its own thread).
-    crate::lifecycle::refill_pool_after_claim(cfg, worktree);
     Some(name)
 }
 
