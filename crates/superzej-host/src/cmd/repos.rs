@@ -1,6 +1,7 @@
-//! `superzej repos` / `superzej recent` — repo discovery + history feeds, plus
-//! `superzej repos trust` — trust-on-first-use review/approval of a repo
-//! `.superzej.*` overlay's gated sandbox requests.
+//! `superzej repo` (and the legacy `repos` / `recent` / `repo-trust`
+//! spellings) — repo discovery + history feeds, plus `repo trust` —
+//! trust-on-first-use review/approval of a repo `.superzej.*` overlay's gated
+//! sandbox requests.
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -10,18 +11,67 @@ use superzej_core::db::Db;
 use superzej_core::store::{RepoTrustStore, WorkspaceStore};
 use superzej_core::{outln, repo, repo_trust, util};
 
+#[derive(clap::Subcommand, Clone)]
+pub enum Action {
+    /// List git repos discovered under repo_roots.
+    List {
+        /// Emit one JSON array of paths instead of plain lines.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List recently opened repos, most-recent first.
+    Recent {
+        count: Option<i64>,
+        /// Emit one JSON array of paths instead of plain lines.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Review/approve a repo `.superzej.*` overlay's gated sandbox requests
+    /// (trust-on-first-use).
+    Trust {
+        /// Repo path (default: current directory).
+        path: Option<String>,
+        /// Approve a pending request by its id.
+        #[arg(long)]
+        approve: Option<String>,
+        /// Revoke a recorded decision by its id.
+        #[arg(long)]
+        revoke: Option<String>,
+    },
+}
+
+pub fn run(cfg: &Config, action: Action) -> Result<()> {
+    match action {
+        Action::List { json } => repos(cfg, json),
+        Action::Recent { count, json } => recent(count, json),
+        Action::Trust {
+            path,
+            approve,
+            revoke,
+        } => trust(cfg, path, approve, revoke),
+    }
+}
+
 /// Git repos discovered under `repo_roots` (what the picker offers).
-pub fn repos(cfg: &Config) -> Result<()> {
-    for path in repo::discover_repos(cfg) {
+pub fn repos(cfg: &Config, json: bool) -> Result<()> {
+    let paths = repo::discover_repos(cfg);
+    if json {
+        return super::emit_json(&paths);
+    }
+    for path in paths {
         outln!("{path}");
     }
     Ok(())
 }
 
 /// Recently opened repos, most-recent first.
-pub fn recent(count: Option<i64>) -> Result<()> {
+pub fn recent(count: Option<i64>, json: bool) -> Result<()> {
     let db = Db::open()?;
-    for path in db.recent_repos(count.unwrap_or(20))? {
+    let paths = db.recent_repos(count.unwrap_or(20))?;
+    if json {
+        return super::emit_json(&paths);
+    }
+    for path in paths {
         outln!("{path}");
     }
     Ok(())

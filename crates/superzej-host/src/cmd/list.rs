@@ -111,10 +111,13 @@ fn view(
     }
 }
 
-pub fn run(cfg: &Config) -> Result<()> {
+pub fn run(cfg: &Config, json: bool) -> Result<()> {
     use std::io::IsTerminal;
 
     let rows = collect(cfg)?;
+    if json {
+        return super::emit_json(&rows);
+    }
     if rows.is_empty() {
         outln!("No worktrees yet. Press Alt-W to open a workspace, Alt-w for a worktree.");
         return Ok(());
