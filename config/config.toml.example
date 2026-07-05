@@ -723,6 +723,9 @@ command = "git diff"
 # [zone.clientA.budget]
 # limit_tokens = 5000000                         # rolled up as the `zone:clientA` proxy scope
 # limit_cost   = 100.0                           # USD ceiling for the period
+# limit_compute_cost = 50.0                      # COMPUTE USD ceiling (placement ledger:
+#                                                #   autoscaled hosts + spillover; separate
+#                                                #   from the model-spend caps above)
 #
 # Manage zones from the CLI: `superzej zone list|create <name>|rm <name> [--force]|
 # assign <zone> [repo]`. Reassignment takes effect on the next worktree launch.
@@ -2094,6 +2097,12 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # spec exists). `superzej placement list` renders all three.
 [placement]
 enabled = false
+# preset = "none"             # preference bundle: cost_optimized (pack hard,
+#                             #   queue on exhaustion) | latency_optimized
+#                             #   (spread, reject) | isolated (dedicated only,
+#                             #   halt) | balanced. Fills only keys still at
+#                             #   their built-in defaults — anything you set
+#                             #   explicitly wins; never touches constraints.
 # mode = "auto"               # auto (broker chooses; packed when trust+capacity
 #                             #   allow, else an empty host) | packed | dedicated.
 #                             #   Per-env override: `[env.<n>] placement_mode`.
@@ -2115,6 +2124,25 @@ enabled = false
 #                             #   [host.<n>] capacity)
 # headroom_ttl_secs = 60      # measured-sample max age before a placement
 #                             #   decision re-probes (lazy; never idle polling)
+# spillover_envs = []         # ordered SPILLOVER lane: [env.<name>] provider
+#                             #   envs (e.g. a sprites env) tried when the
+#                             #   owned pool + autoscale are exhausted. Health-
+#                             #   tracked (429 cools down honoring the vendor,
+#                             #   402 parks until the ledger clears, create
+#                             #   failures escalate) with implicit fail-back;
+#                             #   budget-gated; sticky per worktree. Global/
+#                             #   profile config only — a repo overlay cannot
+#                             #   name spillover targets.
+# max_monthly_spend = 0.0     # USD/month cap for the COMPUTE ledger's global
+#                             #   scope (0 = uncapped). Breach pauses PAID
+#                             #   lanes (autoscale + spillover) per
+#                             #   on_exhaustion; packing onto already-paid
+#                             #   hosts keeps serving. Separate from the LLM
+#                             #   proxy's model-spend ledger by design.
+# [placement.price]           # hourly USD rates for the compute ledger
+# "hetzner:cx32" = 0.0113     #   autoscaled hosts ("provider:size", fallback
+# "hetzner" = 0.008           #   "provider"); unpriced resources meter at $0
+#                             #   with a one-time warning
 # [placement.default_resources] # fallback ask when an env declares none
 # cpu = "1"                   #   cpu floor ("2", "0.5", "500m")
 # memory = "2g"               #   memory floor ("4g", "512m", bare = MiB)

@@ -20,7 +20,9 @@ use superzej_core::config_placement::ManagedTemplate;
 use superzej_core::db::Db;
 use superzej_core::host::HostId;
 use superzej_core::host_config::{HostBinding, HostConfig, HostReach, InstallConsent};
-use superzej_core::store::{HealthMarker, HostCapacityRow, HostStore, PlacementStore};
+use superzej_core::store::{
+    ComputeLedgerStore, ComputeMeterRow, HealthMarker, HostCapacityRow, HostStore, PlacementStore,
+};
 
 /// Engine-host name prefix (also the orphan-reap discriminator).
 const AUTO_PREFIX: &str = "sz-auto-";
@@ -114,6 +116,39 @@ pub(crate) fn provision_managed(
     .context("persist engine host capacity")?;
     // A successful create clears the lane's marker (explicit fail-back).
     let _ = db.health_clear(&template.lane_key());
+    // Fixed-cost meter: an engine host bills from create to destroy. Rate
+    // from [placement.price."provider:size"] (fallback "provider"); unpriced
+    // meters at 0 with a one-time warn (placement list shows "unpriced").
+    let rate = cfg
+        .placement
+        .price
+        .get(&format!(
+            "{}:{}",
+            template.provider.trim(),
+            template.size.trim()
+        ))
+        .or_else(|| cfg.placement.price.get(template.provider.trim()))
+        .copied()
+        .unwrap_or_else(|| {
+            superzej_core::msg::warn(&format!(
+                "placement: no [placement.price] for {} — metering at $0",
+                template.lane_key()
+            ));
+            0.0
+        });
+    let now_ms = unix_now() * 1000;
+    // best-effort: the ledger is bookkeeping, never a create gate here
+    let _ = db.start_compute_meter(&ComputeMeterRow {
+        resource: name.clone(),
+        provider: template.provider.trim().to_string(),
+        category: "fixed".into(),
+        rate_hourly: rate,
+        scope: format!("provider:{}", template.provider.trim()),
+        zone: String::new(),
+        started_at_ms: now_ms,
+        last_accrued_ms: now_ms,
+        stopped_at_ms: None,
+    });
     superzej_core::msg::info(&format!(
         "placement: provisioned {name} ({}) at {ip}",
         template.lane_key()
@@ -242,6 +277,7 @@ fn destroy_engine_host(cfg: &Config, db: &Db, host: &HostId, rows: &[HostCapacit
         provider.destroy(name).await
     }) {
         Ok(()) => {
+            let _ = db.stop_compute_meter(name, unix_now() * 1000);
             let _ = db.capacity_delete(host);
             let _ = db.host_delete(host);
             superzej_core::msg::info(&format!("placement: scaled down idle host {name}"));

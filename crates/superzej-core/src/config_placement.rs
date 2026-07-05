@@ -40,6 +40,20 @@ config_enum! {
 }
 
 config_enum! {
+    /// `placement.preset` — a named bundle of PREFERENCE defaults (never
+    /// constraints). Expansion fills only keys still at their built-in
+    /// defaults, so any explicitly-set key wins; everything still flows
+    /// through zone clamps + the mode floor.
+    pub enum PlacementPreset: "placement preset" {
+        None = "none" | "",
+        Balanced = "balanced",
+        CostOptimized = "cost_optimized" | "cost-optimized",
+        LatencyOptimized = "latency_optimized" | "latency-optimized",
+        Isolated = "isolated",
+    } default = None;
+}
+
+config_enum! {
     /// `placement.on_exhaustion` — what happens when every lane is exhausted:
     /// `queue` falls through once and nudges when capacity frees (re-open to
     /// place), `reject` silently falls back to the env's non-engine path,
@@ -262,6 +276,8 @@ impl AutoscaleConfig {
 pub struct PlacementConfig {
     /// Master switch for the broker. Off ⇒ inert (no decisions, no tenancy).
     pub enabled: bool,
+    /// Named preference bundle (see [`PlacementPreset`]).
+    pub preset: PlacementPreset,
     /// Requested placement class (preference; `[env.<n>] placement_mode`
     /// overrides per env).
     pub mode: PlacementModePref,
@@ -285,6 +301,18 @@ pub struct PlacementConfig {
     /// Max age of a host's measured headroom sample before a placement
     /// decision refreshes it (lazily — never the idle ticker).
     pub headroom_ttl_secs: u64,
+    /// Ordered SPILLOVER lane: `[env.<name>]` entries with a provider
+    /// placement, tried (health- and budget-gated) when the owned pool and
+    /// autoscale are exhausted. Empty ⇒ no spillover.
+    pub spillover_envs: Vec<String>,
+    /// `[placement.price]` — hourly USD rates for the compute ledger, keyed
+    /// `"<provider>:<size>"` (autoscaled hosts) or `"<provider>"`. Unpriced
+    /// resources meter at 0 with a one-time warning.
+    pub price: std::collections::BTreeMap<String, f64>,
+    /// Monthly compute spend cap in USD for the `global` ledger scope
+    /// (`0` ⇒ uncapped). Breach refuses/queues PAID lanes (autoscale,
+    /// spillover) while packing onto already-paid hosts keeps serving.
+    pub max_monthly_spend: f64,
     pub autoscale: AutoscaleConfig,
 }
 
@@ -292,6 +320,7 @@ impl Default for PlacementConfig {
     fn default() -> Self {
         PlacementConfig {
             enabled: false,
+            preset: PlacementPreset::None,
             mode: PlacementModePref::Auto,
             strictest_allowed_mode: PlacementModePref::Auto,
             pack_strategy: PackStrategy::BinPack,
@@ -301,7 +330,48 @@ impl Default for PlacementConfig {
             default_resources: ResourcesDecl::default(),
             independent_safety_pct: 85,
             headroom_ttl_secs: 60,
+            spillover_envs: Vec::new(),
+            price: std::collections::BTreeMap::new(),
+            max_monthly_spend: 0.0,
             autoscale: AutoscaleConfig::default(),
+        }
+    }
+}
+
+impl PlacementPreset {
+    /// Expand into the still-at-default preference keys of `pl`. Presets are
+    /// structurally unable to touch constraint keys (they only ever assign
+    /// the preference fields below).
+    pub fn expand_into(self, pl: &mut PlacementConfig) {
+        let d = PlacementConfig::default();
+        let mut set = |mode: PlacementModePref, pack: PackStrategy, on: OnExhaustion| {
+            if pl.mode == d.mode {
+                pl.mode = mode;
+            }
+            if pl.pack_strategy == d.pack_strategy {
+                pl.pack_strategy = pack;
+            }
+            if pl.on_exhaustion == d.on_exhaustion {
+                pl.on_exhaustion = on;
+            }
+        };
+        match self {
+            PlacementPreset::None | PlacementPreset::Balanced => {}
+            PlacementPreset::CostOptimized => set(
+                PlacementModePref::Packed,
+                PackStrategy::BinPack,
+                OnExhaustion::Queue,
+            ),
+            PlacementPreset::LatencyOptimized => set(
+                PlacementModePref::Auto,
+                PackStrategy::Spread,
+                OnExhaustion::Reject,
+            ),
+            PlacementPreset::Isolated => set(
+                PlacementModePref::Dedicated,
+                PackStrategy::Spread,
+                OnExhaustion::Error,
+            ),
         }
     }
 }
@@ -330,7 +400,9 @@ pub fn resolve_placement(
     env: Option<&EnvConfig>,
     zone_floor: Option<PlacementModePref>,
 ) -> ResolvedPlacement {
-    let pl = &cfg.placement;
+    let mut expanded = cfg.placement.clone();
+    expanded.preset.expand_into(&mut expanded);
+    let pl = &expanded;
     let requested = env.and_then(|e| e.placement_mode).unwrap_or(pl.mode);
     let floor = match zone_floor {
         Some(zf) if mode_rank(zf) > mode_rank(pl.strictest_allowed_mode) => zf,

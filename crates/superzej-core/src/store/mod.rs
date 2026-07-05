@@ -32,6 +32,7 @@
 mod account;
 mod aux;
 mod cache;
+mod compute;
 mod host;
 mod intent;
 mod notification;
@@ -45,6 +46,7 @@ mod zone;
 pub use account::AccountStore;
 pub use aux::WorktreeAuxStore;
 pub use cache::CacheStore;
+pub use compute::{ComputeBudgetRow, ComputeLedgerStore, ComputeMeterRow};
 pub use host::HostStore;
 pub use intent::{IntentRow, IntentStore};
 pub use notification::NotificationStore;

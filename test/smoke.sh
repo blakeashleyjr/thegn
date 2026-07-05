@@ -298,6 +298,11 @@ check "host drain excludes the host from placement candidates" \
   "'$SZ' host drain pool-box >/dev/null 2>&1 && '$SZ' placement plan '$R' --json | grep -q 'draining'"
 check "drained host refuses new provisioning" \
   "! '$SZ' host provision pool-box </dev/null >/dev/null 2>&1"
+# Compute spend ledger: caps set/read + kill-switch round-trip.
+check "placement budget sets and reads a cap" \
+  "'$SZ' placement budget --set-limit 25 | grep -q '25.00'"
+check "placement budget kill-switch round-trips" \
+  "'$SZ' placement budget --kill | grep -q 'killed: true' && '$SZ' placement budget --unkill | grep -q 'killed: false'"
 
 # ── ingress sharing (`[share]`) ──────────────────────────────────────────────
 # The config parses (all provider sub-tables, exercised by validate above).
