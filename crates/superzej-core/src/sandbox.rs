@@ -2394,6 +2394,10 @@ mod tests {
 
     #[test]
     fn bwrap_local_keeps_host_matching_env_off_argv() {
+        // Guarantee SUPERZEJ_SANDBOX is absent from the ambient env: running
+        // `cargo test` inside a live superzej bwrap sandbox leaks it in, which
+        // would make the synthetic pair below "match host" and get omitted.
+        let _env = crate::testenv::EnvGuard::unset(&["SUPERZEJ_SANDBOX"]);
         let mut s = spec(Backend::Bwrap);
         s.image = None;
         // A pair mirroring the host env (PATH always exists) rides the
@@ -2418,6 +2422,27 @@ mod tests {
         ));
         let remote = enter_argv(&s, "true").join(" ");
         assert!(remote.contains("--setenv PATH"));
+    }
+
+    #[test]
+    fn bwrap_local_omits_ambient_matching_marker() {
+        // The nested case (superzej-in-superzej): SUPERZEJ_SANDBOX=1 is already
+        // in the launcher's env, so local bwrap inherits it and the pair is
+        // omitted from the world-readable --setenv argv. A synthetic pair whose
+        // value is absent from the host env still rides --setenv.
+        let _env = crate::testenv::EnvGuard::set(&[("SUPERZEJ_SANDBOX", "1")]);
+        let mut s = spec(Backend::Bwrap);
+        s.image = None;
+        s.env = vec![
+            ("SUPERZEJ_SANDBOX".into(), "1".into()),
+            ("SUPERZEJ_SYNTH_MARKER".into(), "x".into()),
+        ];
+        let argv = enter_argv(&s, "true");
+        // Host-matching marker inherited, not on argv.
+        assert!(!argv.contains(&"SUPERZEJ_SANDBOX".to_string()));
+        // Synthetic pair (absent from host env) rides --setenv.
+        let i = argv.iter().position(|a| a == "--setenv").unwrap();
+        assert_eq!(argv[i + 1], "SUPERZEJ_SYNTH_MARKER");
     }
 
     #[test]

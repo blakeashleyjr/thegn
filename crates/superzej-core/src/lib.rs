@@ -102,6 +102,8 @@ pub mod ssh_creds;
 pub mod startup;
 pub mod store;
 pub mod termcaps;
+#[cfg(test)]
+mod testenv;
 pub mod theme;
 pub mod toolchain;
 pub mod util;
