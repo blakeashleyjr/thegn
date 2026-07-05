@@ -16,14 +16,12 @@
 //! channel owned by `PaletteSession`. `search_gen` increments on every
 //! keystroke; stale results are silently discarded by generation comparison.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Maximum visible rows for async-mode result lists (Files/Content/Git/Symbols).
 const MAX_ASYNC_ITEMS: usize = 8;
 
-use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
 use termwiz::surface::Surface;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -126,43 +124,16 @@ impl PaletteMode {
 
 // ── File index ───────────────────────────────────────────────────────────────
 
-/// A snapshot of all (non-ignored) relative paths in a worktree, built once
-/// per worktree per FS-watcher cycle. Cheap to clone (`Arc` paths).
+/// A readiness marker: the fff picker for `root` has been warmed (built +
+/// scanned) and is ready to serve fuzzy file searches. The path list itself
+/// lives inside the picker (keyed by `root` in `fff_backend`'s registry), so
+/// the fields here are vestigial signalling state, not the index.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct FileIndex {
     pub paths: Arc<Vec<Arc<str>>>,
-    #[allow(dead_code)]
     pub root: PathBuf,
-    #[allow(dead_code)]
     pub generation: u64,
-}
-
-impl FileIndex {
-    pub fn build(root: &Path, include_hidden: bool) -> Self {
-        use ignore::WalkBuilder;
-        let mut paths = Vec::with_capacity(4096);
-        let mut builder = WalkBuilder::new(root);
-        builder
-            .hidden(!include_hidden)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .follow_links(false)
-            .max_depth(None);
-        for entry in builder.build().flatten() {
-            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
-                && let Ok(rel) = entry.path().strip_prefix(root)
-            {
-                let s: Arc<str> = rel.to_string_lossy().into();
-                paths.push(s);
-            }
-        }
-        FileIndex {
-            paths: Arc::new(paths),
-            root: root.to_owned(),
-            generation: 0,
-        }
-    }
 }
 
 // ── Async result types ────────────────────────────────────────────────────────
@@ -501,26 +472,19 @@ impl PaletteSession {
                 .collect();
             return;
         }
-        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
-        let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
-        let mut buf = Vec::new();
-        let mut scored: Vec<(u32, WorktreeNavMatch)> = candidates
-            .filter_map(|i| {
-                pattern
-                    .score(Utf32Str::new(&i.label, &mut buf), &mut matcher)
-                    .map(|s| {
-                        (
-                            s,
-                            WorktreeNavMatch {
-                                key: i.key.clone(),
-                                label: i.label.clone(),
-                            },
-                        )
-                    })
+        let items: Vec<WorktreeNavMatch> = candidates
+            .map(|i| WorktreeNavMatch {
+                key: i.key.clone(),
+                label: i.label.clone(),
             })
             .collect();
-        scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
-        self.async_results.worktrees = scored.into_iter().map(|(_, m)| m).collect();
+        let labels: Vec<&str> = items.iter().map(|m| m.label.as_str()).collect();
+        // neo_frizbee fuzzy rank (best-first); stable so equal scores keep the
+        // caller's frecency order.
+        self.async_results.worktrees = crate::fff_backend::fuzzy_rank(query, &labels)
+            .into_iter()
+            .map(|(idx, _)| items[idx].clone())
+            .collect();
     }
 
     /// Drain the async result channel. Returns `true` if any new results arrived.
@@ -987,11 +951,16 @@ pub fn spawn_file_index_build(
     waker: termwiz::terminal::TerminalWaker,
     include_hidden: bool,
 ) {
+    // fff applies its own gitignore/hidden policy during the scan.
+    let _ = include_hidden;
     tokio::task::spawn_blocking(move || {
-        let index = FileIndex::build(&root, include_hidden);
+        // Warm (build + synchronously scan) the fff picker for this worktree.
+        // `FileIndexReady` is now a pure readiness signal — the path list lives
+        // inside the picker, so the payload carries an empty vec.
+        crate::fff_backend::rebuild(&root);
         let _ = tx.send(AsyncSearchResult::FileIndexReady {
             sg,
-            index: index.paths,
+            index: Arc::new(Vec::new()),
             root,
         });
         let _ = waker.wake();
@@ -999,7 +968,7 @@ pub fn spawn_file_index_build(
 }
 
 pub fn spawn_file_search(
-    paths: Arc<Vec<Arc<str>>>,
+    root: PathBuf,
     query: String,
     sg: u64,
     max_results: usize,
@@ -1007,22 +976,12 @@ pub fn spawn_file_search(
     waker: termwiz::terminal::TerminalWaker,
 ) {
     tokio::task::spawn_blocking(move || {
-        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
-        let pattern = Pattern::parse(&query, CaseMatching::Smart, Normalization::Smart);
-        let mut buf = Vec::new();
-        let mut scored: Vec<(Arc<str>, u32)> = paths
-            .iter()
-            .filter_map(|p| {
-                pattern
-                    .score(Utf32Str::new(p, &mut buf), &mut matcher)
-                    .map(|s| (p.clone(), s))
-            })
-            .collect();
-        scored.sort_by_key(|b| std::cmp::Reverse(b.1));
-        scored.truncate(max_results);
-        let matches = scored
+        let matches = crate::fff_backend::file_search(&root, &query, max_results)
             .into_iter()
-            .map(|(path, score)| FileMatch { path, score })
+            .map(|hit| FileMatch {
+                path: hit.path.into(),
+                score: hit.score,
+            })
             .collect();
         let _ = tx.send(AsyncSearchResult::FileMatches { sg, matches });
         let _ = waker.wake();
@@ -1038,93 +997,27 @@ pub fn spawn_content_search(
     tx: UnboundedSender<AsyncSearchResult>,
     waker: termwiz::terminal::TerminalWaker,
 ) {
+    // fff greps its own (gitignore-respecting) index; `hidden` no longer applies.
+    let _ = include_hidden;
     tokio::task::spawn_blocking(move || {
-        use grep_regex::RegexMatcher;
-        use grep_searcher::SearcherBuilder;
-        use grep_searcher::sinks::UTF8;
-        use ignore::WalkBuilder;
-
-        // Treat query as a literal substring pattern for safety; escape regex special chars.
-        let escaped = regex_escape(&query);
-        let matcher = match RegexMatcher::new_line_matcher(&escaped) {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-        let mut searcher = SearcherBuilder::new()
-            .binary_detection(grep_searcher::BinaryDetection::quit(0))
-            .build();
-
-        let mut all: Vec<ContentMatch> = Vec::new();
-        let mut walk = WalkBuilder::new(&root);
-        walk.hidden(!include_hidden)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true);
-
-        const BATCH: usize = 20;
-        let mut batch: Vec<ContentMatch> = Vec::with_capacity(BATCH);
-        let tx2 = tx.clone();
-        let waker2 = waker.clone();
-
-        for entry in walk.build().flatten() {
-            if gen_stale(sg) {
-                break;
-            }
-            if all.len() >= max_results {
-                break;
-            }
-            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                continue;
-            }
-            let path = entry.path().to_owned();
-            let rel = path
-                .strip_prefix(&root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-
-            let rel2 = rel.clone();
-            let _ = searcher.search_path(
-                &matcher,
-                &path,
-                UTF8(|line_no, line| {
-                    if all.len() + batch.len() >= max_results {
-                        return Ok(false);
-                    }
-                    batch.push(ContentMatch {
-                        path: rel2.clone(),
-                        line_no,
-                        line_text: line.trim_end_matches('\n').to_string(),
-                    });
-                    if batch.len() >= BATCH {
-                        let drained: Vec<_> = std::mem::take(&mut batch);
-                        all.extend(drained.clone());
-                        let _ = tx2.send(AsyncSearchResult::ContentMatches {
-                            sg,
-                            matches: drained,
-                            done: false,
-                        });
-                        let _ = waker2.wake();
-                    }
-                    Ok(true)
-                }),
-            );
+        if gen_stale(sg) {
+            return;
         }
-
-        // Flush any remaining batch.
-        if !batch.is_empty() {
-            let _ = tx.send(AsyncSearchResult::ContentMatches {
-                sg,
-                matches: batch,
-                done: true,
-            });
-        } else {
-            let _ = tx.send(AsyncSearchResult::ContentMatches {
-                sg,
-                matches: vec![],
-                done: true,
-            });
-        }
+        // fff's SIMD grep returns the whole (paginated) result set in one fast
+        // call — no need for the old mid-walk batching.
+        let matches = crate::fff_backend::content_search(&root, &query, max_results)
+            .into_iter()
+            .map(|hit| ContentMatch {
+                path: hit.path,
+                line_no: hit.line_no,
+                line_text: hit.line_text,
+            })
+            .collect();
+        let _ = tx.send(AsyncSearchResult::ContentMatches {
+            sg,
+            matches,
+            done: true,
+        });
         let _ = waker.wake();
     });
 }
@@ -1283,39 +1176,37 @@ fn regex_symbol_sweep(
     Vec<SymbolMatch>,
     std::collections::HashSet<superzej_core::semantic::Lang>,
 ) {
-    use grep_matcher::Matcher;
-    use grep_regex::RegexMatcher;
-    use grep_searcher::SearcherBuilder;
-    use grep_searcher::sinks::UTF8;
-    use ignore::WalkBuilder;
     use superzej_core::semantic::Lang;
 
-    let sym_pat = r"(?m)^\s*(pub\s+)?(async\s+)?(?:fn|def|class|func|function|struct|impl|type|interface|enum)\s+(\w+)";
-    let Ok(matcher) = RegexMatcher::new(sym_pat) else {
-        return (Vec::new(), std::collections::HashSet::new());
-    };
-    let q_lower = query.to_ascii_lowercase();
     let code_exts = &[
         "rs", "py", "ts", "tsx", "js", "jsx", "go", "c", "cpp", "h", "java", "kt", "swift", "rb",
         "php", "cs", "zig", "ex", "exs",
     ];
-    let mut searcher = SearcherBuilder::new()
-        .binary_detection(grep_searcher::BinaryDetection::quit(0))
-        .build();
+
+    // Embed the (escaped) query directly into the declaration regex so fff's
+    // grep returns only definitions whose name contains the query — far fewer
+    // matches to sift than grepping every definition. Case-insensitive; group 3
+    // is the identifier.
+    let ident = if query.is_empty() {
+        r"\w+".to_string()
+    } else {
+        format!(r"\w*{}\w*", regex::escape(query))
+    };
+    let sym_pat = format!(
+        r"(?i)^\s*(pub\s+)?(async\s+)?(?:fn|def|class|func|function|struct|impl|type|interface|enum)\s+({ident})"
+    );
+    let Ok(re) = regex::Regex::new(&sym_pat) else {
+        return (Vec::new(), std::collections::HashSet::new());
+    };
+
     let mut all: Vec<SymbolMatch> = Vec::new();
     let mut langs = std::collections::HashSet::new();
-
-    let mut walk = WalkBuilder::new(root);
-    walk.hidden(false).git_ignore(true);
-    for entry in walk.build().flatten() {
+    // Overscan a little (fff caps by match count, not by relevance) then trim.
+    for (rel, line_no, line) in crate::fff_backend::regex_grep(root, &sym_pat, max_results * 4) {
         if all.len() >= max_results {
             break;
         }
-        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let path = entry.path().to_owned();
-        let ext = path
+        let ext = std::path::Path::new(&rel)
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
@@ -1323,46 +1214,28 @@ fn regex_symbol_sweep(
         if !code_exts.contains(&ext.as_str()) {
             continue;
         }
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
+        let Some(caps) = re.captures(&line) else {
+            continue;
+        };
+        let symbol = caps
+            .get(3)
+            .map(|m| m.as_str())
+            .unwrap_or("")
+            .trim_matches('{')
+            .to_string();
+        if symbol.is_empty() {
+            continue;
+        }
         if let Some(l) = Lang::from_path(&rel) {
             langs.insert(l);
         }
-
-        let q_lower2 = q_lower.clone();
-        let rel2 = rel.clone();
-        let mut local: Vec<SymbolMatch> = Vec::new();
-        let _ = searcher.search_path(
-            &matcher,
-            &path,
-            UTF8(|line_no, line| {
-                if let Ok(Some(m)) = matcher.find(line.as_bytes()) {
-                    let hit = &line[m];
-                    let symbol = hit
-                        .split_whitespace()
-                        .last()
-                        .unwrap_or("")
-                        .trim_matches('{')
-                        .to_string();
-                    if !symbol.is_empty() {
-                        let sym_lower = symbol.to_ascii_lowercase();
-                        if q_lower2.is_empty() || sym_lower.contains(&q_lower2) {
-                            local.push(SymbolMatch {
-                                path: rel2.clone(),
-                                line_no,
-                                symbol,
-                                kind: keyword_kind(hit),
-                            });
-                        }
-                    }
-                }
-                Ok(true)
-            }),
-        );
-        all.extend(local);
+        let hit = caps.get(0).map(|m| m.as_str()).unwrap_or(&line);
+        all.push(SymbolMatch {
+            path: rel,
+            line_no,
+            symbol,
+            kind: keyword_kind(hit),
+        });
     }
     all.truncate(max_results);
     (all, langs)
@@ -1506,11 +1379,13 @@ pub fn kick_palette_search(
                 return;
             }
             match file_index {
-                Some(idx) => {
-                    spawn_file_search(idx.paths.clone(), query, sg, max_file, tx, waker.clone());
+                Some(_idx) => {
+                    // Picker already warmed; search the current worktree root
+                    // (`file_search` self-heals if the warm root differs).
+                    spawn_file_search(worktree_root, query, sg, max_file, tx, waker.clone());
                 }
                 None => {
-                    // Index not built yet; start build.
+                    // Picker not warmed yet; build + scan it first.
                     spawn_file_index_build(worktree_root, sg, tx, waker.clone(), hidden);
                 }
             }
@@ -1598,21 +1473,6 @@ pub fn kick_palette_search(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Escape a string so it can be used as a literal grep-regex pattern.
-fn regex_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 4);
-    for c in s.chars() {
-        match c {
-            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' => {
-                out.push('\\');
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
 
 /// Placeholder for a generation staleness check (can't access the gen from
 /// inside a closure without threading it). We always run to completion and
@@ -1840,12 +1700,6 @@ mod tests {
             extra: String::new(),
         });
         assert_eq!(s.selected_key(), Some("git-branch:main".into()));
-    }
-
-    #[test]
-    fn regex_escape_handles_dots() {
-        let escaped = regex_escape("foo.bar");
-        assert_eq!(escaped, "foo\\.bar");
     }
 
     #[test]

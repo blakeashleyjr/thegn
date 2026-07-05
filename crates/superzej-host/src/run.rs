@@ -5866,50 +5866,12 @@ fn resolve_open_target(
     Some(OpenTarget::Locate(node.id.clone()))
 }
 
-fn on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
-        .unwrap_or(false)
-}
-
-/// Best-effort search for a test definition by name (ripgrep, then grep).
-/// BLOCKING (a repo-wide grep can take seconds) — only reached via
-/// `spawn_test_locate`'s spawn_blocking; never call from the loop.
-#[expect(clippy::disallowed_methods)]
+/// Best-effort search for a test definition by name. In-process fff regex grep
+/// (no `rg`/`grep` subprocess). BLOCKING (a repo-wide grep can take a beat) —
+/// only reached via `spawn_test_locate`'s spawn_blocking; never call from the
+/// loop.
 fn locate_test_in_repo(worktree: &std::path::Path, test_id: &str) -> Option<(String, usize)> {
-    let rg = on_path("rg");
-    for pat in crate::panel::locate_regexes(test_id) {
-        let out = if rg {
-            std::process::Command::new("rg")
-                .args([
-                    "--no-heading",
-                    "--line-number",
-                    "--max-count",
-                    "1",
-                    "-e",
-                    &pat,
-                    ".",
-                ])
-                .current_dir(worktree)
-                .output()
-        } else {
-            std::process::Command::new("grep")
-                .args(["-rnE", "--max-count=1", &pat, "."])
-                .current_dir(worktree)
-                .output()
-        };
-        let Ok(out) = out else { continue };
-        let text = String::from_utf8_lossy(&out.stdout);
-        if let Some(hit) = text.lines().next() {
-            let mut it = hit.trim_start_matches("./").splitn(3, ':');
-            if let (Some(path), Some(line)) = (it.next(), it.next())
-                && let Ok(n) = line.parse::<usize>()
-            {
-                return Some((path.to_string(), n));
-            }
-        }
-    }
-    None
+    crate::fff_backend::locate(worktree, crate::panel::locate_regexes(test_id))
 }
 
 /// Which UI action a background test-locate completes with.
@@ -10319,11 +10281,11 @@ async fn event_loop<T: Terminal>(
                         root,
                     }) => {
                         file_index = Some(crate::search_everywhere::FileIndex {
-                            paths: index.clone(),
+                            paths: index,
                             root: root.clone(),
                             generation: sg,
                         });
-                        // Now that we have an index, kick the search for the
+                        // Now that the picker is warm, kick the search for the
                         // current query (it was pending the index build).
                         let raw_q = ps.raw_query.clone();
                         let (mode, _) = crate::search_everywhere::PaletteMode::parse(&raw_q);
@@ -10336,7 +10298,7 @@ async fn event_loop<T: Terminal>(
                             if !query.is_empty() {
                                 let gen2 = ps.search_gen;
                                 crate::search_everywhere::spawn_file_search(
-                                    index,
+                                    root.clone(),
                                     query,
                                     gen2,
                                     current_config.palette.file_max_results,
@@ -14122,6 +14084,20 @@ async fn event_loop<T: Terminal>(
                                     let worktree_root = active_tab_path(&session);
                                     if let Some((rel_path, line_str)) = payload.rsplit_once(':') {
                                         let line_no: u64 = line_str.parse().unwrap_or(1).max(1);
+                                        // Feed fff's frecency + combo-boost store
+                                        // when opening from the fuzzy file finder,
+                                        // so this file floats up on the next query.
+                                        if p.mode == crate::search_everywhere::PaletteMode::Files {
+                                            let (_, q) =
+                                                crate::search_everywhere::PaletteMode::parse(
+                                                    &p.raw_query,
+                                                );
+                                            crate::fff_backend::record_open(
+                                                &worktree_root,
+                                                q,
+                                                rel_path,
+                                            );
+                                        }
                                         let abs_path = worktree_root.join(rel_path);
                                         let editor = std::env::var("EDITOR")
                                             .or_else(|_| std::env::var("VISUAL"))

@@ -55,11 +55,16 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "registry",
 ] }
-nucleo-matcher = "0.3"
 ignore = "0.4.26"
-grep-searcher = "0.1.16"
-grep-regex = "0.1.14"
-grep-matcher = "0.1.8"
+# fff — Fabulous & Fast File Finder. `fff-search` is the stateful engine (warm
+# in-memory index + LMDB frecency/combo-boost + SIMD fuzzy + multi-mode grep);
+# lives only in the host crate (pulls heed/LMDB + vendored libgit2, so never in
+# the substrate-free core). `neo_frizbee` is fff's underlying pure-Rust SIMD
+# matcher — used directly for in-memory list fuzzing (replaces nucleo-matcher),
+# including in core (C-dep-free, cross-compilable). Pinned to the exact nightly:
+# fff publishes only prereleases (no stable line yet).
+fff-search = "=0.9.7-nightly.fce72fa"
+neo_frizbee = "0.10"
 futures = "0.3"
 # --- native host substrate (Phase 1+) ---
 # NOTE: wezterm-term (the plan's first choice for its built-in sixel/kitty image
