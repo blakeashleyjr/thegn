@@ -13,6 +13,7 @@ mod agent_pi;
 mod agent_ssh;
 mod agent_teardown;
 mod apps;
+mod autoscale;
 mod bar_nav;
 mod borders;
 mod bouncer;
@@ -73,6 +74,7 @@ mod panes;
 mod perf;
 mod pi_assets;
 mod pins;
+mod placement_flow;
 mod predict;
 mod probe;
 mod profile;
@@ -266,6 +268,12 @@ pub enum Command {
     Zone {
         #[command(subcommand)]
         action: cmd::zone::Action,
+    },
+    /// Inspect the placement engine: per-host resources (declared / reserved /
+    /// measured), decision dry-runs, and recorded decision traces.
+    Placement {
+        #[command(subcommand)]
+        action: cmd::placement::Action,
     },
     /// Inspect and provision `[host.<name>]` machines (the once-per-host
     /// lifecycle behind fast remote OCI sandboxes).
@@ -565,6 +573,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
         Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Zone { action } => cmd::zone::run(&cfg, action),
+        Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),
         Command::Agent { action } => cmd::agent::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),

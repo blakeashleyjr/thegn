@@ -39,6 +39,11 @@ pub struct ZoneConfig {
     /// Spend cap for the zone scope (`zone:<name>`), rolled up in the proxy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget: Option<ZoneBudget>,
+    /// Placement-mode floor for member worktrees: a member's requested mode
+    /// may only be equal-or-stricter (auto < packed < dedicated). The
+    /// placement analog of `sandbox_floor`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_floor: Option<crate::config_placement::PlacementModePref>,
 }
 
 /// A zone's spend cap (`[zone.<name>.budget]`).

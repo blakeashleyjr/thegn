@@ -171,13 +171,25 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Resolve the worktree's env → explicit host binding. Conservative gate:
-/// engages ONLY for envs with an explicit `host = "<name>"` reference — the
-/// implicit anonymous-host lowering for inline-ssh envs exists in core but is
-/// not auto-engaged (it would switch those envs onto the superzej base image);
-/// cloud reaches stay with the existing provider pipeline until the phase-6
-/// lowering flips on.
-fn resolve_binding(cfg: &Config, worktree: &str) -> Option<(String, HostBinding)> {
+/// Resolve the worktree's env → host binding. Two gates, in order:
+///
+/// 1. **Explicit pin** — an env with `host = "<name>"` binds that host (the
+///    original conservative gate; implicit anonymous-host lowering for
+///    inline-ssh envs stays un-engaged, and implicit cloud derivations stay
+///    with the legacy provider pipeline). With the placement engine on, the
+///    pin is recorded as `pinned` tenancy so capacity accounting stays
+///    truthful — but the broker is never consulted.
+/// 2. **Placement engine** — with `[placement] enabled = true`, an unpinned
+///    local-placement (or implicit) env is placed by the broker
+///    ([`crate::placement_flow::place`]): `Commit` decides + reserves;
+///    `Query` only reads the sticky tenancy. Engine off ⇒ byte-identical to
+///    the old behavior. `Err` = a loud placement halt
+///    (`on_exhaustion = "error"`).
+fn resolve_binding(
+    cfg: &Config,
+    worktree: &str,
+    intent: crate::placement_flow::PlaceIntent,
+) -> Result<Option<(String, HostBinding)>, HostFailure> {
     let loc = superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(worktree));
     let repo_root = Db::open()
         .ok()
@@ -195,25 +207,36 @@ fn resolve_binding(cfg: &Config, worktree: &str) -> Option<(String, HostBinding)
         std::path::Path::new(worktree),
         selected.as_deref(),
     );
-    let envc = cfg.env.get(&environment.name)?;
-    if envc.host.trim().is_empty() {
-        return None;
+    let envc = cfg.env.get(&environment.name);
+    if let Some(e) = envc.filter(|e| !e.host.trim().is_empty()) {
+        let Some(binding) = cfg.resolve_host_binding(&environment.name, e) else {
+            return Ok(None);
+        };
+        // Cloud reaches engage ONLY via an explicit [host.<name>] reference
+        // (the user opted the machine in); an implicit provider-placement
+        // derivation stays with the legacy sprites pipeline until its
+        // lowering is live-verified end to end.
+        if matches!(binding.reach, Reach::Cloud(_)) && binding.id.config_name().is_none() {
+            return Ok(None);
+        }
+        crate::placement_flow::note_pin(cfg, worktree, envc, &binding, intent);
+        return Ok(Some((environment.name, binding)));
     }
-    let binding = cfg.resolve_host_binding(&environment.name, envc)?;
-    // Cloud reaches engage ONLY via an explicit [host.<name>] reference (the
-    // user opted the machine in); an implicit provider-placement derivation
-    // stays with the legacy sprites pipeline until its lowering is
-    // live-verified end to end.
-    if matches!(binding.reach, Reach::Cloud(_)) && binding.id.config_name().is_none() {
-        return None;
+    if let Some(binding) = crate::placement_flow::place(cfg, worktree, envc, intent)? {
+        return Ok(Some((environment.name, binding)));
     }
-    Some((environment.name, binding))
+    Ok(None)
 }
 
 /// Quick prewarm/eager gate: does this worktree target a host that is NOT yet
 /// Ready-and-fresh? (Prewarm skips such tabs; materialize will drive them.)
 pub(crate) fn host_pending(cfg: &Config, worktree: &str) -> bool {
-    let Some((_, binding)) = resolve_binding(cfg, worktree) else {
+    // Query intent: prewarm gates must never mint placement reservations.
+    let Ok(resolved) = resolve_binding(cfg, worktree, crate::placement_flow::PlaceIntent::Query)
+    else {
+        return true; // a halted placement is pending by definition
+    };
+    let Some((_, binding)) = resolved else {
         return false;
     };
     let Ok(db) = Db::open() else {
@@ -249,7 +272,9 @@ pub(crate) fn provision_worktree(
             // + personal layer inside the container, best-effort) and record
             // the pane-entry hook, then fall through to the provider pipeline
             // (a no-op for host-backed ssh/local envs).
-            if let Some((env_name, binding)) = resolve_binding(cfg, worktree) {
+            if let Ok(Some((env_name, binding))) =
+                resolve_binding(cfg, worktree, crate::placement_flow::PlaceIntent::Query)
+            {
                 let init = crate::host_provision::provision_worktree_on_host(
                     cfg,
                     worktree,
@@ -259,13 +284,25 @@ pub(crate) fn provision_worktree(
                 );
                 set_ready_init(worktree, init);
             }
-            crate::agent::provision_worktree(cfg, worktree, progress)
+            let out = crate::agent::provision_worktree(cfg, worktree, progress);
+            if out.is_ok() {
+                // Engine tenancy (if any) is now backed by a live sandbox.
+                crate::placement_flow::mark_active(worktree);
+            } else {
+                crate::placement_flow::release(worktree);
+            }
+            out
         }
         Ok(_) => crate::agent::provision_worktree(cfg, worktree, progress),
         Err(f) => {
-            let (env_name, binding) = resolve_binding(cfg, worktree)
-                .map(|(n, b)| (n, b.id.to_string()))
-                .unwrap_or_else(|| ("?".into(), "host".into()));
+            // The reservation must not outlive a failed provision.
+            crate::placement_flow::release(worktree);
+            let (env_name, binding) =
+                resolve_binding(cfg, worktree, crate::placement_flow::PlaceIntent::Query)
+                    .ok()
+                    .flatten()
+                    .map(|(n, b)| (n, b.id.to_string()))
+                    .unwrap_or_else(|| ("?".into(), "host".into()));
             Err(anyhow::Error::new(crate::agent::SandboxHalt {
                 env_name,
                 placement: binding,
@@ -295,7 +332,9 @@ pub(crate) fn ensure_ready(
     progress: &mut dyn FnMut(&[ProvisionStepView]),
     ui: Option<&HostUiTx>,
 ) -> Result<HostOutcome, HostFailure> {
-    let Some((_env, binding)) = resolve_binding(cfg, worktree) else {
+    let Some((_env, binding)) =
+        resolve_binding(cfg, worktree, crate::placement_flow::PlaceIntent::Commit)?
+    else {
         return Ok(HostOutcome::NotHostBacked);
     };
     let out = ensure_host_ready(&binding, policy, progress, ui, &mut |reach| {
@@ -1264,6 +1303,7 @@ mod tests {
             volumes: vec![VolumeSpec::by_name("nix-store").unwrap()],
             delivery_prefs: Vec::new(),
             probe_ttl_secs: 900,
+            declared_spec: None,
         }
     }
 

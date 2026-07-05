@@ -2708,6 +2708,10 @@ pub(crate) fn delete_groups(
                         crate::agent::destroy_provider_sandbox(&p, &env_name);
                     });
                 }
+                // A deleted worktree frees its placement-engine slot (own
+                // thread: keep DB writes off the loop).
+                let freed = path.clone();
+                std::thread::spawn(move || crate::placement_flow::release(&freed));
             }
             if let Some(waker) = waker.clone() {
                 let path_clone = path.clone();

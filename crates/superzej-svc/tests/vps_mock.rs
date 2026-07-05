@@ -95,18 +95,15 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
         }
         ("DELETE", "/v1/servers/101") => r#"{}"#.to_string(),
         _ => {
-            // `connection: close` — see below.
             let _ = writer.write_all(
                 b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}",
             );
             return;
         }
     };
-    // One request per connection: this handler drops the socket after the
-    // write, so it MUST advertise `connection: close` — under HTTP/1.1
-    // keep-alive the client's pool would otherwise reuse the dying socket and
-    // race our close (its next request hits an RST: "connection reset by
-    // peer", the historical flake in this test).
+    // `connection: close` matters: this mock serves ONE request per stream,
+    // but reqwest pools HTTP/1.1 connections by default — a reused
+    // just-closed socket surfaces as a flaky "error sending request" RST.
     let _ = writer.write_all(
         format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{resp}",

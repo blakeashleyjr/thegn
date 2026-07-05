@@ -27,6 +27,7 @@ pub mod logs;
 pub mod mcp;
 pub mod notify;
 pub mod open;
+pub mod placement;
 pub mod pr;
 pub mod repos;
 pub mod share;
