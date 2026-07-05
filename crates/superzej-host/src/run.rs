@@ -1952,7 +1952,7 @@ impl SidebarState {
     /// Drop out of the Wide expand back to the resting width (mirrors the
     /// panel's Esc collapse). Returns whether anything changed so the caller can
     /// gate a relayout. Persists "0" so an unfocused bar doesn't re-expand on
-    /// restart, matching [`adjust_width`]'s "drops out of Wide + sticks" rule.
+    /// restart, matching `adjust_width`'s "drops out of Wide + sticks" rule.
     fn collapse_wide(&mut self) -> bool {
         if !self.expanded {
             return false;

@@ -1,4 +1,4 @@
-//! Construction of the API [`Provider`](superzej_svc::provider::Provider) from
+//! Construction of the API [`superzej_svc::provider::Provider`] from
 //! an env's `[env.<name>.provider]` config — extracted from the pinned
 //! `agent.rs` (file-size ratchet); re-exported from `crate::agent` so call
 //! sites are unchanged.

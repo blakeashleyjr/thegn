@@ -7,7 +7,7 @@
 //! materialize, eager, warm pool, wizard, CLI — converge here, so
 //! single-flight is total by construction:
 //! - the FIRST caller becomes the leader: it takes `provision_gate::host_lock`
-//!   and drives the pure [`host_machine`] against a [`HostRunner`];
+//!   and drives the pure `host_machine` against a [`HostRunner`];
 //! - concurrent callers become followers on the in-process Flight registry,
 //!   forwarding every progress snapshot to their OWN tab's splash callback;
 //! - cross-process arbitration rides the DB row's heartbeat (a fresh heartbeat

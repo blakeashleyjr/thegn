@@ -186,7 +186,7 @@ pub fn warm(worktree: &Path, allow: bool) {
 ///
 /// Subprocess/thread orchestration seam: excluded from coverage (justfile
 /// `cov_ignore`); the pure decision logic lives in [`warm_now_plan`] /
-/// [`cache_is_fresh`], which are unit-tested.
+/// `cache_is_fresh`, which are unit-tested.
 pub fn warm_now(worktree: &Path, allow: bool, timeout: Duration) -> bool {
     // Nothing flake-backed to warm (or already fresh) ⇒ the pane replays as-is.
     if !needs_warm(worktree) {

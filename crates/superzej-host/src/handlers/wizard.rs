@@ -67,8 +67,8 @@ pub(crate) fn begin_worktree_wizard(
     *wizard_ui = Some(w);
 }
 
-/// Parse + persist an add-host input ("user@host[:port]" or
-/// "dumbpipe:<ticket> <user>"), then merge the new def into the LIVE config so
+/// Parse + persist an add-host input (`user@host[:port]` or
+/// `dumbpipe:<ticket> <user>`), then merge the new def into the LIVE config so
 /// the re-opened wizard lists it immediately. Returns the host name.
 pub(crate) fn add_host_from_input(
     text: &str,

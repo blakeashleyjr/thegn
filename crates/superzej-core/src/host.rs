@@ -491,8 +491,8 @@ impl HostStep {
     }
 }
 
-/// What a `Ready` host injects into a worktree's [`SandboxSpec`]
-/// (crate::sandbox::SandboxSpec) on the fast path: digest-pinned image, warm
+/// What a `Ready` host injects into a worktree's
+/// [`SandboxSpec`](crate::sandbox::SandboxSpec) on the fast path: digest-pinned image, warm
 /// volumes, and the remote OCI daemon URL. Pure data so the host crate can
 /// build it off-loop and apply it at spec time.
 #[derive(Debug, Clone, PartialEq, Default)]

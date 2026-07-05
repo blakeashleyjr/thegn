@@ -140,7 +140,7 @@ fn impact_footer(data: &crate::panel::PanelData, ui: &PanelUi, cols: usize) -> V
     rows
 }
 
-/// The " · <kind counts> · N files" tail of the collapsed impact line, built from
+/// The `· <kind counts> · N files` tail of the collapsed impact line, built from
 /// the per-file entity churn. Kinds are ordered most-frequent first and dropped
 /// (with a trailing "…") once they'd overflow `cols`, so the line never clips a
 /// word mid-glyph.
