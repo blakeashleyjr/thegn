@@ -241,6 +241,20 @@ check "completions bash emits a script" \
 check "completions zsh emits a compdef" \
   "'$SZ' completions zsh | grep -q compdef"
 
+# open: workspace pointer + repo-name resolution (no TUI launch in smoke;
+# the live-instance intent path is unit-tested in core + verified manually).
+check "open --no-launch sets the active-workspace pointer" \
+  "'$SZ' open '$TMP/code/alpha' --no-launch >/dev/null"
+check "open resolves a repo by basename" \
+  "'$SZ' open alpha --no-launch >/dev/null"
+check "open unknown repo exits 3" \
+  "'$SZ' open no-such-repo --no-launch >/dev/null 2>&1; [[ \$? -eq 3 ]]"
+if command -v sqlite3 >/dev/null 2>&1; then
+  check "open recorded alpha as the active workspace" \
+    "sqlite3 \"$XDG_STATE_HOME/superzej/superzej.db\" \
+       \"SELECT value FROM ui_state WHERE key='active_workspace'\" | grep -q alpha"
+fi
+
 # Named execution environments: list the library and resolve one for a worktree.
 check "env list reports the default env" \
   "'$SZ' env list | grep -q 'default env:'"

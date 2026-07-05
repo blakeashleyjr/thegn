@@ -13,9 +13,9 @@
 /// omitted from the rendering (it is visible to clap but noise here); the
 /// drift test accounts for it.
 pub const GROUPS: &[(&str, &[&str])] = &[
-    ("Workspace", &["wt", "repo", "integrate"]),
+    ("Workspace", &["wt", "repo", "open", "integrate"]),
     ("Forge", &["pr", "issue", "ci"]),
-    ("Environments", &["env", "host", "agent", "debug", "mcp"]),
+    ("Environments", &["env", "zone", "host", "agent", "debug", "mcp"]),
     (
         "Session",
         &["notify", "logs", "share", "forward", "sandbox-argv"],

@@ -342,6 +342,10 @@ pub struct FrameModel {
     /// True when the sidebar is in its slim collapsed rail mode (activity dots
     /// + initials only); false renders the full panel.
     pub sidebar_rail: bool,
+    /// Pending `superzej open` focus intents claimed from the DB mailbox by
+    /// this hydration pass. Drained by the run-loop model drain BEFORE the
+    /// model swap (never rendered, never part of `hydration_eq`).
+    pub intents: Vec<superzej_core::store::IntentRow>,
     /// Data carriers populated by the hydration thread and consumed by the
     /// event loop to (re)derive `sidebar_rows`. The `(slug, display, kind)`
     /// workspace list in display order (`kind` = "repo" | "dir"), and
@@ -585,18 +589,7 @@ impl FrameModel {
     }
 }
 
-/// The worktree label parts for the nav row: `(workspace, leaf)`. The
-/// workspace prefix renders uppercased (display form of the canonical slug);
-/// single-segment names render as the leaf alone.
-fn worktree_parts(model: &FrameModel) -> Option<(String, String)> {
-    if model.worktree.is_empty() {
-        return None;
-    }
-    match model.worktree.split_once('/') {
-        Some((ws, leaf)) => Some((ws.to_uppercase(), leaf.to_string())),
-        None => Some((String::new(), model.worktree.clone())),
-    }
-}
+use crate::nav::worktree_parts;
 
 /// Where the right-aligned pin chips begin in the tab strip (the tab chips
 /// must stop before this column).

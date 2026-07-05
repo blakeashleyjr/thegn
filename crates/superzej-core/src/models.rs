@@ -2,6 +2,29 @@
 
 use serde::Serialize;
 
+/// A persisted ingress share (`[share]`) — the resurrection record for a tunnel
+/// the host respawns on restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShareRow {
+    pub worktree: String,
+    pub local_port: u16,
+    pub provider: String,
+    pub public_url: Option<String>,
+    pub state: String,
+    pub created_at: i64,
+}
+
+/// A persisted auto port forward (`[forward]`) — the resurrection record for a
+/// forward the host re-detects on restart. Keyed by `(worktree, container_port)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForwardRow {
+    pub worktree: String,
+    pub container_port: u16,
+    pub host_port: u16,
+    pub url: String,
+    pub created_at: i64,
+}
+
 /// Payload of a `focus_workspace` intent (the `superzej open` mailbox row):
 /// the CLI writes it, the compositor's model refresh consumes it. One shared
 /// type so producer and consumer can't drift.

@@ -14,7 +14,9 @@ use termwiz::terminal::TerminalWaker;
 
 use crate::chrome::{FrameModel, LoadStep};
 use crate::run::now_secs;
-use superzej_core::store::{CacheStore, NotificationStore, WorkspaceStore, WorktreeAuxStore};
+use superzej_core::store::{
+    CacheStore, IntentStore, NotificationStore, WorkspaceStore, WorktreeAuxStore,
+};
 
 /// Default for [`model_refresh_interval`]. Matches `bg_glyph_ttl`'s 5s default
 /// (the ticker's only job is refreshing background glyphs + the activity FSM);
@@ -1245,6 +1247,9 @@ pub(crate) fn build_model(
         ),
         panel,
         panel_focused: false,
+        // `superzej open` mailbox: claim-and-delete on this hydration pass;
+        // tolerates a DB missing the table (unmerged parallel-branch schema).
+        intents: db.take_intents("focus_workspace").unwrap_or_default(),
         status: format!(
             "Ctrl-Space menu   Alt-w worktree   Alt-o switch   Ctrl-q quit  [build {}]",
             env!("SZHOST_BUILD_TIME")
@@ -1530,35 +1535,7 @@ pub(crate) fn build_panel(
     {
         panel.my_work = rows;
     }
-    // Full notification list for the inbox panel; badge counts are derived from it
-    // by effective priority (Info kinds never count; the red flag is Alert-only).
-    // Scoped to this repo's own worktrees by default (host-global notifications,
-    // with an empty `worktree_path`, always show); the System-tab "all" toggle
-    // reveals every worktree's — so a sibling repo's error doesn't leak here or
-    // light the badge.
-    if let Ok(mut notifications) = db.get_all_notifications(50) {
-        use superzej_core::notification::Priority;
-        if !crate::panel::scope::system_all() {
-            let repo_paths = repo_worktree_paths(db, &repo_root);
-            notifications
-                .retain(|n| n.worktree_path.is_empty() || repo_paths.contains(&n.worktree_path));
-        }
-        let unread = notifications.iter().filter(|n| !n.read);
-        let (mut alert, mut counted) = (0usize, 0usize);
-        for n in unread {
-            match app_cfg.notifications.priority_of(n.kind) {
-                Priority::Alert => {
-                    alert += 1;
-                    counted += 1;
-                }
-                Priority::Notice => counted += 1,
-                Priority::Info => {}
-            }
-        }
-        panel.alert_notifications = alert;
-        panel.unread_notifications = counted;
-        panel.notifications = notifications;
-    }
+    crate::hydrate_feed::populate_notifications(db, &repo_root, app_cfg, &mut panel);
     // Tasks section: populate task specs from config + auto-discovery (reusing the
     // single layered-config load above). Configured tasks win by name; discovered
     // tasks from manifests fill gaps.
@@ -2078,7 +2055,7 @@ fn pr_search_row(
 /// registry. Used to scope the "My Work" feed's notifications to the current
 /// repo — a notification for a sibling worktree of the same repo is relevant;
 /// one for an unrelated repo (often on another host) is not.
-fn repo_worktree_paths(
+pub(crate) fn repo_worktree_paths(
     db: &superzej_core::db::Db,
     repo_root: &std::path::Path,
 ) -> std::collections::HashSet<String> {

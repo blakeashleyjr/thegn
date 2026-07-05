@@ -940,3 +940,55 @@ impl WorkspaceStore for Db {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::db::Db;
+    use crate::store::WorkspaceStore;
+
+    #[test]
+    fn delete_tab_groups_for_worktree_keys_on_path() {
+        use crate::models::{GroupTabRow, TabGroupRow};
+        let db = Db::open_memory().unwrap();
+        let sess = "/repo/root";
+        let mk = |name: &str, wt: &str| TabGroupRow {
+            name: name.into(),
+            kind: "branch".into(),
+            worktree: wt.into(),
+            ordinal: 0,
+            active_tab: 0,
+        };
+        let mktab = |group: &str| GroupTabRow {
+            group_name: group.into(),
+            ordinal: 0,
+            title: "1".into(),
+            pane_tree: r#"{"leaf":0}"#.into(),
+            focused_pane: 0,
+            pane_cwds: String::new(),
+            pane_cmds: String::new(),
+            pane_sessions: String::new(),
+            scrollback_snapshot: String::new(),
+        };
+        db.put_tab_group(sess, &mk("app/feat", "/wt/feat")).unwrap();
+        db.put_tab_group(sess, &mk("app/other", "/wt/other"))
+            .unwrap();
+        db.put_group_tab(sess, &mktab("app/feat")).unwrap();
+        db.put_group_tab(sess, &mktab("app/other")).unwrap();
+        // Same worktree path in another session must be untouched.
+        db.put_tab_group("elsewhere", &mk("x/feat", "/wt/feat"))
+            .unwrap();
+
+        db.delete_tab_groups_for_worktree(sess, "/wt/feat").unwrap();
+        let left = db.groups_for_session(sess).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "app/other");
+        // The group's tabs went with it; the other group's tab survived.
+        let tabs = db.group_tabs_for_session(sess).unwrap();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].group_name, "app/other");
+        assert_eq!(db.groups_for_session("elsewhere").unwrap().len(), 1);
+        // Unknown path is a no-op, not an error.
+        db.delete_tab_groups_for_worktree(sess, "/wt/none").unwrap();
+        assert_eq!(db.groups_for_session(sess).unwrap().len(), 1);
+    }
+}
