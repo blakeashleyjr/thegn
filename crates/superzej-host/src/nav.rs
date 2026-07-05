@@ -58,6 +58,20 @@ pub(crate) fn connect_target(
     Some(ConnectTarget::OfferAdd(root.display().to_string()))
 }
 
+/// The worktree label parts for the nav row: `(workspace, leaf)`. The
+/// workspace prefix renders uppercased (display form of the canonical slug);
+/// single-segment names render as the leaf alone. (Extracted from the pinned
+/// `chrome.rs`.)
+pub(crate) fn worktree_parts(model: &crate::chrome::FrameModel) -> Option<(String, String)> {
+    if model.worktree.is_empty() {
+        return None;
+    }
+    match model.worktree.split_once('/') {
+        Some((ws, leaf)) => Some((ws.to_uppercase(), leaf.to_string())),
+        None => Some((String::new(), model.worktree.clone())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

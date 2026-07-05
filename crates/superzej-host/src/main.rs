@@ -41,6 +41,7 @@ mod host_provision;
 mod host_ui;
 mod hover;
 mod hydrate;
+mod hydrate_feed;
 mod hydrate_terminal;
 mod input;
 mod integrate;
@@ -66,6 +67,7 @@ mod notify;
 mod palette;
 mod pane;
 mod panel;
+mod panel_util;
 mod panes;
 mod perf;
 mod pi_assets;
@@ -184,6 +186,15 @@ pub enum Command {
     Repo {
         #[command(subcommand)]
         action: cmd::repos::Action,
+    },
+    /// Focus a repo in the running instance (DB-mailbox intent, ~1s pickup),
+    /// or launch the compositor onto it when none is running.
+    Open {
+        /// Repo path (any dir inside it) or a unique repo basename.
+        repo: String,
+        /// Only record the pointer / intent; never launch the compositor.
+        #[arg(long)]
+        no_launch: bool,
     },
     /// Hidden legacy spelling of `wt diff` (kept working forever).
     #[command(hide = true)]
@@ -430,17 +441,35 @@ fn main() -> anyhow::Result<()> {
     superzej_core::profile::reroot(cli.profile.as_deref());
 
     // A subcommand runs synchronously and exits; no subcommand launches the
-    // interactive compositor (the default).
+    // interactive compositor (the default). `open` is special: with no live
+    // instance it falls THROUGH to the interactive launch below.
     if let Some(command) = cli.command.take() {
-        return match run_subcommand(&cli, command) {
+        let result = if let Command::Open { repo, no_launch } = command {
+            let mut cfg = superzej_core::config::Config::load_layered(
+                &superzej_core::config::ProcessEnv,
+                &cli.overrides,
+                cli.config.clone(),
+            );
+            superzej_core::host_config::merge_db_hosts(&mut cfg);
+            match cmd::open::run(&cfg, &repo, no_launch) {
+                Ok(cmd::open::OpenOutcome::Delivered) => Ok(()),
+                Ok(cmd::open::OpenOutcome::LaunchTui) => Err(None), // fall through
+                Err(e) => Err(Some(e)),
+            }
+        } else {
+            run_subcommand(&cli, command).map_err(Some)
+        };
+        match result {
+            Ok(()) => return Ok(()),
             // Typed not-found errors map to the scripting exit-code contract
             // (cmd::EXIT_NOT_FOUND); everything else keeps anyhow's exit 1.
-            Err(e) if e.downcast_ref::<cmd::NotFound>().is_some() => {
+            Err(Some(e)) if e.downcast_ref::<cmd::NotFound>().is_some() => {
                 superzej_core::msg::error(&format!("{e:#}"));
                 std::process::exit(cmd::EXIT_NOT_FOUND);
             }
-            other => other,
-        };
+            Err(Some(e)) => return Err(e),
+            Err(None) => {} // `open` with no live instance: launch the TUI
+        }
     }
 
     // Per-profile advisory singleton (H): one interactive window per named
@@ -517,6 +546,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Forward { action } => cmd::forward::run(action),
         Command::Wt { action } => cmd::wt::run(&cfg, action),
         Command::Repo { action } => cmd::repos::run(&cfg, action),
+        // Dispatched before run_subcommand (it may fall through to the TUI);
+        // unreachable here, kept for match exhaustiveness.
+        Command::Open { repo, no_launch } => cmd::open::run(&cfg, &repo, no_launch).map(|_| ()),
         Command::Diff { args } => cmd::wt::run(&cfg, cmd::wt::Action::Diff(args)),
         Command::List { args } => cmd::wt::run(&cfg, cmd::wt::Action::List(args)),
         Command::Integrate => cmd::integrate::run(&cfg),
@@ -551,7 +583,13 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
                         .map(|n| n.to_string_lossy().into_owned())
                 })
                 .unwrap_or_else(|| "szhost".into());
-            clap_complete::generate(shell, &mut tree, bin, &mut std::io::stdout());
+            // Buffer first: generate() panics on write errors, and a consumer
+            // like `… | head` closing the pipe early is normal CLI life.
+            let mut buf = Vec::new();
+            clap_complete::generate(shell, &mut tree, bin, &mut buf);
+            use std::io::Write;
+            // best-effort: a closed pipe just means the reader got enough.
+            let _ = std::io::stdout().write_all(&buf);
             Ok(())
         }
         Command::Bridge => {
