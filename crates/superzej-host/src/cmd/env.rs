@@ -16,7 +16,11 @@ use superzej_svc::projection::ProjectionBackend;
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
     /// List the defined `[env.<name>]` environments and their placement.
-    List,
+    List {
+        /// Emit one JSON array instead of the human list.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the environment that resolves for a worktree (defaults to cwd).
     Show { worktree: Option<String> },
     /// Select an environment for a worktree (persists to the DB).
@@ -77,7 +81,7 @@ pub enum Action {
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
-        Action::List => list(cfg),
+        Action::List { json } => list(cfg, json),
         Action::Show { worktree } => show(cfg, worktree),
         Action::Set {
             name,
@@ -377,12 +381,34 @@ pub(crate) fn resolve_for(
     cfg.resolve_env(&repo_root, &loc, Path::new(&wt), selected.as_deref())
 }
 
-fn list(cfg: &Config) -> Result<()> {
+fn list(cfg: &Config, json: bool) -> Result<()> {
     let default = if cfg.sandbox.default_env.trim().is_empty() {
         "default"
     } else {
         cfg.sandbox.default_env.trim()
     };
+    if json {
+        #[derive(serde::Serialize)]
+        struct EnvJson<'a> {
+            name: &'a str,
+            placement: &'a str,
+            data: &'a str,
+            backend: Option<String>,
+            default: bool,
+        }
+        let rows: Vec<EnvJson> = cfg
+            .env
+            .iter()
+            .map(|(name, e)| EnvJson {
+                name,
+                placement: e.placement.as_str(),
+                data: e.data.as_str(),
+                backend: e.sandbox.backend.map(|b| b.as_str().to_string()),
+                default: name == default,
+            })
+            .collect();
+        return super::emit_json(&rows);
+    }
     outln!("default env: {default}");
     if cfg.env.is_empty() {
         outln!("(no [env.<name>] defined — the implicit 'default' env is the [sandbox] block)");

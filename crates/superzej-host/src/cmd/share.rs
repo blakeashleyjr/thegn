@@ -33,7 +33,11 @@ pub enum Action {
         reach: Option<String>,
     },
     /// List shares recorded in the DB.
-    List,
+    List {
+        /// Emit one JSON array instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a recorded share for a worktree port.
     Stop {
         port: u16,
@@ -49,7 +53,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             worktree,
             reach,
         } => start(cfg, port, worktree, reach),
-        Action::List => list(),
+        Action::List { json } => list(json),
         Action::Stop { port, worktree } => stop(port, worktree),
     }
 }
@@ -136,12 +140,15 @@ fn on_error_exit(on_error: superzej_core::config::ShareOnError, e: anyhow::Error
     }
 }
 
-fn list() -> Result<()> {
+fn list(json: bool) -> Result<()> {
     let Ok(db) = Db::open() else {
         outln!("share: could not open the state DB");
         return Ok(());
     };
     let rows = db.list_shares().unwrap_or_default();
+    if json {
+        return super::emit_json(&rows);
+    }
     if rows.is_empty() {
         outln!("no shares");
         return Ok(());

@@ -176,6 +176,61 @@ check "list runs without error" \
 check "recent runs without error" \
   "'$SZ' recent >/dev/null 2>&1"
 
+# ── CLI surface v2: wt/repo namespaces + headless lifecycle + --json ─────────
+# Namespaced spellings mirror the (hidden but functional) legacy verbs.
+check "wt list matches legacy list" \
+  "[[ \"\$('$SZ' wt list)\" == \"\$('$SZ' list)\" ]]"
+check "repo list matches legacy repos" \
+  "[[ \"\$('$SZ' repo list)\" == \"\$('$SZ' repos)\" ]]"
+check "repo recent matches legacy recent" \
+  "[[ \"\$('$SZ' repo recent)\" == \"\$('$SZ' recent)\" ]]"
+
+# Headless worktree lifecycle: create prints the path and registers in
+# git + DB; removal cleans the checkout + DB rows and honors --delete-branch.
+NP="$("$SZ" wt new smoke-cli --repo "$R")"
+check "wt new prints an existing worktree path" "[[ -d '$NP' ]]"
+check "wt new registered the branch in git" \
+  "git -C '$R' worktree list --porcelain | grep -q 'smoke-cli'"
+check "wt new appears in wt list" "'$SZ' wt list | grep -q 'smoke-cli'"
+NB="$(git -C "$NP" symbolic-ref --short HEAD)"
+NJ="$("$SZ" wt new smoke-json --repo "$R" --json)"
+check "wt new --json emits branch+path" "printf '%s' \"\$NJ\" | grep -q '\"branch\"'"
+NJ_PATH="$(grep -o '"path":"[^"]*"' <<<"$NJ" | cut -d'"' -f4)"
+check "wt rm by branch name removes the checkout" \
+  "'$SZ' wt rm '$NB' --force >/dev/null && [[ ! -d \$NP ]]"
+check "wt rm keeps the branch by default" \
+  "git -C '$R' rev-parse --verify --quiet 'refs/heads/$NB' >/dev/null"
+check "wt rm --delete-branch drops the branch" \
+  "'$SZ' wt rm '$NJ_PATH' --delete-branch --force >/dev/null && \
+   [[ -z \$(git -C '$R' branch --list '*smoke-json*') ]]"
+check "wt rm unknown target exits 3" \
+  "'$SZ' wt rm no-such-thing --force >/dev/null 2>&1; [[ \$? -eq 3 ]]"
+if command -v sqlite3 >/dev/null 2>&1; then
+  DBS="$XDG_STATE_HOME/superzej/superzej.db"
+  check "wt rm cleaned the DB worktree rows" \
+    "[[ \$(sqlite3 \"$DBS\" \"SELECT count(*) FROM worktrees WHERE worktree LIKE '%smoke-cli%'\") -eq 0 ]]"
+  check "wt rm left no tab_groups rows" \
+    "[[ \$(sqlite3 \"$DBS\" \"SELECT count(*) FROM tab_groups WHERE worktree LIKE '%smoke-cli%'\") -eq 0 ]]"
+fi
+
+# Machine-readable output: one parseable JSON document per list surface.
+check "list --json emits a JSON array" \
+  "'$SZ' list --json | head -c1 | grep -q '\['"
+check "env list --json parses" \
+  "'$SZ' env list --json | head -c1 | grep -q '\['"
+check "host list --json includes the seeded host" \
+  "'$SZ' host list --json | grep -q smoke-local"
+check "disk --json emits a JSON array" \
+  "'$SZ' disk --json | head -c1 | grep -q '\['"
+check "share list --json parses" \
+  "'$SZ' share list --json | head -c1 | grep -q '\['"
+check "forward list --json parses" \
+  "'$SZ' forward list --json | head -c1 | grep -q '\['"
+check "repo list --json parses" \
+  "'$SZ' repo list --json | head -c1 | grep -q '\['"
+check "ci runs --json degrades gracefully" \
+  "'$SZ' ci runs --worktree '$WT' --json >/dev/null 2>&1"
+
 # Named execution environments: list the library and resolve one for a worktree.
 check "env list reports the default env" \
   "'$SZ' env list | grep -q 'default env:'"

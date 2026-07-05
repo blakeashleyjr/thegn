@@ -15,7 +15,11 @@ use crate::cmd::resolve_worktree;
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
     /// List active port forwards recorded in the DB.
-    List,
+    List {
+        /// Emit one JSON array instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a recorded forward for a worktree's container port.
     Stop {
         /// The container (sandbox-internal) port whose forward to drop.
@@ -27,7 +31,7 @@ pub enum Action {
 
 pub fn run(action: Action) -> Result<()> {
     match action {
-        Action::List => list(),
+        Action::List { json } => list(json),
         Action::Stop {
             container_port,
             worktree,
@@ -35,12 +39,15 @@ pub fn run(action: Action) -> Result<()> {
     }
 }
 
-fn list() -> Result<()> {
+fn list(json: bool) -> Result<()> {
     let Ok(db) = Db::open() else {
         outln!("forward: could not open the state DB");
         return Ok(());
     };
     let rows = db.list_forwards().unwrap_or_default();
+    if json {
+        return super::emit_json(&rows);
+    }
     if rows.is_empty() {
         outln!("no forwards");
         return Ok(());
