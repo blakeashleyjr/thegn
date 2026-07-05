@@ -257,6 +257,10 @@
             treefmtWrapper
             # line-coverage for `just coverage`
             cargo-llvm-cov
+            # faster test runner (`just test`) + faster linker (mold, wired via
+            # CARGO_TARGET_*_RUSTFLAGS in shellHook below)
+            cargo-nextest
+            mold
             # linters
             shellcheck
             yamllint
@@ -287,6 +291,12 @@
           ++ yaziDeps;
         shellHook = ''
           export PATH="$PWD/target/debug:$PATH"
+          # Link with mold on the linux-gnu host triple — cuts incremental link
+          # time for every cargo invocation (build/clippy/test/coverage), so the
+          # pre-push gate and all `nix develop --command just …` CI jobs are
+          # cheaper. Scoped to this triple so `check-cross` (macOS/Windows/wasm)
+          # is unaffected; the packaged `nix build` never enters this shell.
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
           # Point dev superzej at the pinned yazi (the package wires this too).
           export SUPERZEJ_YAZI_BIN="${yaziPinned}/bin/yazi"
           # Spec-driven development (OpenSpec): telemetry off, no host writes.

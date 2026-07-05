@@ -345,9 +345,13 @@ fmt:
 fmt-check:
     nix fmt -- --ci
 
-# Unit tests.
+# Unit tests. cargo-nextest runs the suite with better parallelism than
+# `cargo test`; it doesn't run doctests, so a `--doc` pass follows (a few crates
+# carry `///` doctests). This recipe is the single source of truth shared by the
+# CI `test` job and the pre-push hook.
 test: _apps
-    cargo test
+    cargo nextest run --workspace
+    cargo test --doc --workspace
 
 # Live integration tests against the REAL Sprites API (creates + destroys throwaway
 # sprites — real cloud spend). Sources SPRITES_TOKEN from .envrc.local. Validates
