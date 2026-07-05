@@ -7,4 +7,6 @@
 pub(crate) mod host;
 pub(crate) mod panel_changes;
 pub(crate) mod provision;
+pub(crate) mod startup;
+pub(crate) mod terminal;
 pub(crate) mod wizard;

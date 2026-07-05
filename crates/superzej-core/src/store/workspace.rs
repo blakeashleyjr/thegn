@@ -248,6 +248,13 @@ pub trait WorkspaceStore {
         folder_id: Option<i64>,
     ) -> Result<i64>;
 
+    /// Record the sandbox backend a local terminal launches under (keyed by the
+    /// terminal's unique name). Mirrors [`set_worktree_sandbox`].
+    fn set_terminal_sandbox(&self, name: &str, backend: &str) -> Result<()>;
+
+    /// Record the named execution environment a terminal launches under.
+    fn set_terminal_env(&self, name: &str, env: &str) -> Result<()>;
+
     fn del_terminal(&self, id: i64) -> Result<()>;
 
     fn rename_terminal(&self, id: i64, new_name: &str) -> Result<()>;

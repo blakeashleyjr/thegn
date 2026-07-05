@@ -61,16 +61,17 @@ use std::path::PathBuf;
 /// v30: adds `hosts` + `host_inventory` + `host_events` (hosts as first-class
 /// resources; see [`crate::host_db`]).
 /// v31: adds `loc_cache.report_json` (per-language tokei breakdown alongside the
-/// total; see [`crate::loc::LocReport`]).
-const SCHEMA_VERSION: i64 = 31;
+/// total; see [`crate::loc::LocReport`]). `pub` for host-side mismatch messaging.
+pub const SCHEMA_VERSION: i64 = 31;
 
 pub struct Db {
     conn: Connection,
+    /// On-disk `user_version` when newer than [`SCHEMA_VERSION`] (a newer build wrote this shared file), else `None`.
+    pub(crate) schema_mismatch: Option<i64>,
 }
 
 impl Db {
-    /// Connection accessor for sibling `impl Db` query modules (host_db) —
-    /// `conn` stays private so all SQL lives in this crate.
+    /// Connection accessor for sibling `impl Db` query modules (`conn` stays private).
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -261,6 +262,9 @@ impl Db {
         if ver < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
+        // A newer-schema DB (different branch sharing this file): warn + tolerate
+        // (no downgrade; the additive schema below is forward-compatible).
+        let schema_mismatch = crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION);
 
         let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN sandbox_backend TEXT", []);
         // v31: per-language LOC report JSON alongside the total (idempotent).
@@ -644,7 +648,10 @@ impl Db {
         // it is idempotent and a failed earlier attempt retries next open.
         migrate_tab_layout_v6(&conn);
         crate::host_db::migrate_v30(&conn)?;
-        Ok(Db { conn })
+        Ok(Db {
+            conn,
+            schema_mismatch,
+        })
     }
 
     pub(crate) fn map_share_row(r: &rusqlite::Row) -> rusqlite::Result<ShareRow> {

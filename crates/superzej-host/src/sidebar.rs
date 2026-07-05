@@ -25,6 +25,10 @@ pub enum RowKind {
     /// `Workspace` for collapse purposes (keyed by `workspace_slug`).
     TerminalHost,
     Terminal,
+    /// A passive, non-interactive placeholder shown under a section banner when
+    /// it has no real rows (e.g. "No terminals — Alt T to add"). Rendered dim;
+    /// carries no `tab_target`, so landing on it and pressing Enter is a no-op.
+    EmptyHint,
 }
 
 /// Contextual activity, mirrored from the host-side `activity` state machine.
@@ -847,9 +851,11 @@ pub fn build_rows(
         }
     }
 
-    if !db_terminals.is_empty() {
+    {
         // TERMINALS is a first-class, static category banner (a peer of the
-        // "WORKSPACES" title), never collapsible and never a nav target.
+        // "WORKSPACES" title), never collapsible and never a nav target. It is
+        // always shown — even with no terminals — so the section (and its
+        // "New terminal…" entry point) never silently vanishes.
         rows.push(SidebarRow {
             kind: RowKind::SectionHeading,
             depth: 0,
@@ -876,6 +882,38 @@ pub fn build_rows(
             disk_bytes: None,
             target_bytes: None,
         });
+
+        // Genuinely-empty fallback (the startup reseed normally keeps a `local`
+        // terminal, so this shows only when that couldn't run): a passive,
+        // non-interactive hint pointing at the add flow.
+        if db_terminals.is_empty() {
+            rows.push(SidebarRow {
+                kind: RowKind::EmptyHint,
+                depth: 1,
+                label: "No terminals — Alt T to add".into(),
+                workspace_slug: "terminals".into(),
+                tab_target: None,
+                active: false,
+                worktree_path: None,
+                pin_key: String::new(),
+                branch: None,
+                git: None,
+                agent: None,
+                sandbox_backend: None,
+                env_name: None,
+                activity: ActivityState::None,
+                visible: true,
+                collapsed: false,
+                dir: false,
+                pr_count: None,
+                pr_number: None,
+                unread_count: 0,
+                alert_count: 0,
+                terminal_connection: None,
+                disk_bytes: None,
+                target_bytes: None,
+            });
+        }
 
         // Under the banner, terminals divide into collapsible sections by host,
         // `local` first, then remote hosts in stable label order. Grouping +
@@ -953,8 +991,13 @@ pub fn build_rows(
                     branch: None,
                     git: None,
                     agent: None,
-                    sandbox_backend: None,
-                    env_name: None,
+                    // Show the sandbox backend on the row like a worktree does;
+                    // blank/`host` means an un-sandboxed shell (rendered as none).
+                    sandbox_backend: {
+                        let b = t.sandbox_backend.trim();
+                        (!b.is_empty() && b != "host" && b != "none").then(|| b.to_string())
+                    },
+                    env_name: (!t.env_name.trim().is_empty()).then(|| t.env_name.clone()),
                     activity: ActivityState::None,
                     visible: true,
                     collapsed: false,
@@ -1143,6 +1186,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     keep[w] = true; // surface the parent repo header
                 }
             }
+            RowKind::EmptyHint => {}
         }
     }
     // Reveal children only for headers/groups that matched on their own label.
@@ -1170,6 +1214,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     keep[i] = true;
                 }
             }
+            RowKind::EmptyHint => {}
         }
     }
     for (i, r) in rows.iter_mut().enumerate() {
@@ -1260,7 +1305,12 @@ mod tests {
             &[],
             &[],
         );
-        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        // The TERMINALS section is always present (empty here → its hint row).
+        let labels: Vec<&str> = rows
+            .iter()
+            .take_while(|r| r.kind != RowKind::SectionHeading)
+            .map(|r| r.label.as_str())
+            .collect();
         assert_eq!(labels, vec!["app", "home", "feat-a", "feat-b"]);
     }
 
@@ -1286,7 +1336,12 @@ mod tests {
             &[],
             &[],
         );
-        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        // Ignore the always-present TERMINALS section (empty → hint row).
+        let labels: Vec<&str> = rows
+            .iter()
+            .take_while(|r| r.kind != RowKind::SectionHeading)
+            .map(|r| r.label.as_str())
+            .collect();
         assert_eq!(labels, vec!["app", "home", "feat"]);
         assert_eq!(rows[0].kind, RowKind::Workspace);
         assert_eq!(rows[1].kind, RowKind::Worktree);
@@ -1473,7 +1528,13 @@ mod tests {
             &[],
             &[],
         );
-        let kinds: Vec<RowKind> = rows.iter().map(|r| r.kind).collect();
+        // Only the workspace-structure rows; the always-present TERMINALS
+        // section (heading + empty-state hint) trails and is excluded here.
+        let kinds: Vec<RowKind> = rows
+            .iter()
+            .take_while(|r| r.kind != RowKind::SectionHeading)
+            .map(|r| r.kind)
+            .collect();
         assert_eq!(kinds, vec![RowKind::Workspace, RowKind::Worktree]);
         // The worktree row jumps to the group's remembered active tab.
         assert_eq!(rows[1].tab_target, Some(RowTarget::Tab(0, 1)));
@@ -1671,6 +1732,8 @@ mod tests {
             created_at: 0,
             last_active: 0,
             position: 0,
+            sandbox_backend: String::new(),
+            env_name: String::new(),
         }
     }
 

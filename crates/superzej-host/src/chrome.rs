@@ -2137,8 +2137,7 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
             lines.insert(0, crate::seg::Line::Blank);
         }
         let bg = row_bg(row, i, cursor, model);
-        // The cursor row always carries the left-edge bar; focus only changes
-        // its tint (bright vs dimmed), applied at draw time in `draw_sidebar`.
+        // The cursor row always carries the left-edge bar; focus only tints it.
         let cursor_bar = !rail && is_cursor && !matches!(row.kind, RowKind::SectionHeading);
         composed.push((lines, bg, cursor_bar));
     }
@@ -2393,8 +2392,8 @@ fn compose_row_lines(
     expanded: bool,
     is_last: bool,
     slot: Option<u8>,
-    // Warm-spare-pool `(ready, target)` to show on THIS row — `Some` only for the
-    // active workspace's row (the pool is per-workspace). `None` hides the chip.
+    // Warm-spare-pool `(ready, target)` for THIS row — `Some` only on the active
+    // workspace's row (pool is per-workspace); `None` hides the chip.
     pool: Option<(usize, usize)>,
 ) -> Vec<crate::seg::Line> {
     use crate::seg::{Line, Seg, Tok, seg, sp};
@@ -2421,8 +2420,7 @@ fn compose_row_lines(
             l.push(seg(Tok::Slot(S::Faint), caret(row.collapsed)));
             l.push(sp(1));
             if row.kind == RowKind::TerminalHost {
-                // Host group glyph: local vs remote, keyed off the
-                // representative connection set in `build_rows`.
+                // Host group glyph: local vs remote (from the rep connection).
                 let local = row
                     .terminal_connection
                     .as_deref()
@@ -2433,13 +2431,12 @@ fn compose_row_lines(
                     if local { "\u{1f4bb} " } else { "\u{1f310} " },
                 ));
             } else if row.dir {
-                // A non-git "dir" workspace gets a folder glyph so it reads
-                // differently from a repo workspace.
+                // A non-git "dir" workspace gets a folder glyph to read apart.
                 l.push(seg(Tok::Slot(S::Text), "\u{1f4c1} "));
             }
             l.push(seg(Tok::Slot(S::Text), row.label.clone()).bold());
-            // Warm-spare-pool chip, RIGHT-aligned on the active workspace's title
-            // (accent when full, dim while still provisioning spares).
+            // Warm-spare-pool chip, right-aligned on the active title (accent
+            // when full, dim while provisioning).
             match pool.filter(|(_, t)| *t > 0) {
                 Some((ready, target)) => {
                     let tok = if ready >= target {
@@ -2458,6 +2455,10 @@ fn compose_row_lines(
         RowKind::SectionHeading => vec![Line::Segs(vec![
             sp(1),
             seg(Tok::Slot(S::Text), row.label.clone()).bold(),
+        ])],
+        RowKind::EmptyHint => vec![Line::Segs(vec![
+            sp(3),
+            seg(Tok::Slot(S::Faint), row.label.clone()),
         ])],
         RowKind::Folder => vec![Line::Segs(vec![
             sp(1),
@@ -2480,9 +2481,8 @@ fn compose_row_lines(
             vec![Line::Segs(l)]
         }
         RowKind::Worktree => {
-            // Left cluster: gutter, the revealed Alt+1..9 quick-jump digit,
-            // tree connector, activity dot (own color), the dynamic name, then
-            // the agent glyph.
+            // Left cluster: gutter, Alt+1..9 jump digit, tree connector,
+            // activity dot, the dynamic name, then the agent glyph.
             let mut left = vec![sp(1)];
             if let Some(n) = slot {
                 // Leading space keeps the digit off the cursor bar (col 0).
@@ -2514,8 +2514,7 @@ fn compose_row_lines(
                 ));
             }
 
-            // Right cluster (always-on): git status + the alert badge. PR /
-            // unread / disk move to the expanded detail line to de-crowd.
+            // Right cluster (always-on): git status + alert badge (PR/unread/disk move to the detail line).
             let mut right: Vec<Seg> = Vec::new();
             let push_sp = |v: &mut Vec<Seg>| {
                 if !v.is_empty() {
