@@ -194,8 +194,8 @@ pub fn name() -> String {
 
 /// Holds the profile's advisory singleton lock for the process lifetime. The
 /// `flock` is tied to the open fd, so it auto-releases on `Drop` and on process
-/// death (incl. SIGKILL) — never a stale lock. `None` for the default profile
-/// (no singleton, preserving today's behavior incl. nested szhost launches).
+/// death (incl. SIGKILL) — never a stale lock. `None` when the lock could not
+/// be taken (contended default profile, permissions quirk, Windows).
 #[must_use = "the lock releases as soon as the guard is dropped"]
 pub struct SingletonGuard(#[allow(dead_code)] Option<std::fs::File>);
 
@@ -226,18 +226,24 @@ fn try_lock_nb(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>>
     if rc == 0 { Ok(Some(file)) } else { Ok(None) }
 }
 
+/// The active profile's singleton lock file (`<root>/run/szhost.lock`),
+/// creating the `run/` dir best-effort.
+fn singleton_lock_path() -> std::path::PathBuf {
+    let run = active().root.join("run");
+    let _ = std::fs::create_dir_all(&run);
+    run.join("szhost.lock")
+}
+
 /// Acquire the active profile's advisory singleton lock at
 /// `<root>/run/szhost.lock`. One-shot non-blocking (never a poll loop — the
-/// 0%-idle contract). No-op (always `Acquired`) for the default profile.
+/// 0%-idle contract). Every profile (incl. default) takes the lock so
+/// [`instance_running`] can detect a live compositor; contention on the
+/// **default** profile still returns `Acquired` silently (no warn, no refusal)
+/// — the lock was always advisory-only there and nested szhost launches must
+/// keep working exactly as before.
 #[cfg(not(windows))]
 pub fn acquire_singleton() -> Singleton {
-    let p = active();
-    if p.is_default() {
-        return Singleton::Acquired(SingletonGuard(None));
-    }
-    let run = p.root.join("run");
-    let _ = std::fs::create_dir_all(&run);
-    match try_lock_nb(&run.join("szhost.lock")) {
+    match try_lock_nb(&singleton_lock_path()) {
         Ok(Some(file)) => {
             // Best-effort pid marker for a future focus path; failure is fine.
             use std::io::Write;
@@ -245,10 +251,25 @@ pub fn acquire_singleton() -> Singleton {
             let _ = writeln!(&file, "{}", std::process::id());
             Singleton::Acquired(SingletonGuard(Some(file)))
         }
+        Ok(None) if active().is_default() => Singleton::Acquired(SingletonGuard(None)),
         Ok(None) => Singleton::AlreadyRunning,
         // A permissions quirk must never wedge the user out — degrade to running.
         Err(_) => Singleton::Acquired(SingletonGuard(None)),
     }
+}
+
+/// Best-effort: is another szhost process holding this profile's singleton
+/// lock (i.e. a live interactive compositor)? Probes the flock without keeping
+/// it. `false` on any error — callers degrade to "no instance" (launch).
+#[cfg(not(windows))]
+pub fn instance_running() -> bool {
+    matches!(try_lock_nb(&singleton_lock_path()), Ok(None))
+}
+
+/// Windows singleton detection is a follow-up; report no instance (launch).
+#[cfg(windows)]
+pub fn instance_running() -> bool {
+    false
 }
 
 #[cfg(windows)]

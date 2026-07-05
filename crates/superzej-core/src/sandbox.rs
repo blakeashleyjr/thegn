@@ -2761,18 +2761,17 @@ mod tests {
         };
         let loc = crate::remote::GitLoc::from_db("/wt/x", None);
         if let Some(spec) = resolve(&cfg, &loc, "test") {
-            // host_toolchain_mounts() entries: not the fake worktree, not the
-            // rw language caches from auto_cache_mounts (those are !ro && cache),
-            // and nothing under $HOME — the $HOME bind-mount itself (parallel
-            // tests may temporarily set HOME to a temp dir that's deleted
-            // mid-assertion) and the rw writable carve-outs (~/tmp,
-            // ~/.local/state, …) both live there and are not ro.
+            // host_toolchain_mounts() entries are ro by definition — filter to
+            // ro, non-cache mounts outside the fake worktree and $HOME. The rw
+            // carve-outs (language caches, ~/tmp, the agent config dir a
+            // parallel test points CLAUDE_CONFIG_DIR at and then deletes) are
+            // not toolchain mounts and may legitimately vanish mid-assertion.
             let home = std::env::var("HOME").unwrap_or_default();
             let toolchain: Vec<_> = spec
                 .mounts
                 .iter()
                 .filter(|m| {
-                    !m.host.starts_with("/wt/")
+                    m.ro && !m.host.starts_with("/wt/")
                         && !m.cache
                         && (home.is_empty() || !m.host.starts_with(&home))
                 })
@@ -2783,7 +2782,6 @@ mod tests {
                     "host_toolchain mount for non-existent path: {}",
                     m.host
                 );
-                assert!(m.ro, "host toolchain mount should be ro: {}", m.host);
             }
             // On NixOS (where /nix/store exists) we must have injected at
             // least the nix store mount.

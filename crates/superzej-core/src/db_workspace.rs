@@ -696,6 +696,20 @@ impl WorkspaceStore for Db {
         Ok(())
     }
 
+    /// Forget every group (and its tabs) of `session` keyed by worktree path.
+    fn delete_tab_groups_for_worktree(&self, session: &str, worktree: &str) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM group_tabs WHERE session_name=?1 AND group_name IN
+               (SELECT name FROM tab_groups WHERE session_name=?1 AND worktree=?2)",
+            params![session, worktree],
+        )?;
+        self.conn().execute(
+            "DELETE FROM tab_groups WHERE session_name=?1 AND worktree=?2",
+            params![session, worktree],
+        )?;
+        Ok(())
+    }
+
     /// Wipe a session's whole persisted layout (groups + tabs). The host
     /// persists snapshots as clear-then-insert inside one transaction so
     /// closed/renamed entries can't linger.
