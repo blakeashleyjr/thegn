@@ -24,7 +24,7 @@ use crate::handlers::host::HostRuntime;
 pub struct HostSnapshot {
     /// The `[host.<name>]` config name.
     pub name: String,
-    /// Canonical id ("host:<name>") — the key into `HostRuntime.state`.
+    /// Canonical id (`host:<name>`) — the key into `HostRuntime.state`.
     pub id: String,
     /// Reach kind ("ssh"/"iroh"/"cloud"/"local").
     pub reach: String,
@@ -211,7 +211,7 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 /// The wizard's per-env host-readiness badges: ENV KEY → a short dim string
-/// ("✓ ready" / "◐ <step>" / "✗ failed" / "○ new") for envs bound to a
+/// (`✓ ready` / `◐ <step>` / `✗ failed` / `○ new`) for envs bound to a
 /// `[host.*]` entry. Envs without a host binding get no badge.
 pub fn wizard_host_badges(cfg: &Config, hosts: &[HostSnapshot]) -> HashMap<String, String> {
     let mut out = HashMap::new();

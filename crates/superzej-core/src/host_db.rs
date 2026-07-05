@@ -259,7 +259,8 @@ impl HostStore for Db {
     }
 
     /// Persist a USER-ADDED host definition (the in-TUI / CLI "add host"
-    /// flow): the serialized [`HostConfig`] rides the host's own row and is
+    /// flow): the serialized [`HostConfig`](crate::host_config::HostConfig)
+    /// rides the host's own row and is
     /// merged into the config catalog at load —
     /// [`crate::host_config::merge_db_hosts`]. Declarative `[host.<name>]`
     /// config SHADOWS a DB def of the same name.

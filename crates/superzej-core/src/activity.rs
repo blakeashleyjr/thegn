@@ -163,7 +163,7 @@ pub const SETTLED_STATE: &str = "none";
 /// running states and already-settled states (`"waiting"`/`"read"`/`"none"`) pass
 /// through unchanged. This is the age-based generalization of the live
 /// `RESUME_GRACE_SECS` sticky logic, applied **once** at resurrection; the live
-/// [`poll`] FSM is untouched. Boundary: an age of exactly `grace_ms` is treated
+/// `poll` FSM is untouched. Boundary: an age of exactly `grace_ms` is treated
 /// as stale (`>=`), matching the `RESUME_GRACE_SECS` convention above.
 pub fn coerce_stale(state: &str, age_ms: u64, grace_ms: u64) -> String {
     let running = matches!(state, "active" | "running");
@@ -178,7 +178,7 @@ pub fn coerce_stale(state: &str, age_ms: u64, grace_ms: u64) -> String {
 /// crash mid-run doesn't resurrect a phantom running/stuck dot. Each entry's age
 /// is `now - last_active_at` (falling back to the snapshot's `polled_at` when the
 /// entry never recorded an active timestamp). A coerced entry also clears its
-/// streak bookkeeping so the next [`poll`] starts clean; the live FSM then
+/// streak bookkeeping so the next `poll` starts clean; the live FSM then
 /// re-derives the true state from fresh CPU deltas. Best-effort: a missing or
 /// garbled snapshot is a no-op, and nothing is written unless a state changed.
 pub fn coerce_stale_states_at(path: &Path, grace_ms: u64, now: f64) {
