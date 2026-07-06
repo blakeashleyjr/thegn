@@ -6626,13 +6626,6 @@ fn apply_search_jump(
     }
 }
 
-fn drawer_cancel_key(key: &KeyCode, modifiers: Modifiers) -> bool {
-    if modifiers.contains(Modifiers::CTRL) || modifiers.contains(Modifiers::ALT) {
-        return false;
-    }
-    crate::input::is_escape_key(key) || matches!(key, KeyCode::Char('q') | KeyCode::Char('Q'))
-}
-
 fn palette_cancel_key(
     palette: &crate::palette::Palette,
     key: &KeyCode,
@@ -9255,6 +9248,28 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
+                            // Private drawer→host control channel (OSC 5379): the
+                            // bundled yazi signals close/open-in-editor here so it
+                            // keeps ownership of every key (no host key-stealing).
+                            if drawer == Some(id)
+                                && let Some(cmd) = crate::queries::drawer_command(&b)
+                            {
+                                crate::actions::dispatch_drawer_command(
+                                    cmd,
+                                    &mut session,
+                                    &mut panes,
+                                    &mut drawer,
+                                    &mut drawer_pool,
+                                    &mut drawer_home,
+                                    &mut focus,
+                                    &mut model,
+                                    &mut sb,
+                                    keymap.config(),
+                                    chrome.center,
+                                );
+                                need_relayout = true;
+                                dirty = true;
+                            }
                         }
                         PaneEvent::Exit(id, exit_code) => {
                             // Program name is needed for attention routing after
@@ -9262,9 +9277,9 @@ async fn event_loop<T: Terminal>(
                             let exited_program =
                                 panes.table.get(&id).map(|p| p.program().to_string());
                             panes.table.remove(&id);
-                            // The visible yazi drawer died on its own (e.g. its
-                            // contained scope hit the memory limit). Clear it,
-                            // mark the worktree's drawer closed, and surface why.
+                            // The visible yazi drawer's process ended. Clear it,
+                            // mark the worktree's drawer closed, hand focus back to
+                            // the center, and relayout to reclaim the bottom slice.
                             if drawer == Some(id) {
                                 drawer = None;
                                 if let Some(dir) =
@@ -9275,9 +9290,18 @@ async fn event_loop<T: Terminal>(
                                     let _ = std::fs::create_dir_all(&ddir);
                                     let _ = std::fs::write(ddir.join(key), "false");
                                 }
-                                model.status = "Files drawer exited; if image previews \
-                                    were enabled it may have hit the drawer memory limit."
-                                    .into();
+                                // A clean exit is the normal `q`-quit path — stay
+                                // quiet. Only an abnormal exit (e.g. the contained
+                                // scope hit the drawer memory limit) gets a hint.
+                                if exit_code != Some(0) {
+                                    model.status = "Files drawer exited unexpectedly; if image \
+                                        previews were on it may have hit the drawer memory limit."
+                                        .into();
+                                }
+                                if focus.drawer() {
+                                    focus.zone = crate::focus::Zone::Center;
+                                }
+                                need_relayout = true;
                                 dirty = true;
                                 continue;
                             }
@@ -14669,26 +14693,12 @@ async fn event_loop<T: Terminal>(
                     }
                     continue;
                 }
-                // Esc / q close the drawer — but only while it owns focus, so
-                // the same keys keep their meaning in the center/sidebar/panel.
-                if drawer.is_some() && focus.drawer() && drawer_cancel_key(&k.key, k.modifiers) {
-                    // Drawer dismiss always closes it; the opt-in adds the snap.
-                    crate::escape::close_drawer_to_pool(
-                        &mut drawer,
-                        &mut drawer_pool,
-                        &mut drawer_home,
-                        &session,
-                        &mut panes,
-                        keymap.config(),
-                    );
-                    if keymap.config().panel.collapse_on_escape {
-                        panel_ui.width = crate::layout::PanelWidth::Normal;
-                    }
-                    focus.zone = crate::focus::Zone::Center;
-                    need_relayout = true;
-                    dirty = true;
-                    continue;
-                }
+                // The drawer's yazi owns every key while it's focused — `q`
+                // closes it and `<C-e>` opens the hovered file, both signalled
+                // back over the private OSC channel (see `drawer_command`) — so
+                // the host no longer intercepts `q`/`Esc` here (that stole them
+                // from yazi's own rename/filter/find inputs). Leave via
+                // `Ctrl+Alt+f`/`Alt+y` or `Ctrl+Up`.
                 // Esc hands the keyboard back to the center while the corner
                 // overlay keeps playing; the player's own keys (space, q to quit,
                 // arrows to seek) still reach it while it's focused, and
@@ -17391,7 +17401,10 @@ async fn event_loop<T: Terminal>(
                                     crate::palette::build_profile_palette(&current_config),
                                 ));
                             }
-                            Action::ToggleDrawer => {
+                            // Both `Ctrl+Alt+f` and `Alt+y` are the same pooled
+                            // toggle: hide-to-pool when open (position survives),
+                            // pool-or-spawn when closed — fast and consistent.
+                            Action::ToggleDrawer | Action::Yazi => {
                                 // The reserved-geometry reflow + PTY resize are
                                 // owned by the top-of-loop drawer sync; here we
                                 // just open/close the pane (sized to its rect) and
@@ -19108,43 +19121,6 @@ async fn event_loop<T: Terminal>(
                                     rollback = Some(modal);
                                 }
                             }
-                            Action::Yazi => {
-                                // Direct bind for yazi: always replace the visible drawer
-                                // with a fresh, contained yazi pane for the active worktree
-                                // (routed through spawn_yazi_pane so it inherits the same
-                                // systemd-run memory/swap/CPU bound as the toggle path).
-                                // Geometry reflow + PTY resize are owned by the
-                                // top-of-loop drawer sync.
-                                if let Some(id) = drawer.take() {
-                                    panes.table.remove(&id);
-                                    drawer_home = None;
-                                }
-                                // Spawn already sized to the drawer's panel rect.
-                                let drect = prospective_drawer_rect(
-                                    cols,
-                                    rows,
-                                    want_sidebar,
-                                    want_panel,
-                                    panel_forced,
-                                    panel_width,
-                                    sidebar_cols,
-                                    zoom,
-                                    &supervisor,
-                                    &current_config,
-                                );
-                                let cwd = active_cwd(&session);
-                                if let Some(id) = spawn_yazi_pane(
-                                    &mut panes,
-                                    keymap.config(),
-                                    cwd.as_deref(),
-                                    drect,
-                                ) {
-                                    drawer = Some(id);
-                                    drawer_home = cwd;
-                                    focus.zone = crate::focus::Zone::Drawer;
-                                }
-                                need_relayout = true;
-                            }
                             Action::SummonPin(n) => {
                                 let status = summon_pin(
                                     n as usize,
@@ -20447,16 +20423,6 @@ mod tests {
         pool.stash(a, 3, 2, &mut panes);
         assert!(pool.remove_id(3));
         assert!(!pool.remove_id(3));
-    }
-
-    #[test]
-    fn drawer_cancel_keys_hide_the_file_picker() {
-        assert!(drawer_cancel_key(&KeyCode::Escape, Modifiers::NONE));
-        assert!(drawer_cancel_key(&KeyCode::Char('\x1b'), Modifiers::NONE));
-        assert!(drawer_cancel_key(&KeyCode::Char('q'), Modifiers::NONE));
-        assert!(drawer_cancel_key(&KeyCode::Char('Q'), Modifiers::SHIFT));
-        assert!(!drawer_cancel_key(&KeyCode::Char('q'), Modifiers::CTRL));
-        assert!(!drawer_cancel_key(&KeyCode::Char('j'), Modifiers::NONE));
     }
 
     #[test]

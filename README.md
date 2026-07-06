@@ -35,8 +35,8 @@ never a session change.
   state, CI check rollup, review decision — plus CI runs, merge queue,
   notifications, and shares, organized in panel tabs.
 - **Tools, scoped to the focused worktree:**
-  `Alt-g` lazygit · `Alt-y` yazi · `Alt-e` `$EDITOR` · `Alt-/` git diff ·
-  `Ctrl-Alt-f` bottom files drawer.
+  `Alt-g` lazygit · `Alt-e` `$EDITOR` · `Alt-/` git diff ·
+  `Ctrl-Alt-f` / `Alt-y` bottom files drawer.
 - **Quick-jump digits:** `Alt-1..9` jump to a worktree, `Ctrl-1..9` to a
   workspace, by their slot in sidebar order. `Ctrl-Alt-1..9` launch or focus
   pinned programs.
@@ -57,33 +57,33 @@ a git URL; it clones off-loop and opens as a workspace). Existing
 tmuxinator/sesh project files show up automatically as new-worktree templates.
 Defaults (override via `[keybinds]`):
 
-| Key                           | Action                                                |
-| ----------------------------- | ----------------------------------------------------- |
-| Ctrl-Space                    | command palette (fuzzy menu of all actions)           |
-| Alt-←/→                       | previous / next tab (within the worktree)             |
-| Alt-↑/↓                       | previous / next worktree (within the workspace)       |
-| Shift-Alt-↑/↓                 | previous / next workspace                             |
-| Ctrl-←/↓/↑/→ (h/j/k/l)        | move focus: sidebar ↔ panes ↔ panel                   |
-| Alt-\`                        | bounce between workspaces region and terminals region |
-| Alt-W                         | new workspace (open a repo)                           |
-| Ctrl-w                        | new worktree (a tab + "what to run" picker)           |
-| Alt-t                         | new tab on the _same_ worktree                        |
-| Alt-p / Alt-n / Alt-N         | new pane: smart split / split down / split right      |
-| Alt-w                         | close pane                                            |
-| Alt-o                         | switch workspace                                      |
-| Alt-s / Alt-.                 | focus sidebar / focus panel                           |
-| Ctrl-Alt-s / Ctrl-Alt-p       | hide/show sidebar / diff-PR panel                     |
-| Ctrl-Alt-f                    | files drawer (bundled yazi, bottom)                   |
-| Alt-g · Alt-y · Alt-e · Alt-/ | lazygit · yazi · `$EDITOR` · git diff                 |
-| Alt-1..9 / Ctrl-1..9          | jump to worktree N / workspace N (sidebar order)      |
-| Ctrl-Alt-1..9                 | launch / focus pinned programs (`[[pins]]`)           |
-| Ctrl-Alt-↑/↓                  | reorder the selected workspace / worktree             |
-| Ctrl-Alt-/ · Ctrl-/           | search pane history · search across panes             |
-| Ctrl-Alt-z                    | zoom the focused pane / zone                          |
-| Alt-r                         | time-travel replay of the focused pane (`[replay]`)   |
-| Ctrl-g                        | keybind lock (pass every chord through to the pane)   |
-| Alt-x / Alt-X                 | close tab / remove worktree                           |
-| Ctrl-q                        | quit                                                  |
+| Key                     | Action                                                |
+| ----------------------- | ----------------------------------------------------- |
+| Ctrl-Space              | command palette (fuzzy menu of all actions)           |
+| Alt-←/→                 | previous / next tab (within the worktree)             |
+| Alt-↑/↓                 | previous / next worktree (within the workspace)       |
+| Shift-Alt-↑/↓           | previous / next workspace                             |
+| Ctrl-←/↓/↑/→ (h/j/k/l)  | move focus: sidebar ↔ panes ↔ panel                   |
+| Alt-\`                  | bounce between workspaces region and terminals region |
+| Alt-W                   | new workspace (open a repo)                           |
+| Ctrl-w                  | new worktree (a tab + "what to run" picker)           |
+| Alt-t                   | new tab on the _same_ worktree                        |
+| Alt-p / Alt-n / Alt-N   | new pane: smart split / split down / split right      |
+| Alt-w                   | close pane                                            |
+| Alt-o                   | switch workspace                                      |
+| Alt-s / Alt-.           | focus sidebar / focus panel                           |
+| Ctrl-Alt-s / Ctrl-Alt-p | hide/show sidebar / diff-PR panel                     |
+| Ctrl-Alt-f · Alt-y      | toggle files drawer (bundled yazi, bottom)            |
+| Alt-g · Alt-e · Alt-/   | lazygit · `$EDITOR` · git diff                        |
+| Alt-1..9 / Ctrl-1..9    | jump to worktree N / workspace N (sidebar order)      |
+| Ctrl-Alt-1..9           | launch / focus pinned programs (`[[pins]]`)           |
+| Ctrl-Alt-↑/↓            | reorder the selected workspace / worktree             |
+| Ctrl-Alt-/ · Ctrl-/     | search pane history · search across panes             |
+| Ctrl-Alt-z              | zoom the focused pane / zone                          |
+| Alt-r                   | time-travel replay of the focused pane (`[replay]`)   |
+| Ctrl-g                  | keybind lock (pass every chord through to the pane)   |
+| Alt-x / Alt-X           | close tab / remove worktree                           |
+| Ctrl-q                  | quit                                                  |
 
 _The above is the `Normal` mode. Native `VimNormal` (with a `Space` leader
 layer) and `Emacs` presets ship too; switch with `Ctrl-Alt-v` / `Ctrl-Alt-e`

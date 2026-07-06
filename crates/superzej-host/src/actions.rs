@@ -64,6 +64,53 @@ pub(crate) fn open_command_pane(
     panes.table.remove(&id);
 }
 
+/// Handle a private `OSC 5379` control message the bundled yazi drawer emitted
+/// on its own PTY (see [`crate::queries::DrawerCmd`]). This is how the drawer
+/// drives the host chrome while yazi keeps ownership of every keystroke, so the
+/// loop never has to intercept — and mis-steal — `q`/`Esc` from yazi's inputs.
+/// The caller marks the frame for relayout.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_drawer_command(
+    cmd: crate::queries::DrawerCmd,
+    session: &mut Session,
+    panes: &mut Panes,
+    drawer: &mut Option<u32>,
+    drawer_pool: &mut crate::run::DrawerPool,
+    drawer_home: &mut Option<std::path::PathBuf>,
+    focus: &mut FocusState,
+    model: &mut FrameModel,
+    sb: &mut SidebarState,
+    cfg: &superzej_core::config::Config,
+    center: Rect,
+) {
+    match cmd {
+        crate::queries::DrawerCmd::Close => {
+            // Hide to the keep-alive pool (position survives reopen); hand the
+            // keyboard back to the center.
+            crate::escape::close_drawer_to_pool(
+                drawer,
+                drawer_pool,
+                drawer_home,
+                session,
+                panes,
+                cfg,
+            );
+            if focus.drawer() {
+                focus.zone = Zone::Center;
+            }
+        }
+        crate::queries::DrawerCmd::Editor(path) => {
+            // Open yazi's hovered file in a fresh center editor tab, reusing the
+            // same invocation every panel open path uses. The drawer stays live.
+            let cwd = crate::run::active_cwd(session);
+            let command = crate::panel_util::editor_open_command(cfg, &path, None);
+            open_command_tab(session, panes, &command, cwd.as_deref(), center);
+            focus.zone = Zone::Center;
+            crate::run::refresh_tab_model(model, session, sb);
+        }
+    }
+}
+
 /// Open a URL in the system browser, fully detached (no `gh`/toolchain needed).
 pub(crate) fn open_url_detached(url: &str) {
     let _ = std::process::Command::new("xdg-open")
