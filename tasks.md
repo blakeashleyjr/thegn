@@ -993,6 +993,8 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [ ] 393. GPU passthrough
 - [ ] 394. Base image catalog/templates
 - [x] 749. Commodity-VPS provider backend — Hetzner via native REST (`Provider::Vps`, ssh exec/files shim, `szhost vps-ssh` self-bridge, intent-ledger + label-scoped reaper, `superzej env image-bake`; DO/Vultr adapters + firewall/spend-UI follow) _(openspec `add-vps-providers`; not live-verified)_
+- [x] 756. DigitalOcean + Fly.io provider backends — DO as a second `VpsKind` behind a `VpsShaper` trait (shared ledger/reaper/self-bridge/bake); Fly as a CLI-free `Provider::Fly` (Machines REST + GraphQL IPv4 + guest sshd over the managed keypair, scale-to-zero, baked `nix/fly-sandbox-image.nix`, `fly_reaper`) _(openspec `add-do-fly-providers`; DO+Hetzner+Fly-control-plane live-verified)_
+- [x] 757. Self-serve environment setup UX — layered secret store (`secret.rs`: `keyring:`/`env:`/`file:`, keyring→file writer) + comment-preserving config write path (`config_write.rs`, `toml_edit`) + CLI (`env create`/`rm`/`test`, `config set`) + TUI (`env_wizard` modal + System ▸ Environments panel, unified `‹ local › ssh fly digitalocean hetzner daytona`) _(openspec `add-env-setup-ux`)_
 
 ### AF. File viewer / search
 
