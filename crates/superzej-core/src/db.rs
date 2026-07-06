@@ -79,9 +79,10 @@ impl Db {
 }
 
 /// One row of the local merge queue (`[merge_queue]`, v22). Keyed by worktree;
-/// `status` is one of queued/folding/verifying/landed/deferred/gate_failed.
+/// `status` is one of queued/folding/verifying/landed/deferred/gate_failed/
+/// agent_running/ready/needs_human.
 /// `conflict_paths` is newline-joined when present.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MergeQueueRow {
     pub worktree: String,
     pub branch: String,

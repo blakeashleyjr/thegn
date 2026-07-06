@@ -2343,6 +2343,17 @@ snapshot_dirty = false        # auto-commit uncommitted worktree work before fol
 regenerate_paths = ["Cargo.lock"]  # conflicts confined to these are "regenerable", not handed off
 regenerate_command = ""        # e.g. "cargo update --workspace"; rebuilds regenerate_paths to auto-land them ("" defers instead)
 conflict_handoff = "agent"    # agent | notify | manual — fate of a deferred branch
+#
+# Agent autopilot: with conflict_handoff = "agent" and agent_command set, the
+# queue driver (`superzej merge queue drain`) grinds queued branches one by one —
+# dispatching a headless CLI agent INSIDE the branch's own worktree to rebase onto
+# the target, resolve conflicts, and fix a red gate, then re-attempting the fold
+# and auto-landing on green. The agent never touches main; superzej does the
+# object-DB fold + CAS itself. {prompt}/{branch}/{target} are substituted.
+agent_command = ""            # e.g. 'claude -p "{prompt}" --permission-mode acceptEdits'; "" ⇒ agent handoff degrades to notify
+auto_land = true              # queue driver: CAS-advance on green; false ⇒ stop at "ready" for a manual land
+agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human"
+agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
 
 # ── Time-travel replay (optional) ───────────────────────────────────────────
 # Record each pane's full byte stream into a bounded in-memory ring so you can

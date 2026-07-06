@@ -695,10 +695,8 @@ impl LlmProxyConfig {
 }
 
 config_enum! {
-    /// `[merge_queue] conflict_handoff` — what happens to a branch that the fold
-    /// can't land cleanly. `"agent"` (default) dispatches the worktree's agent to
-    /// rebase onto the new `main` and re-resolve; `"notify"` just raises a
-    /// notification and leaves it queued; `"manual"` leaves it silently queued.
+    /// `[merge_queue] conflict_handoff` — fate of a branch the fold can't land:
+    /// `"agent"` (default) dispatches the agent to fix it, `"notify"`/`"manual"` don't.
     pub enum ConflictHandoff: "conflict handoff" {
         Agent = "agent",
         Notify = "notify",
@@ -707,46 +705,44 @@ config_enum! {
 }
 
 /// `[merge_queue]` — the local "fold-actor": fold parallel worktree branches into
-/// `target_branch` in the object database (no checkout), auto-landing every
-/// branch that merges clean and deferring only genuine conflicts. On by default;
-/// the core (fold + integrate) is AI-free — the conflict handoff is the only AI
-/// touch and only fires on a deferral. See `superzej_core::fold` for the pure
-/// engine and the host `integrate` runner for the I/O (test-gate + CAS).
+/// `target_branch` in the object DB (no checkout), auto-landing clean merges and
+/// deferring conflicts. See `superzej_core::fold` + host `integrate`/`merge_driver`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct MergeQueueConfig {
-    /// Master switch. When off, the `integrate` command and auto-drain are inert.
+    /// Master switch. When off, the `integrate`/`merge` commands are inert.
     pub enabled: bool,
     /// Branch the fold advances. `"auto"` resolves it per repo (HEAD/default).
     pub target_branch: String,
-    /// Shell command run on the folded tip (in a throwaway worktree) to gate the
-    /// CAS-advance — the "does the union build?" check. Empty disables the gate
-    /// (textual-clean only). Example: `just ci` or `cargo test --workspace`.
+    /// Shell command gating the CAS-advance (throwaway worktree). Empty disables
+    /// it. E.g. `just ci` / `cargo test --workspace`.
     pub gate_command: String,
-    /// Whether to run `gate_command` at all. Off ⇒ advance as soon as branches
-    /// merge without text conflicts.
+    /// Whether to run `gate_command` at all.
     pub gate_on: bool,
-    /// On a red gate, re-land branches incrementally to find the offender and
-    /// defer just that one, instead of failing the whole batch.
+    /// On a red gate, bisect to defer just the offending branch, not the batch.
     pub bisect_on_red: bool,
-    /// Fold automatically when an agent signals done (ACP `AgentEnd` / dispatch
-    /// → merged), so a burst of completions drains the queue without a keystroke.
+    /// Fold automatically when an agent signals done (ACP `AgentEnd`).
     pub auto_drain: bool,
-    /// Auto-commit uncommitted worktree work before folding (a branch must be a
-    /// commit for `merge-tree`). Off ⇒ only committed branch tips are folded and
-    /// dirty worktrees are skipped with a warning.
+    /// Auto-commit uncommitted worktree work before folding (else skip dirty ones).
     pub snapshot_dirty: bool,
-    /// Conflicting paths confined to these (matched by exact path or basename,
-    /// e.g. `Cargo.lock` matches `crates/x/Cargo.lock`) are classified
-    /// regenerable — resolved by regenerating, not handed to a human.
+    /// Conflicts confined to these paths (exact/basename) are regenerable, not
+    /// handed to a human (e.g. `Cargo.lock` matches `crates/x/Cargo.lock`).
     pub regenerate_paths: Vec<String>,
-    /// Command run (in a throwaway worktree, cwd = repo) to rebuild the
-    /// `regenerate_paths` artifacts when a branch's *only* conflicts are in them,
-    /// turning that defer into an automatic land. Empty disables regeneration
-    /// (regenerable conflicts just defer). E.g. `cargo update --workspace`.
+    /// Command (throwaway worktree) that rebuilds `regenerate_paths` to auto-land a
+    /// lockfile-only conflict. Empty defers instead.
     pub regenerate_command: String,
     /// What to do with a deferred (conflicting) branch.
     pub conflict_handoff: ConflictHandoff,
+    /// Headless CLI agent the queue driver runs (in the branch's worktree) to
+    /// rebase/resolve/fix, then re-folds. Shell template with `{prompt}`/`{branch}`/
+    /// `{target}`; empty ⇒ agent handoff degrades to notify. E.g. `claude -p {prompt}`.
+    pub agent_command: String,
+    /// Queue driver: CAS-advance on green; off ⇒ stop at `ready` for a `merge land`.
+    pub auto_land: bool,
+    /// Agent-dispatch → re-fold cycles per branch before it's `needs_human`.
+    pub agent_max_attempts: u32,
+    /// Watchdog (seconds) for one agent invocation. 0 disables it.
+    pub agent_timeout_secs: u64,
 }
 
 impl Default for MergeQueueConfig {
@@ -762,6 +758,10 @@ impl Default for MergeQueueConfig {
             regenerate_paths: vec!["Cargo.lock".to_string()],
             regenerate_command: String::new(),
             conflict_handoff: ConflictHandoff::default(),
+            agent_command: String::new(),
+            auto_land: true,
+            agent_max_attempts: 2,
+            agent_timeout_secs: 900,
         }
     }
 }

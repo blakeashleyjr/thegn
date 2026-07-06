@@ -793,6 +793,7 @@ as the agent-specific side of the broader attention queue._
 - [~] 269. PR creation from review
 - [ ] 270. Semantic merge via weave
 - [ ] 654. Per-line agent-vs-human attribution overlay — track provenance on every line an agent touches; AI/human gutter markers in the diff/review pane; reassign to human on a subsequent human edit; local-only (never written to git), exportable from the diff toolbar (Orca-style; complements entity-blame X 312)
+- [~] 758. Agent-driven merge-queue driver — assign worktree branches to the queue (`merge add [--all]`) and drain them serially (`merge drain`): clean branches auto-land; a conflict or red gate dispatches a headless CLI agent (Claude Code default, any command) inside the branch's worktree to rebase/resolve/fix, then re-folds and auto-lands (configurable), marking `needs_human` after `agent_max_attempts`. Agent never touches the target — superzej does the object-DB fold + CAS, preserving the merge-guard coherence guarantee. Builds on the fold-actor (`4fbc92b`); `add-agent-merge-driver`. Follow-up: in-TUI actions + `auto_drain` (blocked on a run.rs/keymap.rs extraction). _(complements 263/268 and orchestration core Q)_
 
 ### U. LLM proxy
 
