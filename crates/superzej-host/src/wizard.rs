@@ -1046,7 +1046,18 @@ pub fn run_worker(
      -> anyhow::Result<crate::agent::SandboxOutcome> {
         let wt_s = wt.to_string_lossy();
         let loc = GitLoc::from_db(&wt_s, None);
-        crate::agent::prepare_sandbox_env(cfg, root, &wt_s, &loc, Some(backend), scope, Some(env))
+        // A wizard pick is a fresh, explicit user choice — it wins over config
+        // (even a non-"auto" `[sandbox] backend`), so `choice_is_explicit = true`.
+        crate::agent::prepare_sandbox_env(
+            cfg,
+            root,
+            &wt_s,
+            &loc,
+            Some(backend),
+            true,
+            scope,
+            Some(env),
+        )
     };
     // The auto chain's host fallback is visible in the step detail; an
     // explicit choice that can't be honored errors instead (no silent host
@@ -1241,7 +1252,16 @@ pub fn run_worker(
                 fail(CreateStep::Register, format!("db: {e}"));
                 return;
             }
-            let _ = db.set_worktree_sandbox(&path_s, &sandbox.backend_label);
+            // Persist the sandbox backend the same way as the host below: only a
+            // *concrete* pick is a deliberate per-worktree override, pinned so it
+            // sticks across restarts even against a non-"auto" `[sandbox] backend`
+            // (relaunch reads it as explicit — see `agent::launch_spec_with_key`).
+            // An "auto" pick stays NULL so the worktree re-resolves against the
+            // current config each open. `sandbox_key()` already returns "auto" for
+            // a non-local host (which manages its own isolation).
+            if choices.sandbox != "auto" && !choices.sandbox.is_empty() {
+                let _ = db.set_worktree_sandbox(&path_s, &choices.sandbox);
+            }
             let _ = db.set_worktree_agent(&path_s, &choices.agent);
             // Persist the chosen host only when it DIFFERS from the ambient
             // default this worktree would otherwise inherit (repo `.superzej.*`

@@ -53,6 +53,7 @@ pub(crate) fn provision_worktree_on_host(
         worktree,
         &loc,
         None,
+        false,
         SandboxScope::Shell,
         Some(env_name),
     ) {
