@@ -902,6 +902,17 @@ impl PanelUi {
         self.ensure_open_valid();
     }
 
+    /// Open a section, keeping the visible tab in step with it. Row navigation
+    /// flows across the *whole* section order, so a Down at the bottom of a
+    /// tab's last section lands on the next tab's first section — without this
+    /// the tab strip and accordion (both keyed off `self.tab`) would keep
+    /// rendering the old tab, and `ensure_open_valid` would later snap `open`
+    /// back. The invariant is `self.tab == self.open.tab()`.
+    pub fn open_section(&mut self, s: Section) {
+        self.open = s;
+        self.tab = s.tab();
+    }
+
     /// Ensure `open` is a section that belongs to the current tab and exists
     /// in the live order. If not, snap to the first valid section.
     fn ensure_open_valid(&mut self) {
@@ -1193,6 +1204,29 @@ mod tests {
         ui.open = Section::Pr;
         ui.set_order(vec![Section::Pr, Section::Changes]);
         assert_eq!(ui.open, Section::Pr);
+    }
+
+    #[test]
+    fn open_section_syncs_the_tab_across_boundaries() {
+        // Row navigation flows across the whole order, so opening a section can
+        // land in another tab. The tab must follow, or the strip + accordion
+        // (both keyed off `tab`) keep rendering the old tab and
+        // `ensure_open_valid` snaps `open` back.
+        let mut ui = PanelUi::default();
+        assert_eq!(ui.tab, PanelTab::Git); // default lands on Git
+
+        ui.open_section(Section::Pr); // Work-tab section
+        assert_eq!(ui.open, Section::Pr);
+        assert_eq!(ui.tab, PanelTab::Work);
+
+        ui.open_section(Section::Logs); // System-tab section
+        assert_eq!(ui.tab, PanelTab::System);
+
+        ui.open_section(Section::Changes); // back into Git
+        assert_eq!(ui.tab, PanelTab::Git);
+
+        // Invariant: tab always matches the open section's tab.
+        assert_eq!(ui.tab, ui.open.tab());
     }
 
     fn fstat(staged: char, unstaged: char, path: &str) -> superzej_svc::git::FileStatus {
