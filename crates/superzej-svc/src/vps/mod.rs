@@ -13,6 +13,7 @@
 //! [`VpsProvider`] driving them.
 
 pub mod cloudinit;
+pub mod digitalocean;
 pub mod hetzner;
 pub mod registry;
 pub mod ssh_shim;
@@ -26,18 +27,28 @@ use anyhow::{Context, Result, anyhow};
 use crate::provider::{ExecKind, FileEntry, ProviderFiles, RemoteProvider, SandboxHandle};
 use superzej_core::remote::SshTarget;
 
-/// Which VPS vendor an env targets. One enum arm per implemented adapter;
-/// DigitalOcean/Vultr slot in beside [`VpsKind::Hetzner`] with their own pure
-/// shaping modules.
+/// The vendor-neutral instance labels every managed VPS carries. Hetzner sends
+/// them as a native `key=value` label object; DigitalOcean (flat tags) encodes
+/// and reconstructs them (see [`digitalocean::tags_from_labels`]). The reaper
+/// scopes on [`HOST_KEY`], so both vendors must round-trip it.
+pub const MANAGED_KEY: &str = "managed-by";
+pub const MANAGED_VAL: &str = "superzej";
+pub const HOST_KEY: &str = "sz-host";
+
+/// Which VPS vendor an env targets. One enum arm per implemented adapter; each
+/// pairs with a pure shaping module ([`hetzner`], [`digitalocean`]) reached via
+/// [`VpsKind::shaper`] so the async driver holds no vendor `match`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VpsKind {
     Hetzner,
+    DigitalOcean,
 }
 
 impl VpsKind {
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim() {
             "hetzner" => Some(VpsKind::Hetzner),
+            "digitalocean" => Some(VpsKind::DigitalOcean),
             _ => None,
         }
     }
@@ -45,18 +56,29 @@ impl VpsKind {
     pub fn api_base_default(self) -> &'static str {
         match self {
             VpsKind::Hetzner => hetzner::DEFAULT_API_BASE,
+            VpsKind::DigitalOcean => digitalocean::DEFAULT_API_BASE,
         }
     }
 
     pub fn token_env_default(self) -> &'static str {
         match self {
             VpsKind::Hetzner => hetzner::DEFAULT_TOKEN_ENV,
+            VpsKind::DigitalOcean => digitalocean::DEFAULT_TOKEN_ENV,
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             VpsKind::Hetzner => "hetzner",
+            VpsKind::DigitalOcean => "digitalocean",
+        }
+    }
+
+    /// The pure request/response shaper for this vendor.
+    pub(crate) fn shaper(self) -> &'static dyn VpsShaper {
+        match self {
+            VpsKind::Hetzner => &HETZNER_SHAPER,
+            VpsKind::DigitalOcean => &DIGITALOCEAN_SHAPER,
         }
     }
 }
@@ -65,6 +87,195 @@ impl VpsKind {
 /// `superzej_core::config::vps_provider_kind` — keep the two lists in sync).
 pub fn is_vps_provider(name: &str) -> bool {
     VpsKind::parse(name).is_some()
+}
+
+/// Whether two OpenSSH public-key lines carry the same key material (compare
+/// `type + blob`, ignoring the trailing comment — a registered key's comment
+/// rarely matches ours). Vendor-neutral; used by [`VpsProvider::ensure_ssh_key`].
+pub fn same_pubkey(a: &str, b: &str) -> bool {
+    let core = |s: &str| {
+        let mut it = s.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some(t), Some(b)) => Some((t.to_string(), b.to_string())),
+            _ => None,
+        }
+    };
+    match (core(a), core(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Per-vendor **pure** request/response shaping (URLs, bodies, parsers) — one
+/// impl per [`VpsKind`], reached via [`VpsKind::shaper`]. The async
+/// [`VpsProvider`] calls only through this trait, so a new vendor is a new
+/// module + a new arm, never a new `match` in the driver.
+pub(crate) trait VpsShaper: Sync {
+    fn default_region(&self) -> &'static str;
+    fn default_size(&self) -> &'static str;
+    fn default_image(&self) -> &'static str;
+    /// `Some(id)` when `template` is `snapshot:<id>` (a baked image ⇒ keys-only
+    /// cloud-init).
+    fn snapshot_image<'a>(&self, template: &'a str) -> Option<&'a str>;
+
+    fn servers_url(&self, base: &str) -> String;
+    fn server_url(&self, base: &str, id: &str) -> String;
+    fn list_url(&self, base: &str) -> String;
+    fn ssh_keys_url(&self, base: &str) -> String;
+    /// The endpoint + body for a graceful power-off (pre-snapshot quiesce).
+    fn shutdown_url(&self, base: &str, id: &str) -> String;
+    fn shutdown_body(&self) -> serde_json::Value;
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_body(
+        &self,
+        name: &str,
+        size: &str,
+        image: &str,
+        region: &str,
+        ssh_key_ids: &[i64],
+        user_data: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> serde_json::Value;
+    fn ssh_key_body(&self, name: &str, pubkey: &str) -> serde_json::Value;
+
+    fn parse_create(&self, v: &serde_json::Value) -> Option<VpsInstance>;
+    fn parse_get(&self, v: &serde_json::Value) -> Option<VpsInstance>;
+    fn parse_server_list(&self, v: &serde_json::Value) -> Vec<VpsInstance>;
+    fn parse_ssh_keys(&self, v: &serde_json::Value) -> Vec<(i64, String)>;
+    fn parse_ssh_key_created(&self, v: &serde_json::Value) -> Option<i64>;
+}
+
+struct HetznerShaper;
+static HETZNER_SHAPER: HetznerShaper = HetznerShaper;
+
+impl VpsShaper for HetznerShaper {
+    fn default_region(&self) -> &'static str {
+        hetzner::DEFAULT_LOCATION
+    }
+    fn default_size(&self) -> &'static str {
+        hetzner::DEFAULT_SERVER_TYPE
+    }
+    fn default_image(&self) -> &'static str {
+        hetzner::DEFAULT_IMAGE
+    }
+    fn snapshot_image<'a>(&self, template: &'a str) -> Option<&'a str> {
+        hetzner::snapshot_image(template)
+    }
+    fn servers_url(&self, base: &str) -> String {
+        hetzner::servers_url(base)
+    }
+    fn server_url(&self, base: &str, id: &str) -> String {
+        hetzner::server_url(base, id)
+    }
+    fn list_url(&self, base: &str) -> String {
+        hetzner::list_url(base)
+    }
+    fn ssh_keys_url(&self, base: &str) -> String {
+        hetzner::ssh_keys_url(base)
+    }
+    fn shutdown_url(&self, base: &str, id: &str) -> String {
+        hetzner::shutdown_url(base, id)
+    }
+    fn shutdown_body(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn create_body(
+        &self,
+        name: &str,
+        size: &str,
+        image: &str,
+        region: &str,
+        ssh_key_ids: &[i64],
+        user_data: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> serde_json::Value {
+        hetzner::create_body(name, size, image, region, ssh_key_ids, user_data, labels)
+    }
+    fn ssh_key_body(&self, name: &str, pubkey: &str) -> serde_json::Value {
+        hetzner::ssh_key_body(name, pubkey)
+    }
+    fn parse_create(&self, v: &serde_json::Value) -> Option<VpsInstance> {
+        hetzner::parse_create(v)
+    }
+    fn parse_get(&self, v: &serde_json::Value) -> Option<VpsInstance> {
+        hetzner::parse_get(v)
+    }
+    fn parse_server_list(&self, v: &serde_json::Value) -> Vec<VpsInstance> {
+        hetzner::parse_server_list(v)
+    }
+    fn parse_ssh_keys(&self, v: &serde_json::Value) -> Vec<(i64, String)> {
+        hetzner::parse_ssh_keys(v)
+    }
+    fn parse_ssh_key_created(&self, v: &serde_json::Value) -> Option<i64> {
+        hetzner::parse_ssh_key_created(v)
+    }
+}
+
+struct DigitalOceanShaper;
+static DIGITALOCEAN_SHAPER: DigitalOceanShaper = DigitalOceanShaper;
+
+impl VpsShaper for DigitalOceanShaper {
+    fn default_region(&self) -> &'static str {
+        digitalocean::DEFAULT_REGION
+    }
+    fn default_size(&self) -> &'static str {
+        digitalocean::DEFAULT_SIZE
+    }
+    fn default_image(&self) -> &'static str {
+        digitalocean::DEFAULT_IMAGE
+    }
+    fn snapshot_image<'a>(&self, template: &'a str) -> Option<&'a str> {
+        digitalocean::snapshot_image(template)
+    }
+    fn servers_url(&self, base: &str) -> String {
+        digitalocean::droplets_url(base)
+    }
+    fn server_url(&self, base: &str, id: &str) -> String {
+        digitalocean::droplet_url(base, id)
+    }
+    fn list_url(&self, base: &str) -> String {
+        digitalocean::list_url(base)
+    }
+    fn ssh_keys_url(&self, base: &str) -> String {
+        digitalocean::ssh_keys_url(base)
+    }
+    fn shutdown_url(&self, base: &str, id: &str) -> String {
+        digitalocean::droplet_actions_url(base, id)
+    }
+    fn shutdown_body(&self) -> serde_json::Value {
+        digitalocean::shutdown_body()
+    }
+    fn create_body(
+        &self,
+        name: &str,
+        size: &str,
+        image: &str,
+        region: &str,
+        ssh_key_ids: &[i64],
+        user_data: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> serde_json::Value {
+        digitalocean::create_body(name, size, image, region, ssh_key_ids, user_data, labels)
+    }
+    fn ssh_key_body(&self, name: &str, pubkey: &str) -> serde_json::Value {
+        digitalocean::ssh_key_body(name, pubkey)
+    }
+    fn parse_create(&self, v: &serde_json::Value) -> Option<VpsInstance> {
+        digitalocean::parse_droplet_envelope(v)
+    }
+    fn parse_get(&self, v: &serde_json::Value) -> Option<VpsInstance> {
+        digitalocean::parse_droplet_envelope(v)
+    }
+    fn parse_server_list(&self, v: &serde_json::Value) -> Vec<VpsInstance> {
+        digitalocean::parse_droplet_list(v)
+    }
+    fn parse_ssh_keys(&self, v: &serde_json::Value) -> Vec<(i64, String)> {
+        digitalocean::parse_ssh_keys(v)
+    }
+    fn parse_ssh_key_created(&self, v: &serde_json::Value) -> Option<i64> {
+        digitalocean::parse_ssh_key_created(v)
+    }
 }
 
 /// A stable, short label identifying THIS host, attached to every instance as
@@ -138,7 +349,7 @@ impl VpsSpec {
     fn region(&self) -> &str {
         let r = self.region.trim();
         if r.is_empty() {
-            hetzner::DEFAULT_LOCATION
+            self.kind.shaper().default_region()
         } else {
             r
         }
@@ -147,7 +358,7 @@ impl VpsSpec {
     fn size(&self) -> &str {
         let s = self.size.trim();
         if s.is_empty() {
-            hetzner::DEFAULT_SERVER_TYPE
+            self.kind.shaper().default_size()
         } else {
             s
         }
@@ -156,12 +367,13 @@ impl VpsSpec {
     /// `(image argument, is_snapshot)` — a baked snapshot skips the cloud-init
     /// prereq installs.
     fn image(&self) -> (String, bool) {
-        if let Some(id) = hetzner::snapshot_image(&self.image) {
+        let shaper = self.kind.shaper();
+        if let Some(id) = shaper.snapshot_image(&self.image) {
             return (id.to_string(), true);
         }
         let i = self.image.trim();
         if i.is_empty() {
-            (hetzner::DEFAULT_IMAGE.to_string(), false)
+            (shaper.default_image().to_string(), false)
         } else {
             (i.to_string(), false)
         }
@@ -201,10 +413,14 @@ impl VpsProvider {
         &self.spec
     }
 
+    fn shaper(&self) -> &'static dyn VpsShaper {
+        self.spec.kind.shaper()
+    }
+
     fn labels(&self) -> BTreeMap<String, String> {
         let mut l = BTreeMap::new();
-        l.insert(hetzner::MANAGED_LABEL.into(), hetzner::MANAGED_VALUE.into());
-        l.insert(hetzner::HOST_LABEL.into(), host_label());
+        l.insert(MANAGED_KEY.into(), MANAGED_VAL.into());
+        l.insert(HOST_KEY.into(), host_label());
         l
     }
 
@@ -245,9 +461,9 @@ impl VpsProvider {
     /// ips/creation times — the reaper's view.
     pub async fn list_detailed(&self) -> Result<Vec<VpsInstance>> {
         let body = self
-            .get_json(&hetzner::list_url(&self.spec.api_base()))
+            .get_json(&self.shaper().list_url(&self.spec.api_base()))
             .await?;
-        Ok(hetzner::parse_server_list(&body))
+        Ok(self.shaper().parse_server_list(&body))
     }
 
     /// Find one managed instance by name.
@@ -262,20 +478,30 @@ impl VpsProvider {
     /// Ensure the managed public key is registered, returning its vendor id.
     async fn ensure_ssh_key(&self) -> Result<i64> {
         let base = self.spec.api_base();
-        let listed = self.get_json(&hetzner::ssh_keys_url(&base)).await?;
-        if let Some((id, _)) = hetzner::parse_ssh_keys(&listed)
+        let shaper = self.shaper();
+        let listed = self.get_json(&shaper.ssh_keys_url(&base)).await?;
+        if let Some((id, _)) = shaper
+            .parse_ssh_keys(&listed)
             .into_iter()
-            .find(|(_, pk)| hetzner::same_pubkey(pk, &self.spec.pubkey))
+            .find(|(_, pk)| same_pubkey(pk, &self.spec.pubkey))
         {
             return Ok(id);
         }
+        // Name the registered key by its material fingerprint, not a fixed
+        // "superzej-managed": vendor key names must be unique, so a fixed name
+        // would 409 the moment the managed key material differs from an
+        // already-registered same-named key (key rotation, or a stale key from a
+        // reinstall). Keyed by fingerprint, distinct material ⇒ distinct name,
+        // and identical material is already served by the `same_pubkey` fast path.
+        let fp = superzej_core::util::short_hash(self.spec.pubkey.trim(), 8);
         let created = self
             .post_json(
-                &hetzner::ssh_keys_url(&base),
-                &hetzner::ssh_key_body("superzej-managed", self.spec.pubkey.trim()),
+                &shaper.ssh_keys_url(&base),
+                &shaper.ssh_key_body(&format!("superzej-managed-{fp}"), self.spec.pubkey.trim()),
             )
             .await?;
-        hetzner::parse_ssh_key_created(&created)
+        shaper
+            .parse_ssh_key_created(&created)
             .ok_or_else(|| anyhow!("vps: no ssh key id in response: {created}"))
     }
 
@@ -327,8 +553,8 @@ impl VpsProvider {
         let base = self.spec.api_base();
         let start = std::time::Instant::now();
         loop {
-            let body = self.get_json(&hetzner::server_url(&base, id)).await?;
-            if let Some(s) = hetzner::parse_get(&body)
+            let body = self.get_json(&self.shaper().server_url(&base, id)).await?;
+            if let Some(s) = self.shaper().parse_get(&body)
                 && s.running
                 && s.ip.is_some()
             {
@@ -396,18 +622,17 @@ impl VpsProvider {
             .await?
             .ok_or_else(|| anyhow!("vps: instance {name} not found"))?;
         let base = self.spec.api_base();
+        let shaper = self.shaper();
         self.post_json(
-            &hetzner::shutdown_url(&base, &inst.id),
-            &serde_json::json!({}),
+            &shaper.shutdown_url(&base, &inst.id),
+            &shaper.shutdown_body(),
         )
         .await?;
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
         let start = std::time::Instant::now();
         loop {
-            let body = self.get_json(&hetzner::server_url(&base, &inst.id)).await?;
-            let running = hetzner::parse_get(&body)
-                .map(|s| s.running)
-                .unwrap_or(false);
+            let body = self.get_json(&shaper.server_url(&base, &inst.id)).await?;
+            let running = shaper.parse_get(&body).map(|s| s.running).unwrap_or(false);
             if !running {
                 return Ok(());
             }
@@ -419,22 +644,66 @@ impl VpsProvider {
     }
 
     /// Snapshot the (stopped) instance, returning the vendor image id — the
-    /// `template = "snapshot:<id>"` value `image bake` prints.
+    /// `template = "snapshot:<id>"` value `image bake` prints. Hetzner returns
+    /// the id synchronously; DigitalOcean's snapshot is an async action (see
+    /// [`Self::snapshot_do`]).
     pub async fn snapshot(&self, name: &str, description: &str) -> Result<String> {
         let inst = self
             .find_by_name(name)
             .await?
             .ok_or_else(|| anyhow!("vps: instance {name} not found"))?;
         let base = self.spec.api_base();
-        let body = self
+        match self.spec.kind {
+            VpsKind::Hetzner => {
+                let body = self
+                    .post_json(
+                        &hetzner::create_image_url(&base, &inst.id),
+                        &hetzner::create_image_body(description),
+                    )
+                    .await?;
+                hetzner::parse_image_created(&body)
+                    .map(|id| id.to_string())
+                    .ok_or_else(|| anyhow!("vps: no image id in snapshot response: {body}"))
+            }
+            VpsKind::DigitalOcean => self.snapshot_do(&base, &inst.id, description).await,
+        }
+    }
+
+    /// DigitalOcean snapshots are asynchronous: POST the snapshot action, poll it
+    /// to completion, then read the newest `snapshot_ids` off the Droplet.
+    async fn snapshot_do(&self, base: &str, id: &str, name: &str) -> Result<String> {
+        let action = self
             .post_json(
-                &hetzner::create_image_url(&base, &inst.id),
-                &hetzner::create_image_body(description),
+                &digitalocean::droplet_actions_url(base, id),
+                &digitalocean::snapshot_body(name),
             )
             .await?;
-        hetzner::parse_image_created(&body)
-            .map(|id| id.to_string())
-            .ok_or_else(|| anyhow!("vps: no image id in snapshot response: {body}"))
+        let (action_id, mut status) = digitalocean::parse_action(&action)
+            .ok_or_else(|| anyhow!("vps: no action in DO snapshot response: {action}"))?;
+        // Snapshotting a fresh dev image takes minutes; poll bounded.
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+        let start = std::time::Instant::now();
+        while status != "completed" {
+            if status == "errored" {
+                return Err(anyhow!("vps: DO snapshot action {action_id} errored"));
+            }
+            if start.elapsed() >= BUDGET {
+                return Err(anyhow!(
+                    "vps: DO snapshot action {action_id} not complete after {}s",
+                    BUDGET.as_secs()
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let a = self
+                .get_json(&digitalocean::action_url(base, &action_id))
+                .await?;
+            status = digitalocean::parse_action(&a)
+                .map(|(_, s)| s)
+                .unwrap_or(status);
+        }
+        let droplet = self.get_json(&digitalocean::droplet_url(base, id)).await?;
+        digitalocean::parse_latest_snapshot_id(&droplet)
+            .ok_or_else(|| anyhow!("vps: no snapshot id on droplet {id} after snapshot"))
     }
 }
 
@@ -470,7 +739,8 @@ impl RemoteProvider for VpsProvider {
         })?;
 
         let base = self.spec.api_base();
-        let body = hetzner::create_body(
+        let shaper = self.shaper();
+        let body = shaper.create_body(
             &name,
             self.spec.size(),
             &image,
@@ -479,7 +749,7 @@ impl RemoteProvider for VpsProvider {
             &user_data,
             &self.labels(),
         );
-        let created = match self.post_json(&hetzner::servers_url(&base), &body).await {
+        let created = match self.post_json(&shaper.servers_url(&base), &body).await {
             Ok(v) => v,
             Err(e) => {
                 // A definite API rejection means no instance exists — clear the
@@ -491,7 +761,8 @@ impl RemoteProvider for VpsProvider {
                 return Err(e);
             }
         };
-        let inst = hetzner::parse_create(&created)
+        let inst = shaper
+            .parse_create(&created)
             .ok_or_else(|| anyhow!("vps: no server in create response: {created}"))?;
 
         let (ip, instance_id, created_at) = if self.spec.skip_ready_wait {
@@ -546,7 +817,7 @@ impl RemoteProvider for VpsProvider {
         // the sprites destroy).
         const ATTEMPTS: u32 = 3;
         let base = self.spec.api_base();
-        let url = hetzner::server_url(&base, &iid);
+        let url = self.shaper().server_url(&base, &iid);
         let mut last_status = None;
         for attempt in 0..ATTEMPTS {
             let resp = self
@@ -631,10 +902,55 @@ mod tests {
     fn kind_parse_and_defaults() {
         assert_eq!(VpsKind::parse("hetzner"), Some(VpsKind::Hetzner));
         assert_eq!(VpsKind::parse(" hetzner "), Some(VpsKind::Hetzner));
+        assert_eq!(VpsKind::parse("digitalocean"), Some(VpsKind::DigitalOcean));
         assert_eq!(VpsKind::parse("sprites"), None);
         assert!(is_vps_provider("hetzner"));
+        assert!(is_vps_provider("digitalocean"));
         assert!(!is_vps_provider("daytona"));
         assert_eq!(VpsKind::Hetzner.token_env_default(), "HCLOUD_TOKEN");
+        assert_eq!(
+            VpsKind::DigitalOcean.token_env_default(),
+            "DIGITALOCEAN_TOKEN"
+        );
+        assert_eq!(VpsKind::DigitalOcean.as_str(), "digitalocean");
+    }
+
+    #[test]
+    fn digitalocean_spec_defaults_route_through_shaper() {
+        let spec = VpsSpec {
+            kind: VpsKind::DigitalOcean,
+            api_base: String::new(),
+            token: "t".into(),
+            name: "n".into(),
+            region: String::new(),
+            size: String::new(),
+            image: String::new(),
+            max_instances: 0,
+            max_lifetime_secs: 0,
+            key_path: "/k".into(),
+            pubkey: "ssh-ed25519 A".into(),
+            skip_ready_wait: true,
+        };
+        assert_eq!(spec.api_base(), digitalocean::DEFAULT_API_BASE);
+        assert_eq!(spec.region(), "nyc3");
+        assert_eq!(spec.size(), "s-1vcpu-2gb");
+        assert_eq!(spec.image(), ("ubuntu-24-04-x64".to_string(), false));
+        // Snapshot template still flips the keys-only cloud-init flag.
+        let snap = VpsSpec {
+            image: "snapshot:555".into(),
+            ..spec
+        };
+        assert_eq!(snap.image(), ("555".to_string(), true));
+    }
+
+    #[test]
+    fn same_pubkey_ignores_comment() {
+        assert!(same_pubkey(
+            "ssh-ed25519 AAAAC3 superzej",
+            "ssh-ed25519 AAAAC3 imported-2024"
+        ));
+        assert!(!same_pubkey("ssh-ed25519 AAAAC3 x", "ssh-ed25519 BBBBB4 x"));
+        assert!(!same_pubkey("garbage", "ssh-ed25519 AAAAC3 x"));
     }
 
     #[test]
@@ -655,7 +971,7 @@ mod tests {
         };
         assert_eq!(spec.api_base(), hetzner::DEFAULT_API_BASE);
         assert_eq!(spec.region(), "fsn1");
-        assert_eq!(spec.size(), "cx22");
+        assert_eq!(spec.size(), "cx23");
         assert_eq!(spec.image(), ("ubuntu-24.04".to_string(), false));
         assert_eq!(
             spec.max_instances(),

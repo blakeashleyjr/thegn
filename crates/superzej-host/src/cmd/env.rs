@@ -175,9 +175,25 @@ fn api_provider(
                     anyhow::anyhow!("the {vps} API token env var {key:?} is not set")
                 })
         }
+        "fly" => {
+            // Same resolved-id contract as the VPS arm: create/destroy must name
+            // the machine the panes attach to.
+            let id = match &env.placement {
+                superzej_core::placement::Placement::Provider(p) => p.id.clone(),
+                _ => String::new(),
+            };
+            crate::provider_factory::provider_for_named(pc, &id).ok_or_else(|| {
+                let key = if pc.api_key_env.trim().is_empty() {
+                    "FLY_API_TOKEN"
+                } else {
+                    pc.api_key_env.trim()
+                };
+                anyhow::anyhow!("the Fly API token env var {key:?} is not set")
+            })
+        }
         other => anyhow::bail!(
-            "API provisioning supports 'daytona', 'sprites', and VPS kinds \
-             (hetzner); env {} uses {:?}",
+            "API provisioning supports 'daytona', 'sprites', 'fly', and VPS kinds \
+             (hetzner, digitalocean); env {} uses {:?}",
             env.name,
             other
         ),

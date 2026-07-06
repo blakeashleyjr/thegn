@@ -167,7 +167,7 @@ fn create_list_destroy_round_trip_with_ledger() {
     );
     let body: serde_json::Value = serde_json::from_str(&create.body).unwrap();
     assert_eq!(body["name"], "sz-mock-1");
-    assert_eq!(body["server_type"], "cx22");
+    assert_eq!(body["server_type"], "cx23");
     assert_eq!(body["image"], "ubuntu-24.04");
     assert_eq!(body["ssh_keys"], serde_json::json!([42]));
     assert_eq!(body["labels"]["managed-by"], "superzej");

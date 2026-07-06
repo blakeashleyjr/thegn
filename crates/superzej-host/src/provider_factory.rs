@@ -3,6 +3,7 @@
 //! `agent.rs` (file-size ratchet); re-exported from `crate::agent` so call
 //! sites are unchanged.
 
+use superzej_svc::fly::{FlyProvider, FlySpec};
 use superzej_svc::provider::{DaytonaProvider, Provider, SpritesProvider};
 
 /// Build the API provider for an env's provider config (best-effort: `None` if
@@ -48,6 +49,42 @@ pub(crate) fn provider_for_named(
         }
         vps if superzej_core::config::vps_provider_kind(vps) => {
             vps_provider_for(pc, name).map(Provider::Vps)
+        }
+        "fly" => {
+            let key = if pc.api_key_env.trim().is_empty() {
+                "FLY_API_TOKEN"
+            } else {
+                pc.api_key_env.trim()
+            };
+            let token = std::env::var(key).ok()?;
+            // The same managed keypair the VPS ssh transport uses — Fly reaches
+            // its machine over plain ssh (dedicated IPv4 + guest sshd).
+            let (key_path, pubkey) = match crate::agent::sprite_ssh_keypair() {
+                Ok(k) => k,
+                Err(e) => {
+                    superzej_core::msg::warn(&format!(
+                        "fly: managed ssh key generation failed ({e}); cannot drive fly"
+                    ));
+                    return None;
+                }
+            };
+            // org defaults to "personal"; template ⇒ image. A stopped Fly machine
+            // is near-free, so it's scale-to-zero.
+            Some(Provider::Fly(FlyProvider::new(FlySpec {
+                api_base: pc.api_base.clone(),
+                graphql_url: String::new(),
+                token,
+                org_slug: String::new(),
+                name: name.to_string(),
+                region: pc.region.clone(),
+                size: pc.size.clone(),
+                image: pc.template.clone(),
+                max_instances: pc.max_instances,
+                max_lifetime_secs: pc.max_lifetime_secs,
+                key_path,
+                pubkey,
+                skip_ready_wait: false,
+            })))
         }
         _ => None,
     }

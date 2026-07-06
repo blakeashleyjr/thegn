@@ -303,11 +303,11 @@ impl EnvProviderConfig {
     }
 }
 
-/// Whether `name` names a commodity-VPS provider kind (Hetzner today;
-/// DigitalOcean/Vultr as their adapters land). The core-side mirror of
+/// Whether `name` names a commodity-VPS provider kind (Hetzner + DigitalOcean;
+/// Vultr as its adapter lands). The core-side mirror of
 /// `superzej_svc::vps::is_vps_provider` — keep the two lists in sync.
 pub fn vps_provider_kind(name: &str) -> bool {
-    matches!(name.trim(), "hetzner")
+    matches!(name.trim(), "hetzner" | "digitalocean")
 }
 
 /// Whether a provider *kind* is **scale-to-zero**: an idle sandbox self-suspends
@@ -315,13 +315,14 @@ pub fn vps_provider_kind(name: &str) -> bool {
 /// persists). This is the single source of truth the warm-pool policy consults
 /// (`superzej_svc::provider::ProviderCaps::scale_to_zero` mirrors it by kind).
 ///
-/// Only `sprites` qualifies today (Fly's scale-to-zero Firecracker microVMs: a
-/// ~30s idle timeout, zero idle compute charge). Everything else — VPS (a
-/// powered-off instance still bills), Daytona (no confirmed free idle), unknown
-/// kinds — is **false** on purpose: a wrong `false` merely keeps the safe
-/// age-out behavior, while a wrong `true` would park billed instances forever.
+/// `sprites` (Fly's scale-to-zero Firecracker microVMs: a ~30s idle timeout,
+/// zero idle compute charge) and `fly` (a stopped Fly machine bills only for its
+/// rootfs, and start/stop is fast) qualify. Everything else — VPS (a powered-off
+/// instance still bills), Daytona (no confirmed free idle), unknown kinds — is
+/// **false** on purpose: a wrong `false` merely keeps the safe age-out behavior,
+/// while a wrong `true` would park billed instances forever.
 pub fn provider_scale_to_zero(name: &str) -> bool {
-    matches!(name.trim(), "sprites")
+    matches!(name.trim(), "sprites" | "fly")
 }
 
 /// `[metrics]` — Prometheus scrape targets for sidebar metrics display.
