@@ -359,9 +359,9 @@ pub const BUILTINS: &[Action] = &[
         chords: &["Ctrl Alt f"],
         menu_label: "File drawer (yazi)",
         hint: "drawer",
-        // Spawn/close a bottom-anchored floating yazi rooted at the focused
-        // worktree; `superzej files` self-toggles (closes via the statusbar's
-        // `superzej_close_files` pipe when already open).
+        // Legacy registry entry. At runtime the host compositor owns the bottom
+        // drawer natively (`Action::ToggleDrawer`, Ctrl+Alt+f / Alt+y — a pooled
+        // toggle), shadowing this invocation; kept only for the shared registry.
         invocation: run_float!("files"),
         scope: Scope::Shared,
         contexts: &[Context::Global],

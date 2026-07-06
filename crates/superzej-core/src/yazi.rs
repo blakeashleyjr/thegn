@@ -35,6 +35,21 @@ const THEME_TMPL: &str = include_str!("../../../config/yazi/theme.toml");
 /// The vendored `git.yazi` plugin (MIT, yazi-rs), seeded so the drawer can show
 /// git status as a linemode (item 606).
 const GIT_PLUGIN_LUA: &str = include_str!("../../../config/yazi/plugins/git.yazi/main.lua");
+
+/// The drawer-control plugins: tiny emitters that write superzej's private
+/// `OSC 5379` command on yazi's own PTY so the host can drive the chrome while
+/// yazi keeps ownership of every key (see `keymap.toml` + host `drawer_command`).
+/// Derived state — always refreshed like `git.yazi`, never user config.
+const DRAWER_PLUGINS: &[(&str, &str)] = &[
+    (
+        "sz-drawer-close.yazi",
+        include_str!("../../../config/yazi/plugins/sz-drawer-close.yazi/main.lua"),
+    ),
+    (
+        "sz-drawer-editor.yazi",
+        include_str!("../../../config/yazi/plugins/sz-drawer-editor.yazi/main.lua"),
+    ),
+];
 const GIT_POLICY_BEGIN: &str = "# BEGIN SUPERZEJ MANAGED GIT STATUS POLICY";
 const GIT_POLICY_END: &str = "# END SUPERZEJ MANAGED GIT STATUS POLICY";
 /// `prepend_fetchers` registering the git plugin. Array-of-tables syntax so it
@@ -99,9 +114,31 @@ pub fn ensure_config(cfg: &Config) -> Option<PathBuf> {
     seed_once(&dir, "yazi.toml", YAZI_TOML);
     apply_image_preview_policy(&dir, cfg.drawer.image_previews);
     apply_git_status_policy(&dir, cfg.drawer.git_status);
+    apply_drawer_control(&dir);
     seed_once(&dir, "keymap.toml", KEYMAP_TOML);
     write_theme(&dir, &cfg.accent_hex());
     Some(dir)
+}
+
+/// (Re)write the drawer-control plugins (derived state) and migrate a stale
+/// keymap: earlier builds seeded `keymap.toml` bindings that shelled out to
+/// removed `superzej files`/`superzej tool` subcommands. `keymap.toml` is
+/// seed-once (user-editable), so drop it when it still carries those dead
+/// commands — the caller's `seed_once` then rewrites the current, plugin-based
+/// bindings. A user's own keymap (without those strings) is left untouched.
+fn apply_drawer_control(dir: &std::path::Path) {
+    let pdir = dir.join("plugins");
+    for (name, lua) in DRAWER_PLUGINS {
+        let p = pdir.join(name);
+        let _ = std::fs::create_dir_all(&p);
+        let _ = std::fs::write(p.join("main.lua"), lua);
+    }
+    let keymap = dir.join("keymap.toml");
+    if let Ok(body) = std::fs::read_to_string(&keymap)
+        && (body.contains("superzej files") || body.contains("superzej tool"))
+    {
+        let _ = std::fs::remove_file(&keymap);
+    }
 }
 
 /// Add or remove superzej's managed git-status integration (item 606). When
@@ -298,6 +335,68 @@ mod tests {
         let theme = std::fs::read_to_string(dir.join("theme.toml")).unwrap();
         assert!(theme.contains("#abcdef"));
         assert!(!theme.contains("{{ACCENT}}"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_seeds_drawer_control_plugins_and_keymap() {
+        let dir = tmpdir();
+        let cfg = cfg_with("", dir.to_str().unwrap());
+        ensure_config(&cfg).unwrap();
+
+        // Both control plugins are vendored under plugins/.
+        for name in ["sz-drawer-close.yazi", "sz-drawer-editor.yazi"] {
+            let lua = dir.join("plugins").join(name).join("main.lua");
+            assert!(lua.exists(), "{name} seeded");
+            assert!(std::fs::read_to_string(&lua).unwrap().contains("5379"));
+        }
+        // The seeded keymap drives the plugins, not any removed subcommand.
+        let keymap = std::fs::read_to_string(dir.join("keymap.toml")).unwrap();
+        assert!(keymap.contains("plugin sz-drawer-close"));
+        assert!(keymap.contains("plugin sz-drawer-editor"));
+        assert!(!keymap.contains("superzej files"));
+        assert!(!keymap.contains("superzej tool"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_migrates_stale_keymap_with_dead_commands() {
+        let dir = tmpdir();
+        let cfg = cfg_with("", dir.to_str().unwrap());
+        // Simulate a config seeded by an older build (dead `superzej …` shell).
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("keymap.toml"),
+            "[mgr]\nprepend_keymap = [\n  { on = \"q\", run = 'shell \"superzej files --close\" --orphan' },\n]\n",
+        )
+        .unwrap();
+
+        ensure_config(&cfg).unwrap();
+        let keymap = std::fs::read_to_string(dir.join("keymap.toml")).unwrap();
+        assert!(
+            !keymap.contains("superzej files"),
+            "dead binding migrated out"
+        );
+        assert!(
+            keymap.contains("plugin sz-drawer-close"),
+            "fresh binding seeded"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_keeps_a_custom_user_keymap() {
+        let dir = tmpdir();
+        let cfg = cfg_with("", dir.to_str().unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        // A user keymap without our dead strings must survive untouched.
+        std::fs::write(dir.join("keymap.toml"), "# my keys\n").unwrap();
+
+        ensure_config(&cfg).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("keymap.toml")).unwrap(),
+            "# my keys\n",
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -190,8 +190,9 @@ max_body_bytes = 1048576 # Max response size (1 MiB)
 #]
 # labels = { instance = "local" } # optional exact-match labels
 
-# Bottom file-manager drawer (hidden by default; toggle with Ctrl+Alt+f). Runs a
-# pinned, bundled yazi with its own config kept separate from the system.
+# Bottom file-manager drawer (hidden by default; toggle with Ctrl+Alt+f or
+# Alt+y). Runs a pinned, bundled yazi with its own config kept separate from the
+# system. Inside the drawer, `q` closes it and `<C-e>` opens the hovered file.
 [drawer]
 # File manager to run. Empty = the bundled, pinned yazi.
 command = ""
@@ -218,10 +219,11 @@ memory_swap_max = "512M"
 cpu_quota = "200%"
 # Hidden-drawer keepalive: pool_limit caps how many hidden yazi panes are kept
 # warm (oldest evicted past the limit; 0 = hide kills the pane). prewarm spawns a
-# hidden drawer per worktree so the first toggle is instant — off by default so
-# invisible yazi instances never accumulate unbidden.
+# hidden drawer for the ACTIVE worktree so even the first open is instant — on by
+# default (one memory-capped yazi at a time); set false to never spawn an
+# unopened yazi.
 pool_limit = 1
-prewarm = false
+prewarm = true
 
 # GitHub PR data feeding the right panel.
 [pr]

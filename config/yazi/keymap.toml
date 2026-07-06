@@ -2,12 +2,18 @@
 # keys while every default yazi binding still works. If this file fails to parse
 # yazi falls back to its presets (so the drawer still works; only these extras
 # are lost).
+#
+# Both bindings drive the superzej host over a private OSC channel emitted by the
+# bundled sz-drawer plugins (see plugins/sz-drawer-*.yazi and
+# superzej-core/src/yazi.rs). Living under [mgr] they fire only in yazi's manager
+# mode, so `q`/`<C-e>` stay literal while typing in rename/filter/find inputs —
+# the host no longer intercepts keys, yazi owns them all.
 
 [mgr]
 prepend_keymap = [
-  # Quit closes the superzej drawer (records the dismiss so it doesn't reopen on
-  # the next restore, then removes the pane via the statusbar controller).
-  { on = "q", run = 'shell "superzej files --close" --orphan', desc = "Close the superzej drawer" },
-  # Open the hovered file in the superzej editor surface.
-  { on = "<C-e>", run = 'shell "superzej tool editor --file $@" --orphan', desc = "Open in the superzej editor" },
+  # Close the superzej drawer. yazi keeps running, hidden in the keep-alive pool,
+  # so its cursor position survives the next open.
+  { on = "q", run = "plugin sz-drawer-close", desc = "Close the superzej drawer" },
+  # Open the hovered file in the superzej editor surface (a fresh center tab).
+  { on = "<C-e>", run = "plugin sz-drawer-editor", desc = "Open in the superzej editor" },
 ]

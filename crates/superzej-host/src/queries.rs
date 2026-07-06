@@ -191,6 +191,57 @@ pub fn osc_passthrough(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A private control message the bundled yazi drawer emits back to the host on
+/// its own PTY stream via `OSC 5379`. yazi owns all its keys (so `q`/`Esc` stay
+/// literal in its input fields); these commands let a yazi keybind drive the
+/// host chrome without the host having to intercept — and mis-steal — keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrawerCmd {
+    /// Hide the drawer into the keep-alive pool (yazi keeps running; position
+    /// survives the reopen). Bound to `q` in yazi's manager mode.
+    Close,
+    /// Open this (absolute) path in the center editor tab. Bound to `<C-e>`.
+    Editor(String),
+}
+
+/// Private OSC number for the drawer→host control channel. Chosen high to avoid
+/// colliding with any standard OSC; the vt100 emulator ignores it on `feed`.
+const DRAWER_OSC: &[u8] = b"5379;";
+
+/// Scan a drawer pane's output chunk for the first `OSC 5379;<cmd>` control
+/// message and decode it. Returns `None` for ordinary output. Only called for
+/// bytes from the drawer pane, so unrelated OSCs never reach here.
+pub fn drawer_command(bytes: &[u8]) -> Option<DrawerCmd> {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b']' {
+            let body = &bytes[i + 2..];
+            if let Some((seq, len)) = osc_seq(body) {
+                if let Some(rest) = seq.strip_prefix(DRAWER_OSC) {
+                    return decode_drawer_cmd(rest);
+                }
+                i += 2 + len;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn decode_drawer_cmd(rest: &[u8]) -> Option<DrawerCmd> {
+    if rest == b"close" {
+        return Some(DrawerCmd::Close);
+    }
+    if let Some(path) = rest.strip_prefix(b"editor;") {
+        let path = String::from_utf8_lossy(path).into_owned();
+        if !path.is_empty() {
+            return Some(DrawerCmd::Editor(path));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +294,33 @@ mod tests {
         // ST-terminated form too.
         let st = b"\x1b]52;c;eA==\x1b\\";
         assert_eq!(osc_passthrough(st), st);
+    }
+
+    #[test]
+    fn drawer_command_decodes_close_and_editor() {
+        // BEL-terminated close.
+        assert_eq!(
+            drawer_command(b"\x1b]5379;close\x07"),
+            Some(DrawerCmd::Close)
+        );
+        // ST-terminated editor with an absolute path, framed by ordinary output.
+        assert_eq!(
+            drawer_command(b"noise\x1b]5379;editor;/home/u/a q.rs\x1b\\more"),
+            Some(DrawerCmd::Editor("/home/u/a q.rs".into()))
+        );
+    }
+
+    #[test]
+    fn drawer_command_ignores_unrelated_or_malformed() {
+        // A different OSC number is not ours.
+        assert_eq!(drawer_command(b"\x1b]52;c;aGk=\x07"), None);
+        // Unterminated sequence: no command yet.
+        assert_eq!(drawer_command(b"\x1b]5379;close"), None);
+        // Unknown verb / empty editor path.
+        assert_eq!(drawer_command(b"\x1b]5379;bogus\x07"), None);
+        assert_eq!(drawer_command(b"\x1b]5379;editor;\x07"), None);
+        // Ordinary output.
+        assert_eq!(drawer_command(b"just some text\r\n"), None);
     }
 
     #[test]

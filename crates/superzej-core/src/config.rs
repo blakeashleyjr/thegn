@@ -3573,7 +3573,9 @@ pub struct DrawerConfig {
     pub cpu_quota: String,
     /// Maximum hidden drawers to keep alive in native hosts. Zero disables pooling.
     pub pool_limit: usize,
-    /// Whether yazi drawers may be prewarmed before the user opens them.
+    /// Whether the active worktree's yazi drawer is prewarmed (spawned hidden in
+    /// the pool) before the user opens it, so even the first open is instant. On
+    /// by default; set false to never spawn an unopened yazi.
     pub prewarm: bool,
 }
 
@@ -3591,7 +3593,7 @@ impl Default for DrawerConfig {
             memory_swap_max: "512M".into(),
             cpu_quota: "200%".into(),
             pool_limit: 1,
-            prewarm: false,
+            prewarm: true,
         }
     }
 }
@@ -6047,7 +6049,7 @@ name = "minimal"
         assert_eq!(d.memory_swap_max, "512M");
         assert_eq!(d.cpu_quota, "200%");
         assert_eq!(d.pool_limit, 1);
-        assert!(!d.prewarm);
+        assert!(d.prewarm);
     }
 
     #[test]
@@ -6062,13 +6064,13 @@ name = "minimal"
         assert_eq!(cfg.drawer.memory_swap_max, "512M");
         assert_eq!(cfg.drawer.cpu_quota, "200%");
         assert_eq!(cfg.drawer.pool_limit, 1);
-        assert!(!cfg.drawer.prewarm);
+        assert!(cfg.drawer.prewarm);
     }
 
     #[test]
     fn drawer_section_overrides_parse() {
         let cfg: Config = toml::from_str(
-            "[drawer]\ncommand = \"ranger\"\nconfig_home = \"system\"\nheight = \"50%\"\nwidth = \"center\"\nimage_previews = true\ncontain = false\nmemory_max = \"4G\"\nmemory_swap_max = \"0\"\ncpu_quota = \"50%\"\npool_limit = 0\nprewarm = true\n",
+            "[drawer]\ncommand = \"ranger\"\nconfig_home = \"system\"\nheight = \"50%\"\nwidth = \"center\"\nimage_previews = true\ncontain = false\nmemory_max = \"4G\"\nmemory_swap_max = \"0\"\ncpu_quota = \"50%\"\npool_limit = 0\nprewarm = false\n",
         )
         .unwrap();
         assert_eq!(cfg.drawer.command, "ranger");
@@ -6081,7 +6083,7 @@ name = "minimal"
         assert_eq!(cfg.drawer.memory_swap_max, "0");
         assert_eq!(cfg.drawer.cpu_quota, "50%");
         assert_eq!(cfg.drawer.pool_limit, 0);
-        assert!(cfg.drawer.prewarm);
+        assert!(!cfg.drawer.prewarm);
     }
 
     #[test]
@@ -6094,7 +6096,7 @@ name = "minimal"
         assert!(!cfg.drawer.image_previews);
         assert!(cfg.drawer.contain);
         assert_eq!(cfg.drawer.pool_limit, 1);
-        assert!(!cfg.drawer.prewarm);
+        assert!(cfg.drawer.prewarm);
     }
 
     #[test]
