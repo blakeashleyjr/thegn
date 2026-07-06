@@ -85,14 +85,25 @@ pub(crate) fn request_group_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<usize
 /// state, preserving focus across index shifts by stable group name.
 /// `delete_groups` sorts targets descending internally, so no pre-sort here.
 fn perform_delete(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
+    // Remember the active group's name AND workspace slug up front: `delete_groups`
+    // removes groups and leaves `session.active` pointing at whatever slid into the
+    // deleted slot — which may be a Terminal.
     let active_name = cx.session.active_group().map(|g| g.name.clone());
+    let active_slug = active_name
+        .as_deref()
+        .and_then(|n| crate::sidebar::split_tab(n).map(|(s, _)| s));
 
     cx.model.status =
         crate::run::delete_groups(cx.session, cx.panes, targets, false, Some(cx.waker.clone()));
 
-    if let Some(name) = active_name
-        && let Some(idx) = cx.session.worktrees.iter().position(|g| g.name == name)
-    {
+    // Restore focus: prefer the still-living active group (it survived the delete);
+    // if it was itself deleted, land on the home worktree of its workspace rather
+    // than on whichever terminal happened to slide into the active slot.
+    let target = active_name
+        .as_deref()
+        .and_then(|name| cx.session.worktrees.iter().position(|g| g.name == name))
+        .or_else(|| landing_for_slug(cx.session, active_slug.as_deref()));
+    if let Some(idx) = target {
         cx.session.switch_to(idx);
     }
 
@@ -109,4 +120,97 @@ fn perform_delete(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
         cx.cfg,
         cx.center,
     );
+}
+
+/// Pick a non-terminal group to focus after the active worktree was deleted.
+/// Priority: (1) the home worktree of `slug`, (2) any non-terminal worktree of
+/// `slug`, (3) the first non-terminal group anywhere. A workspace's home is
+/// never deletable (`delete_groups` skips `GroupKind::Home`), so #1 resolves
+/// whenever `slug` is known — this keeps focus in the workspace, never on the
+/// Terminals section.
+fn landing_for_slug(session: &crate::session::Session, slug: Option<&str>) -> Option<usize> {
+    use crate::session::GroupKind;
+    let slug_of = |name: &str| crate::sidebar::split_tab(name).map(|(s, _)| s);
+    if let Some(slug) = slug {
+        // Home of the same workspace first.
+        if let Some(i) = session
+            .worktrees
+            .iter()
+            .position(|g| g.kind == GroupKind::Home && slug_of(&g.name).as_deref() == Some(slug))
+        {
+            return Some(i);
+        }
+        // Any surviving non-terminal worktree of the same workspace.
+        if let Some(i) = session.worktrees.iter().position(|g| {
+            g.kind != GroupKind::Terminal && slug_of(&g.name).as_deref() == Some(slug)
+        }) {
+            return Some(i);
+        }
+    }
+    // Fall back to the first non-terminal group anywhere.
+    session
+        .worktrees
+        .iter()
+        .position(|g| g.kind != GroupKind::Terminal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::landing_for_slug;
+    use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    fn group(name: &str, kind: GroupKind) -> WorktreeGroup {
+        WorktreeGroup::new(name.to_string(), kind, String::new())
+    }
+
+    fn session_with(groups: Vec<WorktreeGroup>) -> Session {
+        let mut s = Session::default();
+        for g in groups {
+            s.add_group(g);
+        }
+        s.active = 0;
+        s
+    }
+
+    #[test]
+    fn lands_on_workspace_home_not_terminal() {
+        // A terminal sits right after the branch worktree being deleted; the
+        // landing must be the workspace's home, never the terminal.
+        let s = session_with(vec![
+            group("app/home", GroupKind::Home),
+            group("term", GroupKind::Terminal),
+        ]);
+        assert_eq!(landing_for_slug(&s, Some("app")), Some(0));
+    }
+
+    #[test]
+    fn prefers_home_over_sibling_branch() {
+        let s = session_with(vec![
+            group("app/other", GroupKind::Branch),
+            group("app/home", GroupKind::Home),
+            group("term", GroupKind::Terminal),
+        ]);
+        assert_eq!(landing_for_slug(&s, Some("app")), Some(1));
+    }
+
+    #[test]
+    fn falls_back_to_first_non_terminal_when_slug_unknown() {
+        let s = session_with(vec![
+            group("term", GroupKind::Terminal),
+            group("app/home", GroupKind::Home),
+        ]);
+        assert_eq!(landing_for_slug(&s, None), Some(1));
+    }
+
+    #[test]
+    fn cross_workspace_home_not_chosen_over_own_branch() {
+        // No home for slug "app" survives, so its own surviving branch wins over
+        // another workspace's home.
+        let s = session_with(vec![
+            group("other/home", GroupKind::Home),
+            group("app/feat", GroupKind::Branch),
+            group("term", GroupKind::Terminal),
+        ]);
+        assert_eq!(landing_for_slug(&s, Some("app")), Some(1));
+    }
 }
