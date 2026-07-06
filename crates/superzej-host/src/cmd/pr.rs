@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use superzej_core::db::Db;
-use superzej_core::github::{self, CreateOpts, MergeMethod, PanelState, PrPanel};
+use superzej_core::github::{self, CreateOpts, MergeMethod, PanelState, PrPanel, ReviewState};
 use superzej_core::remote::GitLoc;
 use superzej_core::store::CacheStore;
 use superzej_core::{msg, outln};
@@ -73,6 +73,30 @@ pub enum Action {
         #[arg(long)]
         worktree: Option<String>,
     },
+    /// Post a PR-level comment.
+    Comment {
+        #[arg(long)]
+        worktree: Option<String>,
+        #[arg(long)]
+        body: String,
+    },
+    /// Submit a review (approve / request-changes / comment).
+    Review {
+        #[arg(long)]
+        worktree: Option<String>,
+        #[arg(long, value_enum)]
+        state: ReviewState,
+        /// Required for request-changes / comment.
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// Print the PR's unified diff (or `--json` for the parsed structure).
+    Diff {
+        #[arg(long)]
+        worktree: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Mark the PR ready for review (or `--undo` back to draft).
     Ready {
         #[arg(long)]
@@ -113,6 +137,13 @@ pub fn run(action: Action) -> Result<()> {
         } => merge(worktree, method, delete_branch, auto),
         Action::RerunChecks { worktree } => rerun(worktree),
         Action::Reviews { worktree } => reviews(worktree),
+        Action::Comment { worktree, body } => comment(worktree, body),
+        Action::Review {
+            worktree,
+            state,
+            body,
+        } => review(worktree, state, body),
+        Action::Diff { worktree, json } => diff(worktree, json),
         Action::Ready { worktree, undo } => ready(worktree, undo),
         Action::AutoMerge { worktree, disable } => auto_merge(worktree, disable),
     }
@@ -237,6 +268,41 @@ fn reviews(worktree: Option<String>) -> Result<()> {
     match github::reviews(&loc) {
         Ok(json) => outln!("{json}"),
         Err(e) => msg::die(&format!("pr reviews failed: {}", github::describe(&e))),
+    }
+    Ok(())
+}
+
+fn comment(worktree: Option<String>, body: String) -> Result<()> {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    match github::comment_pr(&loc, &body) {
+        Ok(()) => msg::info("comment posted"),
+        Err(e) => msg::die(&format!("pr comment failed: {}", github::describe(&e))),
+    }
+    Ok(())
+}
+
+fn review(worktree: Option<String>, state: ReviewState, body: Option<String>) -> Result<()> {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    match github::submit_review(&loc, state, body.as_deref()) {
+        Ok(()) => msg::info("review submitted"),
+        Err(e) => msg::die(&format!("pr review failed: {}", github::describe(&e))),
+    }
+    Ok(())
+}
+
+fn diff(worktree: Option<String>, json: bool) -> Result<()> {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    if json {
+        match github::pr_diff(&loc) {
+            Ok(d) => outln!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()),
+            Err(e) => msg::die(&format!("pr diff failed: {}", github::describe(&e))),
+        }
+    } else {
+        // Raw unified diff, straight from `gh pr diff`.
+        match github::gh_out(&loc, &["pr", "diff"]) {
+            Ok(raw) => outln!("{raw}"),
+            Err(e) => msg::die(&format!("pr diff failed: {}", github::describe(&e))),
+        }
     }
     Ok(())
 }

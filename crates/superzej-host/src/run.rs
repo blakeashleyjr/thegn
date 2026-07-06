@@ -3477,38 +3477,6 @@ fn spawn_fold(
     });
 }
 
-/// Kick a `gh` PR action off the loop; a PR-cache + model refresh follows so
-/// the git section reflects the outcome. Failures are logged (the next
-/// refresh's `pr_note` carries the visible state) rather than blocking.
-fn spawn_pr_action<F>(
-    session: &crate::session::Session,
-    refresh_tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
-    waker: &TerminalWaker,
-    label: &'static str,
-    action: F,
-) where
-    F: FnOnce(&superzej_core::remote::GitLoc) -> Result<(), superzej_core::github::GhError>
-        + Send
-        + 'static,
-{
-    let wt = active_tab_path(session);
-    let tx = refresh_tx.clone();
-    let waker = waker.clone();
-    tokio::task::spawn_blocking(move || {
-        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
-        if let Err(e) = action(&loc) {
-            superzej_core::msg::warn(&format!(
-                "{label} failed: {}",
-                superzej_core::github::describe(&e)
-            ));
-        }
-        // A PR refresh implies a model refresh in the loop's intake.
-        if tx.send(RefreshKind::Pr).is_ok() {
-            let _ = waker.wake();
-        }
-    });
-}
-
 // ---------------------------------------------------------------------------
 // The git mutation pipeline: every lazygit-style write flows through ONE
 // runner — `enqueue_git_op` rejects while one is in flight, runs the op on
@@ -7954,6 +7922,11 @@ async fn event_loop<T: Terminal>(
     // A bar-item detail popup/modal (CPU history graph, notifications list, …),
     // opened by Enter or a click on a focused masthead/statusbar item.
     let mut bar_detail: Option<crate::detail::DetailOverlay> = None;
+    // The full-screen in-app PR workflow view (Enter on the panel PR section).
+    // Its async diff + conversation arrive over `pr_view_tx`; `pr_view_gen`
+    // single-flights those fetches (stale deliveries dropped).
+    let mut pr_view: Option<crate::pr_view::PrView> = None;
+    let mut pr_view_gen: u64 = 0;
     // Transient bottom-anchored notifications ("Text copied to clipboard", …).
     // Each push schedules a one-shot waker pulse so the toast clears on its own
     // even with no further input (the loop never polls on a timer).
@@ -8088,6 +8061,9 @@ async fn event_loop<T: Terminal>(
     let (docs_tx, mut docs_rx) =
         tokio_mpsc::unbounded_channel::<(u64, crate::panel::docs::DocsPayload)>();
     let mut docs_gen: u64 = 0;
+    // The full-screen PR view's async diff + conversation feed.
+    let (pr_view_tx, mut pr_view_rx) =
+        tokio_mpsc::unbounded_channel::<crate::pr_view::PrViewData>();
     // Media (optional [media] feature): the watcher / control ops push now-playing
     // snapshots; the picker tasks push playlist/player lists. The watcher runs
     // only while `[media] enabled`; `restart_media_watch` (re)spawns it on config
@@ -10635,6 +10611,13 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
+        // Full-screen PR view: async diff + conversation (stale gens dropped).
+        while let Ok(data) = pr_view_rx.try_recv() {
+            if crate::actions::apply_pr_view_delivery(pr_view.as_mut(), data) {
+                dirty = true;
+            }
+        }
+
         // Worktree-creation progress from the wizard worker; stale
         // generations (a cancelled run's stragglers) are dropped.
         while let Ok(ev) = create_rx.try_recv() {
@@ -11118,6 +11101,15 @@ async fn event_loop<T: Terminal>(
                 current_config.issues.clone(),
                 current_config.disk.clone(),
                 Some(waker.clone()),
+            );
+            // If the PR view is open, re-fetch it too so a just-posted
+            // comment/review shows up.
+            crate::actions::refetch_pr_view(
+                pr_view.as_mut(),
+                &session,
+                &mut pr_view_gen,
+                &pr_view_tx,
+                &waker,
             );
         }
         if want_issue_refresh {
@@ -12046,6 +12038,10 @@ async fn event_loop<T: Terminal>(
             if let Some(d) = &bar_detail {
                 d.render(&mut scratch, screen);
             }
+            // The full-screen PR view sits at the same modal layer.
+            if let Some(v) = &pr_view {
+                v.render(&mut scratch, screen);
+            }
             let accent = current_config.accent_rgb();
             if !which_key.is_empty() {
                 crate::keyhint::render_which_key(
@@ -12927,6 +12923,22 @@ async fn event_loop<T: Terminal>(
                             .run_detail_action(action, bar_detail.take());
                         }
                     }
+                    dirty = true;
+                    continue;
+                }
+                // The full-screen PR view is a top-priority modal (like the
+                // detail overlay): it owns every key while open. Actions run off
+                // the loop and the view stays open (only Close dismisses it).
+                if pr_view.is_some() {
+                    crate::actions::dispatch_pr_view_key(
+                        &mut pr_view,
+                        &k.key,
+                        k.modifiers,
+                        &session,
+                        &refresh_tx,
+                        &waker,
+                        &mut model,
+                    );
                     dirty = true;
                     continue;
                 }
@@ -15484,38 +15496,17 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Pr => {
-                                            // The cursor walks the DISPLAYED review
-                                            // threads — same filter/cap as the git
-                                            // section's content builder.
-                                            let deep = panel_ui.width.is_expanded();
-                                            let visible = if deep { 4 } else { 2 };
-                                            let target = model
-                                                .panel
-                                                .threads
-                                                .iter()
-                                                .filter(|t| !t.resolved || deep)
-                                                .take(visible)
-                                                .nth(panel_ui.cursor)
-                                                .map(|t| {
-                                                    (t.path.clone(), t.line.map(|l| l as usize))
-                                                });
-                                            if let Some((path, line)) = target {
-                                                let cmd = editor_open_command(
-                                                    keymap.config(),
-                                                    &path,
-                                                    line,
-                                                );
-                                                let cwd = active_cwd(&session);
-                                                open_command_tab(
-                                                    &mut session,
-                                                    &mut panes,
-                                                    &cmd,
-                                                    cwd.as_deref(),
-                                                    chrome.center,
-                                                );
-                                                focus.zone = crate::focus::Zone::Center;
-                                                refresh_tab_model(&mut model, &session, &mut sb);
-                                                need_relayout = true;
+                                            // Enter opens the full-screen in-app PR
+                                            // workflow view; `o` still opens the browser.
+                                            match crate::actions::open_pr_view(
+                                                &model,
+                                                &session,
+                                                &mut pr_view_gen,
+                                                &pr_view_tx,
+                                                &waker,
+                                            ) {
+                                                Some(v) => pr_view = Some(v),
+                                                None => model.status = "No pull request".into(),
                                             }
                                         }
                                         Section::Tests => {
@@ -15926,98 +15917,15 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         // -- git: PR actions via `gh`, off the loop ----------
-                        (Section::Pr, KeyCode::Char('M')) => {
-                            match &model.panel.pr {
-                                Some(pr) => {
-                                    model.status = format!("Merging PR #{} (squash)…", pr.number);
-                                    spawn_pr_action(
-                                        &session,
-                                        &refresh_tx,
-                                        &waker,
-                                        "pr merge",
-                                        |loc| {
-                                            superzej_core::github::merge_pr(
-                                                loc,
-                                                superzej_core::github::MergeMethod::Squash,
-                                                false,
-                                                false,
-                                            )
-                                        },
-                                    );
-                                }
-                                None => model.status = "No pull request to merge".into(),
-                            }
-                            true
-                        }
-                        (Section::Pr, KeyCode::Char('A')) => {
-                            match &model.panel.pr {
-                                Some(pr) => {
-                                    model.status = format!("Approving PR #{}…", pr.number);
-                                    spawn_pr_action(
-                                        &session,
-                                        &refresh_tx,
-                                        &waker,
-                                        "pr approve",
-                                        |loc| superzej_core::github::approve_pr(loc, None),
-                                    );
-                                }
-                                None => model.status = "No pull request to approve".into(),
-                            }
-                            true
-                        }
-                        (Section::Pr, KeyCode::Char('c')) => {
-                            if model.panel.pr.is_some() {
-                                model.status = "A pull request already exists".into();
-                            } else {
-                                model.status = "Creating PR from branch commits…".into();
-                                spawn_pr_action(
-                                    &session,
-                                    &refresh_tx,
-                                    &waker,
-                                    "pr create",
-                                    |loc| {
-                                        superzej_core::github::create_pr(
-                                            loc,
-                                            &superzej_core::github::CreateOpts {
-                                                title: None,
-                                                body: None,
-                                                base: None,
-                                                draft: false,
-                                                web: false,
-                                                fill: true,
-                                            },
-                                        )
-                                        .map(|_| ())
-                                    },
-                                );
-                            }
-                            true
-                        }
-                        (Section::Pr, KeyCode::Char('r')) => {
-                            model.status = "Re-running failed checks…".into();
-                            spawn_pr_action(
+                        // -- git: PR actions (merge/approve/create/rerun/browser) --
+                        (Section::Pr, KeyCode::Char(c @ ('M' | 'A' | 'c' | 'r' | 'o'))) => {
+                            crate::actions::panel_pr_action_key(
+                                c,
+                                &mut model,
                                 &session,
                                 &refresh_tx,
                                 &waker,
-                                "pr rerun-checks",
-                                |loc| superzej_core::github::rerun_failed_checks(loc).map(|_| ()),
-                            );
-                            true
-                        }
-                        (Section::Pr, KeyCode::Char('o')) => {
-                            // The PR in the browser, detached (no gh needed).
-                            if let Some(pr) = &model.panel.pr {
-                                let _ = std::process::Command::new("xdg-open")
-                                    .arg(&pr.url)
-                                    .stdin(std::process::Stdio::null())
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null())
-                                    .spawn();
-                                model.status = format!("Opened PR #{} in the browser", pr.number);
-                            } else {
-                                model.status = "No pull request to open".into();
-                            }
-                            true
+                            )
                         }
                         // -- tests: run / discover (capped, single-flight) ---
                         (Section::Tests, KeyCode::Char(c @ ('r' | 'R' | 'f' | 'F' | 'p'))) => {
@@ -19532,6 +19440,11 @@ async fn event_loop<T: Terminal>(
                 // A modal that collects text owns the paste — inject it into
                 // the field (workspace picker, new-worktree wizard) rather than
                 // leaking it into the pane behind the overlay.
+                if let Some(v) = pr_view.as_mut() {
+                    v.handle_paste(&s);
+                    dirty = true;
+                    continue;
+                }
                 if let Some(p) = workspace_picker.as_mut() {
                     p.handle_paste(&s);
                     dirty = true;

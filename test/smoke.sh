@@ -133,6 +133,16 @@ check "diff --stat emits without error" \
 check "pr status degrades gracefully (exit 0)" \
   "'$SZ' pr status --worktree '$WT' >/dev/null 2>&1"
 
+# The in-app PR workflow's headless seams (comment / review / diff) parse and
+# surface in --help (the acting paths need gh + a real PR, so only parsing is
+# hermetic here).
+check "pr comment subcommand parses" \
+  "'$SZ' pr comment --help >/dev/null 2>&1"
+check "pr review subcommand parses" \
+  "'$SZ' pr review --help >/dev/null 2>&1"
+check "pr diff subcommand parses" \
+  "'$SZ' pr diff --help >/dev/null 2>&1"
+
 # Hosts-as-resources CLI: list shows the seeded host; status renders an
 # unprovisioned host; rm-cache refuses without --force and succeeds with it.
 check "host list shows the seeded [host.*]" \

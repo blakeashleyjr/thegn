@@ -78,6 +78,7 @@ mod perf;
 mod pi_assets;
 mod pins;
 mod placement_flow;
+mod pr_view;
 mod predict;
 mod probe;
 mod profile;

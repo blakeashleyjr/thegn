@@ -6,7 +6,8 @@
 
 use serde_json::Value;
 use superzej_core::github::{
-    self, CheckRun, CreateOpts, GhError, MergeMethod, PanelState, PrHeader, PrPanel, PrStatus,
+    self, CheckRun, CreateOpts, GhError, MergeMethod, PanelState, PrConversation, PrDiff, PrHeader,
+    PrPanel, PrStatus, ReviewState,
 };
 use superzej_core::remote::GitLoc;
 
@@ -28,6 +29,55 @@ pub trait GhBackend: Send + Sync {
     /// The repo's open PRs, one header per branch — the branch-badge feed.
     async fn pr_list(&self, loc: &GitLoc) -> Result<Vec<PrHeader>, GhError> {
         github::pr_list(loc, 100)
+    }
+
+    // --- deep PR view (default: `gh` CLI; writes stay CLI-only everywhere) ---
+
+    /// The full conversation feed (comments + reviews + review threads).
+    async fn conversation(
+        &self,
+        loc: &GitLoc,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<PrConversation, GhError> {
+        github::conversation(loc, owner, repo, number)
+    }
+    /// The PR's parsed unified diff (the Files tab).
+    async fn pr_diff(&self, loc: &GitLoc) -> Result<PrDiff, GhError> {
+        github::pr_diff(loc)
+    }
+    /// Post a PR-level comment.
+    async fn comment(&self, loc: &GitLoc, body: &str) -> Result<(), GhError> {
+        github::comment_pr(loc, body)
+    }
+    /// Submit a review with an explicit state + optional body.
+    async fn submit_review(
+        &self,
+        loc: &GitLoc,
+        state: ReviewState,
+        body: Option<&str>,
+    ) -> Result<(), GhError> {
+        github::submit_review(loc, state, body)
+    }
+    /// Reply to an existing review thread (by thread node id).
+    async fn reply_thread(&self, loc: &GitLoc, thread_id: &str, body: &str) -> Result<(), GhError> {
+        github::reply_to_thread(loc, thread_id, body)
+    }
+    /// Post an inline review comment anchored to a new-side line.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_line_comment(
+        &self,
+        loc: &GitLoc,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        commit_id: &str,
+        path: &str,
+        line: u64,
+        body: &str,
+    ) -> Result<(), GhError> {
+        github::add_line_comment(loc, owner, repo, number, commit_id, path, line, body)
     }
 }
 
@@ -113,7 +163,7 @@ query($owner:String!,$repo:String!,$head:String!){
   repository(owner:$owner,name:$repo){
     pullRequests(headRefName:$head, first:1, states:[OPEN,MERGED,CLOSED]){
       nodes{
-        number title state url isDraft headRefName baseRefName
+        number title state url isDraft headRefName headRefOid baseRefName
         mergeable mergeStateStatus reviewDecision
         commits(last:1){ nodes{ commit{ statusCheckRollup{
           contexts(first:100){ nodes{
@@ -187,6 +237,7 @@ pub fn parse_graphql_pr(resp: &Value, worktree: &str, branch: &str, now: i64) ->
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 head_ref_name: s("headRefName"),
+                head_ref_oid: s("headRefOid"),
                 base_ref_name: s("baseRefName"),
                 mergeable: s("mergeable"),
                 merge_state_status: s("mergeStateStatus"),

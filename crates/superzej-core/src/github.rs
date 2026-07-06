@@ -40,6 +40,24 @@ impl MergeMethod {
     }
 }
 
+/// The state to submit a PR review as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReviewState {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+impl ReviewState {
+    fn flag(self) -> &'static str {
+        match self {
+            ReviewState::Approve => "--approve",
+            ReviewState::RequestChanges => "--request-changes",
+            ReviewState::Comment => "--comment",
+        }
+    }
+}
+
 /// Run `gh <args>` with `cwd = worktree` (local, or over ssh on the remote host);
 /// trimmed stdout on success, else a classified error.
 pub fn gh_out(loc: &GitLoc, args: &[&str]) -> Result<String, GhError> {
@@ -187,6 +205,9 @@ pub struct PrStatus {
     pub is_draft: bool,
     #[serde(default)]
     pub head_ref_name: String,
+    /// The head commit SHA — the `commit_id` an inline review comment anchors to.
+    #[serde(default)]
+    pub head_ref_oid: String,
     #[serde(default)]
     pub base_ref_name: String,
     #[serde(default)]
@@ -296,7 +317,7 @@ fn summarize(runs: &[CheckRun]) -> ChecksSummary {
     s
 }
 
-const PR_FIELDS: &str = "number,title,state,url,isDraft,headRefName,baseRefName,\
+const PR_FIELDS: &str = "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,\
                          mergeable,mergeStateStatus,reviewDecision,statusCheckRollup";
 
 /// Fetch the PR state for a worktree, mapping every failure mode to a PanelState.
@@ -630,6 +651,300 @@ pub fn parse_issue_list(json: &str) -> Vec<IssueRow> {
         .collect()
 }
 
+// --- deep PR view model ----------------------------------------------------
+
+/// One PR-level issue comment (the Conversation timeline, non-inline).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrComment {
+    pub author: String,
+    pub body: String,
+    #[serde(default)]
+    pub created_at: String,
+    /// GraphQL node id (reply/edit targeting); empty when unknown.
+    #[serde(default)]
+    pub id: String,
+}
+
+/// One submitted review (APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrReview {
+    pub author: String,
+    pub state: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub submitted_at: String,
+}
+
+/// A full review thread — the deep-view form ([`ReviewThreadRow`] is the
+/// flattened panel-summary form). Carries the thread node id so the view can
+/// reply, every comment, and the anchoring diff hunk for inline context.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewThread {
+    pub id: String,
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u64>,
+    pub resolved: bool,
+    #[serde(default)]
+    pub comments: Vec<PrComment>,
+    #[serde(default)]
+    pub diff_hunk: String,
+}
+
+/// The full conversation feed for the deep view (one GraphQL round trip).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrConversation {
+    #[serde(default)]
+    pub comments: Vec<PrComment>,
+    #[serde(default)]
+    pub reviews: Vec<PrReview>,
+    #[serde(default)]
+    pub threads: Vec<ReviewThread>,
+}
+
+/// A parsed unified diff for the Files tab.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrDiff {
+    pub files: Vec<DiffFile>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffFile {
+    /// New-side path (`b/…`); refined from the `+++` header.
+    pub path: String,
+    /// Old-side path (`a/…`); `None` for added files.
+    #[serde(default)]
+    pub old_path: Option<String>,
+    pub hunks: Vec<DiffHunk>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffHunk {
+    pub header: String,
+    pub lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub text: String,
+    /// The new-side (RIGHT) line number — GitHub's anchor for an inline comment
+    /// on an added/context line. `None` for deletions.
+    #[serde(default)]
+    pub new_lineno: Option<u64>,
+    #[serde(default)]
+    pub old_lineno: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffLineKind {
+    Context,
+    Add,
+    Del,
+}
+
+/// Parse a unified diff (as printed by `gh pr diff`) into a structured [`PrDiff`],
+/// tracking per-line old/new line numbers so the Files tab can anchor inline
+/// comments to the new-side line GitHub expects. Robust to partial/odd input:
+/// anything it can't classify is skipped rather than panicking.
+pub fn parse_unified_diff(raw: &str) -> PrDiff {
+    let mut files: Vec<DiffFile> = Vec::new();
+    let mut old_no = 0u64;
+    let mut new_no = 0u64;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            files.push(DiffFile {
+                path: git_header_path(rest),
+                old_path: None,
+                hunks: Vec::new(),
+            });
+            continue;
+        }
+        let Some(file) = files.last_mut() else {
+            continue; // preamble before any `diff --git`
+        };
+        if let Some(p) = line.strip_prefix("--- ") {
+            file.old_path = strip_ab(p);
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("+++ ") {
+            if let Some(np) = strip_ab(p) {
+                file.path = np;
+            }
+            continue;
+        }
+        if line.starts_with("@@") {
+            if let Some((os, ns)) = parse_hunk_header(line) {
+                old_no = os;
+                new_no = ns;
+            }
+            file.hunks.push(DiffHunk {
+                header: line.to_string(),
+                lines: Vec::new(),
+            });
+            continue;
+        }
+        // Body lines only count inside a hunk.
+        let Some(hunk) = file.hunks.last_mut() else {
+            continue;
+        };
+        let kind = match line.as_bytes().first() {
+            Some(b'+') => DiffLineKind::Add,
+            Some(b'-') => DiffLineKind::Del,
+            Some(b' ') => DiffLineKind::Context,
+            _ => continue, // `\ No newline at end of file`, stray lines, etc.
+        };
+        let text = line[1..].to_string();
+        let (old_lineno, new_lineno) = match kind {
+            DiffLineKind::Context => {
+                let pair = (Some(old_no), Some(new_no));
+                old_no += 1;
+                new_no += 1;
+                pair
+            }
+            DiffLineKind::Add => {
+                let n = Some(new_no);
+                new_no += 1;
+                (None, n)
+            }
+            DiffLineKind::Del => {
+                let o = Some(old_no);
+                old_no += 1;
+                (o, None)
+            }
+        };
+        hunk.lines.push(DiffLine {
+            kind,
+            text,
+            new_lineno,
+            old_lineno,
+        });
+    }
+    PrDiff { files }
+}
+
+/// `a/PATH b/PATH` → the new-side (`b/`) path; the `+++` header refines it later.
+fn git_header_path(rest: &str) -> String {
+    if let Some((_, b)) = rest.split_once(' ') {
+        strip_ab(b).unwrap_or_else(|| b.to_string())
+    } else {
+        rest.to_string()
+    }
+}
+
+/// Strip the `a/`/`b/` prefix from a `---`/`+++` operand; `None` for `/dev/null`.
+fn strip_ab(operand: &str) -> Option<String> {
+    // git may append a tab + metadata; take the leading path token.
+    let path = operand.split('\t').next().unwrap_or(operand).trim();
+    if path == "/dev/null" {
+        return None;
+    }
+    let p = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    (!p.is_empty()).then(|| p.to_string())
+}
+
+/// Parse `@@ -old_start[,n] +new_start[,n] @@ …` → `(old_start, new_start)`.
+fn parse_hunk_header(line: &str) -> Option<(u64, u64)> {
+    let inner = line.trim_start_matches('@').trim();
+    let mut old_start = None;
+    let mut new_start = None;
+    for tok in inner.split_whitespace() {
+        if let Some(rest) = tok.strip_prefix('-') {
+            old_start = rest.split(',').next().and_then(|n| n.parse().ok());
+        } else if let Some(rest) = tok.strip_prefix('+') {
+            new_start = rest.split(',').next().and_then(|n| n.parse().ok());
+            break;
+        }
+    }
+    Some((old_start?, new_start?))
+}
+
+/// Parse a GraphQL conversation response (`CONVERSATION_QUERY`) into a
+/// [`PrConversation`]. Accepts either the full `{data:{repository:{pullRequest}}}`
+/// envelope or a bare `pullRequest` object (for tests).
+pub fn parse_conversation(v: &serde_json::Value) -> PrConversation {
+    let pr = v.pointer("/data/repository/pullRequest").unwrap_or(v);
+    let node_array = |ptr: &str| {
+        pr.pointer(ptr)
+            .and_then(|n| n.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let comments = node_array("/comments/nodes")
+        .iter()
+        .map(comment_from_node)
+        .collect();
+    let reviews = node_array("/reviews/nodes")
+        .iter()
+        .filter_map(review_from_node)
+        .collect();
+    let threads = node_array("/reviewThreads/nodes")
+        .iter()
+        .map(thread_from_node)
+        .collect();
+    PrConversation {
+        comments,
+        reviews,
+        threads,
+    }
+}
+
+fn json_str(v: &serde_json::Value, ptr: &str) -> String {
+    v.pointer(ptr)
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn comment_from_node(n: &serde_json::Value) -> PrComment {
+    PrComment {
+        author: json_str(n, "/author/login"),
+        body: json_str(n, "/body"),
+        created_at: json_str(n, "/createdAt"),
+        id: json_str(n, "/id"),
+    }
+}
+
+fn review_from_node(n: &serde_json::Value) -> Option<PrReview> {
+    let state = json_str(n, "/state");
+    let body = json_str(n, "/body");
+    // Drop the empty `COMMENTED` envelope reviews that only carry inline
+    // thread comments (surfaced under `threads` instead) — they'd be noise.
+    if state.eq_ignore_ascii_case("COMMENTED") && body.trim().is_empty() {
+        return None;
+    }
+    Some(PrReview {
+        author: json_str(n, "/author/login"),
+        state,
+        body,
+        submitted_at: json_str(n, "/submittedAt"),
+    })
+}
+
+fn thread_from_node(n: &serde_json::Value) -> ReviewThread {
+    let comments: Vec<PrComment> = n
+        .pointer("/comments/nodes")
+        .and_then(|c| c.as_array())
+        .map(|nodes| nodes.iter().map(comment_from_node).collect())
+        .unwrap_or_default();
+    ReviewThread {
+        id: json_str(n, "/id"),
+        path: json_str(n, "/path"),
+        line: n.get("line").and_then(|x| x.as_u64()),
+        resolved: n
+            .get("isResolved")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false),
+        diff_hunk: json_str(n, "/comments/nodes/0/diffHunk"),
+        comments,
+    }
+}
+
 // --- actions --------------------------------------------------------------
 
 /// Options for `create_pr`.
@@ -725,6 +1040,124 @@ pub fn reviews(loc: &GitLoc) -> Result<String, GhError> {
     gh_out(
         loc,
         &["pr", "view", "--json", "reviews,latestReviews,comments"],
+    )
+}
+
+const CONVERSATION_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){\
+repository(owner:$owner,name:$name){pullRequest(number:$number){\
+comments(first:100){nodes{author{login} body createdAt}}\
+reviews(first:100){nodes{author{login} state body submittedAt}}\
+reviewThreads(first:100){nodes{id isResolved path line \
+comments(first:50){nodes{author{login} body createdAt diffHunk}}}}}}}";
+
+/// Fetch the deep conversation feed (comments + reviews + review threads) in one
+/// `gh api graphql` round trip.
+pub fn conversation(
+    loc: &GitLoc,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<PrConversation, GhError> {
+    let num = number.to_string();
+    let owner_arg = format!("owner={owner}");
+    let name_arg = format!("name={repo}");
+    let num_arg = format!("number={num}");
+    let query_arg = format!("query={CONVERSATION_QUERY}");
+    let json = gh_out(
+        loc,
+        &[
+            "api", "graphql", "-f", &query_arg, "-f", &owner_arg, "-f", &name_arg, "-F", &num_arg,
+        ],
+    )?;
+    let v: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| GhError::Other(format!("parse error: {e}")))?;
+    Ok(parse_conversation(&v))
+}
+
+/// Fetch the PR's unified diff (`gh pr diff`) and parse it into a [`PrDiff`].
+pub fn pr_diff(loc: &GitLoc) -> Result<PrDiff, GhError> {
+    let raw = gh_out(loc, &["pr", "diff"])?;
+    Ok(parse_unified_diff(&raw))
+}
+
+/// Post a PR-level comment (`gh pr comment --body <body>`).
+pub fn comment_pr(loc: &GitLoc, body: &str) -> Result<(), GhError> {
+    gh_run(loc, &["pr", "comment", "--body", body])
+}
+
+/// Submit a review with an explicit state + optional body. `gh` requires a body
+/// for `--request-changes` and `--comment`; we surface that as a clear error
+/// rather than a raw `gh` failure.
+pub fn submit_review(loc: &GitLoc, state: ReviewState, body: Option<&str>) -> Result<(), GhError> {
+    let body = body.map(str::trim).filter(|b| !b.is_empty());
+    if matches!(state, ReviewState::RequestChanges | ReviewState::Comment) && body.is_none() {
+        return Err(GhError::Other(
+            "a review body is required for request-changes / comment".into(),
+        ));
+    }
+    let mut args = vec!["pr", "review", state.flag()];
+    if let Some(b) = body {
+        args.push("--body");
+        args.push(b);
+    }
+    gh_run(loc, &args)
+}
+
+const THREAD_REPLY_MUTATION: &str = "mutation($threadId:ID!,$body:String!){\
+addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){\
+comment{id}}}";
+
+/// Reply to an existing review thread via the GraphQL mutation (the CLI has no
+/// thread-reply verb). `thread_id` is the review-thread node id.
+pub fn reply_to_thread(loc: &GitLoc, thread_id: &str, body: &str) -> Result<(), GhError> {
+    let query_arg = format!("query={THREAD_REPLY_MUTATION}");
+    let id_arg = format!("threadId={thread_id}");
+    let body_arg = format!("body={body}");
+    gh_run(
+        loc,
+        &[
+            "api", "graphql", "-f", &query_arg, "-f", &id_arg, "-f", &body_arg,
+        ],
+    )
+}
+
+/// Post an inline review comment on a specific new-side line via the REST API
+/// (`gh api POST …/pulls/{n}/comments`). `commit_id` is the PR head SHA
+/// ([`PrStatus::head_ref_oid`]).
+#[allow(clippy::too_many_arguments)]
+pub fn add_line_comment(
+    loc: &GitLoc,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    commit_id: &str,
+    path: &str,
+    line: u64,
+    body: &str,
+) -> Result<(), GhError> {
+    let endpoint = format!("repos/{owner}/{repo}/pulls/{number}/comments");
+    let body_arg = format!("body={body}");
+    let commit_arg = format!("commit_id={commit_id}");
+    let path_arg = format!("path={path}");
+    let line_arg = format!("line={line}");
+    gh_run(
+        loc,
+        &[
+            "api",
+            "-X",
+            "POST",
+            &endpoint,
+            "-f",
+            &body_arg,
+            "-f",
+            &commit_arg,
+            "-f",
+            &path_arg,
+            "-F",
+            &line_arg,
+            "-f",
+            "side=RIGHT",
+        ],
     )
 }
 
@@ -1014,6 +1447,131 @@ mod tests {
         assert_eq!(pr.checks.passed, 1);
         assert_eq!(pr.checks.failed, 1);
         assert_eq!(pr.checks.pending, 2);
+    }
+
+    #[test]
+    fn parse_unified_diff_tracks_line_numbers_and_paths() {
+        // Built from a line array so leading spaces on context lines survive
+        // (a `\`-continuation in a string literal would strip them).
+        let raw = [
+            "diff --git a/src/foo.rs b/src/foo.rs",
+            "index 1234567..89abcde 100644",
+            "--- a/src/foo.rs",
+            "+++ b/src/foo.rs",
+            "@@ -10,4 +10,5 @@ fn existing() {",
+            " ctx one",
+            "-removed line",
+            "+added line a",
+            "+added line b",
+            " ctx two",
+            "diff --git a/new.txt b/new.txt",
+            "new file mode 100644",
+            "--- /dev/null",
+            "+++ b/new.txt",
+            "@@ -0,0 +1,1 @@",
+            "+hello",
+            "\\ No newline at end of file",
+        ]
+        .join("\n");
+        let diff = parse_unified_diff(&raw);
+        assert_eq!(diff.files.len(), 2);
+
+        let f0 = &diff.files[0];
+        assert_eq!(f0.path, "src/foo.rs");
+        assert_eq!(f0.old_path.as_deref(), Some("src/foo.rs"));
+        assert_eq!(f0.hunks.len(), 1);
+        let lines = &f0.hunks[0].lines;
+        // ctx one: old 10 / new 10
+        assert_eq!(lines[0].kind, DiffLineKind::Context);
+        assert_eq!(lines[0].old_lineno, Some(10));
+        assert_eq!(lines[0].new_lineno, Some(10));
+        // removed: old 11 / new None
+        assert_eq!(lines[1].kind, DiffLineKind::Del);
+        assert_eq!(lines[1].old_lineno, Some(11));
+        assert_eq!(lines[1].new_lineno, None);
+        // added a: old None / new 11
+        assert_eq!(lines[2].kind, DiffLineKind::Add);
+        assert_eq!(lines[2].old_lineno, None);
+        assert_eq!(lines[2].new_lineno, Some(11));
+        // added b: new 12
+        assert_eq!(lines[3].new_lineno, Some(12));
+        assert_eq!(lines[3].text, "added line b");
+        // ctx two: old 12 (was at 11, del bumped it) / new 13
+        assert_eq!(lines[4].kind, DiffLineKind::Context);
+        assert_eq!(lines[4].old_lineno, Some(12));
+        assert_eq!(lines[4].new_lineno, Some(13));
+
+        // Added file: /dev/null old side → old_path None; new line anchored at 1.
+        let f1 = &diff.files[1];
+        assert_eq!(f1.path, "new.txt");
+        assert_eq!(f1.old_path, None);
+        assert_eq!(f1.hunks[0].lines[0].new_lineno, Some(1));
+
+        // Garbage degrades to an empty diff, never panics.
+        assert!(
+            parse_unified_diff("not a diff\nrandom text")
+                .files
+                .is_empty()
+        );
+        // A round-trip through serde preserves the structure.
+        let json = serde_json::to_string(&diff).unwrap();
+        assert_eq!(serde_json::from_str::<PrDiff>(&json).unwrap(), diff);
+    }
+
+    #[test]
+    fn parse_conversation_reads_comments_reviews_and_threads() {
+        let json = r#"{"data":{"repository":{"pullRequest":{
+            "comments":{"nodes":[
+                {"author":{"login":"alice"},"body":"top-level comment","createdAt":"2026-06-11T10:00:00Z"}
+            ]},
+            "reviews":{"nodes":[
+                {"author":{"login":"bob"},"state":"APPROVED","body":"LGTM","submittedAt":"2026-06-11T11:00:00Z"},
+                {"author":{"login":"bot"},"state":"COMMENTED","body":"","submittedAt":"2026-06-11T11:05:00Z"}
+            ]},
+            "reviewThreads":{"nodes":[
+                {"id":"THREAD_1","isResolved":false,"path":"src/x.rs","line":42,
+                 "comments":{"nodes":[
+                    {"author":{"login":"carol"},"body":"nit here","createdAt":"2026-06-11T09:00:00Z",
+                     "diffHunk":"@@ -1 +1 @@\n-old\n+new"}
+                 ]}}
+            ]}
+        }}}}"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let conv = parse_conversation(&v);
+        assert_eq!(conv.comments.len(), 1);
+        assert_eq!(conv.comments[0].author, "alice");
+        // The empty COMMENTED envelope review is dropped; only the real one stays.
+        assert_eq!(conv.reviews.len(), 1);
+        assert_eq!(conv.reviews[0].state, "APPROVED");
+        assert_eq!(conv.threads.len(), 1);
+        assert_eq!(conv.threads[0].id, "THREAD_1");
+        assert_eq!(conv.threads[0].line, Some(42));
+        assert_eq!(conv.threads[0].comments[0].body, "nit here");
+        assert!(conv.threads[0].diff_hunk.contains("+new"));
+
+        // Bare pullRequest object (no envelope) also parses.
+        let bare = v.pointer("/data/repository/pullRequest").unwrap();
+        assert_eq!(parse_conversation(bare).comments.len(), 1);
+        // Garbage → empty, never panics.
+        assert!(
+            parse_conversation(&serde_json::json!({}))
+                .comments
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn submit_review_requires_body_for_non_approve() {
+        let loc = GitLoc::for_worktree(std::path::Path::new("/nonexistent"));
+        // request-changes / comment without a body fail before touching `gh`.
+        assert!(matches!(
+            submit_review(&loc, ReviewState::RequestChanges, None),
+            Err(GhError::Other(_))
+        ));
+        assert!(matches!(
+            submit_review(&loc, ReviewState::Comment, Some("   ")),
+            Err(GhError::Other(_))
+        ));
     }
 
     #[test]
