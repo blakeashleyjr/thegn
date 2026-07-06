@@ -13026,21 +13026,9 @@ async fn event_loop<T: Terminal>(
                         crate::terminal_wizard::Outcome::Submit(choice) => {
                             terminal_wizard_ui = None;
                             crate::handlers::terminal::persist(&choice);
-                            session.worktrees.push(crate::session::WorktreeGroup {
-                                name: choice.name.clone(),
-                                kind: crate::session::GroupKind::Terminal,
-                                path: String::new(), // not backed by a local path
-                                tabs: vec![crate::session::Tab {
-                                    title: "main".to_string(),
-                                    center: crate::center::CenterTree::Leaf(0),
-                                    focused_pane: 0,
-                                    pane_cwds: Default::default(),
-                                    pane_cmds: Default::default(),
-                                    pane_sessions: Default::default(),
-                                    pane_scrollback: Default::default(),
-                                }],
-                                active_tab: 0,
-                            });
+                            session
+                                .worktrees
+                                .push(crate::session::WorktreeGroup::terminal(&choice.name));
                             session.active = session.worktrees.len() - 1;
                             let cwd = active_cwd(&session);
                             let new = match spawn_worktree_shell_pane(
@@ -13072,24 +13060,12 @@ async fn event_loop<T: Terminal>(
                 }
                 // Modal: the "Add environment" wizard. Submit writes the env via
                 // the shared create_env path (config_write + secret backend).
-                if let Some(w) = env_wizard_ui.as_mut() {
-                    match w.handle_key(&k.key, k.modifiers) {
-                        crate::env_wizard::Outcome::Pending => {}
-                        crate::env_wizard::Outcome::Cancel => {
-                            env_wizard_ui = None;
-                            model.status = "new environment cancelled".into();
-                        }
-                        crate::env_wizard::Outcome::Submit(args) => {
-                            env_wizard_ui = None;
-                            let name = args.name.clone();
-                            model.status = match crate::cmd::env::create_env(*args) {
-                                Ok(()) => {
-                                    format!("environment '{name}' created — bind it via env set")
-                                }
-                                Err(e) => format!("env create failed: {e}"),
-                            };
-                        }
-                    }
+                if env_wizard_ui.is_some() {
+                    let outcome = env_wizard_ui
+                        .as_mut()
+                        .unwrap()
+                        .handle_key(&k.key, k.modifiers);
+                    crate::env_wizard::apply_outcome(outcome, &mut env_wizard_ui, &mut model);
                     dirty = true;
                     continue;
                 }
@@ -17105,6 +17081,25 @@ async fn event_loop<T: Terminal>(
                                 &mut active_menu,
                             )
                         }
+                        // -- environments: bind here (enter), test (t), remove
+                        // (x), new… (n → the Add-environment wizard).
+                        (Section::Environments, key)
+                            if matches!(key, KeyCode::Enter | KeyCode::Char('t' | 'x' | 'n')) =>
+                        {
+                            let wt = session
+                                .active_group()
+                                .map(|g| g.path.clone())
+                                .unwrap_or_default();
+                            crate::env_ui::panel_key(
+                                &key,
+                                panel_ui.cursor,
+                                &mut model,
+                                &current_config,
+                                &wt,
+                                &refresh_tx,
+                                &mut env_wizard_ui,
+                            )
+                        }
                         // Esc in section mode returns to the terminal (row
                         // mode's Esc is claimed by the accordion map).
                         (_, key) if crate::input::is_escape_key(&key) => {
@@ -19547,6 +19542,11 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 if let Some(w) = terminal_wizard_ui.as_mut() {
+                    w.handle_paste(&s);
+                    dirty = true;
+                    continue;
+                }
+                if let Some(w) = env_wizard_ui.as_mut() {
                     w.handle_paste(&s);
                     dirty = true;
                     continue;

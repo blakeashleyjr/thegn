@@ -55,6 +55,31 @@ pub enum Outcome {
     Submit(Box<CreateArgs>),
 }
 
+/// Apply a wizard [`Outcome`] on the event loop: dismiss on cancel/submit, and
+/// on submit write the env via the shared `create_env` path (config_write +
+/// secret backend). Kept here so the loop's key block stays a one-liner.
+pub fn apply_outcome(
+    outcome: Outcome,
+    slot: &mut Option<EnvWizard>,
+    model: &mut crate::chrome::FrameModel,
+) {
+    match outcome {
+        Outcome::Pending => {}
+        Outcome::Cancel => {
+            *slot = None;
+            model.status = "new environment cancelled".into();
+        }
+        Outcome::Submit(args) => {
+            *slot = None;
+            let name = args.name.clone();
+            model.status = match crate::cmd::env::create_env(*args) {
+                Ok(()) => format!("environment '{name}' created — bind it via env set"),
+                Err(e) => format!("env create failed: {e}"),
+            };
+        }
+    }
+}
+
 pub struct EnvWizard {
     kind_sel: usize,
     focus: Field,
@@ -130,6 +155,15 @@ impl EnvWizard {
         let cur = fields.iter().position(|&f| f == self.focus).unwrap_or(0) as i32;
         let next = (cur + delta).clamp(0, fields.len() as i32 - 1) as usize;
         self.focus = fields[next];
+    }
+
+    /// Inject bracketed-paste text into the focused text field (tokens are long).
+    pub fn handle_paste(&mut self, text: &str) {
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        let f = self.focus;
+        if let Some(s) = self.text_mut(f) {
+            s.push_str(&clean);
+        }
     }
 
     pub fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> Outcome {

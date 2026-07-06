@@ -237,6 +237,18 @@ impl WorktreeGroup {
         }
     }
 
+    /// A path-less terminal group with a single `main` tab — the shape the
+    /// new-terminal wizard builds (kept here so the event loop stays a one-liner).
+    pub fn terminal(name: impl Into<String>) -> Self {
+        WorktreeGroup {
+            name: name.into(),
+            kind: GroupKind::Terminal,
+            path: String::new(),
+            tabs: vec![Tab::new("main")],
+            active_tab: 0,
+        }
+    }
+
     pub fn active_tab(&self) -> Option<&Tab> {
         self.tabs.get(self.active_tab)
     }

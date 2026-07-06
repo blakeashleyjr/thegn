@@ -76,6 +76,88 @@ fn effective_token_env(pc: &EnvProviderConfig) -> String {
     }
 }
 
+/// Handle an action key on the `Environments` panel row at `cursor`:
+/// - **Enter** — bind this env to the active worktree (`db.set_worktree_env`).
+/// - **x** — remove the `[env.<name>]` from config + forget its stored token,
+///   then trigger a model refresh so the row disappears.
+/// - **t** — test the provider token off-loop (a `list()` call); the result
+///   lands in System ▸ Logs (blocking the render loop is not acceptable).
+///
+/// Returns `true` when the key was consumed. `n` (add) is handled by the loop
+/// (it owns the wizard modal).
+#[allow(clippy::too_many_arguments)]
+pub fn panel_key(
+    key: &termwiz::input::KeyCode,
+    cursor: usize,
+    model: &mut crate::chrome::FrameModel,
+    cfg: &Config,
+    worktree: &str,
+    refresh_tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    wizard: &mut Option<crate::env_wizard::EnvWizard>,
+) -> bool {
+    use termwiz::input::KeyCode;
+    // `n` opens the Add-environment wizard (no cursor row needed).
+    if matches!(key, KeyCode::Char('n')) {
+        *wizard = Some(crate::env_wizard::EnvWizard::new(cfg));
+        return true;
+    }
+    let Some(env) = model.panel.environments.get(cursor).cloned() else {
+        return false;
+    };
+    match key {
+        KeyCode::Enter => {
+            if worktree.trim().is_empty() {
+                model.status = "no active worktree to bind (open one first)".into();
+                return true;
+            }
+            use superzej_core::store::WorkspaceStore;
+            model.status = match superzej_core::db::Db::open()
+                .and_then(|db| db.set_worktree_env(worktree, &env.name))
+            {
+                Ok(()) => format!("bound env '{}' to this worktree", env.name),
+                Err(e) => format!("bind failed: {e}"),
+            };
+            true
+        }
+        KeyCode::Char('x') => {
+            let path = Config::path();
+            if let Err(e) = superzej_core::config_write::remove_env(&path, &env.name) {
+                model.status = format!("remove failed: {e}");
+                return true;
+            }
+            crate::secret::forget(&env.name);
+            let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model);
+            model.status = format!("removed env '{}'", env.name);
+            true
+        }
+        KeyCode::Char('t') => {
+            model.status = format!("testing env '{}' — result in System ▸ Logs", env.name);
+            let pc = cfg.env.get(&env.name).map(|e| e.provider.clone());
+            let name = env.name.clone();
+            // Off-loop: a provider `list()` can take seconds; never block the frame.
+            std::thread::spawn(move || {
+                let Some(pc) = pc else { return };
+                match crate::provider_factory::provider_for_named(&pc, &name) {
+                    Some(p) => match crate::agent::block_on_provider(|| async { p.list().await }) {
+                        Ok(list) => superzej_core::msg::info(&format!(
+                            "env {name}: reachable — {} managed sandbox(es)",
+                            list.len()
+                        )),
+                        Err(e) => {
+                            superzej_core::msg::warn(&format!("env {name}: test failed: {e}"))
+                        }
+                    },
+                    None => superzej_core::msg::warn(&format!(
+                        "env {name}: no API provider (or token unresolved)"
+                    )),
+                }
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
