@@ -229,6 +229,10 @@ pub enum SandboxScope {
 /// Prepare the sandbox for a worktree with an explicitly-selected execution
 /// environment name (or `None` to fall through to repo/global selection).
 /// Resolves via [`crate::handlers::repo_trust`] (honours TOFU approvals).
+///
+/// `choice_is_explicit`: the wizard's *fresh* pick passes `true` (always wins
+/// over config); a relaunch passes it only when the DB value is a recorded
+/// deliberate override, so an explicit config backend still beats a stale entry.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_sandbox_env(
     cfg: &Config,
@@ -236,6 +240,7 @@ pub fn prepare_sandbox_env(
     worktree: &str,
     loc: &GitLoc,
     backend_choice: Option<&str>,
+    choice_is_explicit: bool,
     scope: SandboxScope,
     selected_env: Option<&str>,
 ) -> anyhow::Result<SandboxOutcome> {
@@ -293,15 +298,13 @@ pub fn prepare_sandbox_env(
     let mut sb = environment.sandbox;
     let mut explicit_backend =
         sandbox::Backend::from_config(sb.backend).filter(|b| *b != sandbox::Backend::None);
-    // Only let the DB-saved per-worktree backend override when config is "auto".
-    // An explicit config backend (e.g. `backend = "bwrap"`) always wins so that
-    // changing the config actually takes effect instead of being silently trumped
-    // by a stale DB entry from a previous backend that no longer works.
+    // A fresh/explicit choice always wins over config; a non-explicit DB value
+    // only overrides when config is "auto" (an explicit `backend = "bwrap"` must
+    // beat a stale entry). An explicit choice may be "host"/"none" — keep those.
     let config_is_auto = sb.backend == superzej_core::config::SandboxBackend::Auto;
-    if config_is_auto
-        && let Some(saved) = backend_choice.map(str::trim)
+    if let Some(saved) = backend_choice.map(str::trim)
         && !saved.is_empty()
-        && saved != "auto"
+        && (choice_is_explicit || (config_is_auto && saved != "auto"))
         && let Ok(b) = superzej_core::config::SandboxBackend::from_str_validated(saved)
     {
         explicit_backend =
@@ -3010,18 +3013,26 @@ pub fn launch_spec_with_key(
         .ok()
         .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
 
+    // A recorded per-worktree backend is a deliberate override (only the wizard
+    // writes it, when divergent); honour it as explicit so it sticks across
+    // restarts even against a non-"auto" config. Empty/NULL → auto (re-resolve).
+    let saved_is_override = saved_backend
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty() && s != "auto");
     let mut outcome = prepare_sandbox_env(
         cfg,
         &repo_root,
         worktree,
         &loc,
         saved_backend.as_deref(),
+        saved_is_override,
         launch_scope(cfg, choice),
         selected_env.as_deref(),
     )?;
-    if let Ok(db) = Db::open() {
-        let _ = db.set_worktree_sandbox(worktree, &outcome.backend_label);
-    }
+    // NB: the resolved backend is intentionally NOT written back. `sandbox_backend`
+    // is a deliberate-override store (mirrors `env_name`, sole writer = the
+    // wizard's divergence check); auto-stamping it would pin every auto worktree.
 
     // Provision the repo into a fresh provider env on open (8-A.3): clone origin
     // into the sandbox workdir so the chrome's git/files show real data. `outcome
@@ -3197,12 +3208,20 @@ pub fn run_in_sandbox(cfg: &Config, worktree: &str, command: &str) -> anyhow::Re
     } else {
         SandboxScope::Shell
     };
+    // A recorded per-worktree backend is a deliberate override (see
+    // `launch_spec_with_key`); honour it so ACP shell commands run in the same
+    // boundary as the interactive pane. Empty/NULL → auto (re-resolve vs config).
+    let saved_is_override = saved_backend
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty() && s != "auto");
     let outcome = prepare_sandbox_env(
         cfg,
         &repo_root,
         worktree,
         &loc,
         saved_backend.as_deref(),
+        saved_is_override,
         scope,
         selected_env.as_deref(),
     )?;
@@ -4033,6 +4052,7 @@ mod tests {
             "/wt/x",
             &loc,
             None,
+            false,
             SandboxScope::Shell,
             None,
         )
@@ -4046,11 +4066,56 @@ mod tests {
             "/wt/x",
             &loc,
             Some("none"),
+            false,
             SandboxScope::Shell,
             None,
         )
         .unwrap();
         assert!(out.spec.is_none());
+    }
+
+    // Regression (fc68338 merge dropped `choice_is_explicit`): a fresh wizard
+    // pick of "host"/"none" must override a NON-"auto" config backend (e.g.
+    // `backend = "bwrap"`) and drop to the host shell. A non-explicit relaunch
+    // value must NOT — config still wins — so the two callers stay distinct.
+    #[test]
+    fn explicit_host_pick_overrides_nonauto_config() {
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = superzej_core::config::SandboxBackend::Bwrap;
+        let loc = GitLoc::from_db("/wt/x", None);
+        // Fresh wizard pick (explicit) → host wins over the bwrap config.
+        let out = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            "/wt/x",
+            &loc,
+            Some("host"),
+            true,
+            SandboxScope::Shell,
+            None,
+        )
+        .unwrap();
+        assert!(out.spec.is_none(), "explicit host pick must drop to host");
+        assert_eq!(out.backend_label, "host");
+        // Non-explicit relaunch value against a non-"auto" config: config wins
+        // (historical "explicit config beats stale DB"). bwrap may be unavailable
+        // in CI, so only assert it did NOT silently become the host shell.
+        let out = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            "/wt/x",
+            &loc,
+            Some("host"),
+            false,
+            SandboxScope::Shell,
+            None,
+        );
+        if let Ok(o) = out {
+            assert_ne!(
+                o.backend_label, "host",
+                "non-explicit host must not beat bwrap config"
+            );
+        } // Err (bwrap unavailable) is acceptable — still not a host drop.
     }
 
     // H1: E2E launch_spec test — backend="none" → host fallback path.
