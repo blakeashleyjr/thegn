@@ -32,7 +32,7 @@ pub(crate) fn provider_for_named(
             } else {
                 pc.api_key_env.trim()
             };
-            let token = std::env::var(key).ok()?;
+            let token = crate::secret::resolve(key)?;
             Some(Provider::Sprites(SpritesProvider::new(
                 &pc.api_base,
                 &token,
@@ -40,7 +40,7 @@ pub(crate) fn provider_for_named(
             )))
         }
         "daytona" => {
-            let token = std::env::var(pc.api_key_env.trim()).ok()?;
+            let token = crate::secret::resolve(pc.api_key_env.trim())?;
             Some(Provider::Daytona(DaytonaProvider::new(
                 &pc.api_base,
                 &token,
@@ -56,7 +56,7 @@ pub(crate) fn provider_for_named(
             } else {
                 pc.api_key_env.trim()
             };
-            let token = std::env::var(key).ok()?;
+            let token = crate::secret::resolve(key)?;
             // The same managed keypair the VPS ssh transport uses — Fly reaches
             // its machine over plain ssh (dedicated IPv4 + guest sshd).
             let (key_path, pubkey) = match crate::agent::sprite_ssh_keypair() {
@@ -104,7 +104,7 @@ pub(crate) fn vps_provider_for(
     } else {
         pc.api_key_env.trim()
     };
-    let token = std::env::var(key_env).ok()?;
+    let token = crate::secret::resolve(key_env)?;
     // The same managed keypair the sprite ssh transport uses — one key for all
     // superzej-managed remotes.
     let (key_path, pubkey) = match crate::agent::sprite_ssh_keypair() {

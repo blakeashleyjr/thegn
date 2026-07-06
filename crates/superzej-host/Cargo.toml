@@ -35,6 +35,17 @@ serde_json.workspace = true
 # the JSON schema (schemars pinned to core's version).
 toml.workspace = true
 schemars = "0.8"
+# OS keyring for provider tokens (src/secret.rs). Pure-Rust backends only: on
+# Linux the `async-secret-service` path uses zbus (NOT `sync-secret-service`,
+# which pulls the C `libdbus-sys`); `async-io` is its lightweight runtime. Native
+# on macOS/Windows. A missing Secret Service falls back to a 0600 file / env var.
+keyring = { version = "3", default-features = false, features = [
+  "async-secret-service",
+  "async-io",
+  "crypto-rust",
+  "apple-native",
+  "windows-native",
+] }
 # Compositor substrate (Phase 1). Feature set is pinned at the workspace level.
 tokio = { workspace = true }
 # Embedded host nix binary cache (src/nixcache.rs): an axum HTTP server that serves

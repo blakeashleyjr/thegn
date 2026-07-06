@@ -27,6 +27,9 @@ pub enum Action {
     },
     /// Open the config file in $EDITOR (seeds from the example if missing).
     Edit,
+    /// Set one dotted key (`config set sandbox.backend docker`) in the config
+    /// file, preserving comments/formatting. The write counterpart to `get`.
+    Set { key: String, value: String },
     /// Strictly validate the config file; non-zero exit on any problem.
     Validate,
     /// Print the JSON schema for editor autocomplete and validation.
@@ -49,6 +52,10 @@ pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
         Action::Show { json } => show(cfg, json)?,
         Action::Get { key, json } => get(cfg, &key, json)?,
         Action::Edit => edit(&path)?,
+        Action::Set { key, value } => {
+            superzej_core::config_write::set_key(&path, &key, &value)?;
+            outln!("set {key} = {value:?} in {}", path.display());
+        }
         Action::Validate => validate(&path)?,
         Action::Schema => {
             let schema = schemars::schema_for!(Config);

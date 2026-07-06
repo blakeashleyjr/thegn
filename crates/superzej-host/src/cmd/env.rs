@@ -14,6 +14,9 @@ use superzej_core::{msg, outln, repo};
 use superzej_svc::projection::ProjectionBackend;
 
 #[derive(clap::Subcommand, Clone)]
+// `Create` carries many inline clap flags (the setup surface), dwarfing the small
+// variants; clap needs the fields inline, so boxing isn't an option here.
+#[allow(clippy::large_enum_variant)]
 pub enum Action {
     /// List the defined `[env.<name>]` environments and their placement.
     List {
@@ -77,6 +80,48 @@ pub enum Action {
     /// print the `template = "snapshot:<id>"` to use it — the VPS stand-in for
     /// checkpoints (~3-6 min cold provisions drop to ~30-90 s).
     ImageBake { worktree: Option<String> },
+    /// Create (or update — upsert) a `[env.<name>]` in the global config. The
+    /// authoring path behind the TUI setup wizard; also scriptable on its own.
+    Create {
+        /// The env name (e.g. `fly-dev`).
+        name: String,
+        /// Kind: local | ssh | fly | digitalocean | hetzner | daytona | sprites.
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        region: Option<String>,
+        #[arg(long)]
+        size: Option<String>,
+        /// Image/snapshot template (e.g. `image:<ref>` for Fly, `snapshot:<id>` for VPS).
+        #[arg(long)]
+        template: Option<String>,
+        #[arg(long)]
+        max_instances: Option<i64>,
+        #[arg(long)]
+        max_lifetime: Option<i64>,
+        #[arg(long)]
+        auto_provision: bool,
+        /// SSH target (`user@host:port`) when `--provider ssh`.
+        #[arg(long)]
+        ssh_host: Option<String>,
+        /// Local sandbox backend when `--provider local`.
+        #[arg(long)]
+        sandbox: Option<String>,
+        /// Token, entered directly — stored in the OS keyring (else a 0600 file);
+        /// the config records only a `keyring:`/`file:` ref, never the token.
+        #[arg(long)]
+        token: Option<String>,
+        /// Reference an existing env var holding the token (no storage).
+        #[arg(long)]
+        token_env: Option<String>,
+        /// Reference a file holding the token (no copy; a `file:` ref).
+        #[arg(long)]
+        token_file: Option<String>,
+    },
+    /// Remove a `[env.<name>]` from the global config (and forget its stored token).
+    Rm { name: String },
+    /// Verify a provider env's token works by making a cheap `list()` API call.
+    Test { name: String },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -101,7 +146,131 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Snapshots { worktree } => snapshots(cfg, worktree),
         Action::Restore { id, worktree } => restore(cfg, worktree, &id),
         Action::ImageBake { worktree } => super::env_image::run(cfg, worktree),
+        Action::Create {
+            name,
+            provider,
+            region,
+            size,
+            template,
+            max_instances,
+            max_lifetime,
+            auto_provision,
+            ssh_host,
+            sandbox,
+            token,
+            token_env,
+            token_file,
+        } => create(CreateArgs {
+            name,
+            provider,
+            region,
+            size,
+            template,
+            max_instances,
+            max_lifetime,
+            auto_provision,
+            ssh_host,
+            sandbox,
+            token,
+            token_env,
+            token_file,
+        }),
+        Action::Rm { name } => remove(&name),
+        Action::Test { name } => test(cfg, &name),
     }
+}
+
+/// Args for [`create`] (grouped so the dispatch arm stays flat).
+struct CreateArgs {
+    name: String,
+    provider: String,
+    region: Option<String>,
+    size: Option<String>,
+    template: Option<String>,
+    max_instances: Option<i64>,
+    max_lifetime: Option<i64>,
+    auto_provision: bool,
+    ssh_host: Option<String>,
+    sandbox: Option<String>,
+    token: Option<String>,
+    token_env: Option<String>,
+    token_file: Option<String>,
+}
+
+/// Create/upsert `[env.<name>]` in the global config, storing any entered token
+/// via the secret backend and recording only a SecretRef in config.
+fn create(a: CreateArgs) -> Result<()> {
+    use superzej_core::config_write::{EnvSpec, upsert_env};
+    let kind = a.provider.trim().to_lowercase();
+    let placement = match kind.as_str() {
+        "local" => "local",
+        "ssh" => "ssh",
+        "fly" | "digitalocean" | "hetzner" | "vultr" | "daytona" | "sprites" => "provider",
+        other => anyhow::bail!(
+            "unknown --provider {other:?} (local|ssh|fly|digitalocean|hetzner|daytona|sprites)"
+        ),
+    };
+
+    // Resolve the token source into a SecretRef (only for provider kinds).
+    let api_key_env = if placement == "provider" {
+        match (&a.token, &a.token_env, &a.token_file) {
+            (Some(t), _, _) => Some(
+                crate::secret::store(&a.name, t)
+                    .map_err(|e| anyhow::anyhow!("store token: {e}"))?,
+            ),
+            (_, Some(v), _) => Some(format!("env:{}", v.trim())),
+            (_, _, Some(p)) => Some(format!("file:{}", p.trim())),
+            _ => None, // fall back to the provider's default env var at launch
+        }
+    } else {
+        None
+    };
+
+    let spec = EnvSpec {
+        name: a.name.clone(),
+        placement: placement.to_string(),
+        data: (placement == "provider").then(|| "in_env".to_string()),
+        provider: (placement == "provider").then(|| kind.clone()),
+        api_key_env,
+        region: a.region,
+        size: a.size,
+        template: a.template,
+        max_instances: a.max_instances,
+        max_lifetime_secs: a.max_lifetime,
+        auto_provision: a.auto_provision.then_some(true),
+        ssh_host: a.ssh_host,
+        sandbox_backend: a.sandbox,
+    };
+    let path = Config::path();
+    upsert_env(&path, &spec)?;
+    outln!("created env '{}' ({kind}) in {}", a.name, path.display());
+    outln!("  bind it: superzej env set {} [worktree]", a.name);
+    Ok(())
+}
+
+fn remove(name: &str) -> Result<()> {
+    let path = Config::path();
+    superzej_core::config_write::remove_env(&path, name)?;
+    crate::secret::forget(name);
+    outln!("removed env '{name}'");
+    Ok(())
+}
+
+/// Verify a provider env's token by listing its sandboxes (a cheap control call).
+fn test(cfg: &Config, name: &str) -> Result<()> {
+    let envc = cfg
+        .env
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("no [env.{name}] defined"))?;
+    let provider =
+        crate::provider_factory::provider_for_named(&envc.provider, name).ok_or_else(|| {
+            anyhow::anyhow!("env '{name}' has no API provider or its token could not be resolved")
+        })?;
+    let n = crate::agent::block_on_provider(|| async { provider.list().await })
+        .map_err(|e| anyhow::anyhow!("provider check failed: {e}"))?
+        .len();
+    outln!("✓ env '{name}' reachable — {n} managed sandbox(es) visible");
+    Ok(())
 }
 
 /// Build the generic API provider ([`superzej_svc::provider::Provider`]) for a
@@ -125,9 +294,9 @@ fn api_provider(
                     env.name
                 );
             }
-            let token = std::env::var(pc.api_key_env.trim()).map_err(|_| {
+            let token = crate::secret::resolve(pc.api_key_env.trim()).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "the API token env var {:?} (api_key_env) is not set",
+                    "the API token {:?} (api_key_env) could not be resolved",
                     pc.api_key_env
                 )
             })?;
@@ -145,8 +314,8 @@ fn api_provider(
             } else {
                 pc.api_key_env.trim()
             };
-            let token = std::env::var(key_env).map_err(|_| {
-                anyhow::anyhow!("the Sprites API token env var {key_env:?} is not set")
+            let token = crate::secret::resolve(key_env).ok_or_else(|| {
+                anyhow::anyhow!("the Sprites API token {key_env:?} could not be resolved")
             })?;
             Ok(Provider::Sprites(SpritesProvider::new(
                 &pc.api_base,
