@@ -571,9 +571,10 @@ pub struct PanelData {
     pub notifications: Vec<superzej_core::notification::Notification>,
     /// Last 500 lines of szhost.log, parsed. Empty when SUPERZEJ_LOG is unset.
     pub log_lines: Vec<superzej_core::log_view::LogLine>,
-    /// A bounded tail (~400 lines) of parsed szhost.log, kept on *every* refresh
-    /// (unlike `log_lines`, which is section-gated) so the notification
-    /// drilldown log modal always has data to show without new blocking I/O.
+    /// A bounded tail of parsed szhost.log — the last ~400 lines *plus* the most
+    /// recent preceding ERROR lines (see `log_view::error_inclusive_tail`), so the
+    /// error-gated notification drilldown is never empty. Kept on *every* refresh
+    /// (unlike `log_lines`, which is section-gated), without new blocking I/O.
     pub log_tail: Vec<superzej_core::log_view::LogLine>,
     /// Structured logs for the sz-log feature.
     pub log_lines_structured: Vec<superzej_core::log::parser::ParsedLog>,

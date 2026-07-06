@@ -26,8 +26,19 @@ pub(crate) fn last_logged_error_count(notifs: &[Notification]) -> Option<usize> 
 /// stays read (the append-only log otherwise re-lit the badge forever).
 ///
 /// Option ordering makes `None < Some(n)`, so the first-ever error still fires.
+///
+/// When the live log has *no* errors (rotated/truncated away), mark any lingering
+/// unread `log:szhost` row read so the badge clears — otherwise a stale row stays
+/// clickable and drills into an error-free log ("no matching log lines").
 pub(crate) fn maybe_emit_log_error(db: &Db, notifs: &[Notification], error_count: usize) {
-    if error_count > 0 && Some(error_count) > last_logged_error_count(notifs) {
+    if error_count == 0 {
+        for id in stale_log_notifs_to_clear(notifs, error_count) {
+            // best-effort: DB is a cache; a failed mark just re-attempts next refresh.
+            let _ = db.mark_notification_read(id);
+        }
+        return;
+    }
+    if Some(error_count) > last_logged_error_count(notifs) {
         let msg = format!(
             "{} error{} in szhost.log",
             error_count,
@@ -35,6 +46,20 @@ pub(crate) fn maybe_emit_log_error(db: &Db, notifs: &[Notification], error_count
         );
         let _ = db.put_notification("log_error", "log:szhost", &msg, "");
     }
+}
+
+/// The `log:szhost` notification ids to mark read when the live log carries no
+/// errors — a rotated/truncated log otherwise leaves a stale, unread badge that
+/// drills into an error-free log. Returns nothing while errors remain.
+fn stale_log_notifs_to_clear(notifs: &[Notification], error_count: usize) -> Vec<i64> {
+    if error_count > 0 {
+        return Vec::new();
+    }
+    notifs
+        .iter()
+        .filter(|n| n.source_ref == "log:szhost" && !n.read)
+        .map(|n| n.id)
+        .collect()
 }
 
 /// Full notification list for the inbox panel; badge counts are derived from
@@ -157,5 +182,32 @@ mod tests {
         assert!(!would_emit(&[], 0));
         let notifs = vec![log_notif(100, "3 errors in szhost.log")];
         assert!(!would_emit(&notifs, 0));
+    }
+
+    #[test]
+    fn clears_stale_unread_log_badge_when_log_has_no_errors() {
+        // Rotated/truncated log → 0 errors: the lingering unread row is cleared.
+        let notifs = vec![Notification {
+            id: 7,
+            ..log_notif(100, "3 errors in szhost.log")
+        }];
+        assert_eq!(stale_log_notifs_to_clear(&notifs, 0), vec![7]);
+    }
+
+    #[test]
+    fn does_not_clear_while_errors_remain_or_already_read() {
+        let unread = vec![Notification {
+            id: 7,
+            ..log_notif(100, "3 errors in szhost.log")
+        }];
+        // Errors still present → leave the badge alone.
+        assert!(stale_log_notifs_to_clear(&unread, 3).is_empty());
+        // Already-read rows aren't re-touched.
+        let read = vec![Notification {
+            id: 7,
+            read: true,
+            ..log_notif(100, "3 errors in szhost.log")
+        }];
+        assert!(stale_log_notifs_to_clear(&read, 0).is_empty());
     }
 }
