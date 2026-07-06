@@ -195,6 +195,61 @@ pub(crate) fn spawn_ci_action(
     });
 }
 
+/// Fetch a CI run's full detail (jobs/steps) + the failing jobs' log tails off
+/// the loop, then deliver them into the live modal overlay via a
+/// `RefreshKind::CiDetail` on the refresh channel (applied by
+/// `crate::detail::apply_ci_detail`). The header already painted from the cached
+/// run; this fills the drill. On any fetch error we fall back to the cached run
+/// so the modal still shows the header rather than crashing or spawning a pane.
+pub(crate) fn spawn_ci_detail(
+    session: &Session,
+    cfg: &superzej_core::config::CiConfig,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    run: superzej_core::ci::CiRun,
+) {
+    use superzej_core::ci::CiState;
+    let wt = active_tab_path(session);
+    let cfg = cfg.clone();
+    let tx = refresh_tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let Some(client) = superzej_svc::ci::provider_for(&loc, &cfg) else {
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        // Full run (jobs/steps); on error keep the cached run so the header stays.
+        let detail = rt.block_on(client.run_detail(&loc, &run.id)).unwrap_or(run);
+        // Failing-job log tails (the "why did it fail"), each tail-capped by
+        // `log_tail_lines` and prefixed with the job name.
+        let cap = cfg.log_tail_lines;
+        let mut log_tail: Vec<String> = Vec::new();
+        for job in detail.jobs.iter().filter(|j| j.state == CiState::Fail) {
+            if let Ok(log) = rt.block_on(client.logs(&loc, &detail.id, &job.id)) {
+                let lines: Vec<&str> = log.text.lines().collect();
+                let start = lines
+                    .len()
+                    .saturating_sub(if cap > 0 { cap } else { lines.len() });
+                log_tail.push(format!("\u{2500}\u{2500} {} \u{2500}\u{2500}", job.name));
+                log_tail.extend(lines[start..].iter().map(|s| (*s).to_string()));
+            }
+        }
+        let payload = crate::detail::CiDetailPayload {
+            run: detail,
+            log_tail,
+        };
+        if tx.send(RefreshKind::CiDetail(Box::new(payload))).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+}
+
 /// A transient status line for a CI mutation about to be spawned.
 fn status_for(action: &DetailAction) -> &'static str {
     match action {
@@ -249,6 +304,15 @@ impl CiActionCtx<'_> {
         *self.need_relayout = true;
     }
 
+    /// Kick the off-loop fetch that fills a CI-run drill (the overlay already
+    /// swapped to the run's header in place). The result lands back in the modal
+    /// via `RefreshKind::CiDetail` — no pane is spawned (that one-shot pane was
+    /// the "crashed quickly" bug: it printed and exited instantly).
+    fn drill_ci_detail(&mut self, run: superzej_core::ci::CiRun) {
+        self.model.status = "Fetching CI run detail\u{2026}".into();
+        spawn_ci_detail(self.session, &self.cfg.ci, self.refresh_tx, self.waker, run);
+    }
+
     /// Fire a CI mutation off the loop after posting an in-progress status.
     fn spawn_mutation(&mut self, action: DetailAction) {
         self.model.status = status_for(&action).into();
@@ -261,19 +325,23 @@ impl CiActionCtx<'_> {
         );
     }
 
-    /// Execute a detail-overlay row action (the overlay is already closed).
-    /// Covers the CI badge (`OpenUrl`/`RunCommand`/rerun/cancel) and the
-    /// notifications badge (worktree focus, inbox management, log pager, copy).
-    pub(crate) fn run_detail_action(&mut self, action: DetailAction) {
+    /// Execute a detail-overlay row action, returning the overlay to *retain*
+    /// (the CI drill keeps it open to fill in place) or `None` to close it — the
+    /// loop assigns the result back to its `bar_detail` slot. Covers the CI badge
+    /// (`OpenUrl`/`DrillCiRun`/rerun/cancel) and the notifications badge (worktree
+    /// focus, inbox management, log pager, copy).
+    pub(crate) fn run_detail_action(
+        &mut self,
+        action: DetailAction,
+        overlay: Option<crate::detail::DetailOverlay>,
+    ) -> Option<crate::detail::DetailOverlay> {
+        let keep = action.keeps_overlay();
         match action {
             DetailAction::OpenUrl(u) => {
                 open_url_detached(&u);
                 self.model.status = "Opened CI run in the browser".into();
             }
-            DetailAction::RunCommand(args) => {
-                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                self.open_szhost_pane(&refs);
-            }
+            DetailAction::DrillCiRun { run } => self.drill_ci_detail(*run),
             DetailAction::CiRerun { .. } | DetailAction::CiCancel { .. } => {
                 self.spawn_mutation(action)
             }
@@ -288,6 +356,9 @@ impl CiActionCtx<'_> {
             // ShowLog drills in place inside the overlay and never reaches the loop.
             DetailAction::ShowLog(_) => {}
         }
+        // Retain the overlay only for the in-place CI drill; every other action
+        // has done its side effect and the modal should close.
+        keep.then_some(overlay).flatten()
     }
 
     /// Switch to the open worktree tab at `path` (the common case for a

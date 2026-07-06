@@ -150,7 +150,9 @@ pub(crate) fn merge_glyph_scan(
 /// the GitHub PR-cache refresh; `Issues` kicks the issue-tracker cache refresh.
 /// All arrive event-driven (worktree fs-watch, tab switch) and on low-frequency
 /// safety-net intervals.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// Not `Copy`: the `CiDetail` variant boxes a `CiDetailPayload`. Every send is a
+// literal and the loop drains by value, so `Copy` was never relied upon.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum RefreshKind {
     Model,
     Pr,
@@ -160,6 +162,10 @@ pub(crate) enum RefreshKind {
     /// Per-worktree disk-size scan (off-loop `du`, cached in the DB). Slow, so
     /// it runs on a long cadence and the scan itself coalesces by `fetched_at`.
     Disk,
+    /// A CI-run drill's async detail (jobs/steps + failing-log tail) fetched
+    /// off-loop, delivered into the live modal overlay by
+    /// [`crate::detail::apply_ci_detail`].
+    CiDetail(Box<crate::detail::CiDetailPayload>),
 }
 
 const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);

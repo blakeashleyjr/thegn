@@ -2538,9 +2538,9 @@ fn compose_row_lines(
                 push_sp(&mut right);
                 right.push(seg(
                     Tok::Hue(theme::Hue::Red),
-                    format!("\u{26a0}{}", row.alert_count),
+                    format!("{} {}", gl.warn, row.alert_count),
                 ));
-                // ⚠N
+                // ⚠N (caps-routed → `!N` in ASCII)
             }
 
             let mut lines = vec![if right.is_empty() {
@@ -2579,14 +2579,13 @@ fn compose_detail_line(row: &crate::sidebar::SidebarRow) -> Option<crate::seg::L
         segs.push(seg(Tok::Slot(S::Faint), format!("({backend}) ")));
     }
     if let Some(pr) = row.pr_count.filter(|&c| c > 0) {
-        segs.push(seg(Tok::Hue(theme::Hue::Green), format!("\u{2b21}{pr} "))); // ⬡N
+        let hex = crate::caps::active_glyphs().hex;
+        segs.push(seg(Tok::Hue(theme::Hue::Green), format!("{hex} {pr} PR "))); // ⬡N PR
     }
     if row.unread_count > 0 {
-        segs.push(seg(
-            Tok::Hue(theme::Hue::Blue),
-            format!("\u{2709}{} ", row.unread_count),
-        ));
-        // ✉N
+        let mail = crate::caps::active_glyphs().mail;
+        let blue = Tok::Hue(theme::Hue::Blue);
+        segs.push(seg(blue, format!("{mail} {} unread ", row.unread_count)));
     }
     if let Some(total) = row.disk_bytes {
         let target = row.target_bytes.unwrap_or(0);
