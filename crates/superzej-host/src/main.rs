@@ -64,6 +64,7 @@ mod lsp;
 mod managed_tool;
 mod mem;
 mod menu;
+mod merge_driver;
 mod metrics;
 mod mousefilter;
 mod nav;
@@ -220,6 +221,13 @@ pub enum Command {
     /// repo's target branch, landing clean ones and deferring conflicts
     /// (`[merge_queue]`, the fold-actor).
     Integrate,
+    /// Agent-driven merge queue: assign branches (`merge add`) and drain them one
+    /// by one (`merge drain`), dispatching a headless CLI agent to resolve
+    /// conflicts / fix the build (`[merge_queue]`).
+    Merge {
+        #[command(subcommand)]
+        action: cmd::merge::Action,
+    },
     /// Hidden legacy spelling of `wt disk` (kept working forever).
     #[command(hide = true)]
     Disk {
@@ -566,6 +574,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Diff { args } => cmd::wt::run(&cfg, cmd::wt::Action::Diff(args)),
         Command::List { args } => cmd::wt::run(&cfg, cmd::wt::Action::List(args)),
         Command::Integrate => cmd::integrate::run(&cfg),
+        Command::Merge { action } => cmd::merge::run(&cfg, action),
         Command::Disk { args } => cmd::wt::run(&cfg, cmd::wt::Action::Disk(args)),
         Command::Clean { args } => cmd::wt::run(&cfg, cmd::wt::Action::Clean(args)),
         Command::Repos { json } => cmd::repos::repos(&cfg, json),

@@ -25,6 +25,7 @@ pub mod issue;
 pub mod list;
 pub mod logs;
 pub mod mcp;
+pub mod merge;
 pub mod notify;
 pub mod open;
 pub mod placement;

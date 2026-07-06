@@ -273,6 +273,31 @@ check "env show resolves an environment for a worktree" \
 check "env set/show round-trips a selection" \
   "'$SZ' env set company-k8s '$WT' >/dev/null 2>&1 && '$SZ' env show '$WT' >/dev/null 2>&1"
 
+# ── agent-driven merge queue (`merge` namespace, the fold-actor) ─────────────
+# Assign a worktree branch to the queue and drain it: a clean branch folds onto
+# the target and lands (no agent needed). Exercises the CLI + DB round-trip.
+check "merge list starts empty" \
+  "'$SZ' merge list | grep -qi 'empty'"
+MP="$("$SZ" wt new smoke-merge --repo "$R")"
+MB="$(git -C "$MP" symbolic-ref --short HEAD)"
+echo hi >"$MP/smoke-merge.txt"
+git -C "$MP" add -A && git -C "$MP" commit -q -m "smoke merge change"
+check "merge add queues the worktree branch" \
+  "'$SZ' merge add '$MP' | grep -q 'queued'"
+check "merge list shows the queued branch" \
+  "'$SZ' merge list | grep -q '$MB'"
+if command -v sqlite3 >/dev/null 2>&1; then
+  check "merge add wrote a queued row" \
+    "[[ \$(sqlite3 \"$XDG_STATE_HOME/superzej/superzej.db\" \
+       \"SELECT count(*) FROM merge_queue WHERE branch='$MB' AND status='queued'\") -eq 1 ]]"
+fi
+check "merge drain lands the clean branch" \
+  "'$SZ' merge drain | grep -q 'landed'"
+check "drain advanced the target to include the branch's commit" \
+  "git -C '$R' log --oneline | grep -q 'smoke merge change'"
+check "merge rm deletes the entry by the same path" \
+  "'$SZ' merge add '$MP' >/dev/null && '$SZ' merge rm '$MP' >/dev/null 2>&1"
+
 # ── placement engine ─────────────────────────────────────────────────────────
 # Engine OFF (the default): the dry-run reports passthrough and no state is
 # written — the byte-compatibility invariant's shell-visible face.

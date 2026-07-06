@@ -14,6 +14,7 @@
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use superzej_core::config::MergeQueueConfig;
 use superzej_core::db::Db;
 use superzej_core::fold::{self, Branch, ConflictKind, FoldGit, FoldPlan, MergeOutcome};
@@ -21,6 +22,19 @@ use superzej_core::remote::GitLoc;
 use superzej_core::store::WorktreeAuxStore;
 use superzej_core::util;
 use superzej_svc::git::{CliGit, GitBackend, MergeTreeOutcome, PlumbingOps};
+
+/// A unique throwaway path under the temp dir. `util::now()` is seconds-resolution,
+/// so a process-wide sequence keeps two near-simultaneous throwaway worktrees (two
+/// gate runs, or parallel tests) from colliding on the same path.
+fn tmp_path(prefix: &str) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}-{n}",
+        std::process::id(),
+        util::now()
+    ))
+}
 
 /// Drives the pure fold engine over real git plumbing at one repo root.
 struct PlumbingAdapter {
@@ -76,11 +90,7 @@ fn regenerate_merge(
     regenerate_paths: &[String],
     regenerate_command: &str,
 ) -> Option<String> {
-    let tmp = std::env::temp_dir().join(format!(
-        "sz-foldregen-{}-{}",
-        std::process::id(),
-        util::now()
-    ));
+    let tmp = tmp_path("sz-foldregen");
     let tmp_s = tmp.to_string_lossy().to_string();
     if !util::git_ok(
         repo_root,
@@ -297,16 +307,14 @@ pub fn persist(db: &Db, cands: &Candidates, report: &FoldReport) -> Result<()> {
 }
 
 /// Build/test the folded tip in a throwaway detached worktree. Returns whether
-/// `gate_command` exited zero. The worktree is always removed afterward.
+/// `gate_command` exited zero plus its captured combined output (tail-truncated),
+/// which the queue driver feeds to a fixing agent on a red gate. The worktree is
+/// always removed afterward.
 // off-loop: the fold runs from the CLI (`szhost integrate`) or from
 // spawn_fold's spawn_blocking (see the module doc) — never on the loop.
 #[expect(clippy::disallowed_methods)]
-fn gate_tip(repo_root: &Path, oid: &str, gate_command: &str) -> Result<bool> {
-    let tmp = std::env::temp_dir().join(format!(
-        "sz-foldgate-{}-{}",
-        std::process::id(),
-        util::now()
-    ));
+pub(crate) fn gate_tip(repo_root: &Path, oid: &str, gate_command: &str) -> Result<(bool, String)> {
+    let tmp = tmp_path("sz-foldgate");
     let tmp_s = tmp.to_string_lossy().to_string();
     if !util::git_ok(
         repo_root,
@@ -314,14 +322,34 @@ fn gate_tip(repo_root: &Path, oid: &str, gate_command: &str) -> Result<bool> {
     ) {
         anyhow::bail!("merge queue: could not create gate worktree at {tmp_s}");
     }
-    let status = std::process::Command::new("sh")
+    let out = std::process::Command::new("sh")
         .arg("-c")
         .arg(gate_command)
         .current_dir(&tmp)
-        .status();
+        .output();
     // Best-effort teardown — never leak the gate worktree.
     let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &tmp_s]);
-    Ok(status.map(|s| s.success()).unwrap_or(false))
+    Ok(match out {
+        Ok(o) => {
+            let mut log = String::from_utf8_lossy(&o.stdout).into_owned();
+            log.push_str(&String::from_utf8_lossy(&o.stderr));
+            (o.status.success(), tail(&log, 4000))
+        }
+        Err(e) => (false, format!("gate command failed to start: {e}")),
+    })
+}
+
+/// Keep the last `max` bytes of `s` on a char boundary (gate logs can be huge; the
+/// tail — where the failure is — is what a fixing agent needs).
+fn tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut cut = s.len() - max;
+    while cut < s.len() && !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("…\n{}", &s[cut..])
 }
 
 /// On a red gate, re-fold growing prefixes of the landed branches; the first
@@ -345,7 +373,7 @@ fn bisect_offender(
             tip: branch_tip(repo_root, &l.branch)?,
         });
         let plan = fold::fold(adapter, base, prefix.clone(), &cfg.regenerate_paths)?;
-        if plan.advanced() && !gate_tip(repo_root, &plan.final_tip, &cfg.gate_command)? {
+        if plan.advanced() && !gate_tip(repo_root, &plan.final_tip, &cfg.gate_command)?.0 {
             return Ok(Some(l.branch.clone()));
         }
     }
@@ -465,7 +493,7 @@ pub fn run_fold(
 
         // Test-gate the union before blessing it.
         let gate = if gate_on {
-            if gate_tip(repo_root, &plan.final_tip, &cfg.gate_command)? {
+            if gate_tip(repo_root, &plan.final_tip, &cfg.gate_command)?.0 {
                 GateOutcome::Passed
             } else if cfg.bisect_on_red {
                 let landed: Vec<LandedReport> = plan
@@ -542,6 +570,97 @@ pub fn run_fold(
             anyhow::bail!("merge queue: {target_branch} kept moving under the fold");
         }
         // Lost the race — loop, re-read, re-fold.
+    }
+}
+
+/// What the driver's single-branch land attempt decided.
+#[derive(Debug, Clone)]
+pub(crate) enum AttemptOutcome {
+    /// Merged clean, gated green, and CAS-advanced the target. `commit` is the
+    /// fold tip now at the target ref.
+    Landed { commit: String },
+    /// Merged clean and gated green, but `auto_land` is off — held for a manual
+    /// land. `tip` is the (unreferenced) fold commit in the object DB.
+    Ready { tip: String },
+    /// A textual (or unresolved regenerable) conflict against the current target.
+    Conflict { paths: Vec<String> },
+    /// Merged clean but the gate went red. `log` is the tail of the gate output.
+    GateFailed { log: String },
+    /// The branch tip is already an ancestor of the target — nothing to do.
+    UpToDate,
+}
+
+/// Attempt to land a *single* branch onto the repo's current target tip, the way
+/// the queue driver drains one at a time. Mirrors [`run_fold`]'s fold→gate→CAS
+/// path (re-reading the tip and re-folding on a lost CAS race), but for one branch
+/// and with a richer per-outcome result the driver can route to an agent. Never
+/// touches a working tree except the throwaway gate worktree and — on a successful
+/// advance — the guarded main-checkout fast-forward.
+pub(crate) fn attempt_land(
+    cfg: &MergeQueueConfig,
+    repo_root: &Path,
+    branch_name: &str,
+) -> Result<AttemptOutcome> {
+    let loc = GitLoc::for_worktree(repo_root);
+    let target_branch = resolve_target(cfg, repo_root);
+    let target_ref = format!("refs/heads/{target_branch}");
+    let adapter = PlumbingAdapter {
+        loc: loc.clone(),
+        repo_root: repo_root.to_path_buf(),
+        regenerate_paths: cfg.regenerate_paths.clone(),
+        regenerate_command: cfg.regenerate_command.clone(),
+    };
+    let gate_on = cfg.gate_on && !cfg.gate_command.is_empty();
+    let mut cas_attempts = 0u32;
+    loop {
+        let base = CliGit.rev_parse(&loc, &target_ref)?;
+        let branch_tip = CliGit.rev_parse(&loc, &format!("refs/heads/{branch_name}"))?;
+        if util::git_ok(
+            repo_root,
+            &["merge-base", "--is-ancestor", &branch_tip, &base],
+        ) {
+            return Ok(AttemptOutcome::UpToDate);
+        }
+        let branch = Branch {
+            name: branch_name.to_string(),
+            tip: branch_tip,
+        };
+        let plan = fold::fold(&adapter, &base, vec![branch], &cfg.regenerate_paths)?;
+        if !plan.advanced() {
+            // One branch that didn't advance the tip ⇒ it was deferred (conflict).
+            let paths = plan
+                .deferred
+                .first()
+                .map(|d| d.paths.clone())
+                .unwrap_or_default();
+            return Ok(AttemptOutcome::Conflict { paths });
+        }
+        let folded_tip = plan.final_tip.clone();
+        if gate_on {
+            let (ok, log) = gate_tip(repo_root, &folded_tip, &cfg.gate_command)?;
+            if !ok {
+                return Ok(AttemptOutcome::GateFailed { log });
+            }
+        }
+        if !cfg.auto_land {
+            return Ok(AttemptOutcome::Ready { tip: folded_tip });
+        }
+        cas_attempts += 1;
+        if CliGit.update_ref_cas(&loc, &target_ref, &folded_tip, &base)? {
+            if util::resync_ff_checkout(repo_root, &target_branch, &base, &folded_tip)
+                == util::ResyncOutcome::Failed
+            {
+                tracing::warn!(
+                    target: "szhost::integrate",
+                    "could not fast-forward the main checkout; run `git -C <repo> reset --hard {target_branch}` to sync it"
+                );
+            }
+            return Ok(AttemptOutcome::Landed { commit: folded_tip });
+        }
+        if cas_attempts >= 5 {
+            anyhow::bail!("merge queue: {target_branch} kept moving under the fold");
+        }
+        // Lost the CAS race — loop, re-read, re-fold onto the moved tip.
     }
 }
 
@@ -630,6 +749,10 @@ mod tests {
             regenerate_paths: vec!["Cargo.lock".into()],
             regenerate_command: String::new(),
             conflict_handoff: Default::default(),
+            agent_command: String::new(),
+            auto_land: true,
+            agent_max_attempts: 2,
+            agent_timeout_secs: 0,
         }
     }
 
@@ -789,5 +912,87 @@ mod tests {
             std::fs::read_to_string(repo.dir.join("base.txt")).unwrap(),
             "MY LOCAL EDIT\n"
         );
+    }
+
+    // ── attempt_land (the single-branch primitive the queue driver uses) ──────
+
+    #[test]
+    fn attempt_land_lands_a_clean_branch() {
+        let repo = Repo::new("al-clean");
+        repo.feature("b1", "a.txt", "a\n");
+        let before = repo.out(&["rev-parse", "main"]);
+
+        match attempt_land(&cfg(""), &repo.dir, "b1").unwrap() {
+            AttemptOutcome::Landed { commit } => assert!(!commit.is_empty()),
+            o => panic!("expected Landed, got {o:?}"),
+        }
+        assert_ne!(repo.out(&["rev-parse", "main"]), before, "main advanced");
+        assert!(repo.dir.join("a.txt").exists());
+    }
+
+    #[test]
+    fn attempt_land_reports_a_textual_conflict_without_moving_main() {
+        let repo = Repo::new("al-conflict");
+        repo.feature("bad", "base.txt", "changed\n");
+        repo.commit("base.txt", "mainline\n", "main edits base");
+        let before = repo.out(&["rev-parse", "main"]);
+
+        match attempt_land(&cfg(""), &repo.dir, "bad").unwrap() {
+            AttemptOutcome::Conflict { paths } => assert!(paths.iter().any(|p| p == "base.txt")),
+            o => panic!("expected Conflict, got {o:?}"),
+        }
+        assert_eq!(
+            repo.out(&["rev-parse", "main"]),
+            before,
+            "main must not move"
+        );
+    }
+
+    #[test]
+    fn attempt_land_reports_gate_failure_and_holds_main() {
+        let repo = Repo::new("al-gate");
+        repo.feature("b1", "a.txt", "a\n");
+        let before = repo.out(&["rev-parse", "main"]);
+
+        match attempt_land(&cfg("false"), &repo.dir, "b1").unwrap() {
+            AttemptOutcome::GateFailed { .. } => {}
+            o => panic!("expected GateFailed, got {o:?}"),
+        }
+        assert_eq!(
+            repo.out(&["rev-parse", "main"]),
+            before,
+            "red gate holds main"
+        );
+    }
+
+    #[test]
+    fn attempt_land_holds_at_ready_when_auto_land_is_off() {
+        let repo = Repo::new("al-ready");
+        repo.feature("b1", "a.txt", "a\n");
+        let before = repo.out(&["rev-parse", "main"]);
+        let mut c = cfg("true"); // green gate
+        c.auto_land = false;
+
+        match attempt_land(&c, &repo.dir, "b1").unwrap() {
+            AttemptOutcome::Ready { tip } => assert!(!tip.is_empty()),
+            o => panic!("expected Ready, got {o:?}"),
+        }
+        assert_eq!(
+            repo.out(&["rev-parse", "main"]),
+            before,
+            "ready does not land"
+        );
+    }
+
+    #[test]
+    fn attempt_land_is_uptodate_for_an_already_merged_branch() {
+        let repo = Repo::new("al-uptodate");
+        repo.feature("b1", "a.txt", "a\n");
+        attempt_land(&cfg(""), &repo.dir, "b1").unwrap(); // land it
+        // A second attempt sees b1's tip already an ancestor of main.
+        assert!(matches!(
+            attempt_land(&cfg(""), &repo.dir, "b1").unwrap(),
+            AttemptOutcome::UpToDate
+        ));
     }
 }

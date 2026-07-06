@@ -14,9 +14,12 @@ use super::{PanelRow, SectionCtx, d, g, g2, hue};
 pub(super) fn status_glyph(status: &str) -> Seg {
     match status {
         "landed" => seg(hue(Hue::Green), "✓"),
+        "ready" => seg(hue(Hue::Green), "◆"), // gated green, awaiting a land
         "deferred" | "gate_failed" => seg(hue(Hue::Red), "⚑"),
+        "needs_human" => seg(hue(Hue::Red), "✋"), // agent tried and gave up
         "folding" | "verifying" => seg(hue(Hue::Amber), "●"),
-        _ => seg(g(), "○"), // queued / unknown
+        "agent_running" => seg(hue(Hue::Amber), "◐"), // agent fixing the branch
+        _ => seg(g(), "○"),                           // queued / unknown
     }
 }
 
@@ -31,11 +34,13 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     let mut out: Vec<PanelRow> = Vec::new();
     for r in rows {
         let mut left = vec![status_glyph(&r.status), seg(d(), format!(" {}", r.branch))];
-        // Deferred rows carry the reason: the conflicting paths, or "breaks
-        // build" for a gate failure (which has no textual conflict).
-        if r.status == "deferred" || r.status == "gate_failed" {
+        // Blocked rows carry the reason: the conflicting paths, "breaks build"
+        // for a gate failure, or the recorded detail when an agent gave up.
+        if r.status == "deferred" || r.status == "gate_failed" || r.status == "needs_human" {
             let reason = if r.status == "gate_failed" {
                 "breaks build".to_string()
+            } else if let Some(d) = r.error_detail.as_deref().filter(|s| !s.is_empty()) {
+                d.replace('\n', ", ")
             } else {
                 match r.conflict_paths.as_deref() {
                     Some(p) if !p.is_empty() => p.replace('\n', ", "),
