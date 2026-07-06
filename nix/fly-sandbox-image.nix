@@ -12,10 +12,14 @@
 #
 # Runs as ROOT (unlike the uid-1000 base sandbox image): sshd must bind :22 and
 # manage host keys; sessions land as root, matching the VPS reachability model.
-{pkgs}: let
-  # Baked toolchain — rust + just are present immediately (no rustup network
-  # dance), mirroring the lean `devShells.sandbox` (rust + just). `rustup` is also
-  # here so a repo can still pin its own toolchain on top.
+{
+  pkgs,
+  rustToolchain,
+}: let
+  # Baked toolchain — the SAME combined rust toolchain the flake's
+  # `devShells.sandbox` uses (clippy/rustfmt included, single derivation so no
+  # buildEnv collisions), present immediately with no rustup network dance. `just`
+  # rounds out the lean sandbox shell (rust + just).
   toolEnv = pkgs.buildEnv {
     name = "superzej-fly-sandbox-env";
     paths = with pkgs; [
@@ -23,12 +27,8 @@
       nix
       direnv
       nix-direnv
-      # baked rust (instant) + repo-pinnable rustup + task runner
-      cargo
-      rustc
-      clippy
-      rustfmt
-      rustup
+      # baked rust (instant) + task runner
+      rustToolchain
       just
       # daily substrate
       bashInteractive
@@ -57,7 +57,9 @@
   # superzej's injected /root/.ssh/authorized_keys authenticates root by key only.
   entrypoint = pkgs.writeShellScript "sz-fly-entrypoint" ''
     set -e
-    mkdir -p /run/sshd /root/.ssh /etc/ssh
+    # Privilege-separation dir modern sshd requires (owned root, 0755).
+    mkdir -p /run/sshd /var/empty /root/.ssh /etc/ssh
+    chmod 0755 /var/empty
     chmod 700 /root/.ssh
     [ -f /root/.ssh/authorized_keys ] && chmod 600 /root/.ssh/authorized_keys || true
     for t in rsa ed25519; do
@@ -72,17 +74,22 @@
     UsePAM no
     Subsystem sftp internal-sftp
     EOF
+    # -e logs to stderr (→ Fly logs) so a startup failure is diagnosable.
     exec ${pkgs.openssh}/bin/sshd -D -e -f /etc/ssh/sshd_config
   '';
 
   etcFiles = pkgs.runCommand "superzej-fly-etc" {} ''
     mkdir -p $out/etc/nix
+    # Include the unprivileged `sshd` privsep user/group — without it modern
+    # OpenSSH refuses to start ("Privilege separation user sshd does not exist").
     cat > $out/etc/passwd <<EOF
     root:x:0:0:root:/root:${pkgs.bashInteractive}/bin/bash
+    sshd:x:74:74:sshd privsep:/var/empty:/bin/false
     nobody:x:65534:65534:nobody:/nonexistent:/bin/false
     EOF
     cat > $out/etc/group <<EOF
     root:x:0:
+    sshd:x:74:
     nogroup:x:65534:
     EOF
     printf 'experimental-features = nix-command flakes\nrequire-sigs = false\nbuild-users-group =\n' > $out/etc/nix/nix.conf

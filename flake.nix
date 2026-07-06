@@ -203,7 +203,7 @@
       packages.sandbox-image = import ./nix/sandbox-image.nix {inherit pkgs;};
       # Fly.io boot image: sshd entrypoint + baked toolchain, so a Fly machine
       # boots straight into a reachable shell (`template = "image:<ref>"`).
-      packages.fly-sandbox-image = import ./nix/fly-sandbox-image.nix {inherit pkgs;};
+      packages.fly-sandbox-image = import ./nix/fly-sandbox-image.nix {inherit pkgs rustToolchain;};
 
       # `nix fmt` formats every tracked file via treefmt.toml.
       formatter = treefmtWrapper;
