@@ -1182,11 +1182,18 @@ pub(crate) fn build_model(
         .find(|w| w.path == active_path)
         .map(|w| w.repo_path.clone())
         .unwrap_or_else(|| active_path.clone());
+    // Use the EFFECTIVE env selection (per-worktree override, else the
+    // workspace default) — the same source the loading splash's
+    // `agent::loading_context` uses. Reading raw `worktree_env` here missed the
+    // workspace-default case: a worktree created under a workspace whose default
+    // env is a provider (e.g. `sprites`) has no per-worktree row, so the tab bar
+    // resolved it as Local — no `[sprites]` chip and a bogus `(bwrap)` backend
+    // chip — while the splash correctly showed the provider placement.
     let active_env = app_cfg.resolve_env(
         std::path::Path::new(&active_repo),
         &loc,
         std::path::Path::new(&active_path),
-        db.worktree_env(&active_path).ok().flatten().as_deref(),
+        db.effective_env(&active_path, &active_repo).as_deref(),
     );
     let active_placement_kind =
         (!active_env.placement.is_local()).then(|| active_env.placement.kind());
@@ -1204,8 +1211,15 @@ pub(crate) fn build_model(
     });
 
     // Sandbox backend for the tab-bar `(backend)` chip; see `hydrate_terminal`.
-    let active_sandbox_backend =
-        crate::hydrate_terminal::active_backend(db, &loc.path(), active_env.sandbox.backend);
+    // For a REMOTE/provider placement the host `SandboxConfig` backend (e.g.
+    // `bwrap`) is irrelevant — the sprite/provider IS the environment — and the
+    // fallback that reads it produced a misleading `(bwrap)` chip next to the
+    // sprite. The `[kind]` placement chip carries the environment instead.
+    let active_sandbox_backend = if active_env.placement.is_local() {
+        crate::hydrate_terminal::active_backend(db, &loc.path(), active_env.sandbox.backend)
+    } else {
+        String::new()
+    };
 
     tracing::debug!(
         target: "szhost::hydrate",

@@ -7663,6 +7663,11 @@ async fn event_loop<T: Terminal>(
     // premature rc-free-bash fallback. A per-tab bool removes that coupling.
     let mut loading_remote: std::collections::HashMap<(String, usize), bool> =
         std::collections::HashMap::new();
+    // Keys (group name, tab) whose shell already spoke ⇒ splash RETIRED: drop a
+    // late `provision_rx` update that would re-raise it (the flash-back flicker).
+    // Cleared on a fresh materialize. See `loading::splash_update_allowed`.
+    let mut loading_retired: std::collections::HashSet<(String, usize)> =
+        std::collections::HashSet::new();
     // Active-tab keys (group name, tab) whose sandbox probe failed: skip
     // re-probing on the next tick for the same reason as prewarm_failed.
     // Cleared on worktree switch.
@@ -8856,6 +8861,8 @@ async fn event_loop<T: Terminal>(
                     && !materialize_failed.contains(&key)
                 {
                     materialize_inflight.insert(key.clone());
+                    // A fresh materialize is a genuine (re)bring-up: un-retire.
+                    loading_retired.remove(&key);
                     loading_remote.insert(
                         key.clone(),
                         superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(&path))
@@ -9103,24 +9110,15 @@ async fn event_loop<T: Terminal>(
                                         &loading_state,
                                         &key,
                                     ) {
-                                        if tracing::enabled!(target: "szhost::loading", tracing::Level::DEBUG)
-                                        {
-                                            let g = &session.worktrees[gi];
-                                            let remote =
-                                                superzej_core::remote::GitLoc::for_worktree(
-                                                    std::path::Path::new(&g.path),
-                                                )
-                                                .is_remote();
-                                            tracing::debug!(
-                                                target: "szhost::loading",
-                                                worktree = %g.name,
-                                                remote,
-                                                "first pane output cleared the loading splash \
-                                                 (provisioning done, shell live)"
-                                            );
-                                        }
+                                        tracing::debug!(
+                                            target: "szhost::loading",
+                                            worktree = %session.worktrees[gi].name,
+                                            "first pane output cleared the loading splash (provisioning done, shell live)"
+                                        );
                                         loading_state.remove(&key);
                                         loading_remote.remove(&key);
+                                        // Shell spoke ⇒ retire: no late splash re-raise.
+                                        loading_retired.insert(key);
                                     }
                                 }
                                 if Some(id) == corner && corner_kitty {
@@ -10152,6 +10150,7 @@ async fn event_loop<T: Terminal>(
             &session,
             &mut loading_state,
             &mut loading_remote,
+            &loading_retired,
             &mut loop_perf,
         ) {
             dirty = true;

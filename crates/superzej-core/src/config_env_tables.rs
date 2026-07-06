@@ -299,6 +299,23 @@ impl EnvProviderConfig {
                 .unwrap_or_else(|| "szhost".to_string());
             return vec![exe, "vps-ssh".into(), "{id}".into(), "--".into()];
         }
+        if wss_native_provider_kind(&self.provider) {
+            // WSS-native providers (sprites) have no vendor CLI. The
+            // control-plane READ path (chrome git/gh/fs reads + the persisted
+            // worktree `GitLoc`) shells out through the szhost self-bridge,
+            // which runs the command over the provider's native exec API. Panes
+            // attach over that API directly (see `native_exec_for`), so this
+            // prefix drives only the reads — `envbuild` keeps the *interactive*
+            // prefix empty for these providers. Without it the location blob had
+            // an empty prefix, `GitLoc::from_db` fell back to Local, and every
+            // read ran `git -C /workspace` on the HOST (no such dir) → blank
+            // branch / ahead-behind / a stale panel.
+            let exe = std::env::current_exe()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "szhost".to_string());
+            return vec![exe, "sprite-exec".into(), "{id}".into(), "--".into()];
+        }
         Vec::new()
     }
 }
@@ -308,6 +325,14 @@ impl EnvProviderConfig {
 /// `superzej_svc::vps::is_vps_provider` — keep the two lists in sync.
 pub fn vps_provider_kind(name: &str) -> bool {
     matches!(name.trim(), "hetzner" | "digitalocean")
+}
+
+/// Whether `name` names a provider whose control plane runs over the szhost
+/// exec self-bridge (`szhost sprite-exec <id> --`) rather than a vendor CLI or
+/// ssh — the WSS-native exec providers. The core-side mirror of
+/// `superzej_svc::provider::exec_api_by_name` — keep the two lists in sync.
+pub fn wss_native_provider_kind(name: &str) -> bool {
+    matches!(name.trim(), "sprites")
 }
 
 /// Whether a provider *kind* is **scale-to-zero**: an idle sandbox self-suspends

@@ -885,7 +885,7 @@ pub(crate) fn provisioned_agent_kinds(cfg: &Config) -> Vec<String> {
 /// picker is configured at all (see [`provisioned_agent_kinds`]). A known agent
 /// ([`superzej_core::envplan::known_agents`]) counts as present if its binary is
 /// on the host PATH or its config/credential dir exists in `$HOME`.
-fn detect_host_agents() -> Vec<String> {
+pub(crate) fn detect_host_agents() -> Vec<String> {
     let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
     let path = std::env::var("PATH").unwrap_or_default();
     let dirs: Vec<&str> = path.split(':').filter(|s| !s.is_empty()).collect();
@@ -1304,8 +1304,11 @@ pub fn provision_provider_env_named(
         progress(&boot);
     }
 
-    // Idempotent: already provisioned ⇒ nothing to do (no new checkpoint).
+    // Idempotent: already provisioned ⇒ nothing to do (no new checkpoint) — but
+    // still refresh auth creds: the host's OAuth token rotates, so the
+    // provision-time snapshot goes stale and the in-sandbox agent 401s.
     if block_on_provider(|| async { provider.read(&id, &marker).await }).is_ok() {
+        crate::agent_configs::resync_agent_auth(&provider, &id, cfg, worktree, env_name);
         return Ok((true, None));
     }
 
@@ -1554,30 +1557,8 @@ pub fn provision_provider_env_named(
 
         let result: anyhow::Result<()> = match &step.kind {
             StepKind::Exec(script) => {
-                // `/bin/sh -lc` + `2>&1` so the non-tty exec captures stderr too.
-                // Prefix PATH with EVERY place an installer drops `nix` + tools: the
-                // provider exec env is non-login (no `$USER`), so the installer's
-                // profile.d hook is a no-op — each step must put these on PATH itself
-                // for a later step to see what a prior step installed. CRITICAL:
-                // include the daemon/system profile (`/nix/var/nix/profiles/default`)
-                // where the Determinate installer (`--init none`) lands — without it
-                // every nix-using step (devShell, profile install, closure) fails
-                // "nix: not found" after a successful Determinate install, leaving a
-                // bare shell. Also source its profile hook for completeness.
-                let argv = vec![
-                    "/bin/sh".to_string(),
-                    "-lc".to_string(),
-                    format!(
-                        // `[ -r F ] && . F`, NOT `. F 2>/dev/null || true`: in dash
-                        // (the sandbox `/bin/sh`) sourcing a MISSING file is a
-                        // special-builtin error that exits the shell with status 2 —
-                        // `|| true` can't catch it — so on a fresh sandbox (no nix
-                        // yet) it aborted EVERY step, including the fatal `mkdir`.
-                        "[ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && \
-                         . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh; \
-                         export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; {script} 2>&1"
-                    ),
-                ];
+                // `/bin/sh -lc` + PATH-prefix + `2>&1` — see `provision_recover`.
+                let argv = crate::provision_recover::exec_login_argv(script);
                 // Bound every exec: a suspended/slow sandbox can leave `run_exec`
                 // blocked on an exit frame that never comes, hanging the loading
                 // screen forever. Quick steps (git auth, dotfiles repo) get a short
@@ -1710,6 +1691,18 @@ pub fn provision_provider_env_named(
                 return Err(e);
             }
             tracing::warn!(target: "szhost::startup", step = %step.id, ms = step_t0.elapsed().as_millis() as u64, error = %e, "provision step failed (best-effort — continuing)");
+            // If the step likely restarted the sandbox VM (an OOM-killed Nix
+            // install, exit 137), give it a bounded window to come back before
+            // the next step — otherwise every remaining step burns its own
+            // connect budget failing `exec ws connect` against a booting VM.
+            if crate::provision_recover::step_signals_sandbox_restart(&e.to_string()) {
+                tracing::warn!(target: "szhost::startup", step = %step.id, "step may have restarted the sandbox; waiting for it to become ready before continuing");
+                let _ = block_on_provider(|| async {
+                    provider
+                        .wait_ready(&id, std::time::Duration::from_secs(90))
+                        .await
+                });
+            }
             continue;
         }
         tracing::info!(target: "szhost::startup", step = %step.id, ms = step_t0.elapsed().as_millis() as u64, "provision step done");

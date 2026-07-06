@@ -24,6 +24,38 @@
 use crate::agent::block_on_provider;
 use std::path::Path;
 
+/// Whether a resolved file is executable for anyone (unix mode `& 0o111`). The
+/// agent-login sync must preserve this: `~/.claude/hooks/*.sh` are executable
+/// scripts, and the sprites fs API defaults a plain `write` to mode `0644`, so
+/// a hook uploaded via `write` lands non-executable and Claude Code fails with
+/// `…/agentmemory-*.sh: Permission denied`. Non-unix hosts have no exec bit.
+#[cfg(unix)]
+fn is_executable(md: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    md.permissions().mode() & 0o111 != 0
+}
+#[cfg(not(unix))]
+fn is_executable(_md: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Upload `data` to `dest` in the sandbox, preserving the executable bit: an
+/// executable source (a hook script) goes via `write_exec` (mode 0755) so it's
+/// runnable in-sandbox; everything else via `write` (0644).
+async fn write_preserving_mode(
+    provider: &superzej_svc::provider::Provider,
+    id: &str,
+    dest: &str,
+    data: &[u8],
+    exec: bool,
+) -> anyhow::Result<()> {
+    if exec {
+        provider.write_exec(id, dest, data).await
+    } else {
+        provider.write(id, dest, data).await
+    }
+}
+
 /// Directory names under an agent's config tree that hold bulky, ephemeral state
 /// (session transcripts, caches, snapshots) — NEVER needed to make the agent
 /// "logged in", and gigabytes in practice (`~/.claude/projects` alone is often
@@ -78,7 +110,7 @@ const UPLOAD_CONCURRENCY: usize = 8;
 /// "`agentmemory-*.sh`: not found" hook errors). `entry.file_type()` reports the
 /// link itself (neither file nor dir), so we resolve the target via
 /// `fs::metadata`; a `seen` set of canonical dirs guards against symlink cycles.
-pub(crate) fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
+pub(crate) fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf, String, bool)> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
@@ -112,12 +144,142 @@ pub(crate) fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf,
                     continue;
                 }
                 if let Ok(rel) = path.strip_prefix(dir) {
-                    out.push((path.clone(), rel.to_string_lossy().replace('\\', "/")));
+                    out.push((
+                        path.clone(),
+                        rel.to_string_lossy().replace('\\', "/"),
+                        is_executable(&md),
+                    ));
                 }
             }
         }
     }
     out
+}
+
+/// Upload just the auth-critical files (Phase 1) for `agents` into the sandbox
+/// `$HOME` at `base`, preserving the executable bit. Returns `(ok, failed)`.
+/// Small (~5 tiny files per agent) + best-effort — the shared core of the
+/// initial login sync and the connect-time [`resync_agent_auth`] refresh.
+fn sync_agent_auth_critical(
+    provider: &superzej_svc::provider::Provider,
+    id: &str,
+    base: &str,
+    agents: &[String],
+) -> (usize, usize) {
+    let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    for agent in agents {
+        for f in superzej_core::envplan::agent_auth_critical_files(agent) {
+            let src = Path::new(&host_home).join(&f);
+            let Ok(data) = std::fs::read(&src) else {
+                continue; // file absent on this host — skip silently
+            };
+            let exec = std::fs::metadata(&src)
+                .map(|md| is_executable(&md))
+                .unwrap_or(false);
+            let dest = format!("{base}/{f}");
+            match block_on_provider(|| async {
+                match tokio::time::timeout(
+                    AGENT_CONFIG_UPLOAD_TIMEOUT,
+                    write_preserving_mode(provider, id, &dest, &data, exec),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "upload timed out after {}s",
+                        AGENT_CONFIG_UPLOAD_TIMEOUT.as_secs()
+                    )),
+                }
+            }) {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(
+                        target: "szhost::startup",
+                        dest = %dest,
+                        error = %e,
+                        "agent-config auth-critical upload failed (best-effort)"
+                    );
+                }
+            }
+        }
+    }
+    (ok, failed)
+}
+
+/// Re-sync ONLY the auth-critical files into an already-provisioned sandbox, so
+/// a rotated host OAuth token is refreshed. Claude Code stores its subscription
+/// token in `~/.claude/.credentials.json` (accessToken + rotating refreshToken +
+/// expiresAt); the host rewrites it on refresh, so the sandbox's provision-time
+/// snapshot goes stale and the in-sandbox agent 401s ("Invalid authentication
+/// credentials") despite reporting "logged in". Runs on every provider bring-up
+/// (even the cached path where full provisioning short-circuits on its marker) —
+/// cheap (~5 tiny files) + best-effort. Resolves the sandbox `$HOME` and the
+/// agent kinds itself so the caller stays a one-liner.
+pub(crate) fn resync_agent_auth(
+    provider: &superzej_svc::provider::Provider,
+    id: &str,
+    cfg: &superzej_core::config::Config,
+    worktree: &str,
+    env_name: &str,
+) {
+    use superzej_core::store::WorkspaceStore;
+    // Agent kinds: mirror `run_provisioning` — an explicit `[sandbox.home]
+    // agents` list wins, else the `[[agents]]` picker, else host detection.
+    let loc = superzej_core::remote::GitLoc::for_worktree(Path::new(worktree));
+    let repo_root = superzej_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| superzej_core::repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| std::path::PathBuf::from(worktree));
+    let home = cfg
+        .resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name))
+        .sandbox
+        .home;
+    let agents = if !home.agents.is_empty() {
+        home.agents
+    } else {
+        let picker = crate::agent::provisioned_agent_kinds(cfg);
+        if picker.is_empty() {
+            crate::agent::detect_host_agents()
+        } else {
+            picker
+        }
+    };
+    if agents.is_empty() {
+        return;
+    }
+    // Resolve the sandbox `$HOME` (where the auth files must land) the same way
+    // `run_provisioning` does — a tiny non-tty exec.
+    let sprite_home = block_on_provider(|| async {
+        provider
+            .run_exec(
+                id,
+                &[
+                    "/bin/sh".to_string(),
+                    "-lc".to_string(),
+                    "printf %s \"$HOME\"".to_string(),
+                ],
+                None,
+                &[],
+            )
+            .await
+    })
+    .ok()
+    .filter(|(code, out)| *code == 0 && !out.trim().is_empty())
+    .map(|(_, out)| out.trim().to_string())
+    .unwrap_or_else(|| "/root".to_string());
+    let (ok, failed) =
+        sync_agent_auth_critical(provider, id, sprite_home.trim_end_matches('/'), &agents);
+    tracing::debug!(
+        target: "szhost::startup",
+        id, ok, failed,
+        "connect-time agent-auth re-sync (refresh rotated OAuth token)"
+    );
 }
 
 /// Upload coding agents' host config/credential dirs into the sandbox `$HOME`
@@ -139,43 +301,7 @@ pub(crate) fn upload_agent_configs(
     // no deadline. Even a slow provider finishes these in a few seconds.
     // The agent is guaranteed to be logged-in after this phase completes.
     // -----------------------------------------------------------------------
-    let mut auth_ok = 0usize;
-    let mut auth_failed = 0usize;
-    for agent in agents {
-        let critical = superzej_core::envplan::agent_auth_critical_files(agent);
-        for f in &critical {
-            let src = Path::new(&host_home).join(f);
-            let Ok(data) = std::fs::read(&src) else {
-                continue; // file absent on this host — skip silently
-            };
-            let dest = format!("{base}/{f}");
-            match block_on_provider(|| async {
-                match tokio::time::timeout(
-                    AGENT_CONFIG_UPLOAD_TIMEOUT,
-                    provider.write(id, &dest, &data),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "upload timed out after {}s",
-                        AGENT_CONFIG_UPLOAD_TIMEOUT.as_secs()
-                    )),
-                }
-            }) {
-                Ok(()) => auth_ok += 1,
-                Err(e) => {
-                    auth_failed += 1;
-                    tracing::warn!(
-                        target: "szhost::startup",
-                        dest = %dest,
-                        error = %e,
-                        "agent-config auth-critical upload failed (best-effort)"
-                    );
-                }
-            }
-        }
-    }
+    let (auth_ok, auth_failed) = sync_agent_auth_critical(provider, id, base, agents);
 
     // -----------------------------------------------------------------------
     // Phase 2: full config tree — walk directories, skip bulky-state dirs,
@@ -192,7 +318,7 @@ pub(crate) fn upload_agent_configs(
         }
     }
 
-    let mut all_uploads: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut all_uploads: Vec<(String, Vec<u8>, bool)> = Vec::new();
     for agent in agents {
         let (files, dirs) = superzej_core::envplan::agent_config_paths(agent);
         for f in files {
@@ -203,14 +329,17 @@ pub(crate) fn upload_agent_configs(
             let Ok(data) = std::fs::read(&src) else {
                 continue;
             };
-            all_uploads.push((format!("{base}/{f}"), data));
+            let exec = std::fs::metadata(&src)
+                .map(|md| is_executable(&md))
+                .unwrap_or(false);
+            all_uploads.push((format!("{base}/{f}"), data, exec));
         }
         for d in dirs {
             let src = Path::new(&host_home).join(&d);
             if !src.is_dir() {
                 continue;
             }
-            for (abs, rel) in collect_agent_config_files(&src) {
+            for (abs, rel, exec) in collect_agent_config_files(&src) {
                 let host_rel = format!("{d}/{rel}");
                 if already_uploaded.contains(&host_rel) {
                     continue;
@@ -218,7 +347,7 @@ pub(crate) fn upload_agent_configs(
                 let Ok(data) = std::fs::read(&abs) else {
                     continue;
                 };
-                all_uploads.push((format!("{base}/{host_rel}"), data));
+                all_uploads.push((format!("{base}/{host_rel}"), data, exec));
             }
         }
     }
@@ -243,12 +372,12 @@ pub(crate) fn upload_agent_configs(
 
             let futs: Vec<_> = chunk
                 .iter()
-                .map(|(dest, data)| {
+                .map(|(dest, data, exec)| {
                     let dest = dest.as_str();
                     async move {
                         let r = tokio::time::timeout(
                             AGENT_CONFIG_UPLOAD_TIMEOUT,
-                            provider.write(id, dest, data),
+                            write_preserving_mode(provider, id, dest, data, *exec),
                         )
                         .await;
                         (dest, r)
@@ -338,7 +467,7 @@ mod tests {
 
         let got: Vec<String> = collect_agent_config_files(&root)
             .into_iter()
-            .map(|(_, rel)| rel)
+            .map(|(_, rel, _)| rel)
             .collect();
         assert!(
             got.contains(&".credentials.json".to_string()),
@@ -376,6 +505,12 @@ mod tests {
         // Real files "in the store", symlinked into the config tree like home-manager.
         let hook_target = store.join("agentmemory-session-start.sh");
         std::fs::write(&hook_target, b"#!/bin/sh\necho hi\n").unwrap();
+        // Hook scripts are executable on the host; the sync must preserve that
+        // through the symlink (else the sandbox hook errors `Permission denied`).
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook_target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::os::unix::fs::symlink(
             &hook_target,
             root.join("hooks/agentmemory-session-start.sh"),
@@ -387,10 +522,8 @@ mod tests {
         // A dangling link must be tolerated (skipped, not a panic).
         std::os::unix::fs::symlink(store.join("gone"), root.join("dead.json")).unwrap();
 
-        let got: Vec<String> = collect_agent_config_files(&root)
-            .into_iter()
-            .map(|(_, rel)| rel)
-            .collect();
+        let collected = collect_agent_config_files(&root);
+        let got: Vec<String> = collected.iter().map(|(_, rel, _)| rel.clone()).collect();
         assert!(
             got.contains(&"hooks/agentmemory-session-start.sh".to_string()),
             "symlinked hook scripts are followed + uploaded: {got:?}"
@@ -402,6 +535,26 @@ mod tests {
         assert!(
             !got.contains(&"dead.json".to_string()),
             "dangling symlink skipped"
+        );
+        // The hook's executable bit is detected through the symlink so the sync
+        // uploads it via `write_exec` (0755), not `write` (0644) — otherwise the
+        // in-sandbox hook fails with `Permission denied`. A plain config file
+        // (settings.json) stays non-executable.
+        let exec_of = |rel: &str| {
+            collected
+                .iter()
+                .find(|(_, r, _)| r == rel)
+                .map(|(_, _, x)| *x)
+        };
+        assert_eq!(
+            exec_of("hooks/agentmemory-session-start.sh"),
+            Some(true),
+            "executable hook preserves its +x bit"
+        );
+        assert_eq!(
+            exec_of("settings.json"),
+            Some(false),
+            "plain config file is not marked executable"
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&store);

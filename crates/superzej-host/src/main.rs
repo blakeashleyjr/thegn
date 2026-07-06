@@ -85,6 +85,7 @@ mod probe;
 mod profile;
 mod provider_factory;
 mod provision_gate;
+mod provision_recover;
 mod proxy_daemon;
 mod queries;
 mod recorder;
@@ -104,6 +105,7 @@ mod session;
 mod share;
 mod sidebar;
 mod snapshot;
+mod sprite_bridge;
 mod ssh_shim;
 mod subsystem;
 mod tabbar_env;
@@ -372,6 +374,19 @@ pub enum Command {
     VpsSsh {
         /// The managed instance name (the resolved sandbox id).
         name: String,
+        /// Command to run (empty ⇒ a login shell).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
+    /// Hidden: the sprites exec bridge (`sprite-exec <id> -- cmd…`) — the
+    /// control-plane prefix a sprites (WSS-native) env's chrome git/gh/fs reads
+    /// and persisted worktree location run through. Runs the command over the
+    /// sprite's native exec API and relays its stdout. Panes attach over the
+    /// exec API directly (not this bridge). Not for interactive use.
+    #[command(hide = true)]
+    SpriteExec {
+        /// The sprite sandbox id (the resolved provider id).
+        id: String,
         /// Command to run (empty ⇒ a login shell).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
@@ -649,6 +664,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             rt.block_on(sprite_proxy_relay(provider, id))
         }
         Command::VpsSsh { name, cmd } => vps_bridge::run(&cfg, &name, &cmd),
+        Command::SpriteExec { id, cmd } => sprite_bridge::run(&cfg, &id, &cmd),
         Command::SandboxArgv { worktree } => {
             let wt = worktree
                 .or_else(|| std::env::current_dir().ok()?.to_str().map(str::to_string))
