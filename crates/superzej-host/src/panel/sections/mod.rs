@@ -518,8 +518,10 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 .filter(|i| i.status.is_active())
                 .count();
             let linked = model.panel.tracker_links.len();
-            if n == 0 {
+            if !model.panel.issues_configured {
                 vec![seg(g2(), "off")]
+            } else if n == 0 {
+                vec![seg(g2(), "clear")]
             } else if linked > 0 {
                 vec![
                     seg(hue(Hue::Amber), format!("◈{linked} ")),
