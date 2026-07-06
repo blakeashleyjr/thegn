@@ -160,7 +160,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             token,
             token_env,
             token_file,
-        } => create(CreateArgs {
+        } => create_env(CreateArgs {
             name,
             provider,
             region,
@@ -180,26 +180,29 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     }
 }
 
-/// Args for [`create`] (grouped so the dispatch arm stays flat).
-struct CreateArgs {
-    name: String,
-    provider: String,
-    region: Option<String>,
-    size: Option<String>,
-    template: Option<String>,
-    max_instances: Option<i64>,
-    max_lifetime: Option<i64>,
-    auto_provision: bool,
-    ssh_host: Option<String>,
-    sandbox: Option<String>,
-    token: Option<String>,
-    token_env: Option<String>,
-    token_file: Option<String>,
+/// Args for [`create_env`] (grouped so the dispatch arm stays flat). Also the
+/// payload the TUI "Add environment" wizard builds, so both paths share the write.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CreateArgs {
+    pub name: String,
+    pub provider: String,
+    pub region: Option<String>,
+    pub size: Option<String>,
+    pub template: Option<String>,
+    pub max_instances: Option<i64>,
+    pub max_lifetime: Option<i64>,
+    pub auto_provision: bool,
+    pub ssh_host: Option<String>,
+    pub sandbox: Option<String>,
+    pub token: Option<String>,
+    pub token_env: Option<String>,
+    pub token_file: Option<String>,
 }
 
 /// Create/upsert `[env.<name>]` in the global config, storing any entered token
-/// via the secret backend and recording only a SecretRef in config.
-fn create(a: CreateArgs) -> Result<()> {
+/// via the secret backend and recording only a SecretRef in config. Shared by the
+/// `env create` CLI and the TUI wizard.
+pub(crate) fn create_env(a: CreateArgs) -> Result<()> {
     use superzej_core::config_write::{EnvSpec, upsert_env};
     let kind = a.provider.trim().to_lowercase();
     let placement = match kind.as_str() {
