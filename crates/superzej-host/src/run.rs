@@ -3342,7 +3342,7 @@ fn open_panel_section(
     waker: &TerminalWaker,
     docs: PanelDocsWiring<'_>,
 ) {
-    panel_ui.open = s;
+    panel_ui.open_section(s); // keeps `tab` in step (row-flow crosses tab bounds)
     // Sync the git context to the section being opened: `git_key` keys its
     // action table off `git.focus`, NOT `panel_ui.open`, so without this an
     // open Commits/Branches/Stash section still dispatches against whatever
