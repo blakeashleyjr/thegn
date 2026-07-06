@@ -1558,29 +1558,16 @@ pub(crate) fn build_panel(
             .filter_map(superzej_core::log_view::parse_log_line)
             .collect();
 
-        // Surface new ERROR lines as a notification (at most once per 5 min).
-        // `now()`/`created_at_ms` are epoch *seconds*, so the window is too
-        // (this was `*1000`, which stretched "5 minutes" to ~3.5 days).
-        let now_s = superzej_core::util::now();
-        let five_min_s: i64 = 5 * 60;
-        let has_recent_log_error = panel
-            .notifications
+        // Surface ERROR lines as a notification, but only when genuinely *new*
+        // errors have appeared since we last notified (the count grew). The log
+        // is append-only and never cleared, so a time-window dedup re-fired a
+        // fresh `read=0` row every few minutes for the same old errors, undoing
+        // the user's "mark read". See `hydrate_feed::maybe_emit_log_error`.
+        let error_count = all_lines
             .iter()
-            .any(|n| n.source_ref == "log:szhost" && now_s - n.created_at_ms < five_min_s);
-        if !has_recent_log_error {
-            let error_count = all_lines
-                .iter()
-                .filter(|l| l.level == superzej_core::log_view::LogLevel::Error)
-                .count();
-            if error_count > 0 {
-                let msg = format!(
-                    "{} error{} in szhost.log",
-                    error_count,
-                    if error_count == 1 { "" } else { "s" }
-                );
-                let _ = db.put_notification("log_error", "log:szhost", &msg, "");
-            }
-        }
+            .filter(|l| l.level == superzej_core::log_view::LogLevel::Error)
+            .count();
+        crate::hydrate_feed::maybe_emit_log_error(db, &panel.notifications, error_count);
 
         if hints.open == crate::panel::Section::Logs {
             let start = all_lines.len().saturating_sub(500);
