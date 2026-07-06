@@ -1161,6 +1161,7 @@ pub(crate) fn build_model(
     // Self-throttled housekeeping (network/DB on own threads): VPS leak
     // reaper + placement engine (sweep, scale-down, queue nudges).
     crate::vps_reaper::tick(&app_cfg);
+    crate::fly_reaper::tick(&app_cfg);
     crate::placement_flow::maintain_tick(&app_cfg);
     let loc_count = worktree_loc(db, &cwd);
 

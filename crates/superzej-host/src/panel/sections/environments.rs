@@ -9,7 +9,7 @@ use superzej_core::theme::Hue;
 use crate::env_ui::EnvSnapshot;
 use crate::seg::{Line, Seg, seg};
 
-use super::{PanelRow, SectionCtx, d, g, g2, hue};
+use super::{PanelHit, PanelRow, Section, SectionCtx, d, g, g2, hint_row, hue};
 
 /// ● token present (green) · ✗ token missing (red) · ● no token needed (dim).
 fn glyph(e: &EnvSnapshot) -> Seg {
@@ -48,7 +48,9 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         )])));
         return rows;
     }
-    for e in envs {
+    // Each env row carries a `Row` hit so the enumerate index lines up with
+    // `ui.cursor` + `panel.environments` — the action keys target `envs[cursor]`.
+    for (i, e) in envs.iter().enumerate() {
         let mut left = vec![
             glyph(e),
             seg(d(), format!(" {}", e.name)),
@@ -65,12 +67,16 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             Some(false) => seg(hue(Hue::Red), "token ✗".to_string()),
             None => seg(g(), String::new()),
         };
-        rows.push(PanelRow::plain(Line::split(left, vec![right])));
+        rows.push(
+            PanelRow::plain(Line::split(left, vec![right]))
+                .with_hit(PanelHit::Row(Section::Environments, i)),
+        );
     }
-    // Authoring/binding pointers (read-only section; the wizard + CLI do the rest).
-    rows.push(PanelRow::plain(Line::segs(vec![seg(
-        g(),
-        "palette → ＋ New environment…  ·  bind: superzej env set <name>",
-    )])));
+    rows.push(hint_row(&[
+        ("enter", "bind here"),
+        ("t", "test"),
+        ("x", "remove"),
+        ("n", "new…"),
+    ]));
     rows
 }
