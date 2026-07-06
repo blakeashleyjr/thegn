@@ -92,6 +92,7 @@ mod run;
 mod sandbox_events;
 mod search;
 mod search_everywhere;
+mod secret;
 mod seg;
 mod sequence;
 mod session;

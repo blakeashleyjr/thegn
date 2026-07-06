@@ -24,6 +24,7 @@ pub mod config_env_tables;
 pub mod config_issues;
 pub mod config_placement;
 pub mod config_resolve;
+pub mod config_write;
 pub mod custom_cmd;
 pub mod db;
 mod db_account;

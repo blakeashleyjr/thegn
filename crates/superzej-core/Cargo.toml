@@ -28,6 +28,10 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 toml.workspace = true
+# Comment/format-preserving config authoring (config_write.rs): the write half of
+# `superzej env create` / `config set`, so the setup UI edits config.toml in place
+# without clobbering the user's comments. Pure-Rust (cross-compile-safe).
+toml_edit = "0.25.12"
 walkdir.workspace = true
 # Token-reduction engine: ANSI stripping + custom-filter regexes (proxy::compress).
 regex.workspace = true
