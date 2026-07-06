@@ -13,8 +13,9 @@ use super::VpsInstance;
 
 pub const DEFAULT_API_BASE: &str = "https://api.hetzner.cloud/v1";
 pub const DEFAULT_TOKEN_ENV: &str = "HCLOUD_TOKEN";
-/// Cheapest current shared-vCPU type (2 vCPU / 4 GB) — a sane dev default.
-pub const DEFAULT_SERVER_TYPE: &str = "cx22";
+/// Cheapest current shared-vCPU type (2 vCPU / 4 GB, x86) — a sane dev default.
+/// (`cx22` was deprecated by Hetzner; `cx23` is its same-spec successor.)
+pub const DEFAULT_SERVER_TYPE: &str = "cx23";
 pub const DEFAULT_LOCATION: &str = "fsn1";
 pub const DEFAULT_IMAGE: &str = "ubuntu-24.04";
 
@@ -186,23 +187,6 @@ pub fn parse_image_created(v: &serde_json::Value) -> Option<i64> {
     v.pointer("/image/id").and_then(|i| i.as_i64())
 }
 
-/// Whether two OpenSSH public-key lines carry the same key material (compare
-/// `type + blob`, ignoring the trailing comment — the registered key's comment
-/// rarely matches ours).
-pub fn same_pubkey(a: &str, b: &str) -> bool {
-    let core = |s: &str| {
-        let mut it = s.split_whitespace();
-        match (it.next(), it.next()) {
-            (Some(t), Some(b)) => Some((t.to_string(), b.to_string())),
-            _ => None,
-        }
-    };
-    match (core(a), core(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,7 +316,8 @@ mod tests {
             parse_ssh_key_created(&serde_json::json!({ "ssh_key": { "id": 12 } })),
             Some(12)
         );
-        // Key-material match ignores the comment.
+        // Key-material match (shared, vendor-neutral) ignores the comment.
+        use super::super::same_pubkey;
         assert!(same_pubkey(
             "ssh-ed25519 AAAAC3 superzej",
             "ssh-ed25519 AAAAC3 imported-2024"

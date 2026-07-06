@@ -1461,6 +1461,11 @@ pub enum Provider {
     /// over plain ssh. No checkpoints by construction: a powered-off VPS still
     /// bills, so the only free state is destroyed (see `crate::vps`).
     Vps(crate::vps::VpsProvider),
+    /// Fly.io machines (CLI-free) — Machines REST lifecycle, reachability over a
+    /// WireGuard tunnel into Fly's 6PN mesh (`fly ssh console` without flyctl).
+    /// Container-native, so it's not a `VpsKind`; scale-to-zero via stop/start
+    /// (see `crate::fly`). Exec/attach is the reachability spike boundary.
+    Fly(crate::fly::FlyProvider),
 }
 
 impl Provider {
@@ -1489,6 +1494,13 @@ impl Provider {
                 scale_to_zero,
                 ..ProviderCaps::default()
             },
+            // files over the WireGuard/hallpass transport; scale-to-zero via
+            // stop/start; no checkpoints, no native WSS exec/egress API.
+            Provider::Fly(_) => ProviderCaps {
+                files: true,
+                scale_to_zero,
+                ..ProviderCaps::default()
+            },
         }
     }
 
@@ -1497,6 +1509,7 @@ impl Provider {
             Provider::Daytona(p) => p.create().await,
             Provider::Sprites(p) => p.create().await,
             Provider::Vps(p) => p.create().await,
+            Provider::Fly(p) => p.create().await,
         }
     }
 
@@ -1505,6 +1518,7 @@ impl Provider {
             Provider::Daytona(p) => p.destroy(id).await,
             Provider::Sprites(p) => p.destroy(id).await,
             Provider::Vps(p) => p.destroy(id).await,
+            Provider::Fly(p) => p.destroy(id).await,
         }
     }
 
@@ -1513,6 +1527,7 @@ impl Provider {
             Provider::Daytona(p) => p.list().await,
             Provider::Sprites(p) => p.list().await,
             Provider::Vps(p) => p.list().await,
+            Provider::Fly(p) => p.list().await,
         }
     }
 
@@ -1522,6 +1537,7 @@ impl Provider {
             Provider::Daytona(_) => "daytona",
             Provider::Sprites(_) => "sprites",
             Provider::Vps(p) => p.spec().kind.as_str(),
+            Provider::Fly(_) => "fly",
         }
     }
 
@@ -1600,6 +1616,7 @@ impl Provider {
         match self {
             Provider::Sprites(p) => p.read(id, path).await,
             Provider::Vps(p) => p.read(id, path).await,
+            Provider::Fly(p) => p.read(id, path).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
         }
     }
@@ -1609,6 +1626,7 @@ impl Provider {
         match self {
             Provider::Sprites(p) => p.write(id, path, data).await,
             Provider::Vps(p) => p.write(id, path, data).await,
+            Provider::Fly(p) => p.write(id, path, data).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
         }
     }
@@ -1618,6 +1636,7 @@ impl Provider {
         match self {
             Provider::Sprites(p) => p.write_exec(id, path, data).await,
             Provider::Vps(p) => p.write_exec(id, path, data).await,
+            Provider::Fly(p) => p.write_exec(id, path, data).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
         }
     }
@@ -1652,6 +1671,7 @@ impl Provider {
         match self {
             Provider::Sprites(p) => p.upload_dir(id, local, remote).await,
             Provider::Vps(p) => p.upload_dir(id, local, remote).await,
+            Provider::Fly(p) => p.upload_dir(id, local, remote).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
         }
     }
@@ -1661,6 +1681,7 @@ impl Provider {
         match self {
             Provider::Sprites(p) => p.download_dir(id, remote, local).await,
             Provider::Vps(p) => p.download_dir(id, remote, local).await,
+            Provider::Fly(p) => p.download_dir(id, remote, local).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
         }
     }
@@ -1697,6 +1718,7 @@ impl Provider {
         match self {
             Provider::Sprites(p) => p.run_exec(id, argv, cwd, env).await,
             Provider::Vps(p) => p.run_exec(id, argv, cwd, env).await,
+            Provider::Fly(p) => p.run_exec(id, argv, cwd, env).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
         }
     }

@@ -23,12 +23,14 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let pc = &envc.provider;
     if !superzej_core::config::vps_provider_kind(&pc.provider) {
         anyhow::bail!(
-            "image bake is for VPS providers (hetzner); env {} uses {:?}",
+            "image bake is for VPS providers (hetzner, digitalocean); env {} uses {:?}",
             env.name,
             pc.provider
         );
     }
     // Bake FROM stock even when the env already points at a snapshot (re-bake).
+    // The `snapshot:<id>` template prefix is a shared superzej convention across
+    // vendors, so the Hetzner parser recognises it for any VPS kind.
     let mut bake_pc = pc.clone();
     if superzej_svc::vps::hetzner::snapshot_image(&bake_pc.template).is_some() {
         bake_pc.template = String::new();

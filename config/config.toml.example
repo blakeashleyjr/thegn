@@ -2017,7 +2017,7 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # provider = "hetzner"
 # # api_key_env = "HCLOUD_TOKEN"   # token env var (this is the default)
 # # region = "fsn1"                # Hetzner location (fsn1/nbg1/hel1/ash/hil/sin)
-# # size = "cx22"                  # server type (cx22 = 2 vCPU / 4 GB, ≈ €4/mo)
+# # size = "cx23"                  # server type (cx23 = 2 vCPU / 4 GB, ≈ €4/mo)
 # # template = ""                  # image: "" ⇒ ubuntu-24.04 (docker + nix
 # #                                #   prereqs installed via cloud-init on first
 # #                                #   boot), or "snapshot:<id>" from image-bake
@@ -2036,6 +2036,62 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # (`auto_checkpoint` is ignored; bake an image instead), native WSS exec
 # # (`connect`/`exec` are ignored — attach is always the ssh self-bridge), and
 # # egress translation (use an in-VPS backend's network controls).
+#
+# ── DigitalOcean (another commodity VPS — same model, cost, and caveats) ────
+# Identical lifecycle to Hetzner (REST create → ssh self-bridge → ledger +
+# reaper → image-bake; no checkpoints). Only the vendor knobs differ.
+#   1. Create a personal access token in the DigitalOcean control panel
+#      (API → Tokens, write scope).
+#   2. export DIGITALOCEAN_TOKEN=...   (or point api_key_env at your own var,
+#      e.g. DIGITALOCEAN_ACCESS_TOKEN that `doctl` uses)
+#
+# [env.digitalocean]
+# placement = "provider"
+# data = "in_env"
+# [env.digitalocean.provider]
+# provider = "digitalocean"
+# # api_key_env = "DIGITALOCEAN_TOKEN"  # token env var (this is the default)
+# # region = "nyc3"                     # DO region slug (nyc3/sfo3/ams3/fra1/…)
+# # size = "s-1vcpu-2gb"                # Droplet size slug (≈ $18/mo; s-1vcpu-1gb
+# #                                     #   is cheaper but tight for a nix build)
+# # template = ""                       # image: "" ⇒ ubuntu-24-04-x64, or
+# #                                     #   "snapshot:<id>" from `env image-bake`
+# # auto_provision = false
+# # max_instances = 5
+# # max_lifetime_secs = 0
+#
+# ── Fly.io machines (CLI-free — no flyctl) ─────────────────────────────────
+# A Fly machine is container-native (NOT a VPS): superzej drives the Machines
+# REST API directly and reaches INTO the machine over a WireGuard tunnel to
+# Fly's private 6PN network + `hallpass` ssh — the `fly ssh console` path,
+# without the flyctl CLI. Unlike a VPS, a stopped machine is near-free, so it is
+# treated as SCALE-TO-ZERO (idle spares park via stop/start instead of destroy).
+#   1. Create a deploy/org token: `fly tokens create org` (or the dashboard).
+#   2. export FLY_API_TOKEN=...
+#
+# NOTE (reachability spike): the WireGuard data plane that carries exec/attach is
+# validated against a live Fly org before it is enabled. Until then the machine
+# LIFECYCLE (create/list/stop/start/destroy) works, but opening a pane into a
+# machine returns a clear "transport not yet enabled" error. The control plane
+# (Machines API + peer/cert/config shaping) is complete and tested.
+#
+# [env.fly]
+# placement = "provider"
+# data = "in_env"
+# [env.fly.provider]
+# provider = "fly"
+# # api_key_env = "FLY_API_TOKEN"   # token env var (this is the default)
+# # region = "iad"                  # Fly region (iad/lax/ams/syd/…)
+# # size = "shared-cpu-2x"          # preset → guest cpu/memory (shared-cpu-1x…8x,
+# #                                 #   performance-1x…4x)
+# # template = ""                   # image: "" ⇒ ubuntu:24.04, or "image:<ref>"
+# #                                 #   / a bare registry ref (no snapshots — Fly
+# #                                 #   speed comes from small images)
+# # auto_provision = false
+# # max_instances = 5
+# # max_lifetime_secs = 0
+# # Org defaults to "personal" and the app is derived per-host (sz-<hash>);
+# # non-personal orgs / a fixed app name are a follow-up config addition.
 #
 # ── Sandbox lifecycle: warm/suspend + budget ───────────────────────────────
 # Budget-governed warm policy for managed-provider sandboxes (sprites/ssh/k8s).
@@ -2142,7 +2198,7 @@ enabled = false
 #                             #   hosts keeps serving. Separate from the LLM
 #                             #   proxy's model-spend ledger by design.
 # [placement.price]           # hourly USD rates for the compute ledger
-# "hetzner:cx32" = 0.0113     #   autoscaled hosts ("provider:size", fallback
+# "hetzner:cx33" = 0.0154     #   autoscaled hosts ("provider:size", fallback
 # "hetzner" = 0.008           #   "provider"); unpriced resources meter at $0
 #                             #   with a one-time warning
 # [placement.default_resources] # fallback ask when an env declares none
@@ -2163,10 +2219,17 @@ enabled = false
 # [[placement.autoscale.managed]] # ORDERED failover lanes (first viable wins;
 # provider = "hetzner"        #   a failed lane cools down and the next spawn
 # region = "fsn1"             #   tries the next lane; fail-back on expiry)
-# size = "cx32"               #   vendor plan — the lane's identity
-# cpu = "4"                   #   declared spec of the plan (authoritative for
+# size = "cx33"               #   vendor plan — the lane's identity (cx33 =
+# cpu = "4"                   #   4 vCPU / 8 GB; declared spec, authoritative for
 # memory = "8g"               #   the capacity index from create time)
 # max = 2                     #   per-lane ceiling (0 ⇒ 1)
+# [[placement.autoscale.managed]] # a second lane: spill to DigitalOcean when the
+# provider = "digitalocean"   #   Hetzner lane is capped or failing
+# region = "nyc3"
+# size = "s-4vcpu-8gb"
+# cpu = "4"
+# memory = "8g"
+# max = 2
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────
 # The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
 # depends on this — AI is strictly additive — so it is OFF by default. When

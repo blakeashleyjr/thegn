@@ -10,6 +10,7 @@
 pub mod acp;
 pub mod bridge;
 pub mod ci;
+pub mod fly;
 pub mod forward;
 pub mod gh;
 pub mod git;
