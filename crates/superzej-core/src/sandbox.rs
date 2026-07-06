@@ -1670,6 +1670,18 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
         }
     }
     for m in &spec.mounts {
+        // Never bind-mount the host's DNS/hosts files into an OCI container:
+        // it has its own netns, so the runtime synthesizes a correct resolv.conf
+        // (for NAT it rewrites loopback resolvers — systemd-resolved's 127.0.0.53,
+        // a dnsmasq/Tailscale stub at 127.0.0.1 — to the NAT gateway, keeping
+        // routable nameservers + search domains). Force-mounting the host file
+        // (loopback-only on any systemd-resolved box) points DNS at the
+        // container's own empty loopback → "Could not resolve host". bwrap/systemd
+        // share the host netns and keep these mounts (loopback works there); this
+        // also unshadows the `--dns` filter injection above.
+        if matches!(m.dest.as_str(), "/etc/resolv.conf" | "/etc/hosts") {
+            continue;
+        }
         let suffix = if m.ro { ":ro" } else { "" };
         v.extend(["-v".into(), format!("{}:{}{suffix}", m.host, m.dest)]);
     }
@@ -2349,6 +2361,31 @@ mod tests {
         assert!(j.contains("-v /repo/.git:/repo/.git"));
         assert!(j.contains("-e GH_TOKEN=abc"));
         assert!(j.contains("-p 8080:8080"));
+    }
+
+    #[test]
+    fn oci_opts_never_bind_mount_host_dns_files() {
+        // Regression: bind-mounting the host's loopback-only resolv.conf into a
+        // NAT container broke DNS ("Could not resolve host" on git push). The
+        // runtime must own resolv.conf/hosts for OCI backends.
+        let mut s = spec(Backend::Podman);
+        s.mounts.push(Mount {
+            host: "/etc/resolv.conf".into(),
+            dest: "/etc/resolv.conf".into(),
+            ro: true,
+            cache: false,
+        });
+        s.mounts.push(Mount {
+            host: "/etc/hosts".into(),
+            dest: "/etc/hosts".into(),
+            ro: true,
+            cache: false,
+        });
+        let j = oci_create_opts(&s).join(" ");
+        assert!(!j.contains("/etc/resolv.conf"), "resolv.conf mounted: {j}");
+        assert!(!j.contains(":/etc/hosts"), "/etc/hosts mounted: {j}");
+        // Real worktree mounts are untouched.
+        assert!(j.contains("-v /wt/feat:/wt/feat"));
     }
 
     #[test]
