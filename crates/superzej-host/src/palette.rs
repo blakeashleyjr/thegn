@@ -353,6 +353,14 @@ pub(crate) fn build_command_palette_items(
         items.push(crate::palette::PaletteItem::new("new-terminal", label));
     }
 
+    // "Add environment" wizard — author a `[env.<name>]` (local/ssh/cloud) with a
+    // token, region/size/image. Dispatched via the "new-environment" key in the
+    // run-loop palette Enter arm.
+    items.push(crate::palette::PaletteItem::new(
+        "new-environment",
+        "＋ New environment…  (cloud / ssh / local)".to_string(),
+    ));
+
     items
 }
 

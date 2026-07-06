@@ -67,8 +67,6 @@ pub fn forget(name: &str) {
 
 /// Whether an OS keyring is actually usable here (so the UI can tell the user
 /// where a token will land, and tests can skip the keyring leg on a headless CI).
-// Wired into the TUI "Add environment" wizard (Layer 3) to show the storage hint.
-#[allow(dead_code)]
 pub fn keyring_available() -> bool {
     // A round-trip on a throwaway account is the only honest probe.
     let probe = "__superzej_keyring_probe__";

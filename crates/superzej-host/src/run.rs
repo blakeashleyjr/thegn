@@ -7749,6 +7749,8 @@ async fn event_loop<T: Terminal>(
     let mut wizard_ui: Option<wizard::NewWorktreeWizard> = None;
     // The new-terminal wizard (Alt T / palette); no creation worker (synchronous).
     let mut terminal_wizard_ui: Option<crate::terminal_wizard::TerminalWizard> = None;
+    // The "Add environment" wizard (palette); submit writes config via create_env.
+    let mut env_wizard_ui: Option<crate::env_wizard::EnvWizard> = None;
     let mut wizard_cmd_tx: Option<std::sync::mpsc::Sender<wizard::WizardCmd>> = None;
     let mut creating: Option<wizard::CreationProgress> = None;
     // When a worktree is created from a template (item 54), the template is held
@@ -12020,6 +12022,9 @@ async fn event_loop<T: Terminal>(
             if let Some(w) = &terminal_wizard_ui {
                 w.render(&mut scratch, screen);
             }
+            if let Some(w) = &env_wizard_ui {
+                w.render(&mut scratch, screen);
+            }
             if let Some(p) = &workspace_picker {
                 p.render(&mut scratch, screen);
             }
@@ -13060,6 +13065,29 @@ async fn event_loop<T: Terminal>(
                             focus.zone = crate::focus::Zone::Center;
                             refresh_tab_model(&mut model, &session, &mut sb);
                             need_relayout = true;
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
+                // Modal: the "Add environment" wizard. Submit writes the env via
+                // the shared create_env path (config_write + secret backend).
+                if let Some(w) = env_wizard_ui.as_mut() {
+                    match w.handle_key(&k.key, k.modifiers) {
+                        crate::env_wizard::Outcome::Pending => {}
+                        crate::env_wizard::Outcome::Cancel => {
+                            env_wizard_ui = None;
+                            model.status = "new environment cancelled".into();
+                        }
+                        crate::env_wizard::Outcome::Submit(args) => {
+                            env_wizard_ui = None;
+                            let name = args.name.clone();
+                            model.status = match crate::cmd::env::create_env(*args) {
+                                Ok(()) => {
+                                    format!("environment '{name}' created — bind it via env set")
+                                }
+                                Err(e) => format!("env create failed: {e}"),
+                            };
                         }
                     }
                     dirty = true;
@@ -14617,6 +14645,11 @@ async fn event_loop<T: Terminal>(
                                             Err(e) => model.status = e,
                                         }
                                     }
+                                } else if key == "new-environment" {
+                                    // Open the "Add environment" wizard (no Action
+                                    // variant — keymap.rs is a pinned god-file).
+                                    env_wizard_ui =
+                                        Some(crate::env_wizard::EnvWizard::new(keymap.config()));
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
                                     forced_palette_action = Some(action);
                                 } else if let Some(idx) = keymap

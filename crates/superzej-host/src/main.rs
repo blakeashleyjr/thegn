@@ -31,6 +31,7 @@ mod desktop_notify;
 mod detail;
 mod direnv_warm;
 mod emulator;
+mod env_wizard;
 mod escape;
 mod fff_backend;
 mod focus;
