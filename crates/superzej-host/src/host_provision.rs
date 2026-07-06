@@ -182,7 +182,9 @@ pub(crate) fn provision_worktree_on_host(
                         if !src.is_dir() {
                             continue;
                         }
-                        for (abs, inner) in crate::agent_configs::collect_agent_config_files(&src) {
+                        for (abs, inner, _exec) in
+                            crate::agent_configs::collect_agent_config_files(&src)
+                        {
                             let dst = staging.join(&rel).join(&inner);
                             if let Some(parent) = dst.parent() {
                                 let _ = std::fs::create_dir_all(parent);

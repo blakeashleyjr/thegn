@@ -153,10 +153,18 @@ pub(crate) fn build_env_placement(
             // providers (which have no vendor CLI) — see
             // `EnvProviderConfig::control_command_template`.
             let control_prefix = sub(&envc.provider.control_command_template());
-            let interactive_prefix = if envc.provider.interactive_command.is_empty() {
-                control_prefix.clone()
-            } else {
+            let interactive_prefix = if !envc.provider.interactive_command.is_empty() {
                 sub(&envc.provider.interactive_command)
+            } else if crate::config_env_tables::wss_native_provider_kind(&envc.provider.provider) {
+                // WSS-native providers (sprites) attach panes over the provider's
+                // native exec API (see host `native_exec_for`), NOT the control
+                // self-bridge — so the interactive prefix stays EMPTY. Only the
+                // control/read path (`control_prefix`) uses the `sprite-exec`
+                // bridge; giving panes that prefix would route the interactive
+                // shell through a captured non-tty exec instead of the PTY path.
+                Vec::new()
+            } else {
+                control_prefix.clone()
             };
             // Compute all substitutions before moving `id` into the struct (the
             // `sub` closure borrows it).
@@ -213,7 +221,10 @@ mod tests {
             panic!("provider placement expected");
         };
         assert_eq!(pp2.control_prefix[0], "mycli");
-        // Non-VPS providers with no exec_command keep an empty prefix.
+        // WSS-native providers (sprites) get the `sprite-exec` self-bridge as
+        // their CONTROL prefix (so chrome git/fs reads + the persisted GitLoc
+        // route into the sprite), but keep an EMPTY interactive prefix — panes
+        // attach over the native exec API, not the bridge.
         let mut sprites = envc.clone();
         sprites.provider.provider = "sprites".into();
         let Placement::Provider(pp3) =
@@ -221,7 +232,15 @@ mod tests {
         else {
             panic!("provider placement expected");
         };
-        assert!(pp3.control_prefix.is_empty());
+        assert_eq!(pp3.control_prefix.len(), 4, "{:?}", pp3.control_prefix);
+        assert_eq!(pp3.control_prefix[1], "sprite-exec");
+        assert_eq!(pp3.control_prefix[2], pp3.id);
+        assert_eq!(pp3.control_prefix[3], "--");
+        assert!(
+            pp3.interactive_prefix.is_empty(),
+            "sprites panes stay native: {:?}",
+            pp3.interactive_prefix
+        );
     }
 
     #[test]

@@ -150,6 +150,22 @@ pub(crate) fn should_clear_splash_on_output(
     loading_state.get(key).is_some_and(|s| is_shell_wait(s))
 }
 
+/// Whether a live provisioning-splash update for `key` should be applied, given
+/// the set of tabs whose shell has already spoken (the splash was RETIRED on its
+/// first PTY output). Once a tab's shell produces output and its splash clears,
+/// a provisioning update that was queued on `provision_rx` just before the clear
+/// (or a transient pane-death re-raise) must NOT bring the splash back — that's
+/// the "flashes back and forth to the shell" flicker seen during a sprite
+/// bring-up where the OOM-restarted VM churns the pane. A non-retired tab always
+/// applies. Retirement is per-tab and cleared when a fresh materialize re-seeds
+/// the tab (a genuine re-provision), so a rebuilt worktree shows its splash again.
+pub(crate) fn splash_update_allowed(
+    retired: &std::collections::HashSet<(String, usize)>,
+    key: &(String, usize),
+) -> bool {
+    !retired.contains(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +350,25 @@ mod tests {
             any_clearable_splash(&ls),
             "a shell-wait splash makes the drain look for the owning pane"
         );
+    }
+
+    #[test]
+    fn splash_update_dropped_only_for_retired_tabs() {
+        use std::collections::HashSet;
+        let mut retired: HashSet<(String, usize)> = HashSet::new();
+        let live = ("wt-live".to_string(), 0usize);
+        let done = ("wt-done".to_string(), 0usize);
+        // A tab still bringing up applies every provisioning update.
+        assert!(splash_update_allowed(&retired, &live));
+        // A retired tab (its shell already spoke) drops a late/stale update, so
+        // the splash never flashes back over the live shell.
+        retired.insert(done.clone());
+        assert!(!splash_update_allowed(&retired, &done));
+        // Same name, different tab is unaffected.
+        assert!(splash_update_allowed(
+            &retired,
+            &("wt-done".to_string(), 1usize)
+        ));
     }
 
     #[test]

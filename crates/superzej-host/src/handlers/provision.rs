@@ -174,22 +174,30 @@ pub(crate) fn drain_provision(
     session: &crate::session::Session,
     loading_state: &mut std::collections::HashMap<(String, usize), Vec<LoadStep>>,
     loading_remote: &mut std::collections::HashMap<(String, usize), bool>,
+    loading_retired: &std::collections::HashSet<(String, usize)>,
     loop_perf: &mut crate::perf::LoopPerf,
 ) -> bool {
     let mut dirty = false;
     while let Ok((name, ti, steps)) = rx.try_recv() {
         loop_perf.tick(crate::perf::WakeSource::Spec);
+        let key = (name, ti);
+        // A tab whose shell has already spoken has RETIRED its splash: a late
+        // provisioning update (queued before the first-output clear) must not
+        // re-raise it over the live shell — the flash-back-to-splash flicker.
+        if !crate::loading::splash_update_allowed(loading_retired, &key) {
+            continue;
+        }
         // Always record this worktree's progress; the splash for whichever
         // worktree is active is derived from `loading_state` below.
         let active = session
             .worktrees
             .iter()
-            .position(|g| g.name == name)
-            .is_some_and(|gi| gi == session.active && session.worktrees[gi].active_tab == ti);
+            .position(|g| g.name == key.0)
+            .is_some_and(|gi| gi == session.active && session.worktrees[gi].active_tab == key.1);
         // Eager provisioning only runs for a provider (remote) env, so this
         // stream is unconditionally remote — the 300s watchdog window.
-        loading_remote.insert((name.clone(), ti), true);
-        loading_state.insert((name, ti), steps);
+        loading_remote.insert(key.clone(), true);
+        loading_state.insert(key, steps);
         if active {
             dirty = true;
         }
