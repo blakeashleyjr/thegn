@@ -1125,6 +1125,10 @@ fn render_log(surface: &mut Surface, inner: Rect, lg: &LogDetail, scroll: usize,
     if idxs.is_empty() {
         let empty = if lg.lines.is_empty() {
             "no log data (set SUPERZEJ_LOG to enable)"
+        } else if lg.filter.is_empty() && lg.level == Some(LogLevel::Error) {
+            // Non-empty payload, error-gated, nothing matched: the log has no
+            // errors right now (e.g. rotated/truncated since the notification).
+            "no errors in current log (rotated?)"
         } else {
             "no matching log lines"
         };
@@ -2690,6 +2694,39 @@ mod tests {
         assert_eq!(
             ov.handle_key(&KeyCode::Escape, Modifiers::NONE),
             DetailOutcome::Close
+        );
+    }
+
+    #[test]
+    fn log_drilldown_shows_error_that_scrolled_past_the_plain_tail() {
+        // Regression: the notification counts errors over the whole file, but the
+        // drilldown payload used to be the last 400 lines of *all* levels. A single
+        // ERROR older than that window left the error-gated view empty ("no matching
+        // log lines"). `error_inclusive_tail` folds the recent errors back in.
+        let mut all_lines = vec![err_line("boom")]; // the counted error, at the very start
+        all_lines.extend((0..1000).map(|i| info_line(&format!("noise {i}"))));
+        let log_tail = superzej_core::log_view::error_inclusive_tail(&all_lines, 400, 200);
+        let model = notif_model(
+            vec![notif(
+                NotificationKind::LogError,
+                "log:szhost",
+                "1 error in szhost.log",
+                5,
+            )],
+            log_tail,
+        );
+        let mut ov = open_notifications(&model);
+        assert_eq!(
+            ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            DetailOutcome::Pending
+        );
+        let DetailContent::Log(l) = &ov.content else {
+            panic!("expected the log view");
+        };
+        assert_eq!(l.level, Some(LogLevel::Error));
+        assert!(
+            l.matches().len() >= 1,
+            "the scrolled-out ERROR must still appear in the drilldown"
         );
     }
 

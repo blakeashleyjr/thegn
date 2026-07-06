@@ -1606,8 +1606,10 @@ pub(crate) fn build_panel(
 
         // Always keep a bounded tail (unlike section-gated `log_lines`) so the
         // notification → log drilldown modal has data without new blocking I/O.
-        let tail_start = all_lines.len().saturating_sub(400);
-        panel.log_tail = all_lines[tail_start..].to_vec();
+        // The drilldown opens error-gated, and errors are sparse, so a plain last-N
+        // slice usually held none of them ("no matching log lines"). Fold the recent
+        // ERRORs back in — see `error_inclusive_tail`.
+        panel.log_tail = superzej_core::log_view::error_inclusive_tail(&all_lines, 400, 200);
     }
     panel
 }

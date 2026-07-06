@@ -99,6 +99,41 @@ pub fn log_file_path(cfg: &crate::config::LogConfig) -> std::path::PathBuf {
     cfg.dir_path().join("szhost.log")
 }
 
+/// Build a bounded tail that always carries the recent ERROR lines.
+///
+/// A plain last-`context` slice of an append-only log rarely contains any ERROR
+/// line (errors are sparse and scroll out), which left the notification → log
+/// drilldown — opened error-gated — showing "no matching log lines" for an error
+/// it had just counted. This returns the last `context` lines **plus** the most
+/// recent `max_errors` ERROR lines that fall *before* that window, concatenated
+/// in original file order (pre-window errors ascending, then the contiguous
+/// window). The two index ranges are disjoint, so no dedup is needed. Callers
+/// count errors over the same `all_lines`, so whenever the count is non-zero the
+/// result contains at least one ERROR line. The payload is bounded at
+/// `context + max_errors`.
+pub fn error_inclusive_tail(
+    all_lines: &[LogLine],
+    context: usize,
+    max_errors: usize,
+) -> Vec<LogLine> {
+    let window_start = all_lines.len().saturating_sub(context);
+    // Most-recent ERROR indices that fall before the tail window.
+    let mut pre_errors: Vec<usize> = all_lines[..window_start]
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.level == LogLevel::Error)
+        .map(|(i, _)| i)
+        .collect();
+    // Keep only the newest `max_errors`, then restore ascending order.
+    if pre_errors.len() > max_errors {
+        pre_errors.drain(..pre_errors.len() - max_errors);
+    }
+    let mut out = Vec::with_capacity(pre_errors.len() + (all_lines.len() - window_start));
+    out.extend(pre_errors.into_iter().map(|i| all_lines[i].clone()));
+    out.extend_from_slice(&all_lines[window_start..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +270,98 @@ mod tests {
         // Has timestamp + level, but no double-space before the message.
         let line = "2026-06-05T12:00:00  INFO superzej::db message-no-double-space";
         assert!(parse_log_line(line).is_none());
+    }
+
+    /// Build a `LogLine` whose `raw` uniquely encodes its index, so ordering and
+    /// dedup are directly assertable.
+    fn line(level: LogLevel, i: usize) -> LogLine {
+        LogLine {
+            timestamp: "2026-06-05T12:00:00".to_string(),
+            level,
+            target: "superzej::test".to_string(),
+            message: format!("line {i}"),
+            raw: format!("raw-{i}"),
+        }
+    }
+
+    fn error_count(lines: &[LogLine]) -> usize {
+        lines.iter().filter(|l| l.level == LogLevel::Error).count()
+    }
+
+    #[test]
+    fn error_inclusive_tail_includes_error_before_window() {
+        let mut lines: Vec<_> = (0..1000).map(|i| line(LogLevel::Info, i)).collect();
+        lines[10] = line(LogLevel::Error, 10);
+        let out = error_inclusive_tail(&lines, 400, 200);
+        // The pre-window error is carried and lands first (it predates the window).
+        assert_eq!(out.first().unwrap().raw, "raw-10");
+        assert_eq!(error_count(&out), 1);
+        // Window contents preserved after it.
+        assert_eq!(out.last().unwrap().raw, "raw-999");
+        assert_eq!(out.len(), 1 + 400);
+    }
+
+    #[test]
+    fn error_inclusive_tail_no_errors_is_plain_tail() {
+        let lines: Vec<_> = (0..500).map(|i| line(LogLevel::Info, i)).collect();
+        let out = error_inclusive_tail(&lines, 400, 200);
+        assert_eq!(out, lines[100..].to_vec());
+    }
+
+    #[test]
+    fn error_inclusive_tail_caps_pre_window_errors() {
+        let lines: Vec<_> = (0..1000).map(|i| line(LogLevel::Error, i)).collect();
+        let out = error_inclusive_tail(&lines, 400, 50);
+        // 50 most-recent pre-window errors + the 400-line window.
+        assert_eq!(out.len(), 450);
+        // Newest-50 of indices 0..600 are 550..600, ascending.
+        assert_eq!(out.first().unwrap().raw, "raw-550");
+    }
+
+    #[test]
+    fn error_inclusive_tail_does_not_duplicate_error_in_window() {
+        let mut lines: Vec<_> = (0..500).map(|i| line(LogLevel::Info, i)).collect();
+        lines[5] = line(LogLevel::Error, 5); // before window (starts at 100)
+        lines[480] = line(LogLevel::Error, 480); // inside window
+        let out = error_inclusive_tail(&lines, 400, 200);
+        assert_eq!(out.iter().filter(|l| l.raw == "raw-480").count(), 1);
+        assert_eq!(out.len(), 401); // one pre-window error + 400-line window
+    }
+
+    #[test]
+    fn error_inclusive_tail_empty_input() {
+        assert!(error_inclusive_tail(&[], 400, 200).is_empty());
+    }
+
+    #[test]
+    fn error_inclusive_tail_fewer_than_context() {
+        let lines: Vec<_> = (0..10).map(|i| line(LogLevel::Info, i)).collect();
+        let out = error_inclusive_tail(&lines, 400, 200);
+        assert_eq!(out, lines);
+    }
+
+    #[test]
+    fn error_inclusive_tail_preserves_original_order() {
+        let levels = [
+            LogLevel::Error,
+            LogLevel::Info,
+            LogLevel::Error,
+            LogLevel::Warn,
+        ];
+        // context=2 so the first two lines are pre-window.
+        let lines: Vec<_> = (0..4).map(|i| line(levels[i], i)).collect();
+        let out = error_inclusive_tail(&lines, 2, 200);
+        let order: Vec<_> = out.iter().map(|l| l.raw.clone()).collect();
+        // pre-window error at idx 0, then the window (idx 2,3). idx 1 (Info) drops.
+        assert_eq!(order, vec!["raw-0", "raw-2", "raw-3"]);
+    }
+
+    #[test]
+    fn error_inclusive_tail_max_errors_zero_is_window_only() {
+        let mut lines: Vec<_> = (0..500).map(|i| line(LogLevel::Info, i)).collect();
+        lines[5] = line(LogLevel::Error, 5); // before window
+        let out = error_inclusive_tail(&lines, 400, 0);
+        assert_eq!(out, lines[100..].to_vec());
+        assert_eq!(error_count(&out), 0);
     }
 }
