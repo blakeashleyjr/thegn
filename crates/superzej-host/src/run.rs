@@ -24,6 +24,7 @@ use tokio::task;
 use crate::actions::{CiActionCtx, open_command_pane, open_command_tab, open_url_detached};
 use crate::chrome::{FrameModel, LoadStep, render_tab};
 use crate::compositor::Rect;
+use crate::detail::apply_ci_detail;
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::handlers::provision::{
     ProvisionProgress, SpecBatch, SpecDrainCtx, SpecError, drain_provision, drain_specs,
@@ -11094,6 +11095,7 @@ async fn event_loop<T: Terminal>(
                 // The scan only writes the size cache off-thread; sizes land on
                 // the next model hydrate, so this does NOT force one here.
                 RefreshKind::Disk => want_disk_refresh = true,
+                RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
             }
         }
         if want_model_refresh {
@@ -12907,11 +12909,10 @@ async fn event_loop<T: Terminal>(
                     match d.handle_key(&k.key, k.modifiers) {
                         crate::detail::DetailOutcome::Close => bar_detail = None,
                         crate::detail::DetailOutcome::Pending => {}
-                        // A row action fires and closes the overlay (open a URL,
-                        // drill into a pane, or run a CI mutation off the loop).
+                        // A row action normally closes the overlay; the CI drill
+                        // keeps it open (returns the overlay) to fill in place.
                         crate::detail::DetailOutcome::Act(action) => {
-                            bar_detail = None;
-                            CiActionCtx {
+                            bar_detail = CiActionCtx {
                                 session: &mut session,
                                 panes: &mut panes,
                                 model: &mut model,
@@ -12923,7 +12924,7 @@ async fn event_loop<T: Terminal>(
                                 refresh_tx: &refresh_tx,
                                 waker: &waker,
                             }
-                            .run_detail_action(action);
+                            .run_detail_action(action, bar_detail.take());
                         }
                     }
                     dirty = true;

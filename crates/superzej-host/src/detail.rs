@@ -42,9 +42,13 @@ pub struct GraphDetail {
 pub enum DetailAction {
     /// Open a URL in the system browser.
     OpenUrl(String),
-    /// Run `szhost <args>` in a new pane (e.g. `["ci","view",<id>]`). The exe
-    /// path is prepended by the loop.
-    RunCommand(Vec<String>),
+    /// Drill a CI run's detail *in place* in the modal. Carries the cached run so
+    /// the header (state/conclusion/title/branch/…) paints instantly; the loop
+    /// then kicks an off-loop fetch of jobs/steps + failing-log tail and delivers
+    /// the fill via [`apply_ci_detail`]. Unlike every other action, this one keeps
+    /// the overlay open (see [`DetailAction::keeps_overlay`]). Boxed so a large
+    /// `CiRun` doesn't bloat every `DetailAction`/`DetailOutcome`.
+    DrillCiRun { run: Box<superzej_core::ci::CiRun> },
     /// Re-run a CI run (all jobs, or `failed` only), off the loop.
     CiRerun { run_id: String, failed: bool },
     /// Cancel an in-flight CI run, off the loop.
@@ -65,6 +69,22 @@ pub enum DetailAction {
     /// Copy a single log line's raw text to the system clipboard.
     CopyLine(String),
 }
+
+impl DetailAction {
+    /// True for actions that mutate the overlay *in place* and must NOT close it
+    /// when they fire (the CI in-place drill). Every other action closes the
+    /// overlay. Read by the loop's Act dispatch.
+    pub fn keeps_overlay(&self) -> bool {
+        matches!(self, DetailAction::DrillCiRun { .. })
+    }
+}
+
+/// The CI-badge modal's in-place run drill lives in a child module (it reaches
+/// `DetailOverlay`'s private fields); re-exported so callers keep using
+/// `crate::detail::{apply_ci_detail, CiDetailPayload}`.
+mod ci_drill;
+pub use ci_drill::{CiDetailPayload, apply_ci_detail};
+use ci_drill::{ci_fmt_secs, ci_glyph_marker, ci_state_word};
 
 /// One scrollable list row: a colored marker glyph, the body text, and an
 /// optional dim right-aligned note (relative time, count, …). Rows may carry an
@@ -301,6 +321,10 @@ pub struct DetailOverlay {
     sel: usize,
     /// A dim key-hint footer line for actionable lists (drawn on the last row).
     hint: Option<String>,
+    /// While a CI-run drill's async fetch is in flight, the run id being fetched;
+    /// [`apply_ci_detail`] only fills a result whose id still matches (the user
+    /// may have navigated away). `None` outside a CI drill.
+    pending_ci: Option<String>,
 }
 
 /// What a key delivered to the detail overlay meant.
@@ -421,6 +445,14 @@ impl DetailOverlay {
                         Some(DetailAction::ShowLog(lines)) => {
                             self.enter_log_view(lines);
                             DetailOutcome::Pending
+                        }
+                        // DrillCiRun swaps to the run's header in place *and* asks
+                        // the loop to kick the off-loop jobs/steps/log fetch. It's
+                        // the one action that keeps the overlay open (Act, not
+                        // Pending — the loop needs to spawn the fetch).
+                        Some(DetailAction::DrillCiRun { run }) => {
+                            self.enter_ci_view(&run);
+                            DetailOutcome::Act(DetailAction::DrillCiRun { run })
                         }
                         Some(a) => DetailOutcome::Act(a),
                         None => DetailOutcome::Pending,
@@ -1296,6 +1328,7 @@ fn graph(
         scroll: 0,
         sel: 0,
         hint: None,
+        pending_ci: None,
     }
 }
 
@@ -1315,6 +1348,7 @@ fn keyval(
         scroll: 0,
         sel: 0,
         hint: None,
+        pending_ci: None,
     }
 }
 
@@ -1328,6 +1362,7 @@ fn table(title: &str, t: TableDetail, cols: usize, height: usize) -> DetailOverl
         scroll: 0,
         sel: 0,
         hint: None,
+        pending_ci: None,
     }
 }
 
@@ -1344,6 +1379,7 @@ fn sections(title: &str, cols: usize, secs: Vec<Section>, placement: Placement) 
         scroll: 0,
         sel: 0,
         hint: None,
+        pending_ci: None,
     }
 }
 
@@ -1366,6 +1402,7 @@ fn list(
         scroll: 0,
         sel: 0,
         hint: None,
+        pending_ci: None,
     }
 }
 
@@ -1883,26 +1920,40 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                 return None;
             }
             use superzej_core::ci::CiState;
+            let now = superzej_core::util::now();
             let rows: Vec<DetailRow> = model
                 .panel
                 .ci_runs
                 .iter()
                 .map(|r| {
-                    let (glyph, marker) = match r.state {
-                        CiState::Fail => ("✗", Tok::Hue(Hue::Red)),
-                        CiState::Running => ("●", Tok::Hue(Hue::Amber)),
-                        CiState::Pass => ("✓", Tok::Hue(Hue::Green)),
-                        _ => ("•", Tok::Slot(S::Dim)),
-                    };
-                    // Enter drills into the run's jobs/steps in a pane; `o` opens
-                    // the run page; `r`/`R` re-run; `c` cancels an in-flight run.
-                    // Mutations the provider can't perform are declined off-loop.
-                    let mut row = DetailRow::new(marker, glyph, r.name.clone())
-                        .on_enter(DetailAction::RunCommand(vec![
-                            "ci".into(),
-                            "view".into(),
-                            r.id.clone(),
-                        ]))
+                    let (glyph, marker) = ci_glyph_marker(r.state);
+                    // Text: "<name> · <outcome>" plus the commit/PR title when it
+                    // adds something the name doesn't. Note: "#run · event · branch
+                    // · dur" — the context that used to be hidden behind the glyph.
+                    let mut text = format!("{} \u{00b7} {}", r.name, ci_state_word(r.state));
+                    if !r.title.is_empty() && r.title != r.name {
+                        text.push_str(&format!(" \u{2014} {}", r.title));
+                    }
+                    let mut note_parts: Vec<String> = Vec::new();
+                    if let Some(n) = r.run_number {
+                        note_parts.push(format!("#{n}"));
+                    }
+                    if !r.event.is_empty() {
+                        note_parts.push(r.event.clone());
+                    }
+                    if !r.branch.is_empty() {
+                        note_parts.push(r.branch.clone());
+                    }
+                    if let Some(secs) = r.duration_secs(now) {
+                        note_parts.push(ci_fmt_secs(secs));
+                    }
+                    // Enter drills into the run's jobs/steps *in the modal*; `o`
+                    // opens the run page; `r`/`R` re-run; `c` cancels an in-flight
+                    // run. Mutations the provider can't perform are declined off-loop.
+                    let mut row = DetailRow::new(marker, glyph, text)
+                        .on_enter(DetailAction::DrillCiRun {
+                            run: Box::new(r.clone()),
+                        })
                         .action(
                             'r',
                             DetailAction::CiRerun {
@@ -1928,13 +1979,13 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                             },
                         );
                     }
-                    if !r.branch.is_empty() {
-                        row = row.note(r.branch.clone());
+                    if !note_parts.is_empty() {
+                        row = row.note(note_parts.join(" \u{00b7} "));
                     }
                     row
                 })
                 .collect();
-            let mut ov = list("CI runs", rows, "no CI runs", 56, 14);
+            let mut ov = list("CI runs", rows, "no CI runs", 60, 14);
             ov.hint = Some("↵ view · o open · r/R rerun · c cancel".into());
             Some(ov)
         }
@@ -2306,11 +2357,7 @@ mod tests {
         let rows: Vec<DetailRow> = (0..3)
             .map(|i| {
                 DetailRow::new(Tok::Slot(S::Text), "•", format!("run {i}"))
-                    .on_enter(DetailAction::RunCommand(vec![
-                        "ci".into(),
-                        "view".into(),
-                        i.to_string(),
-                    ]))
+                    .on_enter(DetailAction::FocusWorktree(format!("/wt/{i}")))
                     .action('o', DetailAction::OpenUrl(format!("https://ci/{i}")))
             })
             .collect();
@@ -2326,11 +2373,7 @@ mod tests {
         // Enter fires the selected row's drilldown action.
         assert_eq!(
             ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
-            DetailOutcome::Act(DetailAction::RunCommand(vec![
-                "ci".into(),
-                "view".into(),
-                "1".into()
-            ]))
+            DetailOutcome::Act(DetailAction::FocusWorktree("/wt/1".into()))
         );
         // A bound char fires that row's action; an unbound char is a no-op.
         assert_eq!(
@@ -2363,7 +2406,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut ov = open_detail_for(
+        let ov = open_detail_for(
             &BarItemId::Badge(BarBadge::Ci),
             item_at(39),
             screen(),
@@ -2373,16 +2416,10 @@ mod tests {
         .expect("ci badge opens a detail overlay");
         assert!(ov.actionable());
         assert!(ov.hint.is_some());
-        // Enter drills into `ci view 42`; `c` cancels the running run.
-        match ov.handle_key(&KeyCode::Enter, Modifiers::NONE) {
-            DetailOutcome::Act(DetailAction::RunCommand(a)) => {
-                assert_eq!(a, vec!["ci", "view", "42"]);
-            }
-            other => panic!("expected view command, got {other:?}"),
-        }
+        // `c` cancels the running run (still on the list, before drilling).
         assert_eq!(
-            ov.handle_key(&KeyCode::Char('c'), Modifiers::NONE),
-            DetailOutcome::Act(DetailAction::CiCancel {
+            ov.action_for('c'),
+            Some(DetailAction::CiCancel {
                 run_id: "42".into()
             })
         );

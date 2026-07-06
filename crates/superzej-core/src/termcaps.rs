@@ -262,6 +262,9 @@ pub struct GlyphSet {
     pub middot: &'static str,         // · separator
     pub refresh: &'static str,        // ↻ relaunch hint / active (loading) step
     pub emdash: &'static str,         // — hint separator
+    pub warn: &'static str,           // ⚠ alert badge
+    pub hex: &'static str,            // ⬡ open-PR badge
+    pub mail: &'static str,           // ✉ unread-notification badge
     // Half-block pixel-font cells (logotype).
     pub block_full: &'static str, // █
     pub block_top: &'static str,  // ▀
@@ -289,6 +292,9 @@ pub const UNICODE: GlyphSet = GlyphSet {
     middot: "\u{00b7}",         // ·
     refresh: "\u{21bb}",        // ↻
     emdash: "\u{2014}",         // —
+    warn: "\u{26a0}",           // ⚠
+    hex: "\u{2b21}",            // ⬡
+    mail: "\u{2709}",           // ✉
     block_full: "\u{2588}",     // █
     block_top: "\u{2580}",      // ▀
     block_bot: "\u{2584}",      // ▄
@@ -316,6 +322,9 @@ pub const ASCII: GlyphSet = GlyphSet {
     middot: "-",
     refresh: "@",
     emdash: "-",
+    warn: "!",
+    hex: "#",
+    mail: "@",
     // The pixel-font cannot render in ASCII; callers route to the text splash
     // instead, but provide safe stand-ins so a stray cell never emits a block.
     block_full: "#",
@@ -686,6 +695,9 @@ mod tests {
             g.middot,
             g.refresh,
             g.emdash,
+            g.warn,
+            g.hex,
+            g.mail,
             g.block_full,
             g.block_top,
             g.block_bot,
