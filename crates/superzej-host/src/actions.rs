@@ -5,9 +5,11 @@
 //! cancel. The event loop hands its mutable state in via [`CiActionCtx`] so the
 //! loop keeps only thin call sites.
 
-use termwiz::input::KeyCode;
+use termwiz::input::{KeyCode, Modifiers};
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc::UnboundedSender;
+
+use crate::pr_view::{PrView, PrViewData, PrViewOutcome};
 
 use crate::chrome::FrameModel;
 use crate::compositor::Rect;
@@ -248,6 +250,248 @@ pub(crate) fn spawn_ci_detail(
             let _ = waker.wake();
         }
     });
+}
+
+/// Run a full-screen PR-view action off the loop, posting an in-progress status
+/// and pulsing a `RefreshKind::Pr` on completion (which re-hydrates the panel
+/// cache and, if the view is open, re-fetches its diff + conversation). Mirrors
+/// `run.rs`'s `spawn_pr_action`; `OpenUrl` is handled inline (no `gh`).
+pub(crate) fn run_pr_view_action(
+    session: &Session,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    model: &mut FrameModel,
+    action: crate::pr_view::PrViewAction,
+) {
+    use crate::pr_view::PrViewAction as A;
+    use superzej_core::github as gh;
+
+    if let A::OpenUrl(url) = &action {
+        open_url_detached(url);
+        model.status = "Opened PR in the browser".into();
+        return;
+    }
+    let (label, status): (&'static str, &'static str) = match &action {
+        A::Merge => ("pr merge", "Merging PR (squash)…"),
+        A::Approve => ("pr approve", "Approving PR…"),
+        A::Rerun => ("pr rerun-checks", "Re-running failed checks…"),
+        A::Comment { .. } => ("pr comment", "Posting comment…"),
+        A::Review { .. } => ("pr review", "Submitting review…"),
+        A::Reply { .. } => ("pr reply", "Posting reply…"),
+        A::LineComment { .. } => ("pr line-comment", "Posting line comment…"),
+        A::OpenUrl(_) => unreachable!("handled above"),
+    };
+    model.status = status.into();
+    let wt = active_tab_path(session);
+    let tx = refresh_tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let res: Result<(), gh::GhError> = match action {
+            A::Merge => gh::merge_pr(&loc, gh::MergeMethod::Squash, false, false),
+            A::Approve => gh::approve_pr(&loc, None),
+            A::Rerun => gh::rerun_failed_checks(&loc).map(|_| ()),
+            A::Comment { body } => gh::comment_pr(&loc, &body),
+            A::Review { state, body } => gh::submit_review(&loc, state, Some(&body)),
+            A::Reply { thread_id, body } => gh::reply_to_thread(&loc, &thread_id, &body),
+            A::LineComment {
+                owner,
+                repo,
+                number,
+                commit_id,
+                path,
+                line,
+                body,
+            } => gh::add_line_comment(&loc, &owner, &repo, number, &commit_id, &path, line, &body),
+            A::OpenUrl(_) => Ok(()),
+        };
+        if let Err(e) = res {
+            superzej_core::msg::warn(&format!("{label} failed: {}", gh::describe(&e)));
+        }
+        if tx.send(RefreshKind::Pr).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+}
+
+/// The panel `Section::Pr` action keys (`M` merge, `A` approve, `r` re-run,
+/// `o` browser, `c` create). Merge/approve/re-run reuse the PR-view executor;
+/// `o`/`c` are handled here. Returns whether the key was claimed.
+pub(crate) fn panel_pr_action_key(
+    key: char,
+    model: &mut FrameModel,
+    session: &Session,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+) -> bool {
+    use crate::pr_view::PrViewAction as A;
+    let has_pr = model.panel.pr.is_some();
+    match key {
+        'M' if has_pr => run_pr_view_action(session, refresh_tx, waker, model, A::Merge),
+        'M' => model.status = "No pull request to merge".into(),
+        'A' if has_pr => run_pr_view_action(session, refresh_tx, waker, model, A::Approve),
+        'A' => model.status = "No pull request to approve".into(),
+        'r' => run_pr_view_action(session, refresh_tx, waker, model, A::Rerun),
+        'o' if has_pr => {
+            let url = model
+                .panel
+                .pr
+                .as_ref()
+                .map(|p| p.url.clone())
+                .unwrap_or_default();
+            run_pr_view_action(session, refresh_tx, waker, model, A::OpenUrl(url));
+        }
+        'o' => model.status = "No pull request to open".into(),
+        'c' if has_pr => model.status = "A pull request already exists".into(),
+        'c' => {
+            model.status = "Creating PR from branch commits…".into();
+            let wt = active_tab_path(session);
+            let tx = refresh_tx.clone();
+            let waker = waker.clone();
+            tokio::task::spawn_blocking(move || {
+                use superzej_core::github as gh;
+                let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+                let opts = gh::CreateOpts {
+                    title: None,
+                    body: None,
+                    base: None,
+                    draft: false,
+                    web: false,
+                    fill: true,
+                };
+                if let Err(e) = gh::create_pr(&loc, &opts) {
+                    superzej_core::msg::warn(&format!("pr create failed: {}", gh::describe(&e)));
+                }
+                if tx.send(RefreshKind::Pr).is_ok() {
+                    let _ = waker.wake();
+                }
+            });
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Fetch the full-screen PR view's async data (conversation + diff) off the
+/// loop and deliver it over `tx`. Single-flight via `generation` — the loop
+/// drops deliveries from a stale generation. Best-effort: a failed fetch leaves
+/// that half `None` (the view shows "loading" / degrades).
+pub(crate) fn spawn_pr_view_fetch(
+    session: Session,
+    owner: String,
+    repo: String,
+    number: u64,
+    generation: u64,
+    tx: &UnboundedSender<PrViewData>,
+    waker: &TerminalWaker,
+) {
+    let tx = tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let wt = active_tab_path(&session);
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let conversation = superzej_core::github::conversation(&loc, &owner, &repo, number).ok();
+        let diff = superzej_core::github::pr_diff(&loc).ok();
+        let data = PrViewData {
+            generation,
+            conversation,
+            diff,
+        };
+        if tx.send(data).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+}
+
+/// Open the full-screen PR view from the panel's cached PR data, kicking its
+/// async diff + conversation fetch. `None` (with a status set by the caller)
+/// when there's no PR.
+pub(crate) fn open_pr_view(
+    model: &FrameModel,
+    session: &Session,
+    gen_ctr: &mut u64,
+    tx: &UnboundedSender<PrViewData>,
+    waker: &TerminalWaker,
+) -> Option<PrView> {
+    let pr = model.panel.pr.as_ref()?;
+    *gen_ctr += 1;
+    let mut v = PrView::open(
+        pr,
+        &model.panel.checks,
+        &model.panel.pr_base,
+        &model.panel.pr_head_oid,
+        &model.panel.pr_mergeable,
+        &model.panel.pr_merge_state,
+    );
+    v.branch = model.panel.branch.clone();
+    v.generation = *gen_ctr;
+    if !v.owner.is_empty() {
+        spawn_pr_view_fetch(
+            session.clone(),
+            v.owner.clone(),
+            v.repo.clone(),
+            v.number,
+            *gen_ctr,
+            tx,
+            waker,
+        );
+    }
+    Some(v)
+}
+
+/// Re-kick the open view's fetch (after a write) so new comments/reviews show.
+pub(crate) fn refetch_pr_view(
+    view: Option<&mut PrView>,
+    session: &Session,
+    gen_ctr: &mut u64,
+    tx: &UnboundedSender<PrViewData>,
+    waker: &TerminalWaker,
+) {
+    if let Some(v) = view
+        && !v.owner.is_empty()
+    {
+        *gen_ctr += 1;
+        v.generation = *gen_ctr;
+        spawn_pr_view_fetch(
+            session.clone(),
+            v.owner.clone(),
+            v.repo.clone(),
+            v.number,
+            *gen_ctr,
+            tx,
+            waker,
+        );
+    }
+}
+
+/// Route a key to the open PR view: close it, do nothing, or run its action.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_pr_view_key(
+    view: &mut Option<PrView>,
+    key: &KeyCode,
+    mods: Modifiers,
+    session: &Session,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    model: &mut FrameModel,
+) {
+    let Some(v) = view.as_mut() else { return };
+    match v.handle_key(key, mods) {
+        PrViewOutcome::Close => *view = None,
+        PrViewOutcome::Pending => {}
+        PrViewOutcome::Act(action) => run_pr_view_action(session, refresh_tx, waker, model, action),
+    }
+}
+
+/// Apply an async delivery to the open view if its generation is current.
+pub(crate) fn apply_pr_view_delivery(view: Option<&mut PrView>, data: PrViewData) -> bool {
+    if let Some(v) = view
+        && data.generation == v.generation
+    {
+        v.apply_data(data);
+        return true;
+    }
+    false
 }
 
 /// A transient status line for a CI mutation about to be spawned.

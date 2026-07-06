@@ -518,6 +518,13 @@ pub struct PanelData {
     pub log: Vec<superzej_svc::git::LogRow>,
     /// PR base ref ("main") and head→base diffstat, when a PR exists.
     pub pr_base: String,
+    /// PR head commit SHA — the `commit_id` an inline review comment anchors to.
+    /// Powers the full-screen PR view (`crate::pr_view`). Empty without a PR.
+    pub pr_head_oid: String,
+    /// GitHub mergeability ("MERGEABLE" | "CONFLICTING" | "UNKNOWN") + detail
+    /// ("CLEAN" | "BLOCKED" | …) for the PR view's Overview tab.
+    pub pr_mergeable: String,
+    pub pr_merge_state: String,
     /// Review threads (unresolved first) and open issues, from the PR cache.
     pub threads: Vec<superzej_core::github::ReviewThreadRow>,
     pub issues: Vec<superzej_core::github::IssueRow>,

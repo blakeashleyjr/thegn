@@ -1049,6 +1049,9 @@ fn apply_pr_cache(panel: &mut crate::panel::PanelData, cached: superzej_core::gi
                 review_decision: pr.review_decision.clone(),
             });
             panel.pr_base = pr.base_ref_name.clone();
+            panel.pr_head_oid = pr.head_ref_oid.clone();
+            panel.pr_mergeable = pr.mergeable.clone();
+            panel.pr_merge_state = pr.merge_state_status.clone();
             panel.checks = pr
                 .status_check_rollup
                 .iter()
