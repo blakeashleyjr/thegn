@@ -1100,9 +1100,16 @@ pub fn run_worker(
                         prepped = Some((env, sandbox, outcome));
                     }
                     Err(e) => {
-                        worktree::remove(root, &path, &branch, true);
-                        fail(CreateStep::SandboxPrep, e.to_string());
-                        return;
+                        // Non-fatal: user is still browsing — show the backend
+                        // as unavailable without closing the wizard or removing
+                        // the worktree. Submit re-runs prep with the final pick
+                        // and fails fatally there if it's still unavailable.
+                        step(
+                            CreateStep::SandboxPrep,
+                            StepState::Failed(e.to_string()),
+                            None,
+                        );
+                        prepped = None;
                     }
                 }
             }
