@@ -1404,6 +1404,9 @@ pub(crate) fn build_panel(
     // empty (and free) when no [host.*] is configured. The loop live-merges
     // HostRuntime progress on top after each drain.
     panel.hosts = crate::host_ui::host_snapshots(app_cfg, db);
+    // Per-[env.*] display snapshots for the System ▸ Environments section (kind,
+    // region/size, token presence). Cheap config walk; empty without any [env.*].
+    panel.environments = crate::env_ui::env_snapshots(app_cfg);
 
     panel.files = diff_entries
         .iter()

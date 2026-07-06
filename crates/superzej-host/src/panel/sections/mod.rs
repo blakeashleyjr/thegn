@@ -16,6 +16,7 @@ mod branches;
 mod changes;
 mod ci;
 pub(crate) mod commits;
+mod environments;
 mod git;
 mod hosts;
 mod issues;
@@ -459,6 +460,7 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
         }
         Section::Db => vec![seg(g2(), "—")],
         Section::Hosts => hosts::summary(model),
+        Section::Environments => environments::summary(model),
         Section::Telemetry => {
             let s = &model.stats;
             match (s.cpu_pct, s.mem_gib) {
@@ -683,6 +685,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Debug => misc::debug(),
         Section::Sandbox => misc::sandbox(ctx),
         Section::Hosts => hosts::content(ctx),
+        Section::Environments => environments::content(ctx),
         Section::Share => misc::share(ctx),
         Section::Forward => misc::forward(ctx),
         Section::Db => misc::db(),

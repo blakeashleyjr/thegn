@@ -134,6 +134,10 @@ pub enum Section {
     /// Configured `[host.*]` machines (hosts-as-resources): per-host state,
     /// inventory, and provision/re-probe/consent/rm-cache actions.
     Hosts,
+    /// Configured `[env.<name>]` environments: placement kind, region/size, and
+    /// (for provider envs) whether a token resolves. Authored via the palette
+    /// "New environment…" wizard / `superzej env create`.
+    Environments,
     /// Active ingress shares (`[share]`): the ports this worktree exposes and
     /// their public URLs.
     Share,
@@ -156,11 +160,11 @@ pub enum Section {
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
 /// - Work (10): Mine, Across, Pr, Ci, MergeQueue, Issues, Problems, Jobs, Tests, Symbols
-/// - System (9): Notifications, Logs, Sandbox, Hosts, Share, Forward, Telemetry, Media, Keys
+/// - System (10): Notifications, Logs, Sandbox, Hosts, Environments, Share, Forward, Telemetry, Media, Keys
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 24] = [
+pub const SECTION_ORDER: [Section; 25] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -183,6 +187,7 @@ pub const SECTION_ORDER: [Section; 24] = [
     Section::Logs,
     Section::Sandbox,
     Section::Hosts,
+    Section::Environments,
     Section::Share,
     Section::Forward,
     Section::Telemetry,
@@ -211,6 +216,7 @@ impl Section {
             Section::Debug => "debug",
             Section::Sandbox => "sandbox",
             Section::Hosts => "hosts",
+            Section::Environments => "environments",
             Section::Db => "db",
             Section::Telemetry => "telemetry",
             Section::Keys => "keys",
@@ -245,6 +251,7 @@ impl Section {
             | Section::Logs
             | Section::Sandbox
             | Section::Hosts
+            | Section::Environments
             | Section::Share
             | Section::Forward
             | Section::Telemetry
@@ -575,6 +582,10 @@ pub struct PanelData {
     /// `HostRuntime` after each drain. Feeds the `Hosts` section, the sidebar
     /// HOSTS block, and the wizard readiness badges. Empty without `[host.*]`.
     pub hosts: Vec<crate::host_ui::HostSnapshot>,
+    /// Per-`[env.<name>]` display snapshots for the `Environments` section: built
+    /// off-loop from the config by hydration (placement kind, region/size, token
+    /// presence). Empty without any `[env.*]`.
+    pub environments: Vec<crate::env_ui::EnvSnapshot>,
 }
 
 /// One row of the Symbols outline (or, in references mode, a reference site): a
@@ -1121,7 +1132,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 24);
+        assert_eq!(SECTION_ORDER.len(), 25);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab
