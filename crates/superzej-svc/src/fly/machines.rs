@@ -3,10 +3,10 @@
 //! `hetzner`/`digitalocean` split in `crate::vps`.
 //!
 //! API: `https://api.machines.dev/v1` (Bearer auth). A Machine belongs to a Fly
-//! **app**, so the lifecycle is: ensure the app exists → create the machine →
-//! poll it to `started`. Machines are container-native and get a private 6PN
-//! address (`private_ip`, `fdaa:…`) reachable over the org WireGuard mesh — the
-//! CLI-free transport (see [`super::wireguard`]) dials that address.
+//! **app**, so the lifecycle is: ensure the app exists → allocate a dedicated
+//! public IPv4 → create the machine → poll it to `started`. superzej reaches it
+//! over plain ssh on that IPv4 (see [`super::FlyProvider`]), reusing the VPS
+//! `ssh_shim` — no vendor CLI.
 //!
 //! Scoping is by **machine metadata** (`managed-by=superzej`, `sz-host=<hash>`),
 //! the container-native analogue of Hetzner labels / DO tags; `list()` filters
@@ -20,8 +20,8 @@ pub const DEFAULT_TOKEN_ENV: &str = "FLY_API_TOKEN";
 /// usually want more RAM, so callers typically override `size`.
 pub const DEFAULT_SIZE: &str = "shared-cpu-2x";
 pub const DEFAULT_REGION: &str = "iad";
-/// Stock base image: a full-ish userland with an sshd the provisioning pipeline
-/// reaches over the 6PN transport. Overridable via `template`.
+/// Stock base image: a full-ish userland that [`SSHD_INIT`] installs sshd into
+/// at boot. Overridable via `template` (e.g. `image:<ref>` for a prebaked image).
 pub const DEFAULT_IMAGE: &str = "ubuntu:24.04";
 
 /// Metadata keys — the vendor-neutral scoping [`crate::vps::MANAGED_KEY`] mirrors.
@@ -121,11 +121,18 @@ printf '{\"features\":{\"containerd-snapshotter\":false},\"storage-driver\":\"vf
 chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys; \
 ssh-keygen -A; exec /usr/sbin/sshd -D -e";
 
-/// The create-machine body. Since a Fly machine has no plain public-IP ssh and
-/// no cloud-init, superzej reaches it like a VPS: `authorized_key` rides in via a
-/// Machines `files` entry (base64), a `tcp/22` service exposes sshd on the app's
-/// dedicated IPv4, and [`SSHD_INIT`] brings sshd up. Reachability then reuses the
-/// VPS `ssh_shim` verbatim — no WireGuard, no vendor CLI.
+/// The create-machine body. Since a Fly machine has no plain public-IP ssh,
+/// superzej reaches it like a VPS: `authorized_key` rides in via a Machines
+/// `files` entry (base64) and a `tcp/22` service exposes sshd on the app's
+/// dedicated IPv4; reachability then reuses the VPS `ssh_shim` verbatim.
+///
+/// Two image modes:
+/// - **stock** (`prebaked = false`, e.g. `ubuntu:24.04`): no cloud-init, so
+///   [`SSHD_INIT`] apt-installs sshd at boot (the ~40s cold path).
+/// - **prebaked** (`prebaked = true`): a baked superzej image (see
+///   `nix/fly-sandbox-image.nix`) whose OWN entrypoint runs sshd and already has
+///   the toolchain — superzej must NOT override the init, so the machine boots
+///   straight into a reachable shell with rust/just baked (no per-VM install).
 pub fn create_machine_body(
     name: &str,
     region: &str,
@@ -133,35 +140,37 @@ pub fn create_machine_body(
     size: &str,
     authorized_key: &str,
     metadata: &BTreeMap<String, String>,
+    prebaked: bool,
 ) -> serde_json::Value {
     let meta: serde_json::Map<String, serde_json::Value> = metadata
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
     let authkeys_b64 = super::b64(authorized_key.trim().as_bytes());
-    serde_json::json!({
-        "name": name,
-        "region": region,
-        "config": {
-            "image": image,
-            "guest": guest_for_size(size),
-            "metadata": meta,
-            "auto_destroy": false,
-            // Don't let Fly auto-restart a machine superzej parked (scale-to-zero).
-            "restart": { "policy": "no" },
-            "files": [
-                { "guest_path": "/root/.ssh/authorized_keys", "raw_value": authkeys_b64 }
-            ],
-            "services": [
-                {
-                    "protocol": "tcp",
-                    "internal_port": SSH_PORT,
-                    "ports": [ { "port": SSH_PORT } ]
-                }
-            ],
-            "init": { "exec": ["/bin/sh", "-c", SSHD_INIT] }
-        }
-    })
+    let mut config = serde_json::json!({
+        "image": image,
+        "guest": guest_for_size(size),
+        "metadata": meta,
+        "auto_destroy": false,
+        // Don't let Fly auto-restart a machine superzej parked (scale-to-zero).
+        "restart": { "policy": "no" },
+        "files": [
+            { "guest_path": "/root/.ssh/authorized_keys", "raw_value": authkeys_b64 }
+        ],
+        "services": [
+            {
+                "protocol": "tcp",
+                "internal_port": SSH_PORT,
+                "ports": [ { "port": SSH_PORT } ]
+            }
+        ]
+    });
+    if !prebaked {
+        // Stock image: install + start sshd ourselves. A prebaked image runs its
+        // own sshd entrypoint, so overriding init would replace it.
+        config["init"] = serde_json::json!({ "exec": ["/bin/sh", "-c", SSHD_INIT] });
+    }
+    serde_json::json!({ "name": name, "region": region, "config": config })
 }
 
 /// One Machine as parsed from the API.
@@ -171,7 +180,9 @@ pub struct FlyMachine {
     pub name: String,
     /// `created` | `starting` | `started` | `stopping` | `stopped` | `destroyed`.
     pub state: String,
-    /// The 6PN private address (`fdaa:…`) the transport dials.
+    /// The machine's 6PN private address (`fdaa:…`), as reported by the API.
+    /// superzej reaches the machine over the app's public IPv4, not this; kept
+    /// for diagnostics / a future private-network transport.
     pub private_ip: Option<String>,
     pub region: Option<String>,
     pub metadata: BTreeMap<String, String>,
@@ -292,6 +303,7 @@ mod tests {
             "shared-cpu-2x",
             "ssh-ed25519 AAAAKEY superzej",
             &meta,
+            false,
         );
         assert_eq!(b["name"], "sz-fly-1");
         assert_eq!(b["config"]["image"], "ubuntu:24.04");
@@ -322,6 +334,31 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("vfs")
+        );
+    }
+
+    #[test]
+    fn prebaked_image_keeps_key_and_service_but_no_init_override() {
+        let meta = BTreeMap::new();
+        let b = create_machine_body(
+            "sz-fly-1",
+            "iad",
+            "registry.fly.io/x:sz",
+            "shared-cpu-2x",
+            "ssh-ed25519 AAAAKEY superzej",
+            &meta,
+            true,
+        );
+        // Key still injected + ssh service exposed, but the image's OWN entrypoint
+        // runs sshd — no init override that would replace it.
+        assert_eq!(
+            b["config"]["files"][0]["guest_path"],
+            "/root/.ssh/authorized_keys"
+        );
+        assert_eq!(b["config"]["services"][0]["ports"][0]["port"], 22);
+        assert!(
+            b["config"].get("init").is_none(),
+            "prebaked image keeps its entrypoint"
         );
     }
 

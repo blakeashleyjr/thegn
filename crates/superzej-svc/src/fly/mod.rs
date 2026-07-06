@@ -152,6 +152,14 @@ impl FlySpec {
         m.insert(machines::HOST_KEY.into(), host_label());
         m
     }
+
+    /// Whether the template names a **prebaked** superzej image (`image:<ref>`)
+    /// that runs its own sshd + ships the toolchain — the fast path, booting
+    /// straight into a reachable shell with no per-VM install. A bare/empty
+    /// template is a stock distro that gets [`machines::SSHD_INIT`] instead.
+    fn is_prebaked(&self) -> bool {
+        self.image.trim().starts_with("image:")
+    }
 }
 
 /// The async driver: Machines REST lifecycle + ssh reachability for one machine.
@@ -441,6 +449,7 @@ impl RemoteProvider for FlyProvider {
                 self.spec.size(),
                 &self.spec.pubkey,
                 &self.spec.metadata(),
+                self.spec.is_prebaked(),
             );
             let created = self
                 .post_json(&machines::machines_url(&base, &app), &body)

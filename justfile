@@ -669,3 +669,20 @@ image-publish registry tag="v1":
     echo "pushed $ref-$oci — repeat on the other arch, then:"
     echo "  podman manifest create $ref $ref-amd64 $ref-arm64 && podman manifest push $ref"
     echo "  (the printed manifest-list digest pins DEFAULT_BASE_DIGEST)"
+
+# Build the Fly.io boot image (sshd entrypoint + baked nix/rust/just) and push it
+# to a registry Fly can pull, so a Fly machine boots STRAIGHT into a reachable
+# shell with the toolchain baked — no per-VM install. Then set the printed
+# `template` on the env. Run on a machine with a writable /nix + podman.
+#   just fly-image-publish registry=ghcr.io/you tag=v1
+fly-image-publish registry tag="v1":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ref="{{registry}}/superzej-fly-sandbox:{{tag}}"
+    nix build .#fly-sandbox-image
+    ./result | podman load
+    podman tag superzej-fly-sandbox:latest "$ref"
+    podman push "$ref"
+    echo "pushed $ref — point the Fly env at it:"
+    echo "  [env.fly.provider]"
+    echo "  template = \"image:$ref\"   # boots from the baked image (fast path)"

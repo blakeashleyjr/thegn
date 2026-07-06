@@ -2069,11 +2069,18 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 #   1. Create a deploy/org token: `fly tokens create org` (or the dashboard).
 #   2. export FLY_API_TOKEN=...
 #
-# NOTE (reachability spike): the WireGuard data plane that carries exec/attach is
-# validated against a live Fly org before it is enabled. Until then the machine
-# LIFECYCLE (create/list/stop/start/destroy) works, but opening a pane into a
-# machine returns a clear "transport not yet enabled" error. The control plane
-# (Machines API + peer/cert/config shaping) is complete and tested.
+# superzej reaches the machine over ssh on a per-app dedicated IPv4 (~$2/mo,
+# prorated, released when the sandbox is destroyed): each sandbox is its own Fly
+# app, so destroy = delete the app (cascades the machine + IP).
+#
+# TWO speeds, via `template`:
+#   - stock "" ⇒ ubuntu:24.04, and superzej installs sshd + prereqs at boot
+#     (~40-90s cold — the convenient default).
+#   - baked "image:<ref>" ⇒ boot STRAIGHT into a reachable shell with the whole
+#     toolchain (nix + rust + just) already in the image — no per-VM install, the
+#     fast path. Build + publish once: `just fly-image-publish registry=ghcr.io/you`
+#     (nix/fly-sandbox-image.nix: sshd entrypoint + baked toolchain), then set the
+#     printed template below. A stopped machine is scale-to-zero (rootfs-only cost).
 #
 # [env.fly]
 # placement = "provider"
@@ -2084,14 +2091,13 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # region = "iad"                  # Fly region (iad/lax/ams/syd/…)
 # # size = "shared-cpu-2x"          # preset → guest cpu/memory (shared-cpu-1x…8x,
 # #                                 #   performance-1x…4x)
-# # template = ""                   # image: "" ⇒ ubuntu:24.04, or "image:<ref>"
-# #                                 #   / a bare registry ref (no snapshots — Fly
-# #                                 #   speed comes from small images)
+# # template = ""                   # "" ⇒ ubuntu:24.04 (install sshd at boot), or
+# #                                 #   "image:<ref>" to boot from the baked image
+# #                                 #   (the fast path — see `just fly-image-publish`)
 # # auto_provision = false
 # # max_instances = 5
 # # max_lifetime_secs = 0
-# # Org defaults to "personal" and the app is derived per-host (sz-<hash>);
-# # non-personal orgs / a fixed app name are a follow-up config addition.
+# # Org defaults to "personal"; non-personal orgs are a follow-up config addition.
 #
 # ── Sandbox lifecycle: warm/suspend + budget ───────────────────────────────
 # Budget-governed warm policy for managed-provider sandboxes (sprites/ssh/k8s).
