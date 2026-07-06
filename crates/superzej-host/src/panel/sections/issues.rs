@@ -108,7 +108,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let issues = sorted_issues(ctx);
 
     if issues.is_empty() {
-        return empty_rows(false);
+        return empty_rows(ctx.model.panel.issues_configured);
     }
 
     let mut rows = Vec::new();
@@ -181,7 +181,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let issues = sorted_issues(ctx);
 
     if issues.is_empty() {
-        return empty_rows(true);
+        return empty_rows(ctx.model.panel.issues_configured);
     }
 
     let mut rows = Vec::new();
@@ -283,8 +283,10 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let issues = sorted_issues(ctx);
 
     // Header bar
-    let provider_label = if data.tracker_issues.is_empty() {
-        "no provider configured".to_string()
+    let provider_label = if !data.issues_configured {
+        "no issue tracker configured".to_string()
+    } else if data.tracker_issues.is_empty() {
+        "no open issues".to_string()
     } else {
         // Distinct providers, in first-seen order, so an aggregated Linear+Jira
         // list reads as "⬡ ⬢ linear+jira" rather than just the first one.
@@ -318,12 +320,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows.push(rule());
 
     if issues.is_empty() {
-        rows.extend(empty_rows(false));
-        rows.push(PanelRow::plain(Line::segs(vec![
-            seg(g2(), "Configure ".to_string()),
-            seg(f(), "[issues] provider".to_string()),
-            seg(g2(), " in config.toml".to_string()),
-        ])));
+        rows.extend(empty_rows(data.issues_configured));
         return rows;
     }
 
@@ -456,17 +453,24 @@ fn issue_detail_segs(issue: &Issue, links: &[String], w: usize) -> Vec<Vec<Seg>>
 
 // ---- empty state ------------------------------------------------------------
 
-fn empty_rows(deep: bool) -> Vec<PanelRow> {
-    let mut rows = vec![PanelRow::plain(Line::segs(vec![seg(
-        g2(),
-        "no issues".to_string(),
-    )]))];
-    if deep {
-        rows.push(PanelRow::plain(Line::segs(vec![
+fn empty_rows(configured: bool) -> Vec<PanelRow> {
+    if configured {
+        // A provider is set up; the queue is simply empty right now.
+        return vec![PanelRow::plain(Line::segs(vec![seg(
+            g2(),
+            "no open issues".to_string(),
+        )]))];
+    }
+    // No tracker configured — say so, and point at how to enable it.
+    vec![
+        PanelRow::plain(Line::segs(vec![seg(
+            g2(),
+            "no issue tracker configured".to_string(),
+        )])),
+        PanelRow::plain(Line::segs(vec![
             seg(g3(), "set ".to_string()),
             seg(f(), "[issues] provider".to_string()),
             seg(g3(), " to enable".to_string()),
-        ])));
-    }
-    rows
+        ])),
+    ]
 }

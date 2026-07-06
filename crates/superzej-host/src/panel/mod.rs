@@ -549,6 +549,9 @@ pub struct PanelData {
     pub tracker_issues: Vec<superzej_core::issue::Issue>,
     /// Issue ids (in `"<provider>:<key>"` form) linked to the current worktree.
     pub tracker_links: Vec<String>,
+    /// Whether any `[issues]` provider is configured for this repo. Distinguishes
+    /// "off" (no provider) from "clear" (configured but currently empty).
+    pub issues_configured: bool,
     /// Unified cross-repo "My Work" feed (the `Mine` section), loaded from the
     /// `my_work_cache` DB row. Spans every repo, not just the active worktree.
     pub my_work: Vec<superzej_core::work::WorkRow>,

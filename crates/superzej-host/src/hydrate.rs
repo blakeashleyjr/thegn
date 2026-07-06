@@ -1522,6 +1522,9 @@ pub(crate) fn build_panel(
     if let Ok(links) = db.linked_issues(&cwd.to_string_lossy()) {
         panel.tracker_links = links;
     }
+    // Pure config check (no secrets, no network): does any `[issues]` provider
+    // exist? Lets the panel say "off" (unconfigured) vs "clear" (empty) honestly.
+    panel.issues_configured = !app_cfg.issues.active_providers().is_empty();
     // The active worktree's repo root — the default scoping unit for the panel's
     // otherwise-global sections (My Work, notifications).
     let repo_root = superzej_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf());
