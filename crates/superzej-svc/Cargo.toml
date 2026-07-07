@@ -30,6 +30,9 @@ futures-channel = "0.3.32"
 futures-util = "0.3.32"
 # Native provider exec transport (Sprites WSS PTY exec — see provider::SpritesProvider).
 tokio-tungstenite.workspace = true
+# iroh call-home reach: the compositor's home Endpoint (accept loop + per-sandbox
+# connection registry) and the exec surface bridged over iroh bi-streams.
+iroh.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
