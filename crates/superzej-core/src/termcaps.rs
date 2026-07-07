@@ -806,3 +806,59 @@ mod tests {
         assert_eq!(apply_probe(base, &none, true, true, true), base);
     }
 }
+
+// Formal proofs for the pure color-quantization math. These are compiled and run
+// ONLY under `cargo kani` (the `kani` cfg + the injected `kani` crate); a normal
+// `cargo build`/`cargo test`/`just ci` never sees this module, so it adds no
+// dependency and no build cost. Kani solves the full 2^24 `(r, g, b)` domain
+// symbolically (not by enumeration), and on every reachable path it also checks
+// panic-freedom, arithmetic overflow, and out-of-bounds indexing — so the safety
+// of the `CUBE_LEVELS[..]` / `ANSI16[..]` subscripts is proven implicitly. Run
+// with `just verify-kani`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    // The nearest-cube-level helper only ever returns a valid `CUBE_LEVELS`
+    // index; the two public quantizers below rely on this to index safely.
+    #[kani::proof]
+    fn nearest_cube_level_indexes_in_bounds() {
+        let v: u8 = kani::any();
+        assert!(nearest_cube_level(v) < CUBE_LEVELS.len());
+    }
+
+    // Every truecolor maps to a real 256-palette color: the 6×6×6 cube band
+    // (16..=231) or the grayscale ramp (232..=255), never the 0..=15 ANSI band.
+    // Overflow-freedom of `16 + 36*ri + 6*gi + bi` and `8 + 10*gi2` is implicit.
+    #[kani::proof]
+    fn rgb_to_256_lands_in_valid_range() {
+        let (r, g, b): (u8, u8, u8) = (kani::any(), kani::any(), kani::any());
+        let idx = rgb_to_256(r, g, b);
+        assert!((16..=231).contains(&idx) || (232..=255).contains(&idx));
+    }
+
+    // The 16-color quantizer always lands in the base ANSI band.
+    #[kani::proof]
+    fn rgb_to_16_in_ansi_band() {
+        let (r, g, b): (u8, u8, u8) = (kani::any(), kani::any(), kani::any());
+        assert!(rgb_to_16(r, g, b) <= 15);
+    }
+
+    // The inverse is total over all 256 indices — no `CUBE_LEVELS`/`ANSI16`
+    // subscript is ever out of bounds (the assert just anchors the call).
+    #[kani::proof]
+    fn index_256_to_rgb_never_panics() {
+        let i: u8 = kani::any();
+        let (r, g, b) = index_256_to_rgb(i);
+        let _ = (r, g, b);
+    }
+
+    // The real renderer pipeline (truecolor → 256 → re-quantize to RGB) is total
+    // for every truecolor input: `rgb_to_256`'s output always feeds
+    // `index_256_to_rgb` without panicking.
+    #[kani::proof]
+    fn index_256_of_rgb_256_is_total() {
+        let (r, g, b): (u8, u8, u8) = (kani::any(), kani::any(), kani::any());
+        let _ = index_256_to_rgb(rgb_to_256(r, g, b));
+    }
+}
