@@ -648,7 +648,6 @@ fn collect_sidebar_status(
     lifecycle: &superzej_core::config::LifecycleConfig,
 ) -> crate::sidebar::SidebarStatus {
     use superzej_core::remote::GitLoc;
-    use superzej_svc::git::{GitBackend, GixGit};
     let mut status = crate::sidebar::SidebarStatus::default();
     let t0 = std::time::Instant::now();
 
@@ -823,10 +822,12 @@ fn collect_sidebar_status(
                 s.spawn(move || {
                     let wt = std::path::Path::new(p);
                     let loc = GitLoc::for_worktree(wt);
-                    let git = GixGit::new();
-                    let dirty = git.is_dirty(&loc).map_err(|_| ());
-                    let ahead_behind = git.ahead_behind(&loc).map_err(|_| ());
-                    let branch = git.current_branch(&loc).map(Some).map_err(|_| ());
+                    // One batched round-trip for a bridged loc (status + ahead/
+                    // behind + branch), gix/CLI reads for a local one.
+                    let reads = superzej_svc::git::glyph_reads(&loc);
+                    let dirty = reads.dirty.map_err(|_| ());
+                    let ahead_behind = reads.ahead_behind.map_err(|_| ());
+                    let branch = reads.branch.map(Some).map_err(|_| ());
                     let repo_root = superzej_core::repo::main_worktree(wt)
                         .map(|r| r.to_string_lossy().into_owned())
                         .unwrap_or_else(|| p.clone());
