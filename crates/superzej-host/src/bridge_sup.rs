@@ -278,6 +278,13 @@ impl FramesReader {
 
 impl Read for FramesReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        // `blocking_recv` panics inside the tokio runtime; this adapter is only
+        // ever driven by the dedicated `bridge-reader` std thread (no runtime
+        // context). Lock that invariant in so a future rewiring can't regress it.
+        debug_assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "FramesReader::read must run off the tokio runtime",
+        );
         loop {
             if self.pos < self.buf.len() {
                 let n = (self.buf.len() - self.pos).min(out.len());
@@ -303,18 +310,36 @@ impl Read for FramesReader {
 }
 
 /// Adapts blocking [`Write`] into an [`ExecSession`]'s stdin control channel.
-/// Uses `blocking_send` — sound off a runtime worker (the `BridgeClient` writes
-/// from the git backend's `spawn_blocking` threads).
+/// Uses the **non-blocking** `try_send`, so it is sound on ANY thread — the main
+/// event loop, a runtime worker, `spawn_blocking`, or a plain std thread. That
+/// matters because `BridgeClient::call` drives this `write` on whatever thread
+/// issued the git/`exec` op, and several of those are inside the tokio runtime
+/// (where `blocking_send` would panic with "Cannot block ... within a runtime").
+/// Each `BridgeClient::call` writes one framed request in a single `write_all`,
+/// so one `write` == one whole frame == one channel item (never a partial frame).
 struct ControlWriter {
     tx: tokio::sync::mpsc::Sender<ExecControl>,
 }
 
 impl Write for ControlWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.tx
-            .blocking_send(ExecControl::Stdin(data.to_vec()))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "exec session closed"))?;
-        Ok(data.len())
+        use tokio::sync::mpsc::error::TrySendError;
+        match self.tx.try_send(ExecControl::Stdin(data.to_vec())) {
+            Ok(()) => Ok(data.len()),
+            // Full ⇒ fast-fail: `BridgeClient::call` bails on a write error, so the op
+            // errors out and retries next refresh rather than eating the 120s response
+            // timeout. The control channel is bounded (256); with the id-correlated,
+            // ~synchronous-per-connection protocol and small git payloads, Full is
+            // unreachable in practice, but degrade cleanly if it ever isn't.
+            Err(TrySendError::Full(_)) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "bridge control channel full",
+            )),
+            Err(TrySendError::Closed(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "exec session closed",
+            )),
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -374,6 +399,31 @@ mod tests {
             out.extend_from_slice(&tmp[..n]);
         }
         assert_eq!(out, b"abcd");
+    }
+
+    #[test]
+    fn control_writer_write_is_panic_free_inside_runtime() {
+        // Regression: git-over-bridge routes through `ControlWriter::write` on
+        // whatever thread issued the op — often a runtime worker or the main
+        // thread. `blocking_send` panicked there ("Cannot block ... within a
+        // runtime"); `try_send` must not. Write from INSIDE a runtime worker and
+        // assert both no-panic and that the bytes still reach the control channel.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ExecControl>(8);
+        let got = rt.block_on(async move {
+            tokio::spawn(async move {
+                let mut w = ControlWriter { tx };
+                w.write_all(b"hi").unwrap(); // pre-fix: PANIC; post-fix: Ok
+            })
+            .await
+            .unwrap();
+            rx.recv().await
+        });
+        assert_eq!(got, Some(ExecControl::Stdin(b"hi".to_vec())));
     }
 
     #[test]
