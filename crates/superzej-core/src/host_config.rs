@@ -234,10 +234,14 @@ fn ssh_placement(ssh: &EnvSshConfig) -> Option<SshPlacement> {
         host: host.to_string(),
         port: if ssh.port == 0 { 22 } else { ssh.port },
         forward_agent: ssh.forward_agent,
-        // The host control plane always uses plain ssh (BatchMode); the
-        // interactive pane's mosh preference is a pane concern.
+        // `kind` only steers the INTERACTIVE pane (mosh vs ssh -t); the control
+        // plane always wraps with batch ssh regardless (see `control_argv`). So
+        // honour the host's `transport` here — a host-pinned env's pane reaches
+        // the box exactly as configured (e.g. `transport = "ssh"` for a box with
+        // no mosh), instead of silently defaulting to mosh.
         kind: match ssh.transport {
-            RemoteTransport::Ssh | RemoteTransport::Mosh => TransportKind::Ssh,
+            RemoteTransport::Ssh => TransportKind::Ssh,
+            RemoteTransport::Mosh => TransportKind::Mosh,
         },
         ssh_config: opt(&ssh.ssh_config),
         jump_host: opt(&ssh.jump_host),
