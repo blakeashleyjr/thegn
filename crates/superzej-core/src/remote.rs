@@ -50,7 +50,20 @@ pub fn ssh_base(port: u16, forward_agent: bool, batch: bool) -> Vec<String> {
     v.push("ConnectTimeout=10".into());
     // Multiplex so the panel's frequent git polls reuse one connection (and the
     // interactive pane's master serves later control-plane calls without re-auth).
-    let ctl = util::superzej_dir().join("run/ssh-%r@%h:%p");
+    // The ControlPath's parent (`<superzej_dir>/run`) is created by the compositor
+    // at startup, but a headless CLI (`superzej host provision`, `pr`, `diff`, …)
+    // can run before that ever happens — ensure it once so ssh can bind the socket
+    // (otherwise ControlMaster fails with "cannot bind to path … No such file").
+    let run_dir = util::superzej_dir().join("run");
+    {
+        static RUN_DIR_ONCE: std::sync::Once = std::sync::Once::new();
+        let rd = run_dir.clone();
+        // best-effort: if the mkdir fails, ssh reports the bind error as before.
+        RUN_DIR_ONCE.call_once(move || {
+            let _ = std::fs::create_dir_all(rd);
+        });
+    }
+    let ctl = run_dir.join("ssh-%r@%h:%p");
     v.push("-o".into());
     v.push("ControlMaster=auto".into());
     v.push("-o".into());
