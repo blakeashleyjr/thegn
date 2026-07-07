@@ -248,6 +248,18 @@ pub fn add_checked(
     }
 }
 
+/// Delete a removed worktree's files from wherever they actually live: the
+/// local dir AND — for a remote/provider worktree — the checkout on the box
+/// over ssh (the local remove never reaches it, so the remote dir would
+/// otherwise leak under the host's `remote_dir`). ONLY the worktree dir is
+/// removed; the shared base image + warm volumes stay. Best-effort: git is the
+/// source of truth. Call BEFORE the DB's `worktrees.location` row is forgotten
+/// (else the remote target can't be resolved and only the local dir is purged).
+pub fn purge_worktree_files(path: &Path) {
+    crate::remote::GitLoc::for_worktree(path).remove_remote_dir();
+    let _ = std::fs::remove_dir_all(path);
+}
+
 /// Remove a worktree and optionally delete its branch.
 pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) {
     let _lock = util::lock_git_mutations(root);

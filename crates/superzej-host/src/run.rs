@@ -2745,8 +2745,8 @@ pub(crate) fn delete_groups(
                         // git is the source of truth, but `git worktree remove` leaves the
                         // dir behind if it ever fails (locked, detached, prune races); a
                         // lingering dir is re-adopted on the next launch and looks like a
-                        // failed delete. Make sure the directory is actually gone.
-                        let _ = std::fs::remove_dir_all(&path_clone);
+                        // failed delete. Purge it — locally AND on the remote box.
+                        superzej_core::worktree::purge_worktree_files(Path::new(&path_clone));
                     }
                     let _ = waker.wake();
                 });
@@ -2762,7 +2762,7 @@ pub(crate) fn delete_groups(
                     }
                 }
                 if !keep_files {
-                    let _ = std::fs::remove_dir_all(&path);
+                    superzej_core::worktree::purge_worktree_files(Path::new(&path));
                 }
             }
         }
@@ -2845,7 +2845,7 @@ fn remove_workspace(
         let root = Path::new(repo_path);
         for path in &worktree_dirs {
             superzej_core::worktree::remove(root, Path::new(path), "", false);
-            let _ = std::fs::remove_dir_all(path);
+            superzej_core::worktree::purge_worktree_files(Path::new(path));
         }
     }
 
