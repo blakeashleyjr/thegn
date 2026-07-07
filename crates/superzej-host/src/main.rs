@@ -75,6 +75,7 @@ mod pane;
 mod panel;
 mod panel_util;
 mod panes;
+mod parity;
 mod perf;
 mod pi_assets;
 mod pins;
