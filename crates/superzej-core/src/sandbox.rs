@@ -53,7 +53,7 @@ pub(crate) fn status_with_timeout(argv: &[String], timeout: Duration) -> Option<
 
 /// Like [`status_with_timeout`] but also captures stdout. Returns
 /// `(success, stdout)` or `None` on spawn failure or timeout.
-fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<(bool, String)> {
+pub(crate) fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<(bool, String)> {
     use std::process::Stdio;
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
