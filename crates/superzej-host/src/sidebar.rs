@@ -188,6 +188,15 @@ pub struct SidebarRow {
     pub terminal_connection: Option<String>,
 }
 
+impl SidebarRow {
+    /// Whether this row can join the multi-select set: a workspace or worktree
+    /// with a stable identity. Excludes section headings / empty hints (no
+    /// `pin_key`) and folders / terminals (no bulk or reorder action).
+    pub fn is_markable(&self) -> bool {
+        !self.pin_key.is_empty() && matches!(self.kind, RowKind::Workspace | RowKind::Worktree)
+    }
+}
+
 /// Per-worktree status sourced from the (possibly slow) git/activity scan on
 /// the hydration thread, merged onto rows at build time. `git`/`agent` are
 /// keyed by worktree path; `activity` by tab name (matching the `activity`
