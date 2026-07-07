@@ -343,6 +343,161 @@ fn hibernate_one(cfg: &Config, worktree: &str, env_name: &str) -> anyhow::Result
     Ok(())
 }
 
+/// If `worktree` has a restorable hibernation row, flip it to `restoring` and
+/// return the snapshot id the provision plan should overlay. `capturing`
+/// rows are not restorable (their snapshot never verified).
+pub(crate) fn begin_restore(worktree: &str) -> Option<String> {
+    let db = superzej_core::db::Db::open().ok()?;
+    let row = db.hibernation_for(worktree).ok().flatten()?;
+    if row.state == "capturing" || row.snapshot_id.is_empty() {
+        return None;
+    }
+    let _ = db.set_hibernation_state(worktree, "restoring", None);
+    Some(row.snapshot_id)
+}
+
+/// Apply the `snapshot_restore` plan step: fetch the snapshot's artifacts from
+/// the store, verify them against the manifest, upload them into the fresh
+/// sandbox, and replay (fetch bundle + `reset --hard` + apply patch + untar).
+/// NOT best-effort: on failure the row returns to `hibernated` so the next
+/// open retries; the snapshot is retained either way (retention prunes it
+/// naturally later). On success the row is deleted and — durability bonus —
+/// the commit bundle is also fetched into the HOST worktree under
+/// `refs/superzej/hibernate/<id>`, so the commits survive even a lost store.
+pub(crate) fn apply_snapshot_restore(
+    provider: &superzej_svc::provider::Provider,
+    id: &str,
+    cfg: &Config,
+    worktree: &str,
+    workdir: &str,
+    snapshot_id: &str,
+    exec_env: &[(String, String)],
+) -> anyhow::Result<()> {
+    let db = superzej_core::db::Db::open()?;
+    let res = restore_into_sandbox(
+        provider,
+        id,
+        cfg,
+        &db,
+        worktree,
+        workdir,
+        snapshot_id,
+        exec_env,
+    );
+    match &res {
+        Ok(()) => {
+            let _ = db.delete_hibernation(worktree);
+            superzej_core::msg::info(&format!(
+                "restored hibernated work into {worktree}'s fresh sandbox ({snapshot_id})"
+            ));
+        }
+        Err(e) => {
+            let _ = db.set_hibernation_state(worktree, "hibernated", None);
+            superzej_core::msg::warn(&format!(
+                "snapshot restore for {worktree} failed: {e}; will retry on next open"
+            ));
+        }
+    }
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_into_sandbox(
+    provider: &superzej_svc::provider::Provider,
+    id: &str,
+    cfg: &Config,
+    db: &superzej_core::db::Db,
+    worktree: &str,
+    workdir: &str,
+    snapshot_id: &str,
+    exec_env: &[(String, String)],
+) -> anyhow::Result<()> {
+    let _ = exec_env; // replay runs under the login shell defaults, like parity
+    let row = db
+        .hibernation_for(worktree)?
+        .ok_or_else(|| anyhow::anyhow!("no hibernation row for {worktree}"))?;
+    let key = snapshot_key(Path::new(&row.repo_path), worktree, &row.env_name);
+    let store = open_store(&cfg.lifecycle.snapshot)?;
+    let manifest = store.get_manifest(&key, snapshot_id)?;
+
+    let mut bundle_data: Option<Vec<u8>> = None;
+    for a in &manifest.artifacts {
+        let data = store.get(&key, snapshot_id, &a.name)?;
+        // Same integrity bar as capture: what the store returns must be what
+        // the manifest published.
+        if data.len() as u64 != a.bytes || !hex_sha256(&data).eq_ignore_ascii_case(&a.sha256) {
+            anyhow::bail!("artifact {} corrupt in the snapshot store", a.name);
+        }
+        let path = syncstate::artifact_path(STEM, &a.name);
+        block_on_provider(|| async {
+            tokio::time::timeout(READ_TIMEOUT, provider.write(id, &path, &data))
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("upload of {path} timed out")))
+        })?;
+        if a.name == "bundle" {
+            bundle_data = Some(data);
+        }
+    }
+
+    let has_bundle = manifest.artifact("bundle").is_some();
+    let script = syncstate::replay_script(
+        workdir,
+        STEM,
+        (has_bundle && !manifest.head.is_empty()).then_some(manifest.head.as_str()),
+        manifest.artifact("patch").is_some(),
+        manifest.artifact("tar").is_some(),
+        "snapshot restored",
+    );
+    exec_capture(provider, id, &script, CAPTURE_TIMEOUT)?;
+
+    // The replay stages are individually non-fatal (`|| true`), so prove the
+    // part that matters: when commits were carried, the sandbox HEAD must now
+    // BE the captured head.
+    if has_bundle && !manifest.head.is_empty() {
+        let head = exec_capture(
+            provider,
+            id,
+            &format!(
+                "cd {} && git rev-parse HEAD",
+                superzej_core::util::sh_quote(workdir)
+            ),
+            Duration::from_secs(30),
+        )?;
+        let got = head.trim().lines().last().unwrap_or("").trim().to_string();
+        if got != manifest.head {
+            anyhow::bail!(
+                "replay did not land on the captured head (got {got}, want {})",
+                manifest.head
+            );
+        }
+    }
+
+    // Durability bonus, best-effort: park the carried commits in the HOST
+    // worktree under a hibernate ref (prerequisite commits may be absent
+    // locally, in which case the fetch just fails quietly — the store copy
+    // remains the source).
+    if let Some(data) = bundle_data {
+        backup_bundle_to_host(worktree, snapshot_id, &data);
+    }
+    Ok(())
+}
+
+// off-loop: provision worker thread only.
+#[expect(clippy::disallowed_methods)]
+fn backup_bundle_to_host(worktree: &str, snapshot_id: &str, data: &[u8]) {
+    let tmp = std::env::temp_dir().join(format!("sz-hib-restore-{}.bundle", std::process::id()));
+    if std::fs::write(&tmp, data).is_ok() {
+        let refname = format!("HEAD:refs/superzej/hibernate/{snapshot_id}");
+        // best-effort: the snapshot store keeps the authoritative copy.
+        let _ = superzej_core::util::git_cmd(Path::new(worktree))
+            .args(["fetch", "--quiet"])
+            .arg(&tmp)
+            .arg(&refname)
+            .output();
+    }
+    let _ = std::fs::remove_file(&tmp);
+}
+
 /// Run `script` in the sandbox and return its combined output; non-zero exit
 /// is an error.
 fn exec_capture(
