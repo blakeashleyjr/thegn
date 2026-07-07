@@ -145,3 +145,90 @@ provision win1` ends `ready`; `superzej host status win1` reports runtime
    carries your keys through.
 6. The diff/PR panel populates over ssh exactly like a local worktree
    (`GitLoc::Remote`).
+
+## Podman Desktop on Windows (native machine)
+
+Podman is superzej's **preferred** runtime (probed first; the provisioner can
+even install it). Podman Desktop runs podman inside a `podman-machine-default`
+WSL2 VM (Fedora CoreOS), user `core`, rootless — so you can use that machine
+directly as a host. Two rough edges vs a dedicated Ubuntu distro: CoreOS is
+immutable (git must be layered + a restart) and it's a separate WSL VM, so the
+tailnet needs one hop to reach it. `remote_dir` (`~/superzej-worktrees`) lands
+on `/var/home/core`, which persists.
+
+### 1. One-time, inside the machine
+
+```sh
+podman machine ssh              # from the Windows host
+sudo rpm-ostree install git     # not preinstalled on CoreOS
+sudo systemctl reboot           # or: podman machine stop && podman machine start
+# back in: `git --version` and `podman info` both work
+mkdir -p ~/superzej-worktrees
+```
+
+### 2. Reach it over Tailscale — pick one (both durable)
+
+**A — Tailscale SSH inside the machine** (no keys, no port-forward; the machine
+becomes its own tailnet node). Install tailscale in the machine (rpm-ostree with
+the Tailscale repo, or run it as a container), then:
+
+```sh
+sudo tailscale up --ssh         # note its MagicDNS name → connect as core@<name>
+```
+
+**B — Windows-side port-forward + the machine's key** (nothing else installed in
+the machine). Podman already exposes the machine's sshd on `127.0.0.1:<port>`:
+
+```powershell
+podman system connection list   # URI shows core@127.0.0.1:<PORT>
+# forward the Windows Tailscale IP to it (netsh portproxy persists across reboots):
+netsh interface portproxy add v4tov4 listenaddress=<WIN_TS_IP> listenport=2222 `
+  connectaddress=127.0.0.1 connectport=<PORT>
+netsh advfirewall firewall add rule name="sz-podman-ssh" dir=in action=allow `
+  protocol=TCP localport=2222
+# copy the machine key to the superzej host:
+#   %USERPROFILE%\.ssh\podman-machine-default  ->  ~/.ssh/podman-machine  (chmod 600)
+```
+
+### 3. superzej config (`superzej config path`) — declarative + durable
+
+```toml
+[host.winpod]
+reach = "ssh"
+install_runtime = "never"       # podman is already present
+[host.winpod.ssh]
+# A (Tailscale SSH):  host = "core@winpod"
+# B (portproxy+key):  host = "core@<win-tailscale-name>", port = 2222, identity = "~/.ssh/podman-machine"
+host = "core@winpod"
+transport = "ssh"               # keep ssh (CoreOS has no mosh); Tailscale SSH is ssh-only
+forward_agent = true            # remote `git push` uses your local keys
+
+[env.winpod]
+placement = "ssh"
+host = "winpod"
+[env.winpod.sandbox]
+backend = "podman"              # rootless podman as user `core`
+```
+
+Imperative equivalent (persists to the state DB instead of config):
+`superzej host add core@winpod --name winpod --install never`.
+
+### 4. Provision + verify
+
+```sh
+superzej host provision winpod          # connect → probe (podman rootless) → deliver base image → ready
+superzej host status winpod             # runtime shows `podman <ver>`, rootless
+ssh core@winpod -- 'git --version && podman info >/dev/null && echo ok'
+```
+
+Then open a worktree on env `winpod`: the tabbar shows `(ssh) [podman]`,
+`podman ps` on the machine shows the sandbox container, and the worktree lives
+under `/var/home/core/superzej-worktrees`.
+
+**If the CoreOS friction (rpm-ostree + restart, tailscale-in-CoreOS) is more
+than you want**, a dedicated Ubuntu WSL2 distro is the cleaner durable path:
+`sudo apt install -y podman uidmap slirp4netns git openssh-server`, enable
+systemd (`/etc/wsl.conf` `[boot] systemd=true`) + `loginctl enable-linger`, run
+tailscale in the distro (`tailscale up --ssh`), and register the same way — or
+just `superzej host add me@<distro> --install auto` and let superzej install
+podman for you.
