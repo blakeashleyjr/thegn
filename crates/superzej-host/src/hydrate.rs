@@ -66,7 +66,7 @@ fn glyph_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, 
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, (GlyphRow, Instant)>>,
     > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    CACHE.get_or_init(|| std::sync::Mutex::new(crate::warmcache::load_glyphs()))
 }
 
 /// Staleness window for background-worktree git glyphs. The active worktree is
@@ -854,6 +854,7 @@ fn collect_sidebar_status(
         for (p, row, clean) in &scanned {
             if *clean {
                 cache.insert(p.clone(), (row.clone(), now));
+                let _ = db.put_glyph_cache(p, &serde_json::to_string(row).unwrap_or_default());
             }
         }
         cache.retain(|k, _| paths.iter().any(|p| p == k));
@@ -1668,7 +1669,9 @@ pub(crate) fn spawn_panel_prefetch(
     hints: HydrateHints,
     waker: Option<TerminalWaker>,
 ) {
-    task::spawn_blocking(move || {
+    // Prefetch is background warming — ride the background lane so it never
+    // starves the active worktree's (ungated) interactive hydration.
+    crate::sched::spawn_bg(move || {
         if !cwd.is_dir() {
             return;
         }
