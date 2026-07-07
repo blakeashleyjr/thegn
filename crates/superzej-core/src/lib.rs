@@ -102,6 +102,7 @@ pub mod repo_trust;
 pub mod revtunnel;
 pub mod sandbox;
 pub mod sandbox_mounts;
+pub mod sandbox_prefetch;
 pub mod scheduler;
 pub mod search;
 pub mod semantic;

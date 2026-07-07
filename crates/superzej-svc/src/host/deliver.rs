@@ -166,18 +166,11 @@ pub(super) fn ssh_stream(
         ));
     }
 
-    // Load into container storage under the managed digest tag. skopeo (when
-    // present) preserves identities cleanly; the podman fallback captures the
-    // loaded ref and tags it.
+    // Load into the host runtime's image storage under the managed digest tag.
+    // The command is spelled for podman OR docker (storage transport + fallback
+    // binary) — see `OciRunner::load_archive_cmd`.
     let tag = managed_tag(digest);
-    let load = format!(
-        "if command -v skopeo >/dev/null 2>&1; then \
-           skopeo copy oci-archive:{remote_partial} containers-storage:{tag}; \
-         else \
-           ref=$(podman load -i {remote_partial} | sed -n 's/^Loaded image[^:]*: *//p' | tail -1); \
-           [ -n \"$ref\" ] && podman tag \"$ref\" {tag}; \
-         fi && rm -f {remote_partial}"
-    );
+    let load = runner.load_archive_cmd(&remote_partial, &tag)?;
     let (ok, _, err) = runner
         .exec(&load, Duration::from_secs(900))
         .map_err(|e| format!("load: {e}"))?;
