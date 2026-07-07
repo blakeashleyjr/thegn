@@ -460,6 +460,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Arm the in-process sampling profiler (no-op unless built `--features
     // profiling`): SIGUSR2 toggles a flamegraph capture from the live process.
     crate::profile::install();
+    // Record this (the event-loop) thread so the bridge can flag any RPC issued
+    // on it — bridge I/O on the loop blocks the compositor ("never block the
+    // loop"). Non-fatal since the writer is non-blocking; it surfaces the debt.
+    superzej_svc::bridge::note_loop_thread();
 
     // While the compositor owns the screen, any stray write to stderr (e.g.
     // `msg::warn`'s eprintln fallback when no log subscriber is installed)
