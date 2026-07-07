@@ -13100,21 +13100,19 @@ async fn event_loop<T: Terminal>(
                                 let _ = tx.send(wizard::WizardCmd::PrepChosen { env, sandbox });
                             }
                         }
-                        wizard::WizardOutcome::AddHost => {
-                            let root = w.root().clone();
-                            if let Some(tx) = wizard_cmd_tx.take() {
-                                let _ = tx.send(wizard::WizardCmd::Cancel);
-                            }
-                            wizard_ui = None;
-                            creating = None;
-                            create_gen += 1;
-                            host_input = Some((
-                                menu::InputOverlay::new(
-                                    "add host — user@host[:port], or dumbpipe:<ticket> <user>",
-                                    "",
-                                ),
-                                HostInputKind::NewHost { repo_root: root },
-                            ));
+                        outcome @ (wizard::WizardOutcome::AddHost
+                        | wizard::WizardOutcome::SetupEnv(_)) => {
+                            crate::handlers::wizard::leave_for_setup(
+                                outcome,
+                                keymap.config(),
+                                &mut wizard_cmd_tx,
+                                &mut wizard_ui,
+                                &mut creating,
+                                &mut create_gen,
+                                &mut host_input,
+                                &mut env_wizard_ui,
+                                &mut model,
+                            );
                         }
                         wizard::WizardOutcome::Submit(choices) => {
                             if let wizard::NameChoice::Human(tail) = &choices.name
