@@ -582,6 +582,13 @@ impl PtyPane {
 
     /// Resize the transport and the emulator together.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        // No-op when the geometry is unchanged. Re-issuing the winsize would
+        // SIGWINCH the child for nothing, and a stray relayout (e.g. a same-size
+        // window re-configure on Wayland refocus) must not make full-screen TUIs
+        // clear+redraw. Recording a no-op resize would also be pointless.
+        if rows == self.rows && cols == self.cols {
+            return Ok(());
+        }
         match &self.io {
             PaneIo::Pty { master, .. } => {
                 master
@@ -1159,6 +1166,30 @@ mod tests {
                 .map(|r| r.trim_end().to_string()),
             Some("30 100".to_string())
         );
+    }
+
+    #[test]
+    fn same_size_resize_is_a_noop() {
+        // A resize to the current geometry must not touch the child — no winsize
+        // change is sent. This guards the Wayland/niri refocus path, where a
+        // same-size window re-configure would otherwise SIGWINCH every pane and
+        // make full-screen TUIs clear+redraw (a visible black flash).
+        let (ctrl_tx, mut ctrl_rx) = tokio_mpsc::channel::<ExecControl>(16);
+        let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
+
+        // Same size → nothing emitted on the control channel.
+        pane.resize(24, 80).unwrap();
+        assert!(
+            ctrl_rx.try_recv().is_err(),
+            "same-size resize must not signal the child"
+        );
+
+        // A genuine size change → a Resize control frame is emitted.
+        pane.resize(30, 90).unwrap();
+        match ctrl_rx.try_recv() {
+            Ok(ExecControl::Resize { cols, rows }) => assert_eq!((cols, rows), (90, 30)),
+            other => panic!("expected a Resize control frame, got {other:?}"),
+        }
     }
 
     #[test]

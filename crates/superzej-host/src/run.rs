@@ -19355,29 +19355,42 @@ async fn event_loop<T: Terminal>(
                 }
             }
             Ok(Some(InputEvent::Resized { rows: r, cols: c })) => {
-                rows = r;
-                cols = c;
-                // A Wide sidebar tracks the new window width.
-                sidebar_cols = sb.effective_cols(cols);
-                chrome = recompute_chrome!();
-                need_relayout = true;
-                buf.resize(cols, rows);
-                let _ = buf
-                    .terminal()
-                    .set_screen_size(termwiz::terminal::ScreenSize {
-                        rows,
-                        cols,
-                        xpixel: 0,
-                        ypixel: 0,
-                    });
-                // ANY resize scrambles the physical screen (terminals reflow/
-                // clip during the transition), even when the geometry lands
-                // back on the previous size — e.g. a quick 160→120→160 drag
-                // coalesced into one wake leaves `chrome == last_chrome` and
-                // the scratch dimensions unchanged, so without this the diff
-                // against `front` would repaint nothing over the garbage.
-                full_repaint = true;
-                dirty = true;
+                if r == rows && c == cols {
+                    // Same-dimension resize: nothing about the geometry changed,
+                    // so panes must NOT be re-laid-out / re-resized — that would
+                    // SIGWINCH every child and make full-screen TUIs clear+redraw
+                    // (a ~1s black flash in the pane area). Wayland compositors
+                    // (e.g. niri) re-emit a `configure` when the window is
+                    // re-activated on workspace refocus, which the outer terminal
+                    // turns into a same-size SIGWINCH → this arm. We still
+                    // `full_repaint` so that if the physical screen was scrambled
+                    // by a coalesced same-size drag (160→120→160), our already-
+                    // composed frame is re-flushed over the garbage — but without
+                    // disturbing the panes.
+                    full_repaint = true;
+                    dirty = true;
+                } else {
+                    rows = r;
+                    cols = c;
+                    // A Wide sidebar tracks the new window width.
+                    sidebar_cols = sb.effective_cols(cols);
+                    chrome = recompute_chrome!();
+                    need_relayout = true;
+                    buf.resize(cols, rows);
+                    let _ = buf
+                        .terminal()
+                        .set_screen_size(termwiz::terminal::ScreenSize {
+                            rows,
+                            cols,
+                            xpixel: 0,
+                            ypixel: 0,
+                        });
+                    // A real resize scrambles the physical screen (terminals
+                    // reflow/clip during the transition), so rebuild the wire
+                    // state from scratch.
+                    full_repaint = true;
+                    dirty = true;
+                }
             }
             Ok(Some(InputEvent::Paste(s))) => {
                 input_at = Some(std::time::Instant::now()); // input-latency stamp
