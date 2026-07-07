@@ -11,8 +11,8 @@
 //!   [`machines::SSHD_INIT`] brings up sshd with superzej's managed key on a
 //!   `tcp/22` service. Destroy deletes the app (cascading the machine + IP).
 //! - **Reachability** — plain ssh to the app's IPv4:22, so exec/files reuse the
-//!   VPS [`ssh_shim`](crate::vps::ssh_shim) and the leak-safety
-//!   [`registry`](crate::vps::registry) **verbatim**. No WireGuard, no vendor CLI.
+//!   VPS [`crate::vps::ssh_shim`] and the leak-safety
+//!   [`crate::vps::registry`] **verbatim**. No WireGuard, no vendor CLI.
 //!
 //! A Fly machine is a real Firecracker VM (its own kernel), so the standard
 //! provisioning pipeline — nix, direnv, **docker** (with the `vfs` storage driver

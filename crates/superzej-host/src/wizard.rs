@@ -63,7 +63,7 @@ pub enum WizardOutcome {
     /// The "+ add host…" row was chosen: the loop closes the wizard, opens the
     /// add-host input, and re-opens the wizard once the host exists.
     AddHost,
-    /// A "+ set up <kind>…" discovery row was chosen: the loop closes the
+    /// A "+ set up `<kind>`…" discovery row was chosen: the loop closes the
     /// wizard and opens the env wizard pre-seeded to that provider kind.
     SetupEnv(String),
     Pending,
@@ -114,7 +114,7 @@ pub(crate) fn default_env_name(cfg: &Config, repo_root: &Path) -> String {
 /// keys; the loop dispatches on [`WizardOutcome`].
 /// Sentinel env key for the wizard's "+ add host…" row.
 pub const ADD_HOST_KEY: &str = "__add_host__";
-/// Key prefix of the "+ set up <kind>…" provider-discovery rows
+/// Key prefix of the "+ set up `<kind>`…" provider-discovery rows
 /// ([`crate::palette::build_env_palette`] appends them for unconfigured kinds).
 pub const ENV_SETUP_PREFIX: &str = "env-setup:";
 
@@ -282,7 +282,7 @@ impl NewWorktreeWizard {
 
     /// Build a `Submit` from the current selections, or `Pending` if the branch
     /// name is empty (the name field must not be blank).
-    /// The provider kind of the selected "+ set up <kind>…" discovery row, if
+    /// The provider kind of the selected "+ set up `<kind>`…" discovery row, if
     /// the Host selection sits on one.
     fn setup_kind(&self) -> Option<String> {
         self.host_key()

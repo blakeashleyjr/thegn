@@ -1,7 +1,7 @@
 //! DigitalOcean request/response shaping — **pure** functions only (URLs,
 //! bodies, parsers), unit-tested without a live endpoint, mirroring
 //! [`super::hetzner`]. The async HTTP wrappers live in [`super::VpsProvider`],
-//! dispatched through the [`super::VpsShaper`] trait.
+//! dispatched through the `super::VpsShaper` trait.
 //!
 //! API: `https://api.digitalocean.com/v2` (Bearer auth). Two shapes differ from
 //! Hetzner and are handled here so the rest of the VPS machinery stays
@@ -73,7 +73,7 @@ pub fn snapshot_image(template: &str) -> Option<&str> {
 }
 
 /// DO tag strings for superzej's `managed-by` marker + `sz-host` scoping,
-/// derived from the vendor-neutral label map [`super::VpsProvider::labels`]
+/// derived from the vendor-neutral label map `super::VpsProvider::labels`
 /// builds. The inverse of [`labels_from_tags`].
 pub fn tags_from_labels(labels: &BTreeMap<String, String>) -> Vec<String> {
     let mut tags = Vec::new();
