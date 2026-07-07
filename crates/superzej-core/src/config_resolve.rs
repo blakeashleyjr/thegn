@@ -985,8 +985,21 @@ pub fn resolve_environment(
         Some(envc) => {
             let mut sb = base;
             envc.sandbox.clone().apply(&mut sb);
-            let placement =
+            let mut placement =
                 crate::envbuild::build_env_placement(envc, &sb, loc, worktree, repo_root);
+            // A host-pinned ssh env (`[env.*] host = "name"`) reaches the box
+            // exactly as the control plane does — via the `[host.*.ssh]` config
+            // (transport, ProxyCommand, identity, …). Without this the pane is
+            // built from the env's own (usually empty) ssh table, defaulting to
+            // mosh with no ProxyCommand — which dies "mosh failed" on a host
+            // that has no mosh. Pin the pane to the host's placement.
+            if matches!(envc.placement, crate::config::PlacementMode::Ssh)
+                && !envc.host.trim().is_empty()
+                && let Some(binding) = cfg.resolve_host_binding(&name, envc)
+                && let crate::host::Reach::Ssh(p) = binding.reach
+            {
+                placement = crate::placement::Placement::Ssh(p);
+            }
             Environment {
                 name,
                 placement,
@@ -1410,5 +1423,54 @@ mod tests {
         );
         assert_eq!(e.origin, TrustLevel::Runtime);
         assert_eq!(e.value, serde_json::json!("fzf"));
+    }
+
+    #[test]
+    fn host_pinned_ssh_env_pane_follows_host_transport_and_proxycommand() {
+        // Regression: a host-pinned env (`[env.*] host = "name"`) whose
+        // `[host.*.ssh]` sets transport="ssh" + a ProxyCommand must NOT default
+        // the pane to mosh (which dies "mosh failed" on a host with no mosh).
+        // The interactive pane placement follows the host's ssh config.
+        let cfg: Config = toml::from_str(
+            r#"
+            [host.ageless]
+            reach = "ssh"
+            [host.ageless.ssh]
+            host = "targe@ageless-studio"
+            transport = "ssh"
+            extra_args = ["-o", "ProxyCommand=tailscale nc %h %p"]
+            [env.ageless]
+            placement = "ssh"
+            host = "ageless"
+            "#,
+        )
+        .unwrap();
+        let loc = GitLoc::Local(std::path::PathBuf::from("/wt/x"));
+        let (env, _) = resolve_environment(
+            &cfg,
+            std::path::Path::new("/repo"),
+            &loc,
+            std::path::Path::new("/wt/x"),
+            Some("ageless"),
+            &Approvals::deny_all(),
+        );
+        match env.placement {
+            crate::placement::Placement::Ssh(p) => {
+                assert_eq!(
+                    p.kind,
+                    crate::placement::TransportKind::Ssh,
+                    "pane must be ssh, not the mosh default"
+                );
+                assert_eq!(p.host, "targe@ageless-studio");
+                assert!(
+                    p.extra_args
+                        .iter()
+                        .any(|a| a.contains("ProxyCommand=tailscale nc")),
+                    "pane carries the host's ProxyCommand: {:?}",
+                    p.extra_args
+                );
+            }
+            other => panic!("expected ssh placement, got {other:?}"),
+        }
     }
 }

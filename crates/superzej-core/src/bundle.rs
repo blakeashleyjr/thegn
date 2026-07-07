@@ -222,19 +222,19 @@ fn run_resolver(scheme: &str, template: &str, value: &str, rest: &str) -> Option
         .replace("{value}", value)
         .replace("{file}", file)
         .replace("{key}", key);
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    // D4: bound the resolver subprocess. `launch_spec` runs on the event loop, so
+    // a hung secret backend (1password/keyring/dbus) would freeze the compositor
+    // indefinitely; cap it so the worst case is a bounded stall + graceful skip.
+    let argv = ["sh".to_string(), "-c".to_string(), cmd];
+    let (ok, stdout) =
+        crate::sandbox::output_with_timeout(&argv, std::time::Duration::from_secs(8))?;
+    if !ok {
         crate::msg::warn(&format!(
-            "bundle: secret resolver {scheme:?} failed (exit {:?}); skipping",
-            out.status.code()
+            "bundle: secret resolver {scheme:?} failed or timed out; skipping"
         ));
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let s = stdout.trim().to_string();
     if s.is_empty() {
         crate::msg::warn(&format!(
             "bundle: secret resolver {scheme:?} returned empty; skipping"
@@ -691,6 +691,21 @@ fn fold_dotenv(db: &Db, worktree: &str, overrides: &mut BTreeMap<String, String>
 mod tests {
     use super::*;
     use crate::config::{Account, Bundle, NamedCommand};
+
+    #[test]
+    fn secret_resolver_timeout_kills_a_hung_backend() {
+        // D4: `run_resolver` bounds the secret-backend subprocess via
+        // `output_with_timeout` so a wedged resolver can't freeze the loop. A
+        // command that outlives the deadline is killed → graceful `None`; a fast
+        // one returns its stdout.
+        use std::time::Duration;
+        let hung = ["sh".to_string(), "-c".to_string(), "sleep 5".to_string()];
+        assert!(crate::sandbox::output_with_timeout(&hung, Duration::from_millis(150)).is_none());
+        let fast = ["sh".to_string(), "-c".to_string(), "printf hi".to_string()];
+        let (ok, out) = crate::sandbox::output_with_timeout(&fast, Duration::from_secs(5)).unwrap();
+        assert!(ok);
+        assert_eq!(out, "hi");
+    }
 
     fn get<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
         env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())

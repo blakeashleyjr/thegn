@@ -16,6 +16,46 @@
   pkgs,
   rustToolchain,
 }: let
+  inherit (pkgs) lib;
+
+  # The lean iroh call-home agent (`sz-agent`, crate `superzej-agent`), baked into
+  # the image so a Fly machine dials the compositor over iroh **alongside** sshd.
+  # Built with the SAME stable toolchain the rest of the flake uses, scoped to the
+  # one crate (`-p superzej-agent`) so we don't drag in the full host/svc build.
+  # The compositor injects SUPERZEJ_HOME_NODE / SUPERZEJ_SANDBOX_AUTH /
+  # SUPERZEJ_SANDBOX_ID into the machine env (see `FlyProvider`'s `IrohInject`);
+  # the entrypoint launches this binary, which reads them on boot.
+  szAgentPlatform = pkgs.makeRustPlatform {
+    cargo = rustToolchain;
+    rustc = rustToolchain;
+  };
+  szAgent = szAgentPlatform.buildRustPackage {
+    pname = "sz-agent";
+    version = "0.1.0";
+    src = lib.cleanSourceWith {
+      src = ../.;
+      # Drop build artifacts so the store path is stable across rebuilds (same
+      # filter `nix/package.nix` uses).
+      filter = path: _type: let
+        rel = lib.removePrefix (toString ../. + "/") (toString path);
+      in
+        !(lib.hasPrefix "target" rel
+          || lib.hasPrefix "result" rel
+          || lib.hasPrefix ".direnv" rel
+          || lib.hasPrefix ".git/" rel);
+    };
+    cargoLock.lockFile = ../Cargo.lock;
+    # Compile only the lean agent binary (not the host/svc/coverage targets).
+    cargoBuildFlags = ["-p" "superzej-agent" "--bin" "sz-agent"];
+    # superzej-core (the agent's one workspace dep) pulls the same vendored C
+    # (libgit2/LMDB via fff-search → libz-sys), so mirror package.nix's inputs.
+    nativeBuildInputs = [pkgs.pkg-config];
+    buildInputs = [pkgs.zlib];
+    # The PTY tests need a real /bin/sh + pty the hermetic sandbox lacks; `just
+    # test` gates them. This derivation just compiles + installs the binary.
+    doCheck = false;
+  };
+
   # Baked toolchain — the SAME combined rust toolchain the flake's
   # `devShells.sandbox` uses (clippy/rustfmt included, single derivation so no
   # buildEnv collisions), present immediately with no rustup network dance. `just`
@@ -74,6 +114,14 @@
     UsePAM no
     Subsystem sftp internal-sftp
     EOF
+    # iroh call-home: when the compositor injected the three SUPERZEJ_* env vars
+    # (see FlyProvider's IrohInject), start the baked agent in the BACKGROUND so
+    # its iroh reach comes up alongside sshd. sshd stays PID 1 (the reachability
+    # model is unchanged). On an ssh-only machine the vars are absent, so we skip
+    # the launch entirely rather than crash-loop a dial with no home.
+    if [ -n "''${SUPERZEJ_HOME_NODE:-}" ]; then
+      ${szAgent}/bin/sz-agent &
+    fi
     # -e logs to stderr (→ Fly logs) so a startup failure is diagnosable.
     exec ${pkgs.openssh}/bin/sshd -D -e -f /etc/ssh/sshd_config
   '';
@@ -100,6 +148,9 @@ in
     tag = "latest";
     contents = [
       toolEnv
+      # The baked iroh call-home agent — also on PATH as `sz-agent` for debugging
+      # (the entrypoint launches it by absolute store path).
+      szAgent
       etcFiles
       pkgs.dockerTools.usrBinEnv
       pkgs.dockerTools.binSh

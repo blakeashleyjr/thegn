@@ -43,12 +43,16 @@ to 95% first.
 
 | Stage          | What runs                                                                      | Where                  |
 | -------------- | ------------------------------------------------------------------------------ | ---------------------- |
-| **pre-commit** | treefmt, clippy, `cargo test`                                                  | devenv git-hook (fast) |
-| **pre-push**   | `just coverage`, `just e2e`, `just visual`                                     | devenv git-hook        |
-| **CI**         | `just ci` (fmt + lint + build + plugins + test + coverage + smoke + nix-build) | authoritative          |
+| **inner loop** | `just quick [crate]` — clippy on lib/bin only (no tests/coverage)              | on demand (fast)       |
+| **pre-commit** | treefmt, shellcheck, yamllint, god-file ratchet                                | devenv git-hook (fast) |
+| **pre-push**   | clippy, `cargo test`, smoke                                                    | devenv git-hook        |
+| **CI**         | `just ci` (fmt + lint + build + test + **coverage** + smoke + e2e + nix-build) | authoritative          |
 
-All e2e/visual steps sandbox `ZELLIJ_SOCKET_DIR` + `SUPERZEJ_DIR` so they never
-leak into the daily session or DB.
+Coverage (`cargo llvm-cov`) is a **CI-only** gate — it is an instrumented full
+recompile (the heaviest phase) and CI re-runs it regardless, so it is no longer
+on pre-push. Run `just coverage` locally on demand before opening a PR. All
+e2e/visual steps sandbox `SUPERZEJ_DIR` (and the legacy `ZELLIJ_SOCKET_DIR`) so
+they never leak into the daily session or DB.
 
 ## Visual regression
 

@@ -661,7 +661,10 @@ pub(crate) fn build_agent_palette(
     crate::agent::choices(cfg)
         .into_iter()
         .map(|name| {
-            let label = format!("{} {name}", superzej_core::theme::agent_glyph(&name));
+            let label = format!(
+                "{} {name}",
+                superzej_core::theme::agent_glyph(&name, crate::caps::agent_glyph_style())
+            );
             crate::palette::PaletteItem::new(name, label)
         })
         .collect()

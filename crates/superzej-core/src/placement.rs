@@ -114,9 +114,17 @@ impl SshPlacement {
                 v.push("-t".into());
                 v.push(self.host.clone());
                 v.push("--".into());
-                v.push("/bin/sh".into());
-                v.push("-lc".into());
-                v.push(remote_cmd);
+                // ssh appends the remaining argv space-joined and hands the
+                // RESULT to the remote login shell — it does NOT re-quote. So a
+                // multi-word `if…then…fi` script must be ONE pre-quoted arg,
+                // else the remote shell re-parses it ("syntax error near
+                // `then`"). sh_join quotes `/bin/sh -lc <script>` as one word —
+                // matching how `control_wrap` passes control-plane commands.
+                v.push(util::sh_join(&[
+                    "/bin/sh".to_string(),
+                    "-lc".to_string(),
+                    remote_cmd,
+                ]));
                 v
             }
         }
@@ -529,21 +537,23 @@ mod tests {
         ));
         let argv = vec!["podman".to_string(), "exec".into(), "c".into()];
         let out = p.interactive_argv(&argv);
-        // ssh ... -A ... -t dev@box -- /bin/sh -lc '<joined>'
+        // ssh ... -A ... -t dev@box -- '/bin/sh -lc <quoted-script>'
         assert_eq!(out[0], "ssh");
         assert!(out.contains(&"-A".to_string()));
         assert!(out.contains(&"-t".to_string()));
         assert!(out.contains(&"dev@box".to_string()));
-        assert_eq!(out[out.len() - 3], "/bin/sh");
-        assert_eq!(out[out.len() - 2], "-lc");
+        // The remote command is ONE pre-quoted arg (ssh re-parses otherwise).
+        assert_eq!(out[out.len() - 2], "--");
+        assert!(out.last().unwrap().starts_with("/bin/sh -lc "));
 
         let raw = util::sh_join(&argv);
         let dtach_prefix = "if command -v dtach >/dev/null 2>&1; then \
             exec dtach -A /tmp/sz-socket-$(echo $SUPERZEJ_WORKTREE | md5sum | awk '{print $1}') -E -z -r winch ";
         let dtach_suffix = "; else ";
         let fallback_suffix = "; fi";
-        let expected_cmd = format!("{dtach_prefix}{raw}{dtach_suffix}exec {raw}{fallback_suffix}");
-        assert_eq!(out[out.len() - 1], expected_cmd);
+        let remote_cmd = format!("{dtach_prefix}{raw}{dtach_suffix}exec {raw}{fallback_suffix}");
+        let expected = util::sh_join(&["/bin/sh".to_string(), "-lc".to_string(), remote_cmd]);
+        assert_eq!(out[out.len() - 1], expected);
         // Plain target adds no -F/-J/-i.
         assert!(!out.contains(&"-F".to_string()));
         assert!(!out.contains(&"-J".to_string()));

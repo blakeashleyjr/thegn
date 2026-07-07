@@ -20,7 +20,7 @@ verified against the codebase. See `CLAUDE.md` for architecture.
 
 ---
 
-## Progress summary (as of 2026-07-03)
+## Progress summary (as of 2026-07-06)
 
 **Where we are:** **Phase 1** (the AI-free shell) is **essentially complete** — native
 git management, the notification/event bus, and IDE panels (problems/tasks/tests/symbols)
@@ -38,8 +38,8 @@ replay (AN 482)** landed. New tooling capabilities arrived: **managed-tool resol
 pending); the headless **MCP server** (AL) ships a tool/resource subset; and the **ACP client
 seam (R)** is partially wired (`initialize`, `session/update`, fs/terminal surfaces,
 `providers/set` routing, MCP-over-ACP). The true AI layers (Q–T, the rest of AL/R/AR) and
-multi-forge/jujutsu/Windows remain unstarted. **Tally: 245 done · 94 partial · 386 not
-started** of 725.
+multi-forge/jujutsu/Windows remain unstarted. **Tally: 255 done · 91 partial · 379 not
+started** of 725. _(2026-07-06 reconcile: archived `add-{placement-engine,independent-hosts,spillover-and-compute-ledger,inapp-pr-view}` — the multi-host placement engine now lives in `openspec/specs/placement`; flipped shipped-but-unchecked X 309–312/317, Z 333, B 28, L 153, AG 408/410. `add-agent-merge-driver` left in-flight (CLI slice shipped; in-TUI actions deferred). Provider live-verification + DO/Fly token rotation still outstanding.)_
 
 **Shipped & solid:**
 
@@ -132,8 +132,8 @@ and this file is stale — fix it. In-flight work lives in `openspec/changes/<na
 and merges into `openspec/specs/` on archive (`/opsx:archive`), at which point the
 corresponding roadmap items flip to `[x]`.
 
-**Capability index (31 specs) → roadmap groups.** Run `just openspec validate --all
---strict` to confirm all specs + changes are green (currently 50/50).
+**Capability index (32 specs) → roadmap groups.** Run `just openspec validate --all
+--strict` to confirm all specs + changes are green (currently 59/59).
 
 | OpenSpec capability                                 | Roadmap group(s)                                 |
 | --------------------------------------------------- | ------------------------------------------------ |
@@ -154,6 +154,7 @@ corresponding roadmap items flip to `[x]`.
 | `git-backend`                                       | Y/X. Git integration / semantic git              |
 | `file-explorer`                                     | AF. File viewer/search                           |
 | `sandbox`, `provider-native-exec`, `terminal-hosts` | AB/AC. Containers · J. Remote                    |
+| `placement`                                         | AE. Provisioning · J. Remote (multi-host broker) |
 | `notifications`                                     | AI. Notifications                                |
 | `panel`, `test-explorer`                            | Panel tabs · AQ. IDE tooling                     |
 | `ci-inspection`                                     | AV. CI/CD inspection                             |
@@ -382,7 +383,7 @@ close, `<`/`>` width, digits quick-jump._
 - [x] 25. Adjustable/collapsible bar width _(native `<`/`>`; persisted)_
 - [x] 26. Multi-select for bulk actions _(native `Space` mark, `X` bulk close)_
 - [x] 27. Row context menu _(native `m`)_
-- [~] 28. Badge counts — PRs/unread/alerts per row _(`sidebar.rs` per-row `unread_count`/`alert_count` + `unread_counts`/`alert_counts` maps, rendered in chrome; PR-count source wiring pending)_
+- [x] 28. Badge counts — PRs/unread/alerts per row _(`sidebar.rs` per-row `unread_count`/`alert_count`/`pr_count` maps, `pr_count` populated from `db.get_open_pr_counts_by_branch` in `hydrate.rs`, rendered in chrome)_
 
 ### C. Workspaces (repos)
 
@@ -572,7 +573,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [ ] 150. Tokens-per-minute widget
 - [x] 151. System load widget _(cpu/mem/gpu stats cluster in `chrome.rs`, `fit_stats_cluster`)_
 - [x] 152. Per-worktree disk widget _(disk size per worktree; cf. 413)_
-- [~] 153. Notification badges _(sidebar + panel inbox badges; statusbar badge pending)_
+- [x] 153. Notification badges _(sidebar + panel inbox badges + statusbar `BarBadge::Notifications`)_
 - [ ] 154. Now-playing / arbitrary program widget
 - [ ] 155. Next calendar event widget
 - [~] 156. Remote/network status widget
@@ -859,15 +860,15 @@ optimization (553) extend this group across every harness, not just rtk-hooked b
 
 ### X. Semantic git layer
 
-- [ ] 309. sem-core integration (entity parsing)
-- [ ] 310. tokei LOC/language counts
-- [ ] 311. Entity-level diffs
-- [ ] 312. Entity-level blame
-- [ ] 313. Impact/blast-radius analysis
+- [x] 309. sem-core integration (entity parsing) _(`semantic.rs` `parse_entities` — tree-sitter grammar+query, `Entity`/`EntityKind`/`Lang`)_
+- [x] 310. tokei LOC/language counts _(`core/loc.rs` + `host/loc_scan.rs`, DB v31 `loc_cache`)_
+- [x] 311. Entity-level diffs _(`semantic.rs` `entities_for_diff`, `EntityChange`/`Touch`)_
+- [x] 312. Entity-level blame _(`semantic.rs` `blame_entities`, `EntityBlame`)_
+- [~] 313. Impact/blast-radius analysis _(`semantic.rs` `impact_summary` = per-file entity-count aggregation only; persistent call/reference graph + true blast radius is openspec `add-semantic-blast-radius`)_
 - [ ] 314. weave merge driver (code-only default)
 - [ ] 315. Entity-claiming for multi-agent coordination
 - [ ] 316. inspect risk scoring
-- [ ] 317. Entity-derived commit messages
+- [x] 317. Entity-derived commit messages _(`semantic.rs` `derive_commit_message`, structural/no-AI; consumed in `hydrate.rs`)_
 - [ ] 318. lazydiff-style review TUI
 
 ### Y. Git integration
@@ -916,7 +917,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 
 - [x] 331. PR tracking
 - [x] 332. CI checks status
-- [~] 333. PR review comments
+- [x] 333. PR review comments _(`pr_view.rs` `PrConversation`/`ReviewState`, inline/line comments; openspec `add-inapp-pr-view`, archived)_
 - [~] 334. Issues
 - [x] 335. Create PR from worktree _(+ draft/ready toggle + auto-merge enable/disable)_
 - [x] 336. PR↔worktree mapping
@@ -1016,9 +1017,9 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [x] 405. Open in $EDITOR (helix)
 - [x] 406. Open in split/new tab
 - [ ] 407. GUI editor handoff
-- [~] 408. Jump to file:line from logs/diffs
+- [x] 408. Jump to file:line from logs/diffs _(`panel_util.rs` `parse_file_line`, `+N` syntax)_
 - [~] 409. Editor as pinned tile _(opens as a floating tool, not a true pin)_
-- [ ] 410. Per-workspace editor override
+- [x] 410. Per-workspace editor override _(`tool_command("editor")` per-workspace resolution)_
 
 ### AH. Resource / system monitoring
 

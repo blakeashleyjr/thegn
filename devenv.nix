@@ -10,6 +10,11 @@
     # + CI compile/test cost.
     cargo-nextest
     mold
+    # compilation cache (RUSTC_WRAPPER below). superzej is a many-worktree
+    # workflow and each `git worktree` has its own cold target/; sccache shares
+    # compiled crate artifacts across all of them (and across branch switches),
+    # so a fresh worktree's first build is warm instead of from-scratch.
+    sccache
     # coverage gate (`just coverage`) + visual-regression harness
     cargo-llvm-cov
     python3
@@ -55,6 +60,15 @@
   # (which doesn't enter this shell — so it needs no mold build input). Requires
   # mold on PATH (added to `packages` above); gcc's `-fuse-ld=mold` picks it up.
   env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
+
+  # Compilation cache. sccache caches per-crate rustc invocations so cold
+  # worktrees / branch switches reuse artifacts instead of recompiling from
+  # scratch. sccache and Cargo incremental compilation are mutually exclusive
+  # (incremental bypasses the cache), so CARGO_INCREMENTAL=0 lets sccache work;
+  # the fast single-crate iterative path is `just quick <crate>`. Dev-shell only
+  # — the `nix build .#default` package derivation never enters this shell.
+  env.RUSTC_WRAPPER = "sccache";
+  env.CARGO_INCREMENTAL = "0";
 
   # Use the nixpkgs toolchain (no channel/rust-overlay) so rustfmt/clippy match
   # the flake's treefmt + checks exactly — avoids formatter version skew.
@@ -113,10 +127,15 @@
     # ── Tiered gates ──────────────────────────────────────────────────────
     # pre-commit stays CHEAP (formatting + shell/yaml lint + the god-file
     # ratchet) so commits are near-instant. The correctness gates — clippy, the
-    # full test suite, coverage, and smoke — run on pre-push (before code leaves
-    # the machine) and in CI via `just ci`. This defers the semantic-merge check
+    # full test suite, and smoke — run on pre-push (before code leaves the
+    # machine) and in CI via `just ci`. This defers the semantic-merge check
     # (a stale call site across a clean auto-merge) from merge time to push time;
     # it is still caught before the merge is pushed, and always by CI.
+    #
+    # Coverage (`cargo llvm-cov`) is NOT on pre-push: it is an instrumented full
+    # recompile into a separate target dir (the single heaviest gate) and CI
+    # re-runs it anyway. It stays a CI-only gate via `just ci`. Run it locally
+    # on demand with `just coverage` before opening a PR.
     #
     # git hooks run with GIT_DIR and GIT_INDEX_FILE set. This leaks into the
     # git subprocesses spawned by `cargo test`, causing spurious failures in
@@ -133,14 +152,6 @@
       pass_filenames = false;
       stages = ["pre-push"];
     };
-    coverage = {
-      enable = true;
-      name = "coverage 95% (core)";
-      entry = "just coverage";
-      language = "system";
-      pass_filenames = false;
-      stages = ["pre-push"];
-    };
     smoke = {
       enable = true;
       name = "smoke (hermetic CLI verbs)";
@@ -153,6 +164,14 @@
 
   enterShell = ''
     echo "superzej devenv — cargo build | just smoke | nix fmt"
+
+    # Leave headroom so heavy builds don't peg the machine. CARGO_BUILD_JOBS
+    # caps the parallel rustc/codegen jobs cargo spawns; computed at shell entry
+    # since Nix eval can't see the core count. Respect an already-set value.
+    if [ -z "''${CARGO_BUILD_JOBS:-}" ]; then
+      _jobs=$(nproc 2>/dev/null || echo 4)
+      if [ "$_jobs" -gt 2 ]; then export CARGO_BUILD_JOBS=$((_jobs - 2)); else export CARGO_BUILD_JOBS=1; fi
+    fi
 
     # Install the post-checkout hook into the effective (shared) hooks dir so the
     # prek hooks work in EVERY worktree. prek needs .pre-commit-config.yaml in

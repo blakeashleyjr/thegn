@@ -248,7 +248,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
          )",
         [],
     );
-    // v38: worktrees whose provider compute was (or is being) snapshot-then-
+    // v39: worktrees whose provider compute was (or is being) snapshot-then-
     // destroyed. Intent-ordered like the VPS ledger: 'capturing' BEFORE the
     // capture starts, 'hibernated' only after the snapshot verified into the
     // [lifecycle.snapshot] store (then destroy), 'restoring' while a re-open

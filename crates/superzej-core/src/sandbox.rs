@@ -36,24 +36,24 @@ use std::time::{Duration, Instant};
 /// overlay storage) must FAIL the candidate quickly so the backend chain
 /// falls through to bwrap/host instead of freezing the caller — pane spawns
 /// run on the event loop's critical path.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Ceiling for container create (`run -d`): image is prefetched by then, so
 /// this is namespace/cgroup setup, not network.
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Ceiling for image pulls (network, legitimately slow — but never forever).
-const PULL_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const PULL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Run `argv` for its exit status with a hard deadline, stdio discarded.
 /// `None` on spawn failure or timeout (the child is killed and reaped) — for
 /// callers, indistinguishable from "this backend doesn't work", which is
 /// exactly the degradation the chain wants.
-fn status_with_timeout(argv: &[String], timeout: Duration) -> Option<bool> {
+pub(crate) fn status_with_timeout(argv: &[String], timeout: Duration) -> Option<bool> {
     output_with_timeout(argv, timeout).map(|(ok, _)| ok)
 }
 
 /// Like [`status_with_timeout`] but also captures stdout. Returns
 /// `(success, stdout)` or `None` on spawn failure or timeout.
-fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<(bool, String)> {
+pub(crate) fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<(bool, String)> {
     use std::process::Stdio;
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
@@ -91,7 +91,7 @@ fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<(bool, Stri
 
 /// Runtime backend (resolved from the config-facing [`SandboxBackend`]; this set
 /// has no `Auto` — auto resolution is what produces a concrete `Backend`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Backend {
     /// Rootless podman (default podman invocation).
     Podman,
@@ -1019,7 +1019,28 @@ fn on_missing(cfg: &SandboxConfig, what: &str) {
 
 /// Is `backend`'s binary present in this placement (locally on PATH, or probed
 /// through the placement's control primitive: ssh / kubectl exec / provider)?
+///
+/// **Memoized** (D3): availability is stable per `(placement, backend)` for the
+/// session, but the raw probe is a subprocess (`sudo -n podman version`) / PATH
+/// walk / remote `command -v`, and `pick_backend` re-runs it up to ~30× per pane
+/// spawn — a real per-worktree-switch stall. Probe once, cache the result. A
+/// backend that appears/disappears mid-session needs a restart (acceptable).
 fn available(placement: &Placement, backend: Backend) -> bool {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(String, Backend), bool>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = (format!("{placement:?}"), backend);
+    if let Some(&v) = cache.lock().unwrap().get(&key) {
+        return v;
+    }
+    let v = available_probe(placement, backend);
+    cache.lock().unwrap().insert(key, v);
+    v
+}
+
+/// The uncached availability probe (subprocess / PATH / remote). See [`available`].
+fn available_probe(placement: &Placement, backend: Backend) -> bool {
     // Rootful podman can't be detected by a bare PATH probe (it needs `sudo -n
     // podman version`); only meaningful locally.
     if placement.is_local() && backend == Backend::PodmanRootful {
@@ -1043,33 +1064,10 @@ fn available(placement: &Placement, backend: Backend) -> bool {
 
 pub const DEFAULT_OCI_IMAGE: &str = "docker.io/library/debian:stable";
 
-fn effective_image(spec: &SandboxSpec) -> String {
+pub(crate) fn effective_image(spec: &SandboxSpec) -> String {
     spec.image
         .clone()
         .unwrap_or_else(|| DEFAULT_OCI_IMAGE.to_string())
-}
-
-pub fn prefetch_image(spec: &SandboxSpec) -> anyhow::Result<()> {
-    if !spec.backend.is_oci() {
-        return Ok(());
-    }
-    let img = effective_image(spec);
-    let rt = spec.backend.binary();
-    let exists_argv: Vec<String> = vec![rt.into(), "image".into(), "exists".into(), img.clone()];
-    match status_with_timeout(&exists_argv, PROBE_TIMEOUT) {
-        Some(true) => {}
-        Some(false) => {
-            let pull_argv: Vec<String> = vec![rt.into(), "pull".into(), img.clone()];
-            if status_with_timeout(&pull_argv, PULL_TIMEOUT) != Some(true) {
-                anyhow::bail!("{rt} pull {img} failed or timed out");
-            }
-        }
-        // The probe itself wedged: the runtime is unhealthy (stuck
-        // machine, broken storage) — fail the candidate so the chain
-        // falls through instead of trusting a pull to behave.
-        None => anyhow::bail!("{rt} not responding (image probe timed out)"),
-    }
-    Ok(())
 }
 
 pub fn health_check(spec: &SandboxSpec) -> bool {
@@ -1161,7 +1159,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    prefetch_image(spec)?;
+    crate::sandbox_prefetch::prefetch_image(spec)?;
 
     let rt = spec.backend.binary();
 
@@ -1325,7 +1323,8 @@ pub fn run_prepare(worktree: &std::path::Path, cmds: &[String]) {
     let wt = worktree.to_path_buf();
     std::thread::spawn(move || {
         for c in &cmds {
-            let _ = std::process::Command::new("sh")
+            // `detached`: null stdio + own group so a hook can't steal the tty.
+            let _ = crate::util::detached("sh")
                 .arg("-lc")
                 .arg(c)
                 .current_dir(&wt)
@@ -1833,7 +1832,7 @@ fn backend_prefix(backend: Backend) -> Vec<String> {
 /// Falls back to the plain [`backend_prefix`] for the local daemon or a non-OCI
 /// backend. Used by every container lifecycle/exec call so create, inspect, exec
 /// and teardown all target the same daemon.
-fn oci_prefix(spec: &SandboxSpec) -> Vec<String> {
+pub(crate) fn oci_prefix(spec: &SandboxSpec) -> Vec<String> {
     let mut v = backend_prefix(spec.backend);
     let Some(host) = spec
         .oci_host

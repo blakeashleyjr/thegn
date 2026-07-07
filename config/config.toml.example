@@ -81,6 +81,15 @@ color = "auto"
 # terminals / fonts without box-drawing glyphs. Run `superzej doctor` to see
 # what your terminal resolves to. (env: SUPERZEJ_THEME_GLYPHS)
 glyphs = "auto"
+# Marker style for the per-worktree agent indicator in the sidebar tree.
+# "letter" (default) uses universal 1-2 letter marks (C=claude, Cx=codex,
+# Y=yazi, Lg=lazygit, Ed=editor, D=diff) that render in any font; "symbol"
+# uses compact Unicode marks (yazi ⊞, lazygit ↟, editor ✎, diff ±) for
+# Nerd-Font / rich terminals, degrading to letters on ASCII-only terminals;
+# "auto" uses symbols only on a confirmed-modern emulator. The focused sidebar
+# row spells the agent's name out beside its glyph either way.
+# (env: SUPERZEJ_THEME_AGENT_GLYPHS)
+agent_glyphs = "letter"
 
 # Optional: override any chrome surface/text color (all "#rrggbb"; unset keys
 # keep the preset's palette). Invalid hex warns and keeps the default.
@@ -1790,7 +1799,9 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # [host.gpu-box]
 # reach = "ssh"                # ssh | iroh | cloud | local
 # image = ""                   # base-image override (name[:tag][@sha256:…]);
-#                              #   empty = the built-in superzej-sandbox base
+#                              #   empty = your LOCAL sandbox base ([sandbox]
+#                              #   image, else debian:stable), transferred to
+#                              #   the host — so a plain [host.*] works OOTB
 # install_runtime = "ask"      # never | ask | auto — consent for installing
 #                              #   podman on the machine; NEVER silent. `ask`
 #                              #   raises a confirm modal (or `host provision --yes`);
@@ -1834,6 +1845,34 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # ticket = "env:SZ_LAPTOP_TICKET"
 # ssh_port = 22
 # user = "me"
+#
+# # An idle Windows box (on your tailnet, running Docker) as a worktree host.
+# # superzej's remote path is POSIX (/bin/sh, git, dtach, …), so point the ssh
+# # endpoint at a WSL2 distro — a real Linux shell with the Windows Docker
+# # daemon exposed (Docker Desktop WSL integration, or docker-ce inside WSL).
+# # Two entry methods, same landing: run sshd INSIDE the distro, or set the
+# # Windows OpenSSH server's DefaultShell to C:\Windows\System32\wsl.exe so a
+# # session drops straight into Linux. Use the Tailscale MagicDNS name as host.
+# # install_runtime = "never" (Docker is already there — do not install podman);
+# # the bound env sets backend = "docker" so the container runs on that daemon.
+# # Worktrees live under ~/superzej-worktrees in the WSL FS — NOT /mnt/c (a git
+# # worktree needs a real Linux filesystem for symlinks/inodes/perf).
+# [host.win1]
+# reach = "ssh"
+# install_runtime = "never"
+# capacity = { cpu = "8", memory = "16g" }   # omit for manual (pinned) placement
+# [host.win1.ssh]
+# host = "me@win1"             # Tailscale MagicDNS name
+# transport = "mosh"           # or "ssh"; mosh survives the box napping (apt install mosh dtach)
+# forward_agent = true         # remote `git push` uses your local keys
+# [env.win1]                   # MANUAL: pin an env per box, pick it at worktree-create
+# placement = "ssh"
+# host = "win1"
+# [env.win1.sandbox]
+# backend = "docker"
+# # AUTO-SPREAD across win1/win2 instead: give each [host.*] a capacity, enable
+# # [placement] (mode = "packed", pack_strategy = "spread"), and leave an env
+# # UNPINNED (no `host =`) so the broker chooses — see the [placement] section.
 #
 # # Bind envs to hosts: both of these pay gpu-box's setup once, share its
 # # digest-pinned image + warm volumes, and spawn sandboxes near-instantly.

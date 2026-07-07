@@ -1,4 +1,4 @@
-//! The **hibernation** seam (schema v38): worktrees whose provider compute is
+//! The **hibernation** seam (schema v39): worktrees whose provider compute is
 //! snapshot-then-destroyed while idle, keyed by worktree path.
 //!
 //! State machine (intent-before-action, like the VPS create ledger):
@@ -18,7 +18,7 @@
 
 use anyhow::Result;
 
-/// One `worktree_hibernations` row (v38): a worktree whose provider compute
+/// One `worktree_hibernations` row (v39): a worktree whose provider compute
 /// was snapshot-then-destroyed (or is mid-capture/mid-restore).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HibernationRow {

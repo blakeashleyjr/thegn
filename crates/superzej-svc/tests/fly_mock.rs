@@ -14,7 +14,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use superzej_svc::fly::{FlyProvider, FlySpec};
+use superzej_svc::fly::{FlyProvider, FlySpec, IrohInject};
 use superzej_svc::provider::RemoteProvider;
 use superzej_svc::vps::registry;
 
@@ -126,6 +126,7 @@ fn spec(base: &str, tmp: &std::path::Path) -> FlySpec {
         max_lifetime_secs: 0,
         key_path: tmp.join("key"),
         pubkey: "ssh-ed25519 MOCKKEY superzej".into(),
+        iroh: None,
         skip_ready_wait: true,
     }
 }
@@ -173,6 +174,11 @@ fn create_list_destroy_with_ledger() {
             .contains("sshd")
     );
     assert!(cbody["config"]["services"][0]["ports"][0]["port"] == 22);
+    // No iroh injection (spec `iroh: None`) ⇒ no `env` object: today's behavior.
+    assert!(
+        cbody["config"].get("env").is_none(),
+        "absent iroh injection leaves config free of an env object"
+    );
 
     // Ledger finalized (provider=fly, machine id + ip recorded).
     let rec = registry::read("sz-fly-1").expect("ledger record");
@@ -201,4 +207,39 @@ fn create_list_destroy_with_ledger() {
     // Idempotent destroy.
     rt.block_on(p.destroy("never-existed"))
         .expect("idempotent destroy");
+
+    // --- iroh injection (present case): rebuild the provider on the SAME
+    // process-wide `SUPERZEJ_DIR` (this file keeps a single #[test] because the
+    // registry lives under that env var, set process-wide — a second parallel
+    // #[test] would race it). The machine-create POST must now carry a
+    // `config.env` with the three `SUPERZEJ_*` call-home keys. The exhaustive
+    // body-builder coverage lives in `machines::tests`.
+    let mut s = spec(&base, tmp.path());
+    s.name = "sz-fly-iroh".into();
+    s.iroh = Some(IrohInject {
+        home_node: "home-endpoint-id".into(),
+        sandbox_auth: "auth-token-xyz".into(),
+        sandbox_id: "sz-fly-iroh".into(),
+    });
+    let pi = FlyProvider::new(s);
+    rt.block_on(pi.create()).expect("create with iroh");
+    let create = recorded
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|r| r.method == "POST" && r.path.ends_with("/machines"))
+        .cloned()
+        .expect("machine create POST (iroh)");
+    let ibody: serde_json::Value = serde_json::from_str(&create.body).unwrap();
+    let env = &ibody["config"]["env"];
+    assert_eq!(env["SUPERZEJ_HOME_NODE"], "home-endpoint-id");
+    assert_eq!(env["SUPERZEJ_SANDBOX_AUTH"], "auth-token-xyz");
+    assert_eq!(env["SUPERZEJ_SANDBOX_ID"], "sz-fly-iroh");
+    // Additive: the ssh key + service wiring is still present alongside iroh.
+    assert_eq!(
+        ibody["config"]["files"][0]["guest_path"],
+        "/root/.ssh/authorized_keys"
+    );
+    assert!(ibody["config"]["services"][0]["ports"][0]["port"] == 22);
 }

@@ -13,3 +13,21 @@ pub(crate) mod startup;
 pub(crate) mod terminal;
 pub(crate) mod wizard;
 pub(crate) mod worktree_delete;
+
+/// Persist a first-launch keymap-preset choice (item 621) to `ui_state` and
+/// record it on `cfg`, returning the status line to show. The caller rebuilds
+/// the live keymap from `cfg` (that reassignment stays on the loop). Extracted
+/// from the pinned `run.rs`.
+pub(crate) fn apply_keymap_preset(preset: &str, cfg: &mut superzej_core::config::Config) -> String {
+    use superzej_core::store::WorkspaceStore;
+    // best-effort: the preset also rides `cfg`; a failed persist just re-asks.
+    if let Ok(db) = superzej_core::db::Db::open() {
+        let _ = db.set_ui_state("", "keymap_preset", preset);
+    }
+    cfg.keymap_preset = preset.to_string();
+    if preset == "default" {
+        "Keymap: superzej defaults".into()
+    } else {
+        format!("Keymap preset: {preset}")
+    }
+}

@@ -10,6 +10,13 @@ description = "superzej substrate-agnostic core: state, git, sandbox, config, th
 [features]
 test-utils = []
 
+# `cfg(kani)` is set only by the `cargo kani` driver (see the `#[cfg(kani)]`
+# proof module in `termcaps.rs`, run via `just verify-kani`). Declare it as a
+# known cfg so normal `cargo build`/`clippy -D warnings`/`just ci` don't warn on
+# an "unexpected" cfg. No dependency is added — Kani injects its own crate.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [dependencies]
 # The media model lives in the C-dep-free `superzej-media` leaf (so its per-OS
 # control backends cross-check); core re-exports it via `media.rs` and lowers

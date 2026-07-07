@@ -57,6 +57,7 @@ fn live_shell_and_docker() {
         max_lifetime_secs: 0,
         key_path,
         pubkey,
+        iroh: None,
         skip_ready_wait: false,
     };
     let prov = FlyProvider::new(spec);

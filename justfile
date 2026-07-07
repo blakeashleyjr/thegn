@@ -48,6 +48,16 @@ _apps:
 build: _apps
     cargo build --workspace
 
+# Fast inner-loop check: typecheck + clippy on lib/bin code only (no test/bench
+# targets, no tests, no coverage). Pass a crate to scope it further, e.g.
+# `just quick superzej-host`. Use this while iterating; run the heavy gates
+# (`just test` / `just coverage` / `just ci`) only when preparing to push/PR.
+quick pkg="": _apps
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "{{pkg}}" ]; then scope="-p {{pkg}}"; else scope="--workspace"; fi
+    cargo clippy $scope -- -D warnings
+
 # Cross-platform regression gate: typecheck the C-dep-free leaf crates' per-OS
 # code for macOS + Windows on this (Linux) box. `superzej-metrics` covers the
 # sysinfo/battery substrate; `superzej-media` covers the per-OS player backends
@@ -249,7 +259,7 @@ e2e-update: build
 # at 95% lines. The native host and the svc layer carry their own tests but are
 # not part of this gate (their I/O-heavy surface is the same reason the seams
 # above are excluded).
-cov_ignore := 'superzej-core/src/(repo|worktree|sandbox|sandbox_mounts|remote|github|picker|util|msg|out|log|devenv|direnv|plugin_api|profile|forge/mod)\.rs'
+cov_ignore := 'superzej-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|plugin_api|profile|forge/mod)\.rs'
 
 # The LLM-proxy crate is gated separately at 88% lines (its decision logic lives
 # in the 95%-gated core::proxy; this covers the I/O shell — router, server, relay,
@@ -352,6 +362,23 @@ fmt-check:
 test: _apps
     cargo nextest run --workspace
     cargo test --doc --workspace
+
+# Formal verification (bounded model checking, CBMC via Kani) of the pure
+# color-quantization math in `superzej-core::termcaps` (the `#[cfg(kani)]`
+# proofs). Opt-in and machine-local: needs a one-time `cargo install --locked
+# kani-verifier && cargo kani setup`. Deliberately NOT part of `just ci` — Kani's
+# bundled CBMC toolchain is non-hermetic and the solve is slow.
+#
+# KNOWN BLOCKER (spike finding, 2026-07-07, kani 0.67.0): this does not currently
+# compile. Kani must build all of `superzej-core`, and its transitive dep
+# `libsqlite3-sys` (via `rusqlite`) uses the unstable `cfg_select!` in its build
+# script, which Kani's pinned `nightly-2025-11-21` rejects. The 5 harnesses WERE
+# verified (all SUCCESSFUL, ~1.2s) by extracting the color fns verbatim into a
+# standalone dep-free crate. To run in-tree, either Kani's toolchain must advance
+# past that dep, or the pure-math module must be split into a leaf crate with no
+# heavy deps. Until then, treat the `#[cfg(kani)]` proofs as documentation.
+verify-kani:
+    cargo kani -p superzej-core
 
 # Live integration tests against the REAL Sprites API (creates + destroys throwaway
 # sprites — real cloud spend). Sources SPRITES_TOKEN from .envrc.local. Validates
