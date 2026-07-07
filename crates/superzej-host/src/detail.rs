@@ -2725,7 +2725,7 @@ mod tests {
         };
         assert_eq!(l.level, Some(LogLevel::Error));
         assert!(
-            l.matches().len() >= 1,
+            !l.matches().is_empty(),
             "the scrolled-out ERROR must still appear in the drilldown"
         );
     }
