@@ -63,6 +63,9 @@ pub enum WizardOutcome {
     /// The "+ add host…" row was chosen: the loop closes the wizard, opens the
     /// add-host input, and re-opens the wizard once the host exists.
     AddHost,
+    /// A "+ set up <kind>…" discovery row was chosen: the loop closes the
+    /// wizard and opens the env wizard pre-seeded to that provider kind.
+    SetupEnv(String),
     Pending,
     Cancel,
     PrepChosen {
@@ -111,6 +114,9 @@ pub(crate) fn default_env_name(cfg: &Config, repo_root: &Path) -> String {
 /// keys; the loop dispatches on [`WizardOutcome`].
 /// Sentinel env key for the wizard's "+ add host…" row.
 pub const ADD_HOST_KEY: &str = "__add_host__";
+/// Key prefix of the "+ set up <kind>…" provider-discovery rows
+/// ([`crate::palette::build_env_palette`] appends them for unconfigured kinds).
+pub const ENV_SETUP_PREFIX: &str = "env-setup:";
 
 #[derive(Debug)]
 pub struct NewWorktreeWizard {
@@ -265,7 +271,7 @@ impl NewWorktreeWizard {
     /// The prep command for the current (host, sandbox) selection — the loop
     /// forwards it to the worker so bring-up overlaps the user's remaining time.
     fn prep_outcome(&self) -> WizardOutcome {
-        if self.host_key() == ADD_HOST_KEY {
+        if self.host_key() == ADD_HOST_KEY || self.setup_kind().is_some() {
             return WizardOutcome::Pending; // sentinel row: nothing to bring up
         }
         WizardOutcome::PrepChosen {
@@ -276,9 +282,20 @@ impl NewWorktreeWizard {
 
     /// Build a `Submit` from the current selections, or `Pending` if the branch
     /// name is empty (the name field must not be blank).
+    /// The provider kind of the selected "+ set up <kind>…" discovery row, if
+    /// the Host selection sits on one.
+    fn setup_kind(&self) -> Option<String> {
+        self.host_key()
+            .strip_prefix(ENV_SETUP_PREFIX)
+            .map(str::to_string)
+    }
+
     fn submit(&self) -> WizardOutcome {
         if self.host_key() == ADD_HOST_KEY {
             return WizardOutcome::AddHost;
+        }
+        if let Some(kind) = self.setup_kind() {
+            return WizardOutcome::SetupEnv(kind);
         }
         if self.tail.trim().is_empty() {
             return WizardOutcome::Pending;
@@ -410,6 +427,9 @@ impl NewWorktreeWizard {
                     WizardOutcome::Pending
                 }
                 KeyCode::Enter if self.host_key() == ADD_HOST_KEY => WizardOutcome::AddHost,
+                KeyCode::Enter if self.setup_kind().is_some() => {
+                    WizardOutcome::SetupEnv(self.setup_kind().unwrap_or_default())
+                }
                 KeyCode::Enter | KeyCode::DownArrow | KeyCode::Char('j') => {
                     self.focus_down();
                     WizardOutcome::Pending

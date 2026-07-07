@@ -629,8 +629,29 @@ pub(crate) fn build_env_palette(
         ));
     }
     items.sort_by_key(|i| if i.key == def { 0 } else { 1 });
+    // Discovery rows: every known provider kind with no configured env gets a
+    // trailing "+ set up <kind>…" sentinel (`env-setup:<kind>`). Enter on one
+    // opens the env wizard pre-seeded to that kind — the picker doubles as the
+    // map of what superzej can run on, not just what is already configured.
+    for kind in ENV_SETUP_KINDS {
+        let configured = cfg
+            .env
+            .values()
+            .any(|e| matches!(e.placement, P::Provider) && e.provider.provider.trim() == *kind);
+        if !configured {
+            items.push(crate::palette::PaletteItem::new(
+                format!("env-setup:{kind}"),
+                format!("+ set up {kind}… [not configured]"),
+            ));
+        }
+    }
     items
 }
+
+/// Provider kinds offered as "set up …" discovery rows in the host picker,
+/// in display order. Must stay within the kinds the env wizard can author.
+pub(crate) const ENV_SETUP_KINDS: &[&str] =
+    &["fly", "hetzner", "digitalocean", "sprites", "daytona"];
 /// Build the agent-picker palette items for `cfg`: one row per agent/tool, plus
 /// a literal shell. The key is the bare choice name (the `PendingAgent` gate in
 /// the Enter handler routes it to a launch, not a command dispatch).
@@ -908,6 +929,47 @@ mod tests {
         let find = |k: &str| items.iter().find(|i| i.key == k).unwrap();
         assert!(find("remote").label.contains("[ssh:build-box]"));
         assert!(find("sprite").label.contains("[sprites:s-123]"));
+    }
+
+    #[test]
+    fn build_env_palette_offers_setup_rows_for_unconfigured_providers() {
+        use superzej_core::config::{Config, EnvConfig, EnvProviderConfig, PlacementMode};
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "sprite".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                provider: EnvProviderConfig {
+                    provider: "sprites".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let items = build_env_palette(&cfg);
+        let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        // Configured kind gets no setup row; every unconfigured kind gets one.
+        assert!(!keys.contains(&"env-setup:sprites"));
+        for kind in ["fly", "hetzner", "digitalocean", "daytona"] {
+            assert!(
+                keys.contains(&format!("env-setup:{kind}").as_str()),
+                "{kind}"
+            );
+        }
+        // Discovery rows trail the real envs.
+        let first_setup = keys
+            .iter()
+            .position(|k| k.starts_with("env-setup:"))
+            .unwrap();
+        let last_real = keys
+            .iter()
+            .rposition(|k| !k.starts_with("env-setup:"))
+            .unwrap();
+        assert!(last_real < first_setup);
+        let setup = items.iter().find(|i| i.key == "env-setup:hetzner").unwrap();
+        assert!(setup.label.contains("set up hetzner"));
+        assert!(setup.label.contains("[not configured]"));
     }
 
     #[test]
