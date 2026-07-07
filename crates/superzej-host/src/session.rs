@@ -449,6 +449,19 @@ impl Session {
         })
     }
 
+    /// Persist only the active-tab pointer (session/name), skipping the full
+    /// layout rewrite + pane capture that `persist()` does. A worktree/tab
+    /// *switch* changes nothing structural — only which tab is focused — so
+    /// re-serializing every group's tabs (and, via `capture_pane_state`, every
+    /// pane's scrollback tail into the DB) on each keystroke was pure waste; it
+    /// scaled the switch cost with total session size. The heavyweight
+    /// `persist()` still runs on structural changes (tab open/close/split) and
+    /// at shutdown, so nothing is lost — this just records "where the cursor
+    /// is" cheaply. Callable off-loop (see `persist_active_focus`).
+    pub fn persist_active_tab(db: &Db, session: &str, tab: &str, now: i64) -> Result<()> {
+        db.set_active_tab(session, tab, now)
+    }
+
     pub fn active_group(&self) -> Option<&WorktreeGroup> {
         self.worktrees.get(self.active)
     }

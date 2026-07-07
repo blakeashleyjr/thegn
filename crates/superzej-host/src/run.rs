@@ -2076,6 +2076,11 @@ fn activate_row_target(
     // aren't in `model.sidebar_status` yet — without this the git glyphs blank
     // out until the ~1s refresh ticker fires).
     let mut workspace_switched = false;
+    // Set when this activation adds a *new* group to the session (the lazy
+    // terminal-materialize arm below). Only then does the layout structurally
+    // change and warrant the heavyweight `persist_session_layout`; a plain
+    // tab/worktree activation is a pure focus move and persists cheaply.
+    let mut structural = false;
     match target {
         crate::sidebar::RowTarget::Tab(gi, ti) => {
             if gi >= session.worktrees.len() {
@@ -2114,6 +2119,7 @@ fn activate_row_target(
                 });
                 session.active = session.worktrees.len() - 1;
                 *need_relayout = true;
+                structural = true;
             }
         }
         crate::sidebar::RowTarget::Workspace { repo_path, group } => {
@@ -2151,10 +2157,17 @@ fn activate_row_target(
     }
     refresh_tab_model(model, session, sb);
     sync_drawer_persistence(session, panes, drawer, pool, home, cfg, center);
-    // Persist the new active worktree/tab so it survives a non-graceful exit
-    // (the Workspace arm already persisted via switch_to_workspace; this also
-    // covers the in-workspace Tab arm and is cheap/idempotent).
-    persist_session_layout(session, panes);
+    // Persist the new active worktree/tab so it survives a non-graceful exit.
+    // Only a structural change (the terminal-materialize arm, which pushes a
+    // new group) needs the full layout rewrite; the Workspace arm already
+    // persisted its full layout inside `switch_workspace`, and the in-workspace
+    // Tab arm is a pure focus move — both just need the cheap, off-loop
+    // active-pointer write so sidebar activation never blocks a frame.
+    if structural {
+        persist_session_layout(session, panes);
+    } else {
+        persist_active_focus(session);
+    }
     workspace_switched
 }
 
@@ -6646,6 +6659,33 @@ pub(crate) fn persist_session_layout(session: &mut crate::session::Session, pane
     if let Ok(db) = superzej_core::db::Db::open() {
         let _ = session.persist(&db, &session.id, now_secs());
     }
+}
+
+/// Persist a pure focus change (worktree/tab switch) without blocking the loop.
+///
+/// A switch is structurally a no-op — only the active pointer moved — so it
+/// must NOT trigger the heavyweight `persist_session_layout` (whole-session
+/// scrollback capture + full layout rewrite + a DB open/write/checkpoint-fsync,
+/// all on the loop, cost scaling with session size: ~500ms in a debug build on
+/// a populated session). Instead we record just the active-tab pointer, and do
+/// even that off the event loop on `spawn_blocking` so rapid Alt+↑/↓ never
+/// stalls a frame. Best-effort: the DB is a cache and shutdown re-persists the
+/// full layout, so a dropped write only means a slightly stale restore point.
+pub(crate) fn persist_active_focus(session: &crate::session::Session) {
+    let sid = session.id.clone();
+    let Some(name) = session
+        .worktrees
+        .get(session.active)
+        .map(|g| g.name.clone())
+    else {
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        // off-loop: inside spawn_blocking
+        if let Ok(db) = superzej_core::db::Db::open() {
+            let _ = crate::session::Session::persist_active_tab(&db, &sid, &name, now_secs());
+        }
+    });
 }
 
 use crate::acp_gate::AgentChannel;
@@ -17759,7 +17799,7 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     chrome.center,
                                 );
-                                persist_session_layout(&mut session, &panes);
+                                persist_active_focus(&session);
                             }
                             Action::PrevTab => {
                                 session.prev_tab();
@@ -17777,7 +17817,7 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     chrome.center,
                                 );
-                                persist_session_layout(&mut session, &panes);
+                                persist_active_focus(&session);
                             }
                             Action::NextWorktree | Action::PrevWorktree
                                 if active_is_terminal(&session) =>
@@ -17888,7 +17928,7 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     chrome.center,
                                 );
-                                persist_session_layout(&mut session, &panes);
+                                persist_active_focus(&session);
                             }
                             Action::NextWorkspace | Action::PrevWorkspace => {
                                 // One combined ring: the visible workspaces (in
@@ -17963,7 +18003,7 @@ async fn event_loop<T: Terminal>(
                                                     keymap.config(),
                                                     chrome.center,
                                                 );
-                                                persist_session_layout(&mut session, &panes);
+                                                persist_active_focus(&session);
                                             } else if let (Some(target), Ok(db)) =
                                                 (repo_path, superzej_core::db::Db::open())
                                                 && switch_workspace(
@@ -18079,7 +18119,7 @@ async fn event_loop<T: Terminal>(
                                         keymap.config(),
                                         chrome.center,
                                     );
-                                    persist_session_layout(&mut session, &panes);
+                                    persist_active_focus(&session);
                                 } else {
                                     // Entering terminals → the remembered terminal
                                     // if still present, else the first terminal in
@@ -18190,7 +18230,7 @@ async fn event_loop<T: Terminal>(
                                         keymap.config(),
                                         chrome.center,
                                     );
-                                    persist_session_layout(&mut session, &panes);
+                                    persist_active_focus(&session);
                                 }
                             }
                             Action::MoveItemUp | Action::MoveItemDown => {
