@@ -523,10 +523,13 @@ fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs, procs: Procs
 
 /// The agent side (`szhost --bridge`): read framed requests off `reader`, run
 /// them, write framed responses to `writer`, until the stream closes. Runs
-/// *inside* the env. Blocking/synchronous (one request at a time is fine — the
-/// host issues sequentially per connection; concurrency rides separate threads).
-/// A writer shared between the request loop and the `fs.watch` background watcher
-/// threads (which push `fs.event` notifications).
+/// *inside* the env. The stateless, potentially-slow ops (`exec`/`exec.batch`/
+/// `proc.list`) run on their own thread so a slow git command doesn't
+/// head-of-line-block the *concurrent* requests the host issues (the panel /
+/// sidebar git fan-out across scoped threads) — responses are id-correlated, so
+/// out-of-order completion is fine and the shared writer is mutex-guarded. The
+/// writer is shared between the request loop, those exec threads, and the
+/// `fs.watch` background watcher threads (which push `fs.event` notifications).
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// A live streaming child: only its stdin is retained (for `proc.stdin`). Dropping
@@ -556,17 +559,36 @@ pub fn serve(mut reader: impl Read, writer: impl Write + Send + 'static) {
             let Ok(req) = serde_json::from_str::<Request>(&body) else {
                 continue;
             };
-            let resp = match req.method.as_str() {
-                "exec" => exec_response(&req),
-                "exec.batch" => exec_batch_response(&req),
-                "proc.list" => proc_response(&req),
-                "fs.watch" => watch_response(&req, &writer, &mut watchers),
-                "proc.spawn" => proc_spawn_response(&req, &writer, &procs),
-                "proc.stdin" => proc_stdin_response(&req, &procs),
-                "proc.kill" => proc_kill_response(&req, &procs),
-                other => resp_err(req.id, format!("unknown method: {other}")),
-            };
-            write_frame(&writer, &resp);
+            match req.method.as_str() {
+                // Stateless + potentially slow: run off the read loop so concurrent
+                // host requests parallelize (restores the pre-bridge parallel-
+                // subprocess behavior instead of serializing every git read
+                // through one connection).
+                "exec" | "exec.batch" | "proc.list" => {
+                    let w = writer.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("bridge-exec".into())
+                        .spawn(move || {
+                            let resp = match req.method.as_str() {
+                                "exec" => exec_response(&req),
+                                "exec.batch" => exec_batch_response(&req),
+                                _ => proc_response(&req),
+                            };
+                            write_frame(&w, &resp);
+                        });
+                }
+                // Stateful / fast: stay inline (they borrow `watchers`/`procs`).
+                _ => {
+                    let resp = match req.method.as_str() {
+                        "fs.watch" => watch_response(&req, &writer, &mut watchers),
+                        "proc.spawn" => proc_spawn_response(&req, &writer, &procs),
+                        "proc.stdin" => proc_stdin_response(&req, &procs),
+                        "proc.kill" => proc_kill_response(&req, &procs),
+                        other => resp_err(req.id, format!("unknown method: {other}")),
+                    };
+                    write_frame(&writer, &resp);
+                }
+            }
         }
     }
     // Connection closed: drop every child's stdin → EOF → the children exit.
@@ -874,6 +896,11 @@ fn do_exec(p: &ExecParams) -> Result<ExecResult> {
         c.current_dir(cwd);
     }
     scrub_git_env(&mut c);
+    // Concurrent bridged git reads (the panel/sidebar fan-out now runs in
+    // parallel on the agent) must not fight over `index.lock`; mirrors the
+    // host-side `util::git_cmd`. Harmless for non-git argv. Applied before the
+    // caller's `env` so an explicit override still wins.
+    c.env("GIT_OPTIONAL_LOCKS", "0");
     for (k, v) in &p.env {
         c.env(k, v);
     }
