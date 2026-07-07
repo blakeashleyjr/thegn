@@ -1332,13 +1332,15 @@ const SIDEBAR_SCOPE: &str = "sidebar";
 /// derives `FrameModel`'s sidebar fields from it plus the model's data carriers.
 #[derive(Default)]
 pub(crate) struct SidebarState {
-    view: crate::sidebar::ViewState,
-    focused: bool,
+    pub(crate) view: crate::sidebar::ViewState,
+    pub(crate) focused: bool,
     /// Cursor over the *visible* rows.
-    cursor: usize,
+    pub(crate) cursor: usize,
     filtering: bool,
-    /// Marked visible-row indices for bulk actions (item 26).
-    pub(crate) marked: std::collections::HashSet<usize>,
+    /// Marked rows for bulk actions (item 26), keyed by the stable per-row
+    /// `pin_key` so the selection survives rebuilds (collapse/sort/filter/
+    /// hydration/reorder) instead of drifting when row indices shift.
+    pub(crate) marked: std::collections::HashSet<String>,
     /// Open context menu, if any (item 27).
     menu: Option<crate::chrome::RowMenu>,
     /// Adjustable bar width in columns (item 25); `None` = layout default.
@@ -1389,7 +1391,10 @@ impl SidebarState {
     }
 
     /// The currently-selected visible row, if any.
-    fn selected_row<'a>(&self, model: &'a FrameModel) -> Option<&'a crate::sidebar::SidebarRow> {
+    pub(crate) fn selected_row<'a>(
+        &self,
+        model: &'a FrameModel,
+    ) -> Option<&'a crate::sidebar::SidebarRow> {
         model
             .sidebar_rows
             .iter()
@@ -1404,7 +1409,7 @@ impl SidebarState {
 
     /// Rederive `model.sidebar_rows` from its data carriers + this view state,
     /// then mirror interaction fields into the model for the renderer.
-    fn rebuild(&mut self, model: &mut FrameModel, session: &crate::session::Session) {
+    pub(crate) fn rebuild(&mut self, model: &mut FrameModel, session: &crate::session::Session) {
         model.sidebar_rows = crate::sidebar::build_rows(
             session,
             &model.sidebar_workspaces,
@@ -1415,6 +1420,13 @@ impl SidebarState {
             &model.sidebar_db_terminals,
             &model.panel.hosts,
         );
+        // Drop marks whose row is gone (deleted worktree/workspace). Keep marks
+        // whose row exists but is hidden by a collapsed parent, so re-expanding
+        // restores the selection.
+        if !self.marked.is_empty() {
+            self.marked
+                .retain(|k| model.sidebar_rows.iter().any(|r| &r.pin_key == k));
+        }
         let visible = Self::visible_len(model);
         // While unfocused, track the active worktree so opening the sidebar
         // lands on the current tab; once focused, keep the user's cursor.
@@ -1430,13 +1442,23 @@ impl SidebarState {
     }
 
     /// Copy interaction state into the model fields the renderer reads.
-    fn sync(&self, model: &mut FrameModel) {
+    pub(crate) fn sync(&self, model: &mut FrameModel) {
         model.sidebar_selected = self.cursor;
         model.sidebar_focused = self.focused;
         model.sidebar_filter = self.view.filter.clone();
         model.sidebar_filtering = self.filtering;
         model.sidebar_sort = self.view.sort;
-        model.sidebar_marked = self.marked.clone();
+        // Project the stable mark identities onto the current visible-row
+        // indices the renderer paints (`chrome::row_bg`). Re-derived every frame
+        // so marks always land on the right rows after any rebuild.
+        model.sidebar_marked = model
+            .sidebar_rows
+            .iter()
+            .filter(|r| r.visible)
+            .enumerate()
+            .filter(|(_, r)| self.marked.contains(&r.pin_key))
+            .map(|(i, _)| i)
+            .collect();
         model.sidebar_menu = self.menu.clone();
         model.sidebar_scroll = self.scroll;
         model.sidebar_rail = self.mode == crate::layout::SidebarMode::Rail;
@@ -1449,7 +1471,7 @@ impl SidebarState {
 }
 
 /// What the event loop should do after a sidebar key was handled.
-enum SidebarOutcome {
+pub(crate) enum SidebarOutcome {
     /// Key wasn't for the sidebar; let normal dispatch handle it.
     NotHandled,
     /// Handled; just redraw.
@@ -1460,6 +1482,9 @@ enum SidebarOutcome {
     Activate(crate::sidebar::RowTarget),
     /// The layout changed (bar width); recompute chrome.
     Relayout,
+    /// Reorder the current selection (marked rows, else the cursor row) one slot
+    /// (Shift+↑/↓). Needs `&mut Session`, so the loop performs it.
+    ReorderSelection { up: bool },
     /// Close the worktree groups at these session indices (bulk action).
     CloseGroups(Vec<usize>),
     /// DELETE these worktree groups from disk (`git worktree remove`) and
@@ -1487,142 +1512,19 @@ enum SidebarOutcome {
 
 impl SidebarState {
     /// Persist a single `ui_state` key in the global [`SIDEBAR_SCOPE`].
-    fn persist(&self, key: &str, value: &str) {
+    pub(crate) fn persist(&self, key: &str, value: &str) {
         if let Ok(db) = superzej_core::db::Db::open() {
             let _ = db.set_ui_state(SIDEBAR_SCOPE, key, value);
         }
     }
 
-    /// Move the active worktree one slot within its workspace (Shift+Alt+↑/↓).
-    /// Swaps it with the adjacent *same-workspace* branch sibling in both the
-    /// live session order and the persisted registry `position`, so the new
-    /// order survives restart. `home` is a fixed top anchor: a worktree can't
-    /// move above it, and home itself never moves. A move while a computed sort
-    /// is active first flips the workspace back to Manual so the move is visible
-    /// and sticks. Returns whether anything moved.
-    fn move_active_worktree(
-        &mut self,
-        model: &mut FrameModel,
-        session: &mut crate::session::Session,
-        up: bool,
-    ) -> bool {
-        use crate::session::GroupKind;
-        let a = session.active;
-        // Home never moves.
-        if session.worktrees.get(a).map(|g| g.kind) == Some(GroupKind::Home) {
-            return false;
-        }
-        // Walk the on-screen order so the motion matches what the user sees;
-        // same-workspace worktrees are contiguous there (one block per repo).
-        let order = sidebar_worktree_order(model);
-        let Some(p) = order.iter().position(|&g| g == a) else {
-            return false;
-        };
-        let neighbor = if up {
-            p.checked_sub(1)
-        } else {
-            (p + 1 < order.len()).then_some(p + 1)
-        };
-        let Some(np) = neighbor else { return false };
-        let b = order[np];
-        // Stay within the same workspace, and never cross above home.
-        let slug = |gi: usize| {
-            session
-                .worktrees
-                .get(gi)
-                .and_then(|g| crate::sidebar::split_tab(&g.name).map(|(s, _)| s))
-        };
-        if slug(a) != slug(b) {
-            return false;
-        }
-        if session.worktrees.get(b).map(|g| g.kind) == Some(GroupKind::Home) {
-            return false;
-        }
-
-        // Persist the new order: swap the durable `position` of the two paths…
-        if let Ok(db) = superzej_core::db::Db::open() {
-            let (pa, pb) = (
-                session.worktrees[a].path.clone(),
-                session.worktrees[b].path.clone(),
-            );
-            let _ = db.swap_worktree_positions(&pa, &pb);
-        }
-        // …and the live session order, keeping the moved group active.
-        session.worktrees.swap(a, b);
-        session.active = b;
-
-        // A manual move only makes sense under Manual order; flip + persist if a
-        // computed sort was active so the move is visible and survives restart.
-        if self.view.sort != crate::sidebar::SortMode::Manual {
-            self.view.sort = crate::sidebar::SortMode::Manual;
-            self.persist("sort_mode", self.view.sort.as_str());
-        }
-        self.rebuild(model, session);
-        // Keep the highlight on the worktree that just moved (now the active
-        // group), so the cursor travels with the item the way workspace
-        // reorders already do (rebuild only re-syncs the cursor while unfocused).
-        self.cursor = visible_index_of_active(model);
-        self.sync(model);
-        true
-    }
-
-    /// Reorder the workspace under the sidebar cursor one slot (Ctrl+Alt+↑/↓).
-    /// Swaps its persisted `position` with the adjacent DB-backed workspace and
-    /// mirrors the swap into `model.sidebar_workspaces` so the move shows at
-    /// once (the next hydration rebuilds that list from the just-written DB, so
-    /// the two stay consistent). Live-only workspaces (no DB row, hence no
-    /// position) are skipped. Returns whether anything moved.
-    fn move_selected_workspace(
-        &mut self,
-        model: &mut FrameModel,
-        session: &crate::session::Session,
-        up: bool,
-    ) -> bool {
-        let Some(slug) = self.selected_row(model).map(|r| r.workspace_slug.clone()) else {
-            return false;
-        };
-        // The reorderable (DB-backed) workspaces in display order, as
-        // (full-vec index, repo_path). Empty repo_path = live-only, no position.
-        let order: Vec<(usize, String)> = model
-            .sidebar_workspaces
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, _, _, repo))| !repo.is_empty())
-            .map(|(i, (_, _, _, repo))| (i, repo.clone()))
-            .collect();
-        // Locate the cursor workspace within that order by slug.
-        let Some(p) = model
-            .sidebar_workspaces
-            .iter()
-            .position(|(s, _, _, _)| *s == slug)
-            .and_then(|fi| order.iter().position(|(i, _)| *i == fi))
-        else {
-            return false;
-        };
-        let neighbor = if up {
-            p.checked_sub(1)
-        } else {
-            (p + 1 < order.len()).then_some(p + 1)
-        };
-        let Some(np) = neighbor else { return false };
-        let (ia, repo_a) = order[p].clone();
-        let (ib, repo_b) = order[np].clone();
-
-        if let Ok(db) = superzej_core::db::Db::open() {
-            let _ = db.swap_workspace_positions(&repo_a, &repo_b);
-        }
-        // Reflect immediately; keep the cursor on the moved workspace's header.
-        model.sidebar_workspaces.swap(ia, ib);
-        self.rebuild(model, session);
-        if let Some(idx) = visible_index_of_workspace(model, &slug) {
-            self.cursor = idx;
-            self.sync(model);
-        }
-        true
-    }
+    // Sidebar reorder (single item + multi-select) lives in
+    // `handlers/sidebar_reorder.rs` to keep this god-file from growing:
+    // `move_active_worktree`, `move_selected_workspace`, `move_worktree_group`,
+    // `move_workspace_by_slug`, and `reorder_selection`.
 
     /// What the cursor row activates, if anything.
-    fn cursor_target(&self, model: &FrameModel) -> Option<crate::sidebar::RowTarget> {
+    pub(crate) fn cursor_target(&self, model: &FrameModel) -> Option<crate::sidebar::RowTarget> {
         self.selected_row(model).and_then(|r| r.tab_target.clone())
     }
 
@@ -1698,7 +1600,7 @@ impl SidebarState {
 
     /// Handle a key while the sidebar owns focus. Mutates view/interaction
     /// state, rebuilds rows, and returns what the loop must do.
-    fn handle_key(
+    pub(crate) fn handle_key(
         &mut self,
         key: &KeyCode,
         mods: Modifiers,
@@ -1764,6 +1666,14 @@ impl SidebarState {
         match key {
             key if crate::input::is_escape_key(key) => return SidebarOutcome::Defocus,
             KeyCode::Char('q') => return SidebarOutcome::Defocus,
+            // Shift+↑/↓ reorders the selection (the loop has `&mut Session`).
+            // Only the arrows carry Shift here — Shift+j/k normalise to J/K.
+            KeyCode::UpArrow if mods.contains(Modifiers::SHIFT) => {
+                return SidebarOutcome::ReorderSelection { up: true };
+            }
+            KeyCode::DownArrow if mods.contains(Modifiers::SHIFT) => {
+                return SidebarOutcome::ReorderSelection { up: false };
+            }
             KeyCode::DownArrow | KeyCode::Char('j') => {
                 if visible > 0 {
                     self.cursor = (self.cursor + 1).min(visible - 1);
@@ -1813,18 +1723,18 @@ impl SidebarState {
             }
             KeyCode::Char('p') => return self.toggle_pin(model, session),
             KeyCode::Char(' ') => {
-                // Multi-select toggle (item 26); on collapsible headers, collapse.
+                // Multi-select toggle (item 26): mark/unmark the cursor row if it
+                // is a worktree or workspace. Collapse now lives solely on
+                // Enter/←/→ and the caret click, so headers can be selected too.
                 if let Some(row) = self.selected_row(model)
-                    && is_collapsible(row.kind)
+                    && row.is_markable()
                 {
-                    return self.toggle_collapse(model, session);
+                    let key = row.pin_key.clone();
+                    if !self.marked.remove(&key) {
+                        self.marked.insert(key);
+                    }
+                    self.sync(model);
                 }
-                if self.marked.contains(&self.cursor) {
-                    self.marked.remove(&self.cursor);
-                } else {
-                    self.marked.insert(self.cursor);
-                }
-                self.sync(model);
             }
             KeyCode::Char('m') => {
                 self.menu = self.menu_for_cursor(model, session);
@@ -1834,6 +1744,7 @@ impl SidebarState {
                 // Bulk close: every marked worktree, else the cursor row.
                 let targets = self.action_targets(model);
                 if !targets.is_empty() {
+                    self.hint_skipped_workspace_marks(model);
                     return SidebarOutcome::CloseGroups(targets);
                 }
             }
@@ -1846,6 +1757,7 @@ impl SidebarState {
                 // Bulk DELETE from disk: marked worktrees, else the cursor row.
                 let targets = self.action_targets(model);
                 if !targets.is_empty() {
+                    self.hint_skipped_workspace_marks(model);
                     return SidebarOutcome::DeleteGroups(targets);
                 }
             }
@@ -1882,22 +1794,44 @@ impl SidebarState {
     }
 
     /// Marked rows resolved to worktree-group indices (close acts per group).
+    /// Marks that aren't worktree rows (e.g. workspace headers) carry no group
+    /// target and are dropped here; [`Self::marked_nonworktree_count`] reports
+    /// them so the caller can hint the user.
     fn marked_group_targets(&self, model: &FrameModel) -> Vec<usize> {
-        let visible: Vec<&crate::sidebar::SidebarRow> =
-            model.sidebar_rows.iter().filter(|r| r.visible).collect();
-        let mut targets: Vec<usize> = self
-            .marked
+        let mut targets: Vec<usize> = model
+            .sidebar_rows
             .iter()
-            .filter_map(
-                |&i| match visible.get(i).and_then(|r| r.tab_target.clone()) {
-                    Some(crate::sidebar::RowTarget::Tab(g, _)) => Some(g),
-                    _ => None,
-                },
-            )
+            .filter(|r| r.visible && self.marked.contains(&r.pin_key))
+            .filter_map(|r| match r.tab_target {
+                Some(crate::sidebar::RowTarget::Tab(g, _)) => Some(g),
+                _ => None,
+            })
             .collect();
         targets.sort_unstable();
         targets.dedup();
         targets
+    }
+
+    /// How many marked rows are *not* worktree groups (workspace headers), which
+    /// bulk close/delete can't act on. Used to surface a "N workspaces skipped"
+    /// hint rather than silently ignoring them.
+    fn marked_nonworktree_count(&self, model: &FrameModel) -> usize {
+        model
+            .sidebar_rows
+            .iter()
+            .filter(|r| r.visible && self.marked.contains(&r.pin_key))
+            .filter(|r| !matches!(r.tab_target, Some(crate::sidebar::RowTarget::Tab(_, _))))
+            .count()
+    }
+
+    /// Warn when a bulk close/delete silently skips marked workspace headers,
+    /// which those actions can't operate on (worktrees only).
+    fn hint_skipped_workspace_marks(&self, model: &mut FrameModel) {
+        let skipped = self.marked_nonworktree_count(model);
+        if skipped > 0 {
+            model.status =
+                format!("{skipped} workspace(s) skipped — select worktrees to close/delete");
+        }
     }
 
     fn toggle_collapse(
@@ -1929,12 +1863,11 @@ impl SidebarState {
         session: &crate::session::Session,
     ) -> SidebarOutcome {
         // Bulk: every marked row's pin key, else the cursor row's.
-        let visible: Vec<&crate::sidebar::SidebarRow> =
-            model.sidebar_rows.iter().filter(|r| r.visible).collect();
-        let mut keys: Vec<String> = self
-            .marked
+        let mut keys: Vec<String> = model
+            .sidebar_rows
             .iter()
-            .filter_map(|&i| visible.get(i).map(|r| r.pin_key.clone()))
+            .filter(|r| r.visible && self.marked.contains(&r.pin_key))
+            .map(|r| r.pin_key.clone())
             .collect();
         if keys.is_empty()
             && let Some(row) = self.selected_row(model)
@@ -2214,7 +2147,7 @@ fn worktree_landing(session: &crate::session::Session, last_w: Option<usize>) ->
 /// Worktree group indices in the order the sidebar DISPLAYS them (home-first
 /// name sort, pins, filter). Alt+↑/↓ steps through this, not the session's
 /// internal order — otherwise switching "skips around" relative to the tree.
-fn sidebar_worktree_order(model: &FrameModel) -> Vec<usize> {
+pub(crate) fn sidebar_worktree_order(model: &FrameModel) -> Vec<usize> {
     model
         .sidebar_rows
         .iter()
@@ -2233,7 +2166,7 @@ fn sidebar_worktree_order(model: &FrameModel) -> Vec<usize> {
 /// slice (not `FrameModel`) so it's directly unit-testable from `build_rows`
 /// output. Live-fallback workspaces (no DB row yet, empty repo path) carry no
 /// `worktree_path` and are skipped: only DB-backed workspaces are switchable.
-fn sidebar_workspace_order(rows: &[crate::sidebar::SidebarRow]) -> Vec<String> {
+pub(crate) fn sidebar_workspace_order(rows: &[crate::sidebar::SidebarRow]) -> Vec<String> {
     rows.iter()
         .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Workspace)
         .filter_map(|r| r.worktree_path.clone())
@@ -2324,7 +2257,7 @@ fn summon_workspace_target(
 }
 
 /// The visible-row index of the active row, or 0.
-fn visible_index_of_active(model: &FrameModel) -> usize {
+pub(crate) fn visible_index_of_active(model: &FrameModel) -> usize {
     model
         .sidebar_rows
         .iter()
@@ -2334,7 +2267,7 @@ fn visible_index_of_active(model: &FrameModel) -> usize {
 }
 
 /// The visible-row index of a workspace's header row (by slug), if present.
-fn visible_index_of_workspace(model: &FrameModel, slug: &str) -> Option<usize> {
+pub(crate) fn visible_index_of_workspace(model: &FrameModel, slug: &str) -> Option<usize> {
     model
         .sidebar_rows
         .iter()
@@ -12628,9 +12561,18 @@ async fn event_loop<T: Terminal>(
                         {
                             sb.cursor = idx;
                             if m.modifiers.contains(Modifiers::CTRL) {
-                                // Ctrl+click: toggle the multi-select mark.
-                                if !sb.marked.remove(&idx) {
-                                    sb.marked.insert(idx);
+                                // Ctrl+click: toggle the multi-select mark by the
+                                // row's stable identity (only markable rows).
+                                if let Some(key) = model
+                                    .sidebar_rows
+                                    .iter()
+                                    .filter(|r| r.visible)
+                                    .nth(idx)
+                                    .filter(|r| r.is_markable())
+                                    .map(|r| r.pin_key.clone())
+                                    && !sb.marked.remove(&key)
+                                {
+                                    sb.marked.insert(key);
                                 }
                                 sb.sync(&mut model);
                             } else {
@@ -14828,6 +14770,13 @@ async fn event_loop<T: Terminal>(
                             // Width recompute is handled by the reconciliation
                             // block before the relayout gate.
                             need_relayout = true;
+                            dirty = true;
+                            continue;
+                        }
+                        SidebarOutcome::ReorderSelection { up } => {
+                            if sb.reorder_selection(&mut model, &mut session, up) {
+                                need_relayout = true;
+                            }
                             dirty = true;
                             continue;
                         }
