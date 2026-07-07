@@ -41,6 +41,7 @@ mod font;
 mod forward;
 mod gitmut;
 mod handlers;
+mod hibernator;
 mod host_flow;
 mod host_provision;
 mod host_ui;

@@ -1168,10 +1168,12 @@ pub(crate) fn build_model(
         &app_cfg.lifecycle,
     );
     // Self-throttled housekeeping (network/DB on own threads): VPS leak
-    // reaper + placement engine (sweep, scale-down, queue nudges).
+    // reaper + placement engine (sweep, scale-down, queue nudges) + the
+    // hibernator (snapshot-then-destroy for idle billed-while-existing VMs).
     crate::vps_reaper::tick(&app_cfg);
     crate::fly_reaper::tick(&app_cfg);
     crate::placement_flow::maintain_tick(&app_cfg);
+    crate::hibernator::tick(session, &app_cfg);
     let loc_count = worktree_loc(db, &cwd);
 
     // Terse placement kind (ssh/mosh/k8s/<provider>) for the active worktree's
