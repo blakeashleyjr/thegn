@@ -23,6 +23,7 @@ pub mod projection;
 pub mod provider;
 pub mod revtunnel;
 pub mod share;
+pub mod snapshot;
 pub mod ssh;
 pub mod vpn;
 pub mod vps;
