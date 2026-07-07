@@ -110,6 +110,7 @@ pub mod spillover;
 pub mod ssh_creds;
 pub mod startup;
 pub mod store;
+pub mod syncstate;
 pub mod termcaps;
 #[cfg(test)]
 mod testenv;
