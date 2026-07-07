@@ -1790,7 +1790,9 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # [host.gpu-box]
 # reach = "ssh"                # ssh | iroh | cloud | local
 # image = ""                   # base-image override (name[:tag][@sha256:…]);
-#                              #   empty = the built-in superzej-sandbox base
+#                              #   empty = your LOCAL sandbox base ([sandbox]
+#                              #   image, else debian:stable), transferred to
+#                              #   the host — so a plain [host.*] works OOTB
 # install_runtime = "ask"      # never | ask | auto — consent for installing
 #                              #   podman on the machine; NEVER silent. `ask`
 #                              #   raises a confirm modal (or `host provision --yes`);

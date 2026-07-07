@@ -42,8 +42,9 @@ config_enum! {
 #[serde(default)]
 pub struct HostConfig {
     pub reach: HostReach,
-    /// Base image override (`name[:tag][@sha256:…]`); empty ⇒ the built-in
-    /// multi-arch base ([`crate::image::DEFAULT_BASE_IMAGE`]).
+    /// Base image override (`name[:tag][@sha256:…]`); empty ⇒ the LOCAL sandbox
+    /// base (`[sandbox] image`, else the built-in `debian:stable`), transferred
+    /// to the host — see [`Config::default_host_image`].
     pub image: String,
     pub install_runtime: InstallConsent,
     /// Delivery preference order (names per [`DeliveryCap::parse`]); empty ⇒
@@ -150,15 +151,15 @@ fn default_volumes() -> Vec<VolumeSpec> {
     VolumeSpec::from_names(&["nix-store".into(), "cargo".into()])
 }
 
-fn parse_image(name: &str, raw: &str) -> ImageRef {
+fn parse_image(name: &str, raw: &str, default: &ImageRef) -> ImageRef {
     if raw.trim().is_empty() {
-        return ImageRef::default_base();
+        return default.clone();
     }
     match ImageRef::parse(raw) {
         Ok(r) => r,
         Err(e) => {
             config_warn(&format!("[host.{name}] image: {e}; using the default base"));
-            ImageRef::default_base()
+            default.clone()
         }
     }
 }
@@ -346,6 +347,23 @@ pub fn parse_host_target(
 }
 
 impl Config {
+    /// The base image a host delivers when `[host.<n>] image` is unset (or
+    /// unparseable): the **local** sandbox base — `[sandbox] image` if set,
+    /// else the built-in `debian:stable` — so a plain `[host.*]` mirrors your
+    /// local environment onto the remote (the delivery step transfers it) and
+    /// works out of the box, rather than depending on a separately-published
+    /// registry image.
+    fn default_host_image(&self) -> ImageRef {
+        let raw = self.sandbox.image.trim();
+        let src = if raw.is_empty() {
+            crate::sandbox::DEFAULT_OCI_IMAGE
+        } else {
+            raw
+        };
+        // `[sandbox] image` is already validated at load; fall back defensively.
+        ImageRef::parse(src).unwrap_or_else(|_| ImageRef::default_base())
+    }
+
     /// The binding for a named `[host.<name>]` entry. `None` when undefined or
     /// (with a warning) misconfigured for its reach.
     pub fn host_binding(&self, name: &str) -> Option<HostBinding> {
@@ -407,7 +425,7 @@ impl Config {
             id,
             reach,
             consent: hc.install_runtime,
-            image: parse_image(name, &hc.image),
+            image: parse_image(name, &hc.image, &self.default_host_image()),
             volumes: parse_volumes(name, &hc.volumes),
             delivery_prefs: parse_delivery(name, &hc.delivery),
             probe_ttl_secs: if hc.probe_ttl_secs == 0 {
@@ -451,7 +469,7 @@ impl Config {
                     id: HostId::anon_ssh(&p.host, p.port),
                     reach: Reach::Ssh(p),
                     consent: InstallConsent::Never,
-                    image: ImageRef::default_base(),
+                    image: self.default_host_image(),
                     volumes: default_volumes(),
                     delivery_prefs: Vec::new(),
                     probe_ttl_secs: DEFAULT_PROBE_TTL_SECS,
@@ -525,7 +543,9 @@ mod tests {
         );
         assert_eq!(b.probe_ttl_secs, 60);
         assert_eq!(b.volumes.len(), 2, "absent volumes ⇒ default set");
-        assert_eq!(b.image.name_tag(), crate::image::DEFAULT_BASE_IMAGE);
+        // Unset `[host.*] image` ⇒ the local sandbox base (here the built-in
+        // debian, since no `[sandbox] image` is set), transferred to the host.
+        assert_eq!(b.image.name_tag(), crate::sandbox::DEFAULT_OCI_IMAGE);
     }
 
     #[test]
@@ -734,8 +754,30 @@ mod tests {
         );
         assert_eq!(
             cfg.host_binding("b").unwrap().image.name_tag(),
-            crate::image::DEFAULT_BASE_IMAGE,
-            "unparseable override warns + uses default"
+            crate::sandbox::DEFAULT_OCI_IMAGE,
+            "unparseable override warns + uses the local sandbox base"
+        );
+    }
+
+    #[test]
+    fn unset_host_image_follows_the_local_sandbox_base() {
+        // "Transfer the local system": an unset `[host.*] image` follows the
+        // local `[sandbox] image` (which delivery then transfers to the remote),
+        // not a separately-published registry ref.
+        let cfg = cfg_from(
+            "[sandbox]\nimage = \"ghcr.io/me/dev-base:v9\"\n\
+             [host.x]\nreach = \"ssh\"\n[host.x.ssh]\nhost = \"me@box\"\n",
+        );
+        assert_eq!(
+            cfg.host_binding("x").unwrap().image.name_tag(),
+            "ghcr.io/me/dev-base:v9"
+        );
+        // No `[sandbox] image` ⇒ the built-in debian base (pullable, works OOTB),
+        // and the same for an inline-ssh env with no `[host.*]`.
+        let plain = cfg_from("[host.y]\nreach = \"ssh\"\n[host.y.ssh]\nhost = \"me@box\"\n");
+        assert_eq!(
+            plain.host_binding("y").unwrap().image.name_tag(),
+            crate::sandbox::DEFAULT_OCI_IMAGE
         );
     }
 
