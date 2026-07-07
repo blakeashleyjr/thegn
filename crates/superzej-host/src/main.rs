@@ -120,6 +120,7 @@ mod testkit;
 mod toast;
 mod vps_bridge;
 mod vps_reaper;
+mod warmcache;
 mod wire;
 mod wizard;
 mod workspace_create;

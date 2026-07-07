@@ -31,6 +31,7 @@ mod db_account;
 mod db_aux;
 mod db_cache;
 pub mod db_compute;
+mod db_glyph;
 mod db_intent;
 pub mod db_migrate;
 mod db_notification;
