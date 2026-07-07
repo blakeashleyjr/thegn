@@ -11,8 +11,8 @@
 //!   [`machines::SSHD_INIT`] brings up sshd with superzej's managed key on a
 //!   `tcp/22` service. Destroy deletes the app (cascading the machine + IP).
 //! - **Reachability** — plain ssh to the app's IPv4:22, so exec/files reuse the
-//!   VPS [`ssh_shim`](crate::vps::ssh_shim) and the leak-safety
-//!   [`registry`](crate::vps::registry) **verbatim**. No WireGuard, no vendor CLI.
+//!   VPS [`crate::vps::ssh_shim`] and the leak-safety
+//!   [`crate::vps::registry`] **verbatim**. No WireGuard, no vendor CLI.
 //!
 //! A Fly machine is a real Firecracker VM (its own kernel), so the standard
 //! provisioning pipeline — nix, direnv, **docker** (with the `vfs` storage driver
@@ -85,9 +85,27 @@ pub struct FlySpec {
     /// Managed private key path + its OpenSSH public line (as for the VPS shim).
     pub key_path: std::path::PathBuf,
     pub pubkey: String,
+    /// Optional iroh call-home injection: when `Some`, the created machine gets
+    /// the three `SUPERZEJ_*` env vars the baked `sz-agent` reads on boot to dial
+    /// home over iroh. `None` ⇒ today's ssh/IPv4-only behavior, unchanged.
+    pub iroh: Option<IrohInject>,
     /// Test hook: skip the post-create ssh-readiness wait. Never set outside tests.
     #[doc(hidden)]
     pub skip_ready_wait: bool,
+}
+
+/// The three iroh call-home values injected into a Fly machine's environment so
+/// the baked `sz-agent` (see `nix/fly-sandbox-image.nix`) can reach the
+/// compositor. The env-var *keys* come from `superzej_core::iroh_wire`; these are
+/// the per-sandbox *values* the host mints at provision time.
+#[derive(Debug, Clone)]
+pub struct IrohInject {
+    /// The compositor's stable home EndpointId (the agent's dial target).
+    pub home_node: String,
+    /// This sandbox's minted, short-lived auth token.
+    pub sandbox_auth: String,
+    /// Which sandbox the agent serves (the home registry key).
+    pub sandbox_id: String,
 }
 
 impl FlySpec {
@@ -450,6 +468,7 @@ impl RemoteProvider for FlyProvider {
                 &self.spec.pubkey,
                 &self.spec.metadata(),
                 self.spec.is_prebaked(),
+                self.spec.iroh.as_ref(),
             );
             let created = self
                 .post_json(&machines::machines_url(&base, &app), &body)
@@ -574,6 +593,7 @@ mod tests {
             max_lifetime_secs: 0,
             key_path: "/k".into(),
             pubkey: "ssh-ed25519 A".into(),
+            iroh: None,
             skip_ready_wait: true,
         }
     }

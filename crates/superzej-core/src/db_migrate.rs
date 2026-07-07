@@ -248,6 +248,26 @@ pub(crate) fn additive_schema(conn: &Connection) {
          )",
         [],
     );
+    // v39: worktrees whose provider compute was (or is being) snapshot-then-
+    // destroyed. Intent-ordered like the VPS ledger: 'capturing' BEFORE the
+    // capture starts, 'hibernated' only after the snapshot verified into the
+    // [lifecycle.snapshot] store (then destroy), 'restoring' while a re-open
+    // replays it. A 'hibernated' row + a live instance means a crash
+    // interrupted the destroy — the hibernator re-verifies and finishes.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS worktree_hibernations (
+           worktree_path TEXT PRIMARY KEY,
+           repo_path     TEXT NOT NULL,
+           env_name      TEXT NOT NULL,
+           sandbox_name  TEXT NOT NULL,
+           snapshot_id   TEXT NOT NULL,
+           head          TEXT,
+           state         TEXT NOT NULL,
+           created_at    INTEGER NOT NULL,
+           updated_at    INTEGER NOT NULL
+         )",
+        [],
+    );
     let _ = conn.execute(
         "ALTER TABLE worktrees ADD COLUMN provider_sandbox_id TEXT",
         [],

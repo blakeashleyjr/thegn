@@ -29,6 +29,9 @@ superzej-metrics.workspace = true
 superzej-media.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+# CSPRNG for the iroh home secret key + per-sandbox auth tokens (src/iroh_home.rs).
+getrandom = "0.3"
+iroh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # `config show` round-trips the effective config as TOML; `config schema` emits
@@ -85,3 +88,4 @@ toml_edit = "0.25.12"
 # that measures `w` paints exactly `w` columns) and the compositor border clamp
 # (never advance a wide cell past a pane's content rect into the card border).
 unicode-width = "0.2"
+sha2 = "0.10"

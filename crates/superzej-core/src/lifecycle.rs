@@ -269,6 +269,53 @@ pub fn decide_pool(
     PoolAction { create, destroy }
 }
 
+/// One CLAIMED worktree sandbox's inputs to the hibernation decision
+/// (snapshot-then-destroy for compute that bills while it exists — see
+/// `[lifecycle] hibernate_after_secs`). Distinct from [`WarmCandidate`]:
+/// suspend is instant to undo, hibernate costs a full re-provision, so the
+/// gates here are strict and the TTL is expected to be much longer.
+#[derive(Debug, Clone)]
+pub struct HibernateCandidate {
+    pub worktree: String,
+    /// The focused/active worktree is never hibernated.
+    pub is_active: bool,
+    /// A live interactive pane holds the sandbox (never destroy under it).
+    pub has_pane: bool,
+    /// Genuine in-sandbox activity (dev server / agent still working).
+    pub busy: bool,
+    /// Seconds since this worktree was last active.
+    pub idle_secs: u64,
+    /// Env-resolved eligibility: `hibernate` mode on + provider has the file
+    /// API the capture needs + remote placement (the host resolves all that).
+    pub hibernate_enabled: bool,
+    /// Idle TTL for this candidate's env (per-env override or the global);
+    /// `0` disables hibernation for it.
+    pub after_secs: u64,
+    /// A hibernation row already exists (mid-capture, destroyed, or
+    /// restoring) — never start another cycle on top of it.
+    pub already_hibernated: bool,
+}
+
+/// The worktrees whose sandboxes should hibernate NOW: eligible, not
+/// active/pane-held/busy, not already in a hibernation cycle, and idle at
+/// least their TTL. Pure — the host re-checks the volatile gates (pane,
+/// busy) again under the sandbox lock before acting.
+pub fn decide_hibernate(cands: &[HibernateCandidate]) -> Vec<String> {
+    cands
+        .iter()
+        .filter(|c| {
+            c.hibernate_enabled
+                && !c.already_hibernated
+                && !c.is_active
+                && !c.has_pane
+                && !c.busy
+                && c.after_secs > 0
+                && c.idle_secs >= c.after_secs
+        })
+        .map(|c| c.worktree.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,5 +655,61 @@ mod tests {
         };
         let d = decide(&input);
         assert!(d.suspend.is_empty(), "no-op for already-suspended");
+    }
+
+    fn hib(name: &str) -> HibernateCandidate {
+        // An eligible, long-idle candidate; each test flips one gate.
+        HibernateCandidate {
+            worktree: name.into(),
+            is_active: false,
+            has_pane: false,
+            busy: false,
+            idle_secs: 7200,
+            hibernate_enabled: true,
+            after_secs: 3600,
+            already_hibernated: false,
+        }
+    }
+
+    #[test]
+    fn hibernate_picks_only_idle_eligible_candidates() {
+        let cands = vec![hib("/a"), hib("/b")];
+        assert_eq!(decide_hibernate(&cands), vec!["/a", "/b"]);
+    }
+
+    #[test]
+    fn hibernate_every_gate_blocks_independently() {
+        for flip in [
+            &mut |c: &mut HibernateCandidate| c.is_active = true,
+            &mut |c: &mut HibernateCandidate| c.has_pane = true,
+            &mut |c: &mut HibernateCandidate| c.busy = true,
+            &mut |c: &mut HibernateCandidate| c.hibernate_enabled = false,
+            &mut |c: &mut HibernateCandidate| c.already_hibernated = true,
+            &mut |c: &mut HibernateCandidate| c.after_secs = 0,
+            &mut |c: &mut HibernateCandidate| c.idle_secs = 0,
+        ] as [&mut dyn FnMut(&mut HibernateCandidate); 7]
+        {
+            let mut c = hib("/wt");
+            flip(&mut c);
+            assert!(
+                decide_hibernate(&[c.clone()]).is_empty(),
+                "gate failed to block: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hibernate_ttl_boundary_is_inclusive_and_per_candidate() {
+        let mut at = hib("/at"); // idle == ttl ⇒ hibernate
+        at.idle_secs = 3600;
+        let mut under = hib("/under"); // one second short ⇒ keep
+        under.idle_secs = 3599;
+        let mut custom = hib("/custom"); // per-env shorter TTL wins
+        custom.after_secs = 100;
+        custom.idle_secs = 100;
+        assert_eq!(
+            decide_hibernate(&[at, under, custom]),
+            vec!["/at", "/custom"]
+        );
     }
 }

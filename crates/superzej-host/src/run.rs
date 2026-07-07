@@ -703,7 +703,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // the first frame; the config fs-watch re-resolves it live.
     crate::chrome::set_palette(cfg.palette());
     crate::seg::set_undercurl_supported(resolve_undercurl(&cfg));
-    crate::caps::install(resolve_termcaps_with_probe(&cfg, term_probe.as_ref()));
+    crate::caps::install_themed(&cfg, resolve_termcaps_with_probe(&cfg, term_probe.as_ref()));
     crate::center::PANE_HPAD.store(
         cfg.theme.pane_padding as usize,
         std::sync::atomic::Ordering::Relaxed,
@@ -1418,7 +1418,6 @@ impl SidebarState {
             &model.sidebar_db_worktrees,
             &model.sidebar_db_folders,
             &model.sidebar_db_terminals,
-            &model.panel.hosts,
         );
         // Drop marks whose row is gone (deleted worktree/workspace). Keep marks
         // whose row exists but is hidden by a collapsed parent, so re-expanding
@@ -2010,6 +2009,11 @@ fn activate_row_target(
     // aren't in `model.sidebar_status` yet — without this the git glyphs blank
     // out until the ~1s refresh ticker fires).
     let mut workspace_switched = false;
+    // Set when this activation adds a *new* group to the session (the lazy
+    // terminal-materialize arm below). Only then does the layout structurally
+    // change and warrant the heavyweight `persist_session_layout`; a plain
+    // tab/worktree activation is a pure focus move and persists cheaply.
+    let mut structural = false;
     match target {
         crate::sidebar::RowTarget::Tab(gi, ti) => {
             if gi >= session.worktrees.len() {
@@ -2048,6 +2052,7 @@ fn activate_row_target(
                 });
                 session.active = session.worktrees.len() - 1;
                 *need_relayout = true;
+                structural = true;
             }
         }
         crate::sidebar::RowTarget::Workspace { repo_path, group } => {
@@ -2085,10 +2090,17 @@ fn activate_row_target(
     }
     refresh_tab_model(model, session, sb);
     sync_drawer_persistence(session, panes, drawer, pool, home, cfg, center);
-    // Persist the new active worktree/tab so it survives a non-graceful exit
-    // (the Workspace arm already persisted via switch_to_workspace; this also
-    // covers the in-workspace Tab arm and is cheap/idempotent).
-    persist_session_layout(session, panes);
+    // Persist the new active worktree/tab so it survives a non-graceful exit.
+    // Only a structural change (the terminal-materialize arm, which pushes a
+    // new group) needs the full layout rewrite; the Workspace arm already
+    // persisted its full layout inside `switch_workspace`, and the in-workspace
+    // Tab arm is a pure focus move — both just need the cheap, off-loop
+    // active-pointer write so sidebar activation never blocks a frame.
+    if structural {
+        persist_session_layout(session, panes);
+    } else {
+        persist_active_focus(session);
+    }
     workspace_switched
 }
 
@@ -2678,8 +2690,8 @@ pub(crate) fn delete_groups(
                         // git is the source of truth, but `git worktree remove` leaves the
                         // dir behind if it ever fails (locked, detached, prune races); a
                         // lingering dir is re-adopted on the next launch and looks like a
-                        // failed delete. Make sure the directory is actually gone.
-                        let _ = std::fs::remove_dir_all(&path_clone);
+                        // failed delete. Purge it — locally AND on the remote box.
+                        superzej_core::worktree::purge_worktree_files(Path::new(&path_clone));
                     }
                     let _ = waker.wake();
                 });
@@ -2695,7 +2707,7 @@ pub(crate) fn delete_groups(
                     }
                 }
                 if !keep_files {
-                    let _ = std::fs::remove_dir_all(&path);
+                    superzej_core::worktree::purge_worktree_files(Path::new(&path));
                 }
             }
         }
@@ -2778,7 +2790,7 @@ fn remove_workspace(
         let root = Path::new(repo_path);
         for path in &worktree_dirs {
             superzej_core::worktree::remove(root, Path::new(path), "", false);
-            let _ = std::fs::remove_dir_all(path);
+            superzej_core::worktree::purge_worktree_files(Path::new(path));
         }
     }
 
@@ -3777,6 +3789,9 @@ pub(crate) enum HostInputKind {
     /// File the active worktree into a new folder named by the typed value
     /// (the "＋ New folder…" path of the move-to-folder picker).
     FileWorktreeNewFolder,
+    /// Add a `[host.*]` machine from typed input in the System ▸ Hosts panel
+    /// (`n`) and refresh; no worktree wizard, unlike [`Self::NewHost`].
+    AddHost,
 }
 
 // `begin_worktree_wizard` lives in `handlers::wizard` (extracted from this
@@ -5635,10 +5650,13 @@ fn spawn_test_discovery(
 
 /// Load cached test state for a worktree and detect its task if none is known.
 /// Reading only — never spawns a run (no auto-run).
+/// Load cached test state; `detect` runs the `detect_test_task` FS scan only when
+/// needed (D2: the per-switch caller passes `false` to keep that scan off the loop).
 fn sync_tests_for_worktree(
     ui: &mut crate::panel::PanelUi,
     worktree: &std::path::Path,
     cfg: &superzej_core::config::Config,
+    detect: bool,
 ) {
     let key = worktree.to_string_lossy();
     if let Some(cache) = superzej_core::db::Db::open()
@@ -5648,7 +5666,7 @@ fn sync_tests_for_worktree(
     {
         ui.tests.apply_cache(cache);
     }
-    if ui.tests.task.is_none() {
+    if detect && ui.tests.task.is_none() {
         ui.tests.task = crate::task::detect_test_task(worktree, cfg);
     }
 }
@@ -5905,7 +5923,7 @@ fn maybe_discover_tests(
     sem: std::sync::Arc<tokio::sync::Semaphore>,
 ) {
     let wt = active_tab_path(session);
-    sync_tests_for_worktree(ui, &wt, cfg);
+    sync_tests_for_worktree(ui, &wt, cfg, true); // entering Tests → detect now
     // Skip discovery when a prior run/discovery already covered this manifest
     // state: a fresh fingerprint match means nothing relevant changed, so reuse
     // the cache and spawn no subprocess at all.
@@ -6574,6 +6592,33 @@ pub(crate) fn persist_session_layout(session: &mut crate::session::Session, pane
     if let Ok(db) = superzej_core::db::Db::open() {
         let _ = session.persist(&db, &session.id, now_secs());
     }
+}
+
+/// Persist a pure focus change (worktree/tab switch) without blocking the loop.
+///
+/// A switch is structurally a no-op — only the active pointer moved — so it
+/// must NOT trigger the heavyweight `persist_session_layout` (whole-session
+/// scrollback capture + full layout rewrite + a DB open/write/checkpoint-fsync,
+/// all on the loop, cost scaling with session size: ~500ms in a debug build on
+/// a populated session). Instead we record just the active-tab pointer, and do
+/// even that off the event loop on `spawn_blocking` so rapid Alt+↑/↓ never
+/// stalls a frame. Best-effort: the DB is a cache and shutdown re-persists the
+/// full layout, so a dropped write only means a slightly stale restore point.
+pub(crate) fn persist_active_focus(session: &crate::session::Session) {
+    let sid = session.id.clone();
+    let Some(name) = session
+        .worktrees
+        .get(session.active)
+        .map(|g| g.name.clone())
+    else {
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        // off-loop: inside spawn_blocking
+        if let Ok(db) = superzej_core::db::Db::open() {
+            let _ = crate::session::Session::persist_active_tab(&db, &sid, &name, now_secs());
+        }
+    });
 }
 
 use crate::acp_gate::AgentChannel;
@@ -7948,6 +7993,7 @@ async fn event_loop<T: Terminal>(
     // incremental path (recompose + bounded-diff the two 1-row bar rects) instead
     // of the master `dirty` full-chrome repaint. Cleared after flush.
     let mut bars_dirty = false;
+    let mut sidebar_dirty = false; // D5: sidebar-only damage (nav/collapse); reset with bars_dirty
     // One zone owns the keyboard at any time; Ctrl+g toggles the keybind lock.
     // `sb.focused` / `model.panel_focused` / `model.center_focused` mirror it.
     let mut focus = crate::focus::FocusState::default();
@@ -8223,10 +8269,9 @@ async fn event_loop<T: Terminal>(
     // current (a pre-switch hydration landing post-switch). The startup spawn
     // in `run()` used 0, which this initial value accepts.
     let mut hydration_gen: u64 = 0;
-    // Coalesce model hydrations: at most one main-loop `build_model` (seconds, for
-    // a bridged worktree) in flight, so an fs.watch/ticker storm can't stack
-    // concurrent hydrations that flood the sprite bridge. Mirrors `fold_inflight`.
-    let mut model_hydration_inflight = false;
+    // Coalesce model hydrations: one main-loop `build_model` in flight, so a refresh
+    // storm or rapid-switch burst can't stack them. In-flight gen (not a bool).
+    let mut inflight_hydration_gen: Option<u64> = None;
     let mut model_refresh_pending = false;
     // Input dispatch time; next render measures dispatch→frame latency + drives the input-priority PTY budget.
     let mut input_at: Option<std::time::Instant> = None;
@@ -8486,7 +8531,7 @@ async fn event_loop<T: Terminal>(
             // Load this worktree's cached test state (most-recent status) so the
             // Tests tab shows it instantly; discovery stays lazy (on tab open).
             panel_ui.tests = crate::panel::TestPanelState::default();
-            sync_tests_for_worktree(&mut panel_ui, &current_worktree, keymap.config());
+            sync_tests_for_worktree(&mut panel_ui, &current_worktree, keymap.config(), false); // D2: no scan on switch
             loaded_tests_worktree = current_worktree.to_string_lossy().into_owned();
             // Immediate hydrate for the newly-focused worktree. Paint this
             // worktree's last-known panel from the cache (seeded by prior visits
@@ -8545,13 +8590,8 @@ async fn event_loop<T: Terminal>(
                 expanded: panel_ui.width.is_expanded(),
                 profile: current_config.profile.clone(),
             };
-            spawn_model_hydration(
-                model_tx.clone(),
-                hydration_gen,
-                session.clone(),
-                Some(waker.clone()),
-                hints.clone(),
-            );
+            // D1: coalesce rapid switches — the gate hydrates only the settled worktree.
+            model_refresh_pending = true;
             // Warm the worktrees above/below the selection into the cache so a
             // follow-on switch to a neighbor is instant too. Skip ones already
             // cached — the on-switch hydration refreshes them when truly focused.
@@ -10201,11 +10241,14 @@ async fn event_loop<T: Terminal>(
         let mut pending_focus: Option<superzej_core::store::IntentRow> = None;
         while let Ok((generation, mut next_model)) = model_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Model);
+            // In-flight hydration landed — clear the gate (before the stale-check so
+            // a switch that bumped `hydration_gen` mid-flight can't strand it).
+            if Some(generation) == inflight_hydration_gen {
+                inflight_hydration_gen = None;
+            }
             if generation != hydration_gen {
                 continue;
             }
-            // Latest hydration landed — clear the gate (see the spawn guard below).
-            model_hydration_inflight = false;
             // `superzej open` intents ride the hydration result (claimed from
             // the DB mailbox off-loop); take them out before the model swap —
             // last one wins, applied after the drain below.
@@ -10952,7 +10995,7 @@ async fn event_loop<T: Terminal>(
                     // Live theme reload: colors apply on the next repaint.
                     crate::chrome::set_palette(new_cfg.palette());
                     crate::seg::set_undercurl_supported(resolve_undercurl(&new_cfg));
-                    crate::caps::install(resolve_termcaps(&new_cfg));
+                    crate::caps::install_themed(&new_cfg, resolve_termcaps(&new_cfg));
                     wire_renderer.set_depth(crate::caps::color_depth());
                     crate::center::PANE_HPAD.store(
                         new_cfg.theme.pane_padding as usize,
@@ -11050,9 +11093,9 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
             }
         }
-        // One hydration in flight; refreshes during it coalesce into `pending`.
+        // One hydration in flight; refreshes (incl. switches) coalesce into `pending`.
         model_refresh_pending |= want_model_refresh;
-        if model_refresh_pending && !model_hydration_inflight {
+        if model_refresh_pending && inflight_hydration_gen.is_none() {
             hydration_gen += 1;
             spawn_model_hydration(
                 model_tx.clone(),
@@ -11065,7 +11108,7 @@ async fn event_loop<T: Terminal>(
                     profile: current_config.profile.clone(),
                 },
             );
-            model_hydration_inflight = true;
+            inflight_hydration_gen = Some(hydration_gen);
             model_refresh_pending = false;
         }
         if want_pr_refresh {
@@ -11501,7 +11544,8 @@ async fn event_loop<T: Terminal>(
         // 2. Render if anything changed (diff-flush): damaged panes and/or chrome,
         //    cursor in the focused pane. `dirty` = chrome/overlay/geometry channel;
         //    `dirty_panes` = per-pane content; either (or `full_repaint`) → a frame.
-        let should_render = dirty || full_repaint || !dirty_panes.is_empty() || bars_dirty;
+        let should_render =
+            dirty || full_repaint || !dirty_panes.is_empty() || bars_dirty || sidebar_dirty;
         if !should_render {
             // Woke but nothing changed — a wasted wakeup (storm signal).
             loop_perf.render_skip();
@@ -11618,6 +11662,7 @@ async fn event_loop<T: Terminal>(
                 chrome: dirty,
                 panes: dirty_panes.clone(),
                 bars: bars_dirty,
+                sidebar: sidebar_dirty,
             };
             let frame_plan = crate::render_plan::plan(&damage, &overlays);
             // Diagnostic: when a FULL frame is chosen, record which damage
@@ -11743,19 +11788,16 @@ async fn event_loop<T: Terminal>(
             } else if let crate::render_plan::RenderPlan::Incremental {
                 panes: ref ids,
                 bars,
+                sidebar,
             } = frame_plan
             {
-                // INCREMENTAL FAST PATH: pane output and/or a bars (stats/clock)
-                // tick, nothing heavier. Reuse the prior frame in `scratch` and
-                // recompose ONLY the damaged regions — never the full chrome (the
-                // dominant per-frame cost). The bounded diff below then scans just
-                // these rects, so a frame's cost tracks what changed, not the
-                // screen size.
+                // INCREMENTAL FAST PATH: pane output / bars tick / sidebar nav.
+                // Reuse the prior frame in `scratch`, recompose ONLY the damaged
+                // regions (never the full chrome); the bounded diff scans just those.
                 let frames = tree.layout_framed(chrome.center);
                 for &id in ids {
-                    // The corner overlay is an off-tree pane: compose its content
-                    // + card and diff ONLY its outer rect. This keeps a streaming
-                    // video frame a bounded one-rect diff (never a chrome recompose).
+                    // The corner overlay is an off-tree pane: compose its content +
+                    // card and diff ONLY its outer rect (bounded, never a recompose).
                     if Some(id) == corner {
                         if let Some(outer) = compose_corner(
                             &mut scratch,
@@ -11771,10 +11813,8 @@ async fn event_loop<T: Terminal>(
                         }
                         continue;
                     }
-                    // (rect to compose, rect to diff, has a card ring). A framed
-                    // pane composes its content but diffs the *frame* rect so the
-                    // repainted border ring is scanned; the drawer has no card, so
-                    // it composes + diffs its own reserved rect.
+                    // (compose rect, diff rect, has card). A framed pane diffs the
+                    // *frame* rect (border ring); the drawer diffs its reserved rect.
                     let resolved = if let Some(d) = drawer
                         && d == id
                         && let Some(rect) = chrome.drawer
@@ -11786,16 +11826,14 @@ async fn event_loop<T: Terminal>(
                             .find(|(pid, _, _)| *pid == id)
                             .map(|(_, f, c)| (*c, *f, true))
                     };
-                    // A pane awaiting relaunch is a husk with no live process, so
-                    // it never enters `dirty_panes` — no relaunch overlay needed.
+                    // A husk pane awaiting relaunch never enters `dirty_panes`.
                     if let (Some((content, diff_rect, has_card)), Some(p)) =
                         (resolved, panes.table.get(&id))
                     {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
                         if has_card {
-                            // Repaint the card so pane output that lands a wide
-                            // glyph at the edge can't nibble the border `│`; the
-                            // frame rect (pushed below) makes the diff cover it.
+                            // Repaint the card so an edge wide-glyph can't nibble the
+                            // border `│`; the frame rect (below) makes the diff cover it.
                             crate::chrome::redraw_pane_card(
                                 &mut scratch,
                                 &frames,
@@ -11809,17 +11847,19 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 if bars {
-                    // Stats/clock/AI-metrics changed: recompose just the two 1-row
-                    // bars over the reused scratch. They're rect-contained and
-                    // disjoint from the center/sidebar/panel, so nothing else is
-                    // stomped. Reflect the live app-tab strip first (the masthead
-                    // chips read it; the full path does the same below).
+                    // Stats/clock tick: recompose just the two 1-row bars (disjoint
+                    // from center/sidebar/panel). Reflect the app-tab strip first.
                     model.app_tabs = app_host.tab_labels();
                     model.active_app = app_host.active_tab_index();
                     crate::chrome::draw_masthead(&mut scratch, &chrome, &model);
                     crate::chrome::draw_statusbar(&mut scratch, chrome.statusbar, &model);
                     pane_diff_rects.push(chrome.masthead);
                     pane_diff_rects.push(chrome.statusbar);
+                }
+                if sidebar && let Some(sb) = chrome.sidebar {
+                    // D5: recompose just the sidebar rect (disjoint from panel/center).
+                    crate::chrome::draw_sidebar(&mut scratch, sb, &model);
+                    pane_diff_rects.push(sb);
                 }
             } else {
                 crate::chrome::clear_frame(&mut scratch);
@@ -12234,6 +12274,7 @@ async fn event_loop<T: Terminal>(
             // Pane/bars damage is now on screen; an untouched next wake renders nothing.
             dirty_panes.clear();
             bars_dirty = false;
+            sidebar_dirty = false;
             if muse_ready {
                 crate::frame_write::emit_muse_ready_marker(buf, &mut pending_input);
             }
@@ -13041,21 +13082,19 @@ async fn event_loop<T: Terminal>(
                                 let _ = tx.send(wizard::WizardCmd::PrepChosen { env, sandbox });
                             }
                         }
-                        wizard::WizardOutcome::AddHost => {
-                            let root = w.root().clone();
-                            if let Some(tx) = wizard_cmd_tx.take() {
-                                let _ = tx.send(wizard::WizardCmd::Cancel);
-                            }
-                            wizard_ui = None;
-                            creating = None;
-                            create_gen += 1;
-                            host_input = Some((
-                                menu::InputOverlay::new(
-                                    "add host — user@host[:port], or dumbpipe:<ticket> <user>",
-                                    "",
-                                ),
-                                HostInputKind::NewHost { repo_root: root },
-                            ));
+                        outcome @ (wizard::WizardOutcome::AddHost
+                        | wizard::WizardOutcome::SetupEnv(_)) => {
+                            crate::handlers::wizard::leave_for_setup(
+                                outcome,
+                                keymap.config(),
+                                &mut wizard_cmd_tx,
+                                &mut wizard_ui,
+                                &mut creating,
+                                &mut create_gen,
+                                &mut host_input,
+                                &mut env_wizard_ui,
+                                &mut model,
+                            );
                         }
                         wizard::WizardOutcome::Submit(choices) => {
                             if let wizard::NameChoice::Human(tail) = &choices.name
@@ -13400,6 +13439,13 @@ async fn event_loop<T: Terminal>(
                                             Err(e) => model.status = e,
                                         }
                                     }
+                                    HostInputKind::AddHost => {
+                                        model.status = crate::handlers::host::add_and_refresh(
+                                            &text,
+                                            &mut current_config,
+                                            &refresh_tx,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -13636,20 +13682,13 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
-                            // First-launch keymap picker (item 621): persist the
-                            // choice to ui_state and rebuild the live keymap. Not
-                            // a git op, so handle it before the git dispatch.
+                            // First-launch keymap picker (item 621): persist + rebuild.
                             if let menu::MenuChoice::SetKeymapPreset(preset) = &choice {
-                                if let Ok(db) = superzej_core::db::Db::open() {
-                                    let _ = db.set_ui_state("", "keymap_preset", preset);
-                                }
-                                current_config.keymap_preset = preset.clone();
+                                model.status = crate::handlers::apply_keymap_preset(
+                                    preset,
+                                    &mut current_config,
+                                );
                                 keymap = rebuild_keymap(&current_config, &session);
-                                model.status = if preset == "default" {
-                                    "Keymap: superzej defaults".into()
-                                } else {
-                                    format!("Keymap preset: {preset}")
-                                };
                                 dirty = true;
                                 continue;
                             }
@@ -13659,6 +13698,8 @@ async fn event_loop<T: Terminal>(
                             if let Some(status) = crate::handlers::host::intercept_menu_choice(
                                 &choice,
                                 &mut pending_host_consent,
+                                &current_config,
+                                Some(&host_ui),
                             ) {
                                 model.status = status;
                                 dirty = true;
@@ -14740,7 +14781,8 @@ async fn event_loop<T: Terminal>(
                     match sb.handle_key(&k.key, k.modifiers, &mut model, &session) {
                         SidebarOutcome::NotHandled => { /* fall through to keymap */ }
                         SidebarOutcome::Redraw => {
-                            dirty = true;
+                            sidebar_dirty = true; // D5: damage only sidebar + bars, not full chrome
+                            bars_dirty = true;
                             continue;
                         }
                         SidebarOutcome::Defocus => {
@@ -15884,7 +15926,7 @@ async fn event_loop<T: Terminal>(
                                 _ => TestRun::Failed,
                             };
                             let wt = active_tab_path(&session);
-                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
+                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config(), true);
                             if let Some(base) = panel_ui.tests.task.clone() {
                                 if !panel_ui.tests.running {
                                     let task_spec = test_task_for_run(&panel_ui.tests, kind, base);
@@ -15910,7 +15952,7 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Tests, KeyCode::Char('u')) => {
                             let wt = active_tab_path(&session);
-                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
+                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config(), true);
                             if let Some(task) = panel_ui.tests.task.clone() {
                                 test_generation += 1;
                                 panel_ui.tests.discovering = true;
@@ -16923,18 +16965,18 @@ async fn event_loop<T: Terminal>(
                             }
                             .panel_key(key, panel_ui.cursor)
                         }
-                        // -- hosts (hosts-as-resources): provision (p), re-probe
-                        // (r), grant install (c), forget cached state (x).
+                        // -- hosts: p/r/c/x act on the host; m menu, n add-host.
                         (Section::Hosts, key)
-                            if matches!(key, KeyCode::Char('p' | 'r' | 'c' | 'x')) =>
+                            if matches!(key, KeyCode::Char('p' | 'r' | 'c' | 'x' | 'm' | 'n')) =>
                         {
-                            crate::host_ui::panel_key(
+                            crate::handlers::host::section_key(
                                 key,
                                 panel_ui.cursor,
                                 &mut model,
                                 &current_config,
                                 &host_ui,
                                 &mut active_menu,
+                                &mut host_input,
                             )
                         }
                         // -- environments: bind here (enter), test (t), remove
@@ -17706,7 +17748,7 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     chrome.center,
                                 );
-                                persist_session_layout(&mut session, &panes);
+                                persist_active_focus(&session);
                             }
                             Action::PrevTab => {
                                 session.prev_tab();
@@ -17724,7 +17766,7 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     chrome.center,
                                 );
-                                persist_session_layout(&mut session, &panes);
+                                persist_active_focus(&session);
                             }
                             Action::NextWorktree | Action::PrevWorktree
                                 if active_is_terminal(&session) =>
@@ -17835,7 +17877,7 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     chrome.center,
                                 );
-                                persist_session_layout(&mut session, &panes);
+                                persist_active_focus(&session);
                             }
                             Action::NextWorkspace | Action::PrevWorkspace => {
                                 // One combined ring: the visible workspaces (in
@@ -17910,7 +17952,7 @@ async fn event_loop<T: Terminal>(
                                                     keymap.config(),
                                                     chrome.center,
                                                 );
-                                                persist_session_layout(&mut session, &panes);
+                                                persist_active_focus(&session);
                                             } else if let (Some(target), Ok(db)) =
                                                 (repo_path, superzej_core::db::Db::open())
                                                 && switch_workspace(
@@ -18026,7 +18068,7 @@ async fn event_loop<T: Terminal>(
                                         keymap.config(),
                                         chrome.center,
                                     );
-                                    persist_session_layout(&mut session, &panes);
+                                    persist_active_focus(&session);
                                 } else {
                                     // Entering terminals → the remembered terminal
                                     // if still present, else the first terminal in
@@ -18137,7 +18179,7 @@ async fn event_loop<T: Terminal>(
                                         keymap.config(),
                                         chrome.center,
                                     );
-                                    persist_session_layout(&mut session, &panes);
+                                    persist_active_focus(&session);
                                 }
                             }
                             Action::MoveItemUp | Action::MoveItemDown => {
@@ -18187,39 +18229,19 @@ async fn event_loop<T: Terminal>(
                                             .map(|(_, r)| smart_split_dir(r.cols, r.rows))
                                     })
                                     .unwrap_or(crate::center::Dir::Row);
-                                let cwd = active_cwd(&session);
-                                match spawn_worktree_shell_pane(
-                                    &mut panes,
-                                    keymap.config(),
-                                    cwd.as_deref(),
-                                    chrome.center,
-                                    false,
-                                    None,
-                                    "",
-                                ) {
-                                    Ok(new) => {
-                                        if let Some(tab) = session.active_tab_mut() {
-                                            if tab.center.split(focused, dir, new) {
-                                                tab.focused_pane = new;
-                                                need_relayout = true;
-                                            } else {
-                                                panes.table.remove(&new);
-                                            }
-                                        } else {
-                                            panes.table.remove(&new);
-                                        }
+                                // D4: reserve a placeholder leaf; the active-tab
+                                // materialize opens the shell off-thread (+ surfaces
+                                // any SpecError/halt). No on-loop launch_spec.
+                                let new = panes.reserve_ids(1);
+                                if let Some(tab) = session.active_tab_mut() {
+                                    if tab.center.split(focused, dir, new) {
+                                        tab.focused_pane = new;
+                                        need_relayout = true;
+                                    } else {
+                                        panes.table.remove(&new);
                                     }
-                                    Err(e) => {
-                                        if let Some(h) = sandbox_halt_in(&e) {
-                                            active_menu = Some(sandbox_halt_overlay(h));
-                                            model.status = format!(
-                                                "{} unavailable: {}",
-                                                h.placement, h.reason
-                                            );
-                                        } else {
-                                            model.status = format!("Pane spawn failed: {e}");
-                                        }
-                                    }
+                                } else {
+                                    panes.table.remove(&new);
                                 }
                             }
                             Action::CycleTheme => {
@@ -18378,32 +18400,10 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     crate::center::Dir::Row
                                 };
-                                let cwd = active_cwd(&session);
-                                let new = match spawn_worktree_shell_pane(
-                                    &mut panes,
-                                    keymap.config(),
-                                    cwd.as_deref(),
-                                    chrome.center,
-                                    false,
-                                    None,
-                                    "",
-                                ) {
-                                    Ok(id) => id,
-                                    Err(e) => {
-                                        // Survivable: report, don't exit the loop.
-                                        if let Some(h) = sandbox_halt_in(&e) {
-                                            active_menu = Some(sandbox_halt_overlay(h));
-                                            model.status = format!(
-                                                "{} unavailable: {}",
-                                                h.placement, h.reason
-                                            );
-                                        } else {
-                                            model.status = format!("Pane spawn failed: {e}");
-                                        }
-                                        dirty = true;
-                                        continue;
-                                    }
-                                };
+                                // D4: reserve a placeholder leaf (no on-loop
+                                // launch_spec) — the active-tab materialize opens the
+                                // shell off-thread + surfaces any SpecError/halt.
+                                let new = panes.reserve_ids(1);
                                 if let Some(tab) = session.active_tab_mut() {
                                     if tab.center.split(focused, dir, new) {
                                         tab.focused_pane = new;
@@ -18741,40 +18741,19 @@ async fn event_loop<T: Terminal>(
                                 // placeholder, but pane-0 is the very first shell
                                 // ever spawned, so it already exists and gets
                                 // shared with the new tab if we don't override it.
-                                let cwd = active_cwd(&session);
                                 if let Some(g) = session.active_group_mut() {
                                     g.add_tab();
                                 }
-                                let cfg = keymap.config().clone();
-                                match spawn_worktree_shell_pane(
-                                    &mut panes,
-                                    &cfg,
-                                    cwd.as_deref(),
-                                    chrome.center,
-                                    false,
-                                    None,
-                                    "",
-                                ) {
-                                    Ok(id) => {
-                                        if let Some(tab) = session
-                                            .active_group_mut()
-                                            .and_then(|g| g.active_tab_mut())
-                                        {
-                                            tab.center = crate::center::CenterTree::Leaf(id);
-                                            tab.focused_pane = id;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        if let Some(h) = sandbox_halt_in(&e) {
-                                            active_menu = Some(sandbox_halt_overlay(h));
-                                            model.status = format!(
-                                                "{} unavailable: {}",
-                                                h.placement, h.reason
-                                            );
-                                        } else {
-                                            model.status = format!("new tab spawn failed: {e:#}");
-                                        }
-                                    }
+                                // D4: a fresh reserved leaf (never pane-0) overrides
+                                // the Tab::new Leaf(0) placeholder; the active-tab
+                                // materialize opens the shell off-thread (no on-loop
+                                // launch_spec, no premature bare shell).
+                                let new = panes.reserve_ids(1);
+                                if let Some(tab) =
+                                    session.active_group_mut().and_then(|g| g.active_tab_mut())
+                                {
+                                    tab.center = crate::center::CenterTree::Leaf(new);
+                                    tab.focused_pane = new;
                                 }
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
@@ -19867,7 +19846,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
         );
         // Pinned "lib" workspace floats first; order is by repo path.
         assert_eq!(
@@ -19901,7 +19879,6 @@ mod tests {
             &workspaces,
             &view,
             &crate::sidebar::SidebarStatus::default(),
-            &[],
             &[],
             &[],
             &[],
@@ -19978,7 +19955,6 @@ mod tests {
             &[],
             &[],
             &terminals,
-            &[],
         );
         let ring = unified_ring(&rows, &terminals);
         assert_eq!(
@@ -20044,7 +20020,6 @@ mod tests {
             &[],
             &[],
             &terminals,
-            &[],
         );
         // The old path-based order drops the live fallback entirely.
         assert!(sidebar_workspace_order(&rows).is_empty());

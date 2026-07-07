@@ -751,6 +751,17 @@ async fn relay_exec(
     mut ctrl_rx: tokio_mpsc::Receiver<ExecControl>,
     session_cell: Arc<Mutex<Option<String>>>,
 ) {
+    // If this sandbox has dialed home over the iroh call-home reach, carry its
+    // interactive exec over iroh instead of the underlying provider's transport.
+    // Exec-only — lifecycle/fs still go through the real provider. `Provider::Iroh`
+    // holds the home (not a specific connection), so it survives reconnects.
+    let provider = match crate::iroh_home::current() {
+        Some(home) if home.is_connected(&sandbox_id) => Provider::Iroh {
+            home,
+            sandbox: sandbox_id.clone(),
+        },
+        _ => provider,
+    };
     let wake = || {
         if let Some(w) = &waker {
             let _ = w.wake();

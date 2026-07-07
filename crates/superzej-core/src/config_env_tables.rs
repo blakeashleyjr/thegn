@@ -227,6 +227,14 @@ pub struct EnvProviderConfig {
     /// reaper destroys older ones (a VPS bills until destroyed — there is no
     /// free suspended state). `0` ⇒ no ceiling.
     pub max_lifetime_secs: u64,
+    /// Hibernation (snapshot-then-destroy on idle) for this env's claimed
+    /// sandboxes: `auto` (default — on for commodity VPS, off for
+    /// scale-to-zero providers), `on`, or `off`. See `[lifecycle]`
+    /// `hibernate_after_secs` and `[lifecycle.snapshot]`.
+    pub hibernate: HibernateMode,
+    /// Per-env idle-seconds override before hibernation. `0` ⇒ the global
+    /// `[lifecycle] hibernate_after_secs`.
+    pub hibernate_idle_secs: u64,
 }
 
 impl EnvProviderConfig {
@@ -256,6 +264,8 @@ impl EnvProviderConfig {
             && self.size.is_empty()
             && self.max_instances == 0
             && self.max_lifetime_secs == 0
+            && self.hibernate == HibernateMode::Auto
+            && self.hibernate_idle_secs == 0
     }
 
     /// Whether this env's provider is scale-to-zero (an idle sandbox self-suspends
@@ -264,6 +274,28 @@ impl EnvProviderConfig {
     /// spend.
     pub fn scale_to_zero(&self) -> bool {
         provider_scale_to_zero(&self.provider)
+    }
+
+    /// Whether hibernation (snapshot-then-destroy on idle) applies to this
+    /// env's provider: the explicit `hibernate = on|off` wins; `auto` resolves
+    /// on for commodity VPS (bills while it exists) and off for scale-to-zero
+    /// providers (idle compute already ~free).
+    pub fn hibernate_enabled(&self) -> bool {
+        match self.hibernate {
+            HibernateMode::On => true,
+            HibernateMode::Off => false,
+            HibernateMode::Auto => vps_provider_kind(&self.provider),
+        }
+    }
+
+    /// The idle TTL before hibernation for this env: the per-env override, or
+    /// `global` (`[lifecycle] hibernate_after_secs`) when unset. `0` ⇒ off.
+    pub fn hibernate_idle(&self, global: u64) -> u64 {
+        if self.hibernate_idle_secs > 0 {
+            self.hibernate_idle_secs
+        } else {
+            global
+        }
     }
 
     /// `http-connections`/`max-substitution-jobs` value to use, clamped to a sane
@@ -406,6 +438,30 @@ config_enum! {
     } default = ActiveWorktreePlusNew;
 }
 
+config_enum! {
+    /// Whether an env's claimed sandbox may HIBERNATE when idle: snapshot the
+    /// worktree's git/file state to the durable snapshot store, destroy the
+    /// compute, and transparently recreate + restore on next open.
+    /// - `auto` — on for commodity-VPS providers (they bill while the instance
+    ///   exists, even stopped), off for scale-to-zero providers (idle compute
+    ///   is already ~free there).
+    /// - `on` / `off` — force it either way.
+    pub enum HibernateMode: "hibernate mode" {
+        Auto = "auto", On = "on" | "true", Off = "off" | "false",
+    } default = Auto;
+}
+
+config_enum! {
+    /// Where worktree hibernation snapshots are stored.
+    /// - `local` — a directory on this host (`$XDG_STATE_HOME/superzej/snapshots`
+    ///   unless `dir` overrides it). Zero config, no credentials.
+    /// - `s3` — an S3-compatible bucket (`bucket`/`endpoint`/`region`/`prefix`
+    ///   plus `access_key`/`secret_key` secret refs).
+    pub enum SnapshotBackend: "snapshot backend" {
+        Local = "local" | "fs", S3 = "s3",
+    } default = Local;
+}
+
 /// `[lifecycle]` — budget-governed warm/suspend policy for managed-provider
 /// sandboxes. The defaults are budget-safe: superzej's background sidebar/activity
 /// polling never wakes a suspended sandbox, and idle sandboxes suspend after the
@@ -436,6 +492,15 @@ pub struct LifecycleConfig {
     pub cost_ceiling_per_hour: f64,
     /// Optional warm pool of pre-provisioned spares (`[lifecycle.pool]`).
     pub pool: PoolConfig,
+    /// Idle seconds before an eligible CLAIMED sandbox hibernates: its git/file
+    /// state is snapshotted to the durable store, the compute is destroyed, and
+    /// the next open transparently recreates + restores it. Applies to envs
+    /// whose `hibernate` mode resolves on (default: commodity VPS). `0` ⇒ off
+    /// globally. Deliberately much longer than `idle_ttl_secs`: suspend is
+    /// instant to undo, hibernate costs a re-provision on next open.
+    pub hibernate_after_secs: u64,
+    /// `[lifecycle.snapshot]` — where hibernation snapshots live.
+    pub snapshot: SnapshotStoreConfig,
 }
 
 impl Default for LifecycleConfig {
@@ -451,7 +516,74 @@ impl Default for LifecycleConfig {
             cost_per_warm_hour: 0.0,
             cost_ceiling_per_hour: 0.0,
             pool: PoolConfig::default(),
+            hibernate_after_secs: 3600,
+            snapshot: SnapshotStoreConfig::default(),
         }
+    }
+}
+
+/// `[lifecycle.snapshot]` — the durable store for worktree hibernation
+/// snapshots (git bundle + uncommitted patch + untracked tar per worktree).
+/// Only what those artifacts carry survives a hibernate; everything else on
+/// the VM (build caches, containers, ad-hoc data) is ephemeral by design.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct SnapshotStoreConfig {
+    /// `local` (default, this host's disk) or `s3`.
+    pub backend: SnapshotBackend,
+    /// Local backend: root directory override. Empty ⇒
+    /// `$XDG_STATE_HOME/superzej/snapshots`.
+    pub dir: String,
+    /// Snapshots retained per (repo, worktree, env); older ones are pruned
+    /// after each capture. Clamped to ≥ 1.
+    pub keep: usize,
+    /// Abort a hibernate (keep the VM alive, warn) if any single artifact
+    /// exceeds this many MiB — the guard against tarring a huge untracked
+    /// dataset through memory. `0` ⇒ no ceiling.
+    pub max_artifact_mb: u64,
+    /// S3 backend: bucket name (required for `backend = "s3"`).
+    pub bucket: String,
+    /// S3 backend: endpoint URL for S3-compatible stores (R2, B2, MinIO…).
+    /// Empty ⇒ AWS S3.
+    pub endpoint: String,
+    /// S3 backend: region.
+    pub region: String,
+    /// Key prefix inside the bucket.
+    pub prefix: String,
+    /// Secret ref for the access key id (`env:VAR`, `keyring:<name>`,
+    /// `file:/path`, or a bare env-var name).
+    pub access_key: String,
+    /// Secret ref for the secret access key (same forms as `access_key`).
+    pub secret_key: String,
+}
+
+impl Default for SnapshotStoreConfig {
+    fn default() -> Self {
+        Self {
+            backend: SnapshotBackend::Local,
+            dir: String::new(),
+            keep: 3,
+            max_artifact_mb: 512,
+            bucket: String::new(),
+            endpoint: String::new(),
+            region: "us-east-1".into(),
+            prefix: "superzej".into(),
+            access_key: "env:AWS_ACCESS_KEY_ID".into(),
+            secret_key: "env:AWS_SECRET_ACCESS_KEY".into(),
+        }
+    }
+}
+
+impl SnapshotStoreConfig {
+    /// Retention floor: keeping zero snapshots would make every hibernate
+    /// destroy the only copy of the work it just captured.
+    pub fn keep_clamped(&self) -> usize {
+        self.keep.max(1)
+    }
+
+    /// The per-artifact byte ceiling, `None` when uncapped.
+    pub fn max_artifact_bytes(&self) -> Option<u64> {
+        (self.max_artifact_mb > 0).then(|| self.max_artifact_mb * 1024 * 1024)
     }
 }
 
@@ -487,5 +619,109 @@ impl Default for PoolConfig {
             max_idle_secs: 600,
             recycle: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider_env(name: &str) -> EnvProviderConfig {
+        EnvProviderConfig {
+            provider: name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hibernate_auto_resolves_on_for_vps_off_for_scale_to_zero() {
+        // The whole point: VPS bills while it exists; sprites/fly idle ~free.
+        assert!(provider_env("hetzner").hibernate_enabled());
+        assert!(provider_env("digitalocean").hibernate_enabled());
+        assert!(!provider_env("sprites").hibernate_enabled());
+        assert!(!provider_env("fly").hibernate_enabled());
+        // Unknown/no-files providers stay off under auto.
+        assert!(!provider_env("daytona").hibernate_enabled());
+        assert!(!provider_env("").hibernate_enabled());
+    }
+
+    #[test]
+    fn hibernate_explicit_mode_wins_over_auto() {
+        let mut e = provider_env("sprites");
+        e.hibernate = HibernateMode::On;
+        assert!(e.hibernate_enabled());
+        let mut e = provider_env("hetzner");
+        e.hibernate = HibernateMode::Off;
+        assert!(!e.hibernate_enabled());
+    }
+
+    #[test]
+    fn hibernate_idle_prefers_the_per_env_override() {
+        let mut e = provider_env("hetzner");
+        assert_eq!(e.hibernate_idle(3600), 3600);
+        e.hibernate_idle_secs = 120;
+        assert_eq!(e.hibernate_idle(3600), 120);
+        // Both zero ⇒ off.
+        e.hibernate_idle_secs = 0;
+        assert_eq!(e.hibernate_idle(0), 0);
+    }
+
+    #[test]
+    fn hibernate_fields_participate_in_is_default() {
+        let mut e = EnvProviderConfig::default();
+        assert!(e.is_default());
+        e.hibernate = HibernateMode::Off;
+        assert!(!e.is_default());
+        let e = EnvProviderConfig {
+            hibernate_idle_secs: 5,
+            ..Default::default()
+        };
+        assert!(!e.is_default());
+    }
+
+    #[test]
+    fn snapshot_store_defaults_are_local_and_clamped() {
+        let s = SnapshotStoreConfig::default();
+        assert_eq!(s.backend, SnapshotBackend::Local);
+        assert_eq!(s.keep, 3);
+        assert_eq!(s.keep_clamped(), 3);
+        assert_eq!(s.max_artifact_bytes(), Some(512 * 1024 * 1024));
+        assert_eq!(s.access_key, "env:AWS_ACCESS_KEY_ID");
+        let zero = SnapshotStoreConfig {
+            keep: 0,
+            max_artifact_mb: 0,
+            ..Default::default()
+        };
+        // keep=0 would prune the only copy of just-captured work; clamp to 1.
+        assert_eq!(zero.keep_clamped(), 1);
+        assert_eq!(zero.max_artifact_bytes(), None);
+    }
+
+    #[test]
+    fn hibernate_and_backend_enums_parse_their_aliases() {
+        assert_eq!(
+            HibernateMode::from_str_validated("true").unwrap(),
+            HibernateMode::On
+        );
+        assert_eq!(
+            HibernateMode::from_str_validated("off").unwrap(),
+            HibernateMode::Off
+        );
+        assert!(HibernateMode::from_str_validated("sometimes").is_err());
+        assert_eq!(
+            SnapshotBackend::from_str_validated("fs").unwrap(),
+            SnapshotBackend::Local
+        );
+        assert_eq!(
+            SnapshotBackend::from_str_validated("s3").unwrap(),
+            SnapshotBackend::S3
+        );
+    }
+
+    #[test]
+    fn lifecycle_defaults_include_hibernation() {
+        let l = LifecycleConfig::default();
+        assert_eq!(l.hibernate_after_secs, 3600);
+        assert_eq!(l.snapshot.backend, SnapshotBackend::Local);
     }
 }

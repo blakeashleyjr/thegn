@@ -1466,6 +1466,11 @@ pub fn provision_provider_env_named(
         local_parity: (name_override.is_none()
             && env.data == superzej_core::config::DataMode::InEnv)
             .then(|| worktree.to_string()),
+        // A hibernated worktree resumes by overlaying its snapshot on the
+        // fresh clone; the row flips to `restoring` here (deleted on success).
+        snapshot_restore: (name_override.is_none())
+            .then(|| crate::hibernator::begin_restore(worktree))
+            .flatten(),
         // When the host cache is on, bake its sandbox-side loopback substituter into
         // nix.conf so the devShell build + in-pane `nix develop` substitute from the
         // host store over the reverse tunnel (which the host stands up separately).
@@ -1622,12 +1627,24 @@ pub fn provision_provider_env_named(
                 // Host-executed: capture the local worktree's unpushed commits +
                 // uncommitted + untracked state and replay it over the clone.
                 // Best-effort — a failure leaves the pristine origin checkout.
-                if let Err(e) = apply_local_parity(&provider, &id, wt, wd, &exec_env) {
+                if let Err(e) = crate::parity::apply_local_parity(&provider, &id, wt, wd, &exec_env)
+                {
                     superzej_core::msg::warn(&format!(
                         "local parity: {e}; the sandbox keeps the origin checkout."
                     ));
                 }
                 Ok(())
+            }
+            StepKind::SnapshotRestore {
+                worktree: wt,
+                workdir: wd,
+                snapshot_id: snap,
+            } => {
+                // Host-executed, NOT best-effort: a failure fails the step and
+                // the row stays `hibernated` for the next open to retry.
+                crate::hibernator::apply_snapshot_restore(
+                    &provider, &id, cfg, wt, wd, snap, &exec_env,
+                )
             }
             StepKind::ManagedPi => {
                 // Host-executed: provision the managed pi inside the sandbox so the
@@ -1956,20 +1973,7 @@ fn nix_copy_to_file_argv(cache_dir: &str, path: &str) -> Vec<String> {
     ]
 }
 
-/// Filename-safe tag from a sandbox id (alnum/`-`/`_` only) for host temp paths.
-fn sanitize_tag(id: &str) -> String {
-    let t: String = id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    if t.is_empty() { "sandbox".into() } else { t }
-}
+pub(crate) use crate::parity::sanitize_tag;
 
 /// Run a host `nix` subcommand bounded by `timeout` (coreutils). `Ok(output)` on
 /// success; `Err` with a tail of stderr (or "timed out") otherwise.
@@ -2006,151 +2010,6 @@ fn run_host_nix_timeout(secs: u32, argv: &[String]) -> anyhow::Result<std::proce
 /// devShell warm is a local store hit instead of a rebuild. Best-effort; the host
 /// `nix` steps are timeout-bounded. Requires the sandbox store to be writable (the
 /// `nix` step's `claim_store` ran first) + `nix` on the sandbox PATH.
-/// Bring the sandbox clone to full parity with the LOCAL worktree at `wt_host`:
-/// replay unpushed commits (a thin `git bundle … HEAD --not --remotes`), restore
-/// uncommitted tracked changes (`git diff HEAD --binary`), and lay down untracked
-/// non-ignored files (a tar). Host git reads use the GIT_*-scrubbed `git_cmd`
-/// wrapper; the three artifacts are written into the sandbox `/tmp` and a single
-/// replay script applies them in `workdir`. Best-effort throughout — any capture
-/// or apply failure leaves the pristine origin checkout intact.
-// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
-#[expect(clippy::disallowed_methods)]
-pub(crate) fn apply_local_parity(
-    provider: &superzej_svc::provider::Provider,
-    id: &str,
-    wt_host: &str,
-    workdir: &str,
-    exec_env: &[(String, String)],
-) -> anyhow::Result<()> {
-    use superzej_core::util::git_cmd;
-    let wt = Path::new(wt_host);
-    if !wt.join(".git").exists() {
-        // No git metadata (a bare directory) — nothing to mirror.
-        return Ok(());
-    }
-    let host_head = git_cmd(wt)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|h| !h.is_empty());
-
-    let tmp = std::env::temp_dir();
-    let tag = format!("{}-{}", sanitize_tag(id), std::process::id());
-
-    // 1. Unpushed commits → a thin bundle (prerequisites = the remote-tracking
-    //    tips the sandbox clone already has). An empty bundle (nothing unpushed)
-    //    exits non-zero; treat that as "no commits to carry".
-    let bundle_host = tmp.join(format!("sz-parity-{tag}.bundle"));
-    let has_bundle = git_cmd(wt)
-        .args(["bundle", "create"])
-        .arg(&bundle_host)
-        .args(["HEAD", "--not", "--remotes"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        && bundle_host.metadata().map(|m| m.len() > 0).unwrap_or(false);
-
-    // 2. Uncommitted tracked changes (staged + unstaged vs HEAD), incl. deletions.
-    let patch = git_cmd(wt)
-        .args(["diff", "HEAD", "--binary"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| o.stdout)
-        .filter(|p| !p.is_empty());
-
-    // 3. Untracked, non-ignored files → a tar (paths relative to the worktree).
-    let tar_host = tmp.join(format!("sz-parity-{tag}.tar"));
-    let list_host = tmp.join(format!("sz-parity-{tag}.list"));
-    let untracked = git_cmd(wt)
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| o.stdout)
-        .filter(|l| !l.is_empty());
-    let has_tar = if let Some(list) = &untracked {
-        std::fs::write(&list_host, list).is_ok()
-            && std::process::Command::new("tar")
-                .arg("-C")
-                .arg(wt)
-                .arg("--null")
-                .arg("--files-from")
-                .arg(&list_host)
-                .arg("-cf")
-                .arg(&tar_host)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            && tar_host.metadata().map(|m| m.len() > 0).unwrap_or(false)
-    } else {
-        false
-    };
-    let _ = std::fs::remove_file(&list_host);
-
-    if !has_bundle && patch.is_none() && !has_tar {
-        // Clean working tree with nothing unpushed — the origin clone is parity.
-        let _ = std::fs::remove_file(&bundle_host);
-        let _ = std::fs::remove_file(&tar_host);
-        return Ok(());
-    }
-
-    // Upload the captured artifacts into the sandbox /tmp.
-    if has_bundle {
-        let bytes = std::fs::read(&bundle_host)?;
-        block_on_provider(|| async { provider.write(id, "/tmp/sz-parity.bundle", &bytes).await })?;
-    }
-    if let Some(p) = &patch {
-        block_on_provider(|| async { provider.write(id, "/tmp/sz-parity.patch", p).await })?;
-    }
-    if has_tar {
-        let bytes = std::fs::read(&tar_host)?;
-        block_on_provider(|| async { provider.write(id, "/tmp/sz-parity.tar", &bytes).await })?;
-    }
-    let _ = std::fs::remove_file(&bundle_host);
-    let _ = std::fs::remove_file(&tar_host);
-
-    // Replay over the clone, in the workdir. Each stage is independently guarded
-    // (`[ -s file ]`) and non-fatal so a partial capture still helps.
-    let wd = superzej_core::util::sh_quote(workdir);
-    let reset = match (has_bundle, host_head.as_deref()) {
-        (true, Some(h)) => format!(
-            "if [ -s /tmp/sz-parity.bundle ]; then \
-               git fetch /tmp/sz-parity.bundle HEAD 2>&1 || git fetch /tmp/sz-parity.bundle 2>&1 || true; \
-               git reset --hard {} 2>&1 || true; \
-             fi; ",
-            superzej_core::util::sh_quote(h)
-        ),
-        _ => String::new(),
-    };
-    let apply_patch = if patch.is_some() {
-        "if [ -s /tmp/sz-parity.patch ]; then \
-           git apply --whitespace=nowarn /tmp/sz-parity.patch 2>&1 \
-             || git apply --3way --whitespace=nowarn /tmp/sz-parity.patch 2>&1 || true; \
-         fi; "
-    } else {
-        ""
-    };
-    let untar = if has_tar {
-        format!(
-            "if [ -s /tmp/sz-parity.tar ]; then tar xf /tmp/sz-parity.tar -C {wd} 2>&1 || true; fi; "
-        )
-    } else {
-        String::new()
-    };
-    let script = format!(
-        "cd {wd} || exit 1; {reset}{apply_patch}{untar}\
-         rm -f /tmp/sz-parity.bundle /tmp/sz-parity.patch /tmp/sz-parity.tar 2>/dev/null; \
-         echo 'local parity applied'"
-    );
-    let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script];
-    block_on_provider(|| async { provider.run_exec(id, &argv, None, exec_env).await })
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("replay exec failed: {e}"))
-}
-
 // off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
 #[expect(clippy::disallowed_methods)]
 fn push_devshell_closure(
@@ -3621,9 +3480,6 @@ mod tests {
                 "/tmp/gc"
             ]
         );
-        assert_eq!(sanitize_tag("sz-cosmic-puma"), "sz-cosmic-puma");
-        assert_eq!(sanitize_tag("a/b c:d"), "a-b-c-d");
-        assert_eq!(sanitize_tag(""), "sandbox");
     }
 
     #[test]

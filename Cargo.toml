@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/superzej-core",
   "crates/superzej-svc",
+  "crates/superzej-agent",
   "crates/superzej-metrics",
   "crates/superzej-media",
   "crates/superzej-host",
@@ -93,6 +94,14 @@ tokio = { version = "1", features = [
 ] }
 portable-pty = "0.9"
 termwiz = "0.23"
+# --- iroh p2p auto-tunnel (call-home reach; roadmap 124-126) ---
+# Pure-Rust QUIC p2p dialed by NodeId (ed25519 pubkey) with NAT hole-punch +
+# relay fallback (n0 public relays by default). This is the compiled-in
+# transport a remote sandbox uses to *dial home* to superzej — no external
+# daemon/coordinator (unlike Tailscale), so it works out of the box. Traffic is
+# E2E-encrypted (QUIC+TLS by pubkey); relays only rendezvous. Rides the same
+# rustls/ring stack as reqwest (single rustls in tree).
+iroh = "1.0"
 # --- native service layer (Phase 4/5) ---
 octocrab = "0.53"
 reqwest = { version = "0.12", default-features = false, features = [

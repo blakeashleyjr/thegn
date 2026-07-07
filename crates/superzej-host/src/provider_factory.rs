@@ -94,6 +94,12 @@ pub(crate) fn fly_provider_for(
         max_lifetime_secs: pc.max_lifetime_secs,
         key_path,
         pubkey,
+        // iroh call-home: when the reach is enabled, start the home endpoint, mint
+        // this sandbox's auth token, and inject the three `SUPERZEJ_*` vars the
+        // baked `sz-agent` reads on boot to dial home. `None` (disabled) keeps the
+        // reaper/launch construction on today's ssh/IPv4-only path — additive, so
+        // ssh readiness/provisioning is unchanged and iroh only carries panes.
+        iroh: crate::iroh_home::injection_for(name),
         skip_ready_wait: false,
     }))
 }

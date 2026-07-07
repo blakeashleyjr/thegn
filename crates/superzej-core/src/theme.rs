@@ -781,24 +781,71 @@ pub fn agent_hue(name: &str) -> &'static str {
     }
 }
 
-/// Identity glyph for an agent/tool name (1–2 cells). Unknown names fall back
-/// to their first letter, uppercased.
-pub fn agent_glyph(name: &str) -> String {
+/// Rendered style for the agent identity marker. Resolved from the
+/// `[theme] agent_glyphs` config folded with the terminal's detected glyph
+/// level (see [`resolve_agent_glyph_style`]); the render site passes it to
+/// [`agent_glyph`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentGlyphStyle {
+    /// Compact Unicode marks (`⊞ ↟ ✎ ±`). Legible only where the font actually
+    /// carries the symbol — Nerd-Font / rich emulators.
+    Symbol,
+    /// Universal 1–2 letter marks (`Y Lg Ed D`, …) that render in any font on
+    /// any terminal. The safe default.
+    Letter,
+}
+
+/// Resolve the render style from the `[theme] agent_glyphs` preference and the
+/// terminal's detected glyph level. Pure (no I/O) so it is unit-testable and
+/// callable from either core or the host render path.
+///
+/// - `Letter` → always letters (never risks a tofu box).
+/// - `Symbol` → symbols, but degrade to letters when the terminal is ASCII-only.
+/// - `Auto`   → symbols only on a confirmed-modern emulator (`Full` glyph
+///   level); letters on the `Basic`/`Ascii` long tail. Note that even `Full`
+///   cannot guarantee a given font carries `⊞`/`↟` — which is why the shipped
+///   default is `Letter`, not `Auto`.
+pub fn resolve_agent_glyph_style(
+    pref: crate::config::AgentGlyphs,
+    level: crate::termcaps::UnicodeLevel,
+) -> AgentGlyphStyle {
+    use crate::config::AgentGlyphs;
+    use crate::termcaps::UnicodeLevel;
+    match pref {
+        AgentGlyphs::Letter => AgentGlyphStyle::Letter,
+        AgentGlyphs::Symbol => match level {
+            UnicodeLevel::Ascii => AgentGlyphStyle::Letter,
+            _ => AgentGlyphStyle::Symbol,
+        },
+        AgentGlyphs::Auto => match level {
+            UnicodeLevel::Full => AgentGlyphStyle::Symbol,
+            _ => AgentGlyphStyle::Letter,
+        },
+    }
+}
+
+/// Identity glyph for an agent/tool name (1–2 cells) in the requested `style`.
+/// A handful of tools carry a compact symbol mark under [`AgentGlyphStyle::Symbol`];
+/// every mark has a universal letter form under [`AgentGlyphStyle::Letter`] so it
+/// never degrades to a missing-glyph box. Unknown names fall back to their first
+/// letter, uppercased.
+pub fn agent_glyph(name: &str, style: AgentGlyphStyle) -> String {
+    let symbol = matches!(style, AgentGlyphStyle::Symbol);
     match name.to_ascii_lowercase().as_str() {
         "claude" => "C".into(),
         "codex" => "Cx".into(),
         "aider" => "Ai".into(),
         "gemini" => "G".into(),
         "shell" | "__shell__" => "$".into(),
-        "lazygit" => "↟".into(),
-        "yazi" => "⊞".into(),
-        "editor" => "✎".into(),
-        "diff" => "±".into(),
+        "lazygit" => (if symbol { "↟" } else { "Lg" }).into(),
+        "yazi" => (if symbol { "⊞" } else { "Y" }).into(),
+        "editor" => (if symbol { "✎" } else { "Ed" }).into(),
+        "diff" => (if symbol { "±" } else { "D" }).into(),
         other => other
             .chars()
             .next()
             .map(|c| c.to_ascii_uppercase().to_string())
-            .unwrap_or_else(|| "•".into()),
+            .unwrap_or_else(|| (if symbol { "•" } else { "?" }).into()),
     }
 }
 
@@ -1221,10 +1268,59 @@ mod tests {
 
     #[test]
     fn agent_glyph_known_and_fallback() {
-        assert_eq!(agent_glyph("claude"), "C");
-        assert_eq!(agent_glyph("codex"), "Cx");
-        assert_eq!(agent_glyph("shell"), "$");
-        assert_eq!(agent_glyph("goose"), "G");
+        use AgentGlyphStyle::Letter;
+        assert_eq!(agent_glyph("claude", Letter), "C");
+        assert_eq!(agent_glyph("codex", Letter), "Cx");
+        assert_eq!(agent_glyph("shell", Letter), "$");
+        assert_eq!(agent_glyph("goose", Letter), "G");
+    }
+
+    #[test]
+    fn agent_glyph_letter_style_is_pure_ascii() {
+        // The whole point of the letter style: nothing that can tofu. Every
+        // symbol-bearing tool degrades to a universal letter mark.
+        use AgentGlyphStyle::Letter;
+        for name in ["lazygit", "yazi", "editor", "diff", "claude", "unknown", ""] {
+            let g = agent_glyph(name, Letter);
+            assert!(g.is_ascii(), "{name} letter glyph not ASCII: {g:?}");
+            assert!(!g.is_empty(), "{name} letter glyph empty");
+        }
+        assert_eq!(agent_glyph("yazi", Letter), "Y");
+        assert_eq!(agent_glyph("lazygit", Letter), "Lg");
+        assert_eq!(agent_glyph("editor", Letter), "Ed");
+        assert_eq!(agent_glyph("diff", Letter), "D");
+        assert_eq!(agent_glyph("", Letter), "?");
+    }
+
+    #[test]
+    fn agent_glyph_symbol_style_keeps_marks() {
+        use AgentGlyphStyle::Symbol;
+        assert_eq!(agent_glyph("yazi", Symbol), "⊞");
+        assert_eq!(agent_glyph("lazygit", Symbol), "↟");
+        assert_eq!(agent_glyph("editor", Symbol), "✎");
+        assert_eq!(agent_glyph("diff", Symbol), "±");
+        assert_eq!(agent_glyph("", Symbol), "•");
+        // Named letter-only tools are identical in both styles.
+        assert_eq!(agent_glyph("claude", Symbol), "C");
+    }
+
+    #[test]
+    fn resolve_agent_glyph_style_matrix() {
+        use crate::config::AgentGlyphs;
+        use crate::termcaps::UnicodeLevel::{Ascii, Basic, Full};
+        let r = resolve_agent_glyph_style;
+        // Letter: always letters, whatever the terminal.
+        for lvl in [Full, Basic, Ascii] {
+            assert_eq!(r(AgentGlyphs::Letter, lvl), AgentGlyphStyle::Letter);
+        }
+        // Symbol: symbols except when the terminal is ASCII-only.
+        assert_eq!(r(AgentGlyphs::Symbol, Full), AgentGlyphStyle::Symbol);
+        assert_eq!(r(AgentGlyphs::Symbol, Basic), AgentGlyphStyle::Symbol);
+        assert_eq!(r(AgentGlyphs::Symbol, Ascii), AgentGlyphStyle::Letter);
+        // Auto: symbols only on a confirmed-modern (Full) emulator.
+        assert_eq!(r(AgentGlyphs::Auto, Full), AgentGlyphStyle::Symbol);
+        assert_eq!(r(AgentGlyphs::Auto, Basic), AgentGlyphStyle::Letter);
+        assert_eq!(r(AgentGlyphs::Auto, Ascii), AgentGlyphStyle::Letter);
     }
 
     #[test]
@@ -1247,10 +1343,14 @@ mod tests {
             ("diff", AMBER, "±"),
         ] {
             assert_eq!(agent_hue(name), hue, "{name} hue");
-            assert_eq!(agent_glyph(name), glyph, "{name} glyph");
+            assert_eq!(
+                agent_glyph(name, AgentGlyphStyle::Symbol),
+                glyph,
+                "{name} glyph"
+            );
         }
         // empty fallback glyph
-        assert_eq!(agent_glyph(""), "•");
+        assert_eq!(agent_glyph("", AgentGlyphStyle::Symbol), "•");
     }
 
     #[test]

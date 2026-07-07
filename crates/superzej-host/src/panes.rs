@@ -87,24 +87,20 @@ pub(crate) fn pane_shell_argv(
             .unwrap_or(false);
         shell_argv_from(&shell, login)
     } else {
-        // SSH / Mosh connection
+        // SSH / Mosh connection. Split the remainder on whitespace so a target
+        // carrying flags (e.g. `ssh -p 2222 user@host`, as the new-terminal
+        // wizard emits for a registered host on a non-default port) becomes
+        // distinct argv entries rather than one mangled hostname.
         let mut v = vec![];
-        if terminal_connection.starts_with("mosh ") {
+        if let Some(rest) = terminal_connection.strip_prefix("mosh ") {
             v.push("mosh".to_string());
-            v.push(
-                terminal_connection
-                    .strip_prefix("mosh ")
-                    .unwrap_or("")
-                    .to_string(),
-            );
+            v.extend(rest.split_whitespace().map(str::to_string));
         } else {
+            let rest = terminal_connection
+                .strip_prefix("ssh ")
+                .unwrap_or(terminal_connection);
             v.push("ssh".to_string());
-            v.push(
-                terminal_connection
-                    .strip_prefix("ssh ")
-                    .unwrap_or(terminal_connection)
-                    .to_string(),
-            );
+            v.extend(rest.split_whitespace().map(str::to_string));
         }
         v
     };
@@ -813,6 +809,19 @@ mod tests {
 
         let mosh = terminal_launch_spec(&cfg, "mosh user@host", "");
         assert_eq!(mosh.argv, vec!["mosh".to_string(), "user@host".to_string()]);
+
+        // A target carrying flags (registered host on a non-default port) splits
+        // into distinct argv entries, not one mangled hostname.
+        let ported = terminal_launch_spec(&cfg, "ssh -p 2222 user@host", "");
+        assert_eq!(
+            ported.argv,
+            vec![
+                "ssh".to_string(),
+                "-p".to_string(),
+                "2222".to_string(),
+                "user@host".to_string()
+            ]
+        );
 
         // Empty connection → a local interactive shell (argv[0] is env-dependent).
         let local = terminal_launch_spec(&cfg, "", "");
