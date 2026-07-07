@@ -460,6 +460,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Arm the in-process sampling profiler (no-op unless built `--features
     // profiling`): SIGUSR2 toggles a flamegraph capture from the live process.
     crate::profile::install();
+    // Record this (the event-loop) thread so the bridge can flag any RPC issued
+    // on it — bridge I/O on the loop blocks the compositor ("never block the
+    // loop"). Non-fatal since the writer is non-blocking; it surfaces the debt.
+    superzej_svc::bridge::note_loop_thread();
 
     // While the compositor owns the screen, any stray write to stderr (e.g.
     // `msg::warn`'s eprintln fallback when no log subscriber is installed)
@@ -699,7 +703,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // the first frame; the config fs-watch re-resolves it live.
     crate::chrome::set_palette(cfg.palette());
     crate::seg::set_undercurl_supported(resolve_undercurl(&cfg));
-    crate::caps::install(resolve_termcaps_with_probe(&cfg, term_probe.as_ref()));
+    crate::caps::install_themed(&cfg, resolve_termcaps_with_probe(&cfg, term_probe.as_ref()));
     crate::center::PANE_HPAD.store(
         cfg.theme.pane_padding as usize,
         std::sync::atomic::Ordering::Relaxed,
@@ -1409,7 +1413,6 @@ impl SidebarState {
             &model.sidebar_db_worktrees,
             &model.sidebar_db_folders,
             &model.sidebar_db_terminals,
-            &model.panel.hosts,
         );
         let visible = Self::visible_len(model);
         // While unfocused, track the active worktree so opening the sidebar
@@ -2741,8 +2744,8 @@ pub(crate) fn delete_groups(
                         // git is the source of truth, but `git worktree remove` leaves the
                         // dir behind if it ever fails (locked, detached, prune races); a
                         // lingering dir is re-adopted on the next launch and looks like a
-                        // failed delete. Make sure the directory is actually gone.
-                        let _ = std::fs::remove_dir_all(&path_clone);
+                        // failed delete. Purge it — locally AND on the remote box.
+                        superzej_core::worktree::purge_worktree_files(Path::new(&path_clone));
                     }
                     let _ = waker.wake();
                 });
@@ -2758,7 +2761,7 @@ pub(crate) fn delete_groups(
                     }
                 }
                 if !keep_files {
-                    let _ = std::fs::remove_dir_all(&path);
+                    superzej_core::worktree::purge_worktree_files(Path::new(&path));
                 }
             }
         }
@@ -2841,7 +2844,7 @@ fn remove_workspace(
         let root = Path::new(repo_path);
         for path in &worktree_dirs {
             superzej_core::worktree::remove(root, Path::new(path), "", false);
-            let _ = std::fs::remove_dir_all(path);
+            superzej_core::worktree::purge_worktree_files(Path::new(path));
         }
     }
 
@@ -3840,6 +3843,9 @@ pub(crate) enum HostInputKind {
     /// File the active worktree into a new folder named by the typed value
     /// (the "＋ New folder…" path of the move-to-folder picker).
     FileWorktreeNewFolder,
+    /// Add a `[host.*]` machine from typed input in the System ▸ Hosts panel
+    /// (`n`) and refresh; no worktree wizard, unlike [`Self::NewHost`].
+    AddHost,
 }
 
 // `begin_worktree_wizard` lives in `handlers::wizard` (extracted from this
@@ -5698,10 +5704,13 @@ fn spawn_test_discovery(
 
 /// Load cached test state for a worktree and detect its task if none is known.
 /// Reading only — never spawns a run (no auto-run).
+/// Load cached test state; `detect` runs the `detect_test_task` FS scan only when
+/// needed (D2: the per-switch caller passes `false` to keep that scan off the loop).
 fn sync_tests_for_worktree(
     ui: &mut crate::panel::PanelUi,
     worktree: &std::path::Path,
     cfg: &superzej_core::config::Config,
+    detect: bool,
 ) {
     let key = worktree.to_string_lossy();
     if let Some(cache) = superzej_core::db::Db::open()
@@ -5711,7 +5720,7 @@ fn sync_tests_for_worktree(
     {
         ui.tests.apply_cache(cache);
     }
-    if ui.tests.task.is_none() {
+    if detect && ui.tests.task.is_none() {
         ui.tests.task = crate::task::detect_test_task(worktree, cfg);
     }
 }
@@ -5968,7 +5977,7 @@ fn maybe_discover_tests(
     sem: std::sync::Arc<tokio::sync::Semaphore>,
 ) {
     let wt = active_tab_path(session);
-    sync_tests_for_worktree(ui, &wt, cfg);
+    sync_tests_for_worktree(ui, &wt, cfg, true); // entering Tests → detect now
     // Skip discovery when a prior run/discovery already covered this manifest
     // state: a fresh fingerprint match means nothing relevant changed, so reuse
     // the cache and spawn no subprocess at all.
@@ -8011,6 +8020,7 @@ async fn event_loop<T: Terminal>(
     // incremental path (recompose + bounded-diff the two 1-row bar rects) instead
     // of the master `dirty` full-chrome repaint. Cleared after flush.
     let mut bars_dirty = false;
+    let mut sidebar_dirty = false; // D5: sidebar-only damage (nav/collapse); reset with bars_dirty
     // One zone owns the keyboard at any time; Ctrl+g toggles the keybind lock.
     // `sb.focused` / `model.panel_focused` / `model.center_focused` mirror it.
     let mut focus = crate::focus::FocusState::default();
@@ -8038,6 +8048,9 @@ async fn event_loop<T: Terminal>(
     // layout may survive. Tab/worktree switches reuse the same rects and must
     // NOT trigger this: a full repaint flashes the whole center.
     let mut full_repaint = true;
+    // Consecutive transient terminal-write failures (EIO); reset on a clean
+    // flush, torn down only when it persists past `frame_write::RETRY_MAX`.
+    let mut frame_write_errs: u32 = 0;
     let mut clear_on_next_frame = false;
     // Our own Change→escape serializer (undercurl + underline-color capable);
     // `SUPERZEJ_RENDERER=termwiz` falls back to the stock renderer.
@@ -8283,6 +8296,12 @@ async fn event_loop<T: Terminal>(
     // current (a pre-switch hydration landing post-switch). The startup spawn
     // in `run()` used 0, which this initial value accepts.
     let mut hydration_gen: u64 = 0;
+    // Coalesce model hydrations: one main-loop `build_model` in flight, so a refresh
+    // storm or rapid-switch burst can't stack them. In-flight gen (not a bool).
+    let mut inflight_hydration_gen: Option<u64> = None;
+    let mut model_refresh_pending = false;
+    // Input dispatch time; next render measures dispatch→frame latency + drives the input-priority PTY budget.
+    let mut input_at: Option<std::time::Instant> = None;
     // True while a fold-actor run is off the loop; blocks a second concurrent
     // trigger (a fold advances `main` globally, so one at a time).
     let mut fold_inflight = false;
@@ -8539,7 +8558,7 @@ async fn event_loop<T: Terminal>(
             // Load this worktree's cached test state (most-recent status) so the
             // Tests tab shows it instantly; discovery stays lazy (on tab open).
             panel_ui.tests = crate::panel::TestPanelState::default();
-            sync_tests_for_worktree(&mut panel_ui, &current_worktree, keymap.config());
+            sync_tests_for_worktree(&mut panel_ui, &current_worktree, keymap.config(), false); // D2: no scan on switch
             loaded_tests_worktree = current_worktree.to_string_lossy().into_owned();
             // Immediate hydrate for the newly-focused worktree. Paint this
             // worktree's last-known panel from the cache (seeded by prior visits
@@ -8598,13 +8617,8 @@ async fn event_loop<T: Terminal>(
                 expanded: panel_ui.width.is_expanded(),
                 profile: current_config.profile.clone(),
             };
-            spawn_model_hydration(
-                model_tx.clone(),
-                hydration_gen,
-                session.clone(),
-                Some(waker.clone()),
-                hints.clone(),
-            );
+            // D1: coalesce rapid switches — the gate hydrates only the settled worktree.
+            model_refresh_pending = true;
             // Warm the worktrees above/below the selection into the cache so a
             // follow-on switch to a neighbor is instant too. Skip ones already
             // cached — the on-switch hydration refreshes them when truly focused.
@@ -9071,15 +9085,16 @@ async fn event_loop<T: Terminal>(
             visible.insert(cid);
         }
 
-        // 1. Drain pending PTY output, routed by pane id. Only output from a pane
-        //    visible in the active tab dirties the frame; others advance silently.
-        //    The drain is budgeted so a chatty pane cannot starve rendering/input.
+        // 1. Drain pending PTY output, routed by pane id (only a visible pane's
+        //    output dirties the frame). Budgeted so a chatty pane can't starve
+        //    render/input; input priority shrinks it when a key awaits its frame.
         let mut disconnected = false;
         let mut budget_exhausted = false;
         let mut drain_stats_chunks = 0;
+        let pty_budget = if input_at.is_some() { 8 } else { 64 };
 
         loop {
-            if drain_stats_chunks >= 64 {
+            if drain_stats_chunks >= pty_budget {
                 budget_exhausted = true;
                 break;
             }
@@ -10253,6 +10268,11 @@ async fn event_loop<T: Terminal>(
         let mut pending_focus: Option<superzej_core::store::IntentRow> = None;
         while let Ok((generation, mut next_model)) = model_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Model);
+            // In-flight hydration landed — clear the gate (before the stale-check so
+            // a switch that bumped `hydration_gen` mid-flight can't strand it).
+            if Some(generation) == inflight_hydration_gen {
+                inflight_hydration_gen = None;
+            }
             if generation != hydration_gen {
                 continue;
             }
@@ -10691,6 +10711,12 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                     let payload = *payload;
+                    // The user backgrounded this build (Esc hid the progress
+                    // overlay) → don't yank their tab/focus on completion; land
+                    // the worktree quietly. `revealed` stays true only while the
+                    // user is actively watching the overlay through to the end.
+                    let backgrounded = creating.as_ref().is_some_and(|cp| !cp.revealed);
+                    let prev_active = session.active;
                     if let Some(cp) = creating.as_mut() {
                         cp.apply(
                             wizard::CreateStep::LaunchAgent,
@@ -10703,6 +10729,15 @@ async fn event_loop<T: Terminal>(
                         crate::session::GroupKind::Branch,
                         payload.path.clone(),
                     ));
+                    // `add_group` switched the active tab to the new worktree;
+                    // restore it when backgrounded so the user stays put. The
+                    // group is still pushed (visible in the sidebar) and its
+                    // agent pane still attaches below — only the view switch is
+                    // undone. Restore before `refresh_tab_model` so the chrome
+                    // reflects the user's current tab, not the new one.
+                    if backgrounded {
+                        session.active = prev_active;
+                    }
                     // Branch-from-issue: link the freshly created worktree to the
                     // issue it was branched from, so its tab carries the issue badge.
                     if let Some((g, issue_id)) = pending_issue_link.take() {
@@ -10743,7 +10778,12 @@ async fn event_loop<T: Terminal>(
                             &waker,
                         );
                     if attached || native_provider {
-                        focus.zone = crate::focus::Zone::Center;
+                        // Only steal keyboard focus into the new agent pane when
+                        // the user was watching (foreground). A backgrounded build
+                        // must not redirect their input into the fresh pane.
+                        if !backgrounded {
+                            focus.zone = crate::focus::Zone::Center;
+                        }
                         let backend = &payload.spec.backend;
                         model.status = match payload.spec.warning_summary() {
                             Some(warning) => format!(
@@ -10982,7 +11022,7 @@ async fn event_loop<T: Terminal>(
                     // Live theme reload: colors apply on the next repaint.
                     crate::chrome::set_palette(new_cfg.palette());
                     crate::seg::set_undercurl_supported(resolve_undercurl(&new_cfg));
-                    crate::caps::install(resolve_termcaps(&new_cfg));
+                    crate::caps::install_themed(&new_cfg, resolve_termcaps(&new_cfg));
                     wire_renderer.set_depth(crate::caps::color_depth());
                     crate::center::PANE_HPAD.store(
                         new_cfg.theme.pane_padding as usize,
@@ -11080,7 +11120,9 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
             }
         }
-        if want_model_refresh {
+        // One hydration in flight; refreshes (incl. switches) coalesce into `pending`.
+        model_refresh_pending |= want_model_refresh;
+        if model_refresh_pending && inflight_hydration_gen.is_none() {
             hydration_gen += 1;
             spawn_model_hydration(
                 model_tx.clone(),
@@ -11093,6 +11135,8 @@ async fn event_loop<T: Terminal>(
                     profile: current_config.profile.clone(),
                 },
             );
+            inflight_hydration_gen = Some(hydration_gen);
+            model_refresh_pending = false;
         }
         if want_pr_refresh {
             spawn_pr_cache_refresh(
@@ -11524,11 +11568,11 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
-        // 2. Render if anything changed (diff-flush): the damaged panes and/or
-        //    chrome, with the hardware cursor in the focused pane. `dirty` is the
-        //    chrome/overlay/geometry channel; `dirty_panes` the per-pane content
-        //    channel — either (or `full_repaint`) means there is a frame to paint.
-        let should_render = dirty || full_repaint || !dirty_panes.is_empty() || bars_dirty;
+        // 2. Render if anything changed (diff-flush): damaged panes and/or chrome,
+        //    cursor in the focused pane. `dirty` = chrome/overlay/geometry channel;
+        //    `dirty_panes` = per-pane content; either (or `full_repaint`) → a frame.
+        let should_render =
+            dirty || full_repaint || !dirty_panes.is_empty() || bars_dirty || sidebar_dirty;
         if !should_render {
             // Woke but nothing changed — a wasted wakeup (storm signal).
             loop_perf.render_skip();
@@ -11645,6 +11689,7 @@ async fn event_loop<T: Terminal>(
                 chrome: dirty,
                 panes: dirty_panes.clone(),
                 bars: bars_dirty,
+                sidebar: sidebar_dirty,
             };
             let frame_plan = crate::render_plan::plan(&damage, &overlays);
             // Diagnostic: when a FULL frame is chosen, record which damage
@@ -11770,19 +11815,16 @@ async fn event_loop<T: Terminal>(
             } else if let crate::render_plan::RenderPlan::Incremental {
                 panes: ref ids,
                 bars,
+                sidebar,
             } = frame_plan
             {
-                // INCREMENTAL FAST PATH: pane output and/or a bars (stats/clock)
-                // tick, nothing heavier. Reuse the prior frame in `scratch` and
-                // recompose ONLY the damaged regions — never the full chrome (the
-                // dominant per-frame cost). The bounded diff below then scans just
-                // these rects, so a frame's cost tracks what changed, not the
-                // screen size.
+                // INCREMENTAL FAST PATH: pane output / bars tick / sidebar nav.
+                // Reuse the prior frame in `scratch`, recompose ONLY the damaged
+                // regions (never the full chrome); the bounded diff scans just those.
                 let frames = tree.layout_framed(chrome.center);
                 for &id in ids {
-                    // The corner overlay is an off-tree pane: compose its content
-                    // + card and diff ONLY its outer rect. This keeps a streaming
-                    // video frame a bounded one-rect diff (never a chrome recompose).
+                    // The corner overlay is an off-tree pane: compose its content +
+                    // card and diff ONLY its outer rect (bounded, never a recompose).
                     if Some(id) == corner {
                         if let Some(outer) = compose_corner(
                             &mut scratch,
@@ -11798,10 +11840,8 @@ async fn event_loop<T: Terminal>(
                         }
                         continue;
                     }
-                    // (rect to compose, rect to diff, has a card ring). A framed
-                    // pane composes its content but diffs the *frame* rect so the
-                    // repainted border ring is scanned; the drawer has no card, so
-                    // it composes + diffs its own reserved rect.
+                    // (compose rect, diff rect, has card). A framed pane diffs the
+                    // *frame* rect (border ring); the drawer diffs its reserved rect.
                     let resolved = if let Some(d) = drawer
                         && d == id
                         && let Some(rect) = chrome.drawer
@@ -11813,16 +11853,14 @@ async fn event_loop<T: Terminal>(
                             .find(|(pid, _, _)| *pid == id)
                             .map(|(_, f, c)| (*c, *f, true))
                     };
-                    // A pane awaiting relaunch is a husk with no live process, so
-                    // it never enters `dirty_panes` — no relaunch overlay needed.
+                    // A husk pane awaiting relaunch never enters `dirty_panes`.
                     if let (Some((content, diff_rect, has_card)), Some(p)) =
                         (resolved, panes.table.get(&id))
                     {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
                         if has_card {
-                            // Repaint the card so pane output that lands a wide
-                            // glyph at the edge can't nibble the border `│`; the
-                            // frame rect (pushed below) makes the diff cover it.
+                            // Repaint the card so an edge wide-glyph can't nibble the
+                            // border `│`; the frame rect (below) makes the diff cover it.
                             crate::chrome::redraw_pane_card(
                                 &mut scratch,
                                 &frames,
@@ -11836,17 +11874,19 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 if bars {
-                    // Stats/clock/AI-metrics changed: recompose just the two 1-row
-                    // bars over the reused scratch. They're rect-contained and
-                    // disjoint from the center/sidebar/panel, so nothing else is
-                    // stomped. Reflect the live app-tab strip first (the masthead
-                    // chips read it; the full path does the same below).
+                    // Stats/clock tick: recompose just the two 1-row bars (disjoint
+                    // from center/sidebar/panel). Reflect the app-tab strip first.
                     model.app_tabs = app_host.tab_labels();
                     model.active_app = app_host.active_tab_index();
                     crate::chrome::draw_masthead(&mut scratch, &chrome, &model);
                     crate::chrome::draw_statusbar(&mut scratch, chrome.statusbar, &model);
                     pane_diff_rects.push(chrome.masthead);
                     pane_diff_rects.push(chrome.statusbar);
+                }
+                if sidebar && let Some(sb) = chrome.sidebar {
+                    // D5: recompose just the sidebar rect (disjoint from panel/center).
+                    crate::chrome::draw_sidebar(&mut scratch, sb, &model);
+                    pane_diff_rects.push(sb);
                 }
             } else {
                 crate::chrome::clear_frame(&mut scratch);
@@ -12185,29 +12225,39 @@ async fn event_loop<T: Terminal>(
             let seq = scratch.current_seqno();
             scratch.flush_changes_older_than(seq);
             wire.extend(pending);
-            if use_termwiz_renderer {
-                buf.terminal().render(&wire).context("render")?;
-                buf.terminal().flush().context("terminal flush")?;
-            } else {
-                let mut bytes = String::new();
-                wire_renderer.render(&wire, &mut bytes);
-                if let Some(rec) = &mut recorder {
-                    let _ = rec.write_frame(&bytes);
+            // Write the frame. A transient tty write error (EIO from a subprocess
+            // briefly stealing the terminal's foreground process group) must not
+            // tear the compositor down — skip this frame, force a full repaint,
+            // and retry. See `frame_write` for why `?`-propagating here is fatal.
+            match crate::frame_write::emit_frame(
+                use_termwiz_renderer,
+                buf,
+                &mut wire_renderer,
+                &mut recorder,
+                &wire,
+                notify_state.take_bell(),
+            ) {
+                crate::frame_write::FrameWrite::Ok => frame_write_errs = 0,
+                crate::frame_write::FrameWrite::Transient
+                    if frame_write_errs < crate::frame_write::RETRY_MAX =>
+                {
+                    frame_write_errs += 1;
+                    tracing::warn!(
+                        target: "szhost::frame",
+                        attempt = frame_write_errs,
+                        "transient terminal write error; forcing full repaint + retry"
+                    );
+                    full_repaint = true;
+                    dirty = true;
+                    continue;
                 }
-                use std::io::Write as _;
-                let mut out = std::io::stdout();
-                out.write_all(bytes.as_bytes()).context("render")?;
-                out.flush().context("terminal flush")?;
-            }
-            // Terminal bell (item 429): a latched notification sound. Written on
-            // the loop thread right after the frame flush so it never interleaves
-            // with termwiz's writes; BEL neither moves the cursor nor prints, so
-            // it is safe between frames. Best-effort.
-            if notify_state.take_bell() {
-                use std::io::Write as _;
-                let mut out = std::io::stdout();
-                let _ = out.write_all(b"\x07");
-                let _ = out.flush();
+                crate::frame_write::FrameWrite::Transient => {
+                    return Err(anyhow::anyhow!(
+                        "terminal writes failed {} times running (EIO); tearing down",
+                        frame_write_errs
+                    ));
+                }
+                crate::frame_write::FrameWrite::Fatal(e) => return Err(e),
             }
             // Corner kitty images ride ON TOP of the cell frame: emit the queued,
             // repositioned graphics AFTER the diff is flushed. Images aren't cells
@@ -12244,64 +12294,16 @@ async fn event_loop<T: Terminal>(
                 frame_plan,
                 crate::render_plan::RenderPlan::Incremental { .. }
             );
-            loop_perf.render(frame_t0.elapsed(), incremental_frame);
+            loop_perf.render(frame_t0.elapsed(), incremental_frame, &mut input_at);
             // Consumed: the next frame is full unless another drag/scroll re-arms it.
             selection_only = false;
             scroll_only = false;
             // Pane/bars damage is now on screen; an untouched next wake renders nothing.
             dirty_panes.clear();
             bars_dirty = false;
+            sidebar_dirty = false;
             if muse_ready {
-                // Only emit the ready marker when the event queue is
-                // completely drained.  If szhost still has buffered input (e.g.
-                // 51 'a' chars arrive at once, each causing its own render),
-                // emitting after the first render would fire a premature stable
-                // in the muse sync state machine, capturing only the partial
-                // state.  By deferring until both the in-memory queue and the
-                // terminal's own read buffer are empty we guarantee the marker
-                // corresponds to the final rendered state of the batch.
-                // Only KEY/MOUSE/PASTE events defer the marker — Wake/Resize
-                // events (background ticks, hydration) must never block it or
-                // startup will spin indefinitely waiting for an empty queue.
-                let has_pty_pending = {
-                    let in_queue = pending_input.iter().any(|e| {
-                        matches!(
-                            e,
-                            InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_)
-                        )
-                    });
-                    if in_queue {
-                        true
-                    } else {
-                        let mut found = false;
-                        #[allow(clippy::while_let_loop)]
-                        loop {
-                            match buf.terminal().poll_input(Some(std::time::Duration::ZERO)) {
-                                Ok(Some(ev)) => {
-                                    let is_pty = matches!(
-                                        ev,
-                                        InputEvent::Key(_)
-                                            | InputEvent::Mouse(_)
-                                            | InputEvent::Paste(_)
-                                    );
-                                    pending_input.push_back(ev);
-                                    if is_pty {
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                                _ => break,
-                            }
-                        }
-                        found
-                    }
-                };
-                if !has_pty_pending {
-                    use std::io::Write as _;
-                    let _ = std::io::stdout()
-                        .write_all(b"\x1b]5379;muse:ready\x07")
-                        .and_then(|_| std::io::stdout().flush());
-                }
+                crate::frame_write::emit_muse_ready_marker(buf, &mut pending_input);
             }
             tracing::debug!(
                 target: "szhost::frame",
@@ -12343,15 +12345,11 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        // Everything above this point was the loop doing work for this wake;
-        // the poll below is idle time. Record the busy span for the idle ratio.
+        // Work for this wake is done; the poll below is idle (busy span → idle ratio).
         loop_perf.add_busy(iter_t0.elapsed());
 
-        // 3. Block until something happens: a real terminal event, or a
-        //    `waker.wake()` from any producer (PTY reader, model/PR hydration,
-        //    config watcher, diff fs-watch, refresh ticker) which returns
-        //    `InputEvent::Wake`. No timeout → zero idle CPU; we only wake when
-        //    there is work, and render the instant it arrives.
+        // 3. Block until a terminal event or `waker.wake()` (→ `InputEvent::Wake`);
+        //    no timeout → zero idle CPU, wake only on work, render at once.
         let timeout = if dirty || !pending_input.is_empty() || budget_exhausted {
             Some(std::time::Duration::from_millis(8))
         } else {
@@ -12363,6 +12361,7 @@ async fn event_loop<T: Terminal>(
         };
         match polled {
             Ok(Some(InputEvent::Mouse(m))) => {
+                input_at = Some(std::time::Instant::now()); // input-latency stamp
                 use termwiz::input::MouseButtons;
                 // SGR mouse coordinates are 1-based.
                 let mx = (m.x as usize).saturating_sub(1);
@@ -12864,6 +12863,7 @@ async fn event_loop<T: Terminal>(
                 if residue.swallow(&k.key, k.modifiers) {
                     continue;
                 }
+                input_at = Some(std::time::Instant::now()); // input-latency stamp
                 let k = normalize_key(k);
                 // Register paste is armed (PasteRegister): the next key names the
                 // register (`a`–`z`/`0`–`9`, `"` default, `+` clipboard). It's a
@@ -13457,6 +13457,13 @@ async fn event_loop<T: Terminal>(
                                             Err(e) => model.status = e,
                                         }
                                     }
+                                    HostInputKind::AddHost => {
+                                        model.status = crate::handlers::host::add_and_refresh(
+                                            &text,
+                                            &mut current_config,
+                                            &refresh_tx,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -13693,20 +13700,13 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
-                            // First-launch keymap picker (item 621): persist the
-                            // choice to ui_state and rebuild the live keymap. Not
-                            // a git op, so handle it before the git dispatch.
+                            // First-launch keymap picker (item 621): persist + rebuild.
                             if let menu::MenuChoice::SetKeymapPreset(preset) = &choice {
-                                if let Ok(db) = superzej_core::db::Db::open() {
-                                    let _ = db.set_ui_state("", "keymap_preset", preset);
-                                }
-                                current_config.keymap_preset = preset.clone();
+                                model.status = crate::handlers::apply_keymap_preset(
+                                    preset,
+                                    &mut current_config,
+                                );
                                 keymap = rebuild_keymap(&current_config, &session);
-                                model.status = if preset == "default" {
-                                    "Keymap: superzej defaults".into()
-                                } else {
-                                    format!("Keymap preset: {preset}")
-                                };
                                 dirty = true;
                                 continue;
                             }
@@ -13716,6 +13716,8 @@ async fn event_loop<T: Terminal>(
                             if let Some(status) = crate::handlers::host::intercept_menu_choice(
                                 &choice,
                                 &mut pending_host_consent,
+                                &current_config,
+                                Some(&host_ui),
                             ) {
                                 model.status = status;
                                 dirty = true;
@@ -14797,7 +14799,8 @@ async fn event_loop<T: Terminal>(
                     match sb.handle_key(&k.key, k.modifiers, &mut model, &session) {
                         SidebarOutcome::NotHandled => { /* fall through to keymap */ }
                         SidebarOutcome::Redraw => {
-                            dirty = true;
+                            sidebar_dirty = true; // D5: damage only sidebar + bars, not full chrome
+                            bars_dirty = true;
                             continue;
                         }
                         SidebarOutcome::Defocus => {
@@ -15934,7 +15937,7 @@ async fn event_loop<T: Terminal>(
                                 _ => TestRun::Failed,
                             };
                             let wt = active_tab_path(&session);
-                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
+                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config(), true);
                             if let Some(base) = panel_ui.tests.task.clone() {
                                 if !panel_ui.tests.running {
                                     let task_spec = test_task_for_run(&panel_ui.tests, kind, base);
@@ -15960,7 +15963,7 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Tests, KeyCode::Char('u')) => {
                             let wt = active_tab_path(&session);
-                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
+                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config(), true);
                             if let Some(task) = panel_ui.tests.task.clone() {
                                 test_generation += 1;
                                 panel_ui.tests.discovering = true;
@@ -16973,18 +16976,18 @@ async fn event_loop<T: Terminal>(
                             }
                             .panel_key(key, panel_ui.cursor)
                         }
-                        // -- hosts (hosts-as-resources): provision (p), re-probe
-                        // (r), grant install (c), forget cached state (x).
+                        // -- hosts: p/r/c/x act on the host; m menu, n add-host.
                         (Section::Hosts, key)
-                            if matches!(key, KeyCode::Char('p' | 'r' | 'c' | 'x')) =>
+                            if matches!(key, KeyCode::Char('p' | 'r' | 'c' | 'x' | 'm' | 'n')) =>
                         {
-                            crate::host_ui::panel_key(
+                            crate::handlers::host::section_key(
                                 key,
                                 panel_ui.cursor,
                                 &mut model,
                                 &current_config,
                                 &host_ui,
                                 &mut active_menu,
+                                &mut host_input,
                             )
                         }
                         // -- environments: bind here (enter), test (t), remove
@@ -18237,39 +18240,19 @@ async fn event_loop<T: Terminal>(
                                             .map(|(_, r)| smart_split_dir(r.cols, r.rows))
                                     })
                                     .unwrap_or(crate::center::Dir::Row);
-                                let cwd = active_cwd(&session);
-                                match spawn_worktree_shell_pane(
-                                    &mut panes,
-                                    keymap.config(),
-                                    cwd.as_deref(),
-                                    chrome.center,
-                                    false,
-                                    None,
-                                    "",
-                                ) {
-                                    Ok(new) => {
-                                        if let Some(tab) = session.active_tab_mut() {
-                                            if tab.center.split(focused, dir, new) {
-                                                tab.focused_pane = new;
-                                                need_relayout = true;
-                                            } else {
-                                                panes.table.remove(&new);
-                                            }
-                                        } else {
-                                            panes.table.remove(&new);
-                                        }
+                                // D4: reserve a placeholder leaf; the active-tab
+                                // materialize opens the shell off-thread (+ surfaces
+                                // any SpecError/halt). No on-loop launch_spec.
+                                let new = panes.reserve_ids(1);
+                                if let Some(tab) = session.active_tab_mut() {
+                                    if tab.center.split(focused, dir, new) {
+                                        tab.focused_pane = new;
+                                        need_relayout = true;
+                                    } else {
+                                        panes.table.remove(&new);
                                     }
-                                    Err(e) => {
-                                        if let Some(h) = sandbox_halt_in(&e) {
-                                            active_menu = Some(sandbox_halt_overlay(h));
-                                            model.status = format!(
-                                                "{} unavailable: {}",
-                                                h.placement, h.reason
-                                            );
-                                        } else {
-                                            model.status = format!("Pane spawn failed: {e}");
-                                        }
-                                    }
+                                } else {
+                                    panes.table.remove(&new);
                                 }
                             }
                             Action::CycleTheme => {
@@ -18428,32 +18411,10 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     crate::center::Dir::Row
                                 };
-                                let cwd = active_cwd(&session);
-                                let new = match spawn_worktree_shell_pane(
-                                    &mut panes,
-                                    keymap.config(),
-                                    cwd.as_deref(),
-                                    chrome.center,
-                                    false,
-                                    None,
-                                    "",
-                                ) {
-                                    Ok(id) => id,
-                                    Err(e) => {
-                                        // Survivable: report, don't exit the loop.
-                                        if let Some(h) = sandbox_halt_in(&e) {
-                                            active_menu = Some(sandbox_halt_overlay(h));
-                                            model.status = format!(
-                                                "{} unavailable: {}",
-                                                h.placement, h.reason
-                                            );
-                                        } else {
-                                            model.status = format!("Pane spawn failed: {e}");
-                                        }
-                                        dirty = true;
-                                        continue;
-                                    }
-                                };
+                                // D4: reserve a placeholder leaf (no on-loop
+                                // launch_spec) — the active-tab materialize opens the
+                                // shell off-thread + surfaces any SpecError/halt.
+                                let new = panes.reserve_ids(1);
                                 if let Some(tab) = session.active_tab_mut() {
                                     if tab.center.split(focused, dir, new) {
                                         tab.focused_pane = new;
@@ -18791,40 +18752,19 @@ async fn event_loop<T: Terminal>(
                                 // placeholder, but pane-0 is the very first shell
                                 // ever spawned, so it already exists and gets
                                 // shared with the new tab if we don't override it.
-                                let cwd = active_cwd(&session);
                                 if let Some(g) = session.active_group_mut() {
                                     g.add_tab();
                                 }
-                                let cfg = keymap.config().clone();
-                                match spawn_worktree_shell_pane(
-                                    &mut panes,
-                                    &cfg,
-                                    cwd.as_deref(),
-                                    chrome.center,
-                                    false,
-                                    None,
-                                    "",
-                                ) {
-                                    Ok(id) => {
-                                        if let Some(tab) = session
-                                            .active_group_mut()
-                                            .and_then(|g| g.active_tab_mut())
-                                        {
-                                            tab.center = crate::center::CenterTree::Leaf(id);
-                                            tab.focused_pane = id;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        if let Some(h) = sandbox_halt_in(&e) {
-                                            active_menu = Some(sandbox_halt_overlay(h));
-                                            model.status = format!(
-                                                "{} unavailable: {}",
-                                                h.placement, h.reason
-                                            );
-                                        } else {
-                                            model.status = format!("new tab spawn failed: {e:#}");
-                                        }
-                                    }
+                                // D4: a fresh reserved leaf (never pane-0) overrides
+                                // the Tab::new Leaf(0) placeholder; the active-tab
+                                // materialize opens the shell off-thread (no on-loop
+                                // launch_spec, no premature bare shell).
+                                let new = panes.reserve_ids(1);
+                                if let Some(tab) =
+                                    session.active_group_mut().and_then(|g| g.active_tab_mut())
+                                {
+                                    tab.center = crate::center::CenterTree::Leaf(new);
+                                    tab.focused_pane = new;
                                 }
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
@@ -19434,6 +19374,7 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             Ok(Some(InputEvent::Paste(s))) => {
+                input_at = Some(std::time::Instant::now()); // input-latency stamp
                 // A modal that collects text owns the paste — inject it into
                 // the field (workspace picker, new-worktree wizard) rather than
                 // leaking it into the pane behind the overlay.
@@ -19916,7 +19857,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
         );
         // Pinned "lib" workspace floats first; order is by repo path.
         assert_eq!(
@@ -19950,7 +19890,6 @@ mod tests {
             &workspaces,
             &view,
             &crate::sidebar::SidebarStatus::default(),
-            &[],
             &[],
             &[],
             &[],
@@ -20027,7 +19966,6 @@ mod tests {
             &[],
             &[],
             &terminals,
-            &[],
         );
         let ring = unified_ring(&rows, &terminals);
         assert_eq!(
@@ -20093,7 +20031,6 @@ mod tests {
             &[],
             &[],
             &terminals,
-            &[],
         );
         // The old path-based order drops the live fallback entirely.
         assert!(sidebar_workspace_order(&rows).is_empty());

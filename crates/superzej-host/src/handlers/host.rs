@@ -158,16 +158,140 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Intercept a menu choice that answers a live consent ask, or one of the
-/// System ▸ Hosts panel confirms (`host-grant` / `host-rm` — raised by
-/// `host_ui::panel_key`). Returns a status line when the choice was consumed.
-/// `pending` is the loop's marker for "the consent modal for this host is
-/// (or was) up".
+/// Off-loop removal of a runtime-added host: drop the placement-capacity index,
+/// the DB row (def + cached state + inventory + events), but only when the host
+/// is DB-added and has no live placement tenants. Config-defined hosts and hosts
+/// with running sandboxes are refused (warned), never silently dropped — mirrors
+/// `superzej host rm`'s guardrails without the interactive `--force`/drain path.
+fn remove_host_def(host: String) {
+    let job = move || {
+        let Ok(db) = superzej_core::db::Db::open() else {
+            superzej_core::msg::warn("host remove: state db unavailable");
+            return;
+        };
+        let Some(id) = superzej_core::host::HostId::parse(&host) else {
+            return;
+        };
+        let name = id.config_name().unwrap_or("").to_string();
+        let is_db = db
+            .host_defs()
+            .ok()
+            .is_some_and(|d| d.iter().any(|(n, _)| n == &name));
+        if !is_db {
+            superzej_core::msg::warn(&format!(
+                "host {name}: config-defined — remove it from config.toml"
+            ));
+            return;
+        }
+        use superzej_core::store::PlacementStore;
+        let tenants = db.tenants_of(&id).unwrap_or_default();
+        if !tenants.is_empty() {
+            superzej_core::msg::warn(&format!(
+                "host {name}: {} live placement(s) — drain via `superzej host rm` first",
+                tenants.len()
+            ));
+            return;
+        }
+        let _ = db.capacity_delete(&id);
+        if let Err(e) = db.host_delete(&id) {
+            superzej_core::msg::warn(&format!("host remove: {e}"));
+        }
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::spawn_blocking(job);
+    } else {
+        job();
+    }
+}
+
+/// Parse + persist an add-host target (the System ▸ Hosts panel's `n` key),
+/// then queue a panel refresh so the new machine shows up. Returns the status
+/// line to display (the new host's name, or the parse/persist error).
+pub(crate) fn add_and_refresh(
+    text: &str,
+    cfg: &mut superzej_core::config::Config,
+    refresh_tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+) -> String {
+    match crate::handlers::wizard::add_host_from_input(text, cfg) {
+        Ok(name) => {
+            // best-effort: the ticker also re-hydrates on its cadence.
+            let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model);
+            format!("host {name} added")
+        }
+        Err(e) => format!("add host: {e}"),
+    }
+}
+
+/// A System ▸ Hosts section key press. `p`/`r`/`c`/`x` act on the cursor host
+/// (delegated to [`crate::host_ui::panel_key`]); `m` opens the discoverable
+/// action menu; `n` opens the add-host text input. Returns whether the key was
+/// claimed (so the loop can mark the frame dirty).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn section_key(
+    key: termwiz::input::KeyCode,
+    cursor: usize,
+    model: &mut crate::chrome::FrameModel,
+    cfg: &superzej_core::config::Config,
+    host_ui: &crate::host_flow::HostUiTx,
+    active_menu: &mut Option<MenuOverlay>,
+    host_input: &mut Option<(menu::InputOverlay, crate::run::HostInputKind)>,
+) -> bool {
+    use termwiz::input::KeyCode::Char;
+    match key {
+        Char('n') => {
+            *host_input = Some((
+                menu::InputOverlay::new(
+                    "add host — user@host[:port]  (dumbpipe:<ticket> <user> for iroh)",
+                    "",
+                ),
+                crate::run::HostInputKind::AddHost,
+            ));
+            model.status = "add host: type a target, Enter to add (Esc cancels)".into();
+            true
+        }
+        Char('m') => {
+            if let Some(h) = model.panel.hosts.get(cursor) {
+                *active_menu = Some(menu::host_actions_menu(&h.name, &h.id, h.is_db_def));
+            }
+            true
+        }
+        _ => crate::host_ui::panel_key(key, cursor, model, cfg, host_ui, active_menu),
+    }
+}
+
+/// Intercept a menu choice that answers a live consent ask, one of the System ▸
+/// Hosts panel confirms (`host-grant` / `host-rm`), or a host action-menu item
+/// (`host-provision` / `host-reprobe` / `host-remove` — the `m` menu). Returns a
+/// status line when consumed. `pending` marks "the consent modal for this host
+/// is (or was) up"; `host_ui` is `None` only in unit tests (no fake waker), in
+/// which case the provision/re-probe items are inert.
 pub(crate) fn intercept_menu_choice(
     choice: &MenuChoice,
     pending: &mut Option<String>,
+    cfg: &superzej_core::config::Config,
+    host_ui: Option<&crate::host_flow::HostUiTx>,
 ) -> Option<String> {
     match choice {
+        // Host action-menu provision / re-probe: spawn the same off-loop drive
+        // as the `p`/`r` keys.
+        MenuChoice::Confirm {
+            tag: tag @ ("host-provision" | "host-reprobe"),
+            arg,
+        } => {
+            let name = arg.strip_prefix("host:").unwrap_or(arg);
+            host_ui.map(|ui| crate::host_ui::drive_host(name, *tag == "host-reprobe", cfg, ui))
+        }
+        // Host action-menu "remove host": drop a runtime-added `[host.*]` def.
+        // Tenant-safe + DB-only — validated in the off-loop job, which warns
+        // rather than silently no-op'ing.
+        MenuChoice::Confirm {
+            tag: "host-remove",
+            arg,
+        } => {
+            let name = arg.strip_prefix("host:").unwrap_or(arg).to_string();
+            remove_host_def(arg.clone());
+            Some(format!("host {name}: removing…"))
+        }
         MenuChoice::Confirm {
             tag: "host-install",
             arg,
@@ -306,6 +430,9 @@ mod tests {
 
     #[test]
     fn menu_interception_resolves_grant_and_decline() {
+        // host_ui = None (no fake waker in tests); the paths exercised here don't
+        // spawn a drive, so config + host_ui are inert.
+        let cfg = superzej_core::config::Config::default();
         let mut pending = Some("host:a".to_string());
         let s = intercept_menu_choice(
             &MenuChoice::Confirm {
@@ -313,19 +440,22 @@ mod tests {
                 arg: "host:a".into(),
             },
             &mut pending,
+            &cfg,
+            None,
         )
         .expect("consumed");
         assert!(s.contains("granted"));
         assert!(pending.is_none());
 
         let mut pending = Some("host:a".to_string());
-        let s = intercept_menu_choice(&MenuChoice::Dismiss, &mut pending).expect("consumed");
+        let s = intercept_menu_choice(&MenuChoice::Dismiss, &mut pending, &cfg, None)
+            .expect("consumed");
         assert!(s.contains("declined"));
         assert!(pending.is_none());
 
         // A dismiss with no pending consent is someone else's dismiss.
         let mut none = None;
-        assert!(intercept_menu_choice(&MenuChoice::Dismiss, &mut none).is_none());
+        assert!(intercept_menu_choice(&MenuChoice::Dismiss, &mut none, &cfg, None).is_none());
         // Unrelated confirms pass through.
         assert!(
             intercept_menu_choice(
@@ -333,7 +463,9 @@ mod tests {
                     tag: "git-op",
                     arg: String::new()
                 },
-                &mut Some("host:a".into())
+                &mut Some("host:a".into()),
+                &cfg,
+                None,
             )
             .is_none()
         );

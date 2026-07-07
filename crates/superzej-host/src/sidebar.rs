@@ -342,6 +342,8 @@ pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> 
     // Gutter + indent so the detail reads as hanging under the name.
     let mut segs: Vec<Seg> = vec![sp(5)];
     let start = segs.len();
+    let dirty = row.git.is_some_and(|g| g.dirty);
+    crate::sidebar_legend::push_row_markers(row.agent.as_deref(), dirty, &mut segs);
 
     if let Some(env) = &row.env_name
         && !env.is_empty()
@@ -387,18 +389,6 @@ pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> 
     (segs.len() > start).then_some(Line::Segs(segs))
 }
 
-/// The HOSTS section row label: state glyph + name + a terse note — the live
-/// status while provisioning, else the reach kind. Pure; unit-tested with the
-/// row builder below.
-pub(crate) fn host_row_label(h: &crate::host_ui::HostSnapshot) -> String {
-    let note = if h.provisioning {
-        h.short_status()
-    } else {
-        h.reach.clone()
-    };
-    format!("{} {} · {}", h.glyph(), h.name, note)
-}
-
 /// Group `db_terminals` into host sections in sidebar **display order**:
 /// `local` first, then remote hosts by case-insensitive label. Each entry is
 /// `(collapse-key, display-label, is_local, terminals-in-order)`. The
@@ -442,8 +432,8 @@ pub fn terminal_hosts_ordered(
 /// from the DB + live groups). `status` carries per-worktree status merged
 /// onto rows. `db_worktrees` backs the rows of workspaces that are NOT loaded
 /// in the session — every workspace shows its home + registered worktrees,
-/// and activating one switches workspace. `hosts` (per-`[host.*]` snapshots
-/// off `PanelData`) adds a display-only HOSTS section when non-empty.
+/// and activating one switches workspace. (Configured `[host.*]` machines live
+/// in the System ▸ Hosts panel section, not the sidebar.)
 #[allow(clippy::too_many_arguments)]
 pub fn build_rows(
     session: &Session,
@@ -453,7 +443,6 @@ pub fn build_rows(
     db_worktrees: &[DbWorktree],
     db_folders: &[superzej_core::models::FolderRow],
     db_terminals: &[superzej_core::models::TerminalRow],
-    hosts: &[crate::host_ui::HostSnapshot],
 ) -> Vec<SidebarRow> {
     let activity = &status.activity;
     let mut rows = Vec::new();
@@ -843,72 +832,6 @@ pub fn build_rows(
             disk_bytes: None,
             target_bytes: None,
         });
-    }
-
-    // HOSTS: the configured `[host.*]` machines (hosts-as-resources), shown
-    // only when the config declares any. Display-only for now — the System ▸
-    // Hosts panel section carries the actions; these rows mirror its state
-    // glyph + a terse note (reach, or the live step while provisioning).
-    if !hosts.is_empty() {
-        rows.push(SidebarRow {
-            kind: RowKind::SectionHeading,
-            depth: 0,
-            label: "HOSTS".into(),
-            workspace_slug: "hosts".into(),
-            tab_target: None,
-            active: false,
-            worktree_path: None,
-            pin_key: String::new(),
-            branch: None,
-            git: None,
-            agent: None,
-            sandbox_backend: None,
-            env_name: None,
-            activity: ActivityState::None,
-            visible: true,
-            collapsed: false,
-            dir: false,
-            pr_count: None,
-            pr_number: None,
-            unread_count: 0,
-            alert_count: 0,
-            terminal_connection: None,
-            disk_bytes: None,
-            target_bytes: None,
-        });
-        for h in hosts {
-            rows.push(SidebarRow {
-                kind: RowKind::Terminal,
-                depth: 1,
-                label: host_row_label(h),
-                workspace_slug: "hosts".into(),
-                tab_target: None,
-                active: false,
-                worktree_path: None,
-                pin_key: format!("hosts/{}", h.name),
-                branch: None,
-                git: None,
-                agent: None,
-                sandbox_backend: None,
-                env_name: None,
-                activity: ActivityState::None,
-                visible: true,
-                collapsed: false,
-                dir: false,
-                pr_count: None,
-                pr_number: None,
-                unread_count: 0,
-                alert_count: 0,
-                // Drives the terminal-row glyph: remote reaches read as 🌐.
-                terminal_connection: Some(if h.reach == "local" {
-                    String::new()
-                } else {
-                    format!("ssh {}", h.name)
-                }),
-                disk_bytes: None,
-                target_bytes: None,
-            });
-        }
     }
 
     {
@@ -1363,7 +1286,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
         );
         // The TERMINALS section is always present (empty here → its hint row).
         let labels: Vec<&str> = rows
@@ -1391,7 +1313,6 @@ mod tests {
             &ws,
             &ViewState::default(),
             &no_activity(),
-            &[],
             &[],
             &[],
             &[],
@@ -1433,7 +1354,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
         );
         let homes: Vec<_> = rows.iter().filter(|r| r.label == "home").collect();
         assert_eq!(homes.len(), 1, "rows: {rows:?}");
@@ -1466,7 +1386,6 @@ mod tests {
             &ws,
             &ViewState::default(),
             &no_activity(),
-            &[],
             &[],
             &[],
             &[],
@@ -1514,7 +1433,6 @@ mod tests {
             &dbw,
             &[],
             &[],
-            &[],
         );
         // The DB worktree's selected env flows onto its (unloaded-workspace) row.
         let feat = rows
@@ -1559,7 +1477,7 @@ mod tests {
         )];
         let mut view = ViewState::default();
         view.collapsed.insert("app".to_string());
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[], &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[]);
         assert!(rows[0].visible); // workspace stays
         assert!(!rows[1].visible); // worktree hidden
     }
@@ -1583,7 +1501,6 @@ mod tests {
             &ws,
             &ViewState::default(),
             &no_activity(),
-            &[],
             &[],
             &[],
             &[],
@@ -1617,7 +1534,7 @@ mod tests {
             filter: "feature".into(),
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[], &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[]);
         let visible: Vec<&str> = rows
             .iter()
             .filter(|r| r.visible)
@@ -1644,7 +1561,7 @@ mod tests {
             pins: vec!["app/feat".into()],
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[], &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[]);
         // Workspace block contains all rows (depth>0), so pinning the worktree
         // inside reorders within — feat should precede home.
         let feat = rows.iter().position(|r| r.label == "feat").unwrap();
@@ -1671,7 +1588,7 @@ mod tests {
             sort: SortMode::Activity,
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &act, &[], &[], &[], &[]);
+        let rows = build_rows(&s, &ws, &view, &act, &[], &[], &[]);
         let busy = rows.iter().position(|r| r.label == "busy").unwrap();
         let home = rows.iter().position(|r| r.label == "home").unwrap();
         assert!(busy < home, "active worktree should sort first");
@@ -1706,7 +1623,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
         );
         let labels: Vec<&str> = rows
             .iter()
@@ -1720,7 +1636,7 @@ mod tests {
             sort: SortMode::Name,
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[], &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[]);
         let labels: Vec<&str> = rows
             .iter()
             .filter(|r| r.kind == RowKind::Worktree)
@@ -1769,7 +1685,6 @@ mod tests {
             &ViewState::default(),
             &no_activity(),
             &dbw,
-            &[],
             &[],
             &[],
         );
@@ -1828,86 +1743,6 @@ mod tests {
     }
 
     #[test]
-    fn hosts_render_under_their_banner_only_when_configured() {
-        let s = session(vec![], 0);
-        let ws: Vec<(String, String, String, String)> = vec![];
-        let hosts = vec![
-            crate::host_ui::HostSnapshot {
-                name: "build-box".into(),
-                id: "host:build-box".into(),
-                reach: "ssh".into(),
-                state: "ready".into(),
-                ..Default::default()
-            },
-            crate::host_ui::HostSnapshot {
-                name: "pi".into(),
-                id: "host:pi".into(),
-                reach: "iroh".into(),
-                provisioning: true,
-                live_status: "transfer image — 42 MiB".into(),
-                ..Default::default()
-            },
-        ];
-        let rows = build_rows(
-            &s,
-            &ws,
-            &ViewState::default(),
-            &no_activity(),
-            &[],
-            &[],
-            &[],
-            &hosts,
-        );
-        // The HOSTS banner is a static heading, present because hosts exist.
-        assert!(
-            rows.iter()
-                .any(|r| r.kind == RowKind::SectionHeading && r.label == "HOSTS")
-        );
-        // One display-only row per host: state glyph + name + terse note (the
-        // reach kind, or the live status while provisioning); never a nav target.
-        let host_rows: Vec<&SidebarRow> = rows
-            .iter()
-            .filter(|r| r.workspace_slug == "hosts" && r.kind == RowKind::Terminal)
-            .collect();
-        assert_eq!(host_rows.len(), 2);
-        assert_eq!(host_rows[0].label, "● build-box · ssh");
-        assert_eq!(host_rows[1].label, "◐ pi · transfer image — 42 MiB");
-        assert!(host_rows.iter().all(|r| r.tab_target.is_none()));
-        assert!(host_rows.iter().all(|r| r.visible));
-
-        // No [host.*] entries ⇒ no banner, no rows.
-        let rows = build_rows(
-            &s,
-            &ws,
-            &ViewState::default(),
-            &no_activity(),
-            &[],
-            &[],
-            &[],
-            &[],
-        );
-        assert!(!rows.iter().any(|r| r.label == "HOSTS"));
-        assert!(!rows.iter().any(|r| r.workspace_slug == "hosts"));
-    }
-
-    #[test]
-    fn host_row_label_notes_reach_or_live_status() {
-        let mut h = crate::host_ui::HostSnapshot {
-            name: "box".into(),
-            reach: "ssh".into(),
-            state: "failed".into(),
-            ..Default::default()
-        };
-        assert_eq!(host_row_label(&h), "✗ box · ssh");
-        h.provisioning = true;
-        h.live_status = "connect".into();
-        assert_eq!(host_row_label(&h), "◐ box · connect");
-        h.provisioning = false;
-        h.state = "ready".into();
-        assert_eq!(host_row_label(&h), "● box · ssh");
-    }
-
-    #[test]
     fn terminals_render_under_banner_grouped_by_host_local_first() {
         let s = session(vec![], 0);
         let ws: Vec<(String, String, String, String)> = vec![];
@@ -1924,7 +1759,6 @@ mod tests {
             &[],
             &[],
             &terms,
-            &[],
         );
         // One static banner.
         let banners: Vec<&str> = rows
@@ -1962,7 +1796,7 @@ mod tests {
             collapsed: ["terminals/host:prod".to_string()].into_iter().collect(),
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &terms, &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &terms);
         // The prod host row is present but its terminal `t1` is not.
         assert!(
             rows.iter()
@@ -1992,7 +1826,7 @@ mod tests {
             filter: "web-prod".into(),
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &terms, &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &terms);
         let visible: Vec<(&RowKind, &str)> = rows
             .iter()
             .filter(|r| r.visible)

@@ -133,6 +133,10 @@ ssh-keygen -A; exec /usr/sbin/sshd -D -e";
 ///   `nix/fly-sandbox-image.nix`) whose OWN entrypoint runs sshd and already has
 ///   the toolchain — superzej must NOT override the init, so the machine boots
 ///   straight into a reachable shell with rust/just baked (no per-VM install).
+// The Fly machine body is a flat set of independent scalars (name/region/image/
+// size/key/metadata/prebaked/iroh) each mapping to a distinct config field;
+// bundling them into a struct would only add indirection at every call site.
+#[allow(clippy::too_many_arguments)]
 pub fn create_machine_body(
     name: &str,
     region: &str,
@@ -141,6 +145,7 @@ pub fn create_machine_body(
     authorized_key: &str,
     metadata: &BTreeMap<String, String>,
     prebaked: bool,
+    iroh: Option<&super::IrohInject>,
 ) -> serde_json::Value {
     let meta: serde_json::Map<String, serde_json::Value> = metadata
         .iter()
@@ -169,6 +174,17 @@ pub fn create_machine_body(
         // Stock image: install + start sshd ourselves. A prebaked image runs its
         // own sshd entrypoint, so overriding init would replace it.
         config["init"] = serde_json::json!({ "exec": ["/bin/sh", "-c", SSHD_INIT] });
+    }
+    if let Some(inject) = iroh {
+        // iroh call-home: the baked `sz-agent` reads these three `SUPERZEJ_*` env
+        // vars on boot to dial the compositor. Keys come from `iroh_wire` (never
+        // hardcoded). `None` leaves the machine config free of an `env` object,
+        // preserving today's ssh/IPv4-only behavior verbatim.
+        config["env"] = serde_json::json!({
+            superzej_core::iroh_wire::HOME_NODE_ENV: inject.home_node,
+            superzej_core::iroh_wire::SANDBOX_AUTH_ENV: inject.sandbox_auth,
+            superzej_core::iroh_wire::SANDBOX_ID_ENV: inject.sandbox_id,
+        });
     }
     serde_json::json!({ "name": name, "region": region, "config": config })
 }
@@ -304,6 +320,7 @@ mod tests {
             "ssh-ed25519 AAAAKEY superzej",
             &meta,
             false,
+            None,
         );
         assert_eq!(b["name"], "sz-fly-1");
         assert_eq!(b["config"]["image"], "ubuntu:24.04");
@@ -348,6 +365,7 @@ mod tests {
             "ssh-ed25519 AAAAKEY superzej",
             &meta,
             true,
+            None,
         );
         // Key still injected + ssh service exposed, but the image's OWN entrypoint
         // runs sshd — no init override that would replace it.
@@ -360,6 +378,51 @@ mod tests {
             b["config"].get("init").is_none(),
             "prebaked image keeps its entrypoint"
         );
+        // No iroh injection ⇒ no `env` object (today's ssh/IPv4-only behavior).
+        assert!(
+            b["config"].get("env").is_none(),
+            "absent iroh injection leaves config free of an env object"
+        );
+    }
+
+    #[test]
+    fn iroh_injection_emits_env_with_wire_keys() {
+        let meta = BTreeMap::new();
+        let inject = super::super::IrohInject {
+            home_node: "home-endpoint-id".into(),
+            sandbox_auth: "auth-token-xyz".into(),
+            sandbox_id: "sz-fly-1".into(),
+        };
+        let b = create_machine_body(
+            "sz-fly-1",
+            "iad",
+            "registry.fly.io/x:sz",
+            "shared-cpu-2x",
+            "ssh-ed25519 AAAAKEY superzej",
+            &meta,
+            true,
+            Some(&inject),
+        );
+        // The three call-home env vars are keyed by the iroh_wire constants (never
+        // hardcoded) and carry the injected per-sandbox values.
+        assert_eq!(
+            b["config"]["env"][superzej_core::iroh_wire::HOME_NODE_ENV],
+            "home-endpoint-id"
+        );
+        assert_eq!(
+            b["config"]["env"][superzej_core::iroh_wire::SANDBOX_AUTH_ENV],
+            "auth-token-xyz"
+        );
+        assert_eq!(
+            b["config"]["env"][superzej_core::iroh_wire::SANDBOX_ID_ENV],
+            "sz-fly-1"
+        );
+        // iroh is additive — the ssh key/service wiring is untouched.
+        assert_eq!(
+            b["config"]["files"][0]["guest_path"],
+            "/root/.ssh/authorized_keys"
+        );
+        assert_eq!(b["config"]["services"][0]["ports"][0]["port"], 22);
     }
 
     #[test]

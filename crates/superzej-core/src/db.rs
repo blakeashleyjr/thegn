@@ -63,7 +63,11 @@ use std::path::PathBuf;
 /// v36: adds `compute_budgets`/`compute_meters` (see [`crate::db_compute`]).
 /// v37: adds `intents` (the CLI→compositor mailbox behind `superzej open`;
 /// see [`crate::store::IntentStore`]).
-pub const SCHEMA_VERSION: i64 = 38;
+/// v38: adds `iroh_tokens` (per-sandbox auth tokens for the iroh call-home reach;
+/// see [`crate::db_iroh`]).
+/// v39: adds `worktree_hibernations` (snapshot-then-destroy bookkeeping; see
+/// [`crate::store::HibernationStore`] — DDL in `db_migrate`).
+pub const SCHEMA_VERSION: i64 = 39;
 
 pub struct Db {
     conn: Connection,
@@ -641,6 +645,7 @@ impl Db {
         crate::db_placement::migrate_v34(&conn)?;
         crate::host_db::migrate_v35(&conn);
         crate::db_compute::migrate_v36(&conn)?;
+        crate::db_iroh::migrate_v38(&conn)?;
         Ok(Db {
             conn,
             schema_mismatch,

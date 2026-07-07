@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -56,6 +56,16 @@ pub struct FsEvent {
     pub paths: Vec<String>,
     /// Coarse kind: `"create"` | `"modify"` | `"remove"`.
     pub kind: String,
+}
+
+/// Params for `exec.batch`: run each argv (with the shared `env`) and return all
+/// results in order. Each argv is self-contained (`git -C <path> …`), so no
+/// per-command cwd is carried.
+#[derive(Serialize, Deserialize)]
+struct BatchParams {
+    cmds: Vec<Vec<String>>,
+    #[serde(default)]
+    env: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -221,6 +231,7 @@ impl BridgeClient {
     }
 
     fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        warn_if_on_loop_thread(method);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -259,6 +270,23 @@ impl BridgeClient {
             env: env.to_vec(),
         })?;
         Ok(serde_json::from_value(self.call("exec", params)?)?)
+    }
+
+    /// Run several commands in the env in **one** round-trip, returning each one's
+    /// captured output in order. Semantically N sequential [`exec`](Self::exec)s
+    /// (same shared `env`, no per-command cwd — pass `git -C <path> …` argv), but a
+    /// single RPC — collapses the per-worktree git fan-out (status + ahead/behind +
+    /// branch) from three hops to one over the persistent connection.
+    pub fn exec_batch(
+        &self,
+        cmds: &[Vec<String>],
+        env: &[(String, String)],
+    ) -> Result<Vec<ExecResult>> {
+        let params = serde_json::to_value(BatchParams {
+            cmds: cmds.to_vec(),
+            env: env.to_vec(),
+        })?;
+        Ok(serde_json::from_value(self.call("exec.batch", params)?)?)
     }
 
     /// Sum of CPU jiffies per path for processes in the env whose cwd is under it
@@ -358,6 +386,42 @@ type Registry = Mutex<HashMap<String, Arc<BridgeClient>>>;
 fn registry() -> &'static Registry {
     static R: OnceLock<Registry> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The host's event-loop thread id, recorded once at startup by
+/// [`note_loop_thread`]. A bridge RPC issued on this thread blocks the compositor
+/// on a network/subprocess round-trip — and, before the writer's `try_send` fix,
+/// could panic. `None` in tests / non-host callers (the guard is then inert).
+static LOOP_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
+static LOOP_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Record the current thread as the event loop so [`BridgeClient::call`] can flag
+/// any bridge RPC issued on it. Called once by the host at startup; a no-op
+/// second call is harmless.
+pub fn note_loop_thread() {
+    let _ = LOOP_THREAD.set(std::thread::current().id());
+}
+
+/// Whether the caller is running on the event-loop thread recorded by
+/// [`note_loop_thread`]. The reusable "am I about to block the compositor?"
+/// predicate — blocking I/O seams (bridge RPCs, and future git/DB guards) can
+/// `debug_assert!(!is_on_loop_thread())` to catch loop-thread stalls in tests.
+/// `false` when no loop thread was recorded (tests / non-host callers).
+pub fn is_on_loop_thread() -> bool {
+    LOOP_THREAD.get() == Some(&std::thread::current().id())
+}
+
+/// Warn (once) if a bridge RPC is being issued on the event-loop thread — the
+/// "never block the loop" invariant. Non-fatal: the `try_send` writer keeps this
+/// from crashing, but the caller should move the op off-loop (`spawn_blocking`).
+fn warn_if_on_loop_thread(method: &str) {
+    if is_on_loop_thread() && !LOOP_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            method,
+            "bridge RPC issued on the event-loop thread — this blocks the \
+             compositor; move it off-loop (spawn_blocking)",
+        );
+    }
 }
 
 /// The registry key for a loc, or `None` for a local worktree (no bridge).
@@ -466,10 +530,13 @@ fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs, procs: Procs
 
 /// The agent side (`szhost --bridge`): read framed requests off `reader`, run
 /// them, write framed responses to `writer`, until the stream closes. Runs
-/// *inside* the env. Blocking/synchronous (one request at a time is fine — the
-/// host issues sequentially per connection; concurrency rides separate threads).
-/// A writer shared between the request loop and the `fs.watch` background watcher
-/// threads (which push `fs.event` notifications).
+/// *inside* the env. The stateless, potentially-slow ops (`exec`/`exec.batch`/
+/// `proc.list`) run on their own thread so a slow git command doesn't
+/// head-of-line-block the *concurrent* requests the host issues (the panel /
+/// sidebar git fan-out across scoped threads) — responses are id-correlated, so
+/// out-of-order completion is fine and the shared writer is mutex-guarded. The
+/// writer is shared between the request loop, those exec threads, and the
+/// `fs.watch` background watcher threads (which push `fs.event` notifications).
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// A live streaming child: only its stdin is retained (for `proc.stdin`). Dropping
@@ -499,16 +566,36 @@ pub fn serve(mut reader: impl Read, writer: impl Write + Send + 'static) {
             let Ok(req) = serde_json::from_str::<Request>(&body) else {
                 continue;
             };
-            let resp = match req.method.as_str() {
-                "exec" => exec_response(&req),
-                "proc.list" => proc_response(&req),
-                "fs.watch" => watch_response(&req, &writer, &mut watchers),
-                "proc.spawn" => proc_spawn_response(&req, &writer, &procs),
-                "proc.stdin" => proc_stdin_response(&req, &procs),
-                "proc.kill" => proc_kill_response(&req, &procs),
-                other => resp_err(req.id, format!("unknown method: {other}")),
-            };
-            write_frame(&writer, &resp);
+            match req.method.as_str() {
+                // Stateless + potentially slow: run off the read loop so concurrent
+                // host requests parallelize (restores the pre-bridge parallel-
+                // subprocess behavior instead of serializing every git read
+                // through one connection).
+                "exec" | "exec.batch" | "proc.list" => {
+                    let w = writer.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("bridge-exec".into())
+                        .spawn(move || {
+                            let resp = match req.method.as_str() {
+                                "exec" => exec_response(&req),
+                                "exec.batch" => exec_batch_response(&req),
+                                _ => proc_response(&req),
+                            };
+                            write_frame(&w, &resp);
+                        });
+                }
+                // Stateful / fast: stay inline (they borrow `watchers`/`procs`).
+                _ => {
+                    let resp = match req.method.as_str() {
+                        "fs.watch" => watch_response(&req, &writer, &mut watchers),
+                        "proc.spawn" => proc_spawn_response(&req, &writer, &procs),
+                        "proc.stdin" => proc_stdin_response(&req, &procs),
+                        "proc.kill" => proc_kill_response(&req, &procs),
+                        other => resp_err(req.id, format!("unknown method: {other}")),
+                    };
+                    write_frame(&writer, &resp);
+                }
+            }
         }
     }
     // Connection closed: drop every child's stdin → EOF → the children exit.
@@ -674,6 +761,33 @@ fn exec_response(req: &Request) -> Response {
     }
 }
 
+fn exec_batch_response(req: &Request) -> Response {
+    let p: BatchParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return resp_err(req.id, format!("bad exec.batch params: {e}")),
+    };
+    // Each command runs independently; a spawn failure becomes a synthetic
+    // exit=-1 result rather than failing the whole batch, so one bad subcommand
+    // never masks its siblings' output.
+    let results: Vec<ExecResult> = p
+        .cmds
+        .into_iter()
+        .map(|argv| {
+            do_exec(&ExecParams {
+                argv,
+                cwd: None,
+                env: p.env.clone(),
+            })
+            .unwrap_or_else(|e| ExecResult {
+                stdout: String::new(),
+                stderr: e.to_string(),
+                exit: -1,
+            })
+        })
+        .collect();
+    resp_ok(req.id, results)
+}
+
 fn proc_response(req: &Request) -> Response {
     match serde_json::from_value::<ProcParams>(req.params.clone()) {
         Ok(p) => resp_ok(
@@ -789,6 +903,11 @@ fn do_exec(p: &ExecParams) -> Result<ExecResult> {
         c.current_dir(cwd);
     }
     scrub_git_env(&mut c);
+    // Concurrent bridged git reads (the panel/sidebar fan-out now runs in
+    // parallel on the agent) must not fight over `index.lock`; mirrors the
+    // host-side `util::git_cmd`. Harmless for non-git argv. Applied before the
+    // caller's `env` so an explicit override still wins.
+    c.env("GIT_OPTIONAL_LOCKS", "0");
     for (k, v) in &p.env {
         c.env(k, v);
     }
@@ -864,6 +983,36 @@ mod tests {
         // Untracked file shows as "?? new.rs" in porcelain.
         assert!(r.stdout.contains("?? new.rs"), "porcelain: {:?}", r.stdout);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_on_loop_thread_is_false_off_the_recorded_loop() {
+        // A freshly spawned thread was never recorded as the event loop, so the
+        // guard reads false there regardless of global `LOOP_THREAD` state — the
+        // property the blocking-I/O seams rely on. (No `note_loop_thread` here,
+        // to avoid polluting the process-global for parallel tests.)
+        assert!(!std::thread::spawn(is_on_loop_thread).join().unwrap());
+    }
+
+    #[test]
+    fn exec_batch_runs_all_in_one_round_trip_and_preserves_order() {
+        let c = connect();
+        let r = c
+            .exec_batch(
+                &[
+                    vec!["echo".into(), "first".into()],
+                    vec!["sh".into(), "-c".into(), "exit 7".into()],
+                    vec!["echo".into(), "third".into()],
+                ],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].stdout.trim(), "first");
+        assert_eq!(r[0].exit, 0);
+        // A non-zero exit is data, not an error — the batch still returns it.
+        assert_eq!(r[1].exit, 7);
+        assert_eq!(r[2].stdout.trim(), "third");
     }
 
     #[test]

@@ -264,6 +264,10 @@
             # CARGO_TARGET_*_RUSTFLAGS in shellHook below)
             cargo-nextest
             mold
+            # compilation cache (RUSTC_WRAPPER in shellHook below): shares crate
+            # artifacts across superzej's many cold-target/ worktrees + branch
+            # switches. Dev-shell only — the packaged `nix build` never enters here.
+            sccache
             # linters
             shellcheck
             yamllint
@@ -300,6 +304,18 @@
           # cheaper. Scoped to this triple so `check-cross` (macOS/Windows/wasm)
           # is unaffected; the packaged `nix build` never enters this shell.
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+          # Compilation cache. sccache reuses per-crate rustc output across cold
+          # worktrees / branch switches; it and Cargo incremental are mutually
+          # exclusive, so CARGO_INCREMENTAL=0 lets it work (the fast single-crate
+          # iterative path is `just quick <crate>`).
+          export RUSTC_WRAPPER=sccache
+          export CARGO_INCREMENTAL=0
+          # Leave headroom so heavy builds don't peg the machine (parallel
+          # rustc/codegen jobs); computed here since Nix eval can't see nproc.
+          if [ -z "''${CARGO_BUILD_JOBS:-}" ]; then
+            _jobs=$(nproc 2>/dev/null || echo 4)
+            if [ "$_jobs" -gt 2 ]; then export CARGO_BUILD_JOBS=$((_jobs - 2)); else export CARGO_BUILD_JOBS=1; fi
+          fi
           # Point dev superzej at the pinned yazi (the package wires this too).
           export SUPERZEJ_YAZI_BIN="${yaziPinned}/bin/yazi"
           # Spec-driven development (OpenSpec): telemetry off, no host writes.

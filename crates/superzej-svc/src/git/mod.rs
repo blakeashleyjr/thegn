@@ -245,18 +245,19 @@ pub trait GitBackend: Send + Sync {
     /// state dir, since `REBASE_HEAD` survives a completed rebase. Both work for
     /// remote locs (`rev-parse` over ssh, `read_git_path` cats the file).
     fn merge_state(&self, loc: &GitLoc) -> Result<Option<MergeInfo>> {
+        // Route through the persistent bridge when connected, so each probe is a
+        // cheap RPC on the live connection rather than a per-op `sprite exec`/ssh
+        // spawn (a merge/rebase banner probe was up to 5 spawns per refresh).
         let exists = |what: &str| -> bool {
-            loc.git_command(&["rev-parse", "-q", "--verify", what])
-                .output()
-                .map(|o| o.status.success())
+            run_status(loc, &["rev-parse", "-q", "--verify", what])
+                .map(|(exit, _)| exit == 0)
                 .unwrap_or(false)
         };
         let name_of = |what: &str| -> String {
-            loc.git_command(&["name-rev", "--name-only", "--always", what])
-                .output()
+            run_status(loc, &["name-rev", "--name-only", "--always", what])
                 .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|(exit, _)| *exit == 0)
+                .map(|(_, out)| out.trim().to_string())
                 .unwrap_or_default()
         };
         // A rebase in progress is marked by the `rebase-merge`/`rebase-apply`
@@ -315,12 +316,16 @@ pub trait GitBackend: Send + Sync {
         Ok(parse_unified_hunks(&out, max_lines))
     }
 
-    /// Stash entry count (0 when the stash is empty or absent).
+    /// Stash entry count (0 when the stash is empty or absent). Routes through the
+    /// persistent bridge when connected (no per-op spawn).
     fn stash_count(&self, loc: &GitLoc) -> Result<usize> {
-        let out = match loc.git_command(&["stash", "list", "--format=%h"]).output() {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-            _ => return Ok(0),
+        let (exit, out) = match run_status(loc, &["stash", "list", "--format=%h"]) {
+            Ok(v) => v,
+            Err(_) => return Ok(0),
         };
+        if exit != 0 {
+            return Ok(0);
+        }
         Ok(out.lines().filter(|l| !l.trim().is_empty()).count())
     }
 
@@ -474,6 +479,130 @@ fn run(loc: &GitLoc, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Like [`run`], but returns `(exit_code, stdout)` instead of bailing on a
+/// non-zero exit — for reads that treat a non-zero exit as *data* rather than an
+/// error (`ahead_behind`: no upstream; `merge_state`: a `*_HEAD` ref is absent;
+/// `stash_count`: empty/absent stash). Crucially it routes through the persistent
+/// bridge when one is connected, so these no longer pay a per-op `sprite exec` /
+/// `ssh` process spawn — the bridge's `exec` already carries the exit code.
+fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String)> {
+    if let Some(b) = crate::bridge::for_loc(loc) {
+        let mut argv: Vec<String> = vec!["git".into(), "-C".into(), loc.path()];
+        argv.extend(args.iter().map(|s| s.to_string()));
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let r = b.exec(&refs, None, &[])?;
+        return Ok((r.exit, r.stdout));
+    }
+    let out = loc
+        .git_command(args)
+        .output()
+        .with_context(|| format!("git {}", args.join(" ")))?;
+    Ok((
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
+}
+
+/// Parse `git status --porcelain=v1 -z` output into staged/unstaged/path rows.
+/// Shared by [`CliGit::status`] and the batched [`glyph_reads`].
+fn parse_status_porcelain(out: &str) -> Vec<FileStatus> {
+    let mut v = Vec::new();
+    for entry in out.split('\0').filter(|s| s.len() >= 3) {
+        let bytes = entry.as_bytes();
+        v.push(FileStatus {
+            staged: bytes[0] as char,
+            unstaged: bytes[1] as char,
+            path: entry[3..].to_string(),
+        });
+    }
+    v
+}
+
+/// Parse `git rev-list --left-right --count @{u}...HEAD` output ("<behind>\t
+/// <ahead>") into `(ahead, behind)`. Shared by [`CliGit::ahead_behind`] and the
+/// batched [`glyph_reads`].
+fn parse_ahead_behind(out: &str) -> Option<(usize, usize)> {
+    let mut it = out.split_whitespace();
+    let behind = it.next().and_then(|s| s.parse().ok());
+    let ahead = it.next().and_then(|s| s.parse().ok());
+    match (ahead, behind) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => None,
+    }
+}
+
+/// The sidebar glyph's three reads — dirty / ahead-behind / current-branch — as a
+/// unit. For a **bridged** loc they ride ONE `exec.batch` over the persistent
+/// connection instead of two bridge RPCs plus a per-op `sprite exec` spawn for
+/// ahead-behind; for a local loc each read uses gix/CLI exactly as before. A
+/// transport failure degrades every field to `Err` so the caller reuses its prior
+/// cached row (see the host's `merge_glyph_scan`).
+pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
+    if let Some(b) = crate::bridge::for_loc(loc) {
+        let cmds: Vec<Vec<String>> = [
+            &["status", "--porcelain=v1", "-z"][..],
+            &["rev-list", "--left-right", "--count", "@{u}...HEAD"][..],
+            &["rev-parse", "--abbrev-ref", "HEAD"][..],
+        ]
+        .iter()
+        .map(|args| {
+            let mut argv = vec!["git".to_string(), "-C".into(), loc.path()];
+            argv.extend(args.iter().map(|s| s.to_string()));
+            argv
+        })
+        .collect();
+        match b.exec_batch(&cmds, &[]) {
+            Ok(r) if r.len() == 3 => {
+                let dirty = if r[0].exit == 0 {
+                    Ok(!parse_status_porcelain(&r[0].stdout).is_empty())
+                } else {
+                    Err(anyhow::anyhow!("git status failed: {}", r[0].stderr.trim()))
+                };
+                // A non-zero exit means "no upstream" — data, not an error.
+                let ahead_behind = Ok((r[1].exit == 0)
+                    .then(|| parse_ahead_behind(&r[1].stdout))
+                    .flatten());
+                let branch = if r[2].exit == 0 {
+                    Ok(r[2].stdout.trim().to_string())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "git rev-parse failed: {}",
+                        r[2].stderr.trim()
+                    ))
+                };
+                return GlyphReads {
+                    dirty,
+                    ahead_behind,
+                    branch,
+                };
+            }
+            _ => {
+                let err = || anyhow::anyhow!("bridge exec.batch failed");
+                return GlyphReads {
+                    dirty: Err(err()),
+                    ahead_behind: Err(err()),
+                    branch: Err(err()),
+                };
+            }
+        }
+    }
+    let git = GixGit::new();
+    GlyphReads {
+        dirty: git.is_dirty(loc),
+        ahead_behind: git.ahead_behind(loc),
+        branch: git.current_branch(loc),
+    }
+}
+
+/// The result of [`glyph_reads`]: each field independently `Ok`/`Err` so a
+/// partial failure degrades only that glyph, matching the per-read error handling
+/// the host's `merge_glyph_scan` already expects.
+pub struct GlyphReads {
+    pub dirty: Result<bool>,
+    pub ahead_behind: Result<Option<(usize, usize)>>,
+    pub branch: Result<String>,
+}
+
 /// The write-op runner: like [`run`] but with extra env, a null stdin, and
 /// `GIT_TERMINAL_PROMPT=0` — a credential/gpg prompt must fail fast, never
 /// hang the background thread that mutations run on.
@@ -562,17 +691,10 @@ fn run_root(root: &Path, args: &[&str]) -> Result<()> {
 
 impl GitBackend for CliGit {
     fn status(&self, loc: &GitLoc) -> Result<Vec<FileStatus>> {
-        let out = run(loc, &["status", "--porcelain=v1", "-z"])?;
-        let mut v = Vec::new();
-        for entry in out.split('\0').filter(|s| s.len() >= 3) {
-            let bytes = entry.as_bytes();
-            v.push(FileStatus {
-                staged: bytes[0] as char,
-                unstaged: bytes[1] as char,
-                path: entry[3..].to_string(),
-            });
-        }
-        Ok(v)
+        Ok(parse_status_porcelain(&run(
+            loc,
+            &["status", "--porcelain=v1", "-z"],
+        )?))
     }
 
     fn diff_files(&self, loc: &GitLoc, base: &str) -> Result<Vec<DiffEntry>> {
@@ -614,23 +736,15 @@ impl GitBackend for CliGit {
 
     fn ahead_behind(&self, loc: &GitLoc) -> Result<Option<(usize, usize)>> {
         // `@{u}` resolves the upstream; the command fails when none is set, so a
-        // non-zero exit is treated as "no upstream" rather than an error.
-        let out = match loc
-            .git_command(&["rev-list", "--left-right", "--count", "@{u}...HEAD"])
-            .output()
-        {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-            _ => return Ok(None),
-        };
+        // non-zero exit is treated as "no upstream" rather than an error. Routes
+        // through the persistent bridge when connected (no per-op spawn).
+        let (exit, out) = run_status(loc, &["rev-list", "--left-right", "--count", "@{u}...HEAD"])?;
+        if exit != 0 {
+            return Ok(None);
+        }
         // Output is "<behind>\t<ahead>": left side is @{u} (commits we lack),
         // right side is HEAD (commits ahead).
-        let mut it = out.split_whitespace();
-        let behind = it.next().and_then(|s| s.parse().ok());
-        let ahead = it.next().and_then(|s| s.parse().ok());
-        match (ahead, behind) {
-            (Some(a), Some(b)) => Ok(Some((a, b))),
-            _ => Ok(None),
-        }
+        Ok(parse_ahead_behind(&out))
     }
 
     fn worktrees(&self, root: &Path) -> Result<Vec<WorktreeInfo>> {

@@ -484,6 +484,65 @@ pub fn confirm_menu(
     .with_body(body)
 }
 
+/// The System ▸ Hosts action menu (opened with `m` on a host row): a
+/// discoverable list mirroring the per-key accelerators, plus remove. Every
+/// item resolves to a `Confirm { tag, arg: host_id }` routed by
+/// [`crate::handlers::host::intercept_menu_choice`]. `remove host` is offered
+/// only for runtime-added (DB) hosts — declarative `config.toml` hosts are
+/// edited in the file.
+pub fn host_actions_menu(name: &str, id: &str, is_db_def: bool) -> MenuOverlay {
+    let arg = || id.to_string();
+    let mut items = vec![
+        item(
+            Some('p'),
+            "provision",
+            MenuChoice::Confirm {
+                tag: "host-provision",
+                arg: arg(),
+            },
+        ),
+        item(
+            Some('r'),
+            "re-probe",
+            MenuChoice::Confirm {
+                tag: "host-reprobe",
+                arg: arg(),
+            },
+        ),
+        item(
+            Some('c'),
+            "grant install consent",
+            MenuChoice::Confirm {
+                tag: "host-grant",
+                arg: arg(),
+            },
+        ),
+        item(
+            Some('x'),
+            "forget cached state",
+            MenuChoice::Confirm {
+                tag: "host-rm",
+                arg: arg(),
+            },
+        )
+        .danger(),
+    ];
+    if is_db_def {
+        items.push(
+            item(
+                None,
+                "remove host",
+                MenuChoice::Confirm {
+                    tag: "host-remove",
+                    arg: arg(),
+                },
+            )
+            .danger(),
+        );
+    }
+    MenuOverlay::new(MenuKindTag::Confirm, format!("host: {name}"), items)
+}
+
 /// The bouncer's tool-approval gate: a sealed agent wants to `run`/`edit`/`write`
 /// and the user picks one of ACP's four permission options. `[a]` allows once,
 /// `[s]` allows for the rest of the session (remembered for this worktree +
@@ -1645,6 +1704,48 @@ mod tests {
         assert_eq!(
             m.handle_key(&KeyCode::Char('n'), NONE),
             MenuOutcome::Pick(MenuChoice::Dismiss)
+        );
+    }
+
+    #[test]
+    fn host_actions_menu_gates_remove_on_db_hosts() {
+        // A config host offers p/r/c/x but not remove.
+        let cfg_host = host_actions_menu("build-box", "host:build-box", false);
+        let tags: Vec<&str> = cfg_host
+            .items()
+            .iter()
+            .filter_map(|i| match &i.choice {
+                MenuChoice::Confirm { tag, .. } => Some(*tag),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tags,
+            vec!["host-provision", "host-reprobe", "host-grant", "host-rm"]
+        );
+
+        // A DB-added host adds the removal item, carrying the host id.
+        let db_host = host_actions_menu("laptop", "host:laptop", true);
+        let remove = db_host
+            .items()
+            .iter()
+            .find(|i| {
+                matches!(
+                    &i.choice,
+                    MenuChoice::Confirm {
+                        tag: "host-remove",
+                        ..
+                    }
+                )
+            })
+            .expect("db host offers remove");
+        assert!(remove.danger, "remove is destructive");
+        assert_eq!(
+            remove.choice,
+            MenuChoice::Confirm {
+                tag: "host-remove",
+                arg: "host:laptop".into(),
+            }
         );
     }
 

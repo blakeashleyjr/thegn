@@ -66,7 +66,7 @@ fn glyph_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, 
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, (GlyphRow, Instant)>>,
     > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    CACHE.get_or_init(|| std::sync::Mutex::new(crate::warmcache::load_glyphs()))
 }
 
 /// Staleness window for background-worktree git glyphs. The active worktree is
@@ -594,49 +594,6 @@ pub(crate) fn db_worktree_list(db: &superzej_core::db::Db) -> Vec<crate::sidebar
 /// Gather per-worktree git/agent/activity status for every tab in the session.
 /// Runs on the hydration thread (git can be slow); the event loop merges this
 /// into the tree at render time. Also advances the activity FSM in-process.
-/// Compute the entity-level summary of a worktree's pending changes from
-/// `git diff HEAD` (semantic git layer). Runs on the hydration thread: one diff
-/// subprocess + a tree-sitter parse per changed file. Capped at 50 files so a
-/// sprawling change never balloons hydration; `None` when there's nothing to
-/// show or git/parse yields no entities.
-fn compute_entity_summary(
-    loc: &superzej_core::remote::GitLoc,
-    diff_entries: &[superzej_svc::git::DiffEntry],
-) -> Option<superzej_core::semantic::EntitySummary> {
-    use superzej_core::semantic::{EntitySummary, Lang, entities_for_diff};
-    if diff_entries.is_empty() || diff_entries.len() > 50 {
-        return None;
-    }
-    // Same sanitized flags the git backend uses (see svc SANITIZED_DIFF) so the
-    // patch parses cleanly: no color/ext-diff/renames, 3 lines of context.
-    let diff = loc.git_out(&[
-        "-c",
-        "diff.noprefix=false",
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        "--no-renames",
-        "-U3",
-        "HEAD",
-    ])?;
-    let root = loc.path();
-    let mut per_file = Vec::new();
-    for f in superzej_core::patch::parse_patch(&diff) {
-        let Some(lang) = Lang::from_path(&f.new_path) else {
-            continue;
-        };
-        let Ok(src) = std::fs::read_to_string(std::path::Path::new(&root).join(&f.new_path)) else {
-            continue;
-        };
-        let changes = entities_for_diff(&src, lang, &f.hunks);
-        if !changes.is_empty() {
-            per_file.push((f.new_path.clone(), changes));
-        }
-    }
-    let summary = EntitySummary::new(per_file);
-    (!summary.per_file.is_empty()).then_some(summary)
-}
-
 fn collect_sidebar_status(
     session: &crate::session::Session,
     db: &superzej_core::db::Db,
@@ -648,7 +605,6 @@ fn collect_sidebar_status(
     lifecycle: &superzej_core::config::LifecycleConfig,
 ) -> crate::sidebar::SidebarStatus {
     use superzej_core::remote::GitLoc;
-    use superzej_svc::git::{GitBackend, GixGit};
     let mut status = crate::sidebar::SidebarStatus::default();
     let t0 = std::time::Instant::now();
     // Worktrees mid-hibernation: drives the sidebar ⏾ badge + render cache.
@@ -825,10 +781,12 @@ fn collect_sidebar_status(
                 s.spawn(move || {
                     let wt = std::path::Path::new(p);
                     let loc = GitLoc::for_worktree(wt);
-                    let git = GixGit::new();
-                    let dirty = git.is_dirty(&loc).map_err(|_| ());
-                    let ahead_behind = git.ahead_behind(&loc).map_err(|_| ());
-                    let branch = git.current_branch(&loc).map(Some).map_err(|_| ());
+                    // One batched round-trip for a bridged loc (status + ahead/
+                    // behind + branch), gix/CLI reads for a local one.
+                    let reads = superzej_svc::git::glyph_reads(&loc);
+                    let dirty = reads.dirty.map_err(|_| ());
+                    let ahead_behind = reads.ahead_behind.map_err(|_| ());
+                    let branch = reads.branch.map(Some).map_err(|_| ());
                     let repo_root = superzej_core::repo::main_worktree(wt)
                         .map(|r| r.to_string_lossy().into_owned())
                         .unwrap_or_else(|| p.clone());
@@ -855,6 +813,7 @@ fn collect_sidebar_status(
         for (p, row, clean) in &scanned {
             if *clean {
                 cache.insert(p.clone(), (row.clone(), now));
+                let _ = db.put_glyph_cache(p, &serde_json::to_string(row).unwrap_or_default());
             }
         }
         cache.retain(|k, _| paths.iter().any(|p| p == k));
@@ -1342,7 +1301,7 @@ pub(crate) fn build_panel(
         // `loc`, so they ride one thread (entity parsing is CPU, kept off the rest).
         let h_diff = s.spawn(|| {
             let entries = GixGit::new().diff_files(&loc, "HEAD").unwrap_or_default();
-            let entities = compute_entity_summary(&loc, &entries);
+            let entities = crate::hydrate_semantic::compute_entity_summary(&loc, &entries);
             (entries, entities)
         });
         let h_status = s.spawn(|| GixGit::new().status(&loc).unwrap_or_default());
@@ -1670,7 +1629,9 @@ pub(crate) fn spawn_panel_prefetch(
     hints: HydrateHints,
     waker: Option<TerminalWaker>,
 ) {
-    task::spawn_blocking(move || {
+    // Prefetch is background warming — ride the background lane so it never
+    // starves the active worktree's (ungated) interactive hydration.
+    crate::sched::spawn_bg(move || {
         if !cwd.is_dir() {
             return;
         }
@@ -1700,7 +1661,7 @@ pub(crate) fn spawn_pr_cache_refresh(
 ) {
     let branch_session = session.clone();
     let branch_waker = waker.clone();
-    task::spawn_blocking(move || {
+    crate::sched::spawn_bg(move || {
         let cwd = active_tab_path(&session);
         if !cwd.is_dir() {
             return;
@@ -1779,7 +1740,7 @@ pub(crate) fn spawn_pr_cache_refresh(
     // runs on its own blocking thread under a throwaway current-thread
     // runtime — neither the subprocess fallback nor the HTTP wait can ever
     // touch the event loop.
-    task::spawn_blocking(move || {
+    crate::sched::spawn_bg(move || {
         let cwd = active_tab_path(&branch_session);
         if !cwd.is_dir() {
             return;
@@ -1917,7 +1878,7 @@ pub(crate) fn spawn_disk_scan(
     if !cfg.show_sizes {
         return;
     }
-    task::spawn_blocking(move || {
+    crate::sched::spawn_bg(move || {
         let Ok(db) = superzej_core::db::Db::open() else {
             return;
         };
@@ -1964,7 +1925,7 @@ pub(crate) fn spawn_issue_cache_refresh(
     cfg: superzej_core::config::IssuesConfig,
     waker: Option<TerminalWaker>,
 ) {
-    task::spawn_blocking(move || {
+    crate::sched::spawn_bg(move || {
         use superzej_core::issue::IssueFilter;
         use superzej_svc::issue::IssueRouter;
 
@@ -2106,7 +2067,7 @@ pub(crate) fn spawn_my_work_refresh(
     all: bool,
     waker: Option<TerminalWaker>,
 ) {
-    task::spawn_blocking(move || {
+    crate::sched::spawn_bg(move || {
         use superzej_core::work::{ALL_SCOPE, WorkGroup, WorkKind, WorkRow};
 
         let cwd = active_tab_path(&session);
@@ -2291,7 +2252,7 @@ pub(crate) fn spawn_ci_cache_refresh(
     cfg: superzej_core::config::CiConfig,
     waker: Option<TerminalWaker>,
 ) {
-    task::spawn_blocking(move || {
+    crate::sched::spawn_bg(move || {
         let cwd = active_tab_path(&session);
         if !cwd.is_dir() {
             return;
@@ -2663,58 +2624,6 @@ mod tests {
         let (row, clean) = merge_glyph_scan(None, Err(()), Err(()), Err(()), "/repo".into());
         assert_eq!(row, (false, 0, 0, None, "/repo".into()));
         assert!(!clean);
-    }
-
-    /// End-to-end over the I/O seam: a real temp git repo with an edited
-    /// entity-bearing file → `compute_entity_summary` parses the diff + source
-    /// and attributes churn to the function.
-    #[test]
-    fn compute_entity_summary_over_a_real_repo() {
-        use superzej_core::util::{git_cmd, git_out};
-        let dir = std::env::temp_dir().join(format!("sz-sem-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // test code: fixture setup, never on the event loop.
-        #[expect(clippy::disallowed_methods)]
-        let run = |args: &[&str]| {
-            assert!(
-                git_cmd(&dir).args(args).status().unwrap().success(),
-                "git {args:?}"
-            );
-        };
-        run(&["init", "-q", "-b", "main"]);
-        run(&["config", "user.email", "t@t.t"]);
-        run(&["config", "user.name", "t"]);
-        let file = dir.join("lib.rs");
-        std::fs::write(&file, "fn greet() -> u8 {\n    1\n}\n").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-q", "-m", "init"]);
-        // Edit the function body → a real `git diff HEAD`.
-        std::fs::write(&file, "fn greet() -> u8 {\n    42\n}\n").unwrap();
-
-        let loc = superzej_core::remote::GitLoc::for_worktree(&dir);
-        // A non-empty diff_entries list (only its length gates the call).
-        let entries = vec![superzej_svc::git::DiffEntry {
-            path: "lib.rs".into(),
-            added: 1,
-            deleted: 1,
-        }];
-        let summary = compute_entity_summary(&loc, &entries).expect("entity summary");
-        assert_eq!(summary.per_file.len(), 1, "{summary:?}");
-        let (path, changes) = &summary.per_file[0];
-        assert_eq!(path, "lib.rs");
-        assert_eq!(changes[0].name, "greet");
-        assert!(changes[0].added > 0 && changes[0].deleted > 0);
-        let impact = summary.impact.expect("impact");
-        assert_eq!(impact.entities, 1);
-
-        // A clean repo (no diff vs HEAD) yields None. `git_out` returns None on
-        // empty output, so a clean tree shows no changed names.
-        run(&["checkout", "--", "lib.rs"]);
-        assert!(git_out(&dir, &["diff", "--name-only", "HEAD"]).is_none());
-        assert!(compute_entity_summary(&loc, &entries).is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

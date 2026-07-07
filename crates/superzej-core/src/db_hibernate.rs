@@ -1,4 +1,4 @@
-//! Hibernation state (schema v38): the embedded-SQLite implementation of the
+//! Hibernation state (schema v39): the embedded-SQLite implementation of the
 //! [`HibernationStore`] seam over `worktree_hibernations`. Sibling `impl`
 //! block (via the `conn()` accessor) so `db.rs` only carries the schema DDL.
 

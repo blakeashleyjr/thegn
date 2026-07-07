@@ -247,7 +247,11 @@ awk '/MemTotal/ {print "MEM_TOTAL_KB=" $2} /MemAvailable/ {print "MEM_AVAIL_KB="
 awk '{printf "LOAD1_MILLI=%d
 ", $1 * 1000}' /proc/loadavg 2>/dev/null
 df -kP "${HOME:-/}" 2>/dev/null | awk 'NR==2 {print "DISK_FREE=" $4 * 1024}'
-command -v podman >/dev/null 2>&1 && echo "CONTAINERS=$(podman ps -q 2>/dev/null | wc -l | tr -d ' ')"
+if command -v podman >/dev/null 2>&1; then
+  echo "CONTAINERS=$(podman ps -q 2>/dev/null | wc -l | tr -d ' ')"
+elif command -v docker >/dev/null 2>&1; then
+  echo "CONTAINERS=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')"
+fi
 true
 "#;
 
@@ -290,6 +294,35 @@ fn exec_argv(argv: &[String], timeout: Duration) -> Result<(bool, String, String
             Err(e) => return Err(format!("wait: {e}")),
         }
     }
+}
+
+/// The `containers-storage:[driver@graphroot+runroot]` prefix for the LOCAL
+/// rootless podman store, so skopeo reads a `just image-build`-loaded image (the
+/// bare `containers-storage:` transport hits the *root* store — "mkdir
+/// /run/containers: permission denied" — when run rootless). `None` if local
+/// podman isn't available (callers then fall back to docker-daemon / registry).
+pub(super) fn local_containers_storage_prefix() -> Option<String> {
+    let (ok, out, _) = exec_argv(
+        &[
+            "podman".into(),
+            "info".into(),
+            "--format".into(),
+            "{{.Store.GraphDriverName}}|{{.Store.GraphRoot}}|{{.Store.RunRoot}}".into(),
+        ],
+        Duration::from_secs(10),
+    )
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    let mut parts = out.lines().next()?.trim().split('|');
+    let drv = parts.next()?.trim();
+    let gr = parts.next()?.trim();
+    let rr = parts.next()?.trim();
+    if drv.is_empty() || gr.is_empty() {
+        return None;
+    }
+    Some(format!("containers-storage:[{drv}@{gr}+{rr}]"))
 }
 
 /// Shorten a stderr blob into a one-line error tail.
@@ -470,17 +503,77 @@ impl OciRunner {
         })
     }
 
+    /// The skopeo storage transport that writes into THIS runtime's image
+    /// store: podman reads `containers-storage:`, docker its daemon via
+    /// `docker-daemon:`. (podman's store is invisible to `docker run`, and
+    /// vice-versa — picking the wrong one loads an image the spawn can't see.)
+    fn storage_transport(&self) -> Result<&'static str, String> {
+        Ok(match self.runtime()?.kind {
+            RuntimeKind::Podman => "containers-storage",
+            RuntimeKind::Docker => "docker-daemon",
+            RuntimeKind::CloudManaged => {
+                return Err("cloud-managed runtime has no host binary".into());
+            }
+        })
+    }
+
+    /// A shell test that succeeds iff the named `image`/`volume` exists,
+    /// spelled for the host's runtime. podman has the `… exists` sugar (exit
+    /// 0/1); docker has no such subcommand, so use `… inspect >/dev/null`.
+    fn exists_test(&self, kind: &str, name: &str) -> Result<String, String> {
+        let bin = self.runtime_bin()?;
+        Ok(match self.runtime()?.kind {
+            RuntimeKind::Podman => format!("{bin} {kind} exists {name}"),
+            RuntimeKind::Docker => format!("{bin} {kind} inspect {name} >/dev/null 2>&1"),
+            RuntimeKind::CloudManaged => {
+                return Err("cloud-managed runtime has no host binary".into());
+            }
+        })
+    }
+
+    /// Shell command that loads the verified oci-archive at `archive` into the
+    /// host's image storage under `tag`, then removes the archive. skopeo (when
+    /// present) copies straight into the runtime's storage transport; the
+    /// fallback uses `<bin> load` + `<bin> tag` (both podman and docker spell
+    /// these the same, but only skopeo avoids the oci-archive-vs-docker-archive
+    /// load quirk — recommend skopeo on docker hosts).
+    pub(super) fn load_archive_cmd(&self, archive: &str, tag: &str) -> Result<String, String> {
+        let bin = self.runtime_bin()?;
+        let transport = self.storage_transport()?;
+        Ok(format!(
+            "if command -v skopeo >/dev/null 2>&1; then \
+               skopeo copy oci-archive:{archive} {transport}:{tag}; \
+             else \
+               ref=$({bin} load -i {archive} | sed -n 's/^Loaded image[^:]*: *//p' | tail -1); \
+               [ -n \"$ref\" ] && {bin} tag \"$ref\" {tag}; \
+             fi && rm -f {archive}"
+        ))
+    }
+
     /// Fetch the raw manifest (index) for `reference` and the sha256 of those
     /// bytes, trying local skopeo → local podman → remote skopeo → remote
     /// podman. The digest-of-document IS the (list) digest.
     fn fetch_manifest(&self, reference: &ImageRef) -> Result<(String, Digest), String> {
         let target = reference.pinned().unwrap_or_else(|| reference.name_tag());
-        let attempts: [(bool, String); 4] = [
-            (true, format!("skopeo inspect --raw docker://{target}")),
-            (true, format!("podman manifest inspect docker://{target}")),
-            (false, format!("skopeo inspect --raw docker://{target}")),
-            (false, format!("podman manifest inspect docker://{target}")),
-        ];
+        let name_tag = reference.name_tag();
+        // Local container storage FIRST — the fully-local path (a `just
+        // image-build`-loaded image resolves with NO registry). skopeo must be
+        // told the rootless podman store explicitly ([driver@graphroot+runroot]);
+        // the bare `containers-storage:` transport hits the ROOT store. docker's
+        // daemon transport is unambiguous. Both miss for a genuinely-remote ref
+        // and fall through to the registry.
+        let mut attempts: Vec<(bool, String)> = Vec::new();
+        if let Some(cs) = local_containers_storage_prefix() {
+            attempts.push((true, format!("skopeo inspect --raw {cs}{name_tag}")));
+        }
+        attempts.push((
+            true,
+            format!("skopeo inspect --raw docker-daemon:{name_tag}"),
+        ));
+        attempts.push((true, format!("skopeo inspect --raw docker://{target}")));
+        attempts.push((true, format!("podman manifest inspect docker://{target}")));
+        attempts.push((false, format!("skopeo inspect --raw docker://{target}")));
+        attempts.push((false, format!("podman manifest inspect docker://{target}")));
         let mut last_err = String::from("no manifest tool (skopeo/podman) available");
         for (local, cmd) in &attempts {
             let run = if *local {
@@ -679,10 +772,12 @@ impl HostRunner for OciRunner {
         // images have no name@digest association); either form counts, but a
         // missing tag on a pulled image is repaired so spawn always works.
         let tag = superzej_core::image::managed_tag(digest);
+        let tag_exists = self.exists_test("image", &tag)?;
+        let target_exists = self.exists_test("image", &target)?;
         match self.exec(
             &format!(
-                "if {bin} image exists {tag}; then exit 0; fi; \
-                 if {bin} image exists {target}; then {bin} tag {target} {tag}; exit 0; fi; \
+                "if {tag_exists}; then exit 0; fi; \
+                 if {target_exists}; then {bin} tag {target} {tag}; exit 0; fi; \
                  exit 1"
             ),
             Duration::from_secs(30),
@@ -715,11 +810,12 @@ impl HostRunner for OciRunner {
                 }
             }
             DeliveryStrategy::SkopeoRemoteCopy => {
+                let transport = self.storage_transport()?;
                 let (ok, _, err) = self
                     .exec(
                         &format!(
                             "skopeo copy --retry-times 3 docker://{target} \
-                             containers-storage:{}",
+                             {transport}:{}",
                             image.name_tag()
                         ),
                         Duration::from_secs(1800),
@@ -761,7 +857,7 @@ impl HostRunner for OciRunner {
         // Idempotent: an existing volume is a seeded volume (copy-up happened
         // on its first mount).
         if let Ok((true, _, _)) = self.exec(
-            &format!("{bin} volume exists {}", spec.name),
+            &self.exists_test("volume", &spec.name)?,
             Duration::from_secs(30),
         ) {
             return Ok(());
@@ -931,6 +1027,59 @@ mod tests {
         assert_eq!(
             d.as_str(),
             "sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+        );
+    }
+
+    /// Build a runner whose probed runtime is fixed by a synthetic probe line,
+    /// so the command-spelling helpers can be tested without a real host.
+    fn runner_with_runtime(probe: &str) -> OciRunner {
+        let caps = HostCaps::parse_probe(probe).expect("probe parses");
+        let mut r = OciRunner::new(Placement::Local);
+        r.caps = Some(caps);
+        r
+    }
+
+    #[test]
+    fn oci_command_spelling_is_runtime_aware() {
+        // A docker host answers `docker image inspect` / `docker-daemon:` — the
+        // `podman … exists` sugar and `containers-storage:` transport do NOT
+        // exist there, so a podman-hardcoded command would fail provisioning.
+        let podman = runner_with_runtime("ARCH=x86_64\nOS=linux\nPODMAN=4.9.3\n");
+        let docker = runner_with_runtime("ARCH=x86_64\nOS=linux\nDOCKER=24.0.5\n");
+
+        assert_eq!(podman.runtime_bin().unwrap(), "podman");
+        assert_eq!(docker.runtime_bin().unwrap(), "docker");
+        assert_eq!(podman.storage_transport().unwrap(), "containers-storage");
+        assert_eq!(docker.storage_transport().unwrap(), "docker-daemon");
+
+        assert_eq!(
+            podman.exists_test("image", "img").unwrap(),
+            "podman image exists img"
+        );
+        assert_eq!(
+            docker.exists_test("image", "img").unwrap(),
+            "docker image inspect img >/dev/null 2>&1"
+        );
+        assert_eq!(
+            docker.exists_test("volume", "vol").unwrap(),
+            "docker volume inspect vol >/dev/null 2>&1"
+        );
+
+        let pload = podman.load_archive_cmd("/a.tar", "localhost/x:t").unwrap();
+        assert!(
+            pload.contains("containers-storage:localhost/x:t"),
+            "{pload}"
+        );
+        assert!(pload.contains("podman load -i /a.tar"), "{pload}");
+        assert!(pload.contains("podman tag"), "{pload}");
+
+        let dload = docker.load_archive_cmd("/a.tar", "localhost/x:t").unwrap();
+        assert!(dload.contains("docker-daemon:localhost/x:t"), "{dload}");
+        assert!(dload.contains("docker load -i /a.tar"), "{dload}");
+        assert!(dload.contains("docker tag"), "{dload}");
+        assert!(
+            !dload.contains("podman"),
+            "no podman-isms on docker: {dload}"
         );
     }
 }

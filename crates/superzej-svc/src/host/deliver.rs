@@ -58,21 +58,41 @@ fn stage_local_archive(
         return Ok((tar, d, size));
     }
     let target = format!("{}@{}", image.name, digest);
+    let name_tag = image.name_tag();
     let tmp = dir.join(format!("{hex}.tar.tmp"));
     let _ = std::fs::remove_file(&tmp);
-    // skopeo pulls straight from the registry into an archive; the podman
-    // fallback goes via local container storage.
-    let skopeo = format!(
+    // LOCAL container storage FIRST, by name:tag — a `just image-build`-loaded
+    // image has no RepoDigest, so a `name@digest` pull would miss; staging the
+    // local image directly is the fully-local, registry-free path. `podman save`
+    // is the reliable rootless path; skopeo needs the store spelled out (see
+    // `local_containers_storage_prefix`); docker-daemon covers a docker host.
+    // Then the registry: skopeo streams straight to an archive; podman via store.
+    let mut attempts: Vec<String> = Vec::new();
+    attempts.push(format!(
+        "podman image exists {name_tag} && podman save --format oci-archive -o {} {name_tag}",
+        tmp.display()
+    ));
+    if let Some(cs) = super::local_containers_storage_prefix() {
+        attempts.push(format!(
+            "skopeo copy {cs}{name_tag} oci-archive:{}",
+            tmp.display()
+        ));
+    }
+    attempts.push(format!(
+        "skopeo copy docker-daemon:{name_tag} oci-archive:{}",
+        tmp.display()
+    ));
+    attempts.push(format!(
         "skopeo copy docker://{target} oci-archive:{}",
         tmp.display()
-    );
-    let podman = format!(
+    ));
+    attempts.push(format!(
         "podman image exists {target} || podman pull -q {target}; \
          podman save --format oci-archive -o {} {target}",
         tmp.display()
-    );
+    ));
     let mut staged = false;
-    for cmd in [skopeo, podman] {
+    for cmd in attempts {
         match exec_argv(&["sh".into(), "-lc".into(), cmd], Duration::from_secs(1800)) {
             Ok((true, _, _)) if tmp.is_file() => {
                 staged = true;
@@ -85,7 +105,9 @@ fn stage_local_archive(
     }
     if !staged {
         return Err(format!(
-            "no local route to stage {target} (need skopeo or podman with registry access)"
+            "no route to stage {target} — need the image in local container \
+             storage (`just image-build` / `podman pull`) or skopeo/podman with \
+             registry access"
         ));
     }
     let sha = sha256_file_local(&tmp)?;
@@ -166,18 +188,11 @@ pub(super) fn ssh_stream(
         ));
     }
 
-    // Load into container storage under the managed digest tag. skopeo (when
-    // present) preserves identities cleanly; the podman fallback captures the
-    // loaded ref and tags it.
+    // Load into the host runtime's image storage under the managed digest tag.
+    // The command is spelled for podman OR docker (storage transport + fallback
+    // binary) — see `OciRunner::load_archive_cmd`.
     let tag = managed_tag(digest);
-    let load = format!(
-        "if command -v skopeo >/dev/null 2>&1; then \
-           skopeo copy oci-archive:{remote_partial} containers-storage:{tag}; \
-         else \
-           ref=$(podman load -i {remote_partial} | sed -n 's/^Loaded image[^:]*: *//p' | tail -1); \
-           [ -n \"$ref\" ] && podman tag \"$ref\" {tag}; \
-         fi && rm -f {remote_partial}"
-    );
+    let load = runner.load_archive_cmd(&remote_partial, &tag)?;
     let (ok, _, err) = runner
         .exec(&load, Duration::from_secs(900))
         .map_err(|e| format!("load: {e}"))?;

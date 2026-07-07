@@ -50,7 +50,20 @@ pub fn ssh_base(port: u16, forward_agent: bool, batch: bool) -> Vec<String> {
     v.push("ConnectTimeout=10".into());
     // Multiplex so the panel's frequent git polls reuse one connection (and the
     // interactive pane's master serves later control-plane calls without re-auth).
-    let ctl = util::superzej_dir().join("run/ssh-%r@%h:%p");
+    // The ControlPath's parent (`<superzej_dir>/run`) is created by the compositor
+    // at startup, but a headless CLI (`superzej host provision`, `pr`, `diff`, …)
+    // can run before that ever happens — ensure it once so ssh can bind the socket
+    // (otherwise ControlMaster fails with "cannot bind to path … No such file").
+    let run_dir = util::superzej_dir().join("run");
+    {
+        static RUN_DIR_ONCE: std::sync::Once = std::sync::Once::new();
+        let rd = run_dir.clone();
+        // best-effort: if the mkdir fails, ssh reports the bind error as before.
+        RUN_DIR_ONCE.call_once(move || {
+            let _ = std::fs::create_dir_all(rd);
+        });
+    }
+    let ctl = run_dir.join("ssh-%r@%h:%p");
     v.push("-o".into());
     v.push("ControlMaster=auto".into());
     v.push("-o".into());
@@ -206,6 +219,29 @@ impl GitLoc {
             GitLoc::Remote { path, .. } => path.clone(),
             GitLoc::Provider { path, .. } => path.clone(),
         }
+    }
+
+    /// Best-effort `rm -rf` of THIS worktree's own directory on the box it lives
+    /// on (ssh remote or provider env) — the local delete path can't reach a
+    /// remote checkout, so it would otherwise leak. ONLY the worktree dir is
+    /// removed; the shared base image + warm volumes (labelled
+    /// `superzej.managed`) are untouched. No-op for a local loc (the caller
+    /// removes that itself) or an empty/`~`/`/` path (never `rm -rf /`).
+    pub fn remove_remote_dir(&self) {
+        let path = self.path();
+        let p = path.trim();
+        if p.is_empty() || p == "/" || p == "~" {
+            return;
+        }
+        let script = format!("rm -rf {}", util::sh_quote(p));
+        // best-effort: a lingering remote dir is reclaimable via `host rm-cache`.
+        let _ = match self {
+            GitLoc::Local(_) => return,
+            GitLoc::Remote { ssh, .. } => self.ssh_command(ssh, script).output(),
+            GitLoc::Provider { control_prefix, .. } => {
+                self.provider_command(control_prefix, script).output()
+            }
+        };
     }
 
     /// A `Command` running `git -C <path> <args>` — locally, or over ssh.
@@ -527,6 +563,33 @@ mod tests {
         let loc = GitLoc::from_db("/wt/x", None);
         assert!(!loc.is_remote());
         assert_eq!(loc.path(), "/wt/x");
+    }
+
+    #[test]
+    fn remove_remote_dir_is_safe_on_local_and_guards_dangerous_paths() {
+        // A local loc never sshs anything; the caller purges the local dir.
+        let dir = std::env::temp_dir().join(format!("sz-rrd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        GitLoc::Local(dir.clone()).remove_remote_dir();
+        assert!(
+            dir.exists(),
+            "local loc must NOT be removed by remove_remote_dir"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // Guard: an empty / root / ~ remote path must never `rm -rf` — the
+        // command is skipped entirely (constructing a Remote with such a path
+        // and calling it must not attempt to run anything destructive).
+        for p in ["", "/", "~"] {
+            let loc = GitLoc::Remote {
+                ssh: SshTarget {
+                    host: "nobody@127.0.0.1".into(),
+                    port: 1,
+                    forward_agent: false,
+                },
+                path: p.to_string(),
+            };
+            loc.remove_remote_dir(); // returns without spawning ssh
+        }
     }
 
     #[test]

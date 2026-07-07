@@ -2501,10 +2501,8 @@ fn compose_row_lines(
             let label = crate::sidebar::compose_row_label(row.pr_number, window_title, &row.label);
             left.push(seg(name_fg, label));
             if let Some(agent) = &row.agent {
-                left.push(seg(
-                    Tok::Hue(theme::Hue::Teal),
-                    format!(" {}", superzej_core::theme::agent_glyph(agent)),
-                ));
+                let glyph = theme::agent_glyph(agent, crate::caps::agent_glyph_style());
+                left.push(seg(Tok::Hue(theme::Hue::Teal), format!(" {glyph}")));
             }
 
             // Right cluster (always-on): git status + alert badge (PR/unread/disk move to the detail line).
