@@ -179,6 +179,7 @@ mod tests {
             RenderPlan::Incremental {
                 panes: vec![7],
                 bars: false,
+                sidebar: false,
             }
         );
     }

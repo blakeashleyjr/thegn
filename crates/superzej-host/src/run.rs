@@ -8018,6 +8018,7 @@ async fn event_loop<T: Terminal>(
     // incremental path (recompose + bounded-diff the two 1-row bar rects) instead
     // of the master `dirty` full-chrome repaint. Cleared after flush.
     let mut bars_dirty = false;
+    let mut sidebar_dirty = false; // D5: sidebar-only damage (nav/collapse); reset with bars_dirty
     // One zone owns the keyboard at any time; Ctrl+g toggles the keybind lock.
     // `sb.focused` / `model.panel_focused` / `model.center_focused` mirror it.
     let mut focus = crate::focus::FocusState::default();
@@ -11568,7 +11569,8 @@ async fn event_loop<T: Terminal>(
         // 2. Render if anything changed (diff-flush): damaged panes and/or chrome,
         //    cursor in the focused pane. `dirty` = chrome/overlay/geometry channel;
         //    `dirty_panes` = per-pane content; either (or `full_repaint`) → a frame.
-        let should_render = dirty || full_repaint || !dirty_panes.is_empty() || bars_dirty;
+        let should_render =
+            dirty || full_repaint || !dirty_panes.is_empty() || bars_dirty || sidebar_dirty;
         if !should_render {
             // Woke but nothing changed — a wasted wakeup (storm signal).
             loop_perf.render_skip();
@@ -11685,6 +11687,7 @@ async fn event_loop<T: Terminal>(
                 chrome: dirty,
                 panes: dirty_panes.clone(),
                 bars: bars_dirty,
+                sidebar: sidebar_dirty,
             };
             let frame_plan = crate::render_plan::plan(&damage, &overlays);
             // Diagnostic: when a FULL frame is chosen, record which damage
@@ -11810,19 +11813,16 @@ async fn event_loop<T: Terminal>(
             } else if let crate::render_plan::RenderPlan::Incremental {
                 panes: ref ids,
                 bars,
+                sidebar,
             } = frame_plan
             {
-                // INCREMENTAL FAST PATH: pane output and/or a bars (stats/clock)
-                // tick, nothing heavier. Reuse the prior frame in `scratch` and
-                // recompose ONLY the damaged regions — never the full chrome (the
-                // dominant per-frame cost). The bounded diff below then scans just
-                // these rects, so a frame's cost tracks what changed, not the
-                // screen size.
+                // INCREMENTAL FAST PATH: pane output / bars tick / sidebar nav.
+                // Reuse the prior frame in `scratch`, recompose ONLY the damaged
+                // regions (never the full chrome); the bounded diff scans just those.
                 let frames = tree.layout_framed(chrome.center);
                 for &id in ids {
-                    // The corner overlay is an off-tree pane: compose its content
-                    // + card and diff ONLY its outer rect. This keeps a streaming
-                    // video frame a bounded one-rect diff (never a chrome recompose).
+                    // The corner overlay is an off-tree pane: compose its content +
+                    // card and diff ONLY its outer rect (bounded, never a recompose).
                     if Some(id) == corner {
                         if let Some(outer) = compose_corner(
                             &mut scratch,
@@ -11838,10 +11838,8 @@ async fn event_loop<T: Terminal>(
                         }
                         continue;
                     }
-                    // (rect to compose, rect to diff, has a card ring). A framed
-                    // pane composes its content but diffs the *frame* rect so the
-                    // repainted border ring is scanned; the drawer has no card, so
-                    // it composes + diffs its own reserved rect.
+                    // (compose rect, diff rect, has card). A framed pane diffs the
+                    // *frame* rect (border ring); the drawer diffs its reserved rect.
                     let resolved = if let Some(d) = drawer
                         && d == id
                         && let Some(rect) = chrome.drawer
@@ -11853,16 +11851,14 @@ async fn event_loop<T: Terminal>(
                             .find(|(pid, _, _)| *pid == id)
                             .map(|(_, f, c)| (*c, *f, true))
                     };
-                    // A pane awaiting relaunch is a husk with no live process, so
-                    // it never enters `dirty_panes` — no relaunch overlay needed.
+                    // A husk pane awaiting relaunch never enters `dirty_panes`.
                     if let (Some((content, diff_rect, has_card)), Some(p)) =
                         (resolved, panes.table.get(&id))
                     {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
                         if has_card {
-                            // Repaint the card so pane output that lands a wide
-                            // glyph at the edge can't nibble the border `│`; the
-                            // frame rect (pushed below) makes the diff cover it.
+                            // Repaint the card so an edge wide-glyph can't nibble the
+                            // border `│`; the frame rect (below) makes the diff cover it.
                             crate::chrome::redraw_pane_card(
                                 &mut scratch,
                                 &frames,
@@ -11876,17 +11872,19 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 if bars {
-                    // Stats/clock/AI-metrics changed: recompose just the two 1-row
-                    // bars over the reused scratch. They're rect-contained and
-                    // disjoint from the center/sidebar/panel, so nothing else is
-                    // stomped. Reflect the live app-tab strip first (the masthead
-                    // chips read it; the full path does the same below).
+                    // Stats/clock tick: recompose just the two 1-row bars (disjoint
+                    // from center/sidebar/panel). Reflect the app-tab strip first.
                     model.app_tabs = app_host.tab_labels();
                     model.active_app = app_host.active_tab_index();
                     crate::chrome::draw_masthead(&mut scratch, &chrome, &model);
                     crate::chrome::draw_statusbar(&mut scratch, chrome.statusbar, &model);
                     pane_diff_rects.push(chrome.masthead);
                     pane_diff_rects.push(chrome.statusbar);
+                }
+                if sidebar && let Some(sb) = chrome.sidebar {
+                    // D5: recompose just the sidebar rect (disjoint from panel/center).
+                    crate::chrome::draw_sidebar(&mut scratch, sb, &model);
+                    pane_diff_rects.push(sb);
                 }
             } else {
                 crate::chrome::clear_frame(&mut scratch);
@@ -12301,6 +12299,7 @@ async fn event_loop<T: Terminal>(
             // Pane/bars damage is now on screen; an untouched next wake renders nothing.
             dirty_panes.clear();
             bars_dirty = false;
+            sidebar_dirty = false;
             if muse_ready {
                 crate::frame_write::emit_muse_ready_marker(buf, &mut pending_input);
             }
@@ -14798,7 +14797,8 @@ async fn event_loop<T: Terminal>(
                     match sb.handle_key(&k.key, k.modifiers, &mut model, &session) {
                         SidebarOutcome::NotHandled => { /* fall through to keymap */ }
                         SidebarOutcome::Redraw => {
-                            dirty = true;
+                            sidebar_dirty = true; // D5: damage only sidebar + bars, not full chrome
+                            bars_dirty = true;
                             continue;
                         }
                         SidebarOutcome::Defocus => {
