@@ -293,6 +293,22 @@ pub fn host_base_env() -> Vec<(String, String)> {
     filter_host_env(std::env::vars(), host_env_allow_extra())
 }
 
+/// A `Command` for `program` detached from the compositor's controlling
+/// terminal: null stdin/stdout/stderr + its own process group. An off-loop
+/// helper that inherited the real tty (fd 0/1/2) and touched job control
+/// (setsid / a backgrounding subshell) could push szhost into the terminal's
+/// background process group — after which szhost's next tty write returns EIO
+/// and the render loop tears down. With no fd on the tty and its own group, it
+/// can't. Subprocess seam (cov_ignore), exercised by smoke.
+pub fn detached(program: &str) -> Command {
+    let mut c = Command::new(program);
+    c.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    c
+}
+
 /// A `git -C <dir>` command with the parent's repo-targeting env scrubbed.
 /// When superzej (or its test suite, via a pre-commit hook) runs inside a git
 /// hook, git exports GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE — often as paths

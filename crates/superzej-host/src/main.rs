@@ -39,6 +39,7 @@ mod fly_reaper;
 mod focus;
 mod font;
 mod forward;
+mod frame_write;
 mod gitmut;
 mod handlers;
 mod host_flow;

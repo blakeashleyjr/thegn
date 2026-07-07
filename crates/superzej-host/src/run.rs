@@ -8038,6 +8038,9 @@ async fn event_loop<T: Terminal>(
     // layout may survive. Tab/worktree switches reuse the same rects and must
     // NOT trigger this: a full repaint flashes the whole center.
     let mut full_repaint = true;
+    // Consecutive transient terminal-write failures (EIO); reset on a clean
+    // flush, torn down only when it persists past `frame_write::RETRY_MAX`.
+    let mut frame_write_errs: u32 = 0;
     let mut clear_on_next_frame = false;
     // Our own Change→escape serializer (undercurl + underline-color capable);
     // `SUPERZEJ_RENDERER=termwiz` falls back to the stock renderer.
@@ -10691,6 +10694,12 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                     let payload = *payload;
+                    // The user backgrounded this build (Esc hid the progress
+                    // overlay) → don't yank their tab/focus on completion; land
+                    // the worktree quietly. `revealed` stays true only while the
+                    // user is actively watching the overlay through to the end.
+                    let backgrounded = creating.as_ref().is_some_and(|cp| !cp.revealed);
+                    let prev_active = session.active;
                     if let Some(cp) = creating.as_mut() {
                         cp.apply(
                             wizard::CreateStep::LaunchAgent,
@@ -10703,6 +10712,15 @@ async fn event_loop<T: Terminal>(
                         crate::session::GroupKind::Branch,
                         payload.path.clone(),
                     ));
+                    // `add_group` switched the active tab to the new worktree;
+                    // restore it when backgrounded so the user stays put. The
+                    // group is still pushed (visible in the sidebar) and its
+                    // agent pane still attaches below — only the view switch is
+                    // undone. Restore before `refresh_tab_model` so the chrome
+                    // reflects the user's current tab, not the new one.
+                    if backgrounded {
+                        session.active = prev_active;
+                    }
                     // Branch-from-issue: link the freshly created worktree to the
                     // issue it was branched from, so its tab carries the issue badge.
                     if let Some((g, issue_id)) = pending_issue_link.take() {
@@ -10743,7 +10761,12 @@ async fn event_loop<T: Terminal>(
                             &waker,
                         );
                     if attached || native_provider {
-                        focus.zone = crate::focus::Zone::Center;
+                        // Only steal keyboard focus into the new agent pane when
+                        // the user was watching (foreground). A backgrounded build
+                        // must not redirect their input into the fresh pane.
+                        if !backgrounded {
+                            focus.zone = crate::focus::Zone::Center;
+                        }
                         let backend = &payload.spec.backend;
                         model.status = match payload.spec.warning_summary() {
                             Some(warning) => format!(
@@ -12185,29 +12208,39 @@ async fn event_loop<T: Terminal>(
             let seq = scratch.current_seqno();
             scratch.flush_changes_older_than(seq);
             wire.extend(pending);
-            if use_termwiz_renderer {
-                buf.terminal().render(&wire).context("render")?;
-                buf.terminal().flush().context("terminal flush")?;
-            } else {
-                let mut bytes = String::new();
-                wire_renderer.render(&wire, &mut bytes);
-                if let Some(rec) = &mut recorder {
-                    let _ = rec.write_frame(&bytes);
+            // Write the frame. A transient tty write error (EIO from a subprocess
+            // briefly stealing the terminal's foreground process group) must not
+            // tear the compositor down — skip this frame, force a full repaint,
+            // and retry. See `frame_write` for why `?`-propagating here is fatal.
+            match crate::frame_write::emit_frame(
+                use_termwiz_renderer,
+                buf,
+                &mut wire_renderer,
+                &mut recorder,
+                &wire,
+                notify_state.take_bell(),
+            ) {
+                crate::frame_write::FrameWrite::Ok => frame_write_errs = 0,
+                crate::frame_write::FrameWrite::Transient
+                    if frame_write_errs < crate::frame_write::RETRY_MAX =>
+                {
+                    frame_write_errs += 1;
+                    tracing::warn!(
+                        target: "szhost::frame",
+                        attempt = frame_write_errs,
+                        "transient terminal write error; forcing full repaint + retry"
+                    );
+                    full_repaint = true;
+                    dirty = true;
+                    continue;
                 }
-                use std::io::Write as _;
-                let mut out = std::io::stdout();
-                out.write_all(bytes.as_bytes()).context("render")?;
-                out.flush().context("terminal flush")?;
-            }
-            // Terminal bell (item 429): a latched notification sound. Written on
-            // the loop thread right after the frame flush so it never interleaves
-            // with termwiz's writes; BEL neither moves the cursor nor prints, so
-            // it is safe between frames. Best-effort.
-            if notify_state.take_bell() {
-                use std::io::Write as _;
-                let mut out = std::io::stdout();
-                let _ = out.write_all(b"\x07");
-                let _ = out.flush();
+                crate::frame_write::FrameWrite::Transient => {
+                    return Err(anyhow::anyhow!(
+                        "terminal writes failed {} times running (EIO); tearing down",
+                        frame_write_errs
+                    ));
+                }
+                crate::frame_write::FrameWrite::Fatal(e) => return Err(e),
             }
             // Corner kitty images ride ON TOP of the cell frame: emit the queued,
             // repositioned graphics AFTER the diff is flushed. Images aren't cells
@@ -12252,56 +12285,7 @@ async fn event_loop<T: Terminal>(
             dirty_panes.clear();
             bars_dirty = false;
             if muse_ready {
-                // Only emit the ready marker when the event queue is
-                // completely drained.  If szhost still has buffered input (e.g.
-                // 51 'a' chars arrive at once, each causing its own render),
-                // emitting after the first render would fire a premature stable
-                // in the muse sync state machine, capturing only the partial
-                // state.  By deferring until both the in-memory queue and the
-                // terminal's own read buffer are empty we guarantee the marker
-                // corresponds to the final rendered state of the batch.
-                // Only KEY/MOUSE/PASTE events defer the marker — Wake/Resize
-                // events (background ticks, hydration) must never block it or
-                // startup will spin indefinitely waiting for an empty queue.
-                let has_pty_pending = {
-                    let in_queue = pending_input.iter().any(|e| {
-                        matches!(
-                            e,
-                            InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_)
-                        )
-                    });
-                    if in_queue {
-                        true
-                    } else {
-                        let mut found = false;
-                        #[allow(clippy::while_let_loop)]
-                        loop {
-                            match buf.terminal().poll_input(Some(std::time::Duration::ZERO)) {
-                                Ok(Some(ev)) => {
-                                    let is_pty = matches!(
-                                        ev,
-                                        InputEvent::Key(_)
-                                            | InputEvent::Mouse(_)
-                                            | InputEvent::Paste(_)
-                                    );
-                                    pending_input.push_back(ev);
-                                    if is_pty {
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                                _ => break,
-                            }
-                        }
-                        found
-                    }
-                };
-                if !has_pty_pending {
-                    use std::io::Write as _;
-                    let _ = std::io::stdout()
-                        .write_all(b"\x1b]5379;muse:ready\x07")
-                        .and_then(|_| std::io::stdout().flush());
-                }
+                crate::frame_write::emit_muse_ready_marker(buf, &mut pending_input);
             }
             tracing::debug!(
                 target: "szhost::frame",
