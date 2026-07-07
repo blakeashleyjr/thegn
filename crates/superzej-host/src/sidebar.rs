@@ -209,6 +209,10 @@ pub struct SidebarStatus {
     /// `worktree_disk` cache (populated off-loop by the disk scan). Drives the
     /// sidebar size badge and the statusbar total.
     pub disk_sizes: std::collections::HashMap<String, (i64, i64)>,
+    /// Worktrees mid-hibernation (snapshot taken, compute destroyed or being
+    /// destroyed). In the status so its diff repaints the sidebar; the render
+    /// path reads the mirroring `hibernator::is_hibernated` cache.
+    pub hibernated: std::collections::BTreeSet<String>,
 }
 
 /// Persisted + transient view state that shapes the tree (collapse/sort/pins/
@@ -325,6 +329,62 @@ pub(crate) fn terminal_host(conn: &str, kind: &str) -> (String, String, bool) {
     let host = target.rsplit('@').next().unwrap_or(target).trim();
     let host = if host.is_empty() { target } else { host };
     (host.to_lowercase(), host.to_string(), false)
+}
+
+/// The expanded cursor row's second line: the secondary metadata that would
+/// crowd the always-on row — execution env, sandbox backend, hibernation,
+/// open PRs, unread notifications, and disk size. `None` when the row has
+/// nothing extra to show. (Extracted from the ratchet-pinned `chrome.rs`.)
+pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> {
+    use crate::chrome::S;
+    use crate::seg::{Line, Seg, Tok, seg, sp};
+    use superzej_core::theme;
+    // Gutter + indent so the detail reads as hanging under the name.
+    let mut segs: Vec<Seg> = vec![sp(5)];
+    let start = segs.len();
+
+    if let Some(env) = &row.env_name
+        && !env.is_empty()
+        && env != "default"
+    {
+        segs.push(seg(Tok::Slot(S::Faint), format!("\u{ab}{env}\u{bb} ")));
+    }
+    if let Some(backend) = &row.sandbox_backend
+        && !backend.is_empty()
+        && backend != "none"
+        && backend != "host"
+    {
+        segs.push(seg(Tok::Slot(S::Faint), format!("({backend}) ")));
+    }
+    if row
+        .worktree_path
+        .as_deref()
+        .is_some_and(crate::hibernator::is_hibernated)
+    {
+        let moon = crate::caps::active_glyphs().moon;
+        segs.push(seg(Tok::Slot(S::Faint), format!("{moon} hibernated ")));
+    }
+    if let Some(pr) = row.pr_count.filter(|&c| c > 0) {
+        let hex = crate::caps::active_glyphs().hex;
+        segs.push(seg(Tok::Hue(theme::Hue::Green), format!("{hex} {pr} PR "))); // ⬡N PR
+    }
+    if row.unread_count > 0 {
+        let mail = crate::caps::active_glyphs().mail;
+        let blue = Tok::Hue(theme::Hue::Blue);
+        segs.push(seg(blue, format!("{mail} {} unread ", row.unread_count)));
+    }
+    if let Some(total) = row.disk_bytes {
+        let target = row.target_bytes.unwrap_or(0);
+        let heavy = target > 1024 * 1024 * 1024 && target * 2 > total;
+        let fg = if heavy {
+            Tok::Hue(theme::Hue::Amber)
+        } else {
+            Tok::Slot(S::Dim)
+        };
+        segs.push(seg(fg, superzej_core::disk::human(total)));
+    }
+
+    (segs.len() > start).then_some(Line::Segs(segs))
 }
 
 /// The HOSTS section row label: state glyph + name + a terse note — the live

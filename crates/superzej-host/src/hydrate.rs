@@ -651,6 +651,8 @@ fn collect_sidebar_status(
     use superzej_svc::git::{GitBackend, GixGit};
     let mut status = crate::sidebar::SidebarStatus::default();
     let t0 = std::time::Instant::now();
+    // Worktrees mid-hibernation: drives the sidebar ⏾ badge + render cache.
+    status.hibernated = crate::hibernator::refresh_hibernated(db);
 
     // Advance the activity state machine over ALL registered worktrees,
     // then read the fresh states (keyed by tab name). This keeps background
@@ -1167,9 +1169,8 @@ pub(crate) fn build_model(
         &counted_kinds,
         &app_cfg.lifecycle,
     );
-    // Self-throttled housekeeping (network/DB on own threads): VPS leak
-    // reaper + placement engine (sweep, scale-down, queue nudges) + the
-    // hibernator (snapshot-then-destroy for idle billed-while-existing VMs).
+    // Self-throttled housekeeping (network/DB on own threads): VPS leak reaper
+    // + placement engine + hibernator (snapshot-then-destroy for idle VMs).
     crate::vps_reaper::tick(&app_cfg);
     crate::fly_reaper::tick(&app_cfg);
     crate::placement_flow::maintain_tick(&app_cfg);
