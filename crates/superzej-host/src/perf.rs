@@ -145,6 +145,19 @@ pub fn frame_budget_us() -> u64 {
         .unwrap_or(16_000)
 }
 
+/// Input→frame latency budget in microseconds — the user-facing "usable
+/// performance" number (keypress/click → the frame that shows its effect). A
+/// rollup whose median input latency exceeds this warns (the slow-input guard),
+/// the signal that interactivity regressed regardless of render/idle proxies.
+/// Default 50ms; override with `SUPERZEJ_INPUT_BUDGET_US`.
+pub fn input_budget_us() -> u64 {
+    std::env::var("SUPERZEJ_INPUT_BUDGET_US")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(50_000)
+}
+
 // ---------------------------------------------------------------------------
 // Bench window (SUPERZEJ_BENCH_RUN_MS): run the full loop for a fixed window
 // then exit, so the idle-CPU harness can measure steady state. Honors the
@@ -509,6 +522,9 @@ pub struct LoopPerf {
     pub full_frames: u64,
     pub render_skips: u64,
     pub render_us: Histo,
+    /// Input→frame latency samples: from an input event's dispatch to the frame
+    /// that renders its effect. The primary "usable performance" metric.
+    pub input_us: Histo,
     /// Wall-clock spent inside compose+flush this interval — the honest
     /// "rendering cost" the idle ratio hides (a frame can be 120ms yet the loop
     /// still reports 85% idle because it blocks between frames).
@@ -531,6 +547,7 @@ impl LoopPerf {
             full_frames: 0,
             render_skips: 0,
             render_us: Histo::new(),
+            input_us: Histo::new(),
             render_busy: Duration::ZERO,
             pty_chunks: 0,
             pty_budget_hits: 0,
@@ -581,9 +598,14 @@ impl LoopPerf {
 
     /// A frame was composed + flushed in `dt`. `pane_only` is true when the
     /// streaming fast path served it (recompose + bounded-diff only the damaged
-    /// panes); false for a full/chrome frame.
+    /// panes); false for a full/chrome frame. `input_since` is the dispatch time
+    /// of the input event this frame responds to (if any); it's **taken** so the
+    /// dispatch→frame delta — the user-facing "usable performance" latency — is
+    /// recorded once and the stamp cleared (also unblocks the input-priority PTY
+    /// budget on the next iteration). Cleared even when accounting is off.
     #[inline]
-    pub fn render(&mut self, dt: Duration, pane_only: bool) {
+    pub fn render(&mut self, dt: Duration, pane_only: bool, input_since: &mut Option<Instant>) {
+        let input = input_since.take();
         if enabled() {
             self.renders += 1;
             if pane_only {
@@ -593,6 +615,9 @@ impl LoopPerf {
             }
             self.render_us.record_us(dt.as_micros() as u64);
             self.render_busy += dt;
+            if let Some(t) = input {
+                self.input_us.record_us(t.elapsed().as_micros() as u64);
+            }
         }
     }
 
@@ -662,6 +687,7 @@ impl LoopPerf {
         self.full_frames = 0;
         self.render_skips = 0;
         self.render_us.reset();
+        self.input_us.reset();
         self.render_busy = Duration::ZERO;
         self.pty_chunks = 0;
         self.pty_budget_hits = 0;
@@ -689,6 +715,9 @@ pub struct PerfSnapshot {
     pub render_skips_per_s: f64,
     pub render_p50_us: u64,
     pub render_p99_us: u64,
+    /// Input→frame latency percentiles this interval (0 when no input landed).
+    pub input_p50_us: u64,
+    pub input_p99_us: u64,
     pub idle_ratio: f64,
     /// Fraction of wall-clock spent composing+flushing frames. Unlike
     /// `idle_ratio`, this exposes a slow-render cost even when the loop blocks
@@ -726,6 +755,8 @@ impl LoopPerf {
             render_skips_per_s: self.render_skips as f64 / secs,
             render_p50_us: self.render_us.percentile_us(0.50),
             render_p99_us: self.render_us.percentile_us(0.99),
+            input_p50_us: self.input_us.percentile_us(0.50),
+            input_p99_us: self.input_us.percentile_us(0.99),
             idle_ratio: 1.0 - busy_ratio,
             render_busy_ratio: (self.render_busy.as_secs_f64() / secs).clamp(0.0, 1.0),
             hot_source: hot.label(),
@@ -743,6 +774,8 @@ impl LoopPerf {
             render_skips_per_s = snap.render_skips_per_s,
             render_p50_us = snap.render_p50_us,
             render_p99_us = snap.render_p99_us,
+            input_p50_us = snap.input_p50_us,
+            input_p99_us = snap.input_p99_us,
             idle_ratio = snap.idle_ratio,
             render_busy_ratio = snap.render_busy_ratio,
             hot_source = snap.hot_source,
@@ -816,6 +849,21 @@ impl LoopPerf {
                 full_frames_per_s = snap.full_frames_per_s,
                 budget_us = frame_budget_us(),
                 "slow frames: p50 over budget — render path is recomposing too much"
+            );
+        }
+
+        // Slow-input guard: the median keypress/click took longer than the input
+        // budget to reach the screen — the direct "the UI feels laggy" signal,
+        // which the render/idle/wake proxies structurally miss (a switch can stall
+        // input for 500ms on background work while frames stay cheap and the loop
+        // reads as mostly idle). Gated on having observed input this interval.
+        if !self.input_us.is_empty() && snap.input_p50_us > input_budget_us() {
+            tracing::warn!(
+                target: "szhost::perf",
+                input_p50_us = snap.input_p50_us,
+                input_p99_us = snap.input_p99_us,
+                budget_us = input_budget_us(),
+                "slow input: p50 over budget — input→frame latency regressed"
             );
         }
 
@@ -937,7 +985,7 @@ mod tests {
         let mut lp = LoopPerf::new();
         lp.wake();
         lp.tick(WakeSource::Model);
-        lp.render(Duration::from_micros(900), false);
+        lp.render(Duration::from_micros(900), false, &mut None);
         assert_eq!(lp.wakes, 0);
         assert_eq!(lp.renders, 0);
         assert_eq!(lp.items(WakeSource::Model), 0);
@@ -957,7 +1005,7 @@ mod tests {
         lp.tick(WakeSource::Model);
         lp.tick(WakeSource::Stats);
         lp.pty(10, true);
-        lp.render(Duration::from_micros(900), true);
+        lp.render(Duration::from_micros(900), true, &mut Some(Instant::now()));
         lp.render_skip();
         assert_eq!(lp.wakes, 2);
         assert_eq!(lp.renders, 1);
@@ -969,6 +1017,8 @@ mod tests {
         assert_eq!(lp.items(WakeSource::Model), 5);
         assert_eq!(lp.hot_source(), WakeSource::Model);
         assert_eq!(lp.items(WakeSource::Pty), 10);
+        // The render carried an input stamp, so an input→frame sample landed.
+        assert!(!lp.input_us.is_empty());
         set_enabled(false);
     }
 

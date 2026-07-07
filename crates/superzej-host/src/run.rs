@@ -8295,6 +8295,8 @@ async fn event_loop<T: Terminal>(
     // concurrent hydrations that flood the sprite bridge. Mirrors `fold_inflight`.
     let mut model_hydration_inflight = false;
     let mut model_refresh_pending = false;
+    // Input dispatch time; next render measures dispatch→frame latency + drives the input-priority PTY budget.
+    let mut input_at: Option<std::time::Instant> = None;
     // True while a fold-actor run is off the loop; blocks a second concurrent
     // trigger (a fold advances `main` globally, so one at a time).
     let mut fold_inflight = false;
@@ -9083,15 +9085,16 @@ async fn event_loop<T: Terminal>(
             visible.insert(cid);
         }
 
-        // 1. Drain pending PTY output, routed by pane id. Only output from a pane
-        //    visible in the active tab dirties the frame; others advance silently.
-        //    The drain is budgeted so a chatty pane cannot starve rendering/input.
+        // 1. Drain pending PTY output, routed by pane id (only a visible pane's
+        //    output dirties the frame). Budgeted so a chatty pane can't starve
+        //    render/input; input priority shrinks it when a key awaits its frame.
         let mut disconnected = false;
         let mut budget_exhausted = false;
         let mut drain_stats_chunks = 0;
+        let pty_budget = if input_at.is_some() { 8 } else { 64 };
 
         loop {
-            if drain_stats_chunks >= 64 {
+            if drain_stats_chunks >= pty_budget {
                 budget_exhausted = true;
                 break;
             }
@@ -11562,10 +11565,9 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
-        // 2. Render if anything changed (diff-flush): the damaged panes and/or
-        //    chrome, with the hardware cursor in the focused pane. `dirty` is the
-        //    chrome/overlay/geometry channel; `dirty_panes` the per-pane content
-        //    channel — either (or `full_repaint`) means there is a frame to paint.
+        // 2. Render if anything changed (diff-flush): damaged panes and/or chrome,
+        //    cursor in the focused pane. `dirty` = chrome/overlay/geometry channel;
+        //    `dirty_panes` = per-pane content; either (or `full_repaint`) → a frame.
         let should_render = dirty || full_repaint || !dirty_panes.is_empty() || bars_dirty;
         if !should_render {
             // Woke but nothing changed — a wasted wakeup (storm signal).
@@ -12292,7 +12294,7 @@ async fn event_loop<T: Terminal>(
                 frame_plan,
                 crate::render_plan::RenderPlan::Incremental { .. }
             );
-            loop_perf.render(frame_t0.elapsed(), incremental_frame);
+            loop_perf.render(frame_t0.elapsed(), incremental_frame, &mut input_at);
             // Consumed: the next frame is full unless another drag/scroll re-arms it.
             selection_only = false;
             scroll_only = false;
@@ -12342,15 +12344,11 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        // Everything above this point was the loop doing work for this wake;
-        // the poll below is idle time. Record the busy span for the idle ratio.
+        // Work for this wake is done; the poll below is idle (busy span → idle ratio).
         loop_perf.add_busy(iter_t0.elapsed());
 
-        // 3. Block until something happens: a real terminal event, or a
-        //    `waker.wake()` from any producer (PTY reader, model/PR hydration,
-        //    config watcher, diff fs-watch, refresh ticker) which returns
-        //    `InputEvent::Wake`. No timeout → zero idle CPU; we only wake when
-        //    there is work, and render the instant it arrives.
+        // 3. Block until a terminal event or `waker.wake()` (→ `InputEvent::Wake`);
+        //    no timeout → zero idle CPU, wake only on work, render at once.
         let timeout = if dirty || !pending_input.is_empty() || budget_exhausted {
             Some(std::time::Duration::from_millis(8))
         } else {
@@ -12362,6 +12360,7 @@ async fn event_loop<T: Terminal>(
         };
         match polled {
             Ok(Some(InputEvent::Mouse(m))) => {
+                input_at = Some(std::time::Instant::now()); // input-latency stamp
                 use termwiz::input::MouseButtons;
                 // SGR mouse coordinates are 1-based.
                 let mx = (m.x as usize).saturating_sub(1);
@@ -12863,6 +12862,7 @@ async fn event_loop<T: Terminal>(
                 if residue.swallow(&k.key, k.modifiers) {
                     continue;
                 }
+                input_at = Some(std::time::Instant::now()); // input-latency stamp
                 let k = normalize_key(k);
                 // Register paste is armed (PasteRegister): the next key names the
                 // register (`a`–`z`/`0`–`9`, `"` default, `+` clipboard). It's a
@@ -19435,6 +19435,7 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             Ok(Some(InputEvent::Paste(s))) => {
+                input_at = Some(std::time::Instant::now()); // input-latency stamp
                 // A modal that collects text owns the paste — inject it into
                 // the field (workspace picker, new-worktree wizard) rather than
                 // leaking it into the pane behind the overlay.
