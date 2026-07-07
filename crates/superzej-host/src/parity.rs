@@ -6,7 +6,22 @@
 
 use std::path::Path;
 
-use crate::agent::{block_on_provider, sanitize_tag};
+use crate::agent::block_on_provider;
+
+/// Filename-safe tag from a sandbox id (alnum/`-`/`_` only) for host temp paths.
+pub(crate) fn sanitize_tag(id: &str) -> String {
+    let t: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if t.is_empty() { "sandbox".into() } else { t }
+}
 
 /// Bring the sandbox clone to full parity with the LOCAL worktree at `wt_host`:
 /// replay unpushed commits (a thin `git bundle … HEAD --not --remotes`), restore
@@ -133,4 +148,15 @@ pub(crate) fn apply_local_parity(
     block_on_provider(|| async { provider.run_exec(id, &argv, None, exec_env).await })
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("replay exec failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sanitize_tag_is_filename_safe() {
+        use super::sanitize_tag;
+        assert_eq!(sanitize_tag("sz-cosmic-puma"), "sz-cosmic-puma");
+        assert_eq!(sanitize_tag("a/b c:d"), "a-b-c-d");
+        assert_eq!(sanitize_tag(""), "sandbox");
+    }
 }

@@ -225,6 +225,7 @@ pub(crate) fn provision_worktree_on_host(
             | StepKind::HomeClosurePush(_)
             | StepKind::DevShellClosurePush
             | StepKind::LocalParity { .. }
+            | StepKind::SnapshotRestore { .. }
             | StepKind::ManagedPi => {
                 tracing::debug!(target: "szhost::host", step = %step.id, "skipped (provider-only)");
                 Ok(())

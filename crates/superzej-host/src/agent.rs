@@ -1466,6 +1466,11 @@ pub fn provision_provider_env_named(
         local_parity: (name_override.is_none()
             && env.data == superzej_core::config::DataMode::InEnv)
             .then(|| worktree.to_string()),
+        // A hibernated worktree resumes by overlaying its snapshot on the
+        // fresh clone; the row flips to `restoring` here (deleted on success).
+        snapshot_restore: (name_override.is_none())
+            .then(|| crate::hibernator::begin_restore(worktree))
+            .flatten(),
         // When the host cache is on, bake its sandbox-side loopback substituter into
         // nix.conf so the devShell build + in-pane `nix develop` substitute from the
         // host store over the reverse tunnel (which the host stands up separately).
@@ -1629,6 +1634,17 @@ pub fn provision_provider_env_named(
                     ));
                 }
                 Ok(())
+            }
+            StepKind::SnapshotRestore {
+                worktree: wt,
+                workdir: wd,
+                snapshot_id: snap,
+            } => {
+                // Host-executed, NOT best-effort: a failure fails the step and
+                // the row stays `hibernated` for the next open to retry.
+                crate::hibernator::apply_snapshot_restore(
+                    &provider, &id, cfg, wt, wd, snap, &exec_env,
+                )
             }
             StepKind::ManagedPi => {
                 // Host-executed: provision the managed pi inside the sandbox so the
@@ -1957,20 +1973,7 @@ fn nix_copy_to_file_argv(cache_dir: &str, path: &str) -> Vec<String> {
     ]
 }
 
-/// Filename-safe tag from a sandbox id (alnum/`-`/`_` only) for host temp paths.
-pub(crate) fn sanitize_tag(id: &str) -> String {
-    let t: String = id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    if t.is_empty() { "sandbox".into() } else { t }
-}
+pub(crate) use crate::parity::sanitize_tag;
 
 /// Run a host `nix` subcommand bounded by `timeout` (coreutils). `Ok(output)` on
 /// success; `Err` with a tail of stderr (or "timed out") otherwise.
@@ -3477,9 +3480,6 @@ mod tests {
                 "/tmp/gc"
             ]
         );
-        assert_eq!(sanitize_tag("sz-cosmic-puma"), "sz-cosmic-puma");
-        assert_eq!(sanitize_tag("a/b c:d"), "a-b-c-d");
-        assert_eq!(sanitize_tag(""), "sandbox");
     }
 
     #[test]

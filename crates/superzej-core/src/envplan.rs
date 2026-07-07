@@ -433,6 +433,12 @@ pub struct PlanOpts {
     /// over the clone. `None` ⇒ pristine origin checkout only (e.g. a pool spare,
     /// or a non-`in_env` data mode). Emits a `local_parity` step after `clone`.
     pub local_parity: Option<String>,
+    /// Snapshot id to overlay AFTER local parity: the worktree was hibernated
+    /// (compute destroyed, state captured to the `[lifecycle.snapshot]` store)
+    /// and this fresh sandbox must resume from that snapshot — its
+    /// `reset --hard` wins tracked/commit state over the parity mirror, which
+    /// is strictly older by construction. Emits a `snapshot_restore` step.
+    pub snapshot_restore: Option<String>,
     /// Sandbox-side URL of the host's embedded nix binary cache (the loopback the
     /// reverse tunnel binds, e.g. `http://127.0.0.1:8484`), or `None`. When set,
     /// it's baked into the sandbox nix.conf as an `extra-substituters` entry with
@@ -489,6 +495,7 @@ impl Default for PlanOpts {
             push_devshell: false,
             skip_devshell_warm: false,
             local_parity: None,
+            snapshot_restore: None,
             host_cache_url: None,
             managed_pi: false,
             toolchain: crate::toolchain::ToolchainConfig::default(),
@@ -547,6 +554,15 @@ pub enum StepKind {
     /// artifacts, and execs the replay in `workdir`. Best-effort: a failure
     /// leaves the pristine origin checkout in place.
     LocalParity { worktree: String, workdir: String },
+    /// Host-executed: overlay a hibernation snapshot from the
+    /// `[lifecycle.snapshot]` store onto the fresh clone (fetch bundle +
+    /// `reset --hard` + apply patch + untar). NOT best-effort — a failed
+    /// restore fails the step so the hibernated work is never silently lost.
+    SnapshotRestore {
+        worktree: String,
+        workdir: String,
+        snapshot_id: String,
+    },
     /// Host-executed: provision superzej's managed pi inside the sandbox — carry
     /// the host's `~/.superzej/pi/agent` (the seeded superzej-acp package + config)
     /// into `<home>/.superzej/pi/agent`, then npm-install the pinned pi binary
@@ -630,6 +646,21 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                 kind: StepKind::LocalParity {
                     worktree: local.to_string(),
                     workdir: opts.workdir.clone(),
+                },
+            });
+        }
+        // Overlay the hibernation snapshot AFTER parity: the snapshot carries
+        // the sandbox's own last state (captured at destroy time), which
+        // supersedes the local mirror for tracked/commit state; untracked
+        // files from both survive the untar.
+        if let Some(snap) = opts.snapshot_restore.as_deref() {
+            steps.push(ProvisionStep {
+                id: "snapshot_restore".into(),
+                label: "Restore hibernated work".into(),
+                kind: StepKind::SnapshotRestore {
+                    worktree: opts.local_parity.clone().unwrap_or_default(),
+                    workdir: opts.workdir.clone(),
+                    snapshot_id: snap.to_string(),
                 },
             });
         }
@@ -2147,6 +2178,47 @@ mod tests {
         };
         assert_eq!(worktree, "/home/u/wt");
         assert_eq!(workdir, "/workspace");
+    }
+
+    #[test]
+    fn plan_snapshot_restore_follows_local_parity() {
+        let opts = PlanOpts {
+            origin: Some("https://example.com/r.git".into()),
+            branch: Some("feat".into()),
+            local_parity: Some("/home/u/wt".into()),
+            snapshot_restore: Some("00000000000000000009-abcd1234".into()),
+            checkpoint: false,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        let parity = ids.iter().position(|i| *i == "local_parity").unwrap();
+        let restore = ids
+            .iter()
+            .position(|i| *i == "snapshot_restore")
+            .expect("snapshot_restore step");
+        assert_eq!(restore, parity + 1, "restore right after parity: {ids:?}");
+        let StepKind::SnapshotRestore {
+            worktree,
+            workdir,
+            snapshot_id,
+        } = &p.steps[restore].kind
+        else {
+            panic!("snapshot_restore must be a SnapshotRestore step");
+        };
+        assert_eq!(worktree, "/home/u/wt");
+        assert_eq!(workdir, "/workspace");
+        assert_eq!(snapshot_id, "00000000000000000009-abcd1234");
+        // Without a snapshot id the step never appears.
+        let none = plan(
+            &EnvRequirements::default(),
+            &PlanOpts {
+                origin: Some("https://example.com/r.git".into()),
+                checkpoint: false,
+                ..Default::default()
+            },
+        );
+        assert!(!none.steps.iter().any(|s| s.id == "snapshot_restore"));
     }
 
     #[test]
