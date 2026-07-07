@@ -402,13 +402,20 @@ pub fn note_loop_thread() {
     let _ = LOOP_THREAD.set(std::thread::current().id());
 }
 
+/// Whether the caller is running on the event-loop thread recorded by
+/// [`note_loop_thread`]. The reusable "am I about to block the compositor?"
+/// predicate — blocking I/O seams (bridge RPCs, and future git/DB guards) can
+/// `debug_assert!(!is_on_loop_thread())` to catch loop-thread stalls in tests.
+/// `false` when no loop thread was recorded (tests / non-host callers).
+pub fn is_on_loop_thread() -> bool {
+    LOOP_THREAD.get() == Some(&std::thread::current().id())
+}
+
 /// Warn (once) if a bridge RPC is being issued on the event-loop thread — the
 /// "never block the loop" invariant. Non-fatal: the `try_send` writer keeps this
 /// from crashing, but the caller should move the op off-loop (`spawn_blocking`).
 fn warn_if_on_loop_thread(method: &str) {
-    if LOOP_THREAD.get() == Some(&std::thread::current().id())
-        && !LOOP_WARNED.swap(true, Ordering::Relaxed)
-    {
+    if is_on_loop_thread() && !LOOP_WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             method,
             "bridge RPC issued on the event-loop thread — this blocks the \
@@ -976,6 +983,15 @@ mod tests {
         // Untracked file shows as "?? new.rs" in porcelain.
         assert!(r.stdout.contains("?? new.rs"), "porcelain: {:?}", r.stdout);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_on_loop_thread_is_false_off_the_recorded_loop() {
+        // A freshly spawned thread was never recorded as the event loop, so the
+        // guard reads false there regardless of global `LOOP_THREAD` state — the
+        // property the blocking-I/O seams rely on. (No `note_loop_thread` here,
+        // to avoid polluting the process-global for parallel tests.)
+        assert!(!std::thread::spawn(is_on_loop_thread).join().unwrap());
     }
 
     #[test]
