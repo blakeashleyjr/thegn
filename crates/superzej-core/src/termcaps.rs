@@ -265,6 +265,7 @@ pub struct GlyphSet {
     pub warn: &'static str,           // ⚠ alert badge
     pub hex: &'static str,            // ⬡ open-PR badge
     pub mail: &'static str,           // ✉ unread-notification badge
+    pub moon: &'static str,           // ⏾ hibernated worktree badge
     // Half-block pixel-font cells (logotype).
     pub block_full: &'static str, // █
     pub block_top: &'static str,  // ▀
@@ -295,6 +296,7 @@ pub const UNICODE: GlyphSet = GlyphSet {
     warn: "\u{26a0}",           // ⚠
     hex: "\u{2b21}",            // ⬡
     mail: "\u{2709}",           // ✉
+    moon: "\u{23fe}",           // ⏾
     block_full: "\u{2588}",     // █
     block_top: "\u{2580}",      // ▀
     block_bot: "\u{2584}",      // ▄
@@ -325,6 +327,7 @@ pub const ASCII: GlyphSet = GlyphSet {
     warn: "!",
     hex: "#",
     mail: "@",
+    moon: "z",
     // The pixel-font cannot render in ASCII; callers route to the text splash
     // instead, but provide safe stand-ins so a stray cell never emits a block.
     block_full: "#",
@@ -698,6 +701,7 @@ mod tests {
             g.warn,
             g.hex,
             g.mail,
+            g.moon,
             g.block_full,
             g.block_top,
             g.block_bot,

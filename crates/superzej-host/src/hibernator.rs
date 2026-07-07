@@ -62,6 +62,38 @@ fn failures() -> &'static Mutex<HashMap<String, Instant>> {
 /// One hibernation cycle at a time, process-wide.
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// Sidebar cache of worktrees currently in a hibernation cycle (any row
+/// state). Refreshed on the hydration cadence; read at render time (a mutex
+/// lookup — never DB I/O on the render path).
+fn hibernated_cache() -> &'static Mutex<std::collections::BTreeSet<String>> {
+    static R: std::sync::OnceLock<Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
+
+/// Refresh the render cache from the DB; returns the set for `SidebarStatus`
+/// (whose equality diff drives the repaint when the set changes).
+pub(crate) fn refresh_hibernated(db: &superzej_core::db::Db) -> std::collections::BTreeSet<String> {
+    let set: std::collections::BTreeSet<String> = db
+        .hibernations()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.worktree_path)
+        .collect();
+    if let Ok(mut c) = hibernated_cache().lock() {
+        *c = set.clone();
+    }
+    set
+}
+
+/// Whether `worktree` is mid-hibernation-cycle (render-time lookup).
+pub(crate) fn is_hibernated(worktree: &str) -> bool {
+    hibernated_cache()
+        .lock()
+        .map(|c| c.contains(worktree))
+        .unwrap_or(false)
+}
+
 /// The snapshot key for one worktree: repo slug / worktree dir name / env.
 fn snapshot_key(repo_root: &Path, worktree: &str, env: &str) -> SnapshotKey {
     let wt_slug = Path::new(worktree)
