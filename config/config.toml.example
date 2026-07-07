@@ -81,6 +81,15 @@ color = "auto"
 # terminals / fonts without box-drawing glyphs. Run `superzej doctor` to see
 # what your terminal resolves to. (env: SUPERZEJ_THEME_GLYPHS)
 glyphs = "auto"
+# Marker style for the per-worktree agent indicator in the sidebar tree.
+# "letter" (default) uses universal 1-2 letter marks (C=claude, Cx=codex,
+# Y=yazi, Lg=lazygit, Ed=editor, D=diff) that render in any font; "symbol"
+# uses compact Unicode marks (yazi ⊞, lazygit ↟, editor ✎, diff ±) for
+# Nerd-Font / rich terminals, degrading to letters on ASCII-only terminals;
+# "auto" uses symbols only on a confirmed-modern emulator. The focused sidebar
+# row spells the agent's name out beside its glyph either way.
+# (env: SUPERZEJ_THEME_AGENT_GLYPHS)
+agent_glyphs = "letter"
 
 # Optional: override any chrome surface/text color (all "#rrggbb"; unset keys
 # keep the preset's palette). Invalid hex warns and keeps the default.

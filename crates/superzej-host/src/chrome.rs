@@ -2501,10 +2501,8 @@ fn compose_row_lines(
             let label = crate::sidebar::compose_row_label(row.pr_number, window_title, &row.label);
             left.push(seg(name_fg, label));
             if let Some(agent) = &row.agent {
-                left.push(seg(
-                    Tok::Hue(theme::Hue::Teal),
-                    format!(" {}", superzej_core::theme::agent_glyph(agent)),
-                ));
+                let glyph = theme::agent_glyph(agent, crate::caps::agent_glyph_style());
+                left.push(seg(Tok::Hue(theme::Hue::Teal), format!(" {glyph}")));
             }
 
             // Right cluster (always-on): git status + alert badge (PR/unread/disk move to the detail line).
@@ -2564,6 +2562,8 @@ fn compose_detail_line(row: &crate::sidebar::SidebarRow) -> Option<crate::seg::L
     // Gutter + indent so the detail reads as hanging under the name.
     let mut segs: Vec<Seg> = vec![sp(5)];
     let start = segs.len();
+    let dirty = row.git.is_some_and(|g| g.dirty);
+    crate::sidebar_legend::push_row_markers(row.agent.as_deref(), dirty, &mut segs);
 
     if let Some(env) = &row.env_name
         && !env.is_empty()

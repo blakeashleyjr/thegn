@@ -165,7 +165,10 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
             let hue = theme::agent_hue(&r.agent);
             format!(
                 "{} {}",
-                theme::glyph_square(&theme::agent_glyph(&r.agent), hue),
+                theme::glyph_square(
+                    &theme::agent_glyph(&r.agent, crate::caps::agent_glyph_style()),
+                    hue,
+                ),
                 c(hue, &r.agent)
             )
         } else {

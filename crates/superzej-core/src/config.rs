@@ -136,34 +136,11 @@ config_enum! {
         Auto = "auto", Gum = "gum", Fzf = "fzf", Select = "select",
     } default = Auto;
 }
-config_enum! {
-    /// Whether the outer terminal renders curly underlines (conflict
-    /// squiggles). "auto" sniffs $TERM/$TERM_PROGRAM; unsupported terminals
-    /// degrade to a single underline.
-    pub enum UndercurlMode: "undercurl mode" {
-        Auto = "auto", On = "on", Off = "off",
-    } default = Auto;
-}
-config_enum! {
-    /// Color fidelity sent to the outer terminal. "auto" sniffs the terminal
-    /// (COLORTERM / $TERM / WT_SESSION / NO_COLOR) and degrades truecolor →
-    /// 256 → 16 → mono; the explicit values pin a depth.
-    pub enum ColorMode: "color mode" {
-        Auto = "auto",
-        Truecolor = "truecolor" | "24bit",
-        Ansi256 = "256",
-        Ansi16 = "16",
-        None = "none" | "mono",
-    } default = Auto;
-}
-config_enum! {
-    /// Glyph fidelity for chrome (box drawing, dots, arrows, logotype). "auto"
-    /// sniffs the locale + terminal; "ascii" forces 7-bit fallbacks for bare
-    /// terminals/fonts.
-    pub enum GlyphMode: "glyph mode" {
-        Auto = "auto", Unicode = "unicode", Ascii = "ascii",
-    } default = Auto;
-}
+// The terminal display/glyph config enums (UndercurlMode, ColorMode, GlyphMode,
+// AgentGlyphs) live in the `config_theme` sibling module to keep this god-file
+// flat; re-exported so `config::{ColorMode, …}` import paths keep working.
+pub use crate::config_theme::{AgentGlyphs, ColorMode, GlyphMode, UndercurlMode};
+
 config_enum! {
     /// Where worktrees live on disk.
     pub enum WorktreeMode: "worktree_mode" {
@@ -1472,6 +1449,9 @@ pub struct ThemeConfig {
     pub color: ColorMode,
     /// Glyph fidelity: "auto" (sniff locale/terminal), "unicode", "ascii".
     pub glyphs: GlyphMode,
+    /// Sidebar agent marker style: "letter" (universal), "symbol" (Nerd-Font),
+    /// "auto" (symbols on confirmed-modern emulators only).
+    pub agent_glyphs: AgentGlyphs,
     /// Optional overrides for every chrome surface/text color.
     pub colors: ThemeColors,
     /// Optional overrides for the eight semantic hues.
@@ -1488,6 +1468,7 @@ impl Default for ThemeConfig {
             undercurl: UndercurlMode::Auto,
             color: ColorMode::Auto,
             glyphs: GlyphMode::Auto,
+            agent_glyphs: AgentGlyphs::Letter,
             colors: ThemeColors::default(),
             hues: ThemeHues::default(),
         }
@@ -4352,6 +4333,7 @@ pub struct ConfigOverlay {
     pub frame_border: Option<String>,
     pub theme_color: Option<ColorMode>,
     pub theme_glyphs: Option<GlyphMode>,
+    pub theme_agent_glyphs: Option<AgentGlyphs>,
     pub pr_ttl_secs: Option<u64>,
     pub watch_pr_interval_secs: Option<u64>,
     pub metrics_interval_secs: Option<f64>,
@@ -4400,6 +4382,7 @@ impl ConfigOverlay {
         set!(base.theme.focus_border, self.focus_border);
         set!(base.theme.color, self.theme_color);
         set!(base.theme.glyphs, self.theme_glyphs);
+        set!(base.theme.agent_glyphs, self.theme_agent_glyphs);
         if self.frame_border.is_some() {
             base.theme.colors.border = self.frame_border;
         }
@@ -4491,6 +4474,9 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("SUPERZEJ_THEME_GLYPHS") {
         o.theme_glyphs = GlyphMode::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("SUPERZEJ_THEME_AGENT_GLYPHS") {
+        o.theme_agent_glyphs = AgentGlyphs::from_str_validated(v.trim()).ok();
     }
 
     // [pr] — SUPERZEJ_PR_TTL, with deprecated SZ_PR_TTL fallback.
@@ -8142,13 +8128,19 @@ min_priority = "alert"
             .insert("SUPERZEJ_THEME_COLOR".to_string(), "16".to_string());
         env.0
             .insert("SUPERZEJ_THEME_GLYPHS".to_string(), "ascii".to_string());
+        env.0.insert(
+            "SUPERZEJ_THEME_AGENT_GLYPHS".to_string(),
+            "symbol".to_string(),
+        );
         let o = env_overlay(&env);
         assert_eq!(o.theme_color, Some(ColorMode::Ansi16));
         assert_eq!(o.theme_glyphs, Some(GlyphMode::Ascii));
+        assert_eq!(o.theme_agent_glyphs, Some(AgentGlyphs::Symbol));
         let mut cfg = Config::default();
         o.apply(&mut cfg);
         assert_eq!(cfg.theme.color, ColorMode::Ansi16);
         assert_eq!(cfg.theme.glyphs, GlyphMode::Ascii);
+        assert_eq!(cfg.theme.agent_glyphs, AgentGlyphs::Symbol);
     }
 
     #[test]
@@ -8362,6 +8354,7 @@ min_priority = "alert"
             frame_border: Some("#333333".into()),
             theme_color: Some(ColorMode::Ansi256),
             theme_glyphs: Some(GlyphMode::Unicode),
+            theme_agent_glyphs: Some(AgentGlyphs::Auto),
             pr_ttl_secs: Some(99),
             watch_pr_interval_secs: Some(43),
             metrics_interval_secs: Some(11.0),
@@ -8404,6 +8397,7 @@ min_priority = "alert"
         assert_eq!(cfg.theme.accent, "#111111");
         assert_eq!(cfg.theme.focus_border, "#222222");
         assert_eq!(cfg.theme.colors.border.as_deref(), Some("#333333"));
+        assert_eq!(cfg.theme.agent_glyphs, AgentGlyphs::Auto);
         assert_eq!(cfg.pr.ttl_secs, 99);
         assert_eq!(cfg.watch.pr_interval_secs, 43);
         assert_eq!(cfg.metrics.interval_secs, 11.0);

@@ -107,6 +107,7 @@ mod sequence;
 mod session;
 mod share;
 mod sidebar;
+mod sidebar_legend;
 mod snapshot;
 mod sprite_bridge;
 mod ssh_shim;
