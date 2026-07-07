@@ -53,6 +53,10 @@ pub struct HostSnapshot {
     pub provisioning: bool,
     /// Live one-line status while provisioning; `""` otherwise.
     pub live_status: String,
+    /// This host was added at runtime (a DB `config_json` def) rather than
+    /// declared in `config.toml` — only these can be removed from the UI
+    /// (declarative config hosts are edited in the file). Set by hydration.
+    pub is_db_def: bool,
 }
 
 impl HostSnapshot {
@@ -107,6 +111,13 @@ pub fn host_snapshots(cfg: &Config, db: &Db) -> Vec<HostSnapshot> {
         return Vec::new();
     }
     let rows = db.hosts_all().unwrap_or_default();
+    // Names carrying a DB `config_json` def (runtime-added, hence removable).
+    let db_defs: std::collections::HashSet<String> = db
+        .host_defs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
     cfg.host
         .iter()
         .map(|(name, hc)| {
@@ -147,6 +158,7 @@ pub fn host_snapshots(cfg: &Config, db: &Db) -> Vec<HostSnapshot> {
                 consent,
                 last_probe: row.and_then(|r| r.last_probe),
                 active_step: row.and_then(|r| r.active_step.clone()),
+                is_db_def: db_defs.contains(name),
                 ..HostSnapshot::default()
             };
             if let Some(HostState::Failed(f)) = row.map(|r| &r.state) {
@@ -265,6 +277,43 @@ pub fn env_host_status(cfg: &Config, env_name: &str, hosts: &[HostSnapshot]) -> 
     }
 }
 
+/// Spawn an off-loop provision (or, when `reprobe`, a probe-TTL reset then
+/// provision) for `name`, returning the status line to show. Shared by the
+/// panel's `p`/`r` keys and the host-action menu's provision/re-probe items.
+/// The outcome flows back through the [`HostUiEvent`](crate::host_flow::HostUiEvent)
+/// channel like every other driver, so failures surface in the panel.
+pub(crate) fn drive_host(
+    name: &str,
+    reprobe: bool,
+    cfg: &Config,
+    host_ui: &crate::host_flow::HostUiTx,
+) -> String {
+    let Some(binding) = cfg.host_binding(name) else {
+        return format!("host {name}: invalid [host.{name}] config");
+    };
+    let status = if reprobe {
+        format!("re-probing {name}…")
+    } else {
+        format!("provisioning {name}…")
+    };
+    let ui = host_ui.clone();
+    tokio::task::spawn_blocking(move || {
+        if reprobe && let Ok(db) = Db::open() {
+            // best-effort: a failed reset just means the fast path may still
+            // short-circuit; the drive below re-probes anyway.
+            let _ = db.host_touch_probe(&binding.id, 0);
+        }
+        let _ = crate::host_flow::ensure_host_ready(
+            &binding,
+            crate::host_flow::ConsentPolicy::Interactive,
+            &mut |_| {},
+            Some(&ui),
+            &mut |reach| superzej_svc::host::runner_for(reach),
+        );
+    });
+    status
+}
+
 /// A `Section::Hosts` action key: `p` provision, `r` re-probe (reset the
 /// probe TTL, then provision), `c` grant install consent (confirmed), `x`
 /// forget the cached host state (confirmed). Returns whether the key was
@@ -286,33 +335,7 @@ pub(crate) fn panel_key(
     let (name, id) = (h.name.clone(), h.id.clone());
     match key {
         Char(c @ ('p' | 'r')) => {
-            let Some(binding) = cfg.host_binding(&name) else {
-                model.status = format!("host {name}: invalid [host.{name}] config");
-                return true;
-            };
-            let reprobe = c == 'r';
-            model.status = if reprobe {
-                format!("re-probing {name}…")
-            } else {
-                format!("provisioning {name}…")
-            };
-            let ui = host_ui.clone();
-            tokio::task::spawn_blocking(move || {
-                if reprobe && let Ok(db) = Db::open() {
-                    // best-effort: a failed reset just means the fast path may
-                    // still short-circuit; the drive below re-probes anyway
-                    let _ = db.host_touch_probe(&binding.id, 0);
-                }
-                // The outcome flows to the loop via HostUiEvent::Done (sent by
-                // ensure_host_ready itself), so this result needs no plumbing.
-                let _ = crate::host_flow::ensure_host_ready(
-                    &binding,
-                    crate::host_flow::ConsentPolicy::Interactive,
-                    &mut |_| {},
-                    Some(&ui),
-                    &mut |reach| superzej_svc::host::runner_for(reach),
-                );
-            });
+            model.status = drive_host(&name, c == 'r', cfg, host_ui);
             true
         }
         Char('c') => {

@@ -1413,7 +1413,6 @@ impl SidebarState {
             &model.sidebar_db_worktrees,
             &model.sidebar_db_folders,
             &model.sidebar_db_terminals,
-            &model.panel.hosts,
         );
         let visible = Self::visible_len(model);
         // While unfocused, track the active worktree so opening the sidebar
@@ -3844,6 +3843,9 @@ pub(crate) enum HostInputKind {
     /// File the active worktree into a new folder named by the typed value
     /// (the "＋ New folder…" path of the move-to-folder picker).
     FileWorktreeNewFolder,
+    /// Add a `[host.*]` machine from typed input in the System ▸ Hosts panel
+    /// (`n`) and refresh; no worktree wizard, unlike [`Self::NewHost`].
+    AddHost,
 }
 
 // `begin_worktree_wizard` lives in `handlers::wizard` (extracted from this
@@ -13457,6 +13459,13 @@ async fn event_loop<T: Terminal>(
                                             Err(e) => model.status = e,
                                         }
                                     }
+                                    HostInputKind::AddHost => {
+                                        model.status = crate::handlers::host::add_and_refresh(
+                                            &text,
+                                            &mut current_config,
+                                            &refresh_tx,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -13693,20 +13702,13 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
-                            // First-launch keymap picker (item 621): persist the
-                            // choice to ui_state and rebuild the live keymap. Not
-                            // a git op, so handle it before the git dispatch.
+                            // First-launch keymap picker (item 621): persist + rebuild.
                             if let menu::MenuChoice::SetKeymapPreset(preset) = &choice {
-                                if let Ok(db) = superzej_core::db::Db::open() {
-                                    let _ = db.set_ui_state("", "keymap_preset", preset);
-                                }
-                                current_config.keymap_preset = preset.clone();
+                                model.status = crate::handlers::apply_keymap_preset(
+                                    preset,
+                                    &mut current_config,
+                                );
                                 keymap = rebuild_keymap(&current_config, &session);
-                                model.status = if preset == "default" {
-                                    "Keymap: superzej defaults".into()
-                                } else {
-                                    format!("Keymap preset: {preset}")
-                                };
                                 dirty = true;
                                 continue;
                             }
@@ -13716,6 +13718,8 @@ async fn event_loop<T: Terminal>(
                             if let Some(status) = crate::handlers::host::intercept_menu_choice(
                                 &choice,
                                 &mut pending_host_consent,
+                                &current_config,
+                                Some(&host_ui),
                             ) {
                                 model.status = status;
                                 dirty = true;
@@ -16974,18 +16978,18 @@ async fn event_loop<T: Terminal>(
                             }
                             .panel_key(key, panel_ui.cursor)
                         }
-                        // -- hosts (hosts-as-resources): provision (p), re-probe
-                        // (r), grant install (c), forget cached state (x).
+                        // -- hosts: p/r/c/x act on the host; m menu, n add-host.
                         (Section::Hosts, key)
-                            if matches!(key, KeyCode::Char('p' | 'r' | 'c' | 'x')) =>
+                            if matches!(key, KeyCode::Char('p' | 'r' | 'c' | 'x' | 'm' | 'n')) =>
                         {
-                            crate::host_ui::panel_key(
+                            crate::handlers::host::section_key(
                                 key,
                                 panel_ui.cursor,
                                 &mut model,
                                 &current_config,
                                 &host_ui,
                                 &mut active_menu,
+                                &mut host_input,
                             )
                         }
                         // -- environments: bind here (enter), test (t), remove
@@ -19855,7 +19859,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
         );
         // Pinned "lib" workspace floats first; order is by repo path.
         assert_eq!(
@@ -19889,7 +19892,6 @@ mod tests {
             &workspaces,
             &view,
             &crate::sidebar::SidebarStatus::default(),
-            &[],
             &[],
             &[],
             &[],
@@ -19966,7 +19968,6 @@ mod tests {
             &[],
             &[],
             &terminals,
-            &[],
         );
         let ring = unified_ring(&rows, &terminals);
         assert_eq!(
@@ -20032,7 +20033,6 @@ mod tests {
             &[],
             &[],
             &terminals,
-            &[],
         );
         // The old path-based order drops the live fallback entirely.
         assert!(sidebar_workspace_order(&rows).is_empty());
