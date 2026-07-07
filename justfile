@@ -48,6 +48,16 @@ _apps:
 build: _apps
     cargo build --workspace
 
+# Fast inner-loop check: typecheck + clippy on lib/bin code only (no test/bench
+# targets, no tests, no coverage). Pass a crate to scope it further, e.g.
+# `just quick superzej-host`. Use this while iterating; run the heavy gates
+# (`just test` / `just coverage` / `just ci`) only when preparing to push/PR.
+quick pkg="": _apps
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "{{pkg}}" ]; then scope="-p {{pkg}}"; else scope="--workspace"; fi
+    cargo clippy $scope -- -D warnings
+
 # Cross-platform regression gate: typecheck the C-dep-free leaf crates' per-OS
 # code for macOS + Windows on this (Linux) box. `superzej-metrics` covers the
 # sysinfo/battery substrate; `superzej-media` covers the per-OS player backends
