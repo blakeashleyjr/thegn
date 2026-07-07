@@ -63,8 +63,8 @@ pub fn resolve_command(cfg: &Config, choice: &str) -> String {
 /// walks a preference chain at runtime inside the container and execs the first
 /// one that exists; `/bin/sh` is always the last resort.
 ///
-/// On the host fallback path `in_oci = false` keeps the existing behaviour:
-/// use `$SHELL` verbatim so NixOS users get the right store-path shell.
+/// Non-OCI (`in_oci=false`): emit `${SHELL:-/bin/sh} -l` so `$SHELL` expands at the
+/// exec site (remote-safe: baking the host's abs path → remote `exit 127`).
 pub(crate) fn shell_inner(in_oci: bool) -> String {
     if in_oci {
         // Preference order: honour the host shell name if it's a known shell,
@@ -105,8 +105,7 @@ pub(crate) fn shell_inner(in_oci: bool) -> String {
              {checks}exec /bin/sh -l"
         )
     } else {
-        let host_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        format!("{host_shell} -l")
+        "${SHELL:-/bin/sh} -l".to_string() // deferred, remote-safe (see fn doc)
     }
 }
 
@@ -3807,13 +3806,14 @@ mod tests {
         );
         // bash must always appear in the chain (present in every Debian image).
         assert!(oci.contains("bash"), "bash must be in the probe chain");
-        // Non-OCI: must be a simple "<shell> -l" with the host path, not a chain.
+        // Non-OCI: a simple "<shell> -l", not a chain.
         let host = shell_inner(false);
         assert!(
             !host.contains("command -v"),
             "host form must not emit a probe chain"
         );
         assert!(host.ends_with(" -l"), "host form must end with -l");
+        assert_eq!(host, "${SHELL:-/bin/sh} -l"); // regression: ssh "exit 127"
     }
 
     #[test]
