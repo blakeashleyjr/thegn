@@ -363,6 +363,23 @@ test: _apps
     cargo nextest run --workspace
     cargo test --doc --workspace
 
+# Formal verification (bounded model checking, CBMC via Kani) of the pure
+# color-quantization math in `superzej-core::termcaps` (the `#[cfg(kani)]`
+# proofs). Opt-in and machine-local: needs a one-time `cargo install --locked
+# kani-verifier && cargo kani setup`. Deliberately NOT part of `just ci` — Kani's
+# bundled CBMC toolchain is non-hermetic and the solve is slow.
+#
+# KNOWN BLOCKER (spike finding, 2026-07-07, kani 0.67.0): this does not currently
+# compile. Kani must build all of `superzej-core`, and its transitive dep
+# `libsqlite3-sys` (via `rusqlite`) uses the unstable `cfg_select!` in its build
+# script, which Kani's pinned `nightly-2025-11-21` rejects. The 5 harnesses WERE
+# verified (all SUCCESSFUL, ~1.2s) by extracting the color fns verbatim into a
+# standalone dep-free crate. To run in-tree, either Kani's toolchain must advance
+# past that dep, or the pure-math module must be split into a leaf crate with no
+# heavy deps. Until then, treat the `#[cfg(kani)]` proofs as documentation.
+verify-kani:
+    cargo kani -p superzej-core
+
 # Live integration tests against the REAL Sprites API (creates + destroys throwaway
 # sprites — real cloud spend). Sources SPRITES_TOKEN from .envrc.local. Validates
 # the provider exec/fs/checkpoint primitives + the env-provisioning clone path that
