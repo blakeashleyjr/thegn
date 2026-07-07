@@ -8290,6 +8290,11 @@ async fn event_loop<T: Terminal>(
     // current (a pre-switch hydration landing post-switch). The startup spawn
     // in `run()` used 0, which this initial value accepts.
     let mut hydration_gen: u64 = 0;
+    // Coalesce model hydrations: at most one main-loop `build_model` (seconds, for
+    // a bridged worktree) in flight, so an fs.watch/ticker storm can't stack
+    // concurrent hydrations that flood the sprite bridge. Mirrors `fold_inflight`.
+    let mut model_hydration_inflight = false;
+    let mut model_refresh_pending = false;
     // True while a fold-actor run is off the loop; blocks a second concurrent
     // trigger (a fold advances `main` globally, so one at a time).
     let mut fold_inflight = false;
@@ -10263,6 +10268,8 @@ async fn event_loop<T: Terminal>(
             if generation != hydration_gen {
                 continue;
             }
+            // Latest hydration landed — clear the gate (see the spawn guard below).
+            model_hydration_inflight = false;
             // `superzej open` intents ride the hydration result (claimed from
             // the DB mailbox off-loop); take them out before the model swap —
             // last one wins, applied after the drain below.
@@ -11107,7 +11114,9 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
             }
         }
-        if want_model_refresh {
+        // One hydration in flight; refreshes during it coalesce into `pending`.
+        model_refresh_pending |= want_model_refresh;
+        if model_refresh_pending && !model_hydration_inflight {
             hydration_gen += 1;
             spawn_model_hydration(
                 model_tx.clone(),
@@ -11120,6 +11129,8 @@ async fn event_loop<T: Terminal>(
                     profile: current_config.profile.clone(),
                 },
             );
+            model_hydration_inflight = true;
+            model_refresh_pending = false;
         }
         if want_pr_refresh {
             spawn_pr_cache_refresh(
