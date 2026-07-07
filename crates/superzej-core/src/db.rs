@@ -63,7 +63,7 @@ use std::path::PathBuf;
 /// v36: adds `compute_budgets`/`compute_meters` (see [`crate::db_compute`]).
 /// v37: adds `intents` (the CLI→compositor mailbox behind `superzej open`;
 /// see [`crate::store::IntentStore`]).
-pub const SCHEMA_VERSION: i64 = 37;
+pub const SCHEMA_VERSION: i64 = 38;
 
 pub struct Db {
     conn: Connection,
