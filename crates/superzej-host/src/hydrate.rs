@@ -651,36 +651,9 @@ fn collect_sidebar_status(
     let mut status = crate::sidebar::SidebarStatus::default();
     let t0 = std::time::Instant::now();
 
-    // Advance the activity state machine over ALL registered worktrees,
-    // then read the fresh states (keyed by tab name). This keeps background
-    // agents in other workspaces ticking.
-    let mut managed_map = std::collections::BTreeMap::new();
-    if let Ok(db_wts) = db.worktrees() {
-        for wt in db_wts {
-            if !wt.worktree.is_empty() {
-                managed_map.insert(
-                    wt.worktree.clone(),
-                    superzej_core::activity::ManagedWorktree {
-                        worktree: wt.worktree.clone(),
-                        tab: wt.tab_name.clone(),
-                    },
-                );
-            }
-        }
-    }
-    // Overlay the active session (might have unpersisted fresh worktrees)
-    for g in &session.worktrees {
-        if !g.path.is_empty() {
-            managed_map.insert(
-                g.path.clone(),
-                superzej_core::activity::ManagedWorktree {
-                    worktree: g.path.clone(),
-                    tab: g.name.clone(),
-                },
-            );
-        }
-    }
-    let managed: Vec<_> = managed_map.into_values().collect();
+    // Advance the activity state machine, then read the fresh states (keyed by
+    // tab name). Only agent worktrees drive the dot (see `hydrate_activity`).
+    let managed = crate::hydrate_activity::managed_worktrees(session, db);
     // Remote/provider worktrees: their processes run in the env, not on this
     // host, so the local /proc scan never sees them. For each that has a live
     // resident bridge, fetch its in-env jiffies via `proc.list` and inject them
