@@ -5702,10 +5702,13 @@ fn spawn_test_discovery(
 
 /// Load cached test state for a worktree and detect its task if none is known.
 /// Reading only — never spawns a run (no auto-run).
+/// Load cached test state; `detect` runs the `detect_test_task` FS scan only when
+/// needed (D2: the per-switch caller passes `false` to keep that scan off the loop).
 fn sync_tests_for_worktree(
     ui: &mut crate::panel::PanelUi,
     worktree: &std::path::Path,
     cfg: &superzej_core::config::Config,
+    detect: bool,
 ) {
     let key = worktree.to_string_lossy();
     if let Some(cache) = superzej_core::db::Db::open()
@@ -5715,7 +5718,7 @@ fn sync_tests_for_worktree(
     {
         ui.tests.apply_cache(cache);
     }
-    if ui.tests.task.is_none() {
+    if detect && ui.tests.task.is_none() {
         ui.tests.task = crate::task::detect_test_task(worktree, cfg);
     }
 }
@@ -5972,7 +5975,7 @@ fn maybe_discover_tests(
     sem: std::sync::Arc<tokio::sync::Semaphore>,
 ) {
     let wt = active_tab_path(session);
-    sync_tests_for_worktree(ui, &wt, cfg);
+    sync_tests_for_worktree(ui, &wt, cfg, true); // entering Tests → detect now
     // Skip discovery when a prior run/discovery already covered this manifest
     // state: a fresh fingerprint match means nothing relevant changed, so reuse
     // the cache and spawn no subprocess at all.
@@ -8290,10 +8293,9 @@ async fn event_loop<T: Terminal>(
     // current (a pre-switch hydration landing post-switch). The startup spawn
     // in `run()` used 0, which this initial value accepts.
     let mut hydration_gen: u64 = 0;
-    // Coalesce model hydrations: at most one main-loop `build_model` (seconds, for
-    // a bridged worktree) in flight, so an fs.watch/ticker storm can't stack
-    // concurrent hydrations that flood the sprite bridge. Mirrors `fold_inflight`.
-    let mut model_hydration_inflight = false;
+    // Coalesce model hydrations: one main-loop `build_model` in flight, so a refresh
+    // storm or rapid-switch burst can't stack them. In-flight gen (not a bool).
+    let mut inflight_hydration_gen: Option<u64> = None;
     let mut model_refresh_pending = false;
     // Input dispatch time; next render measures dispatch→frame latency + drives the input-priority PTY budget.
     let mut input_at: Option<std::time::Instant> = None;
@@ -8553,7 +8555,7 @@ async fn event_loop<T: Terminal>(
             // Load this worktree's cached test state (most-recent status) so the
             // Tests tab shows it instantly; discovery stays lazy (on tab open).
             panel_ui.tests = crate::panel::TestPanelState::default();
-            sync_tests_for_worktree(&mut panel_ui, &current_worktree, keymap.config());
+            sync_tests_for_worktree(&mut panel_ui, &current_worktree, keymap.config(), false); // D2: no scan on switch
             loaded_tests_worktree = current_worktree.to_string_lossy().into_owned();
             // Immediate hydrate for the newly-focused worktree. Paint this
             // worktree's last-known panel from the cache (seeded by prior visits
@@ -8612,13 +8614,8 @@ async fn event_loop<T: Terminal>(
                 expanded: panel_ui.width.is_expanded(),
                 profile: current_config.profile.clone(),
             };
-            spawn_model_hydration(
-                model_tx.clone(),
-                hydration_gen,
-                session.clone(),
-                Some(waker.clone()),
-                hints.clone(),
-            );
+            // D1: coalesce rapid switches — the gate hydrates only the settled worktree.
+            model_refresh_pending = true;
             // Warm the worktrees above/below the selection into the cache so a
             // follow-on switch to a neighbor is instant too. Skip ones already
             // cached — the on-switch hydration refreshes them when truly focused.
@@ -10268,11 +10265,14 @@ async fn event_loop<T: Terminal>(
         let mut pending_focus: Option<superzej_core::store::IntentRow> = None;
         while let Ok((generation, mut next_model)) = model_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Model);
+            // In-flight hydration landed — clear the gate (before the stale-check so
+            // a switch that bumped `hydration_gen` mid-flight can't strand it).
+            if Some(generation) == inflight_hydration_gen {
+                inflight_hydration_gen = None;
+            }
             if generation != hydration_gen {
                 continue;
             }
-            // Latest hydration landed — clear the gate (see the spawn guard below).
-            model_hydration_inflight = false;
             // `superzej open` intents ride the hydration result (claimed from
             // the DB mailbox off-loop); take them out before the model swap —
             // last one wins, applied after the drain below.
@@ -11117,9 +11117,9 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
             }
         }
-        // One hydration in flight; refreshes during it coalesce into `pending`.
+        // One hydration in flight; refreshes (incl. switches) coalesce into `pending`.
         model_refresh_pending |= want_model_refresh;
-        if model_refresh_pending && !model_hydration_inflight {
+        if model_refresh_pending && inflight_hydration_gen.is_none() {
             hydration_gen += 1;
             spawn_model_hydration(
                 model_tx.clone(),
@@ -11132,7 +11132,7 @@ async fn event_loop<T: Terminal>(
                     profile: current_config.profile.clone(),
                 },
             );
-            model_hydration_inflight = true;
+            inflight_hydration_gen = Some(hydration_gen);
             model_refresh_pending = false;
         }
         if want_pr_refresh {
@@ -15935,7 +15935,7 @@ async fn event_loop<T: Terminal>(
                                 _ => TestRun::Failed,
                             };
                             let wt = active_tab_path(&session);
-                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
+                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config(), true);
                             if let Some(base) = panel_ui.tests.task.clone() {
                                 if !panel_ui.tests.running {
                                     let task_spec = test_task_for_run(&panel_ui.tests, kind, base);
@@ -15961,7 +15961,7 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Tests, KeyCode::Char('u')) => {
                             let wt = active_tab_path(&session);
-                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
+                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config(), true);
                             if let Some(task) = panel_ui.tests.task.clone() {
                                 test_generation += 1;
                                 panel_ui.tests.discovering = true;
