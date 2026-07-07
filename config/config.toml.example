@@ -1835,6 +1835,34 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # ssh_port = 22
 # user = "me"
 #
+# # An idle Windows box (on your tailnet, running Docker) as a worktree host.
+# # superzej's remote path is POSIX (/bin/sh, git, dtach, …), so point the ssh
+# # endpoint at a WSL2 distro — a real Linux shell with the Windows Docker
+# # daemon exposed (Docker Desktop WSL integration, or docker-ce inside WSL).
+# # Two entry methods, same landing: run sshd INSIDE the distro, or set the
+# # Windows OpenSSH server's DefaultShell to C:\Windows\System32\wsl.exe so a
+# # session drops straight into Linux. Use the Tailscale MagicDNS name as host.
+# # install_runtime = "never" (Docker is already there — do not install podman);
+# # the bound env sets backend = "docker" so the container runs on that daemon.
+# # Worktrees live under ~/superzej-worktrees in the WSL FS — NOT /mnt/c (a git
+# # worktree needs a real Linux filesystem for symlinks/inodes/perf).
+# [host.win1]
+# reach = "ssh"
+# install_runtime = "never"
+# capacity = { cpu = "8", memory = "16g" }   # omit for manual (pinned) placement
+# [host.win1.ssh]
+# host = "me@win1"             # Tailscale MagicDNS name
+# transport = "mosh"           # or "ssh"; mosh survives the box napping (apt install mosh dtach)
+# forward_agent = true         # remote `git push` uses your local keys
+# [env.win1]                   # MANUAL: pin an env per box, pick it at worktree-create
+# placement = "ssh"
+# host = "win1"
+# [env.win1.sandbox]
+# backend = "docker"
+# # AUTO-SPREAD across win1/win2 instead: give each [host.*] a capacity, enable
+# # [placement] (mode = "packed", pack_strategy = "spread"), and leave an env
+# # UNPINNED (no `host =`) so the broker chooses — see the [placement] section.
+#
 # # Bind envs to hosts: both of these pay gpu-box's setup once, share its
 # # digest-pinned image + warm volumes, and spawn sandboxes near-instantly.
 # [env.gpu]
