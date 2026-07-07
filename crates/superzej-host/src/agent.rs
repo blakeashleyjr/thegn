@@ -2836,11 +2836,14 @@ pub fn launch_spec_with_key(
     let loc = GitLoc::for_worktree(Path::new(worktree));
 
     // Record the choice for the dashboard / `--resume` (keyed by worktree path).
-    // The transient `clean-shell` watchdog fallback is NOT recorded: it must not
-    // become the worktree's remembered agent (the user may fix their dotfiles).
+    // Two launches are deliberately NOT recorded as the worktree's remembered
+    // agent: the transient `clean-shell` watchdog fallback (the user may fix
+    // their dotfiles), and tool drawers (yazi/lazygit/editor/diff) — those are
+    // overlays, not the worktree's agent, and are auto-prewarmed on every switch,
+    // so recording them would clobber the real choice on every worktree.
     let saved_backend = match Db::open() {
         Ok(db) => {
-            if choice != "clean-shell" {
+            if choice != "clean-shell" && cfg.tool_command(choice).is_none() {
                 let _ = db.set_worktree_agent(worktree, choice);
             }
             db.worktree_sandbox(worktree).ok().flatten()
@@ -3623,6 +3626,54 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         out
+    }
+
+    #[test]
+    fn tool_drawer_launch_is_not_recorded_as_worktree_agent() {
+        with_temp_state("tool-not-agent", || {
+            // A real agent + a yazi tool; host backend so launch_spec resolves.
+            let mut cfg = cfg_with(&[("claude", "claude")], &[("yazi", "yazi")]);
+            cfg.sandbox.backend = superzej_core::config::SandboxBackend::Auto;
+            cfg.sandbox.backend_chain = vec!["host".to_string()];
+            let worktree =
+                std::env::temp_dir().join(format!("sz-agent-tool-not-agent-{}", std::process::id()));
+            let wt = worktree.to_string_lossy();
+
+            // `set_worktree_agent` is UPDATE-only, so register the worktree row
+            // first (as the real create path does) — otherwise every write is a
+            // no-op and the test can't tell a skipped write from a matched one.
+            superzej_core::db::Db::open()
+                .unwrap()
+                .put_worktree("app/wt", "/x/app", &wt, "sz/wt", None, None)
+                .unwrap();
+
+            // Launching the auto-prewarmed yazi drawer must NOT stamp the worktree.
+            launch_spec(&cfg, &wt, None, "yazi").unwrap();
+            let db = superzej_core::db::Db::open().unwrap();
+            assert_eq!(
+                db.worktree_agent(&wt).unwrap(),
+                None,
+                "tool drawer must not become the worktree's remembered agent"
+            );
+
+            // A real agent still records normally.
+            launch_spec(&cfg, &wt, None, "claude").unwrap();
+            let db = superzej_core::db::Db::open().unwrap();
+            assert_eq!(
+                db.worktree_agent(&wt).unwrap().as_deref(),
+                Some("claude"),
+                "real agents are still remembered"
+            );
+
+            // And a subsequent yazi prewarm must not clobber the real agent.
+            launch_spec(&cfg, &wt, None, "yazi").unwrap();
+            let db = superzej_core::db::Db::open().unwrap();
+            assert_eq!(
+                db.worktree_agent(&wt).unwrap().as_deref(),
+                Some("claude"),
+                "a later tool drawer must not overwrite the remembered agent"
+            );
+        });
     }
 
     #[test]

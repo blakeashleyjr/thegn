@@ -597,6 +597,11 @@ pub(crate) fn db_worktree_list(db: &superzej_core::db::Db) -> Vec<crate::sidebar
 fn collect_sidebar_status(
     session: &crate::session::Session,
     db: &superzej_core::db::Db,
+    // Distinguishes real agents from tool drawers (yazi/lazygit/editor/diff) via
+    // `tool_command`, so a tool auto-prewarmed on every worktree never surfaces as
+    // that worktree's agent glyph — even for rows whose DB `agent` was clobbered
+    // by an older build (self-healing, no migration needed).
+    app_cfg: &superzej_core::config::Config,
     alert_kinds: &[&str],
     counted_kinds: &[&str],
     // The budget-governed warm/lifecycle policy: reconciles the warm set (drops
@@ -686,7 +691,9 @@ fn collect_sidebar_status(
     // when they are rendered as collapsed/switchable sidebar rows.
     if let Ok(db_wts) = db.worktrees() {
         for wt in db_wts {
-            if !wt.agent.is_empty() {
+            // Skip tool drawers (yazi/…): they're auto-prewarmed on every switch
+            // and aren't the worktree's agent. Guards stale rows too.
+            if !wt.agent.is_empty() && app_cfg.tool_command(&wt.agent).is_none() {
                 status.agent.insert(wt.worktree.clone(), wt.agent.clone());
             }
             if !wt.branch.is_empty()
@@ -836,7 +843,9 @@ fn collect_sidebar_status(
                 behind,
             },
         );
-        if let Ok(Some(agent)) = db.worktree_agent(&path) {
+        if let Ok(Some(agent)) = db.worktree_agent(&path)
+            && app_cfg.tool_command(&agent).is_none()
+        {
             status.agent.insert(path.clone(), agent);
         }
         // PR badge: open PRs for this worktree's current branch, joined from the
@@ -1124,6 +1133,7 @@ pub(crate) fn build_model(
     let sidebar_status = collect_sidebar_status(
         session,
         db,
+        &app_cfg,
         &alert_kinds,
         &counted_kinds,
         &app_cfg.lifecycle,
