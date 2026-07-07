@@ -33,13 +33,18 @@ pub struct Damage {
     /// the live clock, AI metrics. Recompose just those two 1-row rects and
     /// bounded-diff them, instead of a full-chrome repaint ~1×/s while idle.
     pub bars: bool,
+    /// Only the sidebar changed — cursor navigation, collapse/expand, multi-select
+    /// (D5). The panel shows the *active* worktree (not the sidebar highlight), so
+    /// it's untouched; recompose + bounded-diff just the sidebar rect (paired with
+    /// `bars` for any selection-count display) instead of the full chrome/panel.
+    pub sidebar: bool,
 }
 
 #[allow(dead_code)] // is_empty/clear are part of the Damage API + exercised by tests
 impl Damage {
     /// True when nothing changed — the loop woke but has no frame to paint.
     pub fn is_empty(&self) -> bool {
-        !self.full && !self.chrome && !self.bars && self.panes.is_empty()
+        !self.full && !self.chrome && !self.bars && !self.sidebar && self.panes.is_empty()
     }
 
     /// Clear all channels — called after a frame is flushed.
@@ -47,6 +52,7 @@ impl Damage {
         self.full = false;
         self.chrome = false;
         self.bars = false;
+        self.sidebar = false;
         self.panes.clear();
     }
 }
@@ -103,10 +109,14 @@ pub enum RenderPlan {
     /// `full_repaint` flag) and any heavy-chrome/overlay change.
     Full,
     /// Reuse the prior frame in `scratch`; recompose + bounded-diff only the
-    /// damaged regions — the named `panes` (sorted, deduped) and/or the
-    /// masthead+statusbar `bars`. The streaming-output + stats-tick fast path.
-    /// At least one of `panes`/`bars` is non-empty/true.
-    Incremental { panes: Vec<PaneId>, bars: bool },
+    /// damaged regions — the named `panes` (sorted, deduped), the masthead+
+    /// statusbar `bars`, and/or the `sidebar`. The streaming-output + stats-tick +
+    /// sidebar-nav fast path. At least one of `panes`/`bars`/`sidebar` is set.
+    Incremental {
+        panes: Vec<PaneId>,
+        bars: bool,
+        sidebar: bool,
+    },
 }
 
 /// Map this frame's damage + overlay state to the cheapest correct plan.
@@ -121,12 +131,13 @@ pub fn plan(damage: &Damage, overlays: &Overlays) -> RenderPlan {
     if damage.chrome || overlays.any() {
         return RenderPlan::Full;
     }
-    if !damage.panes.is_empty() || damage.bars {
+    if !damage.panes.is_empty() || damage.bars || damage.sidebar {
         let mut panes: Vec<PaneId> = damage.panes.iter().copied().collect();
         panes.sort_unstable();
         return RenderPlan::Incremental {
             panes,
             bars: damage.bars,
+            sidebar: damage.sidebar,
         };
     }
     RenderPlan::Skip
@@ -158,14 +169,16 @@ mod tests {
             plan(&panes(&[3]), &Overlays::default()),
             RenderPlan::Incremental {
                 panes: vec![3],
-                bars: false
+                bars: false,
+                sidebar: false
             }
         );
         assert_eq!(
             plan(&panes(&[7, 2, 7, 4]), &Overlays::default()),
             RenderPlan::Incremental {
                 panes: vec![2, 4, 7],
-                bars: false
+                bars: false,
+                sidebar: false
             },
             "ids are sorted + deduped"
         );
@@ -182,7 +195,8 @@ mod tests {
             plan(&d, &Overlays::default()),
             RenderPlan::Incremental {
                 panes: vec![],
-                bars: true
+                bars: true,
+                sidebar: false
             }
         );
     }
@@ -195,9 +209,36 @@ mod tests {
             plan(&d, &Overlays::default()),
             RenderPlan::Incremental {
                 panes: vec![5],
-                bars: true
+                bars: true,
+                sidebar: false
             }
         );
+    }
+
+    #[test]
+    fn sidebar_only_change_is_incremental_not_full() {
+        // D5: sidebar cursor-nav recomposes just the sidebar (+ bars), never the
+        // full chrome/panel — the panel tracks the ACTIVE worktree, not the
+        // sidebar highlight, so it's untouched.
+        let d = Damage {
+            sidebar: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan(&d, &Overlays::default()),
+            RenderPlan::Incremental {
+                panes: vec![],
+                bars: false,
+                sidebar: true
+            }
+        );
+        // A chrome/overlay change still escalates a sidebar-only frame to Full.
+        let d2 = Damage {
+            sidebar: true,
+            chrome: true,
+            ..Default::default()
+        };
+        assert_eq!(plan(&d2, &Overlays::default()), RenderPlan::Full);
     }
 
     #[test]
