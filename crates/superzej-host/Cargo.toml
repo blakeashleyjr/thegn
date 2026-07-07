@@ -85,3 +85,4 @@ toml_edit = "0.25.12"
 # that measures `w` paints exactly `w` columns) and the compositor border clamp
 # (never advance a wide cell past a pane's content rect into the card border).
 unicode-width = "0.2"
+sha2 = "0.10"

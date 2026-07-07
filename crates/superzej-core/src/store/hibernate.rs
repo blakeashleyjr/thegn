@@ -4,16 +4,15 @@
 //! State machine (intent-before-action, like the VPS create ledger):
 //!
 //! ```text
-//! (no row) ──put(capturing)──▶ capturing ──set_state──▶ hibernated ──▶ destroy VM
-//!                                  │                        │
-//!                                  └── capture failed:      └──set_state(restoring)
-//!                                      delete row, VM kept        │ restore ok: delete row
-//!                                                                 │ restore failed: back to hibernated
+//! (no row) ─put─▶ capturing ─snapshot verified─▶ destroying ─destroy ok─▶ hibernated
+//!                     │                              │                        │
+//!                     │ capture failed:              │ crash: healing sweep   └─▶ restoring
+//!                     │  delete row, VM kept         │  re-drives the destroy      │ ok: delete row
+//!                     │ crash: sweep discards        │  (idempotent, 404 = gone)   │ failed: back to
+//!                     ▼  the stale intent            ▼                             ▼  hibernated
 //! ```
 //!
-//! A `hibernated` row plus a still-live instance means a crash interrupted the
-//! destroy — the hibernator re-verifies the snapshot against the live sandbox
-//! and finishes the destroy. A server backend would implement this against
+//! A server backend would implement this against
 //! Postgres; the local shell implements it over the embedded SQLite `Db`
 //! (`db_hibernate.rs`). `HibernationRow` is defined in [`crate::db`].
 

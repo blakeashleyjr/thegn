@@ -106,6 +106,18 @@ pub fn reconcile(session: &crate::session::Session, cfg: &LifecycleConfig) {
     }
 }
 
+/// Seconds since `worktree` was last seen active/busy by the warm reconcile's
+/// clock, or `None` if it hasn't been observed this session. The clock starts
+/// at process start (first observation), so a fresh szhost never hibernates
+/// anything immediately after launch. Consumed by the hibernator.
+pub(crate) fn idle_secs(worktree: &str) -> Option<u64> {
+    last_active()
+        .lock()
+        .ok()?
+        .get(worktree)
+        .map(|t| t.elapsed().as_secs())
+}
+
 /// Resolve the `(repo_root, repo, env_name)` triple the warm pool operates on
 /// for the active worktree — using the worktree's EFFECTIVE env (its DB
 /// selection, falling back through the normal repo/global layering via
