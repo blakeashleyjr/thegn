@@ -296,6 +296,35 @@ fn exec_argv(argv: &[String], timeout: Duration) -> Result<(bool, String, String
     }
 }
 
+/// The `containers-storage:[driver@graphroot+runroot]` prefix for the LOCAL
+/// rootless podman store, so skopeo reads a `just image-build`-loaded image (the
+/// bare `containers-storage:` transport hits the *root* store — "mkdir
+/// /run/containers: permission denied" — when run rootless). `None` if local
+/// podman isn't available (callers then fall back to docker-daemon / registry).
+pub(super) fn local_containers_storage_prefix() -> Option<String> {
+    let (ok, out, _) = exec_argv(
+        &[
+            "podman".into(),
+            "info".into(),
+            "--format".into(),
+            "{{.Store.GraphDriverName}}|{{.Store.GraphRoot}}|{{.Store.RunRoot}}".into(),
+        ],
+        Duration::from_secs(10),
+    )
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    let mut parts = out.lines().next()?.trim().split('|');
+    let drv = parts.next()?.trim();
+    let gr = parts.next()?.trim();
+    let rr = parts.next()?.trim();
+    if drv.is_empty() || gr.is_empty() {
+        return None;
+    }
+    Some(format!("containers-storage:[{drv}@{gr}+{rr}]"))
+}
+
 /// Shorten a stderr blob into a one-line error tail.
 fn err_tail(err: &str) -> String {
     err.lines()
@@ -526,12 +555,25 @@ impl OciRunner {
     /// podman. The digest-of-document IS the (list) digest.
     fn fetch_manifest(&self, reference: &ImageRef) -> Result<(String, Digest), String> {
         let target = reference.pinned().unwrap_or_else(|| reference.name_tag());
-        let attempts: [(bool, String); 4] = [
-            (true, format!("skopeo inspect --raw docker://{target}")),
-            (true, format!("podman manifest inspect docker://{target}")),
-            (false, format!("skopeo inspect --raw docker://{target}")),
-            (false, format!("podman manifest inspect docker://{target}")),
-        ];
+        let name_tag = reference.name_tag();
+        // Local container storage FIRST — the fully-local path (a `just
+        // image-build`-loaded image resolves with NO registry). skopeo must be
+        // told the rootless podman store explicitly ([driver@graphroot+runroot]);
+        // the bare `containers-storage:` transport hits the ROOT store. docker's
+        // daemon transport is unambiguous. Both miss for a genuinely-remote ref
+        // and fall through to the registry.
+        let mut attempts: Vec<(bool, String)> = Vec::new();
+        if let Some(cs) = local_containers_storage_prefix() {
+            attempts.push((true, format!("skopeo inspect --raw {cs}{name_tag}")));
+        }
+        attempts.push((
+            true,
+            format!("skopeo inspect --raw docker-daemon:{name_tag}"),
+        ));
+        attempts.push((true, format!("skopeo inspect --raw docker://{target}")));
+        attempts.push((true, format!("podman manifest inspect docker://{target}")));
+        attempts.push((false, format!("skopeo inspect --raw docker://{target}")));
+        attempts.push((false, format!("podman manifest inspect docker://{target}")));
         let mut last_err = String::from("no manifest tool (skopeo/podman) available");
         for (local, cmd) in &attempts {
             let run = if *local {
