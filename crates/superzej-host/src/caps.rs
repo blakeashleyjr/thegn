@@ -16,11 +16,17 @@
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use superzej_core::config::AgentGlyphs;
 use superzej_core::termcaps::{ColorDepth, GlyphSet, TermCaps, UnicodeLevel, glyphs};
+use superzej_core::theme::AgentGlyphStyle;
 
 static CAPS: RwLock<TermCaps> = RwLock::new(TermCaps::FULL);
 static COLOR_DEPTH: AtomicU8 = AtomicU8::new(0);
 static UNICODE_LEVEL: AtomicU8 = AtomicU8::new(0);
+// The `[theme] agent_glyphs` preference (0 = Letter, the shipped default; the
+// pre-install value is therefore the safe letter style). Resolved against the
+// live glyph level at read time by [`agent_glyph_style`].
+static AGENT_GLYPHS: AtomicU8 = AtomicU8::new(0);
 
 fn color_to_u8(d: ColorDepth) -> u8 {
     match d {
@@ -53,6 +59,22 @@ fn u8_to_level(v: u8) -> UnicodeLevel {
         1 => UnicodeLevel::Basic,
         2 => UnicodeLevel::Ascii,
         _ => UnicodeLevel::Full,
+    }
+}
+
+fn agent_glyphs_to_u8(g: AgentGlyphs) -> u8 {
+    match g {
+        AgentGlyphs::Letter => 0,
+        AgentGlyphs::Symbol => 1,
+        AgentGlyphs::Auto => 2,
+    }
+}
+
+fn u8_to_agent_glyphs(v: u8) -> AgentGlyphs {
+    match v {
+        1 => AgentGlyphs::Symbol,
+        2 => AgentGlyphs::Auto,
+        _ => AgentGlyphs::Letter,
     }
 }
 
@@ -93,6 +115,30 @@ pub fn unicode_level() -> UnicodeLevel {
 /// The active glyph table (`&'static`, no allocation) for the current level.
 pub fn active_glyphs() -> &'static GlyphSet {
     glyphs(unicode_level())
+}
+
+/// Install the resolved capabilities together with the config's themed glyph
+/// preferences. The single install entry point used by the loop at startup and
+/// on config reload — [`install`] handles the color/glyph atomics, and the
+/// `[theme] agent_glyphs` preference is a cheap extra atomic store read back by
+/// [`agent_glyph_style`].
+pub fn install_themed(cfg: &superzej_core::config::Config, caps: TermCaps) {
+    install(caps);
+    AGENT_GLYPHS.store(
+        agent_glyphs_to_u8(cfg.theme.agent_glyphs),
+        Ordering::Relaxed,
+    );
+}
+
+/// The resolved agent-marker style for the sidebar — the configured preference
+/// folded with the live glyph level (see
+/// [`superzej_core::theme::resolve_agent_glyph_style`]). Hot path: two atomic
+/// loads, no allocation.
+pub fn agent_glyph_style() -> AgentGlyphStyle {
+    superzej_core::theme::resolve_agent_glyph_style(
+        u8_to_agent_glyphs(AGENT_GLYPHS.load(Ordering::Relaxed)),
+        unicode_level(),
+    )
 }
 
 /// Per-thread capability overrides for tests. Each `#[test]` runs on its own
@@ -150,6 +196,26 @@ mod tests {
         for l in [UnicodeLevel::Full, UnicodeLevel::Basic, UnicodeLevel::Ascii] {
             assert_eq!(u8_to_level(level_to_u8(l)), l);
         }
+    }
+
+    #[test]
+    fn agent_glyphs_u8_round_trip() {
+        for g in [AgentGlyphs::Letter, AgentGlyphs::Symbol, AgentGlyphs::Auto] {
+            assert_eq!(u8_to_agent_glyphs(agent_glyphs_to_u8(g)), g);
+        }
+    }
+
+    #[test]
+    fn default_agent_glyph_style_is_letter_even_on_modern_terminal() {
+        // The process-wide preference atomic defaults to Letter (0) — so the
+        // resolved style stays Letter regardless of the detected glyph level.
+        // (We never mutate the global here; only the thread-local level.)
+        test_override::with_unicode(UnicodeLevel::Full, || {
+            assert_eq!(agent_glyph_style(), AgentGlyphStyle::Letter);
+        });
+        test_override::with_unicode(UnicodeLevel::Ascii, || {
+            assert_eq!(agent_glyph_style(), AgentGlyphStyle::Letter);
+        });
     }
 
     #[test]

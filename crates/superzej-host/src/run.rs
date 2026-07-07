@@ -703,7 +703,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // the first frame; the config fs-watch re-resolves it live.
     crate::chrome::set_palette(cfg.palette());
     crate::seg::set_undercurl_supported(resolve_undercurl(&cfg));
-    crate::caps::install(resolve_termcaps_with_probe(&cfg, term_probe.as_ref()));
+    crate::caps::install_themed(&cfg, resolve_termcaps_with_probe(&cfg, term_probe.as_ref()));
     crate::center::PANE_HPAD.store(
         cfg.theme.pane_padding as usize,
         std::sync::atomic::Ordering::Relaxed,
@@ -11022,7 +11022,7 @@ async fn event_loop<T: Terminal>(
                     // Live theme reload: colors apply on the next repaint.
                     crate::chrome::set_palette(new_cfg.palette());
                     crate::seg::set_undercurl_supported(resolve_undercurl(&new_cfg));
-                    crate::caps::install(resolve_termcaps(&new_cfg));
+                    crate::caps::install_themed(&new_cfg, resolve_termcaps(&new_cfg));
                     wire_renderer.set_depth(crate::caps::color_depth());
                     crate::center::PANE_HPAD.store(
                         new_cfg.theme.pane_padding as usize,
