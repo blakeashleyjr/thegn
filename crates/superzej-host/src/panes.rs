@@ -550,6 +550,9 @@ impl Panes {
                 superzej_core::db::Db::open()
                     .ok()
                     .and_then(|db| db.worktree_agent(worktree).ok().flatten())
+                    // A remembered tool drawer (yazi/…) is not the worktree's
+                    // agent — fall through to the shell rather than resuming it.
+                    .filter(|c| cfg.tool_command(c).is_none())
                     .as_deref()
                     .and_then(|c| crate::agent::native_agent_exec(cfg, worktree, c))
                     .or_else(|| crate::agent::native_shell_exec(cfg, worktree))
