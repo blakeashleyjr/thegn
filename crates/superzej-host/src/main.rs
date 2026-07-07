@@ -51,6 +51,7 @@ mod hydrate_feed;
 mod hydrate_terminal;
 mod input;
 mod integrate;
+mod iroh_home;
 mod keyhint;
 mod keymap;
 mod kitty_relay;
