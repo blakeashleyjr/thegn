@@ -2026,6 +2026,12 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # #                                #   (0 ⇒ this default) — the spend guardrail
 # # max_lifetime_secs = 0          # destroy instances older than this (0 = off);
 # #                                #   the hard ceiling for forgotten sandboxes
+# # hibernate = "auto"             # snapshot-then-destroy when idle: auto (ON
+# #                                #   for VPS — it bills while it exists) | on
+# #                                #   | off. See [lifecycle] hibernate_after_secs
+# #                                #   + [lifecycle.snapshot]
+# # hibernate_idle_secs = 0        # per-env idle TTL override; 0 ⇒ the global
+# #                                #   [lifecycle] hibernate_after_secs
 # # nix_installer = "determinate"  # the faster installer is a good VPS default
 # # The workload runs directly on the VPS by default (the VPS is the isolation
 # # boundary, like a sprite). To containerize INSIDE it instead (docker is on
@@ -2124,6 +2130,21 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 #                             #   provider worktrees instead of waking them to poll
 # cost_per_warm_hour = 0.0    # est. $/warm-sandbox-hour, for the ceiling below
 # cost_ceiling_per_hour = 0.0 # trim the warm set to stay under this $/hr; 0 ⇒ off
+#
+# HIBERNATION (ephemeral compute, durable state): a commodity VPS (hetzner/
+# digitalocean) bills while the instance EXISTS, even stopped — so an eligible
+# CLAIMED sandbox idle past this TTL hibernates: the host captures the
+# worktree's git/file state (unpushed commits as a git bundle + uncommitted
+# tracked changes as a binary patch + untracked files as a tar), verifies it
+# into the [lifecycle.snapshot] store, DESTROYS the instance, and the next
+# open of that worktree transparently recreates + restores it.
+# ⚠ Only that triple survives. Anything else on the VM — build caches, docker
+# volumes, databases, the warm nix store — is EPHEMERAL and rebuilt on the
+# next open (expect the usual provision time). Never hibernates while a pane
+# is attached, a process is busy, or the capture failed (a failed capture
+# always keeps the VM). Per-env control: `[env.<name>.provider] hibernate`.
+# hibernate_after_secs = 3600 # idle seconds before an eligible sandbox
+#                             #   hibernates; 0 ⇒ off globally
 # [lifecycle.pool]            # WARM SPARE POOL: keep N pre-provisioned, unclaimed
 # size = 0                    #   sandboxes ready per (repo, env) so the NEXT worktree
 #                             #   CLAIMS one instantly (bind + branch checkout) instead
@@ -2144,6 +2165,20 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # destroy+rebuild (minutes) when they go stale or their worktree is deleted;
 # # lockfile-freshness guarded, destroy on any failure. false = always destroy.
 # recycle = true
+# [lifecycle.snapshot]        # WHERE hibernation snapshots live
+# backend = "local"           # local (this host's disk; zero config) | s3
+# dir = ""                    # local: root override; empty ⇒
+#                             #   $XDG_STATE_HOME/superzej/snapshots
+# keep = 3                    # snapshots retained per (repo, worktree, env)
+# max_artifact_mb = 512       # abort the hibernate (keep the VM, warn) if any
+#                             #   single artifact exceeds this; 0 ⇒ no ceiling
+# bucket = ""                 # s3: bucket name (required for backend = "s3")
+# endpoint = ""               # s3: endpoint URL for S3-compatibles (R2/B2/
+#                             #   MinIO…); empty ⇒ AWS S3
+# region = "us-east-1"        # s3: region
+# prefix = "superzej"         # s3: key prefix inside the bucket
+# access_key = "env:AWS_ACCESS_KEY_ID"      # secret ref: env:VAR | keyring:<n>
+# secret_key = "env:AWS_SECRET_ACCESS_KEY"  #   | file:/path | bare env-var name
 
 # ── Placement engine ─────────────────────────────────────────────────────────
 # WHERE each worktree sandbox runs: Dedicated (one sandbox, exclusive host),
