@@ -120,7 +120,7 @@ impl EnvWizard {
     }
 
     /// Like [`EnvWizard::new`] but pre-seeded to `kind` (a host-picker
-    /// "+ set up <kind>…" row). Unknown kinds keep the default selection.
+    /// "+ set up `<kind>`…" row). Unknown kinds keep the default selection.
     pub fn with_kind(cfg: &Config, kind: &str) -> Self {
         let mut w = Self::new(cfg);
         if let Some(i) = KINDS.iter().position(|k| *k == kind) {

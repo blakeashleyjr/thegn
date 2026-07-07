@@ -37,7 +37,7 @@ pub const HOST_KEY: &str = "sz-host";
 
 /// Which VPS vendor an env targets. One enum arm per implemented adapter; each
 /// pairs with a pure shaping module ([`hetzner`], [`digitalocean`]) reached via
-/// [`VpsKind::shaper`] so the async driver holds no vendor `match`.
+/// `VpsKind::shaper` so the async driver holds no vendor `match`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VpsKind {
     Hetzner,
@@ -91,7 +91,7 @@ pub fn is_vps_provider(name: &str) -> bool {
 
 /// Whether two OpenSSH public-key lines carry the same key material (compare
 /// `type + blob`, ignoring the trailing comment — a registered key's comment
-/// rarely matches ours). Vendor-neutral; used by [`VpsProvider::ensure_ssh_key`].
+/// rarely matches ours). Vendor-neutral; used by `VpsProvider::ensure_ssh_key`.
 pub fn same_pubkey(a: &str, b: &str) -> bool {
     let core = |s: &str| {
         let mut it = s.split_whitespace();
@@ -107,7 +107,7 @@ pub fn same_pubkey(a: &str, b: &str) -> bool {
 }
 
 /// Per-vendor **pure** request/response shaping (URLs, bodies, parsers) — one
-/// impl per [`VpsKind`], reached via [`VpsKind::shaper`]. The async
+/// impl per [`VpsKind`], reached via `VpsKind::shaper`. The async
 /// [`VpsProvider`] calls only through this trait, so a new vendor is a new
 /// module + a new arm, never a new `match` in the driver.
 pub(crate) trait VpsShaper: Sync {
@@ -646,7 +646,7 @@ impl VpsProvider {
     /// Snapshot the (stopped) instance, returning the vendor image id — the
     /// `template = "snapshot:<id>"` value `image bake` prints. Hetzner returns
     /// the id synchronously; DigitalOcean's snapshot is an async action (see
-    /// [`Self::snapshot_do`]).
+    /// `Self::snapshot_do`).
     pub async fn snapshot(&self, name: &str, description: &str) -> Result<String> {
         let inst = self
             .find_by_name(name)

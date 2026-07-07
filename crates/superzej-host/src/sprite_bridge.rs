@@ -1,6 +1,6 @@
 //! `szhost sprite-exec <id> [--] cmd…` — the self-bridge that gives a sprites
 //! (WSS-native) env a CLI exec prefix for the control-plane READ path: the
-//! chrome git/gh/fs reads and the persisted worktree [`GitLoc`] all shell out
+//! chrome git/gh/fs reads and the persisted worktree `GitLoc` all shell out
 //! through it (the role `vps-ssh` plays for VPS envs). Interactive panes attach
 //! over the provider's native exec API directly (see `agent::native_exec_for`),
 //! NOT this bridge — so this stays a non-tty, one-shot command runner.
