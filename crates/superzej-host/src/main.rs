@@ -47,7 +47,6 @@ mod host_provision;
 mod host_ui;
 mod hover;
 mod hydrate;
-mod hydrate_activity;
 mod hydrate_feed;
 mod hydrate_terminal;
 mod input;

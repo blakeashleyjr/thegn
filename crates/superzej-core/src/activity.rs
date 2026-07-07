@@ -1,15 +1,9 @@
 //! Host-side terminal-activity state machine for the sidebar's live dots.
 //!
-//! The dot is an **agent-attention signal**, so the FSM only tracks worktrees
-//! that actually run an agent (`ManagedWorktree::has_agent`). A plain shell —
-//! a home tab or any non-agent worktree — is forced to `none` (no dot ever),
-//! because its natural background CPU (direnv, file-watchers, git, whatever the
-//! user runs) would otherwise masquerade as a stuck agent and flap the dot.
-//!
 //! Activity is measured by scanning `/proc` for processes whose cwd sits under
-//! a managed (agent) worktree and summing their CPU time. A worktree whose CPU
-//! is advancing is `active` (filled white dot — working); one that was active
-//! and has gone idle is `waiting` (filled **red** dot — "stuck, look at me", an
+//! a managed worktree and summing their CPU time. A worktree whose CPU is
+//! advancing is `active` (filled white dot — working); one that was active and
+//! has gone idle is `waiting` (filled **red** dot — "stuck, look at me", an
 //! *unread* alert); focusing its tab marks it `read` (hollow red dot — seen but
 //! still stuck) via [`ack`]. A red worktree is **sticky**: it only leaves red
 //! when work *genuinely resumes* — sustained CPU over `RESUME_GRACE_SECS`, not
@@ -45,14 +39,11 @@ const RESUME_GRACE_SECS: f64 = 3.0;
 /// Polls closer together than this reuse the previous scan.
 const MIN_SCAN_INTERVAL_SECS: f64 = 1.0;
 
-/// A managed worktree the scanner should track: `(path, tab_name, has_agent)`.
-/// `has_agent` gates the FSM — a worktree without an agent is held at `none`
-/// (no dot), so a plain shell's incidental CPU never mints a stuck-agent alert.
+/// A managed worktree the scanner should track: `(path, tab_name)`.
 #[derive(Debug, Clone)]
 pub struct ManagedWorktree {
     pub worktree: String,
     pub tab: String,
-    pub has_agent: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -258,20 +249,6 @@ fn poll(snap: &mut Snapshot, managed: &[ManagedWorktree], extra: &BTreeMap<Strin
         });
         e.tab = w.tab.clone(); // tab renames follow the caller
 
-        // Non-agent worktrees never carry a dot. Force `none` (rather than just
-        // skip) so a stale red dot earned before this worktree lost its agent —
-        // or persisted by an older binary — is actively cleared: entries are
-        // carried forward across polls, so skipping would leave it sticky.
-        if !w.has_agent {
-            e.state = "none".into();
-            e.quiet_since = None;
-            e.busy_since = None;
-            e.last_active_at = None;
-            e.cpu_jiffies = cur;
-            next.insert(w.worktree.clone(), e);
-            continue;
-        }
-
         // A first sighting (or first-ever poll) records a baseline; deltas only
         // mean something from the second reading on.
         if prev_known && !first_poll {
@@ -457,7 +434,6 @@ mod tests {
         let managed = vec![ManagedWorktree {
             worktree: "/nonexistent/wt".into(),
             tab: "app/home".into(),
-            has_agent: true,
         }];
         // First poll: baseline, state "none".
         poll_and_save_at(&path, &managed, 1000.0);
@@ -492,7 +468,6 @@ mod tests {
         let managed = vec![ManagedWorktree {
             worktree: "/x".into(),
             tab: "t".into(),
-            has_agent: true,
         }];
         poll_and_save_at(&path, &managed, 1000.0);
         // < MIN_SCAN_INTERVAL_SECS later: no rescan, snapshot unchanged.
@@ -511,7 +486,6 @@ mod tests {
         let managed = vec![ManagedWorktree {
             worktree: "/nonexistent/wt-waiting".into(),
             tab: "app/q".into(),
-            has_agent: true,
         }];
         // Baseline poll establishes prev + polled_at.
         poll_and_save_at(&path, &managed, 1000.0);
@@ -552,7 +526,6 @@ mod tests {
         let managed = vec![ManagedWorktree {
             worktree: "/nonexistent/wt-sticky".into(),
             tab: "app/s".into(),
-            has_agent: true,
         }];
         poll_and_save_at(&path, &managed, 1000.0);
 
@@ -595,7 +568,6 @@ mod tests {
         let managed = vec![ManagedWorktree {
             worktree: wt.to_string_lossy().into_owned(),
             tab: "app/r".into(),
-            has_agent: true,
         }];
 
         let mut child = Command::new("sh")
@@ -653,7 +625,6 @@ mod tests {
         let managed = vec![ManagedWorktree {
             worktree: "/nonexistent/wt-hold".into(),
             tab: "app/h".into(),
-            has_agent: true,
         }];
         poll_and_save_at(&path, &managed, 1000.0);
 
@@ -687,7 +658,6 @@ mod tests {
         let managed = vec![ManagedWorktree {
             worktree: wt.to_string_lossy().into_owned(),
             tab: "app/burn".into(),
-            has_agent: true,
         }];
 
         // A shell that spins, burning CPU, with cwd inside the worktree so
@@ -760,7 +730,6 @@ mod tests {
         let managed = vec![ManagedWorktree {
             worktree: "/nonexistent/remote-wt".into(),
             tab: "app/remote".into(),
-            has_agent: true,
         }];
         // Baseline poll establishes prev + polled_at with injected jiffies = 0.
         let mut extra = BTreeMap::new();
@@ -796,77 +765,6 @@ mod tests {
         // coerce_stale_states against the default path: a no-op unless a stale
         // dot exists — never panics.
         coerce_stale_states(600_000);
-    }
-
-    /// A non-agent worktree never earns a dot: even a real CPU burner under its
-    /// cwd leaves it at `none` (the plain-shell case that used to flap red).
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn non_agent_worktree_never_leaves_none() {
-        use std::process::Command;
-        let wt = std::env::temp_dir().join(format!("sz-act-noagent-{}", std::process::id()));
-        std::fs::create_dir_all(&wt).unwrap();
-        let path = tmp("noagent");
-        let _ = std::fs::remove_file(&path);
-        let managed = vec![ManagedWorktree {
-            worktree: wt.to_string_lossy().into_owned(),
-            tab: "app/home".into(),
-            has_agent: false,
-        }];
-
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("while :; do :; done")
-            .current_dir(&wt)
-            .spawn()
-            .expect("spawn cpu burner");
-
-        poll_and_save_at(&path, &managed, 1000.0);
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        poll_and_save_at(&path, &managed, 1001.0);
-
-        let _ = child.kill();
-        let _ = child.wait();
-
-        // A managed *agent* worktree here would be `active`; without an agent it
-        // stays dotless.
-        assert_eq!(
-            read_states_at(&path).get("app/home").map(String::as_str),
-            Some("none")
-        );
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(&wt);
-    }
-
-    /// A stale red dot persisted for a worktree that no longer has an agent is
-    /// actively cleared to `none` on the next poll (not left sticky).
-    #[test]
-    fn non_agent_worktree_clears_stale_red() {
-        let path = tmp("noagent-clear");
-        let _ = std::fs::remove_file(&path);
-        let managed = vec![ManagedWorktree {
-            worktree: "/nonexistent/wt-cleared".into(),
-            tab: "app/x".into(),
-            has_agent: false,
-        }];
-        // Baseline, then hand-seed a sticky `waiting` (as if minted while it had
-        // an agent, or by an older binary that tracked every worktree).
-        poll_and_save_at(&path, &managed, 1000.0);
-        let mut snap = load(&path);
-        {
-            let e = snap.worktrees.get_mut("/nonexistent/wt-cleared").unwrap();
-            e.state = "waiting".into();
-            e.quiet_since = Some(1000.0);
-        }
-        save(&path, &snap);
-
-        // Next poll with has_agent = false clears it.
-        poll_and_save_at(&path, &managed, 1100.0);
-        assert_eq!(
-            read_states_at(&path).get("app/x").map(String::as_str),
-            Some("none")
-        );
-        let _ = std::fs::remove_file(&path);
     }
 
     // ── restore-time stale-state guard ────────────────────────────────────────
