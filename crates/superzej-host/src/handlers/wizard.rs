@@ -67,6 +67,50 @@ pub(crate) fn begin_worktree_wizard(
     *wizard_ui = Some(w);
 }
 
+/// Route a wizard outcome that abandons worktree creation to go set up its
+/// prerequisite first: `AddHost` opens the add-host input, `SetupEnv` opens the
+/// env wizard pre-seeded to the chosen provider kind. Both cancel the
+/// speculative-create worker; the user re-runs new-worktree once the host/env
+/// exists. Extracted from `run.rs` (pinned by the file-size ratchet).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn leave_for_setup(
+    outcome: wizard::WizardOutcome,
+    cfg: &superzej_core::config::Config,
+    wizard_cmd_tx: &mut Option<std::sync::mpsc::Sender<wizard::WizardCmd>>,
+    wizard_ui: &mut Option<wizard::NewWorktreeWizard>,
+    creating: &mut Option<wizard::CreationProgress>,
+    create_gen: &mut u64,
+    host_input: &mut Option<(crate::menu::InputOverlay, crate::run::HostInputKind)>,
+    env_wizard_ui: &mut Option<crate::env_wizard::EnvWizard>,
+    model: &mut FrameModel,
+) {
+    let root = wizard_ui.as_ref().map(|w| w.root().clone());
+    if let Some(tx) = wizard_cmd_tx.take() {
+        let _ = tx.send(wizard::WizardCmd::Cancel);
+    }
+    *wizard_ui = None;
+    *creating = None;
+    *create_gen += 1;
+    match outcome {
+        wizard::WizardOutcome::AddHost => {
+            let Some(repo_root) = root else { return };
+            *host_input = Some((
+                crate::menu::InputOverlay::new(
+                    "add host — user@host[:port], or dumbpipe:<ticket> <user>",
+                    "",
+                ),
+                crate::run::HostInputKind::NewHost { repo_root },
+            ));
+        }
+        wizard::WizardOutcome::SetupEnv(kind) => {
+            *env_wizard_ui = Some(crate::env_wizard::EnvWizard::with_kind(cfg, &kind));
+            model.status =
+                format!("set up {kind}: create the environment, then rerun new worktree");
+        }
+        _ => {}
+    }
+}
+
 /// Parse + persist an add-host input (`user@host[:port]` or
 /// `dumbpipe:<ticket> <user>`), then merge the new def into the LIVE config so
 /// the re-opened wizard lists it immediately. Returns the host name.

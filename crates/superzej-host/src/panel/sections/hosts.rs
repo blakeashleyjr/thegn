@@ -3,8 +3,9 @@
 //! cursor host's details (image, arch, probe age, consent, inventory, last
 //! error, and — deep — recent events). Reads `model.panel.hosts` (built
 //! off-loop by hydration, live-merged by the loop's `HostRuntime` drain).
-//! Action keys (p/r/c/x) are dispatched by the event loop via
-//! `host_ui::panel_key`; the hint row mirrors them so they can't drift.
+//! Action keys (p/r/c/x on the cursor host, m for the action menu, n to add a
+//! host) are dispatched by the event loop via `handlers::host::section_key`;
+//! the hint row mirrors them so they can't drift.
 
 use superzej_core::theme::Hue;
 
@@ -64,7 +65,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     // Each host row carries a `Row` hit (detail rows don't), so the enumerate
     // index lines up with `ui.cursor` and with `panel.hosts` — the action keys
-    // (p/r/c/x) target `hosts[cursor]`.
+    // (p/r/c/x, m) target `hosts[cursor]`.
     for (i, h) in hosts.iter().enumerate() {
         let mut left = vec![state_glyph(h), seg(d(), format!(" {}", h.name))];
         left.push(seg(g(), format!("  {}", h.reach)));

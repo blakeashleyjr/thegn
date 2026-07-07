@@ -348,7 +348,7 @@ pub fn claim_spare(
         // mirrors the tree by other means). Best-effort.
         if env.data == superzej_core::config::DataMode::InEnv
             && let Err(e) =
-                crate::agent::apply_local_parity(&provider, &name, worktree, &workdir, &[])
+                crate::parity::apply_local_parity(&provider, &name, worktree, &workdir, &[])
         {
             superzej_core::msg::warn(&format!(
                 "local parity on claimed spare {name}: {e}; using the origin checkout."

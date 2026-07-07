@@ -149,6 +149,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
             "config": {
                 "color": cfg.theme.color.as_str(),
                 "glyphs": cfg.theme.glyphs.as_str(),
+                "agent_glyphs": cfg.theme.agent_glyphs.as_str(),
                 "undercurl": cfg.theme.undercurl.as_str(),
             },
             "detected": caps_json(&detected),
@@ -179,6 +180,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     outln!("Config modes ([theme])");
     outln!("  color         {}", cfg.theme.color.as_str());
     outln!("  glyphs        {}", cfg.theme.glyphs.as_str());
+    outln!("  agent glyphs  {}", cfg.theme.agent_glyphs.as_str());
     outln!("  undercurl     {}", cfg.theme.undercurl.as_str());
 
     outln!("");

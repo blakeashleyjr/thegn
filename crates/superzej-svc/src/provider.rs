@@ -1466,6 +1466,22 @@ pub enum Provider {
     /// Container-native, so it's not a `VpsKind`; scale-to-zero via stop/start
     /// (see `crate::fly`). Exec/attach is the reachability spike boundary.
     Fly(crate::fly::FlyProvider),
+    /// An **exec-only** transport to a sandbox reached over the iroh call-home
+    /// reach (`crate::iroh_reach`): the sandbox dialed home and its interactive
+    /// panes ride the iroh connection. The sandbox is created/destroyed through
+    /// its real provider (e.g. `Fly`) elsewhere; this variant is only ever
+    /// constructed for the pane exec path, so `open_exec` routes to the home
+    /// endpoint by sandbox id and the lifecycle/fs methods are not applicable.
+    Iroh {
+        home: std::sync::Arc<crate::iroh_reach::IrohHome>,
+        sandbox: String,
+    },
+}
+
+/// The error every non-exec `Provider` method returns for the exec-only iroh
+/// reach (lifecycle + fs go through the sandbox's real provider, e.g. Fly).
+fn iroh_exec_only(op: &str) -> anyhow::Error {
+    anyhow!("iroh reach is exec-only; {op} goes through the sandbox's underlying provider")
 }
 
 impl Provider {
@@ -1501,6 +1517,13 @@ impl Provider {
                 scale_to_zero,
                 ..ProviderCaps::default()
             },
+            // Exec-only: no files/checkpoints/egress of its own (those go through
+            // the underlying provider that created the sandbox).
+            Provider::Iroh { .. } => ProviderCaps {
+                exec_api: true,
+                scale_to_zero,
+                ..ProviderCaps::default()
+            },
         }
     }
 
@@ -1510,6 +1533,7 @@ impl Provider {
             Provider::Sprites(p) => p.create().await,
             Provider::Vps(p) => p.create().await,
             Provider::Fly(p) => p.create().await,
+            Provider::Iroh { .. } => Err(iroh_exec_only("create")),
         }
     }
 
@@ -1519,6 +1543,7 @@ impl Provider {
             Provider::Sprites(p) => p.destroy(id).await,
             Provider::Vps(p) => p.destroy(id).await,
             Provider::Fly(p) => p.destroy(id).await,
+            Provider::Iroh { .. } => Err(iroh_exec_only("destroy")),
         }
     }
 
@@ -1528,6 +1553,8 @@ impl Provider {
             Provider::Sprites(p) => p.list().await,
             Provider::Vps(p) => p.list().await,
             Provider::Fly(p) => p.list().await,
+            // Exec-only: it manages no sandboxes of its own, so it lists none.
+            Provider::Iroh { .. } => Ok(Vec::new()),
         }
     }
 
@@ -1538,6 +1565,7 @@ impl Provider {
             Provider::Sprites(_) => "sprites",
             Provider::Vps(p) => p.spec().kind.as_str(),
             Provider::Fly(_) => "fly",
+            Provider::Iroh { .. } => "iroh",
         }
     }
 
@@ -1618,6 +1646,7 @@ impl Provider {
             Provider::Vps(p) => p.read(id, path).await,
             Provider::Fly(p) => p.read(id, path).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
+            Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
         }
     }
 
@@ -1628,6 +1657,7 @@ impl Provider {
             Provider::Vps(p) => p.write(id, path, data).await,
             Provider::Fly(p) => p.write(id, path, data).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
+            Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
         }
     }
 
@@ -1638,6 +1668,7 @@ impl Provider {
             Provider::Vps(p) => p.write_exec(id, path, data).await,
             Provider::Fly(p) => p.write_exec(id, path, data).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
+            Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
         }
     }
 
@@ -1673,6 +1704,7 @@ impl Provider {
             Provider::Vps(p) => p.upload_dir(id, local, remote).await,
             Provider::Fly(p) => p.upload_dir(id, local, remote).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
+            Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
         }
     }
 
@@ -1683,6 +1715,7 @@ impl Provider {
             Provider::Vps(p) => p.download_dir(id, remote, local).await,
             Provider::Fly(p) => p.download_dir(id, remote, local).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
+            Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
         }
     }
 
@@ -1692,6 +1725,8 @@ impl Provider {
     pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
         match self {
             Provider::Sprites(p) => p.open_exec(id, spec).await,
+            // The iroh reach carries interactive panes: route to the home endpoint.
+            Provider::Iroh { home, .. } => home.open_exec(id, spec.clone()).await,
             _ => Err(anyhow!("provider '{}' has no native exec API", self.name())),
         }
     }
@@ -1720,6 +1755,30 @@ impl Provider {
             Provider::Vps(p) => p.run_exec(id, argv, cwd, env).await,
             Provider::Fly(p) => p.run_exec(id, argv, cwd, env).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
+            // One-shot capture over iroh: open a non-tty exec and drain it.
+            Provider::Iroh { home, .. } => {
+                let spec = ExecSpec {
+                    argv: argv.to_vec(),
+                    tty: false,
+                    cols: 80,
+                    rows: 24,
+                    env: env.to_vec(),
+                    cwd: cwd.map(str::to_string),
+                };
+                let mut session = home.open_exec(id, spec).await?;
+                let mut out = Vec::new();
+                let mut code = -1;
+                while let Some(frame) = session.frames.recv().await {
+                    match frame {
+                        ExecFrame::Stdout(b) => out.extend(b),
+                        ExecFrame::Exit(c) => {
+                            code = c;
+                            break;
+                        }
+                    }
+                }
+                Ok((code, String::from_utf8_lossy(&out).into_owned()))
+            }
         }
     }
 

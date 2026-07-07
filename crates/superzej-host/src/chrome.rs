@@ -2501,10 +2501,8 @@ fn compose_row_lines(
             let label = crate::sidebar::compose_row_label(row.pr_number, window_title, &row.label);
             left.push(seg(name_fg, label));
             if let Some(agent) = &row.agent {
-                left.push(seg(
-                    Tok::Hue(theme::Hue::Teal),
-                    format!(" {}", superzej_core::theme::agent_glyph(agent)),
-                ));
+                let glyph = theme::agent_glyph(agent, crate::caps::agent_glyph_style());
+                left.push(seg(Tok::Hue(theme::Hue::Teal), format!(" {glyph}")));
             }
 
             // Right cluster (always-on): git status + alert badge (PR/unread/disk move to the detail line).
@@ -2542,63 +2540,26 @@ fn compose_row_lines(
                 ));
                 // ⚠N (caps-routed → `!N` in ASCII)
             }
+            if row
+                .worktree_path
+                .as_deref()
+                .is_some_and(crate::hibernator::is_hibernated)
+            {
+                push_sp(&mut right);
+                right.push(seg(Tok::Slot(S::Dim), gl.moon.to_string())); // ⏾ hibernated
+            }
 
             let mut lines = vec![if right.is_empty() {
                 Line::Segs(left)
             } else {
                 Line::Split { l: left, r: right }
             }];
-            if expanded && let Some(detail) = compose_detail_line(row) {
+            if expanded && let Some(detail) = crate::sidebar::compose_detail_line(row) {
                 lines.push(detail);
             }
             lines
         }
     }
-}
-
-/// The expanded cursor row's second line: the secondary metadata that would
-/// crowd the always-on row — execution env, sandbox backend, open PRs, unread
-/// notifications, and disk size. `None` when the row has nothing extra to show.
-fn compose_detail_line(row: &crate::sidebar::SidebarRow) -> Option<crate::seg::Line> {
-    use crate::seg::{Line, Seg, Tok, seg, sp};
-    // Gutter + indent so the detail reads as hanging under the name.
-    let mut segs: Vec<Seg> = vec![sp(5)];
-    let start = segs.len();
-
-    if let Some(env) = &row.env_name
-        && !env.is_empty()
-        && env != "default"
-    {
-        segs.push(seg(Tok::Slot(S::Faint), format!("\u{ab}{env}\u{bb} ")));
-    }
-    if let Some(backend) = &row.sandbox_backend
-        && !backend.is_empty()
-        && backend != "none"
-        && backend != "host"
-    {
-        segs.push(seg(Tok::Slot(S::Faint), format!("({backend}) ")));
-    }
-    if let Some(pr) = row.pr_count.filter(|&c| c > 0) {
-        let hex = crate::caps::active_glyphs().hex;
-        segs.push(seg(Tok::Hue(theme::Hue::Green), format!("{hex} {pr} PR "))); // ⬡N PR
-    }
-    if row.unread_count > 0 {
-        let mail = crate::caps::active_glyphs().mail;
-        let blue = Tok::Hue(theme::Hue::Blue);
-        segs.push(seg(blue, format!("{mail} {} unread ", row.unread_count)));
-    }
-    if let Some(total) = row.disk_bytes {
-        let target = row.target_bytes.unwrap_or(0);
-        let heavy = target > 1024 * 1024 * 1024 && target * 2 > total;
-        let fg = if heavy {
-            Tok::Hue(theme::Hue::Amber)
-        } else {
-            Tok::Slot(S::Dim)
-        };
-        segs.push(seg(fg, superzej_core::disk::human(total)));
-    }
-
-    (segs.len() > start).then_some(Line::Segs(segs))
 }
 
 /// The slim-rail line for one row: a colored activity dot (or a faint marker
