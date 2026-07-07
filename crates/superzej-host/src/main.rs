@@ -97,6 +97,7 @@ mod replay_overlay;
 mod revtunnel;
 mod run;
 mod sandbox_events;
+mod sched;
 mod search;
 mod search_everywhere;
 mod secret;

@@ -1698,7 +1698,7 @@ pub(crate) fn spawn_pr_cache_refresh(
 ) {
     let branch_session = session.clone();
     let branch_waker = waker.clone();
-    task::spawn_blocking(move || {
+    crate::sched::spawn_bg(move || {
         let cwd = active_tab_path(&session);
         if !cwd.is_dir() {
             return;
@@ -1777,7 +1777,7 @@ pub(crate) fn spawn_pr_cache_refresh(
     // runs on its own blocking thread under a throwaway current-thread
     // runtime — neither the subprocess fallback nor the HTTP wait can ever
     // touch the event loop.
-    task::spawn_blocking(move || {
+    crate::sched::spawn_bg(move || {
         let cwd = active_tab_path(&branch_session);
         if !cwd.is_dir() {
             return;
@@ -1915,7 +1915,7 @@ pub(crate) fn spawn_disk_scan(
     if !cfg.show_sizes {
         return;
     }
-    task::spawn_blocking(move || {
+    crate::sched::spawn_bg(move || {
         let Ok(db) = superzej_core::db::Db::open() else {
             return;
         };
@@ -1962,7 +1962,7 @@ pub(crate) fn spawn_issue_cache_refresh(
     cfg: superzej_core::config::IssuesConfig,
     waker: Option<TerminalWaker>,
 ) {
-    task::spawn_blocking(move || {
+    crate::sched::spawn_bg(move || {
         use superzej_core::issue::IssueFilter;
         use superzej_svc::issue::IssueRouter;
 
@@ -2104,7 +2104,7 @@ pub(crate) fn spawn_my_work_refresh(
     all: bool,
     waker: Option<TerminalWaker>,
 ) {
-    task::spawn_blocking(move || {
+    crate::sched::spawn_bg(move || {
         use superzej_core::work::{ALL_SCOPE, WorkGroup, WorkKind, WorkRow};
 
         let cwd = active_tab_path(&session);
@@ -2289,7 +2289,7 @@ pub(crate) fn spawn_ci_cache_refresh(
     cfg: superzej_core::config::CiConfig,
     waker: Option<TerminalWaker>,
 ) {
-    task::spawn_blocking(move || {
+    crate::sched::spawn_bg(move || {
         let cwd = active_tab_path(&session);
         if !cwd.is_dir() {
             return;
