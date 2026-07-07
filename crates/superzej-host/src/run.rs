@@ -18238,39 +18238,19 @@ async fn event_loop<T: Terminal>(
                                             .map(|(_, r)| smart_split_dir(r.cols, r.rows))
                                     })
                                     .unwrap_or(crate::center::Dir::Row);
-                                let cwd = active_cwd(&session);
-                                match spawn_worktree_shell_pane(
-                                    &mut panes,
-                                    keymap.config(),
-                                    cwd.as_deref(),
-                                    chrome.center,
-                                    false,
-                                    None,
-                                    "",
-                                ) {
-                                    Ok(new) => {
-                                        if let Some(tab) = session.active_tab_mut() {
-                                            if tab.center.split(focused, dir, new) {
-                                                tab.focused_pane = new;
-                                                need_relayout = true;
-                                            } else {
-                                                panes.table.remove(&new);
-                                            }
-                                        } else {
-                                            panes.table.remove(&new);
-                                        }
+                                // D4: reserve a placeholder leaf; the active-tab
+                                // materialize opens the shell off-thread (+ surfaces
+                                // any SpecError/halt). No on-loop launch_spec.
+                                let new = panes.reserve_ids(1);
+                                if let Some(tab) = session.active_tab_mut() {
+                                    if tab.center.split(focused, dir, new) {
+                                        tab.focused_pane = new;
+                                        need_relayout = true;
+                                    } else {
+                                        panes.table.remove(&new);
                                     }
-                                    Err(e) => {
-                                        if let Some(h) = sandbox_halt_in(&e) {
-                                            active_menu = Some(sandbox_halt_overlay(h));
-                                            model.status = format!(
-                                                "{} unavailable: {}",
-                                                h.placement, h.reason
-                                            );
-                                        } else {
-                                            model.status = format!("Pane spawn failed: {e}");
-                                        }
-                                    }
+                                } else {
+                                    panes.table.remove(&new);
                                 }
                             }
                             Action::CycleTheme => {
@@ -18429,32 +18409,10 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     crate::center::Dir::Row
                                 };
-                                let cwd = active_cwd(&session);
-                                let new = match spawn_worktree_shell_pane(
-                                    &mut panes,
-                                    keymap.config(),
-                                    cwd.as_deref(),
-                                    chrome.center,
-                                    false,
-                                    None,
-                                    "",
-                                ) {
-                                    Ok(id) => id,
-                                    Err(e) => {
-                                        // Survivable: report, don't exit the loop.
-                                        if let Some(h) = sandbox_halt_in(&e) {
-                                            active_menu = Some(sandbox_halt_overlay(h));
-                                            model.status = format!(
-                                                "{} unavailable: {}",
-                                                h.placement, h.reason
-                                            );
-                                        } else {
-                                            model.status = format!("Pane spawn failed: {e}");
-                                        }
-                                        dirty = true;
-                                        continue;
-                                    }
-                                };
+                                // D4: reserve a placeholder leaf (no on-loop
+                                // launch_spec) — the active-tab materialize opens the
+                                // shell off-thread + surfaces any SpecError/halt.
+                                let new = panes.reserve_ids(1);
                                 if let Some(tab) = session.active_tab_mut() {
                                     if tab.center.split(focused, dir, new) {
                                         tab.focused_pane = new;
@@ -18792,40 +18750,19 @@ async fn event_loop<T: Terminal>(
                                 // placeholder, but pane-0 is the very first shell
                                 // ever spawned, so it already exists and gets
                                 // shared with the new tab if we don't override it.
-                                let cwd = active_cwd(&session);
                                 if let Some(g) = session.active_group_mut() {
                                     g.add_tab();
                                 }
-                                let cfg = keymap.config().clone();
-                                match spawn_worktree_shell_pane(
-                                    &mut panes,
-                                    &cfg,
-                                    cwd.as_deref(),
-                                    chrome.center,
-                                    false,
-                                    None,
-                                    "",
-                                ) {
-                                    Ok(id) => {
-                                        if let Some(tab) = session
-                                            .active_group_mut()
-                                            .and_then(|g| g.active_tab_mut())
-                                        {
-                                            tab.center = crate::center::CenterTree::Leaf(id);
-                                            tab.focused_pane = id;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        if let Some(h) = sandbox_halt_in(&e) {
-                                            active_menu = Some(sandbox_halt_overlay(h));
-                                            model.status = format!(
-                                                "{} unavailable: {}",
-                                                h.placement, h.reason
-                                            );
-                                        } else {
-                                            model.status = format!("new tab spawn failed: {e:#}");
-                                        }
-                                    }
+                                // D4: a fresh reserved leaf (never pane-0) overrides
+                                // the Tab::new Leaf(0) placeholder; the active-tab
+                                // materialize opens the shell off-thread (no on-loop
+                                // launch_spec, no premature bare shell).
+                                let new = panes.reserve_ids(1);
+                                if let Some(tab) =
+                                    session.active_group_mut().and_then(|g| g.active_tab_mut())
+                                {
+                                    tab.center = crate::center::CenterTree::Leaf(new);
+                                    tab.focused_pane = new;
                                 }
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
