@@ -12588,6 +12588,11 @@ async fn event_loop<T: Terminal>(
                             );
                         }
                     } else if let Some(r) = chrome.sidebar.filter(|r| r.contains(mx, my)) {
+                        // Preserve center focus across a click-driven worktree/
+                        // workspace switch: if the user was typing in the center
+                        // terminal, clicking a row switches to it but keeps the
+                        // keyboard in the pane (see the activation arm below).
+                        let was_center = focus.zone == crate::focus::Zone::Center;
                         focus.zone = crate::focus::Zone::Sidebar;
                         sb.focused = true;
                         sb.sync(&mut model);
@@ -12621,8 +12626,8 @@ async fn event_loop<T: Terminal>(
                                 // row target activations within a single
                                 // workspace are tab/zoom, not relayout;
                                 // workspace switch sets it via need_relayout
-                                if let Some(t) = sb.cursor_target(&model)
-                                    && activate_row_target(
+                                if let Some(t) = sb.cursor_target(&model) {
+                                    let hydrate = activate_row_target(
                                         t,
                                         &mut session,
                                         &mut model,
@@ -12636,9 +12641,21 @@ async fn event_loop<T: Terminal>(
                                         chrome.center,
                                         &mut need_relayout,
                                         &mut clear_on_next_frame,
-                                    )
-                                {
-                                    kick_model_hydration!();
+                                    );
+                                    // A worktree/workspace/terminal switch from
+                                    // the sidebar keeps the user in the center
+                                    // terminal if that's where they were typing
+                                    // — matching the keyboard NextTab/PrevTab
+                                    // behaviour. If the sidebar was the focused
+                                    // zone (browsing via Ctrl+arrow), leave
+                                    // focus there. The pre-render focus mirror
+                                    // resets sb.focused from this zone.
+                                    if was_center {
+                                        focus.zone = crate::focus::Zone::Center;
+                                    }
+                                    if hydrate {
+                                        kick_model_hydration!();
+                                    }
                                 }
                             }
                         }
