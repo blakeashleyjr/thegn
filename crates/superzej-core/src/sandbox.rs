@@ -1325,7 +1325,8 @@ pub fn run_prepare(worktree: &std::path::Path, cmds: &[String]) {
     let wt = worktree.to_path_buf();
     std::thread::spawn(move || {
         for c in &cmds {
-            let _ = std::process::Command::new("sh")
+            // `detached`: null stdio + own group so a hook can't steal the tty.
+            let _ = crate::util::detached("sh")
                 .arg("-lc")
                 .arg(c)
                 .current_dir(&wt)
