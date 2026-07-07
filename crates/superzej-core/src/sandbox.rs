@@ -91,7 +91,7 @@ fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<(bool, Stri
 
 /// Runtime backend (resolved from the config-facing [`SandboxBackend`]; this set
 /// has no `Auto` — auto resolution is what produces a concrete `Backend`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Backend {
     /// Rootless podman (default podman invocation).
     Podman,
@@ -1019,7 +1019,28 @@ fn on_missing(cfg: &SandboxConfig, what: &str) {
 
 /// Is `backend`'s binary present in this placement (locally on PATH, or probed
 /// through the placement's control primitive: ssh / kubectl exec / provider)?
+///
+/// **Memoized** (D3): availability is stable per `(placement, backend)` for the
+/// session, but the raw probe is a subprocess (`sudo -n podman version`) / PATH
+/// walk / remote `command -v`, and `pick_backend` re-runs it up to ~30× per pane
+/// spawn — a real per-worktree-switch stall. Probe once, cache the result. A
+/// backend that appears/disappears mid-session needs a restart (acceptable).
 fn available(placement: &Placement, backend: Backend) -> bool {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(String, Backend), bool>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = (format!("{placement:?}"), backend);
+    if let Some(&v) = cache.lock().unwrap().get(&key) {
+        return v;
+    }
+    let v = available_probe(placement, backend);
+    cache.lock().unwrap().insert(key, v);
+    v
+}
+
+/// The uncached availability probe (subprocess / PATH / remote). See [`available`].
+fn available_probe(placement: &Placement, backend: Backend) -> bool {
     // Rootful podman can't be detected by a bare PATH probe (it needs `sudo -n
     // podman version`); only meaningful locally.
     if placement.is_local() && backend == Backend::PodmanRootful {
