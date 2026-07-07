@@ -106,6 +106,7 @@ pub mod scheduler;
 pub mod search;
 pub mod semantic;
 pub mod share;
+pub mod snapshot_meta;
 pub mod spillover;
 pub mod ssh_creds;
 pub mod startup;
