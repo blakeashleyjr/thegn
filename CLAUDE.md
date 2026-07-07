@@ -129,6 +129,7 @@ doctor` prints the resolved capabilities. Detection logic is pure + unit-tested
 Run inside `nix develop` (rust toolchain + tools).
 
 ```sh
+just quick [crate]   # fast inner-loop: clippy on lib/bin only (no test targets)
 just build           # cargo build --workspace (debug)
 just test            # unit tests
 just smoke           # hermetic end-to-end CLI test
@@ -138,6 +139,25 @@ just bench           # startup benchmarks (hyperfine; not part of ci)
 just start name=dev  # run the host with an isolated XDG_STATE_HOME
 just ci              # fmt-check + lint + build + test + openspec-validate + coverage + smoke + nix-build
 ```
+
+**Dev-loop policy — don't peg the machine.** The heavy gates (`just test`,
+`just coverage`, `just lint`, `just ci`) are full-workspace compiles; running
+them after every edit is what saturates the CPU. **While iterating, use
+`just quick`** (clippy on lib/bin code only — no test/bench targets, no tests,
+no coverage; `just quick superzej-host` scopes to one crate). Run the heavy
+gates **once, when preparing to push or open a PR** — not per-edit. The tiers
+enforce this automatically:
+
+- **pre-commit** (cheap, no compile): treefmt + shellcheck + yamllint + the
+  god-file ratchet.
+- **pre-push**: clippy + `cargo test` + smoke.
+- **CI-only** (`just ci`): coverage (`cargo llvm-cov` — the heaviest gate,
+  instrumented recompile), cross-check, docs, e2e, nix-build. Run `just coverage`
+  locally on demand before a PR if you want the gate early.
+
+The dev shell also **caps `CARGO_BUILD_JOBS`** (leaves ~2 cores free) and wires
+**sccache** (`RUSTC_WRAPPER`, `CARGO_INCREMENTAL=0`) so cold worktrees / branch
+switches reuse compiled crates instead of rebuilding from scratch.
 
 Nix: `nix profile install .#default`; `nix develop` for the dev shell.
 
@@ -163,6 +183,9 @@ part of the shipped `szhost` binary.
   link the `tasks.md` item(s) to the openspec change (cite group letter + number
   in the proposal's Impact). OpenSpec owns per-change detail; tasks.md owns the
   map. Older narrative docs live in `docs/superpowers/{plans,specs}/`.
+- A change's final "run `just ci`" validation task is a **pre-PR gate run once**
+  when the implementation is complete — not something to run per-edit. Iterate
+  with `just quick` (see the dev-loop policy above) and save `just ci` for the end.
 - **Tooling is hermetic:** the `openspec` CLI is a pinned Nix build
   (`nix/openspec.nix`, `nix run .#openspec`), on PATH in `nix develop`; telemetry
   is off by construction. `just openspec <args>` is a passthrough;

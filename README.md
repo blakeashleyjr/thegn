@@ -222,6 +222,7 @@ path**, so host-side git reads (sidebar, panel, PR) keep working.
 Run inside `nix develop` (rust toolchain + tools).
 
 ```sh
+just quick [crate]   # fast inner-loop check while iterating (clippy, no tests)
 just build           # cargo build --workspace (debug)
 just test            # unit tests
 just smoke           # hermetic end-to-end CLI test
@@ -229,6 +230,10 @@ just lint            # clippy -D warnings + shellcheck + yamllint + taplo
 just start name=dev  # run the host with an isolated XDG_STATE_HOME
 just ci              # fmt-check + lint + build + test + coverage + smoke + nix-build + …
 ```
+
+Iterate with `just quick`; save the heavy gates (`just test`, `just coverage`,
+`just ci`) for when you're preparing to push or open a PR. See
+[`docs/coverage.md`](docs/coverage.md) for the tier breakdown.
 
 Contributor docs: [`CLAUDE.md`](CLAUDE.md) (architecture + invariants),
 [`tasks.md`](tasks.md) (roadmap), `openspec/specs/` (behavior specs),
