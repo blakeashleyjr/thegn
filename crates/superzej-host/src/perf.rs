@@ -224,8 +224,9 @@ pub fn thread_cpu_ns() -> u64 {
 // Per-subsystem CPU ledger.
 // ---------------------------------------------------------------------------
 
-/// Off-thread producers whose CPU we attribute. Order matches [`CpuLedger`]'s
-/// arrays; keep [`Subsys::ALL`] in sync.
+/// Producers whose CPU we attribute — mostly off-thread, plus two on-loop
+/// spans (`Switch`, `Drawer`) that time the worktree/tab-switch critical path.
+/// Order matches [`CpuLedger`]'s arrays; keep [`Subsys::ALL`] in sync.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Subsys {
@@ -238,10 +239,14 @@ pub enum Subsys {
     Lsp,
     Sandbox,
     Diff,
+    /// On-loop: `refresh_tab_model` on a tab/worktree switch.
+    Switch,
+    /// On-loop: `sync_drawer_persistence` on a tab/worktree switch.
+    Drawer,
 }
 
 impl Subsys {
-    pub const ALL: [Subsys; 9] = [
+    pub const ALL: [Subsys; 11] = [
         Subsys::Hydrate,
         Subsys::Pr,
         Subsys::Issues,
@@ -251,6 +256,8 @@ impl Subsys {
         Subsys::Lsp,
         Subsys::Sandbox,
         Subsys::Diff,
+        Subsys::Switch,
+        Subsys::Drawer,
     ];
     pub const N: usize = Self::ALL.len();
 
@@ -266,6 +273,8 @@ impl Subsys {
             Subsys::Lsp => "lsp",
             Subsys::Sandbox => "sandbox",
             Subsys::Diff => "diff",
+            Subsys::Switch => "switch",
+            Subsys::Drawer => "drawer",
         }
     }
 }

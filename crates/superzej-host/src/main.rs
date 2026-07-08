@@ -30,6 +30,7 @@ mod copymode;
 mod desktop_notify;
 mod detail;
 mod direnv_warm;
+mod drawer_state;
 mod emulator;
 mod env_ui;
 mod env_wizard;
