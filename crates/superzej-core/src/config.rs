@@ -698,8 +698,6 @@ pub struct MergeQueueConfig {
     pub gate_on: bool,
     /// On a red gate, bisect to defer just the offending branch, not the batch.
     pub bisect_on_red: bool,
-    /// Fold automatically when an agent signals done (ACP `AgentEnd`).
-    pub auto_drain: bool,
     /// Auto-commit uncommitted worktree work before folding (else skip dirty ones).
     pub snapshot_dirty: bool,
     /// Conflicts confined to these paths (exact/basename) are regenerable, not
@@ -730,7 +728,6 @@ impl Default for MergeQueueConfig {
             gate_command: String::new(),
             gate_on: true,
             bisect_on_red: true,
-            auto_drain: true,
             snapshot_dirty: false,
             regenerate_paths: vec!["Cargo.lock".to_string()],
             regenerate_command: String::new(),
@@ -1706,20 +1703,15 @@ impl Default for BarsConfig {
     }
 }
 
-/// `[limits]` — resource ceilings for tools launched in floating panes
-/// (`superzej tool <name>`). When `systemd-run` is available, the tool runs in a
-/// transient `--user --scope` with these caps, so a runaway child (e.g. yazi's
-/// `ueberzugpp` image-preview backend, which can leak to tens of GB) is OOM-killed
-/// *inside its own cgroup* instead of triggering a global OOM that takes the
-/// terminal session down. Scope teardown on tool exit also reaps orphaned
-/// children. An empty `tool_mem_max` disables containment.
+/// `[limits]` — resource ceilings for superzej-spawned `cargo` test/discovery
+/// runs. When `systemd-run` is available, an explicit run executes in a
+/// transient `--user --scope` with these caps so a heavy suite can't pin the
+/// machine or trigger a global OOM that takes the terminal session down; the
+/// scope teardown on exit also reaps orphaned children. (The yazi files-drawer
+/// has its own containment under `[drawer]`.)
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct LimitsConfig {
-    /// `MemoryMax` for the tool scope (e.g. "6G"). Empty = no containment.
-    pub tool_mem_max: String,
-    /// `MemorySwapMax` for the tool scope (e.g. "1G").
-    pub tool_mem_swap_max: String,
     /// `CPUQuota` for test/discovery runs (e.g. "150%" = 1.5 cores). Empty =
     /// uncapped. superzej never auto-runs tests, but an explicit run is still
     /// capped so a heavy suite can't pin the machine.
@@ -1752,8 +1744,6 @@ pub struct LimitsConfig {
 impl Default for LimitsConfig {
     fn default() -> Self {
         LimitsConfig {
-            tool_mem_max: "6G".into(),
-            tool_mem_swap_max: "1G".into(),
             test_cpu_quota: "150%".into(),
             test_mem_max: "4G".into(),
             test_nice: 10,
@@ -1888,8 +1878,6 @@ pub struct CiConfig {
     pub poll_interval_secs: u64,
     /// How many recent runs to fetch and display.
     pub max_runs: usize,
-    /// Start the full-screen CI view with live refresh enabled (gama `ctrl+l`).
-    pub live_refresh: bool,
     /// Cap on fetched log lines (the tail is kept) — bounds memory on huge jobs.
     pub log_tail_lines: usize,
     pub gitlab: GitLabCiConfig,
@@ -1906,7 +1894,6 @@ impl Default for CiConfig {
             ttl_secs: 30,
             poll_interval_secs: 30,
             max_runs: 50,
-            live_refresh: false,
             log_tail_lines: 2000,
             gitlab: GitLabCiConfig::default(),
             drone: DroneCiConfig::default(),
@@ -3933,10 +3920,6 @@ impl StripConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SearchConfig {
-    /// Lines of terminal output kept per pane for searching. A larger value
-    /// lets you search further back in history at the cost of a small amount of
-    /// heap per pane.
-    pub history_lines: usize,
     /// Maximum number of fuzzy-matched results returned per search. Capped at
     /// the UI renderer's visible row count; higher values are just sorted but
     /// not all drawn.
@@ -3945,10 +3928,7 @@ pub struct SearchConfig {
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        SearchConfig {
-            history_lines: 10_000,
-            max_results: 1_000,
-        }
+        SearchConfig { max_results: 1_000 }
     }
 }
 
@@ -7972,7 +7952,6 @@ min_priority = "alert"
         assert_eq!(n.process_exit, "failures_and_tasks");
 
         let s = SearchConfig::default();
-        assert_eq!(s.history_lines, 10_000);
         assert_eq!(s.max_results, 1_000);
 
         let l = LspConfig::default();
@@ -8059,8 +8038,6 @@ min_priority = "alert"
     #[test]
     fn limits_config_defaults() {
         let l = LimitsConfig::default();
-        assert_eq!(l.tool_mem_max, "6G");
-        assert_eq!(l.tool_mem_swap_max, "1G");
         assert_eq!(l.test_cpu_quota, "150%");
         assert_eq!(l.test_mem_max, "4G");
         assert_eq!(l.test_nice, 10);

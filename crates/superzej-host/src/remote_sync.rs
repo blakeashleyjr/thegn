@@ -39,6 +39,9 @@ fn q(s: &str) -> String {
 }
 
 /// Run a local `git -C <worktree> <args>` and return trimmed stdout on success.
+// best-effort blocking git read on the off-loop remote-sync bring-up path
+// (spawn_blocking), never the event loop.
+#[expect(clippy::disallowed_methods)]
 fn local_git(worktree: &str, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")

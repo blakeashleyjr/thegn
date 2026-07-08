@@ -5024,9 +5024,6 @@ fn dispatch_menu_choice(
         );
     };
     match choice {
-        MenuChoice::LocMetrics => {
-            // Nothing to do for LOC, it's just informational
-        }
         MenuChoice::RebaseContinue => enqueue(panel_ui, model, GitOp::RebaseContinue),
         MenuChoice::RebaseAbort => enqueue(panel_ui, model, GitOp::RebaseAbort),
         MenuChoice::RebaseSkip => enqueue(panel_ui, model, GitOp::RebaseSkip),
@@ -5112,9 +5109,6 @@ fn dispatch_menu_choice(
                 p.marks.clear();
                 model.status = "patch reset".into();
             }
-        }
-        MenuChoice::DiffSwap => {
-            model.status = "diff sides swap is not wired yet".into();
         }
         MenuChoice::DiffExit => {
             panel_ui.git.flow = GitFlow::None;

@@ -88,12 +88,6 @@ pub fn install(caps: TermCaps) {
     }
 }
 
-/// The full resolved capability set (cold path — diagnostics / telemetry).
-#[allow(dead_code)]
-pub fn get() -> TermCaps {
-    CAPS.read().map(|c| *c).unwrap_or(TermCaps::FULL)
-}
-
 /// The outer terminal's color depth (hot path — the wire renderer).
 pub fn color_depth() -> ColorDepth {
     #[cfg(test)]
