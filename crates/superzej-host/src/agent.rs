@@ -9,6 +9,7 @@
 //! `launch_spec` are pure over `Config`/`Db`, so the wiring in `run.rs` stays a
 //! thin call.
 
+use crate::remote_sync::ssh_none_guard;
 use std::path::{Path, PathBuf};
 use superzej_core::config::Config;
 use superzej_core::db::Db;
@@ -405,14 +406,13 @@ pub fn prepare_sandbox_env(
             sandbox::resolve_placed(&candidate, loc, &cname, hardening, exec_placement.clone())
         {
             if spec.backend == sandbox::Backend::None {
-                // A `none` backend on a *local* placement means "run on the host"
-                // (the plain-shell fallback below). On a *remote* placement
-                // (ssh/k8s/provider) the placement itself is the boundary — the
-                // bare-shell spec carries the worktree into the pod/host, so use
-                // it instead of falling back to a local host shell.
+                // Local `none` = run on the host (plain-shell fallback below). A
+                // remote SSH placement degrading to `none` fails loud (no
+                // container for the synced worktree) — see ssh_none_guard.
                 if spec.placement.is_local() {
                     break;
                 }
+                ssh_none_guard(&spec, sb.backend, failover, &env_name, &placement_label)?;
                 return Ok(SandboxOutcome {
                     backend_label: spec.backend.label().to_string(),
                     spec: Some(spec),
@@ -2835,26 +2835,26 @@ pub fn launch_spec_with_key(
 ) -> anyhow::Result<LaunchSpec> {
     let loc = GitLoc::for_worktree(Path::new(worktree));
 
+    // One DB handle for the whole spec resolution (each open re-runs pragmas).
+    let db = Db::open().ok();
+
     // Record the choice for the dashboard / `--resume` (keyed by worktree path).
     // Two launches are deliberately NOT recorded as the worktree's remembered
     // agent: the transient `clean-shell` watchdog fallback (the user may fix
     // their dotfiles), and tool drawers (yazi/lazygit/editor/diff) — those are
     // overlays, not the worktree's agent, and are auto-prewarmed on every switch,
     // so recording them would clobber the real choice on every worktree.
-    let saved_backend = match Db::open() {
-        Ok(db) => {
-            if choice != "clean-shell" && cfg.tool_command(choice).is_none() {
-                let _ = db.set_worktree_agent(worktree, choice);
-            }
-            db.worktree_sandbox(worktree).ok().flatten()
+    let saved_backend = db.as_ref().and_then(|db| {
+        if choice != "clean-shell" && cfg.tool_command(choice).is_none() {
+            let _ = db.set_worktree_agent(worktree, choice);
         }
-        Err(_) => None,
-    };
+        db.worktree_sandbox(worktree).ok().flatten()
+    });
 
     // The local repo root drives the per-repo sandbox overlay + slug. Prefer the
     // DB (carries remote worktrees with no local cwd), else climb from the path.
-    let repo_root: PathBuf = Db::open()
-        .ok()
+    let repo_root: PathBuf = db
+        .as_ref()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -2863,8 +2863,8 @@ pub fn launch_spec_with_key(
 
     // The selected execution environment: the worktree's own `env_name`, else
     // its workspace's. `resolve_env` falls through to the repo/global default.
-    let selected_env = Db::open()
-        .ok()
+    let selected_env = db
+        .as_ref()
         .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
 
     // A recorded per-worktree backend is a deliberate override (only the wizard
@@ -2920,12 +2920,12 @@ pub fn launch_spec_with_key(
     // the legacy per-provider active account when nothing else set it). Local
     // worktrees only — a remote agent runs where the host's cred dirs don't exist.
     let resolved = (!loc.is_remote())
-        .then(|| Db::open().ok())
+        .then_some(db.as_ref())
         .flatten()
         .map(|db| {
-            let slug = repo_slug(&db, &repo_root);
+            let slug = repo_slug(db, &repo_root);
             // At launch (off the event loop) so secret resolvers may run.
-            bundle::compose_at_launch(cfg, &db, worktree, slug.as_deref(), Some(choice))
+            bundle::compose_at_launch(cfg, db, worktree, slug.as_deref(), Some(choice))
         })
         .unwrap_or_default();
     // Credential/HOME dirs the child writes into must exist before launch.
@@ -2935,10 +2935,10 @@ pub fn launch_spec_with_key(
     // Tier-2 dotfiles: materialize each active bundle's dotfile tree into its
     // managed HOME (idempotent, off the event loop — launch_spec is blocking).
     if !loc.is_remote()
-        && let Ok(db) = Db::open()
+        && let Some(db) = db.as_ref()
     {
-        let slug = repo_slug(&db, &repo_root);
-        for name in bundle::active_chain(cfg, &db, worktree, slug.as_deref()) {
+        let slug = repo_slug(db, &repo_root);
+        for name in bundle::active_chain(cfg, db, worktree, slug.as_deref()) {
             if let Some(b) = cfg.bundle.get(&name)
                 && let Some(spec) = &b.dotfiles
             {
@@ -3040,19 +3040,18 @@ pub fn launch_spec_with_key(
 #[expect(clippy::disallowed_methods)]
 pub fn run_in_sandbox(cfg: &Config, worktree: &str, command: &str) -> anyhow::Result<String> {
     let loc = GitLoc::for_worktree(Path::new(worktree));
-    let saved_backend = Db::open()
-        .ok()
-        .and_then(|db| db.worktree_sandbox(worktree).ok().flatten());
-    let repo_root: PathBuf = Db::open()
-        .ok()
+    // One DB handle for the whole resolution (each open re-runs pragmas).
+    let db = Db::open().ok();
+    let db_ref = db.as_ref();
+    let saved_backend = db_ref.and_then(|db| db.worktree_sandbox(worktree).ok().flatten());
+    let repo_root: PathBuf = db_ref
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let selected_env =
+        db_ref.and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
 
     // In bouncer mode the command came from the *sealed agent* — run it inside the
     // agent's own (`agent_profile`) container, the same boundary its interactive

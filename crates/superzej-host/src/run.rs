@@ -25,6 +25,11 @@ use crate::actions::{CiActionCtx, open_command_pane, open_command_tab, open_url_
 use crate::chrome::{FrameModel, LoadStep, render_tab};
 use crate::compositor::Rect;
 use crate::detail::apply_ci_detail;
+// Re-exported so pre-split call sites (`crate::run::…` in sibling modules and
+// unqualified uses in this file) keep working after the drawer extraction.
+pub(crate) use crate::drawer_state::{
+    DrawerPool, hide_drawer_into_pool, show_yazi_drawer, sync_drawer_persistence,
+};
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::handlers::provision::{
     ProvisionProgress, SpecBatch, SpecDrainCtx, SpecError, drain_provision, drain_specs,
@@ -1118,39 +1123,6 @@ fn compute_chrome(
     }
 }
 
-/// The rect the drawer WILL occupy if opened now, used to spawn its PTY already
-/// sized to its panel slot. Mirrors the [`compute_chrome`] inputs plus the
-/// config-derived drawer height/width; falls back to the center when the band
-/// is too short to reserve the drawer.
-#[allow(clippy::too_many_arguments)]
-fn prospective_drawer_rect(
-    cols: usize,
-    rows: usize,
-    want_sidebar: bool,
-    want_panel: bool,
-    panel_forced: bool,
-    panel_width: layout::PanelWidth,
-    sidebar_cols: usize,
-    zoom: Option<crate::focus::Zone>,
-    supervisor: &crate::pins::PinSupervisor,
-    cfg: &superzej_core::config::Config,
-) -> Rect {
-    let l = compute_chrome(
-        cols,
-        rows,
-        want_sidebar,
-        want_panel,
-        panel_forced,
-        panel_width,
-        sidebar_cols,
-        zoom,
-        supervisor,
-        resolve_drawer_rows(&cfg.drawer.height, rows),
-        cfg.drawer.width != "center",
-    );
-    l.drawer.unwrap_or(l.center)
-}
-
 /// Working directory for a pin: explicit `cwd`, else the active tab's worktree,
 /// else `$HOME` / cwd.
 fn pin_cwd(
@@ -1292,6 +1264,7 @@ pub(crate) fn refresh_tab_model(
     session: &crate::session::Session,
     sb: &mut SidebarState,
 ) {
+    let _g = crate::perf::measure(crate::perf::Subsys::Switch);
     let (worktree, tabs, active_tab) = crate::hydrate::tab_strip(session);
     let active_path = crate::hydrate::active_tab_path(session);
     model.worktree = worktree;
@@ -5954,111 +5927,6 @@ fn smart_split_dir(cols: usize, rows: usize) -> crate::center::Dir {
     }
 }
 
-/// Spawn `command` (via the login-shell exec wrapper) into a fresh tab of the
-/// active worktree and focus it.
-/// Keep-alive yazi drawers, one per worktree dir: hiding STASHES the pane
-/// (cursor position and yazi state survive), showing takes it back
-/// instantly, and the worktree-change detector pre-warms the pool so the
-/// first toggle never waits on yazi's startup.
-///
-/// The pool is bounded by `[drawer].pool_limit`: hidden drawers are held in
-/// insertion order and the oldest is evicted (its pane torn down) once the
-/// limit is exceeded, so invisible yazi instances cannot accumulate without
-/// limit. `pool_limit = 0` disables pooling entirely (hiding kills the pane).
-#[derive(Default)]
-pub(crate) struct DrawerPool {
-    /// `(dir-key, pane-id)` in insertion order; front is the oldest (next to evict).
-    hidden: std::collections::VecDeque<(String, u32)>,
-}
-
-impl DrawerPool {
-    fn key(dir: &std::path::Path) -> String {
-        superzej_core::util::slugify(&dir.to_string_lossy())
-    }
-    /// Stash `id` for `dir`, enforcing `limit`. A `limit` of 0 tears the pane
-    /// down immediately (no pool); otherwise the oldest entries beyond the
-    /// limit are evicted and their panes dropped from the table.
-    fn stash(&mut self, dir: &std::path::Path, id: u32, limit: usize, panes: &mut Panes) {
-        if limit == 0 {
-            panes.table.remove(&id);
-            return;
-        }
-        let key = Self::key(dir);
-        self.remove_key(&key, panes);
-        self.hidden.push_back((key, id));
-        while self.hidden.len() > limit {
-            if let Some((_, evicted)) = self.hidden.pop_front() {
-                panes.table.remove(&evicted);
-            }
-        }
-    }
-    fn take(&mut self, dir: &std::path::Path) -> Option<u32> {
-        let key = Self::key(dir);
-        let idx = self.hidden.iter().position(|(k, _)| k == &key)?;
-        self.hidden.remove(idx).map(|(_, id)| id)
-    }
-    fn contains(&self, dir: &std::path::Path) -> bool {
-        let key = Self::key(dir);
-        self.hidden.iter().any(|(k, _)| k == &key)
-    }
-    /// Drop a pooled entry by pane id (e.g. its yazi exited on its own).
-    fn remove_id(&mut self, id: u32) -> bool {
-        let Some(idx) = self.hidden.iter().position(|(_, hid)| *hid == id) else {
-            return false;
-        };
-        self.hidden.remove(idx);
-        true
-    }
-    /// Drop the pooled entry for `key`, tearing down its pane.
-    fn remove_key(&mut self, key: &str, panes: &mut Panes) {
-        if let Some(idx) = self.hidden.iter().position(|(k, _)| k == key)
-            && let Some((_, id)) = self.hidden.remove(idx)
-        {
-            panes.table.remove(&id);
-        }
-    }
-}
-
-/// Wrap a drawer yazi argv in a bounded user `systemd-run --scope` so its whole
-/// process tree — including image-preview helpers such as `ueberzugpp`, which
-/// can leak to tens of GB — is OOM-killed inside its own cgroup instead of
-/// triggering a global OOM that takes the terminal session down. Empty limit
-/// strings omit only that property. Containment is skipped when disabled, when
-/// `systemd-run` is unavailable, or when the resolved sandbox already launches
-/// through `systemd-run` (avoids a nested scope that would escape the bound).
-fn contain_yazi_argv(
-    cfg: &superzej_core::config::Config,
-    cmd: Vec<String>,
-    systemd_available: bool,
-) -> Vec<String> {
-    if !cfg.drawer.contain
-        || !systemd_available
-        || cmd.first().map(String::as_str) == Some("systemd-run")
-    {
-        return cmd;
-    }
-    let mut wrapped = vec![
-        "systemd-run".to_string(),
-        "--user".into(),
-        "--scope".into(),
-        "--quiet".into(),
-        "--collect".into(),
-    ];
-    for (key, value) in [
-        ("MemoryMax", cfg.drawer.memory_max.trim()),
-        ("MemorySwapMax", cfg.drawer.memory_swap_max.trim()),
-        ("CPUQuota", cfg.drawer.cpu_quota.trim()),
-    ] {
-        if !value.is_empty() {
-            wrapped.push("-p".into());
-            wrapped.push(format!("{key}={value}"));
-        }
-    }
-    wrapped.push("--".into());
-    wrapped.extend(cmd);
-    wrapped
-}
-
 /// Resolve a terminal group's `(connection, sandbox_backend)` by its unique name
 /// from the `terminals` table: the connection is the ssh/mosh target ("" for a
 /// local shell) and the sandbox backend wraps a local shell ("" = uncontained).
@@ -6089,9 +5957,11 @@ fn bundle_scope_slug(db: &superzej_core::db::Db, worktree: &str) -> Option<Strin
     db.slug_for_repo(&root, &base).ok()
 }
 
-/// Spawn a fresh (hidden or visible) yazi pane for `dir`; falls back to a
-/// plain shell when no yazi tool is configured.
-fn spawn_worktree_shell_pane(
+/// Spawn the worktree's interactive shell pane in `dir`, routing through the
+/// env/sandbox resolution (`launch_spec`), the native-provider exec, or the
+/// terminal connection as appropriate. Resolution can open the DB / probe the
+/// sandbox — call off the hot path where possible.
+pub(crate) fn spawn_worktree_shell_pane(
     panes: &mut Panes,
     cfg: &superzej_core::config::Config,
     dir: Option<&std::path::Path>,
@@ -6328,72 +6198,6 @@ fn compose_corner(
         },
     );
     Some(outer)
-}
-
-fn spawn_yazi_pane(
-    panes: &mut Panes,
-    cfg: &superzej_core::config::Config,
-    dir: Option<&std::path::Path>,
-    center: Rect,
-) -> Option<u32> {
-    if let Some(dir) = dir
-        && dir.is_dir()
-        && cfg.tool_command("yazi").is_some()
-    {
-        let wt = dir.to_string_lossy().into_owned();
-        let spec = crate::agent::launch_spec(cfg, &wt, None, "yazi").ok()?;
-        let yenv = crate::panes::yazi_env(cfg);
-        let argv = contain_yazi_argv(cfg, spec.argv, superzej_core::util::have("systemd-run"));
-        return panes
-            .spawn_argv_env(&argv, spec.cwd.as_deref().or(Some(dir)), &yenv, center)
-            .ok();
-    }
-    spawn_worktree_shell_pane(panes, cfg, dir, center, false, None, "").ok()
-}
-
-/// Show the worktree's drawer: pooled pane if alive (instant, position
-/// preserved), fresh spawn otherwise. Records the dir the pane belongs to in
-/// `home` so hiding stashes it under the RIGHT key even after a switch.
-#[allow(clippy::too_many_arguments)]
-fn show_yazi_drawer(
-    panes: &mut Panes,
-    drawer: &mut Option<u32>,
-    pool: &mut DrawerPool,
-    home: &mut Option<std::path::PathBuf>,
-    cfg: &superzej_core::config::Config,
-    dir: &std::path::Path,
-    center: Rect,
-) {
-    if drawer.is_some() {
-        return;
-    }
-    if let Some(id) = pool.take(dir) {
-        *drawer = Some(id);
-        *home = Some(dir.to_path_buf());
-        return;
-    }
-    *drawer = spawn_yazi_pane(panes, cfg, Some(dir), center);
-    if drawer.is_some() {
-        *home = Some(dir.to_path_buf());
-    }
-}
-
-/// Hide the visible drawer, keeping its pane alive in the pool under the dir
-/// it was opened for (`home`; `fallback` covers pre-tracking drawers). The
-/// stash honors `[drawer].pool_limit`, evicting/tearing down older drawers.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn hide_drawer_into_pool(
-    drawer: &mut Option<u32>,
-    pool: &mut DrawerPool,
-    home: &mut Option<std::path::PathBuf>,
-    fallback: &std::path::Path,
-    cfg: &superzej_core::config::Config,
-    panes: &mut Panes,
-) {
-    if let Some(id) = drawer.take() {
-        let key = home.take().unwrap_or_else(|| fallback.to_path_buf());
-        pool.stash(&key, id, cfg.drawer.pool_limit, panes);
-    }
 }
 
 // ── Search helpers ────────────────────────────────────────────────────────────
@@ -7266,36 +7070,6 @@ fn apply_scoped_edits(worktree: &str, path: &str, edits: &serde_json::Value) -> 
     std::fs::write(&target, text).map_err(|e| format!("{path}: {e}"))
 }
 
-pub(crate) fn sync_drawer_persistence(
-    session: &crate::session::Session,
-    panes: &mut Panes,
-    drawer: &mut Option<u32>,
-    pool: &mut DrawerPool,
-    home: &mut Option<std::path::PathBuf>,
-    cfg: &superzej_core::config::Config,
-    center: Rect,
-) {
-    let Some(dir) = active_cwd(session) else {
-        return;
-    };
-    let key = superzej_core::util::slugify(&dir.to_string_lossy());
-    let should_be_open =
-        std::fs::read_to_string(superzej_core::util::superzej_dir().join("drawer").join(key))
-            .map(|s| s.trim() == "true")
-            .unwrap_or(false);
-
-    // The visible drawer belongs to whichever worktree opened it; on a
-    // mismatch stash it under ITS home before deciding for the new one.
-    if drawer.is_some() && home.as_deref() != Some(dir.as_path()) {
-        hide_drawer_into_pool(drawer, pool, home, &dir, cfg, panes);
-    }
-    if should_be_open && drawer.is_none() {
-        show_yazi_drawer(panes, drawer, pool, home, cfg, &dir, center);
-    } else if !should_be_open && drawer.is_some() {
-        hide_drawer_into_pool(drawer, pool, home, &dir, cfg, panes);
-    }
-}
-
 async fn ensure_app_loaded(
     app_host: &mut crate::apps::AppHost,
     target: crate::apps::ActiveApp,
@@ -7357,35 +7131,9 @@ fn spawn_media_watch(
     tx: tokio_mpsc::UnboundedSender<Option<superzej_core::media::MediaState>>,
     waker: TerminalWaker,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if !cfg.enabled {
-        return None;
-    }
-    Some(tokio::spawn(async move {
-        let Some(client) = superzej_media::client_for(&cfg.resolve_opts()).await else {
-            return;
-        };
-        let _ = tx.send(client.snapshot().await.unwrap_or(None));
-        let _ = waker.wake();
-        if let Some(mut watch) = client.watch().await {
-            // Push path: re-snapshot on each D-Bus signal (no polling timer).
-            while watch.changed().await {
-                if tx.send(client.snapshot().await.unwrap_or(None)).is_err() {
-                    break;
-                }
-                let _ = waker.wake();
-            }
-        } else {
-            // Poll path: backends without a signal stream.
-            let interval = std::time::Duration::from_secs(cfg.poll_interval_secs.max(1));
-            loop {
-                tokio::time::sleep(interval).await;
-                if tx.send(client.snapshot().await.unwrap_or(None)).is_err() {
-                    break;
-                }
-                let _ = waker.wake();
-            }
-        }
-    }))
+    // Body lives in `media_watch` (run.rs is line-ratcheted); it resolves the
+    // backend, streams snapshots, self-heals, and respawns on stream end.
+    crate::media_watch::spawn(cfg, tx, waker)
 }
 
 /// Abort any running watcher and (re)spawn one for `cfg`. Called at startup, on
@@ -7540,15 +7288,18 @@ async fn event_loop<T: Terminal>(
     // re-selects while a fetch is still out.
     let (hunk_tx, mut hunk_rx) =
         tokio_mpsc::unbounded_channel::<(u64, String, Vec<superzej_svc::git::Hunk>)>();
-    // Stale-while-revalidate panel cache: the last-known `PanelData` per worktree
-    // dir. On a worktree switch we paint the cached panel instantly (no blank
-    // flash) while the background hydration refreshes it in place. Fed by both
-    // live model arrivals (active worktree) and neighbor prefetch.
-    let mut panel_cache: std::collections::HashMap<std::path::PathBuf, crate::panel::PanelData> =
-        std::collections::HashMap::new();
+    // Stale-while-revalidate switch cache: the last-known per-worktree slice
+    // (panel + tab-bar chips + timeline — see `handlers::switch_cache`). On a
+    // worktree switch we paint the cached slice instantly (no blank flash, no
+    // previous-worktree bleed-through) while the background hydration refreshes
+    // it in place. Fed by live model arrivals (active) and neighbor prefetch.
+    let mut switch_cache: std::collections::HashMap<
+        std::path::PathBuf,
+        crate::handlers::switch_cache::WorktreeSlice,
+    > = std::collections::HashMap::new();
     // Background neighbor-prefetch results: `(worktree_path, panel)` warmed by
     // `spawn_panel_prefetch` for the worktrees above/below the selection. These
-    // only seed `panel_cache`; they never touch the live frame.
+    // only seed `switch_cache`; they never touch the live frame.
     let (prefetch_tx, mut prefetch_rx) =
         tokio_mpsc::unbounded_channel::<(std::path::PathBuf, crate::panel::PanelData)>();
     // The inline Files preview reader: `(rel_path, Ok(lines) | Err(reason))`.
@@ -7596,6 +7347,14 @@ async fn event_loop<T: Terminal>(
     // as `LoadStep`s so the splash shows a rich "setting up your environment"
     // screen while a fresh provider sandbox is built. Keyed (group name, tab).
     let (provision_tx, mut provision_rx) = tokio_mpsc::unbounded_channel::<ProvisionProgress>();
+    // Drawer cold-spawn pipeline: a cold drawer only *requests* its launch spec
+    // (`drawer_state::request_spawn` resolves it off-loop — DB opens + sandbox
+    // resolution) and the resolved spec lands here; the drain below opens the
+    // pane. The flag cache load is the one sanctioned pre-loop fs read.
+    let (drawer_tx, mut drawer_rx) =
+        tokio_mpsc::unbounded_channel::<crate::drawer_state::DrawerSpecMsg>();
+    crate::drawer_state::install_spawner(drawer_tx, waker.clone());
+    crate::drawer_state::load_flags();
     // Host-level provisioning UI events (panel/sidebar/consent), keyed by host
     // — the per-tab splash rides `provision_tx` above (see handlers::host).
     let (host_ui_tx, host_ui_rx) = tokio_mpsc::unbounded_channel();
@@ -8147,6 +7906,10 @@ async fn event_loop<T: Terminal>(
     let mut drawer_pool = DrawerPool::default();
     // The dir the VISIBLE drawer was opened for (its pool key when hidden).
     let mut drawer_home: Option<std::path::PathBuf> = None;
+    // A cold ToggleDrawer / Files-reveal wants its async spawn SHOWN when the
+    // spec lands (`(dir, take_focus)`), regardless of the persisted flag — the
+    // pooled path shows synchronously. Dir-keyed so a stale spec can't show.
+    let mut drawer_show_pending: Option<(std::path::PathBuf, bool)> = None;
     // The live corner-overlay pin pane (e.g. an `mpv --vo=tct` video player), if
     // any. A single slot, so the corner is inherently a singleton; the pin name
     // is kept so exit/toggle can drive the supervisor.
@@ -8367,7 +8130,7 @@ async fn event_loop<T: Terminal>(
             expanded: panel_ui.width.is_expanded(),
             profile: current_config.profile.clone(),
         };
-        for path in neighbor_worktree_paths(&session) {
+        for path in neighbor_worktree_paths(&session, &sidebar_worktree_order(&model)) {
             spawn_panel_prefetch(
                 prefetch_tx.clone(),
                 path,
@@ -8516,15 +8279,16 @@ async fn event_loop<T: Terminal>(
             sync_tests_for_worktree(&mut panel_ui, &current_worktree, keymap.config(), false); // D2: no scan on switch
             loaded_tests_worktree = current_worktree.to_string_lossy().into_owned();
             // Immediate hydrate for the newly-focused worktree. Paint this
-            // worktree's last-known panel from the cache (seeded by prior visits
-            // and neighbor prefetch) so the switch is instant instead of flashing
-            // the previous worktree's data or an empty panel; the background
-            // hydration below refreshes it in place a beat later. Falls back to an
-            // empty panel for a worktree never hydrated this session.
-            model.panel = panel_cache
-                .get(&current_worktree)
-                .cloned()
-                .unwrap_or_default();
+            // worktree's last-known slice (panel + tab-bar chips + timeline)
+            // from the cache (seeded by prior visits and neighbor prefetch) so
+            // the switch is instant instead of flashing the previous worktree's
+            // data; the background hydration below refreshes it in place a beat
+            // later. A never-hydrated worktree gets blanked fields (wrong-
+            // worktree data is worse than empty).
+            match switch_cache.get(&current_worktree) {
+                Some(slice) => slice.apply(&mut model),
+                None => crate::handlers::switch_cache::WorktreeSlice::clear(&mut model),
+            }
             // The old worktree's hunk previews are meaningless here: drop them and
             // raise the acceptance cutoff so in-flight fetches die on arrival.
             hydration_gen += 1;
@@ -8577,8 +8341,8 @@ async fn event_loop<T: Terminal>(
             // Warm the worktrees above/below the selection into the cache so a
             // follow-on switch to a neighbor is instant too. Skip ones already
             // cached — the on-switch hydration refreshes them when truly focused.
-            for path in neighbor_worktree_paths(&session) {
-                if panel_cache.contains_key(&path) {
+            for path in neighbor_worktree_paths(&session, &sidebar_worktree_order(&model)) {
+                if switch_cache.contains_key(&path) {
                     continue;
                 }
                 spawn_panel_prefetch(
@@ -8738,25 +8502,15 @@ async fn event_loop<T: Terminal>(
             }
             // And the new worktree's hidden yazi drawer, so the first toggle
             // never waits on yazi's startup. Off by default ([drawer].prewarm)
-            // so invisible yazi instances never accumulate unbidden.
+            // so invisible yazi instances never accumulate unbidden. Async: the
+            // spec resolves off-loop and the drawer drain stashes the pane.
             if keymap.config().drawer.prewarm
                 && keymap.config().drawer.pool_limit > 0
                 && drawer.is_none()
                 && keymap.config().tool_command("yazi").is_some()
                 && !drawer_pool.contains(&current_worktree)
-                && let Some(id) = spawn_yazi_pane(
-                    &mut panes,
-                    keymap.config(),
-                    Some(&current_worktree),
-                    chrome.center,
-                )
             {
-                drawer_pool.stash(
-                    &current_worktree,
-                    id,
-                    keymap.config().drawer.pool_limit,
-                    &mut panes,
-                );
+                crate::drawer_state::request_spawn(keymap.config(), &current_worktree);
             }
         }
 
@@ -9234,10 +8988,7 @@ async fn event_loop<T: Terminal>(
                                 if let Some(dir) =
                                     drawer_home.take().or_else(|| active_cwd(&session))
                                 {
-                                    let key = superzej_core::util::slugify(&dir.to_string_lossy());
-                                    let ddir = superzej_core::util::superzej_dir().join("drawer");
-                                    let _ = std::fs::create_dir_all(&ddir);
-                                    let _ = std::fs::write(ddir.join(key), "false");
+                                    crate::drawer_state::set_flag(&dir, false);
                                 }
                                 // A clean exit is the normal `q`-quit path — stay
                                 // quiet. Only an abnormal exit (e.g. the contained
@@ -10168,6 +9919,62 @@ async fn event_loop<T: Terminal>(
             },
         );
 
+        // Resolved drawer launch specs (the async half of a cold drawer spawn).
+        // Policy by CURRENT state, not the state at request time: show it when
+        // the active worktree still wants its drawer; otherwise keep the work —
+        // stash it as a pre-warmed pool entry for the next visit; else drop.
+        while let Ok((ddir, res)) = drawer_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Spec);
+            crate::drawer_state::request_done(&ddir);
+            let launch = match res {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::debug!(target: "szhost::drawer", dir = %ddir.display(), %e,
+                        "drawer spec resolution failed");
+                    drawer_show_pending = None;
+                    continue;
+                }
+            };
+            let cfg = keymap.config();
+            let pending = drawer_show_pending
+                .as_ref()
+                .filter(|(d, _)| d == &ddir)
+                .map(|&(_, f)| f);
+            let want_show = drawer.is_none()
+                && (pending.is_some()
+                    || (active_cwd(&session).as_deref() == Some(ddir.as_path())
+                        && crate::drawer_state::flag(&ddir)));
+            if want_show {
+                if let Some(id) = crate::drawer_state::open_resolved(
+                    &mut panes,
+                    launch,
+                    cfg,
+                    &ddir,
+                    chrome.center,
+                ) {
+                    drawer = Some(id);
+                    drawer_home = Some(ddir.clone());
+                    if pending == Some(true) {
+                        focus.zone = crate::focus::Zone::Drawer;
+                    }
+                    need_relayout = true;
+                    dirty = true;
+                }
+                drawer_show_pending = None;
+            } else if cfg.drawer.pool_limit > 0 && !drawer_pool.contains(&ddir) {
+                let limit = cfg.drawer.pool_limit;
+                if let Some(id) = crate::drawer_state::open_resolved(
+                    &mut panes,
+                    launch,
+                    cfg,
+                    &ddir,
+                    chrome.center,
+                ) {
+                    drawer_pool.stash(&ddir, id, limit, &mut panes);
+                }
+            }
+        }
+
         // Drain palette async results (file/content/git/symbol search workers).
         // FileIndexReady is special: it propagates back to `file_index` for
         // future searches rather than updating displayed results.
@@ -10298,9 +10105,12 @@ async fn event_loop<T: Terminal>(
                 model.status = prev_status;
             }
             // Seed the stale-while-revalidate cache with this worktree's fresh
-            // git panel (pre LSP-merge: LSP diags are editor-global, not
+            // slice (pre LSP-merge: LSP diags are editor-global, not
             // per-worktree) so a later switch back paints instantly.
-            panel_cache.insert(active_tab_path(&session), model.panel.clone());
+            switch_cache.insert(
+                active_tab_path(&session),
+                crate::handlers::switch_cache::WorktreeSlice::seed_from(&model),
+            );
             // A fresh model carries only git/db diagnostics; re-apply LSP ones.
             if !lsp_diags.is_empty() {
                 lsp_diags.merge_into(&mut model.panel.diagnostics);
@@ -10398,10 +10208,11 @@ async fn event_loop<T: Terminal>(
         }
 
         // Neighbor-prefetch results: seed the switch cache only. No repaint —
-        // these warm worktrees the user hasn't focused yet.
+        // these warm worktrees the user hasn't focused yet. Prefetch computes
+        // just the panel; keep any chip/timeline fields from a prior full seed.
         while let Ok((path, panel)) = prefetch_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Prefetch);
-            panel_cache.insert(path, panel);
+            switch_cache.entry(path).or_default().panel = panel;
         }
 
         // Fresh stats reading from the ticker thread (top-bar widgets + the
@@ -12314,10 +12125,8 @@ async fn event_loop<T: Terminal>(
                     && keymap.config().tool_command("yazi").is_some()
                     && let Some(dir) = active_cwd(&session)
                     && !drawer_pool.contains(&dir)
-                    && let Some(id) =
-                        spawn_yazi_pane(&mut panes, keymap.config(), Some(&dir), chrome.center)
                 {
-                    drawer_pool.stash(&dir, id, keymap.config().drawer.pool_limit, &mut panes);
+                    crate::drawer_state::request_spawn(keymap.config(), &dir);
                 }
             }
         }
@@ -16166,13 +15975,11 @@ async fn event_loop<T: Terminal>(
                             } else if let Some(id) = drawer.take() {
                                 panes.table.remove(&id);
                             }
-                            drawer = spawn_yazi_pane(
-                                &mut panes,
-                                keymap.config(),
-                                Some(dir.as_path()),
-                                chrome.center,
-                            );
-                            drawer_home = Some(dir);
+                            // Async: the drawer drain shows the pane at `dir`
+                            // when its spec lands (no focus steal — parity with
+                            // the old synchronous reveal).
+                            crate::drawer_state::request_spawn(keymap.config(), &dir);
+                            drawer_show_pending = Some((dir, false));
                             true
                         }
                         (Section::Files, KeyCode::Char('o')) => {
@@ -17336,58 +17143,39 @@ async fn event_loop<T: Terminal>(
                                             keymap.config(),
                                             &mut panes,
                                         );
-                                        let key =
-                                            superzej_core::util::slugify(&cwd.to_string_lossy());
-                                        let dir =
-                                            superzej_core::util::superzej_dir().join("drawer");
-                                        let _ = std::fs::write(dir.join(key), "false");
+                                        crate::drawer_state::set_flag(&cwd, false);
                                     } else if let Some(id) = drawer.take() {
                                         panes.table.remove(&id);
                                     }
+                                    drawer_show_pending = None;
                                     // The bottom slice is relinquished: drop focus
                                     // back to the center.
                                     if focus.drawer() {
                                         focus.zone = crate::focus::Zone::Center;
                                     }
                                 } else {
-                                    // Show the worktree's drawer (pooled pane
-                                    // when pre-warmed — instant), spawned already
-                                    // sized to its panel rect.
+                                    // Show the worktree's drawer: pooled pane
+                                    // when pre-warmed (instant), else an async
+                                    // spec request — the drawer drain opens the
+                                    // pane (and takes focus) when it lands.
                                     let cwd = active_cwd(&session);
                                     if let Some(d) = cwd.as_deref() {
-                                        let drect = prospective_drawer_rect(
-                                            cols,
-                                            rows,
-                                            want_sidebar,
-                                            want_panel,
-                                            panel_forced,
-                                            panel_width,
-                                            sidebar_cols,
-                                            zoom,
-                                            &supervisor,
-                                            &current_config,
-                                        );
                                         show_yazi_drawer(
-                                            &mut panes,
                                             &mut drawer,
                                             &mut drawer_pool,
                                             &mut drawer_home,
                                             keymap.config(),
                                             d,
-                                            drect,
                                         );
                                         // Auto-focus so yazi is live immediately.
                                         if drawer.is_some() {
                                             focus.zone = crate::focus::Zone::Drawer;
+                                        } else {
+                                            drawer_show_pending = Some((d.to_path_buf(), true));
                                         }
                                     }
                                     if let Some(dir) = cwd {
-                                        let key =
-                                            superzej_core::util::slugify(&dir.to_string_lossy());
-                                        let dir =
-                                            superzej_core::util::superzej_dir().join("drawer");
-                                        let _ = std::fs::create_dir_all(&dir);
-                                        let _ = std::fs::write(dir.join(key), "true");
+                                        crate::drawer_state::set_flag(&dir, true);
                                     }
                                 }
                             }
@@ -20199,50 +19987,6 @@ mod tests {
         let has = |c: &str, l: &str| hints.iter().any(|(hc, hl)| hc == c && hl == l);
         assert!(has("Ctrl Alt x", "close"), "hints were {hints:?}");
         assert!(!has("Alt x", "close"), "hints were {hints:?}");
-    }
-
-    #[test]
-    fn contain_yazi_argv_wraps_scope_with_drawer_limits() {
-        let cfg = superzej_core::config::Config::default();
-        let argv = contain_yazi_argv(&cfg, vec!["yazi".into()], true);
-
-        assert_eq!(argv[0], "systemd-run");
-        assert!(argv.contains(&"--user".to_string()));
-        assert!(argv.contains(&"--scope".to_string()));
-        assert!(argv.contains(&"--collect".to_string()));
-        assert!(argv.contains(&"MemoryMax=2G".to_string()));
-        assert!(argv.contains(&"MemorySwapMax=512M".to_string()));
-        assert!(argv.contains(&"CPUQuota=200%".to_string()));
-        // The wrapped command follows the `--` separator.
-        let sep = argv.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&argv[sep + 1..], &["yazi".to_string()]);
-    }
-
-    #[test]
-    fn contain_yazi_argv_omits_empty_limits_and_can_disable() {
-        let mut cfg = superzej_core::config::Config::default();
-        cfg.drawer.memory_swap_max.clear();
-        cfg.drawer.cpu_quota.clear();
-        let argv = contain_yazi_argv(&cfg, vec!["yazi".into()], true);
-        assert_eq!(argv[0], "systemd-run");
-        assert!(argv.contains(&"MemoryMax=2G".to_string()));
-        assert!(!argv.iter().any(|a| a.starts_with("MemorySwapMax=")));
-        assert!(!argv.iter().any(|a| a.starts_with("CPUQuota=")));
-
-        // Disabled, missing systemd-run, or an already-wrapped sandbox argv all
-        // pass the command through untouched.
-        cfg.drawer.contain = false;
-        assert_eq!(
-            contain_yazi_argv(&cfg, vec!["yazi".into()], true),
-            vec!["yazi"]
-        );
-        cfg.drawer.contain = true;
-        assert_eq!(
-            contain_yazi_argv(&cfg, vec!["yazi".into()], false),
-            vec!["yazi"]
-        );
-        let nested = vec!["systemd-run".to_string(), "--user".into(), "--pty".into()];
-        assert_eq!(contain_yazi_argv(&cfg, nested.clone(), true), nested);
     }
 
     #[test]

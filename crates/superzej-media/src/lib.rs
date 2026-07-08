@@ -228,7 +228,38 @@ async fn auto_client(opts: &ResolveOpts) -> Option<MediaClient> {
 #[cfg(target_os = "linux")]
 async fn mpris_client(opts: &ResolveOpts) -> Option<MediaClient> {
     match MprisZbus::connect(opts.players_priority.clone()).await {
-        Ok(m) => Some(MediaClient::Mpris(m)),
+        Ok(m) => {
+            // Connecting to the session bus isn't enough: the native path can
+            // still fail to *read* a player — a broken proxy squatting on the
+            // bus (e.g. a `playerctld` whose object doesn't exist), an
+            // unexpected variant shape, a permissions quirk. Probe once; if a
+            // player is present on the bus but the native read yields no track,
+            // degrade to the `playerctl` CLI, which works wherever the bus does.
+            match m.snapshot().await {
+                Ok(Some(_)) => {
+                    tracing::debug!(target: "szhost::media", "media backend: native MPRIS (zbus)");
+                    Some(MediaClient::Mpris(m))
+                }
+                probe => {
+                    let players = m.list_players().await.unwrap_or_default();
+                    if !players.is_empty() && MprisCli::available() {
+                        tracing::debug!(
+                            target: "szhost::media",
+                            ?probe, players = ?players,
+                            "native MPRIS read yielded no track despite players present; degrading to playerctl",
+                        );
+                        Some(MediaClient::MprisCli(MprisCli::new(
+                            opts.players_priority.clone(),
+                        )))
+                    } else {
+                        // No player on the bus yet — keep the native push path so
+                        // the badge appears the instant one shows up.
+                        tracing::debug!(target: "szhost::media", "media backend: native MPRIS (zbus), no player yet");
+                        Some(MediaClient::Mpris(m))
+                    }
+                }
+            }
+        }
         Err(e) => {
             tracing::debug!(target: "szhost::media", error = %e, "MPRIS zbus connect failed; trying playerctl");
             if MprisCli::available() {
