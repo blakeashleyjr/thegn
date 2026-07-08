@@ -60,6 +60,10 @@ pub struct PairingRow {
     pub created_at: i64,
     pub expires_at: Option<i64>,
     pub redeemed_at: Option<i64>,
+    /// A `token` row authorizes requests only once approved. Auto-approve
+    /// pairing sets this at mint time; `[serve] require_approval` parks it
+    /// `NULL` until an in-app / `szhost pair approve` decision.
+    pub approved_at: Option<i64>,
     pub revoked_at: Option<i64>,
 }
 
@@ -106,8 +110,11 @@ pub trait ControlStore {
     fn put_pairing(&self, row: &PairingRow) -> Result<()>;
     fn pairings(&self) -> Result<Vec<PairingRow>>;
     /// Live-token lookup by public id for request auth: `kind = "token"`,
-    /// unrevoked, unexpired at `now_ms`. The caller compares the secret hash.
+    /// approved, unrevoked, unexpired at `now_ms`. The caller compares the
+    /// secret hash.
     fn pairing_for_auth(&self, pairing_id: &str, now_ms: i64) -> Result<Option<PairingRow>>;
+    /// Approve a parked `token` row (the `[serve] require_approval` flow).
+    fn approve_pairing(&self, pairing_id: &str, now_ms: i64) -> Result<()>;
     /// Atomic single-use redeem of a `kind = "code"` row: returns it iff it was
     /// live (unexpired, unrevoked) and unredeemed, marking `redeemed_at` in the
     /// same UPDATE so a racing second redeem gets `None` (no TOCTOU).
