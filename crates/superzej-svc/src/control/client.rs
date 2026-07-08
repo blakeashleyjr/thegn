@@ -195,6 +195,20 @@ impl ControlClient {
         .map(|_| ())
     }
 
+    /// The reserved drive-browser verb (v1 answers 501 Unimplemented).
+    pub async fn send_browse(&self, session: Option<&str>, url: &str) -> Result<()> {
+        self.request(
+            "POST",
+            "/v1/browser",
+            Some(json!({
+                "session": session,
+                "action": { "navigate": { "url": url } },
+            })),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub async fn pair(&self, code: &str, label: &str) -> Result<Value> {
         self.request(
             "POST",

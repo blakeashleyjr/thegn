@@ -374,6 +374,31 @@ pub enum Command {
     /// Generate shell completions (bash/zsh/fish/elvish/powershell) for the
     /// invoked binary name — `superzej completions zsh > …/_superzej`.
     Completions { shell: clap_complete::Shell },
+    /// Serve this machine's superzej to remote thin clients: runs the pane
+    /// daemon in the foreground with a TCP control listener (HTTP/WS + gRPC,
+    /// scoped bearer tokens) and prints a single-use pairing URL. v1 listens
+    /// in PLAINTEXT — bind to a trusted network (tailscale/wireguard) or
+    /// tunnel over `ssh -L`.
+    Serve {
+        /// TCP bind address (defaults to `[serve] bind`, e.g. 0.0.0.0:5380).
+        #[arg(long)]
+        bind: Option<String>,
+        /// Skip minting + printing the startup pairing URL.
+        #[arg(long)]
+        no_pair_url: bool,
+    },
+    /// Drive a running pane daemon: list sessions, send input, dump
+    /// snapshots, stream output, inspect relay leases.
+    Session {
+        #[command(subcommand)]
+        action: cmd::session::SessionAction,
+    },
+    /// Manage pairing credentials for thin clients (mint codes, list,
+    /// approve, revoke). Works with or without a running daemon.
+    Pair {
+        #[command(subcommand)]
+        action: cmd::pair::PairAction,
+    },
     /// Hidden: run the pane daemon — the control-plane process that owns
     /// portable-pty sessions so they survive UI clients detaching. Spawned
     /// lazily by the first attach (`[daemon] enabled`, `szhost serve`, or the
@@ -676,6 +701,11 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             let _ = std::io::stdout().write_all(&buf);
             Ok(())
         }
+        Command::Serve { bind, no_pair_url } => {
+            daemon::serve_blocking(&cfg, daemon::ServeOpts { bind, no_pair_url })
+        }
+        Command::Session { action } => cmd::session::run(&cfg, action),
+        Command::Pair { action } => cmd::pair::run(&cfg, action),
         Command::Daemon { socket } => daemon::run_blocking(&cfg, socket),
         Command::Bridge => {
             // The resident agent: framed protocol over stdio until EOF. stdout is

@@ -60,6 +60,8 @@ impl From<ControlError> for Status {
 
 impl GrpcControl {
     /// Authenticate + enforce the verb's scope — the single gRPC chokepoint.
+    // The Err IS the RPC's whole response; produced once per request.
+    #[allow(clippy::result_large_err)]
     fn authed<T>(&self, req: &Request<T>, verb: Verb) -> Result<AuthCtx, Status> {
         let ctx = if self.local_admin {
             AuthCtx::local_admin()
