@@ -44,6 +44,9 @@ pub enum ActivityState {
     Active,
     Waiting,
     Read,
+    /// A worktree being created: the loop overlays this on rows whose tab is in
+    /// `loading_state`, rendered as an accent "↻" while the splash builds.
+    Loading,
 }
 
 impl ActivityState {
@@ -1055,10 +1058,11 @@ fn sort_groups(groups: &mut [Group], sort: SortMode) {
         SortMode::Activity => {
             // Active, then stuck (waiting/read), then idle; home first per tier.
             let rank = |s: ActivityState| match s {
-                ActivityState::Active => 0,
-                ActivityState::Waiting => 1,
-                ActivityState::Read => 2,
-                ActivityState::None => 3,
+                ActivityState::Loading => 0, // building — freshest activity
+                ActivityState::Active => 1,
+                ActivityState::Waiting => 2,
+                ActivityState::Read => 3,
+                ActivityState::None => 4,
             };
             groups.sort_by(|a, b| {
                 rank(a.activity)

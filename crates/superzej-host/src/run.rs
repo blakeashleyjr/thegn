@@ -1353,6 +1353,9 @@ pub(crate) struct SidebarState {
     /// Desired top visible-row index of the scroll window; `build_sidebar`
     /// clamps it each frame so the cursor row stays in view.
     scroll: usize,
+    /// Group names of worktrees mid-creation; `rebuild` overlays a loading dot
+    /// on their rows (a build in flight has no CPU-based activity yet).
+    pub(crate) creating: std::collections::HashSet<String>,
 }
 
 impl SidebarState {
@@ -1410,6 +1413,14 @@ impl SidebarState {
     /// Rederive `model.sidebar_rows` from its data carriers + this view state,
     /// then mirror interaction fields into the model for the renderer.
     pub(crate) fn rebuild(&mut self, model: &mut FrameModel, session: &crate::session::Session) {
+        // Overlay a loading dot on worktrees mid-creation, re-applied every
+        // rebuild so a hydration pass can't drop the marker.
+        for name in &self.creating {
+            model
+                .sidebar_status
+                .activity
+                .insert(name.clone(), crate::sidebar::ActivityState::Loading);
+        }
         model.sidebar_rows = crate::sidebar::build_rows(
             session,
             &model.sidebar_workspaces,
@@ -3856,17 +3867,9 @@ fn begin_worktree_preset(
         agent,
     }));
     *wizard_cmd_tx = Some(cmd_tx);
-    // No interactive overlay (`wizard_ui` stays None); reveal the progress
-    // overlay and start its ticker, mirroring the wizard's submit path.
-    let mut cp = wizard::CreationProgress::new(*create_gen, candidate);
-    cp.revealed = true;
-    wizard::spawn_ticker(cp.generation, cp.ticker_alive.clone(), create_tx.clone(), {
-        let wk = waker.clone();
-        move || {
-            let _ = wk.wake();
-        }
-    });
-    *creating = Some(cp);
+    // No interactive overlay (`wizard_ui` stays None); the worker's `TabOpened`
+    // event opens the tab + loading splash, same as the wizard's submit path.
+    *creating = Some(wizard::CreationProgress::new(candidate));
     model.status = "Creating worktree…".into();
 }
 
@@ -7633,6 +7636,11 @@ async fn event_loop<T: Terminal>(
     // on the owning pane's first PTY output (loading done) or on a hard failure.
     let mut loading_state: std::collections::HashMap<(String, usize), Vec<LoadStep>> =
         std::collections::HashMap::new();
+    // Keys (group name, tab) of worktrees whose tab is open for the loading
+    // splash while the create worker finishes (`TabOpened` → `Done`/`Failed`).
+    // The materialize path skips these so it never races the worker.
+    let mut creating_tabs: std::collections::HashSet<(String, usize)> =
+        std::collections::HashSet::new();
     // Per-worktree remoteness for the loading splash, keyed identically to
     // `loading_state` and kept in LOCKSTEP with it (seeded/removed at the same
     // sites). The startup-shell watchdog reads THIS — captured for certain when
@@ -8846,6 +8854,8 @@ async fn event_loop<T: Terminal>(
                 if !missing.is_empty()
                     && !materialize_inflight.contains(&key)
                     && !materialize_failed.contains(&key)
+                    // A worktree mid-creation owns its splash; don't race it.
+                    && !creating_tabs.contains(&key)
                 {
                     materialize_inflight.insert(key.clone());
                     // A fresh materialize is a genuine (re)bring-up: un-retire.
@@ -10641,21 +10651,40 @@ async fn event_loop<T: Terminal>(
                     }
                     if let Some(cp) = creating.as_mut() {
                         cp.apply(step, state, detail);
-                        if cp.revealed {
+                        // Mirror into the tab's loading splash (no-op until the
+                        // tab has opened).
+                        if crate::handlers::creating::sync_steps(
+                            cp,
+                            &mut loading_state,
+                            &creating_tabs,
+                        ) {
                             dirty = true;
                         }
                     }
                 }
-                wizard::CreateEvent::Tick { generation } => {
+                wizard::CreateEvent::TabOpened {
+                    generation,
+                    tab,
+                    path,
+                } => {
                     if generation != create_gen {
                         continue;
                     }
-                    if let Some(cp) = creating.as_mut() {
-                        cp.bump_tick();
-                        if cp.revealed {
-                            dirty = true;
-                        }
-                    }
+                    // Open the tab (splash in its center); jump to it by default.
+                    let jump = keymap.config().session.focus_on_create;
+                    crate::handlers::creating::open_tab(
+                        &mut session,
+                        &mut model,
+                        &mut sb,
+                        &mut loading_state,
+                        &mut creating_tabs,
+                        creating.as_ref(),
+                        tab,
+                        path,
+                        jump,
+                    );
+                    need_relayout = true;
+                    dirty = true;
                 }
                 wizard::CreateEvent::Failed {
                     generation,
@@ -10665,15 +10694,19 @@ async fn event_loop<T: Terminal>(
                     if generation != create_gen {
                         continue;
                     }
-                    // The worker cleaned up and exited; surface the failure
-                    // immediately (even mid-wizard — nothing left to submit).
+                    // Worker cleaned up + exited; surface it, drop any open tab.
                     wizard_ui = None;
                     wizard_cmd_tx = None;
-                    if let Some(cp) = creating.as_mut() {
-                        cp.revealed = true;
-                        cp.stop_ticker();
-                    }
+                    crate::handlers::creating::abort(
+                        &mut session,
+                        &mut model,
+                        &mut sb,
+                        &mut loading_state,
+                        &mut creating_tabs,
+                    );
+                    creating = None;
                     model.status = format!("worktree creation failed ({}): {error}", step.label());
+                    need_relayout = true;
                     dirty = true;
                 }
                 wizard::CreateEvent::Done {
@@ -10684,12 +10717,6 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                     let payload = *payload;
-                    // The user backgrounded this build (Esc hid the progress
-                    // overlay) → don't yank their tab/focus on completion; land
-                    // the worktree quietly. `revealed` stays true only while the
-                    // user is actively watching the overlay through to the end.
-                    let backgrounded = creating.as_ref().is_some_and(|cp| !cp.revealed);
-                    let prev_active = session.active;
                     if let Some(cp) = creating.as_mut() {
                         cp.apply(
                             wizard::CreateStep::LaunchAgent,
@@ -10697,20 +10724,16 @@ async fn event_loop<T: Terminal>(
                             Some(payload.agent.clone()),
                         );
                     }
-                    session.add_group(crate::session::WorktreeGroup::new(
-                        payload.tab.clone(),
-                        crate::session::GroupKind::Branch,
-                        payload.path.clone(),
-                    ));
-                    // `add_group` switched the active tab to the new worktree;
-                    // restore it when backgrounded so the user stays put. The
-                    // group is still pushed (visible in the sidebar) and its
-                    // agent pane still attaches below — only the view switch is
-                    // undone. Restore before `refresh_tab_model` so the chrome
-                    // reflects the user's current tab, not the new one.
-                    if backgrounded {
-                        session.active = prev_active;
-                    }
+                    // Adopt the early-opened tab (retire creation markers); learn
+                    // whether it's the active tab (whether to pull focus below).
+                    let is_active_new = crate::handlers::creating::adopt(
+                        &mut session,
+                        &mut sb,
+                        &mut loading_state,
+                        &mut creating_tabs,
+                        &payload.tab,
+                        &payload.path,
+                    );
                     // Branch-from-issue: link the freshly created worktree to the
                     // issue it was branched from, so its tab carries the issue badge.
                     if let Some((g, issue_id)) = pending_issue_link.take() {
@@ -10751,10 +10774,9 @@ async fn event_loop<T: Terminal>(
                             &waker,
                         );
                     if attached || native_provider {
-                        // Only steal keyboard focus into the new agent pane when
-                        // the user was watching (foreground). A backgrounded build
-                        // must not redirect their input into the fresh pane.
-                        if !backgrounded {
+                        // Only pull focus to the new pane when its tab is active
+                        // (jump-to-create default, user not since navigated away).
+                        if is_active_new {
                             focus.zone = crate::focus::Zone::Center;
                         }
                         let backend = &payload.spec.backend;
@@ -10796,9 +10818,7 @@ async fn event_loop<T: Terminal>(
                             });
                         }
                     }
-                    if let Some(cp) = creating.take() {
-                        cp.stop_ticker();
-                    }
+                    creating = None;
                     wizard_cmd_tx = None;
                     // Worktree template (item 54): apply the initial layout
                     // (named snapshot, else `commands` even-split) and start the
@@ -12034,13 +12054,7 @@ async fn event_loop<T: Terminal>(
             if let Some(p) = &workspace_picker {
                 p.render(&mut scratch, screen);
             }
-            if let Some(cp) = &creating
-                && cp.revealed
-            {
-                // Center within the pane content area, not the full terminal
-                // (which would put it behind the sidebar).
-                cp.render(&mut scratch, chrome.center);
-            }
+            // Worktree-creation progress renders as the new tab's loading splash.
             // The hover preview floats above the panel, below modal input.
             if let Some(hp) = &hover_popup {
                 hp.render(&mut scratch, screen);
@@ -12140,10 +12154,9 @@ async fn event_loop<T: Terminal>(
                 pending.push(Change::CursorVisibility(
                     termwiz::surface::CursorVisibility::Hidden,
                 ));
-            } else if palette.is_none()
-                && wizard_ui.is_none()
-                && !creating.as_ref().is_some_and(|cp| cp.revealed)
-            {
+            } else if palette.is_none() && wizard_ui.is_none() {
+                // The creation toast is non-modal — the focused pane keeps its
+                // hardware cursor while a worktree builds in the background.
                 // The hardware cursor sits in the focused pane's CONTENT rect
                 // (inside its frame ring). When the drawer owns focus it follows
                 // yazi into the drawer rect instead. With no live focused pane
@@ -13001,30 +13014,8 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 let mut forced_palette_action: Option<crate::keymap::Action> = None;
-                // Modal: the revealed worktree-creation progress overlay
-                // swallows every key. Esc hides it while work continues (a
-                // mid-flight checkout isn't safely interruptible and the
-                // result is useful); on a failed run Esc/Enter dismisses.
-                if creating.as_ref().is_some_and(|cp| cp.revealed) {
-                    let failed = creating.as_ref().is_some_and(|cp| cp.failed);
-                    let dismiss = crate::input::is_escape_key(&k.key)
-                        || (failed && k.key == KeyCode::Enter)
-                        || (matches!(k.key, KeyCode::Char('c' | 'C' | 'g' | 'G'))
-                            && k.modifiers.contains(Modifiers::CTRL));
-                    if dismiss {
-                        if failed {
-                            creating = None;
-                            wizard_cmd_tx = None;
-                            create_gen += 1;
-                        } else if let Some(cp) = creating.as_mut() {
-                            cp.revealed = false;
-                            cp.stop_ticker();
-                            model.status = format!("creating {} in the background…", cp.branch);
-                        }
-                    }
-                    dirty = true;
-                    continue;
-                }
+                // Worktree creation is non-modal (its own tab's loading splash);
+                // it swallows no input. Failure removes the tab + shows status.
                 // Modal: the new-terminal wizard captures all keys; submit is
                 // synchronous (DB upsert + pane spawn), handled inline below.
                 if let Some(w) = terminal_wizard_ui.as_mut() {
@@ -13122,21 +13113,10 @@ async fn event_loop<T: Terminal>(
                             if let Some(tx) = wizard_cmd_tx.as_ref() {
                                 let _ = tx.send(wizard::WizardCmd::Submit(choices));
                             }
+                            // The worker's `TabOpened` event opens the new tab +
+                            // loading splash once the name/path settle; nothing
+                            // to reveal here.
                             wizard_ui = None;
-                            if let Some(cp) = creating.as_mut() {
-                                cp.revealed = true;
-                                wizard::spawn_ticker(
-                                    cp.generation,
-                                    cp.ticker_alive.clone(),
-                                    create_tx.clone(),
-                                    {
-                                        let wk = waker.clone();
-                                        move || {
-                                            let _ = wk.wake();
-                                        }
-                                    },
-                                );
-                            }
                         }
                     }
                     dirty = true;

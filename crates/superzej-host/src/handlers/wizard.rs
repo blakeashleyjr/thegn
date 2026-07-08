@@ -62,7 +62,7 @@ pub(crate) fn begin_worktree_wizard(
             let _ = wk.wake();
         });
     });
-    *creating = Some(wizard::CreationProgress::new(*create_gen, w.candidate()));
+    *creating = Some(wizard::CreationProgress::new(w.candidate()));
     *wizard_cmd_tx = Some(cmd_tx);
     *wizard_ui = Some(w);
 }

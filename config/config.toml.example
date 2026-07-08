@@ -880,6 +880,8 @@ command = "git diff"
 #                              #   snapshot and repainted on restore; 0 = disable (blank restore)
 # restore_grace_secs = 600     # a persisted active/running activity dot older than this at
 #                              #   restore is downgraded to a settled state; live FSM untouched
+# focus_on_create = true       # creating a worktree (Alt+w) jumps to its new tab and shows the
+#                              #   loading splash; false = build in background with a sidebar dot
 
 # Aggregated notification bus. Events (PR state, agent done/failed, test
 # failures, log errors, worktree created) surface as sidebar badges + the
