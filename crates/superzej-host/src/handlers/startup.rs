@@ -6,6 +6,17 @@
 use superzej_core::db::Db;
 use superzej_core::store::WorkspaceStore;
 
+/// Install the per-pane service configs on the registry — `[replay]`
+/// recording and the `[daemon]` control-plane route — in one call so the
+/// startup and live-config-reload paths in `run.rs` can't drift apart.
+pub(crate) fn install_pane_services(
+    panes: &mut crate::panes::Panes,
+    cfg: &superzej_core::config::Config,
+) {
+    panes.set_replay_config(cfg.replay.clone());
+    panes.set_daemon_config(cfg.daemon.clone());
+}
+
 /// Ensure a default `local` terminal exists so the sidebar's TERMINALS section
 /// always has a live entry. Seeding only on an empty table keeps it a one-time
 /// default the user can rename or delete; a deliberately-emptied list is

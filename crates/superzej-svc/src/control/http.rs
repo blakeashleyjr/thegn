@@ -714,6 +714,9 @@ pub fn frame_json(frame: &EventFrame) -> serde_json::Value {
             "scopes": scope, "state": state,
         }),
         EventFrame::Sessions => json!({ "kind": "sessions" }),
+        EventFrame::SessionExit { session, code } => json!({
+            "kind": "exit", "session": session, "code": code,
+        }),
     }
 }
 
