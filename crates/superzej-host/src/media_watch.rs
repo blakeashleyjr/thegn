@@ -1,0 +1,133 @@
+//! The now-playing watcher task (the optional `[media]` feature's host driver).
+//!
+//! Extracted from `run.rs` (which is line-ratcheted) so the watcher can grow the
+//! resilience it needs without touching the god file. `spawn` owns one tokio task
+//! that resolves a [`superzej_media`] backend and streams [`MediaState`] snapshots
+//! back to the event loop over an mpsc channel + [`TerminalWaker`] pulse.
+//!
+//! Resilience contract (media is *strictly additive* — never disrupts the shell,
+//! never breaks the ~0%-idle invariant):
+//!
+//! - **Errors surface, never swallow.** Read failures log on `szhost::media`
+//!   (was a blind `unwrap_or(None)`), so `SUPERZEJ_LOG=szhost::media=debug`
+//!   explains a missing badge instead of leaving it a mystery.
+//! - **Self-heal while nothing shows.** On the native MPRIS push path we also run
+//!   a slow safety re-snapshot *only while no track is currently displayed*, so a
+//!   missed/failed initial read recovers without waiting for a track change. Once
+//!   a badge is showing we go signal-only again — no idle polling during playback,
+//!   preserving the 0%-idle contract.
+//! - **Respawn on stream end.** If the D-Bus signal stream ends (bus restart,
+//!   player teardown) the task re-resolves the backend with backoff rather than
+//!   dying permanently.
+
+use tokio::sync::mpsc as tokio_mpsc;
+
+use superzej_core::config::MediaConfig;
+use superzej_core::media::MediaState;
+use termwiz::terminal::TerminalWaker;
+
+/// Spawn the now-playing watcher for `cfg`. Returns the task handle so the caller
+/// can abort it on a config/player change; `None` when media is disabled.
+pub(crate) fn spawn(
+    cfg: MediaConfig,
+    tx: tokio_mpsc::UnboundedSender<Option<MediaState>>,
+    waker: TerminalWaker,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !cfg.enabled {
+        return None;
+    }
+    Some(tokio::spawn(run(cfg, tx, waker)))
+}
+
+/// Send a fresh snapshot, logging read errors instead of swallowing them.
+/// Returns `Some(active)` (whether a track is currently displayed) on success,
+/// or `None` when the receiver is gone and the task should stop.
+async fn push_snapshot(
+    client: &superzej_media::MediaClient,
+    tx: &tokio_mpsc::UnboundedSender<Option<MediaState>>,
+    waker: &TerminalWaker,
+) -> Option<bool> {
+    let snap = match client.snapshot().await {
+        Ok(snap) => snap,
+        Err(e) => {
+            tracing::debug!(target: "szhost::media", error = %e, "media snapshot failed");
+            None
+        }
+    };
+    let active = snap.as_ref().and_then(|s| s.badge()).is_some();
+    if tx.send(snap).is_err() {
+        return None;
+    }
+    let _ = waker.wake();
+    Some(active)
+}
+
+async fn run(
+    cfg: MediaConfig,
+    tx: tokio_mpsc::UnboundedSender<Option<MediaState>>,
+    waker: TerminalWaker,
+) {
+    let period = std::time::Duration::from_secs(cfg.poll_interval_secs.max(1));
+    let max_backoff = std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_secs(1);
+
+    loop {
+        let Some(client) = superzej_media::client_for(&cfg.resolve_opts()).await else {
+            // No backend yet (bus down, playerctl absent). Retry with backoff so
+            // media appears once the transport comes up, rather than never.
+            tracing::debug!(target: "szhost::media", "media backend unavailable; retrying");
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(max_backoff);
+            continue;
+        };
+        backoff = std::time::Duration::from_secs(1);
+
+        // Initial snapshot.
+        let mut active = match push_snapshot(&client, &tx, &waker).await {
+            Some(a) => a,
+            None => return, // receiver gone
+        };
+
+        if let Some(mut watch) = client.watch().await {
+            // Native push path. Re-snapshot on each D-Bus signal; additionally,
+            // *while no track is displayed*, run a slow safety poll so a failed
+            // initial read self-heals. Once a badge shows, drop back to
+            // signal-only (no idle polling during playback).
+            let mut safety = tokio::time::interval(period);
+            safety.tick().await; // consume the immediate first tick
+            let stream_ended = loop {
+                let changed = if active {
+                    watch.changed().await
+                } else {
+                    tokio::select! {
+                        c = watch.changed() => c,
+                        _ = safety.tick() => true,
+                    }
+                };
+                if !changed {
+                    break true; // signal stream ended → reconnect
+                }
+                match push_snapshot(&client, &tx, &waker).await {
+                    Some(a) => active = a,
+                    None => return, // receiver gone
+                }
+            };
+            if stream_ended {
+                tracing::debug!(target: "szhost::media", "MPRIS signal stream ended; reconnecting");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(max_backoff);
+                continue;
+            }
+        } else {
+            // Poll path: backends without a signal stream (mpv / playerctl).
+            let mut ticker = tokio::time::interval(period);
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                ticker.tick().await;
+                if push_snapshot(&client, &tx, &waker).await.is_none() {
+                    return; // receiver gone
+                }
+            }
+        }
+    }
+}
