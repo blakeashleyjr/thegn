@@ -2342,6 +2342,41 @@ enabled = false
 # cpu = "4"
 # memory = "8g"
 # max = 2
+# ── Control plane (pane daemon + serve) ────────────────────────────────────
+# The pane daemon: a `szhost daemon` process that owns the portable-pty panes
+# so they survive the UI exiting — quit the compositor, relaunch, and
+# warm-reattach to a still-running agent. OPT-IN: with `enabled = false` (the
+# default) bare `szhost` behaves exactly as today (in-process PTYs).
+[daemon]
+enabled = false
+# Control-socket override. Empty (default) resolves to
+# $XDG_RUNTIME_DIR/superzej/daemon.sock, falling back to
+# $XDG_STATE_HOME/superzej/run/daemon.sock (so isolated state dirs — `just
+# start`, smoke tests — get isolated daemons).
+socket = ""
+# The daemon exits after this long with no sessions and no attached clients.
+# 0 = never exit on idle.
+idle_exit_secs = 1800
+# When the last client detaches from a session, keep its PTY warm this long
+# (the relay lease). Reconnect within the grace resumes the same live screen;
+# expiry reaps the process.
+lease_grace_secs = 3600
+
+# `szhost serve`: pair remote thin clients (desktop/web/mobile) over a pairing
+# URL and let them attach through the scoped control API. v1 serves PLAINTEXT —
+# bind to a trusted network interface (tailscale/wireguard) or reach it over
+# `ssh -L`; every request is still token-gated.
+[serve]
+# Default TCP bind (override per-run with `szhost serve --bind`).
+bind = "0.0.0.0:5380"
+# Require in-app / `szhost pair approve` approval before a redeemed pairing
+# token becomes usable. Default off: possession of the single-use pairing URL
+# is the credential.
+require_approval = false
+# Local unix-socket peers (same uid) get implicit admin, so local CLI verbs
+# (`szhost session …`) need no token. Tokens are always required on TCP.
+local_admin = true
+
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────
 # The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
 # depends on this — AI is strictly additive — so it is OFF by default. When
