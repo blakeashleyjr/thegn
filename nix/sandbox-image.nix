@@ -1,5 +1,6 @@
 # The superzej multi-arch base sandbox image: nix (flakes on) + devenv/direnv +
-# rust toolchain + the daily tools, with a populated /nix and a warmed ~/.cargo
+# rust toolchain + node + the Claude Code CLI + the daily tools, with a populated
+# /nix and a warmed ~/.cargo
 # owned by uid 1000 (`superzej`, matching `--userns keep-id`). Built per-arch on
 # native builders and pushed as a manifest list (see `just image-publish`); the
 # host provisioner delivers the per-arch digest registry-lessly by default.
@@ -26,6 +27,12 @@
       # rust (rustup so repos pin their own toolchains; a stable default is
       # warmed at build time below)
       rustup
+      # devenv (repo devShells) + node (agents) + the Claude Code CLI, baked so
+      # a container on a remote host has the toolchain without per-worktree
+      # install (the remote-OCI worktree path can't push the host's nix closure).
+      devenv
+      nodejs
+      claude-code
       # the daily substrate
       bashInteractive
       zsh
