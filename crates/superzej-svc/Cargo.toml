@@ -7,6 +7,16 @@ publish = false
 license.workspace = true
 description = "superzej native service layer: git/GitHub/ssh behind traits with CLI fallbacks"
 
+[features]
+# The control-plane gRPC surface (tonic server + generated proto bindings).
+# The HTTP+WS surface is always built; gRPC is additive for external tooling.
+control-grpc = ["dep:tonic", "dep:prost"]
+
+[build-dependencies]
+# Proto codegen for `control-grpc` (build.rs no-ops without the feature).
+tonic-build.workspace = true
+protox.workspace = true
+
 [dependencies]
 superzej-core.workspace = true
 anyhow.workspace = true
@@ -44,6 +54,8 @@ hyper-util = "0.1"
 http-body-util = "0.1"
 sha2 = "0.10"
 getrandom = "0.3"
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

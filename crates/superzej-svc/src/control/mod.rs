@@ -21,6 +21,8 @@ use superzej_core::store::LeaseRow;
 
 pub mod auth;
 pub mod client;
+#[cfg(feature = "control-grpc")]
+pub mod grpc;
 pub mod http;
 
 /// One daemon-owned session (= one PTY + emulator). The compositor's tab/pane
