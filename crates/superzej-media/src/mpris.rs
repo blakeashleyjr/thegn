@@ -161,10 +161,17 @@ impl MprisZbus {
 impl MediaBackend for MprisZbus {
     async fn snapshot(&self) -> Result<Option<MediaState>, MediaError> {
         let Some(bus) = self.active_player().await? else {
+            tracing::debug!(target: "szhost::media", "MPRIS: no active player on the bus");
             return Ok(None);
         };
         let props = self.player_props(&bus).await?;
-        Ok(Some(parse_state(tail(&bus), &props)))
+        let state = parse_state(tail(&bus), &props);
+        tracing::debug!(
+            target: "szhost::media",
+            bus = %bus, state = ?state.state, title = %state.title, artist = %state.artist,
+            "MPRIS snapshot",
+        );
+        Ok(Some(state))
     }
 
     async fn play_pause(&self) -> Result<(), MediaError> {
@@ -351,9 +358,14 @@ fn playback_state(props: &HashMap<String, OwnedValue>) -> PlaybackState {
 
 /// Fold a `Player` property map into a normalized [`MediaState`].
 fn parse_state(player: &str, props: &HashMap<String, OwnedValue>) -> MediaState {
+    // `Metadata` arrives from `Properties.GetAll` inside a variant; peel any
+    // variant layers (like every other decoder here) before the dict
+    // conversion, else a variant-wrapped `a{sv}` silently fails `try_from` and
+    // we lose title/artist. `peel` no-ops when the value is already a bare dict.
     let meta: HashMap<String, OwnedValue> = props
         .get("Metadata")
-        .and_then(|v| HashMap::try_from(v.clone()).ok())
+        .and_then(|v| peel(v).try_to_owned().ok())
+        .and_then(|owned| HashMap::try_from(owned).ok())
         .unwrap_or_default();
 
     let length = meta
@@ -434,5 +446,38 @@ mod tests {
         assert_eq!(s.shuffle, Some(true));
         assert_eq!(s.volume, Some(80));
         assert_eq!(s.now_playing(), "Daft Punk \u{2014} Get Lucky");
+    }
+
+    #[test]
+    fn parse_state_peels_variant_wrapped_metadata() {
+        // `Properties.GetAll` nests each value in a variant, so `Metadata` can
+        // arrive as `v(a{sv})` rather than a bare `a{sv}`. `parse_state` must
+        // peel that extra layer, else title/artist come back empty even though
+        // the player is happily playing (the real-world "music not detected" bug).
+        let mut meta: HashMap<String, OwnedValue> = HashMap::new();
+        meta.insert(
+            "xesam:title".into(),
+            Value::new("The Rebel Path").try_to_owned().unwrap(),
+        );
+        meta.insert(
+            "xesam:artist".into(),
+            Value::new(vec!["P.T. Adamczyk".to_string()])
+                .try_to_owned()
+                .unwrap(),
+        );
+        // Wrap the metadata dict in an extra variant layer.
+        let wrapped = Value::Value(Box::new(Value::new(meta)));
+
+        let mut props: HashMap<String, OwnedValue> = HashMap::new();
+        props.insert(
+            "PlaybackStatus".into(),
+            Value::new("Playing").try_to_owned().unwrap(),
+        );
+        props.insert("Metadata".into(), wrapped.try_to_owned().unwrap());
+
+        let s = parse_state("mpd", &props);
+        assert_eq!(s.title, "The Rebel Path");
+        assert_eq!(s.artist, "P.T. Adamczyk");
+        assert_eq!(s.state, PlaybackState::Playing);
     }
 }

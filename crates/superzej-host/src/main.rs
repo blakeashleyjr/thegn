@@ -67,6 +67,7 @@ mod loc_scan;
 mod logotype;
 mod lsp;
 mod managed_tool;
+mod media_watch;
 mod mem;
 mod menu;
 mod merge_driver;

@@ -7374,35 +7374,9 @@ fn spawn_media_watch(
     tx: tokio_mpsc::UnboundedSender<Option<superzej_core::media::MediaState>>,
     waker: TerminalWaker,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if !cfg.enabled {
-        return None;
-    }
-    Some(tokio::spawn(async move {
-        let Some(client) = superzej_media::client_for(&cfg.resolve_opts()).await else {
-            return;
-        };
-        let _ = tx.send(client.snapshot().await.unwrap_or(None));
-        let _ = waker.wake();
-        if let Some(mut watch) = client.watch().await {
-            // Push path: re-snapshot on each D-Bus signal (no polling timer).
-            while watch.changed().await {
-                if tx.send(client.snapshot().await.unwrap_or(None)).is_err() {
-                    break;
-                }
-                let _ = waker.wake();
-            }
-        } else {
-            // Poll path: backends without a signal stream.
-            let interval = std::time::Duration::from_secs(cfg.poll_interval_secs.max(1));
-            loop {
-                tokio::time::sleep(interval).await;
-                if tx.send(client.snapshot().await.unwrap_or(None)).is_err() {
-                    break;
-                }
-                let _ = waker.wake();
-            }
-        }
-    }))
+    // Body lives in `media_watch` (run.rs is line-ratcheted); it resolves the
+    // backend, streams snapshots, self-heals, and respawns on stream end.
+    crate::media_watch::spawn(cfg, tx, waker)
 }
 
 /// Abort any running watcher and (re)spawn one for `cfg`. Called at startup, on
