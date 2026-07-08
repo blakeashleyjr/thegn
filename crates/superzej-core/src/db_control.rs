@@ -51,6 +51,7 @@ pub(crate) fn migrate_v40(conn: &Connection) -> Result<()> {
             created_at  INTEGER NOT NULL,
             expires_at  INTEGER,
             redeemed_at INTEGER,
+            approved_at INTEGER,
             revoked_at  INTEGER
         );
         "#,
@@ -100,12 +101,13 @@ fn pairing_row(r: &Row<'_>) -> rusqlite::Result<PairingRow> {
         created_at: r.get(6)?,
         expires_at: r.get(7)?,
         redeemed_at: r.get(8)?,
-        revoked_at: r.get(9)?,
+        approved_at: r.get(9)?,
+        revoked_at: r.get(10)?,
     })
 }
 
 const PAIRING_COLS: &str = "pairing_id, kind, token_hash, scope, label, parent_id, \
-                            created_at, expires_at, redeemed_at, revoked_at";
+                            created_at, expires_at, redeemed_at, approved_at, revoked_at";
 
 impl ControlStore for Db {
     fn put_daemon(&self, row: &DaemonRow) -> Result<()> {
@@ -236,8 +238,8 @@ impl ControlStore for Db {
         self.conn().execute(
             "INSERT OR REPLACE INTO pairings \
              (pairing_id, kind, token_hash, scope, label, parent_id, \
-              created_at, expires_at, redeemed_at, revoked_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              created_at, expires_at, redeemed_at, approved_at, revoked_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 row.pairing_id,
                 row.kind,
@@ -248,6 +250,7 @@ impl ControlStore for Db {
                 row.created_at,
                 row.expires_at,
                 row.redeemed_at,
+                row.approved_at,
                 row.revoked_at
             ],
         )?;
@@ -269,6 +272,7 @@ impl ControlStore for Db {
                 &format!(
                     "SELECT {PAIRING_COLS} FROM pairings \
                      WHERE pairing_id = ?1 AND kind = 'token' AND revoked_at IS NULL \
+                       AND approved_at IS NOT NULL \
                        AND (expires_at IS NULL OR expires_at > ?2)"
                 ),
                 params![pairing_id, now_ms],
@@ -296,6 +300,15 @@ impl ControlStore for Db {
             )
             .optional()?;
         Ok(row)
+    }
+
+    fn approve_pairing(&self, pairing_id: &str, now_ms: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE pairings SET approved_at = ?2 \
+             WHERE pairing_id = ?1 AND approved_at IS NULL AND revoked_at IS NULL",
+            params![pairing_id, now_ms],
+        )?;
+        Ok(())
     }
 
     fn revoke_pairing(&self, pairing_id: &str, now_ms: i64) -> Result<()> {
@@ -336,6 +349,7 @@ mod tests {
             created_at: 1_000,
             expires_at,
             redeemed_at: None,
+            approved_at: Some(1_000),
             revoked_at: None,
         }
     }
@@ -483,6 +497,31 @@ mod tests {
         db.put_pairing(&pairing("tok1", "token", "h", None))
             .unwrap();
         assert!(db.redeem_pairing_code("tok1", 1_000).unwrap().is_none());
+    }
+
+    #[test]
+    fn parked_token_needs_approval() {
+        let db = Db::open_memory().unwrap();
+        let mut parked = pairing("tok-p", "token", "h", None);
+        parked.approved_at = None; // [serve] require_approval parks it
+        db.put_pairing(&parked).unwrap();
+        assert!(db.pairing_for_auth("tok-p", 2_000).unwrap().is_none());
+
+        db.approve_pairing("tok-p", 3_000).unwrap();
+        let ok = db.pairing_for_auth("tok-p", 4_000).unwrap().unwrap();
+        assert_eq!(ok.approved_at, Some(3_000));
+        // Approval never resurrects a revoked row; approve is idempotent.
+        db.approve_pairing("tok-p", 9_000).unwrap();
+        assert_eq!(
+            db.pairing_for_auth("tok-p", 9_500)
+                .unwrap()
+                .unwrap()
+                .approved_at,
+            Some(3_000)
+        );
+        db.revoke_pairing("tok-p", 10_000).unwrap();
+        db.approve_pairing("tok-p", 11_000).unwrap();
+        assert!(db.pairing_for_auth("tok-p", 12_000).unwrap().is_none());
     }
 
     #[test]

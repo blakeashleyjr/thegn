@@ -133,10 +133,13 @@ impl ScopeSet {
 pub enum Verb {
     ListSessions,
     ListWorktrees,
+    OpenSession,
     Attach,
     Detach,
     SendInput,
+    Resize,
     Snapshot,
+    KillSession,
     OpenWorktree,
     DriveBrowser,
     GitStatus,
@@ -164,9 +167,14 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
-        Verb::Attach | Verb::Detach | Verb::SendInput | Verb::OpenWorktree | Verb::DriveBrowser => {
-            Scope::Write
-        }
+        Verb::OpenSession
+        | Verb::Attach
+        | Verb::Detach
+        | Verb::SendInput
+        | Verb::Resize
+        | Verb::KillSession
+        | Verb::OpenWorktree
+        | Verb::DriveBrowser => Scope::Write,
         Verb::GitStage | Verb::GitCommit => Scope::Git,
         Verb::IssuePairing
         | Verb::ListPairings
@@ -418,7 +426,16 @@ mod tests {
             GitStatus,
             Me,
         ];
-        let write = [Attach, Detach, SendInput, OpenWorktree, DriveBrowser];
+        let write = [
+            OpenSession,
+            Attach,
+            Detach,
+            SendInput,
+            Resize,
+            KillSession,
+            OpenWorktree,
+            DriveBrowser,
+        ];
         let git = [GitStage, GitCommit];
         let admin = [
             IssuePairing,
