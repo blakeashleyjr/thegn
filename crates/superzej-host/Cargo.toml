@@ -78,6 +78,9 @@ pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 # re-export). The host renders embedded apps' ratatui buffers through
 # `sz_kit::ratatui` so the Buffer type is identical to what the apps produce.
 sz-kit = { path = "../sz-kit" }
+# The embedded "Observe" observability app tile (gtui). Rendered through the
+# same `sz_kit::ratatui` Buffer as any other AppTile.
+gtui-embed = { path = "../gtui-embed" }
 tokei.workspace = true
 # Symbol-declaration regex (search_everywhere symbol sweep) — extracts the
 # identifier from a definition line returned by fff grep.

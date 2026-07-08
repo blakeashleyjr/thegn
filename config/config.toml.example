@@ -305,12 +305,29 @@ token = "env:JENKINS_TOKEN"
 server = ""                # empty = ambient argo/argocd/kubeconfig context
 token = "env:ARGOCD_TOKEN"
 
-# Top-level app tab strip. Only "work" (your worktree IDE) is available today;
-# unknown ids are ignored.
+# Top-level app tab strip. "work" (your worktree IDE) is always present; the
+# "Observe" tab appears when [observe] enabled = true (below). Unknown ids ignored.
 # Valid ids: "work".
 [apps]
 default_tab = "work" # initial tab (SUPERZEJ_APPS_DEFAULT_TAB); "work" = your worktree
 tab_order = ["work"]
+
+# The embedded "Observe" observability app tab: a Grafana-style in-terminal
+# dashboard. Off by default (additive). When enabled it shows a built-in
+# host-metrics dashboard (CPU/mem/load, sampled locally — no external services);
+# point it at Prometheus/Loki and/or a custom dashboard TOML for more.
+# Switch to the tab with Alt+2 (or Alt+] to cycle); inside: [r]efresh,
+# [ / ] to narrow/widen the window, [esc] back to work.
+[observe]
+enabled = false               # show the Observe tab in the app strip
+refresh_interval_secs = 15    # panel auto-refresh cadence
+dashboard_path = ""           # "" = built-in host dashboard; else a dashboard TOML path (~ ok)
+[observe.prometheus]
+# base_url = "http://localhost:9090"   # empty ⇒ Prometheus panels report "not configured"
+# token = "env:PROMETHEUS_TOKEN"       # bearer token; env:VAR / file:PATH / literal
+[observe.loki]
+# base_url = "http://localhost:3100"
+# token = "env:LOKI_TOKEN"
 
 # The per-session daemon that pushes live diff/PR updates to the panel.
 [watch]
