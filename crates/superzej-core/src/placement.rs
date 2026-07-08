@@ -394,14 +394,29 @@ impl Placement {
         }
     }
 
+    /// The control-plane argv that probes for `bin` on a remote placement.
+    /// Probes through a *login* shell (`sh -lc`), matching the login-shell
+    /// semantics of every real remote exec (OciRunner::control_shell_argv,
+    /// interactive_wrap, host_exec). On Nix/WSL2 hosts podman lands only on the
+    /// login PATH, so a bare `ssh host -- command -v podman` returns 127 and
+    /// strands the placement on Backend::None even though the real exec would
+    /// find it.
+    fn probe_argv(&self, bin: &str) -> Vec<String> {
+        let probe = vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            format!("command -v {bin} >/dev/null 2>&1"),
+        ];
+        self.control_argv(&probe)
+    }
+
     /// Is the named binary present in this placement? (Local: PATH; remote: a
-    /// `command -v` probe through the placement's control primitive.)
+    /// login-shell `command -v` probe through the placement's control primitive.)
     pub fn has_binary(&self, bin: &str) -> bool {
         match self {
             Placement::Local => util::have(bin),
             _ => {
-                let probe = vec![format!("command -v {bin} >/dev/null 2>&1")];
-                let argv = self.control_argv(&probe);
+                let argv = self.probe_argv(bin);
                 std::process::Command::new(&argv[0])
                     .args(&argv[1..])
                     .output()
@@ -578,6 +593,30 @@ mod tests {
         // Assert the raw command is in both the dtach execution and the fallback
         assert!(cmd.contains("exec echo hello"));
         assert!(cmd.contains("; else exec echo hello; fi"));
+    }
+
+    #[test]
+    fn remote_binary_probe_uses_login_shell() {
+        // The availability probe must run under a *login* shell (`sh -lc`) so it
+        // sees the same PATH as the real remote exec — on Nix/WSL2 hosts podman
+        // is only on the login PATH. A bare `ssh host -- command -v podman`
+        // regresses this and strands the placement on Backend::None.
+        let p = Placement::Ssh(SshPlacement::plain(
+            "dev@box".into(),
+            22,
+            false,
+            TransportKind::Ssh,
+        ));
+        let argv = p.probe_argv("podman");
+        let joined = argv.join(" ");
+        assert!(
+            joined.contains("/bin/sh -lc"),
+            "probe not login-shell: {joined}"
+        );
+        assert!(
+            joined.contains("command -v podman"),
+            "probe missing bin: {joined}"
+        );
     }
 
     #[test]

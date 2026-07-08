@@ -30,6 +30,38 @@ const REMOTE_WORKTREE_DEST: &str = "/workspace";
 static SYNCED: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Guard a REMOTE placement that resolved to a bare `Backend::None`. A remote
+/// SSH placement has no container to hold the synced worktree, so degrading to
+/// `none` would ship a `cd <local-worktree>` to a bare remote shell (the
+/// "cd: can't cd to …" fallback). Bail with a [`SandboxHalt`] — unless the user
+/// asked for `none` explicitly, or opted into `failover`. K8s/Provider `none` is
+/// legitimate (the placement itself is the boundary); an SSH env with a
+/// projection runs locally (`Local`) and never reaches here.
+///
+/// [`SandboxHalt`]: crate::agent::SandboxHalt
+pub(crate) fn ssh_none_guard(
+    spec: &superzej_core::sandbox::SandboxSpec,
+    configured: superzej_core::config::SandboxBackend,
+    failover: bool,
+    env_name: &str,
+    placement_label: &str,
+) -> anyhow::Result<()> {
+    let ssh = matches!(spec.placement, superzej_core::placement::Placement::Ssh(_));
+    let explicit_none = configured == superzej_core::config::SandboxBackend::None;
+    if ssh && !explicit_none && !failover {
+        return Err(crate::agent::SandboxHalt {
+            env_name: env_name.to_string(),
+            placement: placement_label.to_string(),
+            reason: "no container runtime found on the remote host (podman not \
+                     detected over ssh); install a container runtime there, or \
+                     set a reachable [sandbox] backend"
+                .to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
@@ -39,10 +71,11 @@ fn q(s: &str) -> String {
 }
 
 /// Run a local `git -C <worktree> <args>` and return trimmed stdout on success.
+/// Uses `util::git_cmd` for the GIT_* env scrub (never raw `Command::new("git")`).
 fn local_git(worktree: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
+    // off-loop: the sandbox-prepare path runs on spawn_blocking, never the loop.
+    #[expect(clippy::disallowed_methods)]
+    let out = superzej_core::util::git_cmd(std::path::Path::new(worktree))
         .args(args)
         .output()
         .ok()?;

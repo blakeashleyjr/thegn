@@ -9,6 +9,7 @@
 //! `launch_spec` are pure over `Config`/`Db`, so the wiring in `run.rs` stays a
 //! thin call.
 
+use crate::remote_sync::ssh_none_guard;
 use std::path::{Path, PathBuf};
 use superzej_core::config::Config;
 use superzej_core::db::Db;
@@ -405,14 +406,13 @@ pub fn prepare_sandbox_env(
             sandbox::resolve_placed(&candidate, loc, &cname, hardening, exec_placement.clone())
         {
             if spec.backend == sandbox::Backend::None {
-                // A `none` backend on a *local* placement means "run on the host"
-                // (the plain-shell fallback below). On a *remote* placement
-                // (ssh/k8s/provider) the placement itself is the boundary — the
-                // bare-shell spec carries the worktree into the pod/host, so use
-                // it instead of falling back to a local host shell.
+                // Local `none` = run on the host (plain-shell fallback below). A
+                // remote SSH placement degrading to `none` fails loud (no
+                // container for the synced worktree) — see ssh_none_guard.
                 if spec.placement.is_local() {
                     break;
                 }
+                ssh_none_guard(&spec, sb.backend, failover, &env_name, &placement_label)?;
                 return Ok(SandboxOutcome {
                     backend_label: spec.backend.label().to_string(),
                     spec: Some(spec),
