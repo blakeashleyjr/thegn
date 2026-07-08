@@ -84,9 +84,6 @@ pub trait PaneEmulator: Send {
     }
     /// Cursor position as `(row, col)`.
     fn cursor(&self) -> (u16, u16);
-    /// Whether the cursor should be drawn (hidden in some modes).
-    #[allow(dead_code)]
-    fn cursor_visible(&self) -> bool;
     /// Scroll the viewport up into history by `n` rows (copy-mode / scrollback).
     fn scroll_up(&mut self, _n: usize) {}
     /// Scroll the viewport back down toward the live tail by `n` rows.
@@ -123,14 +120,6 @@ pub trait PaneEmulator: Send {
     /// them for its own selection (hold Shift to force host selection).
     fn mouse_mode(&self) -> (MouseMode, bool) {
         (MouseMode::None, false)
-    }
-    /// Number of lines currently stored in the parallel history ring. Used by
-    /// `apply_search_jump` to compute the scroll offset needed to bring a
-    /// matched line into view. Returns `None` when the emulator has no attached
-    /// history ring (e.g. in unit tests that use a stub emulator).
-    #[allow(dead_code)] // used by search jump scroll-offset calculation
-    fn history_len(&self) -> Option<usize> {
-        None
     }
 }
 
@@ -268,11 +257,6 @@ impl PaneEmulator for AlacrittyEmulator {
         let term = self.term.lock();
         let point = term.grid().cursor.point;
         (point.line.0 as u16, point.column.0 as u16)
-    }
-
-    fn cursor_visible(&self) -> bool {
-        let term = self.term.lock();
-        term.mode().contains(TermMode::SHOW_CURSOR)
     }
 
     fn scroll_up(&mut self, n: usize) {

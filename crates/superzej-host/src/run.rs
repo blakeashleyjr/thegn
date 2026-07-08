@@ -4997,9 +4997,6 @@ fn dispatch_menu_choice(
         );
     };
     match choice {
-        MenuChoice::LocMetrics => {
-            // Nothing to do for LOC, it's just informational
-        }
         MenuChoice::RebaseContinue => enqueue(panel_ui, model, GitOp::RebaseContinue),
         MenuChoice::RebaseAbort => enqueue(panel_ui, model, GitOp::RebaseAbort),
         MenuChoice::RebaseSkip => enqueue(panel_ui, model, GitOp::RebaseSkip),
@@ -5085,9 +5082,6 @@ fn dispatch_menu_choice(
                 p.marks.clear();
                 model.status = "patch reset".into();
             }
-        }
-        MenuChoice::DiffSwap => {
-            model.status = "diff sides swap is not wired yet".into();
         }
         MenuChoice::DiffExit => {
             panel_ui.git.flow = GitFlow::None;
@@ -7079,9 +7073,9 @@ fn apply_scoped_edits(worktree: &str, path: &str, edits: &serde_json::Value) -> 
 async fn ensure_app_loaded(
     app_host: &mut crate::apps::AppHost,
     target: crate::apps::ActiveApp,
-    _app_tx: &tokio_mpsc::UnboundedSender<usize>,
-    _waker: &TerminalWaker,
-    _current_config: &superzej_core::config::Config,
+    app_tx: &tokio_mpsc::UnboundedSender<usize>,
+    waker: &TerminalWaker,
+    current_config: &superzej_core::config::Config,
     event_bus: &superzej_core::event_bus::EventBus,
 ) -> bool {
     let crate::apps::ActiveApp::Tile(i) = target else {
@@ -7091,18 +7085,7 @@ async fn ensure_app_loaded(
         return true;
     }
     let slot = &mut app_host.slots[i];
-    if slot.id == "agent" {
-        let (mcp_transport, _rx) =
-            crate::apps::agent::AgentMcpTransport::new(std::sync::Arc::new(event_bus.clone()));
-        let ui = Box::new(crate::apps::agent::AgentUi { mcp_transport });
-        slot.state = crate::apps::SlotState::Running(ui);
-        return true;
-    }
-
-    // No embedded app builders are registered today, so a tile target can't be
-    // constructed (`AppHost::from_config` never produces tile slots). When a
-    // builder is added, construct the tile here and store it as `Running`.
-    false
+    crate::apps::start_slot_tile(slot, i, app_tx, waker, current_config, event_bus)
 }
 
 // === media control (optional [media] feature) ==============================

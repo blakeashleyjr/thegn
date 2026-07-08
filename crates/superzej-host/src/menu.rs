@@ -21,7 +21,6 @@ use superzej_core::theme::Hue;
 /// A typed menu outcome the event loop dispatches on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MenuChoice {
-    LocMetrics,
     // rebase options (m)
     RebaseContinue,
     RebaseAbort,
@@ -39,7 +38,6 @@ pub enum MenuChoice {
     PatchRemoveFromCommit,
     PatchReset,
     // diff-mode menu (W)
-    DiffSwap,
     DiffExit,
     // bisect menu (b)
     BisectStart,
@@ -609,22 +607,6 @@ pub fn sandbox_halt_menu(title: impl Into<String>, body: impl Into<String>) -> M
     .with_body(body)
 }
 
-/// First-launch keymap picker (item 621): pick a familiar IDE keymap overlay or
-/// keep superzej's defaults. Each choice resolves to `SetKeymapPreset`.
-pub fn loc_metrics_menu(loc: Option<u64>) -> MenuOverlay {
-    let loc_str = loc
-        .map(|l| format!("Total Lines of Code: {}", l))
-        .unwrap_or_else(|| "Total Lines of Code: Unknown".to_string());
-    let items = vec![MenuItem {
-        key: Some('L'),
-        label: loc_str,
-        note: None,
-        choice: MenuChoice::LocMetrics,
-        danger: false,
-    }];
-    MenuOverlay::new(MenuKindTag::CustomCommands, "loc metrics", items)
-}
-
 pub fn keymap_preset_menu() -> MenuOverlay {
     MenuOverlay::new(
         MenuKindTag::KeymapPicker,
@@ -756,10 +738,7 @@ pub fn diff_menu(marked: &str) -> MenuOverlay {
     MenuOverlay::new(
         MenuKindTag::Diff,
         "diffing",
-        vec![
-            item(Some('s'), "swap diff sides", MenuChoice::DiffSwap).note(format!("vs {marked}")),
-            item(Some('x'), "exit diff mode", MenuChoice::DiffExit),
-        ],
+        vec![item(Some('x'), "exit diff mode", MenuChoice::DiffExit).note(format!("vs {marked}"))],
     )
 }
 
@@ -1499,7 +1478,7 @@ mod tests {
     fn patch_and_diff_menus_have_expected_hotkeys() {
         assert_eq!(hotkeys(&patch_menu()), vec!['a', 'r', 'i', 'c', 'd', 'x']);
         let d = diff_menu("main");
-        assert_eq!(hotkeys(&d), vec!['s', 'x']);
+        assert_eq!(hotkeys(&d), vec!['x']);
         assert_eq!(d.items()[0].note.as_deref(), Some("vs main"));
     }
 
