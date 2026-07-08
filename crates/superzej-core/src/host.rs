@@ -536,7 +536,13 @@ pub fn apply_ready_host(spec: &mut crate::sandbox::SandboxSpec, rh: &ReadyHostSp
     if spec.image.is_none() && !rh.image.is_empty() {
         spec.image = Some(rh.image.clone());
     }
-    if spec.oci_host.is_none() {
+    // Adopt the remote daemon URL only for a LOCAL placement (podman's native
+    // `--url ssh://` client). For a remote placement (Ssh/K8s/Provider) the
+    // placement already wraps the `podman` argv with the correct transport
+    // (ProxyCommand etc.); layering `podman --url ssh://host` on top double-wraps
+    // the hop AND the inner `--url` carries none of the placement's ssh options
+    // (ProxyCommand), so it can't connect. Let the placement own the hop.
+    if spec.oci_host.is_none() && spec.placement.is_local() {
         spec.oci_host = rh.oci_url.clone();
     }
     for (name, dest) in &rh.volumes {
@@ -547,6 +553,26 @@ pub fn apply_ready_host(spec: &mut crate::sandbox::SandboxSpec, rh: &ReadyHostSp
     if spec.init_script.is_none() {
         spec.init_script = rh.init_script.clone();
     }
+}
+
+/// Point a REMOTE-placement OCI `spec` at a worktree tree materialized on the
+/// remote host at `remote_host_path`, bind-mounted into the container at `dest`.
+/// The default path-preserving worktree + git-common + host-toolchain mounts are
+/// all **local** paths absent on the remote, so they're replaced with the single
+/// remote bind (the fresh remote clone is self-contained; the container's
+/// toolchain comes from the baked image).
+pub fn mount_remote_worktree(
+    spec: &mut crate::sandbox::SandboxSpec,
+    remote_host_path: &str,
+    dest: &str,
+) {
+    spec.worktree = std::path::PathBuf::from(dest);
+    spec.mounts = vec![crate::sandbox::Mount {
+        host: remote_host_path.to_string(),
+        dest: dest.to_string(),
+        ro: false,
+        cache: false,
+    }];
 }
 
 #[cfg(test)]
@@ -814,6 +840,54 @@ mod tests {
         assert_eq!(spec2.oci_host.as_deref(), Some("unix:///mine.sock"));
         assert_eq!(spec2.volumes.len(), 2, "only the missing dest was added");
         assert!(spec2.volumes.iter().any(|(n, _)| n == "custom-nix"));
+    }
+
+    #[test]
+    fn mount_remote_worktree_replaces_local_mounts_with_single_remote_bind() {
+        let mut spec = blank_spec();
+        spec.mounts = vec![crate::sandbox::Mount {
+            host: "/nix/store".into(),
+            dest: "/nix/store".into(),
+            ro: true,
+            cache: false,
+        }];
+        mount_remote_worktree(
+            &mut spec,
+            "/home/targe/superzej-worktrees/sz-x",
+            "/workspace",
+        );
+        assert_eq!(spec.worktree, std::path::PathBuf::from("/workspace"));
+        assert_eq!(spec.mounts.len(), 1, "local git/toolchain mounts dropped");
+        assert_eq!(spec.mounts[0].host, "/home/targe/superzej-worktrees/sz-x");
+        assert_eq!(spec.mounts[0].dest, "/workspace");
+        assert!(!spec.mounts[0].ro);
+    }
+
+    #[test]
+    fn apply_ready_host_skips_oci_url_for_remote_placement() {
+        // Regression: a remote (ssh) placement must NOT adopt the ready host's
+        // `--url ssh://` — the placement already wraps podman with the correct
+        // transport; `podman --url ssh://host` inside `ssh host -- …` double-wraps
+        // the hop and the inner url carries no ProxyCommand → can't connect.
+        let mut spec = blank_spec();
+        spec.placement = crate::placement::Placement::Ssh(SshPlacement::plain(
+            "targe@ageless-studio".into(),
+            22,
+            false,
+            crate::placement::TransportKind::Ssh,
+        ));
+        let rh = ReadyHostSpec {
+            image: "ghcr.io/x/base@sha256:abc".into(),
+            oci_url: Some("ssh://targe@ageless-studio:22/run/podman.sock".into()),
+            volumes: vec![],
+            init_script: None,
+        };
+        apply_ready_host(&mut spec, &rh);
+        assert_eq!(spec.image.as_deref(), Some("ghcr.io/x/base@sha256:abc"));
+        assert!(
+            spec.oci_host.is_none(),
+            "remote placement must keep oci_host None (no --url double-wrap)"
+        );
     }
 
     #[test]

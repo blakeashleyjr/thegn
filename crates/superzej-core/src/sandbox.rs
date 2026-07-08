@@ -1020,22 +1020,24 @@ fn on_missing(cfg: &SandboxConfig, what: &str) {
 /// Is `backend`'s binary present in this placement (locally on PATH, or probed
 /// through the placement's control primitive: ssh / kubectl exec / provider)?
 ///
-/// **Memoized** (D3): availability is stable per `(placement, backend)` for the
-/// session, but the raw probe is a subprocess (`sudo -n podman version`) / PATH
-/// walk / remote `command -v`, and `pick_backend` re-runs it up to ~30× per pane
-/// spawn — a real per-worktree-switch stall. Probe once, cache the result. A
-/// backend that appears/disappears mid-session needs a restart (acceptable).
+/// **Memoized** (D3): probe once per `(placement, backend)`; cache success
+/// permanently, failure only 30s (a permanent `false` stranded a remote host).
 fn available(placement: &Placement, backend: Backend) -> bool {
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(String, Backend), bool>>,
+        std::sync::Mutex<std::collections::HashMap<(String, Backend), (bool, std::time::Instant)>>,
     > = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let key = (format!("{placement:?}"), backend);
-    if let Some(&v) = cache.lock().unwrap().get(&key) {
+    if let Some(&(v, at)) = cache.lock().unwrap().get(&key)
+        && (v || at.elapsed() < std::time::Duration::from_secs(30))
+    {
         return v;
     }
     let v = available_probe(placement, backend);
-    cache.lock().unwrap().insert(key, v);
+    cache
+        .lock()
+        .unwrap()
+        .insert(key, (v, std::time::Instant::now()));
     v
 }
 
