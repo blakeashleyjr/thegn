@@ -40,6 +40,7 @@ mod focus;
 mod font;
 mod forward;
 mod frame_write;
+mod git_watch;
 mod gitmut;
 mod handlers;
 mod hibernator;
@@ -231,6 +232,15 @@ pub enum Command {
     /// repo's target branch, landing clean ones and deferring conflicts
     /// (`[merge_queue]`, the fold-actor).
     Integrate,
+    /// Land the current worktree's branch onto the repo's target branch (`main`)
+    /// via the fold-actor: fold in the object DB, gate, then advance the target
+    /// ref by compare-and-swap — no target checkout needed, so it works even when
+    /// the main checkout is read-only. The blessed one-shot alternative to
+    /// `git checkout main && git merge`.
+    Land {
+        /// Worktree path (default: the current worktree).
+        worktree: Option<String>,
+    },
     /// Agent-driven merge queue: assign branches (`merge add`) and drain them one
     /// by one (`merge drain`), dispatching a headless CLI agent to resolve
     /// conflicts / fix the build (`[merge_queue]`).
@@ -597,6 +607,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Diff { args } => cmd::wt::run(&cfg, cmd::wt::Action::Diff(args)),
         Command::List { args } => cmd::wt::run(&cfg, cmd::wt::Action::List(args)),
         Command::Integrate => cmd::integrate::run(&cfg),
+        Command::Land { worktree } => cmd::land::run(&cfg, worktree),
         Command::Merge { action } => cmd::merge::run(&cfg, action),
         Command::Disk { args } => cmd::wt::run(&cfg, cmd::wt::Action::Disk(args)),
         Command::Clean { args } => cmd::wt::run(&cfg, cmd::wt::Action::Clean(args)),

@@ -239,15 +239,13 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
 }
 
 fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
-    let root = repo_root()?;
     let wt = super::resolve_worktree(worktree);
     let wt_s = wt.to_string_lossy().to_string();
-    let branch = branch_of(&wt).with_context(|| format!("{wt_s}: not on a branch"))?;
-    // Force the land regardless of the configured auto_land (this IS the manual land).
-    let mut mq = cfg.merge_queue.clone();
-    mq.auto_land = true;
+    // Share the fold/gate/CAS core with `superzej land`; this queue-aware path
+    // additionally records the outcome on the worktree's merge-queue row.
+    let (branch, _target, outcome) = super::land::land_branch(cfg, &wt)?;
     let db = Db::open()?;
-    match integrate::attempt_land(&mq, &root, &branch)? {
+    match outcome {
         AttemptOutcome::Landed { commit } => {
             let _ = db.update_merge_status(&wt_s, "landed", Some(&commit), None, None);
             outln!("✓ landed {branch} → {}", &commit[..commit.len().min(12)]);

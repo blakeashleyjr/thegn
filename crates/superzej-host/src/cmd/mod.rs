@@ -22,6 +22,7 @@ pub mod forward;
 pub mod host;
 pub mod integrate;
 pub mod issue;
+pub mod land;
 pub mod list;
 pub mod logs;
 pub mod mcp;

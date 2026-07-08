@@ -5,7 +5,21 @@
 //! filesystem view can diverge from git's (the sandbox-canonical-worktree
 //! incoherence failure mode): the merge half-applies into the working tree and
 //! is silently orphaned, corrupting `main`. The blessed, structurally-immune
-//! path is `szhost integrate` (an object-DB fold with no checkout).
+//! paths are `szhost integrate` (drain the whole queue) and `szhost land`
+//! (one-shot land the current branch) — both object-DB folds with no checkout.
+//!
+//! **The sandbox boundary, and why the blessed paths work.** A sandbox mounts
+//! the canonical's **working tree read-only** (to protect a live instance) but
+//! keeps the shared `.git` (object + ref store) **writable**. So a `git merge` /
+//! `merge --ff-only` fails — it must rewrite the read-only tree — but the fold
+//! path succeeds: it writes objects and advances `refs/heads/main` by
+//! compare-and-swap (`update-ref <ref> <new> <old>`), never touching the tree.
+//! The tree then re-coheres on its own: a running instance whose live checkout
+//! is on the advanced branch fast-forwards its **own** working tree on the ref
+//! move (`util::heal_main_checkout_worktree`, driven by the ref fs-watcher — see
+//! the host's `git_watch::spawn_main_checkout_heal`). Never hand-roll a
+//! `git update-ref` to "merge to main"; use `szhost land`, which folds, gates,
+//! CAS-advances, and lets the live instance sync itself.
 //!
 //! This module ships a `pre-merge-commit` hook that detects exactly that
 //! situation and refuses, pointing at `szhost integrate`. szhost installs it

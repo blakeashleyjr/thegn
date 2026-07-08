@@ -223,3 +223,13 @@ part of the shipped `szhost` binary.
   regenerate. `git add` new files before `nix flake check`.
 - Commit/push only when asked; branch off `main` first. Conventional commit
   style (`feat(scope):`, `fix(scope):`) matches the history.
+- **Landing on `main` from a sandbox/worktree.** The canonical checkout's
+  working tree is mounted **read-only** (protecting a live instance) but the
+  shared `.git` (object + ref store) is **writable**. So `git checkout main &&
+git merge` / `merge --ff-only` fail (they rewrite the read-only tree), while
+  the object-DB fold succeeds. Use **`szhost land`** (one-shot: fold + gate +
+  CAS-advance `refs/heads/main`, no target checkout) — or `szhost integrate` for
+  the whole queue. A running instance on `main` then fast-forwards its own tree
+  on the ref move (`git_watch`/`util::heal_main_checkout_worktree`). Don't
+  hand-roll `git update-ref` to "merge to main" (it moves the ref but leaves the
+  live tree stale). See `crates/superzej-core/src/merge_guard.rs`.

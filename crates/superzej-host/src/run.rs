@@ -7681,6 +7681,10 @@ async fn event_loop<T: Terminal>(
     // media section would otherwise full-recompose the chrome per tick → flicker.
     // Repaint it at most ~1/s; the snapshot data is updated every tick regardless.
     let mut last_media_full: Option<std::time::Instant> = None;
+    // Throttle the main-checkout self-heal: a `MainRefMoved` can arrive from the
+    // ref fs-watcher and the coarse ticker back-to-back; only kick the off-loop
+    // heal at most ~every 2s so rapid ref churn can't spawn a `git` probe storm.
+    let mut last_main_heal: Option<std::time::Instant> = None;
     // Keys whose sandbox probe failed: suppressed from future pre-warm probes
     // so a permanently-unavailable backend (no podman/bwrap installed) cannot
     // keep spawning new threads on every event loop iteration. The active-tab
@@ -8514,28 +8518,15 @@ async fn event_loop<T: Terminal>(
                 keymap.config(),
                 host_cache_port,
             );
-            // Re-heal the canonical checkout's shared `.git/config` off-thread:
-            // another agent committing in a sibling worktree could have leaked a
-            // stray `core.worktree` since launch. Silent unless it strips a key;
-            // off the loop because it shells out (`rev-parse`).
-            {
-                let wt = current_worktree.clone();
-                tokio::task::spawn_blocking(move || {
-                    // off-loop: inside spawn_blocking
-                    #[expect(clippy::disallowed_methods)]
-                    if let Some(common_parent) = superzej_core::util::git_cmd(&wt)
-                        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .and_then(|o| String::from_utf8(o.stdout).ok())
-                        .map(|s| std::path::PathBuf::from(s.trim()))
-                        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-                    {
-                        superzej_core::util::heal_main_checkout_worktree(&common_parent);
-                    }
-                });
-            }
+            // Re-heal the canonical checkout off-thread on switch: another agent
+            // committing / landing in a sibling worktree since the last visit could
+            // have leaked a stray `core.worktree` into the shared `.git/config` or
+            // advanced the branch ref out from under the main checkout's tree.
+            crate::git_watch::spawn_main_checkout_heal(
+                current_worktree.clone(),
+                refresh_tx.clone(),
+                waker.clone(),
+            );
             // Load this worktree's cached test state (most-recent status) so the
             // Tests tab shows it instantly; discovery stays lazy (on tab open).
             panel_ui.tests = crate::panel::TestPanelState::default();
@@ -11061,6 +11052,7 @@ async fn event_loop<T: Terminal>(
         let mut want_issue_refresh = false;
         let mut want_ci_refresh = false;
         let mut want_disk_refresh = false;
+        let mut want_main_sync = false;
         // Fold-actor results: report what landed/deferred and re-hydrate so the
         // advanced target tip and cleared activity dots show immediately.
         while let Ok(result) = fold_rx.try_recv() {
@@ -11111,7 +11103,23 @@ async fn event_loop<T: Terminal>(
                 // the next model hydrate, so this does NOT force one here.
                 RefreshKind::Disk => want_disk_refresh = true,
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
+                // The repo's branch ref moved (external `update-ref` / a fold-actor
+                // CAS land elsewhere); heal the canonical checkout's tree off-loop.
+                RefreshKind::MainRefMoved => want_main_sync = true,
             }
+        }
+        // Fast-forward the canonical main checkout's working tree if its branch ref
+        // advanced under it. Throttled to ~2s (the fs-watch + coarse ticker can both
+        // fire) and run off-loop; a guarded no-op when the checkout is coherent.
+        if want_main_sync
+            && last_main_heal.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2))
+        {
+            last_main_heal = Some(std::time::Instant::now());
+            crate::git_watch::spawn_main_checkout_heal(
+                active_tab_path(&session),
+                refresh_tx.clone(),
+                waker.clone(),
+            );
         }
         // One hydration in flight; refreshes (incl. switches) coalesce into `pending`.
         model_refresh_pending |= want_model_refresh;
