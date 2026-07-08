@@ -111,9 +111,12 @@ impl AppHost {
 
     pub fn from_config(cfg: &superzej_core::config::Config) -> AppHost {
         let tab_ids = cfg.apps.effective_tab_order();
-        // No embedded app tabs are registered today, so `work` is the only tab.
-        // When a builder is added, push an `AppSlot` for its id here.
-        let slots: Vec<AppSlot> = Vec::new();
+        // Registered app tabs. Each is gated on its own `enabled` flag so the
+        // AI-free shell stays a single `work` tab unless opted in.
+        let mut slots: Vec<AppSlot> = Vec::new();
+        if cfg.observe.enabled {
+            slots.push(AppSlot::new("observe", "Observe"));
+        }
 
         let mut tab_order = Vec::new();
         for id in tab_ids {
@@ -121,6 +124,15 @@ impl AppHost {
                 tab_order.push(ActiveApp::Work);
             } else if let Some(idx) = slots.iter().position(|slot| slot.id == id) {
                 tab_order.push(ActiveApp::Tile(idx));
+            }
+        }
+        // Append any registered app slots the `[apps]` order didn't place (the
+        // common case: `[apps]` only lists `work`, app tabs opt in via their own
+        // section) so an enabled tab is always reachable.
+        for idx in 0..slots.len() {
+            let target = ActiveApp::Tile(idx);
+            if !tab_order.contains(&target) {
+                tab_order.push(target);
             }
         }
         if tab_order.is_empty() {
@@ -211,6 +223,62 @@ impl AppHost {
     }
 }
 
+/// Construct an unloaded slot's tile by id (`agent`, `observe`), storing it as
+/// `Running`. Returns whether a tile was built. All the per-app wiring lives here
+/// so the run-loop call site (`ensure_app_loaded`) stays a thin dispatch — both
+/// `run.rs` and this dispatch are on a tokio runtime thread, so
+/// `Handle::current()` is valid. Unknown ids no-op (unreachable: `from_config`
+/// only creates slots it can build).
+pub fn start_slot_tile(
+    slot: &mut AppSlot,
+    idx: usize,
+    app_tx: &tokio::sync::mpsc::UnboundedSender<usize>,
+    waker: &termwiz::terminal::TerminalWaker,
+    cfg: &superzej_core::config::Config,
+    event_bus: &superzej_core::event_bus::EventBus,
+) -> bool {
+    match slot.id {
+        "agent" => {
+            let (mcp_transport, _rx) =
+                agent::AgentMcpTransport::new(std::sync::Arc::new(event_bus.clone()));
+            slot.state = SlotState::Running(Box::new(agent::AgentUi { mcp_transport }));
+            true
+        }
+        "observe" => {
+            let hook = app_change_hook(app_tx, idx, waker);
+            let tile = build_observe_tile(hook, &cfg.observe, tokio::runtime::Handle::current());
+            slot.state = SlotState::Running(tile);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// A tile's [`ChangeHook`]: fired off-thread when the tile has new data, it posts
+/// the slot index on the app channel and pulses the terminal waker so the loop
+/// drains `app_rx` → `pump_all()` → repaint.
+fn app_change_hook(
+    app_tx: &tokio::sync::mpsc::UnboundedSender<usize>,
+    idx: usize,
+    waker: &termwiz::terminal::TerminalWaker,
+) -> sz_kit::ChangeHook {
+    let tx = app_tx.clone();
+    let wk = waker.clone();
+    std::sync::Arc::new(move || {
+        let _ = tx.send(idx);
+        let _ = wk.wake();
+    })
+}
+
+/// Construct the "Observe" (gtui) app tile from resolved config.
+pub fn build_observe_tile(
+    hook: sz_kit::ChangeHook,
+    cfg: &superzej_core::config_observe::ObserveConfig,
+    rt: tokio::runtime::Handle,
+) -> Box<dyn AppTile> {
+    Box::new(gtui_embed::embed::ObserveTile::new(hook, cfg, rt))
+}
+
 /// Parse a `Palette` `"R;G;B"` fragment to an sRGB triple (missing channels → 0).
 fn rgb(frag: &str) -> sz_kit::Rgb {
     let mut it = frag.split(';').map(|n| n.trim().parse::<u8>().unwrap_or(0));
@@ -298,6 +366,22 @@ mod tests {
         assert_eq!(host.tab_target(0), Some(ActiveApp::Work));
         // Cycling stays on the only tab.
         assert_eq!(host.cycle(ActiveApp::Work, 1), ActiveApp::Work);
+    }
+
+    #[test]
+    fn observe_tab_registered_only_when_enabled() {
+        let mut cfg = superzej_core::config::Config::default();
+        // Default: observe disabled ⇒ work-only.
+        assert!(AppHost::from_config(&cfg).slots.is_empty());
+
+        cfg.observe.enabled = true;
+        let host = AppHost::from_config(&cfg);
+        assert_eq!(host.slots.len(), 1);
+        assert_eq!(host.slots[0].id, "observe");
+        assert_eq!(host.tab_labels(), vec!["work", "Observe"]);
+        // The observe tile is reachable as the second tab.
+        assert_eq!(host.tab_target(1), Some(ActiveApp::Tile(0)));
+        assert_eq!(host.cycle(ActiveApp::Work, 1), ActiveApp::Tile(0));
     }
 }
 pub mod agent;

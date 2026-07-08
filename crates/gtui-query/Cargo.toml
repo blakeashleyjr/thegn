@@ -8,8 +8,10 @@ license.workspace = true
 
 [dependencies]
 gtui-core = { path = "../gtui-core" }
+superzej-metrics = { path = "../superzej-metrics" }
 chrono = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
 serde_json.workspace = true
 serde = { workspace = true, features = ["derive"] }
 

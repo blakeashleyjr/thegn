@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Row, Table};
 pub struct TableRenderer;
 
 impl TableRenderer {
-    pub fn render<'a>(frame: &'a Frame) -> Table<'a> {
+    pub fn render<'a>(frame: &'a Frame, title: &str) -> Table<'a> {
         let headers: Vec<String> = frame.fields.iter().map(|f| f.name.clone()).collect();
 
         let mut rows = Vec::new();
@@ -40,7 +40,11 @@ impl TableRenderer {
 
         Table::new(rows, widths)
             .header(Row::new(headers).style(Style::default().fg(Color::Yellow)))
-            .block(Block::default().borders(Borders::ALL).title("Table"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.to_string()),
+            )
     }
 }
 
@@ -57,7 +61,7 @@ mod tests {
         let field = Field::new("val", FieldType::Float64, vec![1.0, 5.0]);
         let frame = Frame::new(vec![field]);
 
-        let t = TableRenderer::render(&frame);
+        let t = TableRenderer::render(&frame, "Table");
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 10));
         t.render(buffer.area, &mut buffer);
 

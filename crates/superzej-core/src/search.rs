@@ -91,8 +91,8 @@ pub type SearchSource<'a> = (u32, &'a str, &'a HistoryBuffer);
 ///
 /// Call [`SearchEngine::set_query`] (or the incremental `push_char`/`backspace`)
 /// after collecting sources; the engine re-scores synchronously. For the default
-/// `max_results = 1000` and `history_lines = 10_000` per pane, scoring a single
-/// pane takes ~1–3 ms on modern hardware (nucleo is SIMD-accelerated).
+/// `max_results = 1000`, scoring a single pane's history takes ~1–3 ms on modern
+/// hardware (nucleo is SIMD-accelerated).
 pub struct SearchEngine {
     query: String,
     pub scope: SearchScope,

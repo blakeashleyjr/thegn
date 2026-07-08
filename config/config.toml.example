@@ -284,7 +284,6 @@ provider = "auto"          # auto | none | github | gitlab | drone | woodpecker 
 ttl_secs = 30              # cache TTL before a background re-fetch of run history
 poll_interval_secs = 30    # background poll cadence while a run is in-flight
 max_runs = 50              # how many recent runs to fetch/display
-live_refresh = false       # start the CI view with live refresh on (toggle: ctrl+l)
 log_tail_lines = 2000      # cap on fetched log lines (the tail is kept)
 
 # Per-provider endpoints + tokens. Tokens accept "env:VAR" so secrets stay out
@@ -306,12 +305,29 @@ token = "env:JENKINS_TOKEN"
 server = ""                # empty = ambient argo/argocd/kubeconfig context
 token = "env:ARGOCD_TOKEN"
 
-# Top-level app tab strip. Only "work" (your worktree IDE) is available today;
-# unknown ids are ignored.
+# Top-level app tab strip. "work" (your worktree IDE) is always present; the
+# "Observe" tab appears when [observe] enabled = true (below). Unknown ids ignored.
 # Valid ids: "work".
 [apps]
 default_tab = "work" # initial tab (SUPERZEJ_APPS_DEFAULT_TAB); "work" = your worktree
 tab_order = ["work"]
+
+# The embedded "Observe" observability app tab: a Grafana-style in-terminal
+# dashboard. Off by default (additive). When enabled it shows a built-in
+# host-metrics dashboard (CPU/mem/load, sampled locally — no external services);
+# point it at Prometheus/Loki and/or a custom dashboard TOML for more.
+# Switch to the tab with Alt+2 (or Alt+] to cycle); inside: [r]efresh,
+# [ / ] to narrow/widen the window, [esc] back to work.
+[observe]
+enabled = false               # show the Observe tab in the app strip
+refresh_interval_secs = 15    # panel auto-refresh cadence
+dashboard_path = ""           # "" = built-in host dashboard; else a dashboard TOML path (~ ok)
+[observe.prometheus]
+# base_url = "http://localhost:9090"   # empty ⇒ Prometheus panels report "not configured"
+# token = "env:PROMETHEUS_TOKEN"       # bearer token; env:VAR / file:PATH / literal
+[observe.loki]
+# base_url = "http://localhost:3100"
+# token = "env:LOKI_TOKEN"
 
 # The per-session daemon that pushes live diff/PR updates to the panel.
 [watch]
@@ -840,8 +856,6 @@ command = "git diff"
 # available, runs go in a transient `--user --scope` with these caps; otherwise
 # they fall back to `nice`. Empty quota/mem = uncapped; test_nice = 0 disables.
 [limits]
-# tool_mem_max = "6G"        # memory cap for floating tool panes
-# tool_mem_swap_max = "1G"
 # test_cpu_quota = "150%"    # 150% = 1.5 cores for a test run; "" = uncapped
 # test_mem_max = "4G"        # memory cap for a test run; "" = uncapped
 # test_nice = 10             # niceness for test runs (0 disables)
@@ -1009,9 +1023,6 @@ visible = true
 
 # In-pane scrollback / copy-mode search (distinct from the palette below).
 [search]
-# Lines of terminal output kept per pane for searching; a larger value searches
-# further back at the cost of a little heap per pane.
-history_lines = 10000
 # Max fuzzy-matched results returned per search (capped at the visible rows).
 max_results = 1000
 
@@ -2408,7 +2419,7 @@ bouncer = false
 # database (no checkout, milliseconds): branches that merge clean land
 # automatically as sequential merge commits, and only genuine conflicts are
 # deferred for you (or an agent) to resolve. Fire it once with `superzej
-# integrate` / the palette action, or let `auto_drain` fold on agent-done.
+# integrate` / the palette action.
 #
 # Because ten clean *textual* merges say nothing about whether their *union*
 # builds, the fold is test-gated: the folded tip is checked out into a throwaway
@@ -2425,7 +2436,6 @@ target_branch = "auto"        # branch to advance; "auto" = repo HEAD/default
 gate_command = ""             # e.g. "just ci" / "cargo test --workspace"; "" disables the gate
 gate_on = true                # run gate_command before advancing main
 bisect_on_red = true          # on a red gate, defer just the offending branch
-auto_drain = true             # fold automatically when an agent signals done
 snapshot_dirty = false        # auto-commit uncommitted worktree work before folding
 regenerate_paths = ["Cargo.lock"]  # conflicts confined to these are "regenerable", not handed off
 regenerate_command = ""        # e.g. "cargo update --workspace"; rebuilds regenerate_paths to auto-land them ("" defers instead)

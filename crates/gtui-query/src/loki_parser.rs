@@ -65,15 +65,8 @@ pub fn parse_loki_response(json: &str) -> Result<Vec<Frame>, QueryError> {
             .cloned()
             .unwrap_or_else(|| format!("stream_{}", i));
 
-        // Note: Field::new for string requires a bit of mapping if it only takes f64 right now in our MVP
-        // Wait, looking back at our gtui_core::frame::Field, the MVP constructor only took Vec<f64>.
-        // For the sake of the parser tests, let's create a stub Frame without the string data if the Field struct doesn't support it easily,
-        // OR better, we use an MVP string fallback.
-
-        // Actually, let's just use the existing Field::new which accepts f64, and pass empty for now.
-        // The spec asks for a typed columnar Frame. We'll use 0.0s for the string field in this MVP stub
-        // because our simple `Field::new` currently only takes `Vec<f64>`.
-        let val_field = Field::new(&series_name, FieldType::String, vec![0.0; values.len()]);
+        // The log lines themselves, as a real string series.
+        let val_field = Field::new_str(&series_name, values);
 
         frames.push(Frame::new(vec![time_field, val_field]));
     }

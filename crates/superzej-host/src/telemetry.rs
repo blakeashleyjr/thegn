@@ -180,8 +180,6 @@ impl TelemetryHistory {
 #[derive(Debug, Clone, Default)]
 pub struct LoopPerfHistory {
     wakes: VecDeque<f32>,
-    renders: VecDeque<f32>,
-    render_p99_us: VecDeque<f32>,
     /// The most recent snapshot, for the headline.
     last: crate::perf::PerfSnapshot,
     any: bool,
@@ -190,8 +188,6 @@ pub struct LoopPerfHistory {
 impl LoopPerfHistory {
     pub fn push(&mut self, snap: &crate::perf::PerfSnapshot) {
         push_cap(&mut self.wakes, snap.wakes_per_s as f32);
-        push_cap(&mut self.renders, snap.renders_per_s as f32);
-        push_cap(&mut self.render_p99_us, snap.render_p99_us as f32);
         self.last = snap.clone();
         self.any = true;
     }
@@ -209,18 +205,6 @@ impl LoopPerfHistory {
     /// Wakes/s series normalized by the window max.
     pub fn wakes_series(&self, n: usize) -> Vec<f32> {
         norm(series(&self.wakes, n))
-    }
-
-    /// Renders/s series normalized by the window max.
-    #[allow(dead_code)] // sparkline series for the Telemetry overlay
-    pub fn renders_series(&self, n: usize) -> Vec<f32> {
-        norm(series(&self.renders, n))
-    }
-
-    /// Render p99 (µs) series normalized by the window max.
-    #[allow(dead_code)] // sparkline series for the Telemetry overlay
-    pub fn render_p99_series(&self, n: usize) -> Vec<f32> {
-        norm(series(&self.render_p99_us, n))
     }
 }
 
