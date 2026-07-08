@@ -1,0 +1,25 @@
+# cargo-nextest configuration. Read automatically by `cargo nextest run`
+# (both the CI `test` job and the pre-push hook run `just test`).
+
+# Concurrency cap for git-subprocess-heavy tests.
+#
+# The worktree / wizard-worker / git-backend / mcp-git tests each shell out to
+# real `git` (init, commit, worktree add, rebase, stash) — fsync-heavy ops. Run
+# at the full default parallelism (one test per core) the suite self-saturates:
+# dozens of these tests fire hundreds of concurrent `git` processes doing fsync
+# on the same filesystem, and it gets pathological when the box is already busy
+# (a live `szhost` tracing git on the same repo, or a second `cargo test`). Under
+# that IO storm individual git ops lose lock/IO races and the tests blow past
+# their internal deadlines and fail — even though every one of them passes in
+# isolation and at normal load.
+#
+# Cap how many run *at once* so the storm can't form. The rest of the suite
+# still runs fully parallel; only membership in this group is throttled, so the
+# git tests cost a few extra seconds of wall-clock instead of flaking.
+[test-groups]
+git-subprocess = { max-threads = 6 }
+
+[[profile.default.overrides]]
+# Whole modules (not individual tests) so tests added to them inherit the cap.
+filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::tests::/) | test(/mcp_git::tests::/) | test(e2e_cargo_real_repo)'
+test-group = 'git-subprocess'
