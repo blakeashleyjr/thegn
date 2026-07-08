@@ -41,6 +41,13 @@
         inherit system;
         overlays = [(import rust-overlay)];
       };
+      # Same nixpkgs but permitting the (unfree) Claude Code CLI — scoped to the
+      # sandbox base image only, so the dev shell / everything else stays free.
+      imagePkgs = import nixpkgs {
+        inherit system;
+        overlays = [(import rust-overlay)];
+        config.allowUnfreePredicate = pkg: builtins.elem (pkgs.lib.getName pkg) ["claude-code"];
+      };
       # Formatter binaries that treefmt.toml references.  Bundled together so
       # both the `formatter` wrapper and `checks.formatting` use identical
       # versions — no drift between `nix fmt` and the devenv pre-commit hook.
@@ -200,7 +207,7 @@
       packages.openspec = openspec;
       # The multi-arch base sandbox image (per-arch; `just image-build` loads it
       # locally, CI pushes both arches + a manifest list — see hosts-as-resources).
-      packages.sandbox-image = import ./nix/sandbox-image.nix {inherit pkgs;};
+      packages.sandbox-image = import ./nix/sandbox-image.nix {pkgs = imagePkgs;};
       # Fly.io boot image: sshd entrypoint + baked toolchain, so a Fly machine
       # boots straight into a reachable shell (`template = "image:<ref>"`).
       packages.fly-sandbox-image = import ./nix/fly-sandbox-image.nix {inherit pkgs rustToolchain;};

@@ -35,10 +35,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/
         "experimental-features = nix-command flakes" --extra-conf "require-sigs = false" \
  || curl -L https://nixos.org/nix/install | sh -s -- --no-daemon
 
-# direnv + rustup with a warmed stable toolchain (the cargo registry index
-# lands in ~/.cargo — the seed for the superzej-cargo warm volume).
+# direnv + devenv + node + Claude Code + rustup with a warmed stable toolchain
+# (the cargo registry index lands in ~/.cargo — the seed for the superzej-cargo
+# warm volume). devenv/node/claude are baked so a container on a REMOTE host has
+# the toolchain without a per-worktree install (the remote-OCI worktree path
+# can't push the host's nix closure).
 RUN . /home/superzej/.nix-profile/etc/profile.d/nix.sh 2>/dev/null || true; \
-    nix profile install nixpkgs#direnv nixpkgs#nix-direnv || true
+    nix profile install nixpkgs#direnv nixpkgs#nix-direnv \
+      nixpkgs#devenv nixpkgs#nodejs nixpkgs#claude-code || true
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --default-toolchain stable --profile minimal
 
