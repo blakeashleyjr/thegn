@@ -13,7 +13,10 @@
 /// omitted from the rendering (it is visible to clap but noise here); the
 /// drift test accounts for it.
 pub const GROUPS: &[(&str, &[&str])] = &[
-    ("Workspace", &["wt", "repo", "open", "integrate", "merge"]),
+    (
+        "Workspace",
+        &["wt", "repo", "open", "land", "integrate", "merge"],
+    ),
     ("Forge", &["pr", "issue", "ci"]),
     (
         "Environments",
