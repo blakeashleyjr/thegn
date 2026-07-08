@@ -24,6 +24,8 @@ pub mod client;
 #[cfg(feature = "control-grpc")]
 pub mod grpc;
 pub mod http;
+#[cfg(test)]
+mod tests;
 
 /// One daemon-owned session (= one PTY + emulator). The compositor's tab/pane
 /// layout stays client-side; the daemon's registry is flat.
