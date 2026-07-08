@@ -275,6 +275,10 @@ impl WorkspaceStore for Db {
     fn del_worktree(&self, wt: &str) -> Result<()> {
         self.conn()
             .execute("DELETE FROM worktrees WHERE worktree=?1", params![wt])?;
+        // Cascade to the disk-size cache so a removed worktree can't leave an
+        // orphaned `worktree_disk` row inflating the statusbar total forever.
+        self.conn()
+            .execute("DELETE FROM worktree_disk WHERE worktree=?1", params![wt])?;
         Ok(())
     }
 
@@ -282,6 +286,13 @@ impl WorkspaceStore for Db {
     /// effects). Pairs with [`Self::del_workspace`] so a removed workspace's
     /// cross-workspace rows neither re-render nor resurrect on the next launch.
     fn del_worktrees_for_repo(&self, repo_path: &str) -> Result<()> {
+        // Drop the disk-size cache for these worktrees first (joined via the
+        // `worktrees` rows we are about to delete) so none are left orphaned.
+        self.conn().execute(
+            "DELETE FROM worktree_disk WHERE worktree IN \
+             (SELECT worktree FROM worktrees WHERE repo_path=?1)",
+            params![repo_path],
+        )?;
         self.conn().execute(
             "DELETE FROM worktrees WHERE repo_path=?1",
             params![repo_path],
@@ -945,6 +956,32 @@ impl WorkspaceStore for Db {
 mod tests {
     use crate::db::Db;
     use crate::store::WorkspaceStore;
+
+    #[test]
+    fn del_worktree_cascades_to_disk_cache() {
+        use crate::store::WorktreeAuxStore;
+        let db = Db::open_memory().unwrap();
+        // A registered worktree with a cached size, plus a sibling.
+        db.put_worktree("tab", "/repo", "/wt/a", "feat", None, None)
+            .unwrap();
+        db.put_worktree("tab", "/repo", "/wt/b", "fix", None, None)
+            .unwrap();
+        db.put_worktree_disk("/wt/a", 5_000, 4_200).unwrap();
+        db.put_worktree_disk("/wt/b", 1_000, 900).unwrap();
+
+        // Removing the worktree drops its size row — no orphan left behind.
+        db.del_worktree("/wt/a").unwrap();
+        assert!(db.get_worktree_disk("/wt/a").unwrap().is_none());
+        assert_eq!(db.all_worktree_disk().unwrap().len(), 1);
+        assert_eq!(
+            db.all_worktree_disk().unwrap().get("/wt/b"),
+            Some(&(1_000, 900))
+        );
+
+        // Per-repo removal cascades for every owned worktree too.
+        db.del_worktrees_for_repo("/repo").unwrap();
+        assert!(db.all_worktree_disk().unwrap().is_empty());
+    }
 
     #[test]
     fn delete_tab_groups_for_worktree_keys_on_path() {

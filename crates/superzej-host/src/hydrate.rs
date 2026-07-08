@@ -1914,6 +1914,20 @@ pub(crate) fn spawn_disk_scan(
         let now = superzej_core::util::now();
         let ttl = cfg.scan_interval_secs.max(1) as i64;
         let mut scanned = 0u32;
+        // Garbage-collect orphaned size-cache rows: any `worktree_disk` entry
+        // whose worktree has left the registry (removed/pruned) is never
+        // re-measured by the loop below and would otherwise inflate the
+        // statusbar total forever. Self-heals pre-existing orphans on launch.
+        let live: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.worktree.as_str()).collect();
+        if let Ok(cached) = db.all_worktree_disk() {
+            for path in cached.keys() {
+                if !live.contains(path.as_str()) {
+                    let _ = db.delete_worktree_disk(path);
+                    scanned += 1;
+                }
+            }
+        }
         for row in rows {
             let path = std::path::PathBuf::from(&row.worktree);
             if !path.is_dir() {
