@@ -35,6 +35,11 @@ ignore = [
   # both when starship-battery releases against quick-xml 0.41+.
   "RUSTSEC-2026-0194", # quick-xml duplicate-attribute check is O(N²) (via starship-battery)
   "RUSTSEC-2026-0195", # quick-xml unbounded namespace bindings (via starship-battery)
+  # paste 1.0.15 is unmaintained (author archived it); reached only through
+  # iroh's netlink stack (netlink-packet-core, the call-home reach). A
+  # proc-macro with no runtime surface and no safe upgrade. Drop when the
+  # netlink crates move off paste.
+  "RUSTSEC-2024-0436", # paste unmaintained (via iroh → netlink-packet-core)
 ]
 
 [licenses]

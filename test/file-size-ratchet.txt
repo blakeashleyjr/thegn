@@ -1,6 +1,6 @@
 # lines path — ceilings for legacy files over 3000 lines (see file-size-ratchet.sh)
 9437 crates/superzej-core/src/config.rs
-4064 crates/superzej-host/src/agent.rs
-4839 crates/superzej-host/src/chrome.rs
+3337 crates/superzej-host/src/agent.rs
+4800 crates/superzej-host/src/chrome.rs
 3028 crates/superzej-host/src/keymap.rs
-22049 crates/superzej-host/src/run.rs
+22005 crates/superzej-host/src/run.rs

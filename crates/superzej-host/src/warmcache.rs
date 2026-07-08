@@ -1,6 +1,6 @@
 //! Launch warm-start for the sidebar-glyph cache.
 //!
-//! Seeds the in-memory [`crate::hydrate::glyph_cache`] from the DB (persisted by
+//! Seeds the in-memory `crate::hydrate::glyph_cache` from the DB (persisted by
 //! the previous session) so the sidebar paints last-known git glyphs instantly
 //! on launch instead of blank-then-scan. Invoked lazily from that cache's
 //! `OnceLock` init — off the event loop, on the first hydration — so it costs
