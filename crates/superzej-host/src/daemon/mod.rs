@@ -70,6 +70,14 @@ pub(crate) fn socket_path(dcfg: &superzej_core::config::DaemonConfig) -> PathBuf
     )
 }
 
+/// `szhost serve` options: expose the daemon to remote thin clients.
+pub(crate) struct ServeOpts {
+    /// TCP bind override (defaults to `[serve] bind`).
+    pub bind: Option<String>,
+    /// Skip minting + printing the startup pairing URL.
+    pub no_pair_url: bool,
+}
+
 /// Entry point for the hidden `szhost daemon` subcommand: builds the runtime
 /// and serves until shutdown. Exits 0 immediately if another daemon already
 /// owns the socket.
@@ -78,10 +86,24 @@ pub(crate) fn run_blocking(cfg: &Config, socket_override: Option<PathBuf>) -> Re
         .enable_all()
         .build()
         .context("daemon runtime")?;
-    rt.block_on(run(cfg, socket_override))
+    rt.block_on(run(cfg, socket_override, None))
 }
 
-async fn run(cfg: &Config, socket_override: Option<PathBuf>) -> Result<()> {
+/// Entry point for `szhost serve` (foreground): the daemon runtime + a TCP
+/// listener (HTTP/WS + gRPC, bearer-token auth) + a printed pairing URL.
+pub(crate) fn serve_blocking(cfg: &Config, opts: ServeOpts) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("daemon runtime")?;
+    rt.block_on(run(cfg, None, Some(opts)))
+}
+
+async fn run(
+    cfg: &Config,
+    socket_override: Option<PathBuf>,
+    serve: Option<ServeOpts>,
+) -> Result<()> {
     let sock = socket_override.unwrap_or_else(|| socket_path(&cfg.daemon));
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -174,6 +196,82 @@ async fn run(cfg: &Config, socket_override: Option<PathBuf>) -> Result<()> {
         server_label: format!("{} superzej {}", hostname(), env!("CARGO_PKG_VERSION")),
     };
     let app = superzej_svc::control::http::router(state);
+
+    // Serve mode: a TCP listener for remote thin clients — the same HTTP/WS
+    // surface merged with the gRPC service, bearer tokens REQUIRED (never
+    // local_admin on TCP) — plus a startup pairing URL. v1 is plaintext:
+    // bind to a trusted interface (tailscale/wireguard) or reach it over
+    // `ssh -L`; every request is still token-gated.
+    if let Some(opts) = serve {
+        let bind = opts.bind.unwrap_or_else(|| cfg.serve.bind.clone());
+        let tcp = tokio::net::TcpListener::bind(&bind)
+            .await
+            .with_context(|| format!("bind {bind}"))?;
+        let actual = tcp.local_addr().context("serve local_addr")?;
+        {
+            let db = db.lock().expect("daemon db lock");
+            let mut row = db
+                .daemons()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|d| d.daemon_id == daemon_id)
+                .expect("own daemon row");
+            row.tcp_addr = Some(actual.to_string());
+            let _ = db.put_daemon(&row);
+        }
+        let tcp_state = superzej_svc::control::http::ControlState {
+            api: svc.clone(),
+            store: db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+            local_admin: false,
+            require_approval: cfg.serve.require_approval,
+            server_label: format!("{} superzej {}", hostname(), env!("CARGO_PKG_VERSION")),
+        };
+        let grpc = superzej_svc::control::grpc::GrpcControl {
+            api: svc.clone(),
+            store: db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+            local_admin: false,
+            server_label: format!("{} superzej {}", hostname(), env!("CARGO_PKG_VERSION")),
+        };
+        let tcp_app = superzej_svc::control::http::router(tcp_state).merge(
+            tonic::service::Routes::new(superzej_svc::control::grpc::ControlServer::new(grpc))
+                .into_axum_router(),
+        );
+        let shutdown_tcp = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(tcp, tcp_app)
+                .with_graceful_shutdown(async move { shutdown_tcp.notified().await })
+                .await;
+        });
+
+        superzej_core::outln!("superzej control plane listening on {actual} (HTTP/WS + gRPC)");
+        if !opts.no_pair_url {
+            let now = now_ms();
+            let minted = superzej_svc::control::auth::mint(
+                superzej_core::control::TokenKind::PairingCode,
+                superzej_core::control::ScopeSet::parse("read"),
+                "serve startup",
+                None,
+                Some(now + 15 * 60_000),
+                now,
+            );
+            {
+                let db = db.lock().expect("daemon db lock");
+                db.put_pairing(&minted.row)?;
+            }
+            let url = superzej_core::control::PairingUrl {
+                host: hostname(),
+                port: actual.port(),
+                code: minted.token,
+                fp: None,
+            };
+            superzej_core::outln!("pair a client (single-use, read scope, 15 min):");
+            superzej_core::outln!("  {}", url.encode());
+            superzej_core::outln!("  {}", url.web_form());
+            superzej_core::outln!(
+                "mint more with `szhost pair new --scope read,git` · approve/revoke with `szhost pair`"
+            );
+        }
+    }
 
     tracing::info!(target: "szhost::daemon", %daemon_id, "pane daemon serving on {}", sock.display());
     let shutdown_wait = shutdown.clone();
