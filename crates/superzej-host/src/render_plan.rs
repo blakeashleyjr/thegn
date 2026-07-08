@@ -326,4 +326,45 @@ mod tests {
         d.clear();
         assert!(d.is_empty());
     }
+
+    // ── control-plane contract (add-control-plane-and-remote) ────────────────
+    // A daemon-backed pane is a `Stream` pane: its bytes arrive as pane damage
+    // via mpsc + waker exactly like a local PTY's, so the same invariants hold.
+    // These re-assert them under the control-plane scenarios by name.
+
+    #[test]
+    fn daemon_reattach_snapshot_is_panes_only() {
+        // The warm-reattach snapshot is one (large) output chunk for one pane:
+        // a bounded pane diff, never a chrome recompose (spec: "Streaming
+        // output is a pane-only frame").
+        assert_eq!(
+            plan(&panes(&[5]), &Overlays::default()),
+            RenderPlan::Incremental {
+                panes: vec![5],
+                bars: false,
+                sidebar: false
+            }
+        );
+    }
+
+    #[test]
+    fn idle_attached_daemon_wake_skips() {
+        // An attached-but-quiet daemon generates zero damage; a spurious wake
+        // maps to Skip (spec: "Daemon work stays off the render loop").
+        assert_eq!(
+            plan(&Damage::default(), &Overlays::default()),
+            RenderPlan::Skip
+        );
+    }
+
+    #[test]
+    fn daemon_attach_status_chrome_is_full() {
+        // Attach/detach status and the pairing-approval overlay are chrome:
+        // they map to Full, the sanctioned path for overlay changes.
+        let d = Damage {
+            chrome: true,
+            ..Default::default()
+        };
+        assert_eq!(plan(&d, &Overlays::default()), RenderPlan::Full);
+    }
 }

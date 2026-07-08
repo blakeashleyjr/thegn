@@ -32,6 +32,7 @@ const T_ACTIVITY: u8 = 3;
 const T_LEASE: u8 = 4;
 const T_PAIRING: u8 = 5;
 const T_SESSIONS: u8 = 6;
+const T_EXIT: u8 = 7;
 
 /// Server greeting on a fresh event stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +86,13 @@ struct LeaseBody {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ExitBody {
+    session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PairingBody {
     pairing_id: String,
     label: String,
@@ -129,6 +137,12 @@ pub enum EventFrame {
     },
     /// The session/worktree list changed — clients re-list.
     Sessions,
+    /// A session's process exited (terminal — distinct from a dropped
+    /// transport, which reconnects). `code` is `None` when unreapable.
+    SessionExit {
+        session: String,
+        code: Option<i32>,
+    },
 }
 
 /// Why the decoder rejected the stream — fatal; tear the connection down.
@@ -244,6 +258,14 @@ impl EventFrame {
                 .expect("pairing json"),
             ),
             EventFrame::Sessions => (T_SESSIONS, Vec::new()),
+            EventFrame::SessionExit { session, code } => (
+                T_EXIT,
+                serde_json::to_vec(&ExitBody {
+                    session: session.clone(),
+                    code: *code,
+                })
+                .expect("exit json"),
+            ),
         };
         let mut out = Vec::with_capacity(5 + payload.len());
         out.push(tag);
@@ -334,6 +356,14 @@ impl EventDecoder {
                 }
             }
             T_SESSIONS => EventFrame::Sessions,
+            T_EXIT => {
+                let b: ExitBody =
+                    serde_json::from_slice(&payload).map_err(|_| WireError::BadPayload(T_EXIT))?;
+                EventFrame::SessionExit {
+                    session: b.session,
+                    code: b.code,
+                }
+            }
             other => return Err(WireError::UnknownTag(other)),
         };
         Ok(Some(frame))
@@ -400,6 +430,14 @@ mod tests {
             state: PairingState::Requested,
         });
         roundtrip(EventFrame::Sessions);
+        roundtrip(EventFrame::SessionExit {
+            session: "sess-1".into(),
+            code: Some(137),
+        });
+        roundtrip(EventFrame::SessionExit {
+            session: "sess-2".into(),
+            code: None,
+        });
     }
 
     #[test]

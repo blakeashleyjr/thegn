@@ -29,6 +29,7 @@ mod clipboard;
 mod cmd;
 mod compositor;
 mod copymode;
+mod daemon;
 mod desktop_notify;
 mod detail;
 mod direnv_warm;
@@ -373,6 +374,16 @@ pub enum Command {
     /// Generate shell completions (bash/zsh/fish/elvish/powershell) for the
     /// invoked binary name — `superzej completions zsh > …/_superzej`.
     Completions { shell: clap_complete::Shell },
+    /// Hidden: run the pane daemon — the control-plane process that owns
+    /// portable-pty sessions so they survive UI clients detaching. Spawned
+    /// lazily by the first attach (`[daemon] enabled`, `szhost serve`, or the
+    /// `session` verbs); the unix socket is the single-instance lock.
+    #[command(hide = true)]
+    Daemon {
+        /// Control-socket override (defaults per `[daemon] socket`).
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
     /// Hidden: run the resident bridge agent over stdio. The host spawns this
     /// *inside* a remote env (`ssh … szhost bridge`, `sprite exec … szhost
     /// bridge`); it speaks the framed bridge protocol (git/fs/proc) on stdin/
@@ -665,6 +676,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             let _ = std::io::stdout().write_all(&buf);
             Ok(())
         }
+        Command::Daemon { socket } => daemon::run_blocking(&cfg, socket),
         Command::Bridge => {
             // The resident agent: framed protocol over stdio until EOF. stdout is
             // the protocol channel — nothing else may write to it.
