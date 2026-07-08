@@ -435,9 +435,9 @@ pub fn prepare_sandbox_env(
             // A Ready host's assets (digest-pinned image, warm volumes, remote
             // OCI url) pin the spec; explicit user values win inside.
             crate::host_flow::apply_ready(worktree, &mut spec);
-            // Bring the VPN tunnel up BEFORE the worktree container is created
-            // (it joins the sidecar's netns). A tunnel failure must never fall
-            // through to a less-isolated backend, so it bails the whole resolve.
+            // Remote OCI: materialize the worktree on the remote; repoint the bind.
+            crate::remote_sync::retarget_if_remote_oci(&mut spec, worktree, &mut warnings);
+            // VPN up BEFORE the container (joins the sidecar netns); failure bails.
             if let Err(e) = attach_vpn(&mut spec) {
                 anyhow::bail!("sandbox vpn attach failed for {worktree}: {e}");
             }

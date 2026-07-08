@@ -96,6 +96,7 @@ mod proxy_daemon;
 mod queries;
 mod recorder;
 mod relay;
+mod remote_sync;
 mod render_plan;
 mod replay;
 mod replay_overlay;

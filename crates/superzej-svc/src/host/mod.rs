@@ -376,6 +376,18 @@ impl OciRunner {
         &self.placement
     }
 
+    /// Run a shell command ON the host (not inside a container) with a deadline,
+    /// returning `(success, stdout, stderr)`. Needs no probe — it only uses the
+    /// placement's control transport (ssh with the configured ProxyCommand etc.).
+    /// Used by the remote-worktree materializer (mkdir / git clone on the host).
+    pub fn host_exec(
+        &self,
+        cmd: &str,
+        timeout: Duration,
+    ) -> Result<(bool, String, String), String> {
+        self.exec(cmd, timeout)
+    }
+
     /// Run a shell command INSIDE a container on this host (the per-worktree
     /// provisioning applier's exec primitive). The runtime binary comes from
     /// the probe; call after [`HostRunner::probe`].
