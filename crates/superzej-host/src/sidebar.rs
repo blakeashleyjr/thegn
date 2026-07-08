@@ -157,6 +157,10 @@ pub struct SidebarRow {
     #[allow(dead_code)]
     pub branch: Option<String>,
     pub git: Option<GitGlyphs>,
+    /// The worktree's remembered agent. The sidebar no longer renders an
+    /// agent/app indicator, but the field is retained (populated from the DB) for
+    /// other surfaces and future status lines.
+    #[allow(dead_code)]
     pub agent: Option<String>,
     pub sandbox_backend: Option<String>,
     /// Selected execution environment (`[env.<name>]`); `None`/`"default"` ⇒
@@ -355,7 +359,7 @@ pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> 
     let mut segs: Vec<Seg> = vec![sp(5)];
     let start = segs.len();
     let dirty = row.git.is_some_and(|g| g.dirty);
-    crate::sidebar_legend::push_row_markers(row.agent.as_deref(), dirty, &mut segs);
+    crate::sidebar_legend::push_row_markers(dirty, &mut segs);
 
     if let Some(env) = &row.env_name
         && !env.is_empty()

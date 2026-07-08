@@ -1,24 +1,19 @@
 //! Self-documenting legend for the sidebar's always-on worktree-row markers.
 //!
-//! The worktree row carries two terse markers that are otherwise opaque: a
-//! teal **agent glyph** after the name (`C`, `Y`, `⊞`, …) and an amber **dirty
-//! dot** on the right. On the focused (expanded) row, [`push_row_markers`]
-//! spells them out on the detail line — the agent's name beside its own glyph,
-//! and "uncommitted" beside the dot — so a first-time reader can decode the
-//! chrome without a manual. Kept out of the pinned `chrome.rs` god-file.
+//! The worktree row carries one otherwise-opaque marker: an amber **dirty dot**
+//! on the right. On the focused (expanded) row, [`push_row_markers`] spells it
+//! out on the detail line — "uncommitted" beside the dot — so a first-time
+//! reader can decode the chrome without a manual. (The old teal agent/app glyph
+//! was dropped from the row entirely, so it no longer needs a legend.) Kept out
+//! of the pinned `chrome.rs` god-file.
 
 use crate::seg::{Seg, Tok, seg};
 use superzej_core::theme::Hue;
 
-/// Append the focused row's marker legend to its detail segments: the running
-/// `agent` (spelled out beside its own glyph) and, when `dirty`, an
-/// "uncommitted" note beside the amber dot. Emits nothing for a clean,
-/// agent-less row so it grows no legend.
-pub fn push_row_markers(agent: Option<&str>, dirty: bool, segs: &mut Vec<Seg>) {
-    if let Some(agent) = agent {
-        let glyph = superzej_core::theme::agent_glyph(agent, crate::caps::agent_glyph_style());
-        segs.push(seg(Tok::Hue(Hue::Teal), format!("{glyph} {agent} ")));
-    }
+/// Append the focused row's marker legend to its detail segments: when `dirty`,
+/// an "uncommitted" note beside the amber dot. Emits nothing for a clean row so
+/// it grows no legend.
+pub fn push_row_markers(dirty: bool, segs: &mut Vec<Seg>) {
     if dirty {
         let dot = crate::caps::active_glyphs().dot_filled;
         segs.push(seg(Tok::Hue(Hue::Amber), format!("{dot} uncommitted ")));
@@ -34,40 +29,16 @@ mod tests {
     }
 
     #[test]
-    fn clean_agentless_row_gets_no_legend() {
+    fn clean_row_gets_no_legend() {
         let mut segs = Vec::new();
-        push_row_markers(None, false, &mut segs);
+        push_row_markers(false, &mut segs);
         assert!(segs.is_empty());
-    }
-
-    #[test]
-    fn agent_is_spelled_out_next_to_its_glyph() {
-        let mut segs = Vec::new();
-        push_row_markers(Some("yazi"), false, &mut segs);
-        // Default (letter) style: the name is present so the glyph is decodable,
-        // and nothing tofu-prone leaks into the letter default.
-        let text = text_of(&segs);
-        assert!(text.contains("yazi"), "agent name spelled out: {text:?}");
-        assert!(
-            text.is_ascii(),
-            "letter-default legend stays ASCII: {text:?}"
-        );
     }
 
     #[test]
     fn dirty_row_labels_the_dot() {
         let mut segs = Vec::new();
-        push_row_markers(None, true, &mut segs);
+        push_row_markers(true, &mut segs);
         assert!(text_of(&segs).contains("uncommitted"));
-    }
-
-    #[test]
-    fn both_markers_render_in_order() {
-        let mut segs = Vec::new();
-        push_row_markers(Some("claude"), true, &mut segs);
-        let text = text_of(&segs);
-        let a = text.find("claude").expect("agent first");
-        let u = text.find("uncommitted").expect("dirty second");
-        assert!(a < u, "agent precedes dirty note: {text:?}");
     }
 }
