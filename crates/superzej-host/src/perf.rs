@@ -253,21 +253,6 @@ impl Subsys {
         Subsys::Diff,
     ];
     pub const N: usize = Self::ALL.len();
-
-    #[allow(dead_code)] // subsystem label, used by the Telemetry overlay's CPU breakdown
-    pub fn label(self) -> &'static str {
-        match self {
-            Subsys::Hydrate => "hydrate",
-            Subsys::Pr => "pr",
-            Subsys::Issues => "issues",
-            Subsys::Stats => "stats",
-            Subsys::Container => "container",
-            Subsys::Metrics => "metrics",
-            Subsys::Lsp => "lsp",
-            Subsys::Sandbox => "sandbox",
-            Subsys::Diff => "diff",
-        }
-    }
 }
 
 /// Global accumulator of CPU-ns and invocation counts per [`Subsys`]. Producers
@@ -662,12 +647,6 @@ impl LoopPerf {
         best
     }
 
-    /// Per-source message counts in [`WakeSource::ALL`] order.
-    #[allow(dead_code)] // consumed by the Telemetry overlay's wake-source breakdown
-    pub fn per_source(&self) -> [u64; WakeSource::N] {
-        self.drain_items
-    }
-
     /// Message count for one source this interval.
     pub fn items(&self, src: WakeSource) -> u64 {
         self.drain_items[src as usize]
@@ -706,8 +685,6 @@ impl Default for LoopPerf {
 /// and consumed by the live Telemetry overlay. All rates are per-second.
 #[derive(Clone, Debug, Default)]
 pub struct PerfSnapshot {
-    #[allow(dead_code)] // rollup interval length; surfaced by the Telemetry overlay
-    pub secs: f64,
     pub wakes_per_s: f64,
     pub renders_per_s: f64,
     pub pane_frames_per_s: f64,
@@ -747,7 +724,6 @@ impl LoopPerf {
         let hot_items = self.items(hot);
         let busy_ratio = (self.busy.as_secs_f64() / secs).clamp(0.0, 1.0);
         let snap = PerfSnapshot {
-            secs,
             wakes_per_s: self.wakes as f64 / secs,
             renders_per_s: self.renders as f64 / secs,
             pane_frames_per_s: self.pane_frames as f64 / secs,

@@ -70,18 +70,6 @@ pub struct GitGlyphs {
     pub behind: usize,
 }
 
-/// Badge kinds displayed on sidebar rows (item 28).
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub enum BadgeKind {
-    /// Open PRs for this worktree's branch.
-    Pr,
-    /// Unread notifications relevant to this worktree.
-    Unread,
-    /// Alerts: test failures, agent failures, log errors.
-    Alert,
-}
-
 /// Tree ordering for worktree groups within a workspace (item 23).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortMode {

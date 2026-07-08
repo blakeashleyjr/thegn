@@ -744,7 +744,6 @@ mod tests {
             gate_command: gate.into(),
             gate_on: !gate.is_empty(),
             bisect_on_red: true,
-            auto_drain: false,
             snapshot_dirty: false,
             regenerate_paths: vec!["Cargo.lock".into()],
             regenerate_command: String::new(),
