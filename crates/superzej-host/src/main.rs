@@ -84,6 +84,8 @@ mod nixcache;
 mod notify;
 mod palette;
 mod pane;
+mod pane_pty;
+mod pane_source;
 mod panel;
 mod panel_util;
 mod panes;

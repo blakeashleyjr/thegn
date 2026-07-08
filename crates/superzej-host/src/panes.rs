@@ -397,9 +397,14 @@ impl Panes {
             .ok_or_else(|| anyhow::anyhow!("native exec needs a tokio runtime handle"))?;
         let id = self.next_id;
         self.next_id += 1;
+        let source = std::sync::Arc::new(crate::pane_source::ProviderSource {
+            provider,
+            provider_name: provider_name.clone(),
+            sandbox_id: sandbox_id.clone(),
+        });
         let pane = PtyPane::spawn_stream(
             id,
-            provider,
+            source,
             provider_name,
             sandbox_id,
             open,
