@@ -485,20 +485,34 @@ pub(crate) fn active_tab_path(session: &crate::session::Session) -> std::path::P
         .unwrap_or_else(|| ".".into())
 }
 
-/// The worktree dirs immediately above and below the active one in the sidebar
-/// order — the prefetch targets so moving to a neighbor is already warm. Skips
-/// the active worktree, empties, and paths that no longer exist on disk.
+/// The worktree dirs immediately above and below the active one in the
+/// sidebar's DISPLAY order (`order`: group indices as the sidebar shows them,
+/// see `run::sidebar_worktree_order`) — the prefetch targets so moving to a
+/// neighbor is already warm. Alt+↑/↓ steps in display order, so session-index
+/// neighbors would warm the WRONG worktrees whenever pins/sort/filter reorder
+/// the tree. Wraps at the ends (the cycle wraps too); falls back to session
+/// ±1 when the active group isn't in `order` (e.g. filtered away). Skips the
+/// active worktree and empties; the existence check lives off-loop in
+/// `spawn_panel_prefetch` (no fs stat on the loop).
 pub(crate) fn neighbor_worktree_paths(
     session: &crate::session::Session,
+    order: &[usize],
 ) -> Vec<std::path::PathBuf> {
     let active = session.active;
-    [active.wrapping_sub(1), active + 1]
+    let neighbors: Vec<usize> = match order.iter().position(|&g| g == active) {
+        Some(p) if order.len() > 1 => {
+            let n = order.len();
+            vec![order[(p + n - 1) % n], order[(p + 1) % n]]
+        }
+        Some(_) => Vec::new(),
+        None => vec![active.wrapping_sub(1), active + 1],
+    };
+    neighbors
         .into_iter()
         .filter(|&i| i != active)
         .filter_map(|i| session.worktrees.get(i))
         .filter(|g| !g.path.is_empty())
         .map(|g| std::path::PathBuf::from(&g.path))
-        .filter(|p| p.is_dir())
         .collect()
 }
 
@@ -2509,6 +2523,80 @@ mod tests {
             worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app")],
             active: 0,
         }
+    }
+
+    fn five_worktree_session(active: usize) -> Session {
+        Session {
+            id: "s1".into(),
+            worktrees: (0..5)
+                .map(|i| {
+                    WorktreeGroup::new(
+                        format!("app/wt{i}"),
+                        if i == 0 {
+                            GroupKind::Home
+                        } else {
+                            GroupKind::Branch
+                        },
+                        format!("/tmp/app-wt{i}"),
+                    )
+                })
+                .collect(),
+            active,
+        }
+    }
+
+    #[test]
+    fn neighbor_paths_follow_sidebar_display_order_not_session_order() {
+        // Sidebar shows the groups shuffled (pins/sort): 3, 1, 4, 0, 2.
+        // Active = 4 sits between 1 (above) and 0 (below) IN DISPLAY ORDER —
+        // its session-index neighbors (3, 0) would warm the wrong worktree.
+        let session = five_worktree_session(4);
+        let order = [3usize, 1, 4, 0, 2];
+        let got = neighbor_worktree_paths(&session, &order);
+        assert_eq!(
+            got,
+            vec![
+                std::path::PathBuf::from("/tmp/app-wt1"),
+                std::path::PathBuf::from("/tmp/app-wt0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn neighbor_paths_wrap_at_the_ends() {
+        // Active first in display order: "previous" wraps to the last row.
+        let session = five_worktree_session(3);
+        let order = [3usize, 1, 4, 0, 2];
+        let got = neighbor_worktree_paths(&session, &order);
+        assert_eq!(
+            got,
+            vec![
+                std::path::PathBuf::from("/tmp/app-wt2"),
+                std::path::PathBuf::from("/tmp/app-wt1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn neighbor_paths_fall_back_to_session_order_when_active_hidden() {
+        // Active group filtered out of the sidebar → session ±1 fallback.
+        let session = five_worktree_session(2);
+        let order = [3usize, 0];
+        let got = neighbor_worktree_paths(&session, &order);
+        assert_eq!(
+            got,
+            vec![
+                std::path::PathBuf::from("/tmp/app-wt1"),
+                std::path::PathBuf::from("/tmp/app-wt3"),
+            ]
+        );
+    }
+
+    #[test]
+    fn neighbor_paths_single_visible_worktree_warms_nothing() {
+        let session = five_worktree_session(2);
+        let got = neighbor_worktree_paths(&session, &[2usize]);
+        assert!(got.is_empty());
     }
 
     #[test]
