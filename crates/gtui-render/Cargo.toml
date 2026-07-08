@@ -8,4 +8,6 @@ license.workspace = true
 
 [dependencies]
 gtui-core = { path = "../gtui-core" }
-ratatui = "0.30.2"
+# Match sz-kit's pin exactly (no default features ⇒ no crossterm) so the host,
+# sz-kit, and the renderers all share one ratatui build and `Buffer` type.
+ratatui = { version = "0.30", default-features = false, features = ["std"] }

@@ -4033,6 +4033,7 @@ fn is_default_preset(s: &str) -> bool {
 }
 
 pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
+pub use crate::config_observe::{LokiSourceConfig, ObserveConfig, PrometheusSourceConfig};
 pub use crate::config_placement::{
     OnExhaustion, PackStrategy, PlacementConfig, PlacementModePref, ResourcesDecl,
 };
@@ -4086,6 +4087,7 @@ pub struct Config {
     pub stats: StatsConfig,
     pub metrics: MetricsConfig,
     pub apps: AppsConfig,
+    pub observe: ObserveConfig,
     pub bars: BarsConfig,
     pub pr: PrConfig,
     pub issues: IssuesConfig,
@@ -4222,6 +4224,7 @@ impl Default for Config {
             stats: StatsConfig::default(),
             metrics: MetricsConfig::default(),
             apps: AppsConfig::default(),
+            observe: ObserveConfig::default(),
             bars: BarsConfig::default(),
             pr: PrConfig::default(),
             issues: IssuesConfig::default(),
