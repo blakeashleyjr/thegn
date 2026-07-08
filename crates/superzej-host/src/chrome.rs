@@ -2347,27 +2347,27 @@ fn tree_lead(depth: u8, is_last: bool) -> Vec<crate::seg::Seg> {
     vec![sp(indent), seg(Tok::Slot(S::Ghost2), conn)]
 }
 
-/// The activity dot glyph for a worktree row (item 20): filled while active or
-/// waiting, hollow once read-but-still-stuck. `None` renders nothing. Uses the
-/// active glyph set so it degrades to ASCII on limited terminals.
+/// The activity dot glyph (item 20): filled while active/waiting, hollow once
+/// read-but-stuck, `↻` while building; `None` = nothing. ASCII-safe glyph set.
 fn activity_dot_glyph(state: crate::sidebar::ActivityState) -> &'static str {
     use crate::sidebar::ActivityState::*;
     let g = crate::caps::active_glyphs();
     match state {
         Active | Waiting => g.dot_filled, // ● / *
         Read => g.dot_hollow,             // ○ / o
+        Loading => g.refresh,             // ↻ / @ — worktree building
         None => "",
     }
 }
 
-/// The activity dot color token, per state (`[theme.colors] activity_active` /
-/// `activity_waiting`). Both red states share the waiting slot — filled vs
-/// hollow is glyph-only.
+/// The activity dot color token per state (`activity_active`/`activity_waiting`;
+/// loading = accent). Both red states share the waiting slot (glyph-only diff).
 fn activity_dot_tok(state: crate::sidebar::ActivityState) -> crate::seg::Tok {
     use crate::sidebar::ActivityState::*;
     crate::seg::Tok::Slot(match state {
         Active => S::ActivityActive,
         Waiting | Read => S::ActivityWaiting,
+        Loading => S::Accent,
         None => S::Dim,
     })
 }

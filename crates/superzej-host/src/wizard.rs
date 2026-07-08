@@ -14,18 +14,16 @@
 //! and rendering live on the loop; [`run_worker`] owns every blocking step
 //! (git, DB, sandbox ensure) on a `spawn_blocking` thread, receives wizard
 //! decisions over a [`WizardCmd`] channel, and reports [`CreateEvent`]s back
-//! over a tokio mpsc + `TerminalWaker` pulse. The spinner is driven by a
-//! short-lived ticker thread alive only while the progress overlay is shown —
+//! over a tokio mpsc + `TerminalWaker` pulse. Progress is surfaced in the new
+//! worktree's own tab (via the shared per-tab loading splash), not a modal —
 //! idle superzej still produces zero events.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 
-use crate::chrome::S;
+use crate::chrome::{LoadStep, S};
 use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::seg::{self, Line, Seg, Tok, seg, sp};
@@ -33,7 +31,6 @@ use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
 use superzej_core::store::WorkspaceStore;
-use superzej_core::theme::Hue;
 use superzej_core::{repo, util, worktree};
 
 // ---------------------------------------------------------------------------
@@ -738,18 +735,20 @@ pub enum StepState {
 #[derive(Debug)]
 pub enum CreateEvent {
     /// Preflight result: resolved base + the collision-free name suggestion.
-    Preflight {
-        generation: u64,
-        suggested: String,
-    },
+    Preflight { generation: u64, suggested: String },
     Step {
         generation: u64,
         step: CreateStep,
         state: StepState,
         detail: Option<String>,
     },
-    Tick {
+    /// The worktree now exists at its final name/path: the loop opens its tab
+    /// (so the loading splash renders in the tab's center) while the worker
+    /// finishes registration + launch-spec composition off-thread.
+    TabOpened {
         generation: u64,
+        tab: String,
+        path: String,
     },
     Done {
         generation: u64,
@@ -788,35 +787,49 @@ pub enum WizardCmd {
     Cancel,
 }
 
-const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-
-/// The progress overlay model. Created (hidden) at Alt+w so pre-submit events
-/// (the speculative create) accumulate; revealed when the wizard submits.
+/// The creation-progress model. Created at Alt+w so pre-submit events (the
+/// speculative create) accumulate; once the worktree's tab opens
+/// ([`CreateEvent::TabOpened`]) its rows are projected into the tab's loading
+/// splash via [`CreationProgress::to_load_steps`].
 #[derive(Debug)]
 pub struct CreationProgress {
-    pub generation: u64,
     pub branch: String,
     rows: Vec<(CreateStep, StepState, Option<String>)>,
-    tick: u64,
-    pub revealed: bool,
     pub failed: bool,
-    pub ticker_alive: Arc<AtomicBool>,
 }
 
 impl CreationProgress {
-    pub fn new(generation: u64, branch: String) -> Self {
+    pub fn new(branch: String) -> Self {
         CreationProgress {
-            generation,
             branch,
             rows: CreateStep::ALL
                 .iter()
                 .map(|s| (*s, StepState::Pending, None))
                 .collect(),
-            tick: 0,
-            revealed: false,
             failed: false,
-            ticker_alive: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Project the accumulated steps into the shared per-tab loading splash's
+    /// [`LoadStep`]s, so the new worktree's center renders the same
+    /// sprite-style "setting up…" screen the materialize path uses. A skipped
+    /// step reads as done (it completed, just for free).
+    pub fn to_load_steps(&self) -> Vec<LoadStep> {
+        self.rows
+            .iter()
+            .map(|(step, state, detail)| {
+                let ls = match state {
+                    StepState::Pending => LoadStep::pending(step.label()),
+                    StepState::Running => LoadStep::active(step.label()),
+                    StepState::Done | StepState::Skipped => LoadStep::done(step.label()),
+                    StepState::Failed(_) => LoadStep::failed(step.label()),
+                };
+                match detail {
+                    Some(d) => ls.with_detail(d.clone()),
+                    None => ls,
+                }
+            })
+            .collect()
     }
 
     pub fn apply(&mut self, step: CreateStep, state: StepState, detail: Option<String>) {
@@ -840,120 +853,6 @@ impl CreationProgress {
             .expect("all steps present")
             .1
     }
-
-    pub fn bump_tick(&mut self) {
-        self.tick = self.tick.wrapping_add(1);
-    }
-
-    pub fn stop_ticker(&self) {
-        self.ticker_alive.store(false, Ordering::Relaxed);
-    }
-
-    /// Paint as a centered layer (topmost): one row per step, then a footer.
-    pub fn render(&self, surface: &mut Surface, screen: Rect) {
-        // The error row (when failed) renders under its step, so size for it.
-        let err_rows = usize::from(self.failed);
-        let spec = LayerSpec {
-            title: format!("creating {}", self.branch),
-            badge: Some(" Alt+w ".into()),
-            cols: 54,
-            rows: self.rows.len() + 1 + err_rows,
-            anchor: Anchor::Center,
-            border: if self.failed {
-                Tok::Hue(Hue::Red)
-            } else {
-                Tok::Slot(S::Accent)
-            },
-            ..LayerSpec::default()
-        };
-        let Some(inner) = open_layer(surface, screen, &spec) else {
-            return;
-        };
-        let panel = Tok::Slot(S::Panel);
-        let mut y = inner.y;
-        let mut error: Option<String> = None;
-        for (step, state, detail) in &self.rows {
-            let (glyph, glyph_tok, text_tok) = match state {
-                StepState::Pending => ("○", Tok::Slot(S::Faint), Tok::Slot(S::Faint)),
-                StepState::Running => (
-                    SPINNER[(self.tick % SPINNER.len() as u64) as usize],
-                    Tok::Slot(S::Accent),
-                    Tok::Slot(S::Text),
-                ),
-                StepState::Done => ("✓", Tok::Hue(Hue::Green), Tok::Slot(S::Dim)),
-                StepState::Skipped => ("–", Tok::Slot(S::Faint), Tok::Slot(S::Faint)),
-                StepState::Failed(e) => {
-                    error = Some(e.clone());
-                    ("✗", Tok::Hue(Hue::Red), Tok::Slot(S::Text))
-                }
-            };
-            let mut segs = vec![
-                sp(1),
-                seg(glyph_tok, glyph.to_string()).bold(),
-                sp(1),
-                seg(text_tok, step.label().to_string()),
-            ];
-            if let Some(d) = detail {
-                segs.push(sp(2));
-                segs.push(seg(Tok::Slot(S::Ghost), format!("({d})")));
-            }
-            seg::draw_line(surface, inner.x, y, inner.cols, &Line::segs(segs), panel);
-            y += 1;
-        }
-        if let Some(e) = error {
-            let mut e = e.replace('\n', " ");
-            if e.chars().count() > inner.cols.saturating_sub(4) {
-                e = e
-                    .chars()
-                    .take(inner.cols.saturating_sub(5))
-                    .collect::<String>()
-                    + "…";
-            }
-            seg::draw_line(
-                surface,
-                inner.x,
-                y,
-                inner.cols,
-                &Line::segs(vec![sp(3), seg(Tok::Hue(Hue::Red), e)]),
-                panel,
-            );
-            y += 1;
-        }
-        let footer = if self.failed {
-            "esc dismiss"
-        } else {
-            "esc hide · creation continues"
-        };
-        seg::draw_line(
-            surface,
-            inner.x,
-            y,
-            inner.cols,
-            &Line::segs(vec![sp(1), seg(Tok::Slot(S::Faint), footer.to_string())]),
-            panel,
-        );
-    }
-}
-
-/// Spawn the spinner ticker: ~8 fps while `alive`, each tick an event + wake.
-/// The thread exits within one period of the loop clearing the flag (done,
-/// failed, or overlay hidden) — no free-running timer survives the overlay.
-pub fn spawn_ticker(
-    generation: u64,
-    alive: Arc<AtomicBool>,
-    events: tokio::sync::mpsc::UnboundedSender<CreateEvent>,
-    notify: impl Fn() + Send + 'static,
-) {
-    alive.store(true, Ordering::Relaxed);
-    std::thread::spawn(move || {
-        while alive.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(120));
-            if events.send(CreateEvent::Tick { generation }).is_err() {
-                break;
-            }
-            notify();
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1200,6 +1099,18 @@ pub fn run_worker(
         }
     }
 
+    // The worktree now exists at its FINAL name/path (past any rename/move):
+    // open its tab so the loading splash renders in the tab's center while the
+    // worker finishes (sandbox ensure, register, launch-spec compose)
+    // off-thread. A later failure removes this speculative tab (see the loop's
+    // `Failed` handler); on success the pane attaches over the splash.
+    let tab = repo::branch_tab(&slug, &branch);
+    send(CreateEvent::TabOpened {
+        generation,
+        tab: tab.clone(),
+        path: path.to_string_lossy().into_owned(),
+    });
+
     // Reuse the speculative prep only when it matches the submitted (env,
     // backend); otherwise (no prep, or the user changed host/sandbox after the
     // last PrepChosen) prepare now with the submitted choice.
@@ -1263,7 +1174,6 @@ pub fn run_worker(
     // --- register: one DB open for the whole pipeline. put_worktree must
     // precede the sandbox/agent updates (they are bare UPDATEs).
     step(CreateStep::Register, StepState::Running, None);
-    let tab = repo::branch_tab(&slug, &branch);
     let path_s = path.to_string_lossy().into_owned();
     let db = match &ctx.db_path {
         Some(p) => Db::open_at(p),
@@ -1622,7 +1532,7 @@ mod tests {
 
     #[test]
     fn progress_tracks_steps_and_failure() {
-        let mut cp = CreationProgress::new(1, "sz/x".into());
+        let mut cp = CreationProgress::new("sz/x".into());
         assert_eq!(*cp.state(CreateStep::CreateWorktree), StepState::Pending);
         cp.apply(CreateStep::CreateWorktree, StepState::Running, None);
         cp.apply(
@@ -1634,9 +1544,6 @@ mod tests {
         assert!(!cp.failed);
         cp.apply(CreateStep::Register, StepState::Failed("boom".into()), None);
         assert!(cp.failed);
-        cp.ticker_alive.store(true, Ordering::Relaxed);
-        cp.stop_ticker();
-        assert!(!cp.ticker_alive.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -1879,32 +1786,39 @@ mod tests {
         w.render(&mut s, screen);
         assert!(text(&mut s).contains("✓ ready"), "badge for selected env");
 
-        let mut cp = CreationProgress::new(1, "sz/swift-reef".into());
+        // The creation steps project into the shared per-tab loading splash's
+        // LoadSteps (the sprite-style "setting up…" screen), mapping states +
+        // carrying step detail; a running step reads as active, a failure as
+        // failed.
+        let mut cp = CreationProgress::new("sz/swift-reef".into());
         cp.apply(
             CreateStep::ResolveBase,
             StepState::Done,
             Some("main".into()),
         );
         cp.apply(CreateStep::CreateWorktree, StepState::Running, None);
-        cp.revealed = true;
-        let mut s = Surface::new(80, 24);
-        cp.render(&mut s, screen);
-        let frame = text(&mut s);
-        assert!(frame.contains("creating sz/swift-reef"));
-        assert!(frame.contains("✓"));
-        assert!(frame.contains("resolve base"));
-        assert!(frame.contains("(main)"));
-        assert!(frame.contains("creation continues"));
+        let steps = cp.to_load_steps();
+        assert_eq!(steps.len(), CreateStep::ALL.len());
+        let resolve = &steps[0];
+        assert_eq!(resolve.label, "resolve base");
+        assert_eq!(resolve.state, crate::chrome::StepState::Done);
+        assert_eq!(resolve.detail.as_deref(), Some("main"));
+        assert_eq!(steps[1].label, "create worktree");
+        assert_eq!(steps[1].state, crate::chrome::StepState::Active);
+        assert_eq!(
+            steps.last().unwrap().state,
+            crate::chrome::StepState::Pending
+        );
 
         cp.apply(
             CreateStep::CreateWorktree,
             StepState::Failed("git worktree add failed".into()),
             None,
         );
-        let mut s = Surface::new(80, 24);
-        cp.render(&mut s, screen);
-        let frame = text(&mut s);
-        assert!(frame.contains("✗"));
-        assert!(frame.contains("esc dismiss"));
+        assert!(cp.failed);
+        assert_eq!(
+            cp.to_load_steps()[1].state,
+            crate::chrome::StepState::Failed
+        );
     }
 }

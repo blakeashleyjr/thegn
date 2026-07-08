@@ -1814,11 +1814,8 @@ impl Default for DiskConfig {
     }
 }
 
-/// `[session]` — session snapshot/restore hardening. Two knobs on the
-/// resurrection path: how much per-pane scrollback is captured and repainted so a
-/// restored pane shows its recent history, and how long a persisted
-/// running/active agent dot may age before it is coerced to a settled state at
-/// restore (so a session killed mid-run never resurrects a phantom running dot).
+/// `[session]` — snapshot/restore hardening plus worktree-create UX: scrollback
+/// capture/repaint, restore-time stale-agent-dot grace, jump-to-new-worktree.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SessionConfig {
@@ -1831,6 +1828,8 @@ pub struct SessionConfig {
     /// downgraded to a settled state. Applied once at restore; the live activity
     /// FSM is untouched.
     pub restore_grace_secs: u64,
+    /// Whether creating a worktree (Alt+w) jumps to its new tab vs. background.
+    pub focus_on_create: bool,
 }
 
 impl Default for SessionConfig {
@@ -1838,6 +1837,7 @@ impl Default for SessionConfig {
         SessionConfig {
             scrollback_lines: 500,
             restore_grace_secs: 600,
+            focus_on_create: true,
         }
     }
 }

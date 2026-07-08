@@ -4,6 +4,7 @@
 //! context struct. The loop calls one `drain_*` per wake; everything here runs
 //! ON the loop and must stay I/O-free.
 
+pub(crate) mod creating;
 pub(crate) mod host;
 pub(crate) mod overlay;
 pub(crate) mod panel_changes;
