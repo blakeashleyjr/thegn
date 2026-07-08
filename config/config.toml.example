@@ -1814,7 +1814,18 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # image = ""                   # base-image override (name[:tag][@sha256:…]);
 #                              #   empty = your LOCAL sandbox base ([sandbox]
 #                              #   image, else debian:stable), transferred to
-#                              #   the host — so a plain [host.*] works OOTB
+#                              #   the host — so a plain [host.*] works OOTB.
+#                              #   NOTE: a LOCAL sandbox inherits your dev
+#                              #   toolchain by bind-mounting the host's /nix; a
+#                              #   REMOTE host CAN'T (different machine). For a
+#                              #   remote shell seeded with nix + your shell +
+#                              #   agents (Claude Code) like a local sprite, use
+#                              #   the baked toolchain image: build it with
+#                              #   `nix build .#sandbox-image` and point either
+#                              #   this key or [sandbox] image at it (delivery
+#                              #   streams/builds it onto the host). A bare
+#                              #   debian:stable base gives a toolchain-less
+#                              #   container.
 # install_runtime = "ask"      # never | ask | auto — consent for installing
 #                              #   podman on the machine; NEVER silent. `ask`
 #                              #   raises a confirm modal (or `host provision --yes`);

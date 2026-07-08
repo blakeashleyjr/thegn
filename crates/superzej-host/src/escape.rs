@@ -6,7 +6,8 @@
 //! file drawer closed. That behaviour is opt-in via `[panel] collapse_on_escape`
 //! (default on) and lives here so the event loop only calls a one-liner.
 
-use crate::run::{DrawerPool, active_cwd, hide_drawer_into_pool};
+use crate::drawer_state::{DrawerPool, hide_drawer_into_pool, set_flag};
+use crate::run::active_cwd;
 
 /// Close the focused bottom drawer: stash its pane into the pool and persist the
 /// "closed" flag so it stays down across restarts (falling back to a plain
@@ -22,11 +23,7 @@ pub(crate) fn close_drawer_to_pool(
 ) {
     if let Some(cwd) = active_cwd(session) {
         hide_drawer_into_pool(drawer, drawer_pool, drawer_home, &cwd, cfg, panes);
-        let key = superzej_core::util::slugify(&cwd.to_string_lossy());
-        let dir = superzej_core::util::superzej_dir().join("drawer");
-        let _ = std::fs::create_dir_all(&dir);
-        // best-effort: the drawer flag is a UI cache; git/session are the truth.
-        let _ = std::fs::write(dir.join(key), "false");
+        set_flag(&cwd, false);
     } else if let Some(id) = drawer.take() {
         panes.table.remove(&id);
     }
