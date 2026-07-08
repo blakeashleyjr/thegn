@@ -2500,10 +2500,6 @@ fn compose_row_lines(
             };
             let label = crate::sidebar::compose_row_label(row.pr_number, window_title, &row.label);
             left.push(seg(name_fg, label));
-            if let Some(agent) = &row.agent {
-                let glyph = theme::agent_glyph(agent, crate::caps::agent_glyph_style());
-                left.push(seg(Tok::Hue(theme::Hue::Teal), format!(" {glyph}")));
-            }
 
             // Right cluster (always-on): git status + alert badge (PR/unread/disk move to the detail line).
             let mut right: Vec<Seg> = Vec::new();
@@ -3609,7 +3605,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_renders_glyphs_caret_dirty_and_agent() {
+    fn sidebar_renders_glyphs_caret_and_dirty() {
         use crate::sidebar::{ActivityState, GitGlyphs, RowKind};
         let rect = Rect {
             x: 0,
@@ -3625,6 +3621,8 @@ mod tests {
             ahead: 2,
             behind: 1,
         });
+        // The agent/app indicator was dropped from the row entirely: a set
+        // `agent` must render no trailing glyph.
         wt.agent = Some("claude".into());
         wt.activity = ActivityState::Active;
         let model = FrameModel {
@@ -3640,7 +3638,16 @@ mod tests {
         assert!(text.contains("feat"));
         assert!(text.contains('\u{2191}'), "ahead glyph ↑: {text:?}");
         assert!(text.contains('\u{2193}'), "behind glyph ↓: {text:?}");
-        assert!(text.contains('C'), "agent glyph for claude: {text:?}");
+        // No agent/app glyph on the worktree row: "claude" would render as a
+        // trailing letter-default 'C', which must not appear on the "feat" line.
+        let feat_line = text
+            .lines()
+            .find(|l| l.contains("feat"))
+            .expect("feat row present");
+        assert!(
+            !feat_line.contains('C'),
+            "agent/app indicator must be gone: {feat_line:?}"
+        );
     }
 
     #[test]
