@@ -44,7 +44,7 @@ pub struct HostConfig {
     pub reach: HostReach,
     /// Base image override (`name[:tag][@sha256:…]`); empty ⇒ the LOCAL sandbox
     /// base (`[sandbox] image`, else the built-in `debian:stable`), transferred
-    /// to the host — see [`Config::default_host_image`].
+    /// to the host — see `Config::default_host_image`.
     pub image: String,
     pub install_runtime: InstallConsent,
     /// Delivery preference order (names per [`DeliveryCap::parse`]); empty ⇒

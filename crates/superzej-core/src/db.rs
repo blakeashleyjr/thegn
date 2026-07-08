@@ -64,7 +64,7 @@ use std::path::PathBuf;
 /// v37: adds `intents` (the CLI→compositor mailbox behind `superzej open`;
 /// see [`crate::store::IntentStore`]).
 /// v38: adds `iroh_tokens` (per-sandbox auth tokens for the iroh call-home reach;
-/// see [`crate::db_iroh`]).
+/// see `crate::db_iroh`).
 /// v39: adds `worktree_hibernations` (snapshot-then-destroy bookkeeping; see
 /// [`crate::store::HibernationStore`] — DDL in `db_migrate`).
 pub const SCHEMA_VERSION: i64 = 39;

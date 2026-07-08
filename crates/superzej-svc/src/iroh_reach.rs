@@ -1,9 +1,9 @@
 //! The compositor's home side of the iroh call-home reach.
 //!
-//! [`IrohHome`] owns a persistent iroh [`Endpoint`] with a **stable** EndpointId
+//! [`IrohHome`] owns a persistent iroh `Endpoint` with a **stable** EndpointId
 //! (its secret key is persisted by the host in the OS keyring), runs an accept
 //! loop, and keeps a registry of live per-sandbox connections. Sandboxes dial in
-//! (the [`superzej-agent`] binary), authenticate with a per-sandbox token, and
+//! (the `superzej-agent` binary), authenticate with a per-sandbox token, and
 //! then the compositor opens an exec bi-stream per shell — bridged to the same
 //! transport-blind [`ExecSession`] channels the pane machinery already consumes,
 //! so no pane code changes.

@@ -395,7 +395,7 @@ fn registry() -> &'static Registry {
 static LOOP_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
 static LOOP_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// Record the current thread as the event loop so [`BridgeClient::call`] can flag
+/// Record the current thread as the event loop so `BridgeClient::call` can flag
 /// any bridge RPC issued on it. Called once by the host at startup; a no-op
 /// second call is harmless.
 pub fn note_loop_thread() {

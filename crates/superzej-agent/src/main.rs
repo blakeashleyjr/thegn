@@ -4,7 +4,7 @@
 //! two env vars injected at provision time — `SUPERZEJ_HOME_NODE` (the
 //! compositor's stable iroh EndpointId, the dial target) and
 //! `SUPERZEJ_SANDBOX_AUTH` (this sandbox's minted, short-lived auth token) — then
-//! creates an iroh [`Endpoint`], **dials home** (the container is behind NAT with
+//! creates an iroh `Endpoint`, **dials home** (the container is behind NAT with
 //! no public IP, so it always dials *out*; iroh hole-punches or falls back to an
 //! n0 relay), authenticates with the token, and serves shells/exec + the reverse
 //! tunnel over the single connection.
