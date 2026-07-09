@@ -460,6 +460,7 @@ mod tests {
             80,
             pane_tx,
             None,
+            None, // no grid in the daemon — no off-thread feed sink
         )
         .expect("open pty");
         let (events, _keep) = broadcast::channel(64);

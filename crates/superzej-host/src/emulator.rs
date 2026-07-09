@@ -60,10 +60,25 @@ pub enum CellColor {
     Rgb(u8, u8, u8),
 }
 
+/// A sink that can feed a pane's grid from OFF the event loop (the pane's
+/// reader thread). Owns its own escape parser; exactly one feeder OR the
+/// loop-side [`PaneEmulator::advance`] drives a given pane's stream — never
+/// both (two parsers on one stream would split escape state).
+pub trait FeedSink: Send {
+    /// Parse + apply PTY output bytes to the shared grid.
+    fn advance(&mut self, bytes: &[u8]);
+}
+
 /// A terminal emulator for a single pane.
 pub trait PaneEmulator: Send {
     /// Feed PTY output bytes (advances the screen; never renders).
     fn advance(&mut self, bytes: &[u8]);
+    /// A handle that feeds this emulator's grid from another thread (the pane
+    /// reader), or `None` when the emulator can't share its grid — the pane
+    /// then stays loop-fed. See `pane_feed` in the module docs of `pane.rs`.
+    fn feeder(&self) -> Option<Box<dyn FeedSink>> {
+        None
+    }
     /// Resize the screen to `rows` x `cols`.
     fn resize(&mut self, rows: u16, cols: u16);
     /// Current grid size as `(rows, cols)`.
@@ -75,6 +90,14 @@ pub trait PaneEmulator: Send {
     /// as a borrow override it (the compositor falls back to [`Self::cell`] when
     /// this returns `None`).
     fn cell_ref(&self, _row: u16, _col: u16) -> Option<CellRef<'_>> {
+        None
+    }
+    /// One-lock bulk read of the visible grid (row-major, `rows × cols`) for
+    /// composition. With the feed running on the pane's READER thread, the
+    /// per-cell accessors would take (and contend) the grid lock once per cell
+    /// — ~10k lock round-trips per pane compose racing a flood's parser. The
+    /// snapshot pays one lock + one pass. Default `None` → per-cell path.
+    fn grid_snapshot(&self) -> Option<Vec<Vec<GridCell>>> {
         None
     }
     /// The OSC window title (OSC 0/2) the app last set, if any. `None` when the
@@ -184,6 +207,19 @@ impl AlacrittyEmulator {
     }
 }
 
+fn conv_cell(cell: &alacritty_terminal::term::cell::Cell) -> GridCell {
+    use alacritty_terminal::term::cell::Flags;
+    GridCell {
+        text: cell.c.to_string(),
+        fg: conv_color(cell.fg),
+        bg: conv_color(cell.bg),
+        bold: cell.flags.contains(Flags::BOLD),
+        italic: cell.flags.contains(Flags::ITALIC),
+        underline: cell.flags.contains(Flags::UNDERLINE),
+        inverse: cell.flags.contains(Flags::INVERSE),
+    }
+}
+
 fn conv_color(c: alacritty_terminal::vte::ansi::Color) -> CellColor {
     use alacritty_terminal::vte::ansi::Color;
     use alacritty_terminal::vte::ansi::NamedColor;
@@ -197,10 +233,35 @@ fn conv_color(c: alacritty_terminal::vte::ansi::Color) -> CellColor {
     }
 }
 
+/// The off-thread feed handle for [`AlacrittyEmulator`]: a clone of the
+/// `FairMutex<Term>` plus its own `Processor`. This is alacritty's shipped
+/// architecture — its reader thread parses into the shared Term while the
+/// render thread reads it; the FairMutex prevents either side starving the
+/// other. Feeds lock once per (≤64KB) chunk, so loop-side reads (compose,
+/// copymode, cursor) never wait long.
+pub struct AlacrittyFeeder {
+    term: Arc<FairMutex<Term<EventProxy>>>,
+    parser: Processor,
+}
+
+impl FeedSink for AlacrittyFeeder {
+    fn advance(&mut self, bytes: &[u8]) {
+        let mut term = self.term.lock();
+        self.parser.advance(&mut *term, bytes);
+    }
+}
+
 impl PaneEmulator for AlacrittyEmulator {
     fn advance(&mut self, bytes: &[u8]) {
         let mut term = self.term.lock();
         self.parser.advance(&mut *term, bytes);
+    }
+
+    fn feeder(&self) -> Option<Box<dyn FeedSink>> {
+        Some(Box::new(AlacrittyFeeder {
+            term: Arc::clone(&self.term),
+            parser: Processor::new(),
+        }))
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -227,24 +288,27 @@ impl PaneEmulator for AlacrittyEmulator {
             alacritty_terminal::index::Line(row as i32 - display_offset as i32),
             alacritty_terminal::index::Column(col as usize),
         );
-        let cell = &term.grid()[point];
-        Some(GridCell {
-            text: cell.c.to_string(),
-            fg: conv_color(cell.fg),
-            bg: conv_color(cell.bg),
-            bold: cell
-                .flags
-                .contains(alacritty_terminal::term::cell::Flags::BOLD),
-            italic: cell
-                .flags
-                .contains(alacritty_terminal::term::cell::Flags::ITALIC),
-            underline: cell
-                .flags
-                .contains(alacritty_terminal::term::cell::Flags::UNDERLINE),
-            inverse: cell
-                .flags
-                .contains(alacritty_terminal::term::cell::Flags::INVERSE),
-        })
+        Some(conv_cell(&term.grid()[point]))
+    }
+
+    fn grid_snapshot(&self) -> Option<Vec<Vec<GridCell>>> {
+        let term = self.term.lock();
+        let (rows, cols) = (term.screen_lines(), term.columns());
+        let display_offset = term.grid().display_offset() as i32;
+        let grid = term.grid();
+        let mut out = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let mut line = Vec::with_capacity(cols);
+            for col in 0..cols {
+                let point = alacritty_terminal::index::Point::new(
+                    alacritty_terminal::index::Line(row as i32 - display_offset),
+                    alacritty_terminal::index::Column(col),
+                );
+                line.push(conv_cell(&grid[point]));
+            }
+            out.push(line);
+        }
+        Some(out)
     }
 
     fn title(&self) -> Option<String> {

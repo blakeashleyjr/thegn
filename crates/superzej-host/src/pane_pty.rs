@@ -32,6 +32,13 @@ pub(crate) struct PtyHandle {
 /// `waker` (when present) is pulsed after every send so the main loop's
 /// blocking `poll_input(None)` returns immediately to drain PTY output — this
 /// is what makes the loop event-driven (zero idle wakeups) rather than polled.
+///
+/// `feed` (when present) is the pane's off-thread grid sink: the reader parses
+/// each chunk into the shared emulator HERE (one lock per ≤64KB read) so the
+/// expensive escape parsing never runs on the event loop — unless the paired
+/// `loop_fed` flag flips the pane back to on-loop parsing (the corner overlay,
+/// whose kitty relay must feed text pieces at exact cursor positions). The
+/// pane daemon passes `None` — it keeps no grid.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open_pty(
     id: u32,
@@ -42,6 +49,10 @@ pub(crate) fn open_pty(
     cols: u16,
     tx: tokio_mpsc::Sender<PaneEvent>,
     waker: Option<TerminalWaker>,
+    feed: Option<(
+        Box<dyn crate::emulator::FeedSink>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )>,
 ) -> Result<PtyHandle> {
     let pty = portable_pty::native_pty_system();
     let pair = pty
@@ -102,15 +113,27 @@ pub(crate) fn open_pty(
         // held is poisoned. A panic degrades into a normal pane exit.
         let tx_panic = tx.clone();
         let waker_panic = waker.clone();
+        let mut feed = feed;
         let body = std::panic::AssertUnwindSafe(move || {
-            let mut buf = [0u8; 8192];
+            // 64KB per read: at full flood this is 8× fewer channel sends +
+            // waker pulses than an 8KB buffer at identical throughput (chunk
+            // boundaries are arbitrary either way, and the drain's budget is
+            // byte-based, so chunk size doesn't affect fairness).
+            let mut buf = vec![0u8; 64 * 1024];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF: child exited or PTY closed
                     Ok(n) => {
+                        // Parse into the shared grid here (one lock per chunk)
+                        // unless the pane went loop-fed.
+                        if let Some((sink, loop_fed)) = feed.as_mut()
+                            && !loop_fed.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            sink.advance(&buf[..n]);
+                        }
                         // One exact-sized Vec per chunk: ownership must cross
-                        // the channel, and the 8K stack buffer is reused, so
-                        // this is the minimal copy (a buffer pool would add
+                        // the channel, and the read buffer is reused, so this
+                        // is the minimal copy (a buffer pool would add
                         // complexity for no measured win).
                         if tx
                             .blocking_send(PaneEvent::Output(id, buf[..n].to_vec()))

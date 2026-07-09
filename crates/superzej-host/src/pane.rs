@@ -112,6 +112,16 @@ pub struct PtyPane {
     /// Time-travel recording ring (`[replay]`). `None` when replay is disabled —
     /// then `feed` does a single null check and allocates nothing.
     record: Option<crate::replay::Recording>,
+    /// Who parses this pane's output into the grid. `false` (default for PTY
+    /// panes): the READER THREAD feeds via the emulator's
+    /// [`crate::emulator::FeedSink`] — the
+    /// expensive escape parsing runs off the event loop, which then only scans
+    /// the bytes (queries/OSC/history/predictor). `true`: the loop's
+    /// [`PtyPane::feed`] advances the emulator — required for the corner
+    /// overlay pane (the kitty relay must feed text pieces at exact positions)
+    /// and for Stream panes (no reader thread). Exactly one side ever parses a
+    /// given stream — two parsers would split escape state.
+    loop_fed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Derive a pane's program name from its spawn argv. Handles the common
@@ -239,16 +249,38 @@ impl PtyPane {
         tx: tokio_mpsc::Sender<PaneEvent>,
         waker: Option<TerminalWaker>,
     ) -> Result<Self> {
+        // Off-thread grid feed: the reader thread owns a FeedSink (the shared
+        // FairMutex<Term> + its own Processor — alacritty's shipped
+        // reader/render split), so the expensive escape parsing runs on the
+        // reader, off the event loop. The loop still receives the raw bytes
+        // for its cheap scans (queries/OSC/history/predictor) and damage
+        // marking. `loop_fed` opts a pane back to on-loop parsing (corner
+        // overlay; Stream panes).
+        let emulator: Box<dyn PaneEmulator> = Box::new(AlacrittyEmulator::new(rows, cols, 10_000));
+        let feeder = emulator.feeder();
+        let loop_fed = Arc::new(std::sync::atomic::AtomicBool::new(feeder.is_none()));
+
         // The PTY open + reader thread live in `pane_pty` so the pane daemon's
-        // session actor spawns the identical PTY (with `waker: None`).
-        let pty = crate::pane_pty::open_pty(id, argv, cwd, env, rows, cols, tx, waker)?;
+        // session actor spawns the identical PTY (with `waker: None` and no
+        // feed sink — a daemon keeps no grid).
+        let pty = crate::pane_pty::open_pty(
+            id,
+            argv,
+            cwd,
+            env,
+            rows,
+            cols,
+            tx,
+            waker,
+            feeder.map(|f| (f, Arc::clone(&loop_fed))),
+        )?;
 
         Ok(Self {
             io: PaneIo::Pty {
                 master: pty.master,
                 writer: pty.writer,
             },
-            emulator: Box::new(AlacrittyEmulator::new(rows, cols, 10_000)),
+            emulator,
             rows,
             cols,
             program: program_name(argv),
@@ -261,6 +293,7 @@ impl PtyPane {
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
+            loop_fed,
         })
     }
 
@@ -317,6 +350,9 @@ impl PtyPane {
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
+            // Stream frames arrive via the relay task's Output events with no
+            // reader-side feeder — the loop parses them.
+            loop_fed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -376,14 +412,18 @@ impl PtyPane {
         self.pending_relaunch.take()
     }
 
-    /// Feed PTY output into the emulator grid and the plain-text history ring.
-    /// Drain-without-render is just this without a subsequent compose.
+    /// Feed PTY output into the emulator grid (loop-fed panes only — a
+    /// reader-fed pane's grid was already advanced on its reader thread) and
+    /// the plain-text history ring. Drain-without-render is just this without
+    /// a subsequent compose.
     pub fn feed(&mut self, bytes: &[u8]) {
         // Server output is authoritative (and carries the echoed keystrokes), so
         // it retires the prediction overlay + folds a round-trip sample into srtt.
         let now = self.predict_now_ms();
         self.predictor.on_server_output(now);
-        self.emulator.advance(bytes);
+        if self.loop_fed.load(std::sync::atomic::Ordering::Relaxed) {
+            self.emulator.advance(bytes);
+        }
         feed_bytes_to_history(
             bytes,
             &mut self.history,
@@ -395,6 +435,14 @@ impl PtyPane {
         if let Some(rec) = &mut self.record {
             rec.push_bytes(bytes, std::time::Instant::now());
         }
+    }
+
+    /// Route this pane's grid parsing back onto the event loop (the corner
+    /// overlay: the kitty relay must feed text pieces at exact cursor
+    /// positions). One-way in practice — a loop-fed pane stays loop-fed.
+    pub fn set_loop_fed(&self, on: bool) {
+        self.loop_fed
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Attach a fresh recording ring so this pane's output is captured for
@@ -569,6 +617,7 @@ impl PtyPane {
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
+            loop_fed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 

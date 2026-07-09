@@ -294,7 +294,7 @@ pub struct WorktreeView {
 }
 
 /// A persistent folder in the sidebar.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FolderRow {
     pub folder_id: i64,
     pub repo_path: String,
