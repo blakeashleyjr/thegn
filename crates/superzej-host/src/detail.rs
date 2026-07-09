@@ -1888,6 +1888,43 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
             ov.hint = Some("↵ open · x dismiss · X clear · o log".into());
             Some(ov)
         }
+        BarBadge::Attention => {
+            use superzej_core::attention::AttentionTier;
+            let g = crate::caps::active_glyphs();
+            let rows: Vec<DetailRow> = crate::handlers::attention::needs_user_ordered(model)
+                .into_iter()
+                .map(|(path, score)| {
+                    // Branch label from the tree when the row exists; else the
+                    // path's basename (registered-but-unlisted edge).
+                    let label = model
+                        .sidebar_rows
+                        .iter()
+                        .find(|r| r.worktree_path.as_deref() == Some(path.as_str()))
+                        .map(|r| r.label.clone())
+                        .unwrap_or_else(|| {
+                            std::path::Path::new(&path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.clone())
+                        });
+                    let (glyph, marker) = match score.tier {
+                        AttentionTier::Blocked => (g.attention, Tok::Hue(Hue::Red)),
+                        AttentionTier::Failure => (g.cross, Tok::Hue(Hue::Red)),
+                        _ => (g.dot_filled, Tok::Hue(Hue::Amber)),
+                    };
+                    let text = format!("{label} \u{2014} {}", score.reason.label());
+                    let mut row = DetailRow::new(marker, glyph, text)
+                        .on_enter(DetailAction::FocusWorktree(path));
+                    if let Some(at) = score.since {
+                        row = row.note(format!("{} ago", superzej_core::util::age(at)));
+                    }
+                    row
+                })
+                .collect();
+            let mut ov = list("Needs you", rows, "nothing needs you", 60, 14);
+            ov.hint = Some("↵ focus \u{00b7} Alt a next".into());
+            Some(ov)
+        }
         BarBadge::Agent => {
             let a = model.agent_activity.as_ref()?;
             let conn = match a.conn {
