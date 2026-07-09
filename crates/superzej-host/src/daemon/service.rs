@@ -164,6 +164,7 @@ impl ControlApi for DaemonService {
                 return Err(ControlError::Conflict("empty argv".into()));
             }
             let id = fresh_id();
+            tracing::debug!(target: "szhost::daemon", argv = ?spec.argv, cwd = ?spec.cwd, "open session");
             let rows = spec.rows.max(1);
             let cols = spec.cols.max(1);
             let (pane_tx, pane_rx) = mpsc::channel(256);

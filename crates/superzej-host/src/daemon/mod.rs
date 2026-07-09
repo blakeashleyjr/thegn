@@ -104,6 +104,18 @@ async fn run(
     socket_override: Option<PathBuf>,
     serve: Option<ServeOpts>,
 ) -> Result<()> {
+    // The daemon is its own process, so it installs its own file-log subscriber
+    // (opt-in via SUPERZEJ_LOG, same as the compositor) — otherwise a headless
+    // daemon is unobservable. Free when SUPERZEJ_LOG is unset.
+    if std::env::var_os("SUPERZEJ_LOG").is_some() {
+        superzej_core::log_trace::init(
+            superzej_core::log_trace::Role::Host,
+            &superzej_core::config::LogConfig {
+                file: true,
+                ..Default::default()
+            },
+        );
+    }
     let sock = socket_override.unwrap_or_else(|| socket_path(&cfg.daemon));
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent).ok();
