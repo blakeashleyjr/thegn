@@ -48,7 +48,7 @@ pub fn run(cfg: &Config) -> Result<()> {
 
     let report = integrate::run_fold(mq, &repo_root, cands.branches.clone())?;
     if let Ok(db) = Db::open() {
-        let _ = integrate::persist(&db, &cands, &report);
+        let _ = integrate::persist(mq, &repo_root, &db, &cands, &report);
     }
 
     for l in &report.landed {

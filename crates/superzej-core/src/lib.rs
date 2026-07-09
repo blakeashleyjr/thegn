@@ -92,6 +92,7 @@ pub mod managed_tool;
 pub mod mcp;
 pub mod media;
 pub mod merge_guard;
+pub mod merge_lifecycle;
 pub mod metrics;
 pub mod models;
 pub mod msg;

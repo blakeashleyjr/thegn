@@ -87,6 +87,12 @@ pub(crate) fn drive_queue(
         let set = |db: &Db, status: &str, oid: Option<&str>, detail: Option<&str>| {
             let _ = db.update_merge_status(&item.worktree, status, oid, detail, None);
         };
+        // Sidebar-folder lifecycle: move the worktree on a settled transition
+        // (landed ⇒ Merged/cleanup, failure ⇒ the failed folder). No-op unless
+        // `[merge_queue] organize_folders` is on.
+        let lifecycle = |db: &Db, event: superzej_core::merge_lifecycle::LifecycleEvent| {
+            crate::merge_lifecycle::apply(cfg, db, repo_root, &item.worktree, &item.branch, event);
+        };
         set(db, "folding", None, None);
         progress(&DriveStep {
             worktree: &item.worktree,
@@ -102,6 +108,7 @@ pub(crate) fn drive_queue(
                 Err(e) => {
                     let detail = format!("{e}");
                     set(db, "needs_human", None, Some(&detail));
+                    lifecycle(db, superzej_core::merge_lifecycle::LifecycleEvent::Failed);
                     progress(&DriveStep {
                         worktree: &item.worktree,
                         branch: &item.branch,
@@ -116,6 +123,7 @@ pub(crate) fn drive_queue(
             let failure = match attempt {
                 AttemptOutcome::Landed { commit } => {
                     set(db, "landed", Some(&commit), None);
+                    lifecycle(db, superzej_core::merge_lifecycle::LifecycleEvent::Landed);
                     progress(&DriveStep {
                         worktree: &item.worktree,
                         branch: &item.branch,
@@ -127,6 +135,7 @@ pub(crate) fn drive_queue(
                 }
                 AttemptOutcome::UpToDate => {
                     set(db, "landed", None, Some("already merged"));
+                    lifecycle(db, superzej_core::merge_lifecycle::LifecycleEvent::Landed);
                     progress(&DriveStep {
                         worktree: &item.worktree,
                         branch: &item.branch,
@@ -217,6 +226,7 @@ pub(crate) fn drive_queue(
                     }
                 }
             }
+            lifecycle(db, superzej_core::merge_lifecycle::LifecycleEvent::Failed);
             break;
         }
     }

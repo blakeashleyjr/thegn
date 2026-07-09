@@ -305,6 +305,56 @@ pub(crate) fn spawn_refresh_ticker(
     });
 }
 
+/// Drop session groups whose local worktree dir has vanished (deleted/moved
+/// outside superzej — including a merge-queue `on_landed = remove/detach` land),
+/// forgetting their registry rows so nothing re-adopts them. Remote worktrees (a
+/// `location` in the registry) are exempt — their path isn't local. Active focus
+/// is re-pinned by name and the session re-persisted. Returns how many were
+/// pruned. Cheap (one `is_dir` stat per group); call on a real event, never idle.
+pub(crate) fn prune_stale_worktree_groups(
+    session: &mut crate::session::Session,
+    db: &superzej_core::db::Db,
+    session_name: &str,
+) -> usize {
+    let remote: std::collections::HashSet<String> = db
+        .worktrees()
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|w| !w.location.is_empty())
+                .map(|w| w.worktree)
+                .collect()
+        })
+        .unwrap_or_default();
+    let active_name = session.active_group().map(|g| g.name.clone());
+    let before = session.worktrees.len();
+    let dead: Vec<crate::session::WorktreeGroup> = {
+        let (live, dead) =
+            session
+                .worktrees
+                .drain(..)
+                .partition(|g: &crate::session::WorktreeGroup| {
+                    g.path.is_empty() || remote.contains(&g.path) || Path::new(&g.path).is_dir()
+                });
+        session.worktrees = live;
+        dead
+    };
+    if session.worktrees.len() != before {
+        for g in &dead {
+            let _ = db.del_worktree(&g.path);
+        }
+        session.active = active_name
+            .and_then(|n| session.worktrees.iter().position(|g| g.name == n))
+            .unwrap_or(0);
+        let _ = session.persist(db, session_name, now_secs());
+        tracing::info!(
+            target: "szhost::startup",
+            pruned = dead.len(),
+            "stale worktrees pruned (dirs gone from disk)"
+        );
+    }
+    dead.len()
+}
+
 /// Resurrect the persisted tab list, seeding a single Home tab for the current
 /// worktree if the session is empty (and persisting it so the next launch
 /// restores it). The native host owns this — it's the resurrect path that
@@ -396,45 +446,8 @@ pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> (crate::session::Se
     let mut session = Session::resurrect(&db, &session_name).unwrap_or_default();
 
     // git is the source of truth for worktrees on disk: drop resurrected
-    // groups whose local dir vanished (deleted/moved outside superzej), and
-    // forget their registry rows so nothing re-adopts them. Remote worktrees
-    // (a `location` in the registry) are exempt — their path isn't local.
-    let remote: std::collections::HashSet<String> = db
-        .worktrees()
-        .map(|rows| {
-            rows.into_iter()
-                .filter(|w| !w.location.is_empty())
-                .map(|w| w.worktree)
-                .collect()
-        })
-        .unwrap_or_default();
-    let active_name = session.active_group().map(|g| g.name.clone());
-    let before = session.worktrees.len();
-    let dead: Vec<crate::session::WorktreeGroup> = {
-        let (live, dead) =
-            session
-                .worktrees
-                .drain(..)
-                .partition(|g: &crate::session::WorktreeGroup| {
-                    g.path.is_empty() || remote.contains(&g.path) || Path::new(&g.path).is_dir()
-                });
-        session.worktrees = live;
-        dead
-    };
-    if session.worktrees.len() != before {
-        for g in &dead {
-            let _ = db.del_worktree(&g.path);
-        }
-        session.active = active_name
-            .and_then(|n| session.worktrees.iter().position(|g| g.name == n))
-            .unwrap_or(0);
-        let _ = session.persist(&db, &session_name, now_secs());
-        tracing::info!(
-            target: "szhost::startup",
-            pruned = dead.len(),
-            "stale worktrees pruned (dirs gone from disk)"
-        );
-    }
+    // groups whose local dir vanished (deleted/moved outside superzej).
+    let _ = prune_stale_worktree_groups(&mut session, &db, &session_name);
 
     let mut seeded = false;
     if session.worktrees.is_empty() {
