@@ -178,6 +178,7 @@ impl ControlApi for DaemonService {
                 cols,
                 pane_tx,
                 None, // a daemon has no render loop to wake
+                None, // ...and no grid — no off-thread feed sink
             )
             .map_err(ControlError::Internal)?;
 

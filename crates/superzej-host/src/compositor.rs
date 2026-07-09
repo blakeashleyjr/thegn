@@ -88,6 +88,11 @@ pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
     use unicode_width::UnicodeWidthStr;
     let (erows, ecols) = emu.size();
     let last_col = rect.cols.min(ecols as usize).saturating_sub(1);
+    // One grid lock for the whole compose: with the feed on the pane's reader
+    // thread, per-cell accessors would contend the grid lock ~10k times per
+    // pane against a flooding parser. Falls back to per-cell reads for
+    // emulators without a snapshot.
+    let snapshot = emu.grid_snapshot();
     let mut current_style: Option<CellStyle> = None;
     let mut run = String::new();
     for row in 0..rect.rows.min(erows as usize) {
@@ -97,13 +102,25 @@ pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
             y: Position::Absolute(rect.y + row),
         });
         for col in 0..rect.cols.min(ecols as usize) {
-            // Prefer the borrowing accessor (no per-cell `String` alloc); fall
-            // back to the owning `cell()` for any emulator that doesn't implement
-            // `cell_ref`. Indices are in-bounds, so `cell_ref` is `Some` for the
-            // real (vt100) emulator and the fallback never runs in production.
+            // Snapshot first (one lock), then the borrowing accessor, then the
+            // owning `cell()` — the fallbacks never run for the real emulator.
             let owned;
             let (text, fg, bg, bold, italic, underline, inverse): (&str, _, _, _, _, _, _) =
-                if let Some(c) = emu.cell_ref(row as u16, col as u16) {
+                if let Some(c) = snapshot
+                    .as_ref()
+                    .and_then(|s| s.get(row))
+                    .and_then(|r| r.get(col))
+                {
+                    (
+                        c.text.as_str(),
+                        c.fg,
+                        c.bg,
+                        c.bold,
+                        c.italic,
+                        c.underline,
+                        c.inverse,
+                    )
+                } else if let Some(c) = emu.cell_ref(row as u16, col as u16) {
                     (c.text, c.fg, c.bg, c.bold, c.italic, c.underline, c.inverse)
                 } else {
                     owned = emu.cell(row as u16, col as u16).unwrap_or_default();

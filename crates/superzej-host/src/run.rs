@@ -50,9 +50,7 @@ use crate::menu::{self, MenuChoice, MenuOverlay};
 use crate::palette::build_palette;
 use crate::pane::PaneEvent;
 use crate::panel::gitui::{self, GitFlow, GitMsg, GitView, StagePane};
-use crate::panes::{
-    Panes, prewarm_requests, relayout, relayout_strip, replace_single_dead_center_pane,
-};
+use crate::panes::{Panes, prewarm_requests, relayout, relayout_strip};
 use crate::recorder::Recorder;
 use crate::wizard;
 use crate::workspace_create::complete_workspace_create;
@@ -1126,7 +1124,7 @@ fn compute_chrome(
 
 /// Working directory for a pin: explicit `cwd`, else the active tab's worktree,
 /// else `$HOME` / cwd.
-fn pin_cwd(
+pub(crate) fn pin_cwd(
     pin: &superzej_core::config::Pin,
     active_dir: Option<std::path::PathBuf>,
 ) -> std::path::PathBuf {
@@ -1142,7 +1140,7 @@ fn pin_cwd(
 
 /// Persist the supervisor's live pin set to `session_state.pin_state` (best
 /// effort; pin persistence never blocks the loop).
-fn persist_pin_state(supervisor: &crate::pins::PinSupervisor, session_id: &str) {
+pub(crate) fn persist_pin_state(supervisor: &crate::pins::PinSupervisor, session_id: &str) {
     if session_id.is_empty() {
         return;
     }
@@ -1380,7 +1378,7 @@ impl SidebarState {
     }
 
     /// Number of currently-visible rows.
-    fn visible_len(model: &FrameModel) -> usize {
+    pub(crate) fn visible_len(model: &FrameModel) -> usize {
         model.sidebar_rows.iter().filter(|r| r.visible).count()
     }
 
@@ -1395,6 +1393,7 @@ impl SidebarState {
                 .activity
                 .insert(name.clone(), crate::sidebar::ActivityState::Loading);
         }
+        let rows_span = crate::perf::measure(crate::perf::Subsys::Rows);
         model.sidebar_rows = crate::sidebar::build_rows(
             session,
             &model.sidebar_workspaces,
@@ -1404,6 +1403,7 @@ impl SidebarState {
             &model.sidebar_db_folders,
             &model.sidebar_db_terminals,
         );
+        drop(rows_span);
         // Drop marks whose row is gone (deleted worktree/workspace). Keep marks
         // whose row exists but is hidden by a collapsed parent, so re-expanding
         // restores the selection.
@@ -2204,7 +2204,7 @@ fn prev_section_in_order(
 }
 
 /// A worktree group's working directory, falling back to the process cwd.
-fn group_cwd(g: &crate::session::WorktreeGroup) -> Option<std::path::PathBuf> {
+pub(crate) fn group_cwd(g: &crate::session::WorktreeGroup) -> Option<std::path::PathBuf> {
     (!g.path.is_empty() && std::path::Path::new(&g.path).is_dir())
         .then(|| std::path::PathBuf::from(&g.path))
         .or_else(|| std::env::current_dir().ok())
@@ -5979,7 +5979,11 @@ fn resolve_drawer_rows(height: &str, rows: usize) -> usize {
 /// bordered card paints over this rect; the PTY gets `pins::inset1` of it. Pure
 /// w.r.t. the screen size, so it is recomputed each frame and reused for the
 /// bounded incremental diff.
-fn prospective_corner_rect(pin: &superzej_core::config::Pin, cols: usize, rows: usize) -> Rect {
+pub(crate) fn prospective_corner_rect(
+    pin: &superzej_core::config::Pin,
+    cols: usize,
+    rows: usize,
+) -> Rect {
     let w = resolve_dim(
         pin.corner_width.as_deref().unwrap_or("30%"),
         cols,
@@ -7271,16 +7275,8 @@ async fn event_loop<T: Terminal>(
     // materialize path retries independently when the tab is actually focused.
     let mut prewarm_failed: std::collections::HashSet<(String, usize)> =
         std::collections::HashSet::new();
-    // Consecutive fast-crash count per (group, tab). A "fast crash" is any
-    // pane that exits within CRASH_THRESHOLD of being spawned — this catches
-    // bwrap failures that print an error to the PTY before dying (output-based
-    // detection would mis-classify those as normal exits). Reset when a pane
-    // survives longer than the threshold. After 3 fast crashes, respawn stops.
-    //
-    // 2 seconds: bwrap/exec failures land in < 100ms; interactive shells need
-    // at least ~300ms to show a prompt + the user must type "exit" + Enter,
-    // making deliberate quick exits practically impossible below 2s.
-    const CRASH_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(2);
+    // Consecutive fast-crash count per (group, tab); the threshold + detection
+    // live with the drain's exit handler (`pty_drain::CRASH_THRESHOLD`).
     let mut respawn_crash_count: std::collections::HashMap<(usize, usize), u32> =
         std::collections::HashMap::new();
     // Startup-shell watchdog deadlines live in `watchdog_deadline` (module-level,
@@ -7623,6 +7619,13 @@ async fn event_loop<T: Terminal>(
     let mut wire_renderer = crate::wire::WireRenderer::new();
     wire_renderer.set_depth(crate::caps::color_depth());
     let use_termwiz_renderer = crate::wire::use_termwiz_renderer();
+    // The terminal writer thread: owns every stdout write inside the loop so
+    // a slow outer terminal never blocks it (see `frame_writer`). Sync mode
+    // (termwiz debug renderer, or SUPERZEJ_SYNC_WRITER=1) writes inline.
+    let writer = crate::frame_writer::FrameWriter::spawn(
+        waker.clone(),
+        crate::frame_writer::FrameWriter::want_sync(use_termwiz_renderer),
+    );
     let mut palette: Option<crate::search_everywhere::PaletteSession> = None;
     // The Alt+W new-workspace fuzzy picker (fuzzy repo list ⇄ manual entry).
     let mut workspace_picker: Option<crate::workspace_picker::WorkspacePicker> = None;
@@ -7872,6 +7875,16 @@ async fn event_loop<T: Terminal>(
     let mut model_refresh_pending = false;
     // Input dispatch time; next render measures dispatch→frame latency + drives the input-priority PTY budget.
     let mut input_at: Option<std::time::Instant> = None;
+    // Tab/worktree-switch action time; the first post-switch frame records
+    // switch→frame latency (`switch_us`) — the perceived switch cost.
+    let mut switch_at: Option<std::time::Instant> = None;
+    // Raw PTY chunks received but not yet parsed (the budgeted drain's stash);
+    // persists across iterations so a capped backlog carries over.
+    let mut pty_backlog = crate::pty_drain::PtyBacklog::default();
+    // Last frame-flush time — drives the pane-only frame pacing gate
+    // (`loop_policy::frame_gate`): streaming output renders at most once per
+    // window, with the trailing frame guaranteed via the poll timeout.
+    let mut last_flush_at = std::time::Instant::now();
     // True while a fold-actor run is off the loop; blocks a second concurrent
     // trigger (a fold advances `main` globally, so one at a time).
     let mut fold_inflight = false;
@@ -7938,6 +7951,11 @@ async fn event_loop<T: Terminal>(
                         supervisor.attach(pin, id);
                         corner = Some(id);
                         corner_name = Some(pin.name.clone());
+                        // Corner panes parse on the loop: the kitty relay must
+                        // feed text pieces at exact cursor positions.
+                        if let Some(p) = panes.table.get(&id) {
+                            p.set_loop_fed(true);
+                        }
                     }
                 }
                 continue;
@@ -8023,6 +8041,23 @@ async fn event_loop<T: Terminal>(
             forward_supervisor.shutdown_all();
             persist_session_layout(&mut session, &panes);
             return Ok(());
+        }
+        // Writer-thread health: a transient write failure means the terminal's
+        // actual content is unknown — resync with a full repaint (the async
+        // sibling of the old inline EIO retry); a fatal one tears down.
+        match writer.take_status() {
+            crate::frame_writer::WriterStatus::Ok => {}
+            crate::frame_writer::WriterStatus::Transient => {
+                tracing::warn!(
+                    target: "szhost::frame",
+                    "transient terminal write error (writer thread); forcing full repaint"
+                );
+                full_repaint = true;
+                dirty = true;
+            }
+            crate::frame_writer::WriterStatus::Fatal(e) => {
+                return Err(anyhow::anyhow!("terminal writer failed: {e}"));
+            }
         }
         // Keep the drawer geometry that `compute_chrome` reserves in sync with
         // the live drawer state. When the reservation changes (any open/close
@@ -8177,11 +8212,17 @@ async fn event_loop<T: Terminal>(
             };
             // D1: coalesce rapid switches — the gate hydrates only the settled worktree.
             model_refresh_pending = true;
-            // Warm the worktrees above/below the selection into the cache so a
-            // follow-on switch to a neighbor is instant too. Skip ones already
-            // cached — the on-switch hydration refreshes them when truly focused.
-            for path in neighbor_worktree_paths(&session, &sidebar_worktree_order(&model)) {
-                if switch_cache.contains_key(&path) {
+            // Warm the ACTIVE WORKSPACE's other worktrees into the cache, in
+            // proximity order, so any follow-on in-workspace switch is a cache
+            // hit — not just the two immediate neighbors. Rides the sched.rs
+            // background lane (8 permits), so a wide workspace can't saturate
+            // the blocking pool. Skip only FRESH entries: the old
+            // contains_key skip was forever, so a once-warmed worktree never
+            // re-warmed and an hour-later switch painted hour-old data.
+            for path in
+                crate::hydrate::workspace_worktree_paths(&session, &sidebar_worktree_order(&model))
+            {
+                if switch_cache.get(&path).is_some_and(|s| s.is_fresh()) {
                     continue;
                 }
                 spawn_panel_prefetch(
@@ -8192,22 +8233,25 @@ async fn event_loop<T: Terminal>(
                 );
             }
             spawn_pr_cache_refresh(
-                session.clone(),
+                current_worktree.clone(),
                 current_config.issues.clone(),
                 current_config.disk.clone(),
                 Some(waker.clone()),
             );
             crate::hydrate::spawn_issue_cache_refresh(
-                session.clone(),
+                current_worktree.clone(),
                 current_config.issues.clone(),
                 Some(waker.clone()),
             );
             crate::hydrate::spawn_my_work_refresh(
-                session.clone(),
+                current_worktree.clone(),
                 current_config.clone(),
                 crate::panel::scope::mine_all(),
                 Some(waker.clone()),
             );
+            // main's ci_refresh rework needs the whole Session (its background
+            // sweep walks session.worktrees), so this call keeps the clone —
+            // coalesced by the [ci] ttl guard, not a per-keystroke cost.
             crate::ci_refresh::spawn_ci_cache_refresh(
                 session.clone(),
                 current_config.ci.clone(),
@@ -8569,6 +8613,7 @@ async fn event_loop<T: Terminal>(
         }
 
         if need_relayout {
+            let _relayout_span = crate::perf::measure(crate::perf::Subsys::Relayout);
             let tree = if zoom == Some(crate::focus::Zone::Center) {
                 crate::center::CenterTree::Leaf(focused_pane_id(&session))
             } else {
@@ -8601,10 +8646,7 @@ async fn event_loop<T: Terminal>(
                 // Clear any kitty image at the old geometry; the child re-transmits
                 // at the new size on its next frame.
                 if corner_kitty {
-                    use std::io::Write as _;
-                    let mut o = std::io::stdout();
-                    let _ = o.write_all(crate::kitty_relay::delete_all());
-                    let _ = o.flush();
+                    writer.submit_oob(crate::kitty_relay::delete_all().to_vec());
                     corner_gfx.clear();
                 }
             }
@@ -8636,566 +8678,71 @@ async fn event_loop<T: Terminal>(
             visible.insert(cid);
         }
 
-        // 1. Drain pending PTY output, routed by pane id (only a visible pane's
-        //    output dirties the frame). Budgeted so a chatty pane can't starve
-        //    render/input; input priority shrinks it when a key awaits its frame.
-        let mut disconnected = false;
-        let mut budget_exhausted = false;
-        let mut drain_stats_chunks = 0;
-        let pty_budget = if input_at.is_some() { 8 } else { 64 };
-
-        loop {
-            if drain_stats_chunks >= pty_budget {
-                budget_exhausted = true;
-                break;
-            }
-            match rx.try_recv() {
-                Ok(ev) => {
-                    drain_stats_chunks += 1;
-                    match ev {
-                        PaneEvent::Output(id, b) => {
-                            if let Some(p) = panes.table.get_mut(&id) {
-                                // First real output ⇒ this worktree's shell is live;
-                                // drop its loading splash (by owner, so a background
-                                // worktree that finished while away shows no stale splash
-                                // on return). Held while provisioning is still live (the
-                                // premature-shell guard); only the shell-wait shape clears.
-                                // `any_clearable_splash` pre-gates the tab scan: the
-                                // lingering empty markers parked by eager/warm-spare success
-                                // keep the map non-empty, so gating on `!is_empty()` rescanned
-                                // + re-logged per output chunk forever (the log storm). See
-                                // `loading::{any_clearable_splash, should_clear_splash_on_output}`.
-                                if crate::loading::any_clearable_splash(&loading_state)
-                                    && let Some((gi, ti)) = session
-                                        .iter_tabs()
-                                        .find(|(_, _, t)| t.center.pane_ids().contains(&id))
-                                        .map(|(gi, ti, _)| (gi, ti))
-                                {
-                                    let key = (session.worktrees[gi].name.clone(), ti);
-                                    if crate::loading::should_clear_splash_on_output(
-                                        &loading_state,
-                                        &key,
-                                    ) {
-                                        tracing::debug!(
-                                            target: "szhost::loading",
-                                            worktree = %session.worktrees[gi].name,
-                                            "first pane output cleared the loading splash (provisioning done, shell live)"
-                                        );
-                                        loading_state.remove(&key);
-                                        loading_remote.remove(&key);
-                                        // Shell spoke ⇒ retire: no late splash re-raise.
-                                        loading_retired.insert(key);
-                                    }
-                                }
-                                if Some(id) == corner && corner_kitty {
-                                    // CRISP CORNER VIDEO: split the corner pane's
-                                    // stream — text feeds the emulator (so its
-                                    // cursor tracks the child's placement), kitty
-                                    // image escapes are pulled out, repositioned to
-                                    // the corner rect, and queued for the outer
-                                    // terminal (emitted after the frame flush). See
-                                    // `kitty_relay`.
-                                    let origin = current_config
-                                        .pins
-                                        .iter()
-                                        .find(|pp| Some(pp.name.as_str()) == corner_name.as_deref())
-                                        .map(|pp| {
-                                            let c = crate::pins::inset1(prospective_corner_rect(
-                                                pp, cols, rows,
-                                            ));
-                                            (c.y as u16, c.x as u16)
-                                        })
-                                        .unwrap_or((0, 0));
-                                    let mut emu_text: Vec<u8> = Vec::new();
-                                    for piece in corner_relay.feed(&b) {
-                                        match piece {
-                                            crate::kitty_relay::Piece::Emulator(t) => {
-                                                p.feed(&t);
-                                                emu_text.extend_from_slice(&t);
-                                            }
-                                            crate::kitty_relay::Piece::GfxDisplay(seq) => {
-                                                // Cursor reflects the text fed so
-                                                // far (the child homes right before
-                                                // the image); place there + origin.
-                                                let cur = p.emulator().cursor();
-                                                let mut bytes =
-                                                    crate::kitty_relay::cup(origin, cur);
-                                                bytes.extend_from_slice(&seq);
-                                                corner_gfx.push(bytes);
-                                            }
-                                            crate::kitty_relay::Piece::GfxOther(seq) => {
-                                                corner_gfx.push(seq);
-                                            }
-                                            crate::kitty_relay::Piece::GfxAnswer(ans) => {
-                                                let _ = p.write_input(&ans);
-                                            }
-                                        }
-                                    }
-                                    // DA/DSR/OSC replies + OSC52 passthrough on the
-                                    // graphics-stripped bytes only (the kitty probe,
-                                    // if any, was answered by the relay).
-                                    if !emu_text.is_empty() {
-                                        let resp = {
-                                            let emu = p.emulator();
-                                            crate::queries::query_responses(
-                                                &emu_text,
-                                                emu.cursor(),
-                                                emu.size(),
-                                            )
-                                        };
-                                        if !resp.is_empty() {
-                                            let _ = p.write_input(&resp);
-                                        }
-                                        let fwd = crate::queries::osc_passthrough(&emu_text);
-                                        if !fwd.is_empty() {
-                                            use std::io::Write;
-                                            let mut out = std::io::stdout();
-                                            let _ = out.write_all(&fwd);
-                                            let _ = out.flush();
-                                        }
-                                    }
-                                    // Corner is in `visible`; mark it dirty so the
-                                    // render block runs and flushes `corner_gfx`.
-                                    dirty_panes.insert(id);
-                                } else {
-                                    p.feed(&b);
-                                    // Answer terminal queries (DA/DSR/OSC color,
-                                    // kitty probes) the app just sent — without a
-                                    // reply, programs like yazi warn or time out.
-                                    let resp = {
-                                        let emu = p.emulator();
-                                        crate::queries::query_responses(
-                                            &b,
-                                            emu.cursor(),
-                                            emu.size(),
-                                        )
-                                    };
-                                    if !resp.is_empty() {
-                                        let _ = p.write_input(&resp);
-                                    }
-                                    // Clipboard sets (OSC 52) from inner apps go
-                                    // VERBATIM to the outer terminal — vim's
-                                    // "+y inside a pane reaches the system
-                                    // clipboard like in a plain terminal.
-                                    let fwd = crate::queries::osc_passthrough(&b);
-                                    if !fwd.is_empty() {
-                                        use std::io::Write;
-                                        let mut out = std::io::stdout();
-                                        let _ = out.write_all(&fwd);
-                                        let _ = out.flush();
-                                    }
-                                    if visible.contains(&id) {
-                                        // Pane-content-only damage: recompose just
-                                        // this pane, not the chrome (see render_plan).
-                                        dirty_panes.insert(id);
-                                    }
-                                }
-                            }
-                            // Private drawer→host control channel (OSC 5379): the
-                            // bundled yazi signals close/open-in-editor here so it
-                            // keeps ownership of every key (no host key-stealing).
-                            if drawer == Some(id)
-                                && let Some(cmd) = crate::queries::drawer_command(&b)
-                            {
-                                crate::actions::dispatch_drawer_command(
-                                    cmd,
-                                    &mut session,
-                                    &mut panes,
-                                    &mut drawer,
-                                    &mut drawer_pool,
-                                    &mut drawer_home,
-                                    &mut focus,
-                                    &mut model,
-                                    &mut sb,
-                                    keymap.config(),
-                                    chrome.center,
-                                );
-                                need_relayout = true;
-                                dirty = true;
-                            }
-                        }
-                        PaneEvent::Exit(id, exit_code) => {
-                            // Program name is needed for attention routing after
-                            // the pane leaves the table (item 524).
-                            let exited_program =
-                                panes.table.get(&id).map(|p| p.program().to_string());
-                            panes.table.remove(&id);
-                            // The visible yazi drawer's process ended. Clear it,
-                            // mark the worktree's drawer closed, hand focus back to
-                            // the center, and relayout to reclaim the bottom slice.
-                            if drawer == Some(id) {
-                                drawer = None;
-                                if let Some(dir) =
-                                    drawer_home.take().or_else(|| active_cwd(&session))
-                                {
-                                    crate::drawer_state::set_flag(&dir, false);
-                                }
-                                // A clean exit is the normal `q`-quit path — stay
-                                // quiet. Only an abnormal exit (e.g. the contained
-                                // scope hit the drawer memory limit) gets a hint.
-                                if exit_code != Some(0) {
-                                    model.status = "Files drawer exited unexpectedly; if image \
-                                        previews were on it may have hit the drawer memory limit."
-                                        .into();
-                                }
-                                if focus.drawer() {
-                                    focus.zone = crate::focus::Zone::Center;
-                                }
-                                need_relayout = true;
-                                dirty = true;
-                                continue;
-                            }
-                            // A pooled (hidden) drawer's yazi exited; just forget it.
-                            if drawer_pool.remove_id(id) {
-                                dirty = true;
-                                continue;
-                            }
-                            // The corner overlay pin died (e.g. mpv quit on `q`).
-                            // It's a supervised pin, so still drive `on_exit` for
-                            // the chip/health + restart policy, but respawn into
-                            // the corner rect (not the center) and re-occupy the
-                            // single corner slot. A clean exit stays down unless
-                            // `restart = always`.
-                            if corner == Some(id) {
-                                corner = None;
-                                let name = corner_name.take();
-                                // The child is gone; clear its last image off the
-                                // outer terminal and reset the relay state.
-                                if corner_kitty {
-                                    use std::io::Write as _;
-                                    let mut o = std::io::stdout();
-                                    let _ = o.write_all(crate::kitty_relay::delete_all());
-                                    let _ = o.flush();
-                                }
-                                corner_relay.reset();
-                                corner_gfx.clear();
-                                corner_occluded = false;
-                                if focus.corner() {
-                                    focus.zone = crate::focus::Zone::Center;
-                                }
-                                if let Some(name) = name {
-                                    let respawn = matches!(
-                                        supervisor.on_exit(id, exit_code == Some(0)),
-                                        crate::pins::RestartDecision::Respawn
-                                    );
-                                    if respawn
-                                        && let Some(pin) = current_config
-                                            .pins
-                                            .iter()
-                                            .find(|p| p.name == name)
-                                            .cloned()
-                                    {
-                                        let active_dir = active_cwd(&session);
-                                        let content = crate::pins::inset1(prospective_corner_rect(
-                                            &pin, cols, rows,
-                                        ));
-                                        let argv = crate::pins::PinSupervisor::argv(&pin);
-                                        let env: Vec<(String, String)> =
-                                            crate::pins::PinSupervisor::spawn_env(&pin)
-                                                .into_iter()
-                                                .collect();
-                                        let cwd = pin_cwd(&pin, active_dir);
-                                        if let Ok(fresh) =
-                                            panes.spawn_argv_env(&argv, Some(&cwd), &env, content)
-                                        {
-                                            supervisor.reattach(&name, fresh);
-                                            corner = Some(fresh);
-                                            corner_name = Some(name);
-                                        }
-                                    }
-                                }
-                                persist_pin_state(&supervisor, &session.id);
-                                need_relayout = true;
-                                dirty = true;
-                                continue;
-                            }
-                            // Pin panes are supervised separately from tab panes: the
-                            // supervisor applies the restart policy. A clean exit
-                            // (code 0) is reported as such so `restart = on-failure`
-                            // pins stay down on a normal stop; an unknown code
-                            // (None) is treated as a failure.
-                            if let Some(inst) = supervisor.instance_of_pane(id) {
-                                let name = inst.name.clone();
-                                match supervisor.on_exit(id, exit_code == Some(0)) {
-                                    crate::pins::RestartDecision::Respawn => {
-                                        let active_dir = active_cwd(&session);
-                                        let pin = current_config
-                                            .pins
-                                            .iter()
-                                            .find(|p| p.name == name)
-                                            .cloned();
-                                        if let Some(pin) = pin {
-                                            let argv = crate::pins::PinSupervisor::argv(&pin);
-                                            let env: Vec<(String, String)> =
-                                                crate::pins::PinSupervisor::spawn_env(&pin)
-                                                    .into_iter()
-                                                    .collect();
-                                            let cwd = pin_cwd(&pin, active_dir);
-                                            if let Ok(fresh) = panes.spawn_argv_env(
-                                                &argv,
-                                                Some(&cwd),
-                                                &env,
-                                                chrome.center,
-                                            ) {
-                                                supervisor.reattach(&name, fresh);
-                                            }
-                                        }
-                                    }
-                                    crate::pins::RestartDecision::Leave => {}
-                                }
-                                persist_pin_state(&supervisor, &session.id);
-                                need_relayout = true;
-                                dirty = true;
-                                continue;
-                            }
-                            // Find the owning (group, tab) and either drop the pane from
-                            // its split or, if its only shell died, keep the tab and
-                            // respawn a fresh shell. Explicit close-pane/worktree actions
-                            // remove the pane from the session before the PTY exit event
-                            // arrives, so this path is for external child death.
-                            let owner = session
-                                .iter_tabs()
-                                .find(|(_, _, t)| t.center.pane_ids().contains(&id))
-                                .map(|(gi, ti, t)| (gi, ti, t.center.pane_ids().len() == 1));
-                            if let Some((gi, ti, sole)) = owner {
-                                let is_active_tab =
-                                    gi == session.active && ti == session.worktrees[gi].active_tab;
-                                // A pane that exits within CRASH_THRESHOLD of being
-                                // spawned is a "fast crash" — bwrap/sandbox failures
-                                // write their error to the PTY before dying, so
-                                // output-based detection would mis-classify them as
-                                // normal exits. Count consecutive fast crashes; reset
-                                // when a pane lives long enough (normal exit).
-                                let age = panes.pane_age(id).unwrap_or_default();
-                                panes.forget_spawn_time(id);
-                                let crash_key = (gi, ti);
-                                let crashes = update_crash_count(
-                                    &mut respawn_crash_count,
-                                    crash_key,
-                                    age,
-                                    CRASH_THRESHOLD,
-                                );
-                                // Prefer the real exit code; fall back to the
-                                // fast-crash heuristic when the child status
-                                // couldn't be reaped. A failed exit arms the
-                                // relaunch overlay on the respawned shell.
-                                let failed = match exit_code {
-                                    Some(c) => c != 0,
-                                    None => crashes > 0,
-                                };
-                                // What this pane was last running (captured at
-                                // persist time) — offered for relaunch after a
-                                // crash. Grabbed before the pane's tab is mutated.
-                                let remembered = session
-                                    .tab_mut(gi, ti)
-                                    .and_then(|t| t.pane_cmds.get(&id))
-                                    .map(|c| c.display())
-                                    .filter(|s| !s.is_empty());
-                                {
-                                    let wt = session.worktrees[gi].path.clone();
-                                    if !wt.is_empty() {
-                                        let program = exited_program.clone().unwrap_or_default();
-                                        let is_shell = crate::pane::is_routine_pane(&program);
-                                        let policy =
-                                            superzej_core::event_bus::ProcessExitPolicy::parse(
-                                                &current_config.notifications.process_exit,
-                                            );
-                                        let outcome =
-                                            superzej_core::event_bus::classify_process_exit(
-                                                exit_code, is_shell, policy,
-                                            );
-                                        let bus = event_bus.clone();
-                                        let nstate = notify_state.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            let Ok(db) = superzej_core::db::Db::open() else {
-                                                return;
-                                            };
-                                            // Agent panes (worktree has a dispatch)
-                                            // keep their dedicated agent_done/failed
-                                            // path; everything else routes through
-                                            // item-524 process attention.
-                                            if let Ok(Some((dispatch_id, issue_id))) =
-                                                db.dispatch_info_for_worktree(&wt)
-                                            {
-                                                let kind = if failed {
-                                                    "agent_failed"
-                                                } else {
-                                                    "agent_done"
-                                                };
-                                                let base = wt.rsplit('/').next().unwrap_or(&wt);
-                                                let msg = format!(
-                                                    "agent {} in {base}",
-                                                    if failed { "crashed" } else { "finished" }
-                                                );
-                                                // Routing gate: a rule may drop this
-                                                // from the inbox; a sound fires per the
-                                                // decision (agent panes have no desktop
-                                                // event, matching prior behavior).
-                                                let (dec, _) = crate::notify::record(
-                                                    &db, &nstate, kind, &issue_id, &msg, &wt,
-                                                );
-                                                nstate.emit_sound(&dec);
-                                                let _ = db.update_dispatch_status(
-                                                    dispatch_id,
-                                                    if failed { "failed" } else { "done" },
-                                                );
-                                                return;
-                                            }
-                                            // Non-agent pane: route per policy.
-                                            let Some(outcome) = outcome else {
-                                                return;
-                                            };
-                                            use superzej_core::event_bus::ProcessOutcome;
-                                            let kind = match outcome {
-                                                ProcessOutcome::Failed => "process_failed",
-                                                ProcessOutcome::TaskDone => "process_exited",
-                                            };
-                                            let label = if program.is_empty() {
-                                                "process"
-                                            } else {
-                                                &program
-                                            };
-                                            let msg = match (outcome, exit_code) {
-                                                (ProcessOutcome::Failed, Some(c)) => {
-                                                    format!("{label} failed (exit {c})")
-                                                }
-                                                (ProcessOutcome::Failed, None) => {
-                                                    format!("{label} crashed")
-                                                }
-                                                (ProcessOutcome::TaskDone, _) => {
-                                                    format!("{label} finished")
-                                                }
-                                            };
-                                            // Routing gate: record (unless dropped),
-                                            // then desktop toast + sound only when the
-                                            // decision allows (rules / DND / modes).
-                                            let (dec, _) = crate::notify::record(
-                                                &db, &nstate, kind, &program, &msg, &wt,
-                                            );
-                                            let event =
-                                                superzej_core::event_bus::Event::ProcessExited {
-                                                    worktree: wt.clone(),
-                                                    program: program.clone(),
-                                                    exit_code,
-                                                    failed: matches!(
-                                                        outcome,
-                                                        ProcessOutcome::Failed
-                                                    ),
-                                                };
-                                            // Desktop urgency gating still applies in the
-                                            // notifier thread; the decision decides whether
-                                            // it is eligible at all.
-                                            if dec.desktop {
-                                                bus.publish_with_notification(&event);
-                                            } else {
-                                                bus.publish(&event);
-                                            }
-                                            nstate.emit_sound(&dec);
-                                        });
-                                    }
-                                }
-                                if sole {
-                                    if is_active_tab {
-                                        if crashes >= 3 {
-                                            // Shell is crashing on every startup — stop
-                                            // the loop and surface the problem. The user
-                                            // can try a different backend or fix their
-                                            // shell config, then switch worktrees to retry.
-                                            loading_state
-                                                .remove(&(session.worktrees[gi].name.clone(), ti));
-                                            model.load_steps.clear();
-                                            center_dormant = true;
-                                            model.status =
-                                                "Shell keeps crashing on startup — not respawning. \
-                                                 Check your sandbox backend and shell config, \
-                                                 then switch worktrees to retry.".into();
-                                        } else {
-                                            // Worktree dir first, then current_dir, then $HOME.
-                                            let cwd =
-                                                group_cwd(&session.worktrees[gi]).or_else(|| {
-                                                    std::env::var("HOME")
-                                                        .ok()
-                                                        .map(std::path::PathBuf::from)
-                                                });
-                                            match spawn_worktree_shell_pane(
-                                                &mut panes,
-                                                keymap.config(),
-                                                cwd.as_deref(),
-                                                chrome.center,
-                                                false,
-                                                None,
-                                                "",
-                                            ) {
-                                                Ok(fresh) => {
-                                                    if let Some(tab) = session.tab_mut(gi, ti) {
-                                                        replace_single_dead_center_pane(
-                                                            tab, id, fresh,
-                                                        );
-                                                    }
-                                                    // On a crash, offer to relaunch what was
-                                                    // running (if known) over the fresh shell;
-                                                    // a clean exit just lands at a prompt.
-                                                    if failed && let Some(cmd) = remembered.clone()
-                                                    {
-                                                        if let Some(p) = panes.table.get_mut(&fresh)
-                                                        {
-                                                            p.set_pending_relaunch(Some(cmd));
-                                                        }
-                                                        model.status =
-                                                            "Pane crashed; press Enter to relaunch \
-                                                             (Esc for a shell)"
-                                                                .into();
-                                                    } else {
-                                                        model.status =
-                                                            "Pane exited; spawned a fresh shell"
-                                                                .into();
-                                                    }
-                                                    need_relayout = true;
-                                                }
-                                                Err(err) => {
-                                                    let k =
-                                                        (session.worktrees[gi].name.clone(), ti);
-                                                    loading_state.remove(&k);
-                                                    loading_remote.remove(&k);
-                                                    model.load_steps.clear();
-                                                    center_dormant = true;
-                                                    model.status =
-                                                        format!("Respawn failed: {err:#}");
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else if let Some(tab) = session.tab_mut(gi, ti) {
-                                    tab.center.remove(id);
-                                    if tab.focused_pane == id
-                                        && let Some(first) = tab.center.pane_ids().first()
-                                    {
-                                        tab.focused_pane = *first;
-                                    }
-                                    need_relayout = true;
-                                }
-                            }
-                            dirty = true;
-                        }
-                    }
-                }
-                Err(tokio_mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
+        // 1. Drain pending PTY output through the budgeted executor
+        //    (`pty_drain`): receive→stash→round-robin parse under the pure
+        //    `loop_policy` byte/deadline budget, with mid-drain input
+        //    preemption. Only a visible pane's output dirties the frame. A
+        //    capped pane's leftover backlog re-wakes the loop via the short
+        //    poll timeout below — never a full-chrome repaint.
+        let drain_t0 = std::time::Instant::now();
+        let drain_summary = {
+            let mut dctx = crate::pty_drain::DrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                sb: &mut sb,
+                focus: &mut focus,
+                keymap_config: keymap.config(),
+                current_config: &current_config,
+                chrome_center: chrome.center,
+                cols,
+                rows,
+                visible: &visible,
+                dirty_panes: &mut dirty_panes,
+                dirty: &mut dirty,
+                need_relayout: &mut need_relayout,
+                drawer: &mut drawer,
+                drawer_pool: &mut drawer_pool,
+                drawer_home: &mut drawer_home,
+                corner: &mut corner,
+                corner_name: &mut corner_name,
+                corner_kitty,
+                corner_relay: &mut corner_relay,
+                corner_gfx: &mut corner_gfx,
+                corner_occluded: &mut corner_occluded,
+                supervisor: &mut supervisor,
+                loading_state: &mut loading_state,
+                loading_remote: &mut loading_remote,
+                loading_retired: &mut loading_retired,
+                respawn_crash_count: &mut respawn_crash_count,
+                center_dormant: &mut center_dormant,
+                event_bus: &event_bus,
+                notify_state: &notify_state,
+                writer: &writer,
+            };
+            crate::pty_drain::drain(
+                &mut dctx,
+                buf,
+                &mut rx,
+                &mut pty_backlog,
+                &mut pending_input,
+                &mut input_at,
+            )
+        };
+        let budget_exhausted = drain_summary.budget_exhausted;
+        // Attribute the PTY chunks/bytes drained this wake + the drain's
+        // loop-thread cost. Only iterations that actually drained sample
+        // `drain_us` — an idle wake would otherwise flood it with zeros.
+        if drain_summary.chunks > 0 {
+            loop_perf.pty(drain_summary.chunks, drain_summary.bytes, budget_exhausted);
+            loop_perf.drain(drain_t0.elapsed());
         }
-        // Attribute the PTY chunks drained this wake (and whether the 64-chunk
-        // budget capped a chatty pane).
-        loop_perf.pty(drain_stats_chunks as u64, budget_exhausted);
-        if disconnected {
+        if drain_summary.preempted {
+            loop_perf.input_preempt();
+        }
+        if drain_summary.disconnected {
             return Ok(());
         }
-        // A capped chatty pane left more PTY queued. The visible chunks we DID
-        // drain already armed `dirty_panes`, so this frame paints them; the
-        // backlog is drained on a fast re-wake (the poll timeout below), not by
-        // forcing a full-chrome repaint.
         if session.worktrees.is_empty() {
             return Ok(());
         }
@@ -9943,6 +9490,14 @@ async fn event_loop<T: Terminal>(
             // The warm-pool chip is loop-set (by the pool maintainer), not hydration
             // data — preserve it across the model swap or it blinks off every tick.
             let pool = model.pool;
+            // Rows carry-over: `hydration_eq` compares every `build_rows` input
+            // (locked by model_eq.rs tests), so an unchanged hydration can reuse
+            // the on-screen rows instead of paying an O(worktrees) rebuild on
+            // the loop for every 5s safety tick. The `creating` overlay bakes
+            // extra state into rows at rebuild time, so its presence forces the
+            // full path.
+            let prev_rows = (!model_changed && sb.creating.is_empty())
+                .then(|| std::mem::take(&mut model.sidebar_rows));
             model = next_model;
             model.stats = stats;
             model.metrics = metrics;
@@ -10003,7 +9558,16 @@ async fn event_loop<T: Terminal>(
                     spawn_rebase_status_fetch(panel_ui.git.op_gen, &session, &gitdoc_tx, &waker);
                 }
             }
-            refresh_tab_model(&mut model, &session, &mut sb);
+            match prev_rows {
+                // Unchanged hydration: restore the rows the swap displaced and
+                // re-mirror cursor state (the swap reset the model's sidebar
+                // interaction fields); `retarget_active` is the cheap pass.
+                Some(rows) => {
+                    model.sidebar_rows = rows;
+                    crate::handlers::switch::retarget_active(&mut sb, &mut model, &session);
+                }
+                None => refresh_tab_model(&mut model, &session, &mut sb),
+            }
             apply_mode_status(&mut model, mode, &current_config);
             model.accent = current_config.accent_rgb();
             model.bars = current_config.bars.clone();
@@ -10060,7 +9624,10 @@ async fn event_loop<T: Terminal>(
         // just the panel; keep any chip/timeline fields from a prior full seed.
         while let Ok((path, panel)) = prefetch_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Prefetch);
-            switch_cache.entry(path).or_default().panel = panel;
+            let slice = switch_cache.entry(path).or_default();
+            slice.panel = panel;
+            // A prefetched panel is fresh — stamps the re-warm TTL.
+            slice.seeded_at = Some(std::time::Instant::now());
         }
 
         // Fresh stats reading from the ticker thread (top-bar widgets + the
@@ -10517,6 +10084,11 @@ async fn event_loop<T: Terminal>(
                                             supervisor.attach(&pin, id);
                                             corner = Some(id);
                                             corner_name = Some(pin.name.clone());
+                                            // Corner panes parse on the loop
+                                            // (kitty relay feeds text pieces).
+                                            if let Some(p) = panes.table.get(&id) {
+                                                p.set_loop_fed(true);
+                                            }
                                         }
                                     }
                                     continue;
@@ -10786,7 +10358,7 @@ async fn event_loop<T: Terminal>(
         }
         if want_pr_refresh {
             spawn_pr_cache_refresh(
-                session.clone(),
+                active_tab_path(&session),
                 current_config.issues.clone(),
                 current_config.disk.clone(),
                 Some(waker.clone()),
@@ -10803,12 +10375,12 @@ async fn event_loop<T: Terminal>(
         }
         if want_issue_refresh {
             crate::hydrate::spawn_issue_cache_refresh(
-                session.clone(),
+                active_tab_path(&session),
                 current_config.issues.clone(),
                 Some(waker.clone()),
             );
             crate::hydrate::spawn_my_work_refresh(
-                session.clone(),
+                active_tab_path(&session),
                 current_config.clone(),
                 crate::panel::scope::mine_all(),
                 Some(waker.clone()),
@@ -11220,9 +10792,54 @@ async fn event_loop<T: Terminal>(
         // 2. Render if anything changed (diff-flush): damaged panes and/or chrome,
         //    cursor in the focused pane. `dirty` = chrome/overlay/geometry channel;
         //    `dirty_panes` = per-pane content; either (or `full_repaint`) → a frame.
-        let should_render =
+        //    The pure pacing gate (`loop_policy::frame_gate`) may defer a
+        //    pane-only streaming frame inside the window (damage stays armed;
+        //    the poll timeout below guarantees the trailing flush) and defers
+        //    composition past a queued-but-undispatched keystroke so one frame
+        //    carries its effect.
+        let have_damage =
             dirty || full_repaint || !dirty_panes.is_empty() || bars_dirty || sidebar_dirty;
-        if !should_render {
+        let mut defer_timeout: Option<std::time::Duration> = None;
+        let pane_only_damage = !dirty
+            && !full_repaint
+            && switch_at.is_none()
+            && !bars_dirty
+            && !sidebar_dirty
+            && !dirty_panes.is_empty();
+        let input_queued = pending_input.iter().any(|e| {
+            matches!(
+                e,
+                InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_)
+            )
+        });
+        // Writer backpressure: with 2 frames already in flight, composing a
+        // third would either block or corrupt the diff chain — defer instead
+        // (damage stays armed and coalesces; the slow terminal's drain rate
+        // paces the frame rate). Checked BEFORE the wire renderer runs, whose
+        // SGR state must only advance for frames that are actually delivered.
+        let writer_busy = !use_termwiz_renderer && !writer.frame_slot_free();
+        let should_render = have_damage
+            && !writer_busy
+            && match crate::loop_policy::frame_gate(
+                input_at.is_some(),
+                input_queued,
+                pane_only_damage,
+                last_flush_at.elapsed(),
+                crate::loop_policy::PANE_FRAME_WINDOW,
+            ) {
+                crate::loop_policy::FrameGate::RenderNow => true,
+                crate::loop_policy::FrameGate::Defer { remaining } => {
+                    defer_timeout = Some(remaining);
+                    loop_perf.frame_deferred();
+                    false
+                }
+            };
+        if writer_busy && have_damage {
+            // Re-check soon; the writer pulses no wake on success, so poll.
+            defer_timeout = Some(std::time::Duration::from_millis(2));
+            loop_perf.frame_deferred();
+        }
+        if !have_damage {
             // Woke but nothing changed — a wasted wakeup (storm signal).
             loop_perf.render_skip();
             // An idle wake is the right moment to return freed arena pages to
@@ -11336,6 +10953,9 @@ async fn event_loop<T: Terminal>(
             let damage = crate::render_plan::Damage {
                 full: full_repaint,
                 chrome: dirty,
+                // The live switch stamp doubles as the damage bit: set on the
+                // switch action, taken by the first flushed frame.
+                switch: switch_at.is_some(),
                 panes: dirty_panes.clone(),
                 bars: bars_dirty,
                 sidebar: sidebar_dirty,
@@ -11353,6 +10973,7 @@ async fn event_loop<T: Terminal>(
                     target: "szhost::frame",
                     full = damage.full,
                     chrome = damage.chrome,
+                    switch = damage.switch,
                     bars = damage.bars,
                     panes = damage.panes.len(),
                     "full frame chosen"
@@ -11867,54 +11488,80 @@ async fn event_loop<T: Terminal>(
             let seq = scratch.current_seqno();
             scratch.flush_changes_older_than(seq);
             wire.extend(pending);
-            // Write the frame. A transient tty write error (EIO from a subprocess
-            // briefly stealing the terminal's foreground process group) must not
-            // tear the compositor down — skip this frame, force a full repaint,
-            // and retry. See `frame_write` for why `?`-propagating here is fatal.
-            match crate::frame_write::emit_frame(
-                use_termwiz_renderer,
-                buf,
-                &mut wire_renderer,
-                &mut recorder,
-                &wire,
-                notify_state.take_bell(),
-            ) {
-                crate::frame_write::FrameWrite::Ok => frame_write_errs = 0,
-                crate::frame_write::FrameWrite::Transient
-                    if frame_write_errs < crate::frame_write::RETRY_MAX =>
-                {
-                    frame_write_errs += 1;
-                    tracing::warn!(
-                        target: "szhost::frame",
-                        attempt = frame_write_errs,
-                        "transient terminal write error; forcing full repaint + retry"
-                    );
+            // Write the frame. The wire-renderer path goes through the writer
+            // thread (`frame_writer`): the loop never blocks on a slow outer
+            // terminal, and transient/fatal write errors surface via
+            // `writer.take_status()` at the next wake. The termwiz debug
+            // renderer keeps the old synchronous path (it writes via the
+            // BufferedTerminal) with its inline retry handling.
+            let flush_t0 = std::time::Instant::now();
+            if use_termwiz_renderer {
+                match crate::frame_write::emit_frame(
+                    true,
+                    buf,
+                    &mut wire_renderer,
+                    &mut recorder,
+                    &wire,
+                    false,
+                ) {
+                    crate::frame_write::FrameWrite::Ok => frame_write_errs = 0,
+                    crate::frame_write::FrameWrite::Transient
+                        if frame_write_errs < crate::frame_write::RETRY_MAX =>
+                    {
+                        frame_write_errs += 1;
+                        tracing::warn!(
+                            target: "szhost::frame",
+                            attempt = frame_write_errs,
+                            "transient terminal write error; forcing full repaint + retry"
+                        );
+                        full_repaint = true;
+                        dirty = true;
+                        continue;
+                    }
+                    crate::frame_write::FrameWrite::Transient => {
+                        return Err(anyhow::anyhow!(
+                            "terminal writes failed {} times running (EIO); tearing down",
+                            frame_write_errs
+                        ));
+                    }
+                    crate::frame_write::FrameWrite::Fatal(e) => return Err(e),
+                }
+            } else {
+                // The wire renderer's SGR state advances only for frames that
+                // are actually delivered — the pre-compose `frame_slot_free`
+                // gate reserved the slot (only the writer drains the queue).
+                let mut cells = String::new();
+                wire_renderer.render(&wire, &mut cells);
+                if let Some(rec) = &mut recorder {
+                    let _ = rec.write_frame(&cells);
+                }
+                if !writer.submit_frame(cells.into_bytes()) {
+                    // Unreachable by construction; if it ever fires, resync
+                    // with a full repaint rather than corrupt the diff chain.
                     full_repaint = true;
                     dirty = true;
                     continue;
                 }
-                crate::frame_write::FrameWrite::Transient => {
-                    return Err(anyhow::anyhow!(
-                        "terminal writes failed {} times running (EIO); tearing down",
-                        frame_write_errs
-                    ));
-                }
-                crate::frame_write::FrameWrite::Fatal(e) => return Err(e),
+            }
+            loop_perf.flush(flush_t0.elapsed());
+            // Terminal bell (item 429): a latched notification sound, ordered
+            // right after the frame in the writer FIFO. BEL neither moves the
+            // cursor nor prints, so it is safe between frames.
+            if notify_state.take_bell() {
+                writer.submit_oob(b"\x07".to_vec());
             }
             // Corner kitty images ride ON TOP of the cell frame: emit the queued,
-            // repositioned graphics AFTER the diff is flushed. Images aren't cells
-            // — they bypass the diff entirely (fine; it's video). While a modal
-            // overlay is up, blank the video (delete once on the transition, drop
-            // new frames) so it can't bleed through the modal; it resumes on the
-            // child's next frame once the overlay clears.
+            // repositioned graphics AFTER the diff — the writer FIFO orders them
+            // behind this frame's cells. Images aren't cells — they bypass the
+            // diff entirely (fine; it's video). While a modal overlay is up,
+            // blank the video (delete once on the transition, drop new frames)
+            // so it can't bleed through the modal; it resumes on the child's
+            // next frame once the overlay clears.
             if corner.is_some() && corner_kitty {
-                use std::io::Write as _;
                 let occluded_now = overlays.any();
-                let mut out = std::io::stdout();
                 if occluded_now {
                     if !corner_occluded {
-                        let _ = out.write_all(crate::kitty_relay::delete_all());
-                        let _ = out.flush();
+                        writer.submit_oob(crate::kitty_relay::delete_all().to_vec());
                     }
                     corner_gfx.clear();
                 } else if !corner_gfx.is_empty() {
@@ -11922,35 +11569,37 @@ async fn event_loop<T: Terminal>(
                     for g in corner_gfx.drain(..) {
                         blob.extend_from_slice(&g);
                     }
-                    let _ = out.write_all(&blob);
-                    let _ = out.flush();
+                    writer.submit_oob(blob);
                 }
                 corner_occluded = occluded_now;
             } else {
                 corner_gfx.clear();
             }
             // Document-viewer graphics: draw (or delete) the rasterized preview
-            // image over the panel rect, after the cell frame is flushed — same
-            // "images ride on top" approach as the corner relay above.
+            // image over the panel rect, after the cell frame — same "images
+            // ride on top" approach as the corner relay above.
             {
                 let open_preview = panel_ui.file_preview.as_ref().map(|fp| fp.path.as_str());
                 let blob =
                     preview_gfx.frame(chrome.panel, open_preview, overlays.any(), corner_kitty);
                 if !blob.is_empty() {
-                    use std::io::Write as _;
-                    let mut out = std::io::stdout();
-                    let _ = out.write_all(&blob);
-                    let _ = out.flush();
+                    writer.submit_oob(blob);
                 }
             }
             dirty = false;
+            last_flush_at = std::time::Instant::now();
             // Record the frame's compose+flush latency (p50/p99 in the rollup)
             // and classify it: cheap incremental fast path vs full recompose.
             let incremental_frame = matches!(
                 frame_plan,
                 crate::render_plan::RenderPlan::Incremental { .. }
             );
-            loop_perf.render(frame_t0.elapsed(), incremental_frame, &mut input_at);
+            loop_perf.render(
+                frame_t0.elapsed(),
+                incremental_frame,
+                &mut input_at,
+                &mut switch_at,
+            );
             // Consumed: the next frame is full unless another drag/scroll re-arms it.
             selection_only = false;
             scroll_only = false;
@@ -11959,12 +11608,12 @@ async fn event_loop<T: Terminal>(
             bars_dirty = false;
             sidebar_dirty = false;
             if muse_ready {
-                crate::frame_write::emit_muse_ready_marker(buf, &mut pending_input);
+                crate::frame_write::emit_muse_ready_marker(buf, &mut pending_input, &writer);
             }
             tracing::debug!(
                 target: "szhost::frame",
                 render_ms = frame_t0.elapsed().as_millis() as u64,
-                drain_chunks = drain_stats_chunks,
+                drain_chunks = drain_summary.chunks,
                 kind = if incremental_frame { "incr" } else { "full" },
                 "frame flushed"
             );
@@ -12003,8 +11652,13 @@ async fn event_loop<T: Terminal>(
         loop_perf.add_busy(iter_t0.elapsed());
 
         // 3. Block until a terminal event or `waker.wake()` (→ `InputEvent::Wake`);
-        //    no timeout → zero idle CPU, wake only on work, render at once.
-        let timeout = if dirty || !pending_input.is_empty() || budget_exhausted {
+        //    no timeout → zero idle CPU, wake only on work, render at once. A
+        //    gate-deferred frame arms its exact remainder (the trailing-flush
+        //    guarantee); otherwise busy work batches on the short 8ms poll.
+        //    Both fire only with work in hand — the idle path never polls.
+        let timeout = if let Some(remaining) = defer_timeout {
+            Some(remaining)
+        } else if dirty || !pending_input.is_empty() || budget_exhausted {
             Some(std::time::Duration::from_millis(8))
         } else {
             None
@@ -12526,14 +12180,11 @@ async fn event_loop<T: Terminal>(
                             if let Some(p) = panes.table.get(id) {
                                 let text = crate::copymode::extract(p.emulator(), sel);
                                 if !text.trim().is_empty() {
-                                    use std::io::Write;
                                     // OSC52 reaches the outer terminal (and over
                                     // SSH); the native tool hits the local
                                     // clipboard directly for terminals that
                                     // ignore OSC52. Belt and braces.
-                                    let mut out = std::io::stdout();
-                                    let _ = out.write_all(&crate::copymode::osc52(&text));
-                                    let _ = out.flush();
+                                    writer.submit_oob(crate::copymode::osc52(&text));
                                     crate::clipboard::copy(&text);
                                     // Also land in the default register (persisted),
                                     // so `PasteRegister "` recalls it across restarts.
@@ -14507,6 +14158,7 @@ async fn event_loop<T: Terminal>(
                             continue;
                         }
                         SidebarOutcome::Activate(target) => {
+                            switch_at = Some(std::time::Instant::now());
                             if activate_row_target(
                                 target,
                                 &mut session,
@@ -14651,10 +14303,7 @@ async fn event_loop<T: Terminal>(
                         }
                         SidebarOutcome::CopyText(text) => {
                             // OSC-52 to the outer terminal's clipboard (item 27).
-                            use std::io::Write as _;
-                            let seq = crate::copymode::osc52(&text);
-                            let mut out = std::io::stdout();
-                            let _ = out.write_all(&seq).and_then(|_| out.flush());
+                            writer.submit_oob(crate::copymode::osc52(&text));
                             model.status = format!("Copied: {text}");
                             dirty = true;
                             continue;
@@ -15398,11 +15047,7 @@ async fn event_loop<T: Terminal>(
                                                 .get(panel_ui.cursor)
                                                 .and_then(|s| s.url.clone())
                                             {
-                                                use std::io::Write as _;
-                                                let mut out = std::io::stdout();
-                                                let _ = out
-                                                    .write_all(&crate::copymode::osc52(&url))
-                                                    .and_then(|_| out.flush());
+                                                writer.submit_oob(crate::copymode::osc52(&url));
                                                 crate::clipboard::copy(&url);
                                                 model.status = format!("Copied {url}");
                                             }
@@ -15414,11 +15059,7 @@ async fn event_loop<T: Terminal>(
                                                 .get(panel_ui.cursor)
                                                 .map(|f| f.url.clone())
                                             {
-                                                use std::io::Write as _;
-                                                let mut out = std::io::stdout();
-                                                let _ = out
-                                                    .write_all(&crate::copymode::osc52(&url))
-                                                    .and_then(|_| out.flush());
+                                                writer.submit_oob(crate::copymode::osc52(&url));
                                                 crate::clipboard::copy(&url);
                                                 model.status = format!("Copied {url}");
                                             }
@@ -15555,10 +15196,7 @@ async fn event_loop<T: Terminal>(
                                 .and_then(crate::panel::docs::copy_target_sha)
                             {
                                 Some(sha) => {
-                                    use std::io::Write;
-                                    let mut out = std::io::stdout();
-                                    let _ = out.write_all(&crate::copymode::osc52(&sha));
-                                    let _ = out.flush();
+                                    writer.submit_oob(crate::copymode::osc52(&sha));
                                     model.status = format!("Copied {sha}");
                                 }
                                 None => model.status = "No commit data yet".into(),
@@ -16040,7 +15678,7 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Mine, KeyCode::Char('R')) => {
                             crate::hydrate::spawn_my_work_refresh(
-                                session.clone(),
+                                active_tab_path(&session),
                                 current_config.clone(),
                                 crate::panel::scope::mine_all(),
                                 Some(waker.clone()),
@@ -16138,7 +15776,7 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Issues, KeyCode::Char('r')) => {
                             crate::hydrate::spawn_issue_cache_refresh(
-                                session.clone(),
+                                active_tab_path(&session),
                                 current_config.issues.clone(),
                                 Some(waker.clone()),
                             );
@@ -16155,7 +15793,7 @@ async fn event_loop<T: Terminal>(
                             {
                                 let cfg = current_config.issues.clone();
                                 let waker2 = waker.clone();
-                                let session2 = session.clone();
+                                let cwd2 = active_tab_path(&session);
                                 tokio::task::spawn_blocking(move || {
                                     use superzej_core::issue::IssuePatch;
                                     use superzej_svc::issue::IssueRouter;
@@ -16175,7 +15813,7 @@ async fn event_loop<T: Terminal>(
                                     };
                                     let _ = rt.block_on(router.update_issue(&issue.id, &patch));
                                     crate::hydrate::spawn_issue_cache_refresh(
-                                        session2,
+                                        cwd2,
                                         cfg,
                                         Some(waker2),
                                     );
@@ -16479,10 +16117,7 @@ async fn event_loop<T: Terminal>(
                                 .nth(panel_ui.logs_cursor)
                                 .map(|l| l.raw.clone());
                             if let Some(text) = line {
-                                use std::io::Write as _;
-                                let mut out = std::io::stdout();
-                                let _ = out.write_all(&crate::copymode::osc52(&text));
-                                let _ = out.flush();
+                                writer.submit_oob(crate::copymode::osc52(&text));
                                 model.status = "Log line copied".into();
                             }
                             true
@@ -16502,10 +16137,7 @@ async fn event_loop<T: Terminal>(
                                 .collect();
                             if !lines.is_empty() {
                                 let text = lines.join("\n");
-                                use std::io::Write as _;
-                                let mut out = std::io::stdout();
-                                let _ = out.write_all(&crate::copymode::osc52(&text));
-                                let _ = out.flush();
+                                writer.submit_oob(crate::copymode::osc52(&text));
                                 model.status = format!("Copied {} log lines", lines.len());
                             }
                             true
@@ -17062,10 +16694,8 @@ async fn event_loop<T: Terminal>(
                                     // Clear the kitty image off the outer terminal
                                     // and reset the relay.
                                     if corner_kitty {
-                                        use std::io::Write as _;
-                                        let mut o = std::io::stdout();
-                                        let _ = o.write_all(crate::kitty_relay::delete_all());
-                                        let _ = o.flush();
+                                        writer
+                                            .submit_oob(crate::kitty_relay::delete_all().to_vec());
                                     }
                                     corner_relay.reset();
                                     corner_gfx.clear();
@@ -17101,6 +16731,11 @@ async fn event_loop<T: Terminal>(
                                                 supervisor.attach(&pin, id);
                                                 corner = Some(id);
                                                 corner_name = Some(pin.name.clone());
+                                                // Corner panes parse on the loop
+                                                // (kitty relay feeds text pieces).
+                                                if let Some(p) = panes.table.get(&id) {
+                                                    p.set_loop_fed(true);
+                                                }
                                                 // Fresh child → fresh relay state.
                                                 corner_relay.reset();
                                                 corner_gfx.clear();
@@ -17372,15 +17007,16 @@ async fn event_loop<T: Terminal>(
                                     );
                                 }
                             }
-                            Action::NextTab => {
-                                session.next_tab();
+                            Action::NextTab | Action::PrevTab => {
+                                switch_at = Some(std::time::Instant::now());
                                 // Tab switches always land focus on the center
                                 // terminal — the user switched to work there.
                                 focus.zone = crate::focus::Zone::Center;
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                need_relayout = true;
-                                sync_drawer_persistence(
-                                    &session,
+                                crate::handlers::switch::cycle_tab(
+                                    action == Action::NextTab,
+                                    &mut session,
+                                    &mut model,
+                                    &mut sb,
                                     &mut panes,
                                     &mut drawer,
                                     &mut drawer_pool,
@@ -17388,25 +17024,7 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     chrome.center,
                                 );
-                                persist_active_focus(&session);
-                            }
-                            Action::PrevTab => {
-                                session.prev_tab();
-                                // Tab switches always land focus on the center
-                                // terminal — the user switched to work there.
-                                focus.zone = crate::focus::Zone::Center;
-                                refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
-                                sync_drawer_persistence(
-                                    &session,
-                                    &mut panes,
-                                    &mut drawer,
-                                    &mut drawer_pool,
-                                    &mut drawer_home,
-                                    keymap.config(),
-                                    chrome.center,
-                                );
-                                persist_active_focus(&session);
                             }
                             Action::NextWorktree | Action::PrevWorktree
                                 if active_is_terminal(&session) =>
@@ -17471,53 +17089,23 @@ async fn event_loop<T: Terminal>(
                                     .map(|g| g.name.clone());
                             }
                             Action::NextWorktree | Action::PrevWorktree => {
-                                // Step in the sidebar's display order so the
-                                // motion matches what the user sees, but confined
-                                // to the active worktree's workspace so wrapping
-                                // never crosses into another workspace.
-                                let active_slug =
-                                    session.worktrees.get(session.active).and_then(|g| {
-                                        crate::sidebar::split_tab(&g.name).map(|(s, _)| s)
-                                    });
-                                let order: Vec<usize> = sidebar_worktree_order(&model)
-                                    .into_iter()
-                                    .filter(|&g| {
-                                        session.worktrees.get(g).and_then(|w| {
-                                            crate::sidebar::split_tab(&w.name).map(|(s, _)| s)
-                                        }) == active_slug
-                                    })
-                                    .collect();
-                                let pos = order.iter().position(|&g| g == session.active);
-                                if let (n, Some(p)) = (order.len(), pos)
-                                    && n > 1
-                                {
-                                    let next = if action == Action::NextWorktree {
-                                        (p + 1) % n
-                                    } else {
-                                        (p + n - 1) % n
-                                    };
-                                    session.switch_to(order[next]);
-                                }
-                                // A single worktree in the workspace (or the
-                                // active group filtered away) is a no-op — we do
-                                // NOT fall back to session order, which would
-                                // cross into another workspace.
+                                switch_at = Some(std::time::Instant::now());
                                 // Worktree switches always land focus on the
                                 // center terminal — the user switched to work there.
                                 focus.zone = crate::focus::Zone::Center;
-                                region_last_w = Some(session.active);
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                need_relayout = true;
-                                sync_drawer_persistence(
-                                    &session,
+                                region_last_w = Some(crate::handlers::switch::cycle_worktree(
+                                    action == Action::NextWorktree,
+                                    &mut session,
+                                    &mut model,
+                                    &mut sb,
                                     &mut panes,
                                     &mut drawer,
                                     &mut drawer_pool,
                                     &mut drawer_home,
                                     keymap.config(),
                                     chrome.center,
-                                );
-                                persist_active_focus(&session);
+                                ));
+                                need_relayout = true;
                             }
                             Action::NextWorkspace | Action::PrevWorkspace => {
                                 // One combined ring: the visible workspaces (in
@@ -18522,10 +18110,7 @@ async fn event_loop<T: Terminal>(
                                         .unwrap_or_else(|| crate::copymode::whole(emu));
                                     let text = crate::copymode::extract(emu, &sel);
                                     if !text.trim().is_empty() {
-                                        use std::io::Write;
-                                        let mut out = std::io::stdout();
-                                        let _ = out.write_all(&crate::copymode::osc52(&text));
-                                        let _ = out.flush();
+                                        writer.submit_oob(crate::copymode::osc52(&text));
                                         crate::clipboard::copy(&text);
                                         store_yank(
                                             &mut registers,
@@ -19129,7 +18714,7 @@ fn render_before_pty_drain(dirty: bool) -> bool {
 /// (which require at least prompt-render-time + keystroke, typically > 2s).
 ///
 /// Returns the new crash count after the update.
-fn update_crash_count(
+pub(crate) fn update_crash_count(
     crash_counts: &mut std::collections::HashMap<(usize, usize), u32>,
     crash_key: (usize, usize),
     age: std::time::Duration,

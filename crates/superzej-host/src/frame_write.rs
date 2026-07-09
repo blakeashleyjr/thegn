@@ -87,6 +87,7 @@ pub(crate) fn emit_frame<T: Terminal>(
 pub(crate) fn emit_muse_ready_marker<T: Terminal>(
     buf: &mut BufferedTerminal<T>,
     pending_input: &mut VecDeque<InputEvent>,
+    writer: &crate::frame_writer::FrameWriter,
 ) {
     let has_pty_pending = {
         let in_queue = pending_input.iter().any(|e| {
@@ -120,10 +121,9 @@ pub(crate) fn emit_muse_ready_marker<T: Terminal>(
         }
     };
     if !has_pty_pending {
-        use std::io::Write as _;
-        let _ = std::io::stdout()
-            .write_all(b"\x1b]5379;muse:ready\x07")
-            .and_then(|_| std::io::stdout().flush());
+        // Through the writer FIFO, so the marker lands AFTER the frame whose
+        // stability it certifies (never mid-frame).
+        writer.submit_oob(b"\x1b]5379;muse:ready\x07".to_vec());
     }
 }
 
@@ -137,7 +137,7 @@ fn is_transient_write_error(err: &anyhow::Error) -> bool {
     })
 }
 
-fn is_transient_io(io: &std::io::Error) -> bool {
+pub(crate) fn is_transient_io(io: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     matches!(io.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock)
         || matches!(
