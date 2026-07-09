@@ -827,6 +827,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // (git + an optional multi-second test-gate) and its result lands here.
     let (fold_tx, fold_rx) =
         tokio_mpsc::unbounded_channel::<anyhow::Result<crate::integrate::FoldReport>>();
+    // The agent-driven queue drain: per-branch status transitions stream back
+    // here so the panel repaints live (see handlers::merge_queue).
+    let (drive_tx, drive_rx) =
+        tokio_mpsc::unbounded_channel::<crate::handlers::merge_queue::DriveMsg>();
     let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<superzej_metrics::StatsSnapshot>();
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<Vec<superzej_core::sandbox::ContainerInfo>>();
@@ -939,6 +943,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         refresh_rx,
         fold_tx,
         fold_rx,
+        drive_tx,
+        drive_rx,
         stats_rx,
         container_rx,
         metrics_rx,
@@ -3269,27 +3275,6 @@ pub(crate) fn spawn_hunk_fetch(
             .diff_hunks(&loc, "HEAD", &path, 16)
             .unwrap_or_default();
         if tx.send((generation, path, hunks)).is_ok() {
-            let _ = waker.wake();
-        }
-    });
-}
-
-/// Kick a one-shot fold-actor run off the loop. The fold does git plumbing plus
-/// an optional multi-second test-gate, so it must never run on the loop; the
-/// result (a `FoldReport` or an error) comes back on `fold_tx` and pulses the
-/// waker, exactly like the hunk/model fetches. `any_path` is any path inside the
-/// repo (the runner resolves the main checkout itself).
-fn spawn_fold(
-    fold_tx: &tokio_mpsc::UnboundedSender<anyhow::Result<crate::integrate::FoldReport>>,
-    waker: &TerminalWaker,
-    mq: superzej_core::config::MergeQueueConfig,
-    any_path: std::path::PathBuf,
-) {
-    let tx = fold_tx.clone();
-    let waker = waker.clone();
-    tokio::task::spawn_blocking(move || {
-        let r = crate::integrate::fold_active_repo(&mq, &any_path);
-        if tx.send(r).is_ok() {
             let _ = waker.wake();
         }
     });
@@ -7057,6 +7042,8 @@ async fn event_loop<T: Terminal>(
     mut refresh_rx: tokio_mpsc::UnboundedReceiver<RefreshKind>,
     fold_tx: tokio_mpsc::UnboundedSender<anyhow::Result<crate::integrate::FoldReport>>,
     mut fold_rx: tokio_mpsc::UnboundedReceiver<anyhow::Result<crate::integrate::FoldReport>>,
+    drive_tx: crate::handlers::merge_queue::DriveTx,
+    mut drive_rx: crate::handlers::merge_queue::DriveRx,
     mut stats_rx: tokio_mpsc::UnboundedReceiver<superzej_metrics::StatsSnapshot>,
     mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<superzej_core::sandbox::ContainerInfo>>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
@@ -10693,35 +10680,23 @@ async fn event_loop<T: Terminal>(
         let mut want_ci_refresh = false;
         let mut want_disk_refresh = false;
         let mut want_main_sync = false;
-        // Fold-actor results: report what landed/deferred and re-hydrate so the
+        // Fold-actor results (batch fold + agent-driven drain): the extracted
+        // drains toast outcomes, patch the panel's queue rows in place, route
+        // settled transitions to the notification inbox, and re-hydrate so the
         // advanced target tip and cleared activity dots show immediately.
-        while let Ok(result) = fold_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Fold);
-            fold_inflight = false;
-            match result {
-                Ok(r) => {
-                    let msg = if r.deferred.is_empty() {
-                        format!("Integrated: {} landed", r.landed.len())
-                    } else {
-                        format!(
-                            "Integrated: {} landed, {} deferred",
-                            r.landed.len(),
-                            r.deferred.len()
-                        )
-                    };
-                    toasts.success(msg, std::time::Instant::now());
-                    want_model_refresh = true;
-                }
-                Err(e) => {
-                    toasts.push(
-                        crate::toast::ToastKind::Info,
-                        format!("Integrate failed: {e}"),
-                        std::time::Instant::now(),
-                        std::time::Duration::from_secs(6),
-                    );
-                }
-            }
-            dirty = true;
+        {
+            let mut mq_ctx = crate::handlers::merge_queue::DrainCtx {
+                model: &mut model,
+                toasts: &mut toasts,
+                notify_state: &notify_state,
+                event_bus: &event_bus,
+                fold_inflight: &mut fold_inflight,
+                want_model_refresh: &mut want_model_refresh,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            };
+            crate::handlers::merge_queue::drain_fold_results(&mut fold_rx, &mut mq_ctx);
+            crate::handlers::merge_queue::drain_drive_msgs(&mut drive_rx, &mut mq_ctx);
         }
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
@@ -12595,6 +12570,35 @@ async fn event_loop<T: Terminal>(
                     match d.handle_key(&k.key, k.modifiers) {
                         crate::detail::DetailOutcome::Close => bar_detail = None,
                         crate::detail::DetailOutcome::Pending => {}
+                        // Opening the merge-queue panel section needs the panel
+                        // locals only the loop owns, so it's intercepted here.
+                        crate::detail::DetailOutcome::Act(
+                            crate::detail::DetailAction::OpenMergeQueueSection,
+                        ) => {
+                            bar_detail = None;
+                            panel_auto_revealed = None;
+                            if chrome.panel.is_none() {
+                                want_panel = true;
+                                panel_forced = cols < layout::PANEL_MIN_COLS;
+                                chrome = recompute_chrome!();
+                                need_relayout = true;
+                            }
+                            panel_ui.switch_tab(crate::panel::PanelTab::Work);
+                            open_panel_section(
+                                crate::panel::Section::MergeQueue,
+                                &mut panel_ui,
+                                &mut hydration_gen,
+                                &model_tx,
+                                &session,
+                                &waker,
+                                PanelDocsWiring {
+                                    model: &model,
+                                    generation: docs_gen,
+                                    tx: &docs_tx,
+                                },
+                            );
+                            focus.zone = crate::focus::Zone::Panel;
+                        }
                         // A row action normally closes the overlay; the CI drill
                         // keeps it open (returns the overlay) to fill in place.
                         crate::detail::DetailOutcome::Act(action) => {
@@ -16615,6 +16619,26 @@ async fn event_loop<T: Terminal>(
                             }
                             .panel_key(key, panel_ui.cursor)
                         }
+                        // -- merge queue: add (a/A), remove (x), land (l),
+                        // retry (r), clear landed (c), drain (D). Mutations run
+                        // off-loop; outcomes ride the drive channel as toasts.
+                        (
+                            Section::MergeQueue,
+                            KeyCode::Char(c @ ('a' | 'A' | 'x' | 'l' | 'r' | 'c' | 'D')),
+                        ) => crate::handlers::merge_queue::section_key(
+                            c,
+                            panel_ui.cursor,
+                            crate::handlers::merge_queue::MqKeyCtx {
+                                model: &mut model,
+                                cfg: &current_config,
+                                active_wt: active_tab_path(&session),
+                                refresh_tx: &refresh_tx,
+                                waker: &waker,
+                                drive_tx: &drive_tx,
+                                fold_inflight: &mut fold_inflight,
+                                toasts: &mut toasts,
+                            },
+                        ),
                         // -- hosts: p/r/c/x act on the host; m menu, n add-host.
                         (Section::Hosts, key)
                             if matches!(key, KeyCode::Char('p' | 'r' | 'c' | 'x' | 'm' | 'n')) =>
@@ -17334,34 +17358,26 @@ async fn event_loop<T: Terminal>(
                                 focus.zone = crate::focus::Zone::Panel;
                             }
                             Action::Integrate => {
-                                if !current_config.merge_queue.enabled {
-                                    toasts.push(
-                                        crate::toast::ToastKind::Info,
-                                        "Merge queue disabled — set [merge_queue] enabled = true"
-                                            .to_string(),
-                                        std::time::Instant::now(),
-                                        std::time::Duration::from_secs(6),
-                                    );
-                                } else if fold_inflight {
-                                    toasts.push(
-                                        crate::toast::ToastKind::Info,
-                                        "Already integrating…".to_string(),
-                                        std::time::Instant::now(),
-                                        std::time::Duration::from_secs(3),
-                                    );
-                                } else {
-                                    fold_inflight = true;
-                                    toasts.success(
-                                        "Integrating…".to_string(),
-                                        std::time::Instant::now(),
-                                    );
-                                    spawn_fold(
-                                        &fold_tx,
-                                        &waker,
-                                        current_config.merge_queue.clone(),
-                                        crate::hydrate::active_tab_path(&session),
-                                    );
-                                }
+                                crate::handlers::merge_queue::dispatch_integrate(
+                                    current_config.merge_queue.enabled,
+                                    &mut fold_inflight,
+                                    &mut toasts,
+                                    &fold_tx,
+                                    &waker,
+                                    current_config.merge_queue.clone(),
+                                    crate::hydrate::active_tab_path(&session),
+                                );
+                            }
+                            Action::DrainMergeQueue => {
+                                crate::handlers::merge_queue::dispatch_drain(
+                                    current_config.merge_queue.enabled,
+                                    &mut fold_inflight,
+                                    &mut toasts,
+                                    &drive_tx,
+                                    &waker,
+                                    current_config.merge_queue.clone(),
+                                    crate::hydrate::active_tab_path(&session),
+                                );
                             }
                             Action::NextTab => {
                                 session.next_tab();

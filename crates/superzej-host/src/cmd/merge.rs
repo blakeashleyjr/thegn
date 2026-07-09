@@ -85,15 +85,11 @@ fn branch_of(worktree: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Queue rows belonging to the current repo (the queue is global; a drain is
-/// per-repo because the target ref is).
+/// Queue rows belonging to the current repo (the membership rule lives in
+/// `merge_driver::rows_for_repo`, shared with the host's in-app drain).
 fn rows_for_repo(root: &Path) -> Result<Vec<superzej_core::db::MergeQueueRow>> {
     let db = Db::open()?;
-    Ok(db
-        .list_merge_queue()?
-        .into_iter()
-        .filter(|r| integrate::main_checkout(Path::new(&r.worktree)).as_deref() == Some(root))
-        .collect())
+    Ok(merge_driver::rows_for_repo(&db, root))
 }
 
 fn list(json: bool) -> Result<()> {

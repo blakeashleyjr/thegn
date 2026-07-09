@@ -304,7 +304,7 @@ pub(crate) fn build_command_palette_items(
         .iter()
         // The fold-actor commands only make sense when the merge queue is on.
         .filter(|spec| {
-            if spec.id == "integrate" || spec.id == "open-merge-queue" {
+            if spec.id == "integrate" || spec.id == "open-merge-queue" || spec.id == "merge-drain" {
                 cfg.merge_queue.enabled
             } else {
                 spec.palette

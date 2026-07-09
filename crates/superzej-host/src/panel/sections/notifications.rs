@@ -20,12 +20,15 @@ fn kind_hue(k: NotificationKind) -> crate::seg::Tok {
     match k {
         NotificationKind::AgentDone
         | NotificationKind::WorktreeCreated
-        | NotificationKind::BlockerResolved => hue(Hue::Green),
+        | NotificationKind::BlockerResolved
+        | NotificationKind::QueueLanded
+        | NotificationKind::QueueReady => hue(Hue::Green),
         NotificationKind::AgentFailed
         | NotificationKind::TestFailed
         | NotificationKind::Overdue
         | NotificationKind::LogError
-        | NotificationKind::ProcessFailed => hue(Hue::Red),
+        | NotificationKind::ProcessFailed
+        | NotificationKind::QueueNeedsHuman => hue(Hue::Red),
         NotificationKind::AgentAttention
         | NotificationKind::PrStateChanged
         | NotificationKind::StatusChanged

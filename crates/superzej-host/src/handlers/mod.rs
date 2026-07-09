@@ -7,6 +7,7 @@
 pub(crate) mod attention;
 pub(crate) mod creating;
 pub(crate) mod host;
+pub(crate) mod merge_queue;
 pub(crate) mod overlay;
 pub(crate) mod panel_changes;
 pub(crate) mod provision;

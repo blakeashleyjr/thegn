@@ -36,6 +36,8 @@ pub(crate) struct QueueItem {
 /// One status transition the driver made, handed to the caller's `progress`
 /// callback (the DB row is already written when this fires).
 pub(crate) struct DriveStep<'a> {
+    /// The queue row's key — lets the host patch its panel row in place.
+    pub worktree: &'a str,
     pub branch: &'a str,
     pub status: &'a str,
     pub detail: &'a str,
@@ -54,6 +56,17 @@ pub(crate) struct DriveOutcome {
 enum Failure {
     Conflict(Vec<String>),
     Gate(String),
+}
+
+/// Queue rows belonging to `root`'s repo (the queue is global; a drain is
+/// per-repo because the target ref is). Shared by the CLI (`merge` namespace)
+/// and the host's in-app drain so both see exactly one membership rule.
+pub(crate) fn rows_for_repo(db: &Db, root: &Path) -> Vec<superzej_core::db::MergeQueueRow> {
+    db.list_merge_queue()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| integrate::main_checkout(Path::new(&r.worktree)).as_deref() == Some(root))
+        .collect()
 }
 
 /// Drain `items` one at a time, landing clean branches and dispatching the agent
@@ -76,6 +89,7 @@ pub(crate) fn drive_queue(
         };
         set(db, "folding", None, None);
         progress(&DriveStep {
+            worktree: &item.worktree,
             branch: &item.branch,
             status: "folding",
             detail: "",
@@ -89,6 +103,7 @@ pub(crate) fn drive_queue(
                     let detail = format!("{e}");
                     set(db, "needs_human", None, Some(&detail));
                     progress(&DriveStep {
+                        worktree: &item.worktree,
                         branch: &item.branch,
                         status: "needs_human",
                         detail: &detail,
@@ -102,6 +117,7 @@ pub(crate) fn drive_queue(
                 AttemptOutcome::Landed { commit } => {
                     set(db, "landed", Some(&commit), None);
                     progress(&DriveStep {
+                        worktree: &item.worktree,
                         branch: &item.branch,
                         status: "landed",
                         detail: &commit[..commit.len().min(12)],
@@ -112,6 +128,7 @@ pub(crate) fn drive_queue(
                 AttemptOutcome::UpToDate => {
                     set(db, "landed", None, Some("already merged"));
                     progress(&DriveStep {
+                        worktree: &item.worktree,
                         branch: &item.branch,
                         status: "landed",
                         detail: "already merged",
@@ -122,6 +139,7 @@ pub(crate) fn drive_queue(
                 AttemptOutcome::Ready { tip } => {
                     set(db, "ready", Some(&tip), Some("gated green — awaiting land"));
                     progress(&DriveStep {
+                        worktree: &item.worktree,
                         branch: &item.branch,
                         status: "ready",
                         detail: "gated green — awaiting land",
@@ -139,6 +157,7 @@ pub(crate) fn drive_queue(
                 let note = format!("agent fixing ({agent_runs}/{})", cfg.agent_max_attempts);
                 set(db, "agent_running", None, Some(&note));
                 progress(&DriveStep {
+                    worktree: &item.worktree,
                     branch: &item.branch,
                     status: "agent_running",
                     detail: &note,
@@ -167,6 +186,7 @@ pub(crate) fn drive_queue(
                         (!detail.is_empty()).then_some(&detail).map(|s| s.as_str()),
                     );
                     progress(&DriveStep {
+                        worktree: &item.worktree,
                         branch: &item.branch,
                         status,
                         detail: &detail,
@@ -185,6 +205,7 @@ pub(crate) fn drive_queue(
                     };
                     set(db, status, None, Some("breaks build"));
                     progress(&DriveStep {
+                        worktree: &item.worktree,
                         branch: &item.branch,
                         status,
                         detail: &tail_line(&log),
