@@ -46,3 +46,36 @@ External file/preview tool processes launched by the drawer SHALL run under a me
 
 - **WHEN** a launched file tool exceeds its memory cap
 - **THEN** it is constrained by the cap rather than exhausting host memory
+
+### Requirement: Document viewers in the preview pane
+
+The preview pane SHALL render Mermaid diagrams, PDF documents, CSV files as a
+table, and Jupyter notebooks as additional content-type routes on the existing
+preview seam, reusing the tree-sitter text route and the kitty graphics route,
+and MUST fall back to a text representation when the terminal lacks kitty
+graphics support. All document parsing and rasterization runs off the event
+loop, and these viewers depend on no AI/agent layer.
+
+#### Scenario: CSV renders as a table
+
+- **WHEN** the user previews a `.csv` file
+- **THEN** the preview pane shows the data as a bounded, scrollable table of rows
+  and columns
+
+#### Scenario: Mermaid renders via the graphics path on a capable terminal
+
+- **WHEN** the user previews a Mermaid document on a terminal that supports kitty
+  graphics and a Mermaid renderer is available
+- **THEN** the rendered diagram is shown through the graphics preview path
+
+#### Scenario: PDF falls back to text without graphics support
+
+- **WHEN** the user previews a PDF on a terminal with no kitty graphics support
+- **THEN** the preview pane shows an extracted-text representation instead of
+  failing
+
+#### Scenario: Jupyter notebook renders cells in order
+
+- **WHEN** the user previews a `.ipynb` notebook
+- **THEN** its cells render in order with code cells highlighted, markdown cells
+  shown as text, and image outputs noted for the graphics path

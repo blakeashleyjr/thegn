@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use fff_search::file_picker::FilePicker;
@@ -52,6 +52,63 @@ const MIN_COMBO_COUNT: u32 = 1;
 fn registry() -> &'static Mutex<HashMap<PathBuf, SharedFilePicker>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, SharedFilePicker>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per-root cache of git-ignored relative paths (pass two of [`file_search`]).
+/// The fff picker excludes ignored files, so they are gathered separately (once
+/// per `rebuild`) and fuzzy-ranked in memory per keystroke.
+fn ignored_registry() -> &'static Mutex<HashMap<PathBuf, Arc<Vec<String>>>> {
+    static IGNORED: OnceLock<Mutex<HashMap<PathBuf, Arc<Vec<String>>>>> = OnceLock::new();
+    IGNORED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cap on cached ignored paths per root — a heavy `node_modules`/`target` tree
+/// can hold hundreds of thousands; bound memory and per-keystroke fuzzing cost.
+const MAX_IGNORED: usize = 50_000;
+
+/// List the paths git ignores under `root` (relative, forward-slashed), bounded
+/// at [`MAX_IGNORED`]. Empty off a git repo or on any error. Blocking.
+fn compute_ignored(root: &Path) -> Vec<String> {
+    // `--others --ignored --exclude-standard` = files present but git-ignored;
+    // `-z` = NUL-separated so paths with odd bytes survive. This is the precise
+    // complement of the fff (non-ignored) set.
+    #[expect(clippy::disallowed_methods)] // blocking git; called from spawn_blocking
+    let out = superzej_core::util::git_cmd(root)
+        .args([
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ])
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    out.stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .take(MAX_IGNORED)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+/// Cached ignored-path list for `root`, computing (and caching) it on first use.
+/// Blocking on first use per root.
+fn ignored_for(root: &Path) -> Arc<Vec<String>> {
+    if let Ok(reg) = ignored_registry().lock()
+        && let Some(v) = reg.get(root)
+    {
+        return v.clone();
+    }
+    let v = Arc::new(compute_ignored(root));
+    if let Ok(mut reg) = ignored_registry().lock() {
+        reg.insert(root.to_path_buf(), v.clone());
+    }
+    v
 }
 
 fn fff_dir() -> PathBuf {
@@ -132,6 +189,11 @@ pub fn rebuild(root: &Path) -> Option<SharedFilePicker> {
     if let Ok(mut reg) = registry().lock() {
         reg.insert(root.to_path_buf(), handle.clone());
     }
+    // Refresh the git-ignored set (pass two of `file_search`) on the same beat.
+    let ignored = Arc::new(compute_ignored(root));
+    if let Ok(mut reg) = ignored_registry().lock() {
+        reg.insert(root.to_path_buf(), ignored);
+    }
     Some(handle)
 }
 
@@ -149,13 +211,58 @@ fn picker_for(root: &Path) -> Option<SharedFilePicker> {
 // ── Searches (all blocking; call from spawn_blocking) ─────────────────────────
 
 /// A fuzzy path match: relative path + a display-order score (higher first).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathHit {
     pub path: String,
     pub score: u32,
 }
 
-/// Fuzzy file-path search over `root`, frecency- and combo-boost-weighted.
+/// Fuzzy file-path search over `root`, in two passes: tracked/non-ignored files
+/// (fff, frecency- and combo-boost-weighted) rank first, then git-ignored files
+/// surface after them (fuzzy-ranked). See [`merge_two_pass`]. Blocking.
 pub fn file_search(root: &Path, query: &str, limit: usize) -> Vec<PathHit> {
+    let pass1 = file_search_tracked(root, query, limit);
+    // Empty query shows the tracked list only — ignored files would flood it.
+    let pass2 = if query.is_empty() {
+        Vec::new()
+    } else {
+        let ignored = ignored_for(root);
+        let refs: Vec<&str> = ignored.iter().map(String::as_str).collect();
+        fuzzy_rank(query, &refs)
+            .into_iter()
+            .map(|(i, score)| PathHit {
+                path: ignored[i].clone(),
+                score: u32::from(score),
+            })
+            .collect()
+    };
+    merge_two_pass(pass1, pass2, limit)
+}
+
+/// Concatenate the tracked pass ahead of the ignored pass: dedup ignored entries
+/// already present in the tracked pass (tracked wins), cap at `limit`, then
+/// re-stamp strictly-decreasing scores so every tracked hit outranks every
+/// ignored hit — including at an equal fuzzy score — under any stable re-sort.
+/// Pure over its inputs (unit-tested); each pass arrives already best-first.
+pub fn merge_two_pass(pass1: Vec<PathHit>, pass2: Vec<PathHit>, limit: usize) -> Vec<PathHit> {
+    let seen: std::collections::HashSet<&str> = pass1.iter().map(|h| h.path.as_str()).collect();
+    let mut out = pass1.clone();
+    for h in pass2 {
+        if !seen.contains(h.path.as_str()) {
+            out.push(h);
+        }
+    }
+    out.truncate(limit);
+    let n = out.len();
+    for (i, h) in out.iter_mut().enumerate() {
+        h.score = (n - i) as u32;
+    }
+    out
+}
+
+/// Tracked/non-ignored fuzzy file search (fff picker) — pass one of
+/// [`file_search`]. Frecency- and combo-boost-weighted. Blocking.
+fn file_search_tracked(root: &Path, query: &str, limit: usize) -> Vec<PathHit> {
     let Some(shared) = picker_for(root) else {
         return Vec::new();
     };
@@ -411,5 +518,60 @@ mod tests {
         let hay = ["Cargo.toml", "unrelated"];
         let ranked = fuzzy_rank("cargo", &hay);
         assert_eq!(ranked.first().map(|(i, _)| *i), Some(0));
+    }
+
+    fn hit(path: &str, score: u32) -> PathHit {
+        PathHit {
+            path: path.to_string(),
+            score,
+        }
+    }
+
+    #[test]
+    fn two_pass_tracked_outranks_ignored_at_equal_score() {
+        // A tracked and an ignored file with the SAME fuzzy score: tracked first.
+        let out = merge_two_pass(vec![hit("src/app.rs", 5)], vec![hit("dist/app.js", 5)], 10);
+        assert_eq!(
+            out.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/app.rs", "dist/app.js"]
+        );
+        assert!(
+            out[0].score > out[1].score,
+            "tracked re-stamped above ignored"
+        );
+    }
+
+    #[test]
+    fn two_pass_ignored_surfaces_when_no_tracked_matches() {
+        let out = merge_two_pass(vec![], vec![hit("node_modules/x.js", 3)], 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "node_modules/x.js");
+    }
+
+    #[test]
+    fn two_pass_no_ignored_leaves_tracked_untouched() {
+        let out = merge_two_pass(vec![hit("a", 9), hit("b", 8)], vec![], 10);
+        assert_eq!(
+            out.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn two_pass_dedups_ignored_already_in_tracked() {
+        // If a path shows up in both passes, the tracked copy wins (appears once).
+        let out = merge_two_pass(vec![hit("shared", 5)], vec![hit("shared", 9)], 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "shared");
+    }
+
+    #[test]
+    fn two_pass_caps_at_limit_tracked_first() {
+        let out = merge_two_pass(vec![hit("t1", 2), hit("t2", 1)], vec![hit("i1", 9)], 2);
+        assert_eq!(
+            out.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["t1", "t2"],
+            "limit fills from the tracked pass first"
+        );
     }
 }

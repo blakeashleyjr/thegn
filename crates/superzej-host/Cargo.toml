@@ -58,6 +58,13 @@ axum = { workspace = true }
 tokio-util = { version = "0.7", features = ["io"] }
 futures = { workspace = true }
 portable-pty.workspace = true
+# Image decoding for the document-viewer graphics path (src/rasterize.rs decodes
+# image/PDF-page/Mermaid rasters to RGBA for the kitty preview in src/graphics.rs).
+# PNG + JPEG only — bound the codec/compile bloat.
+image = { version = "0.25", default-features = false, features = [
+  "png",
+  "jpeg",
+] }
 termwiz.workspace = true
 libc.workspace = true
 chrono.workspace = true
