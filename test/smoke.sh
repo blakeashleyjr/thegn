@@ -490,6 +490,85 @@ else
   echo "  skip v5→v6 migration check (sqlite3 not on PATH)"
 fi
 
+# ── control plane: pairing CRUD, no-daemon degradation, daemon lifecycle ────
+echo "control plane:"
+
+# Pairing management is pure DB — must work with NO daemon running.
+# NOTE: command output is never interpolated into check()'s eval'd condition —
+# the no-daemon message contains backticks, which eval would execute.
+pair_out="$("$SZ" pair new --scope read,git --label smoke 2>&1)"
+pair_url_ok=1
+grep -q 'superzej://pair?' <<<"$pair_out" || pair_url_ok=0
+pair_hash_ok=1
+grep -q 'only its hash is stored' <<<"$pair_out" || pair_hash_ok=0
+check "pair new mints a code and prints the pairing URL" "[[ $pair_url_ok -eq 1 ]]"
+check "pair new never echoes a stored plaintext (hash-only note present)" \
+  "[[ $pair_hash_ok -eq 1 ]]"
+pair_id="$("$SZ" pair list --json | sed -n 's/.*"pairing_id": "\([a-f0-9]*\)".*/\1/p' | head -1)"
+check "pair list --json surfaces the minted code" "[[ -n '$pair_id' ]]"
+"$SZ" pair revoke "$pair_id" >/dev/null
+pair_revoked_ok=1
+"$SZ" pair list | grep -q revoked || pair_revoked_ok=0
+check "pair revoke flips the state" "[[ $pair_revoked_ok -eq 1 ]]"
+
+# Session verbs degrade clearly when no daemon is running (never crash).
+set +e
+nodaemon_out="$("$SZ" session list 2>&1)"
+nodaemon_rc=$?
+nodaemon_json="$("$SZ" session list --json 2>/dev/null)"
+set -e
+nodaemon_msg_ok=1
+[[ $nodaemon_rc -eq 1 ]] && grep -q 'no superzej pane daemon' <<<"$nodaemon_out" || nodaemon_msg_ok=0
+nodaemon_json_ok=1
+grep -q 'no_daemon' <<<"$nodaemon_json" || nodaemon_json_ok=0
+check "session list without a daemon exits 1 with a clear message" \
+  "[[ $nodaemon_msg_ok -eq 1 ]]"
+check "session list --json emits the no_daemon error object" \
+  "[[ $nodaemon_json_ok -eq 1 ]]"
+
+# Daemon lifecycle: spawn on an isolated socket, open a marker session over
+# the unix socket, see it in `session list` and its output in `snapshot`,
+# then stop it and verify the registry row + socket are gone.
+if command -v curl >/dev/null 2>&1; then
+  DSOCK="$TMP/d.sock"
+  "$SZ" daemon --socket "$DSOCK" &
+  DPID=$!
+  for _ in $(seq 1 40); do
+    [[ -S $DSOCK ]] && break
+    sleep 0.1
+  done
+  check "daemon binds its control socket" "[[ -S '$DSOCK' ]]"
+  curl -s --unix-socket "$DSOCK" -X POST http://d/v1/sessions \
+    -H 'content-type: application/json' \
+    -d '{"argv":["/bin/sh","-c","echo smoke-marker; sleep 30"],"rows":24,"cols":80}' >/dev/null
+  sleep 0.5
+  slist_ok=1
+  "$SZ" session list | grep -Eq 'sh|echo' || slist_ok=0
+  check "session list shows the daemon-owned session" "[[ $slist_ok -eq 1 ]]"
+  sid="$("$SZ" session list --json | sed -n 's/.*"id": "\([a-f0-9]*\)".*/\1/p' | head -1)"
+  snap_ok=1
+  "$SZ" session snapshot --session "$sid" | grep -aq smoke-marker || snap_ok=0
+  check "snapshot carries the detached session's output" "[[ $snap_ok -eq 1 ]]"
+  kill "$DPID" 2>/dev/null || true
+  wait "$DPID" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    [[ ! -S $DSOCK ]] && break
+    sleep 0.1
+  done
+  check "daemon cleanup unlinks the socket" "[[ ! -S '$DSOCK' ]]"
+  if command -v sqlite3 >/dev/null 2>&1; then
+    rows="$(sqlite3 "$XDG_STATE_HOME/superzej/superzej.db" 'SELECT count(*) FROM daemons' 2>/dev/null || echo 0)"
+    check "daemon cleanup removes its registry row" "[[ '$rows' -eq 0 ]]"
+  fi
+else
+  echo "  skip daemon lifecycle (curl not on PATH)"
+fi
+
+# Bare compositor config: with [daemon] absent nothing may spawn a daemon
+# (opt-in contract) — the verbs above ran without one and no socket exists.
+check "no daemon is spawned by default (opt-in contract)" \
+  "[[ ! -S \"$XDG_STATE_HOME/superzej/run/daemon.sock\" ]]"
+
 echo
 if [[ $fail -eq 0 ]]; then
   printf '\033[32mall smoke checks passed\033[0m\n'

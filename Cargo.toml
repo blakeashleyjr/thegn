@@ -129,6 +129,22 @@ windows = "0.58"
 # are widened with extra features inside the superzej-proxy crate's own manifest
 # (cargo merges them with the workspace base). ---
 axum = "0.8"
+# --- Control plane (add-control-plane-and-remote): the gRPC surface, feature-
+# gated behind superzej-svc's `control-grpc`. `protox` compiles the .proto in
+# pure Rust — no protoc anywhere in the build (keeps `nix develop`, the lean
+# sandbox devshell, and bare `cargo build` all protoc-free). ---
+tonic = { version = "0.13", default-features = false, features = [
+  "codegen",
+  "prost",
+  "router",
+  "server",
+  "transport",
+] }
+prost = "0.13"
+tonic-build = { version = "0.13", default-features = false, features = [
+  "prost",
+] }
+protox = "0.7"
 regex = "1"
 gix = "0.84"
 tokei = "12"
