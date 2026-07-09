@@ -4,12 +4,14 @@
 //! context struct. The loop calls one `drain_*` per wake; everything here runs
 //! ON the loop and must stay I/O-free.
 
+pub(crate) mod attention;
 pub(crate) mod creating;
 pub(crate) mod host;
 pub(crate) mod overlay;
 pub(crate) mod panel_changes;
 pub(crate) mod provision;
 pub(crate) mod repo_trust;
+pub(crate) mod sidebar_activate;
 pub(crate) mod sidebar_reorder;
 pub(crate) mod startup;
 pub(crate) mod terminal;

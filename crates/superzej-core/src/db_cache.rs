@@ -28,6 +28,19 @@ impl CacheStore for Db {
         Ok(r)
     }
 
+    fn list_pr_cache(&self) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT worktree, json, fetched_at FROM pr_cache")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     fn put_pr_cache(&self, worktree: &str, branch: &str, json: &str) -> Result<()> {
         self.conn().execute(
             r#"INSERT INTO pr_cache(worktree,branch,json,fetched_at)
@@ -239,5 +252,26 @@ impl CacheStore for Db {
             params![worktree, total as i64, report_json, util::now()],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_pr_cache_returns_every_row() {
+        let db = Db::open_memory().unwrap();
+        assert!(db.list_pr_cache().unwrap().is_empty());
+        db.put_pr_cache("/wt/a", "br-a", "{\"n\":1}").unwrap();
+        db.put_pr_cache("/wt/b", "br-b", "{\"n\":2}").unwrap();
+        db.put_pr_cache("/wt/a", "br-a", "{\"n\":3}").unwrap(); // upsert, not duplicate
+        let mut rows = db.list_pr_cache().unwrap();
+        rows.sort();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "/wt/a");
+        assert_eq!(rows[0].1, "{\"n\":3}");
+        assert!(rows[0].2 > 0);
+        assert_eq!(rows[1].0, "/wt/b");
     }
 }
