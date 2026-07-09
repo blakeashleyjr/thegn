@@ -13,6 +13,8 @@ use superzej_core::db::Db;
 use superzej_core::store::WorktreeAuxStore;
 use superzej_core::{outln, util};
 
+use superzej_core::merge_lifecycle::LifecycleEvent;
+
 use crate::integrate::{self, AttemptOutcome};
 use crate::merge_driver::{self, DriveStep, QueueItem};
 
@@ -127,6 +129,7 @@ fn add(cfg: &Config, worktrees: Vec<String>, all: bool) -> Result<()> {
         }
         for (branch, wt) in &cands.worktrees {
             db.enqueue_merge(wt, branch, &target)?;
+            crate::merge_lifecycle::apply(mq, &db, &root, wt, branch, LifecycleEvent::Enqueued);
             outln!("  + queued {branch}");
         }
         return Ok(());
@@ -146,6 +149,7 @@ fn add(cfg: &Config, worktrees: Vec<String>, all: bool) -> Result<()> {
             continue;
         }
         db.enqueue_merge(&wt_s, &branch, &target)?;
+        crate::merge_lifecycle::apply(mq, &db, &root, &wt_s, &branch, LifecycleEvent::Enqueued);
         outln!("  + queued {branch}");
     }
     Ok(())
@@ -241,19 +245,29 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
     // additionally records the outcome on the worktree's merge-queue row.
     let (branch, _target, outcome) = super::land::land_branch(cfg, &wt)?;
     let db = Db::open()?;
+    // Apply the sidebar-folder lifecycle for this worktree once we know its fate.
+    let lifecycle = |event: LifecycleEvent| {
+        if let Some(root) = integrate::main_checkout(&wt) {
+            crate::merge_lifecycle::apply(&cfg.merge_queue, &db, &root, &wt_s, &branch, event);
+        }
+    };
     match outcome {
         AttemptOutcome::Landed { commit } => {
             let _ = db.update_merge_status(&wt_s, "landed", Some(&commit), None, None);
+            lifecycle(LifecycleEvent::Landed);
             outln!("✓ landed {branch} → {}", &commit[..commit.len().min(12)]);
         }
         AttemptOutcome::UpToDate => {
             let _ = db.update_merge_status(&wt_s, "landed", None, Some("already merged"), None);
+            lifecycle(LifecycleEvent::Landed);
             outln!("{branch} already merged.");
         }
         AttemptOutcome::Conflict { paths } => {
+            lifecycle(LifecycleEvent::Failed);
             outln!("✗ {branch} conflicts: {}", paths.join(", "));
         }
         AttemptOutcome::GateFailed { .. } => {
+            lifecycle(LifecycleEvent::Failed);
             outln!("✗ {branch} breaks the build (gate red).");
         }
         AttemptOutcome::Ready { .. } => {

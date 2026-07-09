@@ -81,6 +81,7 @@ mod media_watch;
 mod mem;
 mod menu;
 mod merge_driver;
+mod merge_lifecycle;
 mod metrics;
 mod model_eq;
 mod mousefilter;
