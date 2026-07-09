@@ -1,13 +1,16 @@
 //! Host-side terminal-activity state machine for the sidebar's live dots.
 //!
 //! Activity is measured by scanning `/proc` for processes whose cwd sits under
-//! a managed worktree and summing their CPU time. A worktree whose CPU is
-//! advancing is `active` (filled white dot — working); one that was active and
+//! a managed worktree and summing their CPU time, OR'd with a second signal the
+//! host injects: recent *unsolicited* agent-pane PTY output (an agent blocked on
+//! an API response uses ~0% CPU but keeps redrawing its spinner — CPU alone
+//! would flip it to `waiting` mid-turn). A worktree with either signal is
+//! `active` (filled white dot — working); one that was active and
 //! has gone idle is `waiting` (filled **red** dot — "stuck, look at me", an
 //! *unread* alert); focusing its tab marks it `read` (hollow red dot — seen but
 //! still stuck) via [`ack`]. A red worktree is **sticky**: it only leaves red
-//! when work *genuinely resumes* — sustained CPU over `RESUME_GRACE_SECS`, not
-//! a one-window blip from a spinner redraw or a stray watcher.
+//! when work *genuinely resumes* — sustained busy over `RESUME_GRACE_SECS`, not
+//! a one-window blip from a stray watcher or a stale output stamp.
 //!
 //!   none ─── cpu delta ≥ threshold ─────────▶ active
 //!   active ─ idle ≥ QUIET_GRACE_SECS ───────▶ waiting   (filled red, unread)
@@ -38,6 +41,10 @@ const QUIET_GRACE_SECS: f64 = 5.0;
 const RESUME_GRACE_SECS: f64 = 3.0;
 /// Polls closer together than this reuse the previous scan.
 const MIN_SCAN_INTERVAL_SECS: f64 = 1.0;
+/// Slack added to the poll's wall window when judging an output hint fresh:
+/// covers publish jitter between the run loop stamping pane output and the
+/// hydration thread polling the FSM.
+const OUTPUT_HINT_SLACK_SECS: f64 = 1.0;
 
 /// A managed worktree the scanner should track: `(path, tab_name)`.
 #[derive(Debug, Clone)]
@@ -137,21 +144,29 @@ pub fn read_entries_at(path: &Path) -> BTreeMap<String, ActivityEntry> {
 /// Advance the FSM one step over `managed` and persist. Cheap to call on a
 /// timer; skips the `/proc` walk if the last scan was under a second ago.
 pub fn poll_and_save(managed: &[ManagedWorktree]) {
-    poll_and_save_with(managed, &BTreeMap::new());
+    poll_and_save_with(managed, &BTreeMap::new(), &BTreeMap::new());
 }
 
 /// [`poll_and_save`] with injected per-worktree jiffies (keyed by worktree path)
-/// that **override** the local `/proc` scan for those paths. Used for remote/
-/// provider worktrees whose real processes run in the env, not on this host —
-/// the host gathers their jiffies over the resident bridge (`proc.list`) and
-/// passes them in. Local worktrees (absent from `extra`) are scanned as usual.
-pub fn poll_and_save_with(managed: &[ManagedWorktree], extra: &BTreeMap<String, u64>) {
-    poll_and_save_at_with(&state_path(), managed, extra, unix_now());
+/// that **override** the local `/proc` scan for those paths — used for remote/
+/// provider worktrees whose real processes run in the env, not on this host
+/// (the host gathers their jiffies over the resident bridge, `proc.list`) —
+/// plus `output_hints`: unix seconds of the last *unsolicited* agent-pane PTY
+/// output per worktree path. A fresh hint counts as busy alongside CPU, so an
+/// agent idling on network I/O but still animating its spinner never falsely
+/// flips to `waiting`. Local worktrees (absent from `extra`) are scanned as
+/// usual; worktrees absent from `output_hints` rely on CPU alone.
+pub fn poll_and_save_with(
+    managed: &[ManagedWorktree],
+    extra: &BTreeMap<String, u64>,
+    output_hints: &BTreeMap<String, f64>,
+) {
+    poll_and_save_at_with(&state_path(), managed, extra, output_hints, unix_now());
 }
 
 /// [`poll_and_save`] against an explicit path/clock (testable).
 pub fn poll_and_save_at(path: &Path, managed: &[ManagedWorktree], now: f64) {
-    poll_and_save_at_with(path, managed, &BTreeMap::new(), now);
+    poll_and_save_at_with(path, managed, &BTreeMap::new(), &BTreeMap::new(), now);
 }
 
 /// [`poll_and_save_with`] against an explicit path/clock (testable).
@@ -159,13 +174,14 @@ pub fn poll_and_save_at_with(
     path: &Path,
     managed: &[ManagedWorktree],
     extra: &BTreeMap<String, u64>,
+    output_hints: &BTreeMap<String, f64>,
     now: f64,
 ) {
     let mut snap = load(path);
     if now - snap.polled_at < MIN_SCAN_INTERVAL_SECS {
         return;
     }
-    poll(&mut snap, managed, extra, now);
+    poll(&mut snap, managed, extra, output_hints, now);
     save(path, &snap);
 }
 
@@ -249,8 +265,15 @@ pub fn coerce_stale_states(grace_ms: u64) {
 
 /// One scan + state-machine step over every managed worktree. `extra` supplies
 /// pre-fetched jiffies (e.g. from a remote env's bridge) that override the local
-/// `/proc` scan for those worktree paths.
-fn poll(snap: &mut Snapshot, managed: &[ManagedWorktree], extra: &BTreeMap<String, u64>, now: f64) {
+/// `/proc` scan for those worktree paths; `output_hints` supplies last-output
+/// stamps that count as busy alongside CPU (see [`poll_and_save_with`]).
+fn poll(
+    snap: &mut Snapshot,
+    managed: &[ManagedWorktree],
+    extra: &BTreeMap<String, u64>,
+    output_hints: &BTreeMap<String, f64>,
+    now: f64,
+) {
     // Longest-prefix targets so a worktree nested under its repo root
     // (worktree_mode = "in_repo") wins over the home tab.
     let mut targets: Vec<(PathBuf, String)> = managed
@@ -292,7 +315,18 @@ fn poll(snap: &mut Snapshot, managed: &[ManagedWorktree], extra: &BTreeMap<Strin
         // mean something from the second reading on.
         if prev_known && !first_poll {
             let delta = cur.saturating_sub(e.cpu_jiffies) as f64;
-            let busy = delta >= threshold && wall > 0.0;
+            let cpu_busy = delta >= threshold && wall > 0.0;
+            // Output within the just-elapsed poll window counts as busy: a
+            // working agent redraws its spinner continuously, so a fresh stamp
+            // arrives every poll and the busy streak is sustained — exactly what
+            // the sticky-red resume gate requires. A future stamp (clock skew /
+            // garbage) is capped by the slack so it can't pin busy forever.
+            let out_busy = wall > 0.0
+                && output_hints.get(&w.worktree).is_some_and(|t| {
+                    let age = now - t;
+                    (-OUTPUT_HINT_SLACK_SECS..=wall + OUTPUT_HINT_SLACK_SECS).contains(&age)
+                });
+            let busy = cpu_busy || out_busy;
 
             // Track the uninterrupted busy streak.
             if busy {
@@ -793,7 +827,7 @@ mod tests {
         // Baseline poll establishes prev + polled_at with injected jiffies = 0.
         let mut extra = BTreeMap::new();
         extra.insert("/nonexistent/remote-wt".to_string(), 0u64);
-        poll_and_save_at_with(&path, &managed, &extra, 1000.0);
+        poll_and_save_at_with(&path, &managed, &extra, &BTreeMap::new(), 1000.0);
         assert_eq!(
             read_states_at(&path).get("app/remote").map(String::as_str),
             Some("none")
@@ -801,10 +835,189 @@ mod tests {
         // A second poll 1s later with a large jiffies advance (delta well over
         // the 3-jiffies/s threshold) flips it to active — no /proc involvement.
         extra.insert("/nonexistent/remote-wt".to_string(), 500u64);
-        poll_and_save_at_with(&path, &managed, &extra, 1001.0);
+        poll_and_save_at_with(&path, &managed, &extra, &BTreeMap::new(), 1001.0);
         assert_eq!(
             read_states_at(&path).get("app/remote").map(String::as_str),
             Some("active")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `worktree path -> stamp` output-hint map for the tests below.
+    fn hint(wt: &str, at: f64) -> BTreeMap<String, f64> {
+        let mut m = BTreeMap::new();
+        m.insert(wt.to_string(), at);
+        m
+    }
+
+    /// A fresh output hint counts as busy with zero CPU: `none` wakes to
+    /// `active` purely from the hint (an agent streaming output but idling on
+    /// network I/O).
+    #[test]
+    fn output_hint_drives_none_to_active() {
+        let path = tmp("hint-wake");
+        let _ = std::fs::remove_file(&path);
+        let wt = "/nonexistent/hint-wt";
+        let managed = vec![ManagedWorktree {
+            worktree: wt.into(),
+            tab: "app/hint".into(),
+        }];
+        // Baseline poll: state none, no signals yet.
+        poll_and_save_at(&path, &managed, 1000.0);
+        // Second poll with an output stamp inside the elapsed window and no
+        // CPU at all (the path has no processes) → active.
+        poll_and_save_at_with(&path, &managed, &BTreeMap::new(), &hint(wt, 1001.5), 1002.0);
+        assert_eq!(
+            read_states_at(&path).get("app/hint").map(String::as_str),
+            Some("active")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Continuous fresh hints hold `active` across a stretch far longer than
+    /// QUIET_GRACE_SECS with zero CPU (the mid-turn API wait that used to
+    /// falsely flip the dot to `waiting`); once the hints go stale, the normal
+    /// grace flips it to `waiting`.
+    #[test]
+    fn output_hint_keeps_active_then_waiting_when_stale() {
+        let path = tmp("hint-hold");
+        let _ = std::fs::remove_file(&path);
+        let wt = "/nonexistent/hint-hold-wt";
+        let managed = vec![ManagedWorktree {
+            worktree: wt.into(),
+            tab: "app/hold".into(),
+        }];
+        poll_and_save_at(&path, &managed, 1000.0);
+        // Seed an active entry as of t=1000.
+        let mut snap = load(&path);
+        {
+            let e = snap.worktrees.get_mut(wt).unwrap();
+            e.state = "active".into();
+            e.last_active_at = Some(1000.0);
+        }
+        save(&path, &snap);
+
+        // 10s of zero CPU (double QUIET_GRACE) but a fresh hint each poll:
+        // stays active, last_active_at keeps advancing.
+        poll_and_save_at_with(&path, &managed, &BTreeMap::new(), &hint(wt, 1004.5), 1005.0);
+        poll_and_save_at_with(&path, &managed, &BTreeMap::new(), &hint(wt, 1009.5), 1010.0);
+        assert_eq!(
+            read_states_at(&path).get("app/hold").map(String::as_str),
+            Some("active")
+        );
+        let snap = load(&path);
+        assert_eq!(snap.worktrees[wt].last_active_at, Some(1010.0));
+
+        // Hints go stale (stamp far older than wall + slack): after the quiet
+        // grace the dot flips to waiting as usual.
+        poll_and_save_at_with(&path, &managed, &BTreeMap::new(), &hint(wt, 1005.0), 1020.0);
+        assert_eq!(
+            read_states_at(&path).get("app/hold").map(String::as_str),
+            Some("waiting")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Sticky red holds against output hints exactly like CPU: a red dot needs
+    /// a *sustained* hint streak (RESUME_GRACE_SECS) to resume active — a
+    /// single fresh stamp (e.g. one stray replay burst) is ignored.
+    #[test]
+    fn red_resumes_only_after_sustained_output() {
+        let path = tmp("hint-red");
+        let _ = std::fs::remove_file(&path);
+        let wt = "/nonexistent/hint-red-wt";
+        let managed = vec![ManagedWorktree {
+            worktree: wt.into(),
+            tab: "app/red".into(),
+        }];
+        poll_and_save_at(&path, &managed, 1000.0);
+        let mut snap = load(&path);
+        {
+            let e = snap.worktrees.get_mut(wt).unwrap();
+            e.state = "read".into();
+            e.quiet_since = Some(990.0);
+        }
+        save(&path, &snap);
+
+        // Fresh hint starts the busy streak but the grace hasn't elapsed.
+        poll_and_save_at_with(&path, &managed, &BTreeMap::new(), &hint(wt, 1000.5), 1001.0);
+        assert_eq!(
+            read_states_at(&path).get("app/red").map(String::as_str),
+            Some("read")
+        );
+        // Streak continues but still under RESUME_GRACE_SECS.
+        poll_and_save_at_with(&path, &managed, &BTreeMap::new(), &hint(wt, 1001.9), 1002.0);
+        assert_eq!(
+            read_states_at(&path).get("app/red").map(String::as_str),
+            Some("read")
+        );
+        // Sustained past the grace → genuinely resumed.
+        poll_and_save_at_with(&path, &managed, &BTreeMap::new(), &hint(wt, 1004.0), 1004.5);
+        assert_eq!(
+            read_states_at(&path).get("app/red").map(String::as_str),
+            Some("active")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Hint freshness boundaries: a stamp inside `wall + slack` counts
+    /// (inclusive), older is ignored, a far-future stamp (clock skew/garbage)
+    /// is ignored, and a hint keyed to a different worktree does nothing.
+    #[test]
+    fn stale_future_or_foreign_hints_ignored() {
+        let path = tmp("hint-bounds");
+        let _ = std::fs::remove_file(&path);
+        let wt = "/nonexistent/hint-bounds-wt";
+        let managed = vec![ManagedWorktree {
+            worktree: wt.into(),
+            tab: "app/bounds".into(),
+        }];
+        let seed_active = |at: f64| {
+            let mut snap = load(&path);
+            let e = snap.worktrees.get_mut(wt).unwrap();
+            e.state = "active".into();
+            e.last_active_at = Some(at);
+            e.busy_since = None;
+            save(&path, &snap);
+        };
+        poll_and_save_at(&path, &managed, 1000.0);
+        seed_active(1000.0);
+
+        // wall = 10, slack = 1: age exactly 11 is still fresh (inclusive).
+        poll_and_save_at_with(&path, &managed, &BTreeMap::new(), &hint(wt, 999.0), 1010.0);
+        assert_eq!(
+            read_states_at(&path).get("app/bounds").map(String::as_str),
+            Some("active")
+        );
+
+        // Age just past the window → not busy; grace elapsed → waiting.
+        seed_active(1010.0);
+        poll_and_save_at_with(&path, &managed, &BTreeMap::new(), &hint(wt, 1008.9), 1020.0);
+        assert_eq!(
+            read_states_at(&path).get("app/bounds").map(String::as_str),
+            Some("waiting")
+        );
+
+        // A far-future stamp can't pin busy either.
+        seed_active(1020.0);
+        poll_and_save_at_with(&path, &managed, &BTreeMap::new(), &hint(wt, 1050.0), 1030.0);
+        assert_eq!(
+            read_states_at(&path).get("app/bounds").map(String::as_str),
+            Some("waiting")
+        );
+
+        // A hint for some other worktree leaves this one untouched.
+        seed_active(1030.0);
+        poll_and_save_at_with(
+            &path,
+            &managed,
+            &BTreeMap::new(),
+            &hint("/some/other/wt", 1039.5),
+            1040.0,
+        );
+        assert_eq!(
+            read_states_at(&path).get("app/bounds").map(String::as_str),
+            Some("waiting")
         );
         let _ = std::fs::remove_file(&path);
     }

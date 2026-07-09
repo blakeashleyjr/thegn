@@ -517,12 +517,17 @@ impl Panes {
     }
 
     /// Open a CLI-free `Stream` pane from a resolved [`crate::agent::NativeShell`]:
-    /// a fresh login shell inside the sandbox. `session` (when set) reattaches a
-    /// persisted provider session instead — replaying its scrollback.
+    /// a fresh login shell (or agent exec) inside the sandbox. `session` (when
+    /// set) reattaches a persisted provider session instead — replaying its
+    /// scrollback. `program` labels the pane (`PtyPane::program`): the agent's
+    /// command stem for agent execs, `"sh"` for a plain shell — it keys
+    /// per-program keybind overlays and the activity output signal's shell
+    /// exclusion, so an agent pane must not be mislabeled as an idle shell.
     pub(crate) fn spawn_native_shell(
         &mut self,
         n: crate::agent::NativeShell,
         session: Option<String>,
+        program: String,
         center: Rect,
     ) -> Result<u32> {
         let cols = center.cols.max(1) as u16;
@@ -545,7 +550,7 @@ impl Panes {
             n.provider_name,
             n.sandbox_id,
             open,
-            "sh".to_string(),
+            program,
             center,
         )
     }
@@ -682,12 +687,21 @@ impl Panes {
                     // agent — fall through to the shell rather than resuming it.
                     .filter(|c| cfg.tool_command(c).is_none())
                     .as_deref()
-                    .and_then(|c| crate::agent::native_agent_exec(cfg, worktree, c))
-                    .or_else(|| crate::agent::native_shell_exec(cfg, worktree))
+                    .and_then(|c| {
+                        crate::agent::native_agent_exec(cfg, worktree, c).map(|n| {
+                            // Label the pane with the agent, not the exec's
+                            // `/bin/sh -lc` wrapper.
+                            let cmd = cfg.agent_command(c).unwrap_or(c);
+                            (n, crate::pane::agent_program_name(cmd, c))
+                        })
+                    })
+                    .or_else(|| {
+                        crate::agent::native_shell_exec(cfg, worktree).map(|n| (n, "sh".into()))
+                    })
             };
-            if let Some(n) = native {
+            if let Some((n, program)) = native {
                 let session = tab.pane_sessions.get(old).map(|s| s.session.clone());
-                match self.spawn_native_shell(n, session, center) {
+                match self.spawn_native_shell(n, session, program, center) {
                     Ok(fresh) => {
                         map.insert(*old, fresh);
                         continue;
