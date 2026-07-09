@@ -71,7 +71,7 @@ fn q(s: &str) -> String {
 }
 
 /// Run a local `git -C <worktree> <args>` and return trimmed stdout on success.
-/// Uses `util::git_cmd` for the GIT_* env scrub (never raw `Command::new("git")`).
+/// Goes through `util::git_cmd` for the GIT_* env scrub (never a raw git spawn).
 fn local_git(worktree: &str, args: &[&str]) -> Option<String> {
     // off-loop: the sandbox-prepare path runs on spawn_blocking, never the loop.
     #[expect(clippy::disallowed_methods)]

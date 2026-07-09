@@ -170,7 +170,10 @@ jobs:
       - run: nix develop --command bash -lc "just sandbox-e2e-dns && just sandbox-e2e-db"
   nix-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A cold `nix build .#default` compiles the whole app + deps from source and
+    # can exceed 30m (prior runs were killed at the cap mid-compile). The warmed
+    # nix-store cache usually makes it far quicker; this is the cold-cache budget.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
