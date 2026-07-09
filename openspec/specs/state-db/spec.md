@@ -89,3 +89,52 @@ without altering the live sticky-state machine.
 - **WHEN** a session is restored whose persisted "running" state is newer than the
   grace threshold
 - **THEN** the state is restored as running
+
+### Requirement: Repo trust-on-first-use approvals are persisted
+
+The state database SHALL record trust-on-first-use decisions for a repo's gated
+sandbox requests in a `repo_trust` table (schema v32, added by the additive
+migration ladder), keyed by `(repo_root, canonical request JSON)`. The canonical
+request JSON is the security match key; the recorded `request_id` is a display
+handle only. Reading the approved set for a repo yields the canonical request
+strings whose decision is `approved`.
+
+#### Scenario: An approval is recorded and read back
+
+- **WHEN** a gated request is approved for a repo root
+- **THEN** the repo's approved set includes that request's canonical JSON
+
+#### Scenario: A denied request is not in the approved set
+
+- **WHEN** a gated request is denied for a repo root
+- **THEN** the repo's approved set excludes it, though the decision is listed
+
+#### Scenario: The table is added without disturbing existing data
+
+- **WHEN** a pre-v32 database is opened
+- **THEN** the `repo_trust` table is created additively and existing rows survive
+
+### Requirement: Zones and workspace membership are persisted
+
+The state database SHALL persist zones and workspace membership: a `zones` table
+(unique name) and a nullable `workspaces.zone_id` (schema v33, added by the
+additive migration ladder; NULL = unzoned). Membership is exclusive (one column,
+not a join table). The store SHALL resolve a worktree's zone by mapping the
+worktree to its repo's workspace and thence its zone, falling back to treating the
+argument as a repo path.
+
+#### Scenario: A worktree resolves to its workspace's zone
+
+- **WHEN** a repo is assigned to a zone and a worktree under that repo is queried
+- **THEN** the worktree resolves to that zone
+
+#### Scenario: Membership is added without disturbing existing data
+
+- **WHEN** a pre-v33 database is opened
+- **THEN** the `zones` table and `workspaces.zone_id` column are created
+  additively and existing rows survive
+
+#### Scenario: An unzoned worktree resolves to no zone
+
+- **WHEN** a worktree whose workspace has no zone is queried
+- **THEN** it resolves to no zone
