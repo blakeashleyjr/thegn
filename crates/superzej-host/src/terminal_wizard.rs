@@ -5,8 +5,10 @@
 //! creating a terminal is a synchronous DB insert + pane spawn, so the loop
 //! handles submit inline. The form collects:
 //!
-//! - **name** — free text; when left untouched it is derived from the
-//!   connection (`local` for a local shell, `term-<host>` for a remote target).
+//! - **name** — free text; when left untouched it defaults to a random
+//!   `adj-noun` slug (e.g. `snappy-shark`). For a remote target the selected
+//!   host is prefixed as context (`<host>/<slug>`, e.g. `build-box/snappy-shark`);
+//!   a local shell shows just the slug. Typing overrides the default verbatim.
 //! - **host** — an inline cycle over the machines registered in `[host.*]`
 //!   (reach `ssh`/`local`; iroh/cloud have no interactive pane transport):
 //!   `local` = a local shell, a registered host prefills the connection from
@@ -70,6 +72,9 @@ struct HostChoice {
     /// Resolved connection string for a registered host (`""` for `local`;
     /// unused for `manual`, which reads the free-text field).
     connection: String,
+    /// Bare host slug used as name context for a remote terminal (the registered
+    /// host's key, e.g. `build-box`); `""` for `local` and `manual`.
+    host_slug: String,
     /// The `manual…` sentinel — focus flows to the free-text connection field.
     manual: bool,
 }
@@ -78,6 +83,10 @@ pub struct TerminalWizard {
     focus: Field,
     name: String,
     name_edited: bool,
+    /// The random `adj-noun` slug used as the default terminal name, fixed at
+    /// construction (deduped against existing terminals) so the preview is
+    /// stable across frames.
+    generated_slug: String,
     connection: String,
     /// `local` first, the registered hosts, then `manual…` last.
     host_rows: Vec<HostChoice>,
@@ -110,7 +119,9 @@ fn host_connection(name: &str, hc: &HostConfig) -> Option<String> {
 }
 
 impl TerminalWizard {
-    pub fn new(cfg: &Config) -> Self {
+    /// `taken` is the set of existing terminal names, used to dedupe the random
+    /// default slug so back-to-back creates don't collide.
+    pub fn new(cfg: &Config, taken: &[String]) -> Self {
         let sandbox_rows = crate::palette::build_sandbox_palette(cfg)
             .into_iter()
             .map(|i| {
@@ -123,6 +134,7 @@ impl TerminalWizard {
         let mut host_rows = vec![HostChoice {
             label: "local shell".into(),
             connection: String::new(),
+            host_slug: String::new(),
             manual: false,
         }];
         let mut names: Vec<&String> = cfg.host.keys().collect();
@@ -141,18 +153,25 @@ impl TerminalWizard {
             host_rows.push(HostChoice {
                 label: format!("{name} · {reach}"),
                 connection,
+                host_slug: name.clone(),
                 manual: false,
             });
         }
         host_rows.push(HostChoice {
             label: "manual…".into(),
             connection: String::new(),
+            host_slug: String::new(),
             manual: true,
         });
+        // A random `adj-noun` default, deduped against existing terminal names.
+        let taken_set = superzej_core::worktree::BranchSet::from_names(taken.iter().cloned());
+        let generated_slug =
+            superzej_core::worktree::dedupe(&superzej_core::worktree::random_pair(), &taken_set);
         TerminalWizard {
             focus: Field::Name,
             name: String::new(),
             name_edited: false,
+            generated_slug,
             connection: String::new(),
             host_rows,
             host_sel: 0,
@@ -188,27 +207,44 @@ impl TerminalWizard {
         self.effective_connection().is_empty()
     }
 
-    /// The name to persist: the typed name if the user edited it, else one
-    /// derived from the connection (`local`, or `term-<sanitized-host>`).
+    /// The host slug used as name context, or `None` for a local shell. For a
+    /// registered host it is the host key; for a manual remote it is the
+    /// sanitized ssh target (last whitespace-separated token).
+    fn host_token(&self) -> Option<String> {
+        let hc = self.selected_host();
+        if hc.manual {
+            let conn = self.connection.trim();
+            if conn.is_empty() {
+                return None; // manual local shell
+            }
+            // Strip a leading ssh/mosh verb (+ any flags), then sanitize the
+            // target into a slug (the target is the last token).
+            let rest = conn
+                .strip_prefix("ssh ")
+                .or_else(|| conn.strip_prefix("mosh "))
+                .unwrap_or(conn)
+                .trim();
+            let target = rest.split_whitespace().last().unwrap_or(rest);
+            return Some(target.replace([' ', '@', ':', '/'], "-"));
+        }
+        if hc.connection.trim().is_empty() {
+            return None; // local shell
+        }
+        Some(hc.host_slug.clone())
+    }
+
+    /// The name to persist: the typed name if the user edited it, else the
+    /// random slug (`snappy-shark`), prefixed with the host as context for a
+    /// remote target (`<host>/snappy-shark`).
     fn resolved_name(&self) -> String {
         let typed = self.name.trim();
         if self.name_edited && !typed.is_empty() {
             return typed.replace(' ', "-");
         }
-        let conn = self.effective_connection();
-        let conn = conn.trim();
-        if conn.is_empty() {
-            return "local".to_string();
+        match self.host_token() {
+            Some(host) => format!("{host}/{}", self.generated_slug),
+            None => self.generated_slug.clone(),
         }
-        // Strip a leading ssh/mosh verb (+ any flags), then sanitize the target
-        // into a slug (the target is the last whitespace-separated token).
-        let rest = conn
-            .strip_prefix("ssh ")
-            .or_else(|| conn.strip_prefix("mosh "))
-            .unwrap_or(conn)
-            .trim();
-        let target = rest.split_whitespace().last().unwrap_or(rest);
-        format!("term-{}", target.replace([' ', '@', ':', '/'], "-"))
     }
 
     fn sandbox_key(&self) -> &str {
@@ -550,7 +586,7 @@ mod tests {
     use super::*;
 
     fn wiz() -> TerminalWizard {
-        TerminalWizard::new(&Config::default())
+        TerminalWizard::new(&Config::default(), &[])
     }
 
     /// A config with a couple of registered hosts (ssh + iroh) plus a
@@ -602,7 +638,10 @@ mod tests {
         w.sandbox_sel = 0;
         match w.submit() {
             Outcome::Submit(c) => {
-                assert_eq!(c.name, "local");
+                // A local shell now defaults to the random slug (no host prefix).
+                assert_eq!(c.name, w.generated_slug);
+                assert!(c.name.contains('-'), "adj-noun slug: {}", c.name);
+                assert!(!c.name.contains('/'), "local carries no host prefix");
                 assert_eq!(c.kind, "local");
                 assert_eq!(c.connection, "");
                 assert_eq!(c.sandbox, "bwrap");
@@ -624,7 +663,8 @@ mod tests {
             Outcome::Submit(c) => {
                 assert_eq!(c.kind, "remote");
                 assert_eq!(c.connection, "ssh user@host");
-                assert_eq!(c.name, "term-user-host");
+                // Host context (sanitized ssh target) prefixes the random slug.
+                assert_eq!(c.name, format!("user-host/{}", w.generated_slug));
                 assert_eq!(c.sandbox, "", "remote terminals carry no host sandbox");
             }
             _ => panic!("expected submit"),
@@ -633,7 +673,7 @@ mod tests {
 
     #[test]
     fn registered_ssh_host_resolves_connection_and_port() {
-        let mut w = TerminalWizard::new(&cfg_with_hosts());
+        let mut w = TerminalWizard::new(&cfg_with_hosts(), &[]);
         // Cycle: [local, build-box, ported, manual…] — iroh `pi` excluded.
         assert_eq!(w.host_rows.len(), 4);
         assert_eq!(w.host_rows[0].label, "local shell");
@@ -647,7 +687,8 @@ mod tests {
             Outcome::Submit(c) => {
                 assert_eq!(c.connection, "ssh dev@builder");
                 assert_eq!(c.kind, "remote");
-                assert_eq!(c.name, "term-dev-builder");
+                // Host context is the host *key* (`build-box`), not the target.
+                assert_eq!(c.name, format!("build-box/{}", w.generated_slug));
             }
             _ => panic!("expected submit"),
         }
@@ -662,7 +703,7 @@ mod tests {
 
     #[test]
     fn host_cycle_enter_submits_a_ready_remote_host() {
-        let mut w = TerminalWizard::new(&cfg_with_hosts());
+        let mut w = TerminalWizard::new(&cfg_with_hosts(), &[]);
         w.focus = Field::Host;
         w.host_sel = 1; // build-box (remote, nothing left to fill)
         match w.handle_key(&KeyCode::Enter, Modifiers::NONE) {
@@ -673,7 +714,7 @@ mod tests {
 
     #[test]
     fn local_host_pick_advances_to_sandbox() {
-        let mut w = TerminalWizard::new(&cfg_with_hosts());
+        let mut w = TerminalWizard::new(&cfg_with_hosts(), &[]);
         w.focus = Field::Host;
         w.host_sel = 0; // local shell
         assert_eq!(
@@ -685,7 +726,7 @@ mod tests {
 
     #[test]
     fn manual_pick_reveals_connection_field() {
-        let mut w = TerminalWizard::new(&cfg_with_hosts());
+        let mut w = TerminalWizard::new(&cfg_with_hosts(), &[]);
         w.focus = Field::Host;
         w.host_sel = w.host_rows.len() - 1; // manual…
         assert_eq!(

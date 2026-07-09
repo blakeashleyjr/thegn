@@ -3666,6 +3666,7 @@ pub(crate) enum HostInputKind {
 
 // `begin_worktree_wizard` lives in `handlers::wizard` (extracted from this
 // pinned file); it now also decorates the env rows with host-readiness badges.
+use crate::handlers::terminal::open_wizard as open_terminal_wizard;
 use crate::handlers::wizard::begin_worktree_wizard;
 
 /// Non-interactive worktree creation for a `[[actions]] action = "new-worktree"`
@@ -18212,10 +18213,8 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::NewTerminal => {
-                                // Open the new-terminal wizard (name/connection/sandbox).
-                                terminal_wizard_ui = Some(
-                                    crate::terminal_wizard::TerminalWizard::new(keymap.config()),
-                                );
+                                terminal_wizard_ui =
+                                    Some(open_terminal_wizard(keymap.config(), &session));
                             }
                             Action::NewWorkspace => {
                                 // Fuzzy picker, seeded instantly from the DB;
