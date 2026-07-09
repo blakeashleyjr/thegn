@@ -1117,6 +1117,7 @@ mod tests {
             path: path.into(),
             added: 5,
             deleted: 1,
+            incoming: false,
         }
     }
 

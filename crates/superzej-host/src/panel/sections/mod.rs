@@ -745,6 +745,7 @@ mod spec {
             path: "src/lib.rs".into(),
             added: 10,
             deleted: 2,
+            incoming: false,
         }];
         m.panel.ci_runs = vec![superzej_core::ci::CiRun {
             id: "100".into(),

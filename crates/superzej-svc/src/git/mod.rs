@@ -96,6 +96,19 @@ impl MergeKind {
             MergeKind::Revert => "REVERTING",
         }
     }
+
+    /// The git ref naming the incoming side of the operation, for diffing what
+    /// it brings in (`git diff HEAD...<ref>`). Matches the refs probed by
+    /// [`GitBackend::merge_state`]. Note `REBASE_HEAD` can dangle after a
+    /// resolved rebase — callers treat an empty diff as "no incoming set".
+    pub fn head_ref(self) -> &'static str {
+        match self {
+            MergeKind::Merge => "MERGE_HEAD",
+            MergeKind::Rebase => "REBASE_HEAD",
+            MergeKind::CherryPick => "CHERRY_PICK_HEAD",
+            MergeKind::Revert => "REVERT_HEAD",
+        }
+    }
 }
 
 /// A merge/rebase/cherry-pick in progress.
