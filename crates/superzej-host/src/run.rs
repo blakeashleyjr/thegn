@@ -1282,13 +1282,11 @@ pub(crate) fn refresh_tab_model(
     sb.rebuild(model, session);
 }
 
-/// Rows that toggle collapse on Enter/Space/`h`/`l`: workspaces and terminal
-/// host groups (both keyed by `workspace_slug` in the collapse set).
+/// Rows that toggle collapse on Enter/Space/`h`/`l`: workspaces, 📂 folder
+/// sub-groups, and terminal host groups. Single source of truth lives on
+/// [`crate::sidebar::RowKind::is_collapsible`].
 fn is_collapsible(kind: crate::sidebar::RowKind) -> bool {
-    matches!(
-        kind,
-        crate::sidebar::RowKind::Workspace | crate::sidebar::RowKind::TerminalHost
-    )
+    kind.is_collapsible()
 }
 
 /// `ui_state` scope for the sidebar's persisted view state. The sidebar is a
@@ -1688,12 +1686,14 @@ impl SidebarState {
                 }
             }
             KeyCode::Char('h') | KeyCode::LeftArrow => {
-                // Collapse an expanded header.
-                if let Some(row) = self.selected_row(model)
-                    && is_collapsible(row.kind)
-                    && !row.collapsed
-                {
-                    return self.toggle_collapse(model, session);
+                // On an expanded collapsible header: collapse it. Otherwise (a
+                // leaf sub-item, or an already-collapsed header): collapse the
+                // nearest collapsible ancestor and move the cursor onto it.
+                if let Some(row) = self.selected_row(model) {
+                    if is_collapsible(row.kind) && !row.collapsed {
+                        return self.toggle_collapse(model, session);
+                    }
+                    return self.collapse_parent(model, session);
                 }
             }
             KeyCode::Char('/') => {
@@ -1818,13 +1818,15 @@ impl SidebarState {
         }
     }
 
-    fn toggle_collapse(
+    pub(crate) fn toggle_collapse(
         &mut self,
         model: &mut FrameModel,
         session: &crate::session::Session,
     ) -> SidebarOutcome {
         if let Some(row) = self.selected_row(model) {
-            let slug = row.workspace_slug.clone();
+            // Per-kind collapse key: 📂 folders key on their `pin_key`
+            // (`{slug}/folder:{id}`), everything else on `workspace_slug`.
+            let slug = row.collapse_key().to_string();
             let now_collapsed = if self.view.collapsed.contains(&slug) {
                 self.view.collapsed.remove(&slug);
                 false
@@ -17134,6 +17136,12 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::NextWorktree | Action::PrevWorktree => {
                                 switch_at = Some(std::time::Instant::now());
+                                // Reveal first: if the active workspace/folder is
+                                // collapsed its worktrees are invisible to
+                                // `sidebar_worktree_order` (which `cycle_worktree`
+                                // steps through), so expand the group we're
+                                // navigating within before cycling.
+                                sb.reveal_active_worktree(&mut model, &session);
                                 // Worktree switches always land focus on the
                                 // center terminal — the user switched to work there.
                                 focus.zone = crate::focus::Zone::Center;
@@ -17214,6 +17222,9 @@ async fn event_loop<T: Terminal>(
                                                 focus.zone = crate::focus::Zone::Center;
                                                 region_last_w = Some(session.active);
                                                 refresh_tab_model(&mut model, &session, &mut sb);
+                                                // Reveal the landed worktree if its
+                                                // workspace/folder was collapsed.
+                                                sb.reveal_active_worktree(&mut model, &session);
                                                 need_relayout = true;
                                                 sync_drawer_persistence(
                                                     &session,
@@ -17244,6 +17255,10 @@ async fn event_loop<T: Terminal>(
                                                 region_last_w = Some(session.active);
                                                 region_last_t = None;
                                                 refresh_tab_model(&mut model, &session, &mut sb);
+                                                // Reveal the landed worktree if the
+                                                // destination workspace/folder was
+                                                // collapsed in persistence.
+                                                sb.reveal_active_worktree(&mut model, &session);
                                                 kick_model_hydration!();
                                                 need_relayout = true;
                                                 sync_drawer_persistence(
