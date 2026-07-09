@@ -79,6 +79,25 @@ pub(crate) fn is_ref_move_path(p: &std::path::Path) -> bool {
     comps.contains(&"refs") && !comps.contains(&"logs")
 }
 
+/// Whether a diff-watcher event path is a *remote-tracking* ref update
+/// (`refs/remotes/…`) — the local signature of a `git push` (or fetch). Drives
+/// an immediate PR/CI cache kick so a just-pushed branch's checks appear
+/// without waiting for the 20s / `[ci] poll_interval_secs` tickers. Local
+/// commits only move `refs/heads/…` and deliberately don't match — they'd
+/// churn provider subprocesses on every agent commit.
+pub(crate) fn is_remote_ref_path(p: &std::path::Path) -> bool {
+    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if name.ends_with(".lock") {
+        return false; // react to the final write, not the lock churn
+    }
+    let comps: Vec<&str> = p
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    // Exclude the reflog mirror under `logs/refs/remotes/…`.
+    comps.windows(2).any(|w| w == ["refs", "remotes"]) && !comps.contains(&"logs")
+}
+
 /// Whether a single diff-watcher event path should drive a model re-hydration.
 /// Three cases, in precedence order:
 /// 1. `.git`-internal paths (inside a `.git` component, or under the resolved
@@ -198,6 +217,22 @@ mod tests {
         assert!(!yes("/repo/src/main.rs"));
         assert!(!yes("/repo/.git/index"));
         assert!(!yes("/repo/.git/HEAD"));
+    }
+
+    #[test]
+    fn remote_ref_paths_signal_a_push() {
+        let yes = |p: &str| is_remote_ref_path(std::path::Path::new(p));
+        // A remote-tracking ref write is the local signature of a push/fetch.
+        assert!(yes("/repo/.git/refs/remotes/origin/main"));
+        assert!(yes("/repo/.git/refs/remotes/origin/sz/feat"));
+        // Local commits move refs/heads — deliberately NOT a push signal
+        // (agents commit constantly; each would cost a provider subprocess).
+        assert!(!yes("/repo/.git/refs/heads/main"));
+        assert!(!yes("/repo/.git/refs/tags/v1"));
+        // Reflog mirror + transient lock churn never fire.
+        assert!(!yes("/repo/.git/logs/refs/remotes/origin/main"));
+        assert!(!yes("/repo/.git/refs/remotes/origin/main.lock"));
+        assert!(!yes("/repo/src/main.rs"));
     }
 
     #[test]

@@ -123,6 +123,19 @@ impl CiRun {
     pub fn duration_secs(&self, now: i64) -> Option<i64> {
         duration_secs(self.started_at.as_deref(), self.finished_at.as_deref(), now)
     }
+
+    /// Stable identity of the *workflow* this run is an instance of, the
+    /// grouping key for [`latest_per_workflow`]. Normally the workflow /
+    /// pipeline name; unnamed GitLab pipelines carry a synthesized unique
+    /// `pipeline #<id>` display name, which would defeat grouping, so those
+    /// fold onto one shared key (a branch's unnamed pipelines are all
+    /// instances of the same pipeline config).
+    pub fn workflow_key(&self) -> &str {
+        match self.name.strip_prefix("pipeline #") {
+            Some(rest) if rest == self.id => "",
+            _ => &self.name,
+        }
+    }
 }
 
 /// One job within a run (GitHub job / GitLab job / Drone step-group).
@@ -185,6 +198,26 @@ pub fn summarize<'a>(states: impl IntoIterator<Item = &'a CiState>) -> CiSummary
         }
     }
     s
+}
+
+/// The most recent run per workflow — the pipeline's *current* state, GitHub's
+/// own branch-status semantics. Assumes `runs` is newest-first, which every
+/// provider listing (and therefore the `ci_runs_cache`) guarantees — the panel
+/// already renders `runs[0]` as "latest". Grouping is by
+/// [`CiRun::workflow_key`]; input order is preserved.
+pub fn latest_per_workflow(runs: &[CiRun]) -> Vec<&CiRun> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    runs.iter()
+        .filter(|r| seen.insert(r.workflow_key()))
+        .collect()
+}
+
+/// Rollup of the *current* pipeline state — one entry per workflow, judged by
+/// its most recent run. This is what the statusbar badge and section summary
+/// count: a workflow that failed 16 times but passes now contributes one
+/// `passed`, not 16 `failed` (history stays visible in the run list rows).
+pub fn current_summary(runs: &[CiRun]) -> CiSummary {
+    summarize(latest_per_workflow(runs).into_iter().map(|r| &r.state))
 }
 
 /// Shared duration helper: seconds between `start` and `finish` (or `now` if
@@ -295,6 +328,11 @@ pub struct CiCaps {
     pub steps: bool,
     pub trigger: bool,
     pub rerun: bool,
+    /// Can re-run *only the failed jobs* ([`RerunScope::Failed`]). GitHub can
+    /// (`gh run rerun --failed`); GitLab's pipeline `retry` has no scope, so
+    /// offering "rerun failed" there would silently retry everything.
+    #[serde(default)]
+    pub rerun_failed: bool,
     pub cancel: bool,
 }
 
@@ -549,6 +587,77 @@ mod tests {
         assert_eq!(s.pending, 1);
         assert_eq!(s.other, 2);
         assert_eq!(summarize([].iter()), CiSummary::default());
+    }
+
+    fn run_named(id: &str, name: &str, state: CiState) -> CiRun {
+        CiRun {
+            id: id.into(),
+            name: name.into(),
+            state,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn latest_per_workflow_dedupes_history() {
+        // Newest-first, as providers list them.
+        let runs = vec![
+            run_named("100", "ci", CiState::Pass),
+            run_named("99", "docs", CiState::Running),
+            run_named("98", "ci", CiState::Fail),
+            run_named("97", "ci", CiState::Fail),
+            run_named("96", "docs", CiState::Fail),
+        ];
+        let latest = latest_per_workflow(&runs);
+        let ids: Vec<&str> = latest.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["100", "99"]); // one per workflow, order preserved
+        assert!(latest_per_workflow(&[]).is_empty());
+    }
+
+    #[test]
+    fn current_summary_reflects_now_not_history() {
+        // The "16 failed" regression: a wall of old failures, but every
+        // workflow's most recent run is green → the rollup is quiet.
+        let mut runs = vec![
+            run_named("100", "ci", CiState::Pass),
+            run_named("99", "docs", CiState::Pass),
+        ];
+        for i in 0..16 {
+            runs.push(run_named(&format!("{}", 98 - i), "ci", CiState::Fail));
+        }
+        assert_eq!(summarize(runs.iter().map(|r| &r.state)).failed, 16);
+        let cur = current_summary(&runs);
+        assert_eq!(cur.failed, 0);
+        assert_eq!(cur.passed, 2);
+        assert_eq!(cur.total, 2);
+
+        // …and a currently-failing workflow still counts exactly once.
+        runs.insert(0, run_named("101", "lint", CiState::Fail));
+        let cur = current_summary(&runs);
+        assert_eq!(cur.failed, 1);
+        assert_eq!(cur.total, 3);
+    }
+
+    #[test]
+    fn workflow_key_folds_synthesized_gitlab_names() {
+        // Unnamed GitLab pipelines get a unique "pipeline #<id>" display name;
+        // they all fold onto one key so only the newest pipeline counts.
+        let runs = vec![
+            run_named("12", "pipeline #12", CiState::Pass),
+            run_named("11", "pipeline #11", CiState::Fail),
+            run_named("10", "pipeline #10", CiState::Fail),
+        ];
+        assert_eq!(runs[0].workflow_key(), "");
+        let cur = current_summary(&runs);
+        assert_eq!(cur.total, 1);
+        assert_eq!(cur.failed, 0);
+        assert_eq!(cur.passed, 1);
+
+        // A *named* pipeline keeps its own identity, even if it looks similar.
+        let named = run_named("9", "pipeline #8", CiState::Fail); // id mismatch
+        assert_eq!(named.workflow_key(), "pipeline #8");
+        let real = run_named("7", "deploy", CiState::Fail);
+        assert_eq!(real.workflow_key(), "deploy");
     }
 
     #[test]

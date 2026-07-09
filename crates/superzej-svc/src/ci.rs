@@ -314,6 +314,7 @@ impl CiProvider for GithubCi {
             steps: true,
             trigger: true,
             rerun: true,
+            rerun_failed: true,
             cancel: true,
         }
     }
@@ -524,6 +525,8 @@ impl CiProvider for GitlabCi {
             steps: false,
             trigger: true,
             rerun: true,
+            // Pipeline `retry` has no failed-only scope — see `rerun` above.
+            rerun_failed: false,
             cancel: true,
         }
     }
@@ -754,5 +757,9 @@ mod tests {
         assert!(!GitlabCi.caps().steps);
         assert!(GithubCi.caps().trigger);
         assert!(GitlabCi.caps().cancel);
+        // GitLab's pipeline `retry` can't scope to failed jobs; offering the
+        // distinction anyway would silently retry everything.
+        assert!(GithubCi.caps().rerun_failed);
+        assert!(!GitlabCi.caps().rerun_failed);
     }
 }
