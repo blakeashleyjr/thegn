@@ -1,0 +1,22 @@
+# act config — run the GitHub Actions CI workflow locally (`just act`).
+# One flag per line (# starts a comment). See docs/local-ci.md.
+
+# Map GitHub's `ubuntu-latest` to a runner image that has the tools our
+# `ci-setup` action + the DeterminateSystems nix installer expect. The medium
+# catthehacker image is ~1G; the full image (`:full-latest`, ~18G) is only
+# needed if a step wants a GitHub-preinstalled tool we don't (we don't — every
+# stage runs through `nix develop`).
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+
+# Force amd64 so runs are identical on Apple-silicon hosts (the image + nix
+# binary cache are amd64). Drop this line if you want native arm64.
+--container-architecture linux/amd64
+
+# The workflow needs the NIX_GITHUB_TOKEN secret (private flake inputs). Copy
+# .secrets.example → .secrets and fill it in; .secrets is gitignored.
+--secret-file .secrets
+
+# Keep the job container between runs so the in-container nix install + /nix
+# store persist — without this every run reinstalls nix and cold-builds from
+# scratch. Reset a wedged container with `just act-clean`.
+--reuse

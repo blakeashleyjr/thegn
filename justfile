@@ -207,6 +207,40 @@ openspec-validate:
 ci: fmt-check lint deps-audit build check-cross test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
     @echo "ci: all green"
 
+# --- local CI (act) -------------------------------------------------------
+# Run the GitHub Actions workflow (.github/workflows/ci.yml) locally in a
+# container with `act`, to reproduce/debug the SERVER-side gate. This is HEAVY:
+# every job installs nix in-container and cold-builds. For routine pre-push
+# checks prefer `just ci` (or a single stage: `just lint` / `just test` /
+# `just smoke`) — the CI jobs literally run `nix develop --command just <stage>`,
+# so those give the same result without a container. See docs/local-ci.md.
+#
+# Needs: a running Docker (or podman) daemon + a `.secrets` file with
+# NIX_GITHUB_TOKEN (copy .secrets.example). Config lives in .actrc.
+
+_act-check:
+    @command -v act >/dev/null 2>&1 || { echo "act not found — run inside 'nix develop' (or 'direnv allow'); it's in the dev-shell packages"; exit 1; }
+    @test -f .secrets || { echo "no .secrets file — copy .secrets.example to .secrets and set NIX_GITHUB_TOKEN (see docs/local-ci.md)"; exit 1; }
+
+# List the jobs act would run for the push event.
+act-list:
+    act -l
+
+# Run the whole CI workflow locally (the `push` event the server gate runs on).
+# Pass extra act flags after `--`, e.g. `just act -- --verbose`.
+act *ARGS: _act-check
+    act push {{ARGS}}
+
+# Run a single CI job, e.g. `just act-job name=lint` or `just act-job name=test`.
+act-job name: _act-check
+    act push -j {{name}}
+
+# Remove act's reused job containers (.actrc keeps them warm between runs);
+# use this to reset a wedged/half-installed container.
+act-clean:
+    -docker ps -aq --filter 'name=act-' | xargs -r docker rm -f
+    @echo "act containers removed"
+
 # Dependency gates: security advisories, license policy, duplicate majors
 # (cargo-deny; policy in deny.toml) and unused dependencies (cargo-machete).
 # `cargo deny check advisories` fetches the RustSec DB, so this needs network
