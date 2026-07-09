@@ -2394,10 +2394,10 @@ fn compose_row_lines(
             // Left cluster: gutter, Alt+1..9 jump digit, tree connector,
             // activity dot, the dynamic name, then the agent glyph.
             let mut left = vec![sp(1)];
-            if let Some(n) = slot {
-                // Leading space keeps the digit off the cursor bar (col 0).
-                left.push(seg(Tok::Slot(S::Faint), format!(" {n} ")));
-            }
+            left.push(match slot {
+                Some(n) => seg(Tok::Slot(S::Faint), format!(" {n} ")),
+                None => sp(3), // reserve digit gutter → tree connectors stay aligned (#10+, dormant)
+            });
             left.extend(tree_lead(row.depth, is_last));
             if matches!(row.activity, ActivityState::None) {
                 left.push(sp(2)); // keep names aligned with dotted rows

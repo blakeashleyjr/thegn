@@ -395,19 +395,31 @@ pub fn compose_row_label(
     }
 }
 
-/// A workspace's worktree, ready to sort: the branch label plus its session
-/// group index and status.
+/// A workspace's worktree, ready to sort and render: the branch label plus its
+/// sort key, status, and what activating its row does. Built from either a live
+/// session group or a dormant DB row, so the tree renders identically whether
+/// or not the workspace is the one currently loaded in the session.
 #[derive(Debug, Clone)]
 struct Group {
     label: String,
+    /// Sort tie-break within a tier: the live session slot for a loaded
+    /// workspace, or the DB position (per-slug enumeration index) for a
+    /// dormant one.
     gi: usize,
     /// Worktree path — the key into the attention-rank map for the
-    /// [`SortMode::Attention`] ordering.
+    /// [`SortMode::Attention`] ordering (and into the per-worktree status maps).
     path: String,
     activity: ActivityState,
     sandbox_backend: Option<String>,
     env_name: Option<String>,
     folder_id: Option<i64>,
+    /// What activating this group's row does: focus the live `(gi, tab)` for a
+    /// loaded workspace, or switch to the workspace (landing on this group's
+    /// `{slug}/{branch}` name) for a dormant one.
+    target: RowTarget,
+    /// Whether this is the session's active worktree (always `false` when
+    /// dormant — an unloaded workspace has no active pointer of its own).
+    active: bool,
 }
 
 /// Map a terminal's connection to its host group: `(collapse-key, display
@@ -638,7 +650,13 @@ pub fn build_rows(
             mq_status: None,
         });
 
-        // This repo's worktree groups, straight from the session model.
+        // This repo's worktree groups. A *loaded* workspace draws them straight
+        // from the session model (live `Tab` targets + real active flag). A
+        // *dormant* workspace (parked into the `WorkspacePool` when another
+        // workspace became active — see `switch_workspace`) has no session
+        // slots, so we reconstruct the SAME group list from the DB-registered
+        // rows. Both then flow through one shared sort + render below, so the
+        // tree never rearranges just because a different workspace is active.
         let mut groups: Vec<Group> = Vec::new();
         for (gi, g) in session.worktrees.iter().enumerate() {
             let Some((repo, branch)) = split_tab(&g.name) else {
@@ -656,21 +674,74 @@ pub fn build_rows(
                 env_name: dbw.and_then(|w| w.env_name.clone()),
                 activity: activity.get(&g.name).copied().unwrap_or_default(),
                 folder_id: dbw.and_then(|w| w.folder_id),
+                target: RowTarget::Tab(gi, g.active_tab),
+                active: gi == session.active,
             });
+        }
+        let live = !groups.is_empty();
+
+        // Dormant workspace: synthesize the same shape from the DB. `home`
+        // first (its checkout has no distinct registry row we render, so pull
+        // its folder/backend/env from the `home` DB row when present, else
+        // default), then every registered non-home worktree. Each carries a
+        // `Workspace` switch target; `gi` is the per-slug enumeration index
+        // (DB position order) so sort tie-breaks match the live path.
+        if !live && !repo_path.is_empty() {
+            let slug_rows = db_by_slug
+                .get(repo_slug.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let db_home = slug_rows.iter().find(|w| w.branch == "home");
+            groups.push(Group {
+                label: "home".into(),
+                gi: 0,
+                path: repo_path.clone(),
+                sandbox_backend: db_home.and_then(|w| w.sandbox_backend.clone()),
+                env_name: db_home.and_then(|w| w.env_name.clone()),
+                // Keyed by tab name, same source the live rows use — so a
+                // workspace you switched away from keeps its activity dot.
+                activity: activity
+                    .get(format!("{repo_slug}/home").as_str())
+                    .copied()
+                    .unwrap_or_default(),
+                folder_id: db_home.and_then(|w| w.folder_id),
+                target: RowTarget::Workspace {
+                    repo_path: repo_path.clone(),
+                    group: Some(format!("{repo_slug}/home")),
+                },
+                active: false,
+            });
+            for (i, w) in slug_rows.iter().filter(|w| w.branch != "home").enumerate() {
+                groups.push(Group {
+                    label: w.branch.clone(),
+                    gi: i + 1,
+                    path: w.path.clone(),
+                    sandbox_backend: w.sandbox_backend.clone(),
+                    env_name: w.env_name.clone(),
+                    activity: activity
+                        .get(w.tab_name.as_str())
+                        .copied()
+                        .unwrap_or_default(),
+                    folder_id: w.folder_id,
+                    target: RowTarget::Workspace {
+                        repo_path: repo_path.clone(),
+                        group: Some(w.tab_name.clone()),
+                    },
+                    active: false,
+                });
+            }
         }
 
         sort_groups(&mut groups, view.sort, &status.attention_ranks);
-        let live = !groups.is_empty();
 
-        // Split into unfiled (rendered at root) and filed (rendered under folders).
-        // Unfiled keeps the existing home-first / sort behaviour; filed worktrees
-        // are emitted later under their folder header at depth 2.
-        let loose_groups: Vec<&Group> = groups.iter().filter(|g| g.folder_id.is_none()).collect();
-        for gr in loose_groups {
-            let g = &session.worktrees[gr.gi];
-            let is_active_group = gr.gi == session.active;
-            let wt_path = (!g.path.is_empty()).then(|| g.path.clone());
-            let pin_key = format!("{repo_slug}/{}", gr.label);
+        // One shared worktree-row builder for both the loose (depth 1) and
+        // filed (depth 2) placements, and for both live and dormant sources —
+        // everything placement-specific (`depth`, `pin_key`) is an argument;
+        // everything source-specific (`target`, `active`, `path`) rides on the
+        // `Group`. This is the single render routine that keeps a dormant
+        // workspace's tree identical to its live one.
+        let mk_row = |gr: &Group, depth: u8, pin_key: String| -> SidebarRow {
+            let wt_path = (!gr.path.is_empty()).then(|| gr.path.clone());
             let git = wt_path.as_deref().and_then(|p| status.git.get(p)).copied();
             let agent = wt_path
                 .as_deref()
@@ -694,13 +765,13 @@ pub fn build_rows(
                 .and_then(|p| status.alert_counts.get(p))
                 .copied()
                 .unwrap_or(0);
-            rows.push(SidebarRow {
+            SidebarRow {
                 kind: RowKind::Worktree,
-                depth: 1,
+                depth,
                 label: gr.label.clone(),
                 workspace_slug: repo_slug.clone(),
-                tab_target: Some(RowTarget::Tab(gr.gi, g.active_tab)),
-                active: is_active_group,
+                tab_target: Some(gr.target.clone()),
+                active: gr.active,
                 worktree_path: wt_path,
                 pin_key,
                 branch: Some(gr.label.clone()),
@@ -721,7 +792,15 @@ pub fn build_rows(
                 target_bytes: None,
                 attention: None,
                 mq_status: None,
-            });
+            }
+        };
+
+        // Split into unfiled (rendered at root) and filed (rendered under
+        // folders). Unfiled keeps the sorted home-first order; filed worktrees
+        // are emitted later under their folder header at depth 2.
+        for gr in groups.iter().filter(|g| g.folder_id.is_none()) {
+            let pin_key = format!("{repo_slug}/{}", gr.label);
+            rows.push(mk_row(gr, 1, pin_key));
         }
 
         // Folders section: home → loose (above) → folders by `position`.
@@ -804,167 +883,16 @@ pub fn build_rows(
             });
 
             if !folder_collapsed {
-                // Live groups in this folder, in their sort order. We re-derive
-                // the order from the same sort the loose path used by reusing
-                // the position-based comparator on the slice.
-                if let Some(filed) = filed_in_folders.get(&folder.folder_id) {
-                    let mut filed_sorted: Vec<&Group> = filed.clone();
-                    // Note: Instead of a new sort_groups_by_gi fn, we can just use
-                    // the actual `sort` parameter the user requested, since the loose
-                    // branch used the same sort. We can refactor `sort_groups` to take `&mut [&Group]`.
-                    // For now, let's just sort them manually to match `SortMode::Manual`.
-                    filed_sorted.sort_by_key(|a| (a.label != "home", a.gi));
-                    for gr in filed_sorted {
-                        let g = &session.worktrees[gr.gi];
-                        let is_active_group = gr.gi == session.active;
-                        let wt_path = (!g.path.is_empty()).then(|| g.path.clone());
-                        let pin_key =
-                            format!("{repo_slug}/{}/folder:{}", gr.label, folder.folder_id);
-                        let git = wt_path.as_deref().and_then(|p| status.git.get(p)).copied();
-                        let agent = wt_path
-                            .as_deref()
-                            .and_then(|p| status.agent.get(p))
-                            .cloned();
-                        let pr_count = wt_path
-                            .as_deref()
-                            .and_then(|p| status.pr_counts.get(p))
-                            .copied();
-                        let pr_number = wt_path
-                            .as_deref()
-                            .and_then(|p| status.pr_numbers.get(p))
-                            .copied();
-                        let unread_count = wt_path
-                            .as_deref()
-                            .and_then(|p| status.unread_counts.get(p))
-                            .copied()
-                            .unwrap_or(0);
-                        let alert_count = wt_path
-                            .as_deref()
-                            .and_then(|p| status.alert_counts.get(p))
-                            .copied()
-                            .unwrap_or(0);
-                        rows.push(SidebarRow {
-                            kind: RowKind::Worktree,
-                            depth: 2,
-                            label: gr.label.clone(),
-                            workspace_slug: repo_slug.clone(),
-                            tab_target: Some(RowTarget::Tab(gr.gi, g.active_tab)),
-                            active: is_active_group,
-                            worktree_path: wt_path,
-                            pin_key,
-                            branch: Some(gr.label.clone()),
-                            git,
-                            agent,
-                            sandbox_backend: gr.sandbox_backend.clone(),
-                            env_name: gr.env_name.clone(),
-                            activity: gr.activity,
-                            visible: !collapsed,
-                            collapsed: false,
-                            dir: false,
-                            pr_count,
-                            pr_number,
-                            unread_count,
-                            alert_count,
-                            terminal_connection: None,
-                            disk_bytes: None,
-                            target_bytes: None,
-                            attention: None,
-                            mq_status: None,
-                        });
-                    }
+                // Filed children in the workspace's sort order: iterate the
+                // already-sorted `groups` filtered to this folder, so the same
+                // `view.sort` that ordered the loose rows orders these too.
+                for gr in groups
+                    .iter()
+                    .filter(|g| g.folder_id == Some(folder.folder_id))
+                {
+                    let pin_key = format!("{repo_slug}/{}/folder:{}", gr.label, folder.folder_id);
+                    rows.push(mk_row(gr, 2, pin_key));
                 }
-            }
-        }
-
-        // A workspace with no live session groups still shows its home and
-        // registered worktrees; activating one switches workspace.
-        if !live && !repo_path.is_empty() {
-            let mk = |label: &str,
-                      group: Option<String>,
-                      path: Option<String>,
-                      backend: Option<String>,
-                      env: Option<String>| {
-                let pr_count = path
-                    .as_deref()
-                    .and_then(|p| status.pr_counts.get(p))
-                    .copied();
-                let pr_number = path
-                    .as_deref()
-                    .and_then(|p| status.pr_numbers.get(p))
-                    .copied();
-                let unread_count = path
-                    .as_deref()
-                    .and_then(|p| status.unread_counts.get(p))
-                    .copied()
-                    .unwrap_or(0);
-                let alert_count = path
-                    .as_deref()
-                    .and_then(|p| status.alert_counts.get(p))
-                    .copied()
-                    .unwrap_or(0);
-                // Activity dot keyed by tab name (the `group`), same source the
-                // live rows use — so a workspace you switch away from keeps its
-                // last-known activity dot instead of going dark.
-                let act = group
-                    .as_deref()
-                    .and_then(|t| status.activity.get(t))
-                    .copied()
-                    .unwrap_or_default();
-                SidebarRow {
-                    kind: RowKind::Worktree,
-                    depth: 1,
-                    label: label.to_string(),
-                    workspace_slug: repo_slug.clone(),
-                    tab_target: Some(RowTarget::Workspace {
-                        repo_path: repo_path.clone(),
-                        group,
-                    }),
-                    active: false,
-                    worktree_path: path.clone(),
-                    pin_key: format!("{repo_slug}/{label}"),
-                    branch: Some(label.to_string()),
-                    git: path.as_deref().and_then(|p| status.git.get(p)).copied(),
-                    agent: path.as_deref().and_then(|p| status.agent.get(p)).cloned(),
-                    sandbox_backend: backend,
-                    env_name: env,
-                    activity: act,
-                    visible: !collapsed,
-                    collapsed: false,
-                    dir: false,
-                    pr_count,
-                    pr_number,
-                    unread_count,
-                    alert_count,
-                    terminal_connection: None,
-                    disk_bytes: None,
-                    target_bytes: None,
-                    attention: None,
-                    mq_status: None,
-                }
-            };
-            rows.push(mk(
-                "home",
-                Some(format!("{repo_slug}/home")),
-                Some(repo_path.clone()),
-                None,
-                None,
-            ));
-            // A registry row for the home checkout would duplicate the
-            // synthesized row above — skip it.
-            for w in db_by_slug
-                .get(repo_slug.as_str())
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-                .iter()
-                .filter(|w| w.branch != "home")
-            {
-                rows.push(mk(
-                    &w.branch,
-                    Some(w.tab_name.clone()),
-                    Some(w.path.clone()),
-                    w.sandbox_backend.clone(),
-                    w.env_name.clone(),
-                ));
             }
         }
     }
@@ -2179,6 +2107,104 @@ mod tests {
             rows.iter()
                 .any(|r| r.kind == RowKind::Worktree && r.label == "home" && r.visible)
         );
+    }
+
+    #[test]
+    fn dormant_workspace_renders_same_structure_as_live() {
+        // The same workspace rendered live (loaded in the session) and dormant
+        // (parked → reconstructed from the DB) must produce the same tree
+        // shape. Only the row targets / active flag legitimately differ, so we
+        // compare (kind, depth, label) — folders, the loose/filed split, and
+        // sort order all have to match.
+        let (live_s, ws, dbw, folders) = folder_fixture();
+        let shape = |s: &Session| -> Vec<(RowKind, u8, String)> {
+            build_rows(
+                s,
+                &ws,
+                &ViewState::default(),
+                &no_activity(),
+                &dbw,
+                &folders,
+                &[],
+            )
+            .into_iter()
+            .take_while(|r| r.kind != RowKind::SectionHeading)
+            .map(|r| (r.kind, r.depth, r.label.clone()))
+            .collect()
+        };
+        assert_eq!(shape(&live_s), shape(&session(vec![], 0)));
+    }
+
+    #[test]
+    fn dormant_workspace_files_worktrees_under_folders() {
+        // Regression: a dormant workspace used to render a flat, folder-less
+        // list. It must now emit the folder header + its filed child at depth 2,
+        // with a workspace-switch target (landing on the named group).
+        let (_s, ws, dbw, folders) = folder_fixture();
+        let rows = build_rows(
+            &session(vec![], 0),
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &dbw,
+            &folders,
+            &[],
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == RowKind::Folder && r.label.starts_with("Backend"))
+        );
+        let feat = rows.iter().find(|r| r.label == "feat").expect("filed row");
+        assert_eq!(feat.depth, 2);
+        assert_eq!(
+            feat.tab_target,
+            Some(RowTarget::Workspace {
+                repo_path: "/repos/app".into(),
+                group: Some("app/feat".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn dormant_workspace_respects_sort_mode() {
+        // Under Name sort a dormant workspace's non-home worktrees alphabetize
+        // (they previously rendered in raw DB order, ignoring the sort).
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let mk = |branch: &str, path: &str| DbWorktree {
+            slug: "app".into(),
+            branch: branch.into(),
+            repo_path: "/repos/app".into(),
+            tab_name: format!("app/{branch}"),
+            path: path.into(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: None,
+        };
+        let dbw = vec![mk("zebra", "/wt/zebra"), mk("alpha", "/wt/alpha")];
+        let view = ViewState {
+            sort: SortMode::Name,
+            ..Default::default()
+        };
+        let rows = build_rows(
+            &session(vec![], 0),
+            &ws,
+            &view,
+            &no_activity(),
+            &dbw,
+            &[],
+            &[],
+        );
+        let labels: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Worktree)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["home", "alpha", "zebra"]);
     }
 
     #[test]
