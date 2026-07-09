@@ -7817,9 +7817,9 @@ async fn event_loop<T: Terminal>(
         current_config.profile.clone(),
         waker.clone(),
     );
-    // Time-travel replay: attach a per-pane recording ring to panes spawned from
-    // here on when `[replay] enabled` (default on, bounded 8 MiB / 30 m).
-    panes.set_replay_config(current_config.replay.clone());
+    // Per-pane services: `[replay]` recording ring + the `[daemon]` route
+    // (panes surviving UI exit) for panes spawned from here on.
+    crate::handlers::startup::install_pane_services(&mut panes, &current_config);
 
     // First-launch keymap picker (item 621). Skip entirely when the user has set
     // `keymap_preset` in config (an explicit choice). Otherwise apply a preset
@@ -10665,9 +10665,9 @@ async fn event_loop<T: Terminal>(
                     // Live notification-routing reload: swap in the reloaded
                     // rules/DND/sound/modes (preserving the runtime mode/toggle).
                     notify_state.update_cfg(current_config.effective_notifications(None));
-                    // Live replay toggle: newly spawned panes pick up the reloaded
-                    // `[replay]` config (existing panes keep their current ring).
-                    panes.set_replay_config(current_config.replay.clone());
+                    // Live replay/daemon toggle: newly spawned panes pick up the
+                    // reloaded configs (existing panes keep their transport/ring).
+                    crate::handlers::startup::install_pane_services(&mut panes, &current_config);
                     // Live media toggle: (re)spawn or stop the watcher to match the
                     // reloaded `[media]` config.
                     restart_media_watch(
