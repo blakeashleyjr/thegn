@@ -2,7 +2,7 @@
 //! adapter over the same [`ControlApi`] + [`auth`] seams as the HTTP surface.
 //!
 //! Auth mirrors HTTP: every RPC resolves the caller through one chokepoint
-//! ([`GrpcControl::authed`]) that reads the `authorization` metadata (bearer
+//! (`GrpcControl::authed`) that reads the `authorization` metadata (bearer
 //! token) — or grants implicit admin on a `local_admin` listener — and checks
 //! `required_scope` BEFORE calling in, so a rejected request performs no
 //! action. Event frames are a mechanical `EventFrame` ↔ proto conversion,
