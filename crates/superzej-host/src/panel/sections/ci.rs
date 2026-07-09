@@ -4,7 +4,7 @@
 //! drilldown is the CLI (`superzej ci view <id>`); this is the at-a-glance
 //! "is the pipeline green?" rollup, the CI-provider analogue of the PR checks.
 
-use superzej_core::ci::{CiState, summarize};
+use superzej_core::ci::{CiState, current_summary};
 use superzej_core::theme::Hue;
 
 use crate::seg::{Line, Seg, seg};
@@ -23,6 +23,35 @@ pub(super) fn state_glyph(s: CiState) -> Seg {
     }
 }
 
+/// The rollup summary line shared by the list and full views: per-state counts
+/// from [`current_summary`] (one entry per workflow, judged by its most recent
+/// run — never a wall of historical failures), plus the cache's fetch age so
+/// stale data reads as stale.
+fn summary_line(label: &str, data: &crate::panel::PanelData, now: i64) -> Line {
+    let sum = current_summary(&data.ci_runs);
+    let mut segs = vec![seg(d(), label.to_string())];
+    if sum.passed > 0 {
+        segs.push(seg(hue(Hue::Green), format!(" {}✓", sum.passed)));
+    }
+    if sum.failed > 0 {
+        segs.push(seg(hue(Hue::Red), format!(" {}✗", sum.failed)));
+    }
+    if sum.running > 0 {
+        segs.push(seg(hue(Hue::Amber), format!(" {}●", sum.running)));
+    }
+    if sum.pending > 0 {
+        segs.push(seg(g(), format!(" {}○", sum.pending)));
+    }
+    if sum.other > 0 {
+        segs.push(seg(g(), format!(" {}", sum.other)));
+    }
+    let age = data
+        .ci_fetched_at
+        .map(|at| format!("{} ago", fmt_secs(now.saturating_sub(at).max(0))))
+        .unwrap_or_default();
+    Line::split(segs, vec![seg(f(), age)])
+}
+
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     if ctx.full() {
         return full(ctx);
@@ -34,33 +63,25 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
 /// the latest run's jobs in the deep (Half) view.
 fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
     let data = &ctx.model.panel;
-    if data.ci_runs.is_empty() {
-        return vec![PanelRow::plain(Line::segs(vec![seg(d(), "no CI runs")]))];
-    }
     let now = superzej_core::util::now();
+    if data.ci_runs.is_empty() {
+        return vec![PanelRow::plain(Line::segs(vec![seg(
+            d(),
+            data.ci_note.as_deref().unwrap_or("no CI runs"),
+        )]))];
+    }
     let mut rows: Vec<PanelRow> = Vec::new();
     let limit = if ctx.deep() { ctx.rows.max(1) } else { 5 };
 
-    // Add summary row
-    let states: Vec<&CiState> = data.ci_runs.iter().map(|r| &r.state).collect();
-    let sum = summarize(states);
-    let mut sum_segs = vec![seg(d(), "CI ")];
-    if sum.passed > 0 {
-        sum_segs.push(seg(hue(Hue::Green), format!(" {}✓", sum.passed)));
+    // Summary row: current state (latest run per workflow), not history,
+    // stamped with the cache's fetch age so stale data is visibly stale.
+    rows.push(PanelRow::plain(summary_line("CI ", data, now)));
+    if let Some(note) = &data.ci_note {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            format!("⚠ {note}"),
+        )])));
     }
-    if sum.failed > 0 {
-        sum_segs.push(seg(hue(Hue::Red), format!(" {}✗", sum.failed)));
-    }
-    if sum.running > 0 {
-        sum_segs.push(seg(hue(Hue::Amber), format!(" {}●", sum.running)));
-    }
-    if sum.pending > 0 {
-        sum_segs.push(seg(g(), format!(" {}○", sum.pending)));
-    }
-    if sum.other > 0 {
-        sum_segs.push(seg(g(), format!(" {}", sum.other)));
-    }
-    rows.push(PanelRow::plain(Line::segs(sum_segs)));
 
     // Each run row carries a `Row` hit (the summary/job rows don't), so the
     // enumerate index lines up with `ui.cursor` and with `ci_runs`.
@@ -95,13 +116,14 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
 }
 
 /// The per-section key hints (the same keys the event loop dispatches, so they
-/// can't drift): drill in, open in browser, re-run, cancel.
+/// can't drift): drill in, open in browser, re-run, cancel, refresh.
 fn ci_hint_row() -> PanelRow {
     hint_row(&[
         ("↵", "view"),
         ("o", "browser"),
         ("r/R", "rerun"),
         ("c", "cancel"),
+        ("g", "refresh"),
     ])
 }
 
@@ -118,35 +140,26 @@ fn truncate(s: &str, max: usize) -> String {
 /// Normal/Half list bodies (the panel's three-view contract).
 fn full(ctx: &SectionCtx) -> Vec<PanelRow> {
     let data = &ctx.model.panel;
+    let now = superzej_core::util::now();
     if data.ci_runs.is_empty() {
         return vec![
             PanelRow::plain(Line::segs(vec![seg(d(), "CI RUNS")])),
-            PanelRow::plain(Line::segs(vec![seg(g(), "no CI runs")])),
+            PanelRow::plain(Line::segs(vec![seg(
+                g(),
+                data.ci_note.as_deref().unwrap_or("no CI runs"),
+            )])),
         ];
     }
-    let now = superzej_core::util::now();
     let mut rows: Vec<PanelRow> = vec![];
 
-    // Add summary row
-    let states: Vec<&CiState> = data.ci_runs.iter().map(|r| &r.state).collect();
-    let sum = summarize(states);
-    let mut sum_segs = vec![seg(d(), "CI RUNS ")];
-    if sum.passed > 0 {
-        sum_segs.push(seg(hue(Hue::Green), format!(" {}✓", sum.passed)));
+    // Summary row: current state (latest run per workflow), not history.
+    rows.push(PanelRow::plain(summary_line("CI RUNS ", data, now)));
+    if let Some(note) = &data.ci_note {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            format!("⚠ {note}"),
+        )])));
     }
-    if sum.failed > 0 {
-        sum_segs.push(seg(hue(Hue::Red), format!(" {}✗", sum.failed)));
-    }
-    if sum.running > 0 {
-        sum_segs.push(seg(hue(Hue::Amber), format!(" {}●", sum.running)));
-    }
-    if sum.pending > 0 {
-        sum_segs.push(seg(g(), format!(" {}○", sum.pending)));
-    }
-    if sum.other > 0 {
-        sum_segs.push(seg(g(), format!(" {}", sum.other)));
-    }
-    rows.push(PanelRow::plain(Line::segs(sum_segs)));
 
     for (i, r) in data.ci_runs.iter().take(ctx.rows.max(1)).enumerate() {
         let dur = r

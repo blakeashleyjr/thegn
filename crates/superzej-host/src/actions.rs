@@ -171,6 +171,14 @@ pub(crate) fn spawn_ci_action(
                     superzej_core::msg::warn("ci: this provider can't re-run runs");
                     return;
                 }
+                if failed && !caps.rerun_failed {
+                    // Don't silently retry everything when the user asked for
+                    // failed-only (GitLab's `retry` has no scope).
+                    superzej_core::msg::warn(
+                        "ci: this provider can't re-run only failed jobs — use r to retry all",
+                    );
+                    return;
+                }
                 let scope = if failed {
                     superzej_core::ci::RerunScope::Failed
                 } else {
@@ -191,7 +199,9 @@ pub(crate) fn spawn_ci_action(
         if let Err(e) = res {
             superzej_core::msg::warn(&format!("ci action failed: {e}"));
         }
-        if tx.send(RefreshKind::Ci).is_ok() {
+        // Forced: the user just mutated a run, so the ttl guard must not
+        // swallow the follow-up refetch.
+        if tx.send(RefreshKind::Ci { force: true }).is_ok() {
             let _ = waker.wake();
         }
     });
@@ -229,11 +239,39 @@ pub(crate) fn spawn_ci_detail(
         // Full run (jobs/steps); on error keep the cached run so the header stays.
         let detail = rt.block_on(client.run_detail(&loc, &run.id)).unwrap_or(run);
         // Failing-job log tails (the "why did it fail"), each tail-capped by
-        // `log_tail_lines` and prefixed with the job name.
+        // `log_tail_lines` and prefixed with the job name. Fetched in small
+        // concurrent batches — the provider "async" methods block on a
+        // subprocess, so a run with many failed jobs was N serial calls —
+        // scoped threads (each with a tiny current-thread runtime) buy real
+        // parallelism while chunking keeps display order + bounds the fan-out.
         let cap = cfg.log_tail_lines;
+        let failing: Vec<&superzej_core::ci::CiJob> = detail
+            .jobs
+            .iter()
+            .filter(|j| j.state == CiState::Fail)
+            .collect();
         let mut log_tail: Vec<String> = Vec::new();
-        for job in detail.jobs.iter().filter(|j| j.state == CiState::Fail) {
-            if let Ok(log) = rt.block_on(client.logs(&loc, &detail.id, &job.id)) {
+        for chunk in failing.chunks(4) {
+            let logs: Vec<Option<superzej_core::ci::CiLog>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|job| {
+                        scope.spawn(|| {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .ok()?;
+                            rt.block_on(client.logs(&loc, &detail.id, &job.id)).ok()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().ok().flatten())
+                    .collect()
+            });
+            for (job, log) in chunk.iter().zip(logs) {
+                let Some(log) = log else { continue };
                 let lines: Vec<&str> = log.text.lines().collect();
                 let start = lines
                     .len()
@@ -557,6 +595,20 @@ impl CiActionCtx<'_> {
         spawn_ci_detail(self.session, &self.cfg.ci, self.refresh_tx, self.waker, run);
     }
 
+    /// Force a CI run-history refetch (the `g` key): bypasses the `[ci]
+    /// ttl_secs` guard so the user never stares at data they just asked to
+    /// update. The fetch runs off-loop via the normal refresh path.
+    fn refresh_ci(&mut self) {
+        self.model.status = "Refreshing CI runs\u{2026}".into();
+        if self
+            .refresh_tx
+            .send(RefreshKind::Ci { force: true })
+            .is_ok()
+        {
+            let _ = self.waker.wake();
+        }
+    }
+
     /// Fire a CI mutation off the loop after posting an in-progress status.
     fn spawn_mutation(&mut self, action: DetailAction) {
         self.model.status = status_for(&action).into();
@@ -589,6 +641,7 @@ impl CiActionCtx<'_> {
             DetailAction::CiRerun { .. } | DetailAction::CiCancel { .. } => {
                 self.spawn_mutation(action)
             }
+            DetailAction::CiRefresh => self.refresh_ci(),
             DetailAction::FocusWorktree(path) => self.focus_worktree(&path),
             DetailAction::DismissNotification { id } => self.mutate_notifications(Some(id)),
             DetailAction::ClearNotifications => self.mutate_notifications(None),
@@ -676,11 +729,16 @@ impl CiActionCtx<'_> {
     }
 
     /// A `Section::Ci` action key; returns whether it was claimed. `v` drills in,
-    /// `o` opens the run page, `r`/`R` re-run (all/failed), `c` cancels.
+    /// `o` opens the run page, `r`/`R` re-run (all/failed), `c` cancels,
+    /// `g` force-refreshes the run history.
     pub(crate) fn panel_key(&mut self, key: KeyCode, cursor: usize) -> bool {
         match key {
             KeyCode::Char('v') => {
                 self.open_view_at(cursor);
+                true
+            }
+            KeyCode::Char('g') => {
+                self.refresh_ci();
                 true
             }
             KeyCode::Char('o') => {
