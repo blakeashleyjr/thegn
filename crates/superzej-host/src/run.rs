@@ -5826,7 +5826,7 @@ pub(crate) fn spawn_worktree_shell_pane(
         // provider with a native exec API and `exec != cli`, attach the pane over
         // the provider's WSS exec instead of wrapping its vendor CLI.
         if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
-            return panes.spawn_native_shell(n, None, center);
+            return panes.spawn_native_shell(n, None, "sh".into(), center);
         }
         let spec = crate::agent::launch_spec(cfg, &wt, None, "shell")?;
         return panes.spawn_argv_env(
@@ -10322,6 +10322,13 @@ async fn event_loop<T: Terminal>(
         // One hydration in flight; refreshes (incl. switches) coalesce into `pending`.
         model_refresh_pending |= want_model_refresh;
         if model_refresh_pending && inflight_hydration_gen.is_none() {
+            // Publish agent-pane output stamps for the activity FSM (cheap, on-loop).
+            crate::agent_output::publish(
+                &session,
+                &panes,
+                &model.sidebar_status.agent,
+                &current_config,
+            );
             hydration_gen += 1;
             spawn_model_hydration(
                 model_tx.clone(),

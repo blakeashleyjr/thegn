@@ -122,6 +122,15 @@ pub struct PtyPane {
     /// and for Stream panes (no reader thread). Exactly one side ever parses a
     /// given stream — two parsers would split escape state.
     loop_fed: Arc<std::sync::atomic::AtomicBool>,
+    /// When the last output chunk was fed to this pane ([`Self::feed`]). Only
+    /// touched on the run-loop thread. Feeds the activity FSM's output-hint
+    /// signal (see `agent_output`); scrollback repaint on restore bypasses
+    /// `feed` and never stamps.
+    last_output_at: Option<std::time::Instant>,
+    /// When the user last wrote to this pane ([`Self::write_input`]) — output
+    /// shortly after user input is keystroke echo, not agent work. Host-generated
+    /// protocol replies go through [`Self::write_reply`] and don't stamp.
+    last_input_at: Option<std::time::Instant>,
 }
 
 /// Derive a pane's program name from its spawn argv. Handles the common
@@ -160,6 +169,19 @@ pub fn program_name(argv: &[String]) -> String {
         }
     }
     base
+}
+
+/// Short program name for an agent exec pane: the file stem of the command's
+/// first word when it is a literal path (`~/.superzej/pi/bin/pi --acp` → `pi`),
+/// else the agent's config name (a word carrying shell metacharacters isn't a
+/// path — stemming it yields garbage).
+pub fn agent_program_name(cmd: &str, choice: &str) -> String {
+    cmd.split_whitespace()
+        .next()
+        .filter(|w| !w.contains(['$', '{', '}', '(', ')', '`']))
+        .and_then(|w| std::path::Path::new(w).file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| choice.to_string())
 }
 
 /// Whether `program` (a short program name from [`program_name`]) is an
@@ -294,6 +316,8 @@ impl PtyPane {
             predict_clock: std::time::Instant::now(),
             record: None,
             loop_fed,
+            last_output_at: None,
+            last_input_at: None,
         })
     }
 
@@ -353,6 +377,8 @@ impl PtyPane {
             // Stream frames arrive via the relay task's Output events with no
             // reader-side feeder — the loop parses them.
             loop_fed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            last_output_at: None,
+            last_input_at: None,
         }
     }
 
@@ -417,6 +443,7 @@ impl PtyPane {
     /// the plain-text history ring. Drain-without-render is just this without
     /// a subsequent compose.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.last_output_at = Some(std::time::Instant::now());
         // Server output is authoritative (and carries the echoed keystrokes), so
         // it retires the prediction overlay + folds a round-trip sample into srtt.
         let now = self.predict_now_ms();
@@ -516,9 +543,27 @@ impl PtyPane {
     /// Forward user input bytes to the child. Typing snaps the viewport back to
     /// the live tail (the usual terminal behavior when scrolled into history).
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
+        self.last_input_at = Some(std::time::Instant::now());
         if self.emulator.scrollback() > 0 {
             self.emulator.scroll_reset();
         }
+        self.write_bytes(bytes)
+    }
+
+    /// Write a host-generated protocol reply (DA/DSR/kitty query answers) to the
+    /// child: bytes WITHOUT counting as user input — a reply must not mask the
+    /// querying app's own output as "keystroke echo" for the activity signal —
+    /// and without snapping the viewport out of scrollback.
+    pub fn write_reply(&mut self, bytes: &[u8]) -> Result<()> {
+        self.write_bytes(bytes)
+    }
+
+    /// `(last_output_at, last_input_at)` for the activity output-hint publisher.
+    pub fn output_stamps(&self) -> (Option<std::time::Instant>, Option<std::time::Instant>) {
+        (self.last_output_at, self.last_input_at)
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         match &mut self.io {
             PaneIo::Pty { writer, .. } => {
                 writer.write_all(bytes).context("pty write")?;
@@ -618,6 +663,8 @@ impl PtyPane {
             predict_clock: std::time::Instant::now(),
             record: None,
             loop_fed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            last_output_at: None,
+            last_input_at: None,
         }
     }
 
@@ -982,6 +1029,39 @@ mod tests {
             ]),
             "zsh"
         );
+    }
+
+    #[test]
+    fn agent_program_name_stems_or_falls_back() {
+        assert_eq!(agent_program_name("claude --continue", "claude"), "claude");
+        assert_eq!(
+            agent_program_name("/home/u/.superzej/pi/bin/pi --acp", "pi"),
+            "pi"
+        );
+        // Shell metacharacters aren't a path: fall back to the config name.
+        assert_eq!(agent_program_name("${AGENT:-claude}", "claude"), "claude");
+        assert_eq!(agent_program_name("", "codex"), "codex");
+    }
+
+    #[test]
+    fn output_input_stamps_track_feed_and_user_input_only() {
+        let (ctrl_tx, _ctrl_rx) = tokio_mpsc::channel(8);
+        let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
+        assert_eq!(pane.output_stamps(), (None, None));
+        // A host-generated protocol reply stamps neither side — it must not
+        // mask the querying app's own output as keystroke echo.
+        pane.write_reply(b"\x1b[?6c").unwrap();
+        assert_eq!(pane.output_stamps(), (None, None));
+        // Restore-time scrollback repaint bypasses `feed`: not live output.
+        pane.repaint_scrollback("old history");
+        assert_eq!(pane.output_stamps(), (None, None));
+        // Live output stamps the output side only.
+        pane.feed(b"spinner frame");
+        let (out, inp) = pane.output_stamps();
+        assert!(out.is_some() && inp.is_none());
+        // User input stamps the input side.
+        pane.write_input(b"y").unwrap();
+        assert!(pane.output_stamps().1.is_some());
     }
 
     #[test]
