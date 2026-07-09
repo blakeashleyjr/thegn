@@ -175,6 +175,21 @@ async fn run(
         shutdown: shutdown.clone(),
     });
 
+    // SIGTERM/SIGINT → the same graceful-shutdown path as the shutdown RPC,
+    // so `kill <daemon>` still deregisters and unlinks the socket.
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+            shutdown.notify_waiters();
+        });
+    }
     // Heartbeat (registry freshness for discovery).
     tokio::spawn(heartbeat_loop(db.clone(), daemon_id.clone()));
     // Lease bookkeeping: idle/busy transitions + expiry reaping.
