@@ -72,6 +72,9 @@
   # — the `nix build .#default` package derivation never enters this shell.
   env.RUSTC_WRAPPER = "sccache";
   env.CARGO_INCREMENTAL = "0";
+  # Bound the sccache compile cache so it can't creep unbounded on the dev box
+  # (a full fs makes target/ writes fail with ENOSPC/EROFS mid-build).
+  env.SCCACHE_CACHE_SIZE = "20G";
 
   # Use the nixpkgs toolchain (no channel/rust-overlay) so rustfmt/clippy match
   # the flake's treefmt + checks exactly — avoids formatter version skew.
