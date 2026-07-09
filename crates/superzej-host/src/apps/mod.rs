@@ -254,9 +254,9 @@ pub fn start_slot_tile(
     }
 }
 
-/// A tile's [`ChangeHook`]: fired off-thread when the tile has new data, it posts
-/// the slot index on the app channel and pulses the terminal waker so the loop
-/// drains `app_rx` → `pump_all()` → repaint.
+/// A tile's [`ChangeHook`](sz_kit::ChangeHook): fired off-thread when the tile
+/// has new data, it posts the slot index on the app channel and pulses the
+/// terminal waker so the loop drains `app_rx` → `pump_all()` → repaint.
 fn app_change_hook(
     app_tx: &tokio::sync::mpsc::UnboundedSender<usize>,
     idx: usize,
