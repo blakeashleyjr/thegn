@@ -24,7 +24,7 @@ profiling = ["dep:pprof"]
 clap = { workspace = true, features = ["derive"] }
 clap_complete.workspace = true
 superzej-core.workspace = true
-superzej-svc.workspace = true
+superzej-svc = { workspace = true, features = ["control-grpc"] }
 superzej-metrics.workspace = true
 superzej-media.workspace = true
 anyhow.workspace = true
@@ -99,3 +99,6 @@ toml_edit = "0.25.12"
 # (never advance a wide cell past a pane's content rect into the card border).
 unicode-width = "0.2"
 sha2 = "0.10"
+base64 = "0.22"
+# Serve mode mounts the control-plane gRPC service into the TCP axum router.
+tonic.workspace = true

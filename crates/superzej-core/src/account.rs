@@ -21,7 +21,26 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::store::{AccountStore, WorkspaceStore};
 use crate::util;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// A `[[accounts]]` entry — one credential home for a coding-agent provider
+/// (`codex`/`claude`), used by client-side account switching. superzej points
+/// the agent's credential-home env var (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`) at
+/// the chosen account on launch, so the user's real `~/.codex` / `~/.claude` is
+/// never modified. `dir` omitted ⇒ superzej manages the dir under the state dir
+/// (use "Add account" to log in); `dir` set ⇒ adopt an existing login dir.
+/// (A config type; it lives here with its domain logic and is re-exported by
+/// `config` so `config::Account` paths keep working.)
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct Account {
+    pub name: String,
+    pub provider: String,
+    /// Credential home directory (`~` expanded). When absent, superzej manages a
+    /// dir at `$XDG_STATE_HOME/superzej/accounts/<provider>/<slug>/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+}
 
 /// A coding-agent CLI whose credentials live in a relocatable home directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

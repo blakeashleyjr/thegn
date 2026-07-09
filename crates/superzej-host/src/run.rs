@@ -856,6 +856,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         stats_interval_ms.clone(),
         stats_live.clone(),
         disk_fs_path,
+        cfg.ci.poll_interval_secs,
         waker.clone(),
     );
 
@@ -3665,6 +3666,7 @@ pub(crate) enum HostInputKind {
 
 // `begin_worktree_wizard` lives in `handlers::wizard` (extracted from this
 // pinned file); it now also decorates the env rows with host-readiness badges.
+use crate::handlers::terminal::open_wizard as open_terminal_wizard;
 use crate::handlers::wizard::begin_worktree_wizard;
 
 /// Non-interactive worktree creation for a `[[actions]] action = "new-worktree"`
@@ -7819,9 +7821,9 @@ async fn event_loop<T: Terminal>(
         current_config.profile.clone(),
         waker.clone(),
     );
-    // Time-travel replay: attach a per-pane recording ring to panes spawned from
-    // here on when `[replay] enabled` (default on, bounded 8 MiB / 30 m).
-    panes.set_replay_config(current_config.replay.clone());
+    // Per-pane services: `[replay]` recording ring + the `[daemon]` route
+    // (panes surviving UI exit) for panes spawned from here on.
+    crate::handlers::startup::install_pane_services(&mut panes, &current_config);
 
     // First-launch keymap picker (item 621). Skip entirely when the user has set
     // `keymap_preset` in config (an explicit choice). Otherwise apply a preset
@@ -8247,10 +8249,14 @@ async fn event_loop<T: Terminal>(
                 crate::panel::scope::mine_all(),
                 Some(waker.clone()),
             );
-            crate::hydrate::spawn_ci_cache_refresh(
-                current_worktree.clone(),
+            // main's ci_refresh rework needs the whole Session (its background
+            // sweep walks session.worktrees), so this call keeps the clone —
+            // coalesced by the [ci] ttl guard, not a per-keystroke cost.
+            crate::ci_refresh::spawn_ci_cache_refresh(
+                session.clone(),
                 current_config.ci.clone(),
                 Some(waker.clone()),
+                false, // on-switch backstop: respect the ttl guard
             );
             retarget_diff_watcher(
                 &session,
@@ -10232,9 +10238,9 @@ async fn event_loop<T: Terminal>(
                     // Live notification-routing reload: swap in the reloaded
                     // rules/DND/sound/modes (preserving the runtime mode/toggle).
                     notify_state.update_cfg(current_config.effective_notifications(None));
-                    // Live replay toggle: newly spawned panes pick up the reloaded
-                    // `[replay]` config (existing panes keep their current ring).
-                    panes.set_replay_config(current_config.replay.clone());
+                    // Live replay/daemon toggle: newly spawned panes pick up the
+                    // reloaded configs (existing panes keep their transport/ring).
+                    crate::handlers::startup::install_pane_services(&mut panes, &current_config);
                     // Live media toggle: (re)spawn or stop the watcher to match the
                     // reloaded `[media]` config.
                     restart_media_watch(
@@ -10260,6 +10266,7 @@ async fn event_loop<T: Terminal>(
         let mut want_pr_refresh = false;
         let mut want_issue_refresh = false;
         let mut want_ci_refresh = false;
+        let mut ci_refresh_force = false;
         let mut want_disk_refresh = false;
         let mut want_main_sync = false;
         // Fold-actor results: report what landed/deferred and re-hydrate so the
@@ -10304,8 +10311,9 @@ async fn event_loop<T: Terminal>(
                     want_issue_refresh = true;
                     want_model_refresh = true;
                 }
-                RefreshKind::Ci => {
+                RefreshKind::Ci { force } => {
                     want_ci_refresh = true;
+                    ci_refresh_force |= force;
                     want_model_refresh = true;
                 }
                 // The scan only writes the size cache off-thread; sizes land on
@@ -10379,10 +10387,13 @@ async fn event_loop<T: Terminal>(
             );
         }
         if want_ci_refresh {
-            crate::hydrate::spawn_ci_cache_refresh(
-                active_tab_path(&session),
-                current_config.ci.clone(),
-                Some(waker.clone()),
+            crate::ci_refresh::on_ci_tick(
+                &session,
+                &current_config.ci,
+                &refresh_tx,
+                &waker,
+                ci_refresh_force,
+                &mut bar_detail,
             );
         }
         if want_disk_refresh {
@@ -16226,9 +16237,10 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         // -- ci (AV group): drill in (v), open (o), re-run (r/R),
-                        // cancel (c). Provider is authority; bad ops decline off-loop.
+                        // cancel (c), refresh (g). Provider is authority; bad
+                        // ops decline off-loop.
                         (Section::Ci, key)
-                            if matches!(key, KeyCode::Char('v' | 'o' | 'r' | 'R' | 'c')) =>
+                            if matches!(key, KeyCode::Char('v' | 'o' | 'r' | 'R' | 'c' | 'g')) =>
                         {
                             CiActionCtx {
                                 session: &mut session,
@@ -17789,10 +17801,8 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::NewTerminal => {
-                                // Open the new-terminal wizard (name/connection/sandbox).
-                                terminal_wizard_ui = Some(
-                                    crate::terminal_wizard::TerminalWizard::new(keymap.config()),
-                                );
+                                terminal_wizard_ui =
+                                    Some(open_terminal_wizard(keymap.config(), &session));
                             }
                             Action::NewWorkspace => {
                                 // Fuzzy picker, seeded instantly from the DB;

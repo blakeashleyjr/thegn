@@ -118,6 +118,21 @@ impl DetailOverlay {
         self.scroll = 0;
         self.sel = 0;
         self.pending_ci = Some(run.id.clone());
+        self.live_ci = None;
+    }
+
+    /// The drilled run to re-poll while it's still in flight (live drill
+    /// updates, ridden by the loop's CI tick): re-arms `pending_ci` so the
+    /// refreshed fill lands, and returns the run for the off-loop fetch.
+    /// `None` when the drill is closed, a fetch is already in flight, or the
+    /// run has reached a terminal state.
+    pub(crate) fn live_ci_repoll(&mut self) -> Option<superzej_core::ci::CiRun> {
+        if self.pending_ci.is_some() {
+            return None;
+        }
+        let run = self.live_ci.clone()?;
+        self.pending_ci = Some(run.id.clone());
+        Some(run)
     }
 
     /// Replace the drilled CI view with the fully-fetched run: header + per-job
@@ -185,8 +200,14 @@ impl DetailOverlay {
         self.title = ci_drill_title(run);
         self.content = DetailContent::Sections(SectionsDetail { sections: secs });
         self.rows = self.content_rows().clamp(3, 22);
-        self.scroll = 0;
+        // A live re-fill of the same in-flight run keeps the user's scroll
+        // position; a fresh drill starts at the top.
+        if self.live_ci.as_ref().is_none_or(|r| r.id != run.id) {
+            self.scroll = 0;
+        }
         self.pending_ci = None;
+        // Keep re-polling until the run settles (live drill updates).
+        self.live_ci = (!run.state.is_terminal()).then(|| run.clone());
     }
 }
 
@@ -333,6 +354,54 @@ mod tests {
         // header + "jobs" + build heading + steps table + "log tail" + log table.
         assert!(d.sections.len() >= 5, "sparse fill: {}", d.sections.len());
         assert_eq!(ov.pending_ci, None, "pending cleared after fill");
+    }
+
+    #[test]
+    fn live_drill_repolls_until_terminal() {
+        use superzej_core::ci::{CiRun, CiState};
+        let running = CiRun {
+            id: "7".into(),
+            name: "CI".into(),
+            state: CiState::Running,
+            ..Default::default()
+        };
+        let model = FrameModel {
+            panel: crate::panel::PanelData {
+                ci_runs: vec![running.clone()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut ov = open_detail_for(
+            &BarItemId::Badge(BarBadge::Ci),
+            item_at(39),
+            screen(),
+            &model,
+            &TelemetryHistory::default(),
+        )
+        .expect("ci badge opens");
+        ov.enter_ci_view(&running);
+        // While the first fetch is in flight, no repoll piles on.
+        assert!(ov.live_ci_repoll().is_none());
+        // A fill that's still running arms the live repoll…
+        ov.set_ci_detail(&running, vec![]);
+        ov.scroll = 3;
+        let again = ov.live_ci_repoll().expect("running run repolls");
+        assert_eq!(again.id, "7");
+        assert_eq!(ov.pending_ci.as_deref(), Some("7"), "pending re-armed");
+        // …a live re-fill of the same run preserves the scroll position…
+        ov.set_ci_detail(&running, vec![]);
+        assert_eq!(ov.scroll, 3);
+        // …and a terminal fill stops the polling.
+        let done = CiRun {
+            state: CiState::Pass,
+            ..running
+        };
+        ov.set_ci_detail(&done, vec![]);
+        assert!(
+            ov.live_ci_repoll().is_none(),
+            "terminal run stops repolling"
+        );
     }
 
     #[test]

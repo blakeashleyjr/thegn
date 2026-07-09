@@ -3,9 +3,23 @@
 //! submit inline (it spawns the pane via run-private helpers), delegating only
 //! the DB write here.
 
+use superzej_core::config::Config;
 use superzej_core::store::WorkspaceStore;
 
-use crate::terminal_wizard::TerminalChoice;
+use crate::session::{GroupKind, Session};
+use crate::terminal_wizard::{TerminalChoice, TerminalWizard};
+
+/// Open the new-terminal wizard, seeding it with existing terminal names so its
+/// random default slug is deduped (back-to-back creates would otherwise collide).
+pub(crate) fn open_wizard(cfg: &Config, session: &Session) -> TerminalWizard {
+    let taken: Vec<String> = session
+        .worktrees
+        .iter()
+        .filter(|g| g.kind == GroupKind::Terminal)
+        .map(|g| g.name.clone())
+        .collect();
+    TerminalWizard::new(cfg, &taken)
+}
 
 /// Persist a terminal from the wizard: upsert the row (keyed by unique name) and
 /// record its sandbox backend when local. Best-effort — the DB is a cache; a
