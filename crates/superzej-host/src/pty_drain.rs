@@ -346,7 +346,7 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
                         ctx.corner_gfx.push(seq);
                     }
                     crate::kitty_relay::Piece::GfxAnswer(ans) => {
-                        let _ = p.write_input(&ans);
+                        let _ = p.write_reply(&ans);
                     }
                 }
             }
@@ -358,7 +358,7 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
                     crate::queries::query_responses(&emu_text, emu.cursor(), emu.size())
                 };
                 if !resp.is_empty() {
-                    let _ = p.write_input(&resp);
+                    let _ = p.write_reply(&resp);
                 }
                 let fwd = crate::queries::osc_passthrough(&emu_text);
                 if !fwd.is_empty() {
@@ -377,7 +377,7 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
                 crate::queries::query_responses(b, emu.cursor(), emu.size())
             };
             if !resp.is_empty() {
-                let _ = p.write_input(&resp);
+                let _ = p.write_reply(&resp);
             }
             // Clipboard sets (OSC 52) from inner apps go VERBATIM to the outer
             // terminal — vim's "+y inside a pane reaches the system clipboard
