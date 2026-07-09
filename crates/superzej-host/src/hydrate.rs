@@ -157,8 +157,13 @@ pub(crate) enum RefreshKind {
     Model,
     Pr,
     Issues,
-    /// CI run-history cache refresh (AV group) — same cadence as `Pr`.
-    Ci,
+    /// CI run-history cache refresh (AV group), on its own `[ci]
+    /// poll_interval_secs` cadence. `force` bypasses the `[ci] ttl_secs`
+    /// skip-if-fresh guard — set by user-initiated refreshes (the `g` key,
+    /// post-mutation) but not by the ticker/on-switch backstops.
+    Ci {
+        force: bool,
+    },
     /// Per-worktree disk-size scan (off-loop `du`, cached in the DB). Slow, so
     /// it runs on a long cadence and the scan itself coalesces by `fetched_at`.
     Disk,
@@ -197,6 +202,7 @@ const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// for the Telemetry section's live graphs (`stats_live` set while it's open)
 /// while the model/PR cadences (default 1s/20s, model tunable via
 /// `SUPERZEJ_MODEL_REFRESH_MS`) stay whole multiples of the half-tick.
+#[allow(clippy::too_many_arguments)] // one-call-site startup wiring, not an API
 pub(crate) fn spawn_refresh_ticker(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     stats_tx: tokio_mpsc::UnboundedSender<superzej_metrics::StatsSnapshot>,
@@ -204,6 +210,7 @@ pub(crate) fn spawn_refresh_ticker(
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     disk_path: std::path::PathBuf,
+    ci_poll_secs: u64,
     waker: TerminalWaker,
 ) {
     use std::sync::atomic::Ordering;
@@ -211,6 +218,7 @@ pub(crate) fn spawn_refresh_ticker(
         let tick = Duration::from_millis(500);
         let model_every = (model_refresh_interval().as_millis() as u64 / 500).max(1);
         let pr_every = PR_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let ci_every = crate::ci_refresh::ci_every_slots(ci_poll_secs);
         let issue_every = ISSUE_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let disk_every = DISK_REFRESH_INTERVAL.as_millis() as u64 / 500;
@@ -235,9 +243,13 @@ pub(crate) fn spawn_refresh_ticker(
                 }
                 wake = true;
             }
-            // CI run-history rides the PR cadence (AV group).
-            if ticks.is_multiple_of(pr_every) && tx.send(RefreshKind::Ci).is_err() {
-                break;
+            // CI run-history on its own `[ci] poll_interval_secs` cadence (AV
+            // group); the refresh itself further coalesces via `[ci] ttl_secs`.
+            if ticks.is_multiple_of(ci_every) {
+                if tx.send(RefreshKind::Ci { force: false }).is_err() {
+                    break;
+                }
+                wake = true;
             }
             if ticks.is_multiple_of(issue_every) {
                 if tx.send(RefreshKind::Issues).is_err() {
@@ -1410,12 +1422,15 @@ pub(crate) fn build_panel(
         apply_pr_cache(&mut panel, cached);
     }
 
-    // The CI run-history cache feeds the `Ci` section rollup (AV group).
-    if let Ok(Some((json, _))) = db.get_ci_cache(&loc.path())
+    // The CI run-history cache feeds the `Ci` section rollup (AV group), with
+    // its fetch age (the summary's "Ns ago" stamp) and any fetch-health note.
+    if let Ok(Some((json, fetched_at))) = db.get_ci_cache(&loc.path())
         && let Ok(runs) = serde_json::from_str::<Vec<superzej_core::ci::CiRun>>(&json)
     {
         panel.ci_runs = runs;
+        panel.ci_fetched_at = Some(fetched_at);
     }
+    panel.ci_note = crate::ci_refresh::note_for(&loc.path());
 
     // The local merge queue (fold-actor) — a tiny table, read every model build
     // (no dedicated RefreshKind). Feeds the `MergeQueue` section + statusbar badge.
@@ -2296,47 +2311,6 @@ pub(crate) fn toggle_system_scope(
     }
 }
 
-/// Refresh the CI run-history cache for the active worktree (AV group). Off the
-/// event loop: resolves the provider from `[ci]` config + the git remote,
-/// fetches recent runs for the current branch via the async `CiProvider`, writes
-/// `ci_runs_cache`, and pulses the waker so the panel rehydrates. A missing
-/// provider / unconfigured CI / fetch error simply leaves the cache untouched.
-pub(crate) fn spawn_ci_cache_refresh(
-    session: crate::session::Session,
-    cfg: superzej_core::config::CiConfig,
-    waker: Option<TerminalWaker>,
-) {
-    crate::sched::spawn_bg(move || {
-        let cwd = active_tab_path(&session);
-        if !cwd.is_dir() {
-            return;
-        }
-        let loc = superzej_core::remote::GitLoc::for_worktree(&cwd);
-        let Some(client) = superzej_svc::ci::provider_for(&loc, &cfg) else {
-            return;
-        };
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
-        let branch = loc
-            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-            .filter(|b| !b.is_empty());
-        let runs = rt.block_on(client.runs(&loc, branch.as_deref(), cfg.max_runs));
-        if let Ok(runs) = runs
-            && let Ok(json) = serde_json::to_string(&runs)
-            && let Ok(db) = superzej_core::db::Db::open()
-        {
-            let _ = db.put_ci_cache(&loc.path(), branch.as_deref().unwrap_or(""), &json);
-            if let Some(w) = &waker {
-                let _ = w.wake();
-            }
-        }
-    });
-}
-
 /// Bind (or re-bind) the diff fs-watcher to the active worktree path. A no-op if
 /// the active worktree is unchanged. On a debounced filesystem event under the
 /// worktree, pushes `RefreshKind::Model` and pulses the waker so the loop
@@ -2457,6 +2431,18 @@ pub(crate) fn retarget_diff_watcher(
                     .any(|p| crate::git_watch::is_ref_move_path(p))
                 {
                     let _ = tx.send(RefreshKind::MainRefMoved);
+                }
+                // A remote-tracking ref moved — the local signature of a push
+                // (or fetch): kick the PR + CI caches now so the just-pushed
+                // branch's checks appear without waiting for the tickers.
+                // Non-forced, so `[ci] ttl_secs` still bounds subprocess churn.
+                if ev
+                    .paths
+                    .iter()
+                    .any(|p| crate::git_watch::is_remote_ref_path(p))
+                {
+                    let _ = tx.send(RefreshKind::Pr);
+                    let _ = tx.send(RefreshKind::Ci { force: false });
                 }
                 last_send = Instant::now();
             }

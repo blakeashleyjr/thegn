@@ -53,6 +53,8 @@ pub enum DetailAction {
     CiRerun { run_id: String, failed: bool },
     /// Cancel an in-flight CI run, off the loop.
     CiCancel { run_id: String },
+    /// Force a CI run-history refetch (bypasses the `[ci] ttl_secs` guard).
+    CiRefresh,
     /// Drill the notification overlay into the log viewer *in place*, carrying a
     /// snapshot of the log tail so no model re-borrow / loop round-trip is needed
     /// (handled inside [`DetailOverlay::handle_key`]).
@@ -325,6 +327,10 @@ pub struct DetailOverlay {
     /// [`apply_ci_detail`] only fills a result whose id still matches (the user
     /// may have navigated away). `None` outside a CI drill.
     pending_ci: Option<String>,
+    /// A drilled run that was still in flight at its last fill — the loop
+    /// re-polls it on the CI tick ([`DetailOverlay::live_ci_repoll`]) so the
+    /// drill updates in place. `None` outside a CI drill / once terminal.
+    live_ci: Option<superzej_core::ci::CiRun>,
 }
 
 /// What a key delivered to the detail overlay meant.
@@ -1333,6 +1339,7 @@ fn graph(
         sel: 0,
         hint: None,
         pending_ci: None,
+        live_ci: None,
     }
 }
 
@@ -1353,6 +1360,7 @@ fn keyval(
         sel: 0,
         hint: None,
         pending_ci: None,
+        live_ci: None,
     }
 }
 
@@ -1367,6 +1375,7 @@ fn table(title: &str, t: TableDetail, cols: usize, height: usize) -> DetailOverl
         sel: 0,
         hint: None,
         pending_ci: None,
+        live_ci: None,
     }
 }
 
@@ -1384,6 +1393,7 @@ fn sections(title: &str, cols: usize, secs: Vec<Section>, placement: Placement) 
         sel: 0,
         hint: None,
         pending_ci: None,
+        live_ci: None,
     }
 }
 
@@ -1407,6 +1417,7 @@ fn list(
         sel: 0,
         hint: None,
         pending_ci: None,
+        live_ci: None,
     }
 }
 
@@ -1971,7 +1982,8 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                                 run_id: r.id.clone(),
                                 failed: true,
                             },
-                        );
+                        )
+                        .action('g', DetailAction::CiRefresh);
                     if !r.url.is_empty() {
                         row = row.action('o', DetailAction::OpenUrl(r.url.clone()));
                     }
@@ -1990,7 +2002,7 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                 })
                 .collect();
             let mut ov = list("CI runs", rows, "no CI runs", 60, 14);
-            ov.hint = Some("↵ view · o open · r/R rerun · c cancel".into());
+            ov.hint = Some("↵ view · o open · r/R rerun · c cancel · g refresh".into());
             Some(ov)
         }
         BarBadge::MergeQueue => {

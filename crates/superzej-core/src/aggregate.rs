@@ -156,9 +156,12 @@ impl Aggregation {
 
 // --- pure builders ---------------------------------------------------------
 
-/// One excerpt per *failing* CI run for a worktree (non-failures are dropped).
+/// One excerpt per *currently failing* workflow for a worktree: only each
+/// workflow's most recent run counts ([`crate::ci::latest_per_workflow`]), so
+/// historical failures that have since gone green don't linger in Across.
 pub fn ci_failure_excerpts(worktree: &str, label: &str, runs: &[CiRun]) -> Vec<Excerpt> {
-    runs.iter()
+    crate::ci::latest_per_workflow(runs)
+        .into_iter()
         .filter(|r| r.state.is_failure())
         .map(|r| Excerpt {
             worktree: worktree.to_string(),
@@ -262,6 +265,42 @@ mod tests {
         assert!(names.contains(&"build") && names.contains(&"deploy"));
         // Empty run name falls back to id; url-less run uses branch as detail.
         assert_eq!(ex[0].detail, "b");
+    }
+
+    #[test]
+    fn ci_builder_scopes_to_latest_run_per_workflow() {
+        // Newest-first: "build" failed historically but passes now → no
+        // excerpt; "deploy" is currently failing → one excerpt, not three.
+        let runs = vec![
+            run("build", CiState::Pass),
+            CiRun {
+                id: "d3".into(),
+                name: "deploy".into(),
+                state: CiState::Fail,
+                ..Default::default()
+            },
+            CiRun {
+                id: "b2".into(),
+                name: "build".into(),
+                state: CiState::Fail,
+                ..Default::default()
+            },
+            CiRun {
+                id: "d2".into(),
+                name: "deploy".into(),
+                state: CiState::Fail,
+                ..Default::default()
+            },
+            CiRun {
+                id: "d1".into(),
+                name: "deploy".into(),
+                state: CiState::Fail,
+                ..Default::default()
+            },
+        ];
+        let ex = ci_failure_excerpts("/wt/feat", "feat", &runs);
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].text, "deploy");
     }
 
     #[test]

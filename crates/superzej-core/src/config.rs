@@ -1871,10 +1871,12 @@ config_enum! {
 pub struct CiConfig {
     /// Active provider; `"auto"` detects from the worktree.
     pub provider: CiProviderKind,
-    /// Cache TTL (seconds) before a background re-fetch of run history.
+    /// Freshness window (seconds): non-forced refreshes (ticker, tab switch)
+    /// are skipped while the cached run history is younger than this. `0`
+    /// disables the guard. Manual refresh (`g`) always refetches.
     pub ttl_secs: u64,
-    /// Background poll cadence (seconds) while a run is in-flight / the CI view
-    /// has live-refresh on.
+    /// Background poll cadence (seconds) for the CI run-history refresh
+    /// ticker. Clamped to ≥ 5 (each poll is a provider subprocess).
     pub poll_interval_secs: u64,
     /// How many recent runs to fetch and display.
     pub max_runs: usize,

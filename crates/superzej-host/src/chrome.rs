@@ -1494,24 +1494,16 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
             )],
         ));
     }
-    // CI rollup badge (AV group, item 158): a red ✗ chip when recent runs have
-    // failures, an amber ● chip while runs are in flight; silent when all green
-    // (mirrors the "clean is quiet" notification posture). Only when CI is
-    // configured and the cache is warm (`ci_runs` non-empty).
+    // CI rollup badge (AV group, item 158): a red ✗ chip when workflows are
+    // *currently* failing, an amber ● chip while runs are in flight; silent
+    // when all green (mirrors the "clean is quiet" notification posture). Only
+    // when CI is configured and the cache is warm (`ci_runs` non-empty).
+    // Counts come from `current_summary` — each workflow judged by its most
+    // recent run — so historical failures don't pin the badge red.
     if !model.panel.ci_runs.is_empty() {
-        use superzej_core::ci::CiState;
-        let fail = model
-            .panel
-            .ci_runs
-            .iter()
-            .filter(|r| r.state == CiState::Fail)
-            .count();
-        let running = model
-            .panel
-            .ci_runs
-            .iter()
-            .filter(|r| r.state == CiState::Running)
-            .count();
+        let cur = superzej_core::ci::current_summary(&model.panel.ci_runs);
+        let fail = cur.failed;
+        let running = cur.running;
         if fail > 0 {
             items.push((
                 BarItemId::Badge(BarBadge::Ci),

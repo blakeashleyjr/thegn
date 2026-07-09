@@ -496,6 +496,12 @@ pub struct PanelData {
     /// Recent CI runs (newest first) for the current branch, from `ci_runs_cache`
     /// — feeds the `Ci` section rollup (AV group). Empty when CI is off/undetected.
     pub ci_runs: Vec<superzej_core::ci::CiRun>,
+    /// When `ci_runs` was fetched (epoch seconds) — the Ci summary's age stamp,
+    /// so cached-but-stale data is visibly stale. `None` when the cache is cold.
+    pub ci_fetched_at: Option<i64>,
+    /// A short human note when the CI fetch is unhealthy ("CI provider API rate
+    /// limited", …); mirrors `pr_note`. `None` while fetches succeed.
+    pub ci_note: Option<String>,
     /// Cross-worktree attention stream (the `Across` section): failing CI and
     /// (later) dirty files / content matches from *all* worktrees, grouped by
     /// worktree. Built off-loop during hydration; empty when nothing needs
