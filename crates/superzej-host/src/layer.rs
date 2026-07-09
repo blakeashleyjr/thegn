@@ -8,6 +8,8 @@
 //! repaints. The remap is deterministic, so after the frame a layer opens,
 //! damage tracking only re-emits cells whose backdrop actually changed.
 
+use std::borrow::Cow;
+
 use termwiz::cell::CellAttributes;
 use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::surface::{Change, Position, Surface};
@@ -69,6 +71,20 @@ fn dim_bg(c: ColorAttribute, bg0: SrgbaTuple) -> ColorAttribute {
     }
 }
 
+/// Whether `glyph` is a color-font emoji (the astral pictographic planes:
+/// 💻 🌐 🚀 📁 📂 …). Terminals render these from a color emoji font that
+/// ignores the SGR foreground, so the dim/shadow remap — which only recolors —
+/// can't darken them; the icon shines at full brightness through the backdrop.
+/// `repaint_rect` blanks these instead. Bounded to `U+1F000..=U+1FAFF` so the
+/// BMP symbols the chrome draws as *monochrome* text (box-drawing, arrows,
+/// bullets/dots, ✓ ✗ ⚠ ✉ …) and astral CJK ideographs keep dimming by color.
+fn is_color_emoji(glyph: &str) -> bool {
+    matches!(
+        glyph.chars().next().map(|c| c as u32),
+        Some(0x1F000..=0x1FAFF)
+    )
+}
+
 /// One row-run of repainted cells with shared attributes.
 struct Run {
     x: usize,
@@ -103,16 +119,32 @@ fn repaint_rect(
         for y in rect.y..rect.y + rect.rows {
             let Some(row) = cells.get(y) else { break };
             let mut current: Option<Run> = None;
-            for x in rect.x..rect.x + rect.cols {
+            let end = rect.x + rect.cols;
+            let mut x = rect.x;
+            while x < end {
                 let Some(cell) = row.get(x) else { break };
                 let (fg, bg) = remap(cell.attrs().foreground(), cell.attrs().background());
                 let mut attrs = CellAttributes::default();
                 attrs.set_foreground(fg);
                 attrs.set_background(bg);
-                let glyph = cell.str();
-                let glyph = if glyph.is_empty() { " " } else { glyph };
+                // Advance by the glyph's display width, not one column, so a wide
+                // glyph's blank continuation cell isn't re-emitted as an extra
+                // space — that would shove the rest of the row one column right.
+                // Clamp to the rect edge in case the rect bisects a wide glyph.
+                let w = cell.width().max(1).min(end - x);
+                let raw = cell.str();
+                let glyph: Cow<str> = if is_color_emoji(raw) || cell.width() > w {
+                    // Color emoji ignore the remapped fg (they'd stay bright), and
+                    // a wide glyph clipped by the rect edge can't render in the
+                    // room left — blank either to its width so the backdrop dims.
+                    Cow::Owned(" ".repeat(w))
+                } else if raw.is_empty() {
+                    Cow::Borrowed(" ")
+                } else {
+                    Cow::Borrowed(raw)
+                };
                 match &mut current {
-                    Some(run) if run.attrs == attrs => run.text.push_str(glyph),
+                    Some(run) if run.attrs == attrs => run.text.push_str(&glyph),
                     _ => {
                         if let Some(done) = current.take() {
                             runs.push(done);
@@ -120,11 +152,12 @@ fn repaint_rect(
                         current = Some(Run {
                             x,
                             y,
-                            text: glyph.to_string(),
+                            text: glyph.into_owned(),
                             attrs,
                         });
                     }
                 }
+                x += w;
             }
             if let Some(done) = current.take() {
                 runs.push(done);
@@ -391,6 +424,46 @@ mod tests {
         );
         assert_eq!(row_text(&mut s, 0), "hello     ");
         assert_ne!(fg_at(&mut s, 0, 0), before_fg, "fg must be remapped");
+    }
+
+    #[test]
+    fn dim_blanks_color_emoji_and_keeps_alignment() {
+        // A row like the sidebar's local-terminal entry: "💻 shell". The emoji
+        // is a color-font glyph the fg remap can't dim, so it must be blanked —
+        // and its blank continuation cell must NOT push "shell" a column right.
+        let mut s = surface_with_text(12, 1, "\u{1f4bb} shell");
+        // Sanity: composed as emoji + its blank continuation cell + space +
+        // label (row_text renders the wide glyph's continuation as its own " ").
+        assert_eq!(row_text(&mut s, 0), "\u{1f4bb}  shell    ");
+        dim_rect(
+            &mut s,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 12,
+                rows: 1,
+            },
+        );
+        // Emoji gone (blanked to its 2-col width), label stays put — no shift.
+        assert_eq!(row_text(&mut s, 0), "   shell    ");
+    }
+
+    #[test]
+    fn dim_keeps_wide_text_glyphs_and_alignment() {
+        // A CJK (non-emoji) wide glyph dims by color like any text — kept, not
+        // blanked — and the following label must stay column-aligned.
+        let mut s = surface_with_text(10, 1, "\u{6f22} x");
+        assert_eq!(row_text(&mut s, 0), "\u{6f22}  x      ");
+        dim_rect(
+            &mut s,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 10,
+                rows: 1,
+            },
+        );
+        assert_eq!(row_text(&mut s, 0), "\u{6f22}  x      ");
     }
 
     #[test]
