@@ -414,7 +414,10 @@ pub(crate) fn snapshot_of(
         rows,
         cols,
         cursor: emu.cursor(),
-        cursor_visible: emu.cursor_visible(),
+        // The emulator trait doesn't expose cursor visibility (a rare, transient
+        // state); default to visible — the client's own emulator corrects it
+        // from the very next live delta if the app had hidden it.
+        cursor_visible: true,
         alt_screen,
         app_cursor: emu.application_cursor(),
         bracketed_paste: emu.bracketed_paste(),
