@@ -237,6 +237,132 @@ pub(crate) fn cut(segs: &[Seg], max: usize) -> Vec<Seg> {
     out
 }
 
+/// Flow a seg run into physical lines no wider than `width` display cells,
+/// wrapping (rather than truncating) long content. The first line starts at
+/// column 0; every continuation line is prefixed with `sp(cont_indent)` spaces
+/// (a hanging indent) so wrapped text aligns under the item's primary text
+/// rather than the leading gutter. Breaks on ASCII spaces where a word fits; a
+/// single token wider than the line body is hard-split on a display-width
+/// boundary (never mid-wide-glyph) via [`take_cols`]. Each seg's fg/bg/style is
+/// preserved across splits. Always returns at least one line.
+pub(crate) fn wrap(segs: &[Seg], width: usize, cont_indent: usize) -> Vec<Vec<Seg>> {
+    if width == 0 {
+        return vec![Vec::new()];
+    }
+    let indent = cont_indent.min(width - 1);
+    let mut lines: Vec<Vec<Seg>> = Vec::new();
+    let mut cur: Vec<Seg> = Vec::new();
+    let mut cur_w = 0usize; // display width of `cur`, including any indent
+    let mut line_indent = 0usize; // the current line's hanging indent (0 on line 0)
+
+    // Close the current line and seed a fresh continuation line.
+    macro_rules! break_line {
+        () => {{
+            lines.push(std::mem::take(&mut cur));
+            line_indent = indent;
+            cur_w = indent;
+            if indent > 0 {
+                cur.push(sp(indent));
+            }
+        }};
+    }
+
+    for s in segs {
+        if s.text.is_empty() {
+            continue;
+        }
+        // Walk atoms: alternating runs of spaces and non-spaces, preserving the
+        // item's own leading gutter (spaces are dropped only when they would
+        // lead a wrapped continuation line).
+        for (is_space, atom) in atoms(&s.text) {
+            if is_space {
+                // Drop spaces that would lead a continuation line (the hanging
+                // indent stands in for them); keep the gutter on line 0.
+                if !lines.is_empty() && cur_w == line_indent {
+                    continue;
+                }
+                let room = width.saturating_sub(cur_w);
+                let take = atom.len().min(room); // spaces are 1 byte / 1 cell
+                if take > 0 {
+                    cur.push(seg_like(s, &atom[..take]));
+                    cur_w += take;
+                }
+                continue;
+            }
+            // A word (non-space run).
+            let ww = atom.width();
+            if ww <= width.saturating_sub(cur_w) {
+                cur.push(seg_like(s, atom));
+                cur_w += ww;
+                continue;
+            }
+            // Doesn't fit here. If the whole word fits on a fresh continuation
+            // line, move it down intact (word wrap).
+            if ww <= width.saturating_sub(indent) && cur_w > line_indent {
+                break_line!();
+                cur.push(seg_like(s, atom));
+                cur_w += ww;
+                continue;
+            }
+            // A token wider than the line body: hard-split, filling the current
+            // line's remaining room first, then across continuation lines.
+            let mut rest = atom;
+            loop {
+                let room = width.saturating_sub(cur_w);
+                let chunk = take_cols(rest, room);
+                if chunk.is_empty() {
+                    // No room for even one cell (a 2-wide glyph with 1 left);
+                    // break to a fresh line and retry.
+                    break_line!();
+                    continue;
+                }
+                cur.push(seg_like(s, chunk));
+                cur_w += chunk.width();
+                rest = &rest[chunk.len()..];
+                if rest.is_empty() {
+                    break;
+                }
+                break_line!();
+            }
+        }
+    }
+    // Flush the final line. Suppress a trailing pure-indent line, but always
+    // return at least one line.
+    if cur_w > line_indent || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Clone `s` with replacement text, preserving all styling.
+fn seg_like(s: &Seg, text: &str) -> Seg {
+    let mut c = s.clone();
+    c.text = text.to_string();
+    c
+}
+
+/// Split `s` into maximal alternating runs of spaces / non-spaces, yielding
+/// `(is_space, run)`. ASCII space is the only separator.
+fn atoms(s: &str) -> Vec<(bool, &str)> {
+    let mut out: Vec<(bool, &str)> = Vec::new();
+    let mut start = 0usize;
+    let mut prev: Option<bool> = None;
+    for (i, ch) in s.char_indices() {
+        let is_space = ch == ' ';
+        if let Some(p) = prev
+            && p != is_space
+        {
+            out.push((p, &s[start..i]));
+            start = i;
+        }
+        prev = Some(is_space);
+    }
+    if let Some(p) = prev {
+        out.push((p, &s[start..]));
+    }
+    out
+}
+
 fn attrs_for(s: &Seg, p: &Palette, pad_bg: Tok) -> CellAttributes {
     let mut a = CellAttributes::default();
     a.set_foreground(s.fg.resolve(p));
@@ -424,6 +550,94 @@ mod tests {
     fn seg_width_is_display_width() {
         assert_eq!(seg(Tok::Slot(S::Text), "ab").width(), 2);
         assert_eq!(seg(Tok::Slot(S::Text), "\u{4f60}\u{597d}").width(), 4);
+    }
+
+    fn line_text(l: &[Seg]) -> String {
+        l.iter().map(|s| s.text.clone()).collect()
+    }
+
+    #[test]
+    fn wrap_flows_ascii_on_word_boundaries() {
+        let t = Tok::Slot(S::Text);
+        let lines = wrap(&[seg(t, "aaaa bbbb cccc")], 9, 2);
+        // Each physical line fits the width.
+        for l in &lines {
+            assert!(seg_width(l) <= 9, "{:?}", line_text(l));
+        }
+        // First line has no indent, breaks on the space; continuation carries 2.
+        assert_eq!(line_text(&lines[0]), "aaaa bbbb");
+        assert!(lines.len() >= 2);
+        assert!(
+            line_text(&lines[1]).starts_with("  "),
+            "continuation indent: {:?}",
+            line_text(&lines[1])
+        );
+    }
+
+    #[test]
+    fn wrap_hard_splits_long_unbroken_token() {
+        let t = Tok::Slot(S::Text);
+        let path = "src/averylongpath/no/spaces/here.rs";
+        let lines = wrap(&[seg(t, path)], 10, 4);
+        assert!(lines.len() >= 2);
+        for l in &lines {
+            assert!(seg_width(l) <= 10, "{:?}", line_text(l));
+        }
+        // First line no indent; continuations start with 4 spaces.
+        assert!(!line_text(&lines[0]).starts_with(' '));
+        for l in &lines[1..] {
+            assert!(line_text(l).starts_with("    "), "{:?}", line_text(l));
+        }
+        // Reassembling (stripping the hanging indent) recovers the path.
+        let joined: String = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let s = line_text(l);
+                if i == 0 { s } else { s[4..].to_string() }
+            })
+            .collect();
+        assert_eq!(joined, path);
+    }
+
+    #[test]
+    fn wrap_never_splits_a_wide_glyph() {
+        let t = Tok::Slot(S::Text);
+        // 你好世界 — each glyph is 2 cols; wrap at an odd width to force a straddle.
+        let lines = wrap(&[seg(t, "\u{4f60}\u{597d}\u{4e16}\u{754c}")], 3, 0);
+        for l in &lines {
+            assert!(seg_width(l) <= 3, "{:?}", line_text(l));
+            // No line ends mid-glyph: every glyph is whole (2 cols) so the text
+            // reconstructs exactly.
+        }
+        let joined: String = lines.iter().map(|l| line_text(l)).collect();
+        assert_eq!(joined, "\u{4f60}\u{597d}\u{4e16}\u{754c}");
+    }
+
+    #[test]
+    fn wrap_handles_empty_and_degenerate_inputs() {
+        let t = Tok::Slot(S::Text);
+        assert_eq!(wrap(&[], 10, 4), vec![Vec::<Seg>::new()]);
+        assert_eq!(wrap(&[seg(t, "x")], 0, 0), vec![Vec::<Seg>::new()]);
+        // cont_indent >= width is clamped, no panic, body stays >= 1 cell.
+        let lines = wrap(&[seg(t, "abcdef")], 3, 9);
+        for l in &lines {
+            assert!(seg_width(l) <= 3);
+        }
+    }
+
+    #[test]
+    fn wrap_preserves_style_across_splits() {
+        let lines = wrap(&[seg(Tok::Slot(S::Accent), "alpha bravo").bold()], 6, 0);
+        assert!(lines.len() >= 2);
+        for l in &lines {
+            for s in l {
+                if !s.text.trim().is_empty() {
+                    assert_eq!(s.fg, Tok::Slot(S::Accent));
+                    assert!(s.bold);
+                }
+            }
+        }
     }
 
     #[test]
