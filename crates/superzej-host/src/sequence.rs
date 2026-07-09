@@ -186,6 +186,31 @@ mod tests {
     }
 
     #[test]
+    fn nested_prefix_row_drills_in() {
+        // `Alt m f r` makes `f` an intermediate prefix under `Alt m`. The
+        // which-key popup relies on: `f` shows as a continuation, and pressing it
+        // returns Pending (drills into the deeper level) rather than Matched.
+        let mut matcher = SequenceMatcher::new();
+        let alt_m = Key::modified(KeyCode::Char('m'), Modifiers::ALT);
+        matcher.add_sequence(
+            vec![alt_m.clone(), Key::char('f'), Key::char('r')],
+            Action::TogglePanel,
+        );
+
+        assert_eq!(matcher.feed(alt_m), MatchResult::Pending);
+        let cont = matcher.pending_continuations();
+        assert!(
+            cont.iter().any(|(k, _)| *k == Key::char('f')),
+            "nested-prefix key `f` is listed: {cont:?}"
+        );
+        assert_eq!(matcher.feed(Key::char('f')), MatchResult::Pending);
+        assert_eq!(
+            matcher.feed(Key::char('r')),
+            MatchResult::Matched(Action::TogglePanel)
+        );
+    }
+
+    #[test]
     fn shifted_ascii_letters_normalize_to_uppercase_char() {
         assert_eq!(
             Key::modified(KeyCode::Char('x'), Modifiers::SHIFT | Modifiers::ALT),
