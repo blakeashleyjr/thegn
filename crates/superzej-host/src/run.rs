@@ -858,6 +858,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         stats_interval_ms.clone(),
         stats_live.clone(),
         disk_fs_path,
+        cfg.ci.poll_interval_secs,
         waker.clone(),
     );
 
@@ -8206,10 +8207,11 @@ async fn event_loop<T: Terminal>(
                 crate::panel::scope::mine_all(),
                 Some(waker.clone()),
             );
-            crate::hydrate::spawn_ci_cache_refresh(
+            crate::ci_refresh::spawn_ci_cache_refresh(
                 session.clone(),
                 current_config.ci.clone(),
                 Some(waker.clone()),
+                false, // on-switch backstop: respect the ttl guard
             );
             retarget_diff_watcher(
                 &session,
@@ -10691,6 +10693,7 @@ async fn event_loop<T: Terminal>(
         let mut want_pr_refresh = false;
         let mut want_issue_refresh = false;
         let mut want_ci_refresh = false;
+        let mut ci_refresh_force = false;
         let mut want_disk_refresh = false;
         let mut want_main_sync = false;
         // Fold-actor results: report what landed/deferred and re-hydrate so the
@@ -10735,8 +10738,9 @@ async fn event_loop<T: Terminal>(
                     want_issue_refresh = true;
                     want_model_refresh = true;
                 }
-                RefreshKind::Ci => {
+                RefreshKind::Ci { force } => {
                     want_ci_refresh = true;
+                    ci_refresh_force |= force;
                     want_model_refresh = true;
                 }
                 // The scan only writes the size cache off-thread; sizes land on
@@ -10810,10 +10814,13 @@ async fn event_loop<T: Terminal>(
             );
         }
         if want_ci_refresh {
-            crate::hydrate::spawn_ci_cache_refresh(
-                session.clone(),
-                current_config.ci.clone(),
-                Some(waker.clone()),
+            crate::ci_refresh::on_ci_tick(
+                &session,
+                &current_config.ci,
+                &refresh_tx,
+                &waker,
+                ci_refresh_force,
+                &mut bar_detail,
             );
         }
         if want_disk_refresh {
@@ -16597,9 +16604,10 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         // -- ci (AV group): drill in (v), open (o), re-run (r/R),
-                        // cancel (c). Provider is authority; bad ops decline off-loop.
+                        // cancel (c), refresh (g). Provider is authority; bad
+                        // ops decline off-loop.
                         (Section::Ci, key)
-                            if matches!(key, KeyCode::Char('v' | 'o' | 'r' | 'R' | 'c')) =>
+                            if matches!(key, KeyCode::Char('v' | 'o' | 'r' | 'R' | 'c' | 'g')) =>
                         {
                             CiActionCtx {
                                 session: &mut session,

@@ -23,6 +23,7 @@ mod build_cache;
 mod caps;
 mod center;
 mod chrome;
+mod ci_refresh;
 mod cli_help;
 mod clipboard;
 mod cmd;

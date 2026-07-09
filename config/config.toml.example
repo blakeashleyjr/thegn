@@ -288,8 +288,8 @@ move_on_merge = false        # when a worktree's PR merges, move its linked issu
 # GitHub Actions reuses the existing `gh`/GH_TOKEN auth (no sub-table needed).
 [ci]
 provider = "auto"          # auto | none | github | gitlab | drone | woodpecker | jenkins | argo
-ttl_secs = 30              # cache TTL before a background re-fetch of run history
-poll_interval_secs = 30    # background poll cadence while a run is in-flight
+ttl_secs = 30              # skip non-forced refreshes while cache is younger (0 = off)
+poll_interval_secs = 30    # background refresh cadence for run history (min 5)
 max_runs = 50              # how many recent runs to fetch/display
 log_tail_lines = 2000      # cap on fetched log lines (the tail is kept)
 

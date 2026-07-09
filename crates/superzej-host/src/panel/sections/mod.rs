@@ -334,28 +334,21 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             None => vec![seg(g(), "no pr")],
         },
         Section::Ci => {
-            use superzej_core::ci::CiState;
             if data.ci_runs.is_empty() {
                 vec![seg(g2(), "—")]
             } else {
-                let (mut pass, mut fail, mut run) = (0u32, 0u32, 0u32);
-                for r in &data.ci_runs {
-                    match r.state {
-                        CiState::Pass => pass += 1,
-                        CiState::Fail => fail += 1,
-                        CiState::Running => run += 1,
-                        _ => {}
-                    }
-                }
+                // Current state (latest run per workflow), matching the badge
+                // and body rollups — never a wall of historical failures.
+                let sum = superzej_core::ci::current_summary(&data.ci_runs);
                 let mut v = vec![ci::state_glyph(data.ci_runs[0].state)];
-                v.push(seg(g(), format!(" {pass}")));
-                if fail > 0 {
+                v.push(seg(g(), format!(" {}", sum.passed)));
+                if sum.failed > 0 {
                     v.push(seg(g(), " "));
-                    v.push(seg(hue(Hue::Red), format!("✗{fail}")));
+                    v.push(seg(hue(Hue::Red), format!("✗{}", sum.failed)));
                 }
-                if run > 0 {
+                if sum.running > 0 {
                     v.push(seg(g(), " "));
-                    v.push(seg(hue(Hue::Amber), format!("●{run}")));
+                    v.push(seg(hue(Hue::Amber), format!("●{}", sum.running)));
                 }
                 v
             }
