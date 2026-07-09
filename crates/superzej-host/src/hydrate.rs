@@ -1335,6 +1335,7 @@ pub(crate) fn build_panel(
         branches_raw,
         stashes_raw,
         ls_files,
+        incoming,
     ) = std::thread::scope(|s| {
         let h_branch = s.spawn(|| {
             GixGit::new()
@@ -1351,6 +1352,27 @@ pub(crate) fn build_panel(
         let h_status = s.spawn(|| GixGit::new().status(&loc).unwrap_or_default());
         let h_ahead = s.spawn(|| GixGit::new().ahead_behind(&loc).ok().flatten());
         let h_merge = s.spawn(|| GixGit::new().merge_state(&loc).ok().flatten());
+        // While a merge/rebase is live, the working tree/index carries the whole
+        // incoming diff staged, so the changes list is dominated by files the
+        // *merge* brings in, not the user's own edits. Compute the incoming path
+        // set (files that differ on the incoming side since the merge base:
+        // `git diff HEAD...<HEAD-ref>`) so `build_change_rows` can tag and group
+        // them apart. Empty (and near-free) outside a merge.
+        let h_incoming = s.spawn(|| {
+            GixGit::new()
+                .merge_state(&loc)
+                .ok()
+                .flatten()
+                .map(|mi| {
+                    GixGit::new()
+                        .diff_files(&loc, &format!("HEAD...{}", mi.kind.head_ref()))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|d| d.path)
+                        .collect::<std::collections::HashSet<String>>()
+                })
+                .unwrap_or_default()
+        });
         let h_stash_count = s.spawn(|| GixGit::new().stash_count(&loc).unwrap_or(0));
         // Section-gated heavy reads: spawned only when their section is open, so
         // an idle panel pays nothing. The branch PR-badge join is DB-backed and
@@ -1394,6 +1416,7 @@ pub(crate) fn build_panel(
             h_branches.map(|h| h.join().unwrap()).unwrap_or_default(),
             h_stashes.map(|h| h.join().unwrap()).unwrap_or_default(),
             h_ls.and_then(|h| h.join().unwrap()),
+            h_incoming.join().unwrap(),
         )
     });
     tracing::debug!(
@@ -1448,8 +1471,9 @@ pub(crate) fn build_panel(
         })
         .collect();
 
-    // Changes section: porcelain status joined with the diffstat.
-    panel.changes = crate::panel::build_change_rows(&status, &diff_entries);
+    // Changes section: porcelain status joined with the diffstat, with
+    // merge-incoming files tagged for the "incoming from <onto>" grouping.
+    panel.changes = crate::panel::build_change_rows(&status, &diff_entries, &incoming);
     // Semantic git layer (items 311/313/317): entity-level view of the changes.
     panel.entities = entities;
 

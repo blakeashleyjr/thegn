@@ -34,7 +34,20 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
         )])));
         return rows;
     }
+    // Rows are sorted local-first, then the merge's incoming files. When a merge
+    // is live we split the two with a labeled `◇ N incoming from <onto>` divider,
+    // and collapse the (often huge) incoming block until the section is expanded
+    // (`e`) — so the user's own edits aren't buried under the merge dump.
+    let mut incoming_header_done = false;
     for (i, c) in data.changes.iter().enumerate() {
+        if c.incoming && !incoming_header_done {
+            rows.push(incoming_divider(data, deep, ctx.cols));
+            incoming_header_done = true;
+        }
+        // Collapsed: the divider already summarizes the incoming files.
+        if c.incoming && !deep {
+            continue;
+        }
         let on = ui.chg_sel == Some(i);
         rows.push(change_row(c, i, on, deep, ctx.cols));
         if on {
@@ -270,13 +283,48 @@ fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool, cols: usize) -> Pan
     row
 }
 
+/// The `◇ N incoming from <onto>` divider between the user's local edits and the
+/// files a live merge/rebase brings in. Carries the incoming diffstat total, and
+/// (while collapsed) an `e expand` affordance — expanding the section reveals the
+/// individual incoming rows beneath it.
+fn incoming_divider(data: &crate::panel::PanelData, deep: bool, _cols: usize) -> PanelRow {
+    let (n, added, deleted) = data
+        .changes
+        .iter()
+        .filter(|c| c.incoming)
+        .fold((0usize, 0u32, 0u32), |(n, a, d), c| {
+            (n + 1, a + c.added, d + c.deleted)
+        });
+    let onto = data
+        .merge
+        .as_ref()
+        .map(|m| m.onto.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "the merge".into());
+    let l = vec![
+        seg(hue(Hue::Amber), "◇ "),
+        seg(f(), format!("{n} incoming from {onto}")),
+    ];
+    let mut r = diffstat(added, deleted);
+    if !deep {
+        r.push(sp(1));
+        r.push(seg(g(), "e expand"));
+    }
+    PanelRow::plain(Line::split(l, r))
+}
+
 /// Left-clip `dir` so that `name_w` chars are guaranteed to fit within `budget`.
 ///
 /// Returns the portion of `dir` to display. Clips from the left (preserving the
 /// tail of the path nearest the filename), snapping to a `/` boundary so it
-/// reads as `…parent/` rather than `…arent/`. Returns an empty string when the
-/// budget is too tight to show any directory context.
+/// reads as `…parent/` rather than `…arent/`. When the budget is too tight to
+/// show any directory context, returns a bare `…/` marker (never an empty
+/// string) so a *nested* file can never masquerade as a repo-root file — the
+/// caller passes `""` for genuine root files, which short-circuits below.
 fn clip_dir_left(dir: &str, name_w: usize, budget: usize) -> String {
+    if dir.is_empty() {
+        return String::new();
+    }
     let dir_chars: Vec<char> = dir.chars().collect();
     let dir_w = dir_chars.len();
     if dir_w + name_w <= budget {
@@ -284,7 +332,7 @@ fn clip_dir_left(dir: &str, name_w: usize, budget: usize) -> String {
     }
     let dir_budget = budget.saturating_sub(name_w);
     if dir_budget <= 1 {
-        return String::new();
+        return "…/".to_string();
     }
     // Reserve 1 char for the leading "…", the rest goes to the dir suffix.
     let take = dir_budget.saturating_sub(1);
@@ -296,7 +344,7 @@ fn clip_dir_left(dir: &str, name_w: usize, budget: usize) -> String {
         .map(|p| from + p + 1)
         .unwrap_or(from);
     if snap >= dir_w {
-        return String::new();
+        return "…/".to_string();
     }
     format!("…{}", dir_chars[snap..].iter().collect::<String>())
 }
@@ -713,6 +761,7 @@ mod tests {
             path: "crates/superzej-host/src/changes.rs".into(),
             added: 3,
             deleted: 1,
+            incoming: false,
         };
         for on in [false, true] {
             let row = change_row(&c, 0, on, false, 70);
@@ -750,6 +799,7 @@ mod tests {
                 path: "src/a.rs".into(),
                 added: 30,
                 deleted: 10,
+                incoming: false,
             }],
             entities: Some(EntitySummary::new(vec![(
                 "src/a.rs".into(),
@@ -818,6 +868,103 @@ mod tests {
         );
     }
 
+    fn chg(path: &str, incoming: bool, added: u32) -> ChangeRow {
+        let (dir, name) = match path.rsplit_once('/') {
+            Some((d, n)) => (format!("{d}/"), n.to_string()),
+            None => (String::new(), path.to_string()),
+        };
+        ChangeRow {
+            status: "M".into(),
+            stage: Stage::Staged,
+            dir,
+            name,
+            path: path.into(),
+            added,
+            deleted: 0,
+            incoming,
+        }
+    }
+
+    fn flat(rows: &[PanelRow]) -> String {
+        rows.iter()
+            .map(|r| match &r.line {
+                Line::Blank => String::new(),
+                Line::Fill { ch, .. } => ch.to_string(),
+                Line::Segs(v) => segs_text(v),
+                Line::Split { l, r } => format!("{} {}", segs_text(l), segs_text(r)),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn merge_incoming_files_collapse_under_a_divider_until_expanded() {
+        let data = crate::panel::PanelData {
+            changes: vec![
+                chg("host/src/my_edit.rs", false, 5),
+                chg("core/src/from_main_a.rs", true, 40),
+                chg("core/src/from_main_b.rs", true, 60),
+            ],
+            merge: Some(crate::panel::MergeBanner {
+                label: "MERGING".into(),
+                onto: "main".into(),
+                unresolved: 0,
+                total: None,
+            }),
+            ..Default::default()
+        };
+        let model = crate::chrome::FrameModel {
+            panel: data,
+            ..Default::default()
+        };
+
+        // Collapsed (Normal width): the local edit shows; the two incoming files
+        // are folded into a labeled divider carrying the count + `e expand`.
+        let ui = PanelUi {
+            open: Section::Changes,
+            width: crate::layout::PanelWidth::Normal,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 44,
+            rows: 28,
+        };
+        let out = flat(&content(&ctx));
+        assert!(out.contains("my_edit.rs"), "local edit shown: {out}");
+        assert!(
+            out.contains("2 incoming from main"),
+            "incoming divider: {out}"
+        );
+        assert!(out.contains("e expand"), "collapse affordance: {out}");
+        assert!(
+            !out.contains("from_main_a.rs") && !out.contains("from_main_b.rs"),
+            "incoming files hidden while collapsed: {out}"
+        );
+
+        // Expanded (Half width): the incoming files are revealed; no `e expand`.
+        let ui = PanelUi {
+            open: Section::Changes,
+            width: crate::layout::PanelWidth::Half,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 32,
+        };
+        let out = flat(&content(&ctx));
+        assert!(out.contains("2 incoming from main"), "divider still: {out}");
+        assert!(out.contains("from_main_a.rs"), "incoming revealed: {out}");
+        assert!(out.contains("from_main_b.rs"), "incoming revealed: {out}");
+        assert!(
+            !out.contains("e expand"),
+            "no collapse hint when open: {out}"
+        );
+    }
+
     #[test]
     fn clip_dir_left_passes_through_short_paths() {
         assert_eq!(clip_dir_left("src/", 6, 20), "src/");
@@ -835,12 +982,15 @@ mod tests {
     }
 
     #[test]
-    fn clip_dir_left_drops_dir_when_budget_too_tight() {
-        // budget barely fits the name (10) — no room for any dir
-        assert_eq!(clip_dir_left("src/long/path/", 10, 10), "");
-        // budget = 0 or 1 → empty
-        assert_eq!(clip_dir_left("src/", 3, 1), "");
-        assert_eq!(clip_dir_left("src/", 3, 0), "");
+    fn clip_dir_left_marks_elision_when_budget_too_tight() {
+        // A *nested* file must never render as a bare basename (which would read
+        // as a repo-root file). When there's no room for any dir context, we
+        // still emit a bare "…/" marker rather than an empty string.
+        assert_eq!(clip_dir_left("src/long/path/", 10, 10), "…/");
+        assert_eq!(clip_dir_left("src/", 3, 1), "…/");
+        assert_eq!(clip_dir_left("src/", 3, 0), "…/");
+        // A genuine repo-root file (empty dir) still shows no prefix.
+        assert_eq!(clip_dir_left("", 3, 0), "");
     }
 
     #[test]
@@ -848,7 +998,7 @@ mod tests {
         // dir = "longname/" (9 chars), name = 5, budget = 8 → dir_budget = 3, take = 2
         // chars["longname/"][from=7..] = "e/" — no previous slash to snap to
         let d = clip_dir_left("longname/", 5, 8);
-        // Either shows "…e/" or falls back to empty — either is acceptable
-        assert!(d.is_empty() || d.starts_with('…'));
+        // Shows "…e/" or the bare "…/" marker — never empty for a nested dir.
+        assert!(d.starts_with('…'), "got: {d}");
     }
 }

@@ -4569,18 +4569,18 @@ mod tests {
 
     /// A minimal panel model with one unstaged change.
     fn panel_model() -> FrameModel {
-        use crate::panel::{ChangeRow, PanelData, Stage};
+        use crate::panel::{ChangeRow, PanelData};
         FrameModel {
             panel: PanelData {
                 branch: "feat".into(),
                 changes: vec![ChangeRow {
                     status: "M".into(),
-                    stage: Stage::Unstaged,
                     dir: "src/".into(),
                     name: "main.rs".into(),
                     path: "src/main.rs".into(),
                     added: 3,
                     deleted: 1,
+                    ..Default::default() // stage: Unstaged, incoming: false
                 }],
                 ..Default::default()
             },
