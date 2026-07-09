@@ -67,6 +67,12 @@ pub enum NotificationKind {
     ProcessExited,
     /// A non-agent pane's process crashed or exited non-zero.
     ProcessFailed,
+    /// A merge-queue branch landed on the target (fold-actor).
+    QueueLanded,
+    /// A merge-queue branch gated green and awaits a manual land.
+    QueueReady,
+    /// The merge-queue agent gave up on a branch — human intervention needed.
+    QueueNeedsHuman,
 }
 
 /// Attention priority of a notification — the single source of truth that drives
@@ -112,7 +118,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 15] = [
+    pub const ALL: [NotificationKind; 18] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,
@@ -128,6 +134,9 @@ impl NotificationKind {
         Self::LogError,
         Self::ProcessExited,
         Self::ProcessFailed,
+        Self::QueueLanded,
+        Self::QueueReady,
+        Self::QueueNeedsHuman,
     ];
 
     /// The snake_case identifier for this kind — matches both the serde
@@ -150,6 +159,9 @@ impl NotificationKind {
             Self::LogError => "log_error",
             Self::ProcessExited => "process_exited",
             Self::ProcessFailed => "process_failed",
+            Self::QueueLanded => "queue_landed",
+            Self::QueueReady => "queue_ready",
+            Self::QueueNeedsHuman => "queue_needs_human",
         }
     }
 
@@ -162,8 +174,9 @@ impl NotificationKind {
             | Self::AgentAttention
             | Self::TestFailed
             | Self::LogError
-            | Self::ProcessFailed => Priority::Alert,
-            Self::WorktreeCreated | Self::ProcessExited => Priority::Info,
+            | Self::ProcessFailed
+            | Self::QueueNeedsHuman => Priority::Alert,
+            Self::WorktreeCreated | Self::ProcessExited | Self::QueueLanded => Priority::Info,
             Self::Assigned
             | Self::Mentioned
             | Self::StatusChanged
@@ -171,7 +184,8 @@ impl NotificationKind {
             | Self::PrLinked
             | Self::Overdue
             | Self::PrStateChanged
-            | Self::AgentDone => Priority::Notice,
+            | Self::AgentDone
+            | Self::QueueReady => Priority::Notice,
         }
     }
 
@@ -192,6 +206,9 @@ impl NotificationKind {
             Self::LogError => "✗",
             Self::ProcessExited => "◇",
             Self::ProcessFailed => "✗",
+            Self::QueueLanded => "✓",
+            Self::QueueReady => "◆",
+            Self::QueueNeedsHuman => "✋",
         }
     }
 
@@ -212,6 +229,9 @@ impl NotificationKind {
             Self::LogError => "log error",
             Self::ProcessExited => "process exited",
             Self::ProcessFailed => "process failed",
+            Self::QueueLanded => "merge queue landed",
+            Self::QueueReady => "merge queue ready to land",
+            Self::QueueNeedsHuman => "merge queue needs you",
         }
     }
 }
@@ -248,7 +268,7 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 15, "ALL is missing kinds");
+        assert_eq!(seen.len(), 18, "ALL is missing kinds");
     }
 
     #[test]
@@ -265,10 +285,13 @@ mod tests {
                     | NotificationKind::TestFailed
                     | NotificationKind::LogError
                     | NotificationKind::ProcessFailed
+                    | NotificationKind::QueueNeedsHuman
             );
             let expect_info = matches!(
                 kind,
-                NotificationKind::WorktreeCreated | NotificationKind::ProcessExited
+                NotificationKind::WorktreeCreated
+                    | NotificationKind::ProcessExited
+                    | NotificationKind::QueueLanded
             );
             let expected = if expect_alert {
                 Alert

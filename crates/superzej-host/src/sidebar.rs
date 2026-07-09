@@ -192,6 +192,9 @@ pub struct SidebarRow {
     /// most-urgent-child rollup (Workspace rows — drives the collapsed-row
     /// glyph). Denormalized from `SidebarStatus` in one pass at build time.
     pub attention: Option<superzej_core::attention::AttentionScore>,
+    /// The worktree's merge-queue status (its `merge_queue` row, if any) —
+    /// drives the detail line's MQ chip. Denormalized in the same pass.
+    pub mq_status: Option<superzej_core::attention::MqStatus>,
 }
 
 impl SidebarRow {
@@ -240,6 +243,9 @@ pub struct SidebarStatus {
     /// Drives the collapsed-workspace glyph and workspace bubbling.
     pub workspace_attention:
         std::collections::BTreeMap<String, superzej_core::attention::AttentionScore>,
+    /// Per-worktree merge-queue status (keyed by path) — the queue rows the
+    /// attention scan already reads, re-exposed for the sidebar's MQ chip.
+    pub mq: std::collections::BTreeMap<String, superzej_core::attention::MqStatus>,
 }
 
 /// Persisted + transient view state that shapes the tree (collapse/sort/pins/
@@ -405,6 +411,9 @@ pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> 
         let hex = crate::caps::active_glyphs().hex;
         segs.push(seg(Tok::Hue(theme::Hue::Green), format!("{hex} {pr} PR "))); // ⬡N PR
     }
+    if let Some((glyph, hue)) = row.mq_status.and_then(mq_chip) {
+        segs.push(seg(Tok::Hue(hue), format!("{glyph} MQ ")));
+    }
     if row.unread_count > 0 {
         let mail = crate::caps::active_glyphs().mail;
         let blue = Tok::Hue(theme::Hue::Blue);
@@ -422,6 +431,25 @@ pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> 
     }
 
     (segs.len() > start).then_some(Line::Segs(segs))
+}
+
+/// The detail line's merge-queue chip for a status: the section's glyph
+/// vocabulary (see `panel/sections/merge_queue.rs::status_glyph`), minus
+/// `Landed` — a finished row is panel detail, not sidebar-worthy signal.
+fn mq_chip(
+    mq: superzej_core::attention::MqStatus,
+) -> Option<(&'static str, superzej_core::theme::Hue)> {
+    use superzej_core::attention::MqStatus as M;
+    use superzej_core::theme::Hue;
+    Some(match mq {
+        M::Landed => return None,
+        M::Ready => ("◆", Hue::Green),
+        M::Deferred | M::GateFailed => ("⚑", Hue::Red),
+        M::NeedsHuman => ("✋", Hue::Red),
+        M::Folding | M::Verifying => ("●", Hue::Amber),
+        M::AgentRunning => ("◐", Hue::Amber),
+        M::Queued => ("○", Hue::Blue),
+    })
 }
 
 /// Group `db_terminals` into host sections in sidebar **display order**:
@@ -547,6 +575,7 @@ pub fn build_rows(
             disk_bytes: None,
             target_bytes: None,
             attention: None,
+            mq_status: None,
         });
 
         // This repo's worktree groups, straight from the session model.
@@ -631,6 +660,7 @@ pub fn build_rows(
                 disk_bytes: None,
                 target_bytes: None,
                 attention: None,
+                mq_status: None,
             });
         }
 
@@ -710,6 +740,7 @@ pub fn build_rows(
                 disk_bytes: None,
                 target_bytes: None,
                 attention: None,
+                mq_status: None,
             });
 
             if !folder_collapsed {
@@ -778,6 +809,7 @@ pub fn build_rows(
                             disk_bytes: None,
                             target_bytes: None,
                             attention: None,
+                            mq_status: None,
                         });
                     }
                 }
@@ -847,6 +879,7 @@ pub fn build_rows(
                     disk_bytes: None,
                     target_bytes: None,
                     attention: None,
+                    mq_status: None,
                 }
             };
             rows.push(mk(
@@ -903,6 +936,7 @@ pub fn build_rows(
             disk_bytes: None,
             target_bytes: None,
             attention: None,
+            mq_status: None,
         });
     }
 
@@ -937,6 +971,7 @@ pub fn build_rows(
             disk_bytes: None,
             target_bytes: None,
             attention: None,
+            mq_status: None,
         });
 
         // Genuinely-empty fallback (the startup reseed normally keeps a `local`
@@ -969,6 +1004,7 @@ pub fn build_rows(
                 disk_bytes: None,
                 target_bytes: None,
                 attention: None,
+                mq_status: None,
             });
         }
 
@@ -1016,6 +1052,7 @@ pub fn build_rows(
                 disk_bytes: None,
                 target_bytes: None,
                 attention: None,
+                mq_status: None,
             });
 
             if collapsed {
@@ -1068,6 +1105,7 @@ pub fn build_rows(
                     disk_bytes: None,
                     target_bytes: None,
                     attention: None,
+                    mq_status: None,
                 });
             }
         }
@@ -1097,6 +1135,11 @@ pub fn build_rows(
                     .worktree_path
                     .as_deref()
                     .and_then(|p| status.attention.get(p))
+                    .copied();
+                row.mq_status = row
+                    .worktree_path
+                    .as_deref()
+                    .and_then(|p| status.mq.get(p))
                     .copied();
             }
             RowKind::Workspace => {

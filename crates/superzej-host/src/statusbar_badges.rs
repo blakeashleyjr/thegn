@@ -70,28 +70,48 @@ pub(crate) fn push_ci_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<
     }
 }
 
-/// Merge-queue (fold-actor) badge: a red ⚑ chip when branches are deferred and
-/// need a rebase, else an amber chip while branches are queued/folding. Silent
-/// when the queue is empty (clean is quiet).
+/// Merge-queue (fold-actor) badge: a red ⚑ chip when branches are blocked
+/// (deferred / gate-failed / needs-human), an amber chip while the queue is
+/// working (folding / agent running), and a quiet dim chip whenever anything
+/// is merely queued or held at ready — so an idle-but-populated queue is
+/// visible. Silent only when the queue is empty (clean is quiet). Activating
+/// it opens the queue overlay (`detail.rs`).
 pub(crate) fn push_mq_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
     let q = &model.panel.merge_queue;
-    let deferred = q
+    let blocked = q
         .iter()
-        .filter(|r| r.status == "deferred" || r.status == "gate_failed")
+        .filter(|r| {
+            matches!(
+                r.status.as_str(),
+                "deferred" | "gate_failed" | "needs_human"
+            )
+        })
         .count();
-    let active = q
+    let working = q
         .iter()
-        .filter(|r| matches!(r.status.as_str(), "queued" | "folding" | "verifying"))
+        .filter(|r| matches!(r.status.as_str(), "folding" | "verifying" | "agent_running"))
         .count();
-    if deferred > 0 {
+    let idle = q
+        .iter()
+        .filter(|r| matches!(r.status.as_str(), "queued" | "ready"))
+        .count();
+    if blocked > 0 {
         items.push((
             BarItemId::Badge(BarBadge::MergeQueue),
-            vec![Seg::chip(Tok::Hue(Hue::Red), format!(" ⚑ {deferred} MQ "))],
+            vec![Seg::chip(Tok::Hue(Hue::Red), format!(" ⚑ {blocked} MQ "))],
         ));
-    } else if active > 0 {
+    } else if working > 0 {
         items.push((
             BarItemId::Badge(BarBadge::MergeQueue),
-            vec![Seg::chip(Tok::Hue(Hue::Amber), format!(" ⧉ {active} MQ "))],
+            vec![Seg::chip(Tok::Hue(Hue::Amber), format!(" ⧉ {working} MQ "))],
+        ));
+    } else if idle > 0 {
+        items.push((
+            BarItemId::Badge(BarBadge::MergeQueue),
+            vec![Seg::chip(
+                Tok::Slot(crate::chrome::S::Dim),
+                format!(" ⧉ {idle} MQ "),
+            )],
         ));
     }
 }
@@ -146,5 +166,50 @@ mod tests {
         let mut items = Vec::new();
         push_attention_badge(&model, &mut items);
         assert!(chip_text(&items).contains(" 3 "));
+    }
+
+    fn mq_row(status: &str) -> superzej_core::db::MergeQueueRow {
+        superzej_core::db::MergeQueueRow {
+            worktree: format!("/wt/{status}"),
+            branch: format!("b-{status}"),
+            target_branch: "main".into(),
+            status: status.into(),
+            queued_at: 1,
+            updated_at: 1,
+            result_oid: None,
+            conflict_paths: None,
+            error_detail: None,
+        }
+    }
+
+    fn mq_chip_for(statuses: &[&str]) -> Option<(String, Seg)> {
+        let mut model = FrameModel::default();
+        model.panel.merge_queue = statuses.iter().map(|s| mq_row(s)).collect();
+        let mut items = Vec::new();
+        push_mq_badge(&model, &mut items);
+        items
+            .pop()
+            .map(|(_, mut segs)| (segs[0].text.clone(), segs.remove(0)))
+    }
+
+    #[test]
+    fn mq_badge_hues_by_severity_and_shows_idle_queues() {
+        // Empty queue: silent (clean is quiet).
+        assert!(mq_chip_for(&[]).is_none());
+        // Merely queued / held at ready: a quiet dim chip — the queue must be
+        // discoverable even when nothing is running or failing.
+        let (text, seg) = mq_chip_for(&["queued", "ready"]).unwrap();
+        assert!(text.contains("2 MQ"), "{text}");
+        assert_eq!(seg.bg, Some(Tok::Slot(crate::chrome::S::Dim))); // chips carry the tone as bg
+        // Working (agent included) wins over idle: amber.
+        let (text, seg) = mq_chip_for(&["queued", "agent_running"]).unwrap();
+        assert!(text.contains("1 MQ"), "{text}");
+        assert_eq!(seg.bg, Some(Tok::Hue(Hue::Amber))); // chips carry the tone as bg
+        // Anything blocked (needs_human included) wins over all: red ⚑.
+        let (text, seg) = mq_chip_for(&["queued", "folding", "needs_human"]).unwrap();
+        assert!(text.contains("⚑ 1 MQ"), "{text}");
+        assert_eq!(seg.bg, Some(Tok::Hue(Hue::Red))); // chips carry the tone as bg
+        // Only landed rows: nothing left to signal.
+        assert!(mq_chip_for(&["landed"]).is_none());
     }
 }

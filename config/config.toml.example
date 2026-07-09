@@ -929,11 +929,13 @@ active_mode = ""
 #              mapped to "critical" urgency, a desktop toast
 #   "notice" — counts toward the neutral "N unread" badge, never the red flag
 #   "info"   — inbox history only; never counted toward any badge
-# Defaults: failures (agent_failed, test_failed, log_error, process_failed) are
-# "alert"; lifecycle events (worktree_created, process_exited) are "info";
-# everything else (assigned, mentioned, status_changed, blocker_resolved,
-# pr_linked, overdue, pr_state_changed, agent_done) is "notice". Override any
-# kind below (keys are the snake_case kind names). Unknown keys/values are ignored.
+# Defaults: failures (agent_failed, test_failed, log_error, process_failed,
+# queue_needs_human) are "alert"; lifecycle events (worktree_created,
+# process_exited, queue_landed) are "info"; everything else (assigned,
+# mentioned, status_changed, blocker_resolved, pr_linked, overdue,
+# pr_state_changed, agent_done, queue_ready) is "notice". Override any kind
+# below (keys are the snake_case kind names). Unknown keys/values are ignored.
+# The queue_* kinds are the merge queue's settled transitions ([merge_queue]).
 # [notifications.priority]
 # agent_done = "alert"        # promote: flag me when an agent finishes
 # worktree_created = "notice" # demote less: show in the unread count
@@ -2428,6 +2430,13 @@ bouncer = false
 # automatically as sequential merge commits, and only genuine conflicts are
 # deferred for you (or an agent) to resolve. Fire it once with `superzej
 # integrate` / the palette action.
+#
+# Manage the queue from the TUI: Ctrl+Alt+q (or the palette's "Merge queue")
+# opens Work ▸ Merge queue, where `a`/`A` enqueue, `x` removes, `r` retries,
+# `l` lands a ready branch, `c` clears landed rows, and `D` drains the queue
+# with the agent autopilot — transitions stream into the panel live, and the
+# settled ones (queue_landed / queue_ready / queue_needs_human) toast and land
+# in the notifications inbox. CLI equivalent: `superzej merge …`.
 #
 # Because ten clean *textual* merges say nothing about whether their *union*
 # builds, the fold is test-gated: the folded tip is checked out into a throwaway

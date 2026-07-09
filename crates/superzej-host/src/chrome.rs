@@ -2729,7 +2729,7 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
             ("r", "rerun"),
             ("o", "browser"),
         ],
-        Section::MergeQueue => &[("j/k", "row")],
+        Section::MergeQueue => &[("a/A", "add"), ("D", "drain"), ("l/r/x", "act")],
         Section::Files => &[("↵", "open"), ("y", "yazi")],
         Section::Issues => &[
             ("j/k", "row"),
@@ -3151,11 +3151,7 @@ mod tests {
     fn row(kind: crate::sidebar::RowKind, label: &str) -> crate::sidebar::SidebarRow {
         crate::sidebar::SidebarRow {
             kind,
-            depth: if kind == crate::sidebar::RowKind::Workspace {
-                0
-            } else {
-                1
-            },
+            depth: (kind != crate::sidebar::RowKind::Workspace) as u8,
             label: label.into(),
             workspace_slug: "app".into(),
             tab_target: None,
@@ -3179,6 +3175,7 @@ mod tests {
             target_bytes: None,
             terminal_connection: None,
             attention: None,
+            mq_status: None,
         }
     }
 

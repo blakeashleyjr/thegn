@@ -68,6 +68,9 @@ pub enum DetailAction {
     OpenLogPager,
     /// Copy a single log line's raw text to the system clipboard.
     CopyLine(String),
+    /// Open the right panel to Work ▸ Merge queue (the MQ badge's `m` key —
+    /// intercepted by the loop, which owns the panel state).
+    OpenMergeQueueSection,
 }
 
 impl DetailAction {
@@ -2041,23 +2044,33 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                 .map(|r| {
                     let (glyph, marker) = match r.status.as_str() {
                         "landed" => ("✓", Tok::Hue(Hue::Green)),
+                        "ready" => ("◆", Tok::Hue(Hue::Green)),
                         "deferred" | "gate_failed" => ("⚑", Tok::Hue(Hue::Red)),
+                        "needs_human" => ("✋", Tok::Hue(Hue::Red)),
                         "folding" | "verifying" => ("●", Tok::Hue(Hue::Amber)),
+                        "agent_running" => ("◐", Tok::Hue(Hue::Amber)),
                         _ => ("○", Tok::Slot(S::Dim)),
                     };
-                    let note = if r.status == "deferred" || r.status == "gate_failed" {
-                        r.conflict_paths.as_ref().map(|p| p.replace('\n', ", "))
-                    } else {
-                        None
+                    let note = match r.status.as_str() {
+                        "deferred" | "gate_failed" | "needs_human" => r
+                            .error_detail
+                            .as_deref()
+                            .or(r.conflict_paths.as_deref())
+                            .map(|p| p.replace('\n', ", ")),
+                        _ => Some(r.status.clone()),
                     };
-                    let mut row = DetailRow::new(marker, glyph, r.branch.clone());
+                    let mut row = DetailRow::new(marker, glyph, r.branch.clone())
+                        .on_enter(DetailAction::FocusWorktree(r.worktree.clone()))
+                        .action('m', DetailAction::OpenMergeQueueSection);
                     if let Some(n) = note {
                         row = row.note(n);
                     }
                     row
                 })
                 .collect();
-            Some(list("Merge queue", rows, "merge queue empty", 56, 14))
+            let mut ov = list("Merge queue", rows, "merge queue empty", 56, 14);
+            ov.hint = Some("↵ focus worktree · m open section".into());
+            Some(ov)
         }
         BarBadge::Ingress => {
             if model.shares.is_empty() {

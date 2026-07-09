@@ -7474,16 +7474,13 @@ transport = \"ssh\"
             Priority::Notice
         );
 
-        // Alert set is the failures + the agent-attention request; unread excludes Info.
+        // Alert set: failures + agent-attention + the queue's give-up; unread
+        // excludes Info.
         let alerts = cfg.alert_kind_names();
-        assert_eq!(alerts.len(), 5);
-        for k in [
-            "agent_failed",
-            "agent_attention",
-            "test_failed",
-            "log_error",
-            "process_failed",
-        ] {
+        assert_eq!(alerts.len(), 6);
+        let want = "agent_failed agent_attention test_failed log_error \
+                    process_failed queue_needs_human";
+        for k in want.split_whitespace() {
             assert!(alerts.contains(&k), "missing {k}");
         }
         let counted = cfg.counted_unread_kind_names();
