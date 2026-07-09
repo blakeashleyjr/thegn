@@ -10276,6 +10276,12 @@ async fn event_loop<T: Terminal>(
                 want_model_refresh: &mut want_model_refresh,
                 dirty: &mut dirty,
                 loop_perf: &mut loop_perf,
+                // For reaping a tab whose worktree an `on_landed = remove/detach`
+                // land just deleted (the drains route removals through delete_groups).
+                session: &mut session,
+                panes: &mut panes,
+                need_relayout: &mut need_relayout,
+                waker: &waker,
             };
             crate::handlers::merge_queue::drain_fold_results(&mut fold_rx, &mut mq_ctx);
             crate::handlers::merge_queue::drain_drive_msgs(&mut drive_rx, &mut mq_ctx);
