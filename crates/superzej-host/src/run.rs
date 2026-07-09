@@ -5392,60 +5392,6 @@ fn schedule_toast_clear(waker: &TerminalWaker) {
     });
 }
 
-/// Read a file off the loop for the inline Files preview, sending
-/// `(rel_path, Ok(lines) | Err(reason))` back and pulsing the waker. The
-/// rel_path tags the result so a fast esc/reopen drops strays.
-fn spawn_file_preview_fetch(
-    rel: String,
-    abs: std::path::PathBuf,
-    tx: tokio_mpsc::UnboundedSender<(String, Result<Vec<String>, String>)>,
-    waker: TerminalWaker,
-) {
-    tokio::task::spawn_blocking(move || {
-        let result = read_file_preview(&abs);
-        if tx.send((rel, result)).is_ok() {
-            let _ = waker.wake();
-        }
-    });
-}
-
-/// Read + decode a file for preview, rejecting files that are too large before
-/// reading them. The decode/limits live in [`prepare_preview`] (pure).
-fn read_file_preview(abs: &std::path::Path) -> Result<Vec<String>, String> {
-    const MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
-    if let Ok(meta) = std::fs::metadata(abs)
-        && meta.len() > MAX_BYTES
-    {
-        return Err(format!("file too large ({} KiB)", meta.len() / 1024));
-    }
-    let bytes = std::fs::read(abs).map_err(|e| format!("cannot read: {e}"))?;
-    prepare_preview(&bytes)
-}
-
-/// Decode bytes into preview lines: reject binary content (a NUL byte), expand
-/// tabs to 4 spaces, strip CRs, and cap the line count. Pure + unit-tested.
-fn prepare_preview(bytes: &[u8]) -> Result<Vec<String>, String> {
-    if bytes.contains(&0) {
-        return Err("binary file".into());
-    }
-    const MAX_LINES: usize = 50_000;
-    let text = String::from_utf8_lossy(bytes);
-    let mut lines: Vec<String> = text
-        .split('\n')
-        .take(MAX_LINES)
-        .map(|l| l.trim_end_matches('\r').replace('\t', "    "))
-        .collect();
-    // A trailing newline splits into a spurious empty final element — drop it,
-    // but keep a single empty line for a genuinely empty file.
-    if text.ends_with('\n') && lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    Ok(lines)
-}
-
 /// Run the detected test command off-thread; results (parsed indicator
 /// lines + summary) ride the channel back to the loop with a waker pulse.
 /// Run a test task off the loop, capped + single-flight (see `crate::task`),
@@ -7189,7 +7135,12 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<(std::path::PathBuf, crate::panel::PanelData)>();
     // The inline Files preview reader: `(rel_path, Ok(lines) | Err(reason))`.
     let (file_preview_tx, mut file_preview_rx) =
-        tokio_mpsc::unbounded_channel::<(String, Result<Vec<String>, String>)>();
+        tokio_mpsc::unbounded_channel::<crate::preview_pane::TextMsg>();
+    // The document-viewer graphics path: a rasterized preview image (image /
+    // Mermaid / PDF page) drawn over the panel via kitty (`crate::preview_gfx`).
+    let (preview_img_tx, mut preview_img_rx) =
+        tokio_mpsc::unbounded_channel::<crate::preview_pane::ImageMsg>();
+    let mut preview_gfx = crate::preview_gfx::PreviewGfx::new();
     // The git mutation runner + the line-cursor document fetches (staging
     // diff, drilled-commit files, patch doc). Results are tagged with
     // `panel_ui.git.op_gen` so a worktree switch kills strays on arrival.
@@ -9486,6 +9437,14 @@ async fn event_loop<T: Terminal>(
                 panel_ui.hunks.insert(path, hunks);
                 dirty = true;
             }
+        }
+
+        // Rasterized preview images (document-viewer graphics path) land in the
+        // graphics holder; the post-flush emitter draws them over the panel.
+        while let Ok((path, raster)) = preview_img_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::FilePreview);
+            preview_gfx.set(path, raster);
+            dirty = true;
         }
 
         // Completed inline-file reads land on the open preview (if it's still
@@ -11961,6 +11920,20 @@ async fn event_loop<T: Terminal>(
                 corner_occluded = occluded_now;
             } else {
                 corner_gfx.clear();
+            }
+            // Document-viewer graphics: draw (or delete) the rasterized preview
+            // image over the panel rect, after the cell frame is flushed — same
+            // "images ride on top" approach as the corner relay above.
+            {
+                let open_preview = panel_ui.file_preview.as_ref().map(|fp| fp.path.as_str());
+                let blob =
+                    preview_gfx.frame(chrome.panel, open_preview, overlays.any(), corner_kitty);
+                if !blob.is_empty() {
+                    use std::io::Write as _;
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(&blob);
+                    let _ = out.flush();
+                }
             }
             dirty = false;
             // Record the frame's compose+flush latency (p50/p99 in the rollup)
@@ -15237,11 +15210,13 @@ async fn event_loop<T: Terminal>(
                                                             crate::layout::PanelWidth::Half;
                                                         need_relayout = true;
                                                     }
-                                                    spawn_file_preview_fetch(
+                                                    crate::preview_pane::spawn_fetch(
                                                         entry.path,
                                                         abs,
                                                         file_preview_tx.clone(),
+                                                        preview_img_tx.clone(),
                                                         waker.clone(),
+                                                        corner_kitty,
                                                     );
                                                 }
                                             }
@@ -21179,31 +21154,6 @@ mod tests {
         let (last, leftover) = drain_drag_events(first_drag(1, 1), || q.pop_front());
         assert_eq!((last.x, last.y), (6, 6));
         assert!(matches!(leftover, Some(InputEvent::Key(_))));
-    }
-
-    #[test]
-    fn prepare_preview_expands_tabs_and_drops_trailing_newline() {
-        let lines = prepare_preview(b"a\tb\nc\n").unwrap();
-        assert_eq!(lines, vec!["a    b".to_string(), "c".to_string()]);
-    }
-
-    #[test]
-    fn prepare_preview_rejects_binary() {
-        assert_eq!(prepare_preview(b"abc\0def"), Err("binary file".into()));
-    }
-
-    #[test]
-    fn prepare_preview_strips_cr_and_keeps_interior_blank_lines() {
-        let lines = prepare_preview(b"one\r\n\r\nthree").unwrap();
-        assert_eq!(
-            lines,
-            vec!["one".to_string(), String::new(), "three".to_string()]
-        );
-    }
-
-    #[test]
-    fn prepare_preview_empty_file_is_one_blank_line() {
-        assert_eq!(prepare_preview(b"").unwrap(), vec![String::new()]);
     }
 
     #[test]
