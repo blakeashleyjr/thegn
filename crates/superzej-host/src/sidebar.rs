@@ -31,6 +31,18 @@ pub enum RowKind {
     EmptyHint,
 }
 
+impl RowKind {
+    /// Whether rows of this kind head a collapsible subtree (drive a caret and
+    /// respond to the collapse/expand keys). Workspaces, 📂 folder sub-groups,
+    /// and terminal-host groups collapse; leaves and banners do not.
+    pub fn is_collapsible(self) -> bool {
+        matches!(
+            self,
+            RowKind::Workspace | RowKind::Folder | RowKind::TerminalHost
+        )
+    }
+}
+
 /// Contextual activity, mirrored from the host-side `activity` state machine.
 /// Drives the sidebar dot's glyph + color: `Active` (worktree busy / agent
 /// working) is a filled white ●; `Waiting` (was active, now idle — the agent is
@@ -201,6 +213,17 @@ impl SidebarRow {
     pub fn is_markable(&self) -> bool {
         !self.pin_key.is_empty() && matches!(self.kind, RowKind::Workspace | RowKind::Worktree)
     }
+
+    /// The `ViewState::collapsed` key for this row's group. 📂 Folder groups
+    /// collapse independently of their workspace, so they key on `pin_key`
+    /// (`{slug}/folder:{id}`); every other collapsible row (Workspace,
+    /// TerminalHost) keys on its `workspace_slug`. Meaningless for leaves.
+    pub fn collapse_key(&self) -> &str {
+        match self.kind {
+            RowKind::Folder => &self.pin_key,
+            _ => &self.workspace_slug,
+        }
+    }
 }
 
 /// Per-worktree status sourced from the (possibly slow) git/activity scan on
@@ -298,6 +321,43 @@ pub struct DbWorktree {
 pub fn split_tab(name: &str) -> Option<(String, String)> {
     let (repo, branch) = name.split_once('/')?;
     (!repo.is_empty()).then(|| (repo.to_string(), branch.to_string()))
+}
+
+/// The `ViewState::collapsed` keys that hide the active worktree named
+/// `active_name` (a `{slug}/{branch}` group name). Always its workspace slug;
+/// plus its folder key (`{slug}/folder:{id}`) when a matching `DbWorktree` (by
+/// `tab_name`) is filed to a folder. Empty when `active_name` isn't a worktree
+/// (e.g. a terminal group name that doesn't split), so the caller reveals
+/// nothing. Pure over the DB carrier so it's unit-testable without a `Session`.
+pub fn active_reveal_keys(active_name: &str, db_worktrees: &[DbWorktree]) -> Vec<String> {
+    let Some((slug, _branch)) = split_tab(active_name) else {
+        return Vec::new();
+    };
+    let mut keys = vec![slug.clone()];
+    if let Some(fid) = db_worktrees
+        .iter()
+        .find(|w| w.tab_name == active_name)
+        .and_then(|w| w.folder_id)
+    {
+        keys.push(format!("{slug}/folder:{fid}"));
+    }
+    keys
+}
+
+/// Index (into the same `visible_rows` slice) of the nearest collapsible
+/// **ancestor** of the cursor row — the first earlier row with a smaller depth
+/// whose kind is collapsible. Drives "collapse key on a sub-item collapses its
+/// parent": a filed worktree → its Folder, a loose worktree → its Workspace, a
+/// terminal → its TerminalHost, a folder → its Workspace. `None` at the top of
+/// the tree (no collapsible ancestor). Pure over the visible-row slice.
+pub fn parent_collapsible_index(visible_rows: &[&SidebarRow], cursor: usize) -> Option<usize> {
+    let depth = visible_rows.get(cursor)?.depth;
+    visible_rows[..cursor]
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, r)| r.depth < depth && r.kind.is_collapsible())
+        .map(|(i, _)| i)
 }
 
 /// Strip a single trailing shell-prompt sigil (`$` `%` `#` `>`) and surrounding
@@ -1981,5 +2041,174 @@ mod tests {
         assert!(visible.contains(&(&RowKind::TerminalHost, "prod")));
         assert!(visible.contains(&(&RowKind::Terminal, "web-prod")));
         assert!(!visible.iter().any(|(_, l)| *l == "local"));
+    }
+
+    /// A workspace with one loose worktree (`home`) and one worktree (`feat`)
+    /// filed under a 📂 folder. Returns `(session, workspaces, db_worktrees,
+    /// db_folders)` ready for `build_rows`.
+    #[allow(clippy::type_complexity)]
+    fn folder_fixture() -> (
+        Session,
+        Vec<(String, String, String, String)>,
+        Vec<DbWorktree>,
+        Vec<superzej_core::models::FolderRow>,
+    ) {
+        let s = session(
+            vec![tab("app/home", "/wt/home"), tab("app/feat", "/wt/feat")],
+            1,
+        );
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let dbw = vec![DbWorktree {
+            slug: "app".into(),
+            branch: "feat".into(),
+            repo_path: "/repos/app".into(),
+            tab_name: "app/feat".into(),
+            path: "/wt/feat".into(),
+            folder_id: Some(1),
+            sandbox_backend: None,
+            env_name: None,
+        }];
+        let folders = vec![superzej_core::models::FolderRow {
+            folder_id: 1,
+            repo_path: "/repos/app".into(),
+            name: "Backend".into(),
+            position: 0,
+            created_at: 0,
+        }];
+        (s, ws, dbw, folders)
+    }
+
+    #[test]
+    fn folder_collapse_key_is_per_kind_and_hides_filed_children() {
+        let (s, ws, dbw, folders) = folder_fixture();
+
+        // Expanded: folder header + its filed child both render.
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &dbw,
+            &folders,
+            &[],
+        );
+        let folder = rows
+            .iter()
+            .find(|r| r.kind == RowKind::Folder)
+            .expect("folder row present");
+        // A folder keys collapse on its own pin_key, NOT the workspace slug.
+        assert_eq!(folder.collapse_key(), "app/folder:1");
+        assert!(!folder.collapsed);
+        let workspace = rows
+            .iter()
+            .find(|r| r.kind == RowKind::Workspace)
+            .expect("workspace row present");
+        assert_eq!(workspace.collapse_key(), "app");
+        // The filed worktree renders under the folder (depth 2).
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == RowKind::Worktree && r.label == "feat" && r.depth == 2)
+        );
+
+        // Collapse the folder only: its child hides, but the folder row, the
+        // workspace, and the loose `home` sibling stay visible.
+        let view = ViewState {
+            collapsed: ["app/folder:1".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &folders, &[]);
+        let folder = rows
+            .iter()
+            .find(|r| r.kind == RowKind::Folder)
+            .expect("folder row still present");
+        assert!(folder.collapsed);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.kind == RowKind::Worktree && r.label == "feat")
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == RowKind::Worktree && r.label == "home" && r.visible)
+        );
+    }
+
+    #[test]
+    fn active_reveal_keys_covers_workspace_and_folder() {
+        let dbw = vec![DbWorktree {
+            slug: "app".into(),
+            branch: "feat".into(),
+            repo_path: "/repos/app".into(),
+            tab_name: "app/feat".into(),
+            path: "/wt/feat".into(),
+            folder_id: Some(3),
+            sandbox_backend: None,
+            env_name: None,
+        }];
+        // Filed worktree → both its workspace and its folder key.
+        assert_eq!(
+            active_reveal_keys("app/feat", &dbw),
+            vec!["app".to_string(), "app/folder:3".to_string()]
+        );
+        // Loose worktree (no matching db row) → workspace only.
+        assert_eq!(
+            active_reveal_keys("app/home", &dbw),
+            vec!["app".to_string()]
+        );
+        // A non-worktree name (no slash) → nothing to reveal.
+        assert!(active_reveal_keys("scratch", &dbw).is_empty());
+    }
+
+    #[test]
+    fn parent_collapsible_index_walks_up_to_the_group() {
+        let (s, ws, dbw, folders) = folder_fixture();
+        let terms = vec![term("t1", "remote", "ssh prod")];
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &dbw,
+            &folders,
+            &terms,
+        );
+        let visible: Vec<&SidebarRow> = rows.iter().filter(|r| r.visible).collect();
+        let idx = |kind: RowKind, label: &str| {
+            visible
+                .iter()
+                .position(|r| r.kind == kind && r.label == label)
+                .unwrap_or_else(|| panic!("row {label:?} present"))
+        };
+
+        // Filed worktree → its Folder; loose worktree → its Workspace.
+        let feat = idx(RowKind::Worktree, "feat");
+        assert_eq!(
+            parent_collapsible_index(&visible, feat),
+            Some(idx(RowKind::Folder, "Backend (1)"))
+        );
+        let home = idx(RowKind::Worktree, "home");
+        assert_eq!(
+            parent_collapsible_index(&visible, home),
+            Some(idx(RowKind::Workspace, "app"))
+        );
+        // Folder → its Workspace; a terminal → its TerminalHost.
+        assert_eq!(
+            parent_collapsible_index(&visible, idx(RowKind::Folder, "Backend (1)")),
+            Some(idx(RowKind::Workspace, "app"))
+        );
+        assert_eq!(
+            parent_collapsible_index(&visible, idx(RowKind::Terminal, "t1")),
+            Some(idx(RowKind::TerminalHost, "prod"))
+        );
+        // A top-level workspace has no collapsible ancestor.
+        assert_eq!(
+            parent_collapsible_index(&visible, idx(RowKind::Workspace, "app")),
+            None
+        );
     }
 }

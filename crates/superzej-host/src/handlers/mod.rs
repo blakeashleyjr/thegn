@@ -12,6 +12,7 @@ pub(crate) mod panel_changes;
 pub(crate) mod provision;
 pub(crate) mod repo_trust;
 pub(crate) mod sidebar_activate;
+pub(crate) mod sidebar_collapse;
 pub(crate) mod sidebar_reorder;
 pub(crate) mod startup;
 pub(crate) mod switch;
