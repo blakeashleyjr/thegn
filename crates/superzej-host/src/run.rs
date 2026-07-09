@@ -7663,8 +7663,12 @@ async fn event_loop<T: Terminal>(
         &waker,
     );
     // The transient which-key popup (set while a multi-key prefix is pending).
-    let mut which_key: Vec<crate::keyhint::HintRow> = Vec::new();
+    // `which_key` holds the candidate rows (each keeps its raw `Key` so a
+    // filter-mode `↵` can re-feed it through `keymap.dispatch`); `which_key_filter`
+    // is the optional grep session (`None` = plain reference mode).
+    let mut which_key: Vec<crate::keyhint::WhichKeyRow> = Vec::new();
     let mut which_key_prefix = String::new();
+    let mut which_key_filter: Option<crate::keyhint::WhichKeyFilter> = None;
     // Persisted vim-style registers (`"a`–`"z`/`"0`–`"9`, `"` default, `"+`
     // clipboard). Loaded from the DB; a yank persists back. `PasteRegister` arms
     // `pending_paste_register` so the next key names the register to paste.
@@ -11716,14 +11720,15 @@ async fn event_loop<T: Terminal>(
             if let Some(v) = &pr_view {
                 v.render(&mut scratch, screen);
             }
-            let accent = current_config.accent_rgb();
             if !which_key.is_empty() {
                 crate::keyhint::render_which_key(
                     &mut scratch,
                     screen,
-                    &which_key_prefix,
-                    &which_key,
-                    &accent,
+                    &crate::keyhint::WhichKeyView {
+                        prefix: &which_key_prefix,
+                        rows: &which_key,
+                        filter: which_key_filter.as_ref(),
+                    },
                 );
             }
             // Toasts float above everything else — last in, top of the stack.
@@ -12693,6 +12698,10 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 let mut forced_palette_action: Option<crate::keymap::Action> = None;
+                // Set when a which-key filter row is run via `↵`: its `Key` is
+                // re-fed through the normal dispatch site below (a terminal row
+                // runs; a nested-prefix row drills into the deeper popup).
+                let mut forced_which_key: Option<crate::sequence::Key> = None;
                 // Worktree creation is non-modal (its own tab's loading splash);
                 // it swallows no input. Failure removes the tab + shows status.
                 // Modal: the new-terminal wizard captures all keys; submit is
@@ -16661,9 +16670,43 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                 }
+                // While a which-key popup is open it claims a small key vocabulary
+                // (plain mode: `/` opens the filter, Esc dismisses; filter mode:
+                // typing/arrows/Enter/Backspace). Any other key is `Ignore`d and
+                // falls straight through to normal dispatch, so single-letter
+                // accelerators still run instantly.
+                if !which_key.is_empty() {
+                    match crate::keyhint::handle_which_key_key(
+                        &k,
+                        &which_key,
+                        &mut which_key_filter,
+                    ) {
+                        crate::keyhint::WhichKeyKey::Ignore => {}
+                        crate::keyhint::WhichKeyKey::Redraw => {
+                            dirty = true;
+                            continue;
+                        }
+                        crate::keyhint::WhichKeyKey::Dismiss => {
+                            which_key.clear();
+                            which_key_filter = None;
+                            keymap.reset();
+                            apply_mode_status(&mut model, mode, &current_config);
+                            dirty = true;
+                            continue;
+                        }
+                        crate::keyhint::WhichKeyKey::Run(idx) => {
+                            // Re-feed the selected row's key through the normal
+                            // dispatch site below; the dispatch arms clear the
+                            // popup + filter (Matched/Pending/None all reset it).
+                            forced_which_key = which_key.get(idx).map(|r| r.key.clone());
+                        }
+                    }
+                }
                 // Global/mode chords are intercepted by the keymap; everything
                 // else is forwarded to the focused pane.
-                let input_key = crate::sequence::Key::modified(k.key, k.modifiers);
+                let input_key = forced_which_key
+                    .take()
+                    .unwrap_or_else(|| crate::sequence::Key::modified(k.key, k.modifiers));
                 // The program running in the focused (or drawer) pane keys the
                 // per-program overlay + remap layers.
                 let focused_program = panes
@@ -16706,6 +16749,7 @@ async fn event_loop<T: Terminal>(
                         use crate::keymap::Action;
                         // A completed chord clears any pending which-key popup.
                         which_key.clear();
+                        which_key_filter = None;
                         match action {
                             Action::SwitchMode(next) => {
                                 mode = next;
@@ -18833,19 +18877,22 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                     crate::sequence::MatchResult::Pending => {
-                        // Show the which-key popup of next-key candidates.
+                        // Show the which-key popup of next-key candidates. Drilling
+                        // into a deeper prefix starts fresh in plain mode.
                         which_key_prefix = crate::keyhint::key_hint(&input_key);
-                        which_key = crate::keyhint::which_key_rows(
+                        which_key = crate::keyhint::build_rows(
                             &keymap.pending_continuations(mode),
                             keymap.custom_actions(),
                         );
-                        model.status = format!("{} mode   awaiting next key…", mode.as_str());
+                        which_key_filter = None;
+                        model.status = format!("{} mode   next key…  (/ to filter)", mode.as_str());
                         dirty = true;
                         continue;
                     }
                     crate::sequence::MatchResult::None => {
                         // No match (and not pending): dismiss any which-key popup.
                         which_key.clear();
+                        which_key_filter = None;
                     }
                 }
                 // Keys the sidebar/panel didn't claim must never leak into the
