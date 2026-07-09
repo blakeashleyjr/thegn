@@ -771,7 +771,7 @@ Agent Telemetry Export (**R 690**)._
 - [ ] 253. Screen-phrase matching fallback
 - [ ] 254. OTEL ingestion (CC)
 - [ ] 255. Per-agent activity timeline
-- [ ] 256. Needs-attention surfacing
+- [x] 256. Needs-attention surfacing _(attention tiers + default Attention sort + reason hint + statusbar ✋ chip — openspec `add-sidebar-attention-sort`; authoritative OSC/CLI signals remain `add-osc-attention-signaling`)_
 - [ ] 257. Transcript viewer
 - [ ] 258. Session replay
 - [ ] 655. Per-worktree status/checkpoint field — agent-writable free-text "what just happened / status / next step" string (set via a CLI verb, `--json`), surfaced in the sidebar (feeds B 28), statusbar, panel, and the attention queue; read-before-write to preserve context (Orca worktree-comment pattern)
@@ -781,7 +781,7 @@ Agent Telemetry Export (**R 690**)._
 _Tier-1 attention routing keeps the existing one-key jump and review/merge flows
 as the agent-specific side of the broader attention queue._
 
-- [~] 259. Needs-attention jump (one key)
+- [x] 259. Needs-attention jump (one key) _(`Alt a` / `attention-next`, wraps the needs-you set, crosses workspaces — openspec `add-sidebar-attention-sort`)_
 - [x] 260. Diff review pane (highlighted)
 - [~] 261. Unified/side-by-side toggle
 - [ ] 262. Inline comments → follow-up prompt

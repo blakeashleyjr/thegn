@@ -95,6 +95,45 @@ pub fn read_states_at(path: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// One worktree's full activity entry, keyed by **worktree path** (unlike
+/// [`read_states`], which keys by tab name). Exposes the FSM's timestamps so
+/// consumers (the attention model) can rank by how long a state has held.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivityEntry {
+    pub tab: String,
+    /// `"none" | "active" | "waiting" | "read"`.
+    pub state: String,
+    /// When the state went quiet (unix seconds) — set for waiting/read.
+    pub quiet_since: Option<f64>,
+    /// When the current busy streak began — set while busy.
+    pub busy_since: Option<f64>,
+}
+
+/// Read the latest activity entries as `worktree_path -> entry`. Empty on any
+/// read/parse failure (same self-healing contract as [`read_states`]).
+pub fn read_entries() -> BTreeMap<String, ActivityEntry> {
+    read_entries_at(&state_path())
+}
+
+/// [`read_entries`] against an explicit snapshot path (testable).
+pub fn read_entries_at(path: &Path) -> BTreeMap<String, ActivityEntry> {
+    load(path)
+        .worktrees
+        .into_iter()
+        .map(|(wt, e)| {
+            (
+                wt,
+                ActivityEntry {
+                    tab: e.tab,
+                    state: e.state,
+                    quiet_since: e.quiet_since,
+                    busy_since: e.busy_since,
+                },
+            )
+        })
+        .collect()
+}
+
 /// Advance the FSM one step over `managed` and persist. Cheap to call on a
 /// timer; skips the `/proc` walk if the last scan was under a second ago.
 pub fn poll_and_save(managed: &[ManagedWorktree]) {
@@ -412,6 +451,26 @@ mod tests {
         assert_eq!(m.get("app/home").map(String::as_str), Some("waiting"));
         assert_eq!(m.get("app/feat").map(String::as_str), Some("read"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_entries_exposes_timestamps_keyed_by_path() {
+        let path = tmp("entries");
+        let json = r#"{"worktrees":{
+            "/wt/a":{"tab":"app/home","state":"waiting","cpu_jiffies":0,"quiet_since":1234.0},
+            "/wt/b":{"tab":"app/feat","state":"active","cpu_jiffies":0,"busy_since":2000.0}}}"#;
+        std::fs::write(&path, json).unwrap();
+        let m = read_entries_at(&path);
+        let a = &m["/wt/a"];
+        assert_eq!((a.tab.as_str(), a.state.as_str()), ("app/home", "waiting"));
+        assert_eq!(a.quiet_since, Some(1234.0));
+        assert_eq!(a.busy_since, None);
+        let b = &m["/wt/b"];
+        assert_eq!(b.busy_since, Some(2000.0));
+        // Missing file → empty map; default-path wrapper never panics.
+        let _ = std::fs::remove_file(&path);
+        assert!(read_entries_at(&path).is_empty());
+        let _ = read_entries();
     }
 
     #[test]

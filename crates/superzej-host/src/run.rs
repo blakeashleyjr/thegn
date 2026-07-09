@@ -1969,124 +1969,9 @@ impl SidebarState {
     }
 }
 
-/// Activate a sidebar row target: focus a live `(group, tab)` in the session,
-/// or switch to another workspace (landing on its named worktree group when
-/// that group exists in the target's persisted layout).
-#[allow(clippy::too_many_arguments)]
-fn activate_row_target(
-    target: crate::sidebar::RowTarget,
-    session: &mut crate::session::Session,
-    model: &mut FrameModel,
-    sb: &mut SidebarState,
-    panes: &mut Panes,
-    drawer: &mut Option<u32>,
-    pool: &mut DrawerPool,
-    home: &mut Option<std::path::PathBuf>,
-    workspace_pool: &mut WorkspacePool,
-    cfg: &superzej_core::config::Config,
-    center: Rect,
-    need_relayout: &mut bool,
-    clear_on_next_frame: &mut bool,
-) -> bool {
-    // Set when this activation switched to a different workspace, so the caller
-    // can kick an immediate model hydration (the new workspace's worktree paths
-    // aren't in `model.sidebar_status` yet — without this the git glyphs blank
-    // out until the ~1s refresh ticker fires).
-    let mut workspace_switched = false;
-    // Set when this activation adds a *new* group to the session (the lazy
-    // terminal-materialize arm below). Only then does the layout structurally
-    // change and warrant the heavyweight `persist_session_layout`; a plain
-    // tab/worktree activation is a pure focus move and persists cheaply.
-    let mut structural = false;
-    match target {
-        crate::sidebar::RowTarget::Tab(gi, ti) => {
-            if gi >= session.worktrees.len() {
-                return false;
-            }
-            session.switch_to_tab(gi, ti);
-        }
-        // A terminal row uses the sentinel repo_path "terminal" when its group
-        // isn't resident in the session yet (a terminal declared in the global
-        // `terminals` table — e.g. the auto-provisioned default — that this
-        // session has never opened). Switch to the existing group if present,
-        // else materialize a fresh Terminal group; its pane spawns lazily via
-        // the materialize path, which resolves the connection by name.
-        crate::sidebar::RowTarget::Workspace { repo_path, group } if repo_path == "terminal" => {
-            let Some(name) = group else {
-                return false;
-            };
-            if let Some(gi) = session.worktrees.iter().position(|w| w.name == name) {
-                session.switch_to_tab(gi, 0);
-            } else {
-                let placeholder = panes.reserve_ids(1);
-                session.worktrees.push(crate::session::WorktreeGroup {
-                    name,
-                    kind: crate::session::GroupKind::Terminal,
-                    path: String::new(),
-                    tabs: vec![crate::session::Tab {
-                        title: "main".to_string(),
-                        center: crate::center::CenterTree::Leaf(placeholder),
-                        focused_pane: placeholder,
-                        pane_cwds: Default::default(),
-                        pane_cmds: Default::default(),
-                        pane_sessions: Default::default(),
-                        pane_scrollback: Default::default(),
-                    }],
-                    active_tab: 0,
-                });
-                session.active = session.worktrees.len() - 1;
-                *need_relayout = true;
-                structural = true;
-            }
-        }
-        crate::sidebar::RowTarget::Workspace { repo_path, group } => {
-            let Ok(db) = superzej_core::db::Db::open() else {
-                return false;
-            };
-            // Park the outgoing workspace's panes (kept alive) and restore the
-            // target's — no reaping, so an editor/server keeps running across
-            // the switch. `switch_workspace` handles the id-aliasing that the
-            // old reap guarded against by remapping cold-resurrected ids.
-            if !switch_workspace(
-                &repo_path,
-                group.as_deref(),
-                session,
-                panes,
-                workspace_pool,
-                &db,
-                need_relayout,
-                clear_on_next_frame,
-            ) {
-                return false;
-            }
-            workspace_switched = true;
-        }
-    }
-    // When activating a tab via the sidebar, focus the leftmost visible pane
-    // if the tab has more than one pane open.
-    if let Some(tab) = session.active_tab_mut() {
-        let layout = tab.center.layout(center);
-        if layout.len() > 1
-            && let Some((id, _)) = layout.iter().min_by_key(|(_, r)| r.x)
-        {
-            tab.focused_pane = *id;
-        }
-    }
-    refresh_tab_model(model, session, sb);
-    sync_drawer_persistence(session, panes, drawer, pool, home, cfg, center);
-    // Persist the new active worktree/tab so it survives a non-graceful exit.
-    // Only a structural change (the terminal-materialize arm, which pushes a
-    // new group) needs the full layout rewrite; the Workspace arm already
-    // persisted its full layout inside `switch_workspace`, and the in-workspace
-    // Tab arm is a pure focus move — both just need the cheap, off-loop
-    // active-pointer write so sidebar activation never blocks a frame.
-    if structural {
-        persist_session_layout(session, panes);
-    } else {
-        persist_active_focus(session);
-    }
-    workspace_switched
-}
+// Sidebar row activation lives in `handlers/sidebar_activate.rs` (extracted
+// from this ratchet-pinned file); re-exported so call sites read unchanged.
+pub(crate) use crate::handlers::sidebar_activate::activate_row_target;
 
 /// True when the active group is a terminal (Region T) rather than a worktree
 /// (Region W). Terminals live in the same `session.worktrees` vector, tagged by
@@ -3000,7 +2885,7 @@ pub(crate) fn remap_cold_workspace_ids(session: &mut crate::session::Session, pa
 // Threads the loop's workspace-switch state (session, panes, pool, db, two
 // dirty/clear flags) — splitting it into a struct would only obscure the flow.
 #[allow(clippy::too_many_arguments)]
-fn switch_workspace(
+pub(crate) fn switch_workspace(
     target: &str,
     group: Option<&str>,
     session: &mut crate::session::Session,
@@ -7505,6 +7390,7 @@ async fn event_loop<T: Terminal>(
     // and the right panel's persisted accordion state (open section + wide
     // mode survive restarts; row mode is intentionally transient).
     let mut sb = SidebarState::default();
+    sb.view.workspace_sort = keymap.config().ui.sidebar_workspace_sort;
     let mut panel_ui = crate::panel::PanelUi::default();
     if let Ok(db) = superzej_core::db::Db::open() {
         sb.load(&db, SIDEBAR_SCOPE);
@@ -10795,6 +10681,7 @@ async fn event_loop<T: Terminal>(
             match cfg_res {
                 Ok(new_cfg) => {
                     keymap = rebuild_keymap(&new_cfg, &session);
+                    sb.view.workspace_sort = new_cfg.ui.sidebar_workspace_sort;
                     model.status = keybind_conflict_summary(&new_cfg)
                         .unwrap_or_else(|| "Config reloaded".into());
                     // Live theme reload: colors apply on the next repaint.
@@ -18943,6 +18830,35 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     format!("Notification mode: {mode}")
                                 };
+                            }
+                            Action::JumpAttention => {
+                                match crate::handlers::attention::next_target(&model, &session) {
+                                    Some((t, status)) => {
+                                        let hydrate = activate_row_target(
+                                            t,
+                                            &mut session,
+                                            &mut model,
+                                            &mut sb,
+                                            &mut panes,
+                                            &mut drawer,
+                                            &mut drawer_pool,
+                                            &mut drawer_home,
+                                            &mut workspace_pool,
+                                            keymap.config(),
+                                            chrome.center,
+                                            &mut need_relayout,
+                                            &mut clear_on_next_frame,
+                                        );
+                                        sb.focus_active_row(&mut model);
+                                        model.status = status;
+                                        if hydrate {
+                                            kick_model_hydration!();
+                                        }
+                                    }
+                                    None => {
+                                        model.status = "Nothing needs you right now".into();
+                                    }
+                                }
                             }
                         }
                         dirty = true;

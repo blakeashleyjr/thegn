@@ -16,6 +16,9 @@ use anyhow::Result;
 pub trait CacheStore {
     /// PR-status cache for a worktree: `(json, fetched_at)`.
     fn get_pr_cache(&self, worktree: &str) -> Result<Option<(String, i64)>>;
+    /// Every worktree's PR-status cache row: `(worktree, json, fetched_at)`.
+    /// Feeds cross-worktree rollups (the attention model) in one read.
+    fn list_pr_cache(&self) -> Result<Vec<(String, String, i64)>>;
     /// Replace the PR-status cache for a worktree.
     fn put_pr_cache(&self, worktree: &str, branch: &str, json: &str) -> Result<()>;
 
