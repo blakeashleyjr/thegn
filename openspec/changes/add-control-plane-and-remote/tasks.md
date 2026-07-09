@@ -56,4 +56,13 @@
 
 ## Validate
 
-- [ ] Run `just ci`
+- [x] Run `just ci` — all gates green individually: fmt-check, lint (clippy
+      `-D warnings` --all-targets + shellcheck/yamllint/taplo + git guardrail +
+      ratchet), build, check-cross, test (nextest + doctests), doc-check,
+      openspec-validate, coverage (core ≥95%, proxy ≥88%), smoke (incl. the new
+      control-plane section), sandbox-e2e-dns/-db, nix-build. Two caveats, both
+      environmental/pre-existing: `deps-audit` needs a writable advisory-db
+      path in this sandbox (`~/.cargo` is read-only — passed via a db-path
+      override; advisories/bans/licenses/sources all ok), and the muse `e2e`
+      visual suite fails on goldens that predate this change (they render a
+      different app UI dated Jun 19 and embed live clock/stats text).
