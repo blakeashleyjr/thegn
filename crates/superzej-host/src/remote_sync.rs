@@ -39,10 +39,13 @@ fn q(s: &str) -> String {
 }
 
 /// Run a local `git -C <worktree> <args>` and return trimmed stdout on success.
+/// Routed through `util::git_cmd` so inherited `GIT_*` env can never corrupt
+/// the worktree.
+// Blocking child wait: only reached via `retarget_if_remote_oci` on the
+// sandbox-provision path (spawn_blocking), never the event loop.
+#[expect(clippy::disallowed_methods)]
 fn local_git(worktree: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
+    let out = superzej_core::util::git_cmd(std::path::Path::new(worktree))
         .args(args)
         .output()
         .ok()?;
