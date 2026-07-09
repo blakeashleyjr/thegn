@@ -121,6 +121,49 @@ fn window(len: usize, avail: usize, cursor: usize) -> std::ops::Range<usize> {
     skip..skip + avail
 }
 
+/// A variable-height scroll window: items have per-item physical heights via
+/// `height(i)`; return the contiguous range of items to render within a
+/// `budget` of physical lines, keeping the `cursor` item visible. Whole items
+/// only — when the cursor item alone is taller than the budget, its range is
+/// returned and the caller clips it to `budget`.
+fn vwindow(
+    len: usize,
+    budget: usize,
+    cursor: usize,
+    height: impl Fn(usize) -> usize,
+) -> std::ops::Range<usize> {
+    if budget == 0 || len == 0 {
+        return 0..0;
+    }
+    let cursor = cursor.min(len - 1);
+    // Cursor item alone overflows: show just it (clipped by the caller).
+    if height(cursor) >= budget {
+        return cursor..cursor + 1;
+    }
+    let mut lo = cursor;
+    let mut hi = cursor; // inclusive
+    let mut used = height(cursor);
+    // Grow below first (keep following items visible), then above, alternating
+    // until neither side fits.
+    loop {
+        let mut grew = false;
+        if hi + 1 < len && used + height(hi + 1) <= budget {
+            hi += 1;
+            used += height(hi);
+            grew = true;
+        }
+        if lo > 0 && used + height(lo - 1) <= budget {
+            lo -= 1;
+            used += height(lo);
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    lo..hi + 1
+}
+
 fn short7(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
@@ -219,9 +262,13 @@ fn status_rows(model: &FrameModel, ui: &PanelUi, focused: bool) -> Vec<PanelRow>
 
 // ---- side column ------------------------------------------------------------
 
-/// One side-list item row (no tint/hit — the caller attaches those).
-fn item_row(data: &PanelData, view: GitView, src: usize) -> PanelRow {
-    let segs = match view {
+/// One side-list item's seg run plus the hanging-indent width for its wrapped
+/// continuation lines — the display width of the fixed prefix (gutter, status
+/// glyph / head marker / stash index) before the primary text, so wrapped text
+/// aligns under the name rather than the gutter. No tint/hit — the caller
+/// attaches those and wraps via [`item_block`].
+fn item_segs(data: &PanelData, view: GitView, src: usize) -> (Vec<Seg>, usize) {
+    match view {
         GitView::Files => {
             let c = &data.changes[src];
             let tok = match c.stage {
@@ -230,24 +277,21 @@ fn item_row(data: &PanelData, view: GitView, src: usize) -> PanelRow {
                 Stage::Untracked => g(),
                 Stage::Unstaged => hue(Hue::Amber),
             };
-            vec![
-                sp(1),
-                seg(tok, format!("{:>2}", c.status)),
-                sp(1),
-                // Path prefix is a label, not scaffolding — `faint`, not the
-                // `ghost2` floor (see the changes section).
-                seg(f(), c.dir.clone()),
-                seg(d(), c.name.clone()),
-            ]
+            let prefix = vec![sp(1), seg(tok, format!("{:>2}", c.status)), sp(1)];
+            let indent = seg::seg_width(&prefix);
+            let mut segs = prefix;
+            // Path prefix is a label, not scaffolding — `faint`, not the
+            // `ghost2` floor (see the changes section).
+            segs.push(seg(f(), c.dir.clone()));
+            segs.push(seg(d(), c.name.clone()));
+            (segs, indent)
         }
         GitView::Branches => {
             let b = &data.branches[src];
-            let mut v = vec![
-                sp(1),
-                if b.is_head { seg(ac(), "*") } else { sp(1) },
-                sp(1),
-                seg(if b.is_head { t() } else { d() }, b.name.clone()),
-            ];
+            let prefix = vec![sp(1), if b.is_head { seg(ac(), "*") } else { sp(1) }, sp(1)];
+            let indent = seg::seg_width(&prefix);
+            let mut v = prefix;
+            v.push(seg(if b.is_head { t() } else { d() }, b.name.clone()));
             if b.ahead > 0 {
                 v.push(seg(hue(Hue::Green), format!(" ⇡{}", b.ahead)));
             }
@@ -257,20 +301,67 @@ fn item_row(data: &PanelData, view: GitView, src: usize) -> PanelRow {
             if b.pr.is_some() {
                 v.push(seg(hue(Hue::Green), " ⬤"));
             }
-            v
+            (v, indent)
         }
         GitView::Stash => {
             let s = &data.stashes[src];
-            vec![
-                sp(1),
-                seg(ac(), format!("{}", s.index)),
-                sp(1),
-                seg(d(), s.message.clone()),
-            ]
+            let prefix = vec![sp(1), seg(ac(), format!("{}", s.index)), sp(1)];
+            let indent = seg::seg_width(&prefix);
+            let mut segs = prefix;
+            segs.push(seg(d(), s.message.clone()));
+            (segs, indent)
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), 0),
+    }
+}
+
+/// The commits list item: the mark gutter + short sha prefix, then the subject;
+/// the hanging indent aligns wrapped subject lines under the subject.
+fn commit_segs(data: &PanelData, ui: &PanelUi, src: usize) -> (Vec<Seg>, usize) {
+    let c = &data.commits[src];
+    let prefix = vec![
+        sp(1),
+        commit_mark(&c.sha, ui),
+        sp(1),
+        seg(ac(), c.short.clone()),
+        sp(1),
+    ];
+    let indent = seg::seg_width(&prefix);
+    let mut segs = prefix;
+    segs.push(seg(d(), c.subject.clone()));
+    (segs, indent)
+}
+
+/// The wrapped physical height (line count) of one side-list item at `side_w`.
+fn item_height(data: &PanelData, ui: &PanelUi, view: GitView, src: usize, side_w: usize) -> usize {
+    let (segs, ind) = if view == GitView::Commits {
+        commit_segs(data, ui, src)
+    } else {
+        item_segs(data, view, src)
     };
-    PanelRow::plain(Line::Segs(segs))
+    seg::wrap(&segs, side_w, ind).len()
+}
+
+/// Wrap one item's seg run into a block of `PanelRow`s, every row carrying the
+/// item's `hit` and (when `bg` is set) its selection tint — so the highlight
+/// and the click target span all wrapped continuation lines.
+fn item_block(
+    segs: &[Seg],
+    cont_indent: usize,
+    side_w: usize,
+    hit: PanelHit,
+    bg: Option<Tok>,
+) -> Vec<PanelRow> {
+    seg::wrap(segs, side_w, cont_indent)
+        .into_iter()
+        .map(|line| {
+            let mut r = PanelRow::plain(Line::Segs(line)).with_hit(hit);
+            if let Some(b) = bg {
+                r = r.with_bg(b);
+            }
+            r
+        })
+        .collect()
 }
 
 /// Split `body` rows across the four lists. Every list needs its header;
@@ -320,7 +411,13 @@ fn allocate_side(needs: &[usize; 4], focus: usize, body: usize) -> [usize; 4] {
 /// items with `PanelHit::Row(section, display_idx)`, cursor/range tints on
 /// the focused list, and [`allocate_side`] spreading the column's full
 /// height across them.
-fn side_rows(model: &FrameModel, ui: &PanelUi, focused: bool, body: usize) -> Vec<PanelRow> {
+fn side_rows(
+    model: &FrameModel,
+    ui: &PanelUi,
+    focused: bool,
+    body: usize,
+    side_w: usize,
+) -> Vec<PanelRow> {
     let data = &model.panel;
     let lists: [(GitView, Section, &str); 4] = [
         (GitView::Files, Section::Changes, "FILES"),
@@ -339,15 +436,26 @@ fn side_rows(model: &FrameModel, ui: &PanelUi, focused: bool, body: usize) -> Ve
         .collect();
     // Breathing room between lists when the column is tall enough.
     let gaps = if body >= 20 { 3 } else { 0 };
+    let avail = body.saturating_sub(gaps);
+    // Needs are PHYSICAL rows: a header plus each item's wrapped height, so a
+    // list holding wrapping items asks for (and is granted) the rows it needs
+    // rather than one-per-item. Capped at the column height — no list needs
+    // more — which also bounds the wrap cost to ~`avail` items per list.
     let needs: [usize; 4] = std::array::from_fn(|i| {
-        let mut n = indices[i].len() + 1;
-        if lists[i].0 == focus_list && ui.git.filter.as_ref().is_some_and(|f| f.view == focus_list)
-        {
+        let (view, _, _) = lists[i];
+        let mut n = 1usize; // header
+        for &src in &indices[i] {
+            n += item_height(data, ui, view, src, side_w);
+            if n >= avail {
+                break;
+            }
+        }
+        if view == focus_list && ui.git.filter.as_ref().is_some_and(|f| f.view == focus_list) {
             n += 1;
         }
-        n
+        n.min(avail.max(1))
     });
-    let allocs = allocate_side(&needs, focus_pos, body.saturating_sub(gaps));
+    let allocs = allocate_side(&needs, focus_pos, avail);
 
     let mut out: Vec<PanelRow> = Vec::new();
     for (li, (view, section, name)) in lists.iter().enumerate() {
@@ -360,6 +468,37 @@ fn side_rows(model: &FrameModel, ui: &PanelUi, focused: bool, body: usize) -> Ve
         if gaps > 0 && li > 0 {
             out.push(PanelRow::blank());
         }
+        // Physical-line budget for this list's items: its allocation, less the
+        // header row and (on the focused list) the filter row.
+        let filter = if is_focus {
+            filter_row(ui, *view, ix.len())
+        } else {
+            None
+        };
+        let shown = alloc
+            .saturating_sub(1)
+            .saturating_sub(usize::from(filter.is_some()));
+
+        let cursor = ui.git.cur.get(*view).min(ix.len().saturating_sub(1));
+        let on_view = ui.git.focus == *view;
+
+        // A list item's seg run + hanging indent, and its wrapped physical
+        // height. Items wrap (rather than truncate) to fit `side_w`.
+        let item = |di: usize| -> (Vec<Seg>, usize) {
+            if *view == GitView::Commits {
+                commit_segs(data, ui, ix[di])
+            } else {
+                item_segs(data, *view, ix[di])
+            }
+        };
+        let height = |di: usize| -> usize {
+            let (segs, ind) = item(di);
+            seg::wrap(&segs, side_w, ind).len()
+        };
+        let range = vwindow(ix.len(), shown, if is_focus { cursor } else { 0 }, height);
+        let shown_items = range.len();
+
+        // Header — the count badge reflects items actually shown.
         let mut label = seg(if is_focus { ac() } else { d() }, *name);
         if is_focus {
             label = label.bold();
@@ -371,54 +510,50 @@ fn side_rows(model: &FrameModel, ui: &PanelUi, focused: bool, body: usize) -> Ve
             label,
         ];
         if !ix.is_empty() {
-            let visible = alloc.saturating_sub(1);
             header.push(seg(
                 g3(),
-                if ix.len() > visible {
-                    format!(" {}/{}", visible.min(ix.len()), ix.len())
+                if ix.len() > shown_items {
+                    format!(" {}/{}", shown_items, ix.len())
                 } else {
                     format!(" {}", ix.len())
                 },
             ));
         }
         out.push(PanelRow::plain(Line::segs(header)).with_hit(PanelHit::OpenSection(*section)));
-        let mut shown = alloc.saturating_sub(1);
-        if is_focus && let Some(fr) = filter_row(ui, *view, ix.len()) {
+        if let Some(fr) = filter {
             out.push(fr);
-            shown = shown.saturating_sub(1);
         }
-        let cursor = ui.git.cur.get(*view).min(ix.len().saturating_sub(1));
-        let on_view = ui.git.focus == *view;
-        for di in window(ix.len(), shown, if is_focus { cursor } else { 0 }) {
-            let mut row = if *view == GitView::Commits {
-                // The commits item gets its live mark gutter here.
-                let c = &data.commits[ix[di]];
-                PanelRow::plain(Line::segs(vec![
-                    sp(1),
-                    commit_mark(&c.sha, ui),
-                    sp(1),
-                    seg(ac(), c.short.clone()),
-                    sp(1),
-                    seg(d(), c.subject.clone()),
-                ]))
-            } else {
-                item_row(data, *view, ix[di])
+
+        // Emit each item as a block of wrapped rows, hard-capping the total at
+        // `shown` physical lines so a tall list never steals another's rows.
+        let mut emitted = 0usize;
+        for di in range {
+            if emitted >= shown {
+                break;
             }
-            .with_hit(PanelHit::Row(*section, di));
-            if is_focus && di == cursor {
-                row = row.with_bg(if focused && on_view {
+            let bg = if is_focus && di == cursor {
+                Some(if focused && on_view {
                     Tok::SelAccent
                 } else {
                     range_tint()
-                });
+                })
             } else if is_focus
                 && on_view
                 && ui.git.sel_anchor.is_some()
                 && ui.git.selection().contains(&di)
             {
-                row = row.with_bg(range_tint());
+                Some(range_tint())
+            } else {
+                None
+            };
+            let (segs, ind) = item(di);
+            for row in item_block(&segs, ind, side_w, PanelHit::Row(*section, di), bg) {
+                if emitted >= shown {
+                    break;
+                }
+                out.push(row);
+                emitted += 1;
             }
-            out.push(row);
         }
     }
     out
@@ -948,7 +1083,7 @@ pub(super) fn build_git_full(
     if body > 0 {
         let side_w = SIDE_W.saturating_sub(1).min(cols.saturating_sub(2));
         let main_w = cols.saturating_sub(side_w + 1);
-        let side = side_rows(model, ui, focused, body);
+        let side = side_rows(model, ui, focused, body, side_w);
         let main = main_rows(model, ui, focused, main_w, body);
         out.extend(fuse(&side, &main, body, side_w, main_w));
         out.push(help_row(ui.git.focus));
@@ -1399,5 +1534,137 @@ mod tests {
         keys.open = Section::Keys;
         let frame = super::super::frame::build_panel(&m, &keys, 120, 40, true);
         assert!(!all_text(&frame).contains("STATUS"));
+    }
+
+    // The side portion of a fused row is the text left of the `│` divider.
+    fn side_text_for_hit(frame: &PanelFrame, hit: PanelHit) -> Vec<String> {
+        frame
+            .rows
+            .iter()
+            .filter(|r| r.hit == Some(hit))
+            .map(|r| text_of(&r.line).split('│').next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn long_path_wraps_and_all_lines_carry_the_hit() {
+        let mut m = model();
+        let path = "crates/superzej-host/src/panel/some/deeply/nested/module.rs";
+        m.panel.changes = vec![change(path)];
+        let frame = build_git_full(&m, &ui(GitView::Files), 120, 40, true);
+        // side_w is 33 here, so a 59-col path must wrap onto >= 2 rows, each
+        // carrying the item's Row hit (so a click on any line selects it).
+        let parts = side_text_for_hit(&frame, PanelHit::Row(Section::Changes, 0));
+        assert!(parts.len() >= 2, "path should wrap: {parts:?}");
+        // Reassembling (spaces are only the gutter/indent/pad) recovers the path.
+        let joined: String = parts.join("").replace(' ', "");
+        assert!(
+            joined.contains(path),
+            "wrapped text lost the path: {joined}"
+        );
+    }
+
+    #[test]
+    fn wrapped_continuation_has_hanging_indent() {
+        let mut m = model();
+        m.panel.changes = vec![change(
+            "crates/superzej-host/src/panel/some/deeply/nested/module.rs",
+        )];
+        let frame = build_git_full(&m, &ui(GitView::Files), 120, 40, true);
+        let parts = side_text_for_hit(&frame, PanelHit::Row(Section::Changes, 0));
+        assert!(parts.len() >= 2);
+        // Files gutter = ` MM ` = 4 cells; continuations hang-indent under the
+        // path (4 leading spaces), while line 0 carries the `  M ` gutter+status.
+        assert!(
+            parts[1].starts_with("    "),
+            "continuation should hang-indent 4 cols: {:?}",
+            parts[1]
+        );
+        assert!(
+            !parts[0].starts_with("    "),
+            "first line is gutter+status, not a 4-space indent: {:?}",
+            parts[0]
+        );
+        assert!(
+            parts[0].contains('M'),
+            "line 0 shows the status: {:?}",
+            parts[0]
+        );
+    }
+
+    #[test]
+    fn cursor_tint_spans_all_wrapped_lines() {
+        let mut m = model();
+        m.panel.commits[0].subject =
+            "a very long commit subject that will certainly wrap across multiple side lines".into();
+        let mut u = ui(GitView::Commits);
+        u.git.cur.set(GitView::Commits, 0);
+        let frame = build_git_full(&m, &u, 120, 40, true);
+        let rows: Vec<_> = frame
+            .rows
+            .iter()
+            .filter(|r| r.hit == Some(PanelHit::Row(Section::Commits, 0)))
+            .collect();
+        assert!(rows.len() >= 2, "long subject should wrap: {}", rows.len());
+        for r in &rows {
+            let Line::Segs(v) = &r.line else {
+                panic!("fused rows are segs")
+            };
+            assert!(
+                v.iter().any(|s| s.bg == Some(Tok::SelAccent)),
+                "every wrapped cursor line must carry the tint"
+            );
+        }
+    }
+
+    #[test]
+    fn count_badge_reflects_items_actually_shown() {
+        let mut m = model();
+        // Ten long-path files; a short body can't show all of them once wrapped.
+        m.panel.changes = (0..10)
+            .map(|i| {
+                change(&format!(
+                    "crates/superzej-host/src/panel/deeply/nested/mod_{i}.rs"
+                ))
+            })
+            .collect();
+        let frame = build_git_full(&m, &ui(GitView::Files), 120, 24, true);
+        // The FILES badge is "shown/total"; shown must match the distinct item
+        // indices actually rendered, and be < total (wrapping ate the budget).
+        let shown: std::collections::BTreeSet<usize> = frame
+            .rows
+            .iter()
+            .filter_map(|r| match r.hit {
+                Some(PanelHit::Row(Section::Changes, di)) => Some(di),
+                _ => None,
+            })
+            .collect();
+        let all = all_text(&frame);
+        assert!(
+            all.contains(&format!("FILES {}/10", shown.len())),
+            "badge should read FILES {}/10:\n{all}",
+            shown.len()
+        );
+        assert!(shown.len() < 10, "not all should fit: {}", shown.len());
+    }
+
+    #[test]
+    fn wrapping_never_overflows_tiny_side() {
+        let mut m = model();
+        m.panel.changes = vec![change(
+            "an/extremely/long/unbroken/path/with/no/spaces/that/must/hard/split/many/times.rs",
+        )];
+        m.panel.commits[0].subject =
+            "a long wrapping subject with several words that exceed the column".into();
+        for focus in [GitView::Files, GitView::Commits] {
+            for (cols, rows) in [(10, 3), (34, 5), (40, 8), (80, 20)] {
+                let frame = build_git_full(&m, &ui(focus), cols, rows, true);
+                assert!(
+                    frame.rows.len() <= rows,
+                    "{focus:?} {cols}x{rows} overflowed: {}",
+                    frame.rows.len()
+                );
+            }
+        }
     }
 }

@@ -285,6 +285,10 @@
             cargo-machete
             # startup benchmarks (`just bench`)
             hyperfine
+            # run the GitHub Actions CI workflow locally in Docker/podman
+            # (`just act`). Heavy (each job installs nix in-container); the fast
+            # path for local checks is `just ci` / `just lint|test|smoke`.
+            act
             # pty visual-regression harnesses (test/*.py reconstruct the screen)
             (python3.withPackages (ps: with ps; [pyte]))
             # runtime tools superzej shells out to

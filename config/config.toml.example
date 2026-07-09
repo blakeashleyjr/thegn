@@ -52,6 +52,13 @@ full_mode_chip = true
 # disk-usage popup) to dismiss it, just like pressing Escape. Set false to
 # require Esc.
 dismiss_overlay_on_click_outside = true
+# Sidebar workspace (repo) ordering: "manual" keeps your persisted order
+# (Ctrl+Alt+↑/↓); "attention" bubbles the workspace whose worktrees most need
+# you to the top (stable within a tier — equal-urgency workspaces keep their
+# manual order, so rows only move on a real state change). Worktree ordering
+# *within* a workspace is the separate sidebar sort mode (`s` cycles
+# manual/name/recent/attention; attention — most-urgent-first — is the default).
+sidebar_workspace_sort = "manual"
 
 # Visual tuning. The focus accent recolors every superzej surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused
@@ -399,6 +406,7 @@ format = "text"           # text | json
 # new-worktree = "Ctrl w"
 # toggle-sidebar = "Alt s"
 # switch-font = "Alt f"  # opens the realtime font picker (alacritty profile)
+# attention-next = "Alt a"  # jump to the next worktree that needs you (default)
 # Multi-key sequences (a leader chord) are supported: bind a space-separated
 # sequence and a which-key popup lists the next keys after you press the prefix.
 # Use "Space"/"leader" for the space key. Sequences are safest in the modal

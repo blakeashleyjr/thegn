@@ -20,6 +20,9 @@
     python3
     # startup benchmarks (`just bench`)
     hyperfine
+    # run the GitHub Actions CI workflow locally in Docker/podman (`just act`).
+    # Heavy — the fast local path is `just ci` / `just lint|test|smoke`.
+    act
     # treefmt — reads treefmt.toml; versions must match the flake's nixpkgs
     treefmt
     # formatter binaries treefmt.toml references (rustfmt comes from languages.rust below)

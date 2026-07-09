@@ -960,6 +960,8 @@ pub enum BarItemId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BarBadge {
     Notifications,
+    /// Needs-you rollup: worktrees whose attention tier is T0–T2.
+    Attention,
     Ci,
     MergeQueue,
     DiskWarn,
@@ -1494,65 +1496,11 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
             )],
         ));
     }
-    // CI rollup badge (AV group, item 158): a red ✗ chip when workflows are
-    // *currently* failing, an amber ● chip while runs are in flight; silent
-    // when all green (mirrors the "clean is quiet" notification posture). Only
-    // when CI is configured and the cache is warm (`ci_runs` non-empty).
-    // Counts come from `current_summary` — each workflow judged by its most
-    // recent run — so historical failures don't pin the badge red.
-    if !model.panel.ci_runs.is_empty() {
-        let cur = superzej_core::ci::current_summary(&model.panel.ci_runs);
-        let fail = cur.failed;
-        let running = cur.running;
-        if fail > 0 {
-            items.push((
-                BarItemId::Badge(BarBadge::Ci),
-                vec![Seg::chip(
-                    Tok::Hue(superzej_core::theme::Hue::Red),
-                    format!(" {} {fail} CI ", crate::caps::active_glyphs().cross),
-                )],
-            ));
-        } else if running > 0 {
-            items.push((
-                BarItemId::Badge(BarBadge::Ci),
-                vec![Seg::chip(
-                    Tok::Hue(superzej_core::theme::Hue::Amber),
-                    format!(" {} {running} CI ", crate::caps::active_glyphs().dot_filled),
-                )],
-            ));
-        }
-    }
-    // Merge-queue (fold-actor) badge: a red ⚑ chip when branches are deferred and
-    // need a rebase, else an amber chip while branches are queued/folding. Silent
-    // when the queue is empty (clean is quiet).
-    {
-        let q = &model.panel.merge_queue;
-        let deferred = q
-            .iter()
-            .filter(|r| r.status == "deferred" || r.status == "gate_failed")
-            .count();
-        let active = q
-            .iter()
-            .filter(|r| matches!(r.status.as_str(), "queued" | "folding" | "verifying"))
-            .count();
-        if deferred > 0 {
-            items.push((
-                BarItemId::Badge(BarBadge::MergeQueue),
-                vec![Seg::chip(
-                    Tok::Hue(superzej_core::theme::Hue::Red),
-                    format!(" ⚑ {deferred} MQ "),
-                )],
-            ));
-        } else if active > 0 {
-            items.push((
-                BarItemId::Badge(BarBadge::MergeQueue),
-                vec![Seg::chip(
-                    Tok::Hue(superzej_core::theme::Hue::Amber),
-                    format!(" ⧉ {active} MQ "),
-                )],
-            ));
-        }
-    }
+    // Needs-you / CI rollup / merge-queue chips live in `statusbar_badges.rs`
+    // (extracted from this ratchet-pinned file).
+    crate::statusbar_badges::push_attention_badge(model, &mut items);
+    crate::statusbar_badges::push_ci_badge(model, &mut items);
+    crate::statusbar_badges::push_mq_badge(model, &mut items);
     // Low-free-space badge: trips when the worktrees' filesystem drops to/below
     // `[stats].disk_free_warn` free — amber at the warn line, red at/below
     // `disk_free_critical`. The badge selects into a detailed modal (free/used/
@@ -3230,6 +3178,7 @@ mod tests {
             disk_bytes: None,
             target_bytes: None,
             terminal_connection: None,
+            attention: None,
         }
     }
 

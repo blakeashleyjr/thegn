@@ -901,6 +901,10 @@ fn collect_sidebar_status(
             status.pr_counts.insert(path.clone(), n);
         }
     }
+    // Attention scores + hysteresis-stable ranks (pure DB/snapshot reads; the
+    // branching lives in core). After the git pass so `dirty` is fresh.
+    crate::attention_status::collect_attention(session, db, &mut status);
+
     tracing::debug!(
         target: "szhost::hydrate",
         status_ms = t0.elapsed().as_millis() as u64,
