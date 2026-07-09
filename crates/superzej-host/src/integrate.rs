@@ -228,7 +228,7 @@ pub fn fold_active_repo(mq: &MergeQueueConfig, any_path: &Path) -> Result<FoldRe
     let cands = candidate_branches(mq, &repo_root, &target)?;
     let report = run_fold(mq, &repo_root, cands.branches.clone())?;
     if let Ok(db) = Db::open() {
-        let _ = persist(&db, &cands, &report);
+        let _ = persist(mq, &repo_root, &db, &cands, &report);
     }
     Ok(report)
 }
@@ -281,15 +281,38 @@ pub fn candidate_branches(
 
 /// Mirror a fold's outcome into the `merge_queue` cache (the panel feed +
 /// auto-drain record). Best-effort: keyed by worktree path via `cands.worktrees`.
-pub fn persist(db: &Db, cands: &Candidates, report: &FoldReport) -> Result<()> {
+pub fn persist(
+    cfg: &MergeQueueConfig,
+    repo_root: &Path,
+    db: &Db,
+    cands: &Candidates,
+    report: &FoldReport,
+) -> Result<()> {
+    use superzej_core::merge_lifecycle::LifecycleEvent;
     for b in &cands.branches {
         if let Some(wt) = cands.worktrees.get(&b.name) {
             db.enqueue_merge(wt, &b.name, &report.target_branch)?;
+            crate::merge_lifecycle::apply(
+                cfg,
+                db,
+                repo_root,
+                wt,
+                &b.name,
+                LifecycleEvent::Enqueued,
+            );
         }
     }
     for l in &report.landed {
         if let Some(wt) = cands.worktrees.get(&l.branch) {
             db.update_merge_status(wt, "landed", Some(&l.commit), None, None)?;
+            crate::merge_lifecycle::apply(
+                cfg,
+                db,
+                repo_root,
+                wt,
+                &l.branch,
+                LifecycleEvent::Landed,
+            );
         }
     }
     for d in &report.deferred {
@@ -301,6 +324,14 @@ pub fn persist(db: &Db, cands: &Candidates, report: &FoldReport) -> Result<()> {
             };
             let paths = (!d.paths.is_empty()).then(|| d.paths.join("\n"));
             db.update_merge_status(wt, status, None, paths.as_deref(), None)?;
+            crate::merge_lifecycle::apply(
+                cfg,
+                db,
+                repo_root,
+                wt,
+                &d.branch,
+                LifecycleEvent::Failed,
+            );
         }
     }
     Ok(())
@@ -752,6 +783,7 @@ mod tests {
             auto_land: true,
             agent_max_attempts: 2,
             agent_timeout_secs: 0,
+            ..MergeQueueConfig::default()
         }
     }
 

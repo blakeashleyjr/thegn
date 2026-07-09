@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use superzej_core::config::MergeQueueConfig;
 use superzej_core::db::Db;
+use superzej_core::merge_lifecycle::LifecycleEvent;
 use superzej_core::notification::NotificationKind;
 use superzej_core::store::WorktreeAuxStore;
 use superzej_core::util;
@@ -64,6 +65,24 @@ pub(crate) struct DrainCtx<'a> {
     pub want_model_refresh: &'a mut bool,
     pub dirty: &'a mut bool,
     pub loop_perf: &'a mut crate::perf::LoopPerf,
+    // For the sidebar-folder lifecycle's `on_landed = remove/detach`: after a
+    // land removes a worktree dir off-loop, reap the now-orphaned tab (panes +
+    // session + focus) via `delete_groups`, exactly as a manual close does.
+    pub session: &'a mut crate::session::Session,
+    pub panes: &'a mut crate::panes::Panes,
+    pub need_relayout: &'a mut bool,
+    pub waker: &'a TerminalWaker,
+}
+
+impl DrainCtx<'_> {
+    /// Reap any tab whose worktree dir vanished (an `on_landed = remove/detach`
+    /// land). No-op when nothing was removed. Kept here so both drains share it.
+    fn reap_removed_tabs(&mut self) {
+        if crate::merge_lifecycle::reconcile_removed_tabs(self.session, self.panes, self.waker) {
+            *self.need_relayout = true;
+            *self.want_model_refresh = true;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,8 +250,13 @@ pub(crate) fn drain_fold_results(rx: &mut FoldRx, ctx: &mut DrainCtx) {
                         r.deferred.len()
                     )
                 };
+                let landed = !r.landed.is_empty();
                 ctx.toasts.success(msg, now);
                 *ctx.want_model_refresh = true;
+                // A batch fold's `persist` may have removed landed worktrees.
+                if landed {
+                    ctx.reap_removed_tabs();
+                }
             }
             Err(e) => {
                 ctx.toasts.push(
@@ -272,6 +296,8 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                             format!("merge queue: {branch} landed"),
                         );
                         *ctx.want_model_refresh = true;
+                        // The drive's `apply` may have removed this worktree.
+                        ctx.reap_removed_tabs();
                     }
                     "ready" => {
                         ctx.toasts
@@ -325,6 +351,11 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                         .push(ToastKind::Info, msg, now, std::time::Duration::from_secs(6));
                 }
                 *ctx.want_model_refresh = true;
+                // A land (`l`) records `landed` here without a Step; its `apply`
+                // may have removed the worktree.
+                if !out.landed.is_empty() {
+                    ctx.reap_removed_tabs();
+                }
             }
             DriveMsg::Note(msg) => {
                 ctx.toasts.info(msg, now);
@@ -654,8 +685,16 @@ fn add_worktree(mq: &MergeQueueConfig, wt: &Path) -> String {
     if branch == target {
         return format!("Skipped {branch} — that's the target branch");
     }
-    match Db::open().and_then(|db| db.enqueue_merge(&wt.to_string_lossy(), &branch, &target)) {
-        Ok(()) => format!("Queued {branch}"),
+    let db = match Db::open() {
+        Ok(d) => d,
+        Err(e) => return format!("Add failed: {e}"),
+    };
+    let wt_s = wt.to_string_lossy();
+    match db.enqueue_merge(&wt_s, &branch, &target) {
+        Ok(()) => {
+            crate::merge_lifecycle::apply(mq, &db, &root, &wt_s, &branch, LifecycleEvent::Enqueued);
+            format!("Queued {branch}")
+        }
         Err(e) => format!("Add failed: {e}"),
     }
 }
@@ -678,6 +717,7 @@ fn add_all(mq: &MergeQueueConfig, any_path: &Path) -> String {
     let mut queued = 0usize;
     for (branch, wt) in &cands.worktrees {
         if db.enqueue_merge(wt, branch, &target).is_ok() {
+            crate::merge_lifecycle::apply(mq, &db, &root, wt, branch, LifecycleEvent::Enqueued);
             queued += 1;
         }
     }
@@ -706,9 +746,18 @@ fn land_ready(cfg: &superzej_core::config::Config, wt: &str) -> DriveMsg {
             let _ = db.update_merge_status(wt, status, oid, detail, None);
         }
     };
+    // Drive the sidebar-folder lifecycle for this worktree (no-op unless
+    // organize_folders is on). Any removal is reaped by drain_drive_msgs.
+    // `branch` is a param (not captured) so the arms can still move it below.
+    let lifecycle = |event: LifecycleEvent, branch: &str| {
+        if let (Some(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
+            crate::merge_lifecycle::apply(&cfg.merge_queue, db, &root, wt, branch, event);
+        }
+    };
     match outcome {
         AttemptOutcome::Landed { commit } => {
             record("landed", Some(&commit), None);
+            lifecycle(LifecycleEvent::Landed, &branch);
             DriveMsg::Done(DriveOutcome {
                 landed: vec![branch],
                 ..DriveOutcome::default()
@@ -716,6 +765,7 @@ fn land_ready(cfg: &superzej_core::config::Config, wt: &str) -> DriveMsg {
         }
         AttemptOutcome::UpToDate => {
             record("landed", None, Some("already merged"));
+            lifecycle(LifecycleEvent::Landed, &branch);
             DriveMsg::Done(DriveOutcome {
                 landed: vec![branch],
                 ..DriveOutcome::default()
@@ -724,6 +774,7 @@ fn land_ready(cfg: &superzej_core::config::Config, wt: &str) -> DriveMsg {
         AttemptOutcome::Conflict { paths } => {
             let detail = paths.join("\n");
             record("deferred", None, Some(&detail));
+            lifecycle(LifecycleEvent::Failed, &branch);
             DriveMsg::Failed(format!(
                 "{branch} conflicts: {}",
                 detail.replace('\n', ", ")
@@ -731,6 +782,7 @@ fn land_ready(cfg: &superzej_core::config::Config, wt: &str) -> DriveMsg {
         }
         AttemptOutcome::GateFailed { .. } => {
             record("gate_failed", None, Some("breaks build"));
+            lifecycle(LifecycleEvent::Failed, &branch);
             DriveMsg::Failed(format!("{branch} breaks the build (gate red)"))
         }
         AttemptOutcome::Ready { tip } => {

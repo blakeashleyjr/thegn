@@ -2503,6 +2503,23 @@ agent_command = ""            # e.g. 'claude -p "{prompt}" --permission-mode acc
 auto_land = true              # queue driver: CAS-advance on green; false ⇒ stop at "ready" for a manual land
 agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human"
 agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
+#
+# Sidebar organization (optional, OFF by default). As a branch moves through the
+# queue, file its worktree into sidebar folders so in-flight / merged / blocked
+# work is grouped at a glance. The folder names below are pre-filled for
+# convenience but do NOTHING until organize_folders = true. A worktree open as a
+# live tab is torn down cleanly (like closing it) when on_landed removes it; the
+# home worktree is never filed or removed. Failed branches (conflict/red gate/
+# agent-gave-up) move to failed_folder. Out-of-process `merge add` changes may
+# take up to ~2 s to appear in a running instance (git-watch / refresh ticker).
+organize_folders = false      # master switch for the folder automation below
+queued_folder = "Merging"     # file a worktree here when its branch is enqueued ("" ⇒ don't)
+on_landed = "off"             # off | move | detach | remove — what to do when a branch lands
+                              #   move   = file the worktree into merged_folder
+                              #   detach = remove the worktree, keep the branch
+                              #   remove = remove the worktree AND delete the merged branch
+merged_folder = "Merged"      # destination folder when on_landed = "move" ("" ⇒ don't file)
+failed_folder = "Needs attention"  # folder for a branch that fails to land ("" ⇒ leave it be)
 
 # ── Time-travel replay (optional) ───────────────────────────────────────────
 # Record each pane's full byte stream into a bounded in-memory ring so you can

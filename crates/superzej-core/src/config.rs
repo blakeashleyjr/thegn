@@ -685,6 +685,19 @@ config_enum! {
     } default = Agent;
 }
 
+config_enum! {
+    /// `[merge_queue] on_landed` — what to do with a worktree whose branch just
+    /// landed (only when `organize_folders = true`): `"off"` nothing, `"move"` file
+    /// it into `merged_folder`, `"detach"` remove the worktree but keep the branch,
+    /// `"remove"` remove the worktree AND delete the now-merged branch.
+    pub enum OnLanded: "on landed" {
+        Off = "off" | "none",
+        Move = "move" | "folder",
+        Detach = "detach",
+        Remove = "remove" | "cleanup" | "delete",
+    } default = Off;
+}
+
 /// `[merge_queue]` — the local "fold-actor": fold parallel worktree branches into
 /// `target_branch` in the object DB (no checkout), auto-landing clean merges and
 /// deferring conflicts. See `superzej_core::fold` + host `integrate`/`merge_driver`.
@@ -722,6 +735,19 @@ pub struct MergeQueueConfig {
     pub agent_max_attempts: u32,
     /// Watchdog (seconds) for one agent invocation. 0 disables it.
     pub agent_timeout_secs: u64,
+    /// Master switch for organizing worktrees into sidebar folders as their
+    /// branches move through the queue. Off ⇒ none of the fields below apply.
+    pub organize_folders: bool,
+    /// Folder a worktree is filed into when its branch is enqueued (`queued`).
+    /// Empty ⇒ don't file on enqueue.
+    pub queued_folder: String,
+    /// What to do when a branch lands. See [`OnLanded`].
+    pub on_landed: OnLanded,
+    /// Folder for a landed branch when `on_landed = "move"`. Empty ⇒ don't file.
+    pub merged_folder: String,
+    /// Folder for a branch that fails to land (deferred/gate_failed/needs_human).
+    /// Empty ⇒ leave failed branches wherever they are.
+    pub failed_folder: String,
 }
 
 impl Default for MergeQueueConfig {
@@ -740,6 +766,11 @@ impl Default for MergeQueueConfig {
             auto_land: true,
             agent_max_attempts: 2,
             agent_timeout_secs: 900,
+            organize_folders: false,
+            queued_folder: "Merging".to_string(),
+            on_landed: OnLanded::Off,
+            merged_folder: "Merged".to_string(),
+            failed_folder: "Needs attention".to_string(),
         }
     }
 }
