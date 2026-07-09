@@ -96,6 +96,7 @@ pub mod patch;
 pub mod picker;
 pub mod placement;
 pub mod plugin_api;
+pub mod preview;
 pub mod profile;
 pub mod projection;
 pub mod proxy;
