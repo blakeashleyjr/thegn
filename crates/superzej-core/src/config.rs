@@ -1181,30 +1181,9 @@ pub struct GitCommand {
     pub prompts: Vec<GitPrompt>,
 }
 
-/// UI/Presentation settings (`[ui]`).
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct UiConfig {
-    /// Language code (e.g. "en-US", "ja-JP"). "auto" to detect from system.
-    pub language: String,
-    /// Ask before destructive worktree actions (deleting a worktree from disk via the sidebar).
-    pub confirm_delete_workspace: bool,
-    /// Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
-    pub full_mode_chip: bool,
-    /// Dismiss a detail popup when the user left-clicks outside it, like Escape.
-    pub dismiss_overlay_on_click_outside: bool,
-}
-
-impl Default for UiConfig {
-    fn default() -> Self {
-        Self {
-            language: "auto".to_string(),
-            confirm_delete_workspace: true,
-            full_mode_chip: true,
-            dismiss_overlay_on_click_outside: true,
-        }
-    }
-}
+// UI/presentation (`[ui]`) settings live in the `config_ui` sibling module;
+// re-exported so `config::UiConfig` keeps working.
+pub use crate::config_ui::{UiConfig, WorkspaceSort};
 
 /// Git behavior knobs for the panel's write operations (`[git]`).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1872,11 +1851,9 @@ pub struct CiConfig {
     /// Active provider; `"auto"` detects from the worktree.
     pub provider: CiProviderKind,
     /// Freshness window (seconds): non-forced refreshes (ticker, tab switch)
-    /// are skipped while the cached run history is younger than this. `0`
-    /// disables the guard. Manual refresh (`g`) always refetches.
+    /// skip while the cache is younger. `0` disables; `g` always refetches.
     pub ttl_secs: u64,
-    /// Background poll cadence (seconds) for the CI run-history refresh
-    /// ticker. Clamped to ≥ 5 (each poll is a provider subprocess).
+    /// Run-history refresh cadence (seconds), min 5 (a subprocess per poll).
     pub poll_interval_secs: u64,
     /// How many recent runs to fetch and display.
     pub max_runs: usize,

@@ -39,9 +39,17 @@ on:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+# Runner selection (both GitHub-hosted and self-hosted are supported; default is
+# self-hosted). Every Linux job reads the repo variable `CI_RUNS_ON`; unset, it
+# targets the self-hosted ageless runners (see docs/self-hosted-ci.md). Flip the
+# whole workflow back to GitHub-hosted with one toggle, no edits:
+#   gh variable set CI_RUNS_ON --body '["ubuntu-latest"]'
+#   gh variable delete CI_RUNS_ON        # ← back to self-hosted
+# `ci-setup` adapts either way (installs nix + caches only on github-hosted).
+# The `macos` job is always GitHub-hosted (macos-14).
 jobs:
   fmt:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +62,7 @@ jobs:
   lint:
     # `just lint` also carries the git_cmd guard (no raw Command::new("git"))
     # and the file-size ratchet (test/file-size-ratchet.sh).
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -67,7 +75,7 @@ jobs:
   deps-audit:
     # cargo-deny (advisories/licenses/dup majors) + cargo-machete; fetches the
     # RustSec DB over the network on a cold cache.
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -78,7 +86,7 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just deps-audit
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     # `just build && just test` from a cold cache after a large refactor pushes
     # close to the old 40m cap; give it headroom.
     timeout-minutes: 50
@@ -99,7 +107,7 @@ jobs:
           git config --global user.name "superzej CI"
       - run: nix develop --command bash -lc "just build && just test"
   doc:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -113,7 +121,7 @@ jobs:
     # Typechecks the leaf crates' macOS/Windows code paths from Linux
     # (`cargo check --target`, no cross linker needed; targets come from the
     # flake's rust toolchain).
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -124,7 +132,7 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just check-cross
   openspec:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -135,7 +143,7 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just openspec-validate
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -148,7 +156,7 @@ jobs:
   smoke:
     # Hermetic end-to-end CLI tests against the debug binary (isolated
     # XDG_STATE_HOME; includes the pty-smoke harness, which works on runners).
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -160,7 +168,7 @@ jobs:
       - run: nix develop --command just smoke
   sandbox-e2e:
     # Tier-1 only (DNS filter + DB audit trail) — no container runtime needed.
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -171,7 +179,7 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command bash -lc "just sandbox-e2e-dns && just sandbox-e2e-db"
   nix-build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     # A cold `nix build .#default` compiles the whole app + deps from source
     # (a Cargo.lock change misses the nix-store cache). It was killed at 45m with
     # only the final `superzej-host` compile+link left, so give it 60m; once it
@@ -191,7 +199,7 @@ jobs:
     # dispatch or a `[ci-e2e]` commit-message marker (absent on PR events, so
     # PRs never schedule it).
     if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-e2e]') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -230,7 +238,7 @@ jobs:
   # loop.
   update-baselines:
     if: contains(github.event.head_commit.message, '[gen-baselines]')
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 40
     permissions:
       contents: write

@@ -1,5 +1,5 @@
 name: ci-setup
-description: Install nix (private-flake access-tokens) and restore nix + cargo caches.
+description: Install nix + restore caches on GitHub-hosted runners; no-op on self-hosted (nix + caches are host-level).
 inputs:
   nix-token:
     description: Classic PAT for private + public github flake fetches.
@@ -12,6 +12,16 @@ inputs:
 runs:
   using: composite
   steps:
+    # ── Self-hosted (ageless) note ──────────────────────────────────────────
+    # Every step below is gated on `runner.environment == 'github-hosted'`, so
+    # on our self-hosted ageless runners this action does NOTHING: nix is
+    # installed on the host (persistent /nix/store), and the warm caches
+    # (sccache, CARGO_HOME) + PATH are injected per-job via the runner's
+    # .env/.path files (see scripts/ci/ageless-runner-setup.sh). Installing nix
+    # or round-tripping the store to the GitHub cache there would be pure
+    # overhead — the whole point of self-hosting is that the store already
+    # persists. The macOS job is still GitHub-hosted, so these steps run for it.
+    #
     # Reclaim runner disk before building. The default ubuntu runner ships ~14G
     # free on /, and a full rust+nix build (debug link of szhost, nix store,
     # coverage instrumentation) can exhaust it — mold then dies mid-link with
@@ -19,6 +29,7 @@ runs:
     # here runs through `nix develop`, so the preinstalled toolchains are dead
     # weight; dropping them frees ~20-30G.
     - name: reclaim runner disk
+      if: runner.environment == 'github-hosted'
       shell: bash
       run: |
         if [ "${RUNNER_OS:-Linux}" = "Linux" ]; then
@@ -28,6 +39,7 @@ runs:
         fi
         df -h /
     - uses: DeterminateSystems/nix-installer-action@main
+      if: runner.environment == 'github-hosted'
       with:
         # download-resilience: a runner's outbound DNS/fetch occasionally stalls
         # (seen as "Resolving timed out after 15000 ms" on a source tarball,
@@ -40,6 +52,7 @@ runs:
           download-attempts = 5
           stalled-download-timeout = 90
     - uses: nix-community/cache-nix-action@v6
+      if: runner.environment == 'github-hosted'
       with:
         primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/Cargo.lock') }}
         restore-prefixes-first-match: nix-${{ runner.os }}-
@@ -49,6 +62,7 @@ runs:
         purge-created: 0
         purge-primary-key: never
     - uses: Swatinem/rust-cache@v2
+      if: runner.environment == 'github-hosted'
       with:
         prefix-key: rust-${{ runner.os }}
         key: ${{ hashFiles('flake.lock') }}

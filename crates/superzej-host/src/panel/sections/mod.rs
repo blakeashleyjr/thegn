@@ -1036,6 +1036,7 @@ mod spec {
                 added: 3,
                 deleted: 1,
                 touch: Touch::Modified,
+                start_line: 1,
             }],
         )]));
         let mut u = ui(PanelWidth::Normal, Section::Changes);
@@ -1111,6 +1112,7 @@ mod spec {
                 added: 8,
                 deleted: 0,
                 touch: Touch::Added,
+                start_line: 1,
             }],
         )]));
         let n = m.panel.changes.len();
@@ -1142,6 +1144,63 @@ mod spec {
                 "footer hit pinned at changes.len() (chg_sel={chg_sel:?})"
             );
         }
+    }
+
+    #[test]
+    fn expanded_entity_rows_are_actionable_jump_targets() {
+        use crate::layout::PanelWidth;
+        use superzej_core::semantic::{EntityChange, EntityKind, EntitySummary, Touch};
+        let mut m = model(); // one change row at src/lib.rs
+        m.panel.entities = Some(EntitySummary::new(vec![(
+            "src/lib.rs".into(),
+            vec![
+                EntityChange {
+                    kind: EntityKind::Function,
+                    name: "go".into(),
+                    added: 3,
+                    deleted: 1,
+                    touch: Touch::Modified,
+                    start_line: 12,
+                },
+                EntityChange {
+                    kind: EntityKind::Enum,
+                    name: "V".into(),
+                    added: 8,
+                    deleted: 0,
+                    touch: Touch::Added,
+                    start_line: 40,
+                },
+            ],
+        )]));
+        let n = m.panel.changes.len();
+        let mut u = ui(PanelWidth::Normal, Section::Changes);
+        u.impact_open = true;
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 39,
+            rows: 40,
+        };
+        let rows = content(Section::Changes, &ctx);
+        // Each rendered entity row carries a sequential hit one past the footer,
+        // aligned one-for-one with `entity_targets()` so the drill-in resolves
+        // the right (file, line).
+        let targets = m.panel.entities.as_ref().unwrap().entity_targets();
+        assert_eq!(targets.len(), 2, "two entity targets");
+        for ord in 0..targets.len() {
+            let want = PanelHit::Row(Section::Changes, n + 1 + ord);
+            assert!(
+                rows.iter().any(|r| r.hit == Some(want)),
+                "entity row {ord} actionable at index {}",
+                n + 1 + ord
+            );
+        }
+        // Files + footer + the two entity rows are all actionable, contiguous.
+        let actionable = rows
+            .iter()
+            .filter(|r| matches!(r.hit, Some(PanelHit::Row(Section::Changes, _))))
+            .count();
+        assert_eq!(actionable, n + 1 + targets.len());
     }
 
     #[test]

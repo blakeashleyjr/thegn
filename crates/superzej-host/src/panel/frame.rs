@@ -873,6 +873,7 @@ mod tests {
                 added: 1,
                 deleted: 0,
                 touch: Touch::Added,
+                start_line: 1,
             }],
         )]));
         // Cursor one past the single change row lands on the impact footer.

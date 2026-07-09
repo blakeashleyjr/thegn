@@ -278,7 +278,16 @@ pub struct EntityChange {
     pub added: u32,
     pub deleted: u32,
     pub touch: Touch,
+    /// 1-based start line of the entity in the *new* file — the jump target for
+    /// the panel's semantic drill-in.
+    pub start_line: u32,
 }
+
+/// How many entity rows the panel renders (and offers as jump targets) per file
+/// in the expanded semantic breakdown before collapsing the rest into a
+/// "… +N more" summary. Shared by the renderer and [`EntitySummary::entity_targets`]
+/// so the on-screen order and the jump-target index can never drift.
+pub const ENTITY_ROW_CAP: usize = 8;
 
 /// Attribute a file diff's added/deleted lines to the entities they fall in,
 /// using the *new* file source for entity spans. Added lines map to their
@@ -347,6 +356,7 @@ pub fn entities_for_diff(new_source: &str, lang: Lang, hunks: &[PatchHunk]) -> V
                 added,
                 deleted,
                 touch,
+                start_line: e.start_line,
             }
         })
         .collect()
@@ -380,6 +390,24 @@ impl EntitySummary {
             .collect();
         let impact = (!per_file.is_empty()).then(|| impact_summary(&per_file));
         EntitySummary { per_file, impact }
+    }
+
+    /// The flat `(path, 1-based start line)` jump targets for the expanded
+    /// breakdown, in *exactly* the order the panel renders entity rows — per
+    /// file (skipping files with no churn), capped at [`ENTITY_ROW_CAP`] rows.
+    /// The panel's semantic drill-in indexes this list by the row's ordinal, so
+    /// this order must mirror the renderer's `.take(ENTITY_ROW_CAP)`.
+    pub fn entity_targets(&self) -> Vec<(String, u32)> {
+        let mut out = Vec::new();
+        for (path, changes) in &self.per_file {
+            if changes.is_empty() {
+                continue;
+            }
+            for c in changes.iter().take(ENTITY_ROW_CAP) {
+                out.push((path.clone(), c.start_line));
+            }
+        }
+        out
     }
 }
 
@@ -723,6 +751,8 @@ diff --git a/x.rs b/x.rs
         assert_eq!(changes[0].added, 1);
         assert_eq!(changes[0].deleted, 1);
         assert_eq!(changes[0].touch, Touch::Modified);
+        // `fn b` starts on line 5 of the new source — the jump target.
+        assert_eq!(changes[0].start_line, 5);
     }
 
     #[test]
@@ -737,6 +767,7 @@ diff --git a/x.rs b/x.rs
                         added: 2,
                         deleted: 0,
                         touch: Touch::Added,
+                        start_line: 1,
                     },
                     EntityChange {
                         kind: EntityKind::Function,
@@ -744,6 +775,7 @@ diff --git a/x.rs b/x.rs
                         added: 1,
                         deleted: 1,
                         touch: Touch::Modified,
+                        start_line: 1,
                     },
                 ],
             ),
@@ -755,6 +787,7 @@ diff --git a/x.rs b/x.rs
                     added: 0,
                     deleted: 3,
                     touch: Touch::Removed,
+                    start_line: 1,
                 }],
             ),
         ];
@@ -772,6 +805,38 @@ diff --git a/x.rs b/x.rs
     }
 
     #[test]
+    fn entity_targets_mirrors_render_order_and_cap() {
+        let ec = |name: &str, line: u32| EntityChange {
+            kind: EntityKind::Function,
+            name: name.into(),
+            added: 1,
+            deleted: 0,
+            touch: Touch::Added,
+            start_line: line,
+        };
+        // File with more than the cap; an empty file dropped by `new`; and a
+        // second real file after it. Targets must follow that render order.
+        let over_cap: Vec<EntityChange> = (0..ENTITY_ROW_CAP as u32 + 3)
+            .map(|i| ec(&format!("f{i}"), 100 + i))
+            .collect();
+        let sum = EntitySummary::new(vec![
+            ("a.rs".into(), over_cap),
+            ("empty.rs".into(), vec![]),
+            ("b.rs".into(), vec![ec("g", 7)]),
+        ]);
+        let targets = sum.entity_targets();
+        // a.rs contributes exactly ENTITY_ROW_CAP rows, then b.rs one.
+        assert_eq!(targets.len(), ENTITY_ROW_CAP + 1);
+        assert_eq!(targets[0], ("a.rs".to_string(), 100));
+        assert_eq!(
+            targets[ENTITY_ROW_CAP - 1],
+            ("a.rs".to_string(), 100 + ENTITY_ROW_CAP as u32 - 1)
+        );
+        // The dropped empty file leaves no gap; b.rs's entity is last.
+        assert_eq!(targets[ENTITY_ROW_CAP], ("b.rs".to_string(), 7));
+    }
+
+    #[test]
     fn derive_commit_message_structures_subject_and_body() {
         let per_file = vec![
             (
@@ -782,6 +847,7 @@ diff --git a/x.rs b/x.rs
                     added: 10,
                     deleted: 0,
                     touch: Touch::Added,
+                    start_line: 1,
                 }],
             ),
             (
@@ -792,6 +858,7 @@ diff --git a/x.rs b/x.rs
                     added: 1,
                     deleted: 1,
                     touch: Touch::Modified,
+                    start_line: 1,
                 }],
             ),
         ];
@@ -817,6 +884,7 @@ diff --git a/x.rs b/x.rs
                 added: 5 - i,
                 deleted: 0,
                 touch: Touch::Added,
+                start_line: 1,
             })
             .collect();
         let msg = derive_commit_message(&[("x.rs".into(), changes)]);
@@ -951,6 +1019,7 @@ diff --git a/x.rs b/x.rs
                     added: 1,
                     deleted: 0,
                     touch: Touch::Added,
+                    start_line: 1,
                 }],
             ),
             // This file has no entity churn and must be dropped.
@@ -983,6 +1052,7 @@ diff --git a/x.rs b/x.rs
                 added: 1,
                 deleted: 0,
                 touch: Touch::Added,
+                start_line: 1,
             }],
         )];
         let s = impact_summary(&per_file);
@@ -1003,6 +1073,7 @@ diff --git a/x.rs b/x.rs
                     added: 2,
                     deleted: 1,
                     touch: Touch::Modified,
+                    start_line: 1,
                 }],
             ),
             // Empty section must be skipped in the body.
