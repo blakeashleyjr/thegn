@@ -55,6 +55,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         palette: true,
     },
     ActionSpec {
+        id: "merge-drain",
+        label: "Merge queue: drain (agent autopilot)",
+        hint: "drain queue",
+        // No default chord — palette + the section's `D`; gated on
+        // [merge_queue].enabled like the other fold-actor actions.
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
         id: "new-tab",
         label: "New tab — same worktree",
         hint: "tab",
@@ -366,7 +375,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "open-merge-queue",
         label: "Merge queue",
         hint: "merge queue",
-        default_chords: &[],
+        default_chords: &["Ctrl Alt q"],
         palette: true,
     },
     ActionSpec {

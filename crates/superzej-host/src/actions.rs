@@ -652,6 +652,9 @@ impl CiActionCtx<'_> {
             }
             // ShowLog drills in place inside the overlay and never reaches the loop.
             DetailAction::ShowLog(_) => {}
+            // Intercepted by the loop's Act arm (it owns the panel locals);
+            // unreachable here.
+            DetailAction::OpenMergeQueueSection => {}
         }
         // Retain the overlay only for the in-place CI drill; every other action
         // has done its side effect and the modal should close.
