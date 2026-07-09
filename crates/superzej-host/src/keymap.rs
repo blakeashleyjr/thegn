@@ -130,9 +130,12 @@ pub enum Action {
     StopWorktreeShare,
     /// Open the right panel to the System ▸ Share section and focus it.
     OpenShares,
-    /// Drain the local merge queue: fold eligible worktree branches into the
-    /// repo's target branch (`[merge_queue]`, the fold-actor).
+    /// Batch-fold every eligible worktree branch into the repo's target branch
+    /// (`[merge_queue]`, the fold-actor). No queue, no agent — the batch path.
     Integrate,
+    /// Drain the merge queue with the agent autopilot: land each queued branch,
+    /// dispatching the configured headless agent on conflicts/red gates.
+    DrainMergeQueue,
     OpenPalette,
     Lazygit,
     Yazi,
@@ -375,6 +378,7 @@ impl Action {
             Action::OpenShares => "open-shares",
             Action::ToggleNotifications => "toggle-notifications",
             Action::Integrate => "integrate",
+            Action::DrainMergeQueue => "merge-drain",
             Action::OpenPalette => "palette",
             Action::Lazygit => "lazygit",
             Action::Yazi => "yazi",
@@ -477,6 +481,7 @@ impl Action {
             "open-shares" => Action::OpenShares,
             "toggle-notifications" => Action::ToggleNotifications,
             "integrate" => Action::Integrate,
+            "merge-drain" => Action::DrainMergeQueue,
             "palette" | "menu" => Action::OpenPalette,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
             "yazi" | "tool-yazi" => Action::Yazi,

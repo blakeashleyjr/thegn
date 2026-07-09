@@ -121,6 +121,9 @@ pub(crate) fn collect_attention(
             );
         }
     }
+    // Re-expose the raw statuses for the sidebar's per-worktree MQ chip (the
+    // scorer folds them into tiers; the chip wants the status itself).
+    status.mq = mq.iter().map(|(p, f)| (p.clone(), f.status)).collect();
 
     // Score every worktree.
     let mut scores: BTreeMap<String, AttentionScore> = BTreeMap::new();
