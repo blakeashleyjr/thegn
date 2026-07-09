@@ -516,6 +516,60 @@ pub(crate) fn neighbor_worktree_paths(
         .collect()
 }
 
+/// Every worktree dir in the ACTIVE worktree's workspace, in proximity order
+/// from the active one (next, prev, next+1, prev-1, … in the sidebar's
+/// display order, wrapping) — the widened prefetch target set, so ANY
+/// in-workspace switch lands on a warm cache, not just the two immediate
+/// neighbors. Skips the active worktree itself and empty paths; existence
+/// checks stay off-loop in `spawn_panel_prefetch`.
+pub(crate) fn workspace_worktree_paths(
+    session: &crate::session::Session,
+    order: &[usize],
+) -> Vec<std::path::PathBuf> {
+    let active_slug = session
+        .worktrees
+        .get(session.active)
+        .and_then(|g| crate::sidebar::split_tab(&g.name).map(|(s, _)| s));
+    if active_slug.is_none() {
+        return neighbor_worktree_paths(session, order);
+    }
+    let ring: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|&g| {
+            session
+                .worktrees
+                .get(g)
+                .and_then(|w| crate::sidebar::split_tab(&w.name).map(|(s, _)| s))
+                == active_slug
+        })
+        .collect();
+    let Some(p) = ring.iter().position(|&g| g == session.active) else {
+        return neighbor_worktree_paths(session, order);
+    };
+    let n = ring.len();
+    let mut out = Vec::new();
+    // Proximity interleave: +1, -1, +2, -2, … (display-order distance).
+    for k in 1..n {
+        for idx in [(p + k) % n, (p + n - k) % n] {
+            if idx == p {
+                continue;
+            }
+            let Some(g) = session.worktrees.get(ring[idx]) else {
+                continue;
+            };
+            if g.path.is_empty() {
+                continue;
+            }
+            let path = std::path::PathBuf::from(&g.path);
+            if !out.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
 /// The tabbar strip for the active worktree: (worktree label, tab chip titles,
 /// active chip index).
 pub(crate) fn tab_strip(session: &crate::session::Session) -> (String, Vec<String>, usize) {
@@ -1698,15 +1752,17 @@ pub(crate) fn spawn_panel_prefetch(
 }
 
 pub(crate) fn spawn_pr_cache_refresh(
-    session: crate::session::Session,
+    cwd: std::path::PathBuf,
     cfg: superzej_core::config::IssuesConfig,
     disk_cfg: superzej_core::config::DiskConfig,
     waker: Option<TerminalWaker>,
 ) {
-    let branch_session = session.clone();
+    // Takes the worktree path, NOT the Session: the refreshers only ever read
+    // the active tab's path, and a by-value Session is a String-heavy deep
+    // clone on the loop thread at every call site (4× per worktree switch).
+    let branch_cwd = cwd.clone();
     let branch_waker = waker.clone();
     crate::sched::spawn_bg(move || {
-        let cwd = active_tab_path(&session);
         if !cwd.is_dir() {
             return;
         }
@@ -1785,7 +1841,7 @@ pub(crate) fn spawn_pr_cache_refresh(
     // runtime — neither the subprocess fallback nor the HTTP wait can ever
     // touch the event loop.
     crate::sched::spawn_bg(move || {
-        let cwd = active_tab_path(&branch_session);
+        let cwd = branch_cwd;
         if !cwd.is_dir() {
             return;
         }
@@ -1979,7 +2035,7 @@ pub(crate) fn spawn_disk_scan(
 /// entirely off-thread (no event-loop contact); writes the fresh JSON into
 /// `issue_cache` and pulses the waker so the loop rehydrates promptly.
 pub(crate) fn spawn_issue_cache_refresh(
-    session: crate::session::Session,
+    cwd: std::path::PathBuf,
     cfg: superzej_core::config::IssuesConfig,
     waker: Option<TerminalWaker>,
 ) {
@@ -1987,7 +2043,6 @@ pub(crate) fn spawn_issue_cache_refresh(
         use superzej_core::issue::IssueFilter;
         use superzej_svc::issue::IssueRouter;
 
-        let cwd = active_tab_path(&session);
         if !cwd.is_dir() {
             return;
         }
@@ -2120,7 +2175,7 @@ pub(crate) fn repo_worktree_paths(
 /// `all == true` the fetch is cross-repo and written to the `ALL_SCOPE` row (the
 /// panel's "all repos" toggle). Pulses the waker when done.
 pub(crate) fn spawn_my_work_refresh(
-    session: crate::session::Session,
+    cwd: std::path::PathBuf,
     cfg: superzej_core::config::Config,
     all: bool,
     waker: Option<TerminalWaker>,
@@ -2128,7 +2183,6 @@ pub(crate) fn spawn_my_work_refresh(
     crate::sched::spawn_bg(move || {
         use superzej_core::work::{ALL_SCOPE, WorkGroup, WorkKind, WorkRow};
 
-        let cwd = active_tab_path(&session);
         if !cwd.is_dir() {
             return;
         }
@@ -2262,7 +2316,12 @@ pub(crate) fn toggle_mine_scope(
     waker: &TerminalWaker,
 ) -> String {
     let all = crate::panel::scope::toggle_mine_all();
-    spawn_my_work_refresh(session.clone(), cfg.clone(), all, Some(waker.clone()));
+    spawn_my_work_refresh(
+        active_tab_path(session),
+        cfg.clone(),
+        all,
+        Some(waker.clone()),
+    );
     if all {
         "My Work: all repos".into()
     } else {
@@ -2306,12 +2365,11 @@ pub(crate) fn toggle_system_scope(
 /// `ci_runs_cache`, and pulses the waker so the panel rehydrates. A missing
 /// provider / unconfigured CI / fetch error simply leaves the cache untouched.
 pub(crate) fn spawn_ci_cache_refresh(
-    session: crate::session::Session,
+    cwd: std::path::PathBuf,
     cfg: superzej_core::config::CiConfig,
     waker: Option<TerminalWaker>,
 ) {
     crate::sched::spawn_bg(move || {
-        let cwd = active_tab_path(&session);
         if !cwd.is_dir() {
             return;
         }

@@ -346,6 +346,11 @@ pub struct FrameModel {
     /// this hydration pass. Drained by the run-loop model drain BEFORE the
     /// model swap (never rendered, never part of `hydration_eq`).
     pub intents: Vec<superzej_core::store::IntentRow>,
+    /// A cold worktree switch blanked the panel (switch-cache miss) and its
+    /// hydration hasn't landed yet: the panel draws its skeleton placeholder
+    /// instead of a void. Loop-transient (set by `WorktreeSlice::clear`,
+    /// cleared by the next model swap); never part of `hydration_eq`.
+    pub panel_pending: bool,
     /// Data carriers populated by the hydration thread and consumed by the
     /// event loop to (re)derive `sidebar_rows`. The `(slug, display, kind)`
     /// workspace list in display order (`kind` = "repo" | "dir"), and
@@ -558,35 +563,7 @@ impl FrameModel {
         }
     }
 
-    /// True when a freshly hydrated model carries no render-affecting change
-    /// versus the one on screen — i.e. the 2 s "safety" refresh tick produced
-    /// byte-identical git/db data. The event loop uses this to drain the
-    /// hydration result without repainting, keeping idle CPU at ~0%.
-    ///
-    /// Compares exactly the fields [`crate::hydrate::build_model`] populates
-    /// (plus `status`), and nothing else: stats/metrics/containers/accent/
-    /// bars/pins/app-tabs are owned by other handlers or config and have their
-    /// own dirty triggers, while the session-derived tab/sidebar fields are
-    /// stable during an idle period. KEEP THIS IN SYNC WITH `build_model`.
-    pub fn hydration_eq(&self, other: &Self) -> bool {
-        self.worktree == other.worktree
-            && self.tabs == other.tabs
-            && self.active_tab == other.active_tab
-            && self.sidebar_workspaces == other.sidebar_workspaces
-            && self.sidebar_db_worktrees == other.sidebar_db_worktrees
-            && self.sidebar_status == other.sidebar_status
-            && self.loc == other.loc
-            && self.active_container_name == other.active_container_name
-            && self.active_sandbox_backend == other.active_sandbox_backend
-            && self.active_placement_kind == other.active_placement_kind
-            && self.active_placement_label == other.active_placement_label
-            && self.container_events == other.container_events
-            && self.timeline == other.timeline
-            && self.status == other.status
-            && self.panel == other.panel
-            && self.disk_warn_threshold_gb == other.disk_warn_threshold_gb
-            && self.active_worktree_disk == other.active_worktree_disk
-    }
+    // NOTE: `hydration_eq` (the idle-guard equality) lives in `model_eq.rs`.
 }
 
 use crate::nav::worktree_parts;
@@ -2580,6 +2557,12 @@ pub fn draw_panel(
     if rect.rows == 0 || rect.cols == 0 {
         return;
     }
+    if model.panel_pending {
+        // Cold-switch skeleton: dim placeholder bars while hydration is in
+        // flight (static — no animation, so no timer wakes).
+        crate::panel::skeleton::draw(surface, rect);
+        return;
+    }
     let frame =
         crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused);
     for (i, row) in frame.rows.iter().enumerate() {
@@ -3098,53 +3081,6 @@ mod tests {
             .lines()
             .map(|l| l.to_string())
             .collect()
-    }
-
-    #[test]
-    fn hydration_eq_ignores_non_hydration_fields() {
-        let base = FrameModel::default();
-        // Fields owned by other handlers / config must NOT count as a change,
-        // or the idle guard would still repaint on every safety tick.
-        let mut other = base.clone();
-        other.accent = "ff0000".into();
-        other.pins.push(crate::pins::PinChip {
-            index: 0,
-            label: "p".into(),
-            glyph: '●',
-        });
-        other.stats.cpu_pct = Some(99);
-        other.app_tabs.push("chat".into());
-        other.sidebar_selected = 3;
-        other.center_focused = !base.center_focused;
-        assert!(
-            base.hydration_eq(&other),
-            "non-hydration fields should not trip the idle guard"
-        );
-    }
-
-    #[test]
-    fn hydration_eq_detects_real_changes() {
-        let base = FrameModel::default();
-        let mut panel_changed = base.clone();
-        panel_changed.panel.branch = "feature".into();
-        assert!(
-            !base.hydration_eq(&panel_changed),
-            "panel change must repaint"
-        );
-
-        let mut sidebar_changed = base.clone();
-        sidebar_changed
-            .sidebar_status
-            .activity
-            .insert("tab".into(), crate::sidebar::ActivityState::Active);
-        assert!(
-            !base.hydration_eq(&sidebar_changed),
-            "sidebar status change must repaint"
-        );
-
-        let mut loc_changed = base.clone();
-        loc_changed.loc = Some(superzej_core::loc::LocReport::total_only(42));
-        assert!(!base.hydration_eq(&loc_changed), "loc change must repaint");
     }
 
     /// Build a minimal sidebar row for renderer tests.
