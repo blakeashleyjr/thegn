@@ -79,7 +79,9 @@ jobs:
       - run: nix develop --command just deps-audit
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # `just build && just test` from a cold cache after a large refactor pushes
+    # close to the old 40m cap; give it headroom.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:
@@ -170,10 +172,11 @@ jobs:
       - run: nix develop --command bash -lc "just sandbox-e2e-dns && just sandbox-e2e-db"
   nix-build:
     runs-on: ubuntu-latest
-    # A cold `nix build .#default` compiles the whole app + deps from source and
-    # can exceed 30m (prior runs were killed at the cap mid-compile). The warmed
-    # nix-store cache usually makes it far quicker; this is the cold-cache budget.
-    timeout-minutes: 45
+    # A cold `nix build .#default` compiles the whole app + deps from source
+    # (a Cargo.lock change misses the nix-store cache). It was killed at 45m with
+    # only the final `superzej-host` compile+link left, so give it 60m; once it
+    # succeeds the nix-store cache warms and later runs are far quicker.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
