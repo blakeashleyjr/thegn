@@ -224,8 +224,9 @@ pub fn thread_cpu_ns() -> u64 {
 // Per-subsystem CPU ledger.
 // ---------------------------------------------------------------------------
 
-/// Off-thread producers whose CPU we attribute. Order matches [`CpuLedger`]'s
-/// arrays; keep [`Subsys::ALL`] in sync.
+/// Producers whose CPU we attribute — mostly off-thread, plus two on-loop
+/// spans (`Switch`, `Drawer`) that time the worktree/tab-switch critical path.
+/// Order matches [`CpuLedger`]'s arrays; keep [`Subsys::ALL`] in sync.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Subsys {
@@ -238,10 +239,14 @@ pub enum Subsys {
     Lsp,
     Sandbox,
     Diff,
+    /// On-loop: `refresh_tab_model` on a tab/worktree switch.
+    Switch,
+    /// On-loop: `sync_drawer_persistence` on a tab/worktree switch.
+    Drawer,
 }
 
 impl Subsys {
-    pub const ALL: [Subsys; 9] = [
+    pub const ALL: [Subsys; 11] = [
         Subsys::Hydrate,
         Subsys::Pr,
         Subsys::Issues,
@@ -251,6 +256,8 @@ impl Subsys {
         Subsys::Lsp,
         Subsys::Sandbox,
         Subsys::Diff,
+        Subsys::Switch,
+        Subsys::Drawer,
     ];
     pub const N: usize = Self::ALL.len();
 
@@ -266,6 +273,8 @@ impl Subsys {
             Subsys::Lsp => "lsp",
             Subsys::Sandbox => "sandbox",
             Subsys::Diff => "diff",
+            Subsys::Switch => "switch",
+            Subsys::Drawer => "drawer",
         }
     }
 }
@@ -662,12 +671,6 @@ impl LoopPerf {
         best
     }
 
-    /// Per-source message counts in [`WakeSource::ALL`] order.
-    #[allow(dead_code)] // consumed by the Telemetry overlay's wake-source breakdown
-    pub fn per_source(&self) -> [u64; WakeSource::N] {
-        self.drain_items
-    }
-
     /// Message count for one source this interval.
     pub fn items(&self, src: WakeSource) -> u64 {
         self.drain_items[src as usize]
@@ -706,8 +709,6 @@ impl Default for LoopPerf {
 /// and consumed by the live Telemetry overlay. All rates are per-second.
 #[derive(Clone, Debug, Default)]
 pub struct PerfSnapshot {
-    #[allow(dead_code)] // rollup interval length; surfaced by the Telemetry overlay
-    pub secs: f64,
     pub wakes_per_s: f64,
     pub renders_per_s: f64,
     pub pane_frames_per_s: f64,
@@ -747,7 +748,6 @@ impl LoopPerf {
         let hot_items = self.items(hot);
         let busy_ratio = (self.busy.as_secs_f64() / secs).clamp(0.0, 1.0);
         let snap = PerfSnapshot {
-            secs,
             wakes_per_s: self.wakes as f64 / secs,
             renders_per_s: self.renders as f64 / secs,
             pane_frames_per_s: self.pane_frames as f64 / secs,

@@ -1023,9 +1023,9 @@ fn on_missing(cfg: &SandboxConfig, what: &str) {
 /// **Memoized** (D3): probe once per `(placement, backend)`; cache success
 /// permanently, failure only 30s (a permanent `false` stranded a remote host).
 fn available(placement: &Placement, backend: Backend) -> bool {
-    type ProbeCache =
+    type AvailCache =
         std::sync::Mutex<std::collections::HashMap<(String, Backend), (bool, std::time::Instant)>>;
-    static CACHE: std::sync::OnceLock<ProbeCache> = std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<AvailCache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let key = (format!("{placement:?}"), backend);
     if let Some(&(v, at)) = cache.lock().unwrap().get(&key)

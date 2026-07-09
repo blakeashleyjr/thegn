@@ -498,9 +498,6 @@ impl IssueBackend for JiraBackend {
             struct TransitionId {
                 id: String,
             }
-            #[allow(dead_code)]
-            #[derive(Deserialize)]
-            struct Empty {}
             let _: serde_json::Value = self
                 .post(
                     &format!("issue/{key}/transitions"),

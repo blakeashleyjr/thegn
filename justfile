@@ -301,7 +301,8 @@ lint: _apps
     # Guardrail: all git must route through util::git_cmd / GitLoc so GIT_ENV_VARS
     # is scrubbed (the core.worktree-pollution class). Only the builder in util.rs
     # may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
-    ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'superzej-core/src/util.rs' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
+    # Comment lines are ignored (doc-comments legitimately name the pattern they forbid).
+    ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'superzej-core/src/util.rs' | grep -vE ':[0-9]+:[[:space:]]*//' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
     # Guardrail: god-file ratchet — legacy oversized files may only shrink, new
     # files are hard-capped at 3000 lines. See test/file-size-ratchet.sh.
     bash test/file-size-ratchet.sh

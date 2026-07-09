@@ -396,20 +396,17 @@ struct EventBusState {
 /// The event bus - a simple pub/sub for events with desktop notification support.
 #[derive(Clone)]
 pub struct EventBus {
-    #[allow(dead_code)]
-    tx: Sender<Event>,
     state: Arc<Mutex<EventBusState>>,
 }
 
 impl EventBus {
     /// Create a new event bus.
     pub fn new() -> Self {
-        let (tx, _) = mpsc::channel();
         let state = Arc::new(Mutex::new(EventBusState {
             subscribers: Vec::new(),
             desktop_receivers: Vec::new(),
         }));
-        Self { tx, state }
+        Self { state }
     }
 
     /// Subscribe to events. Returns a subscriber that will receive events.

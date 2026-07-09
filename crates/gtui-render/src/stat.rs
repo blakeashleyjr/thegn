@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 pub struct StatRenderer;
 
 impl StatRenderer {
-    pub fn render<'a>(frame: &'a Frame) -> Paragraph<'a> {
+    pub fn render<'a>(frame: &'a Frame, title: &str) -> Paragraph<'a> {
         let mut text = "No Data".to_string();
 
         if !frame.fields.is_empty() {
@@ -21,7 +21,11 @@ impl StatRenderer {
 
         Paragraph::new(text)
             .style(Style::default().fg(Color::Cyan))
-            .block(Block::default().borders(Borders::ALL).title("Stat"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.to_string()),
+            )
     }
 }
 
@@ -38,7 +42,7 @@ mod tests {
         let field = Field::new("val", FieldType::Float64, vec![1.0, 5.0, 42.0]);
         let frame = Frame::new(vec![field]);
 
-        let p = StatRenderer::render(&frame);
+        let p = StatRenderer::render(&frame, "Stat");
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 10));
         p.render(buffer.area, &mut buffer);
 

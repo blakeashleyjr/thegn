@@ -12,10 +12,33 @@ inputs:
 runs:
   using: composite
   steps:
+    # Reclaim runner disk before building. The default ubuntu runner ships ~14G
+    # free on /, and a full rust+nix build (debug link of szhost, nix store,
+    # coverage instrumentation) can exhaust it — mold then dies mid-link with
+    # "failed to write to an output file. Disk full?" / Bus error. Everything
+    # here runs through `nix develop`, so the preinstalled toolchains are dead
+    # weight; dropping them frees ~20-30G.
+    - name: reclaim runner disk
+      shell: bash
+      run: |
+        if [ "${RUNNER_OS:-Linux}" = "Linux" ]; then
+          sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet \
+            /usr/local/.ghcup /usr/lib/jvm /opt/ghc /usr/local/share/boost 2>/dev/null || true
+          sudo docker image prune -a -f 2>/dev/null || true
+        fi
+        df -h /
     - uses: DeterminateSystems/nix-installer-action@main
       with:
+        # download-resilience: a runner's outbound DNS/fetch occasionally stalls
+        # (seen as "Resolving timed out after 15000 ms" on a source tarball,
+        # cascading into "Cannot build" for every downstream drv). Give nix more
+        # attempts and a longer stall budget so a transient blip retries instead
+        # of failing the whole job.
         extra-conf: |
           access-tokens = github.com=${{ inputs.nix-token }}
+          connect-timeout = 20
+          download-attempts = 5
+          stalled-download-timeout = 90
     - uses: nix-community/cache-nix-action@v6
       with:
         primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/Cargo.lock') }}

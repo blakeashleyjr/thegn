@@ -70,18 +70,6 @@ pub struct GitGlyphs {
     pub behind: usize,
 }
 
-/// Badge kinds displayed on sidebar rows (item 28).
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub enum BadgeKind {
-    /// Open PRs for this worktree's branch.
-    Pr,
-    /// Unread notifications relevant to this worktree.
-    Unread,
-    /// Alerts: test failures, agent failures, log errors.
-    Alert,
-}
-
 /// Tree ordering for worktree groups within a workspace (item 23).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortMode {
@@ -509,6 +497,25 @@ pub fn build_rows(
         });
     }
 
+    // Index the DB rows once. `build_rows` runs on every tab/worktree switch
+    // AND on every filter keystroke, and the per-group / per-folder lookups
+    // below were linear rescans of `db_worktrees` — O(groups × worktrees) per
+    // rebuild. `or_insert` keeps `.find()`'s first-match semantics.
+    let mut db_by_tab: std::collections::HashMap<&str, &DbWorktree> =
+        std::collections::HashMap::with_capacity(db_worktrees.len());
+    let mut db_by_folder: std::collections::HashMap<i64, Vec<&DbWorktree>> =
+        std::collections::HashMap::new();
+    // Per-slug rows keep `db_worktrees`' order (the DB's position ordering).
+    let mut db_by_slug: std::collections::HashMap<&str, Vec<&DbWorktree>> =
+        std::collections::HashMap::new();
+    for w in db_worktrees {
+        db_by_tab.entry(w.tab_name.as_str()).or_insert(w);
+        if let Some(fid) = w.folder_id {
+            db_by_folder.entry(fid).or_default().push(w);
+        }
+        db_by_slug.entry(w.slug.as_str()).or_default().push(w);
+    }
+
     for (repo_slug, display, kind, repo_path) in workspaces {
         let collapsed = view.collapsed.contains(repo_slug);
         rows.push(SidebarRow {
@@ -551,23 +558,15 @@ pub fn build_rows(
             if &repo != repo_slug {
                 continue;
             }
+            let dbw = db_by_tab.get(g.name.as_str());
             groups.push(Group {
                 label: branch,
                 gi,
                 path: g.path.clone(),
-                sandbox_backend: db_worktrees
-                    .iter()
-                    .find(|w| w.tab_name == g.name)
-                    .and_then(|w| w.sandbox_backend.clone()),
-                env_name: db_worktrees
-                    .iter()
-                    .find(|w| w.tab_name == g.name)
-                    .and_then(|w| w.env_name.clone()),
+                sandbox_backend: dbw.and_then(|w| w.sandbox_backend.clone()),
+                env_name: dbw.and_then(|w| w.env_name.clone()),
                 activity: activity.get(&g.name).copied().unwrap_or_default(),
-                folder_id: db_worktrees
-                    .iter()
-                    .find(|w| w.tab_name == g.name)
-                    .and_then(|w| w.folder_id),
+                folder_id: dbw.and_then(|w| w.folder_id),
             });
         }
 
@@ -666,11 +665,12 @@ pub fn build_rows(
                 child_count = filed.len();
             }
             // Also count DB-registered (unloaded) worktrees filed to this folder
-            // by scanning db_worktrees, so the count stays accurate when the
-            // workspace is dormant.
-            for w in db_worktrees
-                .iter()
-                .filter(|w| w.folder_id == Some(folder.folder_id))
+            // (indexed lookup), so the count stays accurate when the workspace
+            // is dormant.
+            for w in db_by_folder
+                .get(&folder.folder_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
             {
                 let already_counted = filed_in_folders
                     .get(&folder.folder_id)
@@ -858,9 +858,12 @@ pub fn build_rows(
             ));
             // A registry row for the home checkout would duplicate the
             // synthesized row above — skip it.
-            for w in db_worktrees
+            for w in db_by_slug
+                .get(repo_slug.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default()
                 .iter()
-                .filter(|w| &w.slug == repo_slug && w.branch != "home")
+                .filter(|w| w.branch != "home")
             {
                 rows.push(mk(
                     &w.branch,

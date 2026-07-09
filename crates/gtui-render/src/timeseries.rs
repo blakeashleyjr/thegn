@@ -7,10 +7,15 @@ pub struct TimeseriesRenderer;
 impl TimeseriesRenderer {
     pub fn render<'a>(
         frame: &'a Frame,
+        title: &str,
         bounds: [f64; 4], // [x_min, x_max, y_min, y_max]
     ) -> Canvas<'a, impl Fn(&mut ratatui::widgets::canvas::Context) + 'a> {
         Canvas::default()
-            .block(Block::default().borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.to_string()),
+            )
             .x_bounds([bounds[0], bounds[1]])
             .y_bounds([bounds[2], bounds[3]])
             .paint(move |ctx| {
@@ -60,7 +65,7 @@ mod tests {
         let field = Field::new("val", FieldType::Float64, vec![1.0, 5.0, 2.0]);
         let frame = Frame::new(vec![field]);
 
-        let canvas = TimeseriesRenderer::render(&frame, [0.0, 2.0, 0.0, 6.0]);
+        let canvas = TimeseriesRenderer::render(&frame, "CPU", [0.0, 2.0, 0.0, 6.0]);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 10));
 
         canvas.render(buffer.area, &mut buffer);

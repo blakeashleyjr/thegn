@@ -8,6 +8,11 @@ license.workspace = true
 
 [dependencies]
 gtui-app = { path = "../gtui-app" }
+gtui-query = { path = "../gtui-query" }
+gtui-render = { path = "../gtui-render" }
 sz-kit = { path = "../sz-kit" }
+superzej-core = { path = "../superzej-core" }
 chrono = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
 gtui-core = { version = "0.1.0", path = "../gtui-core" }

@@ -1579,8 +1579,24 @@ mod tests {
         assert!(matches!(task.matcher.as_str(), "cargo-test" | "nextest"));
 
         // Run the real test command (single-threaded for stable output).
-        let run_task_spec =
-            TestTask::new("cargo test", "cargo test -- --test-threads=1", "cargo-test");
+        //
+        // The empty `RUSTC_WRAPPER=`/`CARGO_BUILD_RUSTC_WRAPPER=` make the
+        // nested compile hermetic: the dev shell wires `sccache` as the rustc
+        // wrapper (both via env and cargo config), which the spawned
+        // `cargo test` would otherwise inherit. A flaky/unservable sccache
+        // (e.g. the read-only-$HOME sandbox this repo often runs in, where
+        // sccache "failed to spawn Command") then kills the compile, so there
+        // are no per-test lines to parse — spuriously failing this e2e even
+        // though the parser under test is correct. Note: the vars must be set
+        // *empty*, not unset — unsetting `RUSTC_WRAPPER` makes cargo fall back
+        // to the config's `build.rustc-wrapper` (still sccache); an empty value
+        // disables the wrapper outright. This keeps the test about
+        // `parse_task_outcome`, not the developer's compiler cache.
+        let run_task_spec = TestTask::new(
+            "cargo test",
+            "env RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= cargo test -- --test-threads=1",
+            "cargo-test",
+        );
         let outcome = run_task(
             wt.clone(),
             &GitLoc::Local(wt.clone()),
