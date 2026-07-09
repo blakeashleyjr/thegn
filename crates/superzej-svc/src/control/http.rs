@@ -2,7 +2,7 @@
 //! [`ControlApi`] (the same seam the gRPC surface and the CLI client use).
 //!
 //! Auth: every handler resolves the caller's [`AuthCtx`] and checks
-//! [`required_scope`] through one helper ([`authed`]) *before* touching the
+//! [`required_scope`] through one helper (`authed`) *before* touching the
 //! API, so an under-scoped request performs no action (the spec's "rejected
 //! without performing the action"). On a unix-socket listener with
 //! `local_admin`, same-uid peers get implicit admin; on TCP a bearer token is

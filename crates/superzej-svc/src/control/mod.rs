@@ -4,7 +4,7 @@
 //! [`ControlApi`] is implemented once (by the daemon's session table, host
 //! side) and adapted thinly: the axum HTTP+WS surface ([`http`]), the tonic
 //! gRPC surface (feature `control-grpc`), and the CLI's [`client`]. Auth is
-//! NOT this trait's job — adapters resolve the caller's [`AuthCtx`]
+//! NOT this trait's job — adapters resolve the caller's [`auth::AuthCtx`]
 //! ([`auth`]) and check [`superzej_core::control::required_scope`] *before*
 //! calling in, so a rejected request performs no action.
 //!

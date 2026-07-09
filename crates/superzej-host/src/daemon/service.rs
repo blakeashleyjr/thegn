@@ -392,14 +392,13 @@ impl ControlApi for DaemonService {
             tokio::task::spawn_blocking(move || {
                 let loc = superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
                 CliGit.commit(&loc, &message, false, None)?;
-                // The new HEAD is the commit we just made.
+                // The new HEAD is the commit we just made (git_cmd scrubs
+                // GIT_* env; inside spawn_blocking, so the wait is off-loop).
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "inside spawn_blocking — off-loop child wait is the sanctioned pattern"
                 )]
-                let out = std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&wt)
+                let out = superzej_core::util::git_cmd(std::path::Path::new(&wt))
                     .args(["rev-parse", "HEAD"])
                     .output()?;
                 anyhow::ensure!(out.status.success(), "rev-parse HEAD failed");
