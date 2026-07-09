@@ -281,6 +281,10 @@ pub(crate) struct Panes {
     /// `[replay]` config — when `enabled`, each newly spawned pane gets a
     /// recording ring attached. `None`/disabled ⇒ panes record nothing.
     replay_cfg: Option<superzej_core::config::ReplayConfig>,
+    /// `[daemon]` config — when `enabled`, new local panes route through the
+    /// pane daemon (control plane) and survive UI exit. `None` ⇒ today's
+    /// in-process PTYs, byte-for-byte.
+    daemon_cfg: Option<superzej_core::config::DaemonConfig>,
 }
 
 impl Panes {
@@ -294,6 +298,7 @@ impl Panes {
             spawn_times: std::collections::HashMap::new(),
             rt: tokio::runtime::Handle::try_current().ok(),
             replay_cfg: None,
+            daemon_cfg: None,
         }
     }
 
@@ -306,6 +311,7 @@ impl Panes {
             spawn_times: std::collections::HashMap::new(),
             rt: tokio::runtime::Handle::try_current().ok(),
             replay_cfg: None,
+            daemon_cfg: None,
         }
     }
 
@@ -314,6 +320,13 @@ impl Panes {
     /// reload.
     pub(crate) fn set_replay_config(&mut self, cfg: superzej_core::config::ReplayConfig) {
         self.replay_cfg = if cfg.enabled { Some(cfg) } else { None };
+    }
+
+    /// Install the `[daemon]` config: when enabled, subsequently spawned local
+    /// panes route through the pane daemon (surviving UI exit). Called at
+    /// startup and on config reload; existing panes keep their transport.
+    pub(crate) fn set_daemon_config(&mut self, cfg: superzej_core::config::DaemonConfig) {
+        self.daemon_cfg = if cfg.enabled { Some(cfg) } else { None };
     }
 
     /// Attach a fresh recording ring to a just-spawned pane when replay is on.
@@ -351,6 +364,11 @@ impl Panes {
     /// As [`Panes::spawn_argv`], but injects `env` into the child — used for
     /// agent panes that expect `SUPERZEJ_WORKTREE`/`SUPERZEJ_BRANCH` and for
     /// per-program env on pinned programs.
+    ///
+    /// The single spawn chokepoint for local panes: with `[daemon] enabled`
+    /// the pane routes through the pane daemon (surviving UI exit); a daemon
+    /// route that can't even be *constructed* (no runtime handle) falls back
+    /// to the in-process PTY so the shell always works.
     pub(crate) fn spawn_argv_env(
         &mut self,
         argv: &[String],
@@ -358,6 +376,17 @@ impl Panes {
         env: &[(String, String)],
         center: Rect,
     ) -> Result<u32> {
+        if self.daemon_cfg.is_some() {
+            match self.spawn_daemon_backed(argv, cwd, env, center, None) {
+                Ok(id) => return Ok(id),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "szhost::daemon",
+                        "daemon-backed spawn unavailable; using in-process PTY: {e}"
+                    );
+                }
+            }
+        }
         let id = self.next_id;
         self.next_id += 1;
         let pane = PtyPane::spawn_with_env(
@@ -373,6 +402,72 @@ impl Panes {
         self.table.insert(id, pane);
         self.spawn_times.insert(id, std::time::Instant::now());
         self.maybe_record(id, center.rows.max(1) as u16, center.cols.max(1) as u16);
+        Ok(id)
+    }
+
+    /// Spawn a pane owned by the pane daemon: a `Stream` pane whose source
+    /// lazily ensures the daemon inside the relay task (never blocking the
+    /// event loop), opening a fresh session — or, with `attach`, warm-
+    /// reattaching a persisted one (snapshot + live deltas), with the fresh
+    /// spec as the reconnect ladder's fallback.
+    pub(crate) fn spawn_daemon_backed(
+        &mut self,
+        argv: &[String],
+        cwd: Option<&std::path::Path>,
+        env: &[(String, String)],
+        center: Rect,
+        attach: Option<String>,
+    ) -> Result<u32> {
+        let dcfg = self
+            .daemon_cfg
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("[daemon] not enabled"))?;
+        let rt = self
+            .rt
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("daemon panes need a tokio runtime handle"))?;
+        let rows = center.rows.max(1) as u16;
+        let cols = center.cols.max(1) as u16;
+        let cwd_s = cwd.map(|p| p.to_string_lossy().into_owned());
+        let spec = superzej_svc::provider::ExecSpec {
+            argv: argv.to_vec(),
+            tty: true,
+            cols,
+            rows,
+            env: env.to_vec(),
+            cwd: cwd_s.clone(),
+        };
+        let open = match attach {
+            Some(session) => crate::pane::ExecOpen::Attach {
+                session,
+                cols,
+                rows,
+                fallback: spec,
+            },
+            None => crate::pane::ExecOpen::Open(spec),
+        };
+        let source = std::sync::Arc::new(crate::daemon::client::LazyDaemonSource {
+            cfg: dcfg,
+            worktree: cwd_s.clone(),
+        });
+        let id = self.next_id;
+        self.next_id += 1;
+        let pane = PtyPane::spawn_stream(
+            id,
+            source,
+            "daemon".to_string(),
+            cwd_s.unwrap_or_else(|| "local".to_string()),
+            open,
+            crate::pane::program_name(argv),
+            rows,
+            cols,
+            self.tx.clone(),
+            self.waker.clone(),
+            &rt,
+        );
+        self.table.insert(id, pane);
+        self.spawn_times.insert(id, std::time::Instant::now());
+        self.maybe_record(id, rows, cols);
         Ok(id)
     }
 
@@ -397,9 +492,14 @@ impl Panes {
             .ok_or_else(|| anyhow::anyhow!("native exec needs a tokio runtime handle"))?;
         let id = self.next_id;
         self.next_id += 1;
+        let source = std::sync::Arc::new(crate::pane_source::ProviderSource {
+            provider,
+            provider_name: provider_name.clone(),
+            sandbox_id: sandbox_id.clone(),
+        });
         let pane = PtyPane::spawn_stream(
             id,
-            provider,
+            source,
             provider_name,
             sandbox_id,
             open,
@@ -507,6 +607,34 @@ impl Panes {
         for (old, spec) in specs {
             if self.table.contains_key(old) || map.contains_key(old) {
                 continue; // raced a direct spawn; keep the live pane
+            }
+            // Pane-daemon warm-reattach: a persisted `provider = "daemon"`
+            // session means this leaf's process may still be alive in the pane
+            // daemon — reattach it (snapshot + live deltas) instead of spawning
+            // fresh. The spec's argv rides along as the reconnect fallback, so
+            // a reaped/expired session degrades to a fresh daemon shell.
+            if self.daemon_cfg.is_some()
+                && let Some(ps) = tab
+                    .pane_sessions
+                    .get(old)
+                    .filter(|s| s.provider == "daemon")
+            {
+                let session = ps.session.clone();
+                match self.spawn_daemon_backed(
+                    &spec.argv,
+                    spec.cwd.as_deref().or(cwd.as_deref()),
+                    &spec.env,
+                    center,
+                    Some(session),
+                ) {
+                    Ok(fresh) => {
+                        map.insert(*old, fresh);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "szhost::startup", "daemon reattach failed, falling back: {e}");
+                    }
+                }
             }
             // SSH-over-WSS (`connect = "ssh"`): attach the leaf as a LOCAL `ssh`
             // client tunneled over the `sprite-proxy` ProxyCommand — ssh owns the

@@ -84,6 +84,13 @@ pub(crate) fn request_group_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<usize
 /// Delete `targets` from disk (keep_files = false) and rebuild sidebar/drawer
 /// state, preserving focus across index shifts by stable group name.
 /// `delete_groups` sorts targets descending internally, so no pre-sort here.
+///
+/// Focus landing (when the active worktree is itself deleted): move to the
+/// **next** worktree within the same workspace in sidebar-visual order — or the
+/// **previous** one when the deleted worktree was last — mirroring
+/// `NextWorktree` navigation. `landing_for_slug` (home-first, then global) is
+/// only the last-resort fallback for edge cases where that neighbor can't be
+/// resolved (collapsed workspace, terminal-active, cross-workspace).
 fn perform_delete(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     // Remember the active group's name AND workspace slug up front: `delete_groups`
     // removes groups and leaves `session.active` pointing at whatever slid into the
@@ -93,15 +100,46 @@ fn perform_delete(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
         .as_deref()
         .and_then(|n| crate::sidebar::split_tab(n).map(|(s, _)| s));
 
+    // Compute the neighbor to land on BEFORE deleting (the pre-delete
+    // `sidebar_rows` still reflect the on-screen order; `refresh_tab_model` runs
+    // later). Confine to the active workspace's slug so we never cross into
+    // another workspace, exactly like the `NextWorktree` handler. Capture the
+    // neighbor as a stable name because `delete_groups` shifts indices.
+    let neighbor_name = {
+        let order: Vec<usize> = crate::run::sidebar_worktree_order(cx.model)
+            .into_iter()
+            .filter(|&g| {
+                cx.session
+                    .worktrees
+                    .get(g)
+                    .and_then(|w| crate::sidebar::split_tab(&w.name).map(|(s, _)| s))
+                    .as_deref()
+                    == active_slug.as_deref()
+            })
+            .collect();
+        let deleted: std::collections::HashSet<usize> = targets.iter().copied().collect();
+        order
+            .iter()
+            .position(|&g| g == cx.session.active)
+            .and_then(|pos| next_or_prev(&order, pos, &deleted))
+            .and_then(|gi| cx.session.worktrees.get(gi).map(|g| g.name.clone()))
+    };
+
     cx.model.status =
         crate::run::delete_groups(cx.session, cx.panes, targets, false, Some(cx.waker.clone()));
 
-    // Restore focus: prefer the still-living active group (it survived the delete);
-    // if it was itself deleted, land on the home worktree of its workspace rather
-    // than on whichever terminal happened to slide into the active slot.
+    // Restore focus: (a) keep the still-living active group (it survived the
+    // delete); (b) if it was deleted, land on the next/prev worktree in the same
+    // workspace (sidebar-visual order); (c) fall back to the workspace home, then
+    // the first non-terminal group anywhere.
     let target = active_name
         .as_deref()
         .and_then(|name| cx.session.worktrees.iter().position(|g| g.name == name))
+        .or_else(|| {
+            neighbor_name
+                .as_deref()
+                .and_then(|name| cx.session.worktrees.iter().position(|g| g.name == name))
+        })
         .or_else(|| landing_for_slug(cx.session, active_slug.as_deref()));
     if let Some(idx) = target {
         cx.session.switch_to(idx);
@@ -120,6 +158,26 @@ fn perform_delete(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
         cx.cfg,
         cx.center,
     );
+}
+
+/// Given worktree group indices in sidebar-visual order (`order`), the position
+/// of the active worktree within that order (`pos`), and the set of indices
+/// being deleted, pick the neighbor to land on: the nearest surviving worktree
+/// AFTER the active one, else the nearest surviving worktree BEFORE it. Returns
+/// the pre-delete group index, or None if no neighbor survives. Pure so the
+/// next/prev landing rule is unit-tested without a `FrameModel`.
+fn next_or_prev(
+    order: &[usize],
+    pos: usize,
+    deleted: &std::collections::HashSet<usize>,
+) -> Option<usize> {
+    let survives = |g: &&usize| !deleted.contains(g);
+    // Forward: the next worktree; else backward: the previous one (deleted last).
+    order[pos + 1..]
+        .iter()
+        .find(survives)
+        .or_else(|| order[..pos].iter().rev().find(survives))
+        .copied()
 }
 
 /// Pick a non-terminal group to focus after the active worktree was deleted.
@@ -156,8 +214,48 @@ fn landing_for_slug(session: &crate::session::Session, slug: Option<&str>) -> Op
 
 #[cfg(test)]
 mod tests {
-    use super::landing_for_slug;
+    use super::{landing_for_slug, next_or_prev};
     use crate::session::{GroupKind, Session, WorktreeGroup};
+    use std::collections::HashSet;
+
+    fn deleted(items: &[usize]) -> HashSet<usize> {
+        items.iter().copied().collect()
+    }
+
+    #[test]
+    fn next_or_prev_lands_on_next_when_middle_deleted() {
+        // Visual order [10, 20, 30]; active 20 (pos 1) deleted → next is 30.
+        let order = [10, 20, 30];
+        assert_eq!(next_or_prev(&order, 1, &deleted(&[20])), Some(30));
+    }
+
+    #[test]
+    fn next_or_prev_lands_on_previous_when_last_deleted() {
+        // Active is last (pos 2); nothing after it → previous survivor 20.
+        let order = [10, 20, 30];
+        assert_eq!(next_or_prev(&order, 2, &deleted(&[30])), Some(20));
+    }
+
+    #[test]
+    fn next_or_prev_skips_a_run_of_deletions() {
+        // Active 10 (pos 0) plus 20 and 30 all deleted → first survivor after is 40.
+        let order = [10, 20, 30, 40];
+        assert_eq!(next_or_prev(&order, 0, &deleted(&[10, 20, 30])), Some(40));
+    }
+
+    #[test]
+    fn next_or_prev_finds_home_at_index_zero_backward() {
+        // Only survivor is the home worktree at the top; active last is deleted.
+        let order = [1, 2];
+        assert_eq!(next_or_prev(&order, 1, &deleted(&[2])), Some(1));
+    }
+
+    #[test]
+    fn next_or_prev_none_when_nothing_survives() {
+        // The whole workspace order is being deleted → no neighbor.
+        let order = [1, 2, 3];
+        assert_eq!(next_or_prev(&order, 1, &deleted(&[1, 2, 3])), None);
+    }
 
     fn group(name: &str, kind: GroupKind) -> WorktreeGroup {
         WorktreeGroup::new(name.to_string(), kind, String::new())

@@ -625,6 +625,7 @@ mod tests {
             path: path.into(),
             added: 10,
             deleted: 2,
+            incoming: false,
         }
     }
 

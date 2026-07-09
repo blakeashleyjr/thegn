@@ -319,9 +319,10 @@ pub fn resolve_order(cfg: &superzej_core::config::Config) -> Vec<Section> {
 }
 
 /// Where a changed file sits in the index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Stage {
     Staged,
+    #[default]
     Unstaged,
     Conflict,
     Untracked,
@@ -329,7 +330,7 @@ pub enum Stage {
 
 /// One row of the changes section: porcelain status joined with the
 /// diffstat, path split for the dim-dir + bright-name rendering.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChangeRow {
     /// Display status ("M", "A", "D", "!U", "?").
     pub status: String,
@@ -342,6 +343,11 @@ pub struct ChangeRow {
     pub path: String,
     pub added: u32,
     pub deleted: u32,
+    /// True when this file was brought in by an in-progress merge/rebase/etc.
+    /// (it differs on the incoming side, not a local edit). Drives the
+    /// "incoming from <onto>" grouping so the merge dump reads apart from the
+    /// user's own changes. Always false outside a merge.
+    pub incoming: bool,
 }
 
 /// A merge/rebase/cherry-pick in progress, for the header zone.
@@ -497,6 +503,12 @@ pub struct PanelData {
     /// Recent CI runs (newest first) for the current branch, from `ci_runs_cache`
     /// — feeds the `Ci` section rollup (AV group). Empty when CI is off/undetected.
     pub ci_runs: Vec<superzej_core::ci::CiRun>,
+    /// When `ci_runs` was fetched (epoch seconds) — the Ci summary's age stamp,
+    /// so cached-but-stale data is visibly stale. `None` when the cache is cold.
+    pub ci_fetched_at: Option<i64>,
+    /// A short human note when the CI fetch is unhealthy ("CI provider API rate
+    /// limited", …); mirrors `pr_note`. `None` while fetches succeed.
+    pub ci_note: Option<String>,
     /// Cross-worktree attention stream (the `Across` section): failing CI and
     /// (later) dirty files / content matches from *all* worktrees, grouped by
     /// worktree. Built off-loop during hydration; empty when nothing needs
@@ -982,6 +994,7 @@ impl PanelUi {
 pub fn build_change_rows(
     status: &[superzej_svc::git::FileStatus],
     diff: &[superzej_svc::git::DiffEntry],
+    incoming: &std::collections::HashSet<String>,
 ) -> Vec<ChangeRow> {
     let counts: std::collections::HashMap<&str, (u32, u32)> = diff
         .iter()
@@ -1020,6 +1033,7 @@ pub fn build_change_rows(
                 stage,
                 dir,
                 name,
+                incoming: incoming.contains(&f.path),
                 path: f.path.clone(),
                 added,
                 deleted,
@@ -1032,9 +1046,12 @@ pub fn build_change_rows(
         Stage::Conflict => 2,
         Stage::Untracked => 3,
     };
+    // Local edits first, then the merge's incoming files, so the user's own
+    // changes never get lost inside a large "merging main" dump.
     rows.sort_by(|a, b| {
-        group(a.stage)
-            .cmp(&group(b.stage))
+        a.incoming
+            .cmp(&b.incoming)
+            .then(group(a.stage).cmp(&group(b.stage)))
             .then(a.path.cmp(&b.path))
     });
     rows
@@ -1268,7 +1285,7 @@ mod tests {
                 deleted: 1,
             },
         ];
-        let rows = build_change_rows(&status, &diff);
+        let rows = build_change_rows(&status, &diff, &std::collections::HashSet::new());
         let order: Vec<(&str, Stage)> = rows.iter().map(|r| (r.path.as_str(), r.stage)).collect();
         assert_eq!(
             order,
@@ -1293,7 +1310,27 @@ mod tests {
         // Root files carry no dir prefix.
         let root = rows.iter().find(|r| r.name == "Cargo.toml").unwrap();
         assert_eq!(root.dir, "");
-        assert!(build_change_rows(&[], &[]).is_empty());
+        assert!(build_change_rows(&[], &[], &std::collections::HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn change_rows_tag_and_order_incoming_after_local() {
+        let status = vec![
+            fstat('M', ' ', "host/src/local_edit.rs"),
+            fstat('M', ' ', "core/src/from_main.rs"),
+        ];
+        let incoming: std::collections::HashSet<String> =
+            ["core/src/from_main.rs".to_string()].into_iter().collect();
+        let rows = build_change_rows(&status, &[], &incoming);
+        let order: Vec<(&str, bool)> = rows.iter().map(|r| (r.path.as_str(), r.incoming)).collect();
+        // Local edits sort ahead of the incoming (merge-brought) file.
+        assert_eq!(
+            order,
+            vec![
+                ("host/src/local_edit.rs", false),
+                ("core/src/from_main.rs", true),
+            ]
+        );
     }
 
     #[test]

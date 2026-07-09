@@ -278,6 +278,10 @@ fn rerun(cfg: &Config, worktree: Option<String>, run_id: &str, failed: bool) -> 
     if !client.caps().rerun {
         msg::die("this provider can't re-run runs");
     }
+    if failed && !client.caps().rerun_failed {
+        // Don't silently retry everything when the user asked for failed-only.
+        msg::die("this provider can't re-run only failed jobs — drop --failed to retry all");
+    }
     let scope = if failed {
         RerunScope::Failed
     } else {

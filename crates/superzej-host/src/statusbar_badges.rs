@@ -30,27 +30,19 @@ pub(crate) fn push_attention_badge(model: &FrameModel, items: &mut Vec<(BarItemI
     ));
 }
 
-/// CI rollup badge (AV group, item 158): a red ✗ chip when recent runs have
-/// failures, an amber ● chip while runs are in flight; silent when all green
-/// (mirrors the "clean is quiet" notification posture). Only when CI is
-/// configured and the cache is warm (`ci_runs` non-empty).
+/// CI rollup badge (AV group, item 158): a red ✗ chip when workflows are
+/// *currently* failing, an amber ● chip while runs are in flight; silent when
+/// all green (mirrors the "clean is quiet" notification posture). Only when CI
+/// is configured and the cache is warm (`ci_runs` non-empty). Counts come from
+/// `current_summary` — each workflow judged by its most recent run — so
+/// historical failures don't pin the badge red.
 pub(crate) fn push_ci_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
-    use superzej_core::ci::CiState;
     if model.panel.ci_runs.is_empty() {
         return;
     }
-    let fail = model
-        .panel
-        .ci_runs
-        .iter()
-        .filter(|r| r.state == CiState::Fail)
-        .count();
-    let running = model
-        .panel
-        .ci_runs
-        .iter()
-        .filter(|r| r.state == CiState::Running)
-        .count();
+    let cur = superzej_core::ci::current_summary(&model.panel.ci_runs);
+    let fail = cur.failed;
+    let running = cur.running;
     if fail > 0 {
         items.push((
             BarItemId::Badge(BarBadge::Ci),
@@ -115,6 +107,35 @@ mod tests {
             .iter()
             .flat_map(|(_, segs)| segs.iter().map(|s| s.text.clone()))
             .collect()
+    }
+
+    #[test]
+    fn ci_badge_reflects_current_state_not_history() {
+        use superzej_core::ci::{CiRun, CiState};
+        let run = |id: &str, name: &str, state| CiRun {
+            id: id.into(),
+            name: name.into(),
+            state,
+            ..Default::default()
+        };
+        let mut model = FrameModel::default();
+        // Newest-first: the "ci" workflow passes now but failed twice before —
+        // the badge must stay quiet (the old all-runs count showed "✗ 2 CI").
+        model.panel.ci_runs = vec![
+            run("4", "ci", CiState::Pass),
+            run("3", "ci", CiState::Fail),
+            run("2", "ci", CiState::Fail),
+        ];
+        let mut items = Vec::new();
+        push_ci_badge(&model, &mut items);
+        assert!(items.is_empty(), "green-now pipeline must be quiet");
+        // A currently-failing workflow counts exactly once.
+        model
+            .panel
+            .ci_runs
+            .insert(0, run("9", "lint", CiState::Fail));
+        push_ci_badge(&model, &mut items);
+        assert!(chip_text(&items).contains(" 1 CI"));
     }
 
     #[test]

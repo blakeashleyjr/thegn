@@ -101,6 +101,16 @@ impl BranchSet {
     }
 }
 
+/// A random `adj-noun` slug (no branch prefix). Pure — seeded with the pid +
+/// wall-clock so concurrent creates don't collide on the same candidate. Shared
+/// by worktree branch naming and the new-terminal wizard.
+pub fn random_pair() -> String {
+    let seed = (std::process::id() as u64).wrapping_add(util::now() as u64);
+    let adj = ADJ[(seed % ADJ.len() as u64) as usize];
+    let noun = NOUN[((seed / 7 + 1) % NOUN.len() as u64) as usize];
+    format!("{adj}-{noun}")
+}
+
 /// The branch-name candidate for an unnamed worktree: `{prefix}{adj}-{noun}`
 /// (or `{prefix}pane` under the numbered scheme). Pure — no git, so a wizard
 /// prefill can be computed synchronously on the UI loop.
@@ -109,12 +119,7 @@ pub fn candidate_name(cfg: &Config) -> String {
     if cfg.name_scheme == NameScheme::Numbered {
         return format!("{prefix}pane");
     }
-    // Seed the random adjective-noun name with the pid + wall-clock so
-    // concurrent creates don't collide on the same candidate.
-    let seed = (std::process::id() as u64).wrapping_add(util::now() as u64);
-    let adj = ADJ[(seed % ADJ.len() as u64) as usize];
-    let noun = NOUN[((seed / 7 + 1) % NOUN.len() as u64) as usize];
-    format!("{prefix}{adj}-{noun}")
+    format!("{prefix}{}", random_pair())
 }
 
 /// The branch-name base for a human-provided name: `{prefix}{slug}`.

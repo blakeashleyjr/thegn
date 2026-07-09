@@ -140,6 +140,10 @@ config_enum! {
 // AgentGlyphs) live in the `config_theme` sibling module to keep this god-file
 // flat; re-exported so `config::{ColorMode, …}` import paths keep working.
 pub use crate::config_theme::{AgentGlyphs, ColorMode, GlyphMode, UndercurlMode};
+// The `[[accounts]]` entry type lives with its domain logic in `account`; the
+// control-plane `[daemon]`/`[serve]` sections live in `config_daemon`.
+pub use crate::account::Account;
+pub use crate::config_daemon::{DaemonConfig, ServeConfig};
 
 config_enum! {
     /// Where worktrees live on disk.
@@ -926,23 +930,6 @@ pub struct NamedCommand {
 pub struct CommandHint {
     pub key: String,
     pub label: String,
-}
-
-/// A `[[accounts]]` entry — one credential home for a coding-agent provider
-/// (`codex`/`claude`), used by client-side account switching. superzej points
-/// the agent's credential-home env var (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`) at
-/// the chosen account on launch, so the user's real `~/.codex` / `~/.claude` is
-/// never modified. `dir` omitted ⇒ superzej manages the dir under the state dir
-/// (use "Add account" to log in); `dir` set ⇒ adopt an existing login dir.
-/// See [`crate::account`].
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct Account {
-    pub name: String,
-    pub provider: String,
-    /// Credential home directory (`~` expanded). When absent, superzej manages a
-    /// dir at `$XDG_STATE_HOME/superzej/accounts/<provider>/<slug>/`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dir: Option<String>,
 }
 
 /// A `[[pins]]` entry — a named program that opens either as its own session
@@ -1850,10 +1837,10 @@ config_enum! {
 pub struct CiConfig {
     /// Active provider; `"auto"` detects from the worktree.
     pub provider: CiProviderKind,
-    /// Cache TTL (seconds) before a background re-fetch of run history.
+    /// Freshness window (seconds): non-forced refreshes (ticker, tab switch)
+    /// skip while the cache is younger. `0` disables; `g` always refetches.
     pub ttl_secs: u64,
-    /// Background poll cadence (seconds) while a run is in-flight / the CI view
-    /// has live-refresh on.
+    /// Run-history refresh cadence (seconds), min 5 (a subprocess per poll).
     pub poll_interval_secs: u64,
     /// How many recent runs to fetch and display.
     pub max_runs: usize,
@@ -4092,6 +4079,10 @@ pub struct Config {
     pub lsp: LspConfig,
     /// The LLM proxy daemon (`[llm_proxy]`). Disabled by default — AI is additive.
     pub llm_proxy: LlmProxyConfig,
+    /// `[daemon]` — the pane daemon (panes survive UI exit). Opt-in, off by default.
+    pub daemon: DaemonConfig,
+    /// `[serve]` — remote thin-client serving + pairing policy (`szhost serve`).
+    pub serve: ServeConfig,
     /// `[merge_queue]` — the local fold-actor (parallel-branch integration).
     /// On by default; the core is AI-free (agent handoff only fires on conflict).
     pub merge_queue: MergeQueueConfig,
@@ -4223,6 +4214,8 @@ impl Default for Config {
             palette: PaletteConfig::default(),
             lsp: LspConfig::default(),
             llm_proxy: LlmProxyConfig::default(),
+            daemon: DaemonConfig::default(),
+            serve: ServeConfig::default(),
             merge_queue: MergeQueueConfig::default(),
             replay: ReplayConfig::default(),
             media: MediaConfig::default(),

@@ -7,6 +7,16 @@ publish = false
 license.workspace = true
 description = "superzej native service layer: git/GitHub/ssh behind traits with CLI fallbacks"
 
+[features]
+# The control-plane gRPC surface (tonic server + generated proto bindings).
+# The HTTP+WS surface is always built; gRPC is additive for external tooling.
+control-grpc = ["dep:tonic", "dep:prost"]
+
+[build-dependencies]
+# Proto codegen for `control-grpc` (build.rs no-ops without the feature).
+tonic-build.workspace = true
+protox.workspace = true
+
 [dependencies]
 superzej-core.workspace = true
 anyhow.workspace = true
@@ -34,10 +44,23 @@ rusty-s3 = "0.10"
 # iroh call-home reach: the compositor's home Endpoint (accept loop + per-sandbox
 # connection registry) and the exec surface bridged over iroh bi-streams.
 iroh.workspace = true
+# Control plane (src/control/): the daemon's HTTP+WS surface (axum) + the CLI
+# client (hyper one-shot requests over unix/TCP). sha2 hashes token secrets;
+# getrandom is the mint-time CSPRNG. hyper/hyper-util/http-body-util are
+# already in the tree transitively via axum — pinned here for the client side.
+axum = { workspace = true, features = ["ws"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = "0.1"
+http-body-util = "0.1"
+sha2 = "0.10"
+getrandom = "0.3"
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }
 
 # The per-worktree git hot path (is_dirty / ahead_behind / current_branch) that
 # the 2s model-refresh ticker fans across every worktree — the dominant idle

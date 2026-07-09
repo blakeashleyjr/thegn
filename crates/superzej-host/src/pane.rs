@@ -13,7 +13,7 @@
 //! emulator, and the render plan are transport-blind.
 
 use anyhow::{Context, Result};
-use portable_pty::{CommandBuilder, MasterPty, PtySize};
+use portable_pty::{MasterPty, PtySize};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
@@ -21,7 +21,7 @@ use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use superzej_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history};
-use superzej_svc::provider::{ExecControl, ExecFrame, ExecSession, Provider};
+use superzej_svc::provider::{ExecControl, ExecFrame, ExecSession};
 
 use crate::emulator::{AlacrittyEmulator, PaneEmulator};
 
@@ -249,132 +249,36 @@ impl PtyPane {
         tx: tokio_mpsc::Sender<PaneEvent>,
         waker: Option<TerminalWaker>,
     ) -> Result<Self> {
-        let pty = portable_pty::native_pty_system();
-        let pair = pty
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("openpty")?;
-
-        let mut cmd = CommandBuilder::new(&argv[0]);
-        cmd.args(&argv[1..]);
-        if let Some(dir) = cwd {
-            cmd.cwd(dir);
-        }
-        // Clear-then-allowlist: a pane does NOT inherit szhost's whole
-        // environment (that leaks the launching shell's GH_TOKEN /
-        // ANTHROPIC_API_KEY / SSH_AUTH_SOCK past any identity boundary). Start
-        // from an empty env seeded only with curated infrastructure vars
-        // (`superzej_core::util::host_base_env` — locale/terminal/display + the
-        // XDG/DBus vars a rootless container runtime needs), then layer the
-        // caller-supplied identity env on top. This is the shared prerequisite
-        // for env-bundles (AU) and process-profiles (H). For sandboxed panes the
-        // secret VALUES reach the container via the wrapper argv (`-e K=V` /
-        // `--setenv`), so clearing the launcher's own env is safe.
-        cmd.env_clear();
-        for (k, v) in superzej_core::util::host_base_env() {
-            cmd.env(k, v);
-        }
-        // Terminal defaults, unless the caller (or base env) already set them.
-        cmd.env("TERM", "xterm-256color");
-        // The emulator parses 24-bit SGR; advertise it so apps (btop, modern
-        // CLIs) pick truecolor instead of degraded 256-color ramps.
-        cmd.env("COLORTERM", "truecolor");
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        let mut child = pair.slave.spawn_command(cmd).context("spawn child")?;
-        // Capture the pid before `child` moves into the reader thread below —
-        // it's the handle we use to read the pane's live cwd for persistence.
-        let pid = child.process_id();
-        // Drop the slave so the master sees EOF when the child exits.
-        drop(pair.slave);
-
-        let writer = pair.master.take_writer().context("take_writer")?;
-        let mut reader = pair.master.try_clone_reader().context("clone_reader")?;
-
         // Off-thread grid feed: the reader thread owns a FeedSink (the shared
         // FairMutex<Term> + its own Processor — alacritty's shipped
-        // reader/render split), so the expensive escape parsing runs HERE, off
-        // the event loop. The loop still receives the raw bytes for its cheap
-        // scans (queries/OSC/history/predictor) and damage marking. `loop_fed`
-        // opts a pane back to on-loop parsing (corner overlay; Stream panes).
+        // reader/render split), so the expensive escape parsing runs on the
+        // reader, off the event loop. The loop still receives the raw bytes
+        // for its cheap scans (queries/OSC/history/predictor) and damage
+        // marking. `loop_fed` opts a pane back to on-loop parsing (corner
+        // overlay; Stream panes).
         let emulator: Box<dyn PaneEmulator> = Box::new(AlacrittyEmulator::new(rows, cols, 10_000));
-        let mut feeder = emulator.feeder();
+        let feeder = emulator.feeder();
         let loop_fed = Arc::new(std::sync::atomic::AtomicBool::new(feeder.is_none()));
-        let loop_fed_reader = Arc::clone(&loop_fed);
 
-        // Use std::thread::spawn for the reader - it doesn't require a Tokio runtime
-        // but can still use blocking_send on the tokio channel. The child handle
-        // moves in here so that, once the read loop ends on PTY EOF, we can
-        // `wait()` for the child's exit status and report its code (item 524).
-        // Blocking the *reader* thread on `wait()` is safe — it's about to end
-        // anyway and never touches the event loop.
-        std::thread::spawn(move || {
-            // Contain panics: an unwinding reader must still deliver an Exit
-            // event, or the pane freezes silently and anything the thread
-            // held is poisoned. A panic degrades into a normal pane exit.
-            let tx_panic = tx.clone();
-            let waker_panic = waker.clone();
-            let body = std::panic::AssertUnwindSafe(move || {
-                // 64KB per read: at full flood this is 8× fewer channel sends +
-                // waker pulses than an 8KB buffer at identical throughput
-                // (chunk boundaries are arbitrary either way, and the drain's
-                // budget is byte-based, so chunk size doesn't affect fairness).
-                let mut buf = vec![0u8; 64 * 1024];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break, // EOF: child exited or PTY closed
-                        Ok(n) => {
-                            // Parse into the shared grid here (one lock per
-                            // ≤64KB chunk) unless the pane went loop-fed.
-                            if let Some(f) = feeder.as_mut()
-                                && !loop_fed_reader.load(std::sync::atomic::Ordering::Relaxed)
-                            {
-                                f.advance(&buf[..n]);
-                            }
-                            // One exact-sized Vec per chunk: ownership must cross
-                            // the channel, and the read buffer is reused, so
-                            // this is the minimal copy (a buffer pool would add
-                            // complexity for no measured win).
-                            if tx
-                                .blocking_send(PaneEvent::Output(id, buf[..n].to_vec()))
-                                .is_err()
-                            {
-                                return; // consumer gone — don't bother reaping
-                            }
-                            if let Some(w) = &waker {
-                                let _ = w.wake();
-                            }
-                        }
-                        Err(_) => break, // read error: treat as exit, status unknown
-                    }
-                }
-                // Reap the child so the exit carries its real code (None if the
-                // status can't be retrieved). u32 → i32 keeps the conventional
-                // exit-code range; 0 == success.
-                let code = child.wait().ok().map(|s| s.exit_code() as i32);
-                let _ = tx.blocking_send(PaneEvent::Exit(id, code));
-                if let Some(w) = &waker {
-                    let _ = w.wake();
-                }
-            });
-            if std::panic::catch_unwind(body).is_err() {
-                tracing::error!("pane {id} reader thread panicked; reporting pane exit");
-                let _ = tx_panic.blocking_send(PaneEvent::Exit(id, None));
-                if let Some(w) = &waker_panic {
-                    let _ = w.wake();
-                }
-            }
-        });
+        // The PTY open + reader thread live in `pane_pty` so the pane daemon's
+        // session actor spawns the identical PTY (with `waker: None` and no
+        // feed sink — a daemon keeps no grid).
+        let pty = crate::pane_pty::open_pty(
+            id,
+            argv,
+            cwd,
+            env,
+            rows,
+            cols,
+            tx,
+            waker,
+            feeder.map(|f| (f, Arc::clone(&loop_fed))),
+        )?;
 
         Ok(Self {
             io: PaneIo::Pty {
-                master: pair.master,
-                writer,
+                master: pty.master,
+                writer: pty.writer,
             },
             emulator,
             rows,
@@ -383,7 +287,7 @@ impl PtyPane {
             history: HistoryBuffer::new(10_000),
             history_partial: Vec::new(),
             history_stripper: AnsiStripper::default(),
-            pid,
+            pid: pty.pid,
             pending_relaunch: None,
             session_cell: None,
             predictor: crate::predict::Predictor::new(),
@@ -393,16 +297,17 @@ impl PtyPane {
         })
     }
 
-    /// Spawn a `Stream` pane backed by a managed-sandbox provider's native exec
-    /// API — the CLI-free interactive pane. Non-blocking: a relay task runs on
-    /// `rt` that opens the session (`open` ⇒ `open_exec`, or a reattach), pumps
+    /// Spawn a `Stream` pane backed by an exec-session source — a managed
+    /// sandbox's native exec API, or the pane daemon (see
+    /// [`crate::pane_source::ExecSource`]). Non-blocking: a relay task runs on
+    /// `rt` that opens the session (`open` ⇒ `source.open`, or a reattach), pumps
     /// its output into `tx` as [`PaneEvent`]s (pulsing `waker`), forwards
     /// stdin/resize from the pane's control channel, and publishes the provider
     /// session id for persistence. A connect/exec failure surfaces as an `Exit`.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_stream(
         id: u32,
-        provider: Provider,
+        source: Arc<dyn crate::pane_source::ExecSource>,
         provider_name: String,
         sandbox_id: String,
         open: ExecOpen,
@@ -417,7 +322,7 @@ impl PtyPane {
         let session_cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         rt.spawn(relay_exec(
             id,
-            provider,
+            source,
             provider_name.clone(),
             sandbox_id.clone(),
             open,
@@ -798,7 +703,7 @@ const MAX_DEAD_RECONNECTS: u32 = 3;
 )]
 async fn relay_exec(
     id: u32,
-    provider: Provider,
+    source: Arc<dyn crate::pane_source::ExecSource>,
     provider_name: String,
     sandbox_id: String,
     open: ExecOpen,
@@ -807,17 +712,6 @@ async fn relay_exec(
     mut ctrl_rx: tokio_mpsc::Receiver<ExecControl>,
     session_cell: Arc<Mutex<Option<String>>>,
 ) {
-    // If this sandbox has dialed home over the iroh call-home reach, carry its
-    // interactive exec over iroh instead of the underlying provider's transport.
-    // Exec-only — lifecycle/fs still go through the real provider. `Provider::Iroh`
-    // holds the home (not a specific connection), so it survives reconnects.
-    let provider = match crate::iroh_home::current() {
-        Some(home) if home.is_connected(&sandbox_id) => Provider::Iroh {
-            home,
-            sandbox: sandbox_id.clone(),
-        },
-        _ => provider,
-    };
     let wake = || {
         if let Some(w) = &waker {
             let _ = w.wake();
@@ -842,27 +736,23 @@ async fn relay_exec(
         "native exec: opening interactive session"
     );
     let opened = match open {
-        ExecOpen::Open(spec) => provider.open_exec(&sandbox_id, &spec).await,
+        ExecOpen::Open(spec) => source.open(&spec).await,
         ExecOpen::Attach {
             session,
             cols,
             rows,
             ..
-        } => {
-            provider
-                .attach_exec(&sandbox_id, &session, cols, rows)
-                .await
-        }
+        } => source.attach(&session, cols, rows).await,
     };
     let mut session = match opened {
         Ok(s) => {
-            crate::agent::native_exec_report(&provider_name, true);
+            source.report_health(true);
             s
         }
         Err(e) => {
             // Mark the provider unhealthy so `exec=auto` panes fall back to the
             // CLI during the cooldown; surface the failure + a non-zero exit.
-            crate::agent::native_exec_report(&provider_name, false);
+            source.report_health(false);
             let _ = tx
                 .send(PaneEvent::Output(
                     id,
@@ -904,7 +794,7 @@ async fn relay_exec(
                     // 1. Prefer reattaching the SAME session: a transient socket
                     //    drop replays scrollback with the shell state preserved.
                     if let Some(sid) = &sid
-                        && let Ok(s) = provider.attach_exec(&sandbox_id, sid, cols, rows).await
+                        && let Ok(s) = source.attach(sid, cols, rows).await
                     {
                         tracing::debug!(target: "szhost::sandbox", pane = id, "reattached exec session");
                         session = s;
@@ -920,13 +810,13 @@ async fn relay_exec(
                         if let Ok(mut c) = session_cell.lock() {
                             *c = None; // drop the stale id; the fresh session announces a new one
                         }
-                        if let Ok(s) = provider.open_exec(&sandbox_id, spec).await {
+                        if let Ok(s) = source.open(spec).await {
                             tracing::debug!(
                                 target: "szhost::sandbox",
                                 pane = id, sandbox = %sandbox_id,
                                 "re-opened a FRESH exec session (resumed the sandbox)"
                             );
-                            crate::agent::native_exec_report(&provider_name, true);
+                            source.report_health(true);
                             session = s;
                             continue;
                         }

@@ -98,3 +98,31 @@ state, regenerable from running daemons + git. CRUD lives in `superzej-core`
   the AI layers absent.
 - git remains the source of truth for worktrees; new tables are cache +
   coordination state. No blocking I/O (git, DB, subprocess, network) on the loop.
+
+## Implementation deviations (recorded at build time)
+
+1. **CRUD location.** "CRUD lives in `superzej-core` `db.rs`" is read as "in
+   core": `db.rs` is ratchet-pinned, so the v40 DDL + `ControlStore` impl live
+   in `db_control.rs` / `store/control.rs` (the v34–v38 precedent). `db.rs`
+   gains only the version bump + one migrate call.
+2. **`pairings` columns.** The two-phase flow (single-use code → minted token)
+   needs `kind`, `parent_id`, `redeemed_at`, and — for the
+   `[serve] require_approval` park/approve flow — `approved_at`, beyond the
+   column list sketched above.
+3. **TLS.** v1 serves plaintext-behind-a-trusted-network (tailscale/wireguard
+   or `ssh -L`); every request is still token-gated, and the pairing-URL format
+   reserves `fp=<cert-fingerprint>` so TLS + pinning is additive later.
+4. **SSE vs WS.** The WebSocket binary feed (core-tested `control_wire`
+   framing) is primary; SSE is a JSON-envelope convenience endpoint. This
+   satisfies "SSE/WebSocket" with a documented primary.
+5. **drive-browser.** Ships as a defined verb answering
+   501/`UNIMPLEMENTED` — a stable contract slot for the `[forward]` preview
+   browser, no behavior in v1.
+6. **`szhost open` ladder.** Unchanged: the daemon's `open_worktree` writes
+   the same v37 intent the CLI already writes, so extending the CLI verb to
+   call the daemon first would be a behavioral no-op.
+7. **Daemon-spawn fallback.** With `[daemon] enabled`, a daemon that cannot be
+   reached surfaces as the pane's error husk with the relay's reconnect ladder
+   (identical to a provider exec failure) rather than a silent local-PTY
+   downgrade; only a route that cannot be _constructed_ (no runtime handle)
+   falls back to an in-process PTY.
