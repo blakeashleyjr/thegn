@@ -3648,7 +3648,12 @@ dependencies = [
  "chrono",
  "gtui-app",
  "gtui-core",
+ "gtui-query",
+ "gtui-render",
+ "superzej-core",
  "sz-kit",
+ "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -3657,8 +3662,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "gtui-core",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "superzej-metrics",
  "tokio",
 ]
 
@@ -7387,8 +7394,6 @@ dependencies = [
  "ratatui-core",
  "ratatui-crossterm",
  "ratatui-macros",
- "ratatui-termina",
- "ratatui-termwiz",
  "ratatui-widgets",
  "serde",
 ]
@@ -7401,7 +7406,6 @@ checksum = "cbb175c433c8e28a809d1f5773a2ae96e68c0ce40db865cbab1020bf33ae479c"
 dependencies = [
  "bitflags 2.13.0",
  "compact_str 0.9.1",
- "critical-section",
  "hashbrown 0.17.1",
  "itertools 0.14.0",
  "kasuari",
@@ -7435,27 +7439,6 @@ checksum = "ed7dc68daa7498a43e4d68e0eb078427e10c38fbcfbb1e42d955f1fa2140d814"
 dependencies = [
  "ratatui-core",
  "ratatui-widgets",
-]
-
-[[package]]
-name = "ratatui-termina"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0bf912d9e66f057a759d92e386a280ea886b352ab757d6ac4d653c7ed2c43c2"
-dependencies = [
- "instability",
- "ratatui-core",
- "termina",
-]
-
-[[package]]
-name = "ratatui-termwiz"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "faf03e0380b7744054d6cb74224fe3adf062a029754933f575ca1e3b4c2ce977"
-dependencies = [
- "ratatui-core",
- "termwiz",
 ]
 
 [[package]]
@@ -8720,6 +8703,7 @@ dependencies = [
  "fff-search",
  "futures",
  "getrandom 0.3.4",
+ "gtui-embed",
  "ignore",
  "iroh",
  "keyring",
@@ -9047,19 +9031,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "termina"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9048a889effe34a5cddee0af7f53285198b16dca3be510858d38dfdb3e62a04e"
-dependencies = [
- "bitflags 2.13.0",
- "parking_lot 0.12.5",
- "rustix",
- "signal-hook 0.3.18",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
