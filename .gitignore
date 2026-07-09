@@ -16,6 +16,8 @@ __pycache__/
 
 # Machine-local secrets sourced by .envrc (e.g. SPRITES_TOKEN); never committed.
 .envrc.local
+# Local-CI (act) secrets — NIX_GITHUB_TOKEN etc.; see .secrets.example.
+.secrets
 .superzej.yaml
 .superzej.yml
 .superzej.json
