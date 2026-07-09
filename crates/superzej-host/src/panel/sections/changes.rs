@@ -72,7 +72,8 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     rows.push(PanelRow::blank());
     rows.push(if ui.impact_open {
-        hint_row(&[("↵", "dismiss")])
+        // On the footer row Enter collapses; on an entity row it opens the def.
+        hint_row(&[("↵", "open/close"), ("j/k", "entity")])
     } else if ui.chg_sel.is_none() {
         hint_row(&[("↵", "preview"), ("space", "stage")])
     } else {
@@ -106,6 +107,11 @@ fn impact_footer(data: &crate::panel::PanelData, ui: &PanelUi, cols: usize) -> V
         sp(2),
         seg(f(), "entity-level changes touched by this diff"),
     ])));
+    // Each rendered entity row is actionable: its hit index runs sequentially
+    // past the footer (`changes.len()`), matching `EntitySummary::entity_targets`
+    // one-for-one so the drill-in can map a cursor row back to its (file, line).
+    let base = data.changes.len() + 1;
+    let mut ordinal = 0usize;
     for (path, changes) in &entities.per_file {
         if changes.is_empty() {
             continue;
@@ -114,7 +120,7 @@ fn impact_footer(data: &crate::panel::PanelData, ui: &PanelUi, cols: usize) -> V
             sp(1),
             seg(f(), path.clone()),
         ])));
-        for c in changes.iter().take(8) {
+        for c in changes.iter().take(superzej_core::semantic::ENTITY_ROW_CAP) {
             let (glyph, tok) = match c.touch {
                 superzej_core::semantic::Touch::Added => ("+", hue(Hue::Green)),
                 superzej_core::semantic::Touch::Modified => ("~", hue(Hue::Amber)),
@@ -128,12 +134,25 @@ fn impact_footer(data: &crate::panel::PanelData, ui: &PanelUi, cols: usize) -> V
                 sp(1),
             ];
             segs.extend(diffstat(c.added, c.deleted));
-            rows.push(PanelRow::plain(Line::segs(segs)));
+            // The row-mode cursor highlight is applied by the frame builder
+            // (`cursor_tint`) for any row carrying `Row(open, cursor)` — just
+            // give the row its hit so the cursor can land on and activate it.
+            rows.push(
+                PanelRow::plain(Line::segs(segs))
+                    .with_hit(PanelHit::Row(Section::Changes, base + ordinal)),
+            );
+            ordinal += 1;
         }
-        if changes.len() > 8 {
+        if changes.len() > superzej_core::semantic::ENTITY_ROW_CAP {
             rows.push(PanelRow::plain(Line::segs(vec![
                 sp(2),
-                seg(f(), format!("… +{} more", changes.len() - 8)),
+                seg(
+                    f(),
+                    format!(
+                        "… +{} more",
+                        changes.len() - superzej_core::semantic::ENTITY_ROW_CAP
+                    ),
+                ),
             ])));
         }
     }
@@ -741,6 +760,7 @@ mod tests {
                         added: 12,
                         deleted: 2,
                         touch: Touch::Modified,
+                        start_line: 1,
                     },
                     EntityChange {
                         kind: EntityKind::Enum,
@@ -748,6 +768,7 @@ mod tests {
                         added: 18,
                         deleted: 0,
                         touch: Touch::Added,
+                        start_line: 1,
                     },
                     EntityChange {
                         kind: EntityKind::Function,
@@ -755,6 +776,7 @@ mod tests {
                         added: 0,
                         deleted: 8,
                         touch: Touch::Removed,
+                        start_line: 1,
                     },
                 ],
             )])),

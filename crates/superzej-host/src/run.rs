@@ -12526,16 +12526,35 @@ async fn event_loop<T: Terminal>(
                                 panel_ui.row_mode = true;
                                 panel_ui.cursor = i;
                                 if sec == crate::panel::Section::Changes {
-                                    crate::handlers::panel_changes::toggle_change_selection(
-                                        i,
-                                        &mut panel_ui,
-                                        &model,
-                                        &session,
-                                        &mut hunk_inflight,
-                                        &hunk_tx,
-                                        &waker,
-                                        hydration_gen,
-                                    );
+                                    if i > model.panel.changes.len() {
+                                        // Click on an expanded-breakdown entity
+                                        // row → drill into its definition, same
+                                        // as keyboard Enter.
+                                        crate::handlers::panel_changes::open_entity_at(
+                                            i,
+                                            crate::handlers::panel_changes::EntityOpenCtx {
+                                                session: &mut session,
+                                                panes: &mut panes,
+                                                model: &mut model,
+                                                focus: &mut focus,
+                                                sb: &mut sb,
+                                                need_relayout: &mut need_relayout,
+                                                center: chrome.center,
+                                                cfg: keymap.config(),
+                                            },
+                                        );
+                                    } else {
+                                        crate::handlers::panel_changes::toggle_change_selection(
+                                            i,
+                                            &mut panel_ui,
+                                            &model,
+                                            &session,
+                                            &mut hunk_inflight,
+                                            &hunk_tx,
+                                            &waker,
+                                            hydration_gen,
+                                        );
+                                    }
                                 }
                             }
                             None => {
@@ -15233,53 +15252,27 @@ async fn event_loop<T: Terminal>(
                                 {
                                     match panel_ui.open {
                                         Section::Changes => {
-                                            // Conflict files open in the editor for
-                                            // resolution; all others expand the diff preview.
-                                            let is_conflict = model
-                                                .panel
-                                                .changes
-                                                .get(panel_ui.cursor)
-                                                .is_some_and(|c| {
-                                                    c.stage == crate::panel::Stage::Conflict
-                                                });
-                                            if is_conflict {
-                                                if let Some(path) = model
-                                                    .panel
-                                                    .changes
-                                                    .get(panel_ui.cursor)
-                                                    .map(|c| c.path.clone())
-                                                {
-                                                    let cmd = editor_open_command(
-                                                        keymap.config(),
-                                                        &path,
-                                                        None,
-                                                    );
-                                                    let cwd = active_cwd(&session);
-                                                    open_command_tab(
-                                                        &mut session,
-                                                        &mut panes,
-                                                        &cmd,
-                                                        cwd.as_deref(),
-                                                        chrome.center,
-                                                    );
-                                                    focus.zone = crate::focus::Zone::Center;
-                                                    refresh_tab_model(
-                                                        &mut model, &session, &mut sb,
-                                                    );
-                                                    need_relayout = true;
-                                                }
-                                            } else {
-                                                crate::handlers::panel_changes::toggle_change_selection(
-                                                    panel_ui.cursor,
-                                                    &mut panel_ui,
-                                                    &model,
-                                                    &session,
-                                                    &mut hunk_inflight,
-                                                    &hunk_tx,
-                                                    &waker,
+                                            // Conflict files open the editor, entity
+                                            // rows drill into their def, the footer
+                                            // toggles the breakdown, files toggle the
+                                            // diff preview — all in the handler module.
+                                            crate::handlers::panel_changes::select_changes_row(
+                                                crate::handlers::panel_changes::ChangesActivateCtx {
+                                                    panel_ui: &mut panel_ui,
+                                                    model: &mut model,
+                                                    session: &mut session,
+                                                    panes: &mut panes,
+                                                    focus: &mut focus,
+                                                    sb: &mut sb,
+                                                    need_relayout: &mut need_relayout,
+                                                    center: chrome.center,
+                                                    cfg: keymap.config(),
+                                                    hunk_inflight: &mut hunk_inflight,
+                                                    hunk_tx: &hunk_tx,
+                                                    waker: &waker,
                                                     hydration_gen,
-                                                );
-                                            }
+                                                },
+                                            );
                                         }
                                         Section::Pr => {
                                             // Enter opens the full-screen in-app PR
@@ -19572,6 +19565,7 @@ mod tests {
                 added: 4,
                 deleted: 0,
                 touch: Touch::Added,
+                start_line: 1,
             }],
         )]));
         let msg = commit_message_prefill(&panel);
