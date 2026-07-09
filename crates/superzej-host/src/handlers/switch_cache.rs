@@ -10,6 +10,12 @@
 
 use crate::chrome::FrameModel;
 
+/// How long a seeded slice counts as fresh for prefetch purposes. Before this
+/// TTL existed, the prefetch loop skipped any already-cached worktree
+/// **forever** — a once-warmed neighbor never re-warmed, so switching to it an
+/// hour later painted hour-old data until hydration landed.
+pub(crate) const FRESH_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The path-derived fields `hydrate::build_model` computes for the ACTIVE
 /// worktree — everything that must swap with it on a switch.
 #[derive(Default, Clone)]
@@ -22,6 +28,9 @@ pub(crate) struct WorktreeSlice {
     pub disk: Option<u64>,
     pub container_events: Vec<superzej_core::models::ContainerEvent>,
     pub timeline: Vec<superzej_core::models::TimelineEvent>,
+    /// When this slice was last seeded/refreshed (`None` = never): drives the
+    /// prefetch re-warm decision via [`WorktreeSlice::is_fresh`].
+    pub seeded_at: Option<std::time::Instant>,
 }
 
 impl WorktreeSlice {
@@ -37,7 +46,13 @@ impl WorktreeSlice {
             disk: model.active_worktree_disk,
             container_events: model.container_events.clone(),
             timeline: model.timeline.clone(),
+            seeded_at: Some(std::time::Instant::now()),
         }
+    }
+
+    /// Fresh enough that a prefetch pass can skip re-warming this worktree.
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.seeded_at.is_some_and(|t| t.elapsed() < FRESH_TTL)
     }
 
     /// Paint this slice into the live model (worktree switch, cache hit).
@@ -54,9 +69,13 @@ impl WorktreeSlice {
 
     /// Cache miss: blank the per-worktree fields rather than leaving the
     /// PREVIOUS worktree's values on screen — wrong-worktree data is worse
-    /// than empty. Hydration fills them in a beat later.
+    /// than empty — and raise `panel_pending` so the panel renders its
+    /// skeleton (dim placeholder bars) instead of a bare void while the
+    /// hydration is in flight. The next accepted hydration's model swap
+    /// clears the flag (a fresh `build_model` carries `false`).
     pub(crate) fn clear(model: &mut FrameModel) {
         WorktreeSlice::default().apply(model);
+        model.panel_pending = true;
     }
 }
 

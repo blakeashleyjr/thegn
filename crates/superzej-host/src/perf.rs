@@ -80,13 +80,15 @@ pub fn wake_storm_limit() -> f64 {
 /// loop with output) is worth a distinct warning. Set high relative to
 /// [`wake_storm_limit`] because steady terminal output is normal and expected;
 /// only a genuinely runaway pane should trip it (`SUPERZEJ_PERF_PTY_LIMIT`,
-/// default 200).
+/// default 50 — chunks are up to 64KB since the reader-buffer bump, so 50/s
+/// ≈ 3MB/s of sustained output, the same byte sensitivity the old default
+/// had against 8KB chunks).
 pub fn pty_storm_limit() -> f64 {
     std::env::var("SUPERZEJ_PERF_PTY_LIMIT")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
-        .unwrap_or(200.0)
+        .unwrap_or(50.0)
 }
 
 /// How a wake storm is attributed, so the rollup can warn accurately instead of
@@ -243,10 +245,16 @@ pub enum Subsys {
     Switch,
     /// On-loop: `sync_drawer_persistence` on a tab/worktree switch.
     Drawer,
+    /// On-loop: `sidebar::build_rows` inside `SidebarState::rebuild` — the
+    /// O(worktrees) sidebar-tree reconstruction (the dominant term of `Switch`
+    /// until the pointer-patch fast path bypasses it).
+    Rows,
+    /// On-loop: the `need_relayout` block (pane geometry + PTY resizes).
+    Relayout,
 }
 
 impl Subsys {
-    pub const ALL: [Subsys; 11] = [
+    pub const ALL: [Subsys; 13] = [
         Subsys::Hydrate,
         Subsys::Pr,
         Subsys::Issues,
@@ -258,6 +266,8 @@ impl Subsys {
         Subsys::Diff,
         Subsys::Switch,
         Subsys::Drawer,
+        Subsys::Rows,
+        Subsys::Relayout,
     ];
     pub const N: usize = Self::ALL.len();
 
@@ -275,6 +285,8 @@ impl Subsys {
             Subsys::Diff => "diff",
             Subsys::Switch => "switch",
             Subsys::Drawer => "drawer",
+            Subsys::Rows => "rows",
+            Subsys::Relayout => "relayout",
         }
     }
 }
@@ -534,6 +546,23 @@ pub struct LoopPerf {
     /// Input→frame latency samples: from an input event's dispatch to the frame
     /// that renders its effect. The primary "usable performance" metric.
     pub input_us: Histo,
+    /// Switch→frame latency samples: from a tab/worktree-switch action to the
+    /// first frame that shows the destination — the perceived switch cost.
+    pub switch_us: Histo,
+    /// Per-iteration PTY drain wall time (receive + emulator feed + routing).
+    /// Under a multi-pane flood this is the loop-thread cost that competes
+    /// directly with input handling.
+    pub drain_us: Histo,
+    /// Time inside `emit_frame` (wire render + stdout write + flush) — the
+    /// slow-outer-terminal (SSH) backpressure signal, split out of `render_us`
+    /// so compose+diff vs flush attribute separately.
+    pub flush_us: Histo,
+    /// PTY output bytes drained this interval (chunk counts hide chunk size).
+    pub pty_bytes: u64,
+    /// Drains aborted for a mid-drain keystroke (the input-preemption path).
+    pub input_preempts: u64,
+    /// Pane-only frames deferred by the pacing gate (`loop_policy::frame_gate`).
+    pub frames_deferred: u64,
     /// Wall-clock spent inside compose+flush this interval — the honest
     /// "rendering cost" the idle ratio hides (a frame can be 120ms yet the loop
     /// still reports 85% idle because it blocks between frames).
@@ -557,6 +586,12 @@ impl LoopPerf {
             render_skips: 0,
             render_us: Histo::new(),
             input_us: Histo::new(),
+            switch_us: Histo::new(),
+            drain_us: Histo::new(),
+            flush_us: Histo::new(),
+            pty_bytes: 0,
+            input_preempts: 0,
+            frames_deferred: 0,
             render_busy: Duration::ZERO,
             pty_chunks: 0,
             pty_budget_hits: 0,
@@ -592,16 +627,49 @@ impl LoopPerf {
         }
     }
 
-    /// PTY drain stats for the iteration (chunks consumed, whether the 64-chunk
-    /// budget was hit). Also counts as `chunks` `Pty` drains.
+    /// PTY drain stats for the iteration (chunks + bytes consumed, whether the
+    /// chunk budget was hit). Also counts as `chunks` `Pty` drains.
     #[inline]
-    pub fn pty(&mut self, chunks: u64, budget_hit: bool) {
+    pub fn pty(&mut self, chunks: u64, bytes: u64, budget_hit: bool) {
         if enabled() {
             self.pty_chunks += chunks;
+            self.pty_bytes += bytes;
             if budget_hit {
                 self.pty_budget_hits += 1;
             }
             self.tick_n(WakeSource::Pty, chunks);
+        }
+    }
+
+    /// One PTY drain pass completed in `dt` (wall time on the loop thread).
+    #[inline]
+    pub fn drain(&mut self, dt: Duration) {
+        if enabled() {
+            self.drain_us.record_us(dt.as_micros() as u64);
+        }
+    }
+
+    /// One frame's `emit_frame` (wire + write + flush) took `dt`.
+    #[inline]
+    pub fn flush(&mut self, dt: Duration) {
+        if enabled() {
+            self.flush_us.record_us(dt.as_micros() as u64);
+        }
+    }
+
+    /// A drain pass aborted early because input arrived mid-drain.
+    #[inline]
+    pub fn input_preempt(&mut self) {
+        if enabled() {
+            self.input_preempts += 1;
+        }
+    }
+
+    /// The pacing gate deferred a pane-only frame to the trailing flush.
+    #[inline]
+    pub fn frame_deferred(&mut self) {
+        if enabled() {
+            self.frames_deferred += 1;
         }
     }
 
@@ -611,10 +679,20 @@ impl LoopPerf {
     /// of the input event this frame responds to (if any); it's **taken** so the
     /// dispatch→frame delta — the user-facing "usable performance" latency — is
     /// recorded once and the stamp cleared (also unblocks the input-priority PTY
-    /// budget on the next iteration). Cleared even when accounting is off.
+    /// budget on the next iteration). `switch_since` is the same mechanism for a
+    /// tab/worktree-switch action: taken here, so `switch_us` records exactly the
+    /// action→first-post-switch-frame latency. Both cleared even when accounting
+    /// is off.
     #[inline]
-    pub fn render(&mut self, dt: Duration, pane_only: bool, input_since: &mut Option<Instant>) {
+    pub fn render(
+        &mut self,
+        dt: Duration,
+        pane_only: bool,
+        input_since: &mut Option<Instant>,
+        switch_since: &mut Option<Instant>,
+    ) {
         let input = input_since.take();
+        let switch = switch_since.take();
         if enabled() {
             self.renders += 1;
             if pane_only {
@@ -626,6 +704,9 @@ impl LoopPerf {
             self.render_busy += dt;
             if let Some(t) = input {
                 self.input_us.record_us(t.elapsed().as_micros() as u64);
+            }
+            if let Some(t) = switch {
+                self.switch_us.record_us(t.elapsed().as_micros() as u64);
             }
         }
     }
@@ -691,6 +772,12 @@ impl LoopPerf {
         self.render_skips = 0;
         self.render_us.reset();
         self.input_us.reset();
+        self.switch_us.reset();
+        self.drain_us.reset();
+        self.flush_us.reset();
+        self.pty_bytes = 0;
+        self.input_preempts = 0;
+        self.frames_deferred = 0;
         self.render_busy = Duration::ZERO;
         self.pty_chunks = 0;
         self.pty_budget_hits = 0;
@@ -719,6 +806,16 @@ pub struct PerfSnapshot {
     /// Input→frame latency percentiles this interval (0 when no input landed).
     pub input_p50_us: u64,
     pub input_p99_us: u64,
+    /// Switch→first-frame latency percentiles (0 when no switch happened).
+    pub switch_p50_us: u64,
+    pub switch_p99_us: u64,
+    /// PTY drain wall-time percentiles per loop iteration.
+    pub drain_p50_us: u64,
+    pub drain_p99_us: u64,
+    /// `emit_frame` (wire+write+flush) percentiles.
+    pub flush_p50_us: u64,
+    pub flush_p99_us: u64,
+    pub pty_bytes_per_s: f64,
     pub idle_ratio: f64,
     /// Fraction of wall-clock spent composing+flushing frames. Unlike
     /// `idle_ratio`, this exposes a slow-render cost even when the loop blocks
@@ -757,6 +854,13 @@ impl LoopPerf {
             render_p99_us: self.render_us.percentile_us(0.99),
             input_p50_us: self.input_us.percentile_us(0.50),
             input_p99_us: self.input_us.percentile_us(0.99),
+            switch_p50_us: self.switch_us.percentile_us(0.50),
+            switch_p99_us: self.switch_us.percentile_us(0.99),
+            drain_p50_us: self.drain_us.percentile_us(0.50),
+            drain_p99_us: self.drain_us.percentile_us(0.99),
+            flush_p50_us: self.flush_us.percentile_us(0.50),
+            flush_p99_us: self.flush_us.percentile_us(0.99),
+            pty_bytes_per_s: self.pty_bytes as f64 / secs,
             idle_ratio: 1.0 - busy_ratio,
             render_busy_ratio: (self.render_busy.as_secs_f64() / secs).clamp(0.0, 1.0),
             hot_source: hot.label(),
@@ -776,12 +880,21 @@ impl LoopPerf {
             render_p99_us = snap.render_p99_us,
             input_p50_us = snap.input_p50_us,
             input_p99_us = snap.input_p99_us,
+            switch_p50_us = snap.switch_p50_us,
+            switch_p99_us = snap.switch_p99_us,
+            drain_p50_us = snap.drain_p50_us,
+            drain_p99_us = snap.drain_p99_us,
+            flush_p50_us = snap.flush_p50_us,
+            flush_p99_us = snap.flush_p99_us,
             idle_ratio = snap.idle_ratio,
             render_busy_ratio = snap.render_busy_ratio,
             hot_source = snap.hot_source,
             hot_items_per_s = snap.hot_items_per_s,
             pty_chunks_per_s = snap.pty_chunks_per_s,
+            pty_bytes_per_s = snap.pty_bytes_per_s,
             pty_budget_hits = self.pty_budget_hits,
+            input_preempts = self.input_preempts,
+            frames_deferred = self.frames_deferred,
             cpu_hydrate_ms = cpu_ms[Subsys::Hydrate as usize],
             cpu_stats_ms = cpu_ms[Subsys::Stats as usize],
             cpu_pr_ms = cpu_ms[Subsys::Pr as usize],
@@ -985,7 +1098,14 @@ mod tests {
         let mut lp = LoopPerf::new();
         lp.wake();
         lp.tick(WakeSource::Model);
-        lp.render(Duration::from_micros(900), false, &mut None);
+        lp.render(Duration::from_micros(900), false, &mut None, &mut None);
+        // Stamps are consumed even while accounting is off (they also gate the
+        // input-priority PTY budget, which must not stick).
+        let mut input = Some(Instant::now());
+        let mut switch = Some(Instant::now());
+        lp.render(Duration::from_micros(900), false, &mut input, &mut switch);
+        assert!(input.is_none());
+        assert!(switch.is_none());
         assert_eq!(lp.wakes, 0);
         assert_eq!(lp.renders, 0);
         assert_eq!(lp.items(WakeSource::Model), 0);
@@ -1004,8 +1124,15 @@ mod tests {
         lp.tick(WakeSource::Model);
         lp.tick(WakeSource::Model);
         lp.tick(WakeSource::Stats);
-        lp.pty(10, true);
-        lp.render(Duration::from_micros(900), true, &mut Some(Instant::now()));
+        lp.pty(10, 80 * 1024, true);
+        lp.drain(Duration::from_micros(300));
+        lp.flush(Duration::from_micros(120));
+        lp.render(
+            Duration::from_micros(900),
+            true,
+            &mut Some(Instant::now()),
+            &mut Some(Instant::now()),
+        );
         lp.render_skip();
         assert_eq!(lp.wakes, 2);
         assert_eq!(lp.renders, 1);
@@ -1013,12 +1140,33 @@ mod tests {
         assert_eq!(lp.full_frames, 0);
         assert_eq!(lp.render_skips, 1);
         assert_eq!(lp.pty_chunks, 10);
+        assert_eq!(lp.pty_bytes, 80 * 1024);
         assert_eq!(lp.pty_budget_hits, 1);
         assert_eq!(lp.items(WakeSource::Model), 5);
         assert_eq!(lp.hot_source(), WakeSource::Model);
         assert_eq!(lp.items(WakeSource::Pty), 10);
-        // The render carried an input stamp, so an input→frame sample landed.
+        // The render carried input + switch stamps, so both latency samples landed.
         assert!(!lp.input_us.is_empty());
+        assert!(!lp.switch_us.is_empty());
+        assert!(!lp.drain_us.is_empty());
+        assert!(!lp.flush_us.is_empty());
+        set_enabled(false);
+    }
+
+    #[test]
+    fn switch_stamp_records_only_on_the_first_post_switch_frame() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_enabled(true);
+        let mut lp = LoopPerf::new();
+        let mut switch = Some(Instant::now());
+        lp.render(Duration::from_micros(500), false, &mut None, &mut switch);
+        assert!(switch.is_none(), "stamp is taken by the first frame");
+        assert!(!lp.switch_us.is_empty());
+        // A second frame without a fresh stamp records no new switch sample.
+        let one = lp.switch_us.percentile_us(1.0);
+        lp.render(Duration::from_micros(500), false, &mut None, &mut switch);
+        assert_eq!(lp.switch_us.percentile_us(1.0), one);
+        assert_eq!(lp.renders, 2);
         set_enabled(false);
     }
 

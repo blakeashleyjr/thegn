@@ -141,6 +141,12 @@ bench-idle-record: release _perf-guard
 bench-steady: release _perf-guard
     bash test/perf/cpu-sample.sh --scenario steady-workload --window-ms 6000
 
+# Switch/input latency under a multi-pane output flood (A/B only — advisory,
+# machine-dependent). Reads switch_p99/input_p99 from the perf rollup while
+# several worktree shells scroll at full speed and Alt+Down fires mid-flood.
+perf-flood *args: release _perf-guard
+    bash test/perf/flood.sh {{args}}
+
 # Criterion micro-benchmarks across the workspace (hot git path, core models).
 # `cargo bench` uses the release-grade bench profile. For a debug-vs-release
 # A/B, append `--profile dev`. Pass extra criterion args after `--`.

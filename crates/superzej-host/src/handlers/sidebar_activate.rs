@@ -39,12 +39,17 @@ pub(crate) fn activate_row_target(
     // change and warrant the heavyweight `persist_session_layout`; a plain
     // tab/worktree activation is a pure focus move and persists cheaply.
     let mut structural = false;
+    // Set on the pure-focus arms (only the active pointer moved): the model
+    // refresh below can then take the light patch path instead of a full
+    // sidebar rebuild — see `handlers::switch` for the contract.
+    let mut pure_focus = false;
     match target {
         crate::sidebar::RowTarget::Tab(gi, ti) => {
             if gi >= session.worktrees.len() {
                 return false;
             }
             session.switch_to_tab(gi, ti);
+            pure_focus = true;
         }
         // A terminal row uses the sentinel repo_path "terminal" when its group
         // isn't resident in the session yet (a terminal declared in the global
@@ -56,6 +61,10 @@ pub(crate) fn activate_row_target(
             let Some(name) = group else {
                 return false;
             };
+            // NOT `pure_focus`: this row carried a Workspace fallback target
+            // (the group wasn't resident at the last rebuild), so the light
+            // patch — which only retargets `RowTarget::Tab` rows — couldn't
+            // move the active highlight onto it. Rebuild.
             if let Some(gi) = session.worktrees.iter().position(|w| w.name == name) {
                 session.switch_to_tab(gi, 0);
             } else {
@@ -113,7 +122,11 @@ pub(crate) fn activate_row_target(
             tab.focused_pane = *id;
         }
     }
-    refresh_tab_model(model, session, sb);
+    if pure_focus {
+        crate::handlers::switch::refresh_tab_model_switch(model, session, sb);
+    } else {
+        refresh_tab_model(model, session, sb);
+    }
     sync_drawer_persistence(session, panes, drawer, pool, home, cfg, center);
     // Persist the new active worktree/tab so it survives a non-graceful exit.
     // Only a structural change (the terminal-materialize arm, which pushes a

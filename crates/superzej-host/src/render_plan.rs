@@ -27,6 +27,13 @@ pub struct Damage {
     /// Heavy chrome / model state changed (sidebar tree, panel, tabbar, focus
     /// ring, hydration carrying real changes): recompose chrome + all panes.
     pub chrome: bool,
+    /// A tab/worktree switch is awaiting its first frame (the loop's
+    /// `switch_at` stamp is live). Forces a full frame like `chrome` — the
+    /// whole center band + tabbar + panel changed — but as its own channel so
+    /// (a) full frames attribute to switches vs hydration vs overlays in the
+    /// perf rollup, and (b) a future switch-back blit plan can key off it
+    /// without re-plumbing the loop.
+    pub switch: bool,
     /// Pane content changed (PTY output): recompose + bounded-diff ONLY these.
     pub panes: HashSet<PaneId>,
     /// Only the masthead/statusbar bars changed — the high-frequency stats tick,
@@ -44,13 +51,19 @@ pub struct Damage {
 impl Damage {
     /// True when nothing changed — the loop woke but has no frame to paint.
     pub fn is_empty(&self) -> bool {
-        !self.full && !self.chrome && !self.bars && !self.sidebar && self.panes.is_empty()
+        !self.full
+            && !self.chrome
+            && !self.switch
+            && !self.bars
+            && !self.sidebar
+            && self.panes.is_empty()
     }
 
     /// Clear all channels — called after a frame is flushed.
     pub fn clear(&mut self) {
         self.full = false;
         self.chrome = false;
+        self.switch = false;
         self.bars = false;
         self.sidebar = false;
         self.panes.clear();
@@ -128,7 +141,7 @@ pub fn plan(damage: &Damage, overlays: &Overlays) -> RenderPlan {
     if damage.full {
         return RenderPlan::Full;
     }
-    if damage.chrome || overlays.any() {
+    if damage.chrome || damage.switch || overlays.any() {
         return RenderPlan::Full;
     }
     if !damage.panes.is_empty() || damage.bars || damage.sidebar {
@@ -317,6 +330,27 @@ mod tests {
     }
 
     #[test]
+    fn switch_forces_full_frame() {
+        // A tab/worktree switch swaps the whole center band + tabbar + panel:
+        // its first frame is a full recompose, on its own damage channel (so
+        // the perf rollup attributes it and a future blit plan can hook it).
+        let d = Damage {
+            switch: true,
+            ..Default::default()
+        };
+        assert_eq!(plan(&d, &Overlays::default()), RenderPlan::Full);
+    }
+
+    #[test]
+    fn switch_with_pane_damage_still_full() {
+        // Pane output racing the switch frame can't demote it to Incremental.
+        let mut d = panes(&[2, 9]);
+        d.switch = true;
+        d.bars = true;
+        assert_eq!(plan(&d, &Overlays::default()), RenderPlan::Full);
+    }
+
+    #[test]
     fn empty_and_clear() {
         assert!(Damage::default().is_empty());
         let mut d = panes(&[1]);
@@ -325,5 +359,13 @@ mod tests {
         assert!(!d.is_empty());
         d.clear();
         assert!(d.is_empty());
+        // The switch channel participates in both is_empty and clear.
+        let mut s = Damage {
+            switch: true,
+            ..Default::default()
+        };
+        assert!(!s.is_empty());
+        s.clear();
+        assert!(s.is_empty());
     }
 }
