@@ -321,6 +321,10 @@
           # iterative path is `just quick <crate>`).
           export RUSTC_WRAPPER=sccache
           export CARGO_INCREMENTAL=0
+          # Bound the sccache cache so it can't creep unbounded on the dev box
+          # (the compile cache is disk; a full fs makes target/ writes fail with
+          # ENOSPC/EROFS mid-build). Honor an already-set value.
+          export SCCACHE_CACHE_SIZE="''${SCCACHE_CACHE_SIZE:-20G}"
           # Leave headroom so heavy builds don't peg the machine (parallel
           # rustc/codegen jobs); computed here since Nix eval can't see nproc.
           if [ -z "''${CARGO_BUILD_JOBS:-}" ]; then
