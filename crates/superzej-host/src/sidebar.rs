@@ -88,16 +88,21 @@ pub enum SortMode {
     /// User-controlled order: trusts the underlying sequence (the session's
     /// group order when loaded, the persisted `position` order when not),
     /// "home" first. Defaults to creation order and is what Shift+Alt+↑/↓
-    /// rearranges. The default — worktrees never reshuffle on their own.
-    #[default]
+    /// rearranges. Worktrees never reshuffle on their own.
     Manual,
     /// Case-insensitive label order, "home" first. Stable — a worktree keeps
     /// its slot when selected/opened (no jumping). The old plugin's default.
     Name,
     /// Most-recently-touched first (by tab position as a recency proxy).
     Recent,
-    /// Active worktrees first, then quiet, then idle.
-    Activity,
+    /// The default: whatever needs the user floats first, by attention tier
+    /// (blocked on input > failures > finished > ready-to-land > working >
+    /// idle; see `superzej_core::attention`). Ordering follows the
+    /// hysteresis-stable ranks from hydration, so rows only move on a real
+    /// state change — never from timestamp or cache churn. Successor of the
+    /// old CPU-dot-only `Activity` mode (whose persisted name still parses).
+    #[default]
+    Attention,
 }
 
 impl SortMode {
@@ -106,15 +111,17 @@ impl SortMode {
             SortMode::Manual => "manual",
             SortMode::Name => "name",
             SortMode::Recent => "recent",
-            SortMode::Activity => "activity",
+            SortMode::Attention => "attention",
         }
     }
     pub fn from_str(s: &str) -> Self {
         match s {
             "name" => SortMode::Name,
             "recent" => SortMode::Recent,
-            "activity" => SortMode::Activity,
-            // Unknown / "manual" → the manual (creation-order) default.
+            // "activity" is the pre-attention name of this mode; saved
+            // ui_state migrates by parsing it as Attention.
+            "attention" | "activity" => SortMode::Attention,
+            // Unknown / "manual" → the manual (creation-order) mode.
             _ => SortMode::Manual,
         }
     }
@@ -123,8 +130,8 @@ impl SortMode {
         match self {
             SortMode::Manual => SortMode::Name,
             SortMode::Name => SortMode::Recent,
-            SortMode::Recent => SortMode::Activity,
-            SortMode::Activity => SortMode::Manual,
+            SortMode::Recent => SortMode::Attention,
+            SortMode::Attention => SortMode::Manual,
         }
     }
 }
@@ -193,6 +200,10 @@ pub struct SidebarRow {
     pub target_bytes: Option<u64>,
     /// Connection string for terminal rows
     pub terminal_connection: Option<String>,
+    /// Attention score: the worktree's own (Worktree rows) or the workspace's
+    /// most-urgent-child rollup (Workspace rows — drives the collapsed-row
+    /// glyph). Denormalized from `SidebarStatus` in one pass at build time.
+    pub attention: Option<superzej_core::attention::AttentionScore>,
 }
 
 impl SidebarRow {
@@ -229,6 +240,18 @@ pub struct SidebarStatus {
     /// destroyed). In the status so its diff repaints the sidebar; the render
     /// path reads the mirroring `hibernator::is_hibernated` cache.
     pub hibernated: std::collections::BTreeSet<String>,
+    /// Per-worktree attention score (keyed by path) — the tiered "what needs
+    /// the user" model (see `superzej_core::attention`). Drives the Attention
+    /// sort, the row reason hint, the jump action, and the statusbar chip.
+    pub attention: std::collections::BTreeMap<String, superzej_core::attention::AttentionScore>,
+    /// Hysteresis-stable display rank per worktree path (0 = most urgent).
+    /// Computed on the hydration thread; only a tier or membership change
+    /// reorders, so timestamp/cache churn never reshuffles rows.
+    pub attention_ranks: std::collections::BTreeMap<String, u32>,
+    /// Per-workspace rollup (keyed by slug): the most urgent worktree's score.
+    /// Drives the collapsed-workspace glyph and workspace bubbling.
+    pub workspace_attention:
+        std::collections::BTreeMap<String, superzej_core::attention::AttentionScore>,
 }
 
 /// Persisted + transient view state that shapes the tree (collapse/sort/pins/
@@ -242,6 +265,10 @@ pub struct ViewState {
     pub pins: Vec<String>,
     /// Active fuzzy filter; empty = no filter.
     pub filter: String,
+    /// Workspace-level ordering, from `[ui] sidebar_workspace_sort` (config,
+    /// not ui_state — mirrored here on startup/reload). When `Attention`,
+    /// workspaces stable-sort by their most-urgent worktree's tier.
+    pub workspace_sort: superzej_core::config::WorkspaceSort,
 }
 
 /// What activating a sidebar row does.
@@ -320,6 +347,9 @@ pub fn compose_row_label(
 struct Group {
     label: String,
     gi: usize,
+    /// Worktree path — the key into the attention-rank map for the
+    /// [`SortMode::Attention`] ordering.
+    path: String,
     activity: ActivityState,
     sandbox_backend: Option<String>,
     env_name: Option<String>,
@@ -360,6 +390,7 @@ pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> 
     let start = segs.len();
     let dirty = row.git.is_some_and(|g| g.dirty);
     crate::sidebar_legend::push_row_markers(dirty, &mut segs);
+    crate::sidebar_legend::push_attention_reason(row.attention.as_ref(), &mut segs);
 
     if let Some(env) = &row.env_name
         && !env.is_empty()
@@ -463,6 +494,21 @@ pub fn build_rows(
     let activity = &status.activity;
     let mut rows = Vec::new();
 
+    // Workspace bubbling (`[ui] sidebar_workspace_sort = "attention"`): order
+    // workspaces by their most-urgent worktree's tier. The sort is stable and
+    // tier-granular, so equal-urgency workspaces keep their manual order and a
+    // workspace only moves on a real tier change — hysteresis for free.
+    let mut workspaces: Vec<&(String, String, String, String)> = workspaces.iter().collect();
+    if view.workspace_sort == superzej_core::config::WorkspaceSort::Attention {
+        workspaces.sort_by_key(|(slug, ..)| {
+            status
+                .workspace_attention
+                .get(slug)
+                .map(|s| s.tier as u8)
+                .unwrap_or(u8::MAX)
+        });
+    }
+
     for (repo_slug, display, kind, repo_path) in workspaces {
         let collapsed = view.collapsed.contains(repo_slug);
         rows.push(SidebarRow {
@@ -493,6 +539,7 @@ pub fn build_rows(
             terminal_connection: None,
             disk_bytes: None,
             target_bytes: None,
+            attention: None,
         });
 
         // This repo's worktree groups, straight from the session model.
@@ -507,6 +554,7 @@ pub fn build_rows(
             groups.push(Group {
                 label: branch,
                 gi,
+                path: g.path.clone(),
                 sandbox_backend: db_worktrees
                     .iter()
                     .find(|w| w.tab_name == g.name)
@@ -523,7 +571,7 @@ pub fn build_rows(
             });
         }
 
-        sort_groups(&mut groups, view.sort);
+        sort_groups(&mut groups, view.sort, &status.attention_ranks);
         let live = !groups.is_empty();
 
         // Split into unfiled (rendered at root) and filed (rendered under folders).
@@ -583,6 +631,7 @@ pub fn build_rows(
                 terminal_connection: None,
                 disk_bytes: None,
                 target_bytes: None,
+                attention: None,
             });
         }
 
@@ -660,6 +709,7 @@ pub fn build_rows(
                 terminal_connection: None,
                 disk_bytes: None,
                 target_bytes: None,
+                attention: None,
             });
 
             if !folder_collapsed {
@@ -727,6 +777,7 @@ pub fn build_rows(
                             terminal_connection: None,
                             disk_bytes: None,
                             target_bytes: None,
+                            attention: None,
                         });
                     }
                 }
@@ -795,6 +846,7 @@ pub fn build_rows(
                     terminal_connection: None,
                     disk_bytes: None,
                     target_bytes: None,
+                    attention: None,
                 }
             };
             rows.push(mk(
@@ -847,6 +899,7 @@ pub fn build_rows(
             terminal_connection: None,
             disk_bytes: None,
             target_bytes: None,
+            attention: None,
         });
     }
 
@@ -880,6 +933,7 @@ pub fn build_rows(
             terminal_connection: None,
             disk_bytes: None,
             target_bytes: None,
+            attention: None,
         });
 
         // Genuinely-empty fallback (the startup reseed normally keeps a `local`
@@ -911,6 +965,7 @@ pub fn build_rows(
                 terminal_connection: None,
                 disk_bytes: None,
                 target_bytes: None,
+                attention: None,
             });
         }
 
@@ -957,6 +1012,7 @@ pub fn build_rows(
                 terminal_connection: Some(rep_conn),
                 disk_bytes: None,
                 target_bytes: None,
+                attention: None,
             });
 
             if collapsed {
@@ -1008,6 +1064,7 @@ pub fn build_rows(
                     terminal_connection: Some(t.connection_string.clone()),
                     disk_bytes: None,
                     target_bytes: None,
+                    attention: None,
                 });
             }
         }
@@ -1027,12 +1084,35 @@ pub fn build_rows(
         }
     }
 
+    // Denormalize attention scores the same way: a worktree row carries its own
+    // score (keyed by path); a workspace row carries its rollup (keyed by slug)
+    // so a collapsed workspace still shows its most urgent child's glyph.
+    for row in &mut rows {
+        match row.kind {
+            RowKind::Worktree => {
+                row.attention = row
+                    .worktree_path
+                    .as_deref()
+                    .and_then(|p| status.attention.get(p))
+                    .copied();
+            }
+            RowKind::Workspace => {
+                row.attention = status.workspace_attention.get(&row.workspace_slug).copied();
+            }
+            _ => {}
+        }
+    }
+
     apply_pins(&mut rows, &view.pins);
     apply_filter(&mut rows, &view.filter);
     rows
 }
 
-fn sort_groups(groups: &mut [Group], sort: SortMode) {
+fn sort_groups(
+    groups: &mut [Group],
+    sort: SortMode,
+    ranks: &std::collections::BTreeMap<String, u32>,
+) {
     match sort {
         SortMode::Manual => {
             // Trust the session order (gi); just float "home" to the top.
@@ -1059,18 +1139,13 @@ fn sort_groups(groups: &mut [Group], sort: SortMode) {
                     .then(b.gi.cmp(&a.gi))
             });
         }
-        SortMode::Activity => {
-            // Active, then stuck (waiting/read), then idle; home first per tier.
-            let rank = |s: ActivityState| match s {
-                ActivityState::Loading => 0, // building — freshest activity
-                ActivityState::Active => 1,
-                ActivityState::Waiting => 2,
-                ActivityState::Read => 3,
-                ActivityState::None => 4,
-            };
+        SortMode::Attention => {
+            // Most urgent first, by the hysteresis-stable ranks computed on the
+            // hydration thread (see `attention_status`). A path with no rank yet
+            // (brand-new worktree, first pass) keeps its manual slot at the end.
             groups.sort_by(|a, b| {
-                rank(a.activity)
-                    .cmp(&rank(b.activity))
+                let r = |g: &Group| ranks.get(&g.path).copied().unwrap_or(u32::MAX);
+                r(a).cmp(&r(b))
                     .then((a.label != "home").cmp(&(b.label != "home")))
                     .then(a.gi.cmp(&b.gi))
             });
@@ -1587,9 +1662,13 @@ mod tests {
     }
 
     #[test]
-    fn activity_sort_puts_active_first() {
+    fn attention_sort_orders_by_hydration_ranks() {
         let s = session(
-            vec![tab("app/home", "/wt/home"), tab("app/busy", "/wt/busy")],
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/calm", "/wt/calm"),
+                tab("app/urgent", "/wt/urgent"),
+            ],
             0,
         );
         let ws = vec![(
@@ -1598,24 +1677,39 @@ mod tests {
             "repo".to_string(),
             String::new(),
         )];
-        let mut act = no_activity();
-        act.activity
-            .insert("app/busy".into(), ActivityState::Active);
+        let mut status = no_activity();
+        // Hydration-computed ranks: urgent first, then home, then calm.
+        for (p, r) in [("/wt/urgent", 0u32), ("/wt/home", 1), ("/wt/calm", 2)] {
+            status.attention_ranks.insert(p.into(), r);
+        }
+        let urgent_score = superzej_core::attention::AttentionScore {
+            tier: superzej_core::attention::AttentionTier::Blocked,
+            sub: 0,
+            reason: superzej_core::attention::AttentionReason::AgentNeedsInput,
+            since: Some(100),
+        };
+        status.attention.insert("/wt/urgent".into(), urgent_score);
         let view = ViewState {
-            sort: SortMode::Activity,
+            sort: SortMode::Attention,
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &act, &[], &[], &[]);
-        let busy = rows.iter().position(|r| r.label == "busy").unwrap();
-        let home = rows.iter().position(|r| r.label == "home").unwrap();
-        assert!(busy < home, "active worktree should sort first");
+        let rows = build_rows(&s, &ws, &view, &status, &[], &[], &[]);
+        let labels: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Worktree)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["urgent", "home", "calm"]);
+        // The urgent row carries its score for the legend/glyph.
+        let urgent = rows.iter().find(|r| r.label == "urgent").unwrap();
+        assert_eq!(urgent.attention, Some(urgent_score));
     }
 
     #[test]
-    fn manual_sort_is_the_default_and_preserves_session_order() {
-        // Session order is zebra, then alpha — deliberately *not* alphabetical.
-        // The default (Manual) keeps that order (home first), so worktrees never
-        // reshuffle on their own; only an explicit Name sort alphabetizes.
+    fn attention_sort_without_ranks_keeps_manual_order() {
+        // No hydration pass yet (empty ranks): the Attention default degrades
+        // to the manual order — home first, then session order — so a fresh
+        // launch never flashes a reshuffle.
         let s = session(
             vec![
                 tab("app/home", "/wt/home"),
@@ -1631,7 +1725,8 @@ mod tests {
             String::new(),
         )];
 
-        // Default == Manual: home, then session order (zebra, alpha).
+        // The default is Attention now.
+        assert_eq!(ViewState::default().sort, SortMode::Attention);
         let rows = build_rows(
             &s,
             &ws,
@@ -1660,6 +1755,34 @@ mod tests {
             .map(|r| r.label.as_str())
             .collect();
         assert_eq!(labels, vec!["home", "alpha", "zebra"]);
+    }
+
+    #[test]
+    fn sort_mode_migrates_and_cycles() {
+        // The old persisted "activity" value parses as Attention (the ui_state
+        // migration), and the cycle visits all four modes.
+        assert_eq!(SortMode::from_str("activity"), SortMode::Attention);
+        assert_eq!(SortMode::from_str("attention"), SortMode::Attention);
+        assert_eq!(SortMode::from_str("manual"), SortMode::Manual);
+        assert_eq!(SortMode::from_str("bogus"), SortMode::Manual);
+        assert_eq!(SortMode::Attention.as_str(), "attention");
+        assert_eq!(SortMode::default(), SortMode::Attention);
+        let mut m = SortMode::Manual;
+        let mut seen = vec![m];
+        for _ in 0..3 {
+            m = m.next();
+            seen.push(m);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                SortMode::Manual,
+                SortMode::Name,
+                SortMode::Recent,
+                SortMode::Attention
+            ]
+        );
+        assert_eq!(m.next(), SortMode::Manual);
     }
 
     #[test]
