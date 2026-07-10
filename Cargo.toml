@@ -49,6 +49,12 @@ syntect = { version = "5", default-features = false, features = [
 ] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
+nix = { version = "0.29", default-features = false, features = [
+  "fs",
+  "time",
+  "signal",
+  "process",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
   "std",

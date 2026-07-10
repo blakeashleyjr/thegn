@@ -116,10 +116,11 @@ fn registry() -> &'static Mutex<HashMap<String, (u64, i32)>> {
 
 #[cfg(unix)]
 fn kill_group(pgid: i32) {
-    // Negative pid would also work via `kill(2)`; killpg is explicit.
-    unsafe {
-        libc::killpg(pgid, libc::SIGTERM);
-    }
+    nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pgid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .ok();
 }
 
 #[cfg(not(unix))]

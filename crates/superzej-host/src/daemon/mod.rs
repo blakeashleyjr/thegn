@@ -319,8 +319,7 @@ async fn run(
 }
 
 fn pid_alive(pid: i64) -> bool {
-    // Signal 0: existence probe, no signal delivered.
-    pid > 0 && unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    pid > 0 && nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
 }
 
 async fn heartbeat_loop(db: service::SharedDb, daemon_id: String) {
