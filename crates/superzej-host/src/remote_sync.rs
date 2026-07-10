@@ -62,6 +62,22 @@ pub(crate) fn ssh_none_guard(
     Ok(())
 }
 
+/// Halt reason when a non-local env's failover-off bring-up produced no runnable
+/// sandbox: distinguish an *unreachable* host (ssh transport failed) from a
+/// reachable host that simply has no container runtime, so the message never
+/// reads "podman missing" when we never actually reached the box.
+pub(crate) fn no_backend_reason(reachable: bool, warnings: &[String]) -> String {
+    if !reachable {
+        "couldn't reach the host to detect a container runtime (ssh transport \
+         failed) — check connectivity, then retry"
+            .to_string()
+    } else if warnings.is_empty() {
+        "no usable backend produced a runnable sandbox".to_string()
+    } else {
+        warnings.join("; ")
+    }
+}
+
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }

@@ -488,14 +488,11 @@ pub fn prepare_sandbox_env(
     // back to a bare host shell. For a NON-LOCAL env with failover off, that
     // silent drop is exactly what we refuse — halt with a warning instead.
     if !placement.is_local() && !failover {
+        let reachable = sandbox::placement_reachable(&exec_placement, &sb.backend_chain);
         return Err(SandboxHalt {
             env_name: env_name.clone(),
             placement: placement_label.clone(),
-            reason: if warnings.is_empty() {
-                "no usable backend produced a runnable sandbox".to_string()
-            } else {
-                warnings.join("; ")
-            },
+            reason: crate::remote_sync::no_backend_reason(reachable, &warnings),
         }
         .into());
     }
