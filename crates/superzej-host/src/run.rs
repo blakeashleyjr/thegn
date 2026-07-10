@@ -8341,11 +8341,12 @@ async fn event_loop<T: Terminal>(
                     if seed_materialize_steps(loading_state.get(&key).map(Vec::as_slice)) {
                         loading_state.insert(
                             key,
-                            vec![
-                                LoadStep::active("sandbox"),
-                                LoadStep::pending("container"),
-                                LoadStep::pending("shell"),
-                            ],
+                            crate::loading::plan::LoadPlan::from_cursor(
+                                &["sandbox", "container", "shell"],
+                                0,
+                                false,
+                            )
+                            .into_steps(),
                         );
                     }
                     dirty = true;
