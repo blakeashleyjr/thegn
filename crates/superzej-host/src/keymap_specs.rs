@@ -25,7 +25,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "new-worktree",
         label: "New worktree",
         hint: "worktree",
-        default_chords: &["Ctrl w"],
+        default_chords: &["Alt w"],
         palette: true,
     },
     ActionSpec {
@@ -95,7 +95,10 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "close-pane",
         label: "Close pane",
         hint: "close pane",
-        default_chords: &["Alt w"],
+        // No default chord: the smart `close` action (`Alt x`) closes the pane
+        // when the tab is split. Kept explicit + rebindable for "always the
+        // pane" semantics.
+        default_chords: &[],
         palette: true,
     },
     ActionSpec {
@@ -156,16 +159,27 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     },
     ActionSpec {
         id: "switch-font",
+        // Single chord `Alt f`; the old redundant `Alt F` alias was dropped so
+        // Shift keeps its "up-a-level" meaning everywhere in the Alt layer.
         label: "Switch font",
         hint: "font",
-        default_chords: &["Alt f", "Alt F"],
+        default_chords: &["Alt f"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "close",
+        label: "Close (pane or tab)",
+        hint: "close",
+        default_chords: &["Alt x"],
         palette: true,
     },
     ActionSpec {
         id: "close-tab",
         label: "Close tab",
         hint: "close tab",
-        default_chords: &["Alt x"],
+        // No default chord: `Alt x` is the smart `close` above. Explicit +
+        // rebindable for "close the tab specifically".
+        default_chords: &[],
         palette: true,
     },
     ActionSpec {
@@ -361,7 +375,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "toggle-notifications",
         label: "Toggle Notifications panel",
         hint: "notifications",
-        default_chords: &["Alt i"],
+        default_chords: &["Ctrl Alt i"],
         palette: true,
     },
     ActionSpec {
