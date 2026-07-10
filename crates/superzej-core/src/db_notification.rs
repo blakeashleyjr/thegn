@@ -93,6 +93,45 @@ impl NotificationStore for Db {
         Ok(())
     }
 
+    fn put_attention_ack(
+        &self,
+        worktree_path: &str,
+        reason: &str,
+        since: Option<i64>,
+    ) -> Result<()> {
+        self.conn().execute(
+            r#"INSERT INTO attention_acks(worktree_path,reason,since,acked_at)
+               VALUES(?1,?2,?3,?4)
+               ON CONFLICT(worktree_path) DO UPDATE SET
+                 reason=excluded.reason, since=excluded.since, acked_at=excluded.acked_at"#,
+            params![worktree_path, reason, since, util::now()],
+        )?;
+        Ok(())
+    }
+
+    fn list_attention_acks(&self) -> Result<Vec<(String, String, Option<i64>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT worktree_path, reason, since FROM attention_acks")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn delete_attention_ack(&self, worktree_path: &str) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM attention_acks WHERE worktree_path=?1",
+            params![worktree_path],
+        )?;
+        Ok(())
+    }
+
     /// Record a new agent dispatch.  Returns the new row id.
     fn put_agent_dispatch(
         &self,

@@ -51,6 +51,23 @@ pub trait NotificationStore {
     /// Delete a single notification row (dismiss).
     fn delete_notification(&self, id: i64) -> Result<()>;
 
+    /// Acknowledge (quiet) a worktree's live "Needs you" signal: UPSERT the
+    /// `(reason, since)` currently showing so it's suppressed until that episode
+    /// changes. `reason` is the serde-encoded [`crate::attention::AttentionReason`].
+    fn put_attention_ack(
+        &self,
+        worktree_path: &str,
+        reason: &str,
+        since: Option<i64>,
+    ) -> Result<()>;
+
+    /// Every stored attention ack as `(worktree_path, reason, since)`. The host
+    /// matches these against fresh scores and garbage-collects stale rows.
+    fn list_attention_acks(&self) -> Result<Vec<(String, String, Option<i64>)>>;
+
+    /// Drop a worktree's attention ack (stale episode, or explicit un-ack).
+    fn delete_attention_ack(&self, worktree_path: &str) -> Result<()>;
+
     /// Record a new agent dispatch.  Returns the new row id.
     fn put_agent_dispatch(
         &self,
