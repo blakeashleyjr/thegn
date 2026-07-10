@@ -26,6 +26,11 @@ pub struct MprisZbus {
     conn: Connection,
     /// Preferred player tails (e.g. `"spotify"`); first match wins.
     priority: Vec<String>,
+    /// The bus name we last resolved as active. When two players are on the bus
+    /// at once (e.g. mpv + mpd), we *stick* to this one while it stays
+    /// playing/paused so the badge doesn't flicker between them on every D-Bus
+    /// signal. Interior-mutable because `snapshot`/controls take `&self`.
+    last: std::sync::Mutex<Option<String>>,
 }
 
 impl MprisZbus {
@@ -35,7 +40,11 @@ impl MprisZbus {
         let conn = Connection::session()
             .await
             .map_err(|e| MediaError::Unavailable(format!("session bus: {e}")))?;
-        Ok(Self { conn, priority })
+        Ok(Self {
+            conn,
+            priority,
+            last: std::sync::Mutex::new(None),
+        })
     }
 
     /// All `org.mpris.MediaPlayer2.*` bus names currently on the bus.
@@ -47,11 +56,15 @@ impl MprisZbus {
             .list_names()
             .await
             .map_err(|e| MediaError::Backend(e.to_string()))?;
-        Ok(names
+        let mut buses: Vec<String> = names
             .into_iter()
             .map(|n| n.as_str().to_string())
             .filter(|n| n.starts_with(MPRIS_PREFIX))
-            .collect())
+            .collect();
+        // `list_names()` order is arbitrary; sort for a deterministic pick so
+        // selection (and the picker list) doesn't drift between calls.
+        buses.sort();
+        Ok(buses)
     }
 
     /// The controllable players' short tails (for the picker UI).
@@ -87,30 +100,36 @@ impl MprisZbus {
             .map_err(|e| MediaError::Backend(e.to_string()))
     }
 
-    /// Resolve which player to control: a `priority` match first, else the first
-    /// that is actively playing, else the first present.
+    /// Resolve which player to control. Reads each present player's state once,
+    /// then delegates the choice to the pure [`choose_player`] (priority →
+    /// sticky-if-active → first-playing → sticky-if-present → first-present) and
+    /// records the winner so the next call can stick to it.
     async fn active_player(&self) -> Result<Option<String>, MediaError> {
         let names = self.player_bus_names().await?;
         if names.is_empty() {
+            // best-effort: clear the sticky pick; the mutex is only poisoned if a
+            // holder panicked, which can't happen (no panic path under the lock).
+            if let Ok(mut last) = self.last.lock() {
+                *last = None;
+            }
             return Ok(None);
         }
-        for p in &self.priority {
-            if let Some(n) = names
-                .iter()
-                .find(|n| tail(n) == p || n.contains(p.as_str()))
-            {
-                return Ok(Some(n.clone()));
-            }
+        let mut candidates: Vec<(String, PlaybackState)> = Vec::with_capacity(names.len());
+        for n in names {
+            let state = match self.player_props(&n).await {
+                Ok(props) => playback_state(&props),
+                // A player that won't answer `GetAll` still counts as present
+                // (Stopped) so priority/sticky can target it if nothing better.
+                Err(_) => PlaybackState::Stopped,
+            };
+            candidates.push((n, state));
         }
-        // Prefer a player that is actually playing.
-        for n in &names {
-            if let Ok(props) = self.player_props(n).await
-                && matches!(playback_state(&props), PlaybackState::Playing)
-            {
-                return Ok(Some(n.clone()));
-            }
+        let sticky = self.last.lock().ok().and_then(|g| g.clone());
+        let chosen = choose_player(&candidates, &self.priority, sticky.as_deref());
+        if let Ok(mut last) = self.last.lock() {
+            *last = chosen.clone();
         }
-        Ok(names.into_iter().next())
+        Ok(chosen)
     }
 
     /// Invoke a no-argument `Player` method (PlayPause / Next / Previous).
@@ -286,6 +305,62 @@ fn tail(bus: &str) -> &str {
     bus.strip_prefix(MPRIS_PREFIX).unwrap_or(bus)
 }
 
+/// Pick which player to show from the present `candidates` (each a sorted
+/// `(bus, state)` pair). Precedence:
+///
+/// 1. **priority** — the first candidate whose tail equals or contains a
+///    configured `priority` entry (an explicit user pin always wins);
+/// 2. **sticky** — the previously-chosen `sticky` player while it stays present
+///    *and* active (playing/paused), so the badge doesn't flip between two
+///    simultaneously-playing players on every D-Bus signal;
+/// 3. **first playing** in sorted order;
+/// 4. **sticky** if still present at all (even if momentarily stopped) — rides
+///    out a brief inter-track gap without switching players;
+/// 5. the first present candidate (deterministic since `candidates` is sorted).
+///
+/// Returns `None` only when `candidates` is empty.
+fn choose_player(
+    candidates: &[(String, PlaybackState)],
+    priority: &[String],
+    sticky: Option<&str>,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    // 1. Explicit priority pin.
+    for p in priority {
+        if let Some((bus, _)) = candidates
+            .iter()
+            .find(|(bus, _)| tail(bus) == p || bus.contains(p.as_str()))
+        {
+            return Some(bus.clone());
+        }
+    }
+    // 2. Keep the sticky player while it's still active.
+    if let Some(last) = sticky
+        && candidates
+            .iter()
+            .any(|(bus, st)| bus == last && st.is_active())
+    {
+        return Some(last.to_string());
+    }
+    // 3. Otherwise prefer whatever is actually playing.
+    if let Some((bus, _)) = candidates
+        .iter()
+        .find(|(_, st)| matches!(st, PlaybackState::Playing))
+    {
+        return Some(bus.clone());
+    }
+    // 4. Nothing playing — keep the sticky player if it's still around.
+    if let Some(last) = sticky
+        && candidates.iter().any(|(bus, _)| bus == last)
+    {
+        return Some(last.to_string());
+    }
+    // 5. First present (candidates are sorted).
+    candidates.first().map(|(bus, _)| bus.clone())
+}
+
 /// Peel any number of nested variant (`v`) layers down to the contained value.
 fn peel<'a>(v: &'a Value<'a>) -> &'a Value<'a> {
     match v {
@@ -407,6 +482,63 @@ mod tests {
             "mpv.instance123"
         );
         assert_eq!(tail("weird"), "weird");
+    }
+
+    fn cands(pairs: &[(&str, PlaybackState)]) -> Vec<(String, PlaybackState)> {
+        pairs.iter().map(|(b, s)| (b.to_string(), *s)).collect()
+    }
+
+    const MPV: &str = "org.mpris.MediaPlayer2.mpv.instance42";
+    const MPD: &str = "org.mpris.MediaPlayer2.mpd";
+
+    #[test]
+    fn choose_priority_beats_a_playing_non_priority_player() {
+        // mpd is playing, but the user pinned mpv → mpv wins even though it's paused.
+        let c = cands(&[(MPD, PlaybackState::Playing), (MPV, PlaybackState::Paused)]);
+        let got = choose_player(&c, &["mpv".to_string()], None);
+        assert_eq!(got.as_deref(), Some(MPV));
+    }
+
+    #[test]
+    fn choose_sticky_retained_while_active_over_another_playing() {
+        // Both playing; we were already showing mpv → stay on mpv (no flicker).
+        let c = cands(&[(MPD, PlaybackState::Playing), (MPV, PlaybackState::Playing)]);
+        let got = choose_player(&c, &[], Some(MPV));
+        assert_eq!(got.as_deref(), Some(MPV));
+        // Paused counts as active too.
+        let c = cands(&[(MPD, PlaybackState::Playing), (MPV, PlaybackState::Paused)]);
+        let got = choose_player(&c, &[], Some(MPV));
+        assert_eq!(got.as_deref(), Some(MPV));
+    }
+
+    #[test]
+    fn choose_sticky_dropped_when_stopped_falls_through_to_playing() {
+        // Sticky mpv went Stopped; mpd is playing → hand off to mpd.
+        let c = cands(&[(MPD, PlaybackState::Playing), (MPV, PlaybackState::Stopped)]);
+        let got = choose_player(&c, &[], Some(MPV));
+        assert_eq!(got.as_deref(), Some(MPD));
+    }
+
+    #[test]
+    fn choose_sticky_kept_when_present_but_nothing_playing() {
+        // Nothing playing, but sticky mpd is still present → keep it (rule 4),
+        // don't jump to the sorted-first mpd/mpv.
+        let c = cands(&[(MPD, PlaybackState::Stopped), (MPV, PlaybackState::Paused)]);
+        let got = choose_player(&c, &[], Some(MPV));
+        assert_eq!(got.as_deref(), Some(MPV));
+    }
+
+    #[test]
+    fn choose_first_present_when_idle_and_no_sticky() {
+        // Deterministic: candidates are sorted, so the first is stable.
+        let c = cands(&[(MPD, PlaybackState::Stopped), (MPV, PlaybackState::Stopped)]);
+        let got = choose_player(&c, &[], None);
+        assert_eq!(got.as_deref(), Some(MPD));
+    }
+
+    #[test]
+    fn choose_empty_is_none() {
+        assert_eq!(choose_player(&[], &["mpv".to_string()], Some(MPV)), None);
     }
 
     #[test]
