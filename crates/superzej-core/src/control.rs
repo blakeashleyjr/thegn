@@ -145,6 +145,9 @@ pub enum Verb {
     GitStatus,
     GitStage,
     GitCommit,
+    MergeList,
+    MergeAdd,
+    MergeClear,
     Events,
     LeaseStatus,
     Me,
@@ -164,6 +167,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::Events
         | Verb::LeaseStatus
         | Verb::GitStatus
+        | Verb::MergeList
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -175,7 +179,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::KillSession
         | Verb::OpenWorktree
         | Verb::DriveBrowser => Scope::Write,
-        Verb::GitStage | Verb::GitCommit => Scope::Git,
+        Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
         Verb::IssuePairing
         | Verb::ListPairings
         | Verb::RevokePairing
@@ -424,6 +428,7 @@ mod tests {
             Events,
             LeaseStatus,
             GitStatus,
+            MergeList,
             Me,
         ];
         let write = [
@@ -436,7 +441,7 @@ mod tests {
             OpenWorktree,
             DriveBrowser,
         ];
-        let git = [GitStage, GitCommit];
+        let git = [GitStage, GitCommit, MergeAdd, MergeClear];
         let admin = [
             IssuePairing,
             ListPairings,

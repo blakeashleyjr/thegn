@@ -185,6 +185,7 @@ async fn run(
         grace_ms: (cfg.daemon.lease_grace_secs as i64).saturating_mul(1000),
         idle_tx,
         shutdown: shutdown.clone(),
+        merge_queue: cfg.merge_queue.clone(),
     });
 
     // SIGTERM/SIGINT → the same graceful-shutdown path as the shutdown RPC,

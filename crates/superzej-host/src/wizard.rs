@@ -950,6 +950,9 @@ pub fn run_worker(
         fail(CreateStep::CreateWorktree, e);
         return;
     }
+    // Seed the bundled /mq merge-queue skill for agents in this worktree
+    // (best-effort, gated on [merge_queue] enabled).
+    crate::mq_assets::seed_if_enabled(cfg, &path);
     step(CreateStep::CreateWorktree, StepState::Done, None);
 
     // --- command loop: the wizard drives the rest.

@@ -93,3 +93,78 @@ fn test_mcp_spawn_subtask_queues_dispatch_and_notifies() {
     // ...and records a tracked (queued) dispatch row.
     assert!(db.dispatch_for_worktree("/wt/x").unwrap().is_some());
 }
+
+/// A canned `HouseMerge` provider so the router tests don't need git/DB state.
+struct FakeMerge;
+impl crate::mcp::HouseMerge for FakeMerge {
+    fn add(&self, worktree: &str) -> Result<String, String> {
+        Ok(format!("queued branch for {worktree}"))
+    }
+    fn clear(&self, _worktree: &str) -> Result<String, String> {
+        Ok("Cleared 2 entries from the merge queue.".to_string())
+    }
+    fn list(&self, _worktree: &str) -> Result<String, String> {
+        Ok("Merge queue empty.".to_string())
+    }
+}
+
+fn tool_names(res: &serde_json::Value) -> Vec<String> {
+    res["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn merge_tools_absent_until_provider_attached() {
+    let db = Arc::new(Db::open_memory().unwrap());
+    let bus = Arc::new(EventBus::new());
+    let list = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} });
+
+    // No merge provider → no merge tools advertised.
+    let bare = McpRouter::new(db.clone(), bus.clone());
+    let names = tool_names(&bare.handle_request(&list));
+    assert!(!names.iter().any(|n| n.starts_with("merge_")), "{names:?}");
+
+    // Attach the provider → all three merge tools advertised.
+    let router = McpRouter::new(db, bus).with_merge(Arc::new(FakeMerge), "/wt".to_string());
+    let names = tool_names(&router.handle_request(&list));
+    for want in ["merge_add", "merge_clear", "merge_list"] {
+        assert!(
+            names.contains(&want.to_string()),
+            "{want} missing from {names:?}"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn merge_add_dispatches_to_provider() {
+    let db = Arc::new(Db::open_memory().unwrap());
+    let bus = Arc::new(EventBus::new());
+    let router = McpRouter::new(db, bus).with_merge(Arc::new(FakeMerge), "/wt".to_string());
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": { "name": "merge_add", "arguments": {} }
+    });
+    let res = router.handle_request(&req);
+    assert!(res["error"].is_null(), "unexpected error: {res}");
+    let text = res["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("queued branch for /wt"), "got: {text}");
+
+    // With no provider, calling the tool is a clean "not configured" error, not a
+    // panic (mirrors the git/forge tools).
+    let bare = McpRouter::new(
+        Arc::new(Db::open_memory().unwrap()),
+        Arc::new(EventBus::new()),
+    );
+    let res = bare.handle_request(&req);
+    assert_eq!(
+        res["error"]["code"], -32603,
+        "no provider ⇒ not-configured error: {res}"
+    );
+}
