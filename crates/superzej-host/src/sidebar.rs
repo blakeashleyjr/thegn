@@ -456,7 +456,6 @@ pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> 
     let start = segs.len();
     let dirty = row.git.is_some_and(|g| g.dirty);
     crate::sidebar_legend::push_row_markers(dirty, &mut segs);
-    crate::sidebar_legend::push_attention_reason(row.attention.as_ref(), &mut segs);
 
     if let Some(env) = &row.env_name
         && !env.is_empty()
