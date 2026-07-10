@@ -588,6 +588,24 @@ fn media_config_defaults_and_enums() {
     assert_eq!(m.volume_step, 0.05);
     assert_eq!(m.poll_interval_secs, 3);
     assert_eq!(m.mpv.socket, "/tmp/mpvsocket");
+    assert_eq!(m.seek_step_secs, 10);
+    assert_eq!(m.seek_step_video_secs, 30);
+    assert!(m.show_art);
+    assert!(m.overlay_on_badge_click);
+    // Seek step picks the coarser cadence for video, the finer one for audio.
+    use superzej_media::model::MediaKind;
+    assert_eq!(
+        m.seek_step(MediaKind::Audio),
+        std::time::Duration::from_secs(10)
+    );
+    assert_eq!(
+        m.seek_step(MediaKind::Video),
+        std::time::Duration::from_secs(30)
+    );
+    assert_eq!(
+        m.seek_step(MediaKind::Unknown),
+        std::time::Duration::from_secs(10)
+    );
 
     // Aliases parse; an unknown value falls back to the default (infallible).
     assert_eq!(

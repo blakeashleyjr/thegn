@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::model::{LoopMode, MediaState, PlaybackState, Playlist};
+use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState, Playlist, QueueItem};
 use crate::{MediaBackend, MediaCaps, MediaError};
 
 pub struct MpvIpc {
@@ -129,6 +129,23 @@ impl MediaBackend for MpvIpc {
                 LoopMode::Playlist
             }
         });
+        // A present, non-empty `video-format` means an actual video track is
+        // decoding (mpv playing music has none) — the reliable audio/video split.
+        let kind = if self
+            .get("video-format")
+            .await
+            .and_then(|v| v.as_str().map(|s| !s.is_empty()))
+            .unwrap_or(false)
+        {
+            MediaKind::Video
+        } else {
+            MediaKind::Audio
+        };
+        let can_seek = self
+            .get("seekable")
+            .await
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         Ok(Some(MediaState {
             player: "mpv".to_string(),
@@ -143,6 +160,10 @@ impl MediaBackend for MpvIpc {
             volume,
             can_go_next: true,
             can_go_previous: true,
+            art_url: None, // mpv doesn't surface cover art over IPC
+            kind,
+            can_seek,
+            track_id: None, // mpv seeks by absolute time, no track id needed
         }))
     }
 
@@ -193,6 +214,84 @@ impl MediaBackend for MpvIpc {
         Ok(())
     }
 
+    async fn seek(&self, offset: Duration, forward: bool) -> Result<(), MediaError> {
+        let secs = offset.as_secs_f64() * if forward { 1.0 } else { -1.0 };
+        self.request(json!(["seek", secs, "relative"]))
+            .await
+            .map(|_| ())
+    }
+    async fn set_position(&self, pos: Duration, _track_id: Option<&str>) -> Result<(), MediaError> {
+        self.request(json!(["seek", pos.as_secs_f64(), "absolute"]))
+            .await
+            .map(|_| ())
+    }
+    async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
+        self.request(json!(["set_property", "volume", level.min(100) as f64]))
+            .await
+            .map(|_| ())
+    }
+
+    async fn queue(&self) -> Result<Vec<QueueItem>, MediaError> {
+        let Some(list) = self.get("playlist").await else {
+            return Ok(Vec::new());
+        };
+        let Some(arr) = list.as_array() else {
+            return Ok(Vec::new());
+        };
+        Ok(arr
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let title = entry
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        // Fall back to the file's basename.
+                        entry
+                            .get("filename")
+                            .and_then(|v| v.as_str())
+                            .map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f).to_string())
+                    })
+                    .unwrap_or_default();
+                let is_current = entry
+                    .get("current")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                QueueItem {
+                    id: i.to_string(),
+                    title,
+                    artist: String::new(),
+                    duration: None,
+                    is_current,
+                }
+            })
+            .collect())
+    }
+    async fn play_queue_item(&self, id: &str) -> Result<(), MediaError> {
+        let idx: i64 = id
+            .parse()
+            .map_err(|_| MediaError::Backend(format!("bad mpv playlist index {id:?}")))?;
+        self.request(json!(["set_property", "playlist-pos", idx]))
+            .await
+            .map(|_| ())
+    }
+
+    async fn chapter_next(&self) -> Result<(), MediaError> {
+        self.request(json!(["add", "chapter", 1])).await.map(|_| ())
+    }
+    async fn chapter_prev(&self) -> Result<(), MediaError> {
+        self.request(json!(["add", "chapter", -1]))
+            .await
+            .map(|_| ())
+    }
+    async fn toggle_fullscreen(&self) -> Result<(), MediaError> {
+        self.request(json!(["cycle", "fullscreen"]))
+            .await
+            .map(|_| ())
+    }
+
     fn caps(&self) -> MediaCaps {
         MediaCaps {
             shuffle: true,
@@ -200,6 +299,12 @@ impl MediaBackend for MpvIpc {
             volume: true,
             playlists: false,
             signals: false, // host polls on [media] poll_interval_secs
+            seek: true,
+            art: false,
+            queue: true,
+            abs_volume: true,
+            chapters: true,
+            fullscreen: true,
         }
     }
 }
