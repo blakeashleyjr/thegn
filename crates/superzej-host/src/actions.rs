@@ -629,7 +629,7 @@ impl CiActionCtx<'_> {
     pub(crate) fn run_detail_action(
         &mut self,
         action: DetailAction,
-        overlay: Option<crate::detail::DetailOverlay>,
+        mut overlay: Option<crate::detail::DetailOverlay>,
     ) -> Option<crate::detail::DetailOverlay> {
         let keep = action.keeps_overlay();
         match action {
@@ -643,6 +643,28 @@ impl CiActionCtx<'_> {
             }
             DetailAction::CiRefresh => self.refresh_ci(),
             DetailAction::FocusWorktree(path) => self.focus_worktree(&path),
+            // Intercepted by the loop's Act arm (it owns the workspace-pool /
+            // drawer locals this ctx lacks); unreachable here.
+            DetailAction::ActivateTarget(_) => {}
+            DetailAction::AckAttention {
+                path,
+                reason,
+                since,
+            } => {
+                self.ack_attention(path, reason, since);
+                // Dim the highlighted row in place so the dot goes hollow as the
+                // cursor moves (the static snapshot won't rebuild until reopen).
+                if let Some(ov) = overlay.as_mut() {
+                    ov.dim_selected();
+                }
+            }
+            DetailAction::AckAllAttention => self.ack_all_attention(),
+            DetailAction::MarkNotificationRead { id } => {
+                self.mark_notif_read_inplace(id);
+                if let Some(ov) = overlay.as_mut() {
+                    ov.dim_selected();
+                }
+            }
             DetailAction::DismissNotification { id } => self.mutate_notifications(Some(id)),
             DetailAction::ClearNotifications => self.mutate_notifications(None),
             DetailAction::OpenLogPager => self.open_log_pager(),
@@ -656,8 +678,8 @@ impl CiActionCtx<'_> {
             // unreachable here.
             DetailAction::OpenMergeQueueSection => {}
         }
-        // Retain the overlay only for the in-place CI drill; every other action
-        // has done its side effect and the modal should close.
+        // Retain the overlay only for the in-place drills (CI, highlight-read);
+        // every other action has done its side effect and the modal should close.
         keep.then_some(overlay).flatten()
     }
 
@@ -698,6 +720,72 @@ impl CiActionCtx<'_> {
         } else {
             "Cleared notifications".into()
         };
+    }
+
+    /// Mark one notification read *in place* (highlight): same DB write as a
+    /// dismiss but no status text — the row just dims and the badge decrements.
+    fn mark_notif_read_inplace(&mut self, id: i64) {
+        let tx = self.refresh_tx.clone();
+        let waker = self.waker.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(db) = superzej_core::db::Db::open() {
+                let _ = db.mark_notification_read(id); // best-effort: DB is a cache
+            }
+            if tx.send(RefreshKind::Model).is_ok() {
+                let _ = waker.wake();
+            }
+        });
+    }
+
+    /// Acknowledge (quiet) one worktree's live "Needs you" signal off the loop,
+    /// then refresh so the badge / popup drop it. UPSERT → idempotent.
+    fn ack_attention(
+        &mut self,
+        path: String,
+        reason: superzej_core::attention::AttentionReason,
+        since: Option<i64>,
+    ) {
+        let reason = serde_json::to_string(&reason).unwrap_or_default();
+        if reason.is_empty() {
+            return;
+        }
+        let tx = self.refresh_tx.clone();
+        let waker = self.waker.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(db) = superzej_core::db::Db::open() {
+                let _ = db.put_attention_ack(&path, &reason, since); // best-effort: DB is a cache
+            }
+            if tx.send(RefreshKind::Model).is_ok() {
+                let _ = waker.wake();
+            }
+        });
+    }
+
+    /// Acknowledge every current needs-you worktree — the "Needs you" mark-all.
+    /// Snapshots the set on the loop (cheap) and writes the acks off it.
+    fn ack_all_attention(&mut self) {
+        let items: Vec<(String, String, Option<i64>)> =
+            crate::handlers::attention::needs_user_ordered(self.model)
+                .into_iter()
+                .filter_map(|(path, score)| {
+                    serde_json::to_string(&score.reason)
+                        .ok()
+                        .map(|r| (path, r, score.since))
+                })
+                .collect();
+        let tx = self.refresh_tx.clone();
+        let waker = self.waker.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(db) = superzej_core::db::Db::open() {
+                for (path, reason, since) in items {
+                    let _ = db.put_attention_ack(&path, &reason, since); // best-effort
+                }
+            }
+            if tx.send(RefreshKind::Model).is_ok() {
+                let _ = waker.wake();
+            }
+        });
+        self.model.status = "Marked all as read".into();
     }
 
     /// Open the raw szhost.log in a pager pane (`$PAGER`, else `less`), scrolled
