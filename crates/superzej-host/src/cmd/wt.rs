@@ -176,6 +176,9 @@ fn new(
         worktree::remove(&root, &path, &branch, true);
         anyhow::anyhow!(e)
     })?;
+    // Seed the bundled /mq merge-queue skill so agents launched in this worktree
+    // discover it (best-effort, gated on [merge_queue] enabled).
+    crate::mq_assets::seed_if_enabled(cfg, &path);
 
     // Register (git stays the source of truth; the DB row is what the sidebar
     // + session resurrection read). put_worktree is the primary path; the env
