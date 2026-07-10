@@ -1240,7 +1240,10 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
         if let Some(hue) = hue {
             items.push((
                 BarItemId::Badge(BarBadge::DiskWarn),
-                vec![Seg::chip(Tok::Hue(hue), format!(" \u{26c1} {free}% free "))],
+                vec![Seg::chip(
+                    Tok::Hue(hue),
+                    format!(" {} {free}% free ", ic.disk_icon),
+                )],
             ));
         }
     }
