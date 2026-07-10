@@ -19,16 +19,16 @@ is instant by construction: sub-300ms launch, <16ms renders, ~0% idle CPU.
 superzej is **one session**; switching repos or worktrees is a tab switch,
 never a session change.
 
-| Concept       | Maps to                       | Created / toggled by                                                     |
-| ------------- | ----------------------------- | ------------------------------------------------------------------------ |
-| **Workspace** | a repo                        | `Alt-W` — pick/clone a repo                                              |
-| **Worktree**  | a git worktree = a tab        | `Ctrl-w` — new worktree off the base branch, then a "what to run" picker |
-| **Pane**      | a terminal split within a tab | `Alt-p` smart split (`Alt-n` down, `Alt-N` right)                        |
-| **Sidebar**   | native left tree              | repo → worktree → tabs; `Alt-s` focus, `Ctrl-Alt-s` hide                 |
-| **Diff / PR** | native right panel            | tracks the focused worktree; `Alt-.` focus, `Ctrl-Alt-p` hide            |
-| **Pins**      | daemon panes in a top strip   | `Ctrl-Alt-1..9` launch/focus a `[[pins]]` program                        |
+| Concept       | Maps to                       | Created / toggled by                                                    |
+| ------------- | ----------------------------- | ----------------------------------------------------------------------- |
+| **Workspace** | a repo                        | `Alt-W` — pick/clone a repo                                             |
+| **Worktree**  | a git worktree = a tab        | `Alt-w` — new worktree off the base branch, then a "what to run" picker |
+| **Pane**      | a terminal split within a tab | `Alt-p` smart split (`Alt-n` down, `Alt-N` right)                       |
+| **Sidebar**   | native left tree              | repo → worktree → tabs; `Alt-s` focus, `Ctrl-Alt-s` hide                |
+| **Diff / PR** | native right panel            | tracks the focused worktree; `Alt-.` focus, `Ctrl-Alt-p` hide           |
+| **Pins**      | daemon panes in a top strip   | `Ctrl-Alt-1..9` launch/focus a `[[pins]]` program                       |
 
-- **Worktree = tab.** `Ctrl-w` creates a new git worktree off the base branch,
+- **Worktree = tab.** `Alt-w` creates a new git worktree off the base branch,
   opens a tab named after the branch, and prompts for a **coding agent**, a
   tool, or a plain shell — optionally inside a sandbox (see below).
 - **Right panel.** For the focused worktree: the git diff and the branch's PR —
@@ -40,9 +40,10 @@ never a session change.
 - **Quick-jump digits:** `Alt-1..9` jump to a worktree, `Ctrl-1..9` to a
   workspace, by their slot in sidebar order. `Ctrl-Alt-1..9` launch or focus
   pinned programs.
-- **Cleanup.** `Alt-X` removes the focused worktree and closes its tab
-  (branch kept); `Alt-x` closes just the tab. Closing a pane (`Alt-w`) never
-  deletes a worktree.
+- **Cleanup.** `Alt-x` is one smart **close** — the focused pane if the tab is
+  split, otherwise the tab. `Alt-X` (Shift) escalates to removing the whole
+  worktree and its tab (branch kept). Close never deletes a worktree unless you
+  reach for the Shift variant.
 
 ## Keys
 
@@ -65,11 +66,9 @@ Defaults (override via `[keybinds]`):
 | Shift-Alt-↑/↓           | previous / next workspace                             |
 | Ctrl-←/↓/↑/→ (h/j/k/l)  | move focus: sidebar ↔ panes ↔ panel                   |
 | Alt-\`                  | bounce between workspaces region and terminals region |
-| Alt-W                   | new workspace (open a repo)                           |
-| Ctrl-w                  | new worktree (a tab + "what to run" picker)           |
-| Alt-t                   | new tab on the _same_ worktree                        |
+| Alt-w / Alt-W           | new worktree ("what to run" picker) / new workspace   |
+| Alt-t / Alt-T           | new tab on the _same_ worktree / new terminal tab     |
 | Alt-p / Alt-n / Alt-N   | new pane: smart split / split down / split right      |
-| Alt-w                   | close pane                                            |
 | Alt-o                   | switch workspace                                      |
 | Alt-s / Alt-.           | focus sidebar / focus panel                           |
 | Ctrl-Alt-s / Ctrl-Alt-p | hide/show sidebar / diff-PR panel                     |
@@ -82,8 +81,15 @@ Defaults (override via `[keybinds]`):
 | Ctrl-Alt-z              | zoom the focused pane / zone                          |
 | Alt-r                   | time-travel replay of the focused pane (`[replay]`)   |
 | Ctrl-g                  | keybind lock (pass every chord through to the pane)   |
-| Alt-x / Alt-X           | close tab / remove worktree                           |
+| Alt-x / Alt-X           | close (pane if split, else tab) / remove worktree     |
 | Ctrl-q                  | quit                                                  |
+
+The defaults follow one modifier grammar, so a chord is predictable from its
+modifiers: **Ctrl** moves focus only (and never creates/destroys, so `Ctrl-w`
+stays free for the shell's delete-word); **Alt** is object lifecycle + tools
+(create is `Alt-<letter>`); **Alt-Shift** is one level up (`Alt-w` worktree →
+`Alt-W` workspace; `Alt-x` close → `Alt-X` remove worktree); **Ctrl-Alt** is
+chrome toggles.
 
 _The above is the `Normal` mode. Native `VimNormal` (with a `Space` leader
 layer) and `Emacs` presets ship too; switch with `Ctrl-Alt-v` / `Ctrl-Alt-e`

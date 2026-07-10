@@ -48,6 +48,9 @@ pub(crate) struct DaemonService {
     pub idle_tx: mpsc::UnboundedSender<IdleTransition>,
     /// Signals the daemon run loop to exit gracefully.
     pub shutdown: Arc<tokio::sync::Notify>,
+    /// `[merge_queue]` config — the merge verbs need it to resolve the target
+    /// branch when enqueuing.
+    pub merge_queue: superzej_core::config::MergeQueueConfig,
 }
 
 fn now_ms() -> i64 {
@@ -408,6 +411,55 @@ impl ControlApi for DaemonService {
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("git task join: {e}")))?
+            .map_err(ControlError::Internal)
+        })
+    }
+
+    fn merge_add<'a>(&'a self, worktree: &'a str) -> BoxFuture<'a, ControlResult<String>> {
+        Box::pin(async move {
+            let wt = worktree.to_string();
+            let mq = self.merge_queue.clone();
+            // Fresh DB handle (like the CLI) so we don't hold the daemon's shared
+            // db lock across the git subprocesses `enqueue_worktree` runs.
+            tokio::task::spawn_blocking(move || {
+                let db = superzej_core::db::Db::open()?;
+                crate::merge_ops::enqueue_worktree(&mq, &db, std::path::Path::new(&wt))
+            })
+            .await
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge task join: {e}")))?
+            .map_err(ControlError::Internal)
+        })
+    }
+
+    fn merge_clear<'a>(&'a self, worktree: &'a str) -> BoxFuture<'a, ControlResult<usize>> {
+        Box::pin(async move {
+            let wt = worktree.to_string();
+            tokio::task::spawn_blocking(move || {
+                let db = superzej_core::db::Db::open()?;
+                let root = crate::merge_ops::repo_root_of(std::path::Path::new(&wt))
+                    .ok_or_else(|| anyhow::anyhow!("{wt}: not inside a git repository"))?;
+                crate::merge_ops::clear_repo(&db, &root)
+            })
+            .await
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge task join: {e}")))?
+            .map_err(ControlError::Internal)
+        })
+    }
+
+    fn merge_list<'a>(
+        &'a self,
+        worktree: &'a str,
+    ) -> BoxFuture<'a, ControlResult<Vec<superzej_core::db::MergeQueueRow>>> {
+        Box::pin(async move {
+            let wt = worktree.to_string();
+            tokio::task::spawn_blocking(move || {
+                let db = superzej_core::db::Db::open()?;
+                let root = crate::merge_ops::repo_root_of(std::path::Path::new(&wt))
+                    .ok_or_else(|| anyhow::anyhow!("{wt}: not inside a git repository"))?;
+                Ok::<_, anyhow::Error>(crate::merge_ops::rows_for_repo(&db, &root))
+            })
+            .await
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge task join: {e}")))?
             .map_err(ControlError::Internal)
         })
     }

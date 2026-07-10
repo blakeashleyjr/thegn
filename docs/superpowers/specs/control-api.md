@@ -72,6 +72,9 @@ an under-scoped request is rejected **before any action runs** (403 /
 | `GET /v1/git/status?worktree=`                                                        | read       | porcelain codes per changed file                                                                                    |
 | `POST /v1/git/stage`                                                                  | git        | `{worktree, paths}` — GitBackend seam; git stays source of truth                                                    |
 | `POST /v1/git/commit`                                                                 | git        | `{worktree, message}` → `{commit}`                                                                                  |
+| `GET /v1/merge/list?worktree=`                                                        | read       | `{queue}` — the repo's merge-queue rows (scoped to the worktree's repo)                                             |
+| `POST /v1/merge/add`                                                                  | git        | `{worktree}` → `{queued, message}` — enqueue the worktree's current branch                                          |
+| `POST /v1/merge/clear`                                                                | git        | `{worktree}` → `{cleared}` — empty the queue for the worktree's repo                                                |
 | `GET/POST /v1/pairings`, `DELETE /v1/pairings/{id}`, `POST /v1/pairings/{id}/approve` | admin      | pairing lifecycle                                                                                                   |
 | `POST /v1/push/register`                                                              | —          | **reserved** for push notifications (AI 422/423); absent in v1                                                      |
 
