@@ -223,7 +223,7 @@ impl AppHost {
     }
 }
 
-/// Construct an unloaded slot's tile by id (`agent`, `observe`), storing it as
+/// Construct an unloaded slot's tile by id (`observe`), storing it as
 /// `Running`. Returns whether a tile was built. All the per-app wiring lives here
 /// so the run-loop call site (`ensure_app_loaded`) stays a thin dispatch — both
 /// `run.rs` and this dispatch are on a tokio runtime thread, so
@@ -235,15 +235,8 @@ pub fn start_slot_tile(
     app_tx: &tokio::sync::mpsc::UnboundedSender<usize>,
     waker: &termwiz::terminal::TerminalWaker,
     cfg: &superzej_core::config::Config,
-    event_bus: &superzej_core::event_bus::EventBus,
 ) -> bool {
     match slot.id {
-        "agent" => {
-            let (mcp_transport, _rx) =
-                agent::AgentMcpTransport::new(std::sync::Arc::new(event_bus.clone()));
-            slot.state = SlotState::Running(Box::new(agent::AgentUi { mcp_transport }));
-            true
-        }
         "observe" => {
             let hook = app_change_hook(app_tx, idx, waker);
             let tile = build_observe_tile(hook, &cfg.observe, tokio::runtime::Handle::current());
@@ -384,4 +377,3 @@ mod tests {
         assert_eq!(host.cycle(ActiveApp::Work, 1), ActiveApp::Tile(0));
     }
 }
-pub mod agent;

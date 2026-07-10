@@ -6864,7 +6864,6 @@ async fn ensure_app_loaded(
     app_tx: &tokio_mpsc::UnboundedSender<usize>,
     waker: &TerminalWaker,
     current_config: &superzej_core::config::Config,
-    event_bus: &superzej_core::event_bus::EventBus,
 ) -> bool {
     let crate::apps::ActiveApp::Tile(i) = target else {
         return true;
@@ -6873,7 +6872,7 @@ async fn ensure_app_loaded(
         return true;
     }
     let slot = &mut app_host.slots[i];
-    crate::apps::start_slot_tile(slot, i, app_tx, waker, current_config, event_bus)
+    crate::apps::start_slot_tile(slot, i, app_tx, waker, current_config)
 }
 
 // === media control (optional [media] feature) ==============================
@@ -7802,16 +7801,7 @@ async fn event_loop<T: Terminal>(
     }
 
     let initial_app = app_host.active;
-    if ensure_app_loaded(
-        &mut app_host,
-        initial_app,
-        &app_tx,
-        &waker,
-        &current_config,
-        &event_bus,
-    )
-    .await
-    {
+    if ensure_app_loaded(&mut app_host, initial_app, &app_tx, &waker, &current_config).await {
         dirty = true;
     }
     // The workspace the keymap was last built for; when the focused workspace
@@ -12337,15 +12327,8 @@ async fn event_loop<T: Terminal>(
                         None
                     };
                     if let Some(target) = target {
-                        if ensure_app_loaded(
-                            &mut app_host,
-                            target,
-                            &app_tx,
-                            &waker,
-                            &current_config,
-                            &event_bus,
-                        )
-                        .await
+                        if ensure_app_loaded(&mut app_host, target, &app_tx, &waker, &current_config)
+                            .await
                         {
                             app_host.active = target;
                             dirty = true;
