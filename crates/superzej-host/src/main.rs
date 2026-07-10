@@ -17,6 +17,7 @@ mod apps;
 mod attention_status;
 mod autoscale;
 mod bar_nav;
+mod blast_radius;
 mod borders;
 mod bouncer;
 mod bridge_sup;

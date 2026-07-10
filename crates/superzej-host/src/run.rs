@@ -10222,10 +10222,9 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
-        // Refresh requests arrive event-driven (worktree fs-watch, on-switch
-        // kick) and on the safety-net ticker. Coalesce all pending into at most
-        // one model + one PR hydrate per wake so a burst of file saves is one
-        // refresh. Both run off-thread and pulse the waker when results land.
+        // Refresh requests arrive event-driven (fs-watch, on-switch) + safety-net
+        // ticker; coalesce all pending into at most one model + one PR hydrate per
+        // wake (off-thread, waker-pulsed) so a burst of saves is one refresh.
         let mut want_model_refresh = false;
         let mut want_pr_refresh = false;
         let mut want_issue_refresh = false;
@@ -10233,10 +10232,9 @@ async fn event_loop<T: Terminal>(
         let mut ci_refresh_force = false;
         let mut want_disk_refresh = false;
         let mut want_main_sync = false;
-        // Fold-actor results (batch fold + agent-driven drain): the extracted
-        // drains toast outcomes, patch the panel's queue rows in place, route
-        // settled transitions to the notification inbox, and re-hydrate so the
-        // advanced target tip and cleared activity dots show immediately.
+        // Fold-actor results (batch fold + agent-driven drain): toast outcomes,
+        // patch queue rows in place, route settled transitions to the inbox, and
+        // re-hydrate so the advanced tip and cleared dots show immediately.
         {
             let mut mq_ctx = crate::handlers::merge_queue::DrainCtx {
                 model: &mut model,
@@ -10247,8 +10245,7 @@ async fn event_loop<T: Terminal>(
                 want_model_refresh: &mut want_model_refresh,
                 dirty: &mut dirty,
                 loop_perf: &mut loop_perf,
-                // For reaping a tab whose worktree an `on_landed = remove/detach`
-                // land just deleted (the drains route removals through delete_groups).
+                // Reap a tab whose worktree an `on_landed = remove/detach` land deleted.
                 session: &mut session,
                 panes: &mut panes,
                 need_relayout: &mut need_relayout,
@@ -10274,18 +10271,14 @@ async fn event_loop<T: Terminal>(
                     ci_refresh_force |= force;
                     want_model_refresh = true;
                 }
-                // The scan only writes the size cache off-thread; sizes land on
-                // the next model hydrate, so this does NOT force one here.
+                // Sizes land on the next hydrate; the scan doesn't force one.
                 RefreshKind::Disk => want_disk_refresh = true,
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
-                // The repo's branch ref moved (external `update-ref` / a fold-actor
-                // CAS land elsewhere); heal the canonical checkout's tree off-loop.
+                // Branch ref moved elsewhere; heal the canonical checkout off-loop.
                 RefreshKind::MainRefMoved => want_main_sync = true,
             }
         }
-        // Fast-forward the canonical main checkout's working tree if its branch ref
-        // advanced under it. Throttled to ~2s (the fs-watch + coarse ticker can both
-        // fire) and run off-loop; a guarded no-op when the checkout is coherent.
+        // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s, off-loop).
         if want_main_sync
             && last_main_heal.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2))
         {
@@ -10296,10 +10289,15 @@ async fn event_loop<T: Terminal>(
                 waker.clone(),
             );
         }
-        // One hydration in flight; refreshes (incl. switches) coalesce into `pending`.
-        model_refresh_pending |= want_model_refresh;
+        // Semantic blast-radius (313/316): rebuild the graph off-loop on diff refresh.
+        crate::blast_radius::maybe_spawn_build(
+            current_config.lsp.enabled && want_model_refresh,
+            active_cwd(&session),
+            lsp_supervisor.handle(),
+            &waker,
+        );
+        model_refresh_pending |= want_model_refresh; // one hydration in flight; coalesce
         if model_refresh_pending && inflight_hydration_gen.is_none() {
-            // Publish agent-pane output stamps for the activity FSM (cheap, on-loop).
             crate::agent_output::publish(
                 &session,
                 &panes,
@@ -10328,8 +10326,7 @@ async fn event_loop<T: Terminal>(
                 current_config.disk.clone(),
                 Some(waker.clone()),
             );
-            // If the PR view is open, re-fetch it too so a just-posted
-            // comment/review shows up.
+            // If the PR view is open, re-fetch it too (just-posted comment/review).
             crate::actions::refetch_pr_view(
                 pr_view.as_mut(),
                 &session,
@@ -10366,10 +10363,9 @@ async fn event_loop<T: Terminal>(
         }
 
         // Derive the loading splash from the per-worktree store: `model.load_steps`
-        // always reflects the ACTIVE worktree's provisioning progress, so switching
-        // away and back preserves it (no reset) and a finished background worktree
-        // shows no stale splash. The store is written by the materialize/provision/
-        // spec flow above and cleared on first PTY output / hard failure.
+        // reflects the ACTIVE worktree's progress (switching away/back preserves it,
+        // finished background worktrees show no stale splash). Cleared on first PTY
+        // output / hard failure.
         {
             let akey = session
                 .worktrees
@@ -10395,14 +10391,12 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        // Startup-shell watchdog: while the loading splash is up (it clears on
-        // the loading pane's first PTY output), a shell that has been alive past
-        // SHELL_OUTPUT_WATCHDOG with nothing on screen is hung — almost always a
-        // personal login shell whose startup files hang or error in a provisioned
-        // env (e.g. a host `.zshrc` sourcing `/nix/store/...` paths absent in the
-        // container). Warn about the likely cause and fall back ONCE per tab to a
-        // clean rc-free shell; the user's dotfiles are left untouched. Re-checked
-        // cheaply on each wake (the 500ms ticker guarantees one) — no new timer.
+        // Startup-shell watchdog: while the loading splash is up (clears on first
+        // PTY output), a shell alive past SHELL_OUTPUT_WATCHDOG with nothing on
+        // screen is hung — usually a login shell whose rc files hang/error in a
+        // provisioned env (e.g. host `.zshrc` sourcing absent `/nix/store/...`).
+        // Warn and fall back ONCE per tab to a clean rc-free shell (dotfiles left
+        // untouched). Re-checked cheaply on each wake (500ms ticker) — no new timer.
         // Arm ONLY in the shell-attach wait — the loading phase's final "shell"
         // step, after provisioning finished and we're waiting on the login shell
         // to produce output. Never during clone/nix/devShell/cold-resume, where

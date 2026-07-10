@@ -69,7 +69,7 @@ use std::path::PathBuf;
 /// [`crate::store::HibernationStore`] — DDL in `db_migrate`).
 /// v40: adds `daemons`/`session_leases`/`pairings` (the control-plane registry;
 /// see [`crate::store::ControlStore`] — DDL in `db_control`).
-pub const SCHEMA_VERSION: i64 = 41;
+pub const SCHEMA_VERSION: i64 = 42;
 
 pub struct Db {
     conn: Connection,
@@ -649,6 +649,29 @@ impl Db {
               payload    TEXT    NOT NULL,
               created_at INTEGER NOT NULL
             );
+            -- semantic blast-radius graph (v42, items 313/316): the inter-entity
+            -- impact graph, sourced from LSP `references` off the event loop.
+            -- Pure derived state — a fresh DB rebuilds it from the fs-watcher, so
+            -- no backfill on upgrade. `file` is the absolute worktree path;
+            -- `id` = hash(repo, file, name, kind); `span` is "start-end" (1-based
+            -- inclusive lines); `source_hash` is the file source at parse time.
+            CREATE TABLE IF NOT EXISTS sem_entity (
+              id          TEXT PRIMARY KEY,
+              file        TEXT NOT NULL,
+              name        TEXT NOT NULL,
+              kind        TEXT NOT NULL,
+              span        TEXT NOT NULL,
+              source_hash TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sem_entity_file ON sem_entity (file);
+            -- sem_edge: caller (src) → callee (dst). kind: 'ref' | 'call' | 'test'.
+            CREATE TABLE IF NOT EXISTS sem_edge (
+              src_id TEXT NOT NULL,
+              dst_id TEXT NOT NULL,
+              kind   TEXT NOT NULL,
+              PRIMARY KEY (src_id, dst_id, kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sem_edge_dst ON sem_edge (dst_id);
             COMMIT;
             "#,
         )?;

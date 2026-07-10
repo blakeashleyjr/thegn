@@ -106,6 +106,30 @@ fn impact_footer(data: &crate::panel::PanelData, ui: &PanelUi, cols: usize) -> V
     let mut rows: Vec<PanelRow> = Vec::new();
     let mut line = vec![seg(hue(Hue::Purple), "◈ "), seg(f(), "semantic")];
     line.extend(impact_counts_segs(&entities.per_file, cols));
+    // Blast-radius tail (items 313/316): the inter-entity fan-out + untested
+    // surface + risk band, from the persisted graph. Only when present (LSP on
+    // and the graph knows callers) and the panel is wide enough to keep the
+    // intra-diff counts legible too.
+    if let Some(br) = entities.blast.as_ref()
+        && cols >= 48
+    {
+        use superzej_core::semantic_graph::Risk;
+        let risk_tok = match br.risk {
+            Risk::High => hue(Hue::Red),
+            Risk::Medium => hue(Hue::Amber),
+            Risk::Low => hue(Hue::Green),
+        };
+        line.push(seg(f(), "  · "));
+        line.push(seg(
+            t(),
+            format!("{} callers/{} files", br.callers, br.files),
+        ));
+        if br.untested > 0 {
+            line.push(seg(hue(Hue::Amber), format!(" · {} untested", br.untested)));
+        }
+        line.push(seg(f(), " · risk:"));
+        line.push(seg(risk_tok, br.risk.as_str()));
+    }
     let mut footer = PanelRow::plain(Line::segs(line))
         .with_hit(PanelHit::Row(Section::Changes, data.changes.len()));
     if ui.impact_open {

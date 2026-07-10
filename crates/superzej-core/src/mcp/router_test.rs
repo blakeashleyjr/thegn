@@ -108,6 +108,77 @@ impl crate::mcp::HouseMerge for FakeMerge {
     }
 }
 
+/// A canned `HouseGit` provider — attaching it advertises the git/semantic
+/// house tools (incl. `blast_radius`) and passes the provider gate. Its methods
+/// are unused by `blast_radius`, which reads the persisted graph via the DB.
+struct FakeGit;
+impl crate::mcp::HouseGit for FakeGit {
+    fn status(&self, _worktree: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+    fn diff(&self, _worktree: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+    fn branches(&self, _worktree: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+    fn semantic_diff(&self, _worktree: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+}
+
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn blast_radius_tool_advertised_and_degrades_without_graph() {
+    // A real temp repo with an edited entity, but an EMPTY semantic graph
+    // (nothing built it) ⇒ the tool degrades to a clear "unavailable" message
+    // rather than erroring, and it is advertised once a git provider is attached.
+    let dir = std::env::temp_dir().join(format!("sz-blast-mcp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |args: &[&str]| {
+        assert!(
+            crate::util::git_cmd(&dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    };
+    run(&["init", "-q", "-b", "main"]);
+    run(&["config", "user.email", "t@t.t"]);
+    run(&["config", "user.name", "t"]);
+    run(&["config", "commit.gpgsign", "false"]);
+    let file = dir.join("lib.rs");
+    std::fs::write(&file, "fn greet() -> u8 {\n    1\n}\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-q", "-m", "init"]);
+    std::fs::write(&file, "fn greet() -> u8 {\n    42\n}\n").unwrap();
+
+    let db = Arc::new(Db::open_memory().unwrap());
+    let bus = Arc::new(EventBus::new());
+    let router =
+        McpRouter::new(db, bus).with_git(Arc::new(FakeGit), dir.to_string_lossy().into_owned());
+
+    // Advertised.
+    let list = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} });
+    let names = tool_names(&router.handle_request(&list));
+    assert!(names.contains(&"blast_radius".to_string()), "{names:?}");
+
+    // Called → clean degradation (no graph built), not an error.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+        "params": { "name": "blast_radius", "arguments": {} }
+    });
+    let res = router.handle_request(&req);
+    assert!(res["error"].is_null(), "unexpected error: {res}");
+    let text = res["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("graph unavailable"), "got: {text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn tool_names(res: &serde_json::Value) -> Vec<String> {
     res["result"]["tools"]
         .as_array()
