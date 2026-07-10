@@ -78,6 +78,7 @@ mod logotype;
 mod loop_policy;
 mod lsp;
 mod managed_tool;
+mod mascot;
 mod masthead;
 mod mcp_merge;
 mod media_art;
