@@ -79,6 +79,46 @@ impl EntityKind {
         }
     }
 
+    /// A stable, round-trippable key for persistence (distinct from [`label`],
+    /// which is UI text and may change). Inverse of [`from_db_str`].
+    ///
+    /// [`label`]: EntityKind::label
+    /// [`from_db_str`]: EntityKind::from_db_str
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            EntityKind::Function => "function",
+            EntityKind::Method => "method",
+            EntityKind::Struct => "struct",
+            EntityKind::Enum => "enum",
+            EntityKind::Trait => "trait",
+            EntityKind::Impl => "impl",
+            EntityKind::Class => "class",
+            EntityKind::Interface => "interface",
+            EntityKind::TypeAlias => "type_alias",
+            EntityKind::Const => "const",
+            EntityKind::Module => "module",
+        }
+    }
+
+    /// Parse a persisted kind key. `None` for an unrecognized string (a
+    /// stale/newer-schema row — safe to drop, the graph is derived state).
+    pub fn from_db_str(s: &str) -> Option<EntityKind> {
+        Some(match s {
+            "function" => EntityKind::Function,
+            "method" => EntityKind::Method,
+            "struct" => EntityKind::Struct,
+            "enum" => EntityKind::Enum,
+            "trait" => EntityKind::Trait,
+            "impl" => EntityKind::Impl,
+            "class" => EntityKind::Class,
+            "interface" => EntityKind::Interface,
+            "type_alias" => EntityKind::TypeAlias,
+            "const" => EntityKind::Const,
+            "module" => EntityKind::Module,
+            _ => return None,
+        })
+    }
+
     /// Map a tree-sitter node kind (the def node's grammar type) to an
     /// `EntityKind`. `None` for node kinds we don't surface.
     fn from_node_kind(kind: &str) -> Option<EntityKind> {
@@ -379,6 +419,12 @@ pub struct ImpactSummary {
 pub struct EntitySummary {
     pub per_file: Vec<(String, Vec<EntityChange>)>,
     pub impact: Option<ImpactSummary>,
+    /// Inter-entity blast-radius (items 313/316), set off-thread by the host
+    /// graph builder when an entity graph exists for the diff's language. `None`
+    /// when the LSP is off / no server / an unserved language — the footer then
+    /// falls back to the intra-diff `impact` summary. See
+    /// [`crate::semantic_graph`].
+    pub blast: Option<crate::semantic_graph::BlastRadius>,
 }
 
 impl EntitySummary {
@@ -389,7 +435,11 @@ impl EntitySummary {
             .filter(|(_, c)| !c.is_empty())
             .collect();
         let impact = (!per_file.is_empty()).then(|| impact_summary(&per_file));
-        EntitySummary { per_file, impact }
+        EntitySummary {
+            per_file,
+            impact,
+            blast: None,
+        }
     }
 
     /// The flat `(path, 1-based start line)` jump targets for the expanded
