@@ -8920,8 +8920,8 @@ dependencies = [
  "clap 4.6.1",
  "criterion",
  "fluent-templates",
- "libc",
  "neo_frizbee",
+ "nix 0.29.0",
  "once_cell",
  "regex",
  "rusqlite",
@@ -8968,6 +8968,7 @@ dependencies = [
  "keyring",
  "libc",
  "neo_frizbee",
+ "nix 0.29.0",
  "notify 6.1.1",
  "portable-pty",
  "pprof",
@@ -9010,7 +9011,7 @@ dependencies = [
 name = "superzej-metrics"
 version = "0.1.0"
 dependencies = [
- "libc",
+ "nix 0.29.0",
  "starship-battery",
  "sysinfo 0.39.5",
  "tempfile",

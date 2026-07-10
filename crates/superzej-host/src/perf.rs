@@ -201,18 +201,11 @@ pub fn request_stop_after(
 #[cfg(unix)]
 #[inline]
 pub fn thread_cpu_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `ts` is a valid, fully-owned timespec for the duration of the call.
-    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-    if rc == 0 {
-        (ts.tv_sec as u64)
+    match nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID) {
+        Ok(ts) => (ts.tv_sec() as u64)
             .wrapping_mul(1_000_000_000)
-            .wrapping_add(ts.tv_nsec as u64)
-    } else {
-        0
+            .wrapping_add(ts.tv_nsec() as u64),
+        Err(_) => 0,
     }
 }
 

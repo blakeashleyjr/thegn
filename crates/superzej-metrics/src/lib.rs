@@ -101,27 +101,20 @@ pub enum DiskKind {
 /// non-unix target or `statvfs` error.
 #[cfg(unix)]
 pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64, u8)> {
-    use std::os::unix::ffi::OsStrExt;
     let mut p = path;
     while !p.exists() {
         p = p.parent()?;
     }
-    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `c` is a valid NUL-terminated path; `st` is zeroed before the
-    // call and only read on success.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    let blocks = st.f_blocks as u64;
+    let st = nix::sys::statvfs::statvfs(p).ok()?;
+    let blocks = st.blocks();
     if blocks == 0 {
         return None;
     }
     // f_bavail = blocks available to unprivileged users (the headroom you'd
     // actually get), which is what "free" should reflect. f_frsize is the
     // fundamental block size the block counts are expressed in.
-    let avail_blocks = st.f_bavail as u64;
-    let frsize = st.f_frsize as u64;
+    let avail_blocks = st.blocks_available();
+    let frsize = st.fragment_size();
     let total_bytes = blocks.saturating_mul(frsize);
     let avail_bytes = avail_blocks.saturating_mul(frsize);
     let pct = ((avail_blocks as f64 / blocks as f64) * 100.0)

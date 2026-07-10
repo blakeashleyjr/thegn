@@ -352,9 +352,11 @@ fn run_agent(
             }
             if !done.load(Ordering::Relaxed) {
                 timed_out.store(true, Ordering::Relaxed);
-                unsafe {
-                    libc::killpg(pgid, libc::SIGTERM);
-                }
+                nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pgid),
+                    nix::sys::signal::Signal::SIGTERM,
+                )
+                .ok();
             }
         })
     });
