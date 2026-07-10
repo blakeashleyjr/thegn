@@ -169,6 +169,32 @@ pub(crate) fn collect_attention(
         scores.insert(path.clone(), attention::score(&inputs));
     }
 
+    // Acknowledgements: an acked worktree is suppressed from the nag surfaces
+    // (badge + "Needs you" popup) only while its *current* score still matches
+    // the acked `(reason, since)`. A changed reason / advanced `since` (a new
+    // episode) no longer matches — so we drop the now-stale ack (best-effort;
+    // the DB is a cache) and the item re-nags.
+    status.acked.clear();
+    for (path, reason_str, since) in db.list_attention_acks().unwrap_or_default() {
+        let Ok(reason) =
+            serde_json::from_str::<superzej_core::attention::AttentionReason>(&reason_str)
+        else {
+            let _ = db.delete_attention_ack(&path); // best-effort: unparseable → prune
+            continue;
+        };
+        let ack = superzej_core::attention::AttentionAck { reason, since };
+        match scores.get(&path) {
+            Some(s) if s.is_acked_by(&ack) => {
+                status.acked.insert(path);
+            }
+            // Reason/episode changed, or the worktree scores nothing now: the
+            // ack is stale. Prune so a genuinely new signal re-fires.
+            _ => {
+                let _ = db.delete_attention_ack(&path); // best-effort: DB is a cache
+            }
+        }
+    }
+
     // Fresh order: urgency, then home-first / persisted position / path within
     // equal urgency — then hysteresis against the previous order.
     let mut fresh: Vec<(String, AttentionScore)> =
@@ -287,6 +313,43 @@ mod tests {
         let mut status2 = crate::sidebar::SidebarStatus::default();
         collect_attention(&session, &db, &mut status2);
         assert_eq!(status2.attention_ranks, ranks_before);
+    }
+
+    #[test]
+    fn ack_suppresses_matching_score_and_gcs_stale() {
+        let db = superzej_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/f", "/repo", "/wt/f", "f", None, None)
+            .unwrap();
+        db.put_notification("test_failed", "y", "3 failed", "/wt/f")
+            .unwrap();
+        let session = session_with(&[("app/f", "/wt/f")]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+        order_memo().lock().unwrap().clear();
+        collect_attention(&session, &db, &mut status);
+        let sc = status.attention["/wt/f"];
+        assert!(sc.needs_user());
+        assert!(status.acked.is_empty(), "no acks yet");
+
+        // Ack the exact showing (reason, since) → suppressed next pass.
+        let reason = serde_json::to_string(&sc.reason).unwrap();
+        db.put_attention_ack("/wt/f", &reason, sc.since).unwrap();
+        let mut status2 = crate::sidebar::SidebarStatus::default();
+        collect_attention(&session, &db, &mut status2);
+        assert!(status2.acked.contains("/wt/f"), "matching ack suppresses");
+
+        // A stale ack (advanced `since` = new episode) is GC'd and re-nags.
+        db.put_attention_ack("/wt/f", &reason, Some(sc.since.unwrap_or(0) + 1))
+            .unwrap();
+        let mut status3 = crate::sidebar::SidebarStatus::default();
+        collect_attention(&session, &db, &mut status3);
+        assert!(
+            !status3.acked.contains("/wt/f"),
+            "stale ack does not suppress"
+        );
+        assert!(
+            db.list_attention_acks().unwrap().is_empty(),
+            "stale ack garbage-collected"
+        );
     }
 
     #[test]

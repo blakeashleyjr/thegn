@@ -13,9 +13,15 @@ use superzej_core::theme::Hue;
 /// Activating it drills into the list; `Alt a` jumps to the next one.
 pub(crate) fn push_attention_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
     use superzej_core::attention::AttentionTier;
-    let scores = model.sidebar_status.attention.values();
+    let status = &model.sidebar_status;
     let (mut n, mut urgent) = (0usize, false);
-    for s in scores.filter(|s| s.needs_user()) {
+    // Acknowledged (quieted) worktrees don't count — the badge tracks the same
+    // needs-you set the "Needs you" popup shows (see `needs_user_ordered`).
+    for (_, s) in status
+        .attention
+        .iter()
+        .filter(|(p, s)| s.needs_user() && !status.acked.contains(p.as_str()))
+    {
         n += 1;
         urgent |= s.tier <= AttentionTier::Failure;
     }

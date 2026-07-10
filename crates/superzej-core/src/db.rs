@@ -69,7 +69,7 @@ use std::path::PathBuf;
 /// [`crate::store::HibernationStore`] — DDL in `db_migrate`).
 /// v40: adds `daemons`/`session_leases`/`pairings` (the control-plane registry;
 /// see [`crate::store::ControlStore`] — DDL in `db_control`).
-pub const SCHEMA_VERSION: i64 = 40;
+pub const SCHEMA_VERSION: i64 = 41;
 
 pub struct Db {
     conn: Connection,
@@ -478,6 +478,18 @@ impl Db {
               created_at_ms  INTEGER NOT NULL,
               read           INTEGER NOT NULL DEFAULT 0,
               worktree_path  TEXT    NOT NULL DEFAULT ''
+            );
+            -- v41: per-worktree acknowledgement of a "Needs you" attention
+            -- signal. Stores the exact (reason, since) that was showing when the
+            -- user quieted it, so the nag stays silenced for *that episode* only
+            -- (a changed reason / advanced `since` re-fires — see
+            -- `attention::AttentionScore::is_acked_by`). Purely additive cache;
+            -- git / live state is truth, so a stale row just re-nags harmlessly.
+            CREATE TABLE IF NOT EXISTS attention_acks (
+              worktree_path TEXT PRIMARY KEY,
+              reason        TEXT    NOT NULL,
+              since         INTEGER,
+              acked_at      INTEGER
             );
             -- v12: agent dispatch registry.  Each row tracks one AI coding
             -- agent assigned to work on one issue in a dedicated worktree.

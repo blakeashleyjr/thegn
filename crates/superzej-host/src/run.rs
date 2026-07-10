@@ -7905,6 +7905,32 @@ async fn event_loop<T: Terminal>(
         }};
     }
 
+    // Activate a resolved sidebar row target (live tab or dormant-workspace
+    // switch) using the loop's activation locals; returns whether the caller
+    // should kick a hydration (a workspace switch). The 13-arg call was copied
+    // verbatim across every activation site (sidebar Enter, the Alt+↑/↓ ring,
+    // terminal cycling, jump-to-attention, and the "Needs you" Enter) — this
+    // collapses them to `activate_row!(target)` with no behavior change.
+    macro_rules! activate_row {
+        ($target:expr) => {
+            activate_row_target(
+                $target,
+                &mut session,
+                &mut model,
+                &mut sb,
+                &mut panes,
+                &mut drawer,
+                &mut drawer_pool,
+                &mut drawer_home,
+                &mut workspace_pool,
+                keymap.config(),
+                chrome.center,
+                &mut need_relayout,
+                &mut clear_on_next_frame,
+            )
+        };
+    }
+
     // Launch eager pins + resurrect previously-running pins for this workspace.
     {
         let ws = (!session.id.is_empty()).then(|| session.id.clone());
@@ -11957,21 +11983,7 @@ async fn event_loop<T: Terminal>(
                                 // workspace are tab/zoom, not relayout;
                                 // workspace switch sets it via need_relayout
                                 if let Some(t) = sb.cursor_target(&model) {
-                                    let hydrate = activate_row_target(
-                                        t,
-                                        &mut session,
-                                        &mut model,
-                                        &mut sb,
-                                        &mut panes,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
-                                        &mut workspace_pool,
-                                        keymap.config(),
-                                        chrome.center,
-                                        &mut need_relayout,
-                                        &mut clear_on_next_frame,
-                                    );
+                                    let hydrate = activate_row!(t);
                                     // A worktree/workspace/terminal switch from
                                     // the sidebar keeps the user in the center
                                     // terminal if that's where they were typing
@@ -12277,6 +12289,19 @@ async fn event_loop<T: Terminal>(
                                 },
                             );
                             focus.zone = crate::focus::Zone::Panel;
+                        }
+                        // "Needs you" Enter: activate the row's resolved target
+                        // (live tab OR dormant-workspace switch). Needs the
+                        // workspace-pool / drawer locals `CiActionCtx` lacks, so
+                        // it's intercepted here — the same path `Alt a` uses.
+                        crate::detail::DetailOutcome::Act(
+                            crate::detail::DetailAction::ActivateTarget(target),
+                        ) => {
+                            bar_detail = None;
+                            if activate_row!(target) {
+                                kick_model_hydration!();
+                            }
+                            sb.focus_active_row(&mut model);
                         }
                         // A row action normally closes the overlay; the CI drill
                         // keeps it open (returns the overlay) to fill in place.
@@ -14187,21 +14212,7 @@ async fn event_loop<T: Terminal>(
                         }
                         SidebarOutcome::Activate(target) => {
                             switch_at = Some(std::time::Instant::now());
-                            if activate_row_target(
-                                target,
-                                &mut session,
-                                &mut model,
-                                &mut sb,
-                                &mut panes,
-                                &mut drawer,
-                                &mut drawer_pool,
-                                &mut drawer_home,
-                                &mut workspace_pool,
-                                keymap.config(),
-                                chrome.center,
-                                &mut need_relayout,
-                                &mut clear_on_next_frame,
-                            ) {
+                            if activate_row!(target) {
                                 kick_model_hydration!();
                             }
                             dirty = true;
@@ -17140,21 +17151,7 @@ async fn event_loop<T: Terminal>(
                                         })
                                 };
                                 if let Some(name) = next_name {
-                                    activate_row_target(
-                                        terminal_target(&name),
-                                        &mut session,
-                                        &mut model,
-                                        &mut sb,
-                                        &mut panes,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
-                                        &mut workspace_pool,
-                                        keymap.config(),
-                                        chrome.center,
-                                        &mut need_relayout,
-                                        &mut clear_on_next_frame,
-                                    );
+                                    activate_row!(terminal_target(&name));
                                     need_relayout = true;
                                 }
                                 focus.zone = crate::focus::Zone::Center;
@@ -17330,21 +17327,7 @@ async fn event_loop<T: Terminal>(
                                                 if sb.view.collapsed.remove(&slug) {
                                                     sb.persist(&format!("collapse:{slug}"), "0");
                                                 }
-                                                activate_row_target(
-                                                    terminal_target(&name),
-                                                    &mut session,
-                                                    &mut model,
-                                                    &mut sb,
-                                                    &mut panes,
-                                                    &mut drawer,
-                                                    &mut drawer_pool,
-                                                    &mut drawer_home,
-                                                    &mut workspace_pool,
-                                                    keymap.config(),
-                                                    chrome.center,
-                                                    &mut need_relayout,
-                                                    &mut clear_on_next_frame,
-                                                );
+                                                activate_row!(terminal_target(&name));
                                                 focus.zone = crate::focus::Zone::Center;
                                                 region_last_t = session
                                                     .worktrees
@@ -17407,21 +17390,7 @@ async fn event_loop<T: Terminal>(
                                         })
                                     };
                                     if let Some(name) = pick {
-                                        activate_row_target(
-                                            terminal_target(&name),
-                                            &mut session,
-                                            &mut model,
-                                            &mut sb,
-                                            &mut panes,
-                                            &mut drawer,
-                                            &mut drawer_pool,
-                                            &mut drawer_home,
-                                            &mut workspace_pool,
-                                            keymap.config(),
-                                            chrome.center,
-                                            &mut need_relayout,
-                                            &mut clear_on_next_frame,
-                                        );
+                                        activate_row!(terminal_target(&name));
                                         focus.zone = crate::focus::Zone::Center;
                                         region_last_t = session
                                             .worktrees
@@ -18482,21 +18451,7 @@ async fn event_loop<T: Terminal>(
                             Action::JumpAttention => {
                                 match crate::handlers::attention::next_target(&model, &session) {
                                     Some((t, status)) => {
-                                        let hydrate = activate_row_target(
-                                            t,
-                                            &mut session,
-                                            &mut model,
-                                            &mut sb,
-                                            &mut panes,
-                                            &mut drawer,
-                                            &mut drawer_pool,
-                                            &mut drawer_home,
-                                            &mut workspace_pool,
-                                            keymap.config(),
-                                            chrome.center,
-                                            &mut need_relayout,
-                                            &mut clear_on_next_frame,
-                                        );
+                                        let hydrate = activate_row!(t);
                                         sb.focus_active_row(&mut model);
                                         model.status = status;
                                         if hydrate {
@@ -18507,6 +18462,13 @@ async fn event_loop<T: Terminal>(
                                         model.status = "Nothing needs you right now".into();
                                     }
                                 }
+                            }
+                            Action::MarkAllRead => {
+                                crate::handlers::attention::mark_all_read(
+                                    &mut model,
+                                    &refresh_tx,
+                                    &waker,
+                                );
                             }
                         }
                         dirty = true;
