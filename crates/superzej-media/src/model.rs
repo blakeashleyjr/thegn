@@ -46,6 +46,97 @@ impl PlaybackState {
     }
 }
 
+/// What kind of media is loaded, so the UI can offer video-centric affordances
+/// (larger seek steps, chapter next/prev, a fullscreen toggle) only when they
+/// make sense. Derived best-effort from metadata / player heuristics; `Unknown`
+/// is treated as audio by the UI (the safe default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKind {
+    /// Music / audio-only.
+    Audio,
+    /// Video (a file with a video track, a movie player, a browser video).
+    Video,
+    /// Couldn't tell — the UI treats this as audio.
+    #[default]
+    Unknown,
+}
+
+impl MediaKind {
+    /// Is this something we should offer video controls for?
+    pub fn is_video(self) -> bool {
+        matches!(self, MediaKind::Video)
+    }
+
+    /// Best-effort classification from MPRIS-ish metadata hints and the player
+    /// name. `mime` is `mpris:mime`/content type when present; `url` is
+    /// `xesam:url`; `player` is the bus-name tail. Pure so it's unit-tested on
+    /// every platform.
+    pub fn from_hints(player: &str, mime: Option<&str>, url: Option<&str>) -> MediaKind {
+        if let Some(m) = mime {
+            let m = m.to_ascii_lowercase();
+            if m.starts_with("video/") {
+                return MediaKind::Video;
+            }
+            if m.starts_with("audio/") {
+                return MediaKind::Audio;
+            }
+        }
+        if let Some(u) = url {
+            let u = u.to_ascii_lowercase();
+            const VIDEO_EXT: &[&str] = &[
+                ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv", ".wmv", ".mpg", ".mpeg",
+                ".ts",
+            ];
+            if VIDEO_EXT.iter().any(|e| u.contains(e)) {
+                return MediaKind::Video;
+            }
+            const AUDIO_EXT: &[&str] = &[
+                ".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".wav", ".aac", ".wma",
+            ];
+            if AUDIO_EXT.iter().any(|e| u.contains(e)) {
+                return MediaKind::Audio;
+            }
+        }
+        // Player-name heuristic: dedicated video players / browsers lean video.
+        let p = player.to_ascii_lowercase();
+        const VIDEO_PLAYERS: &[&str] = &[
+            "mpv",
+            "vlc",
+            "kodi",
+            "smplayer",
+            "totem",
+            "celluloid",
+            "haruna",
+            "chromium",
+            "chrome",
+            "firefox",
+            "brave",
+            "youtube",
+        ];
+        if VIDEO_PLAYERS.iter().any(|n| p.contains(n)) {
+            return MediaKind::Video;
+        }
+        const AUDIO_PLAYERS: &[&str] = &[
+            "spotify",
+            "mpd",
+            "ncspot",
+            "cmus",
+            "moc",
+            "rhythmbox",
+            "clementine",
+            "audacious",
+            "musikcube",
+            "spotifyd",
+            "tidal",
+        ];
+        if AUDIO_PLAYERS.iter().any(|n| p.contains(n)) {
+            return MediaKind::Audio;
+        }
+        MediaKind::Unknown
+    }
+}
+
 /// Repeat mode, normalized across backends (MPRIS `LoopStatus`: None/Track/
 /// Playlist).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -119,6 +210,18 @@ pub struct MediaState {
     pub can_go_next: bool,
     /// MPRIS `CanGoPrevious`.
     pub can_go_previous: bool,
+    /// Cover-art reference (`mpris:artUrl` — a `file://`/`http(s)` URL, an SMTC
+    /// thumbnail token, or an AppleScript artwork path). The host fetches +
+    /// renders it; the leaf only carries the reference. `None` ⇒ no art.
+    pub art_url: Option<String>,
+    /// Audio vs video, so the UI can gate video-only controls.
+    pub kind: MediaKind,
+    /// Whether the backend supports seeking within the current track (MPRIS
+    /// `CanSeek`; true for mpv/playerctl). Gates the scrubber + skip keys.
+    pub can_seek: bool,
+    /// Opaque current-track id (MPRIS `mpris:trackid`), needed for absolute
+    /// `SetPosition`. `None` when the backend doesn't expose one.
+    pub track_id: Option<String>,
 }
 
 impl MediaState {
@@ -163,8 +266,33 @@ pub struct Playlist {
     pub name: String,
 }
 
+/// One entry in the play queue / up-next list (MPRIS `TrackList`, mpv
+/// `playlist`). `id` is the opaque handle handed back to
+/// `MediaBackend::play_queue_item` (an MPRIS track object path, or a stringified
+/// mpv playlist index). Fully `Eq` for dirty-diffing inside `PanelData`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueItem {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub duration: Option<Duration>,
+    /// Whether this is the currently-playing entry (drives the ▸ marker).
+    pub is_current: bool,
+}
+
+impl QueueItem {
+    /// `"Artist — Title"`, falling back to the title/id when fields are missing.
+    pub fn label(&self) -> String {
+        match (self.artist.trim(), self.title.trim()) {
+            ("", "") => self.id.clone(),
+            ("", t) => t.to_string(),
+            (a, t) => format!("{a} \u{2014} {t}"),
+        }
+    }
+}
+
 /// Format a duration as `m:ss` (or `h:mm:ss` past an hour).
-fn fmt_mmss(d: Duration) -> String {
+pub(crate) fn fmt_mmss(d: Duration) -> String {
     let secs = d.as_secs();
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     if h > 0 {
@@ -229,6 +357,55 @@ mod tests {
         assert_eq!(s.badge().as_deref(), Some("\u{25b6} X"));
         s.state = PlaybackState::Paused;
         assert_eq!(s.badge().as_deref(), Some("\u{275a}\u{275a} X"));
+    }
+
+    #[test]
+    fn media_kind_from_hints() {
+        // mime wins.
+        assert_eq!(
+            MediaKind::from_hints("spotify", Some("video/mp4"), None),
+            MediaKind::Video
+        );
+        assert_eq!(
+            MediaKind::from_hints("mpv", Some("audio/flac"), None),
+            MediaKind::Audio
+        );
+        // url extension next.
+        assert_eq!(
+            MediaKind::from_hints("x", None, Some("file:///m/clip.MKV")),
+            MediaKind::Video
+        );
+        assert_eq!(
+            MediaKind::from_hints("x", None, Some("file:///m/song.mp3")),
+            MediaKind::Audio
+        );
+        // player-name heuristic last.
+        assert_eq!(MediaKind::from_hints("mpv", None, None), MediaKind::Video);
+        assert_eq!(
+            MediaKind::from_hints("spotify", None, None),
+            MediaKind::Audio
+        );
+        assert_eq!(
+            MediaKind::from_hints("mystery", None, None),
+            MediaKind::Unknown
+        );
+        assert!(MediaKind::Video.is_video());
+        assert!(!MediaKind::Unknown.is_video());
+    }
+
+    #[test]
+    fn queue_item_label() {
+        let q = QueueItem {
+            artist: "Aphex Twin".into(),
+            title: "Xtal".into(),
+            ..Default::default()
+        };
+        assert_eq!(q.label(), "Aphex Twin \u{2014} Xtal");
+        let q = QueueItem {
+            title: "Untitled".into(),
+            ..Default::default()
+        };
+        assert_eq!(q.label(), "Untitled");
     }
 
     #[test]

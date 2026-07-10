@@ -6867,125 +6867,13 @@ async fn ensure_app_loaded(
 }
 
 // === media control (optional [media] feature) ==============================
-
-/// A media transport op dispatched from a keybind / palette row.
-#[derive(Debug, Clone, Copy)]
-enum MediaOp {
-    PlayPause,
-    Next,
-    Previous,
-    ShuffleToggle,
-    LoopCycle,
-    VolumeUp,
-    VolumeDown,
-}
-
-/// An async result that opens a secondary media picker palette.
-enum MediaPick {
-    Playlists(Vec<superzej_core::media::Playlist>),
-    Players(Vec<String>),
-}
-
-/// The effective media config: the configured `[media]` with the runtime player
-/// override (the "Select player" pick) floated to the front of the priority list.
-fn media_effective_cfg(
-    base: &superzej_core::config::MediaConfig,
-    player_override: &Option<String>,
-) -> superzej_core::config::MediaConfig {
-    let mut cfg = base.clone();
-    if let Some(p) = player_override {
-        cfg.players_priority.retain(|x| x != p);
-        cfg.players_priority.insert(0, p.clone());
-    }
-    cfg
-}
-
-/// Spawn the now-playing watcher: a push-signal stream on the native MPRIS path,
-/// else a slow poll for backends without signals (mpv / playerctl). Returns the
-/// task handle so the caller can abort it on a config/player change; `None` when
-/// media is disabled.
-fn spawn_media_watch(
-    cfg: superzej_core::config::MediaConfig,
-    tx: tokio_mpsc::UnboundedSender<Option<superzej_core::media::MediaState>>,
-    waker: TerminalWaker,
-) -> Option<tokio::task::JoinHandle<()>> {
-    // Body lives in `media_watch` (run.rs is line-ratcheted); it resolves the
-    // backend, streams snapshots, self-heals, and respawns on stream end.
-    crate::media_watch::spawn(cfg, tx, waker)
-}
-
-/// Abort any running watcher and (re)spawn one for `cfg`. Called at startup, on
-/// config reload (handles enable/disable live), and on a player-override change.
-fn restart_media_watch(
-    handle: &mut Option<tokio::task::JoinHandle<()>>,
-    cfg: superzej_core::config::MediaConfig,
-    tx: &tokio_mpsc::UnboundedSender<Option<superzej_core::media::MediaState>>,
-    waker: &TerminalWaker,
-) {
-    if let Some(h) = handle.take() {
-        h.abort();
-    }
-    *handle = spawn_media_watch(cfg, tx.clone(), waker.clone());
-}
-
-/// Fire a transport op off-thread, then push the resulting snapshot so the badge/
-/// panel update immediately (the signal watcher would also catch it).
-fn spawn_media_op(
-    cfg: superzej_core::config::MediaConfig,
-    op: MediaOp,
-    tx: tokio_mpsc::UnboundedSender<Option<superzej_core::media::MediaState>>,
-    waker: TerminalWaker,
-) {
-    use superzej_core::media::LoopMode;
-    tokio::spawn(async move {
-        let Some(client) = superzej_media::client_for(&cfg.resolve_opts()).await else {
-            return;
-        };
-        let cur = client.snapshot().await.unwrap_or(None);
-        let _ = match op {
-            MediaOp::PlayPause => client.play_pause().await,
-            MediaOp::Next => client.next().await,
-            MediaOp::Previous => client.previous().await,
-            MediaOp::ShuffleToggle => {
-                let on = cur.as_ref().and_then(|s| s.shuffle).unwrap_or(false);
-                client.set_shuffle(!on).await
-            }
-            MediaOp::LoopCycle => {
-                let next = cur
-                    .as_ref()
-                    .and_then(|s| s.loop_mode)
-                    .unwrap_or(LoopMode::None)
-                    .cycle();
-                client.set_loop(next).await
-            }
-            MediaOp::VolumeUp => client.volume_step(cfg.volume_step).await,
-            MediaOp::VolumeDown => client.volume_step(-cfg.volume_step).await,
-        };
-        let _ = tx.send(client.snapshot().await.unwrap_or(None));
-        let _ = waker.wake();
-    });
-}
-
-/// Fetch the playlist / player list off-thread for the secondary picker.
-fn spawn_media_pick(
-    cfg: superzej_core::config::MediaConfig,
-    players: bool,
-    tx: tokio_mpsc::UnboundedSender<MediaPick>,
-    waker: TerminalWaker,
-) {
-    tokio::spawn(async move {
-        let Some(client) = superzej_media::client_for(&cfg.resolve_opts()).await else {
-            return;
-        };
-        let pick = if players {
-            MediaPick::Players(client.players().await)
-        } else {
-            MediaPick::Playlists(client.playlists().await.unwrap_or_default())
-        };
-        let _ = tx.send(pick);
-        let _ = waker.wake();
-    });
-}
+// The transport-op enum, picker result, and off-thread spawners live in the
+// `media_ctl` sibling module (run.rs is line-ratcheted); import them by name so
+// the event-loop call sites read unchanged.
+use crate::media_ctl::{
+    MediaOp, MediaPick, media_effective_cfg, restart_media_watch, spawn_media_op, spawn_media_pick,
+    spawn_media_queue,
+};
 
 #[allow(clippy::too_many_arguments)]
 async fn event_loop<T: Terminal>(
@@ -7602,6 +7490,12 @@ async fn event_loop<T: Terminal>(
     let (media_tx, mut media_rx) =
         tokio_mpsc::unbounded_channel::<Option<superzej_core::media::MediaState>>();
     let (media_pick_tx, mut media_pick_rx) = tokio_mpsc::unbounded_channel::<MediaPick>();
+    // The Now-Playing overlay (Alt-m) + its async up-next queue and cover-art feeds.
+    let mut media_overlay: Option<crate::media_overlay::MediaOverlay> = None;
+    let (media_queue_tx, mut media_queue_rx) =
+        tokio_mpsc::unbounded_channel::<Vec<superzej_core::media::QueueItem>>();
+    let (media_art_tx, mut media_art_rx) =
+        tokio_mpsc::unbounded_channel::<crate::media_art::ArtMosaic>();
     let mut media_player_override: Option<String> = None;
     let mut media_watch: Option<tokio::task::JoinHandle<()>> = None;
     restart_media_watch(
@@ -10114,6 +10008,10 @@ async fn event_loop<T: Terminal>(
         // the section closed moves nothing visible and repaints nothing.
         let media_section_open =
             chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Media;
+        // The Now-Playing overlay, like the section, shows the live position — so
+        // it opts into the same coalesced repaint (and refreshes art on a track
+        // change).
+        let media_overlay_open = media_overlay.is_some();
         while let Ok(snap) = media_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             let shown = if current_config.media.enabled {
@@ -10125,7 +10023,19 @@ async fn event_loop<T: Terminal>(
                 let badge_changed = model.panel.media.as_ref().and_then(|m| m.badge())
                     != shown.as_ref().and_then(|m| m.badge());
                 model.panel.media = shown;
-                if media_section_open {
+                if let Some(ov) = &mut media_overlay {
+                    ov.snapshot = model.panel.media.clone();
+                    if let Some(url) = ov.wants_art(current_config.media.show_art) {
+                        crate::media_art::spawn_fetch(
+                            url,
+                            crate::media_overlay::ART_COLS,
+                            crate::media_overlay::ART_ROWS,
+                            media_art_tx.clone(),
+                            waker.clone(),
+                        );
+                    }
+                }
+                if media_section_open || media_overlay_open {
                     // Coalesce: a playing track ticks ~4/s, and a full chrome
                     // recompose per tick is a flicker storm. Repaint at most ~1/s
                     // (the data above is already current); a non-position change
@@ -10172,6 +10082,21 @@ async fn event_loop<T: Terminal>(
                 palette = Some(crate::search_everywhere::PaletteSession::new(items));
             }
             dirty = true;
+        }
+        // Now-Playing overlay feeds: up-next queue + decoded cover art.
+        while let Ok(queue) = media_queue_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Refresh);
+            if let Some(ov) = &mut media_overlay {
+                ov.set_queue(queue);
+                dirty = true;
+            }
+        }
+        while let Ok(art) = media_art_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Refresh);
+            if let Some(ov) = &mut media_overlay {
+                ov.set_art(art);
+                dirty = true;
+            }
         }
 
         while let Ok(cfg_res) = config_rx.try_recv() {
@@ -10908,6 +10833,7 @@ async fn event_loop<T: Terminal>(
                 which_key: !which_key.is_empty(),
                 toasts: !toasts.is_empty(),
                 detail: bar_detail.is_some(),
+                media: media_overlay.is_some(),
             };
             let damage = crate::render_plan::Damage {
                 full: full_repaint,
@@ -11303,6 +11229,10 @@ async fn event_loop<T: Terminal>(
             // The full-screen PR view sits at the same modal layer.
             if let Some(v) = &pr_view {
                 v.render(&mut scratch, screen);
+            }
+            // The Now-Playing media control overlay (centered modal).
+            if let Some(ov) = &media_overlay {
+                ov.render(&mut scratch, screen);
             }
             if !which_key.is_empty() {
                 crate::keyhint::render_which_key(
@@ -12276,6 +12206,22 @@ async fn event_loop<T: Terminal>(
                         &waker,
                         &mut model,
                     );
+                    dirty = true;
+                    continue;
+                }
+                // The Now-Playing overlay owns every key while open: transport ops
+                // run off the loop (overlay stays open); Esc/Ctrl-C dismiss it.
+                if let Some(ov) = &mut media_overlay {
+                    match ov.handle_key(&k.key, k.modifiers) {
+                        crate::media_overlay::MediaOverlayOutcome::Close => media_overlay = None,
+                        crate::media_overlay::MediaOverlayOutcome::Pending => {}
+                        crate::media_overlay::MediaOverlayOutcome::Op(op) => spawn_media_op(
+                            media_effective_cfg(&current_config.media, &media_player_override),
+                            MediaOp::from(op),
+                            media_tx.clone(),
+                            waker.clone(),
+                        ),
+                    }
                     dirty = true;
                     continue;
                 }
@@ -18308,7 +18254,12 @@ async fn event_loop<T: Terminal>(
                             | Action::MediaShuffleToggle
                             | Action::MediaLoopCycle
                             | Action::MediaVolumeUp
-                            | Action::MediaVolumeDown => {
+                            | Action::MediaVolumeDown
+                            | Action::MediaSeekForward
+                            | Action::MediaSeekBack
+                            | Action::MediaChapterNext
+                            | Action::MediaChapterPrev
+                            | Action::MediaFullscreen => {
                                 if current_config.media.enabled {
                                     let op = match action {
                                         Action::MediaNext => MediaOp::Next,
@@ -18317,6 +18268,11 @@ async fn event_loop<T: Terminal>(
                                         Action::MediaLoopCycle => MediaOp::LoopCycle,
                                         Action::MediaVolumeUp => MediaOp::VolumeUp,
                                         Action::MediaVolumeDown => MediaOp::VolumeDown,
+                                        Action::MediaSeekForward => MediaOp::SeekForward,
+                                        Action::MediaSeekBack => MediaOp::SeekBack,
+                                        Action::MediaChapterNext => MediaOp::ChapterNext,
+                                        Action::MediaChapterPrev => MediaOp::ChapterPrev,
+                                        Action::MediaFullscreen => MediaOp::FullscreenToggle,
                                         _ => MediaOp::PlayPause,
                                     };
                                     spawn_media_op(
@@ -18328,6 +18284,32 @@ async fn event_loop<T: Terminal>(
                                         media_tx.clone(),
                                         waker.clone(),
                                     );
+                                } else {
+                                    model.status = "Media is off ([media] enabled = false)".into();
+                                }
+                            }
+                            Action::MediaOpenPanel => {
+                                if current_config.media.enabled {
+                                    // Open the Now-Playing overlay, then eagerly
+                                    // fetch its up-next queue and cover art.
+                                    let ov = crate::media_overlay::MediaOverlay::open(
+                                        model.panel.media.clone(),
+                                    );
+                                    let cfg = media_effective_cfg(
+                                        &current_config.media,
+                                        &media_player_override,
+                                    );
+                                    spawn_media_queue(cfg, media_queue_tx.clone(), waker.clone());
+                                    if let Some(url) = ov.wants_art(current_config.media.show_art) {
+                                        crate::media_art::spawn_fetch(
+                                            url,
+                                            crate::media_overlay::ART_COLS,
+                                            crate::media_overlay::ART_ROWS,
+                                            media_art_tx.clone(),
+                                            waker.clone(),
+                                        );
+                                    }
+                                    media_overlay = Some(ov);
                                 } else {
                                     model.status = "Media is off ([media] enabled = false)".into();
                                 }

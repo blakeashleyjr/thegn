@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use crate::model::{LoopMode, MediaState, PlaybackState};
+use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState};
 
 const SEP: char = '\u{1f}';
 
@@ -30,8 +30,9 @@ pub(crate) fn parse_line(line: &str) -> MediaState {
         .filter(|s| *s >= 0.0)
         .map(Duration::from_secs_f64);
 
+    let player = get(0).to_string();
+    let kind = MediaKind::from_hints(&player, None, None);
     MediaState {
-        player: get(0).to_string(),
         title: get(2).to_string(),
         artist: get(3).to_string(),
         album: get(4).to_string(),
@@ -47,6 +48,11 @@ pub(crate) fn parse_line(line: &str) -> MediaState {
             .map(|v| v.round().clamp(0.0, 100.0) as u8),
         can_go_next: true,
         can_go_previous: true,
+        art_url: None, // artwork is binary; not fetched via the scripting floor
+        kind,
+        can_seek: true, // `player position` is settable on both apps
+        track_id: None,
+        player,
     }
 }
 

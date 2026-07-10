@@ -50,7 +50,9 @@ mod smtc_decode;
 use std::future::Future;
 use std::pin::Pin;
 
-use model::{LoopMode, MediaState, Playlist};
+use std::time::Duration;
+
+use model::{LoopMode, MediaState, Playlist, QueueItem};
 
 #[cfg(target_os = "linux")]
 pub use mpris::{MprisWatch, MprisZbus};
@@ -95,6 +97,18 @@ pub struct MediaCaps {
     pub playlists: bool,
     /// Whether the backend offers a push-signal stream (no polling needed).
     pub signals: bool,
+    /// Relative/absolute seeking within a track (`seek`/`set_position`).
+    pub seek: bool,
+    /// Cover art is exposed (`MediaState::art_url` may be populated).
+    pub art: bool,
+    /// A play queue / up-next list is enumerable (`queue`/`play_queue_item`).
+    pub queue: bool,
+    /// Absolute volume can be set (`set_volume`), not just stepped.
+    pub abs_volume: bool,
+    /// Chapter navigation is available (`chapter_next`/`chapter_prev`).
+    pub chapters: bool,
+    /// A fullscreen toggle is available (`set_fullscreen`).
+    pub fullscreen: bool,
 }
 
 /// A media-control backend for one player protocol. Read (`snapshot`) first;
@@ -123,6 +137,57 @@ pub trait MediaBackend: Send + Sync {
     async fn playlists(&self) -> Result<Vec<Playlist>, MediaError>;
     /// Activate a playlist by its opaque id (an MPRIS object path).
     async fn activate_playlist(&self, id: &str) -> Result<(), MediaError>;
+
+    /// Seek by `offset` relative to the current position, `forward` or back
+    /// (MPRIS `Seek(±µs)`, mpv relative `seek`). Default: unsupported no-op error
+    /// — override + set [`MediaCaps::seek`] where the backend can seek.
+    async fn seek(&self, offset: Duration, forward: bool) -> Result<(), MediaError> {
+        let _ = (offset, forward);
+        Err(MediaError::Backend("seek unsupported".into()))
+    }
+    /// Jump to an absolute `pos` (MPRIS `SetPosition(trackid, µs)`, mpv absolute
+    /// `seek`). `track_id` is the current [`MediaState::track_id`] when the
+    /// backend needs it. Default: unsupported.
+    async fn set_position(&self, pos: Duration, track_id: Option<&str>) -> Result<(), MediaError> {
+        let _ = (pos, track_id);
+        Err(MediaError::Backend("set_position unsupported".into()))
+    }
+    /// Set an absolute volume `level` in `0..=100`. Default falls back to a
+    /// coarse series of `volume_step`s from an unknown base — override for exact
+    /// control and set [`MediaCaps::abs_volume`].
+    async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
+        let _ = level;
+        Err(MediaError::Backend("set_volume unsupported".into()))
+    }
+
+    /// The play queue / up-next list, where the backend exposes one (MPRIS
+    /// `TrackList`, mpv `playlist`). Empty by default — gate on
+    /// [`MediaCaps::queue`].
+    async fn queue(&self) -> Result<Vec<QueueItem>, MediaError> {
+        Ok(Vec::new())
+    }
+    /// Jump to a queue entry by its opaque [`QueueItem::id`]. Default: unsupported.
+    async fn play_queue_item(&self, id: &str) -> Result<(), MediaError> {
+        let _ = id;
+        Err(MediaError::Backend("play_queue_item unsupported".into()))
+    }
+
+    /// Next chapter (mpv `add chapter 1`; players exposing chapters). Default:
+    /// unsupported — gate on [`MediaCaps::chapters`].
+    async fn chapter_next(&self) -> Result<(), MediaError> {
+        Err(MediaError::Backend("chapters unsupported".into()))
+    }
+    /// Previous chapter. Default: unsupported.
+    async fn chapter_prev(&self) -> Result<(), MediaError> {
+        Err(MediaError::Backend("chapters unsupported".into()))
+    }
+
+    /// Toggle player fullscreen (mpv `cycle fullscreen`, MPRIS root `Fullscreen`).
+    /// Self-contained (reads current state where needed) so the UI holds no
+    /// fullscreen state. Default: unsupported — gate on [`MediaCaps::fullscreen`].
+    async fn toggle_fullscreen(&self) -> Result<(), MediaError> {
+        Err(MediaError::Backend("fullscreen unsupported".into()))
+    }
 
     fn caps(&self) -> MediaCaps;
 }
@@ -346,6 +411,34 @@ impl MediaClient {
     }
     pub async fn activate_playlist(&self, id: &str) -> Result<(), MediaError> {
         dispatch!(self, b => b.activate_playlist(id).await)
+    }
+    pub async fn seek(&self, offset: Duration, forward: bool) -> Result<(), MediaError> {
+        dispatch!(self, b => b.seek(offset, forward).await)
+    }
+    pub async fn set_position(
+        &self,
+        pos: Duration,
+        track_id: Option<&str>,
+    ) -> Result<(), MediaError> {
+        dispatch!(self, b => b.set_position(pos, track_id).await)
+    }
+    pub async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
+        dispatch!(self, b => b.set_volume(level).await)
+    }
+    pub async fn queue(&self) -> Result<Vec<QueueItem>, MediaError> {
+        dispatch!(self, b => b.queue().await)
+    }
+    pub async fn play_queue_item(&self, id: &str) -> Result<(), MediaError> {
+        dispatch!(self, b => b.play_queue_item(id).await)
+    }
+    pub async fn chapter_next(&self) -> Result<(), MediaError> {
+        dispatch!(self, b => b.chapter_next().await)
+    }
+    pub async fn chapter_prev(&self) -> Result<(), MediaError> {
+        dispatch!(self, b => b.chapter_prev().await)
+    }
+    pub async fn toggle_fullscreen(&self) -> Result<(), MediaError> {
+        dispatch!(self, b => b.toggle_fullscreen().await)
     }
     pub fn caps(&self) -> MediaCaps {
         dispatch!(self, b => b.caps())
