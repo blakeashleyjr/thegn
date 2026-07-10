@@ -269,6 +269,11 @@ pub struct SidebarStatus {
     /// Per-worktree merge-queue status (keyed by path) — the queue rows the
     /// attention scan already reads, re-exposed for the sidebar's MQ chip.
     pub mq: std::collections::BTreeMap<String, superzej_core::attention::MqStatus>,
+    /// Worktree paths whose current attention signal the user has acknowledged
+    /// (see `attention::AttentionScore::is_acked_by`). Suppressed from the nag
+    /// surfaces — the `✋` badge count and the "Needs you" popup / jump ring —
+    /// while acked; the sidebar sort still reflects the true tier.
+    pub acked: std::collections::BTreeSet<String>,
 }
 
 /// Persisted + transient view state that shapes the tree (collapse/sort/pins/

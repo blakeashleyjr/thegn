@@ -126,11 +126,29 @@ impl Default for AttentionScore {
     }
 }
 
+/// A user's acknowledgement of a worktree's needs-you signal: the exact
+/// `(reason, since)` that was showing when they quieted it. Persisted per
+/// worktree so the "Needs you" nag stays silenced across restarts — but only
+/// for *that episode* (see [`AttentionScore::is_acked_by`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionAck {
+    pub reason: AttentionReason,
+    pub since: Option<i64>,
+}
+
 impl AttentionScore {
     /// Does this worktree need the user (tier ≤ `Waiting`)? Drives the chip
     /// count and the jump-to-next set.
     pub fn needs_user(&self) -> bool {
         self.tier <= AttentionTier::Waiting
+    }
+
+    /// Is this score still covered by a prior acknowledgement? True only when
+    /// the reason **and** episode (`since`) are identical to the ack. A new
+    /// episode (advanced `since`) or a changed reason re-fires — so acking
+    /// "still waiting" quiets *this* wait, but a fresh failure later re-nags.
+    pub fn is_acked_by(&self, ack: &AttentionAck) -> bool {
+        self.reason == ack.reason && self.since == ack.since
     }
 
     /// Ascending sort key: `(tier, sub, since)` — most urgent tier first, then
@@ -844,6 +862,46 @@ mod tests {
                 "{r:?} label too long for a detail line"
             );
         }
+    }
+
+    #[test]
+    fn ack_covers_same_episode_but_refires_on_change() {
+        let s = AttentionScore {
+            tier: T::Waiting,
+            sub: 2,
+            reason: R::StillStuck,
+            since: Some(500),
+        };
+        // Exact (reason, since) match → acked.
+        let ack = AttentionAck {
+            reason: R::StillStuck,
+            since: Some(500),
+        };
+        assert!(s.is_acked_by(&ack));
+        // A new wait episode (advanced `since`) re-fires.
+        let newer = AttentionScore {
+            since: Some(900),
+            ..s
+        };
+        assert!(!newer.is_acked_by(&ack));
+        // A different reason re-fires even at the same timestamp.
+        let other = AttentionScore {
+            reason: R::CiFailed,
+            ..s
+        };
+        assert!(!other.is_acked_by(&ack));
+        // Timestamp-less signals (CI/PR) match on `None == None`.
+        let ci = AttentionScore {
+            tier: T::Failure,
+            sub: 4,
+            reason: R::CiFailed,
+            since: None,
+        };
+        let ci_ack = AttentionAck {
+            reason: R::CiFailed,
+            since: None,
+        };
+        assert!(ci.is_acked_by(&ci_ack));
     }
 
     #[test]

@@ -200,6 +200,10 @@ pub enum Action {
     /// blocked on input, failures, finished-awaiting-review), most urgent
     /// first, wrapping. Works in any sidebar sort mode.
     JumpAttention,
+    /// Mark everything read: all stored notifications read + every live
+    /// "Needs you" signal acknowledged (quieted). The full "clear the nag"
+    /// gesture; also available as `a` / `Shift+R` inside either popup.
+    MarkAllRead,
     Quit,
     Custom(u16),
 }
@@ -418,6 +422,7 @@ impl Action {
             Action::NotifyDndToggle => "notify-dnd-toggle",
             Action::NotifyModeCycle => "notify-mode-cycle",
             Action::JumpAttention => "attention-next",
+            Action::MarkAllRead => "mark-all-read",
             Action::Quit => "quit",
             Action::Custom(_) => "custom-action",
         }
@@ -519,6 +524,7 @@ impl Action {
             "notify-dnd-toggle" | "dnd" | "dnd-toggle" => Action::NotifyDndToggle,
             "notify-mode-cycle" | "notify-mode" => Action::NotifyModeCycle,
             "attention-next" | "jump-attention" => Action::JumpAttention,
+            "mark-all-read" | "notify-mark-all-read" => Action::MarkAllRead,
             // `summon-pin-N` / `pin-N` → SummonPin(N) (1..=9);
             // `summon-workspace-N` / `workspace-N` → SummonWorkspace(N) (1..=9).
             other => {
@@ -1082,6 +1088,7 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt m", Action::NotifyModeCycle)
         .unwrap();
     map.insert_all("Alt a", Action::JumpAttention).unwrap();
+    map.insert_all("Alt Shift R", Action::MarkAllRead).unwrap();
 
     // Vim-normal mode: one-key navigation plus leader-like Space sequences.
     map.insert(Mode::VimNormal, "h", Action::FocusLeft).unwrap();

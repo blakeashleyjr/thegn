@@ -5,8 +5,12 @@
 //! the file-size ratchet).
 
 use superzej_core::attention::{self, AttentionScore};
+use superzej_core::store::NotificationStore;
+use termwiz::terminal::TerminalWaker;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chrome::FrameModel;
+use crate::hydrate::RefreshKind;
 
 /// The worktrees currently needing the user (tiers T0–T2), most urgent first
 /// — the hysteresis-stable hydration order, so the jump ring matches what the
@@ -16,7 +20,10 @@ pub(crate) fn needs_user_ordered(model: &FrameModel) -> Vec<(String, AttentionSc
     let mut v: Vec<(String, AttentionScore)> = status
         .attention
         .iter()
-        .filter(|(_, s)| s.needs_user())
+        // Acknowledged (quieted) worktrees drop out of the needs-you set: the
+        // "Needs you" popup, the `✋` badge, and the `Alt a` jump ring all read
+        // this, so acking silences every nag surface at once.
+        .filter(|(p, s)| s.needs_user() && !status.acked.contains(p.as_str()))
         .map(|(p, s)| (p.clone(), *s))
         .collect();
     v.sort_by_key(|(p, s)| {
@@ -50,6 +57,39 @@ pub(crate) fn next_target(
     let target = row.tab_target.clone()?;
     let status = format!("{} — {}", row.label, score.reason.label());
     Some((target, status))
+}
+
+/// Mark everything read: every stored notification read **and** every live
+/// needs-you signal acknowledged (quieted). The full "clear the nag" gesture
+/// behind `Alt Shift R`. Snapshots the needs-you set on the caller's thread
+/// (cheap) and writes off the loop, then pulses a model refresh.
+pub(crate) fn mark_all_read(
+    model: &mut FrameModel,
+    tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+) {
+    let acks: Vec<(String, String, Option<i64>)> = needs_user_ordered(model)
+        .into_iter()
+        .filter_map(|(p, s)| {
+            serde_json::to_string(&s.reason)
+                .ok()
+                .map(|r| (p, r, s.since))
+        })
+        .collect();
+    let tx = tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Ok(db) = superzej_core::db::Db::open() {
+            let _ = db.mark_all_notifications_read(); // best-effort: DB is a cache
+            for (p, r, since) in acks {
+                let _ = db.put_attention_ack(&p, &r, since);
+            }
+        }
+        if tx.send(RefreshKind::Model).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+    model.status = "Marked all as read".into();
 }
 
 #[cfg(test)]
