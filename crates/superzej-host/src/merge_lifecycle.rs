@@ -35,7 +35,7 @@ pub(crate) fn apply(
     }
     match decide(cfg, event) {
         LifecycleAction::Noop => {}
-        LifecycleAction::FileInto(folder) => file_into(db, repo_root, worktree, &folder),
+        LifecycleAction::FileInto(folder) => file_into(db, repo_root, worktree, branch, &folder),
         LifecycleAction::RemoveWorktree { delete_branch } => {
             remove_landed(db, repo_root, worktree, branch, delete_branch)
         }
@@ -44,17 +44,32 @@ pub(crate) fn apply(
 
 /// File `worktree` into the named sidebar folder (find-or-create), scoped to the
 /// worktree's own workspace so it lands under the right repo in the tree.
-fn file_into(db: &Db, repo_root: &Path, worktree: &str, folder: &str) {
-    // Prefer the worktree's recorded repo_path — the folder is workspace-scoped
-    // exactly as the sidebar filters it — falling back to the fold's repo root.
-    let repo_path = db
-        .repo_root_for(worktree)
-        .ok()
-        .flatten()
+fn file_into(db: &Db, repo_root: &Path, worktree: &str, branch: &str, folder: &str) {
+    // `repo_root_for` doubles as the "is this worktree in the DB cache?" probe:
+    // it reads the row's `repo_path`, so `None` means there is no row. Prefer
+    // that recorded repo_path (the folder is workspace-scoped exactly as the
+    // sidebar filters it), falling back to the fold's repo root.
+    let recorded = db.repo_root_for(worktree).ok().flatten();
+    let repo_path = recorded
+        .clone()
         .unwrap_or_else(|| repo_root.to_string_lossy().into_owned());
-    // best-effort: sidebar filing is cosmetic and must never fail a merge.
-    if let Ok(fid) = db.ensure_folder(&repo_path, folder) {
+    // best-effort throughout: sidebar filing is cosmetic and must never fail a merge.
+    let Ok(fid) = db.ensure_folder(&repo_path, folder) else {
+        return;
+    };
+    if recorded.is_some() {
+        // Row already cached: a narrow update that leaves every other column intact.
         let _ = db.set_worktree_folder(worktree, Some(fid));
+    } else {
+        // No cache row — the worktree was created via git / the `wt` CLI, not the
+        // in-app wizard/provision path that calls `put_worktree`. A bare
+        // `set_worktree_folder` would `UPDATE … WHERE worktree=?` and match zero
+        // rows, so the filing would silently vanish. Register the row instead,
+        // with the canonical `{slug}/{branch}` tab name the sidebar joins live
+        // tabs to (`db_by_tab`), so the folder actually shows.
+        let slug = superzej_core::repo::repo_slug_with(db, Path::new(&repo_path));
+        let tab = superzej_core::repo::branch_tab(&slug, branch);
+        let _ = db.put_worktree(&tab, &repo_path, worktree, branch, None, Some(fid));
     }
 }
 
@@ -207,6 +222,43 @@ mod tests {
             LifecycleEvent::Enqueued,
         );
         assert_eq!(folder_of(&db, &root_s, &feat_s).as_deref(), Some("Merging"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&feat);
+    }
+
+    #[test]
+    fn enqueue_registers_unpersisted_worktree_and_files_it() {
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "unpersist");
+        let (root_s, feat_s) = (
+            root.to_string_lossy().to_string(),
+            feat.to_string_lossy().to_string(),
+        );
+        // A worktree created via git / the `wt` CLI has no `worktrees` cache row.
+        db.del_worktree(&feat_s).unwrap();
+        assert!(db.repo_root_for(&feat_s).unwrap().is_none(), "no cache row");
+
+        apply(
+            &cfg(OnLanded::Move),
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            LifecycleEvent::Enqueued,
+        );
+
+        // The row is registered AND filed into Merging — with the canonical
+        // `{slug}/{branch}` tab name the sidebar joins live tabs by, so the
+        // folder actually renders (a bare `set_worktree_folder` would no-op).
+        assert_eq!(folder_of(&db, &root_s, &feat_s).as_deref(), Some("Merging"));
+        let row = db
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.worktree == feat_s)
+            .expect("worktree row registered");
+        let slug = superzej_core::repo::repo_slug_with(&db, &root);
+        assert_eq!(row.tab_name, superzej_core::repo::branch_tab(&slug, "feat"));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&feat);
     }
