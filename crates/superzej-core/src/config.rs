@@ -878,6 +878,16 @@ pub struct MediaConfig {
     pub default_action: MediaDefaultAction,
     /// Volume step (0.0..=1.0) applied by `media-volume-up`/`-down`.
     pub volume_step: f64,
+    /// Seek step (seconds) applied by `media-seek-forward`/`-back` for audio.
+    pub seek_step_secs: u64,
+    /// Larger seek step (seconds) used when the loaded media is a video, where
+    /// coarser skipping is the norm.
+    pub seek_step_video_secs: u64,
+    /// Render cover art in the Now-Playing overlay when the backend + terminal
+    /// support it (kitty/sixel graphics; falls back to blocks otherwise).
+    pub show_art: bool,
+    /// Open the Now-Playing overlay when the statusbar media badge is clicked.
+    pub overlay_on_badge_click: bool,
     /// Fallback poll cadence (seconds) for backends without a push-signal stream
     /// (mpv IPC / `playerctl`). The native MPRIS path uses D-Bus signals instead,
     /// so this never fires for it (preserving the ~0%-idle contract).
@@ -893,38 +903,18 @@ impl Default for MediaConfig {
             players_priority: Vec::new(),
             default_action: MediaDefaultAction::PlayPause,
             volume_step: 0.05,
+            seek_step_secs: 10,
+            seek_step_video_secs: 30,
+            show_art: true,
+            overlay_on_badge_click: true,
             poll_interval_secs: 3,
             mpv: MpvMediaConfig::default(),
         }
     }
 }
 
-impl MediaConfig {
-    /// Lower this config into the backend-resolution input the `superzej-media`
-    /// leaf consumes (the leaf must not depend on core). When disabled the
-    /// backend maps to `None`, so `superzej_media::client_for` stays inert.
-    pub fn resolve_opts(&self) -> superzej_media::ResolveOpts {
-        use superzej_media::BackendKind;
-        let backend = if !self.enabled {
-            BackendKind::None
-        } else {
-            match self.backend {
-                MediaBackendKind::Auto => BackendKind::Auto,
-                MediaBackendKind::None => BackendKind::None,
-                MediaBackendKind::Mpris => BackendKind::Mpris,
-                MediaBackendKind::Mpv => BackendKind::Mpv,
-                MediaBackendKind::Smtc => BackendKind::Smtc,
-                MediaBackendKind::AppleScript => BackendKind::AppleScript,
-                MediaBackendKind::Jellyfin => BackendKind::Jellyfin,
-            }
-        };
-        superzej_media::ResolveOpts {
-            backend,
-            players_priority: self.players_priority.clone(),
-            mpv_socket: self.mpv.socket.clone(),
-        }
-    }
-}
+// `MediaConfig`'s inherent impls (`resolve_opts`, `seek_step`) live in the
+// `config_media` sibling module to keep this ratcheted god-file from growing.
 
 /// `[media.mpv]` — mpv JSON-IPC backend. Point `socket` at the path mpv was
 /// launched with via `--input-ipc-server=<path>`.

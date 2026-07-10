@@ -193,6 +193,16 @@ pub enum Action {
     MediaLoopCycle,
     MediaVolumeUp,
     MediaVolumeDown,
+    /// Seek within the current track (step from `[media] seek_step*`; video uses
+    /// the larger step). The "skip forward / skip back" controls.
+    MediaSeekForward,
+    MediaSeekBack,
+    /// Video: chapter navigation + fullscreen (inert on audio / unsupported).
+    MediaChapterNext,
+    MediaChapterPrev,
+    MediaFullscreen,
+    /// Open the Now-Playing overlay (the full interactive control panel).
+    MediaOpenPanel,
     /// Open the Cmd+K-style picker for the player's playlists.
     MediaSelectPlaylist,
     /// Open the picker to choose which player to control.
@@ -423,6 +433,12 @@ impl Action {
             Action::MediaLoopCycle => "media-loop-cycle",
             Action::MediaVolumeUp => "media-volume-up",
             Action::MediaVolumeDown => "media-volume-down",
+            Action::MediaSeekForward => "media-seek-forward",
+            Action::MediaSeekBack => "media-seek-back",
+            Action::MediaChapterNext => "media-chapter-next",
+            Action::MediaChapterPrev => "media-chapter-prev",
+            Action::MediaFullscreen => "media-fullscreen",
+            Action::MediaOpenPanel => "media-open-panel",
             Action::MediaSelectPlaylist => "media-select-playlist",
             Action::MediaSelectPlayer => "media-select-player",
             Action::NotifyDndToggle => "notify-dnd-toggle",
@@ -526,6 +542,12 @@ impl Action {
             "media-loop-cycle" | "media-loop" => Action::MediaLoopCycle,
             "media-volume-up" => Action::MediaVolumeUp,
             "media-volume-down" => Action::MediaVolumeDown,
+            "media-seek-forward" | "media-seek-fwd" => Action::MediaSeekForward,
+            "media-seek-back" | "media-seek-backward" => Action::MediaSeekBack,
+            "media-chapter-next" => Action::MediaChapterNext,
+            "media-chapter-prev" | "media-chapter-previous" => Action::MediaChapterPrev,
+            "media-fullscreen" => Action::MediaFullscreen,
+            "media-open-panel" | "media-panel" | "media-now-playing" => Action::MediaOpenPanel,
             "media-select-playlist" | "media-playlist" => Action::MediaSelectPlaylist,
             "media-select-player" | "media-player" => Action::MediaSelectPlayer,
             "notify-dnd-toggle" | "dnd" | "dnd-toggle" => Action::NotifyDndToggle,
@@ -1121,6 +1143,17 @@ pub fn default_keymap() -> KeyMap {
         .unwrap();
     map.insert_all("Alt m o", Action::MediaSelectPlayer)
         .unwrap();
+    // Seek within the track (skip forward / back), the Now-Playing overlay, and
+    // the video-only chapter / fullscreen controls.
+    map.insert_all("Alt m .", Action::MediaSeekForward).unwrap();
+    map.insert_all("Alt m ,", Action::MediaSeekBack).unwrap();
+    map.insert_all("Alt m enter", Action::MediaOpenPanel)
+        .unwrap();
+    // `Alt m f` is reserved as the file-worktree preset sub-leader, so fullscreen
+    // rides `Alt m v` (video).
+    map.insert_all("Alt m v", Action::MediaFullscreen).unwrap();
+    map.insert_all("Alt m ]", Action::MediaChapterNext).unwrap();
+    map.insert_all("Alt m [", Action::MediaChapterPrev).unwrap();
     map.insert_all("Ctrl Alt d", Action::NotifyDndToggle)
         .unwrap();
     map.insert_all("Ctrl Alt m", Action::NotifyModeCycle)

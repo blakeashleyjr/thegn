@@ -45,6 +45,11 @@ pub fn image_file(path: &Path) -> Result<Raster, String> {
     decode_and_fit(&bytes)
 }
 
+/// Decode encoded image `bytes` (e.g. cover art fetched over HTTP) to RGBA.
+pub fn image_bytes(bytes: &[u8]) -> Result<Raster, String> {
+    decode_and_fit(bytes)
+}
+
 /// Rasterize page 1 of a PDF via `pdftoppm` (poppler) → PNG on stdout → RGBA.
 /// Errs (→ text fallback) when the tool is absent or fails. Blocking.
 #[expect(clippy::disallowed_methods)] // off-loop: called from spawn_blocking
