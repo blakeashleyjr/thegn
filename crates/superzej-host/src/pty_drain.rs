@@ -425,6 +425,15 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
     // Program name is needed for attention routing after the pane leaves the
     // table (item 524).
     let exited_program = ctx.panes.table.get(&id).map(|p| p.program().to_string());
+    // Grab the dying pane's last output BEFORE it leaves the table — a
+    // sandbox/exec failure writes its error here, and a fast crash would
+    // otherwise discard it (the pane just vanishes).
+    let crash_tail = ctx
+        .panes
+        .table
+        .get(&id)
+        .map(|p| p.history_tail(12))
+        .unwrap_or_default();
     ctx.panes.table.remove(&id);
     // The visible yazi drawer's process ended. Clear it, mark the worktree's
     // drawer closed, hand focus back to the center, and relayout to reclaim
@@ -670,18 +679,19 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
         if sole {
             if is_active_tab {
                 if crashes >= 3 {
-                    // Shell is crashing on every startup — stop the loop and
-                    // surface the problem. The user can try a different
-                    // backend or fix their shell config, then switch
-                    // worktrees to retry.
+                    // Crashing on every startup — stop respawning and surface the
+                    // pane's real last error (e.g. a container/exec failure) so it
+                    // isn't a silent black hole.
+                    tracing::error!(
+                        worktree = %ctx.session.worktrees[gi].name,
+                        tail = %crash_tail,
+                        "sandbox pane kept crashing; not respawning"
+                    );
                     ctx.loading_state
                         .remove(&(ctx.session.worktrees[gi].name.clone(), ti));
                     ctx.model.load_steps.clear();
                     *ctx.center_dormant = true;
-                    ctx.model.status = "Shell keeps crashing on startup — not respawning. \
-                         Check your sandbox backend and shell config, \
-                         then switch worktrees to retry."
-                        .into();
+                    ctx.model.status = crate::handlers::crash::keeps_crashing_status(&crash_tail);
                 } else {
                     // Worktree dir first, then current_dir, then $HOME.
                     let cwd = group_cwd(&ctx.session.worktrees[gi])
