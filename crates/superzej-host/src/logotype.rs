@@ -75,6 +75,22 @@ const SMALL_J: Glyph = Glyph {
     width: 3,
     rows: &[0b111, 0b010, 0b010, 0b110],
 };
+const SMALL_T: Glyph = Glyph {
+    width: 3,
+    rows: &[0b111, 0b010, 0b010, 0b010],
+};
+const SMALL_H: Glyph = Glyph {
+    width: 3,
+    rows: &[0b101, 0b111, 0b101, 0b101],
+};
+const SMALL_G: Glyph = Glyph {
+    width: 3,
+    rows: &[0b111, 0b100, 0b101, 0b111],
+};
+const SMALL_N: Glyph = Glyph {
+    width: 3,
+    rows: &[0b111, 0b101, 0b101, 0b101],
+};
 
 // ---- Large face: 5×6 px, 1-px corner cuts for a rounded-techy look. ----
 const LARGE_S: Glyph = Glyph {
@@ -104,6 +120,22 @@ const LARGE_Z: Glyph = Glyph {
 const LARGE_J: Glyph = Glyph {
     width: 5,
     rows: &[0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100],
+};
+const LARGE_T: Glyph = Glyph {
+    width: 5,
+    rows: &[0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+};
+const LARGE_H: Glyph = Glyph {
+    width: 5,
+    rows: &[0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+};
+const LARGE_G: Glyph = Glyph {
+    width: 5,
+    rows: &[0b01111, 0b10000, 0b10000, 0b10011, 0b10001, 0b01110],
+};
+const LARGE_N: Glyph = Glyph {
+    width: 5,
+    rows: &[0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001],
 };
 
 fn glyph(face: Face, c: char) -> Option<&'static Glyph> {
@@ -156,6 +188,34 @@ fn glyph(face: Face, c: char) -> Option<&'static Glyph> {
                 &SMALL_J
             } else {
                 &LARGE_J
+            }
+        }
+        'T' => {
+            if small {
+                &SMALL_T
+            } else {
+                &LARGE_T
+            }
+        }
+        'H' => {
+            if small {
+                &SMALL_H
+            } else {
+                &LARGE_H
+            }
+        }
+        'G' => {
+            if small {
+                &SMALL_G
+            } else {
+                &LARGE_G
+            }
+        }
+        'N' => {
+            if small {
+                &SMALL_N
+            } else {
+                &LARGE_N
             }
         }
         _ => return None,
@@ -225,9 +285,10 @@ pub fn draw(
     }
 }
 
-/// Which splash fits a center rect. Thresholds leave 2 cols of margin around
-/// the Large (47-col) and Small (31-col) wordmarks and room for the text
-/// stack beneath.
+/// Which splash fits a center rect. Column thresholds derive from the
+/// wordmark's measured width plus 2 cols of margin each side, so a wordmark
+/// change re-tunes them automatically; row thresholds cover the text stack
+/// beneath.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplashVariant {
     Large,
@@ -236,10 +297,15 @@ pub enum SplashVariant {
     None,
 }
 
+/// Minimum center columns for a pixel-face splash: wordmark width + margin.
+fn face_min_cols(face: Face) -> usize {
+    measure(face, WORDMARK).0 + 4
+}
+
 pub fn splash_variant(cols: usize, rows: usize) -> SplashVariant {
-    if cols >= 51 && rows >= 11 {
+    if cols >= face_min_cols(Face::Large) && rows >= 11 {
         SplashVariant::Large
-    } else if cols >= 35 && rows >= 6 {
+    } else if cols >= face_min_cols(Face::Small) && rows >= 6 {
         SplashVariant::Small
     } else if cols >= 12 && rows >= 1 {
         SplashVariant::Text
@@ -301,8 +367,21 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
             } else {
                 3
             };
-            let total_rows = 9.max(3 + 3 + content_rows); // always at least 9 for stable centering
-            let y0 = rect.y + rect.rows.saturating_sub(total_rows) / 2;
+            let base_rows = 9.max(3 + 3 + content_rows); // always at least 9 for stable centering
+            // Mascot above the wordmark when the center is tall enough for the
+            // whole block plus a row of margin top and bottom; small centers
+            // keep the compact splash unchanged. Uniform math — no per-state
+            // special cases, so the anchor stays stable while steps tick.
+            let mascot_block = crate::mascot::ROWS + 1; // sprite + 1-row gap
+            let with_mascot =
+                rect.cols >= crate::mascot::COLS && rect.rows >= base_rows + mascot_block + 2;
+            let total_rows = base_rows + if with_mascot { mascot_block } else { 0 };
+            let top = rect.y + rect.rows.saturating_sub(total_rows) / 2;
+            if with_mascot {
+                let mx = rect.x + rect.cols.saturating_sub(crate::mascot::COLS) / 2;
+                crate::mascot::draw(surface, mx, top, (rect.x + rect.cols).saturating_sub(mx));
+            }
+            let y0 = top + if with_mascot { mascot_block } else { 0 };
             let (w, _) = measure(Face::Large, WORDMARK);
             let x = rect.x + rect.cols.saturating_sub(w) / 2;
             draw(
@@ -565,6 +644,9 @@ mod tests {
         assert_eq!(measure(Face::Small, "superzej"), (31, 2));
         assert_eq!(measure(Face::Small, "S!Z"), (7, 2));
         assert_eq!(measure(Face::Small, "!?"), (0, 0));
+        // The thegn letterforms exist in both faces.
+        assert_eq!(measure(Face::Small, "THEGN"), (19, 2));
+        assert_eq!(measure(Face::Large, "THEGN"), (29, 3));
     }
 
     #[test]
@@ -635,6 +717,37 @@ mod tests {
 
     #[test]
     fn draw_splash_large_centers_content() {
+        // 14 rows: enough for the Large splash (≥11) but not the mascot block
+        // (9 + 11 + 2 = 22), so the compact 9-row layout is unchanged.
+        let mut s = Surface::new(80, 14);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 14,
+        };
+        let model = crate::chrome::FrameModel::default();
+        draw_splash(&mut s, rect, &model);
+        let l = lines(&mut s);
+        // Block of 9 rows centered: wordmark starts at (14-9)/2 = 2.
+        assert!(
+            l[2].contains('▀') || l[2].contains('▄'),
+            "wordmark row: {:?}",
+            l[2]
+        );
+        assert!(l[6].contains(env!("CARGO_PKG_VERSION")));
+        assert!(l[6].contains("git worktree IDE"));
+        assert!(l[8].contains("Ctrl-Space"));
+        assert!(l[10].contains("Ctrl-g"));
+        // Wordmark horizontally centered: 47 cols in 80 → starts near col 16.
+        let start = l[2].find(['▀', '▄', '█']).unwrap();
+        assert!((15..=17).contains(&start), "start {start}");
+    }
+
+    #[test]
+    fn draw_splash_large_shows_mascot_when_tall() {
+        // 24 rows fits base(9) + mascot block(11) + margin(2): mascot on top,
+        // wordmark shifted below it.
         let mut s = Surface::new(80, 24);
         let rect = Rect {
             x: 0,
@@ -645,19 +758,24 @@ mod tests {
         let model = crate::chrome::FrameModel::default();
         draw_splash(&mut s, rect, &model);
         let l = lines(&mut s);
-        // Block of 9 rows centered: wordmark starts at (24-9)/2 = 7.
+        // total 20 rows centered at top=(24-20)/2=2: mascot rows 2..12.
         assert!(
-            l[7].contains('▀') || l[7].contains('▄'),
-            "wordmark row: {:?}",
-            l[7]
+            l[2].contains('▀') || l[2].contains('▄'),
+            "mascot crest row: {:?}",
+            l[2]
         );
-        assert!(l[11].contains(env!("CARGO_PKG_VERSION")));
-        assert!(l[11].contains("git worktree IDE"));
-        assert!(l[13].contains("Ctrl-Space"));
-        assert!(l[15].contains("Ctrl-g"));
-        // Wordmark horizontally centered: 47 cols in 80 → starts near col 16.
-        let start = l[7].find(['▀', '▄', '█']).unwrap();
-        assert!((15..=17).contains(&start), "start {start}");
+        // Mascot horizontally centered: 28 sprite cols in 80 → cell col 26;
+        // this row's leftmost opaque pixel is inset 3, so blocks start at 29.
+        let mstart = l[5].find(['▀', '▄', '█']).unwrap();
+        assert!((28..=30).contains(&mstart), "mascot start {mstart}");
+        // Wordmark lands after the mascot block: rows 13..16.
+        assert!(
+            l[13].contains('▀') || l[13].contains('▄'),
+            "wordmark row: {:?}",
+            l[13]
+        );
+        assert!(l[17].contains(env!("CARGO_PKG_VERSION")));
+        assert!(l[19].contains("Ctrl-Space"));
     }
 
     #[test]
