@@ -74,6 +74,9 @@ pub fn router(state: ControlState) -> Router {
         .route("/v1/git/status", get(git_status))
         .route("/v1/git/stage", post(git_stage))
         .route("/v1/git/commit", post(git_commit))
+        .route("/v1/merge/list", get(merge_list))
+        .route("/v1/merge/add", post(merge_add))
+        .route("/v1/merge/clear", post(merge_clear))
         .route("/v1/pairings", get(list_pairings).post(issue_pairing))
         .route("/v1/pairings/{id}", delete(revoke_pairing))
         .route("/v1/pairings/{id}/approve", post(approve_pairing))
@@ -575,6 +578,56 @@ async fn git_commit(
     }
     match state.api.git_commit(&body.worktree, &body.message).await {
         Ok(commit) => axum::Json(json!({ "commit": commit })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+// ── merge queue ───────────────────────────────────────────────────────────────
+
+/// POST body for the merge add/clear verbs — scoped to one worktree's repo.
+#[derive(Deserialize)]
+struct MergeBody {
+    worktree: String,
+}
+
+async fn merge_list(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Query(q): Query<WorktreeQuery>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::MergeList) {
+        return r;
+    }
+    match state.api.merge_list(&q.worktree).await {
+        Ok(queue) => axum::Json(json!({ "queue": queue })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn merge_add(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<MergeBody>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::MergeAdd) {
+        return r;
+    }
+    match state.api.merge_add(&body.worktree).await {
+        Ok(message) => axum::Json(json!({ "queued": true, "message": message })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn merge_clear(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<MergeBody>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::MergeClear) {
+        return r;
+    }
+    match state.api.merge_clear(&body.worktree).await {
+        Ok(cleared) => axum::Json(json!({ "cleared": cleared })).into_response(),
         Err(e) => e.into_response(),
     }
 }
