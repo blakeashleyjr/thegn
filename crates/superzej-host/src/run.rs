@@ -2270,7 +2270,7 @@ fn persist_share_event(ev: &crate::share::ShareEvent) {
 /// there's nothing fileable (no active group, the home tab, a terminal, or no
 /// resolvable repo). The repo path is the DB workspace root so the folder we
 /// create lines up with the sidebar's per-workspace folder filter.
-fn active_worktree_repo(session: &crate::session::Session) -> Option<(String, String)> {
+pub(crate) fn active_worktree_repo(session: &crate::session::Session) -> Option<(String, String)> {
     use crate::session::GroupKind;
     let g = session.active_group()?;
     if g.kind != GroupKind::Branch || g.path.is_empty() {
@@ -2288,24 +2288,6 @@ fn active_worktree_repo(session: &crate::session::Session) -> Option<(String, St
                 .map(|p| p.to_string_lossy().into_owned())
         })?;
     Some((wt_path, repo_path))
-}
-
-/// File the active worktree into `folder` (created if absent). Returns a status
-/// line on success or a human-readable reason on failure.
-fn file_active_worktree(session: &crate::session::Session, folder: &str) -> Result<String, String> {
-    let folder = folder.trim();
-    if folder.is_empty() {
-        return Err("Folder name is empty".into());
-    }
-    let (wt_path, repo_path) =
-        active_worktree_repo(session).ok_or("No worktree to file into a folder")?;
-    let db = superzej_core::db::Db::open().map_err(|e| format!("DB open failed: {e}"))?;
-    let fid = db
-        .ensure_folder(&repo_path, folder)
-        .map_err(|e| format!("Folder create failed: {e}"))?;
-    db.set_worktree_folder(&wt_path, Some(fid))
-        .map_err(|e| format!("Filing failed: {e}"))?;
-    Ok(format!("Filed worktree into \"{folder}\""))
 }
 
 /// DELETE these worktree groups from disk (`git worktree remove`, branch
@@ -12793,12 +12775,15 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
                                     HostInputKind::FileWorktreeNewFolder => {
-                                        match file_active_worktree(&session, &text) {
-                                            Ok(msg) => {
-                                                model.status = msg;
-                                                let _ = refresh_tx
-                                                    .send(crate::hydrate::RefreshKind::Model);
-                                            }
+                                        match crate::handlers::sidebar_folder::file_active_worktree(
+                                            &session,
+                                            &mut sb,
+                                            &mut model,
+                                            &text,
+                                            &refresh_tx,
+                                            &waker,
+                                        ) {
+                                            Ok(msg) => model.status = msg,
                                             Err(e) => model.status = e,
                                         }
                                     }
@@ -13969,12 +13954,15 @@ async fn event_loop<T: Terminal>(
                                         model.status =
                                             "New folder: type a name (Esc cancels)".into();
                                     } else {
-                                        match file_active_worktree(&session, rest) {
-                                            Ok(msg) => {
-                                                model.status = msg;
-                                                let _ = refresh_tx
-                                                    .send(crate::hydrate::RefreshKind::Model);
-                                            }
+                                        match crate::handlers::sidebar_folder::file_active_worktree(
+                                            &session,
+                                            &mut sb,
+                                            &mut model,
+                                            rest,
+                                            &refresh_tx,
+                                            &waker,
+                                        ) {
+                                            Ok(msg) => model.status = msg,
                                             Err(e) => model.status = e,
                                         }
                                     }
@@ -16607,12 +16595,15 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         crate::keymap::CompositeAction::FileWorktree { folder } => {
-                                            match file_active_worktree(&session, &folder) {
-                                                Ok(msg) => {
-                                                    model.status = msg;
-                                                    let _ = refresh_tx
-                                                        .send(crate::hydrate::RefreshKind::Model);
-                                                }
+                                            match crate::handlers::sidebar_folder::file_active_worktree(
+                                                &session,
+                                                &mut sb,
+                                                &mut model,
+                                                &folder,
+                                                &refresh_tx,
+                                                &waker,
+                                            ) {
+                                                Ok(msg) => model.status = msg,
                                                 Err(e) => model.status = e,
                                             }
                                         }
