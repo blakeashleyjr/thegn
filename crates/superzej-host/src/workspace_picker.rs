@@ -619,8 +619,15 @@ impl WorkspacePicker {
         let Some(inner) = open_layer(surface, screen, &spec) else {
             return;
         };
+        // The "working" glyph comes from the shared loading vocabulary (the same
+        // ↻ / ascii @ the center-pane splash draws for an active step), so the
+        // modal and the splash can never drift apart or fall out of ASCII sync.
+        let (spin, _) = crate::loading::plan::visual_glyph(
+            crate::chrome::StepState::Active,
+            termwiz::color::ColorAttribute::Default,
+        );
         let title = Line::segs(vec![
-            seg(Tok::Slot(S::Accent), "⟳ ").bold(),
+            seg(Tok::Slot(S::Accent), format!("{spin} ")).bold(),
             seg(Tok::Slot(S::Text), "Cloning "),
             seg(Tok::Slot(S::Dim), url.to_string()),
             seg(Tok::Slot(S::Ghost3), "…"),
