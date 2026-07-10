@@ -1561,7 +1561,12 @@ pub(crate) fn build_panel(
     // merge-incoming files tagged for the "incoming from <onto>" grouping.
     panel.changes = crate::panel::build_change_rows(&status, &diff_entries, &incoming);
     // Semantic git layer (items 311/313/317): entity-level view of the changes.
-    panel.entities = entities;
+    // Blast-radius (313/316): enrich with the persisted caller→callee graph when
+    // it has data (else `None` → the footer keeps its intra-diff summary).
+    panel.entities = entities.map(|mut s| {
+        s.blast = crate::blast_radius::read_blast(cwd, &s, db);
+        s
+    });
 
     // Header zone: upstream divergence + merge-in-progress banner.
     panel.ahead_behind = ahead_behind;
