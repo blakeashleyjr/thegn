@@ -214,20 +214,16 @@ pub enum Singleton {
 /// = acquired (keep the file to hold it); `Ok(None)` = already held elsewhere.
 #[cfg(not(windows))]
 fn try_lock_nb(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
-    use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(path)?;
-    match nix::fcntl::flock(
-        file.as_raw_fd(),
-        nix::fcntl::FlockArg::LockExclusiveNonblock,
-    ) {
+    match file.try_lock() {
         Ok(()) => Ok(Some(file)),
-        Err(nix::errno::Errno::EWOULDBLOCK) => Ok(None),
-        Err(e) => Err(std::io::Error::from_raw_os_error(e as i32)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
 }
 
