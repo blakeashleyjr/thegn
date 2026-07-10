@@ -540,6 +540,81 @@ fn ring_current_index_none_when_active_absent() {
 }
 
 #[test]
+fn ring_navigates_back_to_top_workspace() {
+    // Two DB-backed workspaces: superzej at index 0 (the top) and school at index 1.
+    // The session is currently in school. Stepping Up must land on superzej with a
+    // real repo_path — never a live fallback, which would silently block the switch.
+    // This is the exact scenario: "Shift+Alt+Up does not select superzej (the top one)."
+    let school_session = Session {
+        id: "/tmp/school".into(),
+        worktrees: vec![WorktreeGroup::new(
+            "school/home",
+            GroupKind::Home,
+            "/tmp/school",
+        )],
+        active: 0,
+    };
+    let workspaces = vec![
+        (
+            "superzej".into(),
+            "superzej".into(),
+            "repo".into(),
+            "/tmp/superzej".into(),
+        ),
+        (
+            "school".into(),
+            "school".into(),
+            "repo".into(),
+            "/tmp/school".into(),
+        ),
+    ];
+    let rows = crate::sidebar::build_rows(
+        &school_session,
+        &workspaces,
+        &crate::sidebar::ViewState::default(),
+        &crate::sidebar::SidebarStatus::default(),
+        &[],
+        &[],
+        &[],
+    );
+    let ring = unified_ring(&rows, &[]);
+    // superzej is the top workspace with a real path (not a live fallback).
+    assert_eq!(
+        ring,
+        vec![
+            RingStop::Workspace {
+                slug: "superzej".into(),
+                repo_path: Some("/tmp/superzej".into()),
+            },
+            RingStop::Workspace {
+                slug: "school".into(),
+                repo_path: Some("/tmp/school".into()),
+            },
+        ],
+    );
+    // From school (cur=1), Prev (Up) steps back to superzej (cur=0).
+    let cur = ring_current_index(&ring, Some("school"), None).unwrap();
+    assert_eq!(cur, 1);
+    assert_eq!(
+        ring_step(&ring, cur, false),
+        RingStop::Workspace {
+            slug: "superzej".into(),
+            repo_path: Some("/tmp/superzej".into()),
+        },
+    );
+    // From superzej (cur=0), Next (Down) steps to school (cur=1).
+    let cur_sz = ring_current_index(&ring, Some("superzej"), None).unwrap();
+    assert_eq!(cur_sz, 0);
+    assert_eq!(
+        ring_step(&ring, cur_sz, true),
+        RingStop::Workspace {
+            slug: "school".into(),
+            repo_path: Some("/tmp/school".into()),
+        },
+    );
+}
+
+#[test]
 fn forgetting_closed_worktree_registry_prevents_restart_readoption() {
     let root = std::env::temp_dir().join(format!(
         "superzej-close-worktree-{}-{}",
