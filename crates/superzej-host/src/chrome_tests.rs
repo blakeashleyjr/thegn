@@ -264,8 +264,8 @@ fn masthead_fit_sheds_items_when_narrow() {
         },
         ..Default::default()
     };
-    let (_, wide) = masthead_fit(&model, 200);
-    let (_, narrow) = masthead_fit(&model, 24);
+    let wide = crate::masthead::masthead_layout(&model, 200, None).right_spans;
+    let narrow = crate::masthead::masthead_layout(&model, 24, None).right_spans;
     assert_eq!(wide.len(), 4);
     assert!(
         narrow.len() < wide.len(),
@@ -277,8 +277,74 @@ fn masthead_fit_sheds_items_when_narrow() {
     assert!(
         narrow
             .iter()
-            .any(|(id, _)| *id == BarItemId::Widget("cpu".into()))
+            .any(|(id, _, _)| *id == BarItemId::Widget("cpu".into()))
     );
+}
+
+#[test]
+fn masthead_left_keeps_active_chip_and_never_overlaps_when_narrow() {
+    // The top bar degrades like the bottom bar: the active app-tab chip stays,
+    // the breadcrumb elides with `…`, and the right stats cluster never runs
+    // into the left content (no overlap, nothing clipped mid-glyph).
+    let model = FrameModel {
+        bars: superzej_core::config::BarsConfig {
+            top_left: vec!["brand".into(), "clock".into()],
+            top_right: vec!["cpu".into(), "mem".into(), "date".into()],
+            ..Default::default()
+        },
+        app_tabs: vec!["work".into(), "chat".into(), "observe".into()],
+        active_app: 1,
+        stats: superzej_metrics::StatsSnapshot {
+            cpu_pct: Some(50),
+            mem_gib: Some((4.0, 16.0)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for cols in [40usize, 60, 96, 160] {
+        let lay = crate::masthead::masthead_layout(&model, cols, None);
+        // The active chip ("chat") is always present.
+        let left_text: String = lay.left.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            left_text.contains("chat"),
+            "active chip missing at cols={cols}: {left_text:?}"
+        );
+        // Left + right + the split gutter fit within the width — no overlap.
+        let lw = crate::seg::seg_width(&lay.left);
+        let rw = crate::seg::seg_width(&lay.right);
+        assert!(
+            lw + rw + usize::from(rw > 0) <= cols,
+            "overlap at cols={cols}: left={lw} right={rw}"
+        );
+    }
+}
+
+#[test]
+fn masthead_item_spans_match_painted_right_cluster() {
+    // Hit-test Rects must land exactly on the painted stat cells: the cluster is
+    // right-aligned, so the first span sits at cols - right_width.
+    let model = FrameModel {
+        bars: superzej_core::config::BarsConfig {
+            top_right: vec!["cpu".into(), "mem".into()],
+            ..Default::default()
+        },
+        stats: superzej_metrics::StatsSnapshot {
+            cpu_pct: Some(50),
+            mem_gib: Some((4.0, 16.0)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let chrome = layout::compute(160, 10, false, false);
+    let spans = crate::masthead::masthead_item_spans(&model, &chrome);
+    assert_eq!(spans.len(), 2);
+    // Spans are in display order and don't overlap.
+    assert!(spans[0].1.x + spans[0].1.cols <= spans[1].1.x);
+    // The cluster hugs the right edge (within the 1-col trailing margin).
+    let cols = chrome.masthead.cols;
+    let last = &spans[1].1;
+    assert!(last.x + last.cols <= cols);
+    assert!(last.x + last.cols >= cols - 2);
 }
 
 #[test]

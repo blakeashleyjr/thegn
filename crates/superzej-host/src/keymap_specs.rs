@@ -661,6 +661,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         default_chords: &["Alt a"],
         palette: true,
     },
+    ActionSpec {
+        id: "mark-all-read",
+        label: "Notifications: Mark all as read",
+        hint: "mark all read",
+        default_chords: &["Alt Shift R"],
+        palette: true,
+    },
 ];
 
 pub fn action_specs() -> &'static [ActionSpec] {

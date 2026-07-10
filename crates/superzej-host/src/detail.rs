@@ -60,7 +60,28 @@ pub enum DetailAction {
     /// (handled inside [`DetailOverlay::handle_key`]).
     ShowLog(Vec<LogLine>),
     /// Switch to the worktree at this path (a notification's `worktree_path`).
+    /// Only reaches an *open* tab; the "Needs you" list uses [`Self::ActivateTarget`]
+    /// instead so a dormant-workspace worktree opens rather than erroring.
     FocusWorktree(String),
+    /// Activate a resolved sidebar row target (live tab or dormant-workspace
+    /// switch) — the "Needs you" Enter action. Intercepted by the loop's Act arm
+    /// (it owns the workspace-pool / drawer locals `CiActionCtx` lacks), the same
+    /// machinery `Alt a` (jump-attention) uses.
+    ActivateTarget(crate::sidebar::RowTarget),
+    /// Acknowledge (quiet) one worktree's live "Needs you" signal, carrying the
+    /// exact `(reason, since)` showing so the ack only covers that episode.
+    /// Fired on highlight; keeps the overlay open.
+    AckAttention {
+        path: String,
+        reason: superzej_core::attention::AttentionReason,
+        since: Option<i64>,
+    },
+    /// Acknowledge every current needs-you worktree (the "Needs you" mark-all).
+    AckAllAttention,
+    /// Mark a single notification read *in place* (highlight) — like
+    /// [`Self::DismissNotification`] but keeps the overlay open and doesn't post
+    /// the "Dismissed" status.
+    MarkNotificationRead { id: i64 },
     /// Mark a single notification read (dismiss from the inbox + badge), off the
     /// loop, then refresh.
     DismissNotification { id: i64 },
@@ -80,7 +101,12 @@ impl DetailAction {
     /// when they fire (the CI in-place drill). Every other action closes the
     /// overlay. Read by the loop's Act dispatch.
     pub fn keeps_overlay(&self) -> bool {
-        matches!(self, DetailAction::DrillCiRun { .. })
+        matches!(
+            self,
+            DetailAction::DrillCiRun { .. }
+                | DetailAction::AckAttention { .. }
+                | DetailAction::MarkNotificationRead { .. }
+        )
     }
 }
 
@@ -103,6 +129,10 @@ pub struct DetailRow {
     pub note: Option<String>,
     pub enter: Option<DetailAction>,
     pub actions: Vec<(char, DetailAction)>,
+    /// Fired when the row-cursor lands on this row (mark-read-on-highlight).
+    /// The action keeps the overlay open (see [`DetailAction::keeps_overlay`]);
+    /// the loop dims the row in place after applying it.
+    pub on_highlight: Option<DetailAction>,
 }
 
 impl DetailRow {
@@ -115,6 +145,7 @@ impl DetailRow {
             note: None,
             enter: None,
             actions: Vec::new(),
+            on_highlight: None,
         }
     }
     pub fn note(mut self, note: impl Into<String>) -> DetailRow {
@@ -123,6 +154,11 @@ impl DetailRow {
     }
     pub fn on_enter(mut self, action: DetailAction) -> DetailRow {
         self.enter = Some(action);
+        self
+    }
+    /// Fire `action` when the cursor highlights this row (mark-read-on-highlight).
+    pub fn on_highlight(mut self, action: DetailAction) -> DetailRow {
+        self.on_highlight = Some(action);
         self
     }
     pub fn action(mut self, key: char, action: DetailAction) -> DetailRow {
@@ -474,37 +510,41 @@ impl DetailOverlay {
                 if actionable {
                     self.sel = (self.sel + 1).min(max);
                     self.scroll_to_sel();
+                    self.highlight_outcome()
                 } else {
                     self.scroll = (self.scroll + 1).min(max);
+                    DetailOutcome::Pending
                 }
-                DetailOutcome::Pending
             }
             KeyCode::UpArrow | KeyCode::Char('k') => {
                 if actionable {
                     self.sel = self.sel.saturating_sub(1);
                     self.scroll_to_sel();
+                    self.highlight_outcome()
                 } else {
                     self.scroll = self.scroll.saturating_sub(1);
+                    DetailOutcome::Pending
                 }
-                DetailOutcome::Pending
             }
             KeyCode::PageDown => {
                 if actionable {
                     self.sel = (self.sel + 8).min(max);
                     self.scroll_to_sel();
+                    self.highlight_outcome()
                 } else {
                     self.scroll = (self.scroll + 8).min(max);
+                    DetailOutcome::Pending
                 }
-                DetailOutcome::Pending
             }
             KeyCode::PageUp => {
                 if actionable {
                     self.sel = self.sel.saturating_sub(8);
                     self.scroll_to_sel();
+                    self.highlight_outcome()
                 } else {
                     self.scroll = self.scroll.saturating_sub(8);
+                    DetailOutcome::Pending
                 }
-                DetailOutcome::Pending
             }
             KeyCode::Char(c) if actionable => match self.action_for(*c) {
                 Some(a) => DetailOutcome::Act(a),
@@ -520,6 +560,32 @@ impl DetailOverlay {
             return None;
         };
         l.rows.get(self.sel).and_then(|r| r.enter.clone())
+    }
+
+    /// Outcome after a cursor move: fire the selected row's `on_highlight`
+    /// (mark-read-on-highlight) if it has one, else just stay open. The action
+    /// keeps the overlay open, so navigation continues normally.
+    fn highlight_outcome(&self) -> DetailOutcome {
+        if let DetailContent::List(l) = &self.content
+            && let Some(a) = l.rows.get(self.sel).and_then(|r| r.on_highlight.clone())
+        {
+            DetailOutcome::Act(a)
+        } else {
+            DetailOutcome::Pending
+        }
+    }
+
+    /// Mark the selected row read *in place*: swap its marker to the ghost tone
+    /// (the same read-tone the inbox uses) and clear its `on_highlight` so
+    /// re-landing on it in this static snapshot doesn't re-fire the (idempotent)
+    /// DB write. Called by the loop right after applying a highlight action.
+    pub fn dim_selected(&mut self) {
+        if let DetailContent::List(l) = &mut self.content
+            && let Some(row) = l.rows.get_mut(self.sel)
+        {
+            row.marker = Tok::Slot(S::Ghost);
+            row.on_highlight = None;
+        }
     }
 
     /// Key handling for the log viewer (`DetailContent::Log`). `l` cycles the
@@ -1891,15 +1957,21 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                     } else if !n.worktree_path.is_empty() {
                         row = row.on_enter(DetailAction::FocusWorktree(n.worktree_path.clone()));
                     }
-                    // Inbox management on any row: x dismisses this one, X clears all.
+                    // Inbox management on any row: x dismisses this one, X/R/a
+                    // clear all. Highlighting an unread row marks it read in place.
                     if n.id != 0 {
                         row = row.action('x', DetailAction::DismissNotification { id: n.id });
+                        if !n.read {
+                            row = row.on_highlight(DetailAction::MarkNotificationRead { id: n.id });
+                        }
                     }
                     row.action('X', DetailAction::ClearNotifications)
+                        .action('R', DetailAction::ClearNotifications)
+                        .action('a', DetailAction::ClearNotifications)
                 })
                 .collect();
             let mut ov = list("Notifications", rows, "no notifications", 60, 16);
-            ov.hint = Some("↵ open · x dismiss · X clear · o log".into());
+            ov.hint = Some("↵ open · x dismiss · a mark all read · o log".into());
             Some(ov)
         }
         BarBadge::Attention => {
@@ -1927,8 +1999,31 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                         _ => (g.dot_filled, Tok::Hue(Hue::Amber)),
                     };
                     let text = format!("{label} \u{2014} {}", score.reason.label());
+                    // Enter resolves the sidebar row's target (live tab OR a
+                    // dormant-workspace switch) so activation never dead-ends on
+                    // "isn't open"; only the no-row edge falls back to the
+                    // open-tab-only `FocusWorktree`. Same machinery as `Alt a`.
+                    let enter = model
+                        .sidebar_rows
+                        .iter()
+                        .find(|r| {
+                            r.kind == crate::sidebar::RowKind::Worktree
+                                && r.worktree_path.as_deref() == Some(path.as_str())
+                                && r.tab_target.is_some()
+                        })
+                        .and_then(|r| r.tab_target.clone())
+                        .map(DetailAction::ActivateTarget)
+                        .unwrap_or_else(|| DetailAction::FocusWorktree(path.clone()));
                     let mut row = DetailRow::new(marker, glyph, text)
-                        .on_enter(DetailAction::FocusWorktree(path));
+                        .on_enter(enter)
+                        // Highlighting quiets this episode; a/R quiet them all.
+                        .on_highlight(DetailAction::AckAttention {
+                            path: path.clone(),
+                            reason: score.reason,
+                            since: score.since,
+                        })
+                        .action('a', DetailAction::AckAllAttention)
+                        .action('R', DetailAction::AckAllAttention);
                     if let Some(at) = score.since {
                         row = row.note(format!("{} ago", superzej_core::util::age(at)));
                     }
@@ -1936,7 +2031,7 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                 })
                 .collect();
             let mut ov = list("Needs you", rows, "nothing needs you", 60, 14);
-            ov.hint = Some("↵ focus \u{00b7} Alt a next".into());
+            ov.hint = Some("↵ focus \u{00b7} a mark all read \u{00b7} Alt a next".into());
             Some(ov)
         }
         BarBadge::Agent => {

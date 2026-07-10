@@ -13,6 +13,11 @@ use superzej_core::theme;
 
 use serde::Deserialize;
 
+// The masthead (top bar) layout + hit-test spans live in the `masthead` sibling
+// module (seg-layer, mirrors the statusbar); re-exported so callers that reach
+// for `chrome::masthead_item_spans` keep resolving.
+pub use crate::masthead::masthead_item_spans;
+
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct TokenUsage {
     pub input: u32,
@@ -623,9 +628,9 @@ pub fn center_tab_hit(model: &FrameModel, strip: Rect, x: usize) -> Option<usize
 
 /// Brand slot widths for the masthead text logo.
 /// " ◆ superzej v0.0.0 " — glyph + name + version…
-const BRAND_FULL_COLS: usize = 20;
+pub(crate) const BRAND_FULL_COLS: usize = 20;
 /// …or just " ◆ superzej " on narrower screens…
-const BRAND_COMPACT_COLS: usize = 13;
+pub(crate) const BRAND_COMPACT_COLS: usize = 13;
 /// …and nothing below this (content wins).
 const MASTHEAD_FULL_MIN_COLS: usize = 96;
 const MASTHEAD_COMPACT_MIN_COLS: usize = 60;
@@ -644,7 +649,7 @@ pub fn masthead_brand_cols(cols: usize) -> usize {
 
 /// The total columns a kept subset of the right cluster occupies
 /// (widget widths + " · " separators + 1 right margin).
-fn cluster_width(parts: &[(String, usize)], kept: &[usize]) -> usize {
+pub(crate) fn cluster_width(parts: &[(String, usize)], kept: &[usize]) -> usize {
     if kept.is_empty() {
         return 0;
     }
@@ -655,7 +660,7 @@ fn cluster_width(parts: &[(String, usize)], kept: &[usize]) -> usize {
 /// columns — softest stats shed first, leaving cpu/mem/net/battery longest.
 /// (The brand/logo is the caller's final sacrifice.) Returns the surviving
 /// indices in display order.
-fn fit_stats_cluster(parts: &[(String, usize)], avail: usize) -> Vec<usize> {
+pub(crate) fn fit_stats_cluster(parts: &[(String, usize)], avail: usize) -> Vec<usize> {
     let mut kept: Vec<usize> = (0..parts.len()).collect();
     for victim in [
         "date", "uptime", "load", "freq", "swap", "temp", "disk", "gpu",
@@ -668,16 +673,20 @@ fn fit_stats_cluster(parts: &[(String, usize)], avail: usize) -> Vec<usize> {
     kept
 }
 
-/// The single-row masthead: a regular-font text brand on the left and the
-/// `[bars]`-configured stats cluster on the right. When width runs short the
-/// masthead degrades gracefully — date drops first, then GPU, then the brand
-/// shrinks and finally disappears — so nothing ever clips mid-glyph. (The
-/// pixel wordmark survives on the empty-state splash.)
+/// The single-row masthead: a regular-font text brand + app-tab chips +
+/// `top_left` breadcrumb on the left and the `[bars]`-configured stats cluster
+/// on the right. Built on the same seg / [`crate::seg::Line::split`] machinery
+/// as the statusbar (see [`crate::masthead::masthead_layout`]), so it degrades
+/// identically at narrow widths — display-width measurement, atomic-unit left
+/// fit, a ghost `…` on the breadcrumb, and the stats cluster shedding by
+/// priority — with nothing ever clipping mid-glyph or overlapping. (The pixel
+/// wordmark survives on the empty-state splash.)
 pub fn draw_masthead(
     surface: &mut Surface,
     layout: &crate::layout::ChromeLayout,
     model: &FrameModel,
 ) {
+    use crate::seg::{Line, Tok, draw_line};
     let rect = layout.masthead;
     if rect.rows == 0 || rect.cols == 0 {
         return;
@@ -688,93 +697,23 @@ pub fn draw_masthead(
         S::Panel
     };
     fill(surface, rect, col(bar_bg));
-    let accent = theme_color(model.accent_or_default());
-    let bg = col(bar_bg);
 
-    // Resolve the visible cluster + brand width once (shared with navigation /
-    // hit-testing via `masthead_fit`).
-    let (brand_cols, items) = masthead_fit(model, rect.cols);
-
-    if brand_cols > 0 {
-        draw_text(
-            surface,
-            rect.x + 1,
-            rect.y,
-            &format!("{} ", crate::caps::active_glyphs().diamond_filled),
-            accent,
-            bg,
-            2,
-        );
-        draw_text(surface, rect.x + 3, rect.y, "superzej", col(S::Text), bg, 8);
-        if brand_cols >= BRAND_FULL_COLS {
-            draw_text(
-                surface,
-                rect.x + 12,
-                rect.y,
-                concat!("v", env!("CARGO_PKG_VERSION")),
-                col(S::Ghost),
-                bg,
-                brand_cols.saturating_sub(13),
-            );
-        }
-    }
-
-    draw_masthead_cluster(
+    // Focused selection on the right stats cluster: bright focus fg over a
+    // focus-tinted pill, matching the app-chips' active look.
+    let sel = model.masthead_focused.then(|| {
+        let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.28));
+        (model.masthead_sel, pill, col(S::Focus))
+    });
+    let lay = crate::masthead::masthead_layout(model, rect.cols, sel);
+    let row = layout.masthead_stats_row();
+    draw_line(
         surface,
-        layout.masthead_stats_row(),
-        &items,
-        brand_cols,
-        bg,
-        model,
+        row.x,
+        row.y,
+        row.cols,
+        &Line::split(lay.left, lay.right),
+        Tok::Slot(bar_bg),
     );
-    // Top-level app tabs sit right after the brand; the masthead-left widgets
-    // (breadcrumb/clock/…) start after them.
-    let stats_row = layout.masthead_stats_row();
-    let chips_start = stats_row.x + brand_cols.max(1);
-    let chips_w = draw_app_chips(surface, stats_row, model, chips_start);
-    draw_masthead_left(surface, stats_row, model, brand_cols + chips_w);
-}
-
-/// The top-level app-tab chips (`work`, `chat`, …) in the masthead, just after
-/// the brand. Active chip in the focus color on a focus-tinted pill; the rest
-/// quiet on the bar. Returns the columns consumed (0 when there are no tabs),
-/// so the caller can place the remaining masthead-left widgets after them.
-fn draw_app_chips(surface: &mut Surface, rect: Rect, model: &FrameModel, start_x: usize) -> usize {
-    if model.app_tabs.is_empty() || rect.rows == 0 {
-        return 0;
-    }
-    let bar_bg = if model.masthead_focused {
-        S::Raise
-    } else {
-        S::Panel
-    };
-    let focus = col(S::Focus);
-    let dim = col(S::Dim);
-    let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.28));
-    let end = rect.x + rect.cols;
-    let mut x = start_x;
-    for (i, label) in model.app_tabs.iter().enumerate() {
-        if x >= end {
-            break;
-        }
-        let chip = format!(" {label} ");
-        let (fg, chip_bg) = if i == model.active_app {
-            (focus, pill)
-        } else {
-            (dim, col(bar_bg))
-        };
-        draw_text(
-            surface,
-            x,
-            rect.y,
-            &chip,
-            fg,
-            chip_bg,
-            end.saturating_sub(x),
-        );
-        x += chip.chars().count() + 1; // trailing gap between chips
-    }
-    x.min(end).saturating_sub(start_x)
 }
 
 /// The center column's tab bar, directly below the divider: the worktree
@@ -916,8 +855,8 @@ fn draw_pin_chips(
 /// A resolved masthead widget: its text plus the color it earned (stats turn
 /// amber/red as they cross pressure thresholds; quiet otherwise).
 pub struct MastheadWidget {
-    text: String,
-    fg: ColorAttribute,
+    pub(crate) text: String,
+    pub(crate) fg: ColorAttribute,
 }
 
 /// The stable identity of a navigable bar item — what focus selects, what Enter
@@ -1039,7 +978,7 @@ fn level_color(level: Level) -> ColorAttribute {
 
 /// Resolve a masthead widget id to its display text + color; `None` hides the
 /// widget (no data yet, GPU absent, unknown id).
-fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
+pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
     let s = &model.stats;
     let ic = &model.stats_icons;
     let w = |text: String, fg: ColorAttribute| MastheadWidget { text, fg };
@@ -1213,198 +1152,6 @@ pub fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> 
         }),
         "status" => (!model.status.is_empty()).then(|| w(model.status.clone(), col(S::Dim))),
         _ => None,
-    }
-}
-
-/// `[bars] top_left` widgets drawn after the brand slot (the `brand` id is
-/// owned by the masthead's slot logic and skipped here).
-fn draw_masthead_left(surface: &mut Surface, rect: Rect, model: &FrameModel, brand_cols: usize) {
-    if rect.rows == 0 || rect.cols == 0 {
-        return;
-    }
-    let bg = col(if model.masthead_focused {
-        S::Raise
-    } else {
-        S::Panel
-    });
-    let sep = " \u{00b7} ";
-    let end = rect.x + rect.cols;
-    let mut x = rect.x + brand_cols.max(1);
-    let mut first = true;
-    for id in &model.bars.top_left {
-        if id == "brand" {
-            continue;
-        }
-        let Some(wd) = masthead_widget(id, model) else {
-            continue;
-        };
-        if !first && x < end {
-            draw_text(surface, x, rect.y, sep, col(S::Ghost), bg, 3);
-            x += 3;
-        }
-        draw_text(
-            surface,
-            x,
-            rect.y,
-            &wd.text,
-            wd.fg,
-            bg,
-            end.saturating_sub(x),
-        );
-        x += wd.text.chars().count();
-        first = false;
-    }
-}
-
-/// The masthead's resolved layout for a width: the brand column count and the
-/// visible right-cluster items (stable id + resolved widget) in display order,
-/// after the graceful width-degradation drop. The single source of truth shared
-/// by [`draw_masthead`] (placement) and [`masthead_item_spans`] (navigation +
-/// hit-testing), so which items show — and in what order — never disagrees.
-fn masthead_fit(model: &FrameModel, cols: usize) -> (usize, Vec<(BarItemId, MastheadWidget)>) {
-    let parts: Vec<(String, MastheadWidget)> = model
-        .bars
-        .top_right
-        .iter()
-        .filter_map(|id| masthead_widget(id, model).map(|w| (id.clone(), w)))
-        .collect();
-    let widths: Vec<(String, usize)> = parts
-        .iter()
-        .map(|(id, w)| (id.clone(), w.text.chars().count()))
-        .collect();
-    let mut brand_cols = masthead_brand_cols(cols);
-    let kept = loop {
-        let avail = cols.saturating_sub(brand_cols.max(1));
-        let kept = fit_stats_cluster(&widths, avail);
-        if cluster_width(&widths, &kept) <= avail || brand_cols == 0 {
-            break kept;
-        }
-        brand_cols = if brand_cols >= BRAND_FULL_COLS {
-            BRAND_COMPACT_COLS
-        } else {
-            0
-        };
-    };
-    let items = kept
-        .into_iter()
-        .map(|i| {
-            let (id, w) = &parts[i];
-            (
-                BarItemId::Widget(id.clone()),
-                MastheadWidget {
-                    text: w.text.clone(),
-                    fg: w.fg,
-                },
-            )
-        })
-        .collect();
-    (brand_cols, items)
-}
-
-/// The right cluster's `(x, width)` cell spans, right-aligned with ` · `
-/// separators. Mirrors [`draw_masthead_cluster`]'s placement exactly (the +1
-/// right margin, the brand floor) so highlight and hit-testing land on the
-/// painted glyphs.
-fn masthead_cluster_spans(widths: &[usize], rect: Rect, brand_cols: usize) -> Vec<(usize, usize)> {
-    if widths.is_empty() {
-        return Vec::new();
-    }
-    let end = rect.x + rect.cols;
-    let total: usize = widths.iter().sum::<usize>() + 3 * (widths.len() - 1) + 1;
-    let mut rx = end
-        .saturating_sub(total)
-        .max(rect.x + brand_cols.max(1) + 1);
-    let mut out = Vec::with_capacity(widths.len());
-    for (i, w) in widths.iter().enumerate() {
-        if i > 0 {
-            rx += 3;
-        }
-        out.push((rx, *w));
-        rx += w;
-    }
-    out
-}
-
-/// The masthead right cluster's absolute `(id, Rect)` spans for the loop's mouse
-/// hit-testing and detail-popup anchoring.
-pub fn masthead_item_spans(
-    model: &FrameModel,
-    layout: &crate::layout::ChromeLayout,
-) -> Vec<(BarItemId, Rect)> {
-    let rect = layout.masthead_stats_row();
-    if rect.rows == 0 || rect.cols == 0 {
-        return Vec::new();
-    }
-    let (brand_cols, items) = masthead_fit(model, rect.cols);
-    let widths: Vec<usize> = items.iter().map(|(_, w)| w.text.chars().count()).collect();
-    masthead_cluster_spans(&widths, rect, brand_cols)
-        .into_iter()
-        .zip(items)
-        .map(|((x, w), (id, _))| {
-            (
-                id,
-                Rect {
-                    x,
-                    y: rect.y,
-                    cols: w,
-                    rows: 1,
-                },
-            )
-        })
-        .collect()
-}
-
-/// The pre-fitted right cluster, right-aligned with `·` separators, with the
-/// focused item drawn as a focus-tinted selection block. The caller has already
-/// dropped whatever wouldn't fit (see `draw_masthead` / `masthead_fit`).
-fn draw_masthead_cluster(
-    surface: &mut Surface,
-    rect: Rect,
-    parts: &[(BarItemId, MastheadWidget)],
-    brand_cols: usize,
-    bg: ColorAttribute,
-    model: &FrameModel,
-) {
-    if rect.rows == 0 || rect.cols == 0 || parts.is_empty() {
-        return;
-    }
-    let sep = " \u{00b7} ";
-    let widths: Vec<usize> = parts.iter().map(|(_, w)| w.text.chars().count()).collect();
-    let spans = masthead_cluster_spans(&widths, rect, brand_cols);
-    let sel = if model.masthead_focused {
-        Some(model.masthead_sel.min(parts.len().saturating_sub(1)))
-    } else {
-        None
-    };
-    let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.28));
-    let focus_fg = col(S::Focus);
-    for (i, ((_, p), (x, w))) in parts.iter().zip(spans.iter()).enumerate() {
-        if i > 0 {
-            draw_text(
-                surface,
-                x.saturating_sub(3),
-                rect.y,
-                sep,
-                col(S::Ghost),
-                bg,
-                3,
-            );
-        }
-        if sel == Some(i) {
-            fill(
-                surface,
-                Rect {
-                    x: *x,
-                    y: rect.y,
-                    cols: *w,
-                    rows: 1,
-                },
-                pill,
-            );
-            draw_text(surface, *x, rect.y, &p.text, focus_fg, pill, *w);
-        } else {
-            draw_text(surface, *x, rect.y, &p.text, p.fg, bg, *w);
-        }
     }
 }
 
@@ -1635,7 +1382,7 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
 /// Recolor an item's segments as the focused-selection block: bright focus
 /// foreground over a focus-tinted pill, matching the masthead app-chips' active
 /// look ("reads like a selected tab"). Width is unchanged, so spans are stable.
-fn highlight_segs(
+pub(crate) fn highlight_segs(
     segs: &[crate::seg::Seg],
     pill: ColorAttribute,
     fg: ColorAttribute,
