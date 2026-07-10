@@ -56,8 +56,7 @@ pub fn cheatsheet_groups(cfg: &superzej_core::config::Config) -> Vec<HintGroup> 
             }
             id if id.starts_with("focus-")
                 || id.ends_with("-tab")
-                || id == "switch-workspace"
-                || id == "dashboard" =>
+                || id == "switch-workspace" =>
             {
                 &mut nav
             }
