@@ -712,6 +712,74 @@ fn many_rows(n: usize) -> Vec<crate::sidebar::SidebarRow> {
 }
 
 #[test]
+fn nav_hints_footer_shown_only_when_focused_with_spare_room() {
+    // The navigation-tips footer rides the empty tail of the column, so it must
+    // appear only when (a) the sidebar is focused and (b) the laid-out rows
+    // leave genuine blank space below them — never pushing a row or scrolling.
+    let tall = Rect {
+        x: 0,
+        y: 0,
+        cols: 30,
+        rows: 40,
+    };
+    let rows = many_rows(3); // a short list under a very tall column → lots of tail
+
+    // Focused + spare room → footer present, anchored to the tail, above metrics.
+    let focused = FrameModel {
+        sidebar_rows: rows.clone(),
+        sidebar_selected: 0,
+        sidebar_focused: true,
+        ..Default::default()
+    };
+    let frame = build_sidebar(&focused, tall, focused.sidebar_scroll);
+    let hints = frame
+        .hints
+        .expect("focused tall column reveals the hints footer");
+    // It sits below the last rendered row (fills the blank tail, no overlap).
+    let last_row_bottom = frame.rows.iter().map(|p| p.y + p.height).max().unwrap_or(0);
+    assert!(
+        hints.y >= last_row_bottom,
+        "footer clears the rows: {hints:?}"
+    );
+    assert_eq!(
+        hints.y + hints.rows,
+        tall.y + tall.rows,
+        "footer anchors to the bottom"
+    );
+
+    // Unfocused → no footer (resting view stays uncluttered).
+    let unfocused = FrameModel {
+        sidebar_focused: false,
+        ..focused.clone()
+    };
+    assert!(
+        build_sidebar(&unfocused, tall, unfocused.sidebar_scroll)
+            .hints
+            .is_none(),
+        "an unfocused sidebar shows no hints"
+    );
+
+    // Focused but the list fills the column → no blank tail → no footer.
+    let short = Rect {
+        x: 0,
+        y: 0,
+        cols: 30,
+        rows: 8,
+    };
+    let packed = FrameModel {
+        sidebar_rows: many_rows(20),
+        sidebar_focused: true,
+        ..Default::default()
+    };
+    assert!(
+        build_sidebar(&packed, short, packed.sidebar_scroll)
+            .hints
+            .is_none(),
+        "a full list leaves no room for hints"
+    );
+}
+
+#[test]
 fn build_sidebar_and_click_hit_test_round_trip() {
     // Every rendered row's [y, y+height) maps back to its own visible index
     // via `sidebar_hits` — the contract that keeps clicks aligned with paint
