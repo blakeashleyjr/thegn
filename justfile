@@ -299,7 +299,7 @@ e2e-update: build
 # at 95% lines. The native host and the svc layer carry their own tests but are
 # not part of this gate (their I/O-heavy surface is the same reason the seams
 # above are excluded).
-cov_ignore := 'superzej-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|plugin_api|profile|forge/mod)\.rs'
+cov_ignore := 'superzej-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|plugin_api|profile|forge/mod)\.rs'
 
 # The LLM-proxy crate is gated separately at 88% lines (its decision logic lives
 # in the 95%-gated core::proxy; this covers the I/O shell — router, server, relay,

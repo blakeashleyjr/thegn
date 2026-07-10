@@ -117,6 +117,7 @@ pub mod revtunnel;
 pub mod sandbox;
 pub mod sandbox_mounts;
 pub mod sandbox_prefetch;
+pub mod sandbox_preflight;
 pub mod scheduler;
 pub mod search;
 pub mod semantic;
