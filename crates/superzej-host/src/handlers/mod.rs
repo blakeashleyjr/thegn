@@ -5,6 +5,7 @@
 //! ON the loop and must stay I/O-free.
 
 pub(crate) mod attention;
+pub(crate) mod close;
 pub(crate) mod crash;
 pub(crate) mod creating;
 pub(crate) mod host;
