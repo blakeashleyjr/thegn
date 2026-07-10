@@ -41,6 +41,7 @@ mod notification;
 mod placement;
 mod pool;
 mod proxy;
+mod semantic;
 mod trust;
 mod workspace;
 mod zone;
@@ -60,6 +61,7 @@ pub use placement::{
 };
 pub use pool::PoolStore;
 pub use proxy::ProxyStore;
+pub use semantic::{SemEdgeRow, SemEntityRow, SemanticStore};
 pub use trust::{RepoTrustRow, RepoTrustStore};
 pub use workspace::WorkspaceStore;
 pub use zone::{ZoneDeleteOutcome, ZoneRow, ZoneStore};

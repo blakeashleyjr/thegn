@@ -1,6 +1,6 @@
 use crate::db::Db;
 use crate::mcp::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
-use crate::store::{CacheStore, NotificationStore, ProxyStore};
+use crate::store::{CacheStore, NotificationStore, ProxyStore, SemanticStore};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -129,6 +129,8 @@ impl McpRouter {
                     "inputSchema": { "type": "object", "properties": {} } }),
                 json!({ "name": "semantic_diff", "description": "Entity-level (function/struct/...) summary of the diff vs HEAD plus a suggested commit message.",
                     "inputSchema": { "type": "object", "properties": {} } }),
+                json!({ "name": "blast_radius", "description": "Inter-entity blast-radius of the diff vs HEAD: for each changed function/method, who depends on it (callers/files), which are untested, and an overall risk band. Reads superzej's persisted semantic graph.",
+                    "inputSchema": { "type": "object", "properties": {} } }),
             ]
         } else {
             Vec::new()
@@ -220,7 +222,7 @@ impl McpRouter {
     fn git_tool(&self, name: &str) -> Option<Result<serde_json::Value, (i32, String)>> {
         if !matches!(
             name,
-            "git_status" | "git_diff" | "git_branches" | "semantic_diff"
+            "git_status" | "git_diff" | "git_branches" | "semantic_diff" | "blast_radius"
         ) {
             return None;
         }
@@ -232,12 +234,100 @@ impl McpRouter {
             "git_diff" => git.diff(wt),
             "git_branches" => git.branches(wt),
             "semantic_diff" => git.semantic_diff(wt),
+            // Reads the persisted graph via `self.db`; no LSP at call time.
+            "blast_radius" => self.blast_radius_text(wt),
             _ => unreachable!(),
         };
         Some(match res {
             Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
             Err(e) => Err((-32603, e)),
         })
+    }
+
+    /// Render the blast-radius report for the connection worktree from the
+    /// persisted semantic graph (no LSP at call time). Computes the diff's
+    /// changed entities inline (`git diff HEAD` → `entities_for_diff`) and joins
+    /// each against its persisted callers. Degrades to a clear message when the
+    /// graph has no callers (LSP off / not yet built / no dependents).
+    pub(crate) fn blast_radius_text(&self, wt: &str) -> Result<String, String> {
+        use crate::semantic::{Lang, entities_for_diff};
+        use crate::semantic_graph::{CallerRef, ChangedEntity, compute_blast_radius, entity_id};
+        use std::collections::BTreeMap;
+
+        let root = std::path::Path::new(wt);
+        let root_s = wt.to_string();
+        let loc = crate::remote::GitLoc::for_worktree(root);
+        let diff = loc
+            .git_out(&[
+                "-c",
+                "diff.noprefix=false",
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-renames",
+                "-U3",
+                "HEAD",
+            ])
+            .unwrap_or_default();
+
+        let mut changed: Vec<ChangedEntity> = Vec::new();
+        let mut callers_by: BTreeMap<String, Vec<CallerRef>> = BTreeMap::new();
+        let mut detail: Vec<String> = Vec::new();
+
+        for f in crate::patch::parse_patch(&diff) {
+            let Some(lang) = Lang::from_path(&f.new_path) else {
+                continue;
+            };
+            let abs = root.join(&f.new_path);
+            let abs_s = abs.to_string_lossy().into_owned();
+            let Ok(src) = std::fs::read_to_string(&abs) else {
+                continue;
+            };
+            for ch in entities_for_diff(&src, lang, &f.hunks) {
+                let id = entity_id(&root_s, &abs_s, &ch.name, ch.kind);
+                let callers: Vec<CallerRef> = self
+                    .db
+                    .callers_of(&id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| CallerRef {
+                        id: r.id,
+                        file: r.file,
+                        name: r.name,
+                        kind: r.kind,
+                    })
+                    .collect();
+                detail.push(format!(
+                    "  {} {} — {} caller{}",
+                    ch.kind.label(),
+                    ch.name,
+                    callers.len(),
+                    if callers.len() == 1 { "" } else { "s" }
+                ));
+                if !callers.is_empty() {
+                    callers_by.insert(id.clone(), callers);
+                }
+                changed.push(ChangedEntity {
+                    id,
+                    name: ch.name.clone(),
+                    kind: ch.kind,
+                    touch: ch.touch,
+                });
+            }
+        }
+
+        if changed.is_empty() {
+            return Ok("no entity-level changes vs HEAD".to_string());
+        }
+        let total_callers: usize = callers_by.values().map(Vec::len).sum();
+        if total_callers == 0 {
+            return Ok("blast-radius graph unavailable — no callers known \
+                       (LSP disabled, no server for this language, or the graph \
+                       is not yet built)"
+                .to_string());
+        }
+        let br = compute_blast_radius(&changed, &callers_by);
+        Ok(format!("{}\n{}", br.render(), detail.join("\n")))
     }
 
     /// Dispatch the forge/git-write house tools (these take args). Returns `None`

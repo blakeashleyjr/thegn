@@ -1083,6 +1083,13 @@ max_results = 1000
 # enabled = true               # master switch
 # hover   = true               # show hover / signature previews
 #
+# The `enabled` switch also gates the semantic blast-radius (items 313/316): the
+# `◈ semantic` diff footer's "N callers/F files · U untested · risk:R" tail and
+# the `blast_radius` MCP house tool. Edges are sourced from the language server's
+# `textDocument/references`, so with `enabled = false` (or no server for the
+# diff's language) the graph contributes nothing and the footer falls back to its
+# intra-diff entity summary — the feature is strictly additive.
+#
 # Per-language server overrides. `lang` is one of rust / typescript / tsx /
 # javascript / python / go. `command = ""` disables that language.
 # [[lsp.servers]]
