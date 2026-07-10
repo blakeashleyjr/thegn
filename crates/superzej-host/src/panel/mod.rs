@@ -345,7 +345,7 @@ pub struct ChangeRow {
     pub deleted: u32,
     /// True when this file was brought in by an in-progress merge/rebase/etc.
     /// (it differs on the incoming side, not a local edit). Drives the
-    /// "incoming from <onto>" grouping so the merge dump reads apart from the
+    /// `incoming from <onto>` grouping so the merge dump reads apart from the
     /// user's own changes. Always false outside a merge.
     pub incoming: bool,
 }
