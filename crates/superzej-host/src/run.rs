@@ -9728,9 +9728,11 @@ async fn event_loop<T: Terminal>(
                     if generation != create_gen {
                         continue;
                     }
-                    // Open the tab (splash in its center); jump to it by default.
+                    // Reconcile the placeholder the Submit path opened (rename in
+                    // place to the authoritative name), or open fresh when there
+                    // was none. Splash in its center; jump to it by default.
                     let jump = keymap.config().session.focus_on_create;
-                    crate::handlers::creating::open_tab(
+                    crate::handlers::creating::open_or_reconcile(
                         &mut session,
                         &mut model,
                         &mut sb,
@@ -12388,9 +12390,23 @@ async fn event_loop<T: Terminal>(
                             if let Some(tx) = wizard_cmd_tx.as_ref() {
                                 let _ = tx.send(wizard::WizardCmd::Submit(choices));
                             }
-                            // The worker's `TabOpened` event opens the new tab +
-                            // loading splash once the name/path settle; nothing
-                            // to reveal here.
+                            // Optimistic open: reveal the tab + sidebar loading
+                            // dot NOW so a remote host's slow bring-up doesn't
+                            // leave the sidebar empty until the worker reaches
+                            // `TabOpened` (which then reconciles the name).
+                            if let (Some(w), Some(cp)) = (wizard_ui.as_ref(), creating.as_ref()) {
+                                crate::handlers::creating::open_optimistic(
+                                    &mut session,
+                                    &mut model,
+                                    &mut sb,
+                                    &mut loading_state,
+                                    &mut creating_tabs,
+                                    cp,
+                                    w,
+                                    keymap.config(),
+                                );
+                                need_relayout = true;
+                            }
                             wizard_ui = None;
                         }
                     }
