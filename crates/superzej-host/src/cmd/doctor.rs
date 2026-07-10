@@ -10,7 +10,7 @@ use superzej_core::capabilities::{Capabilities, IsolationClass};
 use superzej_core::config::{Config, SandboxProfile};
 use superzej_core::managed_tool::{ManagedTool, Resolution};
 use superzej_core::outln;
-use superzej_core::placement::Placement;
+use superzej_core::placement::{Placement, RuntimeProbe};
 use superzej_core::sandbox::Backend;
 use superzej_core::store::HostStore;
 use superzej_core::termcaps::{ColorDepth, TermCaps, TermEnv, UnicodeLevel};
@@ -155,6 +155,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
             "detected": caps_json(&detected),
             "resolved": caps_json(&resolved),
             "sandbox": sandbox_json(cfg),
+            "remote_sandbox": remote_sandbox_json(cfg),
             "managed_tools": managed_tools_json(cfg),
             "mcp_servers": mcp_servers_json(cfg),
         });
@@ -197,6 +198,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     hosts_report(cfg);
+
+    outln!("");
+    remote_sandbox_report(cfg);
 
     outln!("");
     home_layer_report(cfg);
@@ -252,6 +256,89 @@ fn hosts_report(cfg: &Config) {
         yn(has("skopeo")),
         yn(has("rsync")),
     );
+}
+
+fn probe_word(p: RuntimeProbe) -> &'static str {
+    match p {
+        RuntimeProbe::Present => "present",
+        RuntimeProbe::Absent => "absent",
+        RuntimeProbe::Unreachable => "unreachable (ssh transport failed)",
+    }
+}
+
+/// Every ssh `[host.*]` as `(name, Placement::Ssh)`. Iroh/cloud/local hosts have
+/// no directly-probeable ssh control transport here, so they're skipped.
+fn remote_ssh_placements(cfg: &Config) -> Vec<(String, Placement)> {
+    let mut names: Vec<&String> = cfg.host.keys().collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let binding = cfg.host_binding(name)?;
+            match binding.reach {
+                superzej_core::host::Reach::Ssh(p) => Some((name.clone(), Placement::Ssh(p))),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Live per-backend runtime probe for each ssh `[host.*]`: is podman/docker/bwrap
+/// actually present on the remote? Distinguishes a genuinely-absent runtime from
+/// an *unreachable* host (ssh failed) — the false-negative that used to strand a
+/// reachable remote on `Backend::None` and ship a `cd <local-path>` to it. Each
+/// probe is `ConnectTimeout=10`-bounded. No-op when no ssh hosts are configured.
+fn remote_sandbox_report(cfg: &Config) {
+    outln!("Remote sandbox runtime (live ssh probe)");
+    let hosts = remote_ssh_placements(cfg);
+    if hosts.is_empty() {
+        outln!("  (no ssh [host.*] configured)");
+        return;
+    }
+    let chain = shell_chain(cfg);
+    for (name, placement) in hosts {
+        outln!("  {name}");
+        for bname in &chain {
+            let Some(b) = Backend::parse(bname) else {
+                continue;
+            };
+            if b == Backend::None {
+                continue; // "host"/"none" have no runtime to probe
+            }
+            outln!(
+                "    {:<10} {}",
+                bname,
+                probe_word(placement.probe_runtime(b.binary()))
+            );
+        }
+    }
+}
+
+fn remote_sandbox_json(cfg: &Config) -> serde_json::Value {
+    let chain = shell_chain(cfg);
+    let mut map = serde_json::Map::new();
+    for (name, placement) in remote_ssh_placements(cfg) {
+        let mut backends = serde_json::Map::new();
+        for bname in &chain {
+            let Some(b) = Backend::parse(bname) else {
+                continue;
+            };
+            if b == Backend::None {
+                continue;
+            }
+            backends.insert(
+                bname.clone(),
+                match placement.probe_runtime(b.binary()) {
+                    RuntimeProbe::Present => "present",
+                    RuntimeProbe::Absent => "absent",
+                    RuntimeProbe::Unreachable => "unreachable",
+                }
+                .into(),
+            );
+        }
+        map.insert(name, serde_json::Value::Object(backends));
+    }
+    serde_json::Value::Object(map)
 }
 
 /// Cheap PATH probe (doctor is a diagnostic CLI; subprocess is fine here).
@@ -686,5 +773,17 @@ args = ["--verbose"]
         assert!(v.get("enabled").is_some());
         assert!(v.get("candidates").unwrap().is_array());
         assert!(v.get("agent_profile").unwrap().get("policy").is_some());
+    }
+
+    #[test]
+    fn remote_sandbox_probe_is_empty_without_ssh_hosts() {
+        // Default config has no [host.*] — the live-probe surface is an empty
+        // object and the report doesn't ssh anywhere (so the tests never dial).
+        let cfg = Config::default();
+        assert!(remote_ssh_placements(&cfg).is_empty());
+        assert_eq!(remote_sandbox_json(&cfg), serde_json::json!({}));
+        remote_sandbox_report(&cfg);
+        assert_eq!(probe_word(RuntimeProbe::Present), "present");
+        assert!(probe_word(RuntimeProbe::Unreachable).starts_with("unreachable"));
     }
 }

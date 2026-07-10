@@ -17,11 +17,11 @@
 //! layer (mosh preferred / ssh) runs the whole thing on a remote machine.
 
 use crate::config::{
-    CustomVpnConfig, FileAccess, NetbirdConfig, Network, OnMissing, OpenvpnConfig, RemoteTransport,
+    CustomVpnConfig, FileAccess, NetbirdConfig, Network, OpenvpnConfig, RemoteTransport,
     SandboxBackend, SandboxConfig, SandboxProfile, TailscaleConfig, VpnConfig, VpnDnsMode, VpnMode,
     VpnOnError, VpnProviderKind, WireguardConfig, ZerotierConfig,
 };
-use crate::placement::{Placement, SshPlacement, TransportKind};
+use crate::placement::{Placement, RuntimeProbe, SshPlacement, TransportKind};
 use crate::remote::GitLoc;
 use crate::sandbox_mounts::{
     auto_cache_mounts, default_writable_carveouts, host_toolchain_mounts_ro_home, keep_cfg_mount,
@@ -193,7 +193,7 @@ impl Backend {
         )
     }
 
-    fn is_host_toolchain(self) -> bool {
+    pub(crate) fn is_host_toolchain(self) -> bool {
         matches!(
             self,
             Backend::Bwrap | Backend::Systemd | Backend::WinAppContainer | Backend::WinJobObject
@@ -952,117 +952,8 @@ pub fn placement_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Placement {
     }
 }
 
-fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option<Backend> {
-    let suitable = |b: Backend| -> bool {
-        match b {
-            Backend::None => true,
-            _ if b.is_oci() => true,
-            _ if b.is_host_toolchain() => true,
-            _ => false,
-        }
-    };
-
-    // Explicit backend: use it if suitable+available; otherwise warn and fall
-    // through to the chain. `Auto` falls straight through to the chain.
-    if let Some(explicit) = Backend::from_config(cfg.backend) {
-        match explicit {
-            Backend::None => return Some(Backend::None),
-            b if suitable(b) && available(placement, b) => return Some(b),
-            b => on_missing(
-                cfg,
-                &format!(
-                    "sandbox backend '{}' unavailable{}; trying the chain",
-                    cfg.backend,
-                    if suitable(b) {
-                        ""
-                    } else {
-                        " for this image mode"
-                    }
-                ),
-            ),
-        }
-    }
-
-    for name in &cfg.backend_chain {
-        let Some(b) = Backend::parse(name) else {
-            continue;
-        };
-        let is_win_native = b == Backend::WinAppContainer || b == Backend::WinJobObject;
-        if b == Backend::None {
-            if !is_win_native {
-                on_missing(
-                    cfg,
-                    "sandbox: no container backend available; running on the host",
-                );
-            }
-            return Some(Backend::None);
-        }
-        if suitable(b) && available(placement, b) {
-            return Some(b);
-        }
-    }
-    // Chain didn't include "none": still fall back to host rather than block.
-    on_missing(
-        cfg,
-        "sandbox: no usable backend in chain; running on the host",
-    );
-    Some(Backend::None)
-}
-
-fn on_missing(cfg: &SandboxConfig, what: &str) {
-    match cfg.on_missing {
-        OnMissing::Fail => msg::die(what),
-        // "prompt" is treated as "warn" here; the picker layer can offer choices.
-        _ => msg::warn(what),
-    }
-}
-
-/// Is `backend`'s binary present in this placement (locally on PATH, or probed
-/// through the placement's control primitive: ssh / kubectl exec / provider)?
-///
-/// **Memoized** (D3): probe once per `(placement, backend)`; cache success
-/// permanently, failure only 30s (a permanent `false` stranded a remote host).
-fn available(placement: &Placement, backend: Backend) -> bool {
-    type AvailCache =
-        std::sync::Mutex<std::collections::HashMap<(String, Backend), (bool, std::time::Instant)>>;
-    static CACHE: std::sync::OnceLock<AvailCache> = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let key = (format!("{placement:?}"), backend);
-    if let Some(&(v, at)) = cache.lock().unwrap().get(&key)
-        && (v || at.elapsed() < std::time::Duration::from_secs(30))
-    {
-        return v;
-    }
-    let v = available_probe(placement, backend);
-    cache
-        .lock()
-        .unwrap()
-        .insert(key, (v, std::time::Instant::now()));
-    v
-}
-
-/// The uncached availability probe (subprocess / PATH / remote). See [`available`].
-fn available_probe(placement: &Placement, backend: Backend) -> bool {
-    // Rootful podman can't be detected by a bare PATH probe (it needs `sudo -n
-    // podman version`); only meaningful locally.
-    if placement.is_local() && backend == Backend::PodmanRootful {
-        return run_local_output(&backend_prefix(backend), &["version"]).is_some();
-    }
-
-    if placement.is_local()
-        && (backend == Backend::WinAppContainer || backend == Backend::WinJobObject)
-    {
-        return cfg!(windows);
-    }
-
-    if !placement.is_local()
-        && (backend == Backend::WinAppContainer || backend == Backend::WinJobObject)
-    {
-        return false;
-    }
-
-    placement.has_binary(backend.binary())
-}
+pub use crate::sandbox_backend::placement_reachable;
+use crate::sandbox_backend::{available, pick_backend};
 
 pub const DEFAULT_OCI_IMAGE: &str = "docker.io/library/debian:stable";
 
@@ -1259,7 +1150,7 @@ pub fn teardown_by_path(worktree: &str) {
         Backend::Smol,
         Backend::Apple,
     ] {
-        if available(&placement, b) {
+        if available(&placement, b) == RuntimeProbe::Present {
             let mut argv = backend_prefix(b);
             argv.extend([
                 "rm".into(),
@@ -1293,7 +1184,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
         Backend::Smol,
         Backend::Apple,
     ] {
-        if available(&placement, b) {
+        if available(&placement, b) == RuntimeProbe::Present {
             let mut argv = backend_prefix(b);
             argv.extend([
                 "rm".into(),
@@ -1596,8 +1487,20 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
         }
         Backend::None => {
             // Bare shell (reached only for a remote worktree — local `none` runs
-            // on the host via the caller). cd into the worktree first.
-            let body = format!("cd {} && {script}", util::sh_quote(&wt));
+            // on the host via the caller). `spec.worktree` is only rewritten to a
+            // real remote path for OCI backends (`retarget_if_remote_oci`); for a
+            // bare remote shell it's still the LOCAL path, which doesn't exist on
+            // the remote. Only `cd` when the target is known to be a real path on
+            // the exec host: a local placement (host `none`), or a remote whose
+            // worktree was retargeted (mounts point at it). Otherwise start in the
+            // remote `$HOME` rather than ship a `cd <local-path>` that fails with
+            // "cd: can't cd to …".
+            let cd_ok = spec.placement.is_local() || spec.mounts.iter().any(|m| m.dest == wt);
+            let body = if cd_ok {
+                format!("cd {} && {script}", util::sh_quote(&wt))
+            } else {
+                script.to_string()
+            };
             vec!["/bin/sh".into(), "-lc".into(), body]
         }
     }
@@ -1820,7 +1723,7 @@ fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String
     }
 }
 
-fn backend_prefix(backend: Backend) -> Vec<String> {
+pub(crate) fn backend_prefix(backend: Backend) -> Vec<String> {
     match backend {
         Backend::PodmanRootful => vec!["sudo".into(), "-n".into(), "podman".into()],
         _ => vec![backend.binary().into()],
@@ -1874,7 +1777,7 @@ pub fn oci_runtime_prefix(backend: Backend) -> Option<Vec<String>> {
     backend.is_oci().then(|| backend_prefix(backend))
 }
 
-fn run_local_output(prefix: &[String], args: &[&str]) -> Option<String> {
+pub(crate) fn run_local_output(prefix: &[String], args: &[&str]) -> Option<String> {
     let (cmd, rest) = prefix.split_first()?;
     let mut c = Command::new(cmd);
     c.args(rest).args(args);
@@ -2082,6 +1985,46 @@ pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::sandbox_mounts::host_toolchain_mounts;
+
+    #[test]
+    fn none_backend_skips_cd_for_unretargeted_remote_worktree() {
+        // A bare remote shell whose worktree was NOT retargeted (local path) must
+        // NOT `cd <local-path>` on the remote — it would fail "cd: can't cd to …".
+        let mut s = spec(Backend::None);
+        s.worktree = PathBuf::from("/home/me/wt");
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "host".into(),
+            22,
+            false,
+            TransportKind::Ssh,
+        ));
+        s.mounts.clear();
+        let body = backend_enter_argv(&s, "exec sh").pop().unwrap();
+        assert!(!body.contains("cd "), "no local cd shipped remote: {body}");
+        assert!(body.contains("exec sh"));
+
+        // A retargeted remote (a mount whose dest == the worktree path) DOES cd.
+        s.mounts = vec![Mount {
+            host: "/home/me/wt".into(),
+            dest: "/home/me/wt".into(),
+            ro: false,
+            cache: false,
+        }];
+        let retargeted = backend_enter_argv(&s, "exec sh").pop().unwrap();
+        assert!(
+            retargeted.starts_with("cd "),
+            "retargeted remote cds: {retargeted}"
+        );
+
+        // A local `none` still cds into the worktree.
+        let mut local = spec(Backend::None);
+        local.placement = Placement::Local;
+        let body_local = backend_enter_argv(&local, "exec sh").pop().unwrap();
+        assert!(
+            body_local.starts_with("cd "),
+            "local none cds: {body_local}"
+        );
+    }
 
     fn vpn_cfg(provider: VpnProviderKind) -> VpnConfig {
         VpnConfig {

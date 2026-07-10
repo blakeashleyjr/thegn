@@ -27,6 +27,47 @@ pub enum TransportKind {
     Mosh,
 }
 
+/// Outcome of a runtime (container-backend) presence probe. `Present`/`Absent`
+/// are *definite* answers about the binary; `Unreachable` means the transport
+/// (ssh) failed, so we learned **nothing** about what runtimes exist and MUST
+/// NOT treat it as `Absent` — doing so silently degrades a reachable remote to
+/// `Backend::None` (and ships a `cd <local-path>` to the remote shell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeProbe {
+    Present,
+    Absent,
+    Unreachable,
+}
+
+/// Sentinels the remote *login shell* prints to stdout so we can tell "the
+/// remote actually ran the probe" (present/absent) from "ssh never got there"
+/// (no sentinel at all). Deliberately unusual so a login banner can't collide.
+pub(crate) const PROBE_HIT: &str = "__SZ_HAVE__";
+pub(crate) const PROBE_MISS: &str = "__SZ_MISS__";
+
+/// Pure classification of a remote probe from its `(exit_code, stdout)`. Kept
+/// free of any subprocess so it is unit-tested under the core coverage gate.
+///
+/// - ssh connection failure (exit 255) or a spawn error (`None`) ⇒ `Unreachable`.
+/// - `PROBE_HIT` on stdout ⇒ `Present`; `PROBE_MISS` (and no hit) ⇒ `Absent`.
+/// - neither sentinel ⇒ `Unreachable`: the remote shell never emitted our marker
+///   (mangled login profile, killed connection), so we can't claim `Absent`.
+///
+/// Uses `contains` (not equality) to tolerate login-shell banner noise on stdout.
+pub(crate) fn classify_probe(exit_code: Option<i32>, stdout: &str) -> RuntimeProbe {
+    match exit_code {
+        Some(255) | None => return RuntimeProbe::Unreachable,
+        _ => {}
+    }
+    if stdout.contains(PROBE_HIT) {
+        RuntimeProbe::Present
+    } else if stdout.contains(PROBE_MISS) {
+        RuntimeProbe::Absent
+    } else {
+        RuntimeProbe::Unreachable
+    }
+}
+
 /// An SSH (or mosh-over-ssh) placement. The first four fields reproduce the old
 /// `Remote`; the rest are per-environment SSH knobs (empty/`None` for a worktree
 /// whose target was derived from its `GitLoc`, which keeps argv identical).
@@ -400,29 +441,61 @@ impl Placement {
     /// interactive_wrap, host_exec). On Nix/WSL2 hosts podman lands only on the
     /// login PATH, so a bare `ssh host -- command -v podman` returns 127 and
     /// strands the placement on Backend::None even though the real exec would
-    /// find it.
+    /// find it. The probe prints [`PROBE_HIT`]/[`PROBE_MISS`] on stdout so a
+    /// definite absent answer (`command -v` failed, exit still 0 via `||`) is
+    /// distinguishable from ssh never reaching the remote (no sentinel) — see
+    /// [`classify_probe`].
     fn probe_argv(&self, bin: &str) -> Vec<String> {
         let probe = vec![
             "/bin/sh".to_string(),
             "-lc".to_string(),
-            format!("command -v {bin} >/dev/null 2>&1"),
+            format!(
+                "command -v {bin} >/dev/null 2>&1 && printf %s {PROBE_HIT} || printf %s {PROBE_MISS}"
+            ),
         ];
         self.control_argv(&probe)
     }
 
+    /// Three-state runtime presence probe (Local: PATH; remote: a login-shell
+    /// probe through the placement's control primitive). Unlike [`has_binary`],
+    /// this separates a genuinely-absent binary from an unreachable host so the
+    /// caller never degrades a reachable remote to `Backend::None`. The probe is
+    /// ssh-only even when the pane transport is mosh — mosh bootstraps over ssh,
+    /// so ssh reachability is a valid precondition (and mosh can't capture
+    /// non-interactive command output).
+    ///
+    /// Subprocess seam (cov_ignore); the decision logic lives in the pure,
+    /// unit-tested [`classify_probe`].
+    pub fn probe_runtime(&self, bin: &str) -> RuntimeProbe {
+        match self {
+            Placement::Local => {
+                if util::have(bin) {
+                    RuntimeProbe::Present
+                } else {
+                    RuntimeProbe::Absent
+                }
+            }
+            _ => {
+                let argv = self.probe_argv(bin);
+                match std::process::Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .output()
+                {
+                    Ok(o) => classify_probe(o.status.code(), &String::from_utf8_lossy(&o.stdout)),
+                    Err(_) => RuntimeProbe::Unreachable,
+                }
+            }
+        }
+    }
+
     /// Is the named binary present in this placement? (Local: PATH; remote: a
-    /// login-shell `command -v` probe through the placement's control primitive.)
+    /// login-shell probe through the placement's control primitive.) A remote
+    /// `Unreachable` answer collapses to `false` here — callers that must not
+    /// degrade on an unreachable host should use [`probe_runtime`] instead.
     pub fn has_binary(&self, bin: &str) -> bool {
         match self {
             Placement::Local => util::have(bin),
-            _ => {
-                let argv = self.probe_argv(bin);
-                std::process::Command::new(&argv[0])
-                    .args(&argv[1..])
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false)
-            }
+            _ => self.probe_runtime(bin) == RuntimeProbe::Present,
         }
     }
 
@@ -531,6 +604,51 @@ impl ReconnectPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_probe_three_states() {
+        // Definite answers require the remote shell to have emitted a sentinel.
+        assert_eq!(
+            classify_probe(Some(0), PROBE_HIT),
+            RuntimeProbe::Present,
+            "hit sentinel ⇒ present"
+        );
+        assert_eq!(
+            classify_probe(Some(0), PROBE_MISS),
+            RuntimeProbe::Absent,
+            "miss sentinel (command -v failed, exit 0 via `||`) ⇒ absent"
+        );
+        // ssh transport failures / spawn errors are never "absent".
+        assert_eq!(classify_probe(Some(255), ""), RuntimeProbe::Unreachable);
+        assert_eq!(classify_probe(None, ""), RuntimeProbe::Unreachable);
+        // Exit 0 but no sentinel ⇒ the remote never ran our probe (mangled login
+        // profile / killed connection) — inconclusive, not absent.
+        assert_eq!(classify_probe(Some(0), ""), RuntimeProbe::Unreachable);
+        // Login-shell banner noise on stdout is tolerated (contains, not equals).
+        assert_eq!(
+            classify_probe(Some(0), &format!("motd banner\n{PROBE_HIT}")),
+            RuntimeProbe::Present
+        );
+    }
+
+    #[test]
+    fn probe_argv_emits_sentinels_through_login_shell() {
+        let p = SshPlacement::plain("dev@box".into(), 22, true, TransportKind::Ssh);
+        let argv = Placement::Ssh(p).probe_argv("podman");
+        let joined = argv.join(" ");
+        assert!(joined.contains("-lc"), "probes via login shell: {joined}");
+        assert!(joined.contains(PROBE_HIT) && joined.contains(PROBE_MISS));
+        assert!(joined.contains("command -v podman"));
+    }
+
+    #[test]
+    fn local_probe_runtime_is_present_absent_never_unreachable() {
+        assert_eq!(Placement::Local.probe_runtime("sh"), RuntimeProbe::Present);
+        assert_eq!(
+            Placement::Local.probe_runtime("definitely-not-a-real-binary-zzz"),
+            RuntimeProbe::Absent
+        );
+    }
 
     #[test]
     fn local_is_passthrough() {
