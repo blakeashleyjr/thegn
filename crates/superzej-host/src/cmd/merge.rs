@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use superzej_core::config::Config;
 use superzej_core::db::Db;
+use superzej_core::outln;
 use superzej_core::store::WorktreeAuxStore;
-use superzej_core::{outln, util};
 
 use superzej_core::merge_lifecycle::LifecycleEvent;
 
@@ -80,13 +80,6 @@ fn repo_root() -> Result<PathBuf> {
     integrate::main_checkout(&cwd).context("not inside a git repository")
 }
 
-/// The branch a worktree is currently on.
-fn branch_of(worktree: &Path) -> Option<String> {
-    util::git_out(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 /// Queue rows belonging to the current repo (the membership rule lives in
 /// `merge_driver::rows_for_repo`, shared with the host's in-app drain).
 fn rows_for_repo(root: &Path) -> Result<Vec<superzej_core::db::MergeQueueRow>> {
@@ -141,16 +134,13 @@ fn add(cfg: &Config, worktrees: Vec<String>, all: bool) -> Result<()> {
         worktrees.iter().map(PathBuf::from).collect()
     };
     for wt in paths {
-        let wt_s = wt.to_string_lossy().to_string();
-        let branch =
-            branch_of(&wt).with_context(|| format!("{wt_s}: not on a branch (detached HEAD?)"))?;
-        if branch == target {
-            outln!("  • skipped {branch} (that's the target branch)");
-            continue;
-        }
-        db.enqueue_merge(&wt_s, &branch, &target)?;
-        crate::merge_lifecycle::apply(mq, &db, &root, &wt_s, &branch, LifecycleEvent::Enqueued);
-        outln!("  + queued {branch}");
+        let msg = crate::merge_ops::enqueue_worktree(mq, &db, &wt)?;
+        let mark = if msg.starts_with("skipped") {
+            "•"
+        } else {
+            "+"
+        };
+        outln!("  {mark} {msg}");
     }
     Ok(())
 }
@@ -166,11 +156,9 @@ fn rm(worktree: Option<String>) -> Result<()> {
 fn clear(cfg: &Config) -> Result<()> {
     let root = repo_root()?;
     let db = Db::open()?;
-    for r in rows_for_repo(&root)? {
-        db.remove_merge_entry(&r.worktree)?;
-    }
+    let n = crate::merge_ops::clear_repo(&db, &root)?;
     let _ = cfg;
-    outln!("Queue cleared.");
+    outln!("Queue cleared ({n} removed).");
     Ok(())
 }
 

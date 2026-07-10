@@ -41,3 +41,18 @@ pub trait HouseForge: Send + Sync {
     /// Commit staged changes with `message`.
     fn commit(&self, worktree: &str, message: &str) -> Result<String, String>;
 }
+
+/// Host-provided merge-queue capability exposed as house tools. Like the others,
+/// the router (core) can't reach the host-side merge logic (`integrate` /
+/// `merge_driver` / `merge_lifecycle`), so the host implements this trait
+/// (`superzej-host::mcp_merge`) and injects it via [`router::McpRouter::with_merge`].
+/// Every method operates on the connection's own worktree/repo — the agent can't
+/// name another worktree — mirroring the git/forge house tools.
+pub trait HouseMerge: Send + Sync {
+    /// Add the worktree's current branch to the merge queue.
+    fn add(&self, worktree: &str) -> Result<String, String>;
+    /// Clear the merge queue for the worktree's repo.
+    fn clear(&self, worktree: &str) -> Result<String, String>;
+    /// Show the merge queue for the worktree's repo.
+    fn list(&self, worktree: &str) -> Result<String, String>;
+}

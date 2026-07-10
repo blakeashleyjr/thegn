@@ -161,6 +161,21 @@ impl ControlApi for FakeApi {
         self.record("git_commit");
         Box::pin(async { Ok("abc123".into()) })
     }
+    fn merge_add<'a>(&'a self, _worktree: &'a str) -> BoxFuture<'a, ControlResult<String>> {
+        self.record("merge_add");
+        Box::pin(async { Ok("queued feature-x".into()) })
+    }
+    fn merge_clear<'a>(&'a self, _worktree: &'a str) -> BoxFuture<'a, ControlResult<usize>> {
+        self.record("merge_clear");
+        Box::pin(async { Ok(0) })
+    }
+    fn merge_list<'a>(
+        &'a self,
+        _worktree: &'a str,
+    ) -> BoxFuture<'a, ControlResult<Vec<superzej_core::db::MergeQueueRow>>> {
+        self.record("merge_list");
+        Box::pin(async { Ok(vec![]) })
+    }
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>> {
         self.record("lease_status");
         Box::pin(async { Ok(vec![]) })
@@ -246,6 +261,8 @@ fn default_body(path: &str) -> &'static str {
         r#"{"worktree":"/w","paths":["a"]}"#
     } else if path.contains("/git/commit") {
         r#"{"worktree":"/w","message":"m"}"#
+    } else if path.contains("/merge/add") || path.contains("/merge/clear") {
+        r#"{"worktree":"/w"}"#
     } else if path.ends_with("/v1/sessions") {
         r#"{"argv":["/bin/sh"],"rows":24,"cols":80}"#
     } else if path.contains("/pairings") {
@@ -265,6 +282,7 @@ async fn read_scope_covers_exactly_the_read_surface() {
         ("GET", "/v1/me"),
         ("GET", "/v1/sessions/s1/snapshot"),
         ("GET", "/v1/git/status?worktree=%2Fw"),
+        ("GET", "/v1/merge/list?worktree=%2Fw"),
     ] {
         assert_eq!(
             call(&r, method, path, Some(&read)).await,
@@ -290,6 +308,8 @@ async fn under_scoped_requests_are_rejected_with_zero_side_effects() {
         ("POST", "/v1/browser"),
         ("POST", "/v1/git/stage"),
         ("POST", "/v1/git/commit"),
+        ("POST", "/v1/merge/add"),
+        ("POST", "/v1/merge/clear"),
         ("POST", "/v1/pairings"),
         ("GET", "/v1/pairings"),
         ("DELETE", "/v1/pairings/x"),
@@ -321,9 +341,23 @@ async fn git_scope_commits_but_cannot_type_into_terminals() {
         call(&r, "POST", "/v1/git/commit", Some(&git)).await,
         StatusCode::OK
     );
+    // …and the git-adjacent merge add/clear verbs.
+    assert_eq!(
+        call(&r, "POST", "/v1/merge/add", Some(&git)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&r, "POST", "/v1/merge/clear", Some(&git)).await,
+        StatusCode::OK
+    );
     assert_eq!(
         r.api.calls(),
-        vec!["git_stage".to_string(), "git_commit".to_string()]
+        vec![
+            "git_stage".to_string(),
+            "git_commit".to_string(),
+            "merge_add".to_string(),
+            "merge_clear".to_string(),
+        ]
     );
     // …but must NOT reach a terminal (Git ⊅ Write) or admin surface.
     assert_eq!(
@@ -334,7 +368,7 @@ async fn git_scope_commits_but_cannot_type_into_terminals() {
         call(&r, "GET", "/v1/pairings", Some(&git)).await,
         StatusCode::FORBIDDEN
     );
-    assert_eq!(r.api.calls().len(), 2, "rejections added no calls");
+    assert_eq!(r.api.calls().len(), 4, "rejections added no calls");
 }
 
 #[tokio::test]

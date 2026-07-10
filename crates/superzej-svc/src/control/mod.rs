@@ -220,6 +220,21 @@ pub trait ControlApi: Send + Sync + 'static {
         message: &'a str,
     ) -> BoxFuture<'a, ControlResult<String>>;
 
+    // Merge-queue verbs — add the worktree's branch / clear / list the queue for
+    // the worktree's repo. Impls reuse the host `merge_ops` primitive so behavior
+    // matches the CLI and MCP surfaces.
+    /// Add the worktree's current branch; returns a status message.
+    fn merge_add<'a>(&'a self, worktree: &'a str) -> BoxFuture<'a, ControlResult<String>>;
+
+    /// Clear the queue for the worktree's repo; returns the number removed.
+    fn merge_clear<'a>(&'a self, worktree: &'a str) -> BoxFuture<'a, ControlResult<usize>>;
+
+    /// The queue rows for the worktree's repo.
+    fn merge_list<'a>(
+        &'a self,
+        worktree: &'a str,
+    ) -> BoxFuture<'a, ControlResult<Vec<superzej_core::db::MergeQueueRow>>>;
+
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>>;
 
     /// The broadcast event feed (activity, lease, pairing, session-list
