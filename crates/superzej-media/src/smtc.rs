@@ -18,7 +18,7 @@ use windows::Media::Control::{
 };
 use windows::Media::MediaPlaybackAutoRepeatMode;
 
-use crate::model::{LoopMode, MediaState};
+use crate::model::{LoopMode, MediaKind, MediaState};
 use crate::smtc_decode::{
     duration_from_ticks, loop_from_repeat, loop_to_repeat, playback_state_from_status,
 };
@@ -118,6 +118,43 @@ impl MediaBackend for Smtc {
         Ok(())
     }
 
+    async fn seek(&self, offset: std::time::Duration, forward: bool) -> Result<(), MediaError> {
+        run_blocking(move || {
+            let session = current_session()?;
+            let cur = session
+                .GetTimelineProperties()
+                .and_then(|t| t.Position())
+                .map(|ts| ts.Duration)
+                .unwrap_or(0);
+            let delta = ticks_from_duration(offset);
+            let target = if forward {
+                cur + delta
+            } else {
+                (cur - delta).max(0)
+            };
+            session
+                .TryChangePlaybackPositionAsync(target)
+                .and_then(|op| op.get())
+                .map_err(win_err)?;
+            Ok(())
+        })
+        .await
+    }
+    async fn set_position(
+        &self,
+        pos: std::time::Duration,
+        _track_id: Option<&str>,
+    ) -> Result<(), MediaError> {
+        run_blocking(move || {
+            current_session()?
+                .TryChangePlaybackPositionAsync(ticks_from_duration(pos))
+                .and_then(|op| op.get())
+                .map_err(win_err)?;
+            Ok(())
+        })
+        .await
+    }
+
     fn caps(&self) -> MediaCaps {
         MediaCaps {
             shuffle: true,
@@ -125,8 +162,20 @@ impl MediaBackend for Smtc {
             volume: false,
             playlists: false,
             signals: false, // host polls on [media] poll_interval_secs
+            seek: true,
+            art: false,
+            queue: false,
+            abs_volume: false,
+            chapters: false,
+            fullscreen: false,
         }
     }
+}
+
+/// A [`std::time::Duration`] as WinRT 100-nanosecond ticks (inverse of
+/// [`duration_from_ticks`]).
+fn ticks_from_duration(d: std::time::Duration) -> i64 {
+    (d.as_nanos() / 100).min(i64::MAX as u128) as i64
 }
 
 // === blocking COM helpers ==================================================
@@ -198,6 +247,14 @@ fn snapshot_blocking() -> Result<Option<MediaState>, MediaError> {
         .map(|h| h.to_string())
         .unwrap_or_default();
 
+    // SMTC exposes a PlaybackType (Music/Video/Image) — map it, falling back to
+    // the player-name heuristic.
+    let kind = match props.PlaybackType().ok().and_then(|r| r.Value().ok()) {
+        Some(t) if t.0 == 3 => MediaKind::Video, // MediaPlaybackType::Video
+        Some(t) if t.0 == 1 => MediaKind::Audio, // MediaPlaybackType::Music
+        _ => MediaKind::from_hints(&player, None, None),
+    };
+
     Ok(Some(MediaState {
         player,
         title,
@@ -211,6 +268,10 @@ fn snapshot_blocking() -> Result<Option<MediaState>, MediaError> {
         volume: None, // SMTC has no volume
         can_go_next,
         can_go_previous,
+        art_url: None, // thumbnail is a stream, not fetched in v1
+        kind,
+        can_seek: true, // SMTC position change is generally available
+        track_id: None,
     }))
 }
 

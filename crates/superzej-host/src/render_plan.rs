@@ -92,6 +92,8 @@ pub struct Overlays {
     pub toasts: bool,
     /// A bar-item detail popup/modal (CPU graph, notifications list, …).
     pub detail: bool,
+    /// The Now-Playing media overlay (centered control-panel modal).
+    pub media: bool,
 }
 
 impl Overlays {
@@ -109,6 +111,7 @@ impl Overlays {
             || self.which_key
             || self.toasts
             || self.detail
+            || self.media
     }
 }
 

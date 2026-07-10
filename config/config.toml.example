@@ -2584,6 +2584,15 @@ players_priority = []        # e.g. ["spotify", "mpv"]
 default_action = "play_pause"  # play_pause | next | previous | volume_up | volume_down
 # Volume step (0.0–1.0) for media-volume-up / media-volume-down.
 volume_step = 0.05
+# Seek step (seconds) for media-seek-forward / media-seek-back. Video uses the
+# larger step, matching the coarser skipping people expect from a video player.
+seek_step_secs = 10
+seek_step_video_secs = 30
+# Render cover art in the Now-Playing overlay (Alt-m) when the backend exposes it
+# and the terminal supports kitty/sixel graphics; otherwise a block-glyph mosaic.
+show_art = true
+# Open the Now-Playing overlay when the statusbar media badge is clicked.
+overlay_on_badge_click = true
 # Fallback poll cadence (seconds) for backends WITHOUT a push stream (mpv IPC /
 # playerctl). The native MPRIS path uses D-Bus PropertiesChanged signals
 # instead, so this never fires for it (the ~0%-idle contract holds).

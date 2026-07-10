@@ -7,13 +7,13 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-use crate::model::{LoopMode, MediaState, PlaybackState, Playlist};
+use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState, Playlist};
 use crate::{MediaBackend, MediaCaps, MediaError};
 
 /// Field separator for the `metadata --format` template — a unit-separator byte,
 /// which never appears in track text.
 const SEP: char = '\u{1f}';
-const FORMAT: &str = "{{playerName}}\u{1f}{{status}}\u{1f}{{title}}\u{1f}{{artist}}\u{1f}{{album}}\u{1f}{{mpris:length}}\u{1f}{{position}}\u{1f}{{shuffle}}\u{1f}{{loopStatus}}\u{1f}{{volume}}";
+const FORMAT: &str = "{{playerName}}\u{1f}{{status}}\u{1f}{{title}}\u{1f}{{artist}}\u{1f}{{album}}\u{1f}{{mpris:length}}\u{1f}{{position}}\u{1f}{{shuffle}}\u{1f}{{loopStatus}}\u{1f}{{volume}}\u{1f}{{mpris:artUrl}}\u{1f}{{xesam:url}}\u{1f}{{mpris:trackid}}";
 
 pub struct MprisCli {
     priority: Vec<String>,
@@ -119,6 +119,25 @@ impl MediaBackend for MprisCli {
         Ok(()) // no-op; caps().playlists == false so the UI never calls this
     }
 
+    async fn seek(&self, offset: Duration, forward: bool) -> Result<(), MediaError> {
+        // `playerctl position <secs>+` / `<secs>-` seeks relative.
+        let arg = format!(
+            "{:.3}{}",
+            offset.as_secs_f64(),
+            if forward { "+" } else { "-" }
+        );
+        self.run(&["position", &arg]).await.map(|_| ())
+    }
+    async fn set_position(&self, pos: Duration, _track_id: Option<&str>) -> Result<(), MediaError> {
+        // Bare `playerctl position <secs>` sets an absolute position.
+        let arg = format!("{:.3}", pos.as_secs_f64());
+        self.run(&["position", &arg]).await.map(|_| ())
+    }
+    async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
+        let arg = format!("{:.3}", (level.min(100) as f64) / 100.0);
+        self.run(&["volume", &arg]).await.map(|_| ())
+    }
+
     fn caps(&self) -> MediaCaps {
         MediaCaps {
             shuffle: true,
@@ -126,6 +145,12 @@ impl MediaBackend for MprisCli {
             volume: true,
             playlists: false,
             signals: false, // host polls on [media] poll_interval_secs
+            seek: true,
+            art: true,
+            queue: false,
+            abs_volume: true,
+            chapters: false,
+            fullscreen: false,
         }
     }
 }
@@ -148,8 +173,11 @@ fn parse_line(line: &str) -> MediaState {
         .filter(|n| *n >= 0)
         .map(|us| Duration::from_micros(us as u64));
 
+    let player = get(0).to_string();
+    let art = get(10);
+    let url = get(11);
+    let trackid = get(12);
     MediaState {
-        player: get(0).to_string(),
         title: get(2).to_string(),
         artist: get(3).to_string(),
         album: get(4).to_string(),
@@ -164,6 +192,11 @@ fn parse_line(line: &str) -> MediaState {
             .map(|v| (v * 100.0).round().clamp(0.0, 100.0) as u8),
         can_go_next: true,
         can_go_previous: true,
+        art_url: (!art.is_empty()).then(|| art.to_string()),
+        kind: MediaKind::from_hints(&player, None, (!url.is_empty()).then_some(url)),
+        can_seek: true, // playerctl can always position-seek
+        track_id: (!trackid.is_empty()).then(|| trackid.to_string()),
+        player,
     }
 }
 

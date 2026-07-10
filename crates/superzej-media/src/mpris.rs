@@ -12,13 +12,15 @@ use zbus::names::InterfaceName;
 use zbus::zvariant::{Array, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream};
 
-use crate::model::{LoopMode, MediaState, PlaybackState, Playlist};
+use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState, Playlist, QueueItem};
 use crate::{MediaBackend, MediaCaps, MediaError, MediaWatch};
 
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
+const ROOT_IFACE: &str = "org.mpris.MediaPlayer2";
 const PLAYER_IFACE: &str = "org.mpris.MediaPlayer2.Player";
 const PLAYLISTS_IFACE: &str = "org.mpris.MediaPlayer2.Playlists";
+const TRACKLIST_IFACE: &str = "org.mpris.MediaPlayer2.TrackList";
 
 /// A connected MPRIS controller. Holds one session-bus connection; the active
 /// player is re-resolved per call so launching/quitting a player is picked up.
@@ -265,6 +267,160 @@ impl MediaBackend for MprisZbus {
             .map_err(|e| MediaError::Backend(e.to_string()))
     }
 
+    async fn seek(&self, offset: Duration, forward: bool) -> Result<(), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        let micros = offset.as_micros().min(i64::MAX as u128) as i64;
+        let signed = if forward { micros } else { -micros };
+        // Player.Seek(Offset: x)
+        self.conn
+            .call_method(
+                Some(bus.as_str()),
+                MPRIS_PATH,
+                Some(PLAYER_IFACE),
+                "Seek",
+                &(signed,),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| MediaError::Backend(e.to_string()))
+    }
+
+    async fn set_position(&self, pos: Duration, track_id: Option<&str>) -> Result<(), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        // Resolve the track id: prefer the caller's, else read it fresh.
+        let tid = match track_id {
+            Some(t) => t.to_string(),
+            None => {
+                let props = self.player_props(&bus).await?;
+                trackid_of(&props)
+                    .ok_or_else(|| MediaError::Backend("no trackid for SetPosition".into()))?
+            }
+        };
+        let path = OwnedObjectPath::try_from(tid.as_str())
+            .map_err(|e| MediaError::Backend(e.to_string()))?;
+        let micros = pos.as_micros().min(i64::MAX as u128) as i64;
+        // Player.SetPosition(TrackId: o, Position: x)
+        self.conn
+            .call_method(
+                Some(bus.as_str()),
+                MPRIS_PATH,
+                Some(PLAYER_IFACE),
+                "SetPosition",
+                &(path, micros),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| MediaError::Backend(e.to_string()))
+    }
+
+    async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        let v = (level.min(100) as f64) / 100.0;
+        self.player_set(&bus, "Volume", Value::F64(v)).await
+    }
+
+    async fn queue(&self) -> Result<Vec<QueueItem>, MediaError> {
+        let Some(bus) = self.active_player().await? else {
+            return Ok(Vec::new());
+        };
+        // TrackList.Tracks is `ao`; read it via Properties.Get. Players without
+        // the TrackList interface error here → treat as an empty queue.
+        let proxy = self.props_proxy(&bus).await?;
+        let iface = InterfaceName::try_from(TRACKLIST_IFACE)
+            .map_err(|e| MediaError::Backend(e.to_string()))?;
+        let Ok(tracks_val) = proxy.get(iface, "Tracks").await else {
+            return Ok(Vec::new());
+        };
+        let paths: Vec<OwnedObjectPath> = match Vec::try_from(tracks_val) {
+            Ok(p) => p,
+            Err(_) => return Ok(Vec::new()),
+        };
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        // GetTracksMetadata(ao) -> aa{sv}
+        let reply = match self
+            .conn
+            .call_method(
+                Some(bus.as_str()),
+                MPRIS_PATH,
+                Some(TRACKLIST_IFACE),
+                "GetTracksMetadata",
+                &(paths.clone(),),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let metas: Vec<HashMap<String, OwnedValue>> = match reply.body().deserialize() {
+            Ok(m) => m,
+            Err(_) => return Ok(Vec::new()),
+        };
+        // The current track, so we can mark it in the list.
+        let current = self
+            .player_props(&bus)
+            .await
+            .ok()
+            .and_then(|p| trackid_of(&p));
+        Ok(metas
+            .into_iter()
+            .map(|meta| {
+                let id = str_of(&meta, "mpris:trackid")
+                    .or_else(|| objpath_of(&meta, "mpris:trackid"))
+                    .unwrap_or_default();
+                let is_current = current.as_deref() == Some(id.as_str());
+                QueueItem {
+                    id,
+                    title: str_of(&meta, "xesam:title").unwrap_or_default(),
+                    artist: artists_of(&meta),
+                    duration: meta
+                        .get("mpris:length")
+                        .and_then(|v| micros_of(v))
+                        .filter(|n| *n > 0)
+                        .map(|us| Duration::from_micros(us as u64)),
+                    is_current,
+                }
+            })
+            .collect())
+    }
+
+    async fn play_queue_item(&self, id: &str) -> Result<(), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        let path = OwnedObjectPath::try_from(id).map_err(|e| MediaError::Backend(e.to_string()))?;
+        // TrackList.GoTo(TrackId: o)
+        self.conn
+            .call_method(
+                Some(bus.as_str()),
+                MPRIS_PATH,
+                Some(TRACKLIST_IFACE),
+                "GoTo",
+                &(path,),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| MediaError::Backend(e.to_string()))
+    }
+
+    async fn toggle_fullscreen(&self) -> Result<(), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        // Root MediaPlayer2.Fullscreen (writable when CanSetFullscreen); read the
+        // current value and set its inverse so the op is a self-contained toggle.
+        let proxy = self.props_proxy(&bus).await?;
+        let iface =
+            InterfaceName::try_from(ROOT_IFACE).map_err(|e| MediaError::Backend(e.to_string()))?;
+        let cur = proxy
+            .get(iface.clone(), "Fullscreen")
+            .await
+            .ok()
+            .and_then(|v| bool::try_from(v).ok())
+            .unwrap_or(false);
+        proxy
+            .set(iface, "Fullscreen", Value::Bool(!cur))
+            .await
+            .map_err(|e| MediaError::Backend(e.to_string()))
+    }
+
     fn caps(&self) -> MediaCaps {
         MediaCaps {
             shuffle: true,
@@ -272,6 +428,12 @@ impl MediaBackend for MprisZbus {
             volume: true,
             playlists: true,
             signals: true,
+            seek: true,
+            art: true,
+            queue: true,
+            abs_volume: true,
+            chapters: false,
+            fullscreen: true,
         }
     }
 }
@@ -376,6 +538,25 @@ fn str_of(map: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
     }
 }
 
+/// Read an object-path value (e.g. `mpris:trackid`) as its string form.
+fn objpath_of(map: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
+    match peel(map.get(key)?) {
+        Value::ObjectPath(p) => Some(p.as_str().to_string()),
+        _ => None,
+    }
+}
+
+/// The current track's id (`mpris:trackid`) from a `Player` property map, whether
+/// the player sends it as an object path or a bare string. Reads through the
+/// nested `Metadata` dict.
+fn trackid_of(props: &HashMap<String, OwnedValue>) -> Option<String> {
+    let meta: HashMap<String, OwnedValue> = props
+        .get("Metadata")
+        .and_then(|v| peel(v).try_to_owned().ok())
+        .and_then(|owned| HashMap::try_from(owned).ok())?;
+    objpath_of(&meta, "mpris:trackid").or_else(|| str_of(&meta, "mpris:trackid"))
+}
+
 fn bool_of(map: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
     match peel(map.get(key)?) {
         Value::Bool(b) => Some(*b),
@@ -454,6 +635,8 @@ fn parse_state(player: &str, props: &HashMap<String, OwnedValue>) -> MediaState 
         .filter(|n| *n >= 0)
         .map(|us| Duration::from_micros(us as u64));
 
+    let url = str_of(&meta, "xesam:url");
+    let mime = str_of(&meta, "mpris:mime"); // rare, but honored when present
     MediaState {
         player: player.to_string(),
         title: str_of(&meta, "xesam:title").unwrap_or_default(),
@@ -467,6 +650,10 @@ fn parse_state(player: &str, props: &HashMap<String, OwnedValue>) -> MediaState 
         volume: f64_of(props, "Volume").map(|v| (v * 100.0).round().clamp(0.0, 100.0) as u8),
         can_go_next: bool_of(props, "CanGoNext").unwrap_or(true),
         can_go_previous: bool_of(props, "CanGoPrevious").unwrap_or(true),
+        art_url: str_of(&meta, "mpris:artUrl").filter(|s| !s.is_empty()),
+        kind: MediaKind::from_hints(player, mime.as_deref(), url.as_deref()),
+        can_seek: bool_of(props, "CanSeek").unwrap_or(false),
+        track_id: objpath_of(&meta, "mpris:trackid").or_else(|| str_of(&meta, "mpris:trackid")),
     }
 }
 

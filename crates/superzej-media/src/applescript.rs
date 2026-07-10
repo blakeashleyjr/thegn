@@ -121,6 +121,27 @@ impl MediaBackend for AppleScript {
         Ok(())
     }
 
+    async fn seek(&self, offset: std::time::Duration, forward: bool) -> Result<(), MediaError> {
+        // `player position` is in seconds on both apps; nudge relative to it.
+        let step = offset.as_secs_f64() * if forward { 1.0 } else { -1.0 };
+        let body = format!(
+            "set p to (player position) + {step}\nif p < 0 then set p to 0\nset player position to p"
+        );
+        self.control(&body, &body).await
+    }
+    async fn set_position(
+        &self,
+        pos: std::time::Duration,
+        _track_id: Option<&str>,
+    ) -> Result<(), MediaError> {
+        let body = format!("set player position to {}", pos.as_secs_f64());
+        self.control(&body, &body).await
+    }
+    async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
+        let body = format!("set sound volume to {}", level.min(100));
+        self.control(&body, &body).await
+    }
+
     fn caps(&self) -> MediaCaps {
         MediaCaps {
             shuffle: true,
@@ -128,6 +149,12 @@ impl MediaBackend for AppleScript {
             volume: true,
             playlists: false,
             signals: false, // host polls on [media] poll_interval_secs
+            seek: true,
+            art: false,
+            queue: false,
+            abs_volume: true,
+            chapters: false,
+            fullscreen: false,
         }
     }
 }

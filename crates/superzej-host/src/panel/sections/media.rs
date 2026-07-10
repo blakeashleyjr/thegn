@@ -2,7 +2,7 @@
 //! and the transport/shuffle/loop/volume state of the controlled player. Hidden
 //! unless `[media] enabled`; empty when nothing is loaded.
 
-use superzej_core::media::{LoopMode, PlaybackState};
+use superzej_core::media::{LoopMode, MediaKind, PlaybackState};
 use superzej_core::theme::Hue;
 
 use crate::seg::{Line, seg, sp};
@@ -18,11 +18,15 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     let Some(m) = &ctx.model.panel.media else {
         rows.push(PanelRow::plain(Line::segs(vec![seg(g(), "no player")])));
-        rows.push(hint_row(&[("⏯", "play/pause"), ("⏭", "next")]));
+        rows.push(hint_row(&[
+            ("⏯", "play/pause"),
+            ("⏭", "next"),
+            ("↵", "panel"),
+        ]));
         if ctx.deep() {
             rows.push(PanelRow::plain(Line::segs(vec![seg(
                 g2(),
-                "start a player (Spotify, mpv, VLC…); Alt-m drives transport".to_string(),
+                "start a player (Spotify, mpv, VLC…); Alt-m ↵ opens the control panel".to_string(),
             )])));
         }
         return rows;
@@ -92,18 +96,33 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         rows.push(PanelRow::plain(Line::segs(status)));
     }
 
-    rows.push(hint_row(&[
-        ("⏯", "play/pause"),
-        ("⏭", "next"),
-        ("🔀", "shuffle"),
-        ("≡", "playlist"),
-    ]));
+    // Video sources get a dedicated affordance row (chapters + fullscreen).
+    if matches!(m.kind, MediaKind::Video) {
+        rows.push(hint_row(&[("⏮⏭", "chapter"), ("⛶", "fullscreen")]));
+    }
+
+    // Transport hints: seek is offered only when the backend can seek.
+    if m.can_seek {
+        rows.push(hint_row(&[
+            ("⏯", "play/pause"),
+            ("⏪⏩", "seek"),
+            ("↵", "panel"),
+        ]));
+    } else {
+        rows.push(hint_row(&[
+            ("⏯", "play/pause"),
+            ("⏭", "next"),
+            ("↵", "panel"),
+        ]));
+    }
     // Wider tiers add a dim source footer (also makes the three widths distinct).
     if ctx.deep() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(
-            g2(),
-            format!("via {}", m.player),
-        )])));
+        let mut foot = vec![seg(g2(), format!("via {}", m.player))];
+        if matches!(m.kind, MediaKind::Video) {
+            foot.push(seg(g(), "  ·  "));
+            foot.push(seg(hue(Hue::Purple), "video"));
+        }
+        rows.push(PanelRow::plain(Line::segs(foot)));
     }
     rows
 }
