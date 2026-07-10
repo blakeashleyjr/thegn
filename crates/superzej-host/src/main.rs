@@ -77,6 +77,7 @@ mod logotype;
 mod loop_policy;
 mod lsp;
 mod managed_tool;
+mod masthead;
 mod media_watch;
 mod mem;
 mod menu;
