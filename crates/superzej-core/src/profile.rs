@@ -221,9 +221,14 @@ fn try_lock_nb(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>>
         .write(true)
         .truncate(false)
         .open(path)?;
-    // SAFETY: plain flock(2) on a live fd we own; LOCK_NB never blocks.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 { Ok(Some(file)) } else { Ok(None) }
+    match nix::fcntl::flock(
+        file.as_raw_fd(),
+        nix::fcntl::FlockArg::LockExclusiveNonblock,
+    ) {
+        Ok(()) => Ok(Some(file)),
+        Err(nix::errno::Errno::EWOULDBLOCK) => Ok(None),
+        Err(e) => Err(std::io::Error::from_raw_os_error(e as i32)),
+    }
 }
 
 /// The active profile's singleton lock file (`<root>/run/szhost.lock`),

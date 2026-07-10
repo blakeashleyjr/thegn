@@ -29,9 +29,18 @@ mod imp {
 
     /// Install the SIGUSR2 handler. Called once at startup under the feature.
     pub fn install() {
-        // SAFETY: registering a signal handler that only does a relaxed store.
+        use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+        // SAFETY: handler only does a relaxed atomic store (async-signal-safe).
         unsafe {
-            libc::signal(libc::SIGUSR2, on_sigusr2 as *const () as libc::sighandler_t);
+            sigaction(
+                Signal::SIGUSR2,
+                &SigAction::new(
+                    SigHandler::Handler(on_sigusr2),
+                    SaFlags::empty(),
+                    SigSet::empty(),
+                ),
+            )
+            .ok();
         }
         tracing::info!(
             target: "szhost::startup",

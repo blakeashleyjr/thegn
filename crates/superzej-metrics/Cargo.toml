@@ -15,7 +15,7 @@ sysinfo.workspace = true
 
 # statvfs for the unix disk-free fast path.
 [target.'cfg(unix)'.dependencies]
-libc.workspace = true
+nix.workspace = true
 
 # Battery on non-Linux (Linux uses our own sysfs reader in battery.rs).
 [target.'cfg(not(target_os = "linux"))'.dependencies]

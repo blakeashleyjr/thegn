@@ -38,7 +38,7 @@ pub use unix::probe_outer_terminal;
 
 #[cfg(unix)]
 mod unix {
-    use std::io::{Read as _, Write as _};
+    use std::io::{IsTerminal as _, Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
     use std::time::{Duration, Instant};
 
@@ -48,11 +48,6 @@ mod unix {
     /// and falling back to env detection. Kept well under the launch budget;
     /// overridable via `SUPERZEJ_PROBE_MS` (0 disables the probe entirely).
     const PROBE_BUDGET: Duration = Duration::from_millis(80);
-
-    fn is_tty(fd: i32) -> bool {
-        // SAFETY: isatty is a pure query on a file descriptor.
-        unsafe { libc::isatty(fd) == 1 }
-    }
 
     fn budget() -> Option<Duration> {
         match std::env::var("SUPERZEJ_PROBE_MS") {
@@ -72,8 +67,7 @@ mod unix {
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
         let in_fd = stdin.as_raw_fd();
-        let out_fd = stdout.as_raw_fd();
-        if !is_tty(in_fd) || !is_tty(out_fd) {
+        if !stdin.is_terminal() || !stdout.is_terminal() {
             return None;
         }
         let deadline_budget = budget()?;
