@@ -33,10 +33,11 @@ impl Drop for ProxyHandle {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
         if let Some(pid) = *self.shared.pid.lock().unwrap() {
-            // SAFETY: sending a signal to a pid we spawned; harmless if already gone.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            )
+            .ok();
         }
     }
 }

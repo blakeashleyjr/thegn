@@ -988,31 +988,22 @@ fn redirect_stderr_to_logfile() -> Option<StderrGuard> {
         .append(true)
         .open(dir.join("szhost-stderr.log"))
         .ok()?;
-    // SAFETY: dup/dup2 on live fds; the guard restores fd 2 before close.
-    unsafe {
-        let saved = libc::dup(2);
-        if saved < 0 {
-            return None;
-        }
-        if libc::dup2(file.as_raw_fd(), 2) < 0 {
-            libc::close(saved);
-            return None;
-        }
-        Some(StderrGuard { saved })
+    let saved = nix::unistd::dup(2).ok()?;
+    if nix::unistd::dup2(file.as_raw_fd(), 2).is_err() {
+        nix::unistd::close(saved).ok();
+        return None;
     }
+    Some(StderrGuard { saved })
 }
 
 struct StderrGuard {
-    saved: i32,
+    saved: std::os::unix::io::RawFd,
 }
 
 impl Drop for StderrGuard {
     fn drop(&mut self) {
-        // SAFETY: `saved` is the dup of the original stderr taken at startup.
-        unsafe {
-            libc::dup2(self.saved, 2);
-            libc::close(self.saved);
-        }
+        nix::unistd::dup2(self.saved, 2).ok();
+        nix::unistd::close(self.saved).ok();
     }
 }
 
@@ -12327,8 +12318,14 @@ async fn event_loop<T: Terminal>(
                         None
                     };
                     if let Some(target) = target {
-                        if ensure_app_loaded(&mut app_host, target, &app_tx, &waker, &current_config)
-                            .await
+                        if ensure_app_loaded(
+                            &mut app_host,
+                            target,
+                            &app_tx,
+                            &waker,
+                            &current_config,
+                        )
+                        .await
                         {
                             app_host.active = target;
                             dirty = true;

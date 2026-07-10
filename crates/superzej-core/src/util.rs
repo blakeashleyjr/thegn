@@ -556,9 +556,8 @@ pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
         .truncate(false)
         .open(&path)
         .ok()?;
-    // SAFETY: a plain flock(2) on a live fd we own; LOCK_EX blocks until granted.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    (rc == 0).then_some(GitLock(file))
+    nix::fcntl::flock(file.as_raw_fd(), nix::fcntl::FlockArg::LockExclusive).ok()?;
+    Some(GitLock(file))
 }
 
 #[cfg(windows)]
@@ -582,8 +581,7 @@ pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
 impl Drop for GitLock {
     fn drop(&mut self) {
         use std::os::unix::io::AsRawFd;
-        // SAFETY: same fd we locked; explicit unlock (close would also release).
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        nix::fcntl::flock(self.0.as_raw_fd(), nix::fcntl::FlockArg::Unlock).ok();
     }
 }
 
