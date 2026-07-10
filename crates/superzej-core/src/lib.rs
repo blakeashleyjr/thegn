@@ -115,6 +115,7 @@ pub mod repo;
 pub mod repo_trust;
 pub mod revtunnel;
 pub mod sandbox;
+pub mod sandbox_backend;
 pub mod sandbox_mounts;
 pub mod sandbox_prefetch;
 pub mod sandbox_preflight;
