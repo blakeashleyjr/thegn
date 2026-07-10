@@ -441,7 +441,12 @@ pub fn prepare_sandbox_env(
             if let Err(e) = attach_vpn(&mut spec) {
                 anyhow::bail!("sandbox vpn attach failed for {worktree}: {e}");
             }
-            match sandbox::ensure(&spec) {
+            // `ensure` proves the container RUNNING, but not that OCI `exec` works
+            // (broken keep-id/crun); probe so the real error surfaces, not a vanish.
+            match sandbox::ensure(&spec).and_then(|()| {
+                superzej_core::sandbox_preflight::preflight_exec(&spec)
+                    .map_err(|e| anyhow::anyhow!("exec probe failed: {e}"))
+            }) {
                 Ok(()) => {
                     return Ok(SandboxOutcome {
                         backend_label: spec.backend.label().to_string(),
@@ -453,18 +458,13 @@ pub fn prepare_sandbox_env(
                         location,
                     });
                 }
-                Err(e) if explicit_choice => {
-                    anyhow::bail!(
-                        "sandbox {} failed for {worktree}: {e}",
-                        spec.backend.label()
-                    );
-                }
                 Err(e) => {
-                    warnings.push(format!("sandbox {} failed: {e}", spec.backend.label()));
-                    superzej_core::msg::warn(&format!(
-                        "sandbox {} failed for {worktree}: {e}; trying next backend",
-                        spec.backend.label()
-                    ));
+                    let m = format!("sandbox {} failed: {e}", spec.backend.label());
+                    if explicit_choice {
+                        anyhow::bail!("{m} for {worktree}")
+                    }
+                    superzej_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
+                    warnings.push(m);
                 }
             }
         } else if candidate.backend == superzej_core::config::SandboxBackend::None {
