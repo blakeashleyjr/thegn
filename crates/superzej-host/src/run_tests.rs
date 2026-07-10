@@ -731,7 +731,10 @@ fn center_context_hints_include_close_tab_and_split_controls() {
     let hints = context_hints(&focus, &panel, &cfg);
 
     let has = |c: &str, l: &str| hints.iter().any(|(hc, hl)| hc == c && hl == l);
+    // Smart close on `Alt x`; worktree-removal escalates to `Alt X` (distinct
+    // hint so both surface in the context bar).
     assert!(has("Alt x", "close"), "hints were {hints:?}");
+    assert!(has("Alt X", "del wt"), "hints were {hints:?}");
     assert!(has("Alt n", "split↓"), "hints were {hints:?}");
     assert!(has("Alt N", "split→"), "hints were {hints:?}");
 }
@@ -739,8 +742,7 @@ fn center_context_hints_include_close_tab_and_split_controls() {
 #[test]
 fn center_context_hints_follow_keybind_overrides() {
     let mut cfg = superzej_core::config::Config::default();
-    cfg.keybinds
-        .insert("close-worktree".into(), "Ctrl Alt x".into());
+    cfg.keybinds.insert("close".into(), "Ctrl Alt x".into());
     let focus = crate::focus::FocusState::default();
     let panel = crate::panel::PanelUi::default();
     let hints = context_hints(&focus, &panel, &cfg);

@@ -13,6 +13,9 @@ pub struct McpRouter {
     /// Host-injected forge (PR/CI) + git-write provider. When set, the forge house
     /// tools are advertised + serviced against `worktree`.
     forge: Option<Arc<dyn crate::mcp::HouseForge>>,
+    /// Host-injected merge-queue provider. When set, the `merge_add`/`merge_clear`/
+    /// `merge_list` house tools are advertised + serviced against `worktree`.
+    merge: Option<Arc<dyn crate::mcp::HouseMerge>>,
     /// The connection's worktree (the git/forge tools operate here; the agent
     /// doesn't pass a path, so it can't reach other worktrees).
     worktree: Option<String>,
@@ -25,6 +28,7 @@ impl McpRouter {
             bus,
             git: None,
             forge: None,
+            merge: None,
             worktree: None,
         }
     }
@@ -41,6 +45,14 @@ impl McpRouter {
     /// enabling `pr_status`/`pr_list`/`ci_runs`/`create_branch`/`commit`.
     pub fn with_forge(mut self, forge: Arc<dyn crate::mcp::HouseForge>, worktree: String) -> Self {
         self.forge = Some(forge);
+        self.worktree = Some(worktree);
+        self
+    }
+
+    /// Attach the host's merge-queue provider scoped to `worktree`, enabling the
+    /// `merge_add`/`merge_clear`/`merge_list` house tools.
+    pub fn with_merge(mut self, merge: Arc<dyn crate::mcp::HouseMerge>, worktree: String) -> Self {
+        self.merge = Some(merge);
         self.worktree = Some(worktree);
         self
     }
@@ -133,6 +145,17 @@ impl McpRouter {
                     "inputSchema": { "type": "object", "properties": { "name": { "type": "string" }, "base": { "type": "string" } }, "required": ["name"] } }),
                 json!({ "name": "commit", "description": "Commit staged changes in this worktree with a message.",
                     "inputSchema": { "type": "object", "properties": { "message": { "type": "string" } }, "required": ["message"] } }),
+            ]);
+        }
+        // Merge-queue house tools — no args; scoped to the connection's repo.
+        if self.merge.is_some() {
+            tools.extend([
+                json!({ "name": "merge_add", "description": "Add this worktree's current branch to superzej's local merge queue.",
+                    "inputSchema": { "type": "object", "properties": {} } }),
+                json!({ "name": "merge_clear", "description": "Clear superzej's merge queue for this repo.",
+                    "inputSchema": { "type": "object", "properties": {} } }),
+                json!({ "name": "merge_list", "description": "Show superzej's merge queue for this repo.",
+                    "inputSchema": { "type": "object", "properties": {} } }),
             ]);
         }
         let base = json!([
@@ -251,6 +274,30 @@ impl McpRouter {
         })
     }
 
+    /// Dispatch the merge-queue house tools against the connection worktree/repo.
+    /// Returns `None` when `name` isn't one of them.
+    fn merge_tool(&self, name: &str) -> Option<Result<serde_json::Value, (i32, String)>> {
+        if !matches!(name, "merge_add" | "merge_clear" | "merge_list") {
+            return None;
+        }
+        let (Some(merge), Some(wt)) = (self.merge.as_ref(), self.worktree.as_deref()) else {
+            return Some(Err((
+                -32603,
+                "merge-queue provider not configured".to_string(),
+            )));
+        };
+        let res = match name {
+            "merge_add" => merge.add(wt),
+            "merge_clear" => merge.clear(wt),
+            "merge_list" => merge.list(wt),
+            _ => unreachable!(),
+        };
+        Some(match res {
+            Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
+            Err(e) => Err((-32603, e)),
+        })
+    }
+
     fn handle_tools_call(
         &self,
         params: &serde_json::Value,
@@ -264,6 +311,10 @@ impl McpRouter {
         }
         // Forge / git-write house tools (take args).
         if let Some(out) = self.forge_tool(name, args) {
+            return out;
+        }
+        // Merge-queue house tools — no args; scoped to the connection's repo.
+        if let Some(out) = self.merge_tool(name) {
             return out;
         }
 

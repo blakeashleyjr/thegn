@@ -93,6 +93,11 @@ pub enum Action {
     SplitDown,
     SplitRight,
     CloseSplitPane,
+    /// Smart "close this" (default `Alt+x`): closes the focused pane when the
+    /// active tab is split, otherwise closes the tab. Shift escalates to
+    /// CloseWorktree (`Alt+X`). The explicit `CloseSplitPane` / `CloseTab`
+    /// actions remain available for the palette and for users who rebind them.
+    Close,
     FocusLeft,
     FocusRight,
     FocusUp,
@@ -360,6 +365,7 @@ impl Action {
             Action::SplitDown => "split-down",
             Action::SplitRight => "split-right",
             Action::CloseSplitPane => "close-pane",
+            Action::Close => "close",
             Action::FocusLeft => "focus-left",
             Action::FocusRight => "focus-right",
             Action::FocusUp => "focus-up",
@@ -464,6 +470,7 @@ impl Action {
             "split-down" | "new-panel-native" => Action::SplitDown,
             "split-right" | "new-panel" => Action::SplitRight,
             "close-pane" => Action::CloseSplitPane,
+            "close" => Action::Close,
             "focus-left" => Action::FocusLeft,
             "focus-right" => Action::FocusRight,
             "focus-up" => Action::FocusUp,
@@ -942,6 +949,24 @@ fn parse_chord(s: &str) -> Result<Vec<Key>, String> {
     Ok(out)
 }
 
+/// The default keymap follows a four-rule modifier grammar so every chord is
+/// predictable from its modifiers alone:
+///
+///   1. **Ctrl = focus movement only** (the spatial sidebar↔panes↔panel graph)
+///      plus a few universal singletons (`Ctrl+Space` palette, `Ctrl+q` quit,
+///      `Ctrl+g` key-lock, `Ctrl+/` search, `Ctrl+<digit>` workspace jump).
+///      Ctrl never creates or destroys an object — so `Ctrl+<letter>` stays
+///      free for the shell (e.g. `Ctrl+w` delete-word).
+///   2. **Alt = object lifecycle + tools.** Create = `Alt+<letter>`;
+///      `Alt+<digit>` jumps to a worktree; `Alt+<tool>` launches a tool.
+///   3. **Alt+Shift = one level up from the Alt action** (worktree→workspace,
+///      worktree-nav→workspace-nav, close-this→close-worktree). The lone
+///      exception is the pane-split direction pair `Alt+n`/`Alt+N`.
+///   4. **Ctrl+Alt = chrome / UI toggles & meta** (sidebar, panel, drawer,
+///      zoom, theme, recorder, notifications, pins, mode switches).
+///
+/// A regression test locks rule 1 (no default `Ctrl+<letter>` maps to a
+/// create/close action); see `crates/superzej-core/src/keymap.rs`.
 pub fn default_keymap() -> KeyMap {
     let mut map = KeyMap::new();
     // Global defaults: work in every host mode, so Vim/Emacs modes never trap
@@ -963,7 +988,9 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt o", Action::ToggleCorner).unwrap();
     map.insert_all("Alt s", Action::FocusSidebar).unwrap();
     map.insert_all("Alt .", Action::FocusPanel).unwrap();
-    map.insert_all("Alt i", Action::ToggleNotifications)
+    // Notifications is a chrome toggle, so it lives in the Ctrl+Alt layer
+    // (rule 4) alongside the other toggles, not on a bare Alt key.
+    map.insert_all("Ctrl Alt i", Action::ToggleNotifications)
         .unwrap();
     map.insert_all("Alt Shift S", Action::ShareWorktreePort)
         .unwrap();
@@ -976,7 +1003,12 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt e", Action::SwitchMode(Mode::Emacs))
         .unwrap();
 
-    map.insert_all("Ctrl w", Action::NewWorktree).unwrap();
+    // Object lifecycle (rule 2/3): create = Alt+<letter>, Shift = up-a-level.
+    // Worktree `Alt w` → its parent workspace `Alt W`; tab `Alt t` → the plain
+    // terminal-tab variant `Alt T`. New-worktree used to live on `Ctrl w`, but
+    // that both violated "Ctrl = focus only" and stole delete-word from every
+    // shell — it now sits with the rest of the create family on Alt.
+    map.insert_all("Alt w", Action::NewWorktree).unwrap();
     map.insert_all("Alt W", Action::NewWorkspace).unwrap();
     // NB: `Alt X` / `Space X` bind close-worktree below; delete-workspace has no
     // default chord (palette-driven + user-bindable) to avoid shadowing it.
@@ -988,21 +1020,27 @@ pub fn default_keymap() -> KeyMap {
         .unwrap();
     map.insert_all("Ctrl Alt t", Action::CycleTheme).unwrap();
     map.insert_all("Alt f", Action::SwitchFont).unwrap();
-    map.insert_all("Alt F", Action::SwitchFont).unwrap();
-    map.insert_all("Alt x", Action::CloseTab).unwrap();
+    // Close (rule 3): `Alt x` is one smart "close this" — pane if the tab is
+    // split, else the tab; Shift escalates to worktree removal (`Alt X`). This
+    // folds the old separate pane-close (`Alt w`) and tab-close together, and
+    // frees `Alt w` for new-worktree above.
+    map.insert_all("Alt x", Action::Close).unwrap();
     map.insert_all("Alt X", Action::CloseWorktree).unwrap();
     map.insert_all("Alt o", Action::SwitchWorkspace).unwrap();
+    // Pane-create variants: `Alt p` smart-splits; `Alt n`/`Alt N` force the
+    // direction (down/right). Shift-as-direction is a sanctioned local
+    // sub-grammar of the pane-create family — the only place Shift means
+    // "direction" rather than "up-a-level".
     map.insert_all("Alt n", Action::SplitDown).unwrap();
     map.insert_all("Alt N", Action::SplitRight).unwrap();
-    map.insert_all("Alt w", Action::CloseSplitPane).unwrap();
     map.insert_all("Alt g", Action::Lazygit).unwrap();
     map.insert_all("Alt y", Action::Yazi).unwrap();
     map.insert_all("Alt e", Action::Editor).unwrap();
     map.insert_all("Alt /", Action::Diff).unwrap();
     map.insert_all("Alt s", Action::FocusSidebar).unwrap();
 
-    // Ctrl owns focus: one spatial graph across sidebar ← panes → panel.
-    // Arrows always work; h/j/k/l mirror them (kitty-protocol terminals
+    // Rule 1 — Ctrl owns focus: one spatial graph across sidebar ← panes →
+    // panel. Arrows always work; h/j/k/l mirror them (kitty-protocol terminals
     // disambiguate; on legacy terminals those keys pass through and the
     // arrows carry the feature). Ctrl+g suspends all of these.
     map.insert_all("Ctrl Left", Action::FocusLeft).unwrap();
@@ -1125,7 +1163,7 @@ pub fn default_keymap() -> KeyMap {
         .unwrap();
     map.insert(Mode::VimNormal, "Space t", Action::NewTab)
         .unwrap();
-    map.insert(Mode::VimNormal, "Space x", Action::CloseTab)
+    map.insert(Mode::VimNormal, "Space x", Action::Close)
         .unwrap();
     map.insert(Mode::VimNormal, "Space X", Action::CloseWorktree)
         .unwrap();
@@ -1410,28 +1448,75 @@ mod tests {
     }
 
     #[test]
-    fn runtime_dispatch_matches_ctrl_w_in_normal_mode() {
+    fn runtime_dispatch_matches_alt_w_in_normal_mode() {
         // The runtime path is keymap.dispatch(mode, Key), NOT map_key. Prove a
-        // parsed Alt+w (what termwiz yields for both legacy ESC-w and kitty
-        // CSI 119;3u) actually triggers NewWorktree through the real matcher.
+        // parsed Alt+w actually triggers NewWorktree through the real matcher —
+        // and that Ctrl+w is NOT bound (it passes through to the pane, e.g. the
+        // shell's delete-word), per the "Ctrl = focus only" grammar rule.
         let mut map = default_keymap();
-        let key = Key::modified(KeyCode::Char('w'), Modifiers::CTRL);
+        let key = Key::modified(KeyCode::Char('w'), Modifiers::ALT);
         assert!(
             matches!(
                 map.dispatch(Mode::Normal, key),
                 crate::sequence::MatchResult::Matched(Action::NewWorktree)
             ),
-            "Ctrl+w must match NewWorktree via the runtime dispatch path"
+            "Alt+w must match NewWorktree via the runtime dispatch path"
+        );
+        let ctrl_w = Key::modified(KeyCode::Char('w'), Modifiers::CTRL);
+        assert!(
+            matches!(
+                map.dispatch(Mode::Normal, ctrl_w),
+                crate::sequence::MatchResult::None
+            ),
+            "Ctrl+w must be unbound so it reaches the pane (shell delete-word)"
         );
     }
 
     #[test]
     fn alt_chords_map_to_lifecycle_actions() {
-        assert_eq!(k('w', Modifiers::ALT), Some(Action::CloseSplitPane));
-        assert_eq!(k('w', Modifiers::CTRL), Some(Action::NewWorktree));
+        // Rule 2/3: create = Alt+<letter>, Shift = up-a-level. `w` is worktree,
+        // `W` its parent workspace; smart `close` sits on `Alt x`, escalating to
+        // worktree-removal on `Alt X`. `Ctrl w` is unbound (shell delete-word).
+        assert_eq!(k('w', Modifiers::ALT), Some(Action::NewWorktree));
+        assert_eq!(k('w', Modifiers::CTRL), None);
         assert_eq!(k('W', Modifiers::ALT), Some(Action::NewWorkspace));
+        assert_eq!(k('x', Modifiers::ALT), Some(Action::Close));
+        assert_eq!(k('X', Modifiers::ALT), Some(Action::CloseWorktree));
         assert_eq!(k('o', Modifiers::ALT), Some(Action::SwitchWorkspace));
         assert_eq!(k('t', Modifiers::ALT), Some(Action::NewTab));
+    }
+
+    #[test]
+    fn ctrl_letter_is_never_object_crud() {
+        // Grammar rule 1: Ctrl owns focus only — no default `Ctrl+<letter>`
+        // creates or destroys an object, so those chords stay free for the pane
+        // (e.g. `Ctrl w` = shell delete-word). Locks the invariant against
+        // regressions like the old `Ctrl w` = new-worktree binding.
+        let is_crud = |a: &Action| {
+            matches!(
+                a,
+                Action::NewWorktree
+                    | Action::NewWorkspace
+                    | Action::DeleteWorkspace
+                    | Action::NewTab
+                    | Action::NewTerminal
+                    | Action::NewPane
+                    | Action::SplitDown
+                    | Action::SplitRight
+                    | Action::Close
+                    | Action::CloseTab
+                    | Action::CloseWorktree
+                    | Action::CloseSplitPane
+            )
+        };
+        for c in ('a'..='z').chain('A'..='Z') {
+            if let Some(a) = k(c, Modifiers::CTRL) {
+                assert!(
+                    !is_crud(&a),
+                    "Ctrl+{c} maps to object CRUD ({a:?}); rule 1 forbids it"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1618,20 +1703,32 @@ mod tests {
         assert_eq!(Action::from_key("font"), Some(Action::SwitchFont));
         assert_eq!(
             action_spec("switch-font").unwrap().default_chords,
-            &["Alt f", "Alt F"]
+            &["Alt f"]
         );
         assert_eq!(k('f', Modifiers::ALT), Some(Action::SwitchFont));
-        assert_eq!(k('F', Modifiers::ALT), Some(Action::SwitchFont));
+        // The redundant `Alt F` alias was dropped.
+        assert_eq!(k('F', Modifiers::ALT), None);
     }
 
     #[test]
-    fn close_tab_is_lowercase_alt_x_and_close_worktree_is_shift_alt_x() {
-        assert_eq!(action_spec("close-tab").unwrap().default_chords, &["Alt x"]);
+    fn smart_close_is_lowercase_alt_x_and_close_worktree_is_shift_alt_x() {
+        // `Alt x` is the smart `close` (pane-or-tab); `close-tab`/`close-pane`
+        // keep no default chord (explicit + rebindable). `Alt X` escalates to
+        // worktree removal.
+        assert_eq!(action_spec("close").unwrap().default_chords, &["Alt x"]);
+        assert_eq!(
+            action_spec("close-tab").unwrap().default_chords,
+            &[] as &[&str]
+        );
+        assert_eq!(
+            action_spec("close-pane").unwrap().default_chords,
+            &[] as &[&str]
+        );
         assert_eq!(
             action_spec("close-worktree").unwrap().default_chords,
             &["Alt X"]
         );
-        assert_eq!(k('x', Modifiers::ALT), Some(Action::CloseTab));
+        assert_eq!(k('x', Modifiers::ALT), Some(Action::Close));
         assert_eq!(k('X', Modifiers::ALT), Some(Action::CloseWorktree));
     }
 
@@ -1724,14 +1821,15 @@ mod tests {
         );
         let spec = action_spec("toggle-notifications").expect("spec registered");
         assert!(spec.palette, "must appear in the command palette");
-        assert_eq!(spec.default_chords, &["Alt i"]);
-        // The default keymap must actually BIND Alt+i (default_chords is only
-        // metadata; the binding is a separate explicit insert).
+        assert_eq!(spec.default_chords, &["Ctrl Alt i"]);
+        // The default keymap must actually BIND Ctrl+Alt+i (default_chords is
+        // only metadata; the binding is a separate explicit insert). It lives in
+        // the Ctrl+Alt toggle layer (rule 4), not on a bare Alt key.
         let mut map = default_keymap();
         assert_eq!(
             map.dispatch(
                 Mode::Normal,
-                Key::modified(KeyCode::Char('i'), Modifiers::ALT)
+                Key::modified(KeyCode::Char('i'), Modifiers::CTRL | Modifiers::ALT)
             ),
             MatchResult::Matched(Action::ToggleNotifications)
         );
@@ -1882,7 +1980,7 @@ mod tests {
                 Mode::Normal,
                 Key::modified(KeyCode::Char('w'), Modifiers::ALT)
             ),
-            MatchResult::Matched(Action::CloseSplitPane)
+            MatchResult::Matched(Action::NewWorktree)
         );
         assert_eq!(
             map.dispatch(Mode::VimNormal, Key::char('j')),

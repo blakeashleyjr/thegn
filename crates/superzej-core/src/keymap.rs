@@ -291,7 +291,7 @@ macro_rules! run_float {
 pub const BUILTINS: &[Action] = &[
     Action {
         id: "new-worktree",
-        chords: &["Ctrl w"],
+        chords: &["Alt w"],
         menu_label: "New worktree — branch off the base",
         hint: "worktree",
         invocation: run_float!("new-worktree"),
@@ -301,10 +301,24 @@ pub const BUILTINS: &[Action] = &[
         menu: true,
     },
     Action {
-        id: "close-worktree",
+        // Smart "close this": pane if the tab is split, else the tab. Shift
+        // escalates to close-worktree (`Alt X`). This is the default `Alt x`
+        // binding; the explicit `close-tab` action below has no default chord.
+        id: "close",
         chords: &["Alt x"],
-        menu_label: "Close worktree (+ its tab)",
+        menu_label: "Close (pane or tab)",
         hint: "close",
+        invocation: Invocation::Native { body: "Close;" },
+        scope: Scope::Shared,
+        contexts: &[Context::Global],
+        priority: 100,
+        menu: true,
+    },
+    Action {
+        id: "close-worktree",
+        chords: &["Alt X"],
+        menu_label: "Close worktree (+ its tab)",
+        hint: "del wt",
         invocation: run_float!("close-worktree"),
         scope: Scope::Shared,
         contexts: &[Context::Global],
@@ -544,8 +558,11 @@ pub const BUILTINS: &[Action] = &[
         menu: false,
     },
     Action {
+        // No default chord: `Alt x` is the smart `close` action above. Kept as
+        // an explicit, rebindable action for users who want "close the tab
+        // specifically" regardless of pane splits.
         id: "close-tab",
-        chords: &["Alt X"],
+        chords: &[],
         menu_label: "Close tab",
         hint: "tabs",
         invocation: Invocation::Native { body: "CloseTab;" },
@@ -1155,7 +1172,7 @@ mod tests {
         // A floating Run is emitted MULTI-LINE (zellij KDL rejects an inline
         // nested block); check the head line + its child options.
         assert!(kdl.contains(
-            "        bind \"Ctrl w\" {\n            Run \"superzej\" \"new-worktree\" {\n"
+            "        bind \"Alt w\" {\n            Run \"superzej\" \"new-worktree\" {\n"
         ));
         assert!(kdl.contains("                floating true\n"));
         assert!(kdl.contains("                close_on_exit true\n"));
@@ -1438,7 +1455,7 @@ mod tests {
         let acts = effective(&cfg);
         let nw = acts.iter().find(|a| a.id == "new-worktree").unwrap();
         // The bad rebind is rejected; the builtin default chord is kept.
-        assert_eq!(nw.chords[0].to_kdl(), "Ctrl w");
+        assert_eq!(nw.chords[0].to_kdl(), "Alt w");
     }
 
     #[test]

@@ -393,6 +393,18 @@ format = "text"           # text | json
 # - Emacs: `Ctrl x` / `Ctrl g` layer.
 # Switch modes: `Ctrl Alt n` (Normal), `Ctrl Alt v` (VimNormal), `Ctrl Alt e` (Emacs).
 #
+# Normal-mode defaults follow one modifier grammar, so a chord is predictable
+# from its modifiers (rebinds below can break it, but the defaults hold to it):
+#   Ctrl     — focus movement only; never creates/destroys an object, so
+#              `Ctrl w` stays free for the shell (delete-word).
+#   Alt      — object lifecycle + tools; create = `Alt <letter>`
+#              (`Alt w` worktree, `Alt t` tab, `Alt p` pane).
+#   Alt+Shift— one level up (`Alt w`→`Alt W` workspace; smart-close `Alt x`
+#              → `Alt X` remove-worktree).
+#   Ctrl+Alt — chrome/UI toggles (sidebar, panel, zoom, theme, notifications…).
+# `Alt x` is a smart "close this": the focused pane if the tab is split, else
+# the tab. `close-tab` / `close-pane` are explicit, rebindable, no default chord.
+#
 # Rebind a built-in by its id (see `superzej keys list` for ids).
 # Flat entries override chords globally.
 # IDE keymap preset overlaid on the built-in defaults: "default" (none),
@@ -403,7 +415,7 @@ format = "text"           # text | json
 # keymap_preset = "vscode"
 
 [keybinds]
-# new-worktree = "Ctrl w"
+# new-worktree = "Alt w"
 # toggle-sidebar = "Alt s"
 # switch-font = "Alt f"  # opens the realtime font picker (alacritty profile)
 # attention-next = "Alt a"  # jump to the next worktree that needs you (default)
@@ -544,7 +556,7 @@ format = "text"           # text | json
 # above [keybinds] but below a repo-root `.superzej.{toml,yaml,json}` overlay,
 # which may also carry its own [keybinds] table — the most specific layer wins.
 # [workspace.my-repo.keybinds]
-# new-worktree = "Ctrl w"
+# new-worktree = "Alt w"
 
 # Per-program host-action overlays, keyed by the focused pane's program name.
 # These intercept *before* the active mode — useful for binding a host action
