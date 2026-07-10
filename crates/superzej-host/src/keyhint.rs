@@ -47,7 +47,11 @@ pub fn cheatsheet_groups(cfg: &superzej_core::config::Config) -> Vec<HintGroup> 
             label: a.menu_label.clone(),
         };
         let bucket = match a.id.as_str() {
-            id if id.starts_with("new-") || id == "close-worktree" || id == "quit" => {
+            id if id.starts_with("new-")
+                || id == "close"
+                || id == "close-worktree"
+                || id == "quit" =>
+            {
                 &mut lifecycle
             }
             id if id.starts_with("focus-")
