@@ -17223,13 +17223,13 @@ async fn event_loop<T: Terminal>(
                                         (cur + total - 1) % total
                                     };
                                     match ring[next].clone() {
-                                        RingStop::Workspace { slug, repo_path } => {
-                                            // Landing back on the current workspace
-                                            // (by slug), or on a live fallback (no DB
-                                            // row to switch to): just leave the
-                                            // terminals region for a worktree.
+                                        RingStop::Workspace { slug: _, repo_path } => {
+                                            // Landing back on home or a live fallback (no DB
+                                            // row): path compare, not slug — slug mismatches
+                                            // silently block the top workspace.
                                             let onto_home = repo_path.is_none()
-                                                || Some(slug.as_str()) == home_slug.as_deref();
+                                                || repo_path.as_deref()
+                                                    == Some(session.id.as_str());
                                             if onto_home {
                                                 if let Some(gi) =
                                                     worktree_landing(&session, region_last_w)
