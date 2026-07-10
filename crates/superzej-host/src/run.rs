@@ -18073,79 +18073,48 @@ async fn event_loop<T: Terminal>(
                                 need_relayout = true;
                             }
                             Action::CloseSplitPane => {
-                                // Close the currently focused split pane. If
-                                // this is the only pane in the tab, do nothing
-                                // (can't close the last pane without closing
-                                // the tab/worktree).
-                                let pane_count = session
-                                    .active_tab()
-                                    .map(|t| t.center.pane_ids().len())
-                                    .unwrap_or(0);
-                                if pane_count <= 1 {
-                                    model.status =
-                                        "Only one pane — use Close tab to close the tab".into();
-                                } else {
-                                    let removed = session
-                                        .active_tab_mut()
-                                        .map(|t| t.center.remove(focused))
-                                        .unwrap_or(false);
-                                    if removed {
-                                        panes.table.remove(&focused);
-                                        // Focus whatever is now the first pane.
-                                        if let Some(tab) = session.active_tab_mut()
-                                            && let Some(first) =
-                                                tab.center.pane_ids().first().copied()
-                                        {
-                                            tab.focused_pane = first;
-                                        }
-                                        need_relayout = true;
-                                        persist_session_layout(&mut session, &panes);
-                                    }
-                                }
-                                refresh_tab_model(&mut model, &session, &mut sb);
+                                crate::handlers::close::close_pane(
+                                    &mut crate::handlers::close::CloseCtx {
+                                        session: &mut session,
+                                        panes: &mut panes,
+                                        model: &mut model,
+                                        sb: &mut sb,
+                                        focus: &mut focus,
+                                        need_relayout: &mut need_relayout,
+                                    },
+                                );
                             }
                             Action::CloseTab => {
-                                // Close the active tab only. The final tab is
-                                // the durable surface for its worktree; closing
-                                // a worktree is a separate explicit action
-                                // (CloseWorktree) so CloseTab can never erase a
-                                // home checkout or branch worktree by accident.
-                                if session
-                                    .active_group()
-                                    .map(|g| g.tabs.len() <= 1)
-                                    .unwrap_or(false)
-                                {
-                                    model.status = session
-                                        .active_group()
-                                        .map(|g| {
-                                            if g.kind == crate::session::GroupKind::Home {
-                                                "Cannot close the last tab in the home worktree"
-                                                    .to_string()
-                                            } else {
-                                                format!(
-                                                    "Cannot close the last tab in '{}'; use Close worktree to remove it",
-                                                    g.name
-                                                )
-                                            }
-                                        })
-                                        .unwrap_or_else(|| "No tab to close".into());
+                                if crate::handlers::close::close_tab(
+                                    &mut crate::handlers::close::CloseCtx {
+                                        session: &mut session,
+                                        panes: &mut panes,
+                                        model: &mut model,
+                                        sb: &mut sb,
+                                        focus: &mut focus,
+                                        need_relayout: &mut need_relayout,
+                                    },
+                                ) {
                                     dirty = true;
                                     continue;
                                 }
-                                match session.close_active_tab() {
-                                    crate::session::CloseResult::Tab(tab) => {
-                                        for id in tab.center.pane_ids() {
-                                            panes.table.remove(&id);
-                                        }
-                                    }
-                                    crate::session::CloseResult::Nothing => {}
+                            }
+                            Action::Close => {
+                                // Smart "close this": pane if the tab is split,
+                                // else the tab. Shift escalates to CloseWorktree.
+                                if crate::handlers::close::close_smart(
+                                    &mut crate::handlers::close::CloseCtx {
+                                        session: &mut session,
+                                        panes: &mut panes,
+                                        model: &mut model,
+                                        sb: &mut sb,
+                                        focus: &mut focus,
+                                        need_relayout: &mut need_relayout,
+                                    },
+                                ) {
+                                    dirty = true;
+                                    continue;
                                 }
-                                persist_session_layout(&mut session, &panes);
-                                // Close always lands the user on the center
-                                // terminal of whichever tab is now active.
-                                focus.zone = crate::focus::Zone::Center;
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                need_relayout = true;
                             }
                             Action::CloseWorktree => {
                                 // Remove the active worktree group via the shared

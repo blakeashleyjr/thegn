@@ -2,4 +2,4 @@
 5400 crates/superzej-core/src/config.rs
 3336 crates/superzej-host/src/agent.rs
 3075 crates/superzej-host/src/chrome.rs
-18883 crates/superzej-host/src/run.rs
+18852 crates/superzej-host/src/run.rs
