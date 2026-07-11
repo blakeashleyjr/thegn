@@ -3,20 +3,27 @@
 //! whatever app currently owns the system media session (Spotify, browsers,
 //! Groove, …).
 //!
-//! Poll mode for now (`caps.signals = false`): the host re-snapshots on the
-//! `[media] poll_interval_secs` ticker. A push watcher over
-//! `PlaybackInfoChanged`/`MediaPropertiesChanged` is a future enhancement.
+//! Push mode (`caps.signals = true`): a [`SmtcWatch`] subscribes to the session
+//! manager's `CurrentSessionChanged` and the current session's
+//! `PlaybackInfoChanged`/`MediaPropertiesChanged`, and rebinds to the new session
+//! whenever the active app changes — so the badge updates event-driven (the
+//! ~0%-idle contract) instead of polling.
 //!
 //! All WinRT calls run inside `spawn_blocking` and return plain owned data
 //! (`String`/`bool`/`MediaState`), so no COM object crosses an `.await`. The
 //! pure enum/tick decoding lives in [`crate::smtc_decode`] (Linux-testable).
 
+use std::sync::{Arc, Mutex};
+
+use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
 use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager as Manager;
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSession as Session,
     GlobalSystemMediaTransportControlsSessionManager,
 };
 use windows::Media::MediaPlaybackAutoRepeatMode;
+
+use crate::MediaWatch;
 
 use crate::model::{LoopMode, MediaKind, MediaState};
 use crate::smtc_decode::{
@@ -35,6 +42,15 @@ impl Smtc {
             .await
             .unwrap_or(false);
         ok.then_some(Smtc)
+    }
+
+    /// Subscribe to SMTC session/playback events for push updates. Rebinds to the
+    /// new current session on `CurrentSessionChanged`, so it never freezes when
+    /// the active app changes.
+    pub async fn watch(&self) -> Result<SmtcWatch, MediaError> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let sub = run_blocking(move || subscribe(tx)).await?;
+        Ok(SmtcWatch { _sub: sub, rx })
     }
 
     /// The current session's source app id (SMTC's notion of "player").
@@ -161,7 +177,7 @@ impl MediaBackend for Smtc {
             loop_mode: true,
             volume: false,
             playlists: false,
-            signals: false, // host polls on [media] poll_interval_secs
+            signals: true, // push via CurrentSessionChanged/PlaybackInfoChanged
             seek: true,
             art: false,
             queue: false,
@@ -169,6 +185,114 @@ impl MediaBackend for Smtc {
             chapters: false,
             fullscreen: false,
         }
+    }
+}
+
+// === push watcher ==========================================================
+
+/// The per-session event bindings, swapped out whenever the current session
+/// changes. Tokens are removed on drop / rebind.
+#[derive(Default)]
+struct SessionBind {
+    session: Option<Session>,
+    info_token: Option<EventRegistrationToken>,
+    props_token: Option<EventRegistrationToken>,
+}
+
+impl SessionBind {
+    /// Detach the current session's handlers (best-effort).
+    fn clear(&mut self) {
+        if let Some(sess) = self.session.take() {
+            if let Some(t) = self.info_token.take() {
+                let _ = sess.RemovePlaybackInfoChanged(t);
+            }
+            if let Some(t) = self.props_token.take() {
+                let _ = sess.RemoveMediaPropertiesChanged(t);
+            }
+        }
+    }
+}
+
+/// Live SMTC subscription — kept alive by [`SmtcWatch`]; drop detaches handlers.
+struct Subscription {
+    manager: Manager,
+    session_changed_token: Option<EventRegistrationToken>,
+    bind: Arc<Mutex<SessionBind>>,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some(t) = self.session_changed_token.take() {
+            let _ = self.manager.RemoveCurrentSessionChanged(t);
+        }
+        self.bind.lock().unwrap().clear();
+    }
+}
+
+/// (Re)bind `PlaybackInfoChanged` + `MediaPropertiesChanged` on the manager's
+/// current session, replacing any prior bindings. Each fires `tx`.
+fn rebind(
+    manager: &Manager,
+    bind: &Arc<Mutex<SessionBind>>,
+    tx: &tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    let mut b = bind.lock().unwrap();
+    b.clear();
+    let Ok(session) = manager.GetCurrentSession() else {
+        return;
+    };
+    let tx_info = tx.clone();
+    b.info_token = session
+        .PlaybackInfoChanged(&TypedEventHandler::new(move |_, _| {
+            let _ = tx_info.send(());
+            Ok(())
+        }))
+        .ok();
+    let tx_props = tx.clone();
+    b.props_token = session
+        .MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
+            let _ = tx_props.send(());
+            Ok(())
+        }))
+        .ok();
+    b.session = Some(session);
+}
+
+/// Build the full subscription: bind the current session now, then subscribe to
+/// `CurrentSessionChanged` to rebind + tick on app swaps.
+fn subscribe(tx: tokio::sync::mpsc::UnboundedSender<()>) -> Result<Subscription, MediaError> {
+    let manager = manager().map_err(win_err)?;
+    let bind = Arc::new(Mutex::new(SessionBind::default()));
+    rebind(&manager, &bind, &tx);
+
+    let mgr_for_handler = manager.clone();
+    let bind_for_handler = bind.clone();
+    let session_changed_token = manager
+        .CurrentSessionChanged(&TypedEventHandler::new(move |_, _| {
+            rebind(&mgr_for_handler, &bind_for_handler, &tx);
+            Ok(())
+        }))
+        .map_err(win_err)?;
+
+    Ok(Subscription {
+        manager,
+        session_changed_token: Some(session_changed_token),
+        bind,
+    })
+}
+
+/// A push watcher over SMTC session events. Each `changed()` resolves when the
+/// playback info, media properties, or current session change.
+pub struct SmtcWatch {
+    _sub: Subscription,
+    rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+}
+
+impl MediaWatch for SmtcWatch {
+    fn changed(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move { self.rx.recv().await.is_some() })
     }
 }
 
