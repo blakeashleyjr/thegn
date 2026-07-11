@@ -12,31 +12,34 @@
   stdenv,
   fetchFromGitHub,
   nodejs,
-  pnpm_9,
+  pnpm,
+  pnpmConfigHook,
+  fetchPnpmDeps,
   makeWrapper,
 }:
 stdenv.mkDerivation (finalAttrs: {
   pname = "openspec";
-  version = "1.4.1";
+  version = "1.6.0";
 
   src = fetchFromGitHub {
     owner = "Fission-AI";
     repo = "OpenSpec";
     rev = "v${finalAttrs.version}";
-    hash = "sha256-VZZ/ukjciXqiebwei2JizyOnxx0T3IeoowFWElKec4o=";
+    hash = "sha256-lvg10gpx6tB6eSv5iesqhUQqYqkVuU4hpSVfYy/f3bE=";
   };
 
   nativeBuildInputs = [
     nodejs
-    pnpm_9.configHook
+    pnpm
+    pnpmConfigHook
     makeWrapper
   ];
 
-  # Fixed-output fetch of the full pnpm dependency closure (lockfileVersion 9.0).
-  pnpmDeps = pnpm_9.fetchDeps {
+  # Fixed-output fetch of the full pnpm dependency closure (fetcherVersion 4 = pnpm 11+).
+  pnpmDeps = fetchPnpmDeps {
     inherit (finalAttrs) pname version src;
-    fetcherVersion = 3;
-    hash = "sha256-9s2kdvd7svK4hofnD66HkDc86WTQeayfF5y7L2dmjNg=";
+    fetcherVersion = 4;
+    hash = "sha256-+392kmJ9fWQZW4R7n3sompLirulmA5VfTUWH6IL9MBU=";
   };
 
   # The postinstall script only prints a shell-completions tip; CI=1 +
