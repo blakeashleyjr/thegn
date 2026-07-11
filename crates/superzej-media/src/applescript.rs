@@ -1,7 +1,10 @@
-//! macOS backend driving Music.app + Spotify via `osascript` (AppleScript). The
-//! dependency-light floor: no entitlement, every macOS version (Apple gates the
-//! system-wide MediaRemote *read* path for unsigned binaries on 15.4+, so we
-//! script the two common players directly instead).
+//! macOS **fallback** backend driving Music.app + Spotify via `osascript`
+//! (AppleScript). Universal now-playing (any app, incl. browser tabs) comes from
+//! [`crate::mediaremote`], which `auto` prefers; this per-app floor runs only
+//! when the MediaRemote adapter isn't installed. No entitlement, every macOS
+//! version — it scripts the two reliably-scriptable players directly (broader
+//! apps like VLC/browsers aren't uniformly scriptable, so they're covered by the
+//! MediaRemote path rather than faked here).
 //!
 //! Poll mode (`caps.signals = false`): the host re-snapshots on the
 //! `[media] poll_interval_secs` ticker. The unit-separated read output is folded
