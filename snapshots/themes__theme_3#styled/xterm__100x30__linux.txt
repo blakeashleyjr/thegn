@@ -1,10 +1,11 @@
-L0| ◆ superzej v0.1.0 work     16.2/94G ·   7% ·  51% ·  95°C ·  ↓  993B ↑    0B ·  100% · 22:07
+L0| þ thegn v0.1.0  work       19.0/94G ·   7% ·  35% ·  95°C ·  ↓    5K ↑    9K ·  100% · 02:21
 R0 0 1 fg=#1e222e bg=#e4e7f0 attrs=
 R0 1 2 fg=#6ee7d8 bg=#e4e7f0 attrs=
-R0 3 9 fg=#1e222e bg=#e4e7f0 attrs=
-R0 12 6 fg=#b6bccb bg=#e4e7f0 attrs=
-R0 18 6 fg=#2663b0 bg=#afc2de attrs=BOLD
-R0 24 3 fg=#1e222e bg=#e4e7f0 attrs=
+R0 3 6 fg=#1e222e bg=#e4e7f0 attrs=
+R0 9 6 fg=#b6bccb bg=#e4e7f0 attrs=
+R0 15 1 fg=#1e222e bg=#e4e7f0 attrs=
+R0 16 6 fg=#2663b0 bg=#afc2de attrs=BOLD
+R0 22 5 fg=#1e222e bg=#e4e7f0 attrs=
 R0 27 10 fg=#585f72 bg=#e4e7f0 attrs=
 R0 37 3 fg=#b6bccb bg=#e4e7f0 attrs=
 R0 40 5 fg=#f7768e bg=#e4e7f0 attrs=
@@ -52,12 +53,11 @@ R4 5 4 fg=#1e222e bg=#f5f6fa attrs=BOLD
 R4 9 23 fg=#1e222e bg=#f5f6fa attrs=
 R4 32 24 fg=default bg=#f5f6fa attrs=
 R4 56 44 fg=#dde0e8 bg=#e4e7f0 attrs=
-L5|▐   └ ○ home                                             1 changes                            clean
+L5|▐   └ ● home                                             1 changes                            clean
 R5 0 1 fg=#85a5d0 bg=#d5dae8 attrs=
 R5 1 3 fg=#1e222e bg=#d5dae8 attrs=
 R5 4 2 fg=#ced2dd bg=#d5dae8 attrs=
-R5 6 1 fg=#c23b3b bg=#d5dae8 attrs=
-R5 7 1 fg=#1e222e bg=#d5dae8 attrs=
+R5 6 2 fg=#1e222e bg=#d5dae8 attrs=
 R5 8 4 fg=#2663b0 bg=#d5dae8 attrs=
 R5 12 20 fg=#1e222e bg=#d5dae8 attrs=
 R5 32 24 fg=default bg=#f5f6fa attrs=
@@ -134,12 +134,12 @@ L14|
 R14 0 32 fg=default bg=#e4e7f0 attrs=
 R14 32 24 fg=default bg=#f5f6fa attrs=
 R14 56 44 fg=#1e222e bg=#e4e7f0 attrs=
-L15|                                    superzej v0.1.0      5 files                              0 loc
+L15|                                      thegn v0.1.0       5 files                              0 loc
 R15 0 32 fg=default bg=#e4e7f0 attrs=
-R15 32 4 fg=default bg=#f5f6fa attrs=
-R15 36 9 fg=#6ee7d8 bg=#f5f6fa attrs=
-R15 45 6 fg=#585f72 bg=#f5f6fa attrs=
-R15 51 5 fg=default bg=#f5f6fa attrs=
+R15 32 6 fg=default bg=#f5f6fa attrs=
+R15 38 6 fg=#6ee7d8 bg=#f5f6fa attrs=
+R15 44 6 fg=#585f72 bg=#f5f6fa attrs=
+R15 50 6 fg=default bg=#f5f6fa attrs=
 R15 56 1 fg=#1e222e bg=#e4e7f0 attrs=
 R15 57 1 fg=#ced2dd bg=#e4e7f0 attrs=BOLD
 R15 58 1 fg=#1e222e bg=#e4e7f0 attrs=
@@ -199,18 +199,16 @@ L28|
 R28 0 32 fg=default bg=#e4e7f0 attrs=
 R28 32 24 fg=default bg=#f5f6fa attrs=
 R28 56 44 fg=default bg=#e4e7f0 attrs=
-L29|  NORMAL   Ctrl Space menu     0 LOC │ Theme: light (set [theme] preset to keep)  ✋ 1    7% free
+L29|  NORMAL   Ctrl Space menu            0 LOC │ Theme: light (set [theme] preset to keep)   7% free
 R29 0 1 fg=#1e222e bg=#e4e7f0 attrs=
 R29 1 8 fg=#f5f6fa bg=#008a7d attrs=BOLD
 R29 9 2 fg=#1e222e bg=#e4e7f0 attrs=
 R29 11 10 fg=#888fa2 bg=#e4e7f0 attrs=
 R29 21 5 fg=#b6bccb bg=#e4e7f0 attrs=
-R29 26 5 fg=#1e222e bg=#e4e7f0 attrs=
-R29 31 5 fg=#585f72 bg=#e4e7f0 attrs=
-R29 36 3 fg=#dde0e8 bg=#e4e7f0 attrs=
-R29 39 41 fg=#585f72 bg=#e4e7f0 attrs=
-R29 80 1 fg=#1e222e bg=#e4e7f0 attrs=
-R29 81 6 fg=#f5f6fa bg=#9a6a00 attrs=BOLD
+R29 26 12 fg=#1e222e bg=#e4e7f0 attrs=
+R29 38 5 fg=#585f72 bg=#e4e7f0 attrs=
+R29 43 3 fg=#dde0e8 bg=#e4e7f0 attrs=
+R29 46 41 fg=#585f72 bg=#e4e7f0 attrs=
 R29 87 1 fg=#1e222e bg=#e4e7f0 attrs=
 R29 88 11 fg=#f5f6fa bg=#c23b3b attrs=BOLD
 R29 99 1 fg=#1e222e bg=#e4e7f0 attrs=

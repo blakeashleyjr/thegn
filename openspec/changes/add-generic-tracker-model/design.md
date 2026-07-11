@@ -2,12 +2,12 @@
 
 ## TrackerBackend trait + TrackerCaps (capability-gated provider)
 
-Generalize `crates/superzej-svc/src/issue/mod.rs` `trait IssueBackend` into
-`trait TrackerBackend: Send + Sync`, mirroring `crates/superzej-svc/src/ci.rs`
+Generalize `crates/thegn-svc/src/issue/mod.rs` `trait IssueBackend` into
+`trait TrackerBackend: Send + Sync`, mirroring `crates/thegn-svc/src/ci.rs`
 `trait CiProvider` + `fn caps(&self) -> CiCaps`:
 
 ```rust
-// crates/superzej-svc/src/issue/mod.rs
+// crates/thegn-svc/src/issue/mod.rs
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrackerCaps {
     pub projects: bool,
@@ -51,7 +51,7 @@ than panicking, exactly like CI providers degrade.
 
 ## WorkItem supersedes Issue (datamodel)
 
-`crates/superzej-core/src/issue.rs`: introduce `WorkItem` carrying every existing
+`crates/thegn-core/src/issue.rs`: introduce `WorkItem` carrying every existing
 `Issue` field (`id: "provider:key"`, `number`, `provider`, `title`, `body`,
 `priority`, `assignees`, `labels`, `url`, `branch_hint`, `updated_at_ms`,
 `project_ids`, `blocked_by`) plus:
@@ -84,30 +84,30 @@ raw-name-preservation contract `ci::status_raw` upholds. `IssueStatus` maps onto
 
 ## Relation kinds (reuse issue_relations.kind)
 
-`crates/superzej-core/src/issue.rs` relation enum extends beyond `blocked_by`:
+`crates/thegn-core/src/issue.rs` relation enum extends beyond `blocked_by`:
 `RelationKind { Blocks, BlockedBy, ParentOf, ChildOf, Relates, Duplicates }`,
 persisted over the existing `issue_relations (from_id, to_id, kind)` rows — no
 schema change for relations, only new `kind` string values.
 
 ## Seam / wiring
 
-- **Config** (`crates/superzej-core/src/config.rs`): extend `config_enum!`
+- **Config** (`crates/thegn-core/src/config.rs`): extend `config_enum!`
   `IssueProviderKind { Linear, Github, Jira, None }` with `GithubProjects` and
   `Gitlab`; each gets an `[issues.<provider>]` sub-table in `IssuesConfig`
   (`linear`, `github_issues`, `jira`, plus new `github_projects`, `gitlab`),
   with secrets via the existing `expand_env_ref("env:VAR")` token path.
   `WorkKind`/`WorkStatus` use the `config_enum!` macro for stable serde.
-- **Router** (`crates/superzej-svc/src/issue/mod.rs`): `RouterInner` gains
+- **Router** (`crates/thegn-svc/src/issue/mod.rs`): `RouterInner` gains
   `GithubProjects` and `Gitlab` arms; `IssueRouter::list_per_provider` (used for
   cache diffing) and fan-out are reused verbatim. `id: "provider:key"` routing is
   generalized so the router dispatches `get_item`/`transition`/`add_comment` to
   the owning provider by splitting on the `provider:` prefix.
-- **Hydration** (`crates/superzej-host/src/hydrate.rs`): reuse
+- **Hydration** (`crates/thegn-host/src/hydrate.rs`): reuse
   `RefreshKind::Issues` + `spawn_issue_cache_refresh()`; the off-thread refresh
   also warms `project_cache`. A new `RefreshKind` variant is NOT required —
   projects/cycles ride the existing Issues refresh on `spawn_blocking`, ending
   with a single `TerminalWaker` pulse.
-- **Panel** (`crates/superzej-host/src/panel/mod.rs`): `Section::Issues` renders
+- **Panel** (`crates/thegn-host/src/panel/mod.rs`): `Section::Issues` renders
   the multi-tier tree (Project → Cycle → WorkItem → subtask) and the kanban board
   when `caps().boards`; `Section::Mine` is unchanged. Transition/comment/assignee
   write-back actions are gated on the active provider's `caps()`.
@@ -128,7 +128,7 @@ existing `RefreshKind::Issues` cadence test in `hydrate.rs` continues to hold.
 
 ## Persistence
 
-SQLite (`crates/superzej-core/src/db.rs`): add a `project_cache (repo_root,
+SQLite (`crates/thegn-core/src/db.rs`): add a `project_cache (repo_root,
 provider, json, fetched_at)` table mirroring `issue_cache`, for the Project/Cycle
 tier. `WorkItem`/`Cycle` are serialized into the existing `issue_cache.json`
 column (JSON is forward-compatible — new fields are additive, old rows

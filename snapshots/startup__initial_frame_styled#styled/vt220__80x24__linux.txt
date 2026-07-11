@@ -1,4 +1,4 @@
-L0| ◆ superzej work         16.2/94G ·  51% ·  ↓  178K ↑   61K ·  100% · 22:06
+L0| þ thegn  work           21.5/94G ·  36% ·  ↓    0B ↑    0B ·  100% · 02:20
 R0 0 34 fg=idx08 bg=idx00 attrs=
 R0 34 3 fg=idx00 bg=idx00 attrs=
 R0 37 5 fg=idx08 bg=idx00 attrs=
@@ -29,7 +29,7 @@ L6|
 R6 0 80 fg=idx08 bg=idx00 attrs=
 L7| TERMINALS
 R7 0 80 fg=idx08 bg=idx00 attrs=
-L8|   No terminals — Enter to add
+L8|   No terminals — Enter to add            ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
 R8 0 3 fg=idx08 bg=idx00 attrs=
 R8 3 27 fg=idx00 bg=idx00 attrs=
 R8 30 50 fg=idx08 bg=idx00 attrs=
@@ -47,14 +47,14 @@ R10 76 1 fg=idx08 bg=idx00 attrs=
 R10 77 1 fg=default bg=idx00 attrs=
 R10 78 1 fg=idx08 bg=idx00 attrs=
 R10 79 1 fg=idx00 bg=idx00 attrs=
-L11| │ ❯  d  superzej defaults                                    Alt/Ctrl chords │
+L11| │ ❯  d  thegn defaults                                       Alt/Ctrl chords │
 R11 0 2 fg=idx08 bg=idx00 attrs=
 R11 2 1 fg=default bg=idx00 attrs=
 R11 3 2 fg=idx06 bg=idx00 attrs=BOLD
 R11 5 3 fg=idx07 bg=idx00 attrs=BOLD
 R11 8 1 fg=idx07 bg=idx00 attrs=
-R11 9 17 fg=idx07 bg=idx00 attrs=BOLD
-R11 26 36 fg=idx07 bg=idx00 attrs=
+R11 9 14 fg=idx07 bg=idx00 attrs=BOLD
+R11 23 39 fg=idx07 bg=idx00 attrs=
 R11 62 15 fg=idx08 bg=idx00 attrs=
 R11 77 1 fg=default bg=idx00 attrs=
 R11 78 1 fg=idx08 bg=idx00 attrs=
@@ -82,11 +82,13 @@ R13 79 1 fg=idx00 bg=idx00 attrs=
 L14| ╰────────────────────────────────────────────────────────────────────────────╯
 R14 0 79 fg=idx08 bg=idx00 attrs=
 R14 79 1 fg=idx00 bg=idx00 attrs=
-L15|                                        Ctrl-Space palette · Ctrl-g lock
+L15|                                         Alt-↑↓      prev/next worktree
 R15 0 3 fg=idx08 bg=idx00 attrs=
 R15 3 77 fg=idx00 bg=idx00 attrs=
-L16|
-R16 0 80 fg=idx08 bg=idx00 attrs=
+L16|                                         Ctrl-g      lock keys to pane
+R16 0 53 fg=idx08 bg=idx00 attrs=
+R16 53 17 fg=idx00 bg=idx00 attrs=
+R16 70 10 fg=idx08 bg=idx00 attrs=
 L17|
 R17 0 80 fg=idx08 bg=idx00 attrs=
 L18|

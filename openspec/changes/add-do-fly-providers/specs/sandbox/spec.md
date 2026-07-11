@@ -4,10 +4,10 @@
 
 ### Requirement: DigitalOcean is a commodity-VPS provider kind
 
-superzej SHALL support DigitalOcean as a `VpsKind` sharing the entire VPS core
-(instance ledger, label/tag-scoped reaper, `szhost vps-ssh` self-bridge, image
+thegn SHALL support DigitalOcean as a `VpsKind` sharing the entire VPS core
+(instance ledger, label/tag-scoped reaper, `thegn vps-ssh` self-bridge, image
 bake). An `[env.<name>.provider]` with `provider = "digitalocean"` SHALL create
-a droplet via the DigitalOcean REST API tagged as superzej-managed, register
+a droplet via the DigitalOcean REST API tagged as thegn-managed, register
 the managed ssh key idempotently, wait until reachable over ssh, and run the
 standard provisioning pipeline over the ssh exec/files transport. No vendor CLI
 is required.
@@ -17,7 +17,7 @@ is required.
 - **WHEN** a worktree resolves to a `provider = "digitalocean"` env with its API
   token set and is provisioned
 - **THEN** a droplet is created via the DO API with the managed key and
-  superzej tags, the pipeline runs over ssh, and the pane attaches through the
+  thegn tags, the pipeline runs over ssh, and the pane attaches through the
   `vps-ssh` self-bridge
 
 #### Scenario: DigitalOcean reuses the VPS leak-safety machinery
@@ -29,7 +29,7 @@ is required.
 
 ### Requirement: Fly.io is a CLI-free managed sandbox provider
 
-superzej SHALL support Fly.io as a first-class `Provider::Fly` (not a
+thegn SHALL support Fly.io as a first-class `Provider::Fly` (not a
 `VpsKind`): an `[env.<name>.provider]` with `provider = "fly"` SHALL create an
 app-per-sandbox Machine via the Fly Machines REST API, allocate a dedicated
 IPv4 via the Fly GraphQL API, and make the machine reachable over the managed
@@ -54,7 +54,7 @@ Fly CLI (`flyctl`) is required; secrets MUST NOT appear on any command line.
 
 ### Requirement: Fly envs are scale-to-zero, not destroy-on-idle
 
-superzej SHALL treat Fly as scale-to-zero because a stopped Fly Machine is
+thegn SHALL treat Fly as scale-to-zero because a stopped Fly Machine is
 near-free (unlike a billing stopped VPS): an idle Fly sandbox is **stopped**
 (not destroyed), and start/stop MUST poll the Machine's real state so a
 still-transitioning machine is never treated as ready. The env's

@@ -1,10 +1,11 @@
-L0| ◆ superzej v0.1.0 work                                            86% ·  15.5/94G ·   7% ·  53% ·  94°C ·  ↓    6K ↑    7K ·  100% · Fri Jul 10 · 22:07
+L0| þ thegn v0.1.0  work                                              89% ·  18.9/94G ·   7% ·  37% ·  97°C ·  ↓  1.5M ↑  839K ·  100% · Sat Jul 11 · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
-R0 3 9 fg=#edf0f8 bg=#151a28 attrs=
-R0 12 6 fg=#6f788e bg=#151a28 attrs=
-R0 18 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 24 42 fg=#edf0f8 bg=#151a28 attrs=
+R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 9 6 fg=#6f788e bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 44 fg=#edf0f8 bg=#151a28 attrs=
 R0 66 5 fg=#f0c674 bg=#151a28 attrs=
 R0 71 3 fg=#6f788e bg=#151a28 attrs=
 R0 74 10 fg=#c6ccdb bg=#151a28 attrs=
@@ -269,7 +270,7 @@ L38|                                 ╰─────────────�
 R38 0 32 fg=default bg=#151a28 attrs=
 R38 32 1 fg=default bg=#0b0e16 attrs=
 R38 33 127 fg=#6ee7d8 bg=#151a28 attrs=
-L39|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓            0 LOC  ✋ 1    7% free   ❚❚ Justin Hurwitz — Houston
+L39|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓   Alt N split→   Alt s focus-sidebar     0 LOC  ✋ 1    7% free
 R39 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R39 1 8 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
 R39 9 2 fg=#edf0f8 bg=#151a28 attrs=
@@ -287,12 +288,16 @@ R39 73 5 fg=#6f788e bg=#151a28 attrs=
 R39 78 3 fg=#edf0f8 bg=#151a28 attrs=
 R39 81 5 fg=#7a8197 bg=#151a28 attrs=
 R39 86 7 fg=#6f788e bg=#151a28 attrs=
-R39 93 12 fg=#edf0f8 bg=#151a28 attrs=
-R39 105 5 fg=#c6ccdb bg=#151a28 attrs=
-R39 110 1 fg=#edf0f8 bg=#151a28 attrs=
-R39 111 6 fg=#0b0e16 bg=#e6c264 attrs=BOLD
-R39 117 1 fg=#edf0f8 bg=#151a28 attrs=
-R39 118 11 fg=#0b0e16 bg=#ef6f6f attrs=BOLD
-R39 129 1 fg=#edf0f8 bg=#151a28 attrs=
-R39 130 29 fg=#0b0e16 bg=#7fb4ec attrs=BOLD
+R39 93 3 fg=#edf0f8 bg=#151a28 attrs=
+R39 96 5 fg=#7a8197 bg=#151a28 attrs=
+R39 101 7 fg=#6f788e bg=#151a28 attrs=
+R39 108 3 fg=#edf0f8 bg=#151a28 attrs=
+R39 111 5 fg=#7a8197 bg=#151a28 attrs=
+R39 116 14 fg=#6f788e bg=#151a28 attrs=
+R39 130 5 fg=#edf0f8 bg=#151a28 attrs=
+R39 135 5 fg=#c6ccdb bg=#151a28 attrs=
+R39 140 1 fg=#edf0f8 bg=#151a28 attrs=
+R39 141 6 fg=#0b0e16 bg=#e6c264 attrs=BOLD
+R39 147 1 fg=#edf0f8 bg=#151a28 attrs=
+R39 148 11 fg=#0b0e16 bg=#ef6f6f attrs=BOLD
 R39 159 1 fg=#edf0f8 bg=#151a28 attrs=

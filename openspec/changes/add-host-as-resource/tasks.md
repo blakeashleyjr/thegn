@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Spine (superzej-core + wiring headroom)
+## 1. Spine (thegn-core + wiring headroom)
 
 - [x] 1.1 Ratchet payments: extract run.rs provision/spec drains →
       `handlers/provision.rs`; config.rs env sub-tables →
@@ -26,7 +26,7 @@
       splash-step mapping + provision_worktree wrapper + host_pending),
       `provision_gate::host_lock`, `handlers/host.rs` (HostRuntime drain),
       run.rs wiring (net-negative), `host_ui.rs`, `Section::Hosts` panel
-      section + DetailActions, sidebar HOSTS rows, `szhost host` CLI.
+      section + DetailActions, sidebar HOSTS rows, `thegn host` CLI.
 
 ## 2. SSH remote podman
 
@@ -74,14 +74,14 @@
 ## 8. Docs + validate
 
 - [x] 8.1 Document `[host.<name>]` + `[env.<name>] host` in
-      `config/config.toml.example`; `superzej doctor` host summary optional.
+      `config/config.toml.example`; `thegn doctor` host summary optional.
 - [ ] 8.2 `just ci` green per phase (fmt, lint incl. ratchet, build, test,
       coverage ≥95% core, openspec validate, smoke incl. host golden path).
 
 ## 9. Batteries + sprites (hosts v2)
 
 - [x] 9.1 In-TUI/CLI host add (DB defs merged into the config catalog, wizard
-      "+ add host…" row, `superzej host add/rm`, doctor Hosts section).
+      "+ add host…" row, `thegn host add/rm`, doctor Hosts section).
 - [x] 9.2 Detection extensions (deno/scala/shell.nix) + `Tier::SynthNix` +
       pure `toolchain.rs` synthesis + `[toolchain]` config.
 - [x] 9.3 Host-backed per-worktree pipeline (`host_provision.rs`): remote

@@ -6,7 +6,7 @@ Give the AI gateway a **versioned skills registry** and a distribution UX so a
 capability — a `SKILL.md`-style package — is **registered once and injected into
 the relevant agent(s) by task/context**, instead of being hand-copied into each
 harness's prompt. This is the _distribution_ side of the gateway's capability
-injection: the proxy (`superzej-proxy`) is the single interception point all
+injection: the proxy (`thegn-proxy`) is the single interception point all
 model traffic crosses ("configure once, every harness inherits it"), and a skill
 becomes one of the capability blocks it can inject.
 

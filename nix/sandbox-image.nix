@@ -1,7 +1,7 @@
-# The superzej multi-arch base sandbox image: nix (flakes on) + devenv/direnv +
+# The thegn multi-arch base sandbox image: nix (flakes on) + devenv/direnv +
 # rust toolchain + node + the Claude Code CLI + the daily tools, with a populated
 # /nix and a warmed ~/.cargo
-# owned by uid 1000 (`superzej`, matching `--userns keep-id`). Built per-arch on
+# owned by uid 1000 (`thegn`, matching `--userns keep-id`). Built per-arch on
 # native builders and pushed as a manifest list (see `just image-publish`); the
 # host provisioner delivers the per-arch digest registry-lessly by default.
 #
@@ -9,16 +9,16 @@
 #   ./result | podman load           # local test load
 #
 # The /nix in this image IS the warm-volume seed: first mount of the
-# `superzej-nix-store` named volume at /nix copy-ups the whole store — zero
-# extra transfer (see superzej-core/src/host.rs VolumeSeed::ImageCopyUp).
+# `thegn-nix-store` named volume at /nix copy-ups the whole store — zero
+# extra transfer (see thegn-core/src/host.rs VolumeSeed::ImageCopyUp).
 {pkgs}: let
-  user = "superzej";
+  user = "thegn";
   uid = "1000";
   gid = "1000";
 
   # What a fresh sandbox needs before any repo-specific devShell exists.
   rootEnv = pkgs.buildEnv {
-    name = "superzej-sandbox-env";
+    name = "thegn-sandbox-env";
     paths = with pkgs; [
       # nix-first workflow
       nix
@@ -57,11 +57,11 @@
     pathsToLink = ["/bin" "/share" "/etc"];
   };
 
-  etcFiles = pkgs.runCommand "superzej-sandbox-etc" {} ''
+  etcFiles = pkgs.runCommand "thegn-sandbox-etc" {} ''
     mkdir -p $out/etc/nix $out/etc/skel
     cat > $out/etc/passwd <<EOF
     root:x:0:0:root:/root:/bin/sh
-    ${user}:x:${uid}:${gid}:superzej:/home/${user}:${pkgs.bashInteractive}/bin/bash
+    ${user}:x:${uid}:${gid}:thegn:/home/${user}:${pkgs.bashInteractive}/bin/bash
     nobody:x:65534:65534:nobody:/nonexistent:/bin/false
     EOF
     cat > $out/etc/group <<EOF
@@ -78,7 +78,7 @@
   '';
 in
   pkgs.dockerTools.streamLayeredImage {
-    name = "superzej-sandbox";
+    name = "thegn-sandbox";
     tag = "latest";
     contents = [rootEnv etcFiles pkgs.dockerTools.usrBinEnv pkgs.dockerTools.binSh];
 
@@ -108,10 +108,10 @@ in
       ];
       Cmd = ["/bin/sh" "-l"];
       Labels = {
-        "superzej.managed" = "true";
-        "superzej.image.role" = "base";
-        "org.opencontainers.image.source" = "https://github.com/blake/superzej";
-        "org.opencontainers.image.description" = "superzej sandbox base: nix + direnv + rustup, uid-1000, warm-volume seedable";
+        "thegn.managed" = "true";
+        "thegn.image.role" = "base";
+        "org.opencontainers.image.source" = "https://github.com/blake/thegn";
+        "org.opencontainers.image.description" = "thegn sandbox base: nix + direnv + rustup, uid-1000, warm-volume seedable";
       };
     };
   }

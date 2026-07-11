@@ -1,6 +1,6 @@
 # Plan: Verify and restore font reloading with selected monospace fonts
 
-**Goal:** Answer the user's questions: "did our font reloading survive the redesign?" and "Should have these: [list of 10 specific fonts]". The redesign (which stripped out the old `szhost` UI and rebuilt it via `termwiz`) must still support the `just font name="..."` realtime alacritty reloading feature. I will also ensure the Nix flake / development environment correctly bundles the 10 requested fonts.
+**Goal:** Answer the user's questions: "did our font reloading survive the redesign?" and "Should have these: [list of 10 specific fonts]". The redesign (which stripped out the old `thegn` UI and rebuilt it via `termwiz`) must still support the `just font name="..."` realtime alacritty reloading feature. I will also ensure the Nix flake / development environment correctly bundles the 10 requested fonts.
 
 **Architecture:**
 The font reloading feature currently works by updating the `config/alacritty.toml` file in-place using `sed` within the `just font name="..."` task. Alacritty is configured to watch this file and live-reload the font without restarting. The requested fonts need to be added to the Nix dependencies to ensure they are available in the development environment and CI/CD pipelines.

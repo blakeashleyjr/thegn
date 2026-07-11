@@ -23,7 +23,7 @@ runs:
     # persists. The macOS job is still GitHub-hosted, so these steps run for it.
     #
     # Reclaim runner disk before building. The default ubuntu runner ships ~14G
-    # free on /, and a full rust+nix build (debug link of szhost, nix store,
+    # free on /, and a full rust+nix build (debug link of thegn, nix store,
     # coverage instrumentation) can exhaust it — mold then dies mid-link with
     # "failed to write to an output file. Disk full?" / Bus error. Everything
     # here runs through `nix develop`, so the preinstalled toolchains are dead

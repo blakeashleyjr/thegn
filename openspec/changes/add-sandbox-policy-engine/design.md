@@ -22,7 +22,7 @@ writes/deletes to `.git/config`, `~/.ssh`, `~/.gnupg`, and the configured secret
 paths — mirrors the "shared .git/config is read-only in the sandbox" invariant
 already in the sandbox spec.
 
-## Config (superzej-core, config.rs)
+## Config (thegn-core, config.rs)
 
 ```toml
 [policy]
@@ -54,7 +54,7 @@ workspace → repo) following `effective_keybinds` / `repo_sandbox`.
 ## Enforcement seam (host / bouncer)
 
 The bouncer's tool broker (`[llm_proxy].bouncer`) already services `fs/read`,
-`superzej/edit`+`write`, and `terminal/create` over unix-socket ACP with an
+`thegn/edit`+`write`, and `terminal/create` over unix-socket ACP with an
 approval step. Insert `policy::decide` **before** servicing each brokered op:
 
 - `Allow` → service it (no prompt).
@@ -79,6 +79,6 @@ approval step. Insert `policy::decide` **before** servicing each brokered op:
 ## Alternatives considered
 
 - **Bake policy into seccomp/bwrap profiles** — too coarse and per-backend; the
-  broker seam is where superzej already mediates file/shell ops uniformly.
+  broker seam is where thegn already mediates file/shell ops uniformly.
 - **Prompt on everything (status quo)** — high friction; the whole point is to
   auto-allow the safe common case and reserve prompts for genuinely risky ops.

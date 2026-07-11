@@ -1,11 +1,11 @@
-# szhost chrome stability design
+# thegn chrome stability design
 
 Date: 2026-06-07
 Status: approved (committed)
 
 ## Goal
 
-Fix the two remaining regressions after the `szhost` performance/jank pass:
+Fix the two remaining regressions after the `thegn` performance/jank pass:
 
 1. tab labels briefly flash at the far left of the top chrome before moving to the
    workspace/center area; and

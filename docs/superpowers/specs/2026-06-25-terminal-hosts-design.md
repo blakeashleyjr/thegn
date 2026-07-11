@@ -2,7 +2,7 @@
 
 ## Overview
 
-This feature introduces a "Terminals" section into the superzej sidebar, bringing first-class management of isolated terminal environments (Local, SSH, Mosh) that exist outside of git worktrees. The goal is to let developers manage remote infrastructure and scratch environments in the same seamless way they manage branches, without shoehorning these shells into dummy git repos.
+This feature introduces a "Terminals" section into the thegn sidebar, bringing first-class management of isolated terminal environments (Local, SSH, Mosh) that exist outside of git worktrees. The goal is to let developers manage remote infrastructure and scratch environments in the same seamless way they manage branches, without shoehorning these shells into dummy git repos.
 
 ## User Experience
 
@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS terminals (
 );
 ```
 
-### 2. `superzej-core/src/db.rs` API
+### 2. `thegn-core/src/db.rs` API
 
 - `put_terminal(...)`
 - `terminals() -> Result<Vec<TerminalRow>>`
@@ -102,13 +102,13 @@ pub enum RowKind {
 
 ### M2: Rendering the Sidebar
 
-- Read terminals in `superzej-host/src/sidebar.rs` `build_rows()`.
+- Read terminals in `thegn-host/src/sidebar.rs` `build_rows()`.
 - Append a `TerminalsHeader` row and the list of `Terminal` rows to the end of the sidebar.
 - Style `TerminalsHeader` similar to a folder or top-level item.
 
 ### M3: Execution (PTY / Session)
 
-- Update the PTY spawner (`crates/superzej-host/src/pane.rs` or `emulator.rs`) to inspect `GroupKind::Terminal`.
+- Update the PTY spawner (`crates/thegn-host/src/pane.rs` or `emulator.rs`) to inspect `GroupKind::Terminal`.
 - When `Terminal`, execute based on the connection type.
 - Handle graceful fallback / errors if `ssh` is unavailable.
 
@@ -121,5 +121,5 @@ pub enum RowKind {
 ## Open Questions & Considerations
 
 - **Sandboxing**: Should "local" terminals run in a `podman` sandbox if enabled, or always strictly local host? (Decision: Follow global sandbox config, but maybe provide an override later. Start simple: strictly host unless configured.)
-- **Git Context**: `superzej` relies heavily on git metadata for PR counts, branch names, etc. We must ensure `Terminal` groups gracefully return empty/None for these queries without throwing errors.
+- **Git Context**: `thegn` relies heavily on git metadata for PR counts, branch names, etc. We must ensure `Terminal` groups gracefully return empty/None for these queries without throwing errors.
 - **Auto-provisioning**: Automatically create a "Local" terminal entry on first boot so users always have an escape hatch.

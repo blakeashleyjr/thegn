@@ -1,13 +1,13 @@
 # Tasks
 
-## 1. i18n core (superzej-core)
+## 1. i18n core (thegn-core)
 
 - [ ] 1.1 `i18n.rs`: embed `locales/<lang>/main.ftl` (`fluent-templates` +
       `rust-embed`); global resolver + `t!` macro — **unit tests** (key lookup,
       interpolation, pluralization, missing-key fallback).
 - [ ] 1.2 `UiConfig` + `[ui] language` (default `auto`) parsing; `sys-locale`
       detection — **unit tests** (auto vs explicit).
-- [ ] 1.3 Resolve locale once in the `szhost::startup` waterfall before first render.
+- [ ] 1.3 Resolve locale once in the `thegn::startup` waterfall before first render.
 
 ## 2. Layout safety (host)
 

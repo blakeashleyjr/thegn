@@ -5,13 +5,13 @@
 - [x] 1.1 Content-type detection that maps a previewed file to a route
       (Mermaid / PDF / CSV / Jupyter / text / image) — **unit tests** for the
       pure extension/sniff → route mapping, including ambiguous/unknown fallback.
-      (`superzej_core::preview::route_for`.)
+      (`thegn_core::preview::route_for`.)
 - [x] 1.2 CSV → bounded scrollable table model (pure parse + cell layout) —
       **unit tests** for parsing, column sizing, and row/column bounds.
-      (`superzej_core::preview::CsvTable`; rendered by `preview_render::csv_lines`.)
+      (`thegn_core::preview::CsvTable`; rendered by `preview_render::csv_lines`.)
 - [x] 1.3 Jupyter `.ipynb` → ordered cell model (code via 396, markdown text,
       image outputs via 399) — **unit tests** for cell ordering and cell-type
-      classification. (`superzej_core::preview::Notebook`;
+      classification. (`thegn_core::preview::Notebook`;
       rendered by `preview_render::notebook_lines`.)
 - [x] 1.4 Off-loop Mermaid / PDF / image rasterization handed to the graphics
       path (kitty; `src/rasterize.rs` → `src/graphics.rs` → `src/preview_gfx.rs`)

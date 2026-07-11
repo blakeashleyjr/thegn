@@ -1,10 +1,11 @@
-L0| ◆ superzej v0.1.0 work     15.4/94G ·   7% ·  49% ·  96°C ·  ↓  948K ↑  530K ·  100% · 22:07
+L0| þ thegn v0.1.0  work       18.4/94G ·   7% ·  34% ·  95°C ·  ↓    0B ↑    0B ·  100% · 02:22
 R0 0 1 fg=idx07 bg=idx00 attrs=
 R0 1 2 fg=idx06 bg=idx00 attrs=
-R0 3 9 fg=idx07 bg=idx00 attrs=
-R0 12 6 fg=idx08 bg=idx00 attrs=
-R0 18 6 fg=idx06 bg=idx08 attrs=BOLD
-R0 24 13 fg=idx07 bg=idx00 attrs=
+R0 3 6 fg=idx07 bg=idx00 attrs=
+R0 9 6 fg=idx08 bg=idx00 attrs=
+R0 15 1 fg=idx07 bg=idx00 attrs=
+R0 16 6 fg=idx06 bg=idx08 attrs=BOLD
+R0 22 15 fg=idx07 bg=idx00 attrs=
 R0 37 11 fg=idx08 bg=idx00 attrs=
 R0 48 5 fg=idx07 bg=idx00 attrs=
 R0 53 12 fg=idx08 bg=idx00 attrs=
@@ -110,11 +111,11 @@ R13 99 1 fg=idx07 bg=idx00 attrs=
 L14|
 R14 0 56 fg=default bg=idx00 attrs=
 R14 56 44 fg=idx07 bg=idx00 attrs=
-L15|                                    superzej v0.1.0      5 files                              0 loc
-R15 0 36 fg=default bg=idx00 attrs=
-R15 36 9 fg=idx06 bg=idx00 attrs=
-R15 45 6 fg=idx07 bg=idx00 attrs=
-R15 51 5 fg=default bg=idx00 attrs=
+L15|                                      thegn v0.1.0       5 files                              0 loc
+R15 0 38 fg=default bg=idx00 attrs=
+R15 38 6 fg=idx06 bg=idx00 attrs=
+R15 44 6 fg=idx07 bg=idx00 attrs=
+R15 50 6 fg=default bg=idx00 attrs=
 R15 56 1 fg=idx07 bg=idx00 attrs=
 R15 57 1 fg=idx08 bg=idx00 attrs=BOLD
 R15 58 36 fg=idx07 bg=idx00 attrs=

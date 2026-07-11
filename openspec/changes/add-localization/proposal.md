@@ -19,7 +19,7 @@ Source design: `docs/superpowers/specs/2026-06-25-localization-strategy.md`.
 
 The sub-300ms startup and zero-idle invariants forbid runtime file I/O for
 translations, so `fluent-templates` + `rust-embed` bake locales into the binary and
-the locale resolves once during the `szhost::startup` waterfall. Terminal i18n's
+the locale resolves once during the `thegn::startup` waterfall. Terminal i18n's
 real hazard is layout geometry (a 4-cell label may become 9 cells), handled with
 `unicode-width` and responsive/truncating layout.
 

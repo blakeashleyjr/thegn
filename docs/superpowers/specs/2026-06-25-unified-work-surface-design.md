@@ -1,7 +1,7 @@
 # Unified work surface — design
 
 Status: Slices 1, 2 & 3 landed (multi-provider + "My Work" + worktree binding).
-Author: superzej.
+Author: thegn.
 
 > DB note: this branch bumps `SCHEMA_VERSION` to 18 for `my_work_cache`. Sibling
 > branches (CI-group `ci_runs_cache`, named-environments `env_name`) also use 18.
@@ -20,20 +20,20 @@ everywhere. The tools they reach for are each a **read dashboard for one tool**:
 - [`jiratui`](https://github.com/whyisdifficult/jiratui) — a Jira TUI. Jira only.
 - Linear's app / [linear](https://github.com/linear/linear) — Linear only.
 
-superzej has a structural advantage none of them has: **the git worktree is the
+thegn has a structural advantage none of them has: **the git worktree is the
 unit of work**. Each worktree is a tab that already holds the branch, the editor,
 the diff, the PR, the CI status, and (via `issue_links`) the tracked issue. So the
 maximal play is not "another dashboard" but a **cross-tool, cross-repo work surface
 whose every row is one keystroke from a worktree that already contains the work**.
 
-gh-dash/jiratui/Linear can _show_ you work. superzej can _put you in it_.
+gh-dash/jiratui/Linear can _show_ you work. thegn can _put you in it_.
 
 ## What already exists (reused, not rebuilt)
 
 - Tracker-agnostic issue layer: `IssueBackend` trait + per-provider backends
-  (Linear GraphQL, Jira REST v3, GitHub `gh`) in `crates/superzej-svc/src/issue/`,
+  (Linear GraphQL, Jira REST v3, GitHub `gh`) in `crates/thegn-svc/src/issue/`,
   fronted by `IssueRouter`. Unified `Issue` domain type in
-  `crates/superzej-core/src/issue.rs` (carries `provider`, `branch_hint`,
+  `crates/thegn-core/src/issue.rs` (carries `provider`, `branch_hint`,
   `project_ids`, `blocked_by`).
 - `[issues]` config with per-provider sections and `env:` secret expansion.
 - SQLite caches keyed `(repo_root, provider)`: `issue_cache`, `issue_links`,

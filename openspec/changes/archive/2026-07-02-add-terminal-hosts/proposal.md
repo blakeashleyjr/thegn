@@ -16,7 +16,7 @@ Source design: `docs/superpowers/specs/2026-06-25-terminal-hosts-design.md`.
 
 ## Rationale
 
-superzej relies on git metadata for worktree rows; non-git shells (a remote box, a
+thegn relies on git metadata for worktree rows; non-git shells (a remote box, a
 local scratch shell) have nowhere to live today. A `terminals` DB table + a
 `GroupKind::Terminal` lets them reuse the existing group/tab/pane machinery while
 returning empty for git-only queries.

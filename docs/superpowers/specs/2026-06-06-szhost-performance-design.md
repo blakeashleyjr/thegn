@@ -1,10 +1,10 @@
-# szhost performance and jank fix design
+# thegn performance and jank fix design
 
 Date: 2026-06-06
 
 ## Goal
 
-Make the native host (`szhost`) feel usable in a real terminal: fast first paint,
+Make the native host (`thegn`) feel usable in a real terminal: fast first paint,
 no visible blank/flash during startup, responsive input while panes are chatty, and
 no ghosting/stale cells when overlays or layouts change.
 
@@ -14,7 +14,7 @@ larger tokio app/render split and a higher-fidelity emulator remain future work.
 
 ## Observed problems
 
-1. **Slow/blank launch.** `szhost` enters raw mode and the alternate screen before
+1. **Slow/blank launch.** `thegn` enters raw mode and the alternate screen before
    it has painted anything, then performs session resurrection, DB reads, branch
    resolution, recent-repo reads, and `diff_files("HEAD")` synchronously. Large
    repos can leave the alternate screen blank or half-painted while this work runs.
@@ -146,7 +146,7 @@ rendering) is deferred unless the surgical cleanup is insufficient.
 
 Use a non-login shell by default. The preferred behavior is:
 
-- if `SUPERZEJ_LOGIN_SHELL=1`, spawn `$SHELL -l`;
+- if `THEGN_LOGIN_SHELL=1`, spawn `$SHELL -l`;
 - otherwise spawn `$SHELL -i` when the shell supports it, or plain `$SHELL` if the
   shell path is unknown.
 
@@ -187,7 +187,7 @@ Add tests for the behavior that can be verified headlessly:
 4. **Logical frame clear.** A surface test renders content, then renders a smaller
    or empty state after a logical clear and verifies stale text is gone.
 5. **Shell argv.** Unit tests cover default non-login shell argv and
-   `SUPERZEJ_LOGIN_SHELL=1` login override.
+   `THEGN_LOGIN_SHELL=1` login override.
 6. **Regression gates.** Run `just fmt-check`, `just build`, `just test`,
    `nix develop --command just lint`, `just coverage`, and `just smoke`.
 

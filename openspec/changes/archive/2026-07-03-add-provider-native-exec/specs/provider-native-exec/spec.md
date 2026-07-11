@@ -45,5 +45,5 @@ A native-exec pane's provider session id SHALL be persisted with the tab layout,
 
 #### Scenario: Restart resumes the live session
 
-- **WHEN** superzej restarts with a persisted native-exec pane whose remote session is still alive
+- **WHEN** thegn restarts with a persisted native-exec pane whose remote session is still alive
 - **THEN** the resurrected pane reattaches and replays the scrollback rather than starting a new shell

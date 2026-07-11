@@ -4,7 +4,7 @@ Load-bearing decisions; full type/flow detail lives with the implementation.
 
 ## Decision as a pure function
 
-`superzej-core/src/scheduler.rs::decide_placement(request, inputs) ->
+`thegn-core/src/scheduler.rs::decide_placement(request, inputs) ->
 PlacementDecision` is total and deterministic over snapshot inputs (host
 capacities + tenancies + policy + `now`), mirroring `render_plan::plan` /
 `host_machine::step`. Lane order is fixed and trust runs **before** cost:
@@ -84,7 +84,7 @@ fail-back is automatic on cooldown expiry (the proxy router's
 Hetzner create (labels `sz-placement=managed`) → `put_host_def` +
 `capacity_put` (spec authoritative from the template) → the **unchanged**
 `ensure_host_ready` drives Probing→Installing→Ready (`install_runtime =
-"auto"` is legitimate: `autoscale.enabled` _is_ the consent — superzej created
+"auto"` is legitimate: `autoscale.enabled` _is_ the consent — thegn created
 the box). The VPS reaper gains one rule: `sz-placement=managed` instances with
 no `host_capacity` row and age > orphan threshold are destroyed (crash between
 POST and register). Scale-down runs from the existing lifecycle maintainer

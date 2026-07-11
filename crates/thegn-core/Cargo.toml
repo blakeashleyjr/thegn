@@ -1,0 +1,76 @@
+[package]
+name = "thegn-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+description = "thegn substrate-agnostic core: state, git, sandbox, config, theme"
+
+[features]
+test-utils = []
+
+# `cfg(kani)` is set only by the `cargo kani` driver (see the `#[cfg(kani)]`
+# proof module in `termcaps.rs`, run via `just verify-kani`). Declare it as a
+# known cfg so normal `cargo build`/`clippy -D warnings`/`just ci` don't warn on
+# an "unexpected" cfg. No dependency is added — Kani injects its own crate.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[dependencies]
+# The media model lives in the C-dep-free `thegn-media` leaf (so its per-OS
+# control backends cross-check); core re-exports it via `media.rs` and lowers
+# `MediaConfig` into the leaf's `ResolveOpts`. Pure-Rust dep — does not affect
+# core's own (non-cross-compilable) status.
+thegn-media.workspace = true
+# Only for the `clap::ValueEnum` derive on `github::MergeMethod` (a CLI arg type
+# that lives with its domain model). Cheap; keeps core CLI-usable.
+clap.workspace = true
+anyhow.workspace = true
+schemars = "0.8"
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+# Comment/format-preserving config authoring (config_write.rs): the write half of
+# `thegn env create` / `config set`, so the setup UI edits config.toml in place
+# without clobbering the user's comments. Pure-Rust (cross-compile-safe).
+toml_edit = "0.25.12"
+walkdir.workspace = true
+# Token-reduction engine: ANSI stripping + custom-filter regexes (proxy::compress).
+regex.workspace = true
+syntect.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-go.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# fff's pure-Rust SIMD fuzzy matcher (no C deps, cross-compilable) — replaces
+# nucleo-matcher for scrollback/list fuzzy search in the substrate crate.
+neo_frizbee.workspace = true
+# Word-level / intra-line diff for the diff view (item 601): pure-Rust,
+# `TextDiff::from_words` tokenizes on word boundaries.
+similar = "2"
+fluent-templates = "0.14.0"
+unic-langid = "0.9.6"
+sys-locale = "0.3.2"
+once_cell = "1.21.4"
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+# Display-width invariant tests for the chrome glyph tables.
+unicode-width = "0.2"
+
+# Theme/palette construction — runs at startup and on every theme cycle.
+[[bench]]
+name = "core_hot"
+harness = false

@@ -2,11 +2,11 @@
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Provide an extreme, exhaustive testing suite for the Superzej sandbox subsystem. This includes unit tests covering every parser branch, E2E tests validating actual container lifecycles (Podman/Bwrap) and multi-container Compose stacks, and integration tests confirming port exposure and filesystem access bounds.
+**Goal:** Provide an extreme, exhaustive testing suite for the Thegn sandbox subsystem. This includes unit tests covering every parser branch, E2E tests validating actual container lifecycles (Podman/Bwrap) and multi-container Compose stacks, and integration tests confirming port exposure and filesystem access bounds.
 
 **Architecture:**
 
-- **Unit Tests:** Expand `crates/superzej-core/src/sandbox.rs` tests. Mock nothing; test the pure functions like `oci_create_opts`, `enter_argv`, and config parsing.
+- **Unit Tests:** Expand `crates/thegn-core/src/sandbox.rs` tests. Mock nothing; test the pure functions like `oci_create_opts`, `enter_argv`, and config parsing.
 - **Integration Tests:** Add tests inside `sandbox.rs` that check if the host has Podman/Docker. If so, actually execute `sandbox::ensure` and `sandbox::stats` on a dummy container.
 - **E2E Tests:** Create Python-based E2E UI/CLI tests (similar to existing `test/toggle-mixed.py`) that spin up a sandboxed Zellij, trigger `new-worktree` with specific sandbox configs (like `ports` and `file_access: none`), and use external assertions (like `curl`ing the exposed port) to prove it works.
 
@@ -20,7 +20,7 @@
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 1: Write exhaustive unit tests**
 
@@ -62,7 +62,7 @@ Run: `cargo nextest run test_sandbox_all_oci_flags_applied`
 **Step 3: Commit**
 
 ```bash
-git add crates/superzej-core/src/sandbox.rs
+git add crates/thegn-core/src/sandbox.rs
 git commit -m "test(sandbox): exhaustive unit tests for OCI mapping flags"
 ```
 
@@ -74,7 +74,7 @@ git commit -m "test(sandbox): exhaustive unit tests for OCI mapping flags"
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 1: Write the integration test**
 
@@ -87,7 +87,7 @@ fn integration_test_sandbox_lifecycle() {
     }
 
     let mut s = spec(Backend::Podman);
-    s.name = "superzej-test-lifecycle-container".into();
+    s.name = "thegn-test-lifecycle-container".into();
 
     // 1. Ensure (create keep-alive)
     let res = ensure(&s);
@@ -122,7 +122,7 @@ Run: `cargo nextest run integration_test_sandbox_lifecycle`
 **Step 3: Commit**
 
 ```bash
-git add crates/superzej-core/src/sandbox.rs
+git add crates/thegn-core/src/sandbox.rs
 git commit -m "test(sandbox): add live container lifecycle integration test"
 ```
 
@@ -130,7 +130,7 @@ git commit -m "test(sandbox): add live container lifecycle integration test"
 
 ### Task 3: E2E Network & File Access Verification
 
-**Objective:** Write a Python script that acts as a user. It creates a `.superzej.toml` with `ports = ["8080:8080"]` and `file_access = "none"`, spins up a web server inside a Superzej worktree, and `curl`s it from the host to prove NAT routing works and the host filesystem is blocked.
+**Objective:** Write a Python script that acts as a user. It creates a `.thegn.toml` with `ports = ["8080:8080"]` and `file_access = "none"`, spins up a web server inside a Thegn worktree, and `curl`s it from the host to prove NAT routing works and the host filesystem is blocked.
 
 **Files:**
 
@@ -159,7 +159,7 @@ def run_test():
         subprocess.run(["git", "commit", "--allow-empty", "-m", "init"], cwd=repo_dir, check=True)
 
         # Write config
-        with open(os.path.join(repo_dir, ".superzej.toml"), "w") as f:
+        with open(os.path.join(repo_dir, ".thegn.toml"), "w") as f:
             f.write("""
 [sandbox]
 backend = "podman"
@@ -167,15 +167,15 @@ ports = ["8081:8081"]
 file_access = "none"
             """)
 
-        # Start a server inside superzej via `pick-agent` directly or by wrapping a tool
+        # Start a server inside thegn via `pick-agent` directly or by wrapping a tool
         env = os.environ.copy()
-        env["SUPERZEJ_DIR"] = sz_dir
+        env["THEGN_DIR"] = sz_dir
 
         # Open workspace and create a worktree running a python server
-        # using the superzej CLI to bypass the UI for the test.
+        # using the thegn CLI to bypass the UI for the test.
         # This tests that the sandbox layer wraps correctly.
 
-        server_cmd = ["superzej", "tool", "run", "--", "python3", "-m", "http.server", "8081"]
+        server_cmd = ["thegn", "tool", "run", "--", "python3", "-m", "http.server", "8081"]
         server_proc = subprocess.Popen(server_cmd, cwd=repo_dir, env=env)
 
         # Wait for boot
@@ -194,7 +194,7 @@ file_access = "none"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
         # Cleanup orphaned containers just in case
-        subprocess.run(["podman", "rm", "-f", "superzej-repo"], stderr=subprocess.DEVNULL)
+        subprocess.run(["podman", "rm", "-f", "thegn-repo"], stderr=subprocess.DEVNULL)
 
 if __name__ == "__main__":
     if shutil.which("podman"):

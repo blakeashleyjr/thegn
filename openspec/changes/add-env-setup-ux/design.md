@@ -11,13 +11,13 @@ and re-renders only when dirty, honouring the ~0% idle invariant. No SQLite
 schema change (the env binding reuses the existing `worktree_env` row via
 `db.set_worktree_env`).
 
-## Layer 1 — secret backend (`superzej-core/secret.rs`)
+## Layer 1 — secret backend (`thegn-core/secret.rs`)
 
 `resolve(secret_ref) -> Option<String>` matches a prefix chain:
 `keyring:<service>/<account>` → OS keyring; `env:VAR` → `$VAR`; `file:PATH` →
 a `0600` file; a bare string → treated as `env:` (back-compat, keeps every
 existing config working). `store(name, token) -> SecretRef` tries the keyring,
-falls back to a `0600` file under `$XDG_CONFIG_HOME/superzej/secrets/`, and
+falls back to a `0600` file under `$XDG_CONFIG_HOME/thegn/secrets/`, and
 returns the ref to write into config. `forget(name)` removes both. All degrade
 softly: a headless box with no Secret Service falls keyring → file → env and
 never wedges a launch.
@@ -25,17 +25,17 @@ never wedges a launch.
 **Dependency constraint (hard):** the `keyring` crate MUST use
 `async-secret-service` + `async-io` + `crypto-rust` (zbus, pure Rust). The
 `sync-secret-service` feature pulls C `libdbus-sys`, which breaks
-superzej-core's C-dep-free / cross-compile posture and its 95% coverage build.
+thegn-core's C-dep-free / cross-compile posture and its 95% coverage build.
 Verified with `cargo tree -i libdbus-sys` (empty).
 
-## Layer 2 — config write path (`superzej-core/config_write.rs`)
+## Layer 2 — config write path (`thegn-core/config_write.rs`)
 
 `toml_edit` (already a dep) for comment/format-preserving edits.
 `upsert_env(scope, name, EnvSpec)` writes `[env.<name>]` +
 `[env.<name>.provider]`/`.ssh` from a typed `EnvSpec` mirroring
 `EnvProviderConfig`; `remove_env`, `set_key(dotted, value)`,
 `select_env_in_repo`. A `subtable` helper creates nested tables idempotently.
-`select_env_in_repo` is the only write allowed against a repo `.superzej.toml`
+`select_env_in_repo` is the only write allowed against a repo `.thegn.toml`
 (the `env = "…"` selection); env _definitions_ refuse a repo scope, enforcing
 the trust-clamp model in `config_resolve.rs`.
 

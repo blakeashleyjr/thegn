@@ -1,10 +1,14 @@
-L0| 15.4/94G ·  ↓  1.1M ↑  603K ·  100%…
-R0 0 10 fg=#c6ccdb bg=#151a28 attrs=
-R0 10 3 fg=#6f788e bg=#151a28 attrs=
-R0 13 17 fg=#c6ccdb bg=#151a28 attrs=
-R0 30 3 fg=#6f788e bg=#151a28 attrs=
-R0 33 6 fg=#f09d6a bg=#151a28 attrs=
-R0 39 1 fg=#6f788e bg=#151a28 attrs=
+L0| þ thegn v0.1.0  work        97% ·  17
+R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
+R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 9 6 fg=#6f788e bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 28 5 fg=#f7768e bg=#151a28 attrs=
+R0 33 3 fg=#6f788e bg=#151a28 attrs=
+R0 36 4 fg=#c6ccdb bg=#151a28 attrs=
 L1|────────────────────────────────────────
 R1 0 40 fg=#6f788e bg=#151a28 attrs=
 L2| HOME ▸ home   1
@@ -14,28 +18,18 @@ R2 5 3 fg=#6f788e bg=#0b0e16 attrs=
 R2 8 4 fg=#6ee7d8 bg=#0b0e16 attrs=
 R2 12 2 fg=default bg=default attrs=
 R2 14 3 fg=#6ee7d8 bg=#2e5359 attrs=
-L3|    █▀▀ █ █ █▀█ ██▀ █▀█ ▀▀█ ██▀ ▀█▀
-R3 0 4 fg=default bg=default attrs=
-R3 4 31 fg=#6ee7d8 bg=#0b0e16 attrs=
-L4|    ▄▄█ █▄█ █▀▀ █▄▄ █▀▄ █▄▄ █▄▄ ▄█
-R4 0 4 fg=default bg=default attrs=
-R4 4 31 fg=#6ee7d8 bg=#0b0e16 attrs=
-L5|
-L6|       v0.1.0 · git worktree IDE
-R6 0 7 fg=default bg=default attrs=
-R6 7 6 fg=#c6ccdb bg=#0b0e16 attrs=
-R6 13 19 fg=#7a8197 bg=#0b0e16 attrs=
-L7|
-L8|               ↻ sandbox
-R8 0 15 fg=default bg=default attrs=
-R8 15 9 fg=#6ee7d8 bg=#0b0e16 attrs=
-L9|  NORMAL       0 LOC  ✋ 1    7% free
-R9 0 1 fg=#edf0f8 bg=#151a28 attrs=
-R9 1 8 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
-R9 9 6 fg=#edf0f8 bg=#151a28 attrs=
-R9 15 5 fg=#c6ccdb bg=#151a28 attrs=
-R9 20 1 fg=#edf0f8 bg=#151a28 attrs=
-R9 21 6 fg=#0b0e16 bg=#e6c264 attrs=BOLD
-R9 27 1 fg=#edf0f8 bg=#151a28 attrs=
-R9 28 11 fg=#0b0e16 bg=#ef6f6f attrs=BOLD
-R9 39 1 fg=#edf0f8 bg=#151a28 attrs=
+L3|
+L4|
+L5|                                   ▀▀█▀▀
+R5 0 35 fg=default bg=default attrs=
+R5 35 5 fg=#6ee7d8 bg=#0b0e16 attrs=
+L6|                                     █
+R6 0 35 fg=default bg=default attrs=
+R6 35 5 fg=#6ee7d8 bg=#0b0e16 attrs=
+L7|                                     █
+R7 0 35 fg=default bg=default attrs=
+R7 35 5 fg=#6ee7d8 bg=#0b0e16 attrs=
+L8|
+L9|                                     v0.
+R9 0 37 fg=default bg=default attrs=
+R9 37 3 fg=#c6ccdb bg=#0b0e16 attrs=

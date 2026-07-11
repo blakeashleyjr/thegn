@@ -2,7 +2,7 @@
 # flaky-proxy.sh — a deliberately unreliable ssh ProxyCommand for testing the
 # remote-connection hardening (keepalives, transient-retry, auto-heal).
 #
-# Usage (in ~/.ssh/config or superzej [host.*.ssh] extra_args):
+# Usage (in ~/.ssh/config or thegn [host.*.ssh] extra_args):
 #   extra_args = ["-o", "ProxyCommand=scripts/flaky-proxy.sh %h %p"]
 #
 # Modes (env vars):

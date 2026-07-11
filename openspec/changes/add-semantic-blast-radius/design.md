@@ -5,7 +5,7 @@
 The subsystem is deliberately halved along the core's substrate-agnostic seam so
 the interesting logic is unit-testable and coverage-gated:
 
-- **PURE (superzej-core, 95%-gated).** All of it takes owned data and returns
+- **PURE (thegn-core, 95%-gated).** All of it takes owned data and returns
   owned data — no LSP, no DB, no clock:
   - `entity_id(repo, file, qualified_name, kind)` — a stable content-free hash
     that is the join key across parses. Two parses of an unchanged entity yield
@@ -24,7 +24,7 @@ the interesting logic is unit-testable and coverage-gated:
     thresholds.
   - `BlastRadius` summary (changed count, caller count, file count, untested
     count, risk) that the footer and MCP tool both render.
-- **I/O (superzej-svc / superzej-host, excluded from the core gate, exercised by
+- **I/O (thegn-svc / thegn-host, excluded from the core gate, exercised by
   smoke).** The `references` LSP round-trips and the SQLite reads/writes. These
   run on the hydration `spawn_blocking` path and the fs-watcher thread — never on
   the event loop.

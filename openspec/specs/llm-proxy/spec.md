@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The LLM proxy (`szproxy`) is the lower control plane for AI traffic: a
+The LLM proxy (`tgproxy`) is the lower control plane for AI traffic: a
 dual-protocol relay that fronts upstream model providers with failover, circuit
 breaking, streaming passthrough, and per-agent virtual keys with budgets. It is
 strictly additive — the AI-free shell never depends on it — and runs as a managed

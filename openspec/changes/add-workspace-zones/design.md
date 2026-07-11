@@ -6,7 +6,7 @@ A `[zone.<name>]` table holds declarative, git-diffable policy (bound bundles,
 egress/budget ceilings, sandbox floor). Membership is a nullable
 `workspaces.zone_id` — a single column, not a join table, so membership is
 exclusive by construction (a workspace in two zones would dissolve the firewall).
-Membership is set by an explicit action (`superzej zone assign`), never inferred
+Membership is set by an explicit action (`thegn zone assign`), never inferred
 from a path; a filesystem path may only _suggest_ a zone in the UI. The DB is
 already per-profile (profiles reroot `XDG_STATE_HOME`), so zone rows are
 profile-scoped for free. Deleting a zone with members is refused unless forced.
@@ -31,7 +31,7 @@ Global (unzoned) bundles remain composable everywhere.
 
 ## Budget rollup — no sync protocol
 
-szproxy opens the _same_ per-profile `superzej.db` as the host, so the
+tgproxy opens the _same_ per-profile `thegn.db` as the host, so the
 worktree→zone mapping needs no push or periodic sync: `resolve_identity` derives
 the worktree from a `worktree:<path>` scope and looks up its zone under the
 already-held DB lock. `check_budget` and `record_spend` iterate `scope → zone →

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-superzej's appearance is fully configurable and live-reloadable: named presets
+thegn's appearance is fully configurable and live-reloadable: named presets
 plus per-color overrides resolve into a single `Palette` carried in the frame
 model, and stats use threshold colors. Chrome never hardcodes colors, so themes
 can change at runtime without a restart.

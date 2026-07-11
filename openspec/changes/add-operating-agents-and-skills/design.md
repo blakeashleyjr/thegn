@@ -3,7 +3,7 @@
 ## Operating-agent definitions (core, declarative)
 
 A definition is a markdown file with front-matter, resolved from
-`.superzej/agents/*.md` (repo) then `$XDG_CONFIG_HOME/superzej/agents/*.md`
+`.thegn/agents/*.md` (repo) then `$XDG_CONFIG_HOME/thegn/agents/*.md`
 (global), repo winning — the same layering as other config:
 
 ```markdown
@@ -18,7 +18,7 @@ You are a read-only research agent. You never modify files…
 ```
 
 Parsed into `OperatingAgent { id, title, tools: BTreeSet<ToolId>, model,
-system_prompt }` in `superzej-core::operating_agent` — **pure + unit-tested**:
+system_prompt }` in `thegn-core::operating_agent` — **pure + unit-tested**:
 front-matter parse, tool-set parse, missing-fields defaults, precedence
 (repo overrides global by `id`). Ship three built-in defaults:
 
@@ -40,13 +40,13 @@ engine (which decides allow/deny/ask _within_ an allowed tool) and the bouncer
 
 ## Skills (declarative workflows, injected by the gateway)
 
-A skill is a named, reusable workflow resolved from `.superzej/skills/<name>/`
+A skill is a named, reusable workflow resolved from `.thegn/skills/<name>/`
 (and the global dir): a `SKILL.md` describing when/how to use it plus optional
 parameters. Skills are **orthogonal to agents** — any agent may invoke a skill.
 They are surfaced to harnesses by the gateway's capability injection (AR
 541–543): the skill becomes an advertised tool/command, **translated per harness**
 (AR 570) so one definition works across Claude Code / Codex / OpenCode.
-`superzej-core::skill` parses and validates a skill definition (pure, tested);
+`thegn-core::skill` parses and validates a skill definition (pure, tested);
 the injection/translation itself is AR's mechanism (a dependency, not built here).
 
 ## Cache-aware injection (constraint, not mechanism)

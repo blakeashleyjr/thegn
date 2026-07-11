@@ -1,10 +1,11 @@
-L0| ◆ superzej v0.1.0 work     16.2/94G ·   7% ·  51% ·  95°C ·  ↓   28K ↑    0B ·  100% · 22:06
+L0| þ thegn v0.1.0  work       21.5/94G ·   7% ·  36% ·  97°C ·  ↓    4K ↑   22K ·  100% · 02:20
 R0 0 1 fg=idx3b bg=idxe9 attrs=
 R0 1 2 fg=idxef bg=idxe9 attrs=
-R0 3 9 fg=idx3b bg=idxe9 attrs=
-R0 12 6 fg=idxed bg=idxe9 attrs=
-R0 18 6 fg=idxef bg=idxeb attrs=
-R0 24 3 fg=idx3b bg=idxe9 attrs=
+R0 3 6 fg=idx3b bg=idxe9 attrs=
+R0 9 6 fg=idxed bg=idxe9 attrs=
+R0 15 1 fg=idx3b bg=idxe9 attrs=
+R0 16 6 fg=idxef bg=idxeb attrs=
+R0 22 5 fg=idx3b bg=idxe9 attrs=
 R0 27 10 fg=idxef bg=idxe9 attrs=
 R0 37 3 fg=idxed bg=idxe9 attrs=
 R0 40 5 fg=idxee bg=idxe9 attrs=
@@ -113,15 +114,15 @@ R13 89 2 fg=idxeb bg=idxe8 attrs=
 R13 91 7 fg=idx3b bg=idxe9 attrs=
 R13 98 1 fg=idxec bg=idxe9 attrs=
 R13 99 1 fg=idx3b bg=idxe9 attrs=
-L14|          │ ❯  d  superzej defaults                                     Alt/Ctrl chords │
+L14|          │ ❯  d  thegn defaults                                        Alt/Ctrl chords │
 R14 0 10 fg=idx3c bg=idxe9 attrs=
 R14 10 1 fg=idx66 bg=idxea attrs=
 R14 11 1 fg=default bg=idxea attrs=
 R14 12 2 fg=idx50 bg=idxec attrs=BOLD
 R14 14 3 fg=idxff bg=idxec attrs=BOLD
 R14 17 1 fg=idxff bg=idxec attrs=
-R14 18 17 fg=idxff bg=idxec attrs=BOLD
-R14 35 37 fg=idxff bg=idxec attrs=
+R14 18 14 fg=idxff bg=idxec attrs=BOLD
+R14 32 40 fg=idxff bg=idxec attrs=
 R14 72 15 fg=idx42 bg=idxec attrs=
 R14 87 1 fg=default bg=idxea attrs=
 R14 88 1 fg=idx66 bg=idxea attrs=

@@ -30,7 +30,7 @@ Make landing in the right worktree instant, borrowing the entry-UX from
 ## Rationale
 
 sesh's whole value is "type a fuzzy fragment, land in the right session," backed
-by zoxide frecency and a `sesh root` jump. superzej already persists `repos`
+by zoxide frecency and a `sesh root` jump. thegn already persists `repos`
 (`last_opened`, `seq`, `open_count`) and a `frecency` table for the palette, and
 already knows every worktree root — so this is wiring existing data into the
 opener, not new persistence. `sesh root` in particular maps cleanly: a user who
@@ -40,11 +40,11 @@ migration lever: they let users bring existing layouts without hand-rebuilding.
 
 ## Non-goals
 
-- **A zoxide hard dependency** — superzej owns its own frecency table; reading an
+- **A zoxide hard dependency** — thegn owns its own frecency table; reading an
   external `zoxide query` is an optional enrichment, not required.
-- **A general session-manager mode** — superzej is one-session (repos/worktrees
+- **A general session-manager mode** — thegn is one-session (repos/worktrees
   are tabs); this is about _entering_ a worktree fast, not spawning detached
   sessions.
-- **Bidirectional layout export** — importers are read-only; superzej does not
+- **Bidirectional layout export** — importers are read-only; thegn does not
   write back tmuxinator/sesh files.
 - **Any AI dependency** — pure shell navigation; no proxy/agent involvement.

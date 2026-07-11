@@ -4,7 +4,7 @@
 # the termwiz/openpty path that ordinary non-PTY CLI smoke tests cannot touch.
 set -euo pipefail
 
-SZ="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/szhost}"
+SZ="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/thegn}"
 SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
 [[ -x $SZ ]] || {
   echo "not executable: $SZ (run: cargo build)" >&2
@@ -41,7 +41,7 @@ run_case() {
 
   local cmd
   printf -v cmd \
-    'stty cols %q rows %q; env HOME=%q XDG_CONFIG_HOME=%q XDG_STATE_HOME=%q SUPERZEJ_BENCH_FIRST_FRAME_EXIT=1 %q' \
+    'stty cols %q rows %q; env HOME=%q XDG_CONFIG_HOME=%q XDG_STATE_HOME=%q THEGN_BENCH_FIRST_FRAME_EXIT=1 %q' \
     "$cols" "$rows" "$home" "$config" "$state" "$SZ"
 
   if timeout 20s script -qec "$cmd" "$log" >/dev/null; then
@@ -57,7 +57,7 @@ run_case() {
   fi
 }
 
-echo "superzej PTY smoke test"
+echo "thegn PTY smoke test"
 run_case normal 100 30
 run_case short 40 8
 

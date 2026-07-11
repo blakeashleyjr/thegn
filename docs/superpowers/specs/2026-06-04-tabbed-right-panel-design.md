@@ -88,11 +88,11 @@ struct FileEntry {
 Add to `src/commands/diff.rs` and `src/cli.rs`:
 
 ```
-superzej diff --files --worktree <wt>
+thegn diff --files --worktree <wt>
   → TSV output: <status>\t<path>\n
   → Based on merge-base target
 
-superzej diff --file <path> --worktree <wt>
+thegn diff --file <path> --worktree <wt>
   → Colorized git diff -- <path>
   → Piped through delta when available
 ```

@@ -8,7 +8,7 @@
 # at the full default parallelism (one test per core) the suite self-saturates:
 # dozens of these tests fire hundreds of concurrent `git` processes doing fsync
 # on the same filesystem, and it gets pathological when the box is already busy
-# (a live `szhost` tracing git on the same repo, or a second `cargo test`). Under
+# (a live `thegn` tracing git on the same repo, or a second `cargo test`). Under
 # that IO storm individual git ops lose lock/IO races and the tests blow past
 # their internal deadlines and fail — even though every one of them passes in
 # isolation and at normal load.

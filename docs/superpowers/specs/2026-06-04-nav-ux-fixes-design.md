@@ -15,7 +15,7 @@ Status: approved (user picked the recommended option for each issue)
    zellij new-tab creates a bare, chrome-less `Tab #N` — no sidebar/tabbar/
    panel, not listed in the tabbar strip (it only lists `{slug}/…` tabs).
 3. **`Alt+[ / Alt+]` is a silent no-op.** They map to zellij swap-layout
-   cycling, but the superzej layouts define no `swap_tiled_layout` variants.
+   cycling, but the thegn layouts define no `swap_tiled_layout` variants.
 
 ## Decisions (from user Q&A)
 
@@ -38,13 +38,13 @@ Status: approved (user picked the recommended option for each issue)
   cycling: **arrows = tabs, letters = panes**.
 - Add `Super Alt h` / `Super Alt l` for parity with the existing `j/k`.
 
-### 2. Same-worktree tabs (`superzej new-tab`, Alt+t)
+### 2. Same-worktree tabs (`thegn new-tab`, Alt+t)
 
 - **New layout `layouts/worktree-tab-extra.kdl`**: identical chrome wrapper
   (sidebar | tabbar/terminal | panel | statusbar) but the center pane is a
   plain default shell — NOT `pick-agent --in-place`, which would rename the
   tab and clobber the `·N` name.
-- **New command `superzej new-tab`** (clap `NewTab`, `src/commands/new_tab.rs`):
+- **New command `thegn new-tab`** (clap `NewTab`, `src/commands/new_tab.rs`):
   1. Resolve the current worktree from cwd (`repo::toplevel`); derive the base
      tab name: `{slug}/home` for the main checkout, else
      `repo::branch_tab(slug, branch)`.
@@ -52,7 +52,7 @@ Status: approved (user picked the recommended option for each issue)
      N ≥ 2.
   3. `zellij new-tab --name "{base} ·N" --cwd <worktree> --layout
 worktree-tab-extra` (fallback: no layout, as new-worktree does).
-- **Keybinds**: `Alt t` → `Run superzej new-tab` (floating, close_on_exit,
+- **Keybinds**: `Alt t` → `Run thegn new-tab` (floating, close_on_exit,
   like Alt+w); `keybinds.tab` `n` → same Run + `SwitchToMode "Normal"`.
 - **Resolution**: `resolve-worktree` (panel feed) tries the exact tab name,
   then retries with a trailing ` ·N` stripped — so the diff/PR panel works on
@@ -65,7 +65,7 @@ worktree-tab-extra` (fallback: no layout, as new-worktree does).
 
 ### 3. Swap layouts for the center column
 
-Add to each tab layout file (`superzej.kdl`, `home-tab.kdl`,
+Add to each tab layout file (`thegn.kdl`, `home-tab.kdl`,
 `worktree-tab.kdl`, `worktree-tab-extra.kdl`) — they are deliberately
 self-contained copies, keep in sync:
 

@@ -1,10 +1,11 @@
-L0| ◆ superzej v0.1.0 work     16.1/94G ·   7% ·  49% ·  94°C ·  ↓    0B ↑   28K ·  100% · 22:06
+L0| þ thegn v0.1.0  work       21.7/94G ·   7% ·  37% ·  96°C ·  ↓    0B ↑    0B ·  100% · 02:20
 R0 0 1 fg=#5a5d65 bg=#0f131e attrs=
 R0 1 2 fg=#2d5959 bg=#0f131e attrs=
-R0 3 9 fg=#5a5d65 bg=#0f131e attrs=
-R0 12 6 fg=#2e3340 bg=#0f131e attrs=
-R0 18 6 fg=#2d5959 bg=#1a2d34 attrs=
-R0 24 3 fg=#5a5d65 bg=#0f131e attrs=
+R0 3 6 fg=#5a5d65 bg=#0f131e attrs=
+R0 9 6 fg=#2e3340 bg=#0f131e attrs=
+R0 15 1 fg=#5a5d65 bg=#0f131e attrs=
+R0 16 6 fg=#2d5959 bg=#1a2d34 attrs=
+R0 22 5 fg=#5a5d65 bg=#0f131e attrs=
 R0 27 10 fg=#4c505a bg=#0f131e attrs=
 R0 37 3 fg=#2e3340 bg=#0f131e attrs=
 R0 40 5 fg=#5d3240 bg=#0f131e attrs=
@@ -121,15 +122,15 @@ R13 89 2 fg=#1c2233 bg=#05070c attrs=
 R13 91 7 fg=#5a5d65 bg=#0f131e attrs=
 R13 98 1 fg=#2b303c bg=#0f131e attrs=
 R13 99 1 fg=#5a5d65 bg=#0f131e attrs=
-L14|          │ ❯  d  superzej defaults                                     Alt/Ctrl chords │
+L14|          │ ❯  d  thegn defaults                                        Alt/Ctrl chords │
 R14 0 10 fg=#677084 bg=#0f131e attrs=
 R14 10 1 fg=#7a8197 bg=#151a28 attrs=
 R14 11 1 fg=default bg=#151a28 attrs=
 R14 12 2 fg=#6ee7d8 bg=#1f363d attrs=BOLD
 R14 14 3 fg=#edf0f8 bg=#222942 attrs=BOLD
 R14 17 1 fg=#edf0f8 bg=#1f363d attrs=
-R14 18 17 fg=#edf0f8 bg=#1f363d attrs=BOLD
-R14 35 37 fg=#edf0f8 bg=#1f363d attrs=
+R14 18 14 fg=#edf0f8 bg=#1f363d attrs=BOLD
+R14 32 40 fg=#edf0f8 bg=#1f363d attrs=
 R14 72 15 fg=#6f788e bg=#1f363d attrs=
 R14 87 1 fg=default bg=#151a28 attrs=
 R14 88 1 fg=#7a8197 bg=#151a28 attrs=

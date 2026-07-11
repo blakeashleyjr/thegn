@@ -1,6 +1,6 @@
 //! `HostSource` — the zero-dependency datasource backing the built-in Observe
 //! dashboard. It samples the local machine's CPU/mem/load with the host's own
-//! [`superzej_metrics::StatsSampler`] on a dedicated thread (the sampler is
+//! [`thegn_metrics::StatsSampler`] on a dedicated thread (the sampler is
 //! blocking, stateful, and primes a CPU delta over two reads — so it can never
 //! touch the UI thread), keeps a rolling ring of recent snapshots, and answers
 //! queries by slicing that ring into a [`Frame`].
@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gtui_core::datasource::{DataSource, Query, QueryError};
 use gtui_core::frame::{Field, FieldType, Frame};
-use superzej_metrics::{StatsSampler, StatsSnapshot};
+use thegn_metrics::{StatsSampler, StatsSnapshot};
 
 /// How many samples to retain (≈ this many seconds at the 1 Hz sample rate).
 const RING_CAP: usize = 600;

@@ -2,7 +2,7 @@
 
 ## Summary
 
-superzej already routes foreign agents through the proxy — `route_agent` mints a
+thegn already routes foreign agents through the proxy — `route_agent` mints a
 **per-worktree virtual key** and relays the traffic — but there is no single
 place where that identity is turned into _policy_. The pieces exist and are
 scattered: `bouncer.rs` gates individual shell/edit/write calls for **human**
@@ -36,7 +36,7 @@ The policy itself is **declarative layered TOML** front-matter (agent identity �
 consistent with `config_enum!` and the markdown+TOML agent definitions the
 content change assumes. No new DSL/CEL dependency. The pure
 identity+request→`{allowed tools, injected blocks}` evaluation lives in
-**superzej-core** (coverage-gated); the wiring into the proxy/MCP I/O path is
+**thegn-core** (coverage-gated); the wiring into the proxy/MCP I/O path is
 the host/proxy crate.
 
 ## Impact
@@ -58,9 +58,9 @@ the host/proxy crate.
   policy chokepoint). MODIFY `mcp-servers` (tools/list filtered + deny-unlisted
   at tools/call, keyed by identity) and `llm-proxy` (per-identity injection on
   the request path + egress guardrail chain).
-- **superzej-core** — a new pure `gateway` module (policy load/layer + evaluate)
+- **thegn-core** — a new pure `gateway` module (policy load/layer + evaluate)
   under coverage; `proxy/transform.rs` gains a cache-safe injection helper.
-- **superzej-proxy / superzej-host** — wire the evaluated policy into the relay
+- **thegn-proxy / thegn-host** — wire the evaluated policy into the relay
   request path and the MCP router; the identity is the existing per-worktree
   virtual key (no new key concept).
 - **No DB schema change** — policy is declarative files resolved like layered
@@ -76,13 +76,13 @@ the host/proxy crate.
 
 The design north-star is **agentgateway** (the open-source agent-traffic gateway):
 one identity-keyed chokepoint that filters tools, injects capabilities, and
-guards egress for every agent behind it. superzej wants that _shape_, but **not**
+guards egress for every agent behind it. thegn wants that _shape_, but **not**
 its substrate — we do **not** vendor a Kubernetes controller/daemon or adopt a CEL
-policy engine. superzej already owns the choke points agentgateway externalizes:
+policy engine. thegn already owns the choke points agentgateway externalizes:
 the proxy request path (`proxy/transform.rs`), the MCP router (`mcp/router.rs`),
 and a per-worktree virtual-key identity minted by `route_agent`. Building the
 gateway **natively** over those seams, with policy expressed as the same layered
-TOML the rest of superzej uses, keeps the AI-free shell independent and the whole
+TOML the rest of thegn uses, keeps the AI-free shell independent and the whole
 thing hermetic — no new runtime, no new DSL. The single hard correctness
 constraint is prompt-cache safety: injection reorders/adds prompt blocks, and if
 the cache breakpoint lands before an injected block the upstream cache is busted

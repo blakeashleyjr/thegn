@@ -23,9 +23,9 @@ fallback:
   `gitmut.rs`.
 - **Commit flow** in `gitmut.rs`: hooks run normally and the existing
   `--no-verify` toggle is left untouched — this change MUST NOT bypass it.
-- **Proxy** `superzej-proxy` (group U): the single transport for every model
+- **Proxy** `thegn-proxy` (group U): the single transport for every model
   call (commit-message draft, batch annotation prompt, fix-with-AI repair).
-- **CI** `crates/superzej-svc/src/ci.rs`: `CiRun { jobs }` and
+- **CI** `crates/thegn-svc/src/ci.rs`: `CiRun { jobs }` and
   `CiLog { text, truncated }`, plus `CiLog::first_failure_line`, supply the
   failed-job names and first-failure line for the fix-with-AI repair prompt.
 - **Graphics preview path** (AF 399): the kitty/iTerm/sixel renderer used for

@@ -2,7 +2,7 @@
 
 ## Summary
 
-Give superzej a way to run **several agents against one task** and to
+Give thegn a way to run **several agents against one task** and to
 **coordinate fleets** of them, on a different axis from the fold-actor local
 merge-queue (which folds N already-finished worktree branches into local main).
 Three capabilities:
@@ -50,7 +50,7 @@ New DB state: a `scheduled_tasks` table; SQLite `user_version` bumps 21 → 22.
 
 ## Rationale
 
-- **superzej is worktree-native and already spins per-worktree sandboxes**, so
+- **thegn is worktree-native and already spins per-worktree sandboxes**, so
   N racing agents map cleanly onto N worktrees and the existing diff/review pane
   (T 267) is already a side-by-side compare surface. Cherry-pick into a merge
   worktree reuses the existing git mutations in `gitmut.rs`.

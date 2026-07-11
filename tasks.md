@@ -1,4 +1,4 @@
-# superzej — roadmap & progress
+# thegn — roadmap & progress
 
 **725 features across 50 groups (A–AX).** The list is **two tracks joined by one
 keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**. The
@@ -7,7 +7,7 @@ control plane has **two layers** (see
 **lower** plane is the **proxy** (**U/V/W → AR**), the single interception point
 every agent's _model traffic_ crosses — configure a cross-cutting concern **once,
 every harness inherits it**; the **upper** plane is **ACP** (group **R**), which owns
-the _agent conversation_ (superzej as Client/Agent/Proxy). The planes meet at
+the _agent conversation_ (thegn as Client/Agent/Proxy). The planes meet at
 `providers/set` (R 689 → U) and MCP-over-ACP (R 696 → AL). U/V/W graduates into the
 **AI gateway / context fabric** in **AR (541–586)**.
 
@@ -43,7 +43,7 @@ started** of 725. _(2026-07-06 reconcile: archived `add-{placement-engine,indepe
 
 **Shipped & solid:**
 
-- **Shell core** — native `superzej-host` compositor (termwiz + portable-pty +
+- **Shell core** — native `thegn-host` compositor (termwiz + portable-pty +
   `CenterTree`, `alacritty_terminal` emulator); in-process chrome, workspaces × worktree
   tabs, session detach/attach/resurrection. (Zellij/WASM stripped in Phase 0.)
 - **Keybinds** — full registry, KDL splice, conflict detection, cheatsheet (`F`), chords/
@@ -62,7 +62,7 @@ started** of 725. _(2026-07-06 reconcile: archived `add-{placement-engine,indepe
   remote worktrees over ssh/mosh.
 - **Notification/event bus** — first-class `EventBus` (PR/agent/test/log/worktree/process),
   urgency thresholds, desktop notifications, notifications panel/inbox, sidebar badges.
-- **Proxy** — `superzej-proxy`: dual-protocol relay (Anthropic SSE + OpenAI), failover/
+- **Proxy** — `thegn-proxy`: dual-protocol relay (Anthropic SSE + OpenAI), failover/
   load-balanced/speculative routing, limit/reset tracking, per-scope budgets + spend
   attribution, in-flight token reduction; host auto-launches it.
 - **IDE panels** — problems/diagnostics, task registry + test discovery, symbols, LSP
@@ -96,8 +96,8 @@ started** of 725. _(2026-07-06 reconcile: archived `add-{placement-engine,indepe
   earlier embedded-`termite-agent`-tile path (an `agent` app tab driving `AgentRuntime`
   on `spawn_blocking`) was **reverted** — the tab was dropped, `apps/agent.rs` is an inert
   stub, and there is no `AgentRuntime`. The **shipping agent surface is a managed `pi`
-  driven over ACP** (R1 client committed on `main`: `crates/superzej-{svc,core}/src/acp/`,
-  `extensions/superzej-acp.ts`, host `bouncer.rs`/`relay.rs`), routed through `szproxy`
+  driven over ACP** (R1 client committed on `main`: `crates/thegn-{svc,core}/src/acp/`,
+  `extensions/thegn-acp.ts`, host `bouncer.rs`/`relay.rs`), routed through `tgproxy`
   under per-worktree virtual keys. R is the upper control plane (ACP Client/Agent/Proxy).
   Orchestration core **Q** (task registry → worktree → agent → review → merge pipeline +
   queue) is **unstarted**; **S** observability and **T** review/merge are largely
@@ -125,7 +125,7 @@ started** of 725. _(2026-07-06 reconcile: archived `add-{placement-engine,indepe
 
 **This file is the _map_; `openspec/specs/<capability>/spec.md` is the _territory_.**
 Where a capability spec exists, it — not this roadmap — is the authoritative,
-behavior-first record of how the shipped `szhost` behaves _today_ (`### Requirement:`
+behavior-first record of how the shipped `thegn` behaves _today_ (`### Requirement:`
 SHALL/MUST + `#### Scenario:` WHEN/THEN). This roadmap owns the numbered backlog and
 the phasing; OpenSpec owns per-capability detail. When they disagree, the spec wins
 and this file is stale — fix it. In-flight work lives in `openspec/changes/<name>/`
@@ -244,7 +244,7 @@ The visual-staging (**Y 601–602, 604–605**), file-management (**AF 606**), a
 jujutsu/VCS-backend (**AS 587–600**) groups are a deliberate import of the
 **Kyde** feature set ("git add -p, made visual" — a fast native commit/diff
 client) extended to a second VCS. Deliberately **excluded**: Kyde's in-place
-text editing (native editor, in-buffer find/replace, editable diff) — superzej
+text editing (native editor, in-buffer find/replace, editable diff) — thegn
 stays a viewer/VCS client and hands editing off to `$EDITOR` (AG). A backend
 abstraction means each remaining surface ships once and works for both git and
 jujutsu.
@@ -273,12 +273,12 @@ orchestrator.
 
 Depends on Phase 1 (shell) + Phase 2 (proxy + containers).
 
-- **Embedded harness first** — the `termite-agent` submodule is superzej's first-party
+- **Embedded harness first** — the `termite-agent` submodule is thegn's first-party
   coding agent, hosted as the `agent` app tab. Q/S/T track against **its** roadmap
   (`apps/termite-agent/docs/ROADMAP.md`) as the source of truth.
 - Orchestration core **Q (211–224)** (defer 225–228)
 - **R is now secondary:** ACP client + native adapters **(229–242)** are an _additive_
-  path for running _foreign_ harnesses, not the headline — superzej ships its own.
+  path for running _foreign_ harnesses, not the headline — thegn ships its own.
 - Observability **S (243–258)** (tokens/cost 249–250 light up because the proxy exists)
 - Review/merge basics **T (259–263, 267–268)**
 - **Milestone:** spawn, monitor, review, and merge agents across worktrees, metered
@@ -347,22 +347,22 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 
 ### A. Core architecture
 
-- [~] 1. Coordinator core — `superzej-core` owns all state (in-process, not a daemon)
-- [x] 2. ~~zellij substrate~~ — **REMOVED**: the native `superzej-host` compositor owns multiplexing/rendering (termwiz + portable-pty + `CenterTree`)
-- [x] 3. ~~Thin zellij WASM plugins~~ — **REMOVED**: chrome (sidebar/panel/tabbar/statusbar) is in-process in `superzej-host`
+- [~] 1. Coordinator core — `thegn-core` owns all state (in-process, not a daemon)
+- [x] 2. ~~zellij substrate~~ — **REMOVED**: the native `thegn-host` compositor owns multiplexing/rendering (termwiz + portable-pty + `CenterTree`)
+- [x] 3. ~~Thin zellij WASM plugins~~ — **REMOVED**: chrome (sidebar/panel/tabbar/statusbar) is in-process in `thegn-host`
 - [ ] 4. ~~Daemon↔plugin IPC~~ — **N/A after strip**: no separate plugin process; the future native plugin API contract lives in `core/plugin_api.rs` (unwired)
-- [x] 5. Single-binary distribution — one `superzej`(=`szhost`); no side artifacts
-- [~] 6. One core, many front doors — TUI (host) + CLI verbs share `superzej-core`; API/MCP still aspirational (AK/AL) _(CLI surface v2 — `wt`/`repo` namespaces, headless `wt new`/`rm`, blanket `--json`, grouped help, completions, `open` remote control: `openspec/changes/add-cli-namespaces-and-remote-open/`)_
+- [x] 5. Single-binary distribution — one `thegn`(=`thegn`); no side artifacts
+- [~] 6. One core, many front doors — TUI (host) + CLI verbs share `thegn-core`; API/MCP still aspirational (AK/AL) _(CLI surface v2 — `wt`/`repo` namespaces, headless `wt new`/`rm`, blanket `--json`, grouped help, completions, `open` remote control: `openspec/changes/add-cli-namespaces-and-remote-open/`)_
 - [ ] 7. Headless daemon — UI attaches/detaches _(not yet; host is a foreground compositor, state resurrects from SQLite)_
 - [ ] 8. Daemon supervision — crash recovery _(state resurrection only; no supervisor)_
-- [x] 9. Internal event bus — normalized events _(first-class `EventBus` in `superzej-core`: subscribe/publish, urgency ranking, desktop-notification derivation)_
+- [x] 9. Internal event bus — normalized events _(first-class `EventBus` in `thegn-core`: subscribe/publish, urgency ranking, desktop-notification derivation)_
 - [x] 10. Embedded state store — sqlite
 - [x] 11. Config hot-reload — without dropping sessions
 - [x] 12. Structured logging
 
 ### B. Workspace bar / tree
 
-_Rebuilt natively in `superzej-host` (`sidebar.rs` tree model + `SidebarState`
+_Rebuilt natively in `thegn-host` (`sidebar.rs` tree model + `SidebarState`
 focus mode in `run.rs` + `chrome::draw_sidebar`); view state persists in the
 `ui_state` DB table. Press `Alt-s` to focus the tree, then `j/k` move, `Enter`
 open/collapse, `/` filter, `s` sort, `p` pin, `Space` select, `m` menu, `X` bulk
@@ -415,9 +415,9 @@ _Tier-2 layout/task templates generalize worktree templates (54) with native
 - [x] 48. Stale worktree GC _(auto `cargo clean` of `target/` on PR merge/close via the `pr_branch_cache` feed → `worktree::clean_target`, gated `[disk].auto_clean_on_merge`/`clean_on_pr_closed`; active worktree + running builds skipped)_
 - [x] 49. Dirty-state warning before destructive ops
 - [ ] 50. Dependency sharing — hardlink/CoW node_modules etc.
-- [x] 51. Per-worktree disk usage _(off-loop `du` scan → `worktree_disk` cache (db v20), sidebar size badge + statusbar `[disk].warn_threshold_gb` chip + `superzej disk`/`clean` CLI; `disk.rs`)_
+- [x] 51. Per-worktree disk usage _(off-loop `du` scan → `worktree_disk` cache (db v20), sidebar size badge + statusbar `[disk].warn_threshold_gb` chip + `thegn disk`/`clean` CLI; `disk.rs`)_
 - [x] 52. Fork worktree (branch from existing) _(`SidebarOutcome::Fork` from the row menu → `begin_worktree_wizard(base_override=Some(branch))` in run.rs)_
-- [x] 53. Rename worktree/branch _(`PromptRename` → `HostInputKind::RenameWorktree` → `superzej_core::worktree::rename` (branch -m + worktree move); tested by `rename_moves_branch_and_checkout`)_
+- [x] 53. Rename worktree/branch _(`PromptRename` → `HostInputKind::RenameWorktree` → `thegn_core::worktree::rename` (branch -m + worktree move); tested by `rename_moves_branch_and_checkout`)_
 - [~] 54. Worktree templates — layout+programs+container preset + setup/post-create hooks (deps install, env restore; see 657) _(`NewWorktreeFromTemplate` action wired in run.rs + `[[worktree_templates]]` config; setup/post-create hook depth still partial)_
 - [x] 55. Worktree↔PR mapping _(`pr_branch_cache` keyed by repo root; `get_open_pr_counts_by_branch`/`spawn_pr_cache_refresh` in hydrate.rs — every worktree resolves its branch's badge)_
 - [x] 56. Bulk worktree cleanup _(sidebar multi-select `Space` + `X` bulk close)_
@@ -428,8 +428,8 @@ _Tier-2 layout/task templates generalize worktree templates (54) with native
 `Alt-1..9` / tabbar pin chips. Global + lazy only. See `src/commands/pin.rs`,
 `layouts/pin-tab.kdl`, the tabbar chip strip, and `[[pins]]` config.
 
-**Slice 2 (native host, shipped):** the full pin/daemon system in `superzej-host`
-— a `PinSupervisor` (`crates/superzej-host/src/pins.rs`) owns daemon panes
+**Slice 2 (native host, shipped):** the full pin/daemon system in `thegn-host`
+— a `PinSupervisor` (`crates/thegn-host/src/pins.rs`) owns daemon panes
 independent of tabs/visibility, a real top-**strip** chrome region
 (`layout.rs::compute_with_strip`, `chrome.rs::draw_strip`), tabbar pin chips, and
 `[[pins]]` extended with `args/env/label/ratio` + `location = strip|float`. Pins
@@ -672,30 +672,30 @@ tests, symbols, git objects, and worktrees._
 
 ### R. Agent integration protocols (ACP — the upper control plane)
 
-_Reframed (2026-06-24): superzej is **one control plane in two layers** (see
+_Reframed (2026-06-24): thegn is **one control plane in two layers** (see
 `docs/superpowers/specs/2026-06-24-acp-two-layer-control-plane-design.md`). The
-**lower** plane is `szproxy` (**U/V/W → AR**), which owns model traffic. This
+**lower** plane is `tgproxy` (**U/V/W → AR**), which owns model traffic. This
 group is the **upper** plane — the **Agent Client Protocol** (ACP), which owns
 the agent conversation (sessions, tool calls, permissions, diffs, plans, config
 options). ACP is **co-primary**, not "additive/secondary". (The earlier
 embedded-`termite-agent`-tile framing is **superseded** — that tile was reverted;
 the shipping harness is a **managed `pi`** driven over ACP. See the SUPERSEDED banner
 in `docs/superpowers/specs/2026-06-22-embedded-agent-integration-design.md`.)
-superzej participates in ACP in **three roles** — **Client** (R1, consume
+thegn participates in ACP in **three roles** — **Client** (R1, consume
 foreign agents), **Agent** (R2, expose its own harness outward), and **Proxy** (R3,
 realize AR for any ACP agent). The two planes meet at two seams:
-`providers/set` (point any ACP agent's model traffic at `szproxy`) and
+`providers/set` (point any ACP agent's model traffic at `tgproxy`) and
 MCP-over-ACP (advertise AR's house tools up to any agent)._
 
 _**Landed (committed on `main`; the real, shipping agent surface):** the R1 client +
 the two convergence seams are functionally working against a managed `pi`: ACP client
 (`initialize`), client-serviced `terminal/create` (sandboxed run-to-completion),
-`fs/read_text_file`, `superzej/edit`+`write` (worktree-scoped), `providers/set`
-routing through `szproxy` with a per-worktree minted virtual key, and a
+`fs/read_text_file`, `thegn/edit`+`write` (worktree-scoped), `providers/set`
+routing through `tgproxy` with a per-worktree minted virtual key, and a
 per-worktree `session/update` → statusbar **agent chip** (tool + ctx% + connection
-lifecycle). Code: `crates/superzej-svc/src/acp/` (`AcpClient`),
-`crates/superzej-core/src/acp/` (data model), `extensions/superzej-acp.ts` (the
-in-pane pi bridge, pinned pi `0.80.2`), `crates/superzej-host/src/{bouncer,relay}.rs`
+lifecycle). Code: `crates/thegn-svc/src/acp/` (`AcpClient`),
+`crates/thegn-core/src/acp/` (data model), `extensions/thegn-acp.ts` (the
+in-pane pi bridge, pinned pi `0.80.2`), `crates/thegn-host/src/{bouncer,relay}.rs`
 (sealed-sandbox tool gate + model relay). Transport is **TCP or a bind-mounted unix
 socket + newline-JSON** (the pi extension's server), not stdio. (This work was earlier
 mis-recorded as an uncommitted `sz/spicy-dragon` branch; it is committed on `main`.)_
@@ -723,15 +723,15 @@ surfaces on top of the minimal baseline — see the approved plan._
 - [ ] 686. ACP Elicitation — `elicitation/create` form mode (restricted JSON Schema) + URL mode (OAuth); accept/decline/cancel → native iocraft form UI (shares AL 459)
 - [~] 687. Client filesystem surface — serve `fs/read_text_file`/`fs/write_text_file`, unsaved-buffer aware, scoped to the worktree
 - [~] 688. Client terminal surface — serve `terminal/create`/`output`/`wait_for_exit`/`kill`/`release` (env/cwd/outputByteLimit) through our PTY + `sandbox::enter_argv`; embed in tool calls. _We are a terminal multiplexer — this makes us a premier ACP terminal client._
-- [~] 689. **Configurable LLM Providers** — `providers/list`/`providers/set`/`providers/disable` (id/apiType/baseUrl/headers) to route any ACP agent's model traffic through `szproxy`. **The R↔U bridge** _(connects U 271/287; powers U 283 local upstreams)_
+- [~] 689. **Configurable LLM Providers** — `providers/list`/`providers/set`/`providers/disable` (id/apiType/baseUrl/headers) to route any ACP agent's model traffic through `tgproxy`. **The R↔U bridge** _(connects U 271/287; powers U 283 local upstreams)_
 - [ ] 690. Agent Telemetry Export — inject `OTEL_EXPORTER_OTLP_ENDPOINT` + `params._meta` traceparent into agent subprocs; ingest into the perf/observability suite _(feeds S 254)_
 - [ ] 691. Protocol-version negotiation + `_meta`/extensibility + **v2 readiness** — track the ACP v2 redesign (unified `capabilities`, object-valued markers, item-based `plan_update`, upsert `tool_call`, content chunks) and build v2-shaped
 
-**R2 · ACP Agent — expose superzej / termite outward:**
+**R2 · ACP Agent — expose thegn / termite outward:**
 
 - [ ] 692. termite-agent as an ACP **agent server** — implement the Agent side so termite is consumable by Zed/other ACP clients; submit to the ACP Registry (distribution play) _(wraps the same `AgentRuntime` as `apps/agent.rs`)_
 - [ ] 693. Emit ACP updates from termite — `plan`/`tool_call`/`tool_call_update`/`usage_update`/`config_option_update` over the ACP channel
-- [ ] 694. superzej house-tools as an ACP agent endpoint — expose house tools/context (rtk, sem, weave) as an ACP agent for foreign clients
+- [ ] 694. thegn house-tools as an ACP agent endpoint — expose house tools/context (rtk, sem, weave) as an ACP agent for foreign clients
 
 **R3 · ACP Proxy — the convergence (AR realized over ACP):**
 
@@ -794,12 +794,12 @@ as the agent-specific side of the broader attention queue._
 - [~] 269. PR creation from review
 - [ ] 270. Semantic merge via weave
 - [ ] 654. Per-line agent-vs-human attribution overlay — track provenance on every line an agent touches; AI/human gutter markers in the diff/review pane; reassign to human on a subsequent human edit; local-only (never written to git), exportable from the diff toolbar (Orca-style; complements entity-blame X 312)
-- [~] 758. Agent-driven merge-queue driver — assign worktree branches to the queue (`merge add [--all]`) and drain them serially (`merge drain`): clean branches auto-land; a conflict or red gate dispatches a headless CLI agent (Claude Code default, any command) inside the branch's worktree to rebase/resolve/fix, then re-folds and auto-lands (configurable), marking `needs_human` after `agent_max_attempts`. Agent never touches the target — superzej does the object-DB fold + CAS, preserving the merge-guard coherence guarantee. Builds on the fold-actor (`4fbc92b`); `add-agent-merge-driver`. Follow-up: in-TUI actions + `auto_drain` (blocked on a run.rs/keymap.rs extraction). _(complements 263/268 and orchestration core Q)_
+- [~] 758. Agent-driven merge-queue driver — assign worktree branches to the queue (`merge add [--all]`) and drain them serially (`merge drain`): clean branches auto-land; a conflict or red gate dispatches a headless CLI agent (Claude Code default, any command) inside the branch's worktree to rebase/resolve/fix, then re-folds and auto-lands (configurable), marking `needs_human` after `agent_max_attempts`. Agent never touches the target — thegn does the object-DB fold + CAS, preserving the merge-guard coherence guarantee. Builds on the fold-actor (`4fbc92b`); `add-agent-merge-driver`. Follow-up: in-TUI actions + `auto_drain` (blocked on a run.rs/keymap.rs extraction). _(complements 263/268 and orchestration core Q)_
 
 ### U. LLM proxy
 
 _The **lower control plane**. Foreign ACP agents are pointed here via ACP's
-Configurable LLM Providers (`providers/set` with `baseUrl` = `szproxy`) — **R 689**
+Configurable LLM Providers (`providers/set` with `baseUrl` = `tgproxy`) — **R 689**
 is the bridge; 283 (local upstreams) is reachable the same way. Per-agent virtual
 keys (287) are the `providers/set` credential target._
 
@@ -988,13 +988,13 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [x] 386. Prewarmed pool (fast spawn) _(`[lifecycle.pool]` warm-spare sandbox pool, DB v26)_
 - [ ] 387. Intelligent resource caching (node/cargo/pip)
 - [x] 388. Shared cache across worktrees _(`[disk].sccache` → `RUSTC_WRAPPER`/`SCCACHE_DIR` + `[disk].shared_target_dir` → `CARGO_TARGET_DIR` injected into pane env at `agent::launch_spec`; shared-target serializes builds, opt-in)_
-- [x] 389. Auto cache cleanup _(see 48: PR-merge/close auto `cargo clean`; manual `superzej clean [--all]`)_
+- [x] 389. Auto cache cleanup _(see 48: PR-merge/close auto `cargo clean`; manual `thegn clean [--all]`)_
 - [ ] 390. Snapshot/checkpoint (CRIU/commit)
 - [ ] 391. Rollback container state
 - [ ] 392. Image build cache
 - [ ] 393. GPU passthrough
 - [ ] 394. Base image catalog/templates
-- [x] 749. Commodity-VPS provider backend — Hetzner via native REST (`Provider::Vps`, ssh exec/files shim, `szhost vps-ssh` self-bridge, intent-ledger + label-scoped reaper, `superzej env image-bake`; DO/Vultr adapters + firewall/spend-UI follow) _(openspec `add-vps-providers`; not live-verified)_
+- [x] 749. Commodity-VPS provider backend — Hetzner via native REST (`Provider::Vps`, ssh exec/files shim, `thegn vps-ssh` self-bridge, intent-ledger + label-scoped reaper, `thegn env image-bake`; DO/Vultr adapters + firewall/spend-UI follow) _(openspec `add-vps-providers`; not live-verified)_
 - [x] 756. DigitalOcean + Fly.io provider backends — DO as a second `VpsKind` behind a `VpsShaper` trait (shared ledger/reaper/self-bridge/bake); Fly as a CLI-free `Provider::Fly` (Machines REST + GraphQL IPv4 + guest sshd over the managed keypair, scale-to-zero, baked `nix/fly-sandbox-image.nix`, `fly_reaper`) _(openspec `add-do-fly-providers`; DO+Hetzner+Fly-control-plane live-verified)_
 - [x] 757. Self-serve environment setup UX — layered secret store (`secret.rs`: `keyring:`/`env:`/`file:`, keyring→file writer) + comment-preserving config write path (`config_write.rs`, `toml_edit`) + CLI (`env create`/`rm`/`test`, `config set`) + TUI (`env_wizard` modal + System ▸ Environments panel, unified `‹ local › ssh fly digitalocean hetzner daytona`) _(openspec `add-env-setup-ux`)_
 
@@ -1055,7 +1055,7 @@ _**Near-term (flagged 2026-06-29): sophisticated in-app diagnostic / toast surfa
 Today `msg::warn`/`msg::error` + `config_warn` route through `tracing` to the LOG
 FILE once the subscriber is installed — invisible in the TUI. So config/overlay
 parse errors, capability downgrades, and best-effort provisioning failures sink
-silently. Motivating bug: a malformed repo `.superzej.toml` silently dropped an
+silently. Motivating bug: a malformed repo `.thegn.toml` silently dropped an
 `env = "sprites"` selection and the session ran local; only `env_halt_reason` now
 halts (warning modal) on the placement-changing case. The general fix is a
 first-class surfacing layer on top of the existing `toast` module + `EventBus` +
@@ -1187,11 +1187,11 @@ their original groups._
 - [x] 522. Task output capture + problem matching — feed Tests and Problems without polling _(`task.rs` parses rustc/gcc/clang → diagnostics)_
 - [x] 523. Search Everywhere provider aggregation — actions, files, symbols, tasks, tests, problems, git, worktrees _(`PaletteMode` prefixes `!`/`$`/`%` for tasks/problems/tests; filled synchronously from in-memory panel state alongside the async file/content/git/symbol workers)_
 - [x] 524. Non-agent process attention routing — exited/failed/waiting panes join the attention queue _(`ProcessExited` event + exit classification/policy)_
-- [ ] 525. DAP client substrate — debug adapter JSON-RPC service seam in `superzej-svc`
+- [ ] 525. DAP client substrate — debug adapter JSON-RPC service seam in `thegn-svc`
 - [ ] 526. Debug breakpoints and stepping — continue/pause/step controls and breakpoint state
 - [ ] 527. Debug variables/watch/call-stack panel — inspect runtime state in the right panel
 - [ ] 528. Debug launch/attach configurations — task-backed debug profiles per workspace
-- [~] 529. LSP client substrate — language-server JSON-RPC service seam in `superzej-svc`
+- [~] 529. LSP client substrate — language-server JSON-RPC service seam in `thegn-svc`
 - [ ] 530. Go-to-definition and find-references — navigate via `$EDITOR`/panel handoff, not in-place editing
 - [x] 531. Document/workspace symbols — feed Search Everywhere and outline/reference views _(`panel/sections/symbols.rs` + LSP/tree-sitter)_
 - [x] 532. Hover/signature/code-action preview — read-only context and previewable actions
@@ -1312,7 +1312,7 @@ opportunistically alongside basic git (Phase 1)._
 - [ ] 597. First-class conflict handling — show/resolve jj's in-tree conflicts in the diff/merge UI (Y 322)
 - [ ] 598. Revset-powered log/graph view — `jj log` revsets feed the graph (Y 324)
 - [ ] 599. jj fetch/push to git remotes — incl. PR/worktree mapping (Z 336, Y 605)
-- [ ] 600. jj workspaces ↔ superzej worktree-tab model — map `jj workspace` onto the per-worktree tab/sidebar
+- [ ] 600. jj workspaces ↔ thegn worktree-tab model — map `jj workspace` onto the per-worktree tab/sidebar
 - [ ] 622. Repo adoption — `jj git init` (colocate in an existing git worktree) + `jj git clone` (fresh jj repo); auto-detect and offer to adopt (extends 589)
 - [ ] 623. `jj absorb` — auto-distribute working-copy edits into the ancestor changes that last touched each line (the "smart squash", no git equivalent)
 - [ ] 624. `jj duplicate` / `jj backout` — copy a change elsewhere; create an inverse change (jj's revert)
@@ -1428,14 +1428,14 @@ CLI → unavailable. Surfaced as a panel `Section::Ci` rollup **and** a full-scr
 drilldown (Runs → Jobs/Steps → Logs). **AI-free** — "why did it fail" is log + jump-to-
 failure, no LLM. Folds in Z 332 and L 158. Validated on GitHub + GitLab first._
 
-- [x] 698. `CiProvider` trait + normalized model — `runs`/`run_detail`/`logs`/`workflows`/`trigger`/`rerun`/`cancel`/`capabilities`; `CiRun`→`CiJob`→`CiStep` + `CiLog`/`CiWorkflow` in `superzej-core/src/ci.rs` (+ `CiState` mappers, log failure-scanner, CI-config detection); trait in `superzej-svc/src/ci.rs` w/ native+CLI degradation, capability-gated mutations (Phase A) ✓
+- [x] 698. `CiProvider` trait + normalized model — `runs`/`run_detail`/`logs`/`workflows`/`trigger`/`rerun`/`cancel`/`capabilities`; `CiRun`→`CiJob`→`CiStep` + `CiLog`/`CiWorkflow` in `thegn-core/src/ci.rs` (+ `CiState` mappers, log failure-scanner, CI-config detection); trait in `thegn-svc/src/ci.rs` w/ native+CLI degradation, capability-gated mutations (Phase A) ✓
 - [x] 699. `ci_runs_cache` table + `[ci]` config — TTL'd JSON cache (mirrors `pr_cache`, db v18), `config_enum!` `CiProviderKind` + per-provider sub-tables (gitlab/drone/woodpecker/jenkins/argo) w/ `env:` tokens, poll interval, live-refresh default, log-tail lines (Phase A) ✓
 - [x] 700. GitHub Actions provider — `gh run list`/`gh run view --json jobs`/`gh run view --log`; run history, jobs/steps, logs; reuses `gh` auth; fixture-tested parsers; deepens Z 332 (Phase A) ✓
 - [x] 701. GitLab CI provider — pipelines→jobs→trace via `glab api`; subgroup-aware project path; fixture-tested parsers (Phase A; also AT 633) ✓
 - [x] 702. Panel `Section::Ci` — Work-tab rollup: recent runs + per-run state glyph + duration, latest run's jobs when deep; summary chip (✓N ✗N ●N) (Phase A) ✓
-- [~] 703. CI drilldown view — `szhost ci view <id>` (run→jobs/steps) + `ci log` + the deep/Full panel section serve the Runs→Jobs→Logs drilldown today; a dedicated full-screen center-pane overlay (live-refresh toggle, filter) is the remaining UI iteration (needs live-terminal verification) (Phase A)
+- [~] 703. CI drilldown view — `thegn ci view <id>` (run→jobs/steps) + `ci log` + the deep/Full panel section serve the Runs→Jobs→Logs drilldown today; a dedicated full-screen center-pane overlay (live-refresh toggle, filter) is the remaining UI iteration (needs live-terminal verification) (Phase A)
 - [x] 704. `RefreshKind::Ci` + `spawn_ci_cache_refresh` — off-loop poller (`spawn_blocking` + mpsc + `TerminalWaker`), on-switch + PR-cadence interval; writes `ci_runs_cache`; 0% idle preserved (Phase A) ✓
-- [x] 705. CI actions + keymap + palette + CLI — `Action::OpenCi` (+ `ACTION_SPECS`, `palette:true`); full `szhost ci` group: `runs`/`view`/`log`/`rerun`/`trigger`/`cancel`/`detect`; smoke-tested (Phase A) ✓
+- [x] 705. CI actions + keymap + palette + CLI — `Action::OpenCi` (+ `ACTION_SPECS`, `palette:true`); full `thegn ci` group: `runs`/`view`/`log`/`rerun`/`trigger`/`cancel`/`detect`; smoke-tested (Phase A) ✓
 - [x] 706. "Why did it fail" — `ci log` applies the `log_tail` cap and prints a `>> first failure at line N` marker via `CiLog::first_failure_line` (`##[error]`/error/exit-code/panic scan, no AI) (Phase A) ✓
 - [x] 707. Statusbar CI badge — closes L 158: red `✗N CI` chip on failures, amber `●N CI` while running, silent when green (Phase A) ✓
 - [ ] 708. Trigger / `workflow_dispatch` — dispatch a workflow with declared inputs (gama's headline; extended-inputs JSON for 10+ inputs); capability-gated (Phase B)
@@ -1472,7 +1472,7 @@ _The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 fo
 - [ ] 729. Cross-platform filesystem watching — replace `inotify` with `notify` (`ReadDirectoryChangesW`) for diff watchers
 - [ ] 730. Native Sandboxing: AppContainers — low-integrity process isolation granting read/write ACLs only to the specific worktree path
 - [ ] 731. Native Sandboxing: Job Objects — prevent fork-bombs, block UI popups, and ensure child process trees die instantly on tab close
-- [ ] 732. Standardized paths — migrate from Unix `$XDG_STATE_HOME` to `directories` crate resolving to `%LOCALAPPDATA%\superzej`
+- [ ] 732. Standardized paths — migrate from Unix `$XDG_STATE_HOME` to `directories` crate resolving to `%LOCALAPPDATA%\thegn`
 - [ ] 733. Signals mapping — map Unix profiling triggers (`SIGUSR2`) to internal keymaps or named events for Windows flame-graphs
 - [ ] 734. PowerShell / NuShell defaults — default pane spawning to native Windows shells over `cmd.exe`
 

@@ -40,7 +40,7 @@ operating agents_: a research agent that literally cannot modify files is safer
 and more predictable than one general agent with all tools. Separately, Forge's
 **skills** decouple "what can be done" (a reusable workflow) from "how to decide
 when to do it" (agent reasoning), and its markdown-front-matter agent definitions
-make customization a low barrier. superzej already has the injection/filtering
+make customization a low barrier. thegn already has the injection/filtering
 chokepoint designed (AR "configure once, every harness inherits it", #570
 tool-format translation, R 695 ACP proxy) — this change is the _content_ that
 flows through it: declarative agents + skills. cmux-skills' `npx skills add`

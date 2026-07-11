@@ -1,20 +1,20 @@
 # Tasks
 
-## 1. Viewed-state cache (superzej-core / state-db)
+## 1. Viewed-state cache (thegn-core / state-db)
 
 - [ ] 1.1 Bump `user_version`: add `pr_file_views (worktree, pr_number, file_path,
 viewed_at)` + accessors `put_pr_file_viewed` / `get_pr_files_viewed` /
       `clear_pr_file_viewed` — **unit tests**: put+get round-trip, per-worktree/PR
       scoping, additive migration (absent table ⇒ empty).
 
-## 2. GitHub sync (superzej-svc)
+## 2. GitHub sync (thegn-svc)
 
 - [ ] 2.1 Extend `GhBackend`: read the current user's viewed files for a PR (via
       the existing GraphQL PR query where possible) and mark a file viewed/unviewed;
       reconcile GitHub's set into the local cache on refresh (GitHub wins on
       conflict). Sync failure degrades to local-only (no panic).
 
-## 3. Panel: viewed glyph + stacked walker (superzej-host)
+## 3. Panel: viewed glyph + stacked walker (thegn-host)
 
 - [ ] 3.1 Render a viewed glyph/dim per file in the PR file list
       (`caps::active_glyphs()` + ASCII fallback); a "mark viewed" action writes the

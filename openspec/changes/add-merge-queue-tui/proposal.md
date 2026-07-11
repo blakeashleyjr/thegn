@@ -36,8 +36,8 @@ deferred by `add-agent-merge-driver` (its tasks 7.1/7.2) now that the
 
 - tasks.md: the same **T/Q** merge-pipeline groups as `add-agent-merge-driver`
   — this is its deferred in-TUI surface.
-- **superzej-core** — three new `NotificationKind`s (+ exhaustive-test updates).
-- **superzej-host** — new `handlers/merge_queue.rs` (spawners, channel drains,
+- **thegn-core** — three new `NotificationKind`s (+ exhaustive-test updates).
+- **thegn-host** — new `handlers/merge_queue.rs` (spawners, channel drains,
   section keys; `spawn_fold` moved out of the pinned `run.rs`);
   `merge_driver::DriveStep` gains `worktree` (the panel-row patch key) and the
   repo-membership filter is shared with the CLI; panel/statusbar/sidebar/
