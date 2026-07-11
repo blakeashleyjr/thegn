@@ -139,7 +139,10 @@ config_enum! {
 // The terminal display/glyph config enums (UndercurlMode, ColorMode, GlyphMode,
 // AgentGlyphs) live in the `config_theme` sibling module to keep this god-file
 // flat; re-exported so `config::{ColorMode, …}` import paths keep working.
-pub use crate::config_theme::{AgentGlyphs, ColorMode, GlyphMode, UndercurlMode};
+pub use crate::config_theme::{
+    AgentGlyphs, ColorMode, GlyphMode, MascotKind, MascotMotion, ThemeColors, ThemeHues,
+    UndercurlMode,
+};
 // The `[[accounts]]` entry type lives with its domain logic in `account`; the
 // control-plane `[daemon]`/`[serve]` sections live in `config_daemon`.
 pub use crate::account::Account;
@@ -1206,6 +1209,12 @@ pub struct ThemeConfig {
     /// Sidebar agent marker style: "letter" (universal), "symbol" (Nerd-Font),
     /// "auto" (symbols on confirmed-modern emulators only).
     pub agent_glyphs: AgentGlyphs,
+    /// Loading-splash mascot: "owl" (default), "knight" (Sutton Hoo bust),
+    /// "off". The sprite recolors with the active `preset`.
+    pub mascot: MascotKind,
+    /// Splash-mascot motion: "blink" (default; only redraws on wakes that
+    /// already repaint — idle stays 0%) or "still".
+    pub mascot_motion: MascotMotion,
     /// Optional overrides for every chrome surface/text color.
     pub colors: ThemeColors,
     /// Optional overrides for the eight semantic hues.
@@ -1223,6 +1232,8 @@ impl Default for ThemeConfig {
             color: ColorMode::Auto,
             glyphs: GlyphMode::Auto,
             agent_glyphs: AgentGlyphs::Letter,
+            mascot: MascotKind::Owl,
+            mascot_motion: MascotMotion::Blink,
             colors: ThemeColors::default(),
             hues: ThemeHues::default(),
         }
@@ -1235,80 +1246,6 @@ impl Default for ThemeConfig {
 /// preset-cycling behavior).
 const DEFAULTISH_ACCENTS: &[&str] = &["#6ee7d8", "#76eede"];
 const DEFAULTISH_FOCUS: &[&str] = &["#6ee7d8", "#9bd1ff"];
-
-/// `[theme.colors]` — all optional "#rrggbb" overrides; unset keys keep the
-/// built-in storm-blue defaults (src/theme.rs).
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct ThemeColors {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bg0: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bg1: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub panel: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub panel2: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raise: Option<String>,
-    /// Frame lines around unfocused panes and chrome edges (light grey).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub border: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dim: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub faint: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ghost: Option<String>,
-    /// Foreground ramp step below ghost (structural glyphs).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ghost2: Option<String>,
-    /// Deepest structural foreground (rules, fills, tracks).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ghost3: Option<String>,
-    /// Background of layer shadow cells.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shadow_bg: Option<String>,
-    /// Foreground of layer shadow cells.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shadow_fg: Option<String>,
-    /// Text inside inverse chips (defaults to bg0).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chip_fg: Option<String>,
-    /// Sidebar activity dot when a worktree is busy / its agent is working
-    /// (defaults to the text tone, "white").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub activity_active: Option<String>,
-    /// Sidebar activity dot when an agent is waiting for the user's input
-    /// (defaults to the red status hue).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub activity_waiting: Option<String>,
-}
-
-/// `[theme.hues]` — all optional "#rrggbb" overrides for the eight semantic
-/// hues (identity + status colors); unset keys keep the preset's hues.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct ThemeHues {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub teal: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub magenta: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub purple: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub green: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub amber: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub red: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blue: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub orange: Option<String>,
-}
 
 /// `[monitor]` — the resource managers opened from the top-bar stats widget
 /// (highlight a stat with Super+Alt+Up, then Enter). Each is a shell command

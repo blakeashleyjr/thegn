@@ -97,6 +97,7 @@ mod mq_assets;
 mod nav;
 mod nixcache;
 mod notify;
+mod owl;
 mod palette;
 mod pane;
 mod pane_pty;

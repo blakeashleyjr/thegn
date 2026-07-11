@@ -372,14 +372,30 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
             // whole block plus a row of margin top and bottom; small centers
             // keep the compact splash unchanged. Uniform math — no per-state
             // special cases, so the anchor stays stable while steps tick.
-            let mascot_block = crate::mascot::ROWS + 1; // sprite + 1-row gap
+            // `[theme] mascot` picks the sprite (owl / knight / off); its
+            // cell footprint feeds the same centering math either way.
+            let mascot_kind = crate::owl::active_kind();
+            let (mcols, mrows) = match mascot_kind {
+                thegn_core::config::MascotKind::Owl => (crate::owl::COLS, crate::owl::ROWS),
+                thegn_core::config::MascotKind::Knight => {
+                    (crate::mascot::COLS, crate::mascot::ROWS)
+                }
+                thegn_core::config::MascotKind::Off => (0, 0),
+            };
+            let mascot_block = mrows + 1; // sprite + 1-row gap
             let with_mascot =
-                rect.cols >= crate::mascot::COLS && rect.rows >= base_rows + mascot_block + 2;
+                mrows > 0 && rect.cols >= mcols && rect.rows >= base_rows + mascot_block + 2;
             let total_rows = base_rows + if with_mascot { mascot_block } else { 0 };
             let top = rect.y + rect.rows.saturating_sub(total_rows) / 2;
             if with_mascot {
-                let mx = rect.x + rect.cols.saturating_sub(crate::mascot::COLS) / 2;
-                crate::mascot::draw(surface, mx, top, (rect.x + rect.cols).saturating_sub(mx));
+                let mx = rect.x + rect.cols.saturating_sub(mcols) / 2;
+                let maxc = (rect.x + rect.cols).saturating_sub(mx);
+                match mascot_kind {
+                    thegn_core::config::MascotKind::Owl => {
+                        crate::owl::draw(surface, mx, top, maxc, crate::owl::blink_now());
+                    }
+                    _ => crate::mascot::draw(surface, mx, top, maxc),
+                }
             }
             let y0 = top + if with_mascot { mascot_block } else { 0 };
             let (w, _) = measure(Face::Large, WORDMARK);
