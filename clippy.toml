@@ -1,4 +1,4 @@
-# Enforce superzej's output discipline (the `checks.clippy` flake check runs
+# Enforce thegn's output discipline (the `checks.clippy` flake check runs
 # `clippy --all-targets -D warnings`, so these become hard errors in CI).
 #
 #   stdout = machine data  → use `crate::out!` / `crate::outln!`

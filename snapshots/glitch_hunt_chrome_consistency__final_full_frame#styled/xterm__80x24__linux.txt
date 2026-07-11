@@ -1,10 +1,10 @@
-L0| ◆ superzej work         77% ·  15.4/94G ·  ↓  1.3M ↑  848K ·  100% · 22:07
+L0| þ thegn  work           94% ·  18.9/94G ·  ↓  1.1M ↑  688K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
-R0 3 8 fg=#edf0f8 bg=#151a28 attrs=
-R0 11 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 17 7 fg=#edf0f8 bg=#151a28 attrs=
-R0 24 5 fg=#c6ccdb bg=#151a28 attrs=
+R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 9 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 15 9 fg=#edf0f8 bg=#151a28 attrs=
+R0 24 5 fg=#f7768e bg=#151a28 attrs=
 R0 29 3 fg=#6f788e bg=#151a28 attrs=
 R0 32 10 fg=#c6ccdb bg=#151a28 attrs=
 R0 42 3 fg=#6f788e bg=#151a28 attrs=
@@ -24,18 +24,18 @@ R2 8 4 fg=#6ee7d8 bg=#0b0e16 attrs=
 R2 12 2 fg=default bg=#0b0e16 attrs=
 R2 14 3 fg=#6ee7d8 bg=#2e5359 attrs=
 R2 17 63 fg=default bg=#0b0e16 attrs=
-L3|                ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
-R3 0 16 fg=default bg=#0b0e16 attrs=
-R3 16 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R3 63 17 fg=default bg=#0b0e16 attrs=
-L4|                 ▀▀▀▄ █   █ █▄▄▄▀ █▀▀▀  █▄▄▄▀  ▄▀   █▀▀▀     █
-R4 0 16 fg=default bg=#0b0e16 attrs=
-R4 16 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R4 63 17 fg=default bg=#0b0e16 attrs=
-L5|                ▄▄▄▄▀ ▀▄▄▄▀ █     █▄▄▄▄ █  ▀▄ █▄▄▄▄ █▄▄▄▄ ▀▄▄▀
-R5 0 16 fg=default bg=#0b0e16 attrs=
-R5 16 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R5 63 17 fg=default bg=#0b0e16 attrs=
+L3|                         ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
+R3 0 25 fg=default bg=#0b0e16 attrs=
+R3 25 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R3 54 26 fg=default bg=#0b0e16 attrs=
+L4|                           █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
+R4 0 25 fg=default bg=#0b0e16 attrs=
+R4 25 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R4 54 26 fg=default bg=#0b0e16 attrs=
+L5|                           █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
+R5 0 25 fg=default bg=#0b0e16 attrs=
+R5 25 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R5 54 26 fg=default bg=#0b0e16 attrs=
 L6|
 R6 0 80 fg=default bg=#0b0e16 attrs=
 L7|                           v0.1.0 · git worktree IDE
@@ -85,18 +85,18 @@ L21|
 R21 0 80 fg=default bg=#0b0e16 attrs=
 L22|
 R22 0 80 fg=default bg=#0b0e16 attrs=
-L23|  N… 0 LOC │ Keybinds unlocked  ✋ 1    7% free   ❚❚ Justin Hurwitz — Houston
+L23|  NORMAL   Ctrl Space menu         0 LOC │ Keybinds unlocked  ✋ 1    7% free
 R23 0 1 fg=#edf0f8 bg=#151a28 attrs=
-R23 1 2 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
-R23 3 1 fg=#6f788e bg=#151a28 attrs=
-R23 4 1 fg=#edf0f8 bg=#151a28 attrs=
-R23 5 5 fg=#c6ccdb bg=#151a28 attrs=
-R23 10 3 fg=#60687b bg=#151a28 attrs=
-R23 13 17 fg=#c6ccdb bg=#151a28 attrs=
-R23 30 1 fg=#edf0f8 bg=#151a28 attrs=
-R23 31 6 fg=#0b0e16 bg=#e6c264 attrs=BOLD
-R23 37 1 fg=#edf0f8 bg=#151a28 attrs=
-R23 38 11 fg=#0b0e16 bg=#ef6f6f attrs=BOLD
-R23 49 1 fg=#edf0f8 bg=#151a28 attrs=
-R23 50 29 fg=#0b0e16 bg=#7fb4ec attrs=BOLD
+R23 1 8 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
+R23 9 2 fg=#edf0f8 bg=#151a28 attrs=
+R23 11 10 fg=#7a8197 bg=#151a28 attrs=
+R23 21 5 fg=#6f788e bg=#151a28 attrs=
+R23 26 9 fg=#edf0f8 bg=#151a28 attrs=
+R23 35 5 fg=#c6ccdb bg=#151a28 attrs=
+R23 40 3 fg=#60687b bg=#151a28 attrs=
+R23 43 17 fg=#c6ccdb bg=#151a28 attrs=
+R23 60 1 fg=#edf0f8 bg=#151a28 attrs=
+R23 61 6 fg=#0b0e16 bg=#e6c264 attrs=BOLD
+R23 67 1 fg=#edf0f8 bg=#151a28 attrs=
+R23 68 11 fg=#0b0e16 bg=#ef6f6f attrs=BOLD
 R23 79 1 fg=#edf0f8 bg=#151a28 attrs=

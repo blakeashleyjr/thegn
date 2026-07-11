@@ -1,11 +1,12 @@
-L0| ◆ superzej v0.1.0 work      61% ·  15.4/94G ·   7% ·  52% ·  ↓   10K ↑    9K ·  100% · 22:07
+L0| þ thegn v0.1.0  work        90% ·  18.4/94G ·   7% ·  37% ·  ↓  1.2M ↑  717K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
-R0 3 9 fg=#edf0f8 bg=#151a28 attrs=
-R0 12 6 fg=#6f788e bg=#151a28 attrs=
-R0 18 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 24 4 fg=#edf0f8 bg=#151a28 attrs=
-R0 28 5 fg=#c6ccdb bg=#151a28 attrs=
+R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 9 6 fg=#6f788e bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 28 5 fg=#f0c674 bg=#151a28 attrs=
 R0 33 3 fg=#6f788e bg=#151a28 attrs=
 R0 36 10 fg=#c6ccdb bg=#151a28 attrs=
 R0 46 3 fg=#6f788e bg=#151a28 attrs=
@@ -45,7 +46,7 @@ R4 32 1 fg=default bg=#0b0e16 attrs=
 R4 33 1 fg=#6ee7d8 bg=#151a28 attrs=
 R4 34 65 fg=default bg=default attrs=
 R4 99 1 fg=#6ee7d8 bg=#151a28 attrs=
-L5|▐   └ ○ home                     │                                                                 │
+L5|▐   └ ○ home                     │\[\][\[\]blake@ws-3:~]$\[\] ee                                   │
 R5 0 1 fg=#428180 bg=#1a2031 attrs=
 R5 1 3 fg=#edf0f8 bg=#1a2031 attrs=
 R5 4 2 fg=#677084 bg=#1a2031 attrs=
@@ -55,7 +56,9 @@ R5 8 4 fg=#6ee7d8 bg=#1a2031 attrs=
 R5 12 20 fg=#edf0f8 bg=#1a2031 attrs=
 R5 32 1 fg=default bg=#0b0e16 attrs=
 R5 33 1 fg=#6ee7d8 bg=#151a28 attrs=
-R5 34 65 fg=default bg=default attrs=
+R5 34 2 fg=default bg=default attrs=
+R5 36 23 fg=idx02 bg=default attrs=BOLD
+R5 59 40 fg=default bg=default attrs=
 R5 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L6|                                 │                                                                 │
 R6 0 32 fg=#edf0f8 bg=#151a28 attrs=
@@ -203,8 +206,22 @@ L28|                                 ╰─────────────�
 R28 0 32 fg=default bg=#151a28 attrs=
 R28 32 1 fg=default bg=#0b0e16 attrs=
 R28 33 67 fg=#6ee7d8 bg=#151a28 attrs=
-L29|0 LOC │ ⚠ Sandbox fallback: sandbox podman-rootless failed: could not start podman container 'super…
-R29 0 5 fg=#c6ccdb bg=#151a28 attrs=
-R29 5 3 fg=#60687b bg=#151a28 attrs=
-R29 8 91 fg=#c6ccdb bg=#151a28 attrs=
-R29 99 1 fg=#6f788e bg=#151a28 attrs=
+L29|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav              0 LOC  ✋ 1    7% free
+R29 0 1 fg=#edf0f8 bg=#151a28 attrs=
+R29 1 8 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
+R29 9 2 fg=#edf0f8 bg=#151a28 attrs=
+R29 11 10 fg=#7a8197 bg=#151a28 attrs=
+R29 21 5 fg=#6f788e bg=#151a28 attrs=
+R29 26 3 fg=#edf0f8 bg=#151a28 attrs=
+R29 29 6 fg=#7a8197 bg=#151a28 attrs=
+R29 35 5 fg=#6f788e bg=#151a28 attrs=
+R29 40 3 fg=#edf0f8 bg=#151a28 attrs=
+R29 43 14 fg=#7a8197 bg=#151a28 attrs=
+R29 57 4 fg=#6f788e bg=#151a28 attrs=
+R29 61 14 fg=#edf0f8 bg=#151a28 attrs=
+R29 75 5 fg=#c6ccdb bg=#151a28 attrs=
+R29 80 1 fg=#edf0f8 bg=#151a28 attrs=
+R29 81 6 fg=#0b0e16 bg=#e6c264 attrs=BOLD
+R29 87 1 fg=#edf0f8 bg=#151a28 attrs=
+R29 88 11 fg=#0b0e16 bg=#ef6f6f attrs=BOLD
+R29 99 1 fg=#edf0f8 bg=#151a28 attrs=

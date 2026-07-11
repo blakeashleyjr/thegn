@@ -3,7 +3,7 @@
 ## The verb
 
 ```
-szhost team <task> \
+thegn team <task> \
   --agents claude,codex,gemini   # one worktree+agent per entry (heterogeneous)
   # or
   --best-of-N 3 --agent claude   # N isolated attempts of the same task

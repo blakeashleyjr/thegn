@@ -8,7 +8,7 @@ distant fly.io region; sprites expose **no region selection** and **no UDP**, so
 neither config nor mosh is available). The lag is the RTT, so it is **independent
 of the transport** — the WSS exec PTY and ssh-over-WSS are equally laggy. The
 only fix is what mosh does: **echo the user's keystrokes locally, immediately, and
-reconcile when the server's authoritative output arrives.** superzej owns the
+reconcile when the server's authoritative output arrives.** thegn owns the
 vt100 emulator + the pane, so it can do this transport-agnostically — it works on
 the _existing_ native-exec pane (no ssh, no fresh sprite, no re-provision).
 
@@ -41,11 +41,11 @@ subset that covers the 90% case (typing a command at a shell prompt):
 
 ## Where it hooks (real code)
 
-- `crates/superzej-host/src/pane.rs` (`PtyPane`): add a `Prediction` overlay
+- `crates/thegn-host/src/pane.rs` (`PtyPane`): add a `Prediction` overlay
   (buffer of predicted chars + predicted cursor col, an `enabled` flag, and an
   srtt estimate). `feed()` (server output, pane.rs:427) **clears** the overlay;
   `write_input()` (439) is where keystrokes already go.
-- `crates/superzej-host/src/emulator.rs`: expose `alt_screen()` / `app_cursor()` /
+- `crates/thegn-host/src/emulator.rs`: expose `alt_screen()` / `app_cursor()` /
   cursor position from the alacritty emulator (the `PaneEmulator` trait) so the
   predictor can gate + place the overlay.
 - Input path (`run.rs`, the focused-pane `Key` handling near `write_input`): on a

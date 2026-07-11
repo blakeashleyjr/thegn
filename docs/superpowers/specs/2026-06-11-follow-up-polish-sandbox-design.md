@@ -53,7 +53,7 @@ The default selected option is configurable, e.g. `[sandbox].default_backend = "
 
 ### Automatic startup
 
-When an interactive pane is spawned for a worktree, superzej resolves the worktree's sandbox choice, ensures the backing environment exists, and then launches the shell through that environment. For OCI backends this means create/start/exec into a keep-alive container. For bubblewrap this means wrap each shell process directly. For host fallback this means spawn the host shell and mark the worktree as uncontained.
+When an interactive pane is spawned for a worktree, thegn resolves the worktree's sandbox choice, ensures the backing environment exists, and then launches the shell through that environment. For OCI backends this means create/start/exec into a keep-alive container. For bubblewrap this means wrap each shell process directly. For host fallback this means spawn the host shell and mark the worktree as uncontained.
 
 All backend detection, container creation, and stats probing must stay off the input/render loop. Failures are reported as pane/status messages rather than panics.
 
@@ -118,7 +118,7 @@ If a backend cannot enforce the requested policy, `Auto` tries the next configur
 
 ## SANDBOXES panel
 
-The panel's sandbox section shows one row per active worktree environment, prioritizing superzej-owned environments.
+The panel's sandbox section shows one row per active worktree environment, prioritizing thegn-owned environments.
 
 Each row should show:
 

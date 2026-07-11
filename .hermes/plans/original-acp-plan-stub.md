@@ -1,10 +1,10 @@
 ### R. Agent integration protocols
 
-_Reframed (2026-06-22): superzej's primary agent is the **embedded first-party
+_Reframed (2026-06-22): thegn's primary agent is the **embedded first-party
 harness** `termite-agent` (the `agent` app tab). This group — ACP + native adapters
 for **foreign** harnesses — is now an **additive, secondary** path, not the primary
 one. "Primary path" below refers to ACP being the preferred way to integrate an
-external harness, not to ACP being superzej's primary agent._
+external harness, not to ACP being thegn's primary agent._
 
 - [ ] 229. ACP client (primary path)
 - [ ] 230. ACP session management

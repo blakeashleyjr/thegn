@@ -1,5 +1,5 @@
 #!/bin/sh
-# superzej: make the devenv-generated prek config available in every worktree.
+# thegn: make the devenv-generated prek config available in every worktree.
 #
 # The shared git hooks (core.hooksPath -> the canonical checkout's .git/hooks)
 # run in every worktree, but prek needs .pre-commit-config.yaml in the worktree
@@ -8,7 +8,7 @@
 # worktree and prek aborts with "config file not found" -- which is why commits
 # and merges in worktrees used to need --no-verify.
 #
-# git fires post-checkout after `git worktree add` (superzej creates worktrees
+# git fires post-checkout after `git worktree add` (thegn creates worktrees
 # via the git CLI) and on branch checkout, with cwd = the worktree, so we seed a
 # chained symlink to the canonical checkout's config here. Chained (rather than
 # resolved to the store path) so it auto-follows devenv re-locks. Idempotent and
@@ -23,7 +23,7 @@
 # branch checkout, the moments such a leak most often lands, and while the
 # target path usually still exists (so git isn't yet wedged). Pure-text, no git;
 # a safe no-op when clean. Best-effort: never block the checkout. (cwd is the
-# worktree top, where the tracked script lives; szhost heals the same key
+# worktree top, where the tracked script lives; thegn heals the same key
 # in-process, and `just heal-git` covers the wedged/dangling case.)
 if [ -f test/git-hooks/heal-worktree.sh ]; then
   sh test/git-hooks/heal-worktree.sh >/dev/null 2>&1 || true

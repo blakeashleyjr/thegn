@@ -2,7 +2,7 @@
 
 ### Requirement: Heterogeneous results aggregate into one sorted, grouped excerpt stream
 
-superzej SHALL provide a pure aggregation model that collects excerpts from
+thegn SHALL provide a pure aggregation model that collects excerpts from
 multiple worktrees and multiple source kinds (CI failure, dirty file, content
 match) into one deterministically ordered stream, grouped by worktree. Each
 excerpt MUST carry its owning worktree path (the jump target) and a display
@@ -48,7 +48,7 @@ also expose per-kind summary counts.
 
 ### Requirement: A read-only cross-worktree section renders the stream
 
-superzej SHALL render the aggregation as a read-only panel section in the Work
+thegn SHALL render the aggregation as a read-only panel section in the Work
 tab, showing each excerpt with its source (`worktree · file:line · text`) grouped
 under per-worktree headers, across the panel's view widths. The section MUST be
 populated off the event loop (from the cross-worktree CI cache) and MUST NOT

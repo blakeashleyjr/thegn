@@ -5,7 +5,7 @@
 ### Requirement: A pane process can raise an explicit attention signal via OSC
 
 A process running in a pane SHALL be able to raise an explicit attention signal
-by emitting a recognized OSC escape sequence, and superzej MUST parse it at the
+by emitting a recognized OSC escape sequence, and thegn MUST parse it at the
 terminal-emulator seam into a normalized attention event without disturbing the
 pane's rendered content. The recognized sequences are `OSC 9 ; <text>` (the body
 is `<text>`) and `OSC 777 ; notify ; <title> ; <body>`; an `OSC 777` whose
@@ -14,13 +14,13 @@ sub-command is not `notify` MUST be ignored as an attention signal.
 #### Scenario: OSC 9 raises a signal
 
 - **WHEN** a pane process emits `OSC 9 ; Build finished ST`
-- **THEN** superzej raises an attention event for that pane with body "Build
+- **THEN** thegn raises an attention event for that pane with body "Build
   finished" and the pane's screen content is otherwise rendered unchanged
 
 #### Scenario: OSC 777 carries a title and body
 
 - **WHEN** a pane process emits `OSC 777 ; notify ; Tests ; 3 failed ST`
-- **THEN** superzej raises an attention event with title "Tests" and body "3
+- **THEN** thegn raises an attention event with title "Tests" and body "3
   failed"
 
 #### Scenario: Non-notify OSC 777 is not a signal
@@ -31,23 +31,23 @@ sub-command is not `notify` MUST be ignored as an attention signal.
 
 ### Requirement: A process can raise the same signal via the notify CLI verb
 
-superzej SHALL provide a `szhost notify` CLI verb that raises the same attention
+thegn SHALL provide a `thegn notify` CLI verb that raises the same attention
 event as the OSC path for a target worktree or pane, so a process that cannot
 emit escape sequences (or a shell hook) can still raise its hand. The target MUST
 resolve from `--worktree`/`--pane` flags or, when absent, from the
-`$SUPERZEJ_WORKTREE`/`$SUPERZEJ_PANE` environment exported into panes; when no
+`$THEGN_WORKTREE`/`$THEGN_PANE` environment exported into panes; when no
 live host session is running the verb MUST exit non-zero with a clear message.
 
 #### Scenario: notify verb raises attention for the current pane
 
-- **WHEN** a process inside a pane runs `szhost notify "ready for review"` with
-  `$SUPERZEJ_PANE` set
+- **WHEN** a process inside a pane runs `thegn notify "ready for review"` with
+  `$THEGN_PANE` set
 - **THEN** an attention event is raised for that pane identical to the OSC path
 
 #### Scenario: notify verb outside a live session fails clearly
 
-- **WHEN** `szhost notify` runs with no live host session
-- **THEN** it exits non-zero and prints that a running superzej session is
+- **WHEN** `thegn notify` runs with no live host session
+- **THEN** it exits non-zero and prints that a running thegn session is
   required
 
 ### Requirement: An explicit attention signal drives the existing attention pipeline authoritatively
@@ -78,7 +78,7 @@ activity, only by the process resuming output or the human focusing the pane.
 
 ### Requirement: The sidebar can order rows by attention (who needs the human most)
 
-superzej SHALL provide an opt-in attention sort that ranks sidebar rows by how
+thegn SHALL provide an opt-in attention sort that ranks sidebar rows by how
 much they need the human — a needs-attention (waiting) state outranks an error
 state, which outranks an idle-ready state, which outranks a running state — with
 an agent-raisable urgent flag (fed by the same OSC/notify signal) taking top

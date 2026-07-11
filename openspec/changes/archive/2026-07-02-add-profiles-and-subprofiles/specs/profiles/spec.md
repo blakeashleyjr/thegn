@@ -4,11 +4,11 @@
 
 ### Requirement: A profile is a firewalled separate process
 
-A profile SHALL run as its own OS process rooted at a profile scope resolved from `--profile`/`SUPERZEJ_PROFILE` (default `default`) and set into the process environment before any thread or DB opens, firewalling state/DB, config, credentials + git identity, and sandbox/network policy; a per-profile advisory `flock` MUST prevent a second process for the same profile without busy-polling.
+A profile SHALL run as its own OS process rooted at a profile scope resolved from `--profile`/`THEGN_PROFILE` (default `default`) and set into the process environment before any thread or DB opens, firewalling state/DB, config, credentials + git identity, and sandbox/network policy; a per-profile advisory `flock` MUST prevent a second process for the same profile without busy-polling.
 
 #### Scenario: Profile reroots its storage
 
-- **WHEN** superzej starts with `SUPERZEJ_PROFILE=work`
+- **WHEN** thegn starts with `THEGN_PROFILE=work`
 - **THEN** its DB, logs, activity, and sockets resolve under `profiles/work/`
   while worktrees stay at their existing absolute paths
 

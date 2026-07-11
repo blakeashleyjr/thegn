@@ -1,8 +1,8 @@
-# szhost Architectural Performance Implementation Plan
+# thegn Architectural Performance Implementation Plan
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Overhaul the `szhost` (native host) substrate by replacing the initial first-pass jank fixes with robust architectural optimizations: moving to a `tokio` multi-task split, batching terminal rendering via entire rows, bounding PTY channels with backpressure, and reducing IPC overhead for the WASM UI plugins.
+**Goal:** Overhaul the `thegn` (native host) substrate by replacing the initial first-pass jank fixes with robust architectural optimizations: moving to a `tokio` multi-task split, batching terminal rendering via entire rows, bounding PTY channels with backpressure, and reducing IPC overhead for the WASM UI plugins.
 
 **Architecture:**
 The host drops the single-loop `std::sync::mpsc` design in favor of `tokio`. We split into a dedicated UI/render task and separate I/O tasks for PTY draining. We optimize `termwiz` cell blitting by changing `PaneEmulator` to yield row references instead of individual cells. We replace `serde_json` over `zellij::pipe` with a zero-copy structured or highly optimized text format.
@@ -17,20 +17,20 @@ The host drops the single-loop `std::sync::mpsc` design in favor of `tokio`. We 
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/main.rs`
-- Modify: `crates/superzej-host/src/run.rs`
-- Modify: `crates/superzej-host/Cargo.toml`
+- Modify: `crates/thegn-host/src/main.rs`
+- Modify: `crates/thegn-host/src/run.rs`
+- Modify: `crates/thegn-host/Cargo.toml`
 
 **Step 1: Add `tokio` dependency**
 
 ```bash
-cargo add tokio -p superzej-host --features full
+cargo add tokio -p thegn-host --features full
 ```
 
 **Step 2: Convert `run.rs` loop to use `tokio::sync::mpsc`**
 
 ```rust
-// In `crates/superzej-host/src/run.rs`
+// In `crates/thegn-host/src/run.rs`
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::timeout;
 
@@ -46,7 +46,7 @@ pub async fn run_host(...) -> Result<()> {
 **Step 3: Update `main.rs` entrypoint**
 
 ```rust
-// In `crates/superzej-host/src/main.rs`
+// In `crates/thegn-host/src/main.rs`
 #[tokio::main]
 async fn main() -> Result<()> {
     // ... setup ...
@@ -56,13 +56,13 @@ async fn main() -> Result<()> {
 
 **Step 4: Verify Compilation and Run**
 
-Run: `cargo build -p superzej-host`
+Run: `cargo build -p thegn-host`
 Expected: Compiles with no async/await syntax errors.
 
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-host/
+git add crates/thegn-host/
 git commit -m "perf(host): migrate single-thread event loop to tokio"
 ```
 
@@ -74,14 +74,14 @@ git commit -m "perf(host): migrate single-thread event loop to tokio"
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/pane.rs`
+- Modify: `crates/thegn-host/src/pane.rs`
 
 **Step 1: Implement bounded buffer read loops**
 
 Modify the PTY reader thread spawned in `Pane::new()` to read chunks but drop/coalesce data if the `tokio` sender is full, acting as backpressure.
 
 ```rust
-// In `crates/superzej-host/src/pane.rs`
+// In `crates/thegn-host/src/pane.rs`
 
 pub fn new(...) -> Self {
     let (tx, rx) = tokio::sync::mpsc::channel(256); // Bounded channel
@@ -108,10 +108,10 @@ In `run.rs`, remove the ad-hoc chunk/budget limit since `tokio::select!` and the
 
 **Step 3: Test and Commit**
 
-Run: `cargo test -p superzej-host`
+Run: `cargo test -p thegn-host`
 
 ```bash
-git add crates/superzej-host/src/pane.rs crates/superzej-host/src/run.rs
+git add crates/thegn-host/src/pane.rs crates/thegn-host/src/run.rs
 git commit -m "perf(host): implement bounded PTY channels with backpressure"
 ```
 
@@ -123,13 +123,13 @@ git commit -m "perf(host): implement bounded PTY channels with backpressure"
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/emulator.rs`
-- Modify: `crates/superzej-host/src/compositor.rs`
+- Modify: `crates/thegn-host/src/emulator.rs`
+- Modify: `crates/thegn-host/src/compositor.rs`
 
 **Step 1: Add `row_text` and `row_styles` to `PaneEmulator`**
 
 ```rust
-// In `crates/superzej-host/src/emulator.rs`
+// In `crates/thegn-host/src/emulator.rs`
 
 pub trait PaneEmulator: Send {
     // ... existing ...
@@ -144,7 +144,7 @@ pub trait PaneEmulator: Send {
 **Step 2: Optimize `compose_pane` in `compositor.rs`**
 
 ```rust
-// In `crates/superzej-host/src/compositor.rs`
+// In `crates/thegn-host/src/compositor.rs`
 pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
     let (erows, ecols) = emu.size();
 
@@ -167,10 +167,10 @@ pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
 
 **Step 3: Test and Commit**
 
-Run: `cargo test -p superzej-host` (Ensure `composing_a_grid_reproduces_its_text` passes).
+Run: `cargo test -p thegn-host` (Ensure `composing_a_grid_reproduces_its_text` passes).
 
 ```bash
-git add crates/superzej-host/src/emulator.rs crates/superzej-host/src/compositor.rs
+git add crates/thegn-host/src/emulator.rs crates/thegn-host/src/compositor.rs
 git commit -m "perf(host): implement fast-path row blitting in compositor"
 ```
 
@@ -178,26 +178,26 @@ git commit -m "perf(host): implement fast-path row blitting in compositor"
 
 ### Task 4: Reduce JSON Parsing Overhead in WASM Pipes
 
-**Objective:** Reduce the `serde_json` deserialization cost inside the WASM `panel` plugin when it receives `superzej_diff` and `superzej_pr` pipes.
+**Objective:** Reduce the `serde_json` deserialization cost inside the WASM `panel` plugin when it receives `thegn_diff` and `thegn_pr` pipes.
 
 **Files:**
 
 - Modify: `plugin/panel/src/main.rs`
-- Modify: `crates/superzej-cli/src/commands/watch.rs`
+- Modify: `crates/thegn-cli/src/commands/watch.rs`
 
 **Step 1: Serialize diffs as optimized TSV payloads**
 
 Instead of building a JSON map `{"worktree": wt, "files": tsv}`, serialize the pipe message cleanly so the WASM side doesn't have to invoke `serde_json::from_str`.
 
 ```rust
-// In `crates/superzej-cli/src/commands/watch.rs`
+// In `crates/thegn-cli/src/commands/watch.rs`
 fn push_diff(url: &str, wt: &str) {
     let tsv = diff::files_for(Path::new(wt));
     // ... DB cache logic ...
 
     // Pipe payload: purely text, formatted as "worktree_path\n<TSV DATA>"
     let payload = format!("{}\n{}", wt, tsv);
-    zellij::pipe_plugin(url, "superzej_diff", &payload);
+    zellij::pipe_plugin(url, "thegn_diff", &payload);
 }
 ```
 
@@ -205,7 +205,7 @@ fn push_diff(url: &str, wt: &str) {
 
 ```rust
 // In `plugin/panel/src/main.rs`
-            "superzej_diff" => {
+            "thegn_diff" => {
                 if let Some(payload) = pipe.payload {
                     // Optimized manual parse: zero JSON allocation
                     if let Some((wt, files_tsv)) = payload.split_once('\n') {
@@ -226,6 +226,6 @@ fn push_diff(url: &str, wt: &str) {
 Run: `just build-plugins`
 
 ```bash
-git add plugin/panel/src/main.rs crates/superzej-cli/src/commands/watch.rs
+git add plugin/panel/src/main.rs crates/thegn-cli/src/commands/watch.rs
 git commit -m "perf(panel): drop JSON serialization for diff pipes to reduce WASM CPU cost"
 ```

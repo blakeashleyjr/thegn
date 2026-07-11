@@ -18,7 +18,7 @@ Source design (design-only): `docs/superpowers/specs/2026-06-11-profiles-subprof
 
 ## Rationale
 
-superzej is one process / one world today: a single config, DB, credential set,
+thegn is one process / one world today: a single config, DB, credential set,
 theme. The roadmap flags profiles as cross-cutting and "seed early." The codebase
 is already env-driven (path roots, sandbox env-passthrough, `gh` token all read
 `std::env`), so the firewall is best enforced by rerooting a profile-scoped

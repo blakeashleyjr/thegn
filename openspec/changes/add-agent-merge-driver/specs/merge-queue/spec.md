@@ -4,7 +4,7 @@
 
 ### Requirement: Worktree branches can be assigned to the merge queue
 
-superzej SHALL let a user assign worktree branches to a per-repo merge queue,
+thegn SHALL let a user assign worktree branches to a per-repo merge queue,
 both explicitly (one or more named worktrees) and in bulk (every eligible
 worktree branch), and SHALL let them list, remove, and clear queue entries. An
 assigned branch MUST be recorded with a `queued` status keyed by its worktree
@@ -29,7 +29,7 @@ path, so the queue survives across invocations and is visible in the panel.
 
 ### Requirement: The queue drains branches one at a time and auto-lands the clean ones
 
-superzej SHALL drain the queue serially, one branch at a time, oldest-queued
+thegn SHALL drain the queue serially, one branch at a time, oldest-queued
 first. For each branch it SHALL fold the branch onto the repo's current target
 tip in the object database and test-gate the result; a branch that merges clean
 and passes the gate SHALL be landed by an atomic compare-and-swap of the target
@@ -64,7 +64,7 @@ or fails the test gate, running the agent in that branch's own worktree with a
 task prompt describing the conflict paths or the gate output. After the agent
 finishes, the driver SHALL re-attempt the fold; it SHALL retry up to
 `agent_max_attempts` and mark the branch `needs_human` if it still cannot land.
-The agent MUST NOT be relied on to merge into the target — superzej performs the
+The agent MUST NOT be relied on to merge into the target — thegn performs the
 land itself, so the object-DB coherence guarantee and the merge guard hold. Each
 agent invocation SHALL be bounded by `agent_timeout_secs`.
 
@@ -88,7 +88,7 @@ agent invocation SHALL be bounded by `agent_timeout_secs`.
 
 ### Requirement: The merge queue is driven from the CLI
 
-superzej SHALL expose a `merge` command namespace (`add`, `list`, `rm`, `clear`,
+thegn SHALL expose a `merge` command namespace (`add`, `list`, `rm`, `clear`,
 `drain`, `land`) that assigns and drains the queue programmatically, honoring the
 `--json` output convention. The batch fold-everything path SHALL remain available
 as the `integrate` command.

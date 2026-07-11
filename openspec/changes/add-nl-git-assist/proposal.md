@@ -5,10 +5,10 @@
 Add a natural-language → git action, modeled on
 [`lumen`](https://github.com/jnsahaj/lumen)'s `operate`: the user (or an agent)
 describes an intent in prose ("squash the last three commits", "undo my last
-merge"), superzej proposes the concrete git operation with an **explanation** and
+merge"), thegn proposes the concrete git operation with an **explanation** and
 any **danger warnings**, and executes only after an explicit **y/N confirm**. The
 model returns an XML-tagged `<command>/<explanation>/<warning>` contract that maps
-onto superzej's existing typed `GitOp` surface.
+onto thegn's existing typed `GitOp` surface.
 
 ## Impact
 
@@ -21,14 +21,14 @@ onto superzej's existing typed `GitOp` surface.
 
 ## Rationale
 
-superzej already has a complete typed git mutation surface (`gitmut.rs` `GitOp`
+thegn already has a complete typed git mutation surface (`gitmut.rs` `GitOp`
 with 100+ ops + `execute()`), template expansion (`custom_cmd`), a semantic layer
 that suggests commit messages, and the proxy for the model call — plus the
 bouncer's approval-overlay pattern to model a confirm gate. lumen shows the safe
 shape: never run NL directly; translate it to a concrete command, **explain it,
 warn on danger, and require confirmation**. Mapping the model's proposal onto the
 typed `GitOp` enum (rather than executing raw shell) means the proposal is
-validated against superzej's own operations and can be pre-checked for safety
+validated against thegn's own operations and can be pre-checked for safety
 before the user confirms. Git remains fully usable without this — it is an
 additive assist over the existing ops.
 

@@ -1,12 +1,12 @@
-# Superzej Feature Implementation: Refine Panel Files/Changes Section Interaction
+# Thegn Feature Implementation: Refine Panel Files/Changes Section Interaction
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Make the files and changes lists in the superzej panel faster to navigate, default to expanded, and unify editor commands (bat, external editor, terminal editor).
+**Goal:** Make the files and changes lists in the thegn panel faster to navigate, default to expanded, and unify editor commands (bat, external editor, terminal editor).
 
-**Architecture:** The modifications exist entirely within `crates/superzej-host/src/run.rs` (the main event loop), `crates/superzej-host/src/hydrate.rs`, and `crates/superzej-host/src/panel/`. The underlying data model (the tree structure from `build_file_tree`) is largely untouched, but the default UI state is adjusted so that the Changes section (which contains files) is expanded by default. The keybindings in `run.rs` are extended and unified to support `Enter` (bat), `shift+o` / `O` (terminal editor in new pane), and `ctrl+o` (external editor).
+**Architecture:** The modifications exist entirely within `crates/thegn-host/src/run.rs` (the main event loop), `crates/thegn-host/src/hydrate.rs`, and `crates/thegn-host/src/panel/`. The underlying data model (the tree structure from `build_file_tree`) is largely untouched, but the default UI state is adjusted so that the Changes section (which contains files) is expanded by default. The keybindings in `run.rs` are extended and unified to support `Enter` (bat), `shift+o` / `O` (terminal editor in new pane), and `ctrl+o` (external editor).
 
-**Tech Stack:** Rust, superzej-host event loop.
+**Tech Stack:** Rust, thegn-host event loop.
 
 ---
 
@@ -16,13 +16,13 @@
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/run.rs`
+- Modify: `crates/thegn-host/src/run.rs`
 
 **Step 1: Check out clean run.rs**
 
 ```bash
-git checkout -- crates/superzej-host/src/run.rs
-cargo check -p superzej-host
+git checkout -- crates/thegn-host/src/run.rs
+cargo check -p thegn-host
 ```
 
 _Expected: Clean compilation._
@@ -41,7 +41,7 @@ _(Skip if `git diff` shows no other changes you want to keep)_
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/run.rs` (in `event_loop`, `PanelMsg::Select` and direct key handling for `Section::Files`/`Section::Changes`)
+- Modify: `crates/thegn-host/src/run.rs` (in `event_loop`, `PanelMsg::Select` and direct key handling for `Section::Files`/`Section::Changes`)
 
 **Step 1: Update key dispatch in event loop**
 
@@ -111,13 +111,13 @@ _Implementation detail for `Ctrl-O` (`\x0F`) - External Editor:_
 ```
 
 **Step 2: Run test to verify compilation**
-Run: `cargo test -p superzej-host`
+Run: `cargo test -p thegn-host`
 Expected: PASS
 
 **Step 3: Commit**
 
 ```bash
-git add crates/superzej-host/src/run.rs
+git add crates/thegn-host/src/run.rs
 git commit -m "feat(panel): unify file open keybinds (Enter=bat, O=pane, C-o=external)"
 ```
 
@@ -127,8 +127,8 @@ git commit -m "feat(panel): unify file open keybinds (Enter=bat, O=pane, C-o=ext
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/run.rs` (near `let mut panel_ui = crate::panel::PanelUi::default();`)
-- Modify: `crates/superzej-host/src/panel/mod.rs` (if `PanelWidth::default()` needs tweaking, though usually it's handled in `run.rs` hydration).
+- Modify: `crates/thegn-host/src/run.rs` (near `let mut panel_ui = crate::panel::PanelUi::default();`)
+- Modify: `crates/thegn-host/src/panel/mod.rs` (if `PanelWidth::default()` needs tweaking, though usually it's handled in `run.rs` hydration).
 
 **Step 1: Inspect `PanelUi` persistence in `run.rs`**
 Currently, `run.rs` reads `ui_state_in_scope("panel")`. We need to ensure that if no width state is found, it defaults to `PanelWidth::Half` instead of `PanelWidth::Normal`, OR if the width is `Normal`, it forces the section list to behave correctly. The prompt says "accordianed by default" which implies the tree-view inside the section is expanded.
@@ -140,24 +140,24 @@ For the `Changes` section, the tree expansion is managed by the `FileEntry` stru
 let mut panel_ui = crate::panel::PanelUi::default();
 // Ensure default width is expanded if no DB state exists
 panel_ui.width = crate::layout::PanelWidth::Half;
-if let Ok(db) = superzej_core::db::Db::open() {
+if let Ok(db) = thegn_core::db::Db::open() {
     // ... db loading overrides this if present
 }
 ```
 
 **Step 2: Verify File Tree logic**
-Ensure `crates/superzej-host/src/panel/mod.rs` or `misc.rs` where the tree is rendered doesn't collapse dirs by default. The current `build_file_tree` doesn't seem to track collapsed/expanded state per directory, meaning the whole list _is_ always expanded. If we need to remember the state, we might need a `HashSet<String>` of collapsed paths in `PanelUi`.
+Ensure `crates/thegn-host/src/panel/mod.rs` or `misc.rs` where the tree is rendered doesn't collapse dirs by default. The current `build_file_tree` doesn't seem to track collapsed/expanded state per directory, meaning the whole list _is_ always expanded. If we need to remember the state, we might need a `HashSet<String>` of collapsed paths in `PanelUi`.
 
 _Note for implementer: Check if dir collapsing is already implemented. If not, implementing tree collapsing is out of scope for a quick fix unless specifically requested, but the prompt says "accordianed by default (remember last state)". If the panel sections themselves are the accordions, they remember their state via `ui_state_in_scope("panel")` which saves the `open` section._
 
 **Step 3: Run test**
-Run: `cargo test -p superzej-host`
+Run: `cargo test -p thegn-host`
 Expected: PASS
 
 **Step 4: Commit**
 
 ```bash
-git add crates/superzej-host/src/run.rs
+git add crates/thegn-host/src/run.rs
 git commit -m "feat(panel): default panel to expanded width"
 ```
 
@@ -167,10 +167,10 @@ git commit -m "feat(panel): default panel to expanded width"
 
 **Files:**
 
-- Inspect: `crates/superzej-host/src/hydrate.rs` (where `git diff_files` and `git status` are called).
+- Inspect: `crates/thegn-host/src/hydrate.rs` (where `git diff_files` and `git status` are called).
 
 **Step 1: Review Hydration for bottlenecks**
-`superzej-host` runs `git.status()` and `git.diff_files()` in `hydrate.rs`. If the user wants the "ALL files" list back, they are referring to `Section::Files`. Currently `Section::Files` might be rendering the same diff/status as Changes, or it used to use `git ls-files`.
+`thegn-host` runs `git.status()` and `git.diff_files()` in `hydrate.rs`. If the user wants the "ALL files" list back, they are referring to `Section::Files`. Currently `Section::Files` might be rendering the same diff/status as Changes, or it used to use `git ls-files`.
 
 In `hydrate.rs`, lines 749-756:
 

@@ -4,7 +4,7 @@
 
 ### Requirement: Per-pane scrollback is captured on snapshot and repainted on restore
 
-superzej SHALL capture a bounded tail of each pane's scrollback when a session is
+thegn SHALL capture a bounded tail of each pane's scrollback when a session is
 persisted and repaint it into the pane on restore, so a resurrected pane shows its
 recent history rather than a blank screen. The captured tail MUST be bounded by a
 configurable cap, and a snapshot taken before this feature (with no scrollback)
@@ -24,7 +24,7 @@ with an additive, null-defaulted column.
 
 ### Requirement: Stale agent state is coerced to a settled state on restore
 
-superzej SHALL run each persisted "running"/"active" agent or activity state
+thegn SHALL run each persisted "running"/"active" agent or activity state
 through an age-based guard at restore, downgrading any state older than a
 configurable grace threshold to a settled state, so a session killed mid-run does
 not resurrect a phantom forever-running indicator. States fresher than the

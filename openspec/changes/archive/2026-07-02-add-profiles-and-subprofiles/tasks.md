@@ -1,8 +1,8 @@
 # Tasks
 
-## 1. Startup reroot + ProfilePaths (superzej-core / host main)
+## 1. Startup reroot + ProfilePaths (thegn-core / host main)
 
-- [x] 1.1 Resolve active profile from `--profile`/`SUPERZEJ_PROFILE`; `set_var`
+- [x] 1.1 Resolve active profile from `--profile`/`THEGN_PROFILE`; `set_var`
       the profile roots as the **first** statements in `main` (before tokio/threads)
       via `profile::reroot` (`main.rs`).
 - [x] 1.2 `ProfilePaths` accessor + `profile.rs` typed module; path helpers read
@@ -12,7 +12,7 @@
       (no whole-user data migration); only named profiles reroot into a fresh
       `profiles/<name>/` tree. Documented in `profile.rs` + `config.toml.example`.
 
-## 2. Config layering (superzej-core)
+## 2. Config layering (thegn-core)
 
 - [x] 2.1 Two-root layered load: shared base + named-profile `config.toml` overlay
       from the real `XDG_CONFIG_HOME` (`apply_toml_overlay` deep-merge, below

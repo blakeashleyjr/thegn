@@ -1,6 +1,6 @@
 ## Context
 
-superzej's panel is a three-tab accordion (Git/Work/System) of ~24 sections; a
+thegn's panel is a three-tab accordion (Git/Work/System) of ~24 sections; a
 section is a `pub fn content(ctx: &SectionCtx) -> Vec<PanelRow>` plus registry
 entries in `panel/mod.rs` + `panel/sections/mod.rs` — none of which are ratcheted
 god-files. The ratcheted `run.rs` (23299) and `chrome.rs` (4819) are both at

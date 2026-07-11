@@ -2,7 +2,7 @@
 
 ## Architecture: daemon owns PTYs, UI is a client
 
-Today `superzej-host` is a foreground compositor: it spawns `portable-pty`
+Today `thegn-host` is a foreground compositor: it spawns `portable-pty`
 panes, renders chrome, and on exit relies on `session.rs`
 (persist/resurrect) to rebuild from the SQLite DB on next launch — the live
 PTYs are lost. This change moves PTY ownership into a **long-lived daemon**:
@@ -62,7 +62,7 @@ revoked_at` — pairing-URL credentials and AK 452 auth scopes/tokens for thin
   clients (771/773). Tokens are stored hashed; never plaintext.
 
 git stays the source of truth for worktrees; these tables are cache/coordination
-state, regenerable from running daemons + git. CRUD lives in `superzej-core`
+state, regenerable from running daemons + git. CRUD lives in `thegn-core`
 `db.rs` with the 95%-line unit-test gate.
 
 ## API, relay, and clients
@@ -70,13 +70,13 @@ state, regenerable from running daemons + git. CRUD lives in `superzej-core`
 - **Control API (445/451/452):** the daemon exposes attach/detach, list
   sessions/worktrees, send-to-terminal, snapshot, and drive-browser verbs over
   HTTP/gRPC, with an SSE/WebSocket event feed for pane deltas + activity, gated
-  by scoped tokens. `szhost` CLI verbs (770) are thin API callers (extends the
+  by scoped tokens. `thegn` CLI verbs (770) are thin API callers (extends the
   454 headless CLI) and degrade gracefully when no daemon is running.
 - **Relay (772):** when the last client detaches, the daemon opens a
   grace-period **lease** instead of tearing down the PTY; on reconnect within the
   lease the client resumes the same emulator state (warm). Lease expiry reaps the
   PTY. The relay is transport, off-loop, AI-free.
-- **Thin clients (771/773):** `szhost serve` advertises a **pairing URL**; a
+- **Thin clients (771/773):** `thegn serve` advertises a **pairing URL**; a
   desktop/web/mobile client pairs (token in `pairings`) and attaches over the API.
   The **mobile companion** (773) is read-mostly (monitor agents, view activity,
   receive AI 422/423 push) and can stage/commit via the GitBackend seam and
@@ -101,7 +101,7 @@ state, regenerable from running daemons + git. CRUD lives in `superzej-core`
 
 ## Implementation deviations (recorded at build time)
 
-1. **CRUD location.** "CRUD lives in `superzej-core` `db.rs`" is read as "in
+1. **CRUD location.** "CRUD lives in `thegn-core` `db.rs`" is read as "in
    core": `db.rs` is ratchet-pinned, so the v40 DDL + `ControlStore` impl live
    in `db_control.rs` / `store/control.rs` (the v34–v38 precedent). `db.rs`
    gains only the version bump + one migrate call.
@@ -118,7 +118,7 @@ state, regenerable from running daemons + git. CRUD lives in `superzej-core`
 5. **drive-browser.** Ships as a defined verb answering
    501/`UNIMPLEMENTED` — a stable contract slot for the `[forward]` preview
    browser, no behavior in v1.
-6. **`szhost open` ladder.** Unchanged: the daemon's `open_worktree` writes
+6. **`thegn open` ladder.** Unchanged: the daemon's `open_worktree` writes
    the same v37 intent the CLI already writes, so extending the CLI verb to
    call the daemon first would be a behavioral no-op.
 7. **Daemon-spawn fallback.** With `[daemon] enabled`, a daemon that cannot be

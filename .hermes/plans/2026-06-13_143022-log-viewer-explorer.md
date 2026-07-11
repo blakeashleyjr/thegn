@@ -2,14 +2,14 @@
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Build a highly performant log viewer/explorer as a section in the right panel (or a dedicated modal) capable of ingesting `szhost` logs and external application/container logs (via Docker/Podman/Systemd) with live tailing, filtering, and export.
+**Goal:** Build a highly performant log viewer/explorer as a section in the right panel (or a dedicated modal) capable of ingesting `thegn` logs and external application/container logs (via Docker/Podman/Systemd) with live tailing, filtering, and export.
 
 **Architecture:**
 
 1. **Model:** Extend `PanelData` with a `Logs` section or add a new `LogsData` structure populated via a background hydration thread that tails specific log streams.
-2. **Ingestion Layer:** Introduce a new abstraction `LogSource` (e.g., `SzhostLog`, `ContainerLog`, `FileLog`) in the `superzej-svc` or `superzej-core` layer to handle tailing and rotation. The loop communicates with these sources via `mpsc` channels, pulsing the waker on new data.
+2. **Ingestion Layer:** Introduce a new abstraction `LogSource` (e.g., `SzhostLog`, `ContainerLog`, `FileLog`) in the `thegn-svc` or `thegn-core` layer to handle tailing and rotation. The loop communicates with these sources via `mpsc` channels, pulsing the waker on new data.
 3. **Storage:** Keep the most recent N lines (e.g., 10k) in a `VecDeque` or `HistoryBuffer` (similar to `PtyPane`). Do not store them in the SQLite DB to avoid WAL write-amplification for high-throughput logs.
-4. **UI:** Add a `Logs` variant to `PanelHit` and `Section`. The UI renders `PanelRow`s from the buffer. Features include filtering (via a sidebar-like filter input), auto-scrolling, and an action to export to a file. Auto-import from containers integrates with `superzej_core::sandbox::running_containers()`.
+4. **UI:** Add a `Logs` variant to `PanelHit` and `Section`. The UI renders `PanelRow`s from the buffer. Features include filtering (via a sidebar-like filter input), auto-scrolling, and an action to export to a file. Auto-import from containers integrates with `thegn_core::sandbox::running_containers()`.
 
 **Tech Stack:** Rust, `tokio`, `termwiz`, `mpsc` channels.
 
@@ -21,8 +21,8 @@
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/panel/mod.rs`
-- Create: `crates/superzej-host/src/panel/logs.rs`
+- Modify: `crates/thegn-host/src/panel/mod.rs`
+- Create: `crates/thegn-host/src/panel/logs.rs`
 
 **Step 1: Write failing test**
 (Skipped for config changes, but we'll add a test for the new section enum parsing)
@@ -37,8 +37,8 @@ fn test_section_logs_parses() {
 
 **Step 2: Write minimal implementation**
 
-1. Add `Logs` to `crates/superzej-host/src/panel/mod.rs` `Section` enum and update `SECTION_ORDER`, `label()`, `is_git_family()`, `home_view()`.
-2. Create `crates/superzej-host/src/panel/logs.rs` with:
+1. Add `Logs` to `crates/thegn-host/src/panel/mod.rs` `Section` enum and update `SECTION_ORDER`, `label()`, `is_git_family()`, `home_view()`.
+2. Create `crates/thegn-host/src/panel/logs.rs` with:
 
    ```rust
    use std::collections::VecDeque;
@@ -65,20 +65,20 @@ fn test_section_logs_parses() {
 **Step 3: Commit**
 
 ```bash
-git add crates/superzej-host/src/panel/mod.rs crates/superzej-host/src/panel/logs.rs
+git add crates/thegn-host/src/panel/mod.rs crates/thegn-host/src/panel/logs.rs
 git commit -m "feat(panel): Add Logs section and basic data structures"
 ```
 
 ---
 
-### Task 2: Implement the Log Ingestion Worker (szhost logs)
+### Task 2: Implement the Log Ingestion Worker (thegn logs)
 
-**Objective:** Create a background worker that tails `$XDG_STATE_HOME/superzej/logs/szhost.log` and feeds it to the event loop.
+**Objective:** Create a background worker that tails `$XDG_STATE_HOME/thegn/logs/thegn.log` and feeds it to the event loop.
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/hydrate.rs`
-- Modify: `crates/superzej-host/src/run.rs`
+- Modify: `crates/thegn-host/src/hydrate.rs`
+- Modify: `crates/thegn-host/src/run.rs`
 
 **Step 1: Implement the Worker**
 
@@ -104,7 +104,7 @@ pub(crate) fn spawn_log_tailer(
                 let lines: Vec<_> = buf.lines().map(|l| crate::panel::logs::LogLine {
                     timestamp: crate::run::now_secs(),
                     level: "INFO".into(), // basic parse, refine later
-                    source: "szhost".into(),
+                    source: "thegn".into(),
                     content: l.to_string(),
                 }).collect();
                 if tx.send(lines).is_err() { break; }
@@ -120,14 +120,14 @@ pub(crate) fn spawn_log_tailer(
 In `run.rs`:
 
 1. Add `let (logs_tx, mut logs_rx) = tokio_mpsc::unbounded_channel();`
-2. Spawn the tailer pointing to `superzej_core::util::superzej_dir().join("logs/szhost.log")`.
+2. Spawn the tailer pointing to `thegn_core::util::thegn_dir().join("logs/thegn.log")`.
 3. In the `poll_input` loop, drain `logs_rx` and append to `panel_ui.logs.lines` (cap at e.g., 5000), then set `dirty = true`.
 
 **Step 3: Commit**
 
 ```bash
-git add crates/superzej-host/src/hydrate.rs crates/superzej-host/src/run.rs
-git commit -m "feat(logs): Add background tailer for szhost logs"
+git add crates/thegn-host/src/hydrate.rs crates/thegn-host/src/run.rs
+git commit -m "feat(logs): Add background tailer for thegn logs"
 ```
 
 ---
@@ -138,8 +138,8 @@ git commit -m "feat(logs): Add background tailer for szhost logs"
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/panel/sections/misc.rs`
-- Modify: `crates/superzej-host/src/panel/sections/mod.rs` (to route it)
+- Modify: `crates/thegn-host/src/panel/sections/misc.rs`
+- Modify: `crates/thegn-host/src/panel/sections/mod.rs` (to route it)
 
 **Step 1: Implementation**
 
@@ -183,7 +183,7 @@ pub(super) fn logs(ctx: &SectionCtx) -> Vec<PanelRow> {
 **Step 2: Commit**
 
 ```bash
-git add crates/superzej-host/src/panel/sections/misc.rs crates/superzej-host/src/panel/sections/mod.rs
+git add crates/thegn-host/src/panel/sections/misc.rs crates/thegn-host/src/panel/sections/mod.rs
 git commit -m "feat(panel): Render the logs accordion section"
 ```
 
@@ -195,8 +195,8 @@ git commit -m "feat(panel): Render the logs accordion section"
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/hydrate.rs`
-- Modify: `crates/superzej-host/src/run.rs`
+- Modify: `crates/thegn-host/src/hydrate.rs`
+- Modify: `crates/thegn-host/src/run.rs`
 
 **Step 1: Implement Container Log Tailer**
 
@@ -245,7 +245,7 @@ In `run.rs`, when the active container (`model.active_container_name`) changes o
 **Step 3: Commit**
 
 ```bash
-git add crates/superzej-host/src/hydrate.rs crates/superzej-host/src/run.rs
+git add crates/thegn-host/src/hydrate.rs crates/thegn-host/src/run.rs
 git commit -m "feat(logs): Auto-tail worktree container logs"
 ```
 
@@ -257,8 +257,8 @@ git commit -m "feat(logs): Auto-tail worktree container logs"
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/panel/mod.rs` (intent)
-- Modify: `crates/superzej-host/src/run.rs` (action)
+- Modify: `crates/thegn-host/src/panel/mod.rs` (intent)
+- Modify: `crates/thegn-host/src/run.rs` (action)
 
 **Step 1: Implementation**
 
@@ -266,8 +266,8 @@ git commit -m "feat(logs): Auto-tail worktree container logs"
 2. In `run.rs`, handle the action:
 
 ```rust
-// Ask user for path (or auto-generate in XDG_STATE_HOME/superzej/exports/)
-let export_path = superzej_core::util::superzej_dir().join("exports").join(format!("logs_{}.txt", now_secs()));
+// Ask user for path (or auto-generate in XDG_STATE_HOME/thegn/exports/)
+let export_path = thegn_core::util::thegn_dir().join("exports").join(format!("logs_{}.txt", now_secs()));
 let lines: Vec<String> = panel_ui.logs.lines.iter().map(|l| format!("[{}] {} {}", l.source, l.level, l.content)).collect();
 std::fs::create_dir_all(export_path.parent().unwrap());
 std::fs::write(&export_path, lines.join("\n"));

@@ -20,7 +20,7 @@ A `PinSupervisor` SHALL own pinned program panes independently of the active tab
 
 #### Scenario: Pins resurrect on restart
 
-- **WHEN** superzej restarts
+- **WHEN** thegn restarts
 - **THEN** previously running pins are resurrected from persisted pin state
 
 ### Requirement: Launch-or-focus with restart-on-exit policy

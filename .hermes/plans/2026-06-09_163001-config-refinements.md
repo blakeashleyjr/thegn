@@ -1,8 +1,8 @@
-# Superzej Config Refinements Implementation Plan
+# Thegn Config Refinements Implementation Plan
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Elevate live configuration management in `superzej` with 3 major improvements: resilient safe-reloading that doesn't wipe state on parse errors, visual hot-swapping for deep UI state synchronization, and a generic `--set key=value` CLI override system.
+**Goal:** Elevate live configuration management in `thegn` with 3 major improvements: resilient safe-reloading that doesn't wipe state on parse errors, visual hot-swapping for deep UI state synchronization, and a generic `--set key=value` CLI override system.
 
 **Architecture:**
 
@@ -20,12 +20,12 @@
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/config.rs:952`
-- Modify: `crates/superzej-host/src/run.rs:645`
+- Modify: `crates/thegn-core/src/config.rs:952`
+- Modify: `crates/thegn-host/src/run.rs:645`
 
 **Step 1: Add `try_load_layered` method**
 
-In `crates/superzej-core/src/config.rs`, change the parser behavior and add a fallback option.
+In `crates/thegn-core/src/config.rs`, change the parser behavior and add a fallback option.
 
 ```rust
 impl Config {
@@ -69,15 +69,15 @@ Change `load_layered` to call `try_load_layered` and fallback to default (so we 
 
 **Step 2: Update host channel payload**
 
-In `crates/superzej-host/src/run.rs`, change `config_tx` to send `Result<Config, String>`.
+In `crates/thegn-host/src/run.rs`, change `config_tx` to send `Result<Config, String>`.
 
 ```rust
     // Line 624
-    let (config_tx, config_rx) = std::sync::mpsc::channel::<Result<superzej_core::config::Config, String>>();
+    let (config_tx, config_rx) = std::sync::mpsc::channel::<Result<thegn_core::config::Config, String>>();
 
     // Line 641
-    let new_cfg_res = superzej_core::config::Config::try_load_layered(
-        &superzej_core::config::ProcessEnv,
+    let new_cfg_res = thegn_core::config::Config::try_load_layered(
+        &thegn_core::config::ProcessEnv,
         Some(overlay_clone.clone()),
         config_clone.clone()
     );
@@ -86,7 +86,7 @@ In `crates/superzej-host/src/run.rs`, change `config_tx` to send `Result<Config,
 
 **Step 3: Handle in event loop**
 
-In `crates/superzej-host/src/run.rs:1003`:
+In `crates/thegn-host/src/run.rs:1003`:
 
 ```rust
         while let Ok(cfg_res) = config_rx.try_recv() {
@@ -105,7 +105,7 @@ In `crates/superzej-host/src/run.rs:1003`:
 ```
 
 **Step 4: Verify build**
-Run: `cargo build -p superzej-host`
+Run: `cargo build -p thegn-host`
 Expected: SUCCESS
 
 ---
@@ -116,7 +116,7 @@ Expected: SUCCESS
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/run.rs:1003`
+- Modify: `crates/thegn-host/src/run.rs:1003`
 
 **Step 1: Save `config` inside `run.rs` event loop**
 
@@ -142,7 +142,7 @@ In the event loop `while let Ok(cfg_res) = config_rx.try_recv()`:
 
 **Step 3: Link `current_config` to Drawer Height**
 
-In `crates/superzej-host/src/run.rs` inside the `if dirty` block (around line 1050), change the hardcoded height:
+In `crates/thegn-host/src/run.rs` inside the `if dirty` block (around line 1050), change the hardcoded height:
 
 ```rust
                     let height = current_config.drawer.height.min(rows as u32) as usize;
@@ -150,7 +150,7 @@ In `crates/superzej-host/src/run.rs` inside the `if dirty` block (around line 10
 ```
 
 **Step 4: Verify build**
-Run: `cargo build -p superzej-host`
+Run: `cargo build -p thegn-host`
 Expected: SUCCESS
 
 ---
@@ -161,13 +161,13 @@ Expected: SUCCESS
 
 **Files:**
 
-- Modify: `crates/superzej-cli/src/cli.rs`
-- Modify: `crates/superzej-host/src/main.rs`
-- Modify: `crates/superzej-core/src/config.rs`
+- Modify: `crates/thegn-cli/src/cli.rs`
+- Modify: `crates/thegn-host/src/main.rs`
+- Modify: `crates/thegn-core/src/config.rs`
 
 **Step 1: Simplify CLI Struct**
 
-In `crates/superzej-cli/src/cli.rs` and `crates/superzej-host/src/main.rs`:
+In `crates/thegn-cli/src/cli.rs` and `crates/thegn-host/src/main.rs`:
 
 ```rust
 pub struct Cli {
@@ -194,7 +194,7 @@ Remove the `to_overlay` helper, as we will handle overrides more organically. We
 
 **Step 3: Modify `load_layered`**
 
-In `crates/superzej-core/src/config.rs`, alter `try_load_layered`:
+In `crates/thegn-core/src/config.rs`, alter `try_load_layered`:
 
 ```rust
     pub fn try_load_layered(

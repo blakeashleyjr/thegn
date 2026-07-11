@@ -61,7 +61,7 @@ A sandboxed worktree process SHALL see the shared `<git-common>/config` mounted 
 
 ### Requirement: Per-worktree tunnel via a sidecar leaves the host untouched
 
-A worktree MAY attach to its own overlay network through a per-worktree sidecar container whose network namespace the worktree joins (`--network container:<sidecar>`); superzej MUST NOT embed a tunnel datapath, and the host's networking (including any host `tailscaled`) MUST remain unchanged.
+A worktree MAY attach to its own overlay network through a per-worktree sidecar container whose network namespace the worktree joins (`--network container:<sidecar>`); thegn MUST NOT embed a tunnel datapath, and the host's networking (including any host `tailscaled`) MUST remain unchanged.
 
 #### Scenario: Worktree egress is the tunnel
 
@@ -99,7 +99,7 @@ When a tunnel fails to come up, the `on_error` policy SHALL govern the outcome a
 
 ### Requirement: Resolve and inject the repo devShell env into worktree panes
 
-When a worktree's repo exposes a flake `devShell` and `[sandbox] inject_devshell` is enabled, superzej SHALL resolve the devShell env on the host (`nix print-dev-env --json`), cache it by a `flake.lock`+`flake.nix` hash, and merge the exported variables into each worktree pane before the sandbox exec (PATH prepended, other vars set only if unset); a repo without `nix`/`devShell` MUST be a clean no-op.
+When a worktree's repo exposes a flake `devShell` and `[sandbox] inject_devshell` is enabled, thegn SHALL resolve the devShell env on the host (`nix print-dev-env --json`), cache it by a `flake.lock`+`flake.nix` hash, and merge the exported variables into each worktree pane before the sandbox exec (PATH prepended, other vars set only if unset); a repo without `nix`/`devShell` MUST be a clean no-op.
 
 #### Scenario: Flake repo gets the toolchain
 
@@ -133,17 +133,17 @@ The devShell resolve SHALL run on a background thread that pulses the `TerminalW
 #### Scenario: No host daemon
 
 - **WHEN** `nix_daemon` is true but no host daemon socket exists
-- **THEN** superzej warns and leaves the mount off rather than half-wiring nix
+- **THEN** thegn warns and leaves the mount off rather than half-wiring nix
 
 ### Requirement: A commodity VPS can serve as a managed sandbox provider
 
-superzej SHALL support commodity-VPS vendors (Hetzner Cloud first) as managed
+thegn SHALL support commodity-VPS vendors (Hetzner Cloud first) as managed
 sandbox providers: an `[env.<name>.provider]` with a VPS kind SHALL create the
 instance via the vendor's REST API (cloud-init user-data, the managed ssh key,
-and superzej identity labels), wait until it is reachable over ssh, and run the
+and thegn identity labels), wait until it is reachable over ssh, and run the
 standard provisioning pipeline over an ssh exec/files transport that satisfies
 the provider `files` capability. Panes and control-plane git/fs reads MUST
-attach through a `szhost vps-ssh <name> --` self-bridge (the default
+attach through a `thegn vps-ssh <name> --` self-bridge (the default
 control/interactive prefix when no `exec_command` is configured) — no vendor
 CLI is required. Secrets MUST NOT appear on any command line (host or remote);
 provisioning env rides the ssh transport's stdin.
@@ -153,14 +153,14 @@ provisioning env rides the ssh transport's stdin.
 - **WHEN** a worktree resolves to a VPS provider env with its API token set and
   is provisioned
 - **THEN** an instance is created via the vendor API with the managed key and
-  superzej labels, the provisioning pipeline runs over ssh, and the pane
+  thegn labels, the provisioning pipeline runs over ssh, and the pane
   attaches through the `vps-ssh` self-bridge
 
 #### Scenario: The self-bridge is the default exec prefix
 
 - **WHEN** a VPS provider env has no `exec_command` configured
 - **THEN** the placement's control and interactive prefixes are the
-  `szhost vps-ssh <resolved-id> --` self-bridge, and chrome git/fs reads and
+  `thegn vps-ssh <resolved-id> --` self-bridge, and chrome git/fs reads and
   the persisted worktree location route through it
 
 #### Scenario: A stale instance IP self-heals
@@ -170,10 +170,10 @@ provisioning env rides the ssh transport's stdin.
 
 ### Requirement: VPS instances are leak-safe by construction
 
-superzej SHALL write an intent record to the local instance ledger **before**
+thegn SHALL write an intent record to the local instance ledger **before**
 the create API call and finalize it (instance id, IP) after; every destroy
 SHALL retry transient vendor errors and clear the record. A label-scoped reaper
-(instances labeled as superzej-managed **and** created by this host) SHALL
+(instances labeled as thegn-managed **and** created by this host) SHALL
 destroy unledgered instances past a grace age, drop ledger records with no live
 instance, and enforce the env's `max_lifetime_secs` ceiling. Creates MUST be
 refused beyond the env's `max_instances` cap (default 5).
@@ -187,7 +187,7 @@ refused beyond the env's `max_instances` cap (default 5).
 
 #### Scenario: Another host's instances are never reaped
 
-- **WHEN** two superzej hosts share one vendor account
+- **WHEN** two thegn hosts share one vendor account
 - **THEN** the reaper only considers instances whose host label matches its own
 
 #### Scenario: The instance cap refuses runaway creates
@@ -198,11 +198,11 @@ refused beyond the env's `max_instances` cap (default 5).
 
 ### Requirement: VPS envs have no checkpoint semantics; speed comes from baked images
 
-Because a stopped VPS still bills, superzej SHALL NOT expose
+Because a stopped VPS still bills, thegn SHALL NOT expose
 checkpoint/suspend semantics for VPS providers: the provider's `checkpoints`
 capability is absent, the provisioning plan's checkpoint step is skipped, and
 warm-pool spares (which record no checkpoint) MUST be destroyed — never
-recycled in place — when stale or surplus. `superzej env image-bake` SHALL
+recycled in place — when stale or surplus. `thegn env image-bake` SHALL
 build the speed substitute: a throwaway instance runs the repo-independent
 provisioning prefix (Nix, direnv; docker via first-boot cloud-init), is
 snapshotted and destroyed, and the printed `template = "snapshot:<id>"` makes
@@ -215,16 +215,16 @@ later provisions boot from the baked image.
 
 #### Scenario: image-bake never leaks its throwaway instance
 
-- **WHEN** `superzej env image-bake` finishes — successfully or not
+- **WHEN** `thegn env image-bake` finishes — successfully or not
 - **THEN** the bake instance is destroyed, and on success the snapshot template
   line is printed for the env config
 
 ### Requirement: DigitalOcean is a commodity-VPS provider kind
 
-superzej SHALL support DigitalOcean as a `VpsKind` sharing the entire VPS core
-(instance ledger, label/tag-scoped reaper, `szhost vps-ssh` self-bridge, image
+thegn SHALL support DigitalOcean as a `VpsKind` sharing the entire VPS core
+(instance ledger, label/tag-scoped reaper, `thegn vps-ssh` self-bridge, image
 bake). An `[env.<name>.provider]` with `provider = "digitalocean"` SHALL create
-a droplet via the DigitalOcean REST API tagged as superzej-managed, register
+a droplet via the DigitalOcean REST API tagged as thegn-managed, register
 the managed ssh key idempotently, wait until reachable over ssh, and run the
 standard provisioning pipeline over the ssh exec/files transport. No vendor CLI
 is required.
@@ -234,7 +234,7 @@ is required.
 - **WHEN** a worktree resolves to a `provider = "digitalocean"` env with its API
   token set and is provisioned
 - **THEN** a droplet is created via the DO API with the managed key and
-  superzej tags, the pipeline runs over ssh, and the pane attaches through the
+  thegn tags, the pipeline runs over ssh, and the pane attaches through the
   `vps-ssh` self-bridge
 
 #### Scenario: DigitalOcean reuses the VPS leak-safety machinery
@@ -246,7 +246,7 @@ is required.
 
 ### Requirement: Fly.io is a CLI-free managed sandbox provider
 
-superzej SHALL support Fly.io as a first-class `Provider::Fly` (not a
+thegn SHALL support Fly.io as a first-class `Provider::Fly` (not a
 `VpsKind`): an `[env.<name>.provider]` with `provider = "fly"` SHALL create an
 app-per-sandbox Machine via the Fly Machines REST API, allocate a dedicated
 IPv4 via the Fly GraphQL API, and make the machine reachable over the managed
@@ -271,7 +271,7 @@ Fly CLI (`flyctl`) is required; secrets MUST NOT appear on any command line.
 
 ### Requirement: Fly envs are scale-to-zero, not destroy-on-idle
 
-superzej SHALL treat Fly as scale-to-zero because a stopped Fly Machine is
+thegn SHALL treat Fly as scale-to-zero because a stopped Fly Machine is
 near-free (unlike a billing stopped VPS): an idle Fly sandbox is **stopped**
 (not destroyed), and start/stop MUST poll the Machine's real state so a
 still-transitioning machine is never treated as ready. The env's
@@ -300,7 +300,7 @@ whose create crashed between the intent write and finalize.
 
 ### Requirement: Provider secrets resolve through a layered store
 
-superzej SHALL resolve every provider token through a single `secret::resolve`
+thegn SHALL resolve every provider token through a single `secret::resolve`
 chokepoint that accepts a layered `SecretRef`: `keyring:<service>/<account>`
 (OS keyring), `env:VAR`, `file:PATH` (a `0600` file), and a bare string treated
 as `env:` for back-compat. A writer path SHALL persist a collected token —
@@ -331,36 +331,36 @@ and secrets MUST NOT be echoed or written into config in plaintext.
 
 ### Requirement: Environments are authored without hand-editing TOML
 
-superzej SHALL provide a write path that creates, edits, and removes
+thegn SHALL provide a write path that creates, edits, and removes
 `[env.<name>]` / `[env.<name>.provider]` definitions with comments and
 formatting preserved, plus a generic `config set <dotted.key> <value>`. Env
-definitions SHALL be written only to global config; a repo `.superzej.toml` may
+definitions SHALL be written only to global config; a repo `.thegn.toml` may
 only _select_ an env (`env = "…"`), and the write path MUST refuse an env
-definition in a repo scope (the trust-clamp model). A CLI (`superzej env
+definition in a repo scope (the trust-clamp model). A CLI (`thegn env
 create`/`rm`/`test`, `config set`) SHALL back these operations and be usable
 headlessly.
 
 #### Scenario: `env create` writes config and stores the secret
 
-- **WHEN** `superzej env create <name> --provider fly --token-file <path>` runs
+- **WHEN** `thegn env create <name> --provider fly --token-file <path>` runs
 - **THEN** the env is written to global config, the token is stored via the
   secret writer, and no secret is printed
 
 #### Scenario: A repo file cannot define an env
 
 - **WHEN** the write path is asked to define `[env.<name>]` in a repo
-  `.superzej.toml`
+  `.thegn.toml`
 - **THEN** it refuses, allowing only the `env = "…"` selection key
 
 #### Scenario: `env test` verifies a token cheaply
 
-- **WHEN** `superzej env test <name>` runs against a configured env
+- **WHEN** `thegn env test <name>` runs against a configured env
 - **THEN** it builds the provider and performs a cheap `list()` call, reporting
   success or an actionable failure without provisioning anything
 
 ### Requirement: Environments are creatable and manageable from the TUI
 
-superzej SHALL surface environment setup in the compositor: an "Add
+thegn SHALL surface environment setup in the compositor: an "Add
 environment" wizard (reached from the palette) that branches its fields by kind
 (`local`/`ssh`/`fly`/`digitalocean`/`hetzner`/`daytona`), accepts a pasted
 token, validates it off-loop, and on submit writes the env + stores the secret;
@@ -391,7 +391,7 @@ back over the refresh channel and pulse the waker (no idle polling).
 
 ### Requirement: A host is provisioned once via a resumable state machine and reused by every sandbox on it
 
-superzej SHALL model each container-capable machine as a host that walks a
+thegn SHALL model each container-capable machine as a host that walks a
 provisioning state machine (connect → probe runtime → ensure base image by
 digest → seed warm volumes → Ready), persisting only durable checkpoints so an
 interrupted provision resumes from the last completed step rather than
@@ -420,7 +420,7 @@ with a fresh probe MUST perform zero transfers and zero installs.
 
 ### Requirement: Concurrent provisioning of one host is single-flight
 
-superzej SHALL serialize provisioning per host: when N worktrees (or the CLI)
+thegn SHALL serialize provisioning per host: when N worktrees (or the CLI)
 request a host that is mid-provision, later callers MUST await the same
 in-flight run — each still receiving live step progress — rather than starting
 a duplicate install or transfer.
@@ -434,7 +434,7 @@ a duplicate install or transfer.
 
 ### Requirement: Installing a container runtime on a host requires explicit consent
 
-superzej MUST NOT install software on a host without a per-host grant: a probe
+thegn MUST NOT install software on a host without a per-host grant: a probe
 finding no runtime SHALL proceed to installation only via config
 (`install_runtime = "auto"`), an interactive confirmation, or an explicit CLI
 flag; background provisioning (eager, warm pool) MUST never prompt and never
@@ -457,7 +457,7 @@ message instead of installing.
 
 ### Requirement: Base images are delivered by the best available route and verified by digest before boot
 
-superzej SHALL resolve the multi-arch base image to the target host's
+thegn SHALL resolve the multi-arch base image to the target host's
 per-architecture digest, skip delivery entirely when that digest is already in
 the host's inventory, and otherwise deliver it by the best available strategy —
 defaulting to a resumable registry-less transfer over the existing SSH channel,
@@ -487,7 +487,7 @@ boots from it; a mismatch refuses to boot.
 
 ### Requirement: Hosts are declared globally and referenced by envs
 
-superzej SHALL read host definitions only from global configuration
+thegn SHALL read host definitions only from global configuration
 (`[host.<name>]`); repo overlays MUST NOT be able to define hosts. An
 `[env.<name>]` MAY reference a host by name so multiple envs share one host's
 provisioning; an ssh env without a host reference SHALL keep today's behavior
@@ -508,8 +508,8 @@ via an implicit anonymous host whose install consent is `never`.
 
 ### Requirement: Host state is inspectable and failures are actionable
 
-superzej SHALL surface each host's state (state-machine position, runtime info,
-inventory, last error) in the panel and via `szhost host list|status`, and
+thegn SHALL surface each host's state (state-machine position, runtime info,
+inventory, last error) in the panel and via `thegn host list|status`, and
 every failure MUST carry its step, message, and whether retry can succeed —
 mapped to actionable UI text and CLI exit codes (0 ready, 1 fatal, 2
 retryable). Retrying a failed host resumes from the failed step.
@@ -522,15 +522,15 @@ retryable). Retrying a failed host resumes from the failed step.
 
 #### Scenario: CLI provisions headlessly
 
-- **WHEN** `szhost host provision <name>` runs in a terminal
+- **WHEN** `thegn host provision <name>` runs in a terminal
 - **THEN** each step prints progress (including transfer bytes) and the exit
   code distinguishes ready, fatal, and retryable outcomes
 
 ### Requirement: Hosts are addable without editing configuration
 
-superzej SHALL let a user add a host by typing its target (`user@host[:port]`
+thegn SHALL let a user add a host by typing its target (`user@host[:port]`
 or a dumbpipe ticket) in the new-worktree wizard's "+ add host…" row or via
-`superzej host add`; the definition persists in the state DB, becomes a
+`thegn host add`; the definition persists in the state DB, becomes a
 selectable env immediately, and is shadowed by a declarative `[host.<name>]`
 of the same name.
 
@@ -544,12 +544,12 @@ of the same name.
 
 - **WHEN** a `[host.<name>]` exists in config.toml with the same name as a
   DB-added host
-- **THEN** the config definition wins and `superzej host add`/`rm` refuse to
+- **THEN** the config definition wins and `thegn host add`/`rm` refuse to
   override it
 
 ### Requirement: Repo toolchains materialize automatically on hosts
 
-superzej SHALL detect a repo's stack (nix flake/devenv/shell.nix, tool-version
+thegn SHALL detect a repo's stack (nix flake/devenv/shell.nix, tool-version
 pins, or plain language manifests including package.json, pyproject,
 deno.json, build.sbt) and materialize a working toolchain inside the host
 sandbox — the repo's own devshell when it has one, an explicitly pinned mise
@@ -573,7 +573,7 @@ mode and per-language package sets.
 
 ### Requirement: The personal layer applies to host-backed sandboxes
 
-superzej SHALL apply the user's `[sandbox.home]` personal layer (dotfiles,
+thegn SHALL apply the user's `[sandbox.home]` personal layer (dotfiles,
 setup commands, agent CLIs + their logins, atuin) to host-backed sandboxes by
 default, over the host's generic exec channel, honoring the existing shell
 strategy knobs; personal-layer failures MUST be best-effort (warned, never
@@ -587,7 +587,7 @@ blocking the pane).
 
 ### Requirement: Sprite checkpoints are captured and spares recycle in place
 
-superzej SHALL persist the checkpoint id created at the end of sprite
+thegn SHALL persist the checkpoint id created at the end of sprite
 provisioning (base snapshot + pool spare rows) and SHALL recycle stale or
 delete-released spares by restoring them to their checkpoint in place instead
 of destroying and rebuilding, guarded by lockfile freshness, falling back to
@@ -605,10 +605,10 @@ destroy on any restore failure.
 - **WHEN** the repo's flake.lock changed since the spare's checkpoint
 - **THEN** the spare is destroyed and rebuilt (never restored stale)
 
-### Requirement: A repo `.superzej.*` overlay is a clamped request, not an override
+### Requirement: A repo `.thegn.*` overlay is a clamped request, not an override
 
 The effective sandbox for a worktree SHALL be resolved by clamping the repo-root
-`.superzej.{toml,yaml,yml,json}` `[sandbox]` overlay against the trusted base
+`.thegn.{toml,yaml,yml,json}` `[sandbox]` overlay against the trusted base
 (global config plus the active profile overlay). The repo layer, being the
 least-trusted authorship layer, MAY only _request within_ the trusted bound: a
 constraint field may tighten but never weaken, and a field the repo may not set
@@ -664,13 +664,13 @@ canonical form, so a later edit that changes the requested set re-prompts.
 
 ### Requirement: A key's resolution is explainable
 
-The system SHALL provide `superzej config explain <key>` reporting the effective
+The system SHALL provide `thegn config explain <key>` reporting the effective
 value, the trust layer that set it, and — for `sandbox.*` keys with a repo path
 — the clamp trace (which requests were denied or are pending, and why).
 
 #### Scenario: Explain shows why egress was clamped
 
-- **WHEN** `superzej config explain sandbox.network --repo <path>` is run against
+- **WHEN** `thegn config explain sandbox.network --repo <path>` is run against
   a repo whose overlay requested `network = "host"`
 - **THEN** the output shows the effective value, its origin layer, and the denial
   reason for the repo request

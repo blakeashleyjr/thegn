@@ -4,7 +4,7 @@
 
 ### Requirement: Bounded per-pane recording that is free when disabled
 
-When `[replay] enabled` is true, superzej SHALL record each pane's byte stream as timestamped events with periodic keyframe markers, bounded by both a byte and a duration budget (evicting oldest events and orphaned keyframes); when disabled it MUST impose zero cost (no allocation, a single null check in `feed`).
+When `[replay] enabled` is true, thegn SHALL record each pane's byte stream as timestamped events with periodic keyframe markers, bounded by both a byte and a duration budget (evicting oldest events and orphaned keyframes); when disabled it MUST impose zero cost (no allocation, a single null check in `feed`).
 
 #### Scenario: Disabled is free
 
@@ -47,11 +47,11 @@ Time-search SHALL reconstruct frames over the recording and test grid text read 
 
 ### Requirement: Persisted named registers
 
-superzej SHALL provide vim-style named registers (`"a`–`"z`, `"0`–`"9`, the default `"`, and the system-clipboard `"+`) stored in the state DB across restarts, except the volatile `"+` register which reads/writes the live OS clipboard and is never persisted. A copy SHALL populate the default register, and `PasteRegister` SHALL write a chosen register's value into the focused pane (honoring bracketed paste).
+thegn SHALL provide vim-style named registers (`"a`–`"z`, `"0`–`"9`, the default `"`, and the system-clipboard `"+`) stored in the state DB across restarts, except the volatile `"+` register which reads/writes the live OS clipboard and is never persisted. A copy SHALL populate the default register, and `PasteRegister` SHALL write a chosen register's value into the focused pane (honoring bracketed paste).
 
 #### Scenario: Default register survives a restart
 
-- **WHEN** the user copies text, then restarts superzej
+- **WHEN** the user copies text, then restarts thegn
 - **THEN** pasting the default register (`PasteRegister` `"`) yields the copied text
 
 #### Scenario: Clipboard register is not persisted

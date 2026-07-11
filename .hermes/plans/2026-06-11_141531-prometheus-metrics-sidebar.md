@@ -6,9 +6,9 @@
 
 **Architecture:**
 
-1. **Config layer** — Add `[metrics]` table to `crates/superzej-core/src/config.rs` following the existing `StatsConfig` pattern with `targets`, `interval`, `timeout`, and `max_body_bytes` fields.
-2. **Core scraper** — Add a minimal Prometheus text-format parser in `superzej-core` that extracts gauge/counter/untyped samples and supports label matching for allowlisted metrics.
-3. **Host supervisor** — Add a `MetricsSupervisor` in `superzej-host` that runs off-thread (like `StatsSampler`), scrapes targets on a configurable interval, caches latest values + error states, and sends updates over an mpsc channel + pulses the TerminalWaker.
+1. **Config layer** — Add `[metrics]` table to `crates/thegn-core/src/config.rs` following the existing `StatsConfig` pattern with `targets`, `interval`, `timeout`, and `max_body_bytes` fields.
+2. **Core scraper** — Add a minimal Prometheus text-format parser in `thegn-core` that extracts gauge/counter/untyped samples and supports label matching for allowlisted metrics.
+3. **Host supervisor** — Add a `MetricsSupervisor` in `thegn-host` that runs off-thread (like `StatsSampler`), scrapes targets on a configurable interval, caches latest values + error states, and sends updates over an mpsc channel + pulses the TerminalWaker.
 4. **Sidebar rendering** — Extend `FrameModel` with `metrics` data and add a `draw_metrics_section` function that renders the METRICS section below WORKSPACES (or as a collapsible section), with per-target health indicators (● up, stale, err) and allowlisted metric values.
 5. **TUI integration** — Wire the metrics channel into the event loop alongside `stats_rx`, with damage-tracked redraws.
 
@@ -16,14 +16,14 @@
 
 ---
 
-### Task 1: Add `[metrics]` Config to superzej-core
+### Task 1: Add `[metrics]` Config to thegn-core
 
 **Objective:** Define the configuration structure for Prometheus scrape targets.
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/config.rs`
-- Test: `crates/superzej-core/src/config.rs` (add unit test for defaults)
+- Modify: `crates/thegn-core/src/config.rs`
+- Test: `crates/thegn-core/src/config.rs` (add unit test for defaults)
 
 **Step 1: Write the config structs**
 
@@ -140,27 +140,27 @@ if !self.metrics.targets.is_empty() || /* other non-empty checks */ {
 **Step 4: Run test to verify pass**
 
 ```bash
-cd /home/blake/code/superzej
-cargo test -p superzej-core config
+cd /home/blake/code/thegn
+cargo test -p thegn-core config
 ```
 
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-core/src/config.rs
+git add crates/thegn-core/src/config.rs
 git commit -m "feat(config): add [metrics] section for prometheus scrape targets"
 ```
 
 ---
 
-### Task 2: Prometheus Text-Format Parser in superzej-core
+### Task 2: Prometheus Text-Format Parser in thegn-core
 
 **Objective:** Add a minimal parser that extracts gauge/counter/untyped samples from Prometheus text format.
 
 **Files:**
 
-- Create: `crates/superzej-core/src/metrics.rs`
-- Test: `crates/superzej-core/src/metrics.rs` (inline tests)
+- Create: `crates/thegn-core/src/metrics.rs`
+- Test: `crates/thegn-core/src/metrics.rs` (inline tests)
 
 **Step 1: Write the parser**
 
@@ -275,27 +275,27 @@ process_resident_memory_bytes 82440192
 **Step 2: Run tests**
 
 ```bash
-cargo test -p superzej-core metrics
+cargo test -p thegn-core metrics
 ```
 
 **Step 3: Commit**
 
 ```bash
-git add crates/superzej-core/src/metrics.rs
+git add crates/thegn-core/src/metrics.rs
 git commit -m "feat(core): add minimal prometheus text-format parser"
 ```
 
 ---
 
-### Task 3: MetricsSupervisor in superzej-host
+### Task 3: MetricsSupervisor in thegn-host
 
 **Objective:** Create an off-thread supervisor that scrapes targets on interval and sends updates to the TUI.
 
 **Files:**
 
-- Create: `crates/superzej-host/src/metrics.rs`
-- Modify: `crates/superzej-host/src/main.rs` (add `mod metrics;`)
-- Modify: `crates/superzej-host/src/run.rs` (wire channel)
+- Create: `crates/thegn-host/src/metrics.rs`
+- Modify: `crates/thegn-host/src/main.rs` (add `mod metrics;`)
+- Modify: `crates/thegn-host/src/run.rs` (wire channel)
 
 **Step 1: Write the supervisor**
 
@@ -308,8 +308,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-use superzej_core::config::MetricsConfig;
-use superzej_core::metrics::{filter_samples, parse_metrics};
+use thegn_core::config::MetricsConfig;
+use thegn_core::metrics::{filter_samples, parse_metrics};
 
 /// One target's latest state.
 #[derive(Debug, Clone)]
@@ -317,7 +317,7 @@ pub struct MetricTargetState {
     pub name: String,
     pub url: String,
     /// Latest samples (filtered to allowlist).
-    pub samples: Vec<superzej_core::metrics::MetricSample>,
+    pub samples: Vec<thegn_core::metrics::MetricSample>,
     /// Health state.
     pub health: MetricHealth,
     /// Last successful scrape timestamp (for stale detection).
@@ -438,7 +438,7 @@ async fn scrape_target(url: &str, timeout: Duration, max_bytes: usize) -> Result
 
 **Step 2: Add `mod metrics;` to main.rs**
 
-In `crates/superzej-host/src/main.rs`, add:
+In `crates/thegn-host/src/main.rs`, add:
 
 ```rust
 mod metrics;
@@ -475,7 +475,7 @@ mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
 
 **Step 5: Add reqwest to Cargo.toml**
 
-In `crates/superzej-host/Cargo.toml`, add:
+In `crates/thegn-host/Cargo.toml`, add:
 
 ```rust
 reqwest = { version = "0.12", features = ["json"] }
@@ -484,13 +484,13 @@ reqwest = { version = "0.12", features = ["json"] }
 **Step 6: Build and verify**
 
 ```bash
-cargo build -p superzej-host
+cargo build -p thegn-host
 ```
 
 **Step 7: Commit**
 
 ```bash
-git add crates/superzej-host/src/metrics.rs crates/superzej-host/src/main.rs crates/superzej-host/src/run.rs crates/superzej-host/Cargo.toml
+git add crates/thegn-host/src/metrics.rs crates/thegn-host/src/main.rs crates/thegn-host/src/run.rs crates/thegn-host/Cargo.toml
 git commit -m "feat(host): add metrics scraper supervisor for prometheus endpoints"
 ```
 
@@ -502,8 +502,8 @@ git commit -m "feat(host): add metrics scraper supervisor for prometheus endpoin
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/chrome.rs` (add `metrics` to `FrameModel`)
-- Modify: `crates/superzej-host/src/hydrate.rs` (sample metrics into model)
+- Modify: `crates/thegn-host/src/chrome.rs` (add `metrics` to `FrameModel`)
+- Modify: `crates/thegn-host/src/hydrate.rs` (sample metrics into model)
 
 **Step 1: Add to FrameModel**
 
@@ -547,13 +547,13 @@ impl PartialEq for MetricsState {
 **Step 3: Build and verify**
 
 ```bash
-cargo build -p superzej-host
+cargo build -p thegn-host
 ```
 
 **Step 4: Commit**
 
 ```bash
-git add crates/superzej-host/src/chrome.rs crates/superzej-host/src/run.rs crates/superzej-host/src/metrics.rs
+git add crates/thegn-host/src/chrome.rs crates/thegn-host/src/run.rs crates/thegn-host/src/metrics.rs
 git commit -m "feat(host): wire metrics state into frame model"
 ```
 
@@ -565,7 +565,7 @@ git commit -m "feat(host): wire metrics state into frame model"
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/chrome.rs` (add `draw_metrics_section`)
+- Modify: `crates/thegn-host/src/chrome.rs` (add `draw_metrics_section`)
 
 **Step 1: Add render function**
 
@@ -710,13 +710,13 @@ if rect.rows > 10 {
 **Step 3: Build and verify**
 
 ```bash
-cargo build -p superzej-host
+cargo build -p thegn-host
 ```
 
 **Step 4: Commit**
 
 ```bash
-git add crates/superzej-host/src/chrome.rs
+git add crates/thegn-host/src/chrome.rs
 git commit -m "feat(chrome): render metrics section in sidebar"
 ```
 
@@ -764,14 +764,14 @@ git commit -m "docs(config): add [metrics] section example"
 1. **Config loads:**
 
    ```bash
-   cargo run -p superzej-host --bin szhost --config /dev/null
+   cargo run -p thegn-host --bin thegn --config /dev/null
    # Should not panic on missing [metrics] section
    ```
 
 2. **Parser tests:**
 
    ```bash
-   cargo test -p superzej-core metrics
+   cargo test -p thegn-core metrics
    ```
 
 3. **Full build:**
@@ -782,7 +782,7 @@ git commit -m "docs(config): add [metrics] section example"
 
 4. **E2E test:**
    - Add a `[[metrics.targets]]` to config with a real endpoint
-   - Launch superzej
+   - Launch thegn
    - Verify METRICS section appears in sidebar with health indicator
 
 ---

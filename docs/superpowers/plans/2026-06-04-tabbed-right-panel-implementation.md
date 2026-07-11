@@ -380,10 +380,10 @@ Command::Diff {
 ```bash
 cargo build --release
 # Test --files:
-./target/release/superzej diff --files --worktree /tmp/some-repo 2>/dev/null || \
-  echo "Run from a git repo to test: superzej diff --files"
+./target/release/thegn diff --files --worktree /tmp/some-repo 2>/dev/null || \
+  echo "Run from a git repo to test: thegn diff --files"
 # Test --file:
-./target/release/superzej diff --file README.md 2>/dev/null || echo "(needs git context)"
+./target/release/thegn diff --file README.md 2>/dev/null || echo "(needs git context)"
 ```
 
 - [ ] **Step 5: Commit**
@@ -412,7 +412,7 @@ fn fetch_files(&self) {
     let Some(wt) = self.worktree.clone() else { return };
     let mut ctx = BTreeMap::new();
     ctx.insert("cmd".to_string(), "files".to_string());
-    run_command(&["superzej", "diff", "--files", "--worktree", &wt], ctx);
+    run_command(&["thegn", "diff", "--files", "--worktree", &wt], ctx);
 }
 ```
 
@@ -424,19 +424,19 @@ fn fetch(&mut self, refresh: bool) {
     // PR fetch (existing)
     let mut pr_ctx = BTreeMap::new();
     pr_ctx.insert("cmd".to_string(), "pr".to_string());
-    let mut pr_cmd = vec!["superzej", "pr", "status", "--json", "--worktree", &wt];
+    let mut pr_cmd = vec!["thegn", "pr", "status", "--json", "--worktree", &wt];
     if refresh { pr_cmd.push("--refresh"); }
     run_command(&pr_cmd, pr_ctx);
 
     // Files fetch (new)
     let mut file_ctx = BTreeMap::new();
     file_ctx.insert("cmd".to_string(), "files".to_string());
-    run_command(&["superzej", "diff", "--files", "--worktree", &wt], file_ctx);
+    run_command(&["thegn", "diff", "--files", "--worktree", &wt], file_ctx);
 
     // Diff --stat (existing)
     let mut diff_ctx = BTreeMap::new();
     diff_ctx.insert("cmd".to_string(), "diff".to_string());
-    run_command(&["superzej", "diff", "--stat", "--worktree", &wt], diff_ctx);
+    run_command(&["thegn", "diff", "--stat", "--worktree", &wt], diff_ctx);
 }
 ```
 
@@ -476,7 +476,7 @@ fn fetch_file_diff(&self, path: &str) {
     let Some(wt) = self.worktree.clone() else { return };
     let mut ctx = BTreeMap::new();
     ctx.insert("cmd".to_string(), "file_diff".to_string());
-    run_command(&["superzej", "diff", "--file", path, "--worktree", &wt], ctx);
+    run_command(&["thegn", "diff", "--file", path, "--worktree", &wt], ctx);
 }
 ```
 
@@ -936,12 +936,12 @@ cd plugin/panel && cargo build --release --target wasm32-wasip1 2>&1 || echo "fi
 - [ ] **Step 3: Full integration smoke check**
 
 ```bash
-cd /home/blake/code/superzej
+cd /home/blake/code/thegn
 cargo build --release
 # List modified files (run from a git repo):
-./target/release/superzej diff --files
+./target/release/thegn diff --files
 # Single file diff:
-./target/release/superzej diff --file src/main.rs
+./target/release/thegn diff --file src/main.rs
 ```
 
 - [ ] **Step 4: Commit**

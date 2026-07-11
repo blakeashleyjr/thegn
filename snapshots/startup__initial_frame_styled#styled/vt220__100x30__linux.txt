@@ -1,7 +1,7 @@
-L0| ◆ superzej v0.1.0 work     16.2/94G ·   7% ·  49% ·  94°C ·  ↓    9K ↑   50K ·  100% · 22:06
-R0 0 12 fg=idx08 bg=idx00 attrs=
-R0 12 6 fg=idx00 bg=idx00 attrs=
-R0 18 19 fg=idx08 bg=idx00 attrs=
+L0| þ thegn v0.1.0  work       21.2/94G ·   6% ·  38% ·  97°C ·  ↓  419K ↑   37K ·  100% · 02:21
+R0 0 9 fg=idx08 bg=idx00 attrs=
+R0 9 6 fg=idx00 bg=idx00 attrs=
+R0 15 22 fg=idx08 bg=idx00 attrs=
 R0 37 3 fg=idx00 bg=idx00 attrs=
 R0 40 5 fg=idx08 bg=idx00 attrs=
 R0 45 3 fg=idx00 bg=idx00 attrs=
@@ -76,14 +76,14 @@ R13 89 2 fg=idx00 bg=idx00 attrs=
 R13 91 7 fg=idx08 bg=idx00 attrs=
 R13 98 1 fg=idx00 bg=idx00 attrs=
 R13 99 1 fg=idx08 bg=idx00 attrs=
-L14|          │ ❯  d  superzej defaults                                     Alt/Ctrl chords │
+L14|          │ ❯  d  thegn defaults                                        Alt/Ctrl chords │
 R14 0 11 fg=idx08 bg=idx00 attrs=
 R14 11 1 fg=default bg=idx00 attrs=
 R14 12 2 fg=idx06 bg=idx00 attrs=BOLD
 R14 14 3 fg=idx07 bg=idx00 attrs=BOLD
 R14 17 1 fg=idx07 bg=idx00 attrs=
-R14 18 17 fg=idx07 bg=idx00 attrs=BOLD
-R14 35 37 fg=idx07 bg=idx00 attrs=
+R14 18 14 fg=idx07 bg=idx00 attrs=BOLD
+R14 32 40 fg=idx07 bg=idx00 attrs=
 R14 72 15 fg=idx08 bg=idx00 attrs=
 R14 87 1 fg=default bg=idx00 attrs=
 R14 88 1 fg=idx08 bg=idx00 attrs=
@@ -139,7 +139,7 @@ L27|
 R27 0 100 fg=idx08 bg=idx00 attrs=
 L28|
 R28 0 100 fg=idx08 bg=idx00 attrs=
-L29|  NORMAL   Ctrl Space menu   Ctrl g lock                    7% free   ❚❚ Justin Hurwitz — Houston
+L29|  NORMAL   Ctrl Space menu   Ctrl g lock                    6% free   ❚❚ Justin Hurwitz — Houston
 R29 0 1 fg=idx08 bg=idx00 attrs=
 R29 1 8 fg=idx00 bg=idx08 attrs=
 R29 9 2 fg=idx08 bg=idx00 attrs=

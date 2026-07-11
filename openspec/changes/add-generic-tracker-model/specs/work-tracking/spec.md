@@ -100,5 +100,5 @@ Comment, status-transition, and assignee write-back plus the kanban board view S
 
 #### Scenario: Tracking works with AI layers absent
 
-- **WHEN** superzej runs as the AI-free shell with the proxy/agent layers disabled
+- **WHEN** thegn runs as the AI-free shell with the proxy/agent layers disabled
 - **THEN** listing, filtering, transitions, comments, and the board all operate normally and no AI crate is required to build or run the tracker

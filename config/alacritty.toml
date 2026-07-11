@@ -1,13 +1,13 @@
-# Alacritty profile for running superzej (`just start-term`): tuned for a
+# Alacritty profile for running thegn (`just start-term`): tuned for a
 # compositor that owns its own chrome, scrollback, and selection.
 
 [window]
-# superzej draws its own bars; no native decorations or padding.
+# thegn draws its own bars; no native decorations or padding.
 decorations = "None"
 padding = { x = 0, y = 4 } # a touch of air between the bar and the window edge
 dynamic_padding = false
 startup_mode = "Maximized"
-# Fully opaque: superzej's storm-blue surfaces are the design; compositor
+# Fully opaque: thegn's storm-blue surfaces are the design; compositor
 # transparency just muddies the tint contrast between the chrome zones.
 opacity = 1.0
 

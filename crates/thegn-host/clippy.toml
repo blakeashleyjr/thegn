@@ -1,0 +1,29 @@
+# thegn-host clippy config. Clippy resolves the NEAREST clippy.toml per
+# crate (CARGO_MANIFEST_DIR upward), so this file applies to the host only and
+# must repeat the workspace-wide rules from the root clippy.toml.
+
+# --- workspace rules (keep in sync with /clippy.toml) -----------------------
+disallowed-macros = [
+  { path = "std::println", reason = "stdout data: use crate::outln!; diagnostics: use tracing/msg" },
+  { path = "std::print", reason = "stdout data: use crate::out!; diagnostics: use tracing/msg" },
+  { path = "std::eprintln", reason = "diagnostics: use tracing::{warn,error,...}! or msg" },
+  { path = "std::eprint", reason = "diagnostics: use tracing/msg (interactive prompts may #[allow])" },
+  { path = "std::dbg", reason = "remove debug dbg! before committing" },
+]
+
+# --- host-only rules --------------------------------------------------------
+# The event loop must never block on a subprocess (CLAUDE.md invariant: the
+# 2026-07 audit found rg/grep running inline in a key handler). Synchronous
+# child-process waits are therefore banned in this crate; every legitimate
+# site (CLI subcommands in src/cmd/, startup before the loop, closures already
+# inside spawn_blocking / std::thread) carries a local
+# `#[expect(clippy::disallowed_methods)]` with a one-line justification.
+# If clippy flags your new code: move the work off the loop (see
+# spawn_test_discovery / spawn_test_locate in run.rs for the pattern), or —
+# only if it provably never runs on the loop — add the expect + reason.
+disallowed-methods = [
+  { path = "std::process::Command::output", reason = "blocking child wait — off-loop only (spawn_blocking); #[expect] with a reason at sanctioned sites" },
+  { path = "std::process::Command::status", reason = "blocking child wait — off-loop only (spawn_blocking); #[expect] with a reason at sanctioned sites" },
+  { path = "std::process::Child::wait", reason = "blocking child wait — off-loop only (spawn_blocking); #[expect] with a reason at sanctioned sites" },
+  { path = "std::process::Child::wait_with_output", reason = "blocking child wait — off-loop only (spawn_blocking); #[expect] with a reason at sanctioned sites" },
+]

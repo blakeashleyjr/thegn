@@ -2,11 +2,11 @@
 
 ## Executive Summary
 
-superzej has a **sophisticated but incomplete** remote development story. Three distinct modes are architected:
+thegn has a **sophisticated but incomplete** remote development story. Three distinct modes are architected:
 
 1. **SSHFS mode** (`mode=sshfs`) - Mount remote filesystem locally via sshfs
-2. **Local client / Remote daemon** (`mode=remote_exec`) - Run superzej client locally, agents on remote
-3. **Fully remote** (`mode=remote`) - SSH/mosh into a remote machine and run superzej natively
+2. **Local client / Remote daemon** (`mode=remote_exec`) - Run thegn client locally, agents on remote
+3. **Fully remote** (`mode=remote`) - SSH/mosh into a remote machine and run thegn natively
 
 The architecture is **transport-agnostic**: the `GitLoc` abstraction lets every git/gh operation route through ssh transparently, and the sandbox layer composes mosh/ssh transports around OCI container execs. However, **platform provider integrations are missing** - there's no API-specific support for Codespaces, Modal, E2B, Fly.io, etc. Everything is user-configured SSH targets.
 
@@ -16,15 +16,15 @@ The architecture is **transport-agnostic**: the `GitLoc` abstraction lets every 
 
 ### Implemented Components
 
-#### Core Abstraction: `GitLoc` (`crates/superzej-core/src/remote.rs`)
+#### Core Abstraction: `GitLoc` (`crates/thegn-core/src/remote.rs`)
 
 - **Purpose**: Where a worktree's git data lives - local or remote over ssh
 - **Storage**: Remote location persisted as JSON blob in `worktrees.location` column
 - **Resolution**: `GitLoc::for_worktree(path)` resolves location from DB; local on miss
 - **Operations**: `git_command()`, `gh_command()`, `sh_command()`, `git_with_stdin()` - all route through ssh when remote
-- **SSH base**: Multiplexed connection via ControlMaster (`ControlPath=$SUPERZEJ_DIR/ssh-%r@%h:%p`, `ControlPersist=300`)
+- **SSH base**: Multiplexed connection via ControlMaster (`ControlPath=$THEGN_DIR/ssh-%r@%h:%p`, `ControlPersist=300`)
 
-#### Sandbox Layer (`crates/superzej-core/src/sandbox.rs` + `crates/superzej-svc/src/ssh.rs`)
+#### Sandbox Layer (`crates/thegn-core/src/sandbox.rs` + `crates/thegn-svc/src/ssh.rs`)
 
 - **`RemoteConfig`** (`config.rs:895-926`):
 
@@ -34,7 +34,7 @@ The architecture is **transport-agnostic**: the `GitLoc` abstraction lets every 
   port = 22
   transport = "mosh"  # mosh | ssh
   mode = "remote"     # remote | local_exec | sshfs
-  remote_dir = "~/superzej-worktrees"
+  remote_dir = "~/thegn-worktrees"
   forward_agent = true
   ```
 
@@ -67,14 +67,14 @@ The architecture is **transport-agnostic**: the `GitLoc` abstraction lets every 
 - **Available over transport** (sandbox.rs:669-691):
   - For `Transport::Remote`, probes via `ssh host "command -v podman >/dev/null 2>&1"`
 
-#### Agent Launching (`crates/superzej-host/src/agent.rs`)
+#### Agent Launching (`crates/thegn-host/src/agent.rs`)
 
 - `launch_spec()` - Composes final argv from worktree location + sandbox config
 - `prepare_sandbox()` - Resolves sandbox, ensures container (or host fallback)
 - `compose_spec()` - Builds `LaunchSpec` (argv, cwd, env, backend label, warnings)
 - **Key insight**: `backend_label` stored in DB per worktree for persistence
 
-#### SSH Control Plane (`crates/superzej-svc/src/ssh.rs`)
+#### SSH Control Plane (`crates/thegn-svc/src/ssh.rs`)
 
 - **Trait**: `RemoteExec` with `exec()` and `home()` methods
 - **Fallback**: `CliSsh` wraps subprocess ssh (permanent fallback for ProxyJump/Match hosts)
@@ -86,7 +86,7 @@ The architecture is **transport-agnostic**: the `GitLoc` abstraction lets every 
 
 | Feature                                | Status | Notes                                                         |
 | -------------------------------------- | ------ | ------------------------------------------------------------- |
-| 121. SSH attach                        | `~`    | GitLoc exists, but no explicit `superzej ssh-attach` command  |
+| 121. SSH attach                        | `~`    | GitLoc exists, but no explicit `thegn ssh-attach` command     |
 | 122. Mosh support                      | `~`    | TransportKind::Mosh exists, `transport_wrap` builds mosh argv |
 | 123. Tailscale zero-config path        | ` `    | Not started - would be transport layer addition               |
 | 124. iroh embedded p2p                 | ` `    | Not started - P2P transport alternative                       |
@@ -139,7 +139,7 @@ Each provider needs:
 1. **Discovery**: List available sandboxes/dev environments
 2. **Connection**: Obtain SSH target (host, port, auth)
 3. **Lifecycle**: Start/pause/resume/stop the environment
-4. **Metadata**: Map superzej worktree path to provider's path
+4. **Metadata**: Map thegn worktree path to provider's path
 
 **Pattern for integration** (see `RemoteConfig` + new providers):
 
@@ -150,7 +150,7 @@ provider = "codespaces"  # New field
 discovery_cmd = "gh codespace list --json name,sshUrl"
 ```
 
-**Trait for provider backends** (to be added in `superzej-core/src/provider.rs`):
+**Trait for provider backends** (to be added in `thegn-core/src/provider.rs`):
 
 ```rust
 trait RemoteProvider {
@@ -170,7 +170,7 @@ trait RemoteProvider {
 
 **Architecture**:
 
-- Local superzej runs natively
+- Local thegn runs natively
 - Worktree directory mounted via sshfs to local path
 - Git/PR panel work against local path (filesystem is remote)
 - Sandbox applies locally (or could apply on remote)
@@ -250,13 +250,13 @@ trait RemoteProvider {
 
 **Goal**: Wire existing stubs into working basic remote workflows.
 
-| Task | Description                              | Acceptance Criteria                                                                             |
-| ---- | ---------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| R-1  | Implement `remote_dir` worktree creation | `superzej new-worktree --remote user@host` creates worktree in `~/superzej-worktrees` on remote |
-| R-2  | SSHFS mount/unmount lifecycle            | Auto-mount sshfs when `mode=sshfs`; unmount on session end                                      |
-| R-3  | Remote workspace deletion                | `close-worktree` runs `git worktree remove` on remote via ssh                                   |
-| R-4  | Connection status widget                 | Statusbar shows "SSH: user@host" or "MOSh: user@host" for remote sessions                       |
-| R-5  | Remote worktree UI distinction           | Sidebar shows remote worktrees with different icon/color                                        |
+| Task | Description                              | Acceptance Criteria                                                                       |
+| ---- | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
+| R-1  | Implement `remote_dir` worktree creation | `thegn new-worktree --remote user@host` creates worktree in `~/thegn-worktrees` on remote |
+| R-2  | SSHFS mount/unmount lifecycle            | Auto-mount sshfs when `mode=sshfs`; unmount on session end                                |
+| R-3  | Remote workspace deletion                | `close-worktree` runs `git worktree remove` on remote via ssh                             |
+| R-4  | Connection status widget                 | Statusbar shows "SSH: user@host" or "MOSh: user@host" for remote sessions                 |
+| R-5  | Remote worktree UI distinction           | Sidebar shows remote worktrees with different icon/color                                  |
 
 ### Phase 2: Provider Integrations (4-6 weeks)
 
@@ -315,7 +315,7 @@ trait RemoteProvider {
 ### Remote Worktree (Manual SSH)
 
 ```toml
-# ~/.superzej/config.toml
+# ~/.thegn/config.toml
 [sandbox.remote]
 host = "user@devbox"
 port = 22
@@ -324,7 +324,7 @@ mode = "remote"
 remote_dir = "~/projects"
 
 # Per-repo override
-# .superzej.toml in repo root
+# .thegn.toml in repo root
 [sandbox.remote]
 host = "user@gpu-box"
 mode = "local_exec"  # Run on remote, but repo synced

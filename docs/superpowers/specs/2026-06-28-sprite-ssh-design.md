@@ -3,8 +3,8 @@
 ## Why
 
 The sprite interactive pane attaches over the Sprites **WSS `/exec`** PTY API
-(`crates/superzej-svc/src/provider.rs`). In practice it's laggy and drops input
-characters — superzej hand-rolls the vt100-over-WebSocket relay, resize, and
+(`crates/thegn-svc/src/provider.rs`). In practice it's laggy and drops input
+characters — thegn hand-rolls the vt100-over-WebSocket relay, resize, and
 flow control. Sprites expose **no direct SSH and no UDP** (so mosh is impossible),
 but they _do_ expose a **raw-TCP-over-WebSocket proxy** (`/v1/sprites/{id}/proxy`):
 after a JSON init it's a transparent TCP relay to any in-sprite `host:port`.
@@ -13,7 +13,7 @@ the proxy."_
 
 So the fix for the janky PTY is: run a real `sshd` inside the sprite and attach
 the pane as a **local `ssh` client** whose transport is tunneled over the WSS
-proxy. The pane becomes an ordinary local PTY running `ssh` — superzej's vt100
+proxy. The pane becomes an ordinary local PTY running `ssh` — thegn's vt100
 handles it natively (no custom WSS PTY relay), and ssh's mature PTY/flow-control
 eliminates the lag. Bonus: unlocks `scp`/`sshfs`/agent-forwarding.
 
@@ -25,7 +25,7 @@ transport) — this doc is only the sprite/provider path.
 ```
  pane (local PTY)            host                         sprite
  ┌──────────┐   stdio   ┌───────────────────┐  WSS    ┌──────────────┐
- │  ssh     │──────────▶│ szhost sprite-     │════════▶│ /proxy →     │
+ │  ssh     │──────────▶│ thegn sprite-     │════════▶│ /proxy →     │
  │  client  │◀──────────│   proxy (relay)    │◀════════│ localhost:22 │
  └──────────┘           └───────────────────┘         │   sshd        │
    real ssh PTY,          ProxyCommand,                └──────────────┘
@@ -34,17 +34,17 @@ transport) — this doc is only the sprite/provider path.
 
 1. **Provision (once, gated on `connect = "ssh"`):** install `openssh`, generate
    an sshd host key, write a minimal `sshd_config`, start `sshd` listening on
-   `127.0.0.1:22` inside the sprite, and append a superzej-managed public key to
+   `127.0.0.1:22` inside the sprite, and append a thegn-managed public key to
    `~/.ssh/authorized_keys`. Idempotent envplan steps; baked into the checkpoint.
 2. **Transport:** a new provider method `open_proxy(id, host, port)` opens the
    WSS `/proxy` endpoint, sends `{"host","port"}`, and returns a raw byte stream
    (same channel shape as `ExecSession` minus the framing).
-3. **`szhost sprite-proxy <worktree>` (hidden subcommand):** ssh's `ProxyCommand`.
+3. **`thegn sprite-proxy <worktree>` (hidden subcommand):** ssh's `ProxyCommand`.
    Resolves the env→sprite id, calls `open_proxy(id, "127.0.0.1", 22)`, and pumps
    host stdin↔stream↔host stdout until EOF. (Mirrors the resident-bridge stdio
    pump, but over `/proxy` instead of `/exec`.)
 4. **Pane:** when `connect = "ssh"`, the interactive pane is a **local** PTY
-   running `ssh -tt -o ProxyCommand="szhost sprite-proxy <wt>" -o
+   running `ssh -tt -o ProxyCommand="thegn sprite-proxy <wt>" -o
 StrictHostKeyChecking=accept-new -o UserKnownHostsFile=<state> -i <managed
 key> sprite@sprite -- 'cd <workdir>; exec <shell>'` — spawned via the normal
    `panes.spawn_argv_env` local path, not `spawn_native`.
@@ -52,7 +52,7 @@ key> sprite@sprite -- 'cd <workdir>; exec <shell>'` — spawned via the normal
 ## Config
 
 `[env.<name>.provider] connect = "exec" | "ssh"` (default `exec` = today's WSS PTY).
-Reuses the existing key-management dir under `$XDG_STATE_HOME/superzej/ssh/`.
+Reuses the existing key-management dir under `$XDG_STATE_HOME/thegn/ssh/`.
 
 ## Build order
 

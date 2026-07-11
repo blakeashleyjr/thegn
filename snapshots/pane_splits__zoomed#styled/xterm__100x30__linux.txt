@@ -1,11 +1,12 @@
-L0| ◆ superzej v0.1.0 work      69% ·  16.2/94G ·   7% ·  53% ·  ↓   33K ↑   37K ·  100% · 22:06
+L0| þ thegn v0.1.0  work        90% ·  21.6/94G ·   6% ·  38% ·  ↓   24K ↑   12K ·  100% · 02:21
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
-R0 3 9 fg=#edf0f8 bg=#151a28 attrs=
-R0 12 6 fg=#6f788e bg=#151a28 attrs=
-R0 18 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 24 4 fg=#edf0f8 bg=#151a28 attrs=
-R0 28 5 fg=#c6ccdb bg=#151a28 attrs=
+R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 9 6 fg=#6f788e bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 28 5 fg=#f0c674 bg=#151a28 attrs=
 R0 33 3 fg=#6f788e bg=#151a28 attrs=
 R0 36 10 fg=#c6ccdb bg=#151a28 attrs=
 R0 46 3 fg=#6f788e bg=#151a28 attrs=
@@ -33,18 +34,18 @@ L3|
 R3 0 100 fg=default bg=#0b0e16 attrs=
 L4|
 R4 0 100 fg=default bg=#0b0e16 attrs=
-L5|                          ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
-R5 0 26 fg=default bg=#0b0e16 attrs=
-R5 26 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R5 73 27 fg=default bg=#0b0e16 attrs=
-L6|                           ▀▀▀▄ █   █ █▄▄▄▀ █▀▀▀  █▄▄▄▀  ▄▀   █▀▀▀     █
-R6 0 26 fg=default bg=#0b0e16 attrs=
-R6 26 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R6 73 27 fg=default bg=#0b0e16 attrs=
-L7|                          ▄▄▄▄▀ ▀▄▄▄▀ █     █▄▄▄▄ █  ▀▄ █▄▄▄▄ █▄▄▄▄ ▀▄▄▀
-R7 0 26 fg=default bg=#0b0e16 attrs=
-R7 26 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R7 73 27 fg=default bg=#0b0e16 attrs=
+L5|                                   ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
+R5 0 35 fg=default bg=#0b0e16 attrs=
+R5 35 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R5 64 36 fg=default bg=#0b0e16 attrs=
+L6|                                     █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
+R6 0 35 fg=default bg=#0b0e16 attrs=
+R6 35 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R6 64 36 fg=default bg=#0b0e16 attrs=
+L7|                                     █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
+R7 0 35 fg=default bg=#0b0e16 attrs=
+R7 35 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R7 64 36 fg=default bg=#0b0e16 attrs=
 L8|
 R8 0 100 fg=default bg=#0b0e16 attrs=
 L9|                                     v0.1.0 · git worktree IDE
@@ -102,18 +103,16 @@ L27|
 R27 0 100 fg=default bg=#0b0e16 attrs=
 L28|
 R28 0 100 fg=default bg=#0b0e16 attrs=
-L29|  NORMAL   Ctrl Space menu       0 LOC │ Zoomed — Ctrl+Alt+z to restore  ✋ 1    7% free   ⛶ ZOOM
+L29|  NORMAL   Ctrl Space menu              0 LOC │ Zoomed — Ctrl+Alt+z to restore   6% free   ⛶ ZOOM
 R29 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R29 1 8 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
 R29 9 2 fg=#edf0f8 bg=#151a28 attrs=
 R29 11 10 fg=#7a8197 bg=#151a28 attrs=
 R29 21 5 fg=#6f788e bg=#151a28 attrs=
-R29 26 7 fg=#edf0f8 bg=#151a28 attrs=
-R29 33 5 fg=#c6ccdb bg=#151a28 attrs=
-R29 38 3 fg=#60687b bg=#151a28 attrs=
-R29 41 30 fg=#c6ccdb bg=#151a28 attrs=
-R29 71 1 fg=#edf0f8 bg=#151a28 attrs=
-R29 72 6 fg=#0b0e16 bg=#e6c264 attrs=BOLD
+R29 26 14 fg=#edf0f8 bg=#151a28 attrs=
+R29 40 5 fg=#c6ccdb bg=#151a28 attrs=
+R29 45 3 fg=#60687b bg=#151a28 attrs=
+R29 48 30 fg=#c6ccdb bg=#151a28 attrs=
 R29 78 1 fg=#edf0f8 bg=#151a28 attrs=
 R29 79 11 fg=#0b0e16 bg=#ef6f6f attrs=BOLD
 R29 90 1 fg=#edf0f8 bg=#151a28 attrs=

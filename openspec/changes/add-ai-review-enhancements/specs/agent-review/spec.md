@@ -18,7 +18,7 @@ The review pane SHALL let the user pin inline annotations to diff hunks that sur
 
 ### Requirement: Commit-message draft falls back to a template when AI is off
 
-On commit the system SHALL be able to draft a commit message from the staged diff via `superzej-proxy` and pre-fill the commit editor for the user to confirm, and when no agent/proxy is configured it MUST instead open the editor with the deterministic template or empty body; in neither case does it auto-commit or pass `--no-verify`.
+On commit the system SHALL be able to draft a commit message from the staged diff via `thegn-proxy` and pre-fill the commit editor for the user to confirm, and when no agent/proxy is configured it MUST instead open the editor with the deterministic template or empty body; in neither case does it auto-commit or pass `--no-verify`.
 
 #### Scenario: AI available drafts from the staged diff
 

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-superzej's command-line surface exposes noun-verb namespaces (`wt`, `repo`,
+thegn's command-line surface exposes noun-verb namespaces (`wt`, `repo`,
 `merge`, etc.) that drive the worktree lifecycle and workspace focus headlessly,
 reusing the same core pipelines as the TUI. It keeps legacy bare verbs working
 (hidden from help), emits machine-readable `--json` on list-shaped reads under a
@@ -13,7 +13,7 @@ shell completions from the live clap definition.
 
 ### Requirement: The worktree lifecycle is drivable headlessly through a `wt` namespace
 
-superzej SHALL expose a `wt` noun-verb namespace (`wt list|new|rm|diff|disk|clean`)
+thegn SHALL expose a `wt` noun-verb namespace (`wt list|new|rm|diff|disk|clean`)
 whose `new` and `rm` verbs create and remove worktrees headlessly, reusing the
 same core pipeline as the TUI wizard (branch naming, base resolution, git
 worktree add/remove under the serial git-mutation lock, DB registration and
@@ -26,13 +26,13 @@ worktree is never resurrected at next launch.
 
 #### Scenario: Headless creation
 
-- **WHEN** `szhost wt new fix-parser --repo <root>` runs with no TUI
+- **WHEN** `thegn wt new fix-parser --repo <root>` runs with no TUI
 - **THEN** a new branch + worktree exist under the configured worktrees dir,
   the worktree is registered in the DB, and stdout is exactly the new path
 
 #### Scenario: Removal cleans resurrection state
 
-- **WHEN** `szhost wt rm <path> --force` completes
+- **WHEN** `thegn wt rm <path> --force` completes
 - **THEN** the checkout is gone, the branch remains (absent `--delete-branch`),
   and no worktree/tab-group rows for it remain in the DB
 
@@ -43,7 +43,7 @@ worktree is never resurrected at next launch.
 
 ### Requirement: Legacy bare verbs remain functional but hidden
 
-superzej SHALL keep the legacy top-level verbs `list`, `diff`, `disk`,
+thegn SHALL keep the legacy top-level verbs `list`, `diff`, `disk`,
 `clean`, `repos`, and `recent` working with output byte-identical to their namespaced
 equivalents (`wt …`, `repo …`), and SHALL be hidden from `--help`. Their flags
 MUST be shared definitions with the namespaced forms so the two spellings
@@ -51,13 +51,13 @@ cannot drift.
 
 #### Scenario: Old scripts keep working
 
-- **WHEN** `szhost list` runs after the namespaces land
-- **THEN** its output is byte-identical to `szhost wt list` and no deprecation
+- **WHEN** `thegn list` runs after the namespaces land
+- **THEN** its output is byte-identical to `thegn wt list` and no deprecation
   breaks the invocation
 
 ### Requirement: List-shaped read commands emit machine-readable JSON
 
-superzej SHALL accept `--json` on every list-shaped read surface (`wt
+thegn SHALL accept `--json` on every list-shaped read surface (`wt
 list`/`list`, `env list`, `host list`, `ci runs`, `share list`, `forward
 list`, `disk`) and
 emit a single compact JSON document on stdout with no ANSI sequences. The CLI
@@ -66,25 +66,25 @@ transient/retryable, 3 target not found.
 
 #### Scenario: JSON is parseable
 
-- **WHEN** `szhost wt list --json` runs
+- **WHEN** `thegn wt list --json` runs
 - **THEN** stdout parses as one JSON array and contains no escape sequences
 
 #### Scenario: Scripts can branch on exit codes
 
-- **WHEN** `szhost open no-such-repo --no-launch` fails to resolve
+- **WHEN** `thegn open no-such-repo --no-launch` fails to resolve
 - **THEN** the process exits with code 3
 
 ### Requirement: Top-level help renders commands in semantic groups
 
-`szhost --help` SHALL render non-hidden commands grouped (Workspace, Forge,
+`thegn --help` SHALL render non-hidden commands grouped (Workspace, Forge,
 Environments, Session, Meta) with names and descriptions sourced from the live
 clap definitions. A unit test MUST fail when a non-hidden command is not
-assigned to exactly one group. Subcommand help (`szhost wt --help`) MUST be
+assigned to exactly one group. Subcommand help (`thegn wt --help`) MUST be
 unaffected by the grouping template.
 
 #### Scenario: Grouped help
 
-- **WHEN** `szhost --help` is rendered
+- **WHEN** `thegn --help` is rendered
 - **THEN** the Workspace and Forge headings appear and hidden commands do not
 
 #### Scenario: Ungrouped command fails CI
@@ -94,18 +94,18 @@ unaffected by the grouping template.
 
 ### Requirement: Shell completions are generated from the CLI definition
 
-superzej SHALL provide `completions <shell>` generating shell completions from
-the live clap definition, using the invoked binary name (szhost / superzej /
-sj) as the completion target.
+thegn SHALL provide `completions <shell>` generating shell completions from
+the live clap definition, using the invoked binary name (thegn / tg) as
+the completion target.
 
 #### Scenario: Bash completions
 
-- **WHEN** `szhost completions bash` runs
+- **WHEN** `thegn completions bash` runs
 - **THEN** a completion script for the invoked binary name is written to stdout
 
 ### Requirement: `open <repo>` remote-controls or launches the compositor
 
-`szhost open <repo>` SHALL resolve its argument (path, or unique basename/slug
+`thegn open <repo>` SHALL resolve its argument (path, or unique basename/slug
 match against known repos), and: when a live instance holds the profile
 singleton lock, enqueue a `focus_workspace` intent in the DB `intents` mailbox
 (consumed by the compositor's model refresh, claim-and-delete, last intent
@@ -116,13 +116,13 @@ MUST list candidates and exit 3.
 
 #### Scenario: Focus a running instance
 
-- **WHEN** `szhost open myrepo` runs while a compositor is running
+- **WHEN** `thegn open myrepo` runs while a compositor is running
 - **THEN** an intent row is enqueued and the running instance switches to that
   workspace within approximately one model-refresh tick
 
 #### Scenario: Launch focused
 
-- **WHEN** `szhost open myrepo` runs with no live instance
+- **WHEN** `thegn open myrepo` runs with no live instance
 - **THEN** the active-workspace pointer is set and the compositor launches on
   that workspace
 

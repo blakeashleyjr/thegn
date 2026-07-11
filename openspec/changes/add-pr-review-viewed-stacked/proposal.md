@@ -22,11 +22,11 @@ into the PR panel, both pure human-facing git/GitHub UX (no AI):
 
 ## Rationale
 
-superzej already has a worktree-scoped PR panel, a GraphQL PR query + cache, and
+thegn already has a worktree-scoped PR panel, a GraphQL PR query + cache, and
 per-branch PR mapping. What it lacks — and lumen ships — is (a) tracking which
 files you've reviewed, synced to GitHub's own "viewed" checkbox so progress isn't
 lost on restart and matches the web UI, and (b) a stacked view that walks commits
-individually. superzej's SQLite cache is well-suited to the viewed state (the
+individually. thegn's SQLite cache is well-suited to the viewed state (the
 existing `issue_links` table is the precedent for worktree-scoped review
 metadata), and `PanelData.commits` already carries the commit list a walker needs.
 Both are pure review UX and stay entirely in the AI-free shell.

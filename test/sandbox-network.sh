@@ -16,7 +16,7 @@ if ! command -v podman >/dev/null 2>&1; then
   exit 0
 fi
 
-CONTAINER="superzej-e2e-net-sh"
+CONTAINER="thegn-e2e-net-sh"
 IMAGE="docker.io/library/alpine:latest"
 BLOCKED="blocked.internal"
 # shellcheck disable=SC2034  # reserved for future allow-list test
@@ -34,7 +34,7 @@ podman pull "$IMAGE" >/dev/null 2>&1 || true
 
 # Start a container with a fake DNS (127.0.0.1) so all DNS queries fail
 # NXDOMAIN-style (no real server there) — this simulates the blocked path.
-# For a real filter test, the host must run the szhost dns_filter, which is
+# For a real filter test, the host must run the thegn dns_filter, which is
 # exercised by the Rust Suite G tests above. This script validates that the
 # --dns flag injection mechanism works at all.
 echo "==> starting container with --dns 127.0.0.1"

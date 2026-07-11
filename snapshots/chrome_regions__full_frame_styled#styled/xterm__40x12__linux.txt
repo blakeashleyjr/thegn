@@ -1,4 +1,4 @@
-L0| 16.2/94G ·  ↓    0B ↑    0B ·  100%…
+L0| 21.4/94G ·  ↓   18K ↑  143K ·  100%…
 R0 0 10 fg=#4c505a bg=#0f131e attrs=
 R0 10 3 fg=#2e3340 bg=#0f131e attrs=
 R0 13 17 fg=#4c505a bg=#0f131e attrs=
@@ -32,7 +32,7 @@ R4 36 1 fg=#6f788e bg=#151a28 attrs=
 R4 37 1 fg=default bg=#151a28 attrs=
 R4 38 1 fg=#7a8197 bg=#151a28 attrs=
 R4 39 1 fg=#1c2233 bg=#05070c attrs=
-L5| │ ❯  d  superzej de… Alt/Ctrl chords │
+L5| │ ❯  d  thegn defau… Alt/Ctrl chords │
 R5 0 1 fg=#677084 bg=#0b0e16 attrs=
 R5 1 1 fg=#7a8197 bg=#151a28 attrs=
 R5 2 1 fg=default bg=#151a28 attrs=

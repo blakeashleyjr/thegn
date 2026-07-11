@@ -4,7 +4,7 @@
 
 ### Requirement: Resolve and inject the repo devShell env into worktree panes
 
-When a worktree's repo exposes a flake `devShell` and `[sandbox] inject_devshell` is enabled, superzej SHALL resolve the devShell env on the host (`nix print-dev-env --json`), cache it by a `flake.lock`+`flake.nix` hash, and merge the exported variables into each worktree pane before the sandbox exec (PATH prepended, other vars set only if unset); a repo without `nix`/`devShell` MUST be a clean no-op.
+When a worktree's repo exposes a flake `devShell` and `[sandbox] inject_devshell` is enabled, thegn SHALL resolve the devShell env on the host (`nix print-dev-env --json`), cache it by a `flake.lock`+`flake.nix` hash, and merge the exported variables into each worktree pane before the sandbox exec (PATH prepended, other vars set only if unset); a repo without `nix`/`devShell` MUST be a clean no-op.
 
 #### Scenario: Flake repo gets the toolchain
 
@@ -38,4 +38,4 @@ The devShell resolve SHALL run on a background thread that pulses the `TerminalW
 #### Scenario: No host daemon
 
 - **WHEN** `nix_daemon` is true but no host daemon socket exists
-- **THEN** superzej warns and leaves the mount off rather than half-wiring nix
+- **THEN** thegn warns and leaves the mount off rather than half-wiring nix

@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Core parse + event (superzej-core)
+## 1. Core parse + event (thegn-core)
 
 - [ ] 1.1 `attention.rs`: `AttentionSignal`, `parse_osc(params) -> Option<AttentionSignal>`
       for `OSC 9` and `OSC 777;notify` — **unit tests**: well-formed `9`, well-formed
@@ -11,7 +11,7 @@
       (reusing `RESUME_GRACE_SECS`) until resume/focus — **unit tests**: signal
       sets the dot, a CPU blip does not clear it, resume/focus clears it.
 
-## 2. Host emulator + event routing (superzej-host)
+## 2. Host emulator + event routing (thegn-host)
 
 - [ ] 2.1 Forward OSC params from the `PaneEmulator` seam to `attention::parse_osc`;
       on `Some`, emit `Event::Attention { worktree, pane, title, body }` on the
@@ -20,14 +20,14 @@
       sidebar-badge + activity-dot consumers (chrome `dirty` repaint only) —
       **render test**: an attention event marks chrome dirty, not a pane recompose.
 
-## 3. CLI verb (superzej-host)
+## 3. CLI verb (thegn-host)
 
-- [ ] 3.1 `szhost notify [--title T] [--worktree PATH | --pane ID] <body>` in
-      `src/cmd/`: resolve target from flags or `$SUPERZEJ_WORKTREE`/`$SUPERZEJ_PANE`,
+- [ ] 3.1 `thegn notify [--title T] [--worktree PATH | --pane ID] <body>` in
+      `src/cmd/`: resolve target from flags or `$THEGN_WORKTREE`/`$THEGN_PANE`,
       raise the same `AttentionSignal` over the control path; non-zero + clear
       message when no host is live.
 
-## 3b. Attention ordering (superzej-host)
+## 3b. Attention ordering (thegn-host)
 
 - [ ] 3b.1 Add `SortMode::Attention` to `sidebar.rs` and an attention comparator
       in `sort_groups()`: rank `urgent > waiting > error > idle-ready > running`
@@ -41,7 +41,7 @@
 
 ## 4. Docs + validate
 
-- [ ] 4.1 Document `OSC 9` / `OSC 777;notify` recognition, the `szhost notify`
+- [ ] 4.1 Document `OSC 9` / `OSC 777;notify` recognition, the `thegn notify`
       verb, and the opt-in attention sort in `config/config.toml.example` (or the
       CLI/notifications doc section).
 - [ ] 4.2 Run `just ci` (fmt-check + lint + build + test + coverage ≥95% core +

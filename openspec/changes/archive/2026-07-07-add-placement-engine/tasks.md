@@ -47,7 +47,7 @@
       destroy are wired (no-ops until spares land on engine hosts — today's
       pool mints onto cloud providers, which are not engine machines; the
       mint-time reserve lands when the pool grows an engine-host lane).
-- [x] 2.4 Sweep wiring (maintainer tick) + `szhost placement plan --json`
+- [x] 2.4 Sweep wiring (maintainer tick) + `thegn placement plan --json`
       (pure dry-run) + `placement list`; smoke: disabled engine ⇒
       passthrough asserted; enabled fixture ⇒ deterministic decision JSON.
 

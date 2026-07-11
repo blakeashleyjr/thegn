@@ -22,7 +22,7 @@ To address "not allowing any file access, or all access", we will introduce `Fil
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/config.rs`
+- Modify: `crates/thegn-core/src/config.rs`
 
 **Step 1: Write failing config parsing test**
 
@@ -58,7 +58,7 @@ pub enum FileAccess {
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-core/src/config.rs
+git add crates/thegn-core/src/config.rs
 git commit -m "feat(sandbox): add file_access enum to config for strict access control"
 ```
 
@@ -70,7 +70,7 @@ git commit -m "feat(sandbox): add file_access enum to config for strict access c
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 1: Write failing tests for file access**
 
@@ -114,7 +114,7 @@ match cfg.file_access {
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-core/src/sandbox.rs
+git add crates/thegn-core/src/sandbox.rs
 git commit -m "feat(sandbox): control volume and worktree mounts via file_access level"
 ```
 
@@ -126,7 +126,7 @@ git commit -m "feat(sandbox): control volume and worktree mounts via file_access
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 3: Write minimal implementation**
 
@@ -154,6 +154,6 @@ if spec.file_access != FileAccess::None {
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-core/src/sandbox.rs
+git add crates/thegn-core/src/sandbox.rs
 git commit -m "feat(sandbox): enforce read-only hosts and restrict workdirs for file_access none/worktree"
 ```

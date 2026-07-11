@@ -2,7 +2,7 @@
 
 ## Overview
 
-Three independent UX improvements to the superzej terminal IDE:
+Three independent UX improvements to the thegn terminal IDE:
 
 1. **Diff-exit remembers cursor position** — Esc from file-diff view restores the file-list cursor
 2. **Panel toggle fixes** — new `Ctrl Alt s`/`Ctrl Alt p` keybinds + pure pipe-based show/hide via `hide_self()`/`show_self(false)`
@@ -36,34 +36,34 @@ No changes to the Rust binary, CLI, or layout files.
 ### Keybinding Changes (`config/zellij.kdl`)
 
 ```
-bind "Ctrl Alt s" { Run "superzej" "sidebar" "--toggle"; }
-bind "Ctrl Alt p" { Run "superzej" "panel" "--toggle"; }
+bind "Ctrl Alt s" { Run "thegn" "sidebar" "--toggle"; }
+bind "Ctrl Alt p" { Run "thegn" "panel" "--toggle"; }
 ```
 
 `Ctrl Alt` modifier avoids zellij default conflicts (`Alt` + letter is heavily used).
 
 ### Root Cause — URL Mismatch
 
-The `plugin_url()` function expanded `~` to `/home/blake/` when constructing the plugin URL (`file:/home/blake/.local/share/superzej/panel.wasm`). But the layout KDL files use a literal `~` (`file:~/.local/share/superzej/panel.wasm`). zellij identifies running plugins by their original layout URL string, so `pipe_plugin()` and `launch_or_focus_plugin()` couldn't find the plugin and spawned new floating instances instead.
+The `plugin_url()` function expanded `~` to `/home/blake/` when constructing the plugin URL (`file:/home/blake/.local/share/thegn/panel.wasm`). But the layout KDL files use a literal `~` (`file:~/.local/share/thegn/panel.wasm`). zellij identifies running plugins by their original layout URL string, so `pipe_plugin()` and `launch_or_focus_plugin()` couldn't find the plugin and spawned new floating instances instead.
 
 **Fix**: `plugin_url()` now uses the literal `~` format, matching the layout KDL exactly.
 
 ### Toggle Mechanism (`src/commands/panels.rs`)
 
-**State tracking**: A simple text file per surface at `~/.superzej/.sidebar_state` and `~/.superzej/.panel_state`, containing `true` (visible) or `false` (hidden). Initial state assumes visible (file absent = visible).
+**State tracking**: A simple text file per surface at `~/.thegn/.sidebar_state` and `~/.thegn/.panel_state`, containing `true` (visible) or `false` (hidden). Initial state assumes visible (file absent = visible).
 
 Both hide and show use `zellij pipe` to send a named message to the running plugin:
 
 **Hide sequence** (visible → hidden):
 
-1. `zellij pipe --plugin <url> --name superzej_toggle`
-2. Plugin receives `superzej_toggle`, calls `hide_self()` — space is reclaimed
+1. `zellij pipe --plugin <url> --name thegn_toggle`
+2. Plugin receives `thegn_toggle`, calls `hide_self()` — space is reclaimed
 3. Binary writes `"false"` to the state file
 
 **Show sequence** (hidden → visible):
 
-1. `zellij pipe --plugin <url> --name superzej_show`
-2. Plugin receives `superzej_show`, calls `show_self(false)` — restores in its original layout position, not as a floating pane
+1. `zellij pipe --plugin <url> --name thegn_show`
+2. Plugin receives `thegn_show`, calls `show_self(false)` — restores in its original layout position, not as a floating pane
 3. Binary writes `"true"` to the state file
 
 The `false` argument to `show_self()` is critical: `show_self(true)` can cause the plugin to reappear as a floating/centered pane, while `show_self(false)` restores it in-place.
@@ -72,8 +72,8 @@ The `false` argument to `show_self()` is critical: `show_self(true)` can cause t
 
 Both `plugin/panel/src/main.rs` and `plugin/sidebar/src/main.rs`:
 
-- `superzej_toggle` — existing toggle: `hide_self()` if visible, `show_self(true)` if hidden (legacy — `superzej_show` is the primary show path now)
-- `superzej_show` — new: calls `show_self(false)` to restore in original layout position
+- `thegn_toggle` — existing toggle: `hide_self()` if visible, `show_self(true)` if hidden (legacy — `thegn_show` is the primary show path now)
+- `thegn_show` — new: calls `show_self(false)` to restore in original layout position
 
 ---
 
@@ -100,8 +100,8 @@ No binary, plugin, or layout file changes needed.
 
 | File                         | Change                                                                                                           |
 | ---------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `plugin/panel/src/main.rs`   | Added `file_list_scroll` field + save/restore logic (section 1); added `superzej_show` pipe handler (section 2)  |
-| `plugin/sidebar/src/main.rs` | Added `superzej_show` pipe handler (section 2)                                                                   |
+| `plugin/panel/src/main.rs`   | Added `file_list_scroll` field + save/restore logic (section 1); added `thegn_show` pipe handler (section 2)     |
+| `plugin/sidebar/src/main.rs` | Added `thegn_show` pipe handler (section 2)                                                                      |
 | `src/commands/panels.rs`     | Rewrote toggle: state file tracking, pure pipe-based show/hide, fixed URL format to match layout KDL (section 2) |
 | `config/zellij.kdl`          | Replaced `Alt s`/`Alt p` with `Ctrl Alt s`/`Ctrl Alt p`; added `Super Alt j`/`Super Alt k` (sections 2 & 3)      |
 

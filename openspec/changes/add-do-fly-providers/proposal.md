@@ -6,7 +6,7 @@ Extend the managed-sandbox provider seam with two more budget backends:
 
 - **DigitalOcean** — a second `VpsKind` alongside Hetzner. The VPS core
   (`VpsProvider`, ssh exec/files shim, intent-ledger, label-scoped reaper,
-  `szhost vps-ssh` self-bridge, `env image-bake`) is vendor-agnostic; DO is
+  `thegn vps-ssh` self-bridge, `env image-bake`) is vendor-agnostic; DO is
   ~one `VpsShaper` impl (pure request shaping: droplets, ssh keys, snapshots,
   tag selector), exactly the follow-up the VPS change named as a non-goal.
 - **Fly.io** — a CLI-free first-class `Provider::Fly`, not a `VpsKind`. Fly's
@@ -34,14 +34,14 @@ boots ready instead of building a toolchain on every cold start.
   pool). Complements `add-vps-providers` (whose non-goals named DO + a second
   vendor as the follow-up) and `add-env-setup-ux` (the authoring UX that
   surfaces all providers uniformly).
-- **superzej-svc** — `vps/digitalocean.rs` (a `VpsShaper` impl) + the
+- **thegn-svc** — `vps/digitalocean.rs` (a `VpsShaper` impl) + the
   `VpsShaper` trait extraction in `vps/mod.rs`; a new `fly` module
   (`fly/machines.rs` Machines API, `fly/graphql.rs` IPv4 alloc, `fly/mod.rs`
   `FlyProvider`) with a `Provider::Fly` variant (caps: `files`; scale-to-zero).
-- **superzej-core** — `EnvProviderConfig` provider kinds recognize
+- **thegn-core** — `EnvProviderConfig` provider kinds recognize
   `digitalocean` and `fly`; `provider_scale_to_zero()` returns true for `fly`
   (stop, don't destroy, on idle).
-- **superzej-host** — `provider_factory.rs` gains a `fly_provider_for` builder
+- **thegn-host** — `provider_factory.rs` gains a `fly_provider_for` builder
   and the `digitalocean` VPS arm; `fly_reaper.rs` (the Fly counterpart to
   `vps_reaper`, since Fly is not a `VpsKind`).
 - **Nix** — `packages.fly-sandbox-image` (`nix/fly-sandbox-image.nix`) +

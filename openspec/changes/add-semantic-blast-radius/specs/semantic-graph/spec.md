@@ -4,7 +4,7 @@
 
 ### Requirement: The entity graph is built from LSP references off the event loop
 
-superzej SHALL maintain a persistent entity graph whose edges are caller→callee
+thegn SHALL maintain a persistent entity graph whose edges are caller→callee
 relationships, and it MUST source those edges from the language server's
 `textDocument/references` (never from hand-rolled name resolution) using the
 warm per-`(root, lang)` LSP client. Every reference query, parse, and database
@@ -27,7 +27,7 @@ threads); the loop MUST NOT block on graph work.
 
 ### Requirement: The graph is invalidated incrementally on source-hash change
 
-superzej SHALL update the graph incrementally by riding the existing diff
+thegn SHALL update the graph incrementally by riding the existing diff
 fs-watcher: on a file change it MUST re-parse only files whose stored
 `source_hash` differs from the file's current contents, and rewrite only the
 edges touching those files' entities. A file whose hash is unchanged MUST NOT be
@@ -46,8 +46,8 @@ re-parsed, and entities that vanished from a re-parsed file MUST be removed.
 
 ### Requirement: Blast-radius, coverage, and risk are computed by pure tested logic
 
-superzej SHALL compute the blast-radius summary — caller count, distinct caller
-files, untested set, and a risk band — from pure functions in superzej-core that
+thegn SHALL compute the blast-radius summary — caller count, distinct caller
+files, untested set, and a risk band — from pure functions in thegn-core that
 take owned data and perform no I/O, and these functions MUST be unit-tested to
 the core coverage gate. An edge whose caller entity is a test MUST mark its
 callee covered; a changed entity with no test caller MUST be reported untested.
@@ -73,7 +73,7 @@ count, and change kind.
 
 ### Requirement: The semantic footer reports the blast-radius when a graph exists
 
-superzej SHALL enrich the `◈ semantic` diff footer with the blast-radius summary
+thegn SHALL enrich the `◈ semantic` diff footer with the blast-radius summary
 when an entity graph is available for the diff's language, reporting the changed
 count, callers and distinct files, untested count, and risk band (for example
 "3 changed · 14 callers/6 files · 2 untested · risk:high"). The footer MUST
@@ -94,7 +94,7 @@ wake path or damage channel).
 
 ### Requirement: A blast_radius MCP house tool exposes the graph to review agents
 
-superzej SHALL expose a `blast_radius` house tool alongside the existing
+thegn SHALL expose a `blast_radius` house tool alongside the existing
 `semantic_diff` tool in the MCP router, scoped (no args) to the connection's
 worktree, returning the changed entities with their callers, the untested set,
 and the risk band. The risk band MUST also be available as a serializable signal
@@ -108,7 +108,7 @@ the review-gate / change-explanation pipeline can consume.
 
 ### Requirement: The blast-radius degrades gracefully without an LSP
 
-superzej SHALL treat the blast-radius as strictly additive: when `[lsp]` is
+thegn SHALL treat the blast-radius as strictly additive: when `[lsp]` is
 disabled, no server is available for the diff's language, or the language is
 unrecognized, the subsystem MUST write no edges and every surface MUST fall back
 without error — the footer to today's intra-diff summary, the `blast_radius` MCP

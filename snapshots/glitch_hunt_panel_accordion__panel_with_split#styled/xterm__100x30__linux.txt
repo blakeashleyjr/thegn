@@ -1,11 +1,12 @@
-L0| ◆ superzej v0.1.0 work      61% ·  15.4/94G ·   7% ·  52% ·  ↓   10K ↑    9K ·  100% · 22:07
+L0| þ thegn v0.1.0  work        90% ·  18.4/94G ·   7% ·  37% ·  ↓  1.2M ↑  717K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
-R0 3 9 fg=#edf0f8 bg=#151a28 attrs=
-R0 12 6 fg=#6f788e bg=#151a28 attrs=
-R0 18 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 24 4 fg=#edf0f8 bg=#151a28 attrs=
-R0 28 5 fg=#c6ccdb bg=#151a28 attrs=
+R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 9 6 fg=#6f788e bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 28 5 fg=#f0c674 bg=#151a28 attrs=
 R0 33 3 fg=#6f788e bg=#151a28 attrs=
 R0 36 10 fg=#c6ccdb bg=#151a28 attrs=
 R0 46 3 fg=#6f788e bg=#151a28 attrs=
@@ -41,7 +42,7 @@ R4 2 3 fg=#edf0f8 bg=#0b0e16 attrs=
 R4 5 4 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
 R4 9 23 fg=#edf0f8 bg=#0b0e16 attrs=
 R4 32 68 fg=default bg=#0b0e16 attrs=
-L5|▐   └ ○ home                               ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
+L5|▐   └ ○ home                                        ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
 R5 0 1 fg=#428180 bg=#1a2031 attrs=
 R5 1 3 fg=#edf0f8 bg=#1a2031 attrs=
 R5 4 2 fg=#677084 bg=#1a2031 attrs=
@@ -49,21 +50,21 @@ R5 6 1 fg=#ef6f6f bg=#1a2031 attrs=
 R5 7 1 fg=#edf0f8 bg=#1a2031 attrs=
 R5 8 4 fg=#6ee7d8 bg=#1a2031 attrs=
 R5 12 20 fg=#edf0f8 bg=#1a2031 attrs=
-R5 32 11 fg=default bg=#0b0e16 attrs=
-R5 43 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R5 90 10 fg=default bg=#0b0e16 attrs=
-L6|                                            ▀▀▀▄ █   █ █▄▄▄▀ █▀▀▀  █▄▄▄▀  ▄▀   █▀▀▀     █
+R5 32 20 fg=default bg=#0b0e16 attrs=
+R5 52 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R5 81 19 fg=default bg=#0b0e16 attrs=
+L6|                                                      █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
 R6 0 32 fg=#edf0f8 bg=#151a28 attrs=
-R6 32 11 fg=default bg=#0b0e16 attrs=
-R6 43 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R6 90 10 fg=default bg=#0b0e16 attrs=
-L7| TERMINALS                                 ▄▄▄▄▀ ▀▄▄▄▀ █     █▄▄▄▄ █  ▀▄ █▄▄▄▄ █▄▄▄▄ ▀▄▄▀
+R6 32 20 fg=default bg=#0b0e16 attrs=
+R6 52 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R6 81 19 fg=default bg=#0b0e16 attrs=
+L7| TERMINALS                                            █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
 R7 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R7 1 9 fg=#edf0f8 bg=#151a28 attrs=BOLD
 R7 10 22 fg=#edf0f8 bg=#151a28 attrs=
-R7 32 11 fg=default bg=#0b0e16 attrs=
-R7 43 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R7 90 10 fg=default bg=#0b0e16 attrs=
+R7 32 20 fg=default bg=#0b0e16 attrs=
+R7 52 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R7 81 19 fg=default bg=#0b0e16 attrs=
 L8| ▾ ≡ local
 R8 0 1 fg=#edf0f8 bg=#0b0e16 attrs=
 R8 1 1 fg=#7a8197 bg=#0b0e16 attrs=
