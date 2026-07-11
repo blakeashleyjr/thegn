@@ -125,7 +125,9 @@ doctor` prints the resolved capabilities. Detection logic is pure + unit-tested
 
 ## Development
 
-Run inside `nix develop` (rust toolchain + tools).
+Run inside `nix develop` (rust toolchain + tools). Human-contributor
+onboarding (prerequisites per platform, macOS notes) lives in
+`CONTRIBUTING.md`.
 
 ```sh
 just quick [crate]   # fast inner-loop: clippy on lib/bin only (no test targets)

@@ -74,6 +74,6 @@ in
       description = "Terminal-native git-worktree IDE";
       mainProgram = "thegn";
       license = lib.licenses.mit;
-      platforms = lib.platforms.linux;
+      platforms = lib.platforms.linux ++ lib.platforms.darwin;
     };
   }

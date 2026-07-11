@@ -1,55 +1,61 @@
-{pkgs, ...}: {
+{
+  pkgs,
+  lib,
+  ...
+}: {
   # Developer environment for thegn. `devenv shell` to enter, `devenv test`
   # to run the git-hooks + smoke test.
 
-  packages = with pkgs; [
-    # task runner
-    just
-    # faster test runner (`just test` → `cargo nextest run`) + faster linker
-    # (mold, wired via CARGO_TARGET_*_RUSTFLAGS below). Both cut the pre-push
-    # + CI compile/test cost.
-    cargo-nextest
-    mold
-    # compilation cache (RUSTC_WRAPPER below). thegn is a many-worktree
-    # workflow and each `git worktree` has its own cold target/; sccache shares
-    # compiled crate artifacts across all of them (and across branch switches),
-    # so a fresh worktree's first build is warm instead of from-scratch.
-    sccache
-    # coverage gate (`just coverage`) + visual-regression harness
-    cargo-llvm-cov
-    python3
-    # startup benchmarks (`just bench`)
-    hyperfine
-    # run the GitHub Actions CI workflow locally in Docker/podman (`just act`).
-    # Heavy — the fast local path is `just ci` / `just lint|test|smoke`.
-    act
-    # treefmt — reads treefmt.toml; versions must match the flake's nixpkgs
-    treefmt
-    # formatter binaries treefmt.toml references (rustfmt comes from languages.rust below)
-    alejandra
-    shfmt
-    taplo
-    yamlfmt
-    prettier
-    # linters (not formatters — kept as separate pre-commit hooks)
-    shellcheck
-    yamllint
-    # dependency gates (`just deps-audit`)
-    cargo-deny
-    cargo-machete
-    # runtime tools thegn shells out to
-    git
-    fzf
-    gum
-    lazygit
-    yazi
-    delta
-    gh
-    # spec-driven development CLI (hermetic, pinned; see nix/openspec.nix).
-    # thegn manages its own development with OpenSpec — `just openspec*`.
-    nodejs
-    (pkgs.callPackage ./nix/openspec.nix {})
-  ];
+  packages = with pkgs;
+    [
+      # task runner
+      just
+      # faster test runner (`just test` → `cargo nextest run`) — cuts the
+      # pre-push + CI compile/test cost.
+      cargo-nextest
+      # compilation cache (RUSTC_WRAPPER below). thegn is a many-worktree
+      # workflow and each `git worktree` has its own cold target/; sccache shares
+      # compiled crate artifacts across all of them (and across branch switches),
+      # so a fresh worktree's first build is warm instead of from-scratch.
+      sccache
+      # coverage gate (`just coverage`) + visual-regression harness
+      cargo-llvm-cov
+      python3
+      # startup benchmarks (`just bench`)
+      hyperfine
+      # run the GitHub Actions CI workflow locally in Docker/podman (`just act`).
+      # Heavy — the fast local path is `just ci` / `just lint|test|smoke`.
+      act
+      # treefmt — reads treefmt.toml; versions must match the flake's nixpkgs
+      treefmt
+      # formatter binaries treefmt.toml references (rustfmt comes from languages.rust below)
+      alejandra
+      shfmt
+      taplo
+      yamlfmt
+      prettier
+      # linters (not formatters — kept as separate pre-commit hooks)
+      shellcheck
+      yamllint
+      # dependency gates (`just deps-audit`)
+      cargo-deny
+      cargo-machete
+      # runtime tools thegn shells out to
+      git
+      fzf
+      gum
+      lazygit
+      yazi
+      delta
+      gh
+      # spec-driven development CLI (hermetic, pinned; see nix/openspec.nix).
+      # thegn manages its own development with OpenSpec — `just openspec*`.
+      nodejs
+      (pkgs.callPackage ./nix/openspec.nix {})
+    ]
+    # faster linker (mold, wired via CARGO_TARGET_*_RUSTFLAGS below). Linux-only
+    # in nixpkgs — gate it so the shell evaluates on macOS.
+    ++ lib.optionals pkgs.stdenv.isLinux [pkgs.mold];
 
   # OpenSpec: telemetry off by construction (matches the flake dev shell).
   env.OPENSPEC_TELEMETRY = "0";
@@ -61,7 +67,8 @@
   # .cargo/config.toml) so it never touches the `check-cross` macOS/Windows/wasm
   # targets and never leaks into the `nix build .#default` package derivation
   # (which doesn't enter this shell — so it needs no mold build input). Requires
-  # mold on PATH (added to `packages` above); gcc's `-fuse-ld=mold` picks it up.
+  # mold on PATH (added to `packages` above, Linux-only); gcc's `-fuse-ld=mold`
+  # picks it up. Inert on macOS: the var is scoped to the linux-gnu triple.
   env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
 
   # Compilation cache. sccache caches per-crate rustc invocations so cold
