@@ -267,10 +267,8 @@
             treefmtWrapper
             # line-coverage for `just coverage`
             cargo-llvm-cov
-            # faster test runner (`just test`) + faster linker (mold, wired via
-            # CARGO_TARGET_*_RUSTFLAGS in shellHook below)
+            # faster test runner (`just test`)
             cargo-nextest
-            mold
             # compilation cache (RUSTC_WRAPPER in shellHook below): shares crate
             # artifacts across thegn's many cold-target/ worktrees + branch
             # switches. Dev-shell only — the packaged `nix build` never enters here.
@@ -306,7 +304,11 @@
           # The same pinned yazi as the package, so the drawer's preview tools
           # resolve on PATH and `just host` runs the version thegn ships.
           ++ [yaziPinned]
-          ++ yaziDeps;
+          ++ yaziDeps
+          # Faster linker, wired via CARGO_TARGET_*_RUSTFLAGS in shellHook
+          # below. Linux-only in nixpkgs — gate it so the shell evaluates on
+          # macOS (where the default ld64 is used instead).
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.mold];
         shellHook = ''
           export PATH="$PWD/target/debug:$PATH"
           # Link with mold on the linux-gnu host triple — cuts incremental link
