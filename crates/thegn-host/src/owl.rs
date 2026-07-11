@@ -79,7 +79,7 @@ pub const COLS: usize = PX_W;
 pub const ROWS: usize = PX_H / 2;
 
 /// Plumage palette for a `[theme] preset`, as `(role char, rgb)` pairs.
-/// Every preset colors all of [`ROLES`]; unknown presets get prism.
+/// Every preset colors all of `ROLES`; unknown presets get prism.
 pub fn palette(preset: PresetId) -> &'static [(char, (u8, u8, u8))] {
     match preset {
         PresetId::Prism => &[
