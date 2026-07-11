@@ -961,7 +961,7 @@ pub struct GitCommand {
 
 // UI/presentation (`[ui]`) settings live in the `config_ui` sibling module;
 // re-exported so `config::UiConfig` keeps working.
-pub use crate::config_ui::{UiConfig, WorkspaceSort};
+pub use crate::config_ui::{TerminalsSection, UiConfig, WorkspaceSort};
 
 /// Git behavior knobs for the panel's write operations (`[git]`).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -2648,6 +2648,11 @@ pub struct SandboxConfig {
     pub limits: SandboxLimits,
     pub volumes: std::collections::HashMap<String, String>,
     pub compose: Option<String>,
+    /// Programmatic Dockerfile build (set by the devcontainer overlay from a
+    /// `build` block; never from TOML). When present, the sandbox builds the
+    /// image to `image` before create instead of pulling. See [`crate::sandbox_build`].
+    #[serde(skip)]
+    pub build: Option<crate::sandbox_build::SandboxBuild>,
     pub env_passthrough: Vec<String>,
     /// Add common language build caches to `worktree_plus_caches` sandboxes.
     pub auto_caches: bool,
@@ -2740,6 +2745,7 @@ impl Default for SandboxConfig {
             limits: SandboxLimits::default(),
             volumes: std::collections::HashMap::new(),
             compose: None,
+            build: None,
             env_passthrough: [
                 "SSH_AUTH_SOCK",
                 "GH_TOKEN",

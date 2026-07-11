@@ -1127,11 +1127,12 @@ mod tests {
         )
         .expect("pipe succeeds");
         assert_eq!(std::fs::read(dst.join("hello.txt")).unwrap(), b"hi");
-        // A failing host command surfaces its stderr tail.
+        // A failing host command surfaces the failure (the hardened exec
+        // classifier words it as "remote command failed (exit N, …)").
         let err = r
             .pipe_local_to_host(&local, "exit 3", Duration::from_secs(10))
             .unwrap_err();
-        assert!(err.contains("host cmd failed"), "{err}");
+        assert!(err.contains("exit 3"), "{err}");
     }
 
     #[test]

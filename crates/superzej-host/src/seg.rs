@@ -207,8 +207,11 @@ pub fn seg_width(segs: &[Seg]) -> usize {
     segs.iter().map(Seg::width).sum()
 }
 
-/// Truncate a seg run to at most `max` cells, ending with a ghost `…` when
-/// anything was cut (the mockup's cutSegs).
+/// Truncate a seg run to at most `max` cells, ending with a ghost ellipsis
+/// when anything was cut (the mockup's cutSegs). The ellipsis comes from the
+/// capability glyph table (`…`, or `...` under ASCII caps), so a truncated
+/// line degrades with the rest of the chrome; when the fallback is wider than
+/// the available space, the run hard-clips instead.
 pub(crate) fn cut(segs: &[Seg], max: usize) -> Vec<Seg> {
     if max == 0 {
         return Vec::new();
@@ -216,22 +219,29 @@ pub(crate) fn cut(segs: &[Seg], max: usize) -> Vec<Seg> {
     if seg_width(segs) <= max {
         return segs.to_vec();
     }
+    let ell = crate::caps::active_glyphs().ellipsis;
+    let ell_seg = seg(Tok::Slot(S::Ghost), ell);
+    let ell_w = ell_seg.width();
+    // No room for the marker itself (e.g. "..." into 2 cells): hard-clip.
+    let keep = if ell_w >= max { max } else { max - ell_w };
     let mut out = Vec::new();
     let mut used = 0usize;
     for s in segs {
         let w = s.width();
-        if used + w <= max.saturating_sub(1) {
+        if used + w <= keep {
             out.push(s.clone());
             used += w;
             continue;
         }
-        let room = max - 1 - used;
+        let room = keep - used;
         if room > 0 {
             let mut clipped = s.clone();
             clipped.text = take_cols(&s.text, room).to_string();
             out.push(clipped);
         }
-        out.push(seg(Tok::Slot(S::Ghost), "…"));
+        if ell_w < max {
+            out.push(ell_seg);
+        }
         return out;
     }
     out

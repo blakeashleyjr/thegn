@@ -1,151 +1,140 @@
-L0| ◆ superzej   dashboard   work  comms 4 chat 17% · 󰂄 100% · Fri Jun 19 · 22:56
-R0 0 1 fg=default bg=idxea attrs=
-R0 1 2 fg=idx50 bg=idxea attrs=
-R0 3 8 fg=idxff bg=idxea attrs=
-R0 11 2 fg=default bg=idxea attrs=
-R0 13 11 fg=idx50 bg=idxee attrs=
-R0 24 1 fg=default bg=idxea attrs=
-R0 25 24 fg=idx92 bg=idxea attrs=
-R0 49 3 fg=idxf0 bg=idxea attrs=
-R0 52 6 fg=idx92 bg=idxea attrs=
-R0 58 3 fg=idxf0 bg=idxea attrs=
-R0 61 10 fg=idx92 bg=idxea attrs=
-R0 71 3 fg=idxf0 bg=idxea attrs=
-R0 74 5 fg=idx92 bg=idxea attrs=
-R0 79 1 fg=default bg=idxea attrs=
-L1|
-L2|┌ System ──────────────────┐┌ Hacker News ─────────────────────────────────────┐
-R2 0 80 fg=idxf0 bg=default attrs=
-L3|│OS:                       ││No HN stories yet (offline or loading).           │
-R3 0 1 fg=idxf0 bg=default attrs=
-R3 1 4 fg=idx92 bg=default attrs=
-R3 5 22 fg=default bg=default attrs=
-R3 27 2 fg=idxf0 bg=default attrs=
-R3 29 39 fg=idx66 bg=default attrs=
-R3 68 11 fg=default bg=default attrs=
-R3 79 1 fg=idxf0 bg=default attrs=
-L4|│Uptime: 0s                ││                                                  │
-R4 0 1 fg=idxf0 bg=default attrs=
-R4 1 8 fg=idx92 bg=default attrs=
-R4 9 2 fg=idxff bg=default attrs=
-R4 11 16 fg=default bg=default attrs=
-R4 27 2 fg=idxf0 bg=default attrs=
-R4 29 50 fg=default bg=default attrs=
-R4 79 1 fg=idxf0 bg=default attrs=
-L5|│Memory: 0.00 GB / 0.00 GB ││                                                  │
-R5 0 1 fg=idxf0 bg=default attrs=
-R5 1 8 fg=idx92 bg=default attrs=
-R5 9 17 fg=idxff bg=default attrs=
-R5 26 1 fg=default bg=default attrs=
-R5 27 2 fg=idxf0 bg=default attrs=
-R5 29 50 fg=default bg=default attrs=
-R5 79 1 fg=idxf0 bg=default attrs=
-L6|│CPUs: 0                   ││                                                  │
-R6 0 1 fg=idxf0 bg=default attrs=
-R6 1 6 fg=idx92 bg=default attrs=
-R6 7 1 fg=idxff bg=default attrs=
-R6 8 19 fg=default bg=default attrs=
-R6 27 2 fg=idxf0 bg=default attrs=
-R6 29 50 fg=default bg=default attrs=
-R6 79 1 fg=idxf0 bg=default attrs=
-L7|└──────────────────────────┘│                                                  │
-R7 0 29 fg=idxf0 bg=default attrs=
-R7 29 50 fg=default bg=default attrs=
-R7 79 1 fg=idxf0 bg=default attrs=
-L8|┌ Resources ───────────────┐└──────────────────────────────────────────────────┘
-R8 0 80 fg=idxf0 bg=default attrs=
-L9|│CPU: 0.0%                 │┌ Recent Repos ────────────────────────────────────┐
-R9 0 1 fg=idxf0 bg=default attrs=
-R9 1 5 fg=idx92 bg=default attrs=
-R9 6 4 fg=idx73 bg=default attrs=
-R9 10 17 fg=default bg=default attrs=
-R9 27 53 fg=idxf0 bg=default attrs=
-L10|│Mem: 0.0% (0.0/0.0G)      ││No recent repos.                                  │
-R10 0 1 fg=idxf0 bg=default attrs=
-R10 1 5 fg=idx92 bg=default attrs=
-R10 6 15 fg=idx50 bg=default attrs=
-R10 21 6 fg=default bg=default attrs=
-R10 27 2 fg=idxf0 bg=default attrs=
-R10 29 16 fg=idx66 bg=default attrs=
-R10 45 34 fg=default bg=default attrs=
-R10 79 1 fg=idxf0 bg=default attrs=
-L11|│Load: 0.00                ││                                                  │
-R11 0 1 fg=idxf0 bg=default attrs=
-R11 1 6 fg=idx92 bg=default attrs=
-R11 7 4 fg=idxb3 bg=default attrs=
-R11 11 16 fg=default bg=default attrs=
-R11 27 2 fg=idxf0 bg=default attrs=
-R11 29 50 fg=default bg=default attrs=
-R11 79 1 fg=idxf0 bg=default attrs=
-L12|│Processes: 0              ││                                                  │
-R12 0 1 fg=idxf0 bg=default attrs=
-R12 1 11 fg=idx92 bg=default attrs=
-R12 12 1 fg=idxff bg=default attrs=
-R12 13 14 fg=default bg=default attrs=
-R12 27 2 fg=idxf0 bg=default attrs=
-R12 29 50 fg=default bg=default attrs=
-R12 79 1 fg=idxf0 bg=default attrs=
-L13|│                          │└──────────────────────────────────────────────────┘
-R13 0 1 fg=idxf0 bg=default attrs=
-R13 1 26 fg=default bg=default attrs=
-R13 27 53 fg=idxf0 bg=default attrs=
-L14|└──────────────────────────┘┌ Workspaces ──────────────────────────────────────┐
-R14 0 80 fg=idxf0 bg=default attrs=
-L15|┌ Metrics ─────────────────┐│No open workspaces.                               │
-R15 0 29 fg=idxf0 bg=default attrs=
-R15 29 19 fg=idx66 bg=default attrs=
-R15 48 31 fg=default bg=default attrs=
-R15 79 1 fg=idxf0 bg=default attrs=
-L16|│No metric targets configur││                                                  │
-R16 0 1 fg=idxf0 bg=default attrs=
-R16 1 26 fg=idx66 bg=default attrs=
-R16 27 2 fg=idxf0 bg=default attrs=
-R16 29 50 fg=default bg=default attrs=
-R16 79 1 fg=idxf0 bg=default attrs=
-L17|│                          ││                                                  │
-R17 0 1 fg=idxf0 bg=default attrs=
-R17 1 26 fg=default bg=default attrs=
-R17 27 2 fg=idxf0 bg=default attrs=
-R17 29 50 fg=default bg=default attrs=
-R17 79 1 fg=idxf0 bg=default attrs=
-L18|│                          │└──────────────────────────────────────────────────┘
-R18 0 1 fg=idxf0 bg=default attrs=
-R18 1 26 fg=default bg=default attrs=
-R18 27 53 fg=idxf0 bg=default attrs=
-L19|│                          │┌ Superzej Dashboard ──────────────────────────────┐
-R19 0 1 fg=idxf0 bg=default attrs=
-R19 1 26 fg=default bg=default attrs=
-R19 27 53 fg=idxf0 bg=default attrs=
-L20|│                          ││Last updated: 0  |  Refresh interval: 0s  |  Press│
-R20 0 1 fg=idxf0 bg=default attrs=
-R20 1 26 fg=default bg=default attrs=
-R20 27 2 fg=idxf0 bg=default attrs=
-R20 29 50 fg=idx92 bg=default attrs=
-R20 79 1 fg=idxf0 bg=default attrs=
-L21|│                          ││                                                  │
-R21 0 1 fg=idxf0 bg=default attrs=
-R21 1 26 fg=default bg=default attrs=
-R21 27 2 fg=idxf0 bg=default attrs=
-R21 29 50 fg=idx92 bg=default attrs=
-R21 79 1 fg=idxf0 bg=default attrs=
-L22|└──────────────────────────┘└──────────────────────────────────────────────────┘
-R22 0 80 fg=idxf0 bg=default attrs=
-L23|  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab   Alt…
-R23 0 1 fg=idxff bg=idxea attrs=
-R23 1 3 fg=idxe9 bg=idx50 attrs=BOLD
-R23 4 2 fg=idxff bg=idxea attrs=
-R23 6 9 fg=idx66 bg=idxea attrs=
-R23 15 5 fg=idxf0 bg=idxea attrs=
-R23 20 3 fg=idxff bg=idxea attrs=
-R23 23 8 fg=idx66 bg=idxea attrs=
-R23 31 4 fg=idxf0 bg=idxea attrs=
-R23 35 3 fg=idxff bg=idxea attrs=
-R23 38 6 fg=idx66 bg=idxea attrs=
-R23 44 9 fg=idxf0 bg=idxea attrs=
-R23 53 3 fg=idxff bg=idxea attrs=
-R23 56 5 fg=idx66 bg=idxea attrs=
-R23 61 10 fg=idxf0 bg=idxea attrs=
-R23 71 3 fg=idxff bg=idxea attrs=
-R23 74 3 fg=idx66 bg=idxea attrs=
-R23 77 1 fg=idxf0 bg=idxea attrs=
-R23 78 2 fg=idxff bg=idxea attrs=
+L0| ◆ superzej work         16.2/94G ·  50% ·  ↓   81K ↑    4K ·  100% · 22:06
+R0 0 1 fg=idx3b bg=idxe9 attrs=
+R0 1 2 fg=idxef bg=idxe9 attrs=
+R0 3 8 fg=idx3b bg=idxe9 attrs=
+R0 11 6 fg=idxef bg=idxeb attrs=
+R0 17 7 fg=idx3b bg=idxe9 attrs=
+R0 24 10 fg=idxef bg=idxe9 attrs=
+R0 34 3 fg=idxed bg=idxe9 attrs=
+R0 37 5 fg=idxef bg=idxe9 attrs=
+R0 42 3 fg=idxed bg=idxe9 attrs=
+R0 45 17 fg=idxef bg=idxe9 attrs=
+R0 62 3 fg=idxed bg=idxe9 attrs=
+R0 65 6 fg=idxee bg=idxe9 attrs=
+R0 71 3 fg=idxed bg=idxe9 attrs=
+R0 74 5 fg=idxef bg=idxe9 attrs=
+R0 79 1 fg=idx3b bg=idxe9 attrs=
+L1|────────────────────────────────────────────────────────────────────────────────
+R1 0 80 fg=idxed bg=idxe9 attrs=
+L2| WORKSPACES                       HOME ▸ home   1
+R2 0 11 fg=idx3b bg=idxe9 attrs=
+R2 11 23 fg=idx3c bg=idxe9 attrs=
+R2 34 4 fg=idxef bg=idxe9 attrs=
+R2 38 3 fg=idxed bg=idxe9 attrs=
+R2 41 4 fg=idxef bg=idxe9 attrs=
+R2 45 2 fg=idx3c bg=idxe9 attrs=
+R2 47 3 fg=idxef bg=idxeb attrs=
+R2 50 30 fg=idx3c bg=idxe9 attrs=
+L3|
+R3 0 80 fg=idx3c bg=idxe9 attrs=
+L4| ▾ ⌂ home
+R4 0 1 fg=idx3b bg=idxe9 attrs=
+R4 1 1 fg=idxed bg=idxe9 attrs=
+R4 2 30 fg=idx3b bg=idxe9 attrs=
+R4 32 48 fg=idx3c bg=idxe9 attrs=
+L5|▐   └   home
+R5 0 1 fg=idxec bg=idxea attrs=
+R5 1 3 fg=idx3b bg=idxea attrs=
+R5 4 2 fg=idxec bg=idxea attrs=
+R5 6 2 fg=idx3b bg=idxea attrs=
+R5 8 4 fg=idxef bg=idxea attrs=
+R5 12 20 fg=idx3b bg=idxea attrs=
+R5 32 48 fg=idx3c bg=idxe9 attrs=
+L6|
+R6 0 32 fg=idx3b bg=idxe9 attrs=
+R6 32 48 fg=idx3c bg=idxe9 attrs=
+L7| TERMINALS
+R7 0 32 fg=idx3b bg=idxe9 attrs=
+R7 32 48 fg=idx3c bg=idxe9 attrs=
+L8|   No terminals — Enter to add
+R8 0 3 fg=idx3b bg=idxe9 attrs=
+R8 3 27 fg=idxed bg=idxe9 attrs=
+R8 30 2 fg=idx3b bg=idxe9 attrs=
+R8 32 48 fg=idx3c bg=idxe9 attrs=
+L9| ╭─ Choose a keymap ────────────────────────────────────────────────── menu ──╮
+R9 0 1 fg=idx3c bg=idxe9 attrs=
+R9 1 2 fg=idx66 bg=idxea attrs=
+R9 3 17 fg=idxff bg=idxea attrs=
+R9 20 50 fg=idx66 bg=idxea attrs=
+R9 70 6 fg=idxff bg=idxec attrs=BOLD
+R9 76 3 fg=idx66 bg=idxea attrs=
+R9 79 1 fg=idx3c bg=idxe9 attrs=
+L10| │ Familiar shortcuts on top of the defaults. Change later with keymap_prese… │
+R10 0 1 fg=idx3c bg=idxe9 attrs=
+R10 1 1 fg=idx66 bg=idxea attrs=
+R10 2 1 fg=default bg=idxea attrs=
+R10 3 73 fg=idxfc bg=idxea attrs=
+R10 76 1 fg=idx42 bg=idxea attrs=
+R10 77 1 fg=default bg=idxea attrs=
+R10 78 1 fg=idx66 bg=idxea attrs=
+R10 79 1 fg=idxeb bg=idxe8 attrs=
+L11| │ ❯  d  superzej defaults                                    Alt/Ctrl chords │
+R11 0 1 fg=idx3c bg=idxe9 attrs=
+R11 1 1 fg=idx66 bg=idxea attrs=
+R11 2 1 fg=default bg=idxea attrs=
+R11 3 2 fg=idx50 bg=idxec attrs=BOLD
+R11 5 3 fg=idxff bg=idxec attrs=BOLD
+R11 8 1 fg=idxff bg=idxec attrs=
+R11 9 17 fg=idxff bg=idxec attrs=BOLD
+R11 26 36 fg=idxff bg=idxec attrs=
+R11 62 15 fg=idx42 bg=idxec attrs=
+R11 77 1 fg=default bg=idxea attrs=
+R11 78 1 fg=idx66 bg=idxea attrs=
+R11 79 1 fg=idxeb bg=idxe8 attrs=
+L12| │    v  VS Code                                 Ctrl+P, Ctrl+Shift+P, Ctrl+B │
+R12 0 1 fg=idx3c bg=idxe9 attrs=
+R12 1 1 fg=idx66 bg=idxea attrs=
+R12 2 1 fg=default bg=idxea attrs=
+R12 3 2 fg=idxff bg=idxea attrs=
+R12 5 3 fg=idxff bg=idxec attrs=BOLD
+R12 8 1 fg=idxff bg=idxea attrs=
+R12 9 7 fg=idxfc bg=idxea attrs=
+R12 16 33 fg=idxff bg=idxea attrs=
+R12 49 28 fg=idx42 bg=idxea attrs=
+R12 77 1 fg=default bg=idxea attrs=
+R12 78 1 fg=idx66 bg=idxea attrs=
+R12 79 1 fg=idxeb bg=idxe8 attrs=
+L13| │    i  JetBrains                                       Ctrl+Shift+A, Ctrl+E │
+R13 0 1 fg=idx3c bg=idxe9 attrs=
+R13 1 1 fg=idx66 bg=idxea attrs=
+R13 2 1 fg=default bg=idxea attrs=
+R13 3 2 fg=idxff bg=idxea attrs=
+R13 5 3 fg=idxff bg=idxec attrs=BOLD
+R13 8 1 fg=idxff bg=idxea attrs=
+R13 9 9 fg=idxfc bg=idxea attrs=
+R13 18 39 fg=idxff bg=idxea attrs=
+R13 57 20 fg=idx42 bg=idxea attrs=
+R13 77 1 fg=default bg=idxea attrs=
+R13 78 1 fg=idx66 bg=idxea attrs=
+R13 79 1 fg=idxeb bg=idxe8 attrs=
+L14| ╰────────────────────────────────────────────────────────────────────────────╯
+R14 0 1 fg=idx3c bg=idxe9 attrs=
+R14 1 78 fg=idx66 bg=idxea attrs=
+R14 79 1 fg=idxeb bg=idxe8 attrs=
+L15|                                        Ctrl-Space palette · Ctrl-g lock
+R15 0 3 fg=idx3c bg=idxe9 attrs=
+R15 3 77 fg=idxeb bg=idxe8 attrs=
+L16|
+R16 0 80 fg=idx3c bg=idxe9 attrs=
+L17|
+R17 0 80 fg=idx3c bg=idxe9 attrs=
+L18|
+R18 0 80 fg=idx3c bg=idxe9 attrs=
+L19|
+R19 0 80 fg=idx3c bg=idxe9 attrs=
+L20|
+R20 0 80 fg=idx3c bg=idxe9 attrs=
+L21|
+R21 0 80 fg=idx3c bg=idxe9 attrs=
+L22|
+R22 0 80 fg=idx3c bg=idxe9 attrs=
+L23|  NORMAL   Ctrl Space menu              7% free   ❚❚ Justin Hurwitz — Houston
+R23 0 1 fg=idx3b bg=idxe9 attrs=
+R23 1 8 fg=idxe9 bg=idx3b attrs=
+R23 9 2 fg=idx3b bg=idxe9 attrs=
+R23 11 15 fg=idxed bg=idxe9 attrs=
+R23 26 12 fg=idx3b bg=idxe9 attrs=
+R23 38 11 fg=idxe9 bg=idxef attrs=
+R23 49 1 fg=idx3b bg=idxe9 attrs=
+R23 50 29 fg=idxe9 bg=idx3c attrs=
+R23 79 1 fg=idx3b bg=idxe9 attrs=

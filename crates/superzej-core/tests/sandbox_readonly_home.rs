@@ -43,6 +43,7 @@ fn mk_spec(
         limits: SandboxLimits::default(),
         volumes: vec![],
         compose: None,
+        build: None,
         init_script: None,
         devenv: false,
         devenv_path: None,

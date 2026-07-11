@@ -57,6 +57,7 @@ fn alpine_spec(name: &str, worktree: &str) -> SandboxSpec {
         limits: SandboxLimits::default(),
         volumes: vec![],
         compose: None,
+        build: None,
         init_script: None,
         devenv: false,
         devenv_path: None,

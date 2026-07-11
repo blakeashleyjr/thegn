@@ -38,6 +38,8 @@
 
 - [x] 5.1 `sidebar_legend::push_attention_reason` (caps-aware glyph + label,
       hue by tier, silent when idle) called from `compose_detail_line`; tests.
+      **Later removed** (d9384f0b) as visual noise; the delta requirement was
+      deleted to match (see proposal Amendments).
 
 ## 6. Jump-to-next key
 
@@ -65,7 +67,8 @@
       deny passes with a writable CARGO_HOME shim) and `e2e` (untracked
       `snapshots/` baselines are stale June-19 dashboard-era frames — fails
       identically on clean HEAD, confirmed via stash+rebuild).
-- [ ] 8.3 Live check via `just start name=dev`: ordering, `Alt a`, chip,
-      reason hints; confirm PR/CI ticking does not reshuffle rows. (Needs a
-      real interactive session with agent/PR signals — pending restart into
-      the new build.)
+- [x] 8.3 Live check via `just start name=dev`: ordering, `Alt a`, chip;
+      confirm PR/CI ticking does not reshuffle rows. **Re-scoped** into the
+      `stabilize-sidebar-internals` change's live-TUI validation pass (that
+      change also flips the default display sort to Manual, superseding the
+      "Attention is default" premise of this check).

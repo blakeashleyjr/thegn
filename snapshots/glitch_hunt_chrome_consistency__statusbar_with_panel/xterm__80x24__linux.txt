@@ -1,24 +1,24 @@
- ◆ superzej   dashboard   work  comms 4 chat 27% · 󰂄 100% · Fri Jun 19 · 22:56
+ ◆ superzej work         15.4/94G ·  49% ·  ↓  1.2M ↑  857K ·  100% · 22:07
 ────────────────────────────────────────────────────────────────────────────────
- WORKSPACES           REGCLAUDE ▸ h  git  work  system
-                     ╭─ bwrap ·… ─╮  —
- ▾ regclaude         │blake@ws-3:~│ ────────────────────────────────────────────
-   ● home            │            │  1 changes                            clean
-                     │            │
-                     │            │   working tree clean
-                     │            │
-                     │            │  2 commits                                —
-                     │            │
-                     │            │  3 branches                               —
-                     │            │
-                     │            │  4 stash                                  —
-                     │            │
-                     │            │  5 files                              0 loc
-                     │            │
-                     │            │
-                     │            │
-                     │            │
-                     │            │
-                     │            │
-                     ╰────────────╯
-  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab … 0 LOC
+ WORKSPACES                       H  git  work  system
+                                     —
+ ▾ ⌂ home                           ────────────────────────────────────────────
+▐   └ ○ home                         1 changes                            clean
+
+ TERMINALS                            working tree clean
+ ▾ ≡ local
+   └ ≡ local                         2 commits                                —
+
+                                     3 branches                               —
+
+                                     4 stash                                  —
+
+                                     5 files                              0 loc
+
+
+
+
+
+
+
+  NORMAL   Ctrl Space menu   Ctrl g lock               0 LOC  ✋ 1    7% free
