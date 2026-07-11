@@ -12,7 +12,7 @@
   stdenv,
   fetchFromGitHub,
   nodejs,
-  pnpm_9,
+  pnpm_10,
   makeWrapper,
 }:
 stdenv.mkDerivation (finalAttrs: {
@@ -28,15 +28,17 @@ stdenv.mkDerivation (finalAttrs: {
 
   nativeBuildInputs = [
     nodejs
-    pnpm_9.configHook
+    # pnpm 10 reads the same lockfileVersion 9.0; pnpm 9 is marked insecure
+    # in nixpkgs (CVE-2026-48995 et al.) and refuses to evaluate.
+    pnpm_10.configHook
     makeWrapper
   ];
 
   # Fixed-output fetch of the full pnpm dependency closure (lockfileVersion 9.0).
-  pnpmDeps = pnpm_9.fetchDeps {
+  pnpmDeps = pnpm_10.fetchDeps {
     inherit (finalAttrs) pname version src;
     fetcherVersion = 3;
-    hash = "sha256-9s2kdvd7svK4hofnD66HkDc86WTQeayfF5y7L2dmjNg=";
+    hash = "sha256-FToFJ7TnChnKCVLreTd2zJyiuHt8gdEBsMKk6F+uoao=";
   };
 
   # The postinstall script only prints a shell-completions tip; CI=1 +
