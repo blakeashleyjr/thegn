@@ -147,7 +147,10 @@ pub(crate) fn masthead_layout(
         .find(|(a, _)| *a)
         .map(|(_, s)| seg_width(s))
         .unwrap_or(0);
-    let protected = 1 + seg_width(&brand) + active_chip_w;
+    // A quiet gap between the brand and the first chip so the highlighted pill
+    // doesn't butt against the version — only when both are present.
+    let gap = usize::from(!brand.is_empty() && !chips.is_empty());
+    let protected = 1 + seg_width(&brand) + gap + active_chip_w;
 
     // Priority-fit the stats into whatever remains (keep a 1-col gutter).
     let candidates = masthead_right_items(model);
@@ -176,6 +179,9 @@ pub(crate) fn masthead_layout(
 
     let mut left: Vec<Seg> = vec![seg(Tok::Slot(S::Text), " ")];
     left.extend(brand);
+    if gap == 1 {
+        left.push(seg(Tok::Slot(S::Text), " "));
+    }
     // Chips in tab order: the active chip is unconditional (its slot was held in
     // `protected`); inactive chips join only while they fit, holding the active
     // chip's reserve until it lands so an earlier inactive can't crowd it out.
