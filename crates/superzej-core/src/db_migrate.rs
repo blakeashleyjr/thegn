@@ -272,6 +272,15 @@ pub(crate) fn additive_schema(conn: &Connection) {
         "ALTER TABLE worktrees ADD COLUMN provider_sandbox_id TEXT",
         [],
     );
+    // v43: per-request latency on the proxy audit log. `duration_ms` is the
+    // wall-clock request time; `ttfb_ms` is the streaming time-to-first-byte —
+    // together they power the tokens-per-second stats. Pre-v43 rows read as
+    // 0/NULL (= not measured) and are excluded from throughput rollups.
+    let _ = conn.execute(
+        "ALTER TABLE proxy_requests ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE proxy_requests ADD COLUMN ttfb_ms INTEGER", []);
     // Backfill any unset positions deterministically by creation order
     // (path as the tie-breaker), giving pre-v8 worktrees a stable,
     // collision-free order on first launch after upgrade. Runs once: after

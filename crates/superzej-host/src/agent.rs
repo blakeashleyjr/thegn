@@ -17,7 +17,7 @@ use superzej_core::db::Db;
 // Teardown fns live in a sibling (file-size ratchet); same call paths.
 pub use crate::agent_teardown::{checkpoint_on_close, destroy_provider_sandbox};
 use superzej_core::remote::GitLoc;
-use superzej_core::store::{PoolStore, ProxyStore, WorkspaceStore};
+use superzej_core::store::{PoolStore, WorkspaceStore};
 use superzej_core::{bundle, devenv, repo, sandbox};
 use superzej_svc::projection::ProjectionBackend;
 use superzej_svc::vpn::VpnProvider;
@@ -3105,65 +3105,6 @@ pub fn run_in_sandbox(cfg: &Config, worktree: &str, command: &str) -> anyhow::Re
     Ok(combined)
 }
 
-/// Mint (or refresh) a per-worktree virtual key so the agent's model traffic
-/// routes through `szproxy` scoped to `agent:pi:<worktree>` — the proxy then
-/// attributes spend and enforces budgets per worktree. Returns the bearer token
-/// to hand the agent (best-effort; `None` if the DB is unavailable). Revoke it
-/// with [`revoke_agent_proxy_key`] when the agent disconnects. Used by the
-/// non-bouncer (TCP) path, which holds the minted token in scope for revocation.
-pub fn mint_agent_proxy_key(worktree: &str) -> Option<String> {
-    let slug = superzej_core::util::slugify(worktree);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    put_proxy_key(worktree, &format!("szk-{slug}-{nanos}"))
-}
-
-/// The **stable** virtual-key id for a worktree's bouncer agent. Deterministic
-/// (slug-only, no timestamp) so the launch path (which injects it into the
-/// sealed container's env before the agent connects) and the disconnect path
-/// (which revokes it) derive the same token without threading it through.
-pub fn agent_proxy_key_id(worktree: &str) -> String {
-    format!("szk-{}", superzej_core::util::slugify(worktree))
-}
-
-/// Mint the [`agent_proxy_key_id`] for `worktree` (best-effort). Upserts the
-/// row, so relaunching the same worktree's agent reuses the one key.
-pub fn mint_stable_proxy_key(worktree: &str) -> Option<String> {
-    let key = agent_proxy_key_id(worktree);
-    put_proxy_key(worktree, &key)
-}
-
-/// Persist a virtual key row for `worktree` and return the token. The proxy
-/// looks up identity by the token itself; the hash column is stored for parity
-/// with the schema (lookups don't verify it for a local daemon).
-fn put_proxy_key(worktree: &str, key: &str) -> Option<String> {
-    use std::hash::{Hash, Hasher};
-    let db = Db::open().ok()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    let token_hash = format!("{:016x}", hasher.finish());
-    let scope = format!("agent:pi:{worktree}");
-    db.put_proxy_virtual_key(
-        key,
-        &token_hash,
-        &format!("pi agent {worktree}"),
-        &scope,
-        None,
-        superzej_core::util::now(),
-    )
-    .ok()?;
-    Some(key.to_string())
-}
-
-/// Revoke a virtual key minted by [`mint_agent_proxy_key`] (best-effort).
-pub fn revoke_agent_proxy_key(key: &str) {
-    if let Ok(db) = Db::open() {
-        let _ = db.revoke_proxy_virtual_key(key, superzej_core::util::now());
-    }
-}
-
 /// The sandbox scope for launching `choice`: the sealed `agent_profile` when the
 /// bouncer is on and `choice` is a configured agent (so the agent runs in its
 /// own hardened container), else the worktree's interactive shell scope.
@@ -3222,10 +3163,10 @@ pub fn apply_bouncer_launch(
         return BouncerLaunch::default();
     }
     if cfg.llm_proxy.bouncer {
-        let key = cfg
-            .llm_proxy
+        let lp = &cfg.llm_proxy;
+        let key = lp
             .route_agent
-            .then(|| mint_stable_proxy_key(worktree))
+            .then(|| crate::proxy_keys::mint_stable_proxy_key(worktree, lp.upstream_binding()))
             .flatten();
         let sandbox = outcome.spec.as_ref().map(|s| (s.backend, s.network));
         let plan = crate::bouncer::agent_env_plan(cfg, worktree, sandbox, key.as_deref());

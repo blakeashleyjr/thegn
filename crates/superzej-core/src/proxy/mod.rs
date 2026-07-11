@@ -18,6 +18,7 @@ pub mod compress;
 pub mod cost;
 pub mod creds;
 pub mod ratelimit;
+pub mod stats;
 pub mod transform;
 
 pub use backoff::{BackoffConfig, ExhaustionKind, calculate_backoff};

@@ -32,6 +32,7 @@ pub mod open;
 pub mod pair;
 pub mod placement;
 pub mod pr;
+pub mod proxy;
 pub mod repos;
 pub mod session;
 pub mod share;

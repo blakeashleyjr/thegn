@@ -14,8 +14,38 @@
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
-use crate::db::{Db, ProxyBudgetRow, ProxyHealthRow, ProxyRequestRow};
-use crate::store::ProxyStore;
+use crate::db::{Db, ProxyBudgetRow, ProxyHealthRow, ProxyRequestRow, ProxyVirtualKeyRow};
+use crate::store::{ProxyStore, budget_period_len_ms};
+
+/// Shared SELECT prefix for `proxy_requests` readers (column order must match
+/// [`request_row`]).
+const REQUEST_COLS: &str = "SELECT ts_ms,protocol,route,virtual_key,agent,worktree,workspace,
+        client_model,backend,backend_model,input_tokens,output_tokens,
+        cost_usd,cost_source,outcome,error_code,duration_ms,ttfb_ms
+ FROM proxy_requests";
+
+fn request_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyRequestRow> {
+    Ok(ProxyRequestRow {
+        ts_ms: r.get(0)?,
+        protocol: r.get(1)?,
+        route: r.get(2)?,
+        virtual_key: r.get(3)?,
+        agent: r.get(4)?,
+        worktree: r.get(5)?,
+        workspace: r.get(6)?,
+        client_model: r.get(7)?,
+        backend: r.get(8)?,
+        backend_model: r.get(9)?,
+        input_tokens: r.get(10)?,
+        output_tokens: r.get(11)?,
+        cost_usd: r.get(12)?,
+        cost_source: r.get(13)?,
+        outcome: r.get(14)?,
+        error_code: r.get(15)?,
+        duration_ms: r.get(16)?,
+        ttfb_ms: r.get(17)?,
+    })
+}
 
 impl ProxyStore for Db {
     #[allow(clippy::too_many_arguments)]
@@ -95,8 +125,8 @@ impl ProxyStore for Db {
             r#"INSERT INTO proxy_requests
                  (ts_ms,protocol,route,virtual_key,agent,worktree,workspace,
                   client_model,backend,backend_model,input_tokens,output_tokens,
-                  cost_usd,cost_source,outcome,error_code)
-               VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"#,
+                  cost_usd,cost_source,outcome,error_code,duration_ms,ttfb_ms)
+               VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)"#,
             params![
                 r.ts_ms,
                 r.protocol,
@@ -114,41 +144,26 @@ impl ProxyStore for Db {
                 r.cost_source,
                 r.outcome,
                 r.error_code,
+                r.duration_ms,
+                r.ttfb_ms,
             ],
         )?;
         Ok(self.conn().last_insert_rowid())
     }
 
     fn proxy_requests(&self, worktree: &str, limit: usize) -> Result<Vec<ProxyRequestRow>> {
-        let mut stmt = self.conn().prepare(
-            "SELECT ts_ms,protocol,route,virtual_key,agent,worktree,workspace,
-                    client_model,backend,backend_model,input_tokens,output_tokens,
-                    cost_usd,cost_source,outcome,error_code
-             FROM proxy_requests
-             WHERE worktree = ?1
-             ORDER BY ts_ms DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![worktree, limit as i64], |r| {
-            Ok(ProxyRequestRow {
-                ts_ms: r.get(0)?,
-                protocol: r.get(1)?,
-                route: r.get(2)?,
-                virtual_key: r.get(3)?,
-                agent: r.get(4)?,
-                worktree: r.get(5)?,
-                workspace: r.get(6)?,
-                client_model: r.get(7)?,
-                backend: r.get(8)?,
-                backend_model: r.get(9)?,
-                input_tokens: r.get(10)?,
-                output_tokens: r.get(11)?,
-                cost_usd: r.get(12)?,
-                cost_source: r.get(13)?,
-                outcome: r.get(14)?,
-                error_code: r.get(15)?,
-            })
-        })?;
+        let mut stmt = self.conn().prepare(&format!(
+            "{REQUEST_COLS} WHERE worktree = ?1 ORDER BY ts_ms DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![worktree, limit as i64], request_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn proxy_requests_since(&self, since_ms: i64, limit: usize) -> Result<Vec<ProxyRequestRow>> {
+        let mut stmt = self.conn().prepare(&format!(
+            "{REQUEST_COLS} WHERE ts_ms >= ?1 ORDER BY ts_ms DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![since_ms, limit as i64], request_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -212,12 +227,27 @@ impl ProxyStore for Db {
             "INSERT INTO proxy_budgets(scope) VALUES(?1) ON CONFLICT(scope) DO NOTHING",
             params![scope],
         )?;
-        // Roll the window over if due.
-        self.conn().execute(
-            "UPDATE proxy_budgets SET spent_tokens=0, spent_cost=0 \
-             WHERE scope=?1 AND reset_ms>0 AND reset_ms<=?2",
-            params![scope, now_ms],
-        )?;
+        // Roll the window over if due: zero the counters AND advance the anchor
+        // by whole periods, so the new window accumulates instead of resetting
+        // on every subsequent request (a stale anchor stays <= now forever).
+        let due: Option<(String, i64)> = self
+            .conn()
+            .query_row(
+                "SELECT period, reset_ms FROM proxy_budgets \
+                 WHERE scope=?1 AND reset_ms>0 AND reset_ms<=?2",
+                params![scope, now_ms],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((period, reset_ms)) = due {
+            let len = budget_period_len_ms(&period);
+            let next = reset_ms + ((now_ms - reset_ms) / len + 1) * len;
+            self.conn().execute(
+                "UPDATE proxy_budgets SET spent_tokens=0, spent_cost=0, reset_ms=?2 \
+                 WHERE scope=?1",
+                params![scope, next],
+            )?;
+        }
         self.conn().execute(
             "UPDATE proxy_budgets SET spent_tokens=spent_tokens+?2, spent_cost=spent_cost+?3 \
              WHERE scope=?1",
@@ -285,6 +315,48 @@ impl ProxyStore for Db {
         )?;
         Ok(())
     }
+
+    fn proxy_budgets_all(&self) -> Result<Vec<ProxyBudgetRow>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT scope,period,spent_tokens,spent_cost,limit_tokens,limit_cost,reset_ms,killed \
+             FROM proxy_budgets ORDER BY scope",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ProxyBudgetRow {
+                    scope: r.get(0)?,
+                    period: r.get(1)?,
+                    spent_tokens: r.get(2)?,
+                    spent_cost: r.get(3)?,
+                    limit_tokens: r.get(4)?,
+                    limit_cost: r.get(5)?,
+                    reset_ms: r.get(6)?,
+                    killed: r.get::<_, i64>(7)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn proxy_virtual_keys_all(&self) -> Result<Vec<ProxyVirtualKeyRow>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT key_id,label,scope,upstream,created_at,revoked_at \
+             FROM proxy_virtual_keys ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ProxyVirtualKeyRow {
+                    key_id: r.get(0)?,
+                    label: r.get(1)?,
+                    scope: r.get(2)?,
+                    upstream: r.get(3)?,
+                    created_at: r.get(4)?,
+                    revoked_at: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +417,8 @@ mod tests {
             ts_ms: 100,
             worktree: Some("/wt".into()),
             cost_usd: 2.0,
+            duration_ms: 1200,
+            ttfb_ms: Some(300),
             ..Default::default()
         };
         assert!(store.put_proxy_request(&row1).unwrap() > 0);
@@ -357,5 +431,76 @@ mod tests {
         store.put_proxy_request(&row2).unwrap();
         assert_eq!(store.proxy_requests("/wt", 10).unwrap().len(), 2);
         assert!((store.proxy_spend_since("/wt", 0).unwrap() - 5.0).abs() < f64::EPSILON);
+
+        // Cross-caller feed (the /stats source): latency round-trips, newest first.
+        let since = store.proxy_requests_since(150, 10).unwrap();
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].ts_ms, 200);
+        let all = store.proxy_requests_since(0, 10).unwrap();
+        assert_eq!(all[0].ts_ms, 200);
+        assert_eq!(all[1].duration_ms, 1200);
+        assert_eq!(all[1].ttfb_ms, Some(300));
+    }
+
+    #[test]
+    fn budget_window_rollover_advances_anchor() {
+        let db = Db::open_memory().unwrap();
+        let store: &dyn ProxyStore = &db;
+        // Daily window anchored at t=1000ms.
+        store
+            .set_proxy_budget_limits("agent:x", "daily", Some(100), None, 1000)
+            .unwrap();
+        store.add_proxy_spend("agent:x", 40, 0.1, 500).unwrap();
+        assert_eq!(
+            store.proxy_budget("agent:x").unwrap().unwrap().spent_tokens,
+            40
+        );
+
+        // Spend after the anchor: counters zero first, anchor advances by whole
+        // periods past `now` — so the NEXT spend accumulates instead of the
+        // window resetting on every call (the pre-v43 bug).
+        let day = crate::store::budget_period_len_ms("daily");
+        let now = 1000 + day + day / 2; // 1.5 periods past the anchor
+        let (tokens, _, _) = store.add_proxy_spend("agent:x", 10, 0.2, now).unwrap();
+        assert_eq!(tokens, 10, "old spend dropped, new window counts fresh");
+        let b = store.proxy_budget("agent:x").unwrap().unwrap();
+        assert_eq!(
+            b.reset_ms,
+            1000 + 2 * day,
+            "anchor advanced by whole periods"
+        );
+        let (tokens, _, _) = store.add_proxy_spend("agent:x", 5, 0.0, now + 1).unwrap();
+        assert_eq!(tokens, 15, "same window accumulates");
+    }
+
+    #[test]
+    fn budgets_and_virtual_keys_list_all() {
+        let db = Db::open_memory().unwrap();
+        let store: &dyn ProxyStore = &db;
+        store
+            .set_proxy_budget_limits("workspace:/r", "weekly", None, Some(2.5), 0)
+            .unwrap();
+        store.add_proxy_spend("global", 5, 0.1, 1).unwrap();
+        let budgets = store.proxy_budgets_all().unwrap();
+        let scopes: Vec<&str> = budgets.iter().map(|b| b.scope.as_str()).collect();
+        assert_eq!(scopes, vec!["global", "workspace:/r"]);
+        assert_eq!(budgets[1].period, "weekly");
+        assert_eq!(budgets[1].limit_cost, Some(2.5));
+
+        store
+            .put_proxy_virtual_key("k1", "h1", "one", "worktree:/a", Some("nano-gpt"), 10)
+            .unwrap();
+        store
+            .put_proxy_virtual_key("k2", "h2", "two", "global", None, 20)
+            .unwrap();
+        store.revoke_proxy_virtual_key("k1", 30).unwrap();
+        let keys = store.proxy_virtual_keys_all().unwrap();
+        assert_eq!(keys.len(), 2);
+        // Newest first; revocation is metadata, not deletion.
+        assert_eq!(keys[0].key_id, "k2");
+        assert!(keys[0].revoked_at.is_none());
+        assert_eq!(keys[1].key_id, "k1");
+        assert_eq!(keys[1].upstream.as_deref(), Some("nano-gpt"));
+        assert!(keys[1].revoked_at.is_some());
     }
 }

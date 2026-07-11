@@ -119,6 +119,7 @@ mod provider_factory;
 mod provision_gate;
 mod provision_recover;
 mod proxy_daemon;
+mod proxy_keys;
 mod pty_drain;
 mod queries;
 mod rasterize;
@@ -326,6 +327,12 @@ pub enum Command {
     Env {
         #[command(subcommand)]
         action: cmd::env::Action,
+    },
+    /// Inspect and manage the LLM proxy: status, stats (tokens/sec, cost),
+    /// virtual keys (scoped accounts), budgets, and standalone `serve`.
+    Proxy {
+        #[command(subcommand)]
+        action: cmd::proxy::Action,
     },
     /// Manage zones (workspace groups with credential/egress/budget sub-scoping).
     Zone {
@@ -685,6 +692,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Recent { count, json } => cmd::repos::recent(count, json),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
         Command::Env { action } => cmd::env::run(&cfg, action),
+        Command::Proxy { action } => cmd::proxy::run(&cfg, action),
         Command::Zone { action } => cmd::zone::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),

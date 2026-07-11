@@ -11,6 +11,7 @@
 pub mod anthropic_stream;
 pub mod budget;
 pub mod config;
+pub mod headers;
 pub mod health;
 pub mod metrics;
 pub mod model;

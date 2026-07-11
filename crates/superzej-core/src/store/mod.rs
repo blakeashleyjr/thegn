@@ -60,7 +60,7 @@ pub use placement::{
     TenancyRow, TenancyState,
 };
 pub use pool::PoolStore;
-pub use proxy::ProxyStore;
+pub use proxy::{ProxyStore, budget_period_len_ms};
 pub use semantic::{SemEdgeRow, SemEntityRow, SemanticStore};
 pub use trust::{RepoTrustRow, RepoTrustStore};
 pub use workspace::WorkspaceStore;

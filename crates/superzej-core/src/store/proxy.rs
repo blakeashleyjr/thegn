@@ -13,7 +13,18 @@
 
 use anyhow::Result;
 
-use crate::db::{ProxyBudgetRow, ProxyHealthRow, ProxyRequestRow};
+use crate::db::{ProxyBudgetRow, ProxyHealthRow, ProxyRequestRow, ProxyVirtualKeyRow};
+
+/// The length of a budget window in milliseconds. `monthly` (and anything
+/// unrecognized) is a fixed 30 days — budget windows are rolling quotas, not
+/// calendar billing periods.
+pub fn budget_period_len_ms(period: &str) -> i64 {
+    match period {
+        "daily" => 86_400_000,
+        "weekly" => 604_800_000,
+        _ => 2_592_000_000, // monthly: 30d
+    }
+}
 
 /// Persisted LLM-proxy state. Object-safe: every method takes `&self` and
 /// concrete arguments, so `&dyn ProxyStore` works for backend-agnostic
@@ -49,6 +60,11 @@ pub trait ProxyStore {
 
     /// The most recent `limit` proxy requests for a worktree, newest first.
     fn proxy_requests(&self, worktree: &str, limit: usize) -> Result<Vec<ProxyRequestRow>>;
+
+    /// The most recent `limit` proxy requests across ALL callers since
+    /// `since_ms`, newest first — the feed behind the `/stats` rollup and the
+    /// dashboard.
+    fn proxy_requests_since(&self, since_ms: i64, limit: usize) -> Result<Vec<ProxyRequestRow>>;
 
     /// Total proxy spend (USD) for a worktree since `since_ms` (`0.0` if none).
     fn proxy_spend_since(&self, worktree: &str, since_ms: i64) -> Result<f64>;
@@ -98,4 +114,10 @@ pub trait ProxyStore {
 
     /// Set or clear the kill-switch on a budget scope.
     fn set_proxy_kill_switch(&self, scope: &str, killed: bool) -> Result<()>;
+
+    /// All budget rows (for the dashboard / CLI listing).
+    fn proxy_budgets_all(&self) -> Result<Vec<ProxyBudgetRow>>;
+
+    /// All registered virtual keys, newest first (metadata only; never hashes).
+    fn proxy_virtual_keys_all(&self) -> Result<Vec<ProxyVirtualKeyRow>>;
 }

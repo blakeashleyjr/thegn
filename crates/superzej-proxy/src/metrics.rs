@@ -5,6 +5,22 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+/// Cumulative-histogram bucket upper bounds for request duration, in millis
+/// (rendered as seconds — the same spread as the Go proxy's
+/// `model_proxy_request_duration_seconds`).
+const DURATION_BUCKETS_MS: [u64; 12] = [
+    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000, 600_000,
+];
+
+#[derive(Default)]
+struct DurationHist {
+    /// Count per bucket (same index as [`DURATION_BUCKETS_MS`]); values over
+    /// the largest bound only land in `+Inf` (i.e. `count`).
+    buckets: [u64; DURATION_BUCKETS_MS.len()],
+    sum_ms: u64,
+    count: u64,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     // Keyed by label tuple rendered as a stable string, value = counter.
@@ -14,6 +30,7 @@ pub struct Metrics {
     tokens: Mutex<BTreeMap<String, u64>>,
     cost_micros: Mutex<BTreeMap<String, u64>>, // USD * 1e6 to stay integer
     tokens_saved: Mutex<BTreeMap<String, u64>>,
+    durations: Mutex<DurationHist>,
 }
 
 fn bump(map: &Mutex<BTreeMap<String, u64>>, label: String, by: u64) {
@@ -76,6 +93,19 @@ impl Metrics {
         }
     }
 
+    /// Records one served request's wall-clock duration.
+    pub fn observe_duration(&self, ms: i64) {
+        let ms = ms.max(0) as u64;
+        let mut h = self.durations.lock().unwrap();
+        for (i, bound) in DURATION_BUCKETS_MS.iter().enumerate() {
+            if ms <= *bound {
+                h.buckets[i] += 1;
+            }
+        }
+        h.sum_ms += ms;
+        h.count += 1;
+    }
+
     /// Renders all families in Prometheus text exposition format.
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -121,7 +151,26 @@ impl Metrics {
             &self.tokens_saved,
             1.0,
         );
+        self.render_duration_histogram(&mut out);
         out
+    }
+
+    fn render_duration_histogram(&self, out: &mut String) {
+        let h = self.durations.lock().unwrap();
+        let name = "model_proxy_request_duration_seconds";
+        out.push_str(&format!(
+            "# HELP {name} Served request duration.\n# TYPE {name} histogram\n"
+        ));
+        for (i, bound) in DURATION_BUCKETS_MS.iter().enumerate() {
+            out.push_str(&format!(
+                "{name}_bucket{{le=\"{}\"}} {}\n",
+                *bound as f64 / 1000.0,
+                h.buckets[i]
+            ));
+        }
+        out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {}\n", h.count));
+        out.push_str(&format!("{name}_sum {}\n", h.sum_ms as f64 / 1000.0));
+        out.push_str(&format!("{name}_count {}\n", h.count));
     }
 }
 

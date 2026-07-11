@@ -363,6 +363,32 @@ pub(crate) fn intercept_menu_choice(
     }
 }
 
+/// Stop all ingress shares on the active worktree (`Action::StopWorktreeShare`),
+/// extracted from the size-capped `run.rs`. User-invoked and rare, so the
+/// best-effort DB cleanup stays inline.
+pub(crate) fn stop_worktree_share(
+    model: &mut crate::chrome::FrameModel,
+    share_supervisor: &mut crate::share::ShareSupervisor,
+    session: &crate::session::Session,
+) {
+    let Some(wt) = session.active_group().map(|g| g.path.clone()) else {
+        return;
+    };
+    let n = share_supervisor.stop(&wt, None);
+    if let Ok(db) = superzej_core::db::Db::open() {
+        use superzej_core::store::WorktreeAuxStore as _;
+        for v in &model.shares {
+            let _ = db.delete_share(&wt, v.port);
+        }
+    }
+    model.shares = crate::run::current_share_views(share_supervisor, session);
+    model.status = if n == 0 {
+        "No active shares on this worktree".into()
+    } else {
+        format!("Stopped {n} share(s)")
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

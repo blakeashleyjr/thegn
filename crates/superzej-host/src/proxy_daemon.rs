@@ -42,6 +42,25 @@ impl Drop for ProxyHandle {
     }
 }
 
+/// Launches the daemon from the resolved config (no-op unless
+/// `[llm_proxy].enabled`), diagnosing the common silent-failure where superzej
+/// launches ITS OWN proxy and routes agents to it, but no routes are configured
+/// — the proxy then 404s every agent request. (When `route_agent` points at an
+/// EXTERNAL proxy — `enabled = false` — routes live there, so no warning.)
+pub fn launch_from_config(cfg: &superzej_core::config::Config) -> Option<ProxyHandle> {
+    if cfg.llm_proxy.enabled
+        && cfg.llm_proxy.route_agent
+        && cfg.llm_proxy.config_path.trim().is_empty()
+    {
+        tracing::warn!(
+            target: "szhost::startup",
+            "[llm_proxy] enabled + route_agent but config_path is empty — the proxy will \
+             answer /health but 404 agent requests until you point config_path at a routes file."
+        );
+    }
+    cfg.llm_proxy.launch_spec().and_then(launch)
+}
+
 /// Launches and supervises `szproxy` from a `(program, args, env)` launch spec
 /// (as produced by `LlmProxyConfig::launch_spec`). Returns `None` if the
 /// supervisor thread can't be spawned.
@@ -106,7 +125,7 @@ fn supervise(bin: PathBuf, args: Vec<String>, env: BTreeMap<String, String>, sha
 /// Resolves the daemon binary: prefer a sibling of the host binary (szproxy
 /// ships next to szhost in the same bin / Nix-store dir), else fall back to the
 /// bare name so `PATH` resolves it.
-fn resolve_binary(program: &str) -> PathBuf {
+pub(crate) fn resolve_binary(program: &str) -> PathBuf {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
