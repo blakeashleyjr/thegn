@@ -731,7 +731,7 @@ pub enum StepState {
 }
 
 impl StepState {
-    /// Lower creation state onto the shared visual [`chrome::StepState`] — the
+    /// Lower creation state onto the shared visual `chrome::StepState` — the
     /// one place the creation domain maps into the standard loading vocabulary.
     /// `Skipped` reads as `Done` (it completed, just for free); the `Failed`
     /// error string is surfaced separately as the row's detail sub-line.
