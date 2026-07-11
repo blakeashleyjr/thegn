@@ -22,7 +22,7 @@
 set -euo pipefail
 
 # ── knobs (override via env) ─────────────────────────────────────────────────
-GH_REPO="${GH_REPO:-blakeashleyjr/superzej}"
+GH_REPO="${GH_REPO:-blakeashleyjr/thegn}"
 RUNNER_USER="${RUNNER_USER:-targe}"
 RUNNER_COUNT="${RUNNER_COUNT:-4}"
 RUNNER_CPUS="${RUNNER_CPUS:-3}"

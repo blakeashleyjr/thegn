@@ -8,9 +8,9 @@
 #   - the smoke test that seeds old-named dirs to exercise that migration,
 #   - install.sh's sweep of pre-rename entry-point symlinks,
 #   - the migration call-site comments in host main.rs,
-#   - `blakeashleyjr/superzej` GitHub URLs (live until the repo itself is
-#     renamed — allowed by line content, not by file, so anything else in
-#     those files is still guarded).
+#   - `blakeashleyjr/superzej` GitHub URLs in the termite apps' sz-kit git
+#     pins (pre-rename tags; retire when tg-kit-v0.1.x is tagged — allowed by
+#     line content, not by file, so anything else in those files is guarded).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

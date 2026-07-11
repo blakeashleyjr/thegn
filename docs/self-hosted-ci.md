@@ -17,7 +17,7 @@ Run **on ageless-studio, as `targe`** (SSH in over Tailscale, or use a thegn
 `env=ageless` shell):
 
 ```sh
-git clone https://github.com/blakeashleyjr/superzej   # or cd an existing checkout
+git clone https://github.com/blakeashleyjr/thegn   # or cd an existing checkout
 cd thegn
 
 NIX_GITHUB_TOKEN=<classic PAT, repo scope> \  # private flake inputs (muse, termite-chat)
@@ -72,7 +72,7 @@ caps). Knobs (all overridable via env, with these defaults):
 
 ```sh
 # on GitHub: Settings → Actions → Runners  (expect 4 × ageless-* Idle)
-gh api repos/blakeashleyjr/superzej/actions/runners --jq '.runners[]|{name,status}'
+gh api repos/blakeashleyjr/thegn/actions/runners --jq '.runners[]|{name,status}'
 # on the box:
 systemctl list-units 'actions.runner.*' --no-pager
 journalctl -u 'actions.runner.*' -f          # live job logs
