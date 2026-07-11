@@ -1,10 +1,11 @@
-L0| þ thegn v0.1.0 work         85% ·  17.7/94G ·   7% ·  37% ·  ↓  128K ↑  210K ·  100% · 22:41
+L0| þ thegn v0.1.0  work        90% ·  18.4/94G ·   7% ·  37% ·  ↓  1.2M ↑  717K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
 R0 9 6 fg=#6f788e bg=#151a28 attrs=
-R0 15 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 21 7 fg=#edf0f8 bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 6 fg=#edf0f8 bg=#151a28 attrs=
 R0 28 5 fg=#f0c674 bg=#151a28 attrs=
 R0 33 3 fg=#6f788e bg=#151a28 attrs=
 R0 36 10 fg=#c6ccdb bg=#151a28 attrs=
@@ -34,12 +35,12 @@ R2 50 50 fg=default bg=#0b0e16 attrs=
 L3|
 R3 0 32 fg=default bg=#151a28 attrs=
 R3 32 68 fg=default bg=#0b0e16 attrs=
-L4| ▾ 📁 home
+L4| ▾ ⌂ home
 R4 0 1 fg=#edf0f8 bg=#0b0e16 attrs=
 R4 1 1 fg=#7a8197 bg=#0b0e16 attrs=
-R4 2 4 fg=#edf0f8 bg=#0b0e16 attrs=
-R4 6 4 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
-R4 10 22 fg=#edf0f8 bg=#0b0e16 attrs=
+R4 2 3 fg=#edf0f8 bg=#0b0e16 attrs=
+R4 5 4 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
+R4 9 23 fg=#edf0f8 bg=#0b0e16 attrs=
 R4 32 68 fg=default bg=#0b0e16 attrs=
 L5|▐   └ ○ home                                        ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
 R5 0 1 fg=#428180 bg=#1a2031 attrs=
@@ -64,19 +65,19 @@ R7 10 22 fg=#edf0f8 bg=#151a28 attrs=
 R7 32 20 fg=default bg=#0b0e16 attrs=
 R7 52 29 fg=#6ee7d8 bg=#0b0e16 attrs=
 R7 81 19 fg=default bg=#0b0e16 attrs=
-L8| ▾ 💻 local
+L8| ▾ ≡ local
 R8 0 1 fg=#edf0f8 bg=#0b0e16 attrs=
 R8 1 1 fg=#7a8197 bg=#0b0e16 attrs=
 R8 2 1 fg=#edf0f8 bg=#0b0e16 attrs=
-R8 3 3 fg=#c6ccdb bg=#0b0e16 attrs=
-R8 6 5 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
-R8 11 21 fg=#edf0f8 bg=#0b0e16 attrs=
+R8 3 2 fg=#c6ccdb bg=#0b0e16 attrs=
+R8 5 5 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
+R8 10 22 fg=#edf0f8 bg=#0b0e16 attrs=
 R8 32 68 fg=default bg=#0b0e16 attrs=
-L9|   └ 💻 local                                         v0.1.0 · git worktree IDE
+L9|   └ ≡ local                                          v0.1.0 · git worktree IDE
 R9 0 3 fg=#edf0f8 bg=#151a28 attrs=
 R9 3 2 fg=#677084 bg=#151a28 attrs=
-R9 5 8 fg=#c6ccdb bg=#151a28 attrs=
-R9 13 19 fg=#edf0f8 bg=#151a28 attrs=
+R9 5 7 fg=#c6ccdb bg=#151a28 attrs=
+R9 12 20 fg=#edf0f8 bg=#151a28 attrs=
 R9 32 22 fg=default bg=#0b0e16 attrs=
 R9 54 6 fg=#c6ccdb bg=#0b0e16 attrs=
 R9 60 19 fg=#7a8197 bg=#0b0e16 attrs=
@@ -84,27 +85,27 @@ R9 79 21 fg=default bg=#0b0e16 attrs=
 L10|
 R10 0 32 fg=default bg=#151a28 attrs=
 R10 32 68 fg=default bg=#0b0e16 attrs=
-L11|                                                             ↻ sandbox
+L11|                                                        ✓ sandbox
 R11 0 32 fg=default bg=#151a28 attrs=
-R11 32 29 fg=default bg=#0b0e16 attrs=
-R11 61 1 fg=#6ee7d8 bg=#0b0e16 attrs=
-R11 62 1 fg=default bg=#0b0e16 attrs=
-R11 63 7 fg=#edf0f8 bg=#0b0e16 attrs=
-R11 70 30 fg=default bg=#0b0e16 attrs=
-L12|                                                             ◇ container
+R11 32 24 fg=default bg=#0b0e16 attrs=
+R11 56 1 fg=#c6ccdb bg=#0b0e16 attrs=
+R11 57 1 fg=default bg=#0b0e16 attrs=
+R11 58 7 fg=#c6ccdb bg=#0b0e16 attrs=
+R11 65 35 fg=default bg=#0b0e16 attrs=
+L12|                                                        ✓ container  (bwrap)
 R12 0 32 fg=default bg=#151a28 attrs=
-R12 32 29 fg=default bg=#0b0e16 attrs=
-R12 61 1 fg=#6f788e bg=#0b0e16 attrs=
-R12 62 1 fg=default bg=#0b0e16 attrs=
-R12 63 9 fg=#6f788e bg=#0b0e16 attrs=
-R12 72 28 fg=default bg=#0b0e16 attrs=
-L13|                                                             ◇ shell
+R12 32 24 fg=default bg=#0b0e16 attrs=
+R12 56 1 fg=#c6ccdb bg=#0b0e16 attrs=
+R12 57 1 fg=default bg=#0b0e16 attrs=
+R12 58 18 fg=#c6ccdb bg=#0b0e16 attrs=
+R12 76 24 fg=default bg=#0b0e16 attrs=
+L13|                                                        ↻ shell
 R13 0 32 fg=default bg=#151a28 attrs=
-R13 32 29 fg=default bg=#0b0e16 attrs=
-R13 61 1 fg=#6f788e bg=#0b0e16 attrs=
-R13 62 1 fg=default bg=#0b0e16 attrs=
-R13 63 5 fg=#6f788e bg=#0b0e16 attrs=
-R13 68 32 fg=default bg=#0b0e16 attrs=
+R13 32 24 fg=default bg=#0b0e16 attrs=
+R13 56 1 fg=#6ee7d8 bg=#0b0e16 attrs=
+R13 57 1 fg=default bg=#0b0e16 attrs=
+R13 58 5 fg=#edf0f8 bg=#0b0e16 attrs=
+R13 63 37 fg=default bg=#0b0e16 attrs=
 L14|
 R14 0 32 fg=default bg=#151a28 attrs=
 R14 32 68 fg=default bg=#0b0e16 attrs=
@@ -150,22 +151,8 @@ R27 32 68 fg=default bg=#0b0e16 attrs=
 L28|
 R28 0 32 fg=default bg=#151a28 attrs=
 R28 32 68 fg=default bg=#0b0e16 attrs=
-L29|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav              0 LOC  ✋ 1    7% free
-R29 0 1 fg=#edf0f8 bg=#151a28 attrs=
-R29 1 8 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
-R29 9 2 fg=#edf0f8 bg=#151a28 attrs=
-R29 11 10 fg=#7a8197 bg=#151a28 attrs=
-R29 21 5 fg=#6f788e bg=#151a28 attrs=
-R29 26 3 fg=#edf0f8 bg=#151a28 attrs=
-R29 29 6 fg=#7a8197 bg=#151a28 attrs=
-R29 35 5 fg=#6f788e bg=#151a28 attrs=
-R29 40 3 fg=#edf0f8 bg=#151a28 attrs=
-R29 43 14 fg=#7a8197 bg=#151a28 attrs=
-R29 57 4 fg=#6f788e bg=#151a28 attrs=
-R29 61 14 fg=#edf0f8 bg=#151a28 attrs=
-R29 75 5 fg=#c6ccdb bg=#151a28 attrs=
-R29 80 1 fg=#edf0f8 bg=#151a28 attrs=
-R29 81 6 fg=#0b0e16 bg=#e6c264 attrs=BOLD
-R29 87 1 fg=#edf0f8 bg=#151a28 attrs=
-R29 88 11 fg=#0b0e16 bg=#ef6f6f attrs=BOLD
-R29 99 1 fg=#edf0f8 bg=#151a28 attrs=
+L29|0 LOC │ ⚠ Sandbox fallback: sandbox podman-rootless failed: could not start podman container 'thegn…
+R29 0 5 fg=#c6ccdb bg=#151a28 attrs=
+R29 5 3 fg=#60687b bg=#151a28 attrs=
+R29 8 91 fg=#c6ccdb bg=#151a28 attrs=
+R29 99 1 fg=#6f788e bg=#151a28 attrs=

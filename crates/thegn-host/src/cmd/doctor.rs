@@ -289,6 +289,28 @@ fn remote_ssh_placements(cfg: &Config) -> Vec<(String, Placement)> {
 /// reachable remote on `Backend::None` and ship a `cd <local-path>` to it. Each
 /// probe is `ConnectTimeout=10`-bounded. No-op when no ssh hosts are configured.
 fn remote_sandbox_report(cfg: &Config) {
+    // The effective `[remote]` transport tuning every probe below rides.
+    let t = cfg.remote.ssh_tune();
+    let p = cfg.remote.control_plane_policy();
+    outln!("Remote transport tuning ([remote])");
+    outln!(
+        "  keepalive          ServerAliveInterval={} CountMax={} TCPKeepAlive={}",
+        t.keepalive_interval_secs,
+        t.keepalive_count_max,
+        if t.tcp_keepalive { "yes" } else { "no" }
+    );
+    outln!(
+        "  connect/persist    ConnectTimeout={}s ControlPersist={}s",
+        t.connect_timeout_secs,
+        t.control_persist_secs
+    );
+    outln!(
+        "  retry              {} attempts, {}ms..{}ms backoff; heal {:?}s",
+        p.max_attempts,
+        p.base_delay_ms,
+        p.max_delay_ms,
+        cfg.remote.heal_schedule().steps_secs
+    );
     outln!("Remote sandbox runtime (live ssh probe)");
     let hosts = remote_ssh_placements(cfg);
     if hosts.is_empty() {
@@ -297,7 +319,7 @@ fn remote_sandbox_report(cfg: &Config) {
     }
     let chain = shell_chain(cfg);
     for (name, placement) in hosts {
-        outln!("  {name}");
+        outln!("  {name}{}", master_status(&placement));
         for bname in &chain {
             let Some(b) = Backend::parse(bname) else {
                 continue;
@@ -311,6 +333,35 @@ fn remote_sandbox_report(cfg: &Config) {
                 probe_word(placement.probe_runtime(b.binary()))
             );
         }
+    }
+}
+
+/// One-word ControlMaster status for an ssh host: is a multiplex socket on
+/// disk, and does the master behind it answer `ssh -O check`?
+// off-loop: doctor is a synchronous CLI; `-O check` pings a local unix socket.
+#[expect(clippy::disallowed_methods)]
+fn master_status(placement: &thegn_core::placement::Placement) -> String {
+    let thegn_core::placement::Placement::Ssh(p) = placement else {
+        return String::new();
+    };
+    let sock = thegn_core::remote::control_path(&p.host, p.port);
+    if !sock.exists() {
+        return "  (no ControlMaster socket)".into();
+    }
+    let alive = std::process::Command::new("ssh")
+        .arg("-o")
+        .arg(format!("ControlPath={}", sock.display()))
+        .args(["-O", "check", &p.host])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if alive {
+        "  (ControlMaster alive)".into()
+    } else {
+        "  (ControlMaster socket STALE — cleared on next connect)".into()
     }
 }
 

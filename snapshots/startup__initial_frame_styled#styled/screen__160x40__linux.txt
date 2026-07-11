@@ -1,10 +1,11 @@
-L0| þ thegn v0.1.0 work                                                       16.3/94G ·   7% ·  23% ·  92°C ·  ↓  673K ↑  478K ·  100% · Fri Jul 10 · 22:41
+L0| þ thegn v0.1.0  work                                                      21.4/94G ·   7% ·  37% ·  97°C ·  ↓   64K ↑  259K ·  100% · Sat Jul 11 · 02:20
 R0 0 1 fg=idx3b bg=idxe9 attrs=
 R0 1 2 fg=idxef bg=idxe9 attrs=
 R0 3 6 fg=idx3b bg=idxe9 attrs=
 R0 9 6 fg=idxed bg=idxe9 attrs=
-R0 15 6 fg=idxef bg=idxeb attrs=
-R0 21 53 fg=idx3b bg=idxe9 attrs=
+R0 15 1 fg=idx3b bg=idxe9 attrs=
+R0 16 6 fg=idxef bg=idxeb attrs=
+R0 22 52 fg=idx3b bg=idxe9 attrs=
 R0 74 10 fg=idxef bg=idxe9 attrs=
 R0 84 3 fg=idxed bg=idxe9 attrs=
 R0 87 5 fg=idxee bg=idxe9 attrs=
@@ -38,7 +39,7 @@ R2 134 26 fg=idx3b bg=idxe9 attrs=
 L3|                                                                                                                     home/home
 R3 0 116 fg=idx3c bg=idxe9 attrs=
 R3 116 44 fg=idx3b bg=idxe9 attrs=
-L4| ▾    home                                                                                                          ────────────────────────────────────────────
+L4| ▾ ⌂ home                                                                                                           ────────────────────────────────────────────
 R4 0 1 fg=idx3b bg=idxe9 attrs=
 R4 1 1 fg=idxed bg=idxe9 attrs=
 R4 2 30 fg=idx3b bg=idxe9 attrs=
@@ -69,7 +70,7 @@ R7 32 84 fg=idx3c bg=idxe9 attrs=
 R7 116 2 fg=idx3b bg=idxe9 attrs=
 R7 118 18 fg=idxed bg=idxe9 attrs=
 R7 136 24 fg=idx3b bg=idxe9 attrs=
-L8|   No terminals — Alt T to add
+L8|   No terminals — Enter to add
 R8 0 3 fg=idx3b bg=idxe9 attrs=
 R8 3 27 fg=idxed bg=idxe9 attrs=
 R8 30 2 fg=idx3b bg=idxe9 attrs=
@@ -296,7 +297,7 @@ L37|
 R37 0 160 fg=idx3c bg=idxe9 attrs=
 L38|
 R38 0 160 fg=idx3c bg=idxe9 attrs=
-L39|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓   Alt N split→   Alt s focus-sidebar                    7% free
+L39|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓   Alt N split→            7% free   ❚❚ Justin Hurwitz — Houston
 R39 0 1 fg=idx3b bg=idxe9 attrs=
 R39 1 8 fg=idxe9 bg=idx3b attrs=
 R39 9 2 fg=idx3b bg=idxe9 attrs=
@@ -311,8 +312,8 @@ R39 78 3 fg=idx3b bg=idxe9 attrs=
 R39 81 12 fg=idxed bg=idxe9 attrs=
 R39 93 3 fg=idx3b bg=idxe9 attrs=
 R39 96 12 fg=idxed bg=idxe9 attrs=
-R39 108 3 fg=idx3b bg=idxe9 attrs=
-R39 111 19 fg=idxed bg=idxe9 attrs=
-R39 130 18 fg=idx3b bg=idxe9 attrs=
-R39 148 11 fg=idxe9 bg=idxef attrs=
+R39 108 10 fg=idx3b bg=idxe9 attrs=
+R39 118 11 fg=idxe9 bg=idxef attrs=
+R39 129 1 fg=idx3b bg=idxe9 attrs=
+R39 130 29 fg=idxe9 bg=idx3c attrs=
 R39 159 1 fg=idx3b bg=idxe9 attrs=

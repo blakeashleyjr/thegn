@@ -37,6 +37,13 @@ pub struct EnvRequirements {
     pub nix_classic: bool,
     /// Language ecosystems detected from manifests (for the non-Nix tiers).
     pub languages: Vec<Language>,
+    /// A `devcontainer.json` is present. Presence-only: the full parse needs
+    /// the file *contents* (which the remote probe can't emit), so callers use
+    /// this as a signal to read + parse via [`crate::devcontainer`]. Does not
+    /// affect [`EnvRequirements::tier`] — a devcontainer sources the image /
+    /// lifecycle *before* provisioning; the in-container env still tiers
+    /// normally.
+    pub devcontainer: bool,
 }
 
 /// A language ecosystem detected from a manifest file.
@@ -104,6 +111,7 @@ pub const DETECT_PROBE_SCRIPT: &str = r#"
 [ -f Gemfile ] && echo LANG_RUBY=1
 { [ -f deno.json ] || [ -f deno.jsonc ]; } && echo LANG_DENO=1
 { [ -f build.sbt ] || [ -f project/build.properties ] || [ -f .scala-version ]; } && echo LANG_JVM=1
+{ [ -f .devcontainer/devcontainer.json ] || [ -f .devcontainer.json ]; } && echo DEVCONTAINER=1
 true
 "#;
 
@@ -133,6 +141,7 @@ pub fn detect_from_probe(out: &str) -> EnvRequirements {
         tool_versions: has("TOOL_VERSIONS"),
         nix_classic: has("NIX_CLASSIC"),
         languages,
+        devcontainer: has("DEVCONTAINER"),
     }
 }
 
@@ -188,6 +197,8 @@ pub fn detect(worktree: &Path) -> EnvRequirements {
     let nix_classic =
         (exists("shell.nix") || exists("default.nix")) && !nix_flake_devshell && !devenv;
 
+    let devcontainer = exists(".devcontainer/devcontainer.json") || exists(".devcontainer.json");
+
     EnvRequirements {
         nix_flake_devshell,
         devenv,
@@ -196,6 +207,7 @@ pub fn detect(worktree: &Path) -> EnvRequirements {
         tool_versions,
         nix_classic,
         languages,
+        devcontainer,
     }
 }
 

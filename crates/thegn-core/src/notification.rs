@@ -173,10 +173,14 @@ impl NotificationKind {
             Self::AgentFailed
             | Self::AgentAttention
             | Self::TestFailed
-            | Self::LogError
             | Self::ProcessFailed
             | Self::QueueNeedsHuman => Priority::Alert,
-            Self::WorktreeCreated | Self::ProcessExited | Self::QueueLanded => Priority::Info,
+            // LogError is thegn's own diagnostics — informational, never a red
+            // alert (and off by default, see `surface_self_log_errors`). It shows
+            // in the Logs group as a quiet entry point, not the Alerts group.
+            Self::LogError | Self::WorktreeCreated | Self::ProcessExited | Self::QueueLanded => {
+                Priority::Info
+            }
             Self::Assigned
             | Self::Mentioned
             | Self::StatusChanged
@@ -283,13 +287,13 @@ mod tests {
                 NotificationKind::AgentFailed
                     | NotificationKind::AgentAttention
                     | NotificationKind::TestFailed
-                    | NotificationKind::LogError
                     | NotificationKind::ProcessFailed
                     | NotificationKind::QueueNeedsHuman
             );
             let expect_info = matches!(
                 kind,
-                NotificationKind::WorktreeCreated
+                NotificationKind::LogError
+                    | NotificationKind::WorktreeCreated
                     | NotificationKind::ProcessExited
                     | NotificationKind::QueueLanded
             );

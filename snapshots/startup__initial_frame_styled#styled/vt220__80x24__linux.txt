@@ -1,7 +1,5 @@
-L0| þ thegn work    16.3/94G ·   7% ·  22% ·  ↓  1.3M ↑  631K ·  100% · 22:41
-R0 0 26 fg=idx08 bg=idx00 attrs=
-R0 26 3 fg=idx00 bg=idx00 attrs=
-R0 29 5 fg=idx08 bg=idx00 attrs=
+L0| þ thegn  work           21.5/94G ·  36% ·  ↓    0B ↑    0B ·  100% · 02:20
+R0 0 34 fg=idx08 bg=idx00 attrs=
 R0 34 3 fg=idx00 bg=idx00 attrs=
 R0 37 5 fg=idx08 bg=idx00 attrs=
 R0 42 3 fg=idx00 bg=idx00 attrs=
@@ -18,7 +16,7 @@ R2 38 3 fg=idx00 bg=idx00 attrs=
 R2 41 39 fg=idx08 bg=idx00 attrs=
 L3|
 R3 0 80 fg=idx08 bg=idx00 attrs=
-L4| ▾    home
+L4| ▾ ⌂ home
 R4 0 1 fg=idx08 bg=idx00 attrs=
 R4 1 1 fg=idx00 bg=idx00 attrs=
 R4 2 78 fg=idx08 bg=idx00 attrs=
@@ -31,7 +29,7 @@ L6|
 R6 0 80 fg=idx08 bg=idx00 attrs=
 L7| TERMINALS
 R7 0 80 fg=idx08 bg=idx00 attrs=
-L8|   No terminals — Alt T to add            ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
+L8|   No terminals — Enter to add            ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
 R8 0 3 fg=idx08 bg=idx00 attrs=
 R8 3 27 fg=idx00 bg=idx00 attrs=
 R8 30 50 fg=idx08 bg=idx00 attrs=
@@ -103,15 +101,13 @@ L21|
 R21 0 80 fg=idx08 bg=idx00 attrs=
 L22|
 R22 0 80 fg=idx08 bg=idx00 attrs=
-L23|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav         7% free
+L23|  NORMAL   Ctrl Space menu              7% free   ❚❚ Justin Hurwitz — Houston
 R23 0 1 fg=idx08 bg=idx00 attrs=
 R23 1 8 fg=idx00 bg=idx08 attrs=
 R23 9 2 fg=idx08 bg=idx00 attrs=
 R23 11 15 fg=idx00 bg=idx00 attrs=
-R23 26 3 fg=idx08 bg=idx00 attrs=
-R23 29 11 fg=idx00 bg=idx00 attrs=
-R23 40 3 fg=idx08 bg=idx00 attrs=
-R23 43 18 fg=idx00 bg=idx00 attrs=
-R23 61 7 fg=idx08 bg=idx00 attrs=
-R23 68 11 fg=idx00 bg=idx08 attrs=
+R23 26 12 fg=idx08 bg=idx00 attrs=
+R23 38 11 fg=idx00 bg=idx08 attrs=
+R23 49 1 fg=idx08 bg=idx00 attrs=
+R23 50 29 fg=idx00 bg=idx08 attrs=
 R23 79 1 fg=idx08 bg=idx00 attrs=

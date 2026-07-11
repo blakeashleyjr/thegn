@@ -325,6 +325,28 @@
           # (the compile cache is disk; a full fs makes target/ writes fail with
           # ENOSPC/EROFS mid-build). Honor an already-set value.
           export SCCACHE_CACHE_SIZE="''${SCCACHE_CACHE_SIZE:-20G}"
+          # Pin the sccache server to a per-mount-namespace socket. thegn
+          # development happens inside sandboxes (bwrap; the AI agent's own
+          # bwrap) that bind-mount this worktree writable into a fresh mount
+          # namespace. sccache's default server is a long-lived daemon reached
+          # over the shared loopback endpoint — so a sandbox reuses a server
+          # left over from a *different* (often now-defunct) namespace whose
+          # view of this worktree's target/ is stale/read-only, and every
+          # compile dies with "Read-only file system (os error 30)". Keying the
+          # server socket to our mount-namespace inode gives each namespace its
+          # own server (lazily spawned here, where target/ is writable) and
+          # never contacts a foreign one. Guarded: only when sccache is present,
+          # neither endpoint var is already set (CI wires its own), and /proc is
+          # available (skips non-Linux). The short /tmp path stays under the
+          # AF_UNIX SUN_LEN (~108) limit.
+          if command -v sccache >/dev/null 2>&1 \
+            && [ -z "''${SCCACHE_SERVER_UDS:-}" ] && [ -z "''${SCCACHE_SERVER_PORT:-}" ]; then
+            _mnt_ns=$(readlink /proc/self/ns/mnt 2>/dev/null | tr -dc '0-9')
+            if [ -n "$_mnt_ns" ]; then
+              export SCCACHE_SERVER_UDS="/tmp/sccache-$(id -u)-$_mnt_ns.sock"
+            fi
+            unset _mnt_ns
+          fi
           # Leave headroom so heavy builds don't peg the machine (parallel
           # rustc/codegen jobs); computed here since Nix eval can't see nproc.
           if [ -z "''${CARGO_BUILD_JOBS:-}" ]; then

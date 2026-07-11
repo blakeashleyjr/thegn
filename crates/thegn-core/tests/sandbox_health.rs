@@ -45,6 +45,7 @@ fn base_spec(name: &str) -> SandboxSpec {
         limits: SandboxLimits::default(),
         volumes: vec![],
         compose: None,
+        build: None,
         init_script: None,
         devenv: false,
         devenv_path: None,

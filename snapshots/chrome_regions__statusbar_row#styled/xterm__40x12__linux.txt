@@ -1,4 +1,4 @@
-L0| 16.3/94G ·  ↓  242K ↑    9K ·  100%…
+L0| 21.4/94G ·  ↓   18K ↑  143K ·  100%…
 R0 0 10 fg=#4c505a bg=#0f131e attrs=
 R0 10 3 fg=#2e3340 bg=#0f131e attrs=
 R0 13 17 fg=#4c505a bg=#0f131e attrs=
@@ -81,12 +81,9 @@ R9 0 3 fg=#677084 bg=#0b0e16 attrs=
 R9 3 37 fg=#1c2233 bg=#05070c attrs=
 L10|
 R10 0 40 fg=#677084 bg=#0b0e16 attrs=
-L11|  NORMAL   Ctrl Space menu    7% free
+L11|   7% free   ❚❚ Justin Hurwitz — Houst…
 R11 0 1 fg=#5a5d65 bg=#0f131e attrs=
-R11 1 8 fg=#0b0e16 bg=#376f6d attrs=
-R11 9 2 fg=#5a5d65 bg=#0f131e attrs=
-R11 11 10 fg=#313643 bg=#0f131e attrs=
-R11 21 5 fg=#2e3340 bg=#0f131e attrs=
-R11 26 2 fg=#5a5d65 bg=#0f131e attrs=
-R11 28 11 fg=#0b0e16 bg=#71393e attrs=
-R11 39 1 fg=#5a5d65 bg=#0f131e attrs=
+R11 1 11 fg=#0b0e16 bg=#71393e attrs=
+R11 12 1 fg=#5a5d65 bg=#0f131e attrs=
+R11 13 26 fg=#0b0e16 bg=#3f5876 attrs=
+R11 39 1 fg=#2e3340 bg=#0f131e attrs=

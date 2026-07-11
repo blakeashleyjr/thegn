@@ -83,6 +83,9 @@ pub enum MenuChoice {
     ConfirmDeleteWorktrees {
         keep_files: bool,
     },
+    // the `[c]` arm of the close-or-delete chooser: close the pending worktree
+    // groups (forget them in thegn) without touching branch or files.
+    ConfirmCloseWorktrees,
     // delete workspace confirm: variant to capture "leave files" intent
     ConfirmDeleteWorkspace {
         keep_files: bool,
@@ -396,6 +399,113 @@ pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
     .with_body(names_csv)
 }
 
+/// The sidebar's unified close-or-delete chooser (`d` / `Delete`): a
+/// *disambiguation* modal, not just a confirmation, so it always opens
+/// regardless of `confirm_delete`. Close (safe, default) forgets the worktree
+/// but keeps branch + files; delete is the destructive arm.
+pub fn close_or_delete_menu(targets: usize, names_csv: &str) -> MenuOverlay {
+    let title = if targets == 1 {
+        "Close or delete this worktree?".to_string()
+    } else {
+        format!("Close or delete {targets} worktrees?")
+    };
+    MenuOverlay::new_with_default(
+        MenuKindTag::Confirm,
+        title,
+        vec![
+            item(
+                Some('c'),
+                "close — keep branch & files on disk",
+                MenuChoice::ConfirmCloseWorktrees,
+            ),
+            item(
+                Some('y'),
+                "delete branch + files from disk",
+                MenuChoice::ConfirmDeleteWorktrees { keep_files: false },
+            )
+            .danger(),
+            item(Some('n'), "cancel", MenuChoice::Dismiss),
+        ],
+        0,
+    )
+    .with_body(names_csv)
+}
+
+/// The dirty-tree variant of [`close_or_delete_menu`]: preserves the
+/// [`delete_worktree_menu_dirty`] safety net verbatim — the title/body shout
+/// that uncommitted work will be LOST and the pre-selected default is the SAFE
+/// `cancel`, so a dirty delete is never a single-Enter mistake.
+pub fn close_or_delete_menu_dirty(dirty: usize, dirty_csv: &str) -> MenuOverlay {
+    let title = format!("Delete {dirty} worktree(s) with UNCOMMITTED changes?");
+    MenuOverlay::new_with_default(
+        MenuKindTag::Confirm,
+        title,
+        vec![
+            item(
+                Some('c'),
+                "close — keep branch & files on disk (safe)",
+                MenuChoice::ConfirmCloseWorktrees,
+            ),
+            item(
+                Some('y'),
+                "delete from disk (discard changes)",
+                MenuChoice::ConfirmDeleteWorktrees { keep_files: false },
+            )
+            .danger(),
+            item(Some('n'), "cancel", MenuChoice::Dismiss),
+        ],
+        2,
+    )
+    .with_body(format!("uncommitted work will be LOST in: {dirty_csv}"))
+}
+
+/// The sidebar sort-mode picker (`s`): a radio-style list, current mode noted.
+/// Resolves to `Confirm { tag: "sidebar-sort", arg: <mode> }`.
+pub fn sidebar_sort_menu(current: crate::sidebar::SortMode) -> MenuOverlay {
+    use crate::sidebar::SortMode;
+    let row = |key: char, label: &str, mode: SortMode| {
+        let mut it = item(
+            Some(key),
+            label,
+            MenuChoice::Confirm {
+                tag: "sidebar-sort",
+                arg: mode.as_str().to_string(),
+            },
+        );
+        if mode == current {
+            it = it.note("current");
+        }
+        it
+    };
+    let modes = [
+        (
+            'm',
+            "manual — rows stay where you put them",
+            SortMode::Manual,
+        ),
+        ('a', "name — alphabetical", SortMode::Name),
+        ('r', "recent — last used first", SortMode::Recent),
+        (
+            't',
+            "attention — what needs you floats up",
+            SortMode::Attention,
+        ),
+    ];
+    let default = modes
+        .iter()
+        .position(|(_, _, m)| *m == current)
+        .unwrap_or(0);
+    MenuOverlay::new_with_default(
+        MenuKindTag::Confirm,
+        "Sort worktrees by",
+        modes
+            .into_iter()
+            .map(|(k, label, mode)| row(k, label, mode))
+            .collect(),
+        default,
+    )
+}
+
 /// The dirty-tree variant of [`delete_worktree_menu`], shown whenever one or
 /// more targets have uncommitted changes. It is raised EVEN when
 /// `confirm_delete` is off — a destructive delete of unsaved work must never be
@@ -431,33 +541,34 @@ pub fn delete_worktree_menu_dirty(dirty: usize, dirty_csv: &str) -> MenuOverlay 
     .with_body(format!("uncommitted work will be LOST in: {dirty_csv}"))
 }
 
-/// Confirm removing a workspace. Like `delete_worktree_menu`, the default
-/// (pre-selected, index 0) choice is the destructive "delete from disk", which
-/// removes every worktree directory of the workspace. `[f]` removes the
-/// workspace from thegn only, leaving the files on disk.
+/// Confirm removing a workspace. The pre-selected default is the SAFE
+/// "remove from thegn — keep all files" (matching VS Code's "remove folder
+/// from workspace", which never touches disk); deleting the branch worktree
+/// directories is the explicit danger arm. The home checkout is never deleted
+/// either way.
 pub fn delete_workspace_menu(display: &str) -> MenuOverlay {
-    let title = format!("Delete workspace '{display}'?");
+    let title = format!("Remove workspace '{display}'?");
     MenuOverlay::new_with_default(
         MenuKindTag::Confirm,
         title,
         vec![
             item(
+                // 'k' is a reserved nav key (cursor-up); use 'f' (files).
+                Some('f'),
+                "remove from thegn — keep all files",
+                MenuChoice::ConfirmDeleteWorkspace { keep_files: true },
+            ),
+            item(
                 Some('y'),
-                "delete worktrees from disk",
+                "also delete branch worktrees from disk",
                 MenuChoice::ConfirmDeleteWorkspace { keep_files: false },
             )
             .danger(),
-            item(
-                // 'k' is a reserved nav key (cursor-up); use 'f' (files).
-                Some('f'),
-                "keep files on disk",
-                MenuChoice::ConfirmDeleteWorkspace { keep_files: true },
-            ),
             item(Some('n'), "cancel", MenuChoice::Dismiss),
         ],
         0,
     )
-    .with_body("the home checkout is kept; branch worktrees are deleted")
+    .with_body("the home checkout is kept either way")
 }
 
 /// A 2-item yes/no confirm built on the same component: `[y]` resolves to
@@ -1393,21 +1504,24 @@ mod tests {
     }
 
     #[test]
-    fn delete_workspace_menu_defaults_to_delete_from_disk() {
+    fn delete_workspace_menu_defaults_to_keep_files() {
         let m = delete_workspace_menu("myrepo");
-        // Default (pre-selected) item is the destructive "delete from disk".
+        // The pre-selected item is the SAFE "remove — keep all files"
+        // (matching VS Code's remove-folder-from-workspace, which never
+        // touches disk); deleting from disk is the explicit danger arm.
         assert_eq!(m.selected(), 0);
         assert_eq!(
             m.items()[0].choice,
-            MenuChoice::ConfirmDeleteWorkspace { keep_files: false }
-        );
-        assert!(m.items()[0].danger, "delete-from-disk row is danger-marked");
-        assert_eq!(
-            m.items()[1].choice,
             MenuChoice::ConfirmDeleteWorkspace { keep_files: true }
         );
+        assert!(!m.items()[0].danger, "the default row is the safe one");
+        assert_eq!(
+            m.items()[1].choice,
+            MenuChoice::ConfirmDeleteWorkspace { keep_files: false }
+        );
+        assert!(m.items()[1].danger, "delete-from-disk row is danger-marked");
         assert_eq!(m.items()[2].choice, MenuChoice::Dismiss);
-        assert_eq!(hotkeys(&m), vec!['y', 'f', 'n']);
+        assert_eq!(hotkeys(&m), vec!['f', 'y', 'n']);
     }
 
     #[test]

@@ -21,6 +21,15 @@ config_enum! {
     } default = Manual;
 }
 
+config_enum! {
+    /// When the sidebar shows its TERMINALS section. "always" keeps the banner
+    /// (and its "no terminals" hint) visible so the entry point never silently
+    /// vanishes; "nonempty" hides the whole section until a terminal exists.
+    pub enum TerminalsSection: "terminals section" {
+        Always = "always", NonEmpty = "nonempty",
+    } default = Always;
+}
+
 /// UI/Presentation settings (`[ui]`).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -36,6 +45,8 @@ pub struct UiConfig {
     /// Sidebar workspace ordering: keep the manual order, or bubble the
     /// most-urgent workspace to the top (see [`WorkspaceSort`]).
     pub sidebar_workspace_sort: WorkspaceSort,
+    /// Sidebar TERMINALS section visibility (see [`TerminalsSection`]).
+    pub sidebar_terminals_section: TerminalsSection,
 }
 
 impl Default for UiConfig {
@@ -46,6 +57,7 @@ impl Default for UiConfig {
             full_mode_chip: true,
             dismiss_overlay_on_click_outside: true,
             sidebar_workspace_sort: WorkspaceSort::default(),
+            sidebar_terminals_section: TerminalsSection::default(),
         }
     }
 }
@@ -69,6 +81,22 @@ mod tests {
         assert_eq!(
             UiConfig::default().sidebar_workspace_sort,
             WorkspaceSort::Manual
+        );
+    }
+
+    #[test]
+    fn terminals_section_parses_and_defaults_always() {
+        assert_eq!(
+            TerminalsSection::from_str_validated("nonempty").unwrap(),
+            TerminalsSection::NonEmpty
+        );
+        assert!(TerminalsSection::from_str_validated("bogus").is_err());
+        assert_eq!(TerminalsSection::default(), TerminalsSection::Always);
+        let cfg: UiConfig = toml::from_str("sidebar_terminals_section = \"nonempty\"").unwrap();
+        assert_eq!(cfg.sidebar_terminals_section, TerminalsSection::NonEmpty);
+        assert_eq!(
+            UiConfig::default().sidebar_terminals_section,
+            TerminalsSection::Always
         );
     }
 

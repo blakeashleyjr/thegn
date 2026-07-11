@@ -85,23 +85,25 @@ pub struct GitGlyphs {
 /// Tree ordering for worktree groups within a workspace (item 23).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortMode {
-    /// User-controlled order: trusts the underlying sequence (the session's
-    /// group order when loaded, the persisted `position` order when not),
-    /// "home" first. Defaults to creation order and is what Shift+Alt+↑/↓
-    /// rearranges. Worktrees never reshuffle on their own.
+    /// The default: user-controlled order that trusts the underlying sequence
+    /// (the session's group order when loaded, the persisted `position` order
+    /// when not), "home" first. Defaults to creation order and is what
+    /// Shift+↑/↓ rearranges. Worktrees never reshuffle on their own — the
+    /// explorer contract users expect; urgency still surfaces through the
+    /// activity dots, the statusbar needs-you chip, and `Alt a`.
+    #[default]
     Manual,
     /// Case-insensitive label order, "home" first. Stable — a worktree keeps
     /// its slot when selected/opened (no jumping). The old plugin's default.
     Name,
     /// Most-recently-touched first (by tab position as a recency proxy).
     Recent,
-    /// The default: whatever needs the user floats first, by attention tier
-    /// (blocked on input > failures > finished > ready-to-land > working >
-    /// idle; see `thegn_core::attention`). Ordering follows the
-    /// hysteresis-stable ranks from hydration, so rows only move on a real
-    /// state change — never from timestamp or cache churn. Successor of the
-    /// old CPU-dot-only `Activity` mode (whose persisted name still parses).
-    #[default]
+    /// Whatever needs the user floats first, by attention tier (blocked on
+    /// input > failures > finished > ready-to-land > working > idle; see
+    /// `thegn_core::attention`). Ordering follows the hysteresis-stable
+    /// ranks from hydration, so rows only move on a real state change — never
+    /// from timestamp or cache churn. Successor of the old CPU-dot-only
+    /// `Activity` mode (whose persisted name still parses).
     Attention,
 }
 
@@ -116,22 +118,15 @@ impl SortMode {
     }
     pub fn from_str(s: &str) -> Self {
         match s {
+            "manual" => SortMode::Manual,
             "name" => SortMode::Name,
             "recent" => SortMode::Recent,
             // "activity" is the pre-attention name of this mode; saved
-            // ui_state migrates by parsing it as Attention.
+            // ui_state migrates by parsing it as Attention (and `load`
+            // rewrites the stored value to the canonical spelling).
             "attention" | "activity" => SortMode::Attention,
-            // Unknown / "manual" → the manual (creation-order) mode.
-            _ => SortMode::Manual,
-        }
-    }
-    /// Cycle to the next mode (for a single keybind).
-    pub fn next(self) -> Self {
-        match self {
-            SortMode::Manual => SortMode::Name,
-            SortMode::Name => SortMode::Recent,
-            SortMode::Recent => SortMode::Attention,
-            SortMode::Attention => SortMode::Manual,
+            // Unknown → the default.
+            _ => SortMode::default(),
         }
     }
 }
@@ -152,23 +147,17 @@ pub struct SidebarRow {
     pub tab_target: Option<RowTarget>,
     /// Whether this row is (in) the session's active worktree/tab.
     pub active: bool,
-    /// For Worktree rows: the worktree path — the key for git/agent/activity
+    /// For Worktree rows: the worktree path — the key for git/activity/disk
     /// lookups, and for row actions like "copy path". For Workspace rows: the
     /// repo path (the remove-workspace target), or `None` for a live fallback
     /// with no DB row yet.
-    #[allow(dead_code)]
     pub worktree_path: Option<String>,
     /// A stable key for pinning a row (workspace slug, or `slug/branch`).
     pub pin_key: String,
-    /// The worktree's branch (Worktree rows). Retained for future status lines.
-    #[allow(dead_code)]
+    /// The worktree's branch (Worktree rows) — the seed for the rename prompt
+    /// and the base of the "branch from this" action.
     pub branch: Option<String>,
     pub git: Option<GitGlyphs>,
-    /// The worktree's remembered agent. The sidebar no longer renders an
-    /// agent/app indicator, but the field is retained (populated from the DB) for
-    /// other surfaces and future status lines.
-    #[allow(dead_code)]
-    pub agent: Option<String>,
     pub sandbox_backend: Option<String>,
     /// Selected execution environment (`[env.<name>]`); `None`/`"default"` ⇒
     /// the implicit default (no badge shown).
@@ -181,17 +170,16 @@ pub struct SidebarRow {
     pub collapsed: bool,
     /// For Workspace rows: a non-git "dir" workspace (drives a distinct glyph).
     pub dir: bool,
-    /// Badge: open PR count for this worktree's branch (item 28).
-    #[allow(dead_code)]
+    /// Open PR count for this worktree's branch — the cursor row's detail-line
+    /// PR badge (item 28).
     pub pr_count: Option<usize>,
     /// Lowest open PR number for this worktree's branch, used to compose the
     /// dynamic row title (`[PR: <n> | …]`). `None` when no open PR is cached.
     pub pr_number: Option<u64>,
-    /// Badge: unread notification count for this worktree (item 28).
-    #[allow(dead_code)]
+    /// Unread notification count — the detail line's ✉ badge (item 28).
     pub unread_count: usize,
-    /// Badge: alert count (test failures, agent failures, log errors) for this worktree (item 28).
-    #[allow(dead_code)]
+    /// Alert count (test/agent failures, log errors) — the main row's always-on
+    /// red ⚠ badge (item 28).
     pub alert_count: usize,
     /// Disk usage of this worktree's checkout (bytes), from the off-loop scan.
     pub disk_bytes: Option<u64>,
@@ -200,6 +188,13 @@ pub struct SidebarRow {
     pub target_bytes: Option<u64>,
     /// Connection string for terminal rows
     pub terminal_connection: Option<String>,
+    /// For Folder rows: the DB `folders.folder_id` — the key for folder
+    /// actions (rename/delete) without re-parsing `pin_key`.
+    pub folder_id: Option<i64>,
+    /// For Folder rows: how many worktrees are filed inside (drives the
+    /// rendered "(N)" count; the label itself stays the bare folder name so
+    /// actions can seed rename prompts from it).
+    pub child_count: usize,
     /// Attention score: the worktree's own (Worktree rows) or the workspace's
     /// most-urgent-child rollup (Workspace rows — drives the collapsed-row
     /// glyph). Denormalized from `SidebarStatus` in one pass at build time.
@@ -210,6 +205,47 @@ pub struct SidebarRow {
 }
 
 impl SidebarRow {
+    /// A bare row of `kind` at `depth` with every target/status/badge field
+    /// defaulted (visible, not collapsed, no pin key). Construction sites layer
+    /// only what the row actually carries via struct-update syntax, so adding a
+    /// field to `SidebarRow` touches one place.
+    pub fn base(
+        kind: RowKind,
+        depth: u8,
+        label: impl Into<String>,
+        workspace_slug: impl Into<String>,
+    ) -> Self {
+        SidebarRow {
+            kind,
+            depth,
+            label: label.into(),
+            workspace_slug: workspace_slug.into(),
+            tab_target: None,
+            active: false,
+            worktree_path: None,
+            pin_key: String::new(),
+            branch: None,
+            git: None,
+            sandbox_backend: None,
+            env_name: None,
+            activity: ActivityState::None,
+            visible: true,
+            collapsed: false,
+            dir: false,
+            pr_count: None,
+            pr_number: None,
+            unread_count: 0,
+            alert_count: 0,
+            disk_bytes: None,
+            target_bytes: None,
+            terminal_connection: None,
+            folder_id: None,
+            child_count: 0,
+            attention: None,
+            mq_status: None,
+        }
+    }
+
     /// Whether this row can join the multi-select set: a workspace or worktree
     /// with a stable identity. Excludes section headings / empty hints (no
     /// `pin_key`) and folders / terminals (no bulk or reorder action).
@@ -291,6 +327,10 @@ pub struct ViewState {
     /// not ui_state — mirrored here on startup/reload). When `Attention`,
     /// workspaces stable-sort by their most-urgent worktree's tier.
     pub workspace_sort: thegn_core::config::WorkspaceSort,
+    /// TERMINALS section visibility, from `[ui] sidebar_terminals_section`
+    /// (config, mirrored like `workspace_sort`). `NonEmpty` hides the banner
+    /// and its hint until a terminal exists.
+    pub terminals_section: thegn_core::config::TerminalsSection,
 }
 
 /// What activating a sidebar row does.
@@ -466,7 +506,11 @@ pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> 
         && !env.is_empty()
         && env != "default"
     {
-        segs.push(seg(Tok::Slot(S::Faint), format!("\u{ab}{env}\u{bb} ")));
+        let gl = crate::caps::active_glyphs();
+        segs.push(seg(
+            Tok::Slot(S::Faint),
+            format!("{}{env}{} ", gl.quote_open, gl.quote_close),
+        ));
     }
     if let Some(backend) = &row.sandbox_backend
         && !backend.is_empty()
@@ -509,21 +553,15 @@ pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> 
     (segs.len() > start).then_some(Line::Segs(segs))
 }
 
-/// The detail line's merge-queue chip for a status: the section's glyph
-/// vocabulary (see `panel/sections/merge_queue.rs::status_glyph`), minus
-/// `Landed` — a finished row is panel detail, not sidebar-worthy signal.
+/// The detail line's merge-queue chip for a status: the shared
+/// [`thegn_core::attention::MqStatus::glyph`] vocabulary (also used by
+/// `panel/sections/merge_queue.rs`), minus `Landed` — a finished row is panel
+/// detail, not sidebar-worthy signal.
 fn mq_chip(mq: thegn_core::attention::MqStatus) -> Option<(&'static str, thegn_core::theme::Hue)> {
-    use thegn_core::attention::MqStatus as M;
-    use thegn_core::theme::Hue;
-    Some(match mq {
-        M::Landed => return None,
-        M::Ready => ("◆", Hue::Green),
-        M::Deferred | M::GateFailed => ("⚑", Hue::Red),
-        M::NeedsHuman => ("✋", Hue::Red),
-        M::Folding | M::Verifying => ("●", Hue::Amber),
-        M::AgentRunning => ("◐", Hue::Amber),
-        M::Queued => ("○", Hue::Blue),
-    })
+    if mq == thegn_core::attention::MqStatus::Landed {
+        return None;
+    }
+    Some(mq.glyph(crate::caps::active_glyphs()))
 }
 
 /// Group `db_terminals` into host sections in sidebar **display order**:
@@ -616,35 +654,14 @@ pub fn build_rows(
     for (repo_slug, display, kind, repo_path) in workspaces {
         let collapsed = view.collapsed.contains(repo_slug);
         rows.push(SidebarRow {
-            kind: RowKind::Workspace,
-            depth: 0,
-            label: display.clone(),
-            workspace_slug: repo_slug.clone(),
-            tab_target: None,
-            active: false,
             // Workspace rows carry the repo path (not a worktree path) so the
             // remove-workspace action can resolve its DB target without a
             // slug→path lookup. Empty for live fallbacks with no DB row yet.
             worktree_path: (!repo_path.is_empty()).then(|| repo_path.clone()),
             pin_key: repo_slug.clone(),
-            branch: None,
-            git: None,
-            agent: None,
-            sandbox_backend: None,
-            env_name: None,
-            activity: ActivityState::None,
-            visible: true,
             collapsed,
             dir: kind == "dir",
-            pr_count: None,
-            pr_number: None,
-            unread_count: 0,
-            alert_count: 0,
-            terminal_connection: None,
-            disk_bytes: None,
-            target_bytes: None,
-            attention: None,
-            mq_status: None,
+            ..SidebarRow::base(RowKind::Workspace, 0, display.clone(), repo_slug.clone())
         });
 
         // This repo's worktree groups. A *loaded* workspace draws them straight
@@ -740,10 +757,6 @@ pub fn build_rows(
         let mk_row = |gr: &Group, depth: u8, pin_key: String| -> SidebarRow {
             let wt_path = (!gr.path.is_empty()).then(|| gr.path.clone());
             let git = wt_path.as_deref().and_then(|p| status.git.get(p)).copied();
-            let agent = wt_path
-                .as_deref()
-                .and_then(|p| status.agent.get(p))
-                .cloned();
             let pr_count = wt_path
                 .as_deref()
                 .and_then(|p| status.pr_counts.get(p))
@@ -763,32 +776,26 @@ pub fn build_rows(
                 .copied()
                 .unwrap_or(0);
             SidebarRow {
-                kind: RowKind::Worktree,
-                depth,
-                label: gr.label.clone(),
-                workspace_slug: repo_slug.clone(),
                 tab_target: Some(gr.target.clone()),
                 active: gr.active,
                 worktree_path: wt_path,
                 pin_key,
                 branch: Some(gr.label.clone()),
                 git,
-                agent,
                 sandbox_backend: gr.sandbox_backend.clone(),
                 env_name: gr.env_name.clone(),
                 activity: gr.activity,
                 visible: !collapsed,
-                collapsed: false,
-                dir: false,
                 pr_count,
                 pr_number,
                 unread_count,
                 alert_count,
-                terminal_connection: None,
-                disk_bytes: None,
-                target_bytes: None,
-                attention: None,
-                mq_status: None,
+                ..SidebarRow::base(
+                    RowKind::Worktree,
+                    depth,
+                    gr.label.clone(),
+                    repo_slug.clone(),
+                )
             }
         };
 
@@ -847,36 +854,12 @@ pub fn build_rows(
                 }
             }
             rows.push(SidebarRow {
-                kind: RowKind::Folder,
-                depth: 1,
-                label: if child_count > 0 {
-                    format!("{} ({})", folder.name, child_count)
-                } else {
-                    folder.name.clone()
-                },
-                workspace_slug: repo_slug.clone(),
-                tab_target: None,
-                active: false,
-                worktree_path: None,
                 pin_key: folder_key.clone(),
-                branch: None,
-                git: None,
-                agent: None,
-                sandbox_backend: None,
-                env_name: None,
-                activity: ActivityState::None,
                 visible: !collapsed,
                 collapsed: folder_collapsed,
-                dir: false,
-                pr_count: None,
-                pr_number: None,
-                unread_count: 0,
-                alert_count: 0,
-                terminal_connection: None,
-                disk_bytes: None,
-                target_bytes: None,
-                attention: None,
-                mq_status: None,
+                folder_id: Some(folder.folder_id),
+                child_count,
+                ..SidebarRow::base(RowKind::Folder, 1, folder.name.clone(), repo_slug.clone())
             });
 
             if !folder_collapsed {
@@ -895,102 +878,35 @@ pub fn build_rows(
     }
 
     if rows.is_empty() {
-        rows.push(SidebarRow {
-            kind: RowKind::Workspace,
-            depth: 0,
-            label: "no workspaces".into(),
-            workspace_slug: String::new(),
-            tab_target: None,
-            active: false,
-            worktree_path: None,
-            pin_key: String::new(),
-            branch: None,
-            git: None,
-            agent: None,
-            sandbox_backend: None,
-            env_name: None,
-            activity: ActivityState::None,
-            visible: true,
-            collapsed: false,
-            dir: false,
-            pr_count: None,
-            pr_number: None,
-            unread_count: 0,
-            alert_count: 0,
-            terminal_connection: None,
-            disk_bytes: None,
-            target_bytes: None,
-            attention: None,
-            mq_status: None,
-        });
+        rows.push(SidebarRow::base(RowKind::Workspace, 0, "no workspaces", ""));
     }
 
-    {
-        // TERMINALS is a first-class, static category banner (a peer of the
-        // "WORKSPACES" title), never collapsible and never a nav target. It is
-        // always shown — even with no terminals — so the section (and its
-        // "New terminal…" entry point) never silently vanishes.
-        rows.push(SidebarRow {
-            kind: RowKind::SectionHeading,
-            depth: 0,
-            label: "TERMINALS".into(),
-            workspace_slug: "terminals".into(),
-            tab_target: None,
-            active: false,
-            worktree_path: None,
-            pin_key: String::new(),
-            branch: None,
-            git: None,
-            agent: None,
-            sandbox_backend: None,
-            env_name: None,
-            activity: ActivityState::None,
-            visible: true,
-            collapsed: false,
-            dir: false,
-            pr_count: None,
-            pr_number: None,
-            unread_count: 0,
-            alert_count: 0,
-            terminal_connection: None,
-            disk_bytes: None,
-            target_bytes: None,
-            attention: None,
-            mq_status: None,
-        });
+    // TERMINALS is a first-class, static category banner (a peer of the
+    // "WORKSPACES" title), never collapsible and never a nav target. By
+    // default it is always shown — even with no terminals — so the section
+    // (and its "New terminal…" entry point) never silently vanishes;
+    // `[ui] sidebar_terminals_section = "nonempty"` opts into hiding the
+    // whole section until a terminal exists.
+    let hide_terminals = db_terminals.is_empty()
+        && view.terminals_section == thegn_core::config::TerminalsSection::NonEmpty;
+    if !hide_terminals {
+        rows.push(SidebarRow::base(
+            RowKind::SectionHeading,
+            0,
+            "TERMINALS",
+            "terminals",
+        ));
 
         // Genuinely-empty fallback (the startup reseed normally keeps a `local`
         // terminal, so this shows only when that couldn't run): a passive,
         // non-interactive hint pointing at the add flow.
         if db_terminals.is_empty() {
-            rows.push(SidebarRow {
-                kind: RowKind::EmptyHint,
-                depth: 1,
-                label: "No terminals — Alt T to add".into(),
-                workspace_slug: "terminals".into(),
-                tab_target: None,
-                active: false,
-                worktree_path: None,
-                pin_key: String::new(),
-                branch: None,
-                git: None,
-                agent: None,
-                sandbox_backend: None,
-                env_name: None,
-                activity: ActivityState::None,
-                visible: true,
-                collapsed: false,
-                dir: false,
-                pr_count: None,
-                pr_number: None,
-                unread_count: 0,
-                alert_count: 0,
-                terminal_connection: None,
-                disk_bytes: None,
-                target_bytes: None,
-                attention: None,
-                mq_status: None,
-            });
+            rows.push(SidebarRow::base(
+                RowKind::EmptyHint,
+                1,
+                "No terminals — Enter to add",
+                "terminals",
+            ));
         }
 
         // Under the banner, terminals divide into collapsible sections by host,
@@ -1012,32 +928,9 @@ pub fn build_rows(
             };
 
             rows.push(SidebarRow {
-                kind: RowKind::TerminalHost,
-                depth: 1,
-                label: label.clone(),
-                workspace_slug: slug.clone(),
-                tab_target: None,
-                active: false,
-                worktree_path: None,
-                pin_key: String::new(),
-                branch: None,
-                git: None,
-                agent: None,
-                sandbox_backend: None,
-                env_name: None,
-                activity: ActivityState::None,
-                visible: true,
                 collapsed,
-                dir: false,
-                pr_count: None,
-                pr_number: None,
-                unread_count: 0,
-                alert_count: 0,
                 terminal_connection: Some(rep_conn),
-                disk_bytes: None,
-                target_bytes: None,
-                attention: None,
-                mq_status: None,
+                ..SidebarRow::base(RowKind::TerminalHost, 1, label.clone(), slug.clone())
             });
 
             if collapsed {
@@ -1055,10 +948,6 @@ pub fn build_rows(
                     .map(|i| RowTarget::Tab(i, 0));
 
                 rows.push(SidebarRow {
-                    kind: RowKind::Terminal,
-                    depth: 2,
-                    label: t.name.clone(),
-                    workspace_slug: slug.clone(),
                     tab_target: target.or_else(|| {
                         Some(RowTarget::Workspace {
                             repo_path: "terminal".into(),
@@ -1068,9 +957,6 @@ pub fn build_rows(
                     active,
                     worktree_path: Some(t.name.clone()),
                     pin_key: format!("terminals/{}", t.name),
-                    branch: None,
-                    git: None,
-                    agent: None,
                     // Show the sandbox backend on the row like a worktree does;
                     // blank/`host` means an un-sandboxed shell (rendered as none).
                     sandbox_backend: {
@@ -1078,19 +964,8 @@ pub fn build_rows(
                         (!b.is_empty() && b != "host" && b != "none").then(|| b.to_string())
                     },
                     env_name: (!t.env_name.trim().is_empty()).then(|| t.env_name.clone()),
-                    activity: ActivityState::None,
-                    visible: true,
-                    collapsed: false,
-                    dir: false,
-                    pr_count: None,
-                    pr_number: None,
-                    unread_count: 0,
-                    alert_count: 0,
                     terminal_connection: Some(t.connection_string.clone()),
-                    disk_bytes: None,
-                    target_bytes: None,
-                    attention: None,
-                    mq_status: None,
+                    ..SidebarRow::base(RowKind::Terminal, 2, t.name.clone(), slug.clone())
                 });
             }
         }
@@ -1756,8 +1631,9 @@ mod tests {
             String::new(),
         )];
 
-        // The default is Attention now.
-        assert_eq!(ViewState::default().sort, SortMode::Attention);
+        // The default display sort is Manual — an explorer that never
+        // reshuffles itself; Attention is one `s`-menu pick away.
+        assert_eq!(ViewState::default().sort, SortMode::Manual);
         let rows = build_rows(
             &s,
             &ws,
@@ -1789,31 +1665,22 @@ mod tests {
     }
 
     #[test]
-    fn sort_mode_migrates_and_cycles() {
+    fn sort_mode_migrates_and_roundtrips() {
         // The old persisted "activity" value parses as Attention (the ui_state
-        // migration), and the cycle visits all four modes.
+        // migration); unknown strings fall back to the (Manual) default; and
+        // every mode round-trips through its canonical string (the sort-menu
+        // persistence contract).
         assert_eq!(SortMode::from_str("activity"), SortMode::Attention);
-        assert_eq!(SortMode::from_str("attention"), SortMode::Attention);
-        assert_eq!(SortMode::from_str("manual"), SortMode::Manual);
-        assert_eq!(SortMode::from_str("bogus"), SortMode::Manual);
-        assert_eq!(SortMode::Attention.as_str(), "attention");
-        assert_eq!(SortMode::default(), SortMode::Attention);
-        let mut m = SortMode::Manual;
-        let mut seen = vec![m];
-        for _ in 0..3 {
-            m = m.next();
-            seen.push(m);
+        assert_eq!(SortMode::from_str("bogus"), SortMode::default());
+        assert_eq!(SortMode::default(), SortMode::Manual);
+        for m in [
+            SortMode::Manual,
+            SortMode::Name,
+            SortMode::Recent,
+            SortMode::Attention,
+        ] {
+            assert_eq!(SortMode::from_str(m.as_str()), m, "round-trip {m:?}");
         }
-        assert_eq!(
-            seen,
-            vec![
-                SortMode::Manual,
-                SortMode::Name,
-                SortMode::Recent,
-                SortMode::Attention
-            ]
-        );
-        assert_eq!(m.next(), SortMode::Manual);
     }
 
     #[test]
@@ -1956,6 +1823,49 @@ mod tests {
             term_labels,
             vec!["local", "term-ssh-dave-prod", "term-ssh-root-prod"]
         );
+    }
+
+    #[test]
+    fn terminals_section_nonempty_hides_banner_until_a_terminal_exists() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            String::new(),
+        )];
+        let view = ViewState {
+            terminals_section: thegn_core::config::TerminalsSection::NonEmpty,
+            ..Default::default()
+        };
+        // No terminals + "nonempty": the whole section (banner AND hint) is gone.
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[]);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r.kind, RowKind::SectionHeading | RowKind::EmptyHint)),
+            "empty TERMINALS section must vanish under nonempty",
+        );
+        // A terminal exists: the section is back, without the hint.
+        let terms = vec![term("local", "local", "")];
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &terms);
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == RowKind::SectionHeading && r.label == "TERMINALS")
+        );
+        assert!(!rows.iter().any(|r| r.kind == RowKind::EmptyHint));
+        // The default ("always") keeps banner + hint even when empty.
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(rows.iter().any(|r| r.kind == RowKind::SectionHeading));
+        assert!(rows.iter().any(|r| r.kind == RowKind::EmptyHint));
     }
 
     #[test]
@@ -2107,6 +2017,60 @@ mod tests {
     }
 
     #[test]
+    fn dormant_workspace_pins_float_like_live() {
+        // Pin identity parity: the same `pin_key` (`slug/branch`) must exist —
+        // and float the row identically — whether the workspace is live or
+        // reconstructed from the DB. A dormant tree that dropped pins would
+        // silently reshuffle on every workspace switch.
+        let mk_dbw = |branch: &str, path: &str| DbWorktree {
+            slug: "app".into(),
+            branch: branch.into(),
+            repo_path: "/repos/app".into(),
+            tab_name: format!("app/{branch}"),
+            path: path.into(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: None,
+        };
+        let live = session(
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/feat", "/wt/feat"),
+                tab("app/zeta", "/wt/zeta"),
+            ],
+            0,
+        );
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let dbw = vec![mk_dbw("feat", "/wt/feat"), mk_dbw("zeta", "/wt/zeta")];
+        let view = ViewState {
+            pins: vec!["app/zeta".to_string()],
+            ..Default::default()
+        };
+        let order = |s: &Session| -> Vec<String> {
+            build_rows(s, &ws, &view, &no_activity(), &dbw, &[], &[])
+                .into_iter()
+                .filter(|r| r.kind == RowKind::Worktree)
+                .map(|r| r.label)
+                .collect()
+        };
+        let live_order = order(&live);
+        assert_eq!(
+            live_order,
+            order(&session(vec![], 0)),
+            "pinned order must match live vs dormant",
+        );
+        // And the pin actually floated zeta above feat.
+        let zi = live_order.iter().position(|l| l == "zeta").unwrap();
+        let fi = live_order.iter().position(|l| l == "feat").unwrap();
+        assert!(zi < fi, "pinned zeta floats above feat: {live_order:?}");
+    }
+
+    #[test]
     fn dormant_workspace_renders_same_structure_as_live() {
         // The same workspace rendered live (loaded in the session) and dormant
         // (parked → reconstructed from the DB) must produce the same tree
@@ -2255,7 +2219,7 @@ mod tests {
         let feat = idx(RowKind::Worktree, "feat");
         assert_eq!(
             parent_collapsible_index(&visible, feat),
-            Some(idx(RowKind::Folder, "Backend (1)"))
+            Some(idx(RowKind::Folder, "Backend"))
         );
         let home = idx(RowKind::Worktree, "home");
         assert_eq!(
@@ -2264,7 +2228,7 @@ mod tests {
         );
         // Folder → its Workspace; a terminal → its TerminalHost.
         assert_eq!(
-            parent_collapsible_index(&visible, idx(RowKind::Folder, "Backend (1)")),
+            parent_collapsible_index(&visible, idx(RowKind::Folder, "Backend")),
             Some(idx(RowKind::Workspace, "app"))
         );
         assert_eq!(

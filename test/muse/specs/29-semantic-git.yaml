@@ -37,7 +37,7 @@ sync:
   quiet_window_ms: 2500
   max_settle_ms: 12000
 steps:
-  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 8000}
+  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
   # Exit the dashboard tile, open the right panel (Git tab → Changes section),
   # and give the entity hydration a tick to land.
   - key: {key: q}

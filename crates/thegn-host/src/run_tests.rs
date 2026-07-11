@@ -988,7 +988,7 @@ fn move_under_computed_sort_flips_to_manual() {
 }
 
 #[test]
-fn sidebar_multiselect_marks_and_bulk_close_targets_marked() {
+fn sidebar_multiselect_marks_and_bulk_delete_targets_marked() {
     let session = two_worktree_session();
     let mut model = build_initial_model(&session, None);
     model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
@@ -1000,12 +1000,26 @@ fn sidebar_multiselect_marks_and_bulk_close_targets_marked() {
     // Move to feat (index 2) and mark it too.
     press(&mut sb, 'j', &mut model, &session);
     press(&mut sb, ' ', &mut model, &session);
-    let out = sb.handle_key(&KeyCode::Char('X'), Modifiers::NONE, &mut model, &session);
+    // `d` opens the close-or-delete chooser for the whole marked set (the
+    // old X/D pair is gone — removed keys fall through to the keymap).
+    let out = sb.handle_key(&KeyCode::Char('d'), Modifiers::NONE, &mut model, &session);
     match out {
-        SidebarOutcome::CloseGroups(t) => {
+        SidebarOutcome::ConfirmCloseOrDelete(t) => {
             assert_eq!(t.len(), 2);
         }
-        _ => panic!("expected CloseGroups"),
+        _ => panic!("expected ConfirmCloseOrDelete"),
+    }
+    for removed in ['X', 'D'] {
+        let out = sb.handle_key(
+            &KeyCode::Char(removed),
+            Modifiers::NONE,
+            &mut model,
+            &session,
+        );
+        assert!(
+            matches!(out, SidebarOutcome::NotHandled),
+            "{removed} must no longer be a sidebar action",
+        );
     }
 }
 

@@ -130,7 +130,21 @@ pub(crate) fn provision_worktree_on_host(
         toolchain: cfg.toolchain.clone(),
         ..envplan::PlanOpts::default()
     };
-    let plan = envplan::plan(&req, &opts);
+    let mut plan = envplan::plan(&req, &opts);
+    // Trust-gated devcontainer steps, appended after the toolchain tier and
+    // covered by the same provision marker (so they run exactly once):
+    //   1. feature installs (ordered), then
+    //   2. one-time lifecycle commands (onCreate → updateContent → postCreate),
+    //      which may depend on the features.
+    // Both empty without a devcontainer.json (or until their category is approved).
+    plan.steps
+        .extend(crate::handlers::repo_trust::devcontainer_feature_steps(
+            &repo_root, worktree,
+        ));
+    plan.steps
+        .extend(crate::handlers::repo_trust::devcontainer_lifecycle_steps(
+            &repo_root, worktree, worktree,
+        ));
 
     // The pane-entry hook is derived purely — compute it even when the marker
     // short-circuits the replay (a fresh thegn process still needs it).

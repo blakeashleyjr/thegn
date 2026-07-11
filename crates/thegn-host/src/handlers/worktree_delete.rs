@@ -28,6 +28,124 @@ pub(crate) struct DeleteCtx<'a> {
     pub confirm_delete: bool,
 }
 
+/// Resolve the sidebar's `d` into the close-or-delete chooser: a
+/// *disambiguation* modal (close = safe default / delete = danger arm), so it
+/// ALWAYS opens regardless of `confirm_delete`. The dirty-tree variant
+/// preserves the safety net verbatim — it shouts the dirty names and
+/// pre-selects Cancel. Pending targets are stashed for the Pick handler
+/// (`ConfirmCloseWorktrees` / `ConfirmDeleteWorktrees`).
+pub(crate) fn request_close_or_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<usize>) {
+    let (targets, skipped_home) = crate::run::deletable_group_targets(cx.session, raw_targets);
+    if targets.is_empty() {
+        cx.model.status = if skipped_home > 0 {
+            "The home worktree can't be closed or deleted".into()
+        } else {
+            "No worktree selected".into()
+        };
+        return;
+    }
+    let (names, dirty_names) = target_names(&mut cx, &targets);
+    *cx.active_menu = Some(if dirty_names.is_empty() {
+        menu::close_or_delete_menu(names.len(), &names.join(", "))
+    } else {
+        menu::close_or_delete_menu_dirty(dirty_names.len(), &dirty_names.join(", "))
+    });
+    *cx.pending = Some(targets);
+}
+
+/// Close (forget) the worktree groups at `targets` — the `[c]` arm of the
+/// chooser and the menu's "Close": branch + files stay on disk, the groups
+/// leave the session and the DB registry. Restores focus to the pre-close
+/// active group when it survives. (The former inline `CloseGroups` body from
+/// `run.rs`, shared by the direct outcome and the chooser's Pick handler.)
+pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
+    let (mut targets, skipped_home) = crate::run::deletable_group_targets(cx.session, targets);
+    if targets.is_empty() {
+        cx.model.status = if skipped_home > 0 {
+            "The home worktree can't be closed".into()
+        } else {
+            "No worktree selected".into()
+        };
+        return;
+    }
+
+    // Capture the *name* of the active group before deletion, because its
+    // index will shift as groups below it are removed.
+    let active_group_name = cx.session.active_group().map(|g| g.name.clone());
+
+    // Close from the highest index down so earlier indices stay valid.
+    let db = thegn_core::db::Db::open().ok();
+    targets.sort_unstable_by(|a, b| b.cmp(a));
+    for gi in targets {
+        if gi < cx.session.worktrees.len() {
+            if let Some(db) = &db {
+                crate::run::forget_worktree_group(db, &cx.session.id, &cx.session.worktrees[gi]);
+            }
+            for tab in &cx.session.worktrees[gi].tabs {
+                for id in tab.center.pane_ids() {
+                    cx.panes.table.remove(&id);
+                }
+            }
+            cx.session.switch_to(gi);
+            cx.session.close_active_group();
+        }
+    }
+
+    // Restore focus to the group that was active before the bulk close (if it
+    // survived). If it was closed, `close_active_group()` already clamped.
+    if let Some(target_name) = active_group_name
+        && let Some(new_idx) = cx
+            .session
+            .worktrees
+            .iter()
+            .position(|g| g.name == target_name)
+    {
+        cx.session.switch_to(new_idx);
+    }
+
+    if skipped_home > 0 {
+        cx.model.status = "The home worktree can't be closed".into();
+    }
+    crate::run::persist_session_layout(cx.session, cx.panes);
+    cx.sb.marked.clear();
+    crate::run::refresh_tab_model(cx.model, cx.session, cx.sb);
+    cx.sb.focus_active_row(cx.model);
+    *cx.need_relayout = true;
+    crate::run::sync_drawer_persistence(
+        cx.session,
+        cx.panes,
+        cx.drawer,
+        cx.drawer_pool,
+        cx.drawer_home,
+        cx.cfg,
+        cx.center,
+    );
+}
+
+/// Names for the menu body + the dirty subset, from the cached sidebar status
+/// (keyed by worktree path). A missing entry (not yet hydrated) is best-effort
+/// treated as clean.
+fn target_names(cx: &mut DeleteCtx<'_>, targets: &[usize]) -> (Vec<String>, Vec<String>) {
+    let mut names = Vec::with_capacity(targets.len());
+    let mut dirty_names = Vec::new();
+    for &gi in targets {
+        if let Some(g) = cx.session.worktrees.get(gi) {
+            names.push(g.name.clone());
+            let is_dirty = cx
+                .model
+                .sidebar_status
+                .git
+                .get(&g.path)
+                .map(|gl| gl.dirty)
+                .unwrap_or(false);
+            if is_dirty {
+                dirty_names.push(g.name.clone());
+            }
+        }
+    }
+    (names, dirty_names)
+}
+
 /// Resolve a delete request into either a confirm menu (stashing the pending
 /// targets for the menu's Pick handler) or an immediate disk-removal + UI
 /// refresh. A target is "dirty" when its cached `GitGlyphs.dirty` is set; ANY
@@ -44,26 +162,7 @@ pub(crate) fn request_group_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<usize
         return;
     }
 
-    // Names for the menu body + the dirty subset, from the cached sidebar
-    // status (keyed by worktree path). A missing entry (not yet hydrated) is
-    // best-effort treated as clean.
-    let mut names = Vec::with_capacity(targets.len());
-    let mut dirty_names = Vec::new();
-    for &gi in &targets {
-        if let Some(g) = cx.session.worktrees.get(gi) {
-            names.push(g.name.clone());
-            let is_dirty = cx
-                .model
-                .sidebar_status
-                .git
-                .get(&g.path)
-                .map(|gl| gl.dirty)
-                .unwrap_or(false);
-            if is_dirty {
-                dirty_names.push(g.name.clone());
-            }
-        }
-    }
+    let (names, dirty_names) = target_names(&mut cx, &targets);
     let any_dirty = !dirty_names.is_empty();
 
     // Dirty ALWAYS confirms (safety net); clean confirms only when configured.

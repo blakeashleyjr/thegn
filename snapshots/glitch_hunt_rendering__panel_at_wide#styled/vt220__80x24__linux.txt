@@ -1,10 +1,11 @@
-L0| þ thegn v0.1.0 work                                                       17.4/94G ·   7% ·  37% ·  95°C ·  ↓   19K ↑   93K ·  100% · Fri Jul 10 · 22:41
+L0| þ thegn v0.1.0  work                                                      18.2/94G ·   7% ·  36% ·  97°C ·  ↓ 1015K ↑  769K ·  100% · Sat Jul 11 · 02:22
 R0 0 1 fg=idx07 bg=idx00 attrs=
 R0 1 2 fg=idx06 bg=idx00 attrs=
 R0 3 6 fg=idx07 bg=idx00 attrs=
 R0 9 6 fg=idx08 bg=idx00 attrs=
-R0 15 6 fg=idx06 bg=idx08 attrs=BOLD
-R0 21 63 fg=idx07 bg=idx00 attrs=
+R0 15 1 fg=idx07 bg=idx00 attrs=
+R0 16 6 fg=idx06 bg=idx08 attrs=BOLD
+R0 22 62 fg=idx07 bg=idx00 attrs=
 R0 84 11 fg=idx08 bg=idx00 attrs=
 R0 95 5 fg=idx07 bg=idx00 attrs=
 R0 100 12 fg=idx08 bg=idx00 attrs=
@@ -28,23 +29,24 @@ R2 45 2 fg=default bg=default attrs=
 R2 47 3 fg=idx06 bg=idx08 attrs=
 L3|
 R3 0 32 fg=default bg=idx00 attrs=
-L4| ▾ 📁 home                                                                                   ▄▀▀▀▀▄
+L4| ▾ ⌂ home                                                                                    ▄▀▀▀▀▄
 R4 0 1 fg=idx07 bg=idx00 attrs=
 R4 1 1 fg=idx08 bg=idx00 attrs=
-R4 2 4 fg=idx07 bg=idx00 attrs=
-R4 6 4 fg=idx07 bg=idx00 attrs=BOLD
-R4 10 22 fg=idx07 bg=idx00 attrs=
+R4 2 3 fg=idx07 bg=idx00 attrs=
+R4 5 4 fg=idx07 bg=idx00 attrs=BOLD
+R4 9 23 fg=idx07 bg=idx00 attrs=
 R4 32 50 fg=default bg=default attrs=
 R4 82 11 fg=idx00 bg=idx00 attrs=
 R4 93 1 fg=idx08 bg=idx00 attrs=
 R4 94 4 fg=idx0b bg=idx0b attrs=
 R4 98 1 fg=idx08 bg=idx00 attrs=
 R4 99 11 fg=idx00 bg=idx00 attrs=
-L5|▐   └ ● home                                                                           ▄▄▀▀▀▀▀▀▀▀▀▀▀▀▀▀▄▄
+L5|▐   └ ○ home                                                                           ▄▄▀▀▀▀▀▀▀▀▀▀▀▀▀▀▄▄
 R5 0 1 fg=idx08 bg=idx00 attrs=
 R5 1 3 fg=idx07 bg=idx00 attrs=
 R5 4 2 fg=idx08 bg=idx00 attrs=
-R5 6 2 fg=idx07 bg=idx00 attrs=
+R5 6 1 fg=idx09 bg=idx00 attrs=
+R5 7 1 fg=idx07 bg=idx00 attrs=
 R5 8 4 fg=idx06 bg=idx00 attrs=
 R5 12 20 fg=idx07 bg=idx00 attrs=
 R5 32 50 fg=default bg=default attrs=
@@ -71,12 +73,12 @@ R7 32 50 fg=default bg=default attrs=
 R7 82 3 fg=idx00 bg=idx00 attrs=
 R7 85 22 fg=idx08 bg=idx08 attrs=
 R7 107 3 fg=idx00 bg=idx00 attrs=
-L8| ▾ 💻 local                                                                          ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+L8| ▾ ≡ local                                                                           ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 R8 0 1 fg=idx07 bg=idx00 attrs=
 R8 1 1 fg=idx08 bg=idx00 attrs=
-R8 2 4 fg=idx07 bg=idx00 attrs=
-R8 6 5 fg=idx07 bg=idx00 attrs=BOLD
-R8 11 21 fg=idx07 bg=idx00 attrs=
+R8 2 3 fg=idx07 bg=idx00 attrs=
+R8 5 5 fg=idx07 bg=idx00 attrs=BOLD
+R8 10 22 fg=idx07 bg=idx00 attrs=
 R8 32 50 fg=default bg=default attrs=
 R8 82 3 fg=idx00 bg=idx00 attrs=
 R8 85 3 fg=idx08 bg=idx08 attrs=
@@ -87,7 +89,7 @@ R8 97 1 fg=idx08 bg=idx08 attrs=
 R8 98 6 fg=idx08 bg=idx00 attrs=
 R8 104 3 fg=idx08 bg=idx08 attrs=
 R8 107 3 fg=idx00 bg=idx00 attrs=
-L9|   └ 💻 local                                                                        ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+L9|   └ ≡ local                                                                         ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 R9 0 3 fg=idx07 bg=idx00 attrs=
 R9 3 2 fg=idx08 bg=idx00 attrs=
 R9 5 27 fg=idx07 bg=idx00 attrs=
@@ -206,7 +208,7 @@ L37|
 R37 0 32 fg=default bg=idx00 attrs=
 L38|
 R38 0 32 fg=default bg=idx00 attrs=
-L39|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓   Alt N split→   Alt s focus-sidebar            0 LOC   7% free
+L39|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓   Alt N split→   Alt s focus-sidebar     0 LOC  ✋ 1    7% free
 R39 0 1 fg=idx07 bg=idx00 attrs=
 R39 1 8 fg=idx00 bg=idx06 attrs=BOLD
 R39 9 2 fg=idx07 bg=idx00 attrs=
@@ -223,6 +225,8 @@ R39 93 3 fg=idx07 bg=idx00 attrs=
 R39 96 12 fg=idx08 bg=idx00 attrs=
 R39 108 3 fg=idx07 bg=idx00 attrs=
 R39 111 19 fg=idx08 bg=idx00 attrs=
-R39 130 18 fg=idx07 bg=idx00 attrs=
+R39 130 11 fg=idx07 bg=idx00 attrs=
+R39 141 6 fg=idx00 bg=idx03 attrs=BOLD
+R39 147 1 fg=idx07 bg=idx00 attrs=
 R39 148 11 fg=idx00 bg=idx09 attrs=BOLD
 R39 159 1 fg=idx07 bg=idx00 attrs=

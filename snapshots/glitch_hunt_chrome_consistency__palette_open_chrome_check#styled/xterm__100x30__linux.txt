@@ -1,11 +1,12 @@
-L0| þ thegn v0.1.0 work         70% ·  17.6/94G ·   7% ·  37% ·  ↓  111K ↑  148K ·  100% · 22:41
+L0| þ thegn v0.1.0  work        95% ·  18.9/94G ·   7% ·  35% ·  ↓  1.2M ↑  750K ·  100% · 02:22
 R0 0 1 fg=#5a5d65 bg=#0f131e attrs=
 R0 1 2 fg=#2d5959 bg=#0f131e attrs=
 R0 3 6 fg=#5a5d65 bg=#0f131e attrs=
 R0 9 6 fg=#2e3340 bg=#0f131e attrs=
-R0 15 6 fg=#2d5959 bg=#1a2d34 attrs=
-R0 21 7 fg=#5a5d65 bg=#0f131e attrs=
-R0 28 5 fg=#4c505a bg=#0f131e attrs=
+R0 15 1 fg=#5a5d65 bg=#0f131e attrs=
+R0 16 6 fg=#2d5959 bg=#1a2d34 attrs=
+R0 22 6 fg=#5a5d65 bg=#0f131e attrs=
+R0 28 5 fg=#5d3240 bg=#0f131e attrs=
 R0 33 3 fg=#2e3340 bg=#0f131e attrs=
 R0 36 10 fg=#4c505a bg=#0f131e attrs=
 R0 46 3 fg=#2e3340 bg=#0f131e attrs=

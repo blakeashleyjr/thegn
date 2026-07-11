@@ -1,12 +1,10 @@
-L0| þ thegn work    16.3/94G ·   7% ·  20% ·  ↓  261K ↑   75K ·  100% · 22:41
+L0| þ thegn  work           21.7/94G ·  37% ·  ↓    0B ↑    0B ·  100% · 02:20
 R0 0 1 fg=#5a5d65 bg=#0f131e attrs=
 R0 1 2 fg=#2d5959 bg=#0f131e attrs=
-R0 3 5 fg=#5a5d65 bg=#0f131e attrs=
-R0 8 6 fg=#2d5959 bg=#1a2d34 attrs=
-R0 14 2 fg=#5a5d65 bg=#0f131e attrs=
-R0 16 10 fg=#4c505a bg=#0f131e attrs=
-R0 26 3 fg=#2e3340 bg=#0f131e attrs=
-R0 29 5 fg=#5d3240 bg=#0f131e attrs=
+R0 3 6 fg=#5a5d65 bg=#0f131e attrs=
+R0 9 6 fg=#2d5959 bg=#1a2d34 attrs=
+R0 15 9 fg=#5a5d65 bg=#0f131e attrs=
+R0 24 10 fg=#4c505a bg=#0f131e attrs=
 R0 34 3 fg=#2e3340 bg=#0f131e attrs=
 R0 37 5 fg=#4c505a bg=#0f131e attrs=
 R0 42 3 fg=#2e3340 bg=#0f131e attrs=
@@ -31,7 +29,7 @@ R2 50 30 fg=#677084 bg=#0b0e16 attrs=
 L3|
 R3 0 32 fg=#677084 bg=#0f131e attrs=
 R3 32 48 fg=#677084 bg=#0b0e16 attrs=
-L4| ▾    home
+L4| ▾ ⌂ home
 R4 0 1 fg=#5a5d65 bg=#0b0e16 attrs=
 R4 1 1 fg=#313643 bg=#0b0e16 attrs=
 R4 2 30 fg=#5a5d65 bg=#0b0e16 attrs=
@@ -50,7 +48,7 @@ R6 32 48 fg=#677084 bg=#0b0e16 attrs=
 L7| TERMINALS
 R7 0 32 fg=#5a5d65 bg=#0f131e attrs=
 R7 32 48 fg=#677084 bg=#0b0e16 attrs=
-L8|   No terminals — Alt T to add            ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
+L8|   No terminals — Enter to add            ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
 R8 0 3 fg=#5a5d65 bg=#0f131e attrs=
 R8 3 27 fg=#313643 bg=#0f131e attrs=
 R8 30 2 fg=#5a5d65 bg=#0f131e attrs=
@@ -145,18 +143,14 @@ R21 32 48 fg=#677084 bg=#0b0e16 attrs=
 L22|
 R22 0 32 fg=#677084 bg=#0f131e attrs=
 R22 32 48 fg=#677084 bg=#0b0e16 attrs=
-L23|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav         7% free
+L23|  NORMAL   Ctrl Space menu              7% free   ❚❚ Justin Hurwitz — Houston
 R23 0 1 fg=#5a5d65 bg=#0f131e attrs=
 R23 1 8 fg=#0b0e16 bg=#376f6d attrs=
 R23 9 2 fg=#5a5d65 bg=#0f131e attrs=
 R23 11 10 fg=#313643 bg=#0f131e attrs=
 R23 21 5 fg=#2e3340 bg=#0f131e attrs=
-R23 26 3 fg=#5a5d65 bg=#0f131e attrs=
-R23 29 6 fg=#313643 bg=#0f131e attrs=
-R23 35 5 fg=#2e3340 bg=#0f131e attrs=
-R23 40 3 fg=#5a5d65 bg=#0f131e attrs=
-R23 43 14 fg=#313643 bg=#0f131e attrs=
-R23 57 4 fg=#2e3340 bg=#0f131e attrs=
-R23 61 7 fg=#5a5d65 bg=#0f131e attrs=
-R23 68 11 fg=#0b0e16 bg=#71393e attrs=
+R23 26 12 fg=#5a5d65 bg=#0f131e attrs=
+R23 38 11 fg=#0b0e16 bg=#71393e attrs=
+R23 49 1 fg=#5a5d65 bg=#0f131e attrs=
+R23 50 29 fg=#0b0e16 bg=#3f5876 attrs=
 R23 79 1 fg=#5a5d65 bg=#0f131e attrs=

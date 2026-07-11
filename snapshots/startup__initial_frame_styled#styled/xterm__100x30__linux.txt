@@ -1,10 +1,11 @@
-L0| þ thegn v0.1.0 work        16.3/94G ·   7% ·  21% ·  92°C ·  ↓  178K ↑  164K ·  100% · 22:41
+L0| þ thegn v0.1.0  work       21.7/94G ·   7% ·  37% ·  96°C ·  ↓    0B ↑    0B ·  100% · 02:20
 R0 0 1 fg=#5a5d65 bg=#0f131e attrs=
 R0 1 2 fg=#2d5959 bg=#0f131e attrs=
 R0 3 6 fg=#5a5d65 bg=#0f131e attrs=
 R0 9 6 fg=#2e3340 bg=#0f131e attrs=
-R0 15 6 fg=#2d5959 bg=#1a2d34 attrs=
-R0 21 6 fg=#5a5d65 bg=#0f131e attrs=
+R0 15 1 fg=#5a5d65 bg=#0f131e attrs=
+R0 16 6 fg=#2d5959 bg=#1a2d34 attrs=
+R0 22 5 fg=#5a5d65 bg=#0f131e attrs=
 R0 27 10 fg=#4c505a bg=#0f131e attrs=
 R0 37 3 fg=#2e3340 bg=#0f131e attrs=
 R0 40 5 fg=#5d3240 bg=#0f131e attrs=
@@ -41,7 +42,7 @@ L3|                                                         home/home
 R3 0 32 fg=#677084 bg=#0f131e attrs=
 R3 32 24 fg=#677084 bg=#0b0e16 attrs=
 R3 56 44 fg=#5a5d65 bg=#0f131e attrs=
-L4| ▾    home                                              ────────────────────────────────────────────
+L4| ▾ ⌂ home                                               ────────────────────────────────────────────
 R4 0 1 fg=#5a5d65 bg=#0b0e16 attrs=
 R4 1 1 fg=#313643 bg=#0b0e16 attrs=
 R4 2 30 fg=#5a5d65 bg=#0b0e16 attrs=
@@ -72,7 +73,7 @@ R7 32 24 fg=#677084 bg=#0b0e16 attrs=
 R7 56 2 fg=#5a5d65 bg=#0f131e attrs=
 R7 58 18 fg=#2e3340 bg=#0f131e attrs=
 R7 76 24 fg=#5a5d65 bg=#0f131e attrs=
-L8|   No terminals — Alt T to add
+L8|   No terminals — Enter to add
 R8 0 3 fg=#5a5d65 bg=#0f131e attrs=
 R8 3 27 fg=#313643 bg=#0f131e attrs=
 R8 30 2 fg=#5a5d65 bg=#0f131e attrs=
@@ -213,7 +214,7 @@ L28|
 R28 0 32 fg=#677084 bg=#0f131e attrs=
 R28 32 24 fg=#677084 bg=#0b0e16 attrs=
 R28 56 44 fg=#677084 bg=#0f131e attrs=
-L29|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→            7% free
+L29|  NORMAL   Ctrl Space menu   Ctrl g lock                    7% free   ❚❚ Justin Hurwitz — Houston
 R29 0 1 fg=#5a5d65 bg=#0f131e attrs=
 R29 1 8 fg=#0b0e16 bg=#376f6d attrs=
 R29 9 2 fg=#5a5d65 bg=#0f131e attrs=
@@ -222,12 +223,8 @@ R29 21 5 fg=#2e3340 bg=#0f131e attrs=
 R29 26 3 fg=#5a5d65 bg=#0f131e attrs=
 R29 29 6 fg=#313643 bg=#0f131e attrs=
 R29 35 5 fg=#2e3340 bg=#0f131e attrs=
-R29 40 3 fg=#5a5d65 bg=#0f131e attrs=
-R29 43 14 fg=#313643 bg=#0f131e attrs=
-R29 57 4 fg=#2e3340 bg=#0f131e attrs=
-R29 61 3 fg=#5a5d65 bg=#0f131e attrs=
-R29 64 9 fg=#313643 bg=#0f131e attrs=
-R29 73 5 fg=#2e3340 bg=#0f131e attrs=
-R29 78 10 fg=#5a5d65 bg=#0f131e attrs=
-R29 88 11 fg=#0b0e16 bg=#71393e attrs=
+R29 40 18 fg=#5a5d65 bg=#0f131e attrs=
+R29 58 11 fg=#0b0e16 bg=#71393e attrs=
+R29 69 1 fg=#5a5d65 bg=#0f131e attrs=
+R29 70 29 fg=#0b0e16 bg=#3f5876 attrs=
 R29 99 1 fg=#5a5d65 bg=#0f131e attrs=

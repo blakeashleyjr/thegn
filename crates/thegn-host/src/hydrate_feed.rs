@@ -30,7 +30,17 @@ pub(crate) fn last_logged_error_count(notifs: &[Notification]) -> Option<usize> 
 /// When the live log has *no* errors (rotated/truncated away), mark any lingering
 /// unread `log:thegn` row read so the badge clears — otherwise a stale row stays
 /// clickable and drills into an error-free log ("no matching log lines").
-pub(crate) fn maybe_emit_log_error(db: &Db, notifs: &[Notification], error_count: usize) {
+///
+/// `surface` is the `[notifications] surface_self_log_errors` dev flag: when
+/// false (the default) thegn's own log errors are never surfaced as user
+/// notifications — but the stale-clear path still runs, so flipping the flag off
+/// clears any dev-mode rows left behind.
+pub(crate) fn maybe_emit_log_error(
+    db: &Db,
+    notifs: &[Notification],
+    error_count: usize,
+    surface: bool,
+) {
     if error_count == 0 {
         for id in stale_log_notifs_to_clear(notifs, error_count) {
             // best-effort: DB is a cache; a failed mark just re-attempts next refresh.
@@ -38,7 +48,7 @@ pub(crate) fn maybe_emit_log_error(db: &Db, notifs: &[Notification], error_count
         }
         return;
     }
-    if Some(error_count) > last_logged_error_count(notifs) {
+    if surface && Some(error_count) > last_logged_error_count(notifs) {
         let msg = format!(
             "{} error{} in thegn.log",
             error_count,
@@ -154,34 +164,43 @@ mod tests {
     }
 
     // The emit decision (the actual bug): mirrors `maybe_emit_log_error`'s gate
-    // without a DB, so the reset regression is locked without a real Db.
-    fn would_emit(notifs: &[Notification], error_count: usize) -> bool {
-        error_count > 0 && Some(error_count) > last_logged_error_count(notifs)
+    // without a DB, so the reset regression is locked without a real Db. The
+    // `surface` flag is the `surface_self_log_errors` dev gate.
+    fn would_emit(notifs: &[Notification], error_count: usize, surface: bool) -> bool {
+        surface && error_count > 0 && Some(error_count) > last_logged_error_count(notifs)
     }
 
     #[test]
     fn emits_first_error_when_no_prior_notification() {
-        assert!(would_emit(&[], 3));
+        assert!(would_emit(&[], 3, true));
     }
 
     #[test]
     fn does_not_re_emit_when_count_unchanged() {
         // The regression: same errors, no change → stay read, emit nothing.
         let notifs = vec![log_notif(100, "3 errors in thegn.log")];
-        assert!(!would_emit(&notifs, 3));
+        assert!(!would_emit(&notifs, 3, true));
     }
 
     #[test]
     fn emits_when_count_grows() {
         let notifs = vec![log_notif(100, "3 errors in thegn.log")];
-        assert!(would_emit(&notifs, 4));
+        assert!(would_emit(&notifs, 4, true));
     }
 
     #[test]
     fn never_emits_with_zero_errors() {
-        assert!(!would_emit(&[], 0));
+        assert!(!would_emit(&[], 0, true));
         let notifs = vec![log_notif(100, "3 errors in thegn.log")];
-        assert!(!would_emit(&notifs, 0));
+        assert!(!would_emit(&notifs, 0, true));
+    }
+
+    #[test]
+    fn never_emits_when_self_log_errors_off() {
+        // The default: thegn's own log errors are diagnostics, never surfaced.
+        assert!(!would_emit(&[], 3, false));
+        let notifs = vec![log_notif(100, "3 errors in thegn.log")];
+        assert!(!would_emit(&notifs, 9, false));
     }
 
     #[test]

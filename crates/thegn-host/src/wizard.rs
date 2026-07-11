@@ -730,6 +730,22 @@ pub enum StepState {
     Failed(String),
 }
 
+impl StepState {
+    /// Lower creation state onto the shared visual [`chrome::StepState`] — the
+    /// one place the creation domain maps into the standard loading vocabulary.
+    /// `Skipped` reads as `Done` (it completed, just for free); the `Failed`
+    /// error string is surfaced separately as the row's detail sub-line.
+    fn to_visual(&self) -> crate::chrome::StepState {
+        use crate::chrome::StepState as V;
+        match self {
+            StepState::Pending => V::Pending,
+            StepState::Running => V::Active,
+            StepState::Done | StepState::Skipped => V::Done,
+            StepState::Failed(_) => V::Failed,
+        }
+    }
+}
+
 /// Events from the worker (and the spinner ticker) to the loop. Tagged with
 /// the creation generation so a cancelled run's stragglers die on arrival.
 #[derive(Debug)]
@@ -815,21 +831,15 @@ impl CreationProgress {
     /// sprite-style "setting up…" screen the materialize path uses. A skipped
     /// step reads as done (it completed, just for free).
     pub fn to_load_steps(&self) -> Vec<LoadStep> {
-        self.rows
-            .iter()
-            .map(|(step, state, detail)| {
-                let ls = match state {
-                    StepState::Pending => LoadStep::pending(step.label()),
-                    StepState::Running => LoadStep::active(step.label()),
-                    StepState::Done | StepState::Skipped => LoadStep::done(step.label()),
-                    StepState::Failed(_) => LoadStep::failed(step.label()),
-                };
-                match detail {
-                    Some(d) => ls.with_detail(d.clone()),
-                    None => ls,
-                }
-            })
-            .collect()
+        let mut plan = crate::loading::plan::LoadPlan::new();
+        for (step, state, detail) in &self.rows {
+            let vs = state.to_visual();
+            plan = match detail {
+                Some(d) => plan.step_detail(step.label(), vs, d.clone()),
+                None => plan.step(step.label(), vs),
+            };
+        }
+        plan.into_steps()
     }
 
     pub fn apply(&mut self, step: CreateStep, state: StepState, detail: Option<String>) {
@@ -1294,6 +1304,9 @@ mod tests {
             &["init", "-q", "-b", "main"][..],
             &["config", "user.email", "t@t.t"],
             &["config", "user.name", "t"],
+            // Hermetic against the developer's global signing setup (a
+            // global `commit.gpgsign = true` would require a live gpg agent).
+            &["config", "commit.gpgsign", "false"],
             &["commit", "--allow-empty", "-q", "-m", "init"],
         ] {
             assert!(util::git_cmd(&dir).args(args).status().unwrap().success());

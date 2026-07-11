@@ -1,10 +1,11 @@
-L0| þ thegn v0.1.0 work         83% ·  17.7/94G ·   7% ·  38% ·  ↓  124K ↑  137K ·  100% · 22:41
+L0| þ thegn v0.1.0  work        90% ·  18.4/94G ·   7% ·  36% ·  ↓  1.2M ↑  718K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
 R0 9 6 fg=#6f788e bg=#151a28 attrs=
-R0 15 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 21 7 fg=#edf0f8 bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 6 fg=#edf0f8 bg=#151a28 attrs=
 R0 28 5 fg=#f0c674 bg=#151a28 attrs=
 R0 33 3 fg=#6f788e bg=#151a28 attrs=
 R0 36 10 fg=#c6ccdb bg=#151a28 attrs=
@@ -85,12 +86,12 @@ R9 99 1 fg=#edf0f8 bg=#151a28 attrs=
 L10|
 R10 0 56 fg=default bg=#0b0e16 attrs=
 R10 56 44 fg=#edf0f8 bg=#151a28 attrs=
-L11|                      ↻ sandbox                          3 branches                               —
-R11 0 22 fg=default bg=#0b0e16 attrs=
-R11 22 1 fg=#6ee7d8 bg=#0b0e16 attrs=
-R11 23 1 fg=default bg=#0b0e16 attrs=
-R11 24 7 fg=#edf0f8 bg=#0b0e16 attrs=
-R11 31 25 fg=default bg=#0b0e16 attrs=
+L11|                 ✓ sandbox                               3 branches                               —
+R11 0 17 fg=default bg=#0b0e16 attrs=
+R11 17 1 fg=#c6ccdb bg=#0b0e16 attrs=
+R11 18 1 fg=default bg=#0b0e16 attrs=
+R11 19 7 fg=#c6ccdb bg=#0b0e16 attrs=
+R11 26 30 fg=default bg=#0b0e16 attrs=
 R11 56 1 fg=#edf0f8 bg=#151a28 attrs=
 R11 57 1 fg=#677084 bg=#151a28 attrs=BOLD
 R11 58 1 fg=#edf0f8 bg=#151a28 attrs=
@@ -98,19 +99,19 @@ R11 59 8 fg=#c6ccdb bg=#151a28 attrs=
 R11 67 31 fg=#edf0f8 bg=#151a28 attrs=
 R11 98 1 fg=#677084 bg=#151a28 attrs=
 R11 99 1 fg=#edf0f8 bg=#151a28 attrs=
-L12|                      ◇ container
-R12 0 22 fg=default bg=#0b0e16 attrs=
-R12 22 1 fg=#6f788e bg=#0b0e16 attrs=
-R12 23 1 fg=default bg=#0b0e16 attrs=
-R12 24 9 fg=#6f788e bg=#0b0e16 attrs=
-R12 33 23 fg=default bg=#0b0e16 attrs=
+L12|                 ✓ container  (bwrap)
+R12 0 17 fg=default bg=#0b0e16 attrs=
+R12 17 1 fg=#c6ccdb bg=#0b0e16 attrs=
+R12 18 1 fg=default bg=#0b0e16 attrs=
+R12 19 18 fg=#c6ccdb bg=#0b0e16 attrs=
+R12 37 19 fg=default bg=#0b0e16 attrs=
 R12 56 44 fg=#edf0f8 bg=#151a28 attrs=
-L13|                      ◇ shell                            4 stash                                  —
-R13 0 22 fg=default bg=#0b0e16 attrs=
-R13 22 1 fg=#6f788e bg=#0b0e16 attrs=
-R13 23 1 fg=default bg=#0b0e16 attrs=
-R13 24 5 fg=#6f788e bg=#0b0e16 attrs=
-R13 29 27 fg=default bg=#0b0e16 attrs=
+L13|                 ↻ shell                                 4 stash                                  —
+R13 0 17 fg=default bg=#0b0e16 attrs=
+R13 17 1 fg=#6ee7d8 bg=#0b0e16 attrs=
+R13 18 1 fg=default bg=#0b0e16 attrs=
+R13 19 5 fg=#edf0f8 bg=#0b0e16 attrs=
+R13 24 32 fg=default bg=#0b0e16 attrs=
 R13 56 1 fg=#edf0f8 bg=#151a28 attrs=
 R13 57 1 fg=#677084 bg=#151a28 attrs=BOLD
 R13 58 1 fg=#edf0f8 bg=#151a28 attrs=
@@ -169,22 +170,8 @@ R27 56 44 fg=default bg=#151a28 attrs=
 L28|
 R28 0 56 fg=default bg=#0b0e16 attrs=
 R28 56 44 fg=default bg=#151a28 attrs=
-L29|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav              0 LOC  ✋ 1    7% free
-R29 0 1 fg=#edf0f8 bg=#151a28 attrs=
-R29 1 8 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
-R29 9 2 fg=#edf0f8 bg=#151a28 attrs=
-R29 11 10 fg=#7a8197 bg=#151a28 attrs=
-R29 21 5 fg=#6f788e bg=#151a28 attrs=
-R29 26 3 fg=#edf0f8 bg=#151a28 attrs=
-R29 29 6 fg=#7a8197 bg=#151a28 attrs=
-R29 35 5 fg=#6f788e bg=#151a28 attrs=
-R29 40 3 fg=#edf0f8 bg=#151a28 attrs=
-R29 43 14 fg=#7a8197 bg=#151a28 attrs=
-R29 57 4 fg=#6f788e bg=#151a28 attrs=
-R29 61 14 fg=#edf0f8 bg=#151a28 attrs=
-R29 75 5 fg=#c6ccdb bg=#151a28 attrs=
-R29 80 1 fg=#edf0f8 bg=#151a28 attrs=
-R29 81 6 fg=#0b0e16 bg=#e6c264 attrs=BOLD
-R29 87 1 fg=#edf0f8 bg=#151a28 attrs=
-R29 88 11 fg=#0b0e16 bg=#ef6f6f attrs=BOLD
-R29 99 1 fg=#edf0f8 bg=#151a28 attrs=
+L29|0 LOC │ ⚠ Sandbox fallback: sandbox podman-rootless failed: could not start podman container 'thegn…
+R29 0 5 fg=#c6ccdb bg=#151a28 attrs=
+R29 5 3 fg=#60687b bg=#151a28 attrs=
+R29 8 91 fg=#c6ccdb bg=#151a28 attrs=
+R29 99 1 fg=#6f788e bg=#151a28 attrs=

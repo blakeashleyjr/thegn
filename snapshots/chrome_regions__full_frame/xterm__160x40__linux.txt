@@ -1,12 +1,12 @@
- þ thegn v0.1.0 work                                                       16.3/94G ·   7% ·  25% ·  93°C ·  ↓   15K ↑    0B ·  100% · Fri Jul 10 · 22:41
+ þ thegn v0.1.0  work                                                      21.5/94G ·   7% ·  36% ·  97°C ·  ↓   40K ↑   33K ·  100% · Sat Jul 11 · 02:20
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  WORKSPACES                       HOME ▸ home   1                                                                    git  work  system
                                                                                                                      home/home
- ▾    home                                                                                                          ────────────────────────────────────────────
+ ▾ ⌂ home                                                                                                           ────────────────────────────────────────────
 ▐   └   home                                                                                                         1 changes                            clean
 
  TERMINALS                                                                                                            working tree clean
-   No terminals — Alt T to add
+   No terminals — Enter to add
                                                                                                                      2 commits                                —
 
                                                                        ▄▀▀▀▀▄                                        3 branches                               —
@@ -37,4 +37,4 @@
 
 
 
-  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓   Alt N split→   Alt s focus-sidebar                    7% free
+  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓   Alt N split→            7% free   ❚❚ Justin Hurwitz — Houston

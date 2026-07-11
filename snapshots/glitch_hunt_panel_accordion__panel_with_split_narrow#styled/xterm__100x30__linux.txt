@@ -1,14 +1,12 @@
-L0| þ thegn work    88% ·  17.6/94G ·  37% ·  ↓   39K ↑   32K ·  100% · 22:41
+L0| þ thegn  work           90% ·  18.4/94G ·  ↓  1.2M ↑  717K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
-R0 3 5 fg=#edf0f8 bg=#151a28 attrs=
-R0 8 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 14 2 fg=#edf0f8 bg=#151a28 attrs=
-R0 16 5 fg=#f0c674 bg=#151a28 attrs=
-R0 21 3 fg=#6f788e bg=#151a28 attrs=
-R0 24 10 fg=#c6ccdb bg=#151a28 attrs=
-R0 34 3 fg=#6f788e bg=#151a28 attrs=
-R0 37 5 fg=#c6ccdb bg=#151a28 attrs=
+R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 9 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 15 9 fg=#edf0f8 bg=#151a28 attrs=
+R0 24 5 fg=#f0c674 bg=#151a28 attrs=
+R0 29 3 fg=#6f788e bg=#151a28 attrs=
+R0 32 10 fg=#c6ccdb bg=#151a28 attrs=
 R0 42 3 fg=#6f788e bg=#151a28 attrs=
 R0 45 17 fg=#c6ccdb bg=#151a28 attrs=
 R0 62 3 fg=#6f788e bg=#151a28 attrs=
@@ -31,12 +29,12 @@ L3|                                          ▀▀█▀▀ █   █ █▀▀
 R3 0 32 fg=default bg=#151a28 attrs=
 R3 32 10 fg=default bg=default attrs=
 R3 42 29 fg=#6ee7d8 bg=#0b0e16 attrs=
-L4| ▾ 📁 home                                  █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
+L4| ▾ ⌂ home                                   █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
 R4 0 1 fg=#edf0f8 bg=#0b0e16 attrs=
 R4 1 1 fg=#7a8197 bg=#0b0e16 attrs=
-R4 2 4 fg=#edf0f8 bg=#0b0e16 attrs=
-R4 6 4 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
-R4 10 22 fg=#edf0f8 bg=#0b0e16 attrs=
+R4 2 3 fg=#edf0f8 bg=#0b0e16 attrs=
+R4 5 4 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
+R4 9 23 fg=#edf0f8 bg=#0b0e16 attrs=
 R4 32 10 fg=default bg=default attrs=
 R4 42 29 fg=#6ee7d8 bg=#0b0e16 attrs=
 L5|▐   └ ○ home                                █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
@@ -58,18 +56,18 @@ R7 10 22 fg=#edf0f8 bg=#151a28 attrs=
 R7 32 12 fg=default bg=default attrs=
 R7 44 6 fg=#c6ccdb bg=#0b0e16 attrs=
 R7 50 19 fg=#7a8197 bg=#0b0e16 attrs=
-L8| ▾ 💻 local
+L8| ▾ ≡ local
 R8 0 1 fg=#edf0f8 bg=#0b0e16 attrs=
 R8 1 1 fg=#7a8197 bg=#0b0e16 attrs=
 R8 2 1 fg=#edf0f8 bg=#0b0e16 attrs=
-R8 3 3 fg=#c6ccdb bg=#0b0e16 attrs=
-R8 6 5 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
-R8 11 21 fg=#edf0f8 bg=#0b0e16 attrs=
-L9|   └ 💻 local                                      ↻ sandbox
+R8 3 2 fg=#c6ccdb bg=#0b0e16 attrs=
+R8 5 5 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
+R8 10 22 fg=#edf0f8 bg=#0b0e16 attrs=
+L9|   └ ≡ local                                       ↻ sandbox
 R9 0 3 fg=#edf0f8 bg=#151a28 attrs=
 R9 3 2 fg=#677084 bg=#151a28 attrs=
-R9 5 8 fg=#c6ccdb bg=#151a28 attrs=
-R9 13 19 fg=#edf0f8 bg=#151a28 attrs=
+R9 5 7 fg=#c6ccdb bg=#151a28 attrs=
+R9 12 20 fg=#edf0f8 bg=#151a28 attrs=
 R9 32 19 fg=default bg=default attrs=
 R9 51 1 fg=#6ee7d8 bg=#0b0e16 attrs=
 R9 52 1 fg=default bg=default attrs=
@@ -90,25 +88,24 @@ L12|
 R12 0 32 fg=default bg=#151a28 attrs=
 L13|
 R13 0 32 fg=default bg=#151a28 attrs=
-L14|────────────────────────────────────────────────────────────────────────────────
-R14 0 80 fg=#6f788e bg=#151a28 attrs=
-L15|TOML parse error at line 48, column 11
-R15 0 80 fg=default bg=default attrs=
-L16|   |
-R16 0 80 fg=default bg=default attrs=
-L17|48 | updated = { fg = "{{ACCENT}}" }
-R17 0 80 fg=default bg=default attrs=
-L18|   |           ^^^^^^^^^^^^^^^^^^^^^
-R18 0 80 fg=default bg=default attrs=
-L19|data did not match any variant of untagged enum CustomField
-R19 0 80 fg=default bg=default attrs=
+L14|
+R14 0 32 fg=default bg=#151a28 attrs=
+L15|
+R15 0 32 fg=default bg=#151a28 attrs=
+L16|
+R16 0 32 fg=default bg=#151a28 attrs=
+L17|
+R17 0 32 fg=default bg=#151a28 attrs=
+L18|
+R18 0 32 fg=default bg=#151a28 attrs=
+L19|
+R19 0 32 fg=default bg=#151a28 attrs=
 L20|
-R20 0 80 fg=default bg=default attrs=
-L21|Press <Enter> to continue with preset settings...
-R21 0 49 fg=default bg=default attrs=BOLD
-R21 49 31 fg=default bg=default attrs=
+R20 0 32 fg=default bg=#151a28 attrs=
+L21|
+R21 0 32 fg=default bg=#151a28 attrs=
 L22|
-R22 0 80 fg=default bg=default attrs=
+R22 0 32 fg=default bg=#151a28 attrs=
 L23|  NORMAL   Ctrl Space menu   Ctrl g lock               0 LOC  ✋ 1    7% free
 R23 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R23 1 8 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD

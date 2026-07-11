@@ -1,10 +1,11 @@
-L0| þ thegn v0.1.0 work        17.6/94G ·   7% ·  37% ·  96°C ·  ↓  1.2M ↑  103K ·  100% · 22:41
+L0| þ thegn v0.1.0  work       18.2/94G ·   7% ·  35% ·  97°C ·  ↓  1.4M ↑  645K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
 R0 9 6 fg=#6f788e bg=#151a28 attrs=
-R0 15 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 21 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 5 fg=#edf0f8 bg=#151a28 attrs=
 R0 27 10 fg=#c6ccdb bg=#151a28 attrs=
 R0 37 3 fg=#6f788e bg=#151a28 attrs=
 R0 40 5 fg=#f7768e bg=#151a28 attrs=
@@ -169,7 +170,7 @@ R27 56 44 fg=default bg=#151a28 attrs=
 L28|
 R28 0 56 fg=default bg=#0b0e16 attrs=
 R28 56 44 fg=default bg=#151a28 attrs=
-L29|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→    0 LOC   7% free
+L29|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav              0 LOC  ✋ 1    7% free
 R29 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R29 1 8 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
 R29 9 2 fg=#edf0f8 bg=#151a28 attrs=
@@ -181,11 +182,10 @@ R29 35 5 fg=#6f788e bg=#151a28 attrs=
 R29 40 3 fg=#edf0f8 bg=#151a28 attrs=
 R29 43 14 fg=#7a8197 bg=#151a28 attrs=
 R29 57 4 fg=#6f788e bg=#151a28 attrs=
-R29 61 3 fg=#edf0f8 bg=#151a28 attrs=
-R29 64 9 fg=#7a8197 bg=#151a28 attrs=
-R29 73 5 fg=#6f788e bg=#151a28 attrs=
-R29 78 4 fg=#edf0f8 bg=#151a28 attrs=
-R29 82 5 fg=#c6ccdb bg=#151a28 attrs=
+R29 61 14 fg=#edf0f8 bg=#151a28 attrs=
+R29 75 5 fg=#c6ccdb bg=#151a28 attrs=
+R29 80 1 fg=#edf0f8 bg=#151a28 attrs=
+R29 81 6 fg=#0b0e16 bg=#e6c264 attrs=BOLD
 R29 87 1 fg=#edf0f8 bg=#151a28 attrs=
 R29 88 11 fg=#0b0e16 bg=#ef6f6f attrs=BOLD
 R29 99 1 fg=#edf0f8 bg=#151a28 attrs=
