@@ -97,15 +97,20 @@ fn notification_priority_defaults_and_overrides() {
         Priority::Notice
     );
 
-    // Alert set: failures + agent-attention + the queue's give-up; unread
-    // excludes Info.
+    // Alert set: real failures + agent-attention + the queue's give-up; unread
+    // excludes Info. `log_error` is NOT here — szhost's own diagnostics are Info
+    // (quiet), never a red alert.
     let alerts = cfg.alert_kind_names();
-    assert_eq!(alerts.len(), 6);
-    let want = "agent_failed agent_attention test_failed log_error \
+    assert_eq!(alerts.len(), 5);
+    let want = "agent_failed agent_attention test_failed \
                     process_failed queue_needs_human";
     for k in want.split_whitespace() {
         assert!(alerts.contains(&k), "missing {k}");
     }
+    assert!(
+        !alerts.contains(&"log_error"),
+        "log_error is quiet Info, never an alert"
+    );
     let counted = cfg.counted_unread_kind_names();
     assert!(!counted.contains(&"worktree_created"));
     assert!(!counted.contains(&"process_exited"));
@@ -248,6 +253,7 @@ fn notifications_overlay_apply_covers_every_field() {
         desktop: Some(false),
         desktop_min_urgency: Some("critical".into()),
         process_exit: Some("all".into()),
+        surface_self_log_errors: Some(true),
         priority: Some(priority),
         rules: Some(vec![NotificationRule {
             drop: true,
@@ -270,6 +276,7 @@ fn notifications_overlay_apply_covers_every_field() {
     assert!(!base.desktop);
     assert_eq!(base.desktop_min_urgency, "critical");
     assert_eq!(base.process_exit, "all");
+    assert!(base.surface_self_log_errors);
     assert_eq!(base.priority.get("agent_done").unwrap(), "alert");
     assert!(base.has_rules());
     assert!(base.dnd.enabled);
