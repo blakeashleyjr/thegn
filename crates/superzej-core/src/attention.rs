@@ -255,6 +255,25 @@ impl MqStatus {
             _ => return None,
         })
     }
+
+    /// The one hued-glyph vocabulary for merge-queue status, shared by every
+    /// surface that renders it (the sidebar detail chip, the panel's queue
+    /// section) — a single source so the surfaces can never diverge. Glyphs
+    /// come from the caller's capability-resolved
+    /// [`GlyphSet`](crate::termcaps::GlyphSet), so the
+    /// vocabulary degrades to ASCII with the rest of the chrome.
+    pub fn glyph(self, gl: &crate::termcaps::GlyphSet) -> (&'static str, crate::theme::Hue) {
+        use crate::theme::Hue;
+        match self {
+            Self::Landed => (gl.check, Hue::Green),
+            Self::Ready => (gl.diamond_filled, Hue::Green), // gated green, awaiting a land
+            Self::Deferred | Self::GateFailed => (gl.flag, Hue::Red),
+            Self::NeedsHuman => (gl.attention, Hue::Red), // agent tried and gave up
+            Self::Folding | Self::Verifying => (gl.dot_filled, Hue::Amber),
+            Self::AgentRunning => (gl.half_dot, Hue::Amber), // agent fixing the branch
+            Self::Queued => (gl.dot_hollow, Hue::Blue),
+        }
+    }
 }
 
 /// The worktree's merge-queue entry: status + when it last changed (real

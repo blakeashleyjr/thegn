@@ -100,21 +100,29 @@ pub enum DiskKind {
 /// not-yet-created worktrees dir still reports its parent fs. `None` on a
 /// non-unix target or `statvfs` error.
 #[cfg(unix)]
+// The statvfs widenings below are identity conversions on 64-bit Linux
+// (fsblkcnt_t/c_ulong are u64 there) but real u32→u64 widenings on macOS —
+// clippy only sees the native target, so it calls them useless.
+#[allow(clippy::useless_conversion)]
 pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64, u8)> {
     let mut p = path;
     while !p.exists() {
         p = p.parent()?;
     }
     let st = nix::sys::statvfs::statvfs(p).ok()?;
-    let blocks = st.blocks();
+    // Widen everything to u64 up front: `fsblkcnt_t` is u32 on macOS (u64 on
+    // Linux) while `f_frsize` is c_ulong, so the field types only agree on
+    // 64-bit Linux. `Into` is an identity there and lossless on macOS —
+    // unlike `as u64`, it can't clippy-warn as an unnecessary cast natively.
+    let blocks: u64 = st.blocks().into();
     if blocks == 0 {
         return None;
     }
     // f_bavail = blocks available to unprivileged users (the headroom you'd
     // actually get), which is what "free" should reflect. f_frsize is the
     // fundamental block size the block counts are expressed in.
-    let avail_blocks = st.blocks_available();
-    let frsize = st.fragment_size();
+    let avail_blocks: u64 = st.blocks_available().into();
+    let frsize: u64 = st.fragment_size().into();
     let total_bytes = blocks.saturating_mul(frsize);
     let avail_bytes = avail_blocks.saturating_mul(frsize);
     let pct = ((avail_blocks as f64 / blocks as f64) * 100.0)

@@ -948,7 +948,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [x] 355. BYO image substitution
 - [~] 356. Resource caps (cgroup)
 - [~] 357. Per-container env from broker
-- [~] 358. devcontainer.json support
+- [x] 358. devcontainer.json support _(full spec: `core::devcontainer` JSONC parser + `devcontainer_overlay` fold onto `[sandbox]`; image + `build.dockerfile` (`sandbox_build`, synchronous build in `ensure`) + `dockerComposeFile`+service+runServices (`sandbox_compose`, pane enters via `docker compose exec`) + `remote/containerEnv` + mounts/forwardPorts; full lifecycle (initialize→prepare, onCreate/updateContent/postCreate→one-time Exec, postStart/postAttach→init_script); native OCI `features` resolver (`devcontainer_features`: overrideFeatureInstallOrder, option→env, oras|curl pull + install.sh). Every category trust-gated via `devcontainer.*` GatedRequests through the existing repo_trust flow; wired into `resolve_env_trusted` + `host_provision`. E2E-verified against live podman/docker (`tests/devcontainer_e2e.rs`, `PODMAN_E2E_FORCE=1`): build→run→exec, image+env+lifecycle, compose up+exec. Limitations: features live-pull not E2E'd (needs ghcr network); lifecycle/features assume the host-provision OCI path; compose service mounts/ports come from the compose file.)_
 - [x] 359. Nix devshell per worktree _(sandbox devshell injection + direnv warm; `openspec/specs/sandbox`)_
 - [~] 360. Ephemeral reset between runs
 - [x] 361. Container↔worktree binding

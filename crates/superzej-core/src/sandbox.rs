@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Ceiling for container create (`run -d`): image is prefetched by then, so
 /// this is namespace/cgroup setup, not network.
-const RUN_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Ceiling for image pulls (network, legitimately slow — but never forever).
 pub(crate) const PULL_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -258,6 +258,10 @@ pub struct SandboxSpec {
     pub limits: SandboxLimits,
     pub volumes: Vec<(String, String)>,
     pub compose: Option<String>,
+    /// Programmatic Dockerfile build (from a devcontainer `build` block). When
+    /// set, [`ensure`] builds the image to `image` before create. See
+    /// [`crate::sandbox_build`].
+    pub build: Option<crate::sandbox_build::SandboxBuild>,
     pub init_script: Option<String>,
     pub devenv: bool,
     /// Absolute path to the `devenv` binary on the host (resolved at spec-build
@@ -281,6 +285,13 @@ impl SandboxSpec {
     /// ask one value instead of re-deriving `is_oci`/profile/placement booleans.
     pub fn capabilities(&self) -> crate::capabilities::Capabilities {
         crate::capabilities::Capabilities::derive(self)
+    }
+
+    /// The decoded compose declaration, if this spec is compose-backed.
+    pub fn compose_spec(&self) -> Option<crate::sandbox_compose::ComposeSpec> {
+        self.compose
+            .as_deref()
+            .map(crate::sandbox_compose::ComposeSpec::decode)
     }
 }
 
@@ -653,6 +664,7 @@ pub fn resolve_placed(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         compose: cfg.compose.clone(),
+        build: cfg.build.clone(),
         init_script: (!cfg.init_script.trim().is_empty()).then(|| cfg.init_script.clone()),
         // Explicit opt-in, or an OCI-backed local repo with devenv.nix when
         // `devenv` is on PATH.  Auto-detection is OCI-only: for bwrap/systemd
@@ -1045,14 +1057,22 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if let Some(compose_file) = &spec.compose {
-        let _ = std::process::Command::new("docker-compose")
-            .args(["-f", compose_file, "-p", &spec.name, "up", "-d"])
+    if let Some(compose) = spec.compose_spec() {
+        // `docker compose -f … -p <name> up -d [service runServices…]`. The
+        // project name is the sandbox name, so the pane's `compose exec` (see
+        // `enter_argv`) targets the same project.
+        let argv = crate::sandbox_compose::up_argv(&spec.name, &compose);
+        let _ = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
             .output()?;
         return Ok(());
     }
 
-    crate::sandbox_prefetch::prefetch_image(spec)?;
+    // A local Dockerfile build (devcontainer `build`) produces a tag no registry
+    // has — skip the pull-prefetch; it's built below, right before create.
+    if spec.build.is_none() {
+        crate::sandbox_prefetch::prefetch_image(spec)?;
+    }
 
     let rt = spec.backend.binary();
 
@@ -1074,6 +1094,9 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
             PROBE_TIMEOUT,
         );
     }
+    // Build the image now (synchronous, correct ordering) when a Dockerfile
+    // build was requested — the tag is `spec.image`, so the run below finds it.
+    crate::sandbox_build::build_image(spec)?;
     let mut argv: Vec<String> = oci_prefix(spec);
     argv.extend([
         "run".into(),
@@ -1231,7 +1254,17 @@ pub fn run_prepare(worktree: &std::path::Path, cmds: &[String]) {
 /// in the transport (mosh/ssh) when remote.
 pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Vec<String> {
     let script = wrap_script(spec, inner);
-    let backend_argv = backend_enter_argv(spec, &script);
+    // A compose-backed spec with a named service attaches through
+    // `docker compose exec <service>` — no container-name guessing.
+    let backend_argv = spec
+        .compose_spec()
+        .filter(|c| c.has_service())
+        .and_then(|c| {
+            let workdir = (spec.file_access != FileAccess::None)
+                .then(|| spec.worktree.to_string_lossy().into_owned());
+            crate::sandbox_compose::exec_argv(&spec.name, &c, workdir.as_deref(), &script, true)
+        })
+        .unwrap_or_else(|| backend_enter_argv(spec, &script));
     spec.placement.interactive_argv(&backend_argv)
 }
 
@@ -1789,7 +1822,11 @@ pub(crate) fn run_local_output(prefix: &[String], args: &[&str]) -> Option<Strin
 
 /// Run a control-plane command (locally, or on the remote over ssh). Returns
 /// whether it succeeded.
-fn run_control_owned(spec: &SandboxSpec, argv: &[String], timeout: Duration) -> Option<bool> {
+pub(crate) fn run_control_owned(
+    spec: &SandboxSpec,
+    argv: &[String],
+    timeout: Duration,
+) -> Option<bool> {
     run_control_t_owned(&spec.placement, argv, timeout)
 }
 
@@ -2211,6 +2248,7 @@ mod tests {
             limits: SandboxLimits::default(),
             volumes: vec![],
             compose: None,
+            build: None,
             init_script: None,
             file_access: FileAccess::Worktree,
             devenv: false,

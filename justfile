@@ -270,8 +270,17 @@ e2e: build
     #!/usr/bin/env bash
     {{_e2e_env}}
     # muse takes spec FILES (a bare directory is "Is a directory" — os error 21).
+    # Workers 2 (was 4): concurrent szhost instances contend for CPU and push
+    # wide-size cases past their expect_visible windows, capturing blank/late
+    # frames. KNOWN RESIDUAL FLAKE (run-to-run, even serial): live app state —
+    # the activity dot decays ●→○ on output-quiet timers, the ✋ needs-you chip
+    # appears when a fresh shell's output settles mid-run (shifting the whole
+    # statusbar cluster), and muse's quiet-window can fire before the pane
+    # frame paints. Regex normalization cannot mask semantic state; going
+    # green needs an app-side determinism env for e2e (freeze activity/chip/
+    # stats) — tracked in openspec `stabilize-sidebar-internals` follow-ups.
     PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
-        --reporter pretty --workers 4 --deadline-ms 12000
+        --reporter pretty --workers 2 --deadline-ms 20000
 
 # Run only the glitch-hunt specs (18–28) — slower, more thorough.
 e2e-glitch: build
@@ -285,8 +294,10 @@ e2e-glitch: build
 e2e-update: build
     #!/usr/bin/env bash
     {{_e2e_env}}
+    # Same workers/deadline as `e2e`: baselines must be captured under the
+    # SAME contention profile they are verified under.
     PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
-        --update-snapshots --workers 4 --deadline-ms 12000
+        --update-snapshots --workers 2 --deadline-ms 20000
 
 # (e2e/stress/perf harnesses drove the old zellij CLI's worktree-creation
 # commands headlessly; worktree/workspace/pin creation is now an interactive
