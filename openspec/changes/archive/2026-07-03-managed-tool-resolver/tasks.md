@@ -1,10 +1,10 @@
 ## 1. Core: managed_tool module
 
-- [x] 1.1 Add `crates/superzej-core/src/managed_tool.rs` and export it from `lib.rs`.
+- [x] 1.1 Add `crates/thegn-core/src/managed_tool.rs` and export it from `lib.rs`.
 - [x] 1.2 Define `Os`/`Arch` core enums with a `current()` `cfg!`-based constructor and a display form.
 - [x] 1.3 Define `Source` (`GithubRelease { repo, assets: Vec<AssetRule> }` / `Npm { package }`), `AssetRule { os, arch, asset }`, `UpdatePolicy` (`Always`/`Once`/`Never`), and `ManagedTool { name, source, version, policy, path_fallbacks }`.
 - [x] 1.4 Implement `asset_for(os, arch) -> Option<&str>` for GitHub-release sources (unsupported platform ⇒ `None`).
-- [x] 1.5 Implement `managed_dir()`/`bin_path()`/`version_marker()` (namespaced `~/.superzej/tools/<name>` for new tools; a pi `with_layout` override keeps the legacy `util::managed_pi_dir()` + `.superzej-pi-version`).
+- [x] 1.5 Implement `managed_dir()`/`bin_path()`/`version_marker()` (namespaced `~/.thegn/tools/<name>` for new tools; a pi `with_layout` override keeps the legacy `util::managed_pi_dir()` + `.thegn-pi-version`).
 - [x] 1.6 Implement `is_current()`/`is_current_at(dir)` (marker == version && bin exists) and `needs_install(force)` from policy + `is_current` + force (pure `should_install`).
 - [x] 1.7 Implement `Resolution` enum and pure `resolve(override_cfg, which_fn)` following the fixed tier order (override → PATH via injected closure → managed).
 
@@ -36,6 +36,6 @@
 
 ## 7. Verification
 
-- [x] 7.1 `cargo test -p superzej-core` green (1132 tests incl. 9 managed_tool). NOTE: `just coverage` (llvm-cov, nix) not run in this environment; all pure resolver logic is unit-tested, the fetch is a `cov_ignore`/smoke seam.
-- [x] 7.2 `cargo clippy -p superzej-core -p superzej-host --all-targets` clean; `cargo fmt --check` clean; god-file ratchet OK (config.rs 9879 → 9863 via moving `impl ForwardConfig` to `forward.rs`; new code in new sibling modules).
-- [x] 7.3 Manual `szhost agent path` (legacy pi layout unchanged) + `szhost doctor` / `--json` (pi listed; resolved via the PATH tier on this machine) confirm behavior. NOTE: full `test/smoke.sh` (which exercises the real `agent setup` npm fetch) not run here; the acquire path is unchanged from the prior pi install.
+- [x] 7.1 `cargo test -p thegn-core` green (1132 tests incl. 9 managed_tool). NOTE: `just coverage` (llvm-cov, nix) not run in this environment; all pure resolver logic is unit-tested, the fetch is a `cov_ignore`/smoke seam.
+- [x] 7.2 `cargo clippy -p thegn-core -p thegn-host --all-targets` clean; `cargo fmt --check` clean; god-file ratchet OK (config.rs 9879 → 9863 via moving `impl ForwardConfig` to `forward.rs`; new code in new sibling modules).
+- [x] 7.3 Manual `thegn agent path` (legacy pi layout unchanged) + `thegn doctor` / `--json` (pi listed; resolved via the PATH tier on this machine) confirm behavior. NOTE: full `test/smoke.sh` (which exercises the real `agent setup` npm fetch) not run here; the acquire path is unchanged from the prior pi install.

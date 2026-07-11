@@ -123,7 +123,7 @@ text = "…" dim = "…" faint = "…" ghost = "…"
 ```
 
 Default `border` becomes a light grey (`#aab1c4`) per user direction. Bad hex
-falls back to defaults; env overrides (`SUPERZEJ_THEME_FOCUS_BORDER`, …) and
+falls back to defaults; env overrides (`THEGN_THEME_FOCUS_BORDER`, …) and
 `config get/set` keys included. Resolved `Palette` rides in `FrameModel`;
 chrome stops referencing `theme::` constants directly.
 
@@ -135,7 +135,7 @@ Invariant: **no cell from a previous geometry survives a layout change.**
    geometry differs from the previous frame (geometry changes are rare).
 2. Recompute layout from the current terminal size at the top of every render
    pass; on any size mismatch, discard and redraw instead of diffing.
-3. `szhost::frame=debug` logs `geometry_changed → full_repaint`.
+3. `thegn::frame=debug` logs `geometry_changed → full_repaint`.
 
 ## Testing
 

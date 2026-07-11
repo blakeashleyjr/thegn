@@ -3,15 +3,15 @@
 ## Summary
 
 Give any process running in a pane — an agent, a build, a test run — an
-**explicit, authoritative way to say "I need attention"**, instead of superzej
+**explicit, authoritative way to say "I need attention"**, instead of thegn
 having to _infer_ it from CPU and screen-scraping heuristics. Two inbound
 channels feed one existing pipeline:
 
 1. **OSC escape sequences** parsed at the PTY emulator seam — `OSC 9 ; <text>`
    (desktop-notification convention) and `OSC 777 ; notify ; <title> ; <body>`
-   (the terminal-notification convention). When a pane emits one, superzej mints
+   (the terminal-notification convention). When a pane emits one, thegn mints
    a normalized attention event.
-2. **A `szhost notify` CLI verb** — a process without escape-sequence support (or
+2. **A `thegn notify` CLI verb** — a process without escape-sequence support (or
    a shell hook) can shell out to raise the same event for its own worktree/pane.
 
 Both land on the **existing** `EventBus` → notification/badge/activity-dot
@@ -37,15 +37,15 @@ is an ephemeral event; any persistence rides the existing notification inbox row
 
 ## Rationale
 
-superzej already has a rich _consumer_ side (EventBus, badges, activity dots,
+thegn already has a rich _consumer_ side (EventBus, badges, activity dots,
 notifications panel) but the only _inbound_ channels are inference-based:
 CPU/activity sampling and optional screen-phrase matching. Inference is noisy
 (CPU blips reset the dot — see the activity-dot sticky-state work) and can't
 distinguish "waiting for the human" from "idle". Terminal emulators (Ghostty,
 kitty, WezTerm) and tools already emit `OSC 9`/`OSC 777` for exactly this;
-adopting the standard makes superzej a good citizen and gives agents a reliable
+adopting the standard makes thegn a good citizen and gives agents a reliable
 "raise your hand" primitive. cmux/limux validate the pattern — they draw a
-notification ring on `OSC 9/99/777` — but superzej already owns the harder,
+notification ring on `OSC 9/99/777` — but thegn already owns the harder,
 richer consumer side, so this is a small, high-leverage addition.
 
 ## Non-goals

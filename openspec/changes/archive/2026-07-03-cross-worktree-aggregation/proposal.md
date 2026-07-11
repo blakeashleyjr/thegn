@@ -1,7 +1,7 @@
 ## Why
 
 Attention is scattered across worktrees: CI fails on one branch, another has
-uncommitted changes, a grep hit lives in a third — but superzej only ever shows
+uncommitted changes, a grep hit lives in a third — but thegn only ever shows
 the _active_ worktree's state. Zed's **multibuffer** (collect results from many
 files into one excerpt stream, each excerpt a live window onto its source) is the
 transferable UI idea: a read-only, cross-worktree "what needs attention
@@ -9,7 +9,7 @@ everywhere" surface.
 
 ## What Changes
 
-- Add a pure **aggregation model** in `superzej-core` (`aggregate.rs`): an
+- Add a pure **aggregation model** in `thegn-core` (`aggregate.rs`): an
   `Excerpt { worktree, worktree_label, kind, file, line, text, detail }`, an
   `ExcerptKind` (CI failure / dirty file / content match), and an `Aggregation`
   that holds excerpts sorted + grouped by worktree, exposes a flattened
@@ -43,8 +43,8 @@ This change ships the model + the read-only CI-failure aggregation surface.
 
 ## Impact
 
-- **Code:** new `crates/superzej-core/src/aggregate.rs` (+`lib.rs` export);
-  new `crates/superzej-host/src/panel/sections/across.rs`; `panel/mod.rs`
+- **Code:** new `crates/thegn-core/src/aggregate.rs` (+`lib.rs` export);
+  new `crates/thegn-host/src/panel/sections/across.rs`; `panel/mod.rs`
   (`Section::Across` registry + a `PanelData.across: Aggregation` field);
   `panel/sections/mod.rs` (dispatch); `hydrate.rs` (populate from the CI cache
   across `db.worktrees()`). None of the ratcheted god-files (`run.rs`,

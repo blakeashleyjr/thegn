@@ -9,7 +9,7 @@ performant, helpful test explorer backed by a general task/result substrate.
 
 ## Problem
 
-superzej already has a minimal Tests panel: it detects one test command for the
+thegn already has a minimal Tests panel: it detects one test command for the
 focused worktree, runs it on `r`, parses a flat list of pass/fail/skip lines, and
 shows a panel-local summary. That proves the UI seam, but it is not yet an IDE
 explorer:
@@ -73,7 +73,7 @@ The goal is a Tests surface that answers six questions quickly:
 
 ### Core task model
 
-`crates/superzej-core/src/config.rs` gains a future `[[tasks]]` model shaped like
+`crates/thegn-core/src/config.rs` gains a future `[[tasks]]` model shaped like
 `[[pins]]`, not a new command DSL:
 
 ```toml
@@ -101,7 +101,7 @@ Problems/Timeline/Search Everywhere inputs later.
 
 Task specs come from three layers, highest priority first:
 
-1. **Explicit config:** `[[tasks]]` entries in layered superzej config.
+1. **Explicit config:** `[[tasks]]` entries in layered thegn config.
 2. **Static provider discovery:** parse existing runner/manifests such as
    `Justfile`, `Makefile`, `Taskfile.yml`, `package.json`, `Cargo.toml`,
    `go.mod`, `pyproject.toml`, `docker-compose.yml` / `compose.yaml`,
@@ -115,7 +115,7 @@ commands on worktree switch, and run only after explicit user action. Provider
 rows should remain visible alongside aliases, e.g. `cargo:test`, `npm:dev`,
 `just:test`, `compose:up`, plus `Run test` / `Run dev` aliases.
 
-When no configured test task exists, superzej resolves the `test` alias from the
+When no configured test task exists, thegn resolves the `test` alias from the
 provider registry. The default priority should prefer explicit config, then common
 local test runners:
 
@@ -150,14 +150,14 @@ TestResult      // latest status and optional failure location
 TestRollup      // counts and freshness for chrome/sidebar/statusbar
 ```
 
-The first implementation can live in `superzej-host` while the pure config/data
-shapes live in `superzej-core`. A later plugin/API version can expose the same
+The first implementation can live in `thegn-host` while the pure config/data
+shapes live in `thegn-core`. A later plugin/API version can expose the same
 vocabulary through `plugin_api.rs` `ProgramAdapter`, `DataSource`, and
 `NotificationSource` concepts.
 
 ### Tests panel consumer
 
-`crates/superzej-host/src/panel.rs` already has `PanelTab::Tests`; it remains the
+`crates/thegn-host/src/panel.rs` already has `PanelTab::Tests`; it remains the
 UX home. The panel should stop directly owning a single command and instead ask
 the task runner to discover or run test tasks.
 
@@ -182,14 +182,14 @@ TESTS
 cargo test --workspace        last: 42 passed · 1 failed · 3 skipped
 
 ▾ workspace
-  ▾ crates/superzej-core
+  ▾ crates/thegn-core
     ✓ config::tests::loads_layered_config
     ✓ db::tests::migrates_v6_groups
     ✗ activity::tests::acks_quiet_state
-      crates/superzej-core/src/activity.rs:123
+      crates/thegn-core/src/activity.rs:123
       assertion failed: expected quiet, got active
-  ▸ crates/superzej-host
-  ○ crates/superzej-svc
+  ▸ crates/thegn-host
+  ○ crates/thegn-svc
 
 r run selected   R run all   f failed   o open   d debug   u refresh
 ```
@@ -414,7 +414,7 @@ The Test Explorer shipped well beyond the original cargo/go/pytest/jest/vitest
 text matchers. See the matching design notes in
 `2026-06-10-ide-feature-tiers-design.md`.
 
-### Ingestion modes (`crates/superzej-host/src/testkit/`)
+### Ingestion modes (`crates/thegn-host/src/testkit/`)
 
 - **Text** (`panel::parse_test_output`) — cargo, go, pytest, jest/vitest, swift,
   ctest; the fragile baseline.

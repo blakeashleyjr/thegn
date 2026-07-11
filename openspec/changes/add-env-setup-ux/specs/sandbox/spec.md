@@ -4,7 +4,7 @@
 
 ### Requirement: Provider secrets resolve through a layered store
 
-superzej SHALL resolve every provider token through a single `secret::resolve`
+thegn SHALL resolve every provider token through a single `secret::resolve`
 chokepoint that accepts a layered `SecretRef`: `keyring:<service>/<account>`
 (OS keyring), `env:VAR`, `file:PATH` (a `0600` file), and a bare string treated
 as `env:` for back-compat. A writer path SHALL persist a collected token —
@@ -35,36 +35,36 @@ and secrets MUST NOT be echoed or written into config in plaintext.
 
 ### Requirement: Environments are authored without hand-editing TOML
 
-superzej SHALL provide a write path that creates, edits, and removes
+thegn SHALL provide a write path that creates, edits, and removes
 `[env.<name>]` / `[env.<name>.provider]` definitions with comments and
 formatting preserved, plus a generic `config set <dotted.key> <value>`. Env
-definitions SHALL be written only to global config; a repo `.superzej.toml` may
+definitions SHALL be written only to global config; a repo `.thegn.toml` may
 only _select_ an env (`env = "…"`), and the write path MUST refuse an env
-definition in a repo scope (the trust-clamp model). A CLI (`superzej env
+definition in a repo scope (the trust-clamp model). A CLI (`thegn env
 create`/`rm`/`test`, `config set`) SHALL back these operations and be usable
 headlessly.
 
 #### Scenario: `env create` writes config and stores the secret
 
-- **WHEN** `superzej env create <name> --provider fly --token-file <path>` runs
+- **WHEN** `thegn env create <name> --provider fly --token-file <path>` runs
 - **THEN** the env is written to global config, the token is stored via the
   secret writer, and no secret is printed
 
 #### Scenario: A repo file cannot define an env
 
 - **WHEN** the write path is asked to define `[env.<name>]` in a repo
-  `.superzej.toml`
+  `.thegn.toml`
 - **THEN** it refuses, allowing only the `env = "…"` selection key
 
 #### Scenario: `env test` verifies a token cheaply
 
-- **WHEN** `superzej env test <name>` runs against a configured env
+- **WHEN** `thegn env test <name>` runs against a configured env
 - **THEN** it builds the provider and performs a cheap `list()` call, reporting
   success or an actionable failure without provisioning anything
 
 ### Requirement: Environments are creatable and manageable from the TUI
 
-superzej SHALL surface environment setup in the compositor: an "Add
+thegn SHALL surface environment setup in the compositor: an "Add
 environment" wizard (reached from the palette) that branches its fields by kind
 (`local`/`ssh`/`fly`/`digitalocean`/`hetzner`/`daytona`), accepts a pasted
 token, validates it off-loop, and on submit writes the env + stores the secret;

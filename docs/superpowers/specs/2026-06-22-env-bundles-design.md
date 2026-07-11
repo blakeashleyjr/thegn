@@ -2,8 +2,8 @@
 
 ## Context
 
-superzej can already swap **one** thing per coding-agent:
-`crates/superzej-core/src/account.rs` relocates a provider's credential home
+thegn can already swap **one** thing per coding-agent:
+`crates/thegn-core/src/account.rs` relocates a provider's credential home
 (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`) per worktree/workspace/global using a
 precedence chain over the `ui_state` KV table. That proves the per-scope-binding
 pattern — but it is narrow: it moves a single env var, for a _known_ agent,
@@ -49,7 +49,7 @@ Decisions locked with the user:
    may additionally opt into its own `.env`, gated by a direnv-style allowlist.
 4. **`env:` indirection + external secret-resolver hooks** — keep
    `expand_env_ref`'s `env:VAR`; add pluggable resolvers so secrets never land in
-   superzej config/DB in plaintext.
+   thegn config/DB in plaintext.
 
 ---
 
@@ -137,7 +137,7 @@ bundle credentials in precedence — see § .env.)
 
 ## Composition seam — `env::compose()`
 
-A new core function (`crates/superzej-core/src/env.rs`) is the single resolution
+A new core function (`crates/thegn-core/src/env.rs`) is the single resolution
 point:
 
 ```rust
@@ -170,7 +170,7 @@ The returned `ResolvedEnv` maps 1:1 onto the existing
 `compose()` instead of calling `account::launch_env()` directly.
 
 **Shell panes too.** Today only _agent_ choices get account env; a plain shell
-pane inherits whatever szhost inherited. `compose()` is called for **every** pane
+pane inherits whatever thegn inherited. `compose()` is called for **every** pane
 spawn (`choice = None` for shells), so a shell pane in the `work` worktree sees
 the work gitconfig/git identity, not the launching shell's. This is the change
 that makes "different profiles per worktree" real for ordinary terminals, not
@@ -191,7 +191,7 @@ Three tiers, with **Tier 1 as the implicit default** (a bundle that only sets
 
 - **Tier 2 — materialized dotfiles (opt-in).** `[bundle.<n>.dotfiles]` symlinks
   or templates a source tree into a **managed per-bundle HOME** under
-  `$XDG_STATE_HOME/superzej/bundles/<slug>/home/`. Materialization is
+  `$XDG_STATE_HOME/thegn/bundles/<slug>/home/`. Materialization is
   **idempotent** (hash the source, re-link only on change) and runs **off the
   event loop** on a background thread handing back over a channel — same pattern
   as the diff fs-watcher's recursive inotify registration — to preserve the
@@ -206,7 +206,7 @@ Three tiers, with **Tier 1 as the implicit default** (a bundle that only sets
 Managed-HOME layout:
 
 ```
-$XDG_STATE_HOME/superzej/bundles/<slug>/
+$XDG_STATE_HOME/thegn/bundles/<slug>/
   home/          # Tier 2 materialized dotfiles; Tier 3 HOME root
   meta.json      # source hash, last-materialized ts (idempotency)
 ```
@@ -219,7 +219,7 @@ Named bundles are the base. A worktree may **additionally** opt into loading its
 own `.env`, gated direnv-style:
 
 - **Discovery** — only when the active bundle (or a per-worktree toggle) sets
-  `dotenv = true`. superzej never auto-loads a repo's `.env` silently.
+  `dotenv = true`. thegn never auto-loads a repo's `.env` silently.
 - **Allowlist** — first load (and any time the file content hash changes)
   requires an explicit allow, stored as `ui_state["dotenv:allow:<path>"] =
 <content-hash>`. A changed hash re-prompts (the file may now contain hostile
@@ -239,7 +239,7 @@ own `.env`, gated direnv-style:
 
 Keep `expand_env_ref()` (`config.rs:27-44`) for `env:VAR`, and extend the same
 expansion point with **pluggable resolver schemes** so secret _values_ never sit
-in superzej config or the DB in plaintext:
+in thegn config or the DB in plaintext:
 
 ```toml
 [secrets.resolvers]
@@ -300,7 +300,7 @@ Bundles are **soft isolation**, by design:
 - They share the **clear-then-allowlist base env** prerequisite with the
   heavyweight-profile firewall: `pane.rs::spawn_with_env` currently inherits the
   _entire_ parent env and only adds `TERM`/`COLORTERM` on top
-  (`pane.rs:108-119`), so a shell pane sees every var szhost inherited. Bundles
+  (`pane.rs:108-119`), so a shell pane sees every var thegn inherited. Bundles
   need a **curated base** (`PATH`, `HOME`, `TERM`, `LANG`, `USER`, …) with bundle
   env layered on top — otherwise the launching shell's creds leak past the
   bundle. This fix lands here and is reused by the process-profile firewall.
@@ -316,22 +316,22 @@ Bundles are **soft isolation**, by design:
 
 ## Critical files (where the implementation would land)
 
-- `crates/superzej-core/src/env.rs` — **new**: `compose()`, `ResolvedEnv`, bundle
+- `crates/thegn-core/src/env.rs` — **new**: `compose()`, `ResolvedEnv`, bundle
   resolution + precedence (generalized from `account.rs`), secret-resolver
   dispatch, `.env` load + filter.
-- `crates/superzej-core/src/account.rs` — refactored into a _consumer_ of
+- `crates/thegn-core/src/account.rs` — refactored into a _consumer_ of
   `env::compose` (account selection becomes a bundle field); precedence helpers
   generalized to bundle scopes.
-- `crates/superzej-core/src/config.rs` — `[bundle.*]` schema (`Bundle` struct),
+- `crates/thegn-core/src/config.rs` — `[bundle.*]` schema (`Bundle` struct),
   `[secrets].resolvers`, `[workspace.<slug>].env_bundle`; extend
   `expand_env_ref` for resolver schemes.
-- `crates/superzej-host/src/agent.rs` — route **every** pane spawn (agent _and_
+- `crates/thegn-host/src/agent.rs` — route **every** pane spawn (agent _and_
   shell) through `env::compose`; `launch_spec_with_key` delegates to it.
-- `crates/superzej-host/src/pane.rs` — `spawn_with_env` clear-then-allowlist base
+- `crates/thegn-host/src/pane.rs` — `spawn_with_env` clear-then-allowlist base
   env (shared with the profile firewall).
-- `crates/superzej-core/src/sandbox.rs` — reuse `env_overrides`/`env_block`/
+- `crates/thegn-core/src/sandbox.rs` — reuse `env_overrides`/`env_block`/
   `mounts`; bundle managed-HOME mounts ride the existing path-preservation.
-- `crates/superzej-core/src/db.rs` — `ui_state` bundle bindings + `.env`
+- `crates/thegn-core/src/db.rs` — `ui_state` bundle bindings + `.env`
   allowlist hashes (no schema bump); a v16 table only if managed-bundle metadata
   outgrows `ui_state`.
 - Tier-2/3 materialization — a background worker (off-loop, channel + waker),
@@ -359,5 +359,5 @@ mounts`; assert `accounts` folds to the right provider home var + mount;
    reaches the child env and appears in **no** persisted store/log; assert a
    failing resolver warns + skips without blocking the spawn.
 6. **Idle-CPU test**: Tier-2 materialization on a large dotfile tree introduces
-   **no** main-loop wakeups (`SUPERZEJ_LOG` waterfall / 0%-idle check); it runs
+   **no** main-loop wakeups (`THEGN_LOG` waterfall / 0%-idle check); it runs
    off-thread and hands back over a channel.

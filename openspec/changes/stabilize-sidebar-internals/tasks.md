@@ -46,7 +46,7 @@
       (fmt-check, lint, build, test, smoke, openspec-validate, coverage
       core≥95%+proxy≥88%, doc-check — all green). Follow-up fixes landed for
       the formerly-red gates: `check-cross` (statvfs u32/u64 widening in
-      superzej-metrics), `deps-audit` (advisory DB → target/advisory-dbs +
+      thegn-metrics), `deps-audit` (advisory DB → target/advisory-dbs +
       machete ignore for generated-code prost), and the termwiz `?1003h`
       any-motion push (corrective DECSET write; mouse fully off on mouse-less
       terminals, button+drag only elsewhere).

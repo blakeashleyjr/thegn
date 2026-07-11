@@ -1,9 +1,9 @@
-L0| ◆ superzej work         16.2/94G ·  50% ·  ↓   81K ↑    4K ·  100% · 22:06
+L0| þ thegn  work           21.5/94G ·  36% ·  ↓    5K ↑   57K ·  100% · 02:20
 R0 0 1 fg=idx3b bg=idxe9 attrs=
 R0 1 2 fg=idxef bg=idxe9 attrs=
-R0 3 8 fg=idx3b bg=idxe9 attrs=
-R0 11 6 fg=idxef bg=idxeb attrs=
-R0 17 7 fg=idx3b bg=idxe9 attrs=
+R0 3 6 fg=idx3b bg=idxe9 attrs=
+R0 9 6 fg=idxef bg=idxeb attrs=
+R0 15 9 fg=idx3b bg=idxe9 attrs=
 R0 24 10 fg=idxef bg=idxe9 attrs=
 R0 34 3 fg=idxed bg=idxe9 attrs=
 R0 37 5 fg=idxef bg=idxe9 attrs=
@@ -46,11 +46,13 @@ R6 32 48 fg=idx3c bg=idxe9 attrs=
 L7| TERMINALS
 R7 0 32 fg=idx3b bg=idxe9 attrs=
 R7 32 48 fg=idx3c bg=idxe9 attrs=
-L8|   No terminals — Enter to add
+L8|   No terminals — Enter to add            ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
 R8 0 3 fg=idx3b bg=idxe9 attrs=
 R8 3 27 fg=idxed bg=idxe9 attrs=
 R8 30 2 fg=idx3b bg=idxe9 attrs=
-R8 32 48 fg=idx3c bg=idxe9 attrs=
+R8 32 10 fg=idx3c bg=idxe9 attrs=
+R8 42 29 fg=idxef bg=idxe9 attrs=
+R8 71 9 fg=idx3c bg=idxe9 attrs=
 L9| ╭─ Choose a keymap ────────────────────────────────────────────────── menu ──╮
 R9 0 1 fg=idx3c bg=idxe9 attrs=
 R9 1 2 fg=idx66 bg=idxea attrs=
@@ -68,15 +70,15 @@ R10 76 1 fg=idx42 bg=idxea attrs=
 R10 77 1 fg=default bg=idxea attrs=
 R10 78 1 fg=idx66 bg=idxea attrs=
 R10 79 1 fg=idxeb bg=idxe8 attrs=
-L11| │ ❯  d  superzej defaults                                    Alt/Ctrl chords │
+L11| │ ❯  d  thegn defaults                                       Alt/Ctrl chords │
 R11 0 1 fg=idx3c bg=idxe9 attrs=
 R11 1 1 fg=idx66 bg=idxea attrs=
 R11 2 1 fg=default bg=idxea attrs=
 R11 3 2 fg=idx50 bg=idxec attrs=BOLD
 R11 5 3 fg=idxff bg=idxec attrs=BOLD
 R11 8 1 fg=idxff bg=idxec attrs=
-R11 9 17 fg=idxff bg=idxec attrs=BOLD
-R11 26 36 fg=idxff bg=idxec attrs=
+R11 9 14 fg=idxff bg=idxec attrs=BOLD
+R11 23 39 fg=idxff bg=idxec attrs=
 R11 62 15 fg=idx42 bg=idxec attrs=
 R11 77 1 fg=default bg=idxea attrs=
 R11 78 1 fg=idx66 bg=idxea attrs=
@@ -111,11 +113,15 @@ L14| ╰────────────────────────
 R14 0 1 fg=idx3c bg=idxe9 attrs=
 R14 1 78 fg=idx66 bg=idxea attrs=
 R14 79 1 fg=idxeb bg=idxe8 attrs=
-L15|                                        Ctrl-Space palette · Ctrl-g lock
+L15|                                         Alt-↑↓      prev/next worktree
 R15 0 3 fg=idx3c bg=idxe9 attrs=
 R15 3 77 fg=idxeb bg=idxe8 attrs=
-L16|
-R16 0 80 fg=idx3c bg=idxe9 attrs=
+L16|                                         Ctrl-g      lock keys to pane
+R16 0 41 fg=idx3c bg=idxe9 attrs=
+R16 41 6 fg=idxef bg=idxe9 attrs=
+R16 47 6 fg=idx3c bg=idxe9 attrs=
+R16 53 17 fg=idxed bg=idxe9 attrs=
+R16 70 10 fg=idx3c bg=idxe9 attrs=
 L17|
 R17 0 80 fg=idx3c bg=idxe9 attrs=
 L18|

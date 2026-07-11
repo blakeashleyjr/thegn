@@ -1,10 +1,11 @@
-L0| ◆ superzej v0.1.0 work     15.5/94G ·   7% ·  50% ·  96°C ·  ↓  319K ↑  637K ·  100% · 22:07
+L0| þ thegn v0.1.0  work       18.1/94G ·   7% ·  35% ·  97°C ·  ↓  3.4M ↑  1.7M ·  100% · 02:22
 R0 0 1 fg=idxff bg=idxea attrs=
 R0 1 2 fg=idx50 bg=idxea attrs=
-R0 3 9 fg=idxff bg=idxea attrs=
-R0 12 6 fg=idx42 bg=idxea attrs=
-R0 18 6 fg=idx50 bg=idxee attrs=BOLD
-R0 24 3 fg=idxff bg=idxea attrs=
+R0 3 6 fg=idxff bg=idxea attrs=
+R0 9 6 fg=idx42 bg=idxea attrs=
+R0 15 1 fg=idxff bg=idxea attrs=
+R0 16 6 fg=idx50 bg=idxee attrs=BOLD
+R0 22 5 fg=idxff bg=idxea attrs=
 R0 27 10 fg=idxfc bg=idxea attrs=
 R0 37 3 fg=idx42 bg=idxea attrs=
 R0 40 5 fg=idxd2 bg=idxea attrs=
@@ -38,7 +39,7 @@ R4 1 1 fg=idx66 bg=idxe9 attrs=
 R4 2 3 fg=idxff bg=idxe9 attrs=
 R4 5 4 fg=idxff bg=idxe9 attrs=BOLD
 R4 9 23 fg=idxff bg=idxe9 attrs=
-L5|▐   └ ○ home                               ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
+L5|▐   └ ○ home                                        ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
 R5 0 1 fg=idx42 bg=idxeb attrs=
 R5 1 3 fg=idxff bg=idxeb attrs=
 R5 4 2 fg=idx3c bg=idxeb attrs=
@@ -46,18 +47,18 @@ R5 6 1 fg=idxcb bg=idxeb attrs=
 R5 7 1 fg=idxff bg=idxeb attrs=
 R5 8 4 fg=idx50 bg=idxeb attrs=
 R5 12 20 fg=idxff bg=idxeb attrs=
-R5 32 11 fg=default bg=default attrs=
-R5 43 47 fg=idx50 bg=idxe9 attrs=
-L6|                                            ▀▀▀▄ █   █ █▄▄▄▀ █▀▀▀  █▄▄▄▀  ▄▀   █▀▀▀     █
+R5 32 20 fg=default bg=default attrs=
+R5 52 29 fg=idx50 bg=idxe9 attrs=
+L6|                                                      █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
 R6 0 32 fg=idxff bg=idxea attrs=
-R6 32 11 fg=default bg=default attrs=
-R6 43 47 fg=idx50 bg=idxe9 attrs=
-L7| TERMINALS                                 ▄▄▄▄▀ ▀▄▄▄▀ █     █▄▄▄▄ █  ▀▄ █▄▄▄▄ █▄▄▄▄ ▀▄▄▀
+R6 32 20 fg=default bg=default attrs=
+R6 52 29 fg=idx50 bg=idxe9 attrs=
+L7| TERMINALS                                            █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
 R7 0 1 fg=idxff bg=idxea attrs=
 R7 1 9 fg=idxff bg=idxea attrs=BOLD
 R7 10 22 fg=idxff bg=idxea attrs=
-R7 32 11 fg=default bg=default attrs=
-R7 43 47 fg=idx50 bg=idxe9 attrs=
+R7 32 20 fg=default bg=default attrs=
+R7 52 29 fg=idx50 bg=idxe9 attrs=
 L8| ▾ ≡ local
 R8 0 1 fg=idxff bg=idxe9 attrs=
 R8 1 1 fg=idx66 bg=idxe9 attrs=

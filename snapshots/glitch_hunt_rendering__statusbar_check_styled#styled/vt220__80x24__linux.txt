@@ -1,11 +1,12 @@
-L0| ◆ superzej v0.1.0 work      82% ·  15.5/94G ·   7% ·  49% ·  ↓  1.7M ↑  879K ·  100% · 22:07
+L0| þ thegn v0.1.0  work        99% ·  18.2/94G ·   7% ·  35% ·  ↓  2.5M ↑  2.6M ·  100% · 02:22
 R0 0 1 fg=idx07 bg=idx00 attrs=
 R0 1 2 fg=idx06 bg=idx00 attrs=
-R0 3 9 fg=idx07 bg=idx00 attrs=
-R0 12 6 fg=idx08 bg=idx00 attrs=
-R0 18 6 fg=idx06 bg=idx08 attrs=BOLD
-R0 24 9 fg=idx07 bg=idx00 attrs=
-R0 33 3 fg=idx08 bg=idx00 attrs=
+R0 3 6 fg=idx07 bg=idx00 attrs=
+R0 9 6 fg=idx08 bg=idx00 attrs=
+R0 15 1 fg=idx07 bg=idx00 attrs=
+R0 16 6 fg=idx06 bg=idx08 attrs=BOLD
+R0 22 6 fg=idx07 bg=idx00 attrs=
+R0 28 8 fg=idx08 bg=idx00 attrs=
 R0 36 10 fg=idx07 bg=idx00 attrs=
 R0 46 11 fg=idx08 bg=idx00 attrs=
 R0 57 5 fg=idx07 bg=idx00 attrs=
@@ -37,18 +38,17 @@ R3 32 24 fg=default bg=default attrs=
 R3 56 1 fg=idx07 bg=idx00 attrs=
 R3 57 1 fg=idx07 bg=idx00 attrs=BOLD
 R3 58 42 fg=idx07 bg=idx00 attrs=
-L4| ▾ ⌂ home                                               ────────────────────────────────────────────
+L4|  1 ▾ ⌂ home                                            ────────────────────────────────────────────
 R4 0 1 fg=idx07 bg=idx00 attrs=
-R4 1 1 fg=idx08 bg=idx00 attrs=
-R4 2 3 fg=idx07 bg=idx00 attrs=
-R4 5 4 fg=idx07 bg=idx00 attrs=BOLD
-R4 9 23 fg=idx07 bg=idx00 attrs=
+R4 1 4 fg=idx08 bg=idx00 attrs=
+R4 5 3 fg=idx07 bg=idx00 attrs=
+R4 8 4 fg=idx07 bg=idx00 attrs=BOLD
+R4 12 20 fg=idx07 bg=idx00 attrs=
 R4 32 24 fg=default bg=default attrs=
 R4 56 44 fg=idx08 bg=idx00 attrs=
-L5|▐   └ ○ home                                             1 changes                            clean
-R5 0 1 fg=idx08 bg=idx00 attrs=
-R5 1 3 fg=idx07 bg=idx00 attrs=
-R5 4 2 fg=idx08 bg=idx00 attrs=
+L5|▐ 1 └ ○ home                                             1 changes                            clean
+R5 0 1 fg=idx06 bg=idx00 attrs=
+R5 1 5 fg=idx08 bg=idx00 attrs=
 R5 6 1 fg=idx09 bg=idx00 attrs=
 R5 7 1 fg=idx07 bg=idx00 attrs=
 R5 8 4 fg=idx06 bg=idx00 attrs=
@@ -119,12 +119,12 @@ L14|
 R14 0 32 fg=default bg=idx00 attrs=
 R14 32 24 fg=default bg=default attrs=
 R14 56 44 fg=idx07 bg=idx00 attrs=
-L15|                                    superzej v0.1.0      5 files                              0 loc
+L15|                                      thegn v0.1.0       5 files                              0 loc
 R15 0 32 fg=default bg=idx00 attrs=
-R15 32 4 fg=default bg=default attrs=
-R15 36 9 fg=idx06 bg=idx00 attrs=
-R15 45 6 fg=idx07 bg=idx00 attrs=
-R15 51 5 fg=default bg=default attrs=
+R15 32 6 fg=default bg=default attrs=
+R15 38 6 fg=idx06 bg=idx00 attrs=
+R15 44 6 fg=idx07 bg=idx00 attrs=
+R15 50 6 fg=default bg=default attrs=
 R15 56 1 fg=idx07 bg=idx00 attrs=
 R15 57 1 fg=idx08 bg=idx00 attrs=BOLD
 R15 58 36 fg=idx07 bg=idx00 attrs=
@@ -154,45 +154,62 @@ L21|
 R21 0 32 fg=default bg=idx00 attrs=
 R21 32 24 fg=default bg=default attrs=
 R21 56 44 fg=default bg=idx00 attrs=
-L22|
-R22 0 32 fg=default bg=idx00 attrs=
+L22|─ NAVIGATE ─────────────────────
+R22 0 1 fg=idx08 bg=idx00 attrs=
+R22 1 10 fg=idx07 bg=idx00 attrs=BOLD
+R22 11 21 fg=idx08 bg=idx00 attrs=
 R22 32 24 fg=default bg=default attrs=
 R22 56 44 fg=default bg=idx00 attrs=
-L23|
-R23 0 32 fg=default bg=idx00 attrs=
+L23| Alt+1-9  jump worktree
+R23 0 1 fg=default bg=idx00 attrs=
+R23 1 7 fg=idx08 bg=idx00 attrs=
+R23 8 2 fg=default bg=idx00 attrs=
+R23 10 13 fg=idx08 bg=idx00 attrs=
+R23 23 9 fg=default bg=idx00 attrs=
 R23 32 24 fg=default bg=default attrs=
 R23 56 44 fg=default bg=idx00 attrs=
-L24|
-R24 0 32 fg=default bg=idx00 attrs=
+L24| Ctrl+1-9 jump workspace
+R24 0 1 fg=default bg=idx00 attrs=
+R24 1 8 fg=idx08 bg=idx00 attrs=
+R24 9 1 fg=default bg=idx00 attrs=
+R24 10 14 fg=idx08 bg=idx00 attrs=
+R24 24 8 fg=default bg=idx00 attrs=
 R24 32 24 fg=default bg=default attrs=
 R24 56 44 fg=default bg=idx00 attrs=
-L25|
-R25 0 32 fg=default bg=idx00 attrs=
+L25| j / k    move up/down
+R25 0 1 fg=default bg=idx00 attrs=
+R25 1 5 fg=idx08 bg=idx00 attrs=
+R25 6 4 fg=default bg=idx00 attrs=
+R25 10 12 fg=idx08 bg=idx00 attrs=
+R25 22 10 fg=default bg=idx00 attrs=
 R25 32 24 fg=default bg=default attrs=
 R25 56 44 fg=default bg=idx00 attrs=
-L26|
-R26 0 32 fg=default bg=idx00 attrs=
+L26| Enter    open / fold
+R26 0 1 fg=default bg=idx00 attrs=
+R26 1 5 fg=idx08 bg=idx00 attrs=
+R26 6 4 fg=default bg=idx00 attrs=
+R26 10 11 fg=idx08 bg=idx00 attrs=
+R26 21 11 fg=default bg=idx00 attrs=
 R26 32 24 fg=default bg=default attrs=
 R26 56 44 fg=default bg=idx00 attrs=
-L27|
-R27 0 32 fg=default bg=idx00 attrs=
+L27| /        filter
+R27 0 1 fg=default bg=idx00 attrs=
+R27 1 1 fg=idx08 bg=idx00 attrs=
+R27 2 8 fg=default bg=idx00 attrs=
+R27 10 6 fg=idx08 bg=idx00 attrs=
+R27 16 16 fg=default bg=idx00 attrs=
 R27 32 24 fg=default bg=default attrs=
 R27 56 44 fg=default bg=idx00 attrs=
-L28|
-R28 0 32 fg=default bg=idx00 attrs=
+L28| ?        all keys
+R28 0 1 fg=default bg=idx00 attrs=
+R28 1 1 fg=idx08 bg=idx00 attrs=
+R28 2 8 fg=default bg=idx00 attrs=
+R28 10 8 fg=idx08 bg=idx00 attrs=
+R28 18 14 fg=default bg=idx00 attrs=
 R28 32 24 fg=default bg=default attrs=
 R28 56 44 fg=default bg=idx00 attrs=
-L29|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav              0 LOC  ✋ 1    7% free
-R29 0 1 fg=idx07 bg=idx00 attrs=
-R29 1 8 fg=idx00 bg=idx06 attrs=BOLD
-R29 9 2 fg=idx07 bg=idx00 attrs=
-R29 11 15 fg=idx08 bg=idx00 attrs=
-R29 26 3 fg=idx07 bg=idx00 attrs=
-R29 29 11 fg=idx08 bg=idx00 attrs=
-R29 40 3 fg=idx07 bg=idx00 attrs=
-R29 43 18 fg=idx08 bg=idx00 attrs=
-R29 61 20 fg=idx07 bg=idx00 attrs=
-R29 81 6 fg=idx00 bg=idx03 attrs=BOLD
-R29 87 1 fg=idx07 bg=idx00 attrs=
-R29 88 11 fg=idx00 bg=idx09 attrs=BOLD
-R29 99 1 fg=idx07 bg=idx00 attrs=
+L29|0 LOC │ worktree creation failed (resolve base): 'HEAD' has no commits yet — make an initial commit…
+R29 0 5 fg=idx07 bg=idx00 attrs=
+R29 5 3 fg=idx08 bg=idx00 attrs=
+R29 8 91 fg=idx07 bg=idx00 attrs=
+R29 99 1 fg=idx08 bg=idx00 attrs=

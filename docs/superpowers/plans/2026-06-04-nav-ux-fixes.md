@@ -8,9 +8,9 @@ Status: implemented + verified 2026-06-04 (all steps done)
 1. **Keybinds** (`config/zellij.kdl`) — DONE
    - `Alt h/j/k/l` → `MoveFocus` (rebound from default `MoveFocusOrTab`).
    - `Super Alt h/l` added for parity with arrows/`j/k`.
-   - `Alt t` → `Run superzej new-tab` (floating, close_on_exit).
+   - `Alt t` → `Run thegn new-tab` (floating, close_on_exit).
    - `keybinds.tab` `n` → same Run + `SwitchToMode "Normal"`.
-2. **`superzej new-tab`** — DONE
+2. **`thegn new-tab`** — DONE
    - `src/commands/new_tab.rs`: derive base tab name from cwd
      (`{slug}/home` or `{slug}/{branch}`), pick lowest free `·N` (N≥2),
      `new-tab --layout worktree-tab-extra` (fallback bare).
@@ -24,7 +24,7 @@ Status: implemented + verified 2026-06-04 (all steps done)
      (vertical | horizontal | stacked), `min_panes=6`, appended to all four
      tab layouts (kept in sync).
 4. **Packaging** — DONE: `install.sh`, `nix/package.nix`, `nix/hm-module.nix`
-   ship `worktree-tab-extra.kdl`; managed config `~/.superzej/zellij.kdl`
+   ship `worktree-tab-extra.kdl`; managed config `~/.thegn/zellij.kdl`
    refreshed (it was the unmodified previous default).
 5. **Tests** — DONE: `test/nav-ux.py` (headless pty client; 24 assertions:
    focus-after-create, Alt+h/l nav + edge no-spill, Alt+t `·2`/`·3` chrome

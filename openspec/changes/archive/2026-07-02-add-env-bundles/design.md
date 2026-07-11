@@ -10,7 +10,7 @@ per-scope bindings live in `ui_state` (like account pointers).
 
 ## Composition seam — `env::compose()`
 
-New `crates/superzej-core/src/env.rs` is the single resolution point, returning
+New `crates/thegn-core/src/env.rs` is the single resolution point, returning
 `ResolvedEnv { overrides, block, mounts }` (maps 1:1 onto existing
 `SandboxSpec.{env_overrides, env_block, mounts}` — no new sandbox mechanism). It
 subsumes the account-injection currently inlined in `agent::launch_spec_with_key`,

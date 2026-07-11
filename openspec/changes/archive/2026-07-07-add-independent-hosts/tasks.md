@@ -34,9 +34,9 @@ independent_safety_pct` + `headroom_ttl_secs`;
 - [x] 2.2 Placement-time lazy headroom refresh (TTL'd) feeding
       `host_capacity.measured` for EVERY host + the independent ceiling for
       spec-less ones; probe failure ⇒ pack-ineligible this round.
-- [x] 2.3 Drain flow: `superzej host drain <name>` /
+- [x] 2.3 Drain flow: `thegn host drain <name>` /
       `host rm` drains-with-live-tenants (+ `--force` stops
-      superzej-labelled containers); broker + snapshot honor `Draining`;
+      thegn-labelled containers); broker + snapshot honor `Draining`;
       finalize at zero tenants — **mock tests**.
 - [x] 2.4 Surfaces: placement list / Hosts panel show trust class +
       measured age for every host; smoke: drain excludes a host from

@@ -2,8 +2,8 @@
 
 The core `mcp` module is a house-tool _router_ (git/forge), not a declarative
 server model; there is no `[mcp_servers]` config. The managed pi reads its config
-from `settings.json` (written by `pi install packages/superzej-acp` during
-`szhost agent setup`). `capabilities.rs` models sandbox _isolation_, not
+from `settings.json` (written by `pi install packages/thegn-acp` during
+`thegn agent setup`). `capabilities.rs` models sandbox _isolation_, not
 permission grants — there is no grant model. `dns_filter.rs` has a small
 allow/deny glob matcher worth mirroring. Config sub-configs follow the
 `BTreeMap<String, ValueStruct>` + serde-default pattern (`Bundle`, `EnvConfig`).
@@ -21,17 +21,17 @@ is gated by a glob-scoped capability in the manifest.
 - A `[mcp_servers.<name>]` config + pure model + `mcpServers` settings-block
   builder.
 - Real consumption: merge the block into the pi settings during `agent setup`.
-- `szhost mcp` CLI + doctor reporting; grant-checked acquisition.
+- `thegn mcp` CLI + doctor reporting; grant-checked acquisition.
 
 **Non-Goals:**
 
-- Supervising MCP servers as long-lived superzej daemons/panes.
+- Supervising MCP servers as long-lived thegn daemons/panes.
 - Grant-gating the first-party pi/bs tools (implicitly trusted).
-- Changing the `superzej-acp.ts` extension (no TS rebuild).
+- Changing the `thegn-acp.ts` extension (no TS rebuild).
 
 ## Decisions
 
-### Grant model (`superzej-core/src/grants.rs`) — pure
+### Grant model (`thegn-core/src/grants.rs`) — pure
 
 ```
 pub enum GrantKind { Exec, Download, NpmInstall, CargoInstall }   // parsed from "process:exec" etc.
@@ -45,7 +45,7 @@ pub fn glob_match(pattern: &str, value: &str) -> bool              // `*` within
 - **Why a flat `{kind, scope}`**: serde-friendly for `[[mcp_servers.<name>.grants]]`, mirrors Zed's per-capability glob scoping, trivially testable. Kind strings (`process:exec`/`download_file`/`npm:install`/`cargo:install`) parse to `GrantKind`.
 - **glob_match** is our own small matcher (segments split on `/`; `**` spans; `*` within a segment), unit-tested — richer than `dns_filter`'s suffix matcher, which is DNS-specific.
 
-### MCP server model (`superzej-core/src/mcp/config.rs`)
+### MCP server model (`thegn-core/src/mcp/config.rs`)
 
 ```
 pub struct McpServerConfig {
@@ -89,7 +89,7 @@ failure logs, never fails setup). Skipped entirely when no servers are declared.
 - **[settings.json clobber]** Merging could corrupt pi's file. → Read-modify-write
   the parsed JSON, set one key, preserve the rest; best-effort with a log on
   failure; skipped when no servers declared.
-- **[grant bypass]** Enforcement is at superzej's acquire/launch, not the OS. →
+- **[grant bypass]** Enforcement is at thegn's acquire/launch, not the OS. →
   It's a declarative guardrail (like Zed's), not a sandbox; the sandbox layer
   remains the real boundary. Scope is user-declared servers only.
 
@@ -102,6 +102,6 @@ Rollback = revert; an already-written `mcpServers` key is harmless.
 
 ## Open Questions
 
-- Whether to also emit a discoverable `~/.superzej/pi/agent/mcp-servers.json`
+- Whether to also emit a discoverable `~/.thegn/pi/agent/mcp-servers.json`
   artifact in addition to the settings merge (deferred; the merge + `emit` cover
   it).

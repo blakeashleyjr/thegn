@@ -4,7 +4,7 @@
 
 ### Requirement: Spillover is the last paid lane, ordered and health-tracked
 
-superzej SHALL burst to an external sandbox vendor only after the owned pool
+thegn SHALL burst to an external sandbox vendor only after the owned pool
 and autoscale lanes are exhausted, walking the ordered `spillover_envs` list
 (provider-placement envs riding the existing provider pipeline; the list is
 global/profile config only — a repo overlay structurally cannot name
@@ -32,7 +32,7 @@ sticky: fail-back affects new placements only.
 
 ### Requirement: Compute spend is capped by its own ledger with fixed and metered categories
 
-superzej SHALL track placement cost in a compute ledger separate from the
+thegn SHALL track placement cost in a compute ledger separate from the
 LLM proxy's but identical in shape (scope → zone → global caps, monthly
 window, kill-switch): managed hosts accrue fixed hourly cost from create to
 destroy via idempotent watermark accrual (vendor-metered spillover accrual is
@@ -48,12 +48,12 @@ onto already-paid hosts keeps serving.
 
 #### Scenario: Accrual is idempotent across gaps
 
-- **WHEN** superzej is closed for a week while a managed host lives
+- **WHEN** thegn is closed for a week while a managed host lives
 - **THEN** the next accrual tick adds exactly the gap's cost, once
 
 ### Requirement: Presets set preferences, never constraints
 
-superzej SHALL expand a named placement preset into only the preference keys
+thegn SHALL expand a named placement preset into only the preference keys
 still at their built-in defaults — an explicitly-set key always wins — and a
 preset MUST be structurally unable to touch constraint keys; every expansion
 still flows through the zone floor and mode clamp.
@@ -67,16 +67,16 @@ still flows through the zone floor and mode clamp.
 
 ### Requirement: Repo overlays cannot touch fleet placement policy
 
-superzej SHALL keep every `[placement]` key out of the repo overlay schema
+thegn SHALL keep every `[placement]` key out of the repo overlay schema
 entirely (the `[host.*]` structural-exclusion precedent): a checked-in
-`.superzej.*` file cannot set overcommit, spend caps, autoscale lanes,
+`.thegn.*` file cannot set overcommit, spend caps, autoscale lanes,
 prices, or spillover targets, because the overlay simply has no such table —
 packing economics for shared hosts are never authorable from the
 least-trusted layer.
 
 #### Scenario: Hostile repo overlay cannot reach placement config
 
-- **WHEN** a cloned repo's `.superzej.toml` smuggles a `[placement]` table
+- **WHEN** a cloned repo's `.thegn.toml` smuggles a `[placement]` table
   with `overcommit = 16.0` and its own spillover list
 - **THEN** none of it reaches the resolved config (the overlay schema has no
   placement table) and the worktree still opens

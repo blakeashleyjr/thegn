@@ -1,6 +1,6 @@
 # Test coverage & gates
 
-superzej gates its **testable core** at 95% line coverage and tiers the rest of
+thegn gates its **testable core** at 95% line coverage and tiers the rest of
 its checks so commits stay fast while pushes stay safe.
 
 ## What's measured (and what isn't)
@@ -51,7 +51,7 @@ to 95% first.
 Coverage (`cargo llvm-cov`) is a **CI-only** gate — it is an instrumented full
 recompile (the heaviest phase) and CI re-runs it regardless, so it is no longer
 on pre-push. Run `just coverage` locally on demand before opening a PR. All
-e2e/visual steps sandbox `SUPERZEJ_DIR` (and the legacy `ZELLIJ_SOCKET_DIR`) so
+e2e/visual steps sandbox `THEGN_DIR` (and the legacy `ZELLIJ_SOCKET_DIR`) so
 they never leak into the daily session or DB.
 
 ## Visual regression
@@ -59,7 +59,7 @@ they never leak into the daily session or DB.
 `just visual` drives the TUI through `test/visual/manifest.toml` flows in a
 sandboxed zellij, captures each screen with `zellij action dump-screen`, and
 diffs it against a committed golden at ≥95% cell similarity. Determinism comes
-from `SZ_FAKE_STATS` / `SZ_FAKE_TIME` (frozen tabbar) and a fixed terminal size.
+from `TG_FAKE_STATS` / `TG_FAKE_TIME` (frozen tabbar) and a fixed terminal size.
 Capture a baseline with `just visual-update`; CI additionally renders PNG
 artifacts for human review.
 

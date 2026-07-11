@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Persistence (superzej-core)
+## 1. Persistence (thegn-core)
 
 - [ ] 1.1 `terminals` table + `put_terminal`/`terminals`/`del_terminal`/
       `rename_terminal`; `user_version` bump — **unit tests** (CRUD round-trip,

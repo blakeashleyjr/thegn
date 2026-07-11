@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Local usage/rate-limit reader (superzej-core, item 759)
+## 1. Local usage/rate-limit reader (thegn-core, item 759)
 
 - [ ] 1.1 Extend `account.rs::Provider` with a `usage_file` + a pure `parse_usage`
       seam returning `UsageState { plan_pct, reset_at, window }` from the resolved

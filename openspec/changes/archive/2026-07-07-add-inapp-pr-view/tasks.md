@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Core data + parsers + CLI seams (`superzej-core::github`)
+## 1. Core data + parsers + CLI seams (`thegn-core::github`)
 
 - [x] 1.1 Add `PrComment`, `PrReview`, `ReviewThread`, `PrConversation`,
       `PrDiff`/`DiffFile`/`DiffHunk`/`DiffLine`/`DiffLineKind`, `ReviewState`.
@@ -10,13 +10,13 @@
       request-changes/comment), `reply_to_thread` (GraphQL), `pr_diff`,
       `add_line_comment` (REST), `conversation` (GraphQL).
 
-## 2. Service layer (`superzej-svc` `GhBackend`)
+## 2. Service layer (`thegn-svc` `GhBackend`)
 
 - [x] 2.1 Six new trait methods, default-impl'd to the core fns (CliGh free).
 - [x] 2.2 `GhNative` inherits CLI for all six (writes CLI-only invariant);
       `headRefOid` threaded through the native `PR_QUERY` + parse.
 
-## 3. Full-screen PR view (`superzej-host/src/pr_view.rs`)
+## 3. Full-screen PR view (`thegn-host/src/pr_view.rs`)
 
 - [x] 3.1 `PrView` / `PrTab` / `Composer`/`ComposerTarget` / `TextArea` /
       `PrViewOutcome` / `PrViewAction` / `PrViewData`.
@@ -40,7 +40,7 @@
 
 ## 6. CLI parity + wiring + validation
 
-- [x] 6.1 `superzej pr comment|review|diff` subcommands.
+- [x] 6.1 `thegn pr comment|review|diff` subcommands.
 - [x] 6.2 `run.rs` wiring: slot, channel drain, dispatch, render, open-on-Enter,
       paste routing.
 - [x] 6.3 `test/smoke.sh` coverage for `pr comment|review|diff` seams.

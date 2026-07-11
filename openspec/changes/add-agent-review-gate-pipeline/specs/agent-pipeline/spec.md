@@ -39,7 +39,7 @@ The pipeline SHALL be modeled as a workflow graph of typed nodes (`agent-exec`, 
 
 ### Requirement: The graph engine is a pure state machine
 
-The pipeline engine SHALL be a pure, deterministic state machine over the node graph with all I/O injected at its edges, MUST live in `superzej-core` with exhaustive unit tests, and MUST be coverage-gated (95% lines) in the same shape as `render_plan::plan`.
+The pipeline engine SHALL be a pure, deterministic state machine over the node graph with all I/O injected at its edges, MUST live in `thegn-core` with exhaustive unit tests, and MUST be coverage-gated (95% lines) in the same shape as `render_plan::plan`.
 
 #### Scenario: Deterministic node ordering
 

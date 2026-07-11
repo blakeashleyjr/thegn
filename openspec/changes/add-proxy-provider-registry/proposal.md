@@ -2,7 +2,7 @@
 
 ## Summary
 
-Give szproxy a single **declarative provider registry** — one `ProviderInfo`
+Give tgproxy a single **declarative provider registry** — one `ProviderInfo`
 table that is the source of truth for every backend's base URL, auth env var,
 default model, and request transforms — from which both the config surface and the
 client construction are derived. Modeled on
@@ -21,7 +21,7 @@ which fans one declaration out to config prompts and client init.
 
 ## Rationale
 
-szproxy already routes and relays across backends with per-backend transforms
+tgproxy already routes and relays across backends with per-backend transforms
 (`apply_transforms`: ensure-max-tokens, backend defaults, tool-message
 compression), but backend metadata (URLs, env keys, default models, transforms) is
 spread across the router and config. lumen shows the clean shape: a single

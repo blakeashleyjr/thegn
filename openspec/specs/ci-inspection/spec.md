@@ -2,7 +2,7 @@
 
 ## Purpose
 
-superzej surfaces CI/CD pipeline state — run history, job/step drilldown, and logs
+thegn surfaces CI/CD pipeline state — run history, job/step drilldown, and logs
 with jump-to-failure — across providers through a provider-agnostic model. CI is a
 separate axis from the forge: the `CiProvider` trait is a sibling of the forge
 trait, providers degrade native-API → CLI → unavailable, and the whole layer is

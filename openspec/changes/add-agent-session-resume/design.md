@@ -15,7 +15,7 @@ HarnessSpec {
 
 - `resume` for Claude Code → `["claude", "--resume", <id>, ..safe_args]`; Codex →
   `["codex", "resume", <id>, ..safe_args]`; Gemini → its documented resume flag.
-- All of this lives in `superzej-core::agent_session` and is **pure + unit-tested**
+- All of this lives in `thegn-core::agent_session` and is **pure + unit-tested**
   (95% core gate): detection from argv, resume-command reconstruction per harness,
   and the sanitizer.
 
@@ -31,17 +31,17 @@ output round-trips through `resume` with no secret substring present.
 
 ## Capture path (host)
 
-`szhost agent hooks setup` writes/merges a hook into each installed harness's own
+`thegn agent hooks setup` writes/merges a hook into each installed harness's own
 config:
 
 - Claude Code: a `SessionStart`/`SessionEnd` hook in `~/.claude/settings.json`
-  that runs `szhost agent record --harness claude --session-id "$SESSION_ID" …`.
+  that runs `thegn agent record --harness claude --session-id "$SESSION_ID" …`.
 - Codex: `~/.codex/hooks.json` entries for `session-start` / `session-end`.
 - Gemini CLI: `~/.gemini/settings.json` equivalent.
 
-The installer is **idempotent** (detects an existing superzej hook and no-ops),
-merges rather than overwrites, and reports which harnesses were found. `szhost
-agent record` resolves the worktree/pane from `$SUPERZEJ_WORKTREE`/`$SUPERZEJ_PANE`
+The installer is **idempotent** (detects an existing thegn hook and no-ops),
+merges rather than overwrites, and reports which harnesses were found. `thegn
+agent record` resolves the worktree/pane from `$THEGN_WORKTREE`/`$THEGN_PANE`
 and upserts a session record.
 
 ## Persistence (state-db, `user_version` bump)
@@ -70,7 +70,7 @@ upstream, it falls back to a plain relaunch and surfaces a notice.
 
 ## Invariants
 
-- **Event loop**: capture is out-of-band — the hook subprocess calls `szhost
+- **Event loop**: capture is out-of-band — the hook subprocess calls `thegn
 agent record`, which writes over the control path (mpsc + `TerminalWaker`
   pulse). No blocking DB I/O on the loop; the upsert runs on `spawn_blocking`.
 - **Render**: none directly; a restored agent pane repaints as any pane does.

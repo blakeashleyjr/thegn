@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Frecency ranker (superzej-core)
+## 1. Frecency ranker (thegn-core)
 
 - [x] 1.1 `frecency.rs`: pure `score(count, last_used_ms, now_ms) -> f64` with a
       bounded half-life decay, and a `rank(entries) -> Vec` helper — **unit tests**:
@@ -10,14 +10,14 @@
 --show-toplevel` path — **unit tests**: nested cwd resolves to root, cwd
       outside any worktree returns none.
 
-## 2. Layout importer (superzej-core)
+## 2. Layout importer (thegn-core)
 
 - [x] 2.1 `layout_import.rs`: parse a tmuxinator/sesh project file into
       `ImportedLayout { name, root, windows }` — **unit tests**: valid tmuxinator
       project, valid `sesh.toml` `[[session]]`, missing optional fields defaulted,
       malformed input returns an error (no panic).
 
-## 3. Palette + actions (superzej-host)
+## 3. Palette + actions (thegn-host)
 
 - [x] 3.1 Add a repo/worktree `PaletteMode` in `search_everywhere.rs`: list
       workspaces + worktrees ranked by the frecency score, nucleo-filtered; select

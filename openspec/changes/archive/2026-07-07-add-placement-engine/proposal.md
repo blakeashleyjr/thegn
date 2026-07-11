@@ -4,9 +4,9 @@
 
 Give every sandbox spawn a **placement decision**: run **Dedicated** (one
 sandbox, exclusive host), **Packed** (bin-packed with other sandboxes onto a
-shared Ready host via superzej's own container engine), or — in later changes —
+shared Ready host via thegn's own container engine), or — in later changes —
 spill to an external sandbox vendor. A pure, exhaustively-tested broker
-(`superzej-core::scheduler::decide_placement`) ranks the host pool through a
+(`thegn-core::scheduler::decide_placement`) ranks the host pool through a
 capacity index (declared floors vs. spec × overcommit ceilings) behind a trust
 gate (isolation class + zone co-tenancy checked **before** cost), reserves the
 chosen slot atomically in SQLite, and hands the existing `ensure_ready` the
@@ -16,7 +16,7 @@ a new Managed VPS from an ordered template list (Hetzner first), drive it to
 drains.
 
 The economics this encodes: commodity VMs bill for existence at a fraction of
-sandbox-vendor rates, and superzej already owns the isolation layer vendors
+sandbox-vendor rates, and thegn already owns the isolation layer vendors
 charge for — so the default is _pack onto hosts you already pay for first_,
 create new capacity second, and (future change) pay vendor markup only as the
 spillover of last resort.
@@ -37,8 +37,8 @@ spillover of last resort.
   env's binding: engine off (default) or pinned env ⇒ byte-identical old path;
   engine on ⇒ `placement_flow::place()` chooses the host, reserves tenancy,
   and returns a `HostBinding` the unchanged `ensure_host_ready` drives.
-- **CLI** — `szhost placement plan --json` (pure dry-run of the decision, the
-  smoke/debug surface), `szhost placement list` (hosts, capacity, tenants).
+- **CLI** — `thegn placement plan --json` (pure dry-run of the decision, the
+  smoke/debug surface), `thegn placement list` (hosts, capacity, tenants).
 - **tasks.md**: group AE (container provisioning: 385 CoW/base image, 386
   prewarmed pool, 392 image build cache), group J (remote access), 749
   (commodity-VPS backend), 244 (fleet view groundwork — capacity/tenancy rows
@@ -46,7 +46,7 @@ spillover of last resort.
 
 ## Rationale
 
-superzej already has every layer this composes — `[host.*]` bindings, the pure
+thegn already has every layer this composes — `[host.*]` bindings, the pure
 host state machine + single-flight driver, the warm-spare pool, the VPS
 (Hetzner) provider with intent-ledger + reaper, and zone trust ceilings. What
 is missing is the _decision_: nothing today maps sandbox → host with resource

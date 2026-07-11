@@ -5,8 +5,7 @@ Guidance for working in this repo. See `README.md` for the user-facing tour and
 
 ## What this is
 
-**superzej** (binary `szhost`, installed as `superzej` with `sj`/`szhost`
-aliases) — a terminal-native git-worktree IDE that is its own terminal
+**thegn** (binary `thegn`, with a short `tg` alias) — a terminal-native git-worktree IDE that is its own terminal
 multiplexer. One process, one session: each repo is a workspace, each git
 **worktree** is a tab, and the chrome (sidebar tree, diff/PR panel, tabbar,
 statusbar, pin strip) is rendered in-process. There is **no zellij, no WASM
@@ -21,13 +20,13 @@ layers; AI is strictly additive.
 ## Architecture
 
 - **Cargo workspace, three crates:**
-  - `crates/superzej-core` — substrate-agnostic, testable domain logic: layered
+  - `crates/thegn-core` — substrate-agnostic, testable domain logic: layered
     config, SQLite DB, keymap registry, theme, sandbox backends, activity
     state machine, `gh` wrapper. No tokio/termwiz deps.
-  - `crates/superzej-svc` — service trait seams with graceful degradation:
+  - `crates/thegn-svc` — service trait seams with graceful degradation:
     `GitBackend` (gix-native reads, CLI fallback + writes), GitHub (octocrab /
     `gh`), SSH (russh / `ssh`). Native gaps always fall back to subprocess.
-  - `crates/superzej-host` — the compositor: tokio runtime, portable-pty panes
+  - `crates/thegn-host` — the compositor: tokio runtime, portable-pty panes
     through a pluggable `PaneEmulator` (vt100 today), termwiz `Surface`
     diff-flush rendering, in-process chrome.
 - **Event model (a hard invariant: ~0% idle CPU).** When idle, the loop blocks
@@ -52,7 +51,7 @@ layers; AI is strictly additive.
   full chrome recompose. `render_tab` = `render_panes` (center) + `draw_chrome`,
   composed separately so each can repaint without the other.
 - **Terminal compatibility / graceful degradation.** The outer terminal's
-  capabilities (`superzej_core::termcaps`: color depth, glyph level, undercurl,
+  capabilities (`thegn_core::termcaps`: color depth, glyph level, undercurl,
   mouse) are detected purely from the environment (with an optional startup
   DA/XTVERSION probe, `src/probe.rs`), folded with `[theme] color`/`glyphs`
   config, and installed into a render-time holder (`src/caps.rs`, same pattern as
@@ -61,10 +60,10 @@ layers; AI is strictly additive.
   truecolor→256→16→mono (or drops, for `NO_COLOR`) at the single `wire.rs`
   `color_spec` chokepoint, and **glyphs** swap Unicode↔ASCII via
   `caps::active_glyphs()` at the borders/chrome/pins/logotype call sites. Chrome
-  layout widths use display width (`unicode-width`), not char count. `superzej
+  layout widths use display width (`unicode-width`), not char count. `thegn
 doctor` prints the resolved capabilities. Detection logic is pure + unit-tested
   in core; never assume truecolor/Unicode at a draw site — go through `caps`.
-- **State.** SQLite at `$XDG_STATE_HOME/superzej/superzej.db` (WAL, schema
+- **State.** SQLite at `$XDG_STATE_HOME/thegn/thegn.db` (WAL, schema
   versioned via `user_version`): repos, workspaces, worktrees, PR cache,
   tab layouts, session + sidebar UI state. **git is the source of truth** for
   worktrees; the DB is a cache + resurrection layer.
@@ -86,22 +85,22 @@ doctor` prints the resolved capabilities. Detection logic is pure + unit-tested
   reintroduces a full recompose on pane output fails these tests. **When you
   touch the render path, keep these invariants and their tests green** — they are
   the regression gate, not the (advisory) wall-clock benches. The runtime
-  `szhost::perf` rollup also emits a **slow-frame warning** (`render_p50_us` over
-  `SUPERZEJ_FRAME_BUDGET_US`, default 16ms) and `render_busy_ratio`, which catch
+  `thegn::perf` rollup also emits a **slow-frame warning** (`render_p50_us` over
+  `THEGN_FRAME_BUDGET_US`, default 16ms) and `render_busy_ratio`, which catch
   cost-per-frame regressions the idle-ratio/wake-count storm warning cannot see.
 
-- `SUPERZEJ_LOG=info` writes a **startup waterfall** to
-  `$XDG_STATE_HOME/superzej/logs/szhost.log` (`szhost::startup` events with
-  `since_start_ms`). Frame/hydration timings: `SUPERZEJ_LOG=szhost::frame=debug`
-  / `szhost::hydrate=debug`. No subscriber is installed when `SUPERZEJ_LOG` is
+- `THEGN_LOG=info` writes a **startup waterfall** to
+  `$XDG_STATE_HOME/thegn/logs/thegn.log` (`thegn::startup` events with
+  `since_start_ms`). Frame/hydration timings: `THEGN_LOG=thegn::frame=debug`
+  / `thegn::hydrate=debug`. No subscriber is installed when `THEGN_LOG` is
   unset — instrumentation is free.
 - `just bench` (hyperfine) measures process baseline + real launch→first-frame
-  via `SUPERZEJ_BENCH_FIRST_FRAME_EXIT=1`. Machine-dependent, so not in `ci`;
+  via `THEGN_BENCH_FIRST_FRAME_EXIT=1`. Machine-dependent, so not in `ci`;
   perf commits should record before/after deltas.
 - **Perf suite** (`docs/superpowers/specs/perf-suite.md`): runtime self-profiler
-  (`SUPERZEJ_PERF=1` → `szhost::perf` rollup with wake-source + per-subsystem-CPU
+  (`THEGN_PERF=1` → `thegn::perf` rollup with wake-source + per-subsystem-CPU
   attribution + wake-storm warning), steady-state idle harness (`just bench-idle`,
-  `SUPERZEJ_BENCH_RUN_MS`), criterion micro-benches (`just bench-micro`), a live
+  `THEGN_BENCH_RUN_MS`), criterion micro-benches (`just bench-micro`), a live
   Telemetry "LOOP" overlay, and an in-process flame-graph profiler (`just profile`,
   SIGUSR2, `profiling` feature). All free when off; none in `ci` (machine-dependent).
 - Expensive setup belongs off-thread (see the diff fs-watcher: recursive
@@ -110,18 +109,18 @@ doctor` prints the resolved capabilities. Detection logic is pure + unit-tested
 
 ## Source map
 
-- `crates/superzej-host/src/main.rs` — clap tree; bare `szhost` launches the
+- `crates/thegn-host/src/main.rs` — clap tree; bare `thegn` launches the
   compositor, subcommands (`pr`, `issue`, `diff`, `list`, `repos`, `config`)
   run synchronously from `src/cmd/`.
-- `crates/superzej-host/src/run.rs` — the event loop + startup.
-- `crates/superzej-host/src/` — `chrome.rs` (widget rendering), `sidebar.rs`
+- `crates/thegn-host/src/run.rs` — the event loop + startup.
+- `crates/thegn-host/src/` — `chrome.rs` (widget rendering), `sidebar.rs`
   (tree model), `pins.rs` (`PinSupervisor` daemon panes), `center.rs`
   (pane-tree layout), `pane.rs`/`emulator.rs` (PTY + vt100), `session.rs`
   (persist/resurrect), `palette.rs`, `keymap.rs`, `copymode.rs`.
-- `crates/superzej-core/src/` — `config.rs` (layered TOML, `config_enum!`),
+- `crates/thegn-core/src/` — `config.rs` (layered TOML, `config_enum!`),
   `db.rs`, `keymap.rs`, `theme.rs`, `sandbox.rs`, `activity.rs`, `log.rs`
   (branded tracing subscriber + rotating file sink).
-- `config/config.toml.example` — every superzej key, documented.
+- `config/config.toml.example` — every thegn key, documented.
 - `docs/superpowers/{plans,specs}/` — design docs per feature.
 
 ## Development
@@ -144,7 +143,7 @@ just ci              # fmt-check + lint + build + test + openspec-validate + cov
 `just coverage`, `just lint`, `just ci`) are full-workspace compiles; running
 them after every edit is what saturates the CPU. **While iterating, use
 `just quick`** (clippy on lib/bin code only — no test/bench targets, no tests,
-no coverage; `just quick superzej-host` scopes to one crate). Run the heavy
+no coverage; `just quick thegn-host` scopes to one crate). Run the heavy
 gates **once, when preparing to push or open a PR** — not per-edit. The tiers
 enforce this automatically:
 
@@ -163,9 +162,9 @@ Nix: `nix profile install .#default`; `nix develop` for the dev shell.
 
 ## Spec-driven development (OpenSpec)
 
-superzej's **own development** is managed with [OpenSpec](https://github.com/Fission-AI/OpenSpec)
+thegn's **own development** is managed with [OpenSpec](https://github.com/Fission-AI/OpenSpec)
 (spec-driven development for AI agents). This is a dev-process tool — it is **not**
-part of the shipped `szhost` binary.
+part of the shipped `thegn` binary.
 
 - **Source of truth:** `openspec/specs/<capability>/spec.md` describes how the
   system behaves _today_ (behavior-first: `### Requirement:` with SHALL/MUST +
@@ -203,7 +202,7 @@ part of the shipped `szhost` binary.
   a sibling module (e.g. `src/handlers/<area>.rs`) and call it from the loop.
   After shrinking a pinned file, run `test/file-size-ratchet.sh --update` to
   lock in the lower ceiling.
-- **Coverage gate: `superzej-core` only, 95% lines.** I/O / subprocess seams
+- **Coverage gate: `thegn-core` only, 95% lines.** I/O / subprocess seams
   (the `cov_ignore` regex in the justfile) are excluded and exercised by
   `test/smoke.sh` instead. The host and svc crates carry their own unit tests
   but aren't gated. New core logic needs unit tests.
@@ -215,7 +214,7 @@ part of the shipped `szhost` binary.
   `// best-effort: <why>` comment — and never swallow errors on the primary
   path of a user-invoked action (surface those via `model.status`, `msg`, or
   `tracing`).
-- **This shell often runs _inside_ a live superzej.** Anything that opens the
+- **This shell often runs _inside_ a live thegn.** Anything that opens the
   DB or spawns the host in tests/benches must isolate `XDG_STATE_HOME`
   (`just start`/`just bench` already do).
 - **`.pre-commit-config.yaml` is a generated Nix store symlink** (devenv /
@@ -227,9 +226,9 @@ part of the shipped `szhost` binary.
   working tree is mounted **read-only** (protecting a live instance) but the
   shared `.git` (object + ref store) is **writable**. So `git checkout main &&
 git merge` / `merge --ff-only` fail (they rewrite the read-only tree), while
-  the object-DB fold succeeds. Use **`szhost land`** (one-shot: fold + gate +
-  CAS-advance `refs/heads/main`, no target checkout) — or `szhost integrate` for
+  the object-DB fold succeeds. Use **`thegn land`** (one-shot: fold + gate +
+  CAS-advance `refs/heads/main`, no target checkout) — or `thegn integrate` for
   the whole queue. A running instance on `main` then fast-forwards its own tree
   on the ref move (`git_watch`/`util::heal_main_checkout_worktree`). Don't
   hand-roll `git update-ref` to "merge to main" (it moves the ref but leaves the
-  live tree stale). See `crates/superzej-core/src/merge_guard.rs`.
+  live tree stale). See `crates/thegn-core/src/merge_guard.rs`.

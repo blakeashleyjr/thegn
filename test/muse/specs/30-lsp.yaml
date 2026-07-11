@@ -19,19 +19,19 @@ matrix:
   sizes: ["120x36"]
 spawn:
   # The server command is the bare `fake_lsp` — `just e2e` puts target/debug on
-  # PATH, which szhost inherits, so it resolves regardless of the spawn cwd.
+  # PATH, which thegn inherits, so it resolves regardless of the spawn cwd.
   - sh
   - -c
   - |
     # Derive XDG_CONFIG_HOME from the (real, case-isolated) XDG_STATE_HOME and
-    # export it so the exec'd szhost reads the same config dir we write here.
+    # export it so the exec'd thegn reads the same config dir we write here.
     export XDG_CONFIG_HOME="$XDG_STATE_HOME/cfg"
     repo="$XDG_STATE_HOME/wt"
-    mkdir -p "$repo" "$XDG_CONFIG_HOME/superzej"
-    printf '[[lsp.servers]]\n' > "$XDG_CONFIG_HOME/superzej/config.toml"
-    printf 'lang = "rust"\n' >> "$XDG_CONFIG_HOME/superzej/config.toml"
-    printf 'command = "fake_lsp"\n' >> "$XDG_CONFIG_HOME/superzej/config.toml"
-    printf 'args = []\n' >> "$XDG_CONFIG_HOME/superzej/config.toml"
+    mkdir -p "$repo" "$XDG_CONFIG_HOME/thegn"
+    printf '[[lsp.servers]]\n' > "$XDG_CONFIG_HOME/thegn/config.toml"
+    printf 'lang = "rust"\n' >> "$XDG_CONFIG_HOME/thegn/config.toml"
+    printf 'command = "fake_lsp"\n' >> "$XDG_CONFIG_HOME/thegn/config.toml"
+    printf 'args = []\n' >> "$XDG_CONFIG_HOME/thegn/config.toml"
     cd "$repo"
     git init -q -b main
     git config user.email t@t.t
@@ -40,17 +40,17 @@ spawn:
     git add .
     git commit -qm init
     printf 'fn greet() -> u8 {\n    42\n}\n' > lib.rs
-    exec szhost
+    exec thegn
 env:
   XDG_STATE_HOME: "{case_tmp}"
-  SUPERZEJ_LOG: warn
+  THEGN_LOG: warn
   MUSE_READY: "1"
   TERM: xterm-256color
 sync:
   quiet_window_ms: 2000
   max_settle_ms: 12000
 steps:
-  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 20000}
+  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
   # Exit the dashboard, open + focus the right panel.
   - key: {key: q}
   - sleep_ms: 300
@@ -74,5 +74,5 @@ steps:
   - sleep_ms: 1000
   - expect_visible: {regex: "fake error", timeout_ms: 15000}
   - check_file:
-      path: "{case_tmp}/superzej/logs/szhost.log"
+      path: "{case_tmp}/thegn/logs/thegn.log"
       reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"

@@ -1,13 +1,16 @@
-L0| ◆ superzej v0.1.0 work     15.4/94G ·   7% ·  49% ·  96°C ·  ↓ 1014K ↑  571K ·  100% · 22:07
+L0| þ thegn v0.1.0  work        99% ·  18.2/94G ·   7% ·  35% ·  ↓  2.5M ↑  2.6M ·  100% · 02:22
 R0 0 1 fg=idx07 bg=idx00 attrs=
 R0 1 2 fg=idx06 bg=idx00 attrs=
-R0 3 9 fg=idx07 bg=idx00 attrs=
-R0 12 6 fg=idx08 bg=idx00 attrs=
-R0 18 6 fg=idx06 bg=idx08 attrs=BOLD
-R0 24 13 fg=idx07 bg=idx00 attrs=
-R0 37 11 fg=idx08 bg=idx00 attrs=
-R0 48 5 fg=idx07 bg=idx00 attrs=
-R0 53 12 fg=idx08 bg=idx00 attrs=
+R0 3 6 fg=idx07 bg=idx00 attrs=
+R0 9 6 fg=idx08 bg=idx00 attrs=
+R0 15 1 fg=idx07 bg=idx00 attrs=
+R0 16 6 fg=idx06 bg=idx08 attrs=BOLD
+R0 22 6 fg=idx07 bg=idx00 attrs=
+R0 28 8 fg=idx08 bg=idx00 attrs=
+R0 36 10 fg=idx07 bg=idx00 attrs=
+R0 46 11 fg=idx08 bg=idx00 attrs=
+R0 57 5 fg=idx07 bg=idx00 attrs=
+R0 62 3 fg=idx08 bg=idx00 attrs=
 R0 65 17 fg=idx07 bg=idx00 attrs=
 R0 82 3 fg=idx08 bg=idx00 attrs=
 R0 85 6 fg=idx03 bg=idx00 attrs=
@@ -50,8 +53,8 @@ R5 6 1 fg=idx09 bg=idx00 attrs=
 R5 7 1 fg=idx07 bg=idx00 attrs=
 R5 8 4 fg=idx06 bg=idx00 attrs=
 R5 12 20 fg=idx07 bg=idx00 attrs=
-R5 32 11 fg=default bg=default attrs=
-R5 43 13 fg=default bg=idx00 attrs=
+R5 32 20 fg=default bg=default attrs=
+R5 52 4 fg=default bg=idx00 attrs=
 R5 56 1 fg=idx07 bg=idx00 attrs=
 R5 57 1 fg=idx06 bg=idx00 attrs=BOLD
 R5 58 1 fg=idx07 bg=idx00 attrs=
@@ -61,15 +64,15 @@ R5 94 5 fg=idx08 bg=idx00 attrs=
 R5 99 1 fg=idx07 bg=idx00 attrs=
 L6|
 R6 0 32 fg=idx07 bg=idx00 attrs=
-R6 32 11 fg=default bg=default attrs=
-R6 43 13 fg=default bg=idx00 attrs=
+R6 32 20 fg=default bg=default attrs=
+R6 52 4 fg=default bg=idx00 attrs=
 R6 56 44 fg=idx07 bg=idx00 attrs=
 L7| TERMINALS                                                working tree clean
 R7 0 1 fg=idx07 bg=idx00 attrs=
 R7 1 9 fg=idx07 bg=idx00 attrs=BOLD
 R7 10 22 fg=idx07 bg=idx00 attrs=
-R7 32 11 fg=default bg=default attrs=
-R7 43 13 fg=default bg=idx00 attrs=
+R7 32 20 fg=default bg=default attrs=
+R7 52 4 fg=default bg=idx00 attrs=
 R7 56 2 fg=idx07 bg=idx00 attrs=
 R7 58 18 fg=idx08 bg=idx00 attrs=
 R7 76 24 fg=idx07 bg=idx00 attrs=
@@ -120,12 +123,12 @@ L14|
 R14 0 32 fg=default bg=idx00 attrs=
 R14 32 24 fg=default bg=default attrs=
 R14 56 44 fg=idx07 bg=idx00 attrs=
-L15|                                    superzej v0.1.0      5 files                              0 loc
+L15|                                      thegn v0.1.0       5 files                              0 loc
 R15 0 32 fg=default bg=idx00 attrs=
-R15 32 4 fg=default bg=default attrs=
-R15 36 9 fg=idx06 bg=idx00 attrs=
-R15 45 6 fg=idx07 bg=idx00 attrs=
-R15 51 5 fg=default bg=default attrs=
+R15 32 6 fg=default bg=default attrs=
+R15 38 6 fg=idx06 bg=idx00 attrs=
+R15 44 6 fg=idx07 bg=idx00 attrs=
+R15 50 6 fg=default bg=default attrs=
 R15 56 1 fg=idx07 bg=idx00 attrs=
 R15 57 1 fg=idx08 bg=idx00 attrs=BOLD
 R15 58 36 fg=idx07 bg=idx00 attrs=
@@ -155,32 +158,58 @@ L21|
 R21 0 32 fg=default bg=idx00 attrs=
 R21 32 24 fg=default bg=default attrs=
 R21 56 44 fg=default bg=idx00 attrs=
-L22|
-R22 0 32 fg=default bg=idx00 attrs=
+L22|─ NAVIGATE ─────────────────────
+R22 0 1 fg=idx08 bg=idx00 attrs=
+R22 1 10 fg=idx07 bg=idx00 attrs=BOLD
+R22 11 21 fg=idx08 bg=idx00 attrs=
 R22 32 24 fg=default bg=default attrs=
 R22 56 44 fg=default bg=idx00 attrs=
-L23|
-R23 0 32 fg=default bg=idx00 attrs=
+L23| Alt+1-9  jump worktree
+R23 0 1 fg=default bg=idx00 attrs=
+R23 1 7 fg=idx08 bg=idx00 attrs=
+R23 8 2 fg=default bg=idx00 attrs=
+R23 10 13 fg=idx08 bg=idx00 attrs=
+R23 23 9 fg=default bg=idx00 attrs=
 R23 32 24 fg=default bg=default attrs=
 R23 56 44 fg=default bg=idx00 attrs=
-L24|
-R24 0 32 fg=default bg=idx00 attrs=
+L24| Ctrl+1-9 jump workspace
+R24 0 1 fg=default bg=idx00 attrs=
+R24 1 8 fg=idx08 bg=idx00 attrs=
+R24 9 1 fg=default bg=idx00 attrs=
+R24 10 14 fg=idx08 bg=idx00 attrs=
+R24 24 8 fg=default bg=idx00 attrs=
 R24 32 24 fg=default bg=default attrs=
 R24 56 44 fg=default bg=idx00 attrs=
-L25|
-R25 0 32 fg=default bg=idx00 attrs=
+L25| j / k    move up/down
+R25 0 1 fg=default bg=idx00 attrs=
+R25 1 5 fg=idx08 bg=idx00 attrs=
+R25 6 4 fg=default bg=idx00 attrs=
+R25 10 12 fg=idx08 bg=idx00 attrs=
+R25 22 10 fg=default bg=idx00 attrs=
 R25 32 24 fg=default bg=default attrs=
 R25 56 44 fg=default bg=idx00 attrs=
-L26|
-R26 0 32 fg=default bg=idx00 attrs=
+L26| Enter    open / fold
+R26 0 1 fg=default bg=idx00 attrs=
+R26 1 5 fg=idx08 bg=idx00 attrs=
+R26 6 4 fg=default bg=idx00 attrs=
+R26 10 11 fg=idx08 bg=idx00 attrs=
+R26 21 11 fg=default bg=idx00 attrs=
 R26 32 24 fg=default bg=default attrs=
 R26 56 44 fg=default bg=idx00 attrs=
-L27|
-R27 0 32 fg=default bg=idx00 attrs=
+L27| /        filter
+R27 0 1 fg=default bg=idx00 attrs=
+R27 1 1 fg=idx08 bg=idx00 attrs=
+R27 2 8 fg=default bg=idx00 attrs=
+R27 10 6 fg=idx08 bg=idx00 attrs=
+R27 16 16 fg=default bg=idx00 attrs=
 R27 32 24 fg=default bg=default attrs=
 R27 56 44 fg=default bg=idx00 attrs=
-L28|
-R28 0 32 fg=default bg=idx00 attrs=
+L28| ?        all keys
+R28 0 1 fg=default bg=idx00 attrs=
+R28 1 1 fg=idx08 bg=idx00 attrs=
+R28 2 8 fg=default bg=idx00 attrs=
+R28 10 8 fg=idx08 bg=idx00 attrs=
+R28 18 14 fg=default bg=idx00 attrs=
 R28 32 24 fg=default bg=default attrs=
 R28 56 44 fg=default bg=idx00 attrs=
 L29|  NORMAL   ↵ open   n new   d delete   m menu   ? help   Ctrl g lock       0 LOC  ✋ 1    7% free

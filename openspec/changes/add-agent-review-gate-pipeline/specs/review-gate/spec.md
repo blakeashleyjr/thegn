@@ -45,5 +45,5 @@ Pipeline runs and their findings SHALL be persisted in a cache table so a parked
 
 #### Scenario: Restart with a parked gate
 
-- **WHEN** superzej restarts while a run is parked at an approval-gate
+- **WHEN** thegn restarts while a run is parked at an approval-gate
 - **THEN** the run and its findings rehydrate from the cache and the review pane shows the same parked state

@@ -2,7 +2,7 @@
 
 ## Summary
 
-Add a deterministic, pure-Rust **log templater** in `superzej-core` that collapses
+Add a deterministic, pure-Rust **log templater** in `thegn-core` that collapses
 repetitive pane scrollback into compact template groups before it is fed to an
 agent (over ACP) or through the LLM proxy as context — bounding the context (and
 token) spend of "read my terminal output." Modeled on
@@ -30,7 +30,7 @@ preserving diagnosability. Crucially, its authors publish the _negative_ result:
 on small windows the compressed form is **worse** than raw. So this ships with the
 same rule — compaction is applied only above a size threshold, and its
 determinism is an invariant (same input ⇒ same groups, in stable order), matching
-superzej's "render decision is a pure function" ethos. It lives in core with no
+thegn's "render decision is a pure function" ethos. It lives in core with no
 tokio/termwiz deps and is entirely opt-in.
 
 ## Non-goals

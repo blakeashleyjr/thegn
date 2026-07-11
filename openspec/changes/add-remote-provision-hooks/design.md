@@ -6,14 +6,14 @@ A placement/env config gains ordered `provision` and `teardown` hook lists:
 
 ```
 [env.<name>.provision]
-hooks = ["./.superzej/provision.sh", "..."]
+hooks = ["./.thegn/provision.sh", "..."]
 timeout_secs = 300
 [env.<name>.teardown]
-hooks = ["./.superzej/teardown.sh"]
+hooks = ["./.thegn/teardown.sh"]
 ```
 
 Each hook is invoked with the task context in the environment
-(`SUPERZEJ_TASK_ID`, `SUPERZEJ_REPO`, `SUPERZEJ_BRANCH`, worktree path), runs
+(`THEGN_TASK_ID`, `THEGN_REPO`, `THEGN_BRANCH`, worktree path), runs
 sequentially, and fails the bring-up if any hook exits non-zero (respecting the
 failover/halt policy already governing non-local envs). This composes with the
 existing `Placement::ensure()`/`teardown()` — hooks run inside those lifecycle

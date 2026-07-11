@@ -1,11 +1,11 @@
 # OpenSpec project configuration.
 # `schema` selects the workflow (proposal -> specs -> design -> tasks).
 # `context` is injected into every artifact instruction the AI generates, so it
-# is the single place that teaches agents what superzej is and its hard rules.
+# is the single place that teaches agents what thegn is and its hard rules.
 # See CLAUDE.md for the full developer guide and tasks.md for the roadmap.
 schema: spec-driven
 context: |
-  superzej (binary `szhost`, aliases `superzej`/`sj`) is a terminal-native
+  thegn (binary `thegn`, alias `tg`) is a terminal-native
   git-worktree IDE that is its own terminal multiplexer. One process, one
   session: each repo is a workspace, each git worktree is a tab, and the chrome
   (sidebar tree, diff/PR panel, tabbar, statusbar, pin strip) is rendered
@@ -13,13 +13,13 @@ context: |
   Phase 0; references to them in old docs are historical.
 
   Architecture — a Cargo workspace of three crates:
-  - superzej-core: substrate-agnostic, testable domain logic (layered TOML
+  - thegn-core: substrate-agnostic, testable domain logic (layered TOML
     config, SQLite DB, keymap registry, theme, sandbox backends, activity state
     machine, gh wrapper). No tokio/termwiz deps.
-  - superzej-svc: service trait seams with graceful degradation — GitBackend
+  - thegn-svc: service trait seams with graceful degradation — GitBackend
     (gix-native reads, CLI fallback + writes), GitHub (octocrab/gh), SSH
     (russh/ssh). Native gaps always fall back to subprocess.
-  - superzej-host: the compositor — tokio runtime, portable-pty panes through a
+  - thegn-host: the compositor — tokio runtime, portable-pty panes through a
     pluggable PaneEmulator (vt100), termwiz Surface diff-flush rendering,
     in-process chrome.
 
@@ -36,7 +36,7 @@ context: |
     be Skip, pane-only output must be Panes (never recompose chrome), any
     chrome/overlay/geometry change must be Full.
   - git is the source of truth for worktrees; the SQLite DB
-    ($XDG_STATE_HOME/superzej/superzej.db, WAL, schema versioned via
+    ($XDG_STATE_HOME/thegn/thegn.db, WAL, schema versioned via
     user_version) is a cache + resurrection layer.
   - Performance budget: sub-300ms launch to first frame, <16ms render, 0% idle.
     Expensive setup belongs off-thread.
@@ -51,13 +51,13 @@ context: |
   strictly additive.
 
   Conventions:
-  - Coverage gate is superzej-core only, 95% lines; new core logic needs unit
+  - Coverage gate is thegn-core only, 95% lines; new core logic needs unit
     tests. I/O/subprocess seams are excluded and covered by test/smoke.sh.
   - Conventional commits (feat(scope):, fix(scope):). Branch off main first;
     commit/push only when asked.
   - Run inside `nix develop`. `just ci` = fmt-check + lint + build + test +
     coverage + smoke + nix-build (+ openspec-validate).
-  - This shell often runs inside a live superzej; anything opening the DB or
+  - This shell often runs inside a live thegn; anything opening the DB or
     spawning the host in tests must isolate XDG_STATE_HOME.
 
   Roadmap & specs: tasks.md is the authoritative roadmap index (groups A–AX,
@@ -73,5 +73,5 @@ rules:
     - Call out which render damage channel (Skip/Panes/Full) and event-loop wake path the change touches, if any.
     - Note any SQLite schema change and the required user_version bump.
   tasks:
-    - Core logic tasks must include unit tests (95% line gate on superzej-core).
+    - Core logic tasks must include unit tests (95% line gate on thegn-core).
     - End with a task to run `just ci` (includes openspec-validate).

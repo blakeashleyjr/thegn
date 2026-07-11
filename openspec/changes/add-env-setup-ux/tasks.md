@@ -17,7 +17,7 @@ libdbus-sys` empty.
       `select_env_in_repo` via `toml_edit` (`subtable` helper) — **unit tests**:
       round-trip (create → re-parse → fields present, comments preserved) and
       refuse `[env.*]` in a repo file.
-- [x] 2.2 `Cargo.toml`: `toml_edit` dep on `superzej-core`.
+- [x] 2.2 `Cargo.toml`: `toml_edit` dep on `thegn-core`.
 
 ## 3. host: CLI authoring
 

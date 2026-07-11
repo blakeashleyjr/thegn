@@ -2,7 +2,7 @@
 
 ## Purpose
 
-superzej persists session and UI state in a local SQLite database so a restart
+thegn persists session and UI state in a local SQLite database so a restart
 can resurrect the exact working context. The DB is a cache and resurrection
 layer over git (the source of truth), with a versioned schema that migrates
 forward deterministically.
@@ -11,7 +11,7 @@ forward deterministically.
 
 ### Requirement: Single versioned SQLite store
 
-Persistent state SHALL live in a single SQLite database at `$XDG_STATE_HOME/superzej/superzej.db` in WAL mode with the schema version tracked via SQLite `user_version`, and any schema change MUST bump `user_version` and provide a forward migration.
+Persistent state SHALL live in a single SQLite database at `$XDG_STATE_HOME/thegn/thegn.db` in WAL mode with the schema version tracked via SQLite `user_version`, and any schema change MUST bump `user_version` and provide a forward migration.
 
 #### Scenario: Forward migration on open
 
@@ -35,7 +35,7 @@ Any test or benchmark that opens the DB or spawns the host SHALL isolate `XDG_ST
 
 #### Scenario: Isolated test run
 
-- **WHEN** a test that touches the DB runs while a live superzej session exists
+- **WHEN** a test that touches the DB runs while a live thegn session exists
 - **THEN** it uses an isolated `XDG_STATE_HOME` and leaves the real database
   unchanged
 
@@ -50,7 +50,7 @@ The persisted layout SHALL model tabs as belonging to worktree groups (one group
 
 ### Requirement: Per-pane scrollback is captured on snapshot and repainted on restore
 
-superzej SHALL capture a bounded tail of each pane's scrollback when a session is
+thegn SHALL capture a bounded tail of each pane's scrollback when a session is
 persisted and repaint it into the pane on restore, so a resurrected pane shows its
 recent history rather than a blank screen. The captured tail MUST be bounded by a
 configurable cap, and a snapshot taken before this feature (with no scrollback)
@@ -70,7 +70,7 @@ with an additive, null-defaulted column.
 
 ### Requirement: Stale agent state is coerced to a settled state on restore
 
-superzej SHALL run each persisted "running"/"active" agent or activity state
+thegn SHALL run each persisted "running"/"active" agent or activity state
 through an age-based guard at restore, downgrading any state older than a
 configurable grace threshold to a settled state, so a session killed mid-run does
 not resurrect a phantom forever-running indicator. States fresher than the

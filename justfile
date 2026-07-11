@@ -1,8 +1,8 @@
-# superzej — dev & build tasks. Run `just` to list, `just <recipe>` to run.
+# thegn — dev & build tasks. Run `just` to list, `just <recipe>` to run.
 # Recipes assume the dev shell (`nix develop`) or the deps on PATH.
 
-# The native compositor host (crate `superzej-host`); the shipped `superzej`.
-bin := "target/debug/szhost"
+# The native compositor host (crate `thegn-host`); the shipped `thegn`.
+bin := "target/debug/thegn"
 
 # Hermetic-environment preamble for the e2e recipes: redirect HOME, the XDG dirs,
 # and git config into a throwaway temp dir (cleaned on exit) so the visual suite
@@ -13,6 +13,10 @@ set -euo pipefail
 _tmp="$(mktemp -d)"; trap 'rm -rf "$_tmp"' EXIT
 export HOME="$_tmp/home" XDG_CONFIG_HOME="$_tmp/config" XDG_STATE_HOME="$_tmp/state"
 export GIT_CONFIG_GLOBAL="$_tmp/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
+# Cut the session D-Bus: otherwise the developer's live media player leaks
+# into the statusbar/masthead media badge and every snapshot goes
+# nondeterministic as tracks change.
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null/e2e-no-dbus"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 printf '[user]\nname = e2e\nemail = e2e@example.invalid\n' > "$_tmp/gitconfig"
 '''
@@ -50,7 +54,7 @@ build: _apps
 
 # Fast inner-loop check: typecheck + clippy on lib/bin code only (no test/bench
 # targets, no tests, no coverage). Pass a crate to scope it further, e.g.
-# `just quick superzej-host`. Use this while iterating; run the heavy gates
+# `just quick thegn-host`. Use this while iterating; run the heavy gates
 # (`just test` / `just coverage` / `just ci`) only when preparing to push/PR.
 quick pkg="": _apps
     #!/usr/bin/env bash
@@ -59,37 +63,37 @@ quick pkg="": _apps
     cargo clippy $scope -- -D warnings
 
 # Cross-platform regression gate: typecheck the C-dep-free leaf crates' per-OS
-# code for macOS + Windows on this (Linux) box. `superzej-metrics` covers the
-# sysinfo/battery substrate; `superzej-media` covers the per-OS player backends
+# code for macOS + Windows on this (Linux) box. `thegn-metrics` covers the
+# sysinfo/battery substrate; `thegn-media` covers the per-OS player backends
 # (Linux MPRIS/mpv, Windows SMTC, macOS AppleScript). `cargo check --target`
 # needs no cross C toolchain (check never links). Targets are provided by the
 # flake's rust toolchain. Catches the #1 cross-platform breakage — won't-compile
 # — without macOS/Windows runners.
 check-cross:
-    cargo check -p superzej-metrics --target aarch64-apple-darwin
-    cargo check -p superzej-metrics --target x86_64-pc-windows-gnu
-    cargo check -p superzej-media --target aarch64-apple-darwin
-    cargo check -p superzej-media --target x86_64-pc-windows-gnu
+    cargo check -p thegn-metrics --target aarch64-apple-darwin
+    cargo check -p thegn-metrics --target x86_64-pc-windows-gnu
+    cargo check -p thegn-media --target aarch64-apple-darwin
+    cargo check -p thegn-media --target x86_64-pc-windows-gnu
 
 # Debug build of the host with the in-process sampling profiler compiled in
 # (the `profiling` feature → SIGUSR2 flamegraph capture). Same artifact path as
-# `build` (target/debug/szhost), so `start-term` picks it up transparently.
+# `build` (target/debug/thegn), so `start-term` picks it up transparently.
 build-profiling: _apps
-    cargo build --features profiling -p superzej-host
+    cargo build --features profiling -p thegn-host
 
 # Release build (the whole cargo workspace).
 release: _apps
     cargo build --workspace --release
 
-# Build a static x86_64-linux-musl `szhost` — the resident bridge binary pushed
+# Build a static x86_64-linux-musl `thegn` — the resident bridge binary pushed
 # into Firecracker provider envs (Sprites). Self-contained (musl + bundled
 # sqlite + rustls, no openssl) so it runs in a bare microVM. Needs the musl
 # target (`rustup target add x86_64-unknown-linux-musl`) + a musl cross cc; in
-# nix use `nix build .#szhost-musl` instead. Output:
-# target/x86_64-unknown-linux-musl/release/szhost — point SUPERZEJ_BRIDGE_BINARY
-# at it (or drop it next to the host exe as `szhost-musl`).
+# nix use `nix build .#thegn-musl` instead. Output:
+# target/x86_64-unknown-linux-musl/release/thegn — point THEGN_BRIDGE_BINARY
+# at it (or drop it next to the host exe as `thegn-musl`).
 build-musl: _apps
-    cargo build --release -p superzej-host --bin szhost --target x86_64-unknown-linux-musl
+    cargo build --release -p thegn-host --bin thegn --target x86_64-unknown-linux-musl
 
 # Run the native host compositor. Builds it first. Run from a real terminal —
 # it acquires raw mode and owns the screen.
@@ -104,20 +108,20 @@ host *args: build
 # a small constant overhead — fine for A/B deltas. Isolated XDG_STATE_HOME so
 # the bench never touches the daily DB.
 bench: release
-    hyperfine --warmup 3 'target/release/szhost --version'
-    hyperfine --warmup 3 --prepare 'rm -rf /tmp/sz-bench-state' \
-      "script -qec 'env XDG_STATE_HOME=/tmp/sz-bench-state SUPERZEJ_BENCH_FIRST_FRAME_EXIT=1 target/release/szhost' /dev/null"
+    hyperfine --warmup 3 'target/release/thegn --version'
+    hyperfine --warmup 3 --prepare 'rm -rf /tmp/tg-bench-state' \
+      "script -qec 'env XDG_STATE_HOME=/tmp/tg-bench-state THEGN_NO_MIGRATE=1 THEGN_BENCH_FIRST_FRAME_EXIT=1 target/release/thegn' /dev/null"
     hyperfine --warmup 3 \
-      "script -qec 'env XDG_STATE_HOME=/tmp/sz-bench-state SUPERZEJ_BENCH_FIRST_FRAME_EXIT=1 target/release/szhost' /dev/null"
+      "script -qec 'env XDG_STATE_HOME=/tmp/tg-bench-state THEGN_NO_MIGRATE=1 THEGN_BENCH_FIRST_FRAME_EXIT=1 target/release/thegn' /dev/null"
 
 # Guard run by every perf recipe: refuse to measure a debug or stale binary.
 # The debug-vs-release CPU gap is ~2.5x (and cargo test/clippy don't rebuild
-# target/debug/szhost), so a perf number from the wrong binary is worse than
+# target/debug/thegn), so a perf number from the wrong binary is worse than
 # none. Prints the resolved binary + mtime + profile so reports self-describe.
 _perf-guard:
     #!/usr/bin/env bash
     set -euo pipefail
-    b="target/release/szhost"
+    b="target/release/thegn"
     if [ ! -x "$b" ]; then
       echo "perf: $b not built — run 'just release' first" >&2; exit 1
     fi
@@ -127,7 +131,7 @@ _perf-guard:
     fi
     echo "perf: binary=$b mtime=$(date -r "$b" '+%F %T') profile=release"
 
-# Idle CPU benchmark: launch szhost in a PTY over a fixture of N worktrees, let
+# Idle CPU benchmark: launch thegn in a PTY over a fixture of N worktrees, let
 # it settle, sample /proc CPU over a window, and assert it stays under the
 # 0%-idle ceiling. This is the steady-state cost `just bench` never sees.
 bench-idle: release _perf-guard
@@ -156,28 +160,28 @@ bench-micro *args:
 # Just the git hot-path benches (is_dirty / ahead_behind / current_branch,
 # gix vs CLI, scaled by worktree count) — the dominant idle cost.
 bench-micro-svc *args:
-    cargo bench -p superzej-svc --bench git_hot {{args}}
+    cargo bench -p thegn-svc --bench git_hot {{args}}
 
 # Umbrella: startup (hyperfine) + idle CPU + micro-benches. Self-describing
 # (each sub-recipe prints its binary/profile). Machine-dependent — not in CI.
 perf: bench bench-idle bench-micro
     @echo "perf: startup + idle + micro complete"
 
-# Build szhost with the in-process sampling profiler (release + profiling
+# Build thegn with the in-process sampling profiler (release + profiling
 # feature). SIGUSR2 toggles a flamegraph capture written to
-# $XDG_STATE_HOME/superzej/profiles/. Profiles the live process (sidesteps
+# $XDG_STATE_HOME/thegn/profiles/. Profiles the live process (sidesteps
 # ptrace_scope=1, which blocks external perf/gdb attach).
 release-profiling:
-    cargo build --release --features profiling -p superzej-host
+    cargo build --release --features profiling -p thegn-host
 
-# Launch szhost under the profiler and print how to drive it. Run from a real
+# Launch thegn under the profiler and print how to drive it. Run from a real
 # terminal. `kill -USR2 <pid>` once to start sampling, again to dump.
 profile *args: release-profiling
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "profiler: send 'kill -USR2 \$(pgrep -n szhost)' to start, again to dump."
-    echo "profiles land in \$XDG_STATE_HOME/superzej/profiles/ (or ~/.local/state/...)."
-    SUPERZEJ_LOG=szhost::perf=info target/release/szhost {{args}}
+    echo "profiler: send 'kill -USR2 \$(pgrep -n thegn)' to start, again to dump."
+    echo "profiles land in \$XDG_STATE_HOME/thegn/profiles/ (or ~/.local/state/...)."
+    THEGN_LOG=thegn::perf=info target/release/thegn {{args}}
 
 # Build the Nix package; symlinks ./result.
 nix-build:
@@ -192,7 +196,7 @@ flake-check:
     nix flake check
 
 # --- spec-driven development (OpenSpec) -----------------------------------
-# superzej manages its OWN development with OpenSpec (see openspec/, CLAUDE.md).
+# thegn manages its OWN development with OpenSpec (see openspec/, CLAUDE.md).
 # The `openspec` binary is the hermetic, pinned build from nix/openspec.nix,
 # provided on PATH by `nix develop`. tasks.md stays the roadmap index.
 
@@ -256,11 +260,11 @@ deps-audit:
     cargo deny check
     cargo machete
 
-# Visual regression suite: run all muse specs against a live szhost binary.
+# Visual regression suite: run all muse specs against a live thegn binary.
 # Baselines live in test/muse/snapshots/ and are committed to git.
 # Workers default to 4; glitch-hunt specs run serial (--workers 1) to avoid
-# UI-state races between concurrently running szhost processes.
-# szhost is put on PATH so specs can use spawn: ["szhost"] portably.
+# UI-state races between concurrently running thegn processes.
+# thegn is put on PATH so specs can use spawn: ["thegn"] portably.
 #
 # The suite is hermetic w.r.t. the developer's environment: `_e2e_env` isolates
 # HOME, the XDG dirs, and git config into a throwaway temp dir (cleaned on exit),
@@ -270,7 +274,7 @@ e2e: build
     #!/usr/bin/env bash
     {{_e2e_env}}
     # muse takes spec FILES (a bare directory is "Is a directory" — os error 21).
-    # Workers 2 (was 4): concurrent szhost instances contend for CPU and push
+    # Workers 2 (was 4): concurrent thegn instances contend for CPU and push
     # wide-size cases past their expect_visible windows, capturing blank/late
     # frames. KNOWN RESIDUAL FLAKE (run-to-run, even serial): live app state —
     # the activity dot decays ●→○ on output-quiet timers, the ✋ needs-you chip
@@ -303,21 +307,21 @@ e2e-update: build
 # commands headlessly; worktree/workspace/pin creation is now an interactive
 # compositor action, exercised by the host's unit tests.)
 
-# The gate covers the testable core only (crate `superzej-core`). EXCLUDED: the
+# The gate covers the testable core only (crate `thegn-core`). EXCLUDED: the
 # exec / exit / subprocess seams that can't be unit-covered without real external
 # tools (git/gh/podman/ssh) — exercised by smoke instead. See docs/coverage.md.
 # Everything NOT matched here (config, db, theme, diff_highlight, models) is gated
 # at 95% lines. The native host and the svc layer carry their own tests but are
 # not part of this gate (their I/O-heavy surface is the same reason the seams
 # above are excluded).
-cov_ignore := 'superzej-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|plugin_api|profile|forge/mod)\.rs'
+cov_ignore := 'thegn-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|plugin_api|profile|forge/mod)\.rs'
 
 # The LLM-proxy crate is gated separately at 88% lines (its decision logic lives
 # in the 95%-gated core::proxy; this covers the I/O shell — router, server, relay,
 # upstream — via unit + integration (`tests/e2e.rs`) tests, hence `--tests`).
 # EXCLUDED: `main.rs`/`lib.rs` — the bind+serve loop, signal handling, and binary
 # entry can't be unit-covered (same rationale as core's seams; exercised live).
-proxy_cov_ignore := 'superzej-proxy/src/(main|lib)\.rs'
+proxy_cov_ignore := 'thegn-proxy/src/(main|lib)\.rs'
 
 # Coverage gate: core ≥95% lines + proxy ≥88% lines. Writes lcov to target/coverage.
 coverage: _apps
@@ -326,18 +330,18 @@ coverage: _apps
     # produces a false-low (or false-high) line %, which can spuriously fail the
     # gate locally (CI's clean checkout never sees this).
     cargo llvm-cov clean --workspace
-    cargo llvm-cov -p superzej-core --lib --fail-under-lines 95 \
+    cargo llvm-cov -p thegn-core --lib --fail-under-lines 95 \
       --ignore-filename-regex '{{cov_ignore}}' \
       --lcov --output-path target/coverage/lcov.info
     @echo "coverage: core ≥95% lines"
-    cargo llvm-cov -p superzej-proxy --lib --tests --fail-under-lines 88 \
+    cargo llvm-cov -p thegn-proxy --lib --tests --fail-under-lines 88 \
       --ignore-filename-regex '{{proxy_cov_ignore}}' \
       --lcov --output-path target/coverage/lcov-proxy.info
     @echo "coverage: proxy ≥88% lines"
 
 # Coverage as a browsable HTML report (target/llvm-cov/html).
 coverage-html:
-    cargo llvm-cov -p superzej-core --lib --html \
+    cargo llvm-cov -p thegn-core --lib --html \
       --ignore-filename-regex '{{cov_ignore}}'
 
 # --- quality --------------------------------------------------------------
@@ -346,24 +350,27 @@ coverage-html:
 lint: _apps
     @for t in shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
     cargo clippy --workspace --all-targets -- -D warnings
-    shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/file-size-ratchet.sh test/git-hooks/post-checkout.sh test/git-hooks/heal-worktree.sh
+    shellcheck -x install.sh test/smoke.sh test/brand-guard.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/file-size-ratchet.sh test/git-hooks/post-checkout.sh test/git-hooks/heal-worktree.sh
     yamllint .
     taplo lint
     # Guardrail: all git must route through util::git_cmd / GitLoc so GIT_ENV_VARS
     # is scrubbed (the core.worktree-pollution class). Only the builder in util.rs
     # may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
     # Comment lines are ignored (doc-comments legitimately name the pattern they forbid).
-    ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'superzej-core/src/util.rs' | grep -vE ':[0-9]+:[[:space:]]*//' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
+    ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'thegn-core/src/util.rs' | grep -vE ':[0-9]+:[[:space:]]*//' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
     # Guardrail: god-file ratchet — legacy oversized files may only shrink, new
     # files are hard-capped at 3000 lines. See test/file-size-ratchet.sh.
     bash test/file-size-ratchet.sh
+    # Guardrail: pre-rename brand tokens must not come back — this is thegn.
+    # Token list + allowlist live in the script. See test/brand-guard.sh.
+    bash test/brand-guard.sh
 
 # Repair a wedged checkout: strip a stray `core.worktree` that an external
 # worktree tool (herdr) or a GIT_*-exporting child leaked into the shared
 # `.git/config`. Symptom: `git add`/`commit`/`status` mis-target another tree,
 # or (once the leaked path is deleted) git aborts with "Invalid path" / "must be
 # run in a work tree". Pure-text repair — needs no working git, so it fixes the
-# case a pre-commit hook can't (git dies before hooks run). Same key szhost heals
+# case a pre-commit hook can't (git dies before hooks run). Same key thegn heals
 # in-process at startup + on worktree switch; this covers manual/CI git. No-op
 # when clean.
 heal-git:
@@ -372,12 +379,12 @@ heal-git:
 
 # Diagnose the dev environment: report any missing toolchain bit with a one-line
 # fix. Exits non-zero if anything is missing — handy for agents/CI to confirm the
-# gates won't silently skip. (superzej panes get the devShell automatically via
-# `[sandbox] inject_devshell`; this is for working ON superzej directly.)
+# gates won't silently skip. (thegn panes get the devShell automatically via
+# `[sandbox] inject_devshell`; this is for working ON thegn directly.)
 doctor:
     #!/usr/bin/env bash
     set -uo pipefail
-    echo "superzej dev-env doctor"
+    echo "thegn dev-env doctor"
     miss=0
     check() { if command -v "$1" >/dev/null 2>&1; then echo "  ok    $1"; else echo "  MISS  $1 — $2"; miss=1; fi; }
     check nix            "install Nix (or you're on a non-Nix host)"
@@ -416,13 +423,13 @@ test: _apps
     cargo test --doc --workspace
 
 # Formal verification (bounded model checking, CBMC via Kani) of the pure
-# color-quantization math in `superzej-core::termcaps` (the `#[cfg(kani)]`
+# color-quantization math in `thegn-core::termcaps` (the `#[cfg(kani)]`
 # proofs). Opt-in and machine-local: needs a one-time `cargo install --locked
 # kani-verifier && cargo kani setup`. Deliberately NOT part of `just ci` — Kani's
 # bundled CBMC toolchain is non-hermetic and the solve is slow.
 #
 # KNOWN BLOCKER (spike finding, 2026-07-07, kani 0.67.0): this does not currently
-# compile. Kani must build all of `superzej-core`, and its transitive dep
+# compile. Kani must build all of `thegn-core`, and its transitive dep
 # `libsqlite3-sys` (via `rusqlite`) uses the unstable `cfg_select!` in its build
 # script, which Kani's pinned `nightly-2025-11-21` rejects. The 5 harnesses WERE
 # verified (all SUCCESSFUL, ~1.2s) by extracting the color fns verbatim into a
@@ -430,7 +437,7 @@ test: _apps
 # past that dep, or the pure-math module must be split into a leaf crate with no
 # heavy deps. Until then, treat the `#[cfg(kani)]` proofs as documentation.
 verify-kani:
-    cargo kani -p superzej-core
+    cargo kani -p thegn-core
 
 # Live integration tests against the REAL Sprites API (creates + destroys throwaway
 # sprites — real cloud spend). Sources SPRITES_TOKEN from .envrc.local. Validates
@@ -440,7 +447,7 @@ verify-kani:
 test-sprite:
     [ -f .envrc.local ] && set -a && . ./.envrc.local && set +a; \
       [ -n "${SPRITES_TOKEN:-}" ] || { echo "SPRITES_TOKEN not set (put it in .envrc.local)" >&2; exit 1; }; \
-      cargo test -p superzej-svc --test sprites_live -- --ignored --nocapture
+      cargo test -p thegn-svc --test sprites_live -- --ignored --nocapture
 
 # Live sprite-recycle verification (hosts-as-resources S1/S2): checkpoint
 # capture, stale restore-in-place, claimed-delete round trip, bad-checkpoint
@@ -450,7 +457,7 @@ sprites-live-recycle:
     set -euo pipefail
     [ -f .envrc.local ] && . ./.envrc.local
     [ -n "${SPRITES_TOKEN:-}" ] || { echo "SPRITES_TOKEN not set (put it in .envrc.local)" >&2; exit 1; }
-    cargo test -p superzej-host --bin szhost live_recycle -- --ignored --nocapture --test-threads=1
+    cargo test -p thegn-host --bin thegn live_recycle -- --ignored --nocapture --test-threads=1
 
 # Hermetic end-to-end test against the debug binary.
 smoke: build
@@ -465,7 +472,7 @@ smoke: build
 sandbox-e2e: build
     @if command -v podman >/dev/null 2>&1; then \
       echo "sandbox-e2e: podman found, running integration tests"; \
-      PODMAN_E2E_FORCE=1 cargo test -p superzej-core -- sandbox; \
+      PODMAN_E2E_FORCE=1 cargo test -p thegn-core -- sandbox; \
     elif [ "$$PODMAN_E2E_FORCE" = "1" ]; then \
       echo "sandbox-e2e: PODMAN_E2E_FORCE=1 but podman not found"; exit 1; \
     else \
@@ -474,17 +481,17 @@ sandbox-e2e: build
 
 # DNS filter E2E — Tier 1, no podman needed; always runs in CI.
 sandbox-e2e-dns:
-    cargo test -p superzej-core --test sandbox_dns_e2e
+    cargo test -p thegn-core --test sandbox_dns_e2e
 
 # DB audit trail — Tier 1, no podman; always runs in CI.
 sandbox-e2e-db:
-    cargo test -p superzej-core --lib -- db::tests::container_events
+    cargo test -p thegn-core --lib -- db::tests::container_events
 
 # Full podman-backed suite (Tier 2). Discovers podman and exits cleanly if absent.
 sandbox-e2e-full: build
     @if command -v podman >/dev/null 2>&1; then \
       echo "sandbox-e2e-full: podman found, running Tier 2 tests"; \
-      PODMAN_E2E_FORCE=1 cargo test -p superzej-core \
+      PODMAN_E2E_FORCE=1 cargo test -p thegn-core \
         --test sandbox_lifecycle \
         --test sandbox_credentials \
         --test sandbox_health \
@@ -499,31 +506,32 @@ sandbox-e2e-full: build
 
 # Same, but against the built Nix package (verifies the wrapper + injected deps).
 smoke-pkg:
-    ./test/smoke.sh "$(nix build .#default --no-link --print-out-paths)/bin/superzej"
+    ./test/smoke.sh "$(nix build .#default --no-link --print-out-paths)/bin/thegn"
 
 # --- run / install --------------------------------------------------------
 
 # Run a subcommand against the debug build, e.g. `just run list`.
 run *args: build
-    {{bin}} {{args}}
+    env THEGN_NO_MIGRATE=1 {{bin}} {{args}}
 
 # Build and run the native host locally in an isolated state root.
 start name="dev": build
-    state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
+    state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; mkdir -p "$state" "$run"; \
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
       echo $$ > "$pidfile"; exec env \
-      "SUPERZEJ_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
+      "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
+      "THEGN_NO_MIGRATE=1" \
       {{bin}}
 
 # Alias for `start`.
 attach: start
 
-# Headless terminal-capability matrix: run `szhost doctor` under a set of
+# Headless terminal-capability matrix: run `thegn doctor` under a set of
 # degraded environments (each a clean `env -i`, so the outer terminal's
 # COLORTERM / TERM_PROGRAM can't leak in and mask a degradation) and assert the
 # resolved color depth + glyph level match what each terminal should get. Proves
-# the graceful-degradation layer (`superzej_core::termcaps`) end to end without a
+# the graceful-degradation layer (`thegn_core::termcaps`) end to end without a
 # tty, complementing the pure unit tests. For the real rendered proof, launch
 # `just start-term` under a degraded TERM (e.g. `TERM=xterm LANG=C`).
 term-check: build
@@ -548,37 +556,37 @@ term-check: build
           "$name" "$color" "$ec" "$glyph" "$eg"; fail=1
       fi
     }
-    echo "terminal-capability matrix (szhost doctor, clean env):"
+    echo "terminal-capability matrix (thegn doctor, clean env):"
     check kitty      truecolor  full  TERM=xterm-kitty COLORTERM=truecolor LANG=en_US.UTF-8
     check bare       16-color   ascii TERM=xterm LANG=C
     check no-color   monochrome full  TERM=xterm-kitty COLORTERM=truecolor NO_COLOR=1 LANG=en_US.UTF-8
     check 256color   256-color  basic TERM=xterm-256color LANG=en_US.UTF-8
-    check glyph=asci truecolor  ascii TERM=xterm-kitty COLORTERM=truecolor LANG=en_US.UTF-8 SUPERZEJ_THEME_GLYPHS=ascii
-    check color=16   16-color   full  TERM=xterm-kitty COLORTERM=truecolor LANG=en_US.UTF-8 SUPERZEJ_THEME_COLOR=16
+    check glyph=asci truecolor  ascii TERM=xterm-kitty COLORTERM=truecolor LANG=en_US.UTF-8 THEGN_THEME_GLYPHS=ascii
+    check color=16   16-color   full  TERM=xterm-kitty COLORTERM=truecolor LANG=en_US.UTF-8 THEGN_THEME_COLOR=16
     if [ "$fail" = 0 ]; then echo "term-check: all green"; else echo "term-check: MISMATCH"; exit 1; fi
 
 # Point THIS repo (all its worktrees) at a sandbox backend / managed-sandbox
 # provider, without touching any other repo — the engine behind the `backend=`
-# param on `start-term`/`start-term-release`. Writes a per-repo `.superzej.toml`
+# param on `start-term`/`start-term-release`. Writes a per-repo `.thegn.toml`
 # overlay at the MAIN worktree (resolved via `git --git-common-dir`, mirroring
-# `superzej_core::repo::main_worktree`), which every superzej worktree reads.
+# `thegn_core::repo::main_worktree`), which every thegn worktree reads.
 #   - `sprites` (a managed-sandbox PROVIDER) → overlay `env = "sprites"`, and the
 #     global `[env.sprites]` block is auto-scaffolded into
-#     $XDG_CONFIG_HOME/superzej/config.toml if missing. Needs SPRITES_TOKEN set
+#     $XDG_CONFIG_HOME/thegn/config.toml if missing. Needs SPRITES_TOKEN set
 #     (fail-fast); the `sprite` CLI is only advisory now — the default exec=auto
 #     attaches the pane over the native WSS exec API with no vendor CLI.
 #   - a real sandbox backend (podman|docker|bwrap|systemd|none) → overlay
 #     `[sandbox] backend = "<x>"`.
 # Empty `backend` is a no-op. Refuses to clobber a hand-authored overlay that
 # already carries a `[keybinds]`/`[sandbox]` table. To revert: delete the overlay
-# (`rm "$(git rev-parse --show-toplevel)/.superzej.toml"` from the main checkout).
+# (`rm "$(git rev-parse --show-toplevel)/.thegn.toml"` from the main checkout).
 _apply-backend backend="":
     backend="{{backend}}"; \
     if [ -n "$backend" ]; then \
       root="$(git rev-parse --path-format=absolute --git-common-dir)"; \
       case "$root" in */.git) root="${root%/.git}";; esac; \
-      overlay="$root/.superzej.toml"; \
-      cfg="${XDG_CONFIG_HOME:-$HOME/.config}/superzej/config.toml"; \
+      overlay="$root/.thegn.toml"; \
+      cfg="${XDG_CONFIG_HOME:-$HOME/.config}/thegn/config.toml"; \
       if [ -f "$overlay" ] && grep -qE '^\[(keybinds|sandbox)' "$overlay"; then \
         echo "$overlay already has a [keybinds]/[sandbox] table — edit it by hand to set the backend" >&2; exit 1; \
       fi; \
@@ -608,11 +616,12 @@ _apply-backend backend="":
 # with a compile gate; Super+K → "Integrate" / "Merge queue", or it auto-drains
 # ~5s after an agent finishes. Override the gate with `gate='just test'` etc.
 start-mq name="dev" gate="cargo build --workspace": build
-    state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
+    state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; mkdir -p "$state" "$run"; \
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
       echo $$ > "$pidfile"; exec env \
-      "SUPERZEJ_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
+      "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
+      "THEGN_NO_MIGRATE=1" \
       {{bin}} --set merge_queue.enabled=true \
               --set 'merge_queue.gate_command={{gate}}' \
               --set merge_queue.regenerate_command="cargo update --workspace"
@@ -622,13 +631,13 @@ start-mq name="dev" gate="cargo build --workspace": build
 # profile (config/ghostty.config: --config-default-files=false keeps your
 # personal ghostty config out): no decorations/scrollback/URL-detection, vsync
 # off for minimum input-to-present latency, and a dedicated single-instance
-# process so the pidfile + `pgrep -n szhost` + SIGUSR2 drill all hit it. Plus:
+# process so the pidfile + `pgrep -n thegn` + SIGUSR2 drill all hit it. Plus:
 #   - binary built with the `profiling` feature → SIGUSR2 flamegraph capture
 #     (kill -USR2 once to start sampling, again to dump);
 #   - every instrumentation channel on: startup waterfall + frame + hydrate +
-#     perf logs land in $XDG_STATE_HOME/superzej/logs/szhost.log, and the
-#     runtime self-profiler rollup is enabled (SUPERZEJ_PERF=1);
-#   - state stays isolated per instance (~/.superzej-<name>).
+#     perf logs land in $XDG_STATE_HOME/thegn/logs/thegn.log, and the
+#     runtime self-profiler rollup is enabled (THEGN_PERF=1);
+#   - state stays isolated per instance (~/.thegn-<name>).
 # NOTE: this is a DEBUG binary (~2.5x slower than release), so read the
 # flamegraph/perf rollup for structure & relative cost — for absolute timings
 # use the release-grade `just bench` / `just bench-idle` harnesses.
@@ -636,44 +645,44 @@ start-mq name="dev" gate="cargo build --workspace": build
 # managed provider (e.g. `just start-term dev backend=sprites`) — see
 # `_apply-backend`. Empty (the default) leaves config untouched.
 start-term name="dev" backend="": build-profiling (_apply-backend backend)
-    state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
+    state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; mkdir -p "$state" "$run"; \
       if [ -f "$PWD/.envrc.local" ]; then set -a; . "$PWD/.envrc.local"; set +a; fi; \
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
-      echo "profiler: 'kill -USR2 \$(pgrep -n szhost)' to start sampling, again to dump → $state/superzej/profiles/"; \
-      echo "logs: $state/superzej/logs/szhost.log (startup waterfall + frame/hydrate/perf)"; \
+      echo "profiler: 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/"; \
+      echo "logs: $state/thegn/logs/thegn.log (startup waterfall + frame/hydrate/perf)"; \
       setsid -f ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
       'pidfile="$1"; shift; echo $$ > "$pidfile"; exec env "$@"' \
       sh "$pidfile" \
       "XDG_STATE_HOME=$state" \
       "SPRITES_TOKEN=${SPRITES_TOKEN:-}" \
-      "SUPERZEJ_LOG=info,szhost::frame=debug,szhost::hydrate=debug,szhost::perf=debug" \
-      "SUPERZEJ_PERF=1" \
+      "THEGN_LOG=info,thegn::frame=debug,thegn::hydrate=debug,thegn::perf=debug" \
+      "THEGN_PERF=1" \
       "$PWD/{{bin}}"
 
 # Same dev/profiling/instrumentation rig as `start-term`, but a RELEASE binary —
 # the daily-driver launcher. `start-term` stays debug for fast `cargo watch`
 # rebuilds (`just dev-tui`); this gets the ~2.5x release speedup while keeping
 # every log channel + the SIGUSR2 flamegraph profiler on, so live perf readings
-# (frame render_ms, the szhost::perf rollup, idle CPU) reflect real shipped cost
-# instead of the debug penalty. Use this to inhabit superzej all day.
-# LOGGING IS MAXED OUT here for crash diagnosis: SUPERZEJ_LOG=debug globally with
-# all superzej crates at trace → $logs/szhost.log, RUST_BACKTRACE=full, and the
+# (frame render_ms, the thegn::perf rollup, idle CPU) reflect real shipped cost
+# instead of the debug penalty. Use this to inhabit thegn all day.
+# LOGGING IS MAXED OUT here for crash diagnosis: THEGN_LOG=debug globally with
+# all thegn crates at trace → $logs/thegn.log, RUST_BACKTRACE=full, and the
 # host's stderr (where panics print, normally swallowed when the ghostty window
 # closes on a crash) is captured to $logs/stderr.log. After a crash, read
-# stderr.log first (the panic + backtrace), then szhost.log for the lead-up.
+# stderr.log first (the panic + backtrace), then thegn.log for the lead-up.
 # Optional `backend=` flips THIS repo's worktrees onto a sandbox backend /
 # managed provider before launch — `just start-term-release backend=sprites`
-# dogfoods the superzej repo onto sprites (auto-scaffolds the global
+# dogfoods the thegn repo onto sprites (auto-scaffolds the global
 # `[env.sprites]`; needs the `sprite` CLI + SPRITES_TOKEN). Also accepts a real
 # sandbox backend: podman|docker|bwrap|systemd|none. Affects ONLY this repo (a
-# `.superzej.toml` overlay at the main worktree); empty leaves config untouched.
+# `.thegn.toml` overlay at the main worktree); empty leaves config untouched.
 # See `_apply-backend` for the full mechanics.
 start-term-release name="dev" backend="": release-profiling (_apply-backend backend)
-    state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; logs="$state/superzej/logs"; mkdir -p "$state" "$run" "$logs"; \
+    state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; logs="$state/thegn/logs"; mkdir -p "$state" "$run" "$logs"; \
       if [ -f "$PWD/.envrc.local" ]; then set -a; . "$PWD/.envrc.local"; set +a; fi; \
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
-      echo "profiler: 'kill -USR2 \$(pgrep -n szhost)' to start sampling, again to dump → $state/superzej/profiles/"; \
-      echo "logs: $logs/szhost.log (full trace: startup/frame/hydrate/perf + every crate) + $logs/stderr.log (panic message + full backtrace)"; \
+      echo "profiler: 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/"; \
+      echo "logs: $logs/thegn.log (full trace: startup/frame/hydrate/perf + every crate) + $logs/stderr.log (panic message + full backtrace)"; \
       echo "sprites token: $([ -n "${SPRITES_TOKEN:-}" ] && echo "loaded (len ${#SPRITES_TOKEN})" || echo "NOT set — sprites envs will halt; put SPRITES_TOKEN in .envrc.local")"; \
       setsid -f ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
       'pidfile="$1"; errlog="$2"; shift 2; echo $$ > "$pidfile"; exec env "$@" 2>"$errlog"' \
@@ -681,14 +690,14 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
       "XDG_STATE_HOME=$state" \
       "SPRITES_TOKEN=${SPRITES_TOKEN:-}" \
       "RUST_BACKTRACE=full" \
-      "SUPERZEJ_LOG=debug,szhost=trace,superzej_core=trace,superzej_svc=trace,superzej_proxy=trace" \
-      "SUPERZEJ_PERF=1" \
-      "$PWD/target/release/szhost"
+      "THEGN_LOG=debug,thegn=trace,thegn_core=trace,thegn_svc=trace,thegn_proxy=trace" \
+      "THEGN_PERF=1" \
+      "$PWD/target/release/thegn"
 
-# Install/update the native superzej host onto your PATH (standalone, non-Nix):
-# builds release artifacts, installs `sj` as the dedicated alacritty launcher,
-# `sj-tui` for the current terminal window, and direct `superzej`/`szhost`
-# native-host aliases. Pass a bindir to override the default (~/.local/bin),
+# Install/update the native thegn host onto your PATH (standalone, non-Nix):
+# builds release artifacts, installs `tg` as the dedicated alacritty launcher,
+# `tg-tui` for the current terminal window, and the direct `thegn`
+# native-host binary. Pass a bindir to override the default (~/.local/bin),
 # e.g. `just install ~/bin`.
 install *bindir:
     ./install.sh {{bindir}}
@@ -727,23 +736,23 @@ font name:
 
 # Build the base sandbox image for THIS machine's arch and load it into podman
 # (`nix/sandbox-image.nix` → streamLayeredImage). The provisioner then delivers
-# it registry-lessly to hosts (`superzej host provision <name>`).
+# it registry-lessly to hosts (`thegn host provision <name>`).
 image-build:
     nix build .#sandbox-image
     ./result | podman load
 
 # Publish both arches + a manifest list to a registry, then print the list
-# digest to pin as DEFAULT_BASE_DIGEST (superzej-core/src/image.rs). Needs
+# digest to pin as DEFAULT_BASE_DIGEST (thegn-core/src/image.rs). Needs
 # native builders per arch (or remote builders); run on CI normally.
 #   just image-publish registry=ghcr.io/you tag=v1
 image-publish registry tag="v1":
     #!/usr/bin/env bash
     set -euo pipefail
-    ref="{{registry}}/superzej-sandbox:{{tag}}"
+    ref="{{registry}}/thegn-sandbox:{{tag}}"
     arch="$(uname -m)"; case "$arch" in x86_64) oci=amd64;; aarch64) oci=arm64;; *) echo "unsupported arch $arch" >&2; exit 1;; esac
     nix build .#sandbox-image
     ./result | podman load
-    podman tag superzej-sandbox:latest "$ref-$oci"
+    podman tag thegn-sandbox:latest "$ref-$oci"
     podman push "$ref-$oci"
     echo "pushed $ref-$oci — repeat on the other arch, then:"
     echo "  podman manifest create $ref $ref-amd64 $ref-arm64 && podman manifest push $ref"
@@ -757,10 +766,10 @@ image-publish registry tag="v1":
 fly-image-publish registry tag="v1":
     #!/usr/bin/env bash
     set -euo pipefail
-    ref="{{registry}}/superzej-fly-sandbox:{{tag}}"
+    ref="{{registry}}/thegn-fly-sandbox:{{tag}}"
     nix build .#fly-sandbox-image
     ./result | podman load
-    podman tag superzej-fly-sandbox:latest "$ref"
+    podman tag thegn-fly-sandbox:latest "$ref"
     podman push "$ref"
     echo "pushed $ref — point the Fly env at it:"
     echo "  [env.fly.provider]"

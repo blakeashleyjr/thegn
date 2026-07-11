@@ -1,17 +1,17 @@
 ## Context
 
-Today superzej acquires exactly one external tool through code: the `pi` coding
-agent. `crates/superzej-host/src/cmd/agent.rs` hard-codes the npm install
+Today thegn acquires exactly one external tool through code: the `pi` coding
+agent. `crates/thegn-host/src/cmd/agent.rs` hard-codes the npm install
 (`npm install --prefix <dir> @earendil-works/pi-coding-agent@<PI_PIN>`), a
-`.superzej-pi-version` marker, an `is_current()` skip check, and a
+`.thegn-pi-version` marker, an `is_current()` skip check, and a
 `run_setup_cmd` helper that captures output when the TUI is active and inherits
 stdio on the CLI. `PI_PIN` lives in `pi_assets.rs`.
 
-`superzej-core` is deliberately substrate-agnostic: no tokio, no termwiz, and —
-relevant here — **no HTTP client** (`reqwest` is only in `superzej-host`,
-`superzej-svc`, `superzej-proxy`). Core already has the pieces the resolver's
+`thegn-core` is deliberately substrate-agnostic: no tokio, no termwiz, and —
+relevant here — **no HTTP client** (`reqwest` is only in `thegn-host`,
+`thegn-svc`, `thegn-proxy`). Core already has the pieces the resolver's
 pure logic needs: `util::which_path` / `util::have` (PATH lookup),
-`util::superzej_dir()` / `util::managed_pi_dir()` (path roots), and the layered
+`util::thegn_dir()` / `util::managed_pi_dir()` (path roots), and the layered
 TOML config in `config.rs`. Coverage is gated at 95% lines on core only;
 I/O/subprocess seams are `cov_ignore`-excluded and exercised by `test/smoke.sh`.
 
@@ -29,9 +29,9 @@ here.
   tool," generalizing the managed-pi logic.
 - Keep core HTTP/tokio-free: core computes the _decision_ (which tier, which
   asset, whether a refresh is needed, what path); the host performs the fetch.
-- Refactor pi onto the resolver with **zero observable change** to `szhost agent
+- Refactor pi onto the resolver with **zero observable change** to `thegn agent
 setup`.
-- Report resolution in `szhost doctor`.
+- Report resolution in `thegn doctor`.
 
 **Non-Goals:**
 
@@ -45,8 +45,8 @@ setup`.
 
 ### Split: pure `ManagedTool` in core, fetch in host
 
-`superzej-core::managed_tool` holds the spec and all pure logic; the actual
-download/npm-install lives in `superzej-host`.
+`thegn-core::managed_tool` holds the spec and all pure logic; the actual
+download/npm-install lives in `thegn-host`.
 
 - **Why:** core carries no HTTP client and must stay cross-compilable and 95%
   covered by pure unit tests. Mirrors the existing `github.rs` shape (domain
@@ -68,7 +68,7 @@ enum Resolution { Override { path, args }, OnPath { path }, Managed { path, curr
 
 impl ManagedTool {
   fn asset_for(&self, os, arch) -> Option<&str>          // GithubRelease only
-  fn managed_dir(&self) -> PathBuf                       // ~/.superzej/tools/<name> (pi keeps its legacy dir)
+  fn managed_dir(&self) -> PathBuf                       // ~/.thegn/tools/<name> (pi keeps its legacy dir)
   fn bin_path(&self) -> PathBuf
   fn version_marker(&self) -> PathBuf
   fn is_current(&self) -> bool                           // marker == version
@@ -101,14 +101,14 @@ Absent config ⇒ `None` ⇒ resolver falls through to PATH/managed. This is the
 `lsp.<server>.binary` analog from Zed, scoped to managed tools.
 
 - **Alternative considered:** a dedicated env var per tool — rejected as less
-  discoverable and inconsistent with superzej's layered-TOML convention.
+  discoverable and inconsistent with thegn's layered-TOML convention.
 
 ### pi refactor keeps its exact paths and behavior
 
 pi is expressed as `ManagedTool { name: "pi", source: Npm { "@earendil-works/pi-coding-agent" }, version: PI_PIN, policy: Once, path_fallbacks: ["pi"] }`.
 To avoid churn and preserve resurrection/sprite compatibility, pi's
 `managed_dir()`/`version_marker()` return the **current** locations
-(`util::managed_pi_dir()`, `.superzej-pi-version`). `setup()` becomes: build the
+(`util::managed_pi_dir()`, `.thegn-pi-version`). `setup()` becomes: build the
 spec → `needs_install(force)` gate (same as `!is_current()`) → host installer →
 existing seed/register/marker steps unchanged. The npm-absent `pi`-on-PATH
 fallback maps to tier-2. `agent.rs::is_current()` delegates to
@@ -155,8 +155,8 @@ against an already-installed managed pi.
 
 ## Open Questions
 
-- Should the managed tools root be `~/.superzej/tools/<name>` for new tools while
-  pi stays at its legacy `~/.superzej/pi`? (Proposed: yes — new tools get the
+- Should the managed tools root be `~/.thegn/tools/<name>` for new tools while
+  pi stays at its legacy `~/.thegn/pi`? (Proposed: yes — new tools get the
   namespaced dir; pi keeps its path for compatibility.)
 - Later-phase concern only: whether GitHub-release downloads should verify a
   checksum. Deferred; the update policy leaves room to add it.

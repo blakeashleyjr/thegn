@@ -1,6 +1,6 @@
 # Tasks — semantic blast-radius subsystem
 
-## 1. Pure core (superzej-core, 95%-gated)
+## 1. Pure core (thegn-core, 95%-gated)
 
 - [x] 1.1 `entity_id(repo, file, qualified_name, kind)` stable hash join key in
       `semantic.rs` (or a `semantic_graph.rs` sibling). Unit test: identical
@@ -30,7 +30,7 @@
 - [x] 2.4 Core unit tests for the store impl round-trip (upsert → load callers →
       replace edges → re-load) against an isolated temp DB.
 
-## 3. LSP references sourcing (superzej-svc / host, off-loop)
+## 3. LSP references sourcing (thegn-svc / host, off-loop)
 
 - [x] 3.1 Confirm `LspClient::references(uri, pos)` returns caller locations
       through the warm `LspSupervisor::client(root, lang)` path; resolve the

@@ -1,14 +1,14 @@
-# Home-manager module for superzej.
+# Home-manager module for thegn.
 #
 # `self` is the flake, so the default package resolves without an overlay.
-# Imported as:  imports = [ inputs.superzej.homeManagerModules.default ];
+# Imported as:  imports = [ inputs.thegn.homeManagerModules.default ];
 self: {
   config,
   pkgs,
   lib,
   ...
 }: let
-  cfg = config.programs.superzej;
+  cfg = config.programs.thegn;
 
   agentSubmodule = lib.types.submodule {
     options = {
@@ -48,7 +48,7 @@ self: {
       };
       remoteDir = lib.mkOption {
         type = lib.types.str;
-        default = "~/superzej-worktrees";
+        default = "~/thegn-worktrees";
         description = "Where remote worktrees live (mode = remote).";
       };
       forwardAgent = lib.mkOption {
@@ -125,7 +125,7 @@ self: {
       level = lib.mkOption {
         type = lib.types.enum ["error" "warn" "info" "debug" "trace"];
         default = "info";
-        description = "Default log verbosity (SUPERZEJ_LOG can refine per-module).";
+        description = "Default log verbosity (THEGN_LOG can refine per-module).";
       };
       file = lib.mkOption {
         type = lib.types.bool;
@@ -135,7 +135,7 @@ self: {
       dir = lib.mkOption {
         type = lib.types.str;
         default = "";
-        description = "Log directory (empty = $XDG_STATE_HOME/superzej/logs).";
+        description = "Log directory (empty = $XDG_STATE_HOME/thegn/logs).";
       };
       rotationSizeMb = lib.mkOption {
         type = lib.types.int;
@@ -185,8 +185,8 @@ self: {
 
   tomlFormat = pkgs.formats.toml {};
 
-  # Rendered to ~/.config/superzej/config.toml; keys match the Rust serde struct.
-  configFile = tomlFormat.generate "superzej-config.toml" {
+  # Rendered to ~/.config/thegn/config.toml; keys match the Rust serde struct.
+  configFile = tomlFormat.generate "thegn-config.toml" {
     worktrees_dir = cfg.worktreesDir;
     workspaces_dir = cfg.workspacesDir;
     repo_roots = cfg.repoRoots;
@@ -228,19 +228,19 @@ self: {
     };
   };
 in {
-  options.programs.superzej = {
-    enable = lib.mkEnableOption "superzej terminal-native worktree IDE";
+  options.programs.thegn = {
+    enable = lib.mkEnableOption "thegn terminal-native worktree IDE";
 
     package = lib.mkOption {
       type = lib.types.package;
       default = self.packages.${pkgs.system}.default;
-      defaultText = lib.literalExpression "superzej.packages.\${system}.default";
-      description = "The superzej package to use.";
+      defaultText = lib.literalExpression "thegn.packages.\${system}.default";
+      description = "The thegn package to use.";
     };
 
     worktreesDir = lib.mkOption {
       type = lib.types.str;
-      default = "${config.home.homeDirectory}/.superzej/worktrees";
+      default = "${config.home.homeDirectory}/.thegn/worktrees";
       description = "Base directory for git worktrees (grouped per repo).";
     };
 
@@ -253,7 +253,7 @@ in {
     repoRoots = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [cfg.workspacesDir];
-      defaultText = lib.literalExpression "[ config.programs.superzej.workspacesDir ]";
+      defaultText = lib.literalExpression "[ config.programs.thegn.workspacesDir ]";
       example = lib.literalExpression ''[ "/home/you/code" "/home/you/src" ]'';
       description = "Directories scanned by the workspace repo picker.";
     };
@@ -304,7 +304,7 @@ in {
       type = lib.types.str;
       default = "#76eede";
       example = "#f083ba";
-      description = "Focus accent color (#rrggbb) for every superzej surface.";
+      description = "Focus accent color (#rrggbb) for every thegn surface.";
     };
 
     monitorSystem = lib.mkOption {
@@ -401,7 +401,7 @@ in {
       type = lib.types.attrsOf lib.types.str;
       default = {};
       example = lib.literalExpression ''{ new-worktree = "Ctrl w"; }'';
-      description = "Rebind built-in actions by id (see `superzej keys list`).";
+      description = "Rebind built-in actions by id (see `thegn keys list`).";
     };
 
     actions = lib.mkOption {
@@ -428,9 +428,9 @@ in {
   config = lib.mkIf cfg.enable {
     home.packages = [cfg.package];
 
-    # superzej reads this TOML config. The native host owns its own chrome
+    # thegn reads this TOML config. The native host owns its own chrome
     # (sidebar/panel/tabbar/statusbar) in-process — there are no WASM plugins to
     # deploy and no permissions to pre-grant.
-    xdg.configFile."superzej/config.toml".source = configFile;
+    xdg.configFile."thegn/config.toml".source = configFile;
   };
 }

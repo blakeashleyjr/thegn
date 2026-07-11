@@ -3,10 +3,10 @@ case_tmp_env: XDG_STATE_HOME
 matrix:
   profiles: [xterm]
   sizes: ["100x30"]
-spawn: ["szhost"]
+spawn: ["thegn"]
 env:
   XDG_STATE_HOME: "{case_tmp}"
-  SUPERZEJ_LOG: warn
+  THEGN_LOG: warn
   MUSE_READY: "1"
   TERM: xterm-256color
 sync:
@@ -29,7 +29,7 @@ snapshot_defaults:
     - {re: "\\s*\\d{1,3}%", replace: " NN%"}
 steps:
   - begin_step: "startup"
-  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 20000}
+  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
   # Exit the dashboard tile to access the Work tab.
   - key: {key: q}
   - sleep_ms: 200
@@ -86,5 +86,5 @@ steps:
   - snapshot: {name: restored_from_minimum}
   - begin_step: "verify no errors"
   - check_file:
-      path: "{case_tmp}/superzej/logs/szhost.log"
+      path: "{case_tmp}/thegn/logs/thegn.log"
       reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

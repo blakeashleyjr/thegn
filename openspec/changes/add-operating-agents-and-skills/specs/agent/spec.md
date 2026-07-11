@@ -4,9 +4,9 @@
 
 ### Requirement: Operating agents are declarative and tool-restricted
 
-superzej SHALL support named operating-agent definitions declared as markdown
+thegn SHALL support named operating-agent definitions declared as markdown
 files with front-matter (id, title, allowed tool set, optional model, system
-prompt), resolved from a repo `.superzej/agents/` directory layered over a global
+prompt), resolved from a repo `.thegn/agents/` directory layered over a global
 agents directory (repo winning by id). The declared tool set MUST be the upper
 bound on what that agent may call; a tool call outside the set MUST be refused.
 
@@ -24,7 +24,7 @@ bound on what that agent may call; a tool call outside the set MUST be refused.
 
 ### Requirement: Built-in operating agents ship by default
 
-superzej SHALL ship three built-in operating agents — an executor
+thegn SHALL ship three built-in operating agents — an executor
 (read/write/patch/shell), a read-only researcher (read/search/fetch), and a
 planner (read/search plus plan-writing) — and a user file with the same id MUST
 override the built-in.
@@ -37,8 +37,8 @@ override the built-in.
 
 ### Requirement: Skills are reusable workflows orthogonal to agents
 
-superzej SHALL support named skill definitions (a `SKILL.md` with name,
-description, and optional parameters) resolved from a repo `.superzej/skills/`
+thegn SHALL support named skill definitions (a `SKILL.md` with name,
+description, and optional parameters) resolved from a repo `.thegn/skills/`
 directory and a global directory, and a skill MUST be invocable by any operating
 agent rather than being bound to one. Skills are surfaced to harnesses through the
 gateway's capability injection so a single definition is available across

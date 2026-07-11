@@ -68,7 +68,7 @@ pointers into what is a four-row table versioned with the binary.
 
 `[zone.<name>.placement]`: `allowed_providers` (3-valued intersect),
 `strictest_allowed_mode` (floor), `max_concurrent_sandboxes` (min),
-`max_monthly_spend` (→ `zone:` compute scope). Repo `.superzej.*`
+`max_monthly_spend` (→ `zone:` compute scope). Repo `.thegn.*`
 `[placement]`: preferences Allow; `spillover_provider_order` filtered to the
 effective allow-list with ClampEvents; `allowed_providers` intersect-only;
 every fleet-scoped key (overcommit, max_hosts, spend, autoscale, prices)

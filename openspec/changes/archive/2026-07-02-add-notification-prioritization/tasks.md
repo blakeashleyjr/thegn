@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Core priority model (superzej-core)
+## 1. Core priority model (thegn-core)
 
 - [ ] 1.1 `Priority { Info, Notice, Alert }` + `NotificationKind::{ALL, as_str,
 default_priority}` — **unit tests**: total over ALL, Alert = the four failure

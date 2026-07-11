@@ -1,13 +1,13 @@
 {
-  description = "superzej — terminal-native git-worktree IDE";
+  description = "thegn — terminal-native git-worktree IDE";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay.url = "github:oxalica/rust-overlay";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
-    # The pinned yazi superzej drives for its bottom file-manager drawer, on its
-    # OWN nixpkgs input so superzej bundles a specific yazi (+ its preview tools)
+    # The pinned yazi thegn drives for its bottom file-manager drawer, on its
+    # OWN nixpkgs input so thegn bundles a specific yazi (+ its preview tools)
     # independent of the user's system and of the main `nixpkgs`. Bump it
     # deliberately with `nix flake update nixpkgs-yazi`.
     nixpkgs-yazi.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -71,8 +71,8 @@
       '';
       # The pinned yazi + its preview/runtime tools, from `nixpkgs-yazi` so the
       # exact versions are frozen in flake.lock independently of the main nixpkgs.
-      # superzej drives THIS yazi for the file-manager drawer (a private binary
-      # via SUPERZEJ_YAZI_BIN + a private YAZI_CONFIG_HOME), never the system one.
+      # thegn drives THIS yazi for the file-manager drawer (a private binary
+      # via THEGN_YAZI_BIN + a private YAZI_CONFIG_HOME), never the system one.
       yaziPkgs = import nixpkgs-yazi {inherit system;};
       yaziPinned = yaziPkgs.yazi;
       # yazi's preview/runtime deps (fzf + zoxide are already in runtimeDeps).
@@ -103,8 +103,8 @@
       # Local flake sources do not materialize git submodule contents in `self`,
       # but Cargo path dependencies need these embedded app crates at package
       # build time. Compose an explicit source tree with the submodule sources
-      # copied into the paths declared by crates/superzej-host/Cargo.toml.
-      superzejSrc = pkgs.runCommand "superzej-source" {} ''
+      # copied into the paths declared by crates/thegn-host/Cargo.toml.
+      thegnSrc = pkgs.runCommand "thegn-source" {} ''
         mkdir -p $out
         cp -R ${rootSrc}/. $out/
         chmod -R u+w $out
@@ -113,13 +113,13 @@
         mkdir -p $out/apps
         cp -R ${termiteChat} $out/apps/termite-chat
       '';
-      superzej = pkgs.callPackage ./nix/package.nix {
-        src = superzejSrc;
+      thegn = pkgs.callPackage ./nix/package.nix {
+        src = thegnSrc;
         yazi = yaziPinned;
         inherit yaziDeps;
       };
 
-      # The OpenSpec CLI superzej uses for spec-driven development of itself.
+      # The OpenSpec CLI thegn uses for spec-driven development of itself.
       # A hermetic, pinned build (see nix/openspec.nix) — no global npm install,
       # telemetry off — shared by the dev shell and `just openspec*`.
       openspec = pkgs.callPackage ./nix/openspec.nix {};
@@ -156,7 +156,7 @@
         doCheck = false;
       };
 
-      # Static x86_64-linux-musl `szhost` — the resident bridge agent pushed into
+      # Static x86_64-linux-musl `thegn` — the resident bridge agent pushed into
       # Firecracker provider envs (Sprites). Self-contained (musl libc + bundled
       # sqlite + rustls TLS — no openssl), so it runs in a bare microVM. Built via
       # the cross stdenv's musl cc with +crt-static; a bare binary (no yazi/git
@@ -171,16 +171,16 @@
         rustc = rustMusl;
       };
       muslCc = "${muslCross.stdenv.cc}/bin/${muslCross.stdenv.cc.targetPrefix}cc";
-      szhostMusl = muslRustPlatform.buildRustPackage {
-        pname = "szhost-musl";
+      thegnMusl = muslRustPlatform.buildRustPackage {
+        pname = "thegn-musl";
         version = "0.1.0";
-        src = superzejSrc;
+        src = thegnSrc;
         cargoLock.lockFile = ./Cargo.lock;
         # Force the musl target explicitly (env-only CARGO_BUILD_TARGET was being
         # overridden by buildRustPackage → a glibc host binary that can't run in a
         # bare microVM). `+crt-static` makes it fully static (no ld-musl loader
         # needed in the sandbox). Install from the cross target dir, not target/release.
-        cargoBuildFlags = ["-p" "superzej-host" "--bin" "szhost" "--target" muslTarget];
+        cargoBuildFlags = ["-p" "thegn-host" "--bin" "thegn" "--target" muslTarget];
         CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = muslCc;
         CC_x86_64_unknown_linux_musl = muslCc;
@@ -189,20 +189,20 @@
         installPhase = ''
           runHook preInstall
           mkdir -p $out/bin
-          cp target/${muslTarget}/release/szhost $out/bin/szhost
+          cp target/${muslTarget}/release/thegn $out/bin/thegn
           runHook postInstall
         '';
       };
     in {
-      packages.default = superzej;
-      packages.superzej = superzej;
-      # The pinned yazi superzej drives for the file-manager drawer.
+      packages.default = thegn;
+      packages.thegn = thegn;
+      # The pinned yazi thegn drives for the file-manager drawer.
       packages.yazi = yaziPinned;
       # The muse e2e harness (`nix run .#muse`, also on the dev-shell PATH).
       packages.muse = musePkg;
-      # Static musl bridge binary (`nix build .#szhost-musl`) — pushed into
+      # Static musl bridge binary (`nix build .#thegn-musl`) — pushed into
       # provider microVMs as the resident agent (8-B.3).
-      packages.szhost-musl = szhostMusl;
+      packages.thegn-musl = thegnMusl;
       # The OpenSpec CLI for spec-driven development (`nix run .#openspec`).
       packages.openspec = openspec;
       # The multi-arch base sandbox image (per-arch; `just image-build` loads it
@@ -217,7 +217,7 @@
 
       checks = {
         # `nix flake check` gates on a clean build, formatting, and clippy.
-        build = superzej;
+        build = thegn;
         formatting =
           pkgs.runCommand "treefmt-check" {
             buildInputs = fmtPackages ++ [pkgs.treefmt pkgs.git];
@@ -230,8 +230,8 @@
               --no-cache --fail-on-change --tree-root .
             touch $out
           '';
-        clippy = superzej.overrideAttrs (old: {
-          pname = "superzej-clippy";
+        clippy = thegn.overrideAttrs (old: {
+          pname = "thegn-clippy";
           nativeBuildInputs = (old.nativeBuildInputs or []) ++ [pkgs.clippy];
           buildPhase = "cargo clippy --all-targets --offline -- -D warnings";
           installPhase = "touch $out";
@@ -241,18 +241,18 @@
       };
 
       # Lean shell for sandboxes/sprites: ONLY what's needed to build + run
-      # superzej (`cargo build`, `just build`/`just host`). Deliberately omits the
+      # thegn (`cargo build`, `just build`/`just host`). Deliberately omits the
       # full dev closure — yazi + preview deps, openspec, muse, python+pyte,
       # hyperfine, the lint/format stack — which a build sandbox doesn't need and
       # which dominate the devShell's size (the slow part to seed/fetch on a fresh
       # sprite). Anything missing is one `nix shell nixpkgs#<tool>` away in-pane
       # (see the shellHook). Selected per-sandbox via `[sandbox] devshell =
-      # "sandbox"` → `SUPERZEJ_DEVSHELL` → the repo `.envrc`'s `use flake` ref.
+      # "sandbox"` → `THEGN_DEVSHELL` → the repo `.envrc`'s `use flake` ref.
       devShells.sandbox = pkgs.mkShell {
         packages = [rustToolchain pkgs.just];
         shellHook = ''
           export PATH="$PWD/target/debug:$PATH"
-          echo "superzej sandbox shell (lean: rust + just). Need a tool? Ephemeral:"
+          echo "thegn sandbox shell (lean: rust + just). Need a tool? Ephemeral:"
           echo "  nix shell nixpkgs#<tool>   |   persistent: nix profile install nixpkgs#<tool>"
         '';
       };
@@ -272,7 +272,7 @@
             cargo-nextest
             mold
             # compilation cache (RUSTC_WRAPPER in shellHook below): shares crate
-            # artifacts across superzej's many cold-target/ worktrees + branch
+            # artifacts across thegn's many cold-target/ worktrees + branch
             # switches. Dev-shell only — the packaged `nix build` never enters here.
             sccache
             # linters
@@ -291,7 +291,7 @@
             act
             # pty visual-regression harnesses (test/*.py reconstruct the screen)
             (python3.withPackages (ps: with ps; [pyte]))
-            # runtime tools superzej shells out to
+            # runtime tools thegn shells out to
             git
             fzf
             gum
@@ -304,7 +304,7 @@
             openspec
           ]
           # The same pinned yazi as the package, so the drawer's preview tools
-          # resolve on PATH and `just host` runs the version superzej ships.
+          # resolve on PATH and `just host` runs the version thegn ships.
           ++ [yaziPinned]
           ++ yaziDeps;
         shellHook = ''
@@ -325,7 +325,7 @@
           # (the compile cache is disk; a full fs makes target/ writes fail with
           # ENOSPC/EROFS mid-build). Honor an already-set value.
           export SCCACHE_CACHE_SIZE="''${SCCACHE_CACHE_SIZE:-20G}"
-          # Pin the sccache server to a per-mount-namespace socket. superzej
+          # Pin the sccache server to a per-mount-namespace socket. thegn
           # development happens inside sandboxes (bwrap; the AI agent's own
           # bwrap) that bind-mount this worktree writable into a fresh mount
           # namespace. sccache's default server is a long-lived daemon reached
@@ -353,8 +353,8 @@
             _jobs=$(nproc 2>/dev/null || echo 4)
             if [ "$_jobs" -gt 2 ]; then export CARGO_BUILD_JOBS=$((_jobs - 2)); else export CARGO_BUILD_JOBS=1; fi
           fi
-          # Point dev superzej at the pinned yazi (the package wires this too).
-          export SUPERZEJ_YAZI_BIN="${yaziPinned}/bin/yazi"
+          # Point dev thegn at the pinned yazi (the package wires this too).
+          export THEGN_YAZI_BIN="${yaziPinned}/bin/yazi"
           # Spec-driven development (OpenSpec): telemetry off, no host writes.
           export OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1
           # Seed the Claude Code /opsx commands (gitignored, regenerable) if a
@@ -362,13 +362,13 @@
           if [ ! -d .claude/commands/opsx ] && [ -f openspec/config.yaml ]; then
             openspec init --tools claude --profile core --force >/dev/null 2>&1 || true
           fi
-          echo "superzej dev shell — 'cargo build', 'just host', 'just smoke', 'nix fmt', 'just openspec'"
+          echo "thegn dev shell — 'cargo build', 'just host', 'just smoke', 'nix fmt', 'just openspec'"
         '';
       };
     })
     // {
       # home-manager module. Imported as:
-      #   imports = [ inputs.superzej.homeManagerModules.default ];
+      #   imports = [ inputs.thegn.homeManagerModules.default ];
       homeManagerModules.default = import ./nix/hm-module.nix self;
     };
 }

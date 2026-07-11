@@ -59,17 +59,17 @@ _caller → callee_ relationships, so a diff can report its downstream fan-out.
   incremental invalidation, pure blast-radius/coverage/risk, footer enrichment,
   `blast_radius` MCP tool, no-LSP degradation). No existing capability spec is
   removed; the `panel` footer behavior it enriches is captured here.
-- **superzej-core** — new `store/semantic.rs` trait + `db_semantic.rs` SQLite
+- **thegn-core** — new `store/semantic.rs` trait + `db_semantic.rs` SQLite
   impl (registered in `store/mod.rs`); a `user_version` 37 → 38 migration
   (`SCHEMA_VERSION` const + `db_migrate` + the schema-round-trip test); new pure
   functions in `semantic.rs` (or a `semantic_graph.rs` sibling) for
   location→entity mapping, coverage classification, and risk scoring, all
   unit-tested to the 95% gate; a `blast_radius` arm in `mcp/router.rs`.
-- **superzej-svc** — `LspClient::references` already exists
+- **thegn-svc** — `LspClient::references` already exists
   (`svc/lsp/mod.rs:770`); this change _uses_ it. The only svc risk is
   confirming rust-analyzer returns caller ranges reliably enough to resolve back
   to entities (see design's feasibility caveat).
-- **superzej-host** — an off-loop graph builder/invalidator wired to the diff
+- **thegn-host** — an off-loop graph builder/invalidator wired to the diff
   fs-watcher and hydration path (reusing `LspSupervisor::client(root, lang)`);
   `hydrate.rs` `compute_entity_summary` enriches the footer from the graph when
   present. **No new event-loop wake path** — producers pulse the existing

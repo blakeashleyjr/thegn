@@ -2,7 +2,7 @@
 
 ## Purpose
 
-superzej discovers and runs a worktree's tests through a general task/result
+thegn discovers and runs a worktree's tests through a general task/result
 substrate and surfaces them as an IDE-style explorer: a lazily-discovered target
 tree, run-selected/all/failed actions, jumpable failure locations, and per-worktree
 rollups. Discovery is cheap and cached, runs never happen automatically, and every

@@ -1,9 +1,9 @@
-L0| ◆ superzej work         15.4/94G ·  49% ·  ↓  1.2M ↑  857K ·  100% · 22:07
+L0| þ thegn  work           18.9/94G ·  36% ·  ↓  1.5M ↑  738K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
-R0 3 8 fg=#edf0f8 bg=#151a28 attrs=
-R0 11 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 17 7 fg=#edf0f8 bg=#151a28 attrs=
+R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 9 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 15 9 fg=#edf0f8 bg=#151a28 attrs=
 R0 24 10 fg=#c6ccdb bg=#151a28 attrs=
 R0 34 3 fg=#6f788e bg=#151a28 attrs=
 R0 37 5 fg=#c6ccdb bg=#151a28 attrs=
@@ -24,18 +24,18 @@ R2 8 4 fg=#6ee7d8 bg=#0b0e16 attrs=
 R2 12 2 fg=default bg=#0b0e16 attrs=
 R2 14 3 fg=#6ee7d8 bg=#2e5359 attrs=
 R2 17 63 fg=default bg=#0b0e16 attrs=
-L3|                ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
-R3 0 16 fg=default bg=#0b0e16 attrs=
-R3 16 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R3 63 17 fg=default bg=#0b0e16 attrs=
-L4|                 ▀▀▀▄ █   █ █▄▄▄▀ █▀▀▀  █▄▄▄▀  ▄▀   █▀▀▀     █
-R4 0 16 fg=default bg=#0b0e16 attrs=
-R4 16 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R4 63 17 fg=default bg=#0b0e16 attrs=
-L5|                ▄▄▄▄▀ ▀▄▄▄▀ █     █▄▄▄▄ █  ▀▄ █▄▄▄▄ █▄▄▄▄ ▀▄▄▀
-R5 0 16 fg=default bg=#0b0e16 attrs=
-R5 16 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R5 63 17 fg=default bg=#0b0e16 attrs=
+L3|                         ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
+R3 0 25 fg=default bg=#0b0e16 attrs=
+R3 25 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R3 54 26 fg=default bg=#0b0e16 attrs=
+L4|                           █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
+R4 0 25 fg=default bg=#0b0e16 attrs=
+R4 25 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R4 54 26 fg=default bg=#0b0e16 attrs=
+L5|                           █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
+R5 0 25 fg=default bg=#0b0e16 attrs=
+R5 25 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R5 54 26 fg=default bg=#0b0e16 attrs=
 L6|
 R6 0 80 fg=default bg=#0b0e16 attrs=
 L7|                           v0.1.0 · git worktree IDE

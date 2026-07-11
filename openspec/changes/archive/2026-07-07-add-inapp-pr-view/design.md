@@ -2,15 +2,15 @@
 
 ## Where each piece lives (respecting the 3-crate split + god-file ratchet)
 
-- **`superzej-core::github`** — pure serde structs + two pure parsers
+- **`thegn-core::github`** — pure serde structs + two pure parsers
   (`parse_unified_diff`, `parse_conversation`, both unit-tested) and the `gh`
   subprocess seams. The whole module is in the coverage `cov_ignore` list
   (subprocess), so it carries tests for the parsers but no coverage gate.
-- **`superzej-svc` `GhBackend`** — six new async methods with default impls that
+- **`thegn-svc` `GhBackend`** — six new async methods with default impls that
   delegate to the core `gh` fns, so `CliGh` gets them for free and `GhNative`
   inherits CLI behavior. This keeps the "every native path falls back to CLI"
   invariant with zero write-side octocrab surface.
-- **`superzej-host/src/pr_view.rs`** — a NEW module (not an extension of
+- **`thegn-host/src/pr_view.rs`** — a NEW module (not an extension of
   `DetailOverlay`, which snapshots at open and takes no async data). Owns the
   view state, tabbed navigation, the composer sub-mode, and rendering. All the
   substantial host logic lives here.

@@ -12,7 +12,7 @@ Capture and restore are off the render loop (persist already runs on the DB path
 
 ## Stale-state coercion (core, pure)
 
-A pure function in `superzej-core` decides restore-time state:
+A pure function in `thegn-core` decides restore-time state:
 `coerce_stale(state, age_ms, grace_ms) -> State` — a "running"/"active" state
 older than `grace_ms` is downgraded to a settled state; fresher states pass
 through unchanged. It is **unit-tested** (fresh running stays running, stale

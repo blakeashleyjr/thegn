@@ -2,7 +2,7 @@
 
 ## Purpose
 
-superzej embeds a coding agent that is bound to a worktree, routes its model
+thegn embeds a coding agent that is bound to a worktree, routes its model
 traffic through the LLM proxy, and services its tool requests off the event loop
 within the worktree's sandbox boundary. The agent layer is strictly additive — the
 AI-free shell never depends on it — and the in-shell surface is intentionally
@@ -31,7 +31,7 @@ An embedded agent SHALL bind to a worktree with a per-worktree activity indicato
 
 ### Requirement: Agent model traffic routes through the proxy
 
-Agent model traffic SHALL route through `szproxy` via per-worktree virtual keys so spend and budgets attribute to the worktree.
+Agent model traffic SHALL route through `tgproxy` via per-worktree virtual keys so spend and budgets attribute to the worktree.
 
 #### Scenario: Requests carry the worktree key
 
@@ -59,21 +59,21 @@ The shell SHALL function fully with no agent configured; agent features MUST NOT
 
 ### Requirement: The managed pi is acquired through the managed-tool resolver
 
-The managed `pi` binary under `~/.superzej/pi` SHALL be described as a
+The managed `pi` binary under `~/.thegn/pi` SHALL be described as a
 `managed-tools` spec and acquired through the shared resolver rather than a
-bespoke install path. `szhost agent setup` MUST remain idempotent and preserve
+bespoke install path. `thegn agent setup` MUST remain idempotent and preserve
 its observable behavior: install/refresh the pinned pi, always re-seed the
-`superzej-acp` package, register it, and record the pinned version marker.
+`thegn-acp` package, register it, and record the pinned version marker.
 
 #### Scenario: agent setup installs via the shared resolver
 
-- **WHEN** `szhost agent setup` runs and the pinned pi is not yet current
+- **WHEN** `thegn agent setup` runs and the pinned pi is not yet current
 - **THEN** the pinned pi is installed through the managed-tool resolver and the
-  `superzej-acp` package is (re)seeded and registered
+  `thegn-acp` package is (re)seeded and registered
 
 #### Scenario: agent setup is idempotent when already pinned
 
-- **WHEN** `szhost agent setup` runs and the pinned pi is already at the pinned
+- **WHEN** `thegn agent setup` runs and the pinned pi is already at the pinned
   version
-- **THEN** the binary install is skipped while the `superzej-acp` package is
+- **THEN** the binary install is skipped while the `thegn-acp` package is
   still re-seeded and registered

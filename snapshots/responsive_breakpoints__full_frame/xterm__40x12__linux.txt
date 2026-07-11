@@ -1,9 +1,9 @@
- 15.5/94G ·  ↓    0B ↑    0B ·  100%…
+ 19.0/94G ·  ↓  877K ↑  703K ·  100%…
 ────────────────────────────────────────
  HOME ▸ home   1
  ╭─ Choose a keymap ────────── menu ──╮
  │ Familiar shortcuts on top of the … │
- │ ❯  d  superzej de… Alt/Ctrl chords │
+ │ ❯  d  thegn defau… Alt/Ctrl chords │
  │    v… Ctrl+P, Ctrl+Shift+P, Ctrl+B │
  │    i  JetBra… Ctrl+Shift+A, Ctrl+E │
  ╰────────────────────────────────────╯

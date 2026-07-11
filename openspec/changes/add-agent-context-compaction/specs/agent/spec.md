@@ -4,7 +4,7 @@
 
 ### Requirement: Scrollback fed to an agent can be deterministically compacted
 
-superzej SHALL provide a deterministic, pure templater that collapses repetitive
+thegn SHALL provide a deterministic, pure templater that collapses repetitive
 scrollback lines into template groups (template, occurrence count, a few samples,
 and variable slots) before the scrollback is handed to an agent or the proxy as
 context. The same input MUST always produce the same groups in a stable order
@@ -25,7 +25,7 @@ issue any model call.
 
 ### Requirement: Compaction is gated by window size and off by default
 
-superzej SHALL apply compaction only when a scrollback window exceeds a configured
+thegn SHALL apply compaction only when a scrollback window exceeds a configured
 size threshold, passing smaller windows through unchanged, because compaction
 degrades small windows; and compaction MUST be off by default so the AI-free shell
 and un-opted context paths are unaffected.

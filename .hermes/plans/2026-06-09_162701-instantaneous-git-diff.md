@@ -4,7 +4,7 @@
 
 **Goal:** Eliminate the 50–150ms delay and visual flashing when switching worktree tabs in the right panel, making the diff render instantaneously (0ms lag).
 
-**Architecture:** Move the SQLite cache lookup out of the critical tab-switch rendering path. The panel plugin will pre-fetch all session worktrees' diff/PR caches into a WASM memory `HashMap` via a new `superzej panel-snapshot --all` command on startup. When switching tabs, `refocus()` will query this local memory cache for an instant 0ms first-paint, while still triggering the background `watch` daemon hydration.
+**Architecture:** Move the SQLite cache lookup out of the critical tab-switch rendering path. The panel plugin will pre-fetch all session worktrees' diff/PR caches into a WASM memory `HashMap` via a new `thegn panel-snapshot --all` command on startup. When switching tabs, `refocus()` will query this local memory cache for an instant 0ms first-paint, while still triggering the background `watch` daemon hydration.
 
 **Tech Stack:** Rust, clap (CLI), Zellij WASM plugin (panel).
 
@@ -12,22 +12,22 @@
 
 ### Task 1: Add `--all` flag to `panel-snapshot` CLI
 
-**Objective:** Extend `superzej panel-snapshot` to dump the cache for all worktrees in a session.
+**Objective:** Extend `thegn panel-snapshot` to dump the cache for all worktrees in a session.
 
 **Files:**
 
-- Modify: `crates/superzej-cli/src/commands/snapshot.rs`
-- Modify: `crates/superzej-cli/src/cli.rs`
+- Modify: `crates/thegn-cli/src/commands/snapshot.rs`
+- Modify: `crates/thegn-cli/src/cli.rs`
 
 **Step 1: Write failing test / behavior check**
 
-Run: `cargo run -p superzej-cli -- panel-snapshot --session default --all`
+Run: `cargo run -p thegn-cli -- panel-snapshot --session default --all`
 Expected: FAIL — error: unexpected argument `--all`
 
 **Step 2: Add `--all` argument to `cli.rs`**
 
 ```rust
-// In `crates/superzej-cli/src/cli.rs` under `pub enum Command`:
+// In `crates/thegn-cli/src/cli.rs` under `pub enum Command`:
     #[command(name = "panel-snapshot", hide = true)]
     PanelSnapshot {
         #[arg(long)]
@@ -39,12 +39,12 @@ Expected: FAIL — error: unexpected argument `--all`
     },
 ```
 
-Pass the `all` parameter down to `commands::snapshot::run` in `crates/superzej-cli/src/main.rs`.
+Pass the `all` parameter down to `commands::snapshot::run` in `crates/thegn-cli/src/main.rs`.
 
 **Step 3: Implement `--all` logic in `snapshot.rs`**
 
 ```rust
-// In `crates/superzej-cli/src/commands/snapshot.rs`
+// In `crates/thegn-cli/src/commands/snapshot.rs`
 
 pub fn run(session: Option<String>, tab: Option<String>, all: bool) -> Result<()> {
     let session = session.unwrap_or_else(db::session);
@@ -79,13 +79,13 @@ pub fn run(session: Option<String>, tab: Option<String>, all: bool) -> Result<()
 
 **Step 4: Run test to verify pass**
 
-Run: `cargo run -p superzej-cli -- panel-snapshot --session default --all`
+Run: `cargo run -p thegn-cli -- panel-snapshot --session default --all`
 Expected: JSON array output.
 
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-cli/src/cli.rs crates/superzej-cli/src/main.rs crates/superzej-cli/src/commands/snapshot.rs
+git add crates/thegn-cli/src/cli.rs crates/thegn-cli/src/main.rs crates/thegn-cli/src/commands/snapshot.rs
 git commit -m "feat(cli): add --all flag to panel-snapshot to bulk dump caches"
 ```
 
@@ -127,7 +127,7 @@ struct State {
 ```rust
 // Inside `impl ZellijPlugin for State { fn pipe(&mut self, pipe: PipeMessage) -> bool {`
 
-            "superzej_pr" => {
+            "thegn_pr" => {
                 if let Some(payload) = pipe.payload {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
                         if let Some(wt) = v.get("worktree").and_then(|w| w.as_str()) {
@@ -141,7 +141,7 @@ struct State {
                 }
                 false
             }
-            "superzej_diff" => {
+            "thegn_diff" => {
                 if let Some(payload) = pipe.payload {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
                         if let Some(wt) = v.get("worktree").and_then(|w| w.as_str()) {
@@ -189,7 +189,7 @@ git commit -m "feat(panel): track diff and pr cache in plugin memory"
             ctx.insert("cmd".to_string(), "snapshot-all".to_string());
             run_command(
                 &[
-                    "superzej",
+                    "thegn",
                     "panel-snapshot",
                     "--all",
                     "--session",
@@ -306,7 +306,7 @@ fn base_tab_name(tab: &str) -> &str {
         let mut ctx = BTreeMap::new();
         ctx.insert("cmd".to_string(), "snapshot".to_string());
         run_command(
-            &["superzej", "panel-snapshot", "--session", &s, "--tab", &t],
+            &["thegn", "panel-snapshot", "--session", &s, "--tab", &t],
             ctx,
         );
 
