@@ -1294,6 +1294,9 @@ mod tests {
             &["init", "-q", "-b", "main"][..],
             &["config", "user.email", "t@t.t"],
             &["config", "user.name", "t"],
+            // Hermetic against the developer's global signing setup (a
+            // global `commit.gpgsign = true` would require a live gpg agent).
+            &["config", "commit.gpgsign", "false"],
             &["commit", "--allow-empty", "-q", "-m", "init"],
         ] {
             assert!(util::git_cmd(&dir).args(args).status().unwrap().success());

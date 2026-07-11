@@ -213,6 +213,10 @@ pub enum Singleton {
 /// Try to take the exclusive, non-blocking `flock` at `path`. `Ok(Some(file))`
 /// = acquired (keep the file to hold it); `Ok(None)` = already held elsewhere.
 #[cfg(not(windows))]
+// Raw-fd `flock` is deprecated in favor of the owning `nix::fcntl::Flock`,
+// which doesn't fit returning the bare `File` the lock rides on (see
+// `util::lock_git_mutations`); the raw call is still sound here.
+#[allow(deprecated)]
 fn try_lock_nb(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()

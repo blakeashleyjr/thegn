@@ -301,6 +301,11 @@ fn context_hints(
     if focus.zone == crate::focus::Zone::Panel {
         out = crate::chrome::panel_help_pairs(panel_ui);
     }
+    // Sidebar zone: the curated essentials first (the real keys live in
+    // `handlers/sidebar_keys.rs`, invisible to the keymap registry).
+    if focus.zone == crate::focus::Zone::Sidebar {
+        out = crate::sidebar_help::statusbar_pairs();
+    }
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (_, hint) in &out {
@@ -503,10 +508,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // modifyOtherKeys gives us the same disambiguation in a form termwiz
     // parses correctly, so dropping the kitty push is a strict win here.
     //
-    // SGR mouse reporting stays on (1002 = button + drag, 1006 = SGR encoding):
-    // clicks focus panes/rows and drags build a per-pane selection that
-    // auto-copies (OSC 52) on release, zellij-style.
-    //
+    // SGR mouse (1002 button+drag, 1006 SGR) drives click/drag/wheel. termwiz's
+    // `set_raw_mode` above already pushed 1003 (ANY-motion) + 1006; the write
+    // below corrects it: 1003 off always (nothing renders on hover, and pure
+    // pointer motion would wake the idle loop per move — the ~0%-idle
+    // contract; an inner app requesting AnyEventMouse loses only pure-hover
+    // motion), and ALL reporting off on mouse-less terminals.
     // Autowrap OFF (DECRST 7): the compositor positions every cell absolutely
     // and never relies on the cursor wrapping to the next line. With autowrap
     // left ON (the alt-screen default), writing the bottom-right cell — e.g. a
@@ -517,9 +524,15 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     {
         use std::io::Write as _;
         let mut out = std::io::stdout();
-        let _ = out
-            .write_all(b"\x1b[?1002h\x1b[?1006h\x1b[?7l")
-            .and_then(|_| out.flush());
+        // termcaps.mouse = pure env detection (config not loaded yet); ?7l always.
+        let mouse_ok =
+            superzej_core::termcaps::detect(&superzej_core::termcaps::TermEnv::from_env()).mouse;
+        let seq: &[u8] = if mouse_ok {
+            b"\x1b[?1003l\x1b[?1002h\x1b[?1006h\x1b[?7l"
+        } else {
+            b"\x1b[?1003l\x1b[?1006l\x1b[?1002l\x1b[?7l"
+        };
+        let _ = out.write_all(seq).and_then(|_| out.flush());
     }
 
     // Probe the outer terminal (DA + XTVERSION) while we still own the raw tty —
@@ -1283,76 +1296,15 @@ pub(crate) fn refresh_tab_model(
     sb.rebuild(model, session);
 }
 
-/// Rows that toggle collapse on Enter/Space/`h`/`l`: workspaces, 📂 folder
-/// sub-groups, and terminal host groups. Single source of truth lives on
-/// [`crate::sidebar::RowKind::is_collapsible`].
-fn is_collapsible(kind: crate::sidebar::RowKind) -> bool {
-    kind.is_collapsible()
-}
-
-/// `ui_state` scope for the sidebar's persisted view state. The sidebar is a
-/// single global tree showing every workspace at once, so its view state
-/// (pins, collapse, sort, width, expand) is process-global — NOT keyed by the
-/// active workspace. (Mirrors the right panel's `"panel"` scope. Keying this by
-/// `session.id`, which is the active workspace's repo path, stranded pins in
-/// per-workspace scopes so they never reloaded.)
-const SIDEBAR_SCOPE: &str = "sidebar";
-
-/// Interaction + persisted view state for the workspace tree (items 16–27).
-/// The single source of truth the event loop mutates; [`SidebarState::rebuild`]
-/// derives `FrameModel`'s sidebar fields from it plus the model's data carriers.
-#[derive(Default)]
-pub(crate) struct SidebarState {
-    pub(crate) view: crate::sidebar::ViewState,
-    pub(crate) focused: bool,
-    /// Cursor over the *visible* rows.
-    pub(crate) cursor: usize,
-    filtering: bool,
-    /// Marked rows for bulk actions (item 26), keyed by the stable per-row
-    /// `pin_key` so the selection survives rebuilds (collapse/sort/filter/
-    /// hydration/reorder) instead of drifting when row indices shift.
-    pub(crate) marked: std::collections::HashSet<String>,
-    /// Open context menu, if any (item 27).
-    menu: Option<crate::chrome::RowMenu>,
-    /// Adjustable bar width in columns (item 25); `None` = layout default.
-    width: Option<usize>,
-    /// Wide expand toggle (`e`): mirrors the panel's expand affordance. When
-    /// set, the sidebar claims ~half the window, ignoring `width`.
-    expanded: bool,
-    /// Display mode cycled by `ToggleSidebar`: full panel, slim rail, hidden.
-    mode: crate::layout::SidebarMode,
-    /// Desired top visible-row index of the scroll window; `build_sidebar`
-    /// clamps it each frame so the cursor row stays in view.
-    scroll: usize,
-    /// Group names of worktrees mid-creation; `rebuild` overlays a loading dot
-    /// on their rows (a build in flight has no CPU-based activity yet).
-    pub(crate) creating: std::collections::HashSet<String>,
-}
+// Sidebar interaction state + its persisted view state live in
+// `handlers/sidebar_persist.rs`, and key/menu handling in
+// `handlers/sidebar_keys.rs` (both extracted from this ratchet-pinned file);
+// re-exported so call sites read unchanged. Loop-coupled methods
+// (`rebuild`/`sync`/`effective_cols`) stay in the impl block below.
+pub(crate) use crate::handlers::sidebar_keys::SidebarOutcome;
+pub(crate) use crate::handlers::sidebar_persist::{SIDEBAR_SCOPE, SidebarState};
 
 impl SidebarState {
-    /// Load persisted collapse/sort/pins/width from `ui_state` for this session.
-    fn load(&mut self, db: &superzej_core::db::Db, scope: &str) {
-        for (key, value) in db.ui_state_in_scope(scope).unwrap_or_default() {
-            if let Some(slug) = key.strip_prefix("collapse:") {
-                if value == "1" {
-                    self.view.collapsed.insert(slug.to_string());
-                }
-            } else if let Some(slug) = key.strip_prefix("pin:") {
-                if value == "1" && !self.view.pins.contains(&slug.to_string()) {
-                    self.view.pins.push(slug.to_string());
-                }
-            } else if key == "sort_mode" {
-                self.view.sort = crate::sidebar::SortMode::from_str(&value);
-            } else if key == "sidebar_cols" {
-                self.width = value.parse().ok();
-            } else if key == "sidebar_expanded" {
-                self.expanded = value == "1";
-            } else if key == "sidebar_mode" {
-                self.mode = crate::layout::SidebarMode::from_key(&value);
-            }
-        }
-    }
-
     /// Effective sidebar width in columns: the slim rail's fixed width when in
     /// rail mode; otherwise half the window when expanded (Wide), else the
     /// user's fine-nudged width (or the layout default).
@@ -1362,23 +1314,6 @@ impl SidebarState {
             _ if self.expanded => (cols / 2).max(crate::layout::SIDEBAR_COLS),
             _ => self.width.unwrap_or(crate::layout::SIDEBAR_COLS),
         }
-    }
-
-    /// The currently-selected visible row, if any.
-    pub(crate) fn selected_row<'a>(
-        &self,
-        model: &'a FrameModel,
-    ) -> Option<&'a crate::sidebar::SidebarRow> {
-        model
-            .sidebar_rows
-            .iter()
-            .filter(|r| r.visible)
-            .nth(self.cursor)
-    }
-
-    /// Number of currently-visible rows.
-    pub(crate) fn visible_len(model: &FrameModel) -> usize {
-        model.sidebar_rows.iter().filter(|r| r.visible).count()
     }
 
     /// Rederive `model.sidebar_rows` from its data carriers + this view state,
@@ -1450,526 +1385,6 @@ impl SidebarState {
     pub(crate) fn focus_active_row(&mut self, model: &mut FrameModel) {
         self.cursor = visible_index_of_active(model);
         self.sync(model);
-    }
-}
-
-/// What the event loop should do after a sidebar key was handled.
-pub(crate) enum SidebarOutcome {
-    /// Key wasn't for the sidebar; let normal dispatch handle it.
-    NotHandled,
-    /// Handled; just redraw.
-    Redraw,
-    /// Leave sidebar focus (return input to the pane).
-    Defocus,
-    /// Activate this `(worktree group, tab)` target.
-    Activate(crate::sidebar::RowTarget),
-    /// The layout changed (bar width); recompute chrome.
-    Relayout,
-    /// Reorder the current selection (marked rows, else the cursor row) one slot
-    /// (Shift+↑/↓). Needs `&mut Session`, so the loop performs it.
-    ReorderSelection { up: bool },
-    /// Close the worktree groups at these session indices (bulk action).
-    CloseGroups(Vec<usize>),
-    /// DELETE these worktree groups from disk (`git worktree remove`) and
-    /// close them — destructive; the loop may interpose a confirmation.
-    DeleteGroups(Vec<usize>),
-    /// Forget a whole workspace: close its live groups and prune its DB rows,
-    /// WITHOUT touching the worktree files on disk. Always confirmed.
-    RemoveWorkspace {
-        repo_path: String,
-        slug: String,
-        display: String,
-    },
-    /// Copy this text (a worktree path) to the system clipboard via OSC-52.
-    CopyText(String),
-    /// Prompt to rename the worktree group at this session index (its current
-    /// branch seeds the input). Item 53.
-    PromptRename { gi: usize, branch: String },
-    /// Fork a new worktree branching from this source branch (item 52). The
-    /// loop launches the new-worktree wizard with the base overridden.
-    Fork {
-        base_branch: String,
-        repo_root: String,
-    },
-}
-
-impl SidebarState {
-    /// Persist a single `ui_state` key in the global [`SIDEBAR_SCOPE`].
-    pub(crate) fn persist(&self, key: &str, value: &str) {
-        if let Ok(db) = superzej_core::db::Db::open() {
-            let _ = db.set_ui_state(SIDEBAR_SCOPE, key, value);
-        }
-    }
-
-    // Sidebar reorder (single item + multi-select) lives in
-    // `handlers/sidebar_reorder.rs` to keep this god-file from growing:
-    // `move_active_worktree`, `move_selected_workspace`, `move_worktree_group`,
-    // `move_workspace_by_slug`, and `reorder_selection`.
-
-    /// What the cursor row activates, if anything.
-    pub(crate) fn cursor_target(&self, model: &FrameModel) -> Option<crate::sidebar::RowTarget> {
-        self.selected_row(model).and_then(|r| r.tab_target.clone())
-    }
-
-    /// The remove-workspace outcome for the cursor row, when it is a Workspace
-    /// row backed by a DB repo path. `None` for worktree rows or live fallbacks
-    /// with no persisted workspace yet.
-    fn remove_workspace_target(&self, model: &FrameModel) -> Option<SidebarOutcome> {
-        let row = self.selected_row(model)?;
-        if row.kind != crate::sidebar::RowKind::Workspace {
-            return None;
-        }
-        let repo_path = row.worktree_path.clone()?;
-        Some(SidebarOutcome::RemoveWorkspace {
-            repo_path,
-            slug: row.workspace_slug.clone(),
-            display: row.label.clone(),
-        })
-    }
-
-    /// Build the context-menu entries for the cursor row (item 27).
-    fn menu_for_cursor(
-        &self,
-        model: &FrameModel,
-        session: &crate::session::Session,
-    ) -> Option<crate::chrome::RowMenu> {
-        use crate::sidebar::RowKind;
-        let row = self.selected_row(model)?;
-        let mut entries = Vec::new();
-        if row.tab_target.is_some() {
-            entries.push(("open", "Open"));
-        }
-        if is_collapsible(row.kind) {
-            entries.push(("toggle", "Collapse/expand"));
-        }
-        if !row.pin_key.is_empty() {
-            entries.push(("pin", "Pin / unpin"));
-        }
-        // A workspace can be forgotten (no disk deletion); needs a DB row,
-        // carried as the workspace row's `worktree_path`.
-        if row.kind == RowKind::Workspace && row.worktree_path.is_some() {
-            entries.push(("remove-workspace", "Remove workspace"));
-        }
-        if row.kind == RowKind::Worktree {
-            // Copy path / fork apply to any worktree with a real checkout.
-            if row.worktree_path.is_some() {
-                entries.push(("copy-path", "Copy path"));
-                entries.push(("fork", "Fork worktree"));
-            }
-            let is_home = matches!(
-                row.tab_target,
-                Some(crate::sidebar::RowTarget::Tab(gi, _))
-                    if session.worktrees.get(gi).map(|g| g.kind) == Some(crate::session::GroupKind::Home)
-            );
-            if !is_home {
-                entries.push(("rename", "Rename worktree"));
-                entries.push(("close", "Close worktree"));
-                entries.push(("delete", "Delete worktree..."));
-            }
-        }
-        Some(crate::chrome::RowMenu {
-            anchor: self.cursor,
-            target_pin_key: row.pin_key.clone(),
-            entries: entries
-                .into_iter()
-                .map(|(id, label)| crate::chrome::RowMenuEntry {
-                    id: id.into(),
-                    label: label.into(),
-                })
-                .collect(),
-            cursor: 0,
-        })
-    }
-
-    /// Handle a key while the sidebar owns focus. Mutates view/interaction
-    /// state, rebuilds rows, and returns what the loop must do.
-    pub(crate) fn handle_key(
-        &mut self,
-        key: &KeyCode,
-        mods: Modifiers,
-        model: &mut FrameModel,
-        session: &crate::session::Session,
-    ) -> SidebarOutcome {
-        // Filter input sub-mode captures text (item 21).
-        if self.filtering {
-            match key {
-                key if crate::input::is_escape_key(key) => {
-                    self.filtering = false;
-                    self.view.filter.clear();
-                }
-                KeyCode::Enter => self.filtering = false,
-                KeyCode::Backspace => {
-                    self.view.filter.pop();
-                }
-                KeyCode::Char(c) if !mods.contains(Modifiers::CTRL) => {
-                    self.view.filter.push(*c);
-                }
-                _ => return SidebarOutcome::Redraw,
-            }
-            self.cursor = 0;
-            self.rebuild(model, session);
-            return SidebarOutcome::Redraw;
-        }
-
-        // Open context menu captures navigation (item 27).
-        if let Some(menu) = &mut self.menu {
-            match key {
-                key if crate::input::is_escape_key(key) => {
-                    self.menu = None;
-                }
-                KeyCode::UpArrow | KeyCode::Char('k') => {
-                    menu.cursor = menu.cursor.saturating_sub(1);
-                }
-                KeyCode::DownArrow | KeyCode::Char('j') => {
-                    menu.cursor = (menu.cursor + 1).min(menu.entries.len().saturating_sub(1));
-                }
-                KeyCode::Enter => {
-                    let id = menu.entries.get(menu.cursor).map(|e| e.id.clone());
-                    let target_key = menu.target_pin_key.clone();
-                    self.menu = None;
-                    if let Some(id) = id {
-                        if let Some(idx) = model
-                            .sidebar_rows
-                            .iter()
-                            .filter(|r| r.visible)
-                            .position(|r| r.pin_key == target_key)
-                        {
-                            self.cursor = idx;
-                        }
-                        return self.run_menu_action(&id, model, session);
-                    }
-                }
-                _ => {}
-            }
-            self.sync(model);
-            return SidebarOutcome::Redraw;
-        }
-
-        let visible = Self::visible_len(model);
-        match key {
-            key if crate::input::is_escape_key(key) => return SidebarOutcome::Defocus,
-            KeyCode::Char('q') => return SidebarOutcome::Defocus,
-            // Shift+↑/↓ reorders the selection (the loop has `&mut Session`).
-            // Only the arrows carry Shift here — Shift+j/k normalise to J/K.
-            KeyCode::UpArrow if mods.contains(Modifiers::SHIFT) => {
-                return SidebarOutcome::ReorderSelection { up: true };
-            }
-            KeyCode::DownArrow if mods.contains(Modifiers::SHIFT) => {
-                return SidebarOutcome::ReorderSelection { up: false };
-            }
-            KeyCode::DownArrow | KeyCode::Char('j') => {
-                if visible > 0 {
-                    self.cursor = (self.cursor + 1).min(visible - 1);
-                }
-            }
-            KeyCode::UpArrow | KeyCode::Char('k') => {
-                self.cursor = self.cursor.saturating_sub(1);
-            }
-            KeyCode::Enter => {
-                // On a collapsible header (workspace or terminal host), Enter
-                // toggles collapse; elsewhere it opens the row.
-                if let Some(row) = self.selected_row(model) {
-                    if is_collapsible(row.kind) {
-                        return self.toggle_collapse(model, session);
-                    }
-                    if let Some(t) = row.tab_target.clone() {
-                        return SidebarOutcome::Activate(t);
-                    }
-                }
-            }
-            KeyCode::Char('l') | KeyCode::RightArrow => {
-                // Expand a collapsed header.
-                if let Some(row) = self.selected_row(model)
-                    && is_collapsible(row.kind)
-                    && row.collapsed
-                {
-                    return self.toggle_collapse(model, session);
-                }
-            }
-            KeyCode::Char('h') | KeyCode::LeftArrow => {
-                // On an expanded collapsible header: collapse it. Otherwise (a
-                // leaf sub-item, or an already-collapsed header): collapse the
-                // nearest collapsible ancestor and move the cursor onto it.
-                if let Some(row) = self.selected_row(model) {
-                    if is_collapsible(row.kind) && !row.collapsed {
-                        return self.toggle_collapse(model, session);
-                    }
-                    return self.collapse_parent(model, session);
-                }
-            }
-            KeyCode::Char('/') => {
-                self.filtering = true;
-                self.sync(model);
-            }
-            KeyCode::Char('s') => {
-                self.view.sort = self.view.sort.next();
-                self.persist("sort_mode", self.view.sort.as_str());
-                self.rebuild(model, session);
-            }
-            KeyCode::Char('p') => return self.toggle_pin(model, session),
-            KeyCode::Char(' ') => {
-                // Multi-select toggle (item 26): mark/unmark the cursor row if it
-                // is a worktree or workspace. Collapse now lives solely on
-                // Enter/←/→ and the caret click, so headers can be selected too.
-                if let Some(row) = self.selected_row(model)
-                    && row.is_markable()
-                {
-                    let key = row.pin_key.clone();
-                    if !self.marked.remove(&key) {
-                        self.marked.insert(key);
-                    }
-                    self.sync(model);
-                }
-            }
-            KeyCode::Char('m') => {
-                self.menu = self.menu_for_cursor(model, session);
-                self.sync(model);
-            }
-            KeyCode::Char('X') => {
-                // Bulk close: every marked worktree, else the cursor row.
-                let targets = self.action_targets(model);
-                if !targets.is_empty() {
-                    self.hint_skipped_workspace_marks(model);
-                    return SidebarOutcome::CloseGroups(targets);
-                }
-            }
-            KeyCode::Char('D') => {
-                // On a workspace row, D removes the workspace (opens the same
-                // delete-from-disk/keep-files menu as Alt+Shift+X).
-                if let Some(out) = self.remove_workspace_target(model) {
-                    return out;
-                }
-                // Bulk DELETE from disk: marked worktrees, else the cursor row.
-                let targets = self.action_targets(model);
-                if !targets.is_empty() {
-                    self.hint_skipped_workspace_marks(model);
-                    return SidebarOutcome::DeleteGroups(targets);
-                }
-            }
-            KeyCode::Char('<') | KeyCode::Char(',') => {
-                return self.adjust_width(-2);
-            }
-            KeyCode::Char('>') | KeyCode::Char('.') => {
-                return self.adjust_width(2);
-            }
-            KeyCode::Char('e') => {
-                // Toggle the Wide expand (mirrors the panel's `e`): ~half the
-                // window vs. the fine-nudged width.
-                self.expanded = !self.expanded;
-                self.persist("sidebar_expanded", if self.expanded { "1" } else { "0" });
-                return SidebarOutcome::Relayout;
-            }
-            _ => return SidebarOutcome::NotHandled,
-        }
-        self.sync(model);
-        SidebarOutcome::Redraw
-    }
-
-    /// The groups a bulk action applies to: every marked row's group, or the
-    /// cursor row's group when nothing is marked.
-    fn action_targets(&self, model: &FrameModel) -> Vec<usize> {
-        let marked = self.marked_group_targets(model);
-        if !marked.is_empty() {
-            return marked;
-        }
-        match self.cursor_target(model) {
-            Some(crate::sidebar::RowTarget::Tab(g, _)) => vec![g],
-            _ => Vec::new(),
-        }
-    }
-
-    /// Marked rows resolved to worktree-group indices (close acts per group).
-    /// Marks that aren't worktree rows (e.g. workspace headers) carry no group
-    /// target and are dropped here; [`Self::marked_nonworktree_count`] reports
-    /// them so the caller can hint the user.
-    fn marked_group_targets(&self, model: &FrameModel) -> Vec<usize> {
-        let mut targets: Vec<usize> = model
-            .sidebar_rows
-            .iter()
-            .filter(|r| r.visible && self.marked.contains(&r.pin_key))
-            .filter_map(|r| match r.tab_target {
-                Some(crate::sidebar::RowTarget::Tab(g, _)) => Some(g),
-                _ => None,
-            })
-            .collect();
-        targets.sort_unstable();
-        targets.dedup();
-        targets
-    }
-
-    /// How many marked rows are *not* worktree groups (workspace headers), which
-    /// bulk close/delete can't act on. Used to surface a "N workspaces skipped"
-    /// hint rather than silently ignoring them.
-    fn marked_nonworktree_count(&self, model: &FrameModel) -> usize {
-        model
-            .sidebar_rows
-            .iter()
-            .filter(|r| r.visible && self.marked.contains(&r.pin_key))
-            .filter(|r| !matches!(r.tab_target, Some(crate::sidebar::RowTarget::Tab(_, _))))
-            .count()
-    }
-
-    /// Warn when a bulk close/delete silently skips marked workspace headers,
-    /// which those actions can't operate on (worktrees only).
-    fn hint_skipped_workspace_marks(&self, model: &mut FrameModel) {
-        let skipped = self.marked_nonworktree_count(model);
-        if skipped > 0 {
-            model.status =
-                format!("{skipped} workspace(s) skipped — select worktrees to close/delete");
-        }
-    }
-
-    pub(crate) fn toggle_collapse(
-        &mut self,
-        model: &mut FrameModel,
-        session: &crate::session::Session,
-    ) -> SidebarOutcome {
-        if let Some(row) = self.selected_row(model) {
-            // Per-kind collapse key: 📂 folders key on their `pin_key`
-            // (`{slug}/folder:{id}`), everything else on `workspace_slug`.
-            let slug = row.collapse_key().to_string();
-            let now_collapsed = if self.view.collapsed.contains(&slug) {
-                self.view.collapsed.remove(&slug);
-                false
-            } else {
-                self.view.collapsed.insert(slug.clone());
-                true
-            };
-            self.persist(
-                &format!("collapse:{slug}"),
-                if now_collapsed { "1" } else { "0" },
-            );
-            self.rebuild(model, session);
-        }
-        SidebarOutcome::Redraw
-    }
-
-    fn toggle_pin(
-        &mut self,
-        model: &mut FrameModel,
-        session: &crate::session::Session,
-    ) -> SidebarOutcome {
-        // Bulk: every marked row's pin key, else the cursor row's.
-        let mut keys: Vec<String> = model
-            .sidebar_rows
-            .iter()
-            .filter(|r| r.visible && self.marked.contains(&r.pin_key))
-            .map(|r| r.pin_key.clone())
-            .collect();
-        if keys.is_empty()
-            && let Some(row) = self.selected_row(model)
-        {
-            keys.push(row.pin_key.clone());
-        }
-        for key in keys {
-            if let Some(pos) = self.view.pins.iter().position(|k| *k == key) {
-                self.view.pins.remove(pos);
-                self.persist(&format!("pin:{key}"), "0");
-            } else {
-                self.view.pins.push(key.clone());
-                self.persist(&format!("pin:{key}"), "1");
-            }
-        }
-        self.rebuild(model, session);
-        SidebarOutcome::Redraw
-    }
-
-    /// Drop out of the Wide expand back to the resting width (mirrors the
-    /// panel's Esc collapse). Returns whether anything changed so the caller can
-    /// gate a relayout. Persists "0" so an unfocused bar doesn't re-expand on
-    /// restart, matching `adjust_width`'s "drops out of Wide + sticks" rule.
-    fn collapse_wide(&mut self) -> bool {
-        if !self.expanded {
-            return false;
-        }
-        self.expanded = false;
-        self.persist("sidebar_expanded", "0");
-        true
-    }
-
-    fn adjust_width(&mut self, delta: i32) -> SidebarOutcome {
-        // A fine nudge drops out of Wide so the change is visible and sticks.
-        if self.expanded {
-            self.expanded = false;
-            self.persist("sidebar_expanded", "0");
-        }
-        let cur = self.width.unwrap_or(crate::layout::SIDEBAR_COLS) as i32;
-        let next = (cur + delta).clamp(
-            crate::layout::SIDEBAR_MIN_WIDTH as i32,
-            crate::layout::SIDEBAR_MAX_WIDTH as i32,
-        ) as usize;
-        self.width = Some(next);
-        self.persist("sidebar_cols", &next.to_string());
-        SidebarOutcome::Relayout
-    }
-
-    fn run_menu_action(
-        &mut self,
-        id: &str,
-        model: &mut FrameModel,
-        session: &crate::session::Session,
-    ) -> SidebarOutcome {
-        match id {
-            "open" => {
-                if let Some(t) = self.cursor_target(model) {
-                    return SidebarOutcome::Activate(t);
-                }
-            }
-            "toggle" => return self.toggle_collapse(model, session),
-            "pin" => return self.toggle_pin(model, session),
-            "close" => {
-                let targets = self.action_targets(model);
-                if !targets.is_empty() {
-                    return SidebarOutcome::CloseGroups(targets);
-                }
-            }
-            "delete" => {
-                let targets = self.action_targets(model);
-                if !targets.is_empty() {
-                    return SidebarOutcome::DeleteGroups(targets);
-                }
-            }
-            "remove-workspace" => {
-                if let Some(out) = self.remove_workspace_target(model) {
-                    return out;
-                }
-            }
-            "copy-path" => {
-                if let Some(p) = self
-                    .selected_row(model)
-                    .and_then(|r| r.worktree_path.clone())
-                {
-                    return SidebarOutcome::CopyText(p);
-                }
-            }
-            "fork" => {
-                let row = self.selected_row(model);
-                if let Some(branch) = row.and_then(|r| r.branch.clone()).filter(|b| !b.is_empty())
-                    && let Some(path) = self
-                        .selected_row(model)
-                        .and_then(|r| r.worktree_path.clone())
-                {
-                    let repo_root = superzej_core::repo::main_worktree(std::path::Path::new(&path))
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or(path);
-                    return SidebarOutcome::Fork {
-                        base_branch: branch,
-                        repo_root,
-                    };
-                }
-            }
-            "rename" => {
-                // Resolve the live group index + current branch for the cursor row.
-                if let Some(crate::sidebar::RowTarget::Tab(gi, _)) =
-                    self.selected_row(model).and_then(|r| r.tab_target.clone())
-                    && let Some(branch) = self.selected_row(model).and_then(|r| r.branch.clone())
-                {
-                    return SidebarOutcome::PromptRename { gi, branch };
-                }
-            }
-            _ => {}
-        }
-        SidebarOutcome::Redraw
     }
 }
 
@@ -2309,7 +1724,7 @@ pub(crate) fn deletable_group_targets(
     (kept, skipped)
 }
 
-fn forget_worktree_group(
+pub(crate) fn forget_worktree_group(
     db: &superzej_core::db::Db,
     session_id: &str,
     group: &crate::session::WorktreeGroup,
@@ -2319,6 +1734,10 @@ fn forget_worktree_group(
     }
     let _ = db.del_worktree_for_tab(session_id, &group.name);
     let _ = db.delete_tab_group(session_id, &group.name);
+    // The registry row is gone, so its sidebar pin keys (`pin:{slug}/{branch}`
+    // and the filed variant `pin:{slug}/{branch}/folder:{id}`) would orphan in
+    // ui_state. best-effort: cache-only keys. (The group name IS `slug/branch`.)
+    let _ = db.del_ui_state_prefix(SIDEBAR_SCOPE, &format!("pin:{}", group.name));
     // Tear down any sandbox container for this worktree in the background
     // (best-effort: we fire-and-forget on a dedicated thread so the event loop
     // is never blocked by a slow container runtime).
@@ -2744,6 +2163,11 @@ fn remove_workspace_with_db(
         if db.active_workspace().ok().flatten().as_deref() == Some(repo_path) {
             let _ = db.del_ui_state("", "active_workspace");
         }
+        // …including its sidebar view state: `collapse:{slug}`, `pin:{slug}`,
+        // `pin:{slug}/{branch}`, `collapse:{slug}/folder:{id}` would otherwise
+        // orphan in ui_state forever. best-effort: cache-only keys.
+        let _ = db.del_ui_state_prefix(SIDEBAR_SCOPE, &format!("collapse:{slug}"));
+        let _ = db.del_ui_state_prefix(SIDEBAR_SCOPE, &format!("pin:{slug}"));
         // Persist the trimmed layout: otherwise `tab_groups`/`group_tabs`
         // resurrect the closed groups on the next launch (see `delete_groups`).
         let _ = session.persist(db, &session.id, now_secs());
@@ -3623,6 +3047,10 @@ pub(crate) enum HostInputKind {
     /// File the active worktree into a new folder named by the typed value
     /// (the "＋ New folder…" path of the move-to-folder picker).
     FileWorktreeNewFolder,
+    /// Rename the sidebar folder `folder_id` to the typed value.
+    RenameFolder { folder_id: i64 },
+    /// Create an empty sidebar folder named by the typed value in `repo_path`.
+    NewEmptyFolder { repo_path: String },
     /// Add a `[host.*]` machine from typed input in the System ▸ Hosts panel
     /// (`n`) and refresh; no worktree wizard, unlike [`Self::NewHost`].
     AddHost,
@@ -5077,7 +4505,7 @@ fn dispatch_menu_choice(
         // Handled at the call site (item 621) — it needs the live config + keymap,
         // which this git-scoped dispatcher doesn't carry. Never reaches here.
         MenuChoice::SetKeymapPreset(_) => {}
-        MenuChoice::ConfirmDeleteWorktrees { .. } => {}
+        MenuChoice::ConfirmDeleteWorktrees { .. } | MenuChoice::ConfirmCloseWorktrees => {}
         // The reach picker is intercepted at the call site (opens port entry);
         // never reaches this git-scoped dispatcher.
         MenuChoice::ShareReach(_) => {}
@@ -7171,6 +6599,7 @@ async fn event_loop<T: Terminal>(
     // mode survive restarts; row mode is intentionally transient).
     let mut sb = SidebarState::default();
     sb.view.workspace_sort = keymap.config().ui.sidebar_workspace_sort;
+    sb.view.terminals_section = keymap.config().ui.sidebar_terminals_section;
     let mut panel_ui = crate::panel::PanelUi::default();
     if let Ok(db) = superzej_core::db::Db::open() {
         sb.load(&db, SIDEBAR_SCOPE);
@@ -7422,6 +6851,7 @@ async fn event_loop<T: Terminal>(
     // grid selection). Drags highlight within ONE pane only and auto-copy
     // (OSC 52) on release, zellij-style.
     let mut mouse_left_down = false;
+    let mut sidebar_mouse_ui = crate::handlers::sidebar_mouse::MouseUi::default();
     // Swallows split SGR mouse fragments termwiz mis-delivers as keys.
     let mut residue = crate::mousefilter::MouseResidueFilter::default();
     // Events read ahead of their turn by the key-repeat coalescer; consumed
@@ -7433,6 +6863,13 @@ async fn event_loop<T: Terminal>(
     // A destructive delete awaiting its y/N confirmation: (question, targets).
     // A delete worktree action from menu awaiting the user choice
     let mut pending_confirm_delete_worktrees: Option<Vec<usize>> = None;
+    // The sidebar's cursor-row `f`: `(worktree_path, repo_path)` the NEXT
+    // move-to-folder pick applies to (else the active worktree). Cleared when
+    // the active-worktree action opens the picker, so a cancelled sidebar pick
+    // can't misdirect a later one.
+    let mut pending_file_target: Option<(String, String)> = None;
+    // The sidebar's `?` help card; any key dismisses it.
+    let mut sidebar_help_open = false;
     // The workspace (repo_path, slug, display) targeted by an open
     // delete-workspace menu, awaiting the user's keep-files/delete choice.
     let mut pending_delete_workspace: Option<(String, String, String)> = None;
@@ -7767,6 +7204,322 @@ async fn event_loop<T: Terminal>(
                 &mut need_relayout,
                 &mut clear_on_next_frame,
             )
+        };
+    }
+
+    // Dispatch a [`SidebarOutcome`] using the loop's locals — shared by the
+    // keyboard path (sidebar `handle_key`) and the mouse path (row clicks and
+    // context-menu picks), so the two input methods can never diverge.
+    // `$synth` receives `Synthetic` actions: the Key arm passes
+    // `&mut forced_palette_action` (the normal action dispatcher runs them);
+    // the mouse arm handles its reachable subset inline.
+    macro_rules! dispatch_sidebar_outcome {
+        ($out:expr, $synth:expr) => {
+            match $out {
+                SidebarOutcome::NotHandled => { /* fall through to keymap */ }
+                SidebarOutcome::Redraw => {
+                    sidebar_dirty = true; // D5: damage only sidebar + bars, not full chrome
+                    bars_dirty = true;
+                    continue;
+                }
+                SidebarOutcome::Defocus => {
+                    need_relayout |= crate::escape::escape_to_center(
+                        &mut focus,
+                        &mut panel_ui,
+                        &mut drawer,
+                        &mut drawer_pool,
+                        &mut drawer_home,
+                        &session,
+                        &mut panes,
+                        keymap.config(),
+                    );
+                    // Collapse the Wide expand too (the sidebar analogue
+                    // of the panel width reset in escape_to_center); the
+                    // width reconciliation repaints it.
+                    if keymap.config().panel.collapse_on_escape {
+                        need_relayout |= sb.collapse_wide();
+                    }
+                    sb.focused = false;
+                    sb.menu = None;
+                    sb.sync(&mut model);
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::Relayout => {
+                    // Width recompute is handled by the reconciliation
+                    // block before the relayout gate.
+                    need_relayout = true;
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::ReorderSelection { up } => {
+                    if sb.reorder_selection(&mut model, &mut session, up) {
+                        need_relayout = true;
+                    }
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::Activate(target) => {
+                    switch_at = Some(std::time::Instant::now());
+                    if activate_row!(target) {
+                        kick_model_hydration!();
+                    }
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::DeleteGroups(targets) => {
+                    crate::handlers::worktree_delete::request_group_delete(
+                        crate::handlers::worktree_delete::DeleteCtx {
+                            session: &mut session,
+                            panes: &mut panes,
+                            model: &mut model,
+                            sb: &mut sb,
+                            drawer: &mut drawer,
+                            drawer_pool: &mut drawer_pool,
+                            drawer_home: &mut drawer_home,
+                            active_menu: &mut active_menu,
+                            pending: &mut pending_confirm_delete_worktrees,
+                            need_relayout: &mut need_relayout,
+                            waker: &waker,
+                            cfg: keymap.config(),
+                            center: chrome.center,
+                            confirm_delete: current_config.confirm_delete,
+                        },
+                        targets,
+                    );
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::RemoveWorkspace {
+                    repo_path,
+                    slug,
+                    display,
+                } => {
+                    // Same modal + path as Alt+Shift+X: the menu
+                    // defaults to the SAFE "keep all files"; deleting
+                    // from disk is the explicit danger arm. Resolved in
+                    // the menu Pick handler.
+                    if current_config.ui.confirm_delete_workspace {
+                        active_menu = Some(menu::delete_workspace_menu(&display));
+                        pending_delete_workspace = Some((repo_path, slug, display));
+                    } else {
+                        // Confirm skipped: take the SAFE arm (keep
+                        // files) — an unprompted action must never
+                        // delete worktree dirs from disk.
+                        model.status = remove_workspace(
+                            &mut session,
+                            &mut panes,
+                            &repo_path,
+                            &slug,
+                            &display,
+                            true,
+                        );
+                        forget_workspace_in_model(&mut model, &slug, &repo_path);
+                        sb.marked.clear();
+                        refresh_tab_model(&mut model, &session, &mut sb);
+                        sb.focus_active_row(&mut model);
+                        need_relayout = true;
+                        sync_drawer_persistence(
+                            &session,
+                            &mut panes,
+                            &mut drawer,
+                            &mut drawer_pool,
+                            &mut drawer_home,
+                            keymap.config(),
+                            chrome.center,
+                        );
+                    }
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::CloseGroups(targets) => {
+                    crate::handlers::worktree_delete::perform_close(
+                        &mut crate::handlers::worktree_delete::DeleteCtx {
+                            session: &mut session,
+                            panes: &mut panes,
+                            model: &mut model,
+                            sb: &mut sb,
+                            drawer: &mut drawer,
+                            drawer_pool: &mut drawer_pool,
+                            drawer_home: &mut drawer_home,
+                            active_menu: &mut active_menu,
+                            pending: &mut pending_confirm_delete_worktrees,
+                            need_relayout: &mut need_relayout,
+                            waker: &waker,
+                            cfg: keymap.config(),
+                            center: chrome.center,
+                            confirm_delete: current_config.confirm_delete,
+                        },
+                        targets,
+                    );
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::ConfirmCloseOrDelete(targets) => {
+                    crate::handlers::worktree_delete::request_close_or_delete(
+                        crate::handlers::worktree_delete::DeleteCtx {
+                            session: &mut session,
+                            panes: &mut panes,
+                            model: &mut model,
+                            sb: &mut sb,
+                            drawer: &mut drawer,
+                            drawer_pool: &mut drawer_pool,
+                            drawer_home: &mut drawer_home,
+                            active_menu: &mut active_menu,
+                            pending: &mut pending_confirm_delete_worktrees,
+                            need_relayout: &mut need_relayout,
+                            waker: &waker,
+                            cfg: keymap.config(),
+                            center: chrome.center,
+                            confirm_delete: current_config.confirm_delete,
+                        },
+                        targets,
+                    );
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::Synthetic(action) => {
+                    // No `continue`: the caller decides how to run the
+                    // forced action (the Key arm feeds it to the normal
+                    // dispatcher; the mouse arm handles the few
+                    // mouse-reachable actions inline).
+                    *$synth = Some(action);
+                }
+                SidebarOutcome::NewWorktreeIn { repo_root } => {
+                    begin_worktree_wizard(
+                        std::path::PathBuf::from(repo_root),
+                        None,
+                        None,
+                        keymap.config(),
+                        &mut create_gen,
+                        &create_tx,
+                        &waker,
+                        &mut creating,
+                        &mut wizard_cmd_tx,
+                        &mut wizard_ui,
+                        &mut model,
+                    );
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::MoveToFolder {
+                    worktree_path,
+                    repo_path,
+                } => {
+                    match superzej_core::db::Db::open() {
+                        Ok(db) => {
+                            let items = crate::palette::build_move_to_folder_items(
+                                &db,
+                                &repo_path,
+                                &keymap.file_worktree_folders(),
+                            );
+                            pending_file_target = Some((worktree_path, repo_path));
+                            palette = Some(crate::search_everywhere::PaletteSession::new(items));
+                        }
+                        Err(e) => model.status = format!("DB open failed: {e}"),
+                    }
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::NewFolderPrompt { repo_path } => {
+                    host_input = Some((
+                        menu::InputOverlay::new("new folder".to_string(), String::new()),
+                        HostInputKind::NewEmptyFolder { repo_path },
+                    ));
+                    model.status = "New folder: type a name (Esc cancels)".into();
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::RenameFolder { folder_id, name } => {
+                    host_input = Some((
+                        menu::InputOverlay::new(format!("rename folder {name}"), name.clone()),
+                        HostInputKind::RenameFolder { folder_id },
+                    ));
+                    model.status = "Rename folder: edit the name (Esc cancels)".into();
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::DeleteFolder { folder_id, name } => {
+                    active_menu = Some(menu::confirm_menu(
+                        format!("Delete folder '{name}'?"),
+                        "its worktrees move back to the workspace root",
+                        "sidebar-delete-folder",
+                        folder_id.to_string(),
+                        true,
+                    ));
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::CloseTerminal { name } => {
+                    active_menu = Some(menu::confirm_menu(
+                        format!("Close terminal '{name}'?"),
+                        "the shell process ends; scrollback is lost",
+                        "sidebar-close-terminal",
+                        name,
+                        true,
+                    ));
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::SortMenu => {
+                    active_menu = Some(menu::sidebar_sort_menu(sb.view.sort));
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::ShowHelp => {
+                    sidebar_help_open = true;
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::CopyText(text) => {
+                    // OSC-52 to the outer terminal's clipboard (item 27).
+                    writer.submit_oob(crate::copymode::osc52(&text));
+                    model.status = format!("Copied: {text}");
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::PromptRename { gi, branch } => {
+                    if let Some(g) = session.worktrees.get(gi) {
+                        let repo_root = superzej_core::repo::main_worktree(Path::new(&g.path))
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| g.path.clone());
+                        host_input = Some((
+                            menu::InputOverlay::new(format!("rename {branch}"), branch.clone()),
+                            HostInputKind::RenameWorktree {
+                                gi,
+                                repo_root,
+                                old_path: g.path.clone(),
+                                old_branch: branch,
+                            },
+                        ));
+                        model.status = "Rename worktree: edit the branch name (Esc cancels)".into();
+                    }
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::Fork {
+                    base_branch,
+                    repo_root,
+                } => {
+                    // Reuse the new-worktree flow with the base overridden
+                    // to the selected branch (item 52).
+                    begin_worktree_wizard(
+                        std::path::PathBuf::from(repo_root),
+                        Some(base_branch),
+                        None,
+                        keymap.config(),
+                        &mut create_gen,
+                        &create_tx,
+                        &waker,
+                        &mut creating,
+                        &mut wizard_cmd_tx,
+                        &mut wizard_ui,
+                        &mut model,
+                    );
+                    dirty = true;
+                    continue;
+                }
+            }
         };
     }
 
@@ -10107,6 +9860,7 @@ async fn event_loop<T: Terminal>(
                 Ok(new_cfg) => {
                     keymap = rebuild_keymap(&new_cfg, &session);
                     sb.view.workspace_sort = new_cfg.ui.sidebar_workspace_sort;
+                    sb.view.terminals_section = new_cfg.ui.sidebar_terminals_section;
                     model.status = keybind_conflict_summary(&new_cfg)
                         .unwrap_or_else(|| "Config reloaded".into());
                     // Live theme reload: colors apply on the next repaint.
@@ -11042,7 +10796,7 @@ async fn event_loop<T: Terminal>(
                 }
                 if sidebar && let Some(sb) = chrome.sidebar {
                     // D5: recompose just the sidebar rect (disjoint from panel/center).
-                    crate::chrome::draw_sidebar(&mut scratch, sb, &model);
+                    crate::sidebar_view::draw_sidebar(&mut scratch, sb, &model);
                     pane_diff_rects.push(sb);
                 }
             } else {
@@ -11235,6 +10989,9 @@ async fn event_loop<T: Terminal>(
             // The Now-Playing media control overlay (centered modal).
             if let Some(ov) = &media_overlay {
                 ov.render(&mut scratch, screen);
+            }
+            if sidebar_help_open {
+                crate::sidebar_help::render(&mut scratch, screen);
             }
             if !which_key.is_empty() {
                 crate::keyhint::render_which_key(
@@ -11594,6 +11351,64 @@ async fn event_loop<T: Terminal>(
                     crate::handlers::overlay::MousePre::Fall(h, f) => (h, f),
                 };
 
+                // An open sidebar row-menu owns sidebar mouse events: click an
+                // entry to run it, click outside to dismiss, wheel to move.
+                if sb.menu.is_some()
+                    && let Some(r) = chrome.sidebar.filter(|r| r.contains(mx, my))
+                {
+                    let wheel = m
+                        .mouse_buttons
+                        .contains(MouseButtons::VERT_WHEEL)
+                        .then(|| m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE));
+                    let press = left && !mouse_left_down;
+                    if wheel.is_some() || press {
+                        let picked = crate::handlers::sidebar_mouse::on_menu_mouse(
+                            &mut sb, &mut model, &session, r, my, press, wheel,
+                        );
+                        if let Some(out) = picked {
+                            let mut synth: Option<crate::keymap::Action> = None;
+                            dispatch_sidebar_outcome!(out, &mut synth);
+                            match synth {
+                                Some(crate::keymap::Action::NewTerminal) => {
+                                    terminal_wizard_ui =
+                                        Some(open_terminal_wizard(keymap.config(), &session));
+                                }
+                                Some(a) => {
+                                    model.status = format!(
+                                        "Use the keyboard for {:?} (menu shortcut coming)",
+                                        a
+                                    );
+                                }
+                                None => {}
+                            }
+                        }
+                        mouse_left_down = left;
+                        sidebar_dirty = true;
+                        bars_dirty = true;
+                        dirty = true;
+                        continue;
+                    }
+                }
+
+                // Right-click a sidebar row: select it and open its context
+                // menu right there (the same catalog `m` opens).
+                if m.mouse_buttons.contains(MouseButtons::RIGHT)
+                    && !m.mouse_buttons.contains(MouseButtons::VERT_WHEEL)
+                    && let Some(r) = chrome.sidebar.filter(|r| r.contains(mx, my))
+                {
+                    let was_center_zone = focus.zone == crate::focus::Zone::Center;
+                    let _ = was_center_zone; // menu keeps sidebar focus while open
+                    focus.zone = crate::focus::Zone::Sidebar;
+                    sb.focused = true;
+                    crate::handlers::sidebar_mouse::on_right_press(
+                        &mut sb, &mut model, &session, r, my,
+                    );
+                    sidebar_dirty = true;
+                    bars_dirty = true;
+                    dirty = true;
+                    continue;
+                }
+
                 // Wheel over a pane scrolls its scrollback; over the panel /
                 // sidebar it scrolls THAT widget (never the terminal behind).
                 if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
@@ -11695,8 +11510,11 @@ async fn event_loop<T: Terminal>(
                         sb.sync(&mut model);
                         // Persist the clamped scroll window so it stays stable
                         // across subsequent keyboard navigation.
-                        sb.scroll = crate::chrome::build_sidebar(&model, r, sb.scroll).scroll;
+                        sb.scroll = crate::sidebar_view::build_sidebar(&model, r, sb.scroll).scroll;
                         sb.sync(&mut model);
+                        // D5: only the sidebar (and its bar mirror) moved.
+                        sidebar_dirty = true;
+                        bars_dirty = true;
                         dirty = true;
                     }
                 } else if left && !mouse_left_down {
@@ -11823,55 +11641,50 @@ async fn event_loop<T: Terminal>(
                         focus.zone = crate::focus::Zone::Sidebar;
                         sb.focused = true;
                         sb.sync(&mut model);
-                        // Resolve the click against the same `build_sidebar`
-                        // pass the renderer painted, so variable-height (two-
-                        // tier) rows map to the right index — never the old
-                        // `my - r.y - 2` shortcut.
-                        if let Some(idx) = crate::chrome::sidebar_hits(&model, r)
-                            .into_iter()
-                            .find(|(_, y, h)| my >= *y && my < *y + *h)
-                            .map(|(i, _, _)| i)
-                        {
-                            sb.cursor = idx;
-                            if m.modifiers.contains(Modifiers::CTRL) {
-                                // Ctrl+click: toggle the multi-select mark by the
-                                // row's stable identity (only markable rows).
-                                if let Some(key) = model
-                                    .sidebar_rows
-                                    .iter()
-                                    .filter(|r| r.visible)
-                                    .nth(idx)
-                                    .filter(|r| r.is_markable())
-                                    .map(|r| r.pin_key.clone())
-                                    && !sb.marked.remove(&key)
-                                {
-                                    sb.marked.insert(key);
+                        // Caret clicks, Ctrl-marks, double-click, and drag
+                        // arming live in the handler; the click resolves
+                        // against the same `build_sidebar` pass the renderer
+                        // painted, so two-tier rows map to the right index.
+                        match crate::handlers::sidebar_mouse::on_left_press(
+                            &mut sidebar_mouse_ui,
+                            &mut sb,
+                            &mut model,
+                            &session,
+                            r,
+                            mx,
+                            my,
+                            m.modifiers.contains(Modifiers::CTRL),
+                            std::time::Instant::now(),
+                        ) {
+                            crate::handlers::sidebar_mouse::PressOut::Consumed => {}
+                            crate::handlers::sidebar_mouse::PressOut::Activate {
+                                target,
+                                force_center,
+                            } => {
+                                let hydrate = activate_row!(target);
+                                // A switch from the sidebar keeps the user in
+                                // the center terminal if that's where they were
+                                // typing (matching keyboard NextTab/PrevTab);
+                                // a double-click commits focus to the center
+                                // regardless.
+                                if was_center || force_center {
+                                    focus.zone = crate::focus::Zone::Center;
                                 }
-                                sb.sync(&mut model);
-                            } else {
-                                sb.sync(&mut model);
-                                // row target activations within a single
-                                // workspace are tab/zoom, not relayout;
-                                // workspace switch sets it via need_relayout
-                                if let Some(t) = sb.cursor_target(&model) {
-                                    let hydrate = activate_row!(t);
-                                    // A worktree/workspace/terminal switch from
-                                    // the sidebar keeps the user in the center
-                                    // terminal if that's where they were typing
-                                    // — matching the keyboard NextTab/PrevTab
-                                    // behaviour. If the sidebar was the focused
-                                    // zone (browsing via Ctrl+arrow), leave
-                                    // focus there. The pre-render focus mirror
-                                    // resets sb.focused from this zone.
-                                    if was_center {
-                                        focus.zone = crate::focus::Zone::Center;
-                                    }
-                                    if hydrate {
-                                        kick_model_hydration!();
-                                    }
+                                if hydrate {
+                                    kick_model_hydration!();
+                                }
+                            }
+                            crate::handlers::sidebar_mouse::PressOut::Outcome(out) => {
+                                let mut synth: Option<crate::keymap::Action> = None;
+                                dispatch_sidebar_outcome!(out, &mut synth);
+                                if let Some(crate::keymap::Action::NewTerminal) = synth {
+                                    terminal_wizard_ui =
+                                        Some(open_terminal_wizard(keymap.config(), &session));
                                 }
                             }
                         }
+                        sidebar_dirty = true;
+                        bars_dirty = true;
                     } else if let Some(r) = chrome.panel.filter(|r| r.contains(mx, my)) {
                         focus.zone = crate::focus::Zone::Panel;
                         // Resolve the click against the same frame the
@@ -11993,6 +11806,37 @@ async fn event_loop<T: Terminal>(
                         }
                     }
                     dirty = true;
+                } else if left
+                    && mouse_left_down
+                    && sidebar_mouse_ui.drag != crate::handlers::sidebar_mouse::DragPhase::Idle
+                {
+                    // Sidebar drag: coalesce the motion backlog like the pane
+                    // drag below, then advance the gesture with the latest
+                    // sample only.
+                    let (m2, leftover) = drain_drag_events(m, || {
+                        buf.terminal()
+                            .poll_input(Some(std::time::Duration::ZERO))
+                            .ok()
+                            .flatten()
+                    });
+                    if let Some(ev) = leftover {
+                        pending_input.push_back(ev);
+                    }
+                    let my2 = (m2.y as usize).saturating_sub(1);
+                    if let Some(r) = chrome.sidebar
+                        && crate::handlers::sidebar_mouse::on_drag_move(
+                            &mut sidebar_mouse_ui,
+                            &mut sb,
+                            &mut model,
+                            &session,
+                            r,
+                            my2,
+                        )
+                    {
+                        sidebar_dirty = true;
+                        bars_dirty = true;
+                        dirty = true;
+                    }
                 } else if left && mouse_left_down && mouse_selecting {
                     // Coalesce the drag backlog: a fast drag emits many move
                     // samples; applying only the latest (and rendering once)
@@ -12048,6 +11892,39 @@ async fn event_loop<T: Terminal>(
                         selection_only = true;
                     }
                 } else if !left && mouse_left_down {
+                    // A sidebar press/drag ends here: perform the drop (or
+                    // finish the click) and consume the release.
+                    match crate::handlers::sidebar_mouse::on_release(
+                        &mut sidebar_mouse_ui,
+                        &mut model,
+                    ) {
+                        crate::handlers::sidebar_mouse::ReleaseOut::NotOurs => {}
+                        crate::handlers::sidebar_mouse::ReleaseOut::Click => {
+                            sb.sync(&mut model);
+                            mouse_left_down = false;
+                            sidebar_dirty = true;
+                            bars_dirty = true;
+                            dirty = true;
+                            continue;
+                        }
+                        crate::handlers::sidebar_mouse::ReleaseOut::Drop { src, spot } => {
+                            crate::handlers::sidebar_mouse::perform_drop(
+                                &mut sb,
+                                &mut model,
+                                &mut session,
+                                &refresh_tx,
+                                &waker,
+                                &src,
+                                &spot,
+                            );
+                            sb.sync(&mut model);
+                            mouse_left_down = false;
+                            sidebar_dirty = true;
+                            bars_dirty = true;
+                            dirty = true;
+                            continue;
+                        }
+                    }
                     // Release: auto-copy a non-empty selection (zellij-style).
                     mouse_selecting = false;
                     match mouse_sel.as_ref() {
@@ -12093,6 +11970,13 @@ async fn event_loop<T: Terminal>(
                 }
                 input_at = Some(std::time::Instant::now()); // input-latency stamp
                 let k = normalize_key(k);
+                // The sidebar `?` help card is a read-only overlay: any key
+                // dismisses it and is consumed.
+                if sidebar_help_open {
+                    sidebar_help_open = false;
+                    dirty = true;
+                    continue;
+                }
                 // Register paste is armed (PasteRegister): the next key names the
                 // register (`a`–`z`/`0`–`9`, `"` default, `+` clipboard). It's a
                 // top-priority mini-modal so the char never leaks to the pane.
@@ -12718,17 +12602,58 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
                                     HostInputKind::FileWorktreeNewFolder => {
-                                        match crate::handlers::sidebar_folder::file_active_worktree(
-                                            &session,
-                                            &mut sb,
-                                            &mut model,
-                                            &text,
-                                            &refresh_tx,
-                                            &waker,
-                                        ) {
+                                        let r = match pending_file_target.take() {
+                                            Some((wt, repo)) => {
+                                                crate::handlers::sidebar_folder::file_worktree_path(
+                                                    &session,
+                                                    &mut sb,
+                                                    &mut model,
+                                                    &wt,
+                                                    &repo,
+                                                    &text,
+                                                    &refresh_tx,
+                                                    &waker,
+                                                )
+                                            }
+                                            None => {
+                                                crate::handlers::sidebar_folder::file_active_worktree(
+                                                    &session,
+                                                    &mut sb,
+                                                    &mut model,
+                                                    &text,
+                                                    &refresh_tx,
+                                                    &waker,
+                                                )
+                                            }
+                                        };
+                                        match r {
                                             Ok(msg) => model.status = msg,
                                             Err(e) => model.status = e,
                                         }
+                                    }
+                                    HostInputKind::RenameFolder { folder_id } => {
+                                        model.status =
+                                            crate::handlers::sidebar_actions::rename_folder(
+                                                &session,
+                                                &mut sb,
+                                                &mut model,
+                                                folder_id,
+                                                &text,
+                                                &refresh_tx,
+                                                &waker,
+                                            );
+                                    }
+                                    HostInputKind::NewEmptyFolder { repo_path } => {
+                                        model.status =
+                                            crate::handlers::sidebar_actions::create_empty_folder(
+                                                &session,
+                                                &mut sb,
+                                                &mut model,
+                                                &repo_path,
+                                                &text,
+                                                &refresh_tx,
+                                                &waker,
+                                            );
                                     }
                                     HostInputKind::AddHost => {
                                         model.status = crate::handlers::host::add_and_refresh(
@@ -12843,6 +12768,88 @@ async fn event_loop<T: Terminal>(
                                 }
                                 center_dormant = false;
                                 model.status = "Retrying environment bring-up…".into();
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::ConfirmCloseWorktrees = choice
+                                && let Some(targets) = pending_confirm_delete_worktrees.take()
+                            {
+                                crate::handlers::worktree_delete::perform_close(
+                                    &mut crate::handlers::worktree_delete::DeleteCtx {
+                                        session: &mut session,
+                                        panes: &mut panes,
+                                        model: &mut model,
+                                        sb: &mut sb,
+                                        drawer: &mut drawer,
+                                        drawer_pool: &mut drawer_pool,
+                                        drawer_home: &mut drawer_home,
+                                        active_menu: &mut active_menu,
+                                        pending: &mut pending_confirm_delete_worktrees,
+                                        need_relayout: &mut need_relayout,
+                                        waker: &waker,
+                                        cfg: keymap.config(),
+                                        center: chrome.center,
+                                        confirm_delete: current_config.confirm_delete,
+                                    },
+                                    targets,
+                                );
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::Confirm {
+                                tag: "sidebar-sort",
+                                arg,
+                            } = &choice
+                            {
+                                sb.view.sort = crate::sidebar::SortMode::from_str(arg);
+                                sb.persist("sort_mode", sb.view.sort.as_str());
+                                sb.rebuild(&mut model, &session);
+                                model.status = format!("Sort: {}", sb.view.sort.as_str());
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::Confirm {
+                                tag: "sidebar-delete-folder",
+                                arg,
+                            } = &choice
+                            {
+                                model.status = crate::handlers::sidebar_actions::delete_folder(
+                                    &session,
+                                    &mut sb,
+                                    &mut model,
+                                    arg,
+                                    &refresh_tx,
+                                    &waker,
+                                );
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::Confirm {
+                                tag: "sidebar-close-terminal",
+                                arg,
+                            } = &choice
+                            {
+                                let name = arg.clone();
+                                crate::handlers::sidebar_actions::close_terminal(
+                                    &mut crate::handlers::worktree_delete::DeleteCtx {
+                                        session: &mut session,
+                                        panes: &mut panes,
+                                        model: &mut model,
+                                        sb: &mut sb,
+                                        drawer: &mut drawer,
+                                        drawer_pool: &mut drawer_pool,
+                                        drawer_home: &mut drawer_home,
+                                        active_menu: &mut active_menu,
+                                        pending: &mut pending_confirm_delete_worktrees,
+                                        need_relayout: &mut need_relayout,
+                                        waker: &waker,
+                                        cfg: keymap.config(),
+                                        center: chrome.center,
+                                        confirm_delete: current_config.confirm_delete,
+                                    },
+                                    &name,
+                                    &refresh_tx,
+                                );
                                 dirty = true;
                                 continue;
                             }
@@ -13897,14 +13904,31 @@ async fn event_loop<T: Terminal>(
                                         model.status =
                                             "New folder: type a name (Esc cancels)".into();
                                     } else {
-                                        match crate::handlers::sidebar_folder::file_active_worktree(
-                                            &session,
-                                            &mut sb,
-                                            &mut model,
-                                            rest,
-                                            &refresh_tx,
-                                            &waker,
-                                        ) {
+                                        let r = match pending_file_target.take() {
+                                            Some((wt, repo)) => {
+                                                crate::handlers::sidebar_folder::file_worktree_path(
+                                                    &session,
+                                                    &mut sb,
+                                                    &mut model,
+                                                    &wt,
+                                                    &repo,
+                                                    rest,
+                                                    &refresh_tx,
+                                                    &waker,
+                                                )
+                                            }
+                                            None => {
+                                                crate::handlers::sidebar_folder::file_active_worktree(
+                                                    &session,
+                                                    &mut sb,
+                                                    &mut model,
+                                                    rest,
+                                                    &refresh_tx,
+                                                    &waker,
+                                                )
+                                            }
+                                        };
+                                        match r {
                                             Ok(msg) => model.status = msg,
                                             Err(e) => model.status = e,
                                         }
@@ -14072,234 +14096,10 @@ async fn event_loop<T: Terminal>(
                     && !k.modifiers.contains(Modifiers::CTRL)
                     && !k.modifiers.contains(Modifiers::ALT)
                 {
-                    match sb.handle_key(&k.key, k.modifiers, &mut model, &session) {
-                        SidebarOutcome::NotHandled => { /* fall through to keymap */ }
-                        SidebarOutcome::Redraw => {
-                            sidebar_dirty = true; // D5: damage only sidebar + bars, not full chrome
-                            bars_dirty = true;
-                            continue;
-                        }
-                        SidebarOutcome::Defocus => {
-                            need_relayout |= crate::escape::escape_to_center(
-                                &mut focus,
-                                &mut panel_ui,
-                                &mut drawer,
-                                &mut drawer_pool,
-                                &mut drawer_home,
-                                &session,
-                                &mut panes,
-                                keymap.config(),
-                            );
-                            // Collapse the Wide expand too (the sidebar analogue
-                            // of the panel width reset in escape_to_center); the
-                            // width reconciliation repaints it.
-                            if keymap.config().panel.collapse_on_escape {
-                                need_relayout |= sb.collapse_wide();
-                            }
-                            sb.focused = false;
-                            sb.menu = None;
-                            sb.sync(&mut model);
-                            dirty = true;
-                            continue;
-                        }
-                        SidebarOutcome::Relayout => {
-                            // Width recompute is handled by the reconciliation
-                            // block before the relayout gate.
-                            need_relayout = true;
-                            dirty = true;
-                            continue;
-                        }
-                        SidebarOutcome::ReorderSelection { up } => {
-                            if sb.reorder_selection(&mut model, &mut session, up) {
-                                need_relayout = true;
-                            }
-                            dirty = true;
-                            continue;
-                        }
-                        SidebarOutcome::Activate(target) => {
-                            switch_at = Some(std::time::Instant::now());
-                            if activate_row!(target) {
-                                kick_model_hydration!();
-                            }
-                            dirty = true;
-                            continue;
-                        }
-                        SidebarOutcome::DeleteGroups(targets) => {
-                            crate::handlers::worktree_delete::request_group_delete(
-                                crate::handlers::worktree_delete::DeleteCtx {
-                                    session: &mut session,
-                                    panes: &mut panes,
-                                    model: &mut model,
-                                    sb: &mut sb,
-                                    drawer: &mut drawer,
-                                    drawer_pool: &mut drawer_pool,
-                                    drawer_home: &mut drawer_home,
-                                    active_menu: &mut active_menu,
-                                    pending: &mut pending_confirm_delete_worktrees,
-                                    need_relayout: &mut need_relayout,
-                                    waker: &waker,
-                                    cfg: keymap.config(),
-                                    center: chrome.center,
-                                    confirm_delete: current_config.confirm_delete,
-                                },
-                                targets,
-                            );
-                            dirty = true;
-                            continue;
-                        }
-                        SidebarOutcome::RemoveWorkspace {
-                            repo_path,
-                            slug,
-                            display,
-                        } => {
-                            // Same modal + path as Alt+Shift+X: the menu defaults
-                            // to "delete worktrees from disk" (keep-files is the
-                            // opt-out). Resolved in the menu Pick handler.
-                            if current_config.ui.confirm_delete_workspace {
-                                active_menu = Some(menu::delete_workspace_menu(&display));
-                                pending_delete_workspace = Some((repo_path, slug, display));
-                            } else {
-                                model.status = remove_workspace(
-                                    &mut session,
-                                    &mut panes,
-                                    &repo_path,
-                                    &slug,
-                                    &display,
-                                    false,
-                                );
-                                forget_workspace_in_model(&mut model, &slug, &repo_path);
-                                sb.marked.clear();
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                sb.focus_active_row(&mut model);
-                                need_relayout = true;
-                                sync_drawer_persistence(
-                                    &session,
-                                    &mut panes,
-                                    &mut drawer,
-                                    &mut drawer_pool,
-                                    &mut drawer_home,
-                                    keymap.config(),
-                                    chrome.center,
-                                );
-                            }
-                            dirty = true;
-                            continue;
-                        }
-                        SidebarOutcome::CloseGroups(targets) => {
-                            let (mut targets, skipped_home) =
-                                deletable_group_targets(&session, targets);
-
-                            // Capture the *name* of the active group before deletion,
-                            // because its index will shift as groups below it are removed.
-                            let active_group_name = session.active_group().map(|g| g.name.clone());
-
-                            // Close from the highest index down so earlier
-                            // indices stay valid as groups are removed.
-                            let db = superzej_core::db::Db::open().ok();
-                            targets.sort_unstable_by(|a, b| b.cmp(a));
-                            for gi in targets {
-                                if gi < session.worktrees.len() {
-                                    if let Some(db) = &db {
-                                        forget_worktree_group(
-                                            db,
-                                            &session.id,
-                                            &session.worktrees[gi],
-                                        );
-                                    }
-                                    for tab in &session.worktrees[gi].tabs {
-                                        for id in tab.center.pane_ids() {
-                                            panes.table.remove(&id);
-                                        }
-                                    }
-                                    session.switch_to(gi);
-                                    session.close_active_group();
-                                }
-                            }
-
-                            // Restore focus to the group that was active before bulk-delete
-                            // (if it survived). If it was deleted, `close_active_group()`
-                            // above already applied the fallback clamping.
-                            if let Some(target_name) = active_group_name
-                                && let Some(new_idx) =
-                                    session.worktrees.iter().position(|g| g.name == target_name)
-                            {
-                                session.switch_to(new_idx);
-                            }
-
-                            if skipped_home > 0 {
-                                model.status = "Root workspace cannot be closed".into();
-                            }
-                            persist_session_layout(&mut session, &panes);
-                            sb.marked.clear();
-                            refresh_tab_model(&mut model, &session, &mut sb);
-                            sb.focus_active_row(&mut model);
-                            need_relayout = true;
-                            sync_drawer_persistence(
-                                &session,
-                                &mut panes,
-                                &mut drawer,
-                                &mut drawer_pool,
-                                &mut drawer_home,
-                                keymap.config(),
-                                chrome.center,
-                            );
-                            dirty = true;
-                            continue;
-                        }
-                        SidebarOutcome::CopyText(text) => {
-                            // OSC-52 to the outer terminal's clipboard (item 27).
-                            writer.submit_oob(crate::copymode::osc52(&text));
-                            model.status = format!("Copied: {text}");
-                            dirty = true;
-                            continue;
-                        }
-                        SidebarOutcome::PromptRename { gi, branch } => {
-                            if let Some(g) = session.worktrees.get(gi) {
-                                let repo_root =
-                                    superzej_core::repo::main_worktree(Path::new(&g.path))
-                                        .map(|p| p.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| g.path.clone());
-                                host_input = Some((
-                                    menu::InputOverlay::new(
-                                        format!("rename {branch}"),
-                                        branch.clone(),
-                                    ),
-                                    HostInputKind::RenameWorktree {
-                                        gi,
-                                        repo_root,
-                                        old_path: g.path.clone(),
-                                        old_branch: branch,
-                                    },
-                                ));
-                                model.status =
-                                    "Rename worktree: edit the branch name (Esc cancels)".into();
-                            }
-                            dirty = true;
-                            continue;
-                        }
-                        SidebarOutcome::Fork {
-                            base_branch,
-                            repo_root,
-                        } => {
-                            // Reuse the new-worktree flow with the base overridden
-                            // to the selected branch (item 52).
-                            begin_worktree_wizard(
-                                std::path::PathBuf::from(repo_root),
-                                Some(base_branch),
-                                None,
-                                keymap.config(),
-                                &mut create_gen,
-                                &create_tx,
-                                &waker,
-                                &mut creating,
-                                &mut wizard_cmd_tx,
-                                &mut wizard_ui,
-                                &mut model,
-                            );
-                            dirty = true;
-                            continue;
-                        }
-                    }
+                    dispatch_sidebar_outcome!(
+                        sb.handle_key(&k.key, k.modifiers, &mut model, &session),
+                        &mut forced_palette_action
+                    )
                 }
                 // Panel zone: Tab/Shift+Tab cycle panel tabs (Git → Work → System).
                 if forced_palette_action.is_none()
@@ -16544,6 +16344,7 @@ async fn event_loop<T: Terminal>(
                                 // Open the folder picker for the active worktree's
                                 // workspace; the chosen row files via the
                                 // `move-to-folder:` palette-dispatch arm.
+                                pending_file_target = None;
                                 match active_worktree_repo(&session) {
                                     Some((_, repo_path)) => match superzej_core::db::Db::open() {
                                         Ok(db) => {

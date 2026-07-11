@@ -16,12 +16,10 @@ The score drives four surfaces:
    **default** sort. Ordering follows hysteresis-stable ranks computed on the
    hydration thread: only a tier or membership change reorders; timestamp and
    cache churn never reshuffle rows.
-2. **Reason hint** — the focused row's detail line spells out _why_ it floated
-   ("agent needs input", "CI failed", "ready to land"), caps-aware glyphs.
-3. **Jump-to-next** (`Alt a`, action `attention-next`) — focuses the most
+2. **Jump-to-next** (`Alt a`, action `attention-next`) — focuses the most
    urgent needs-you worktree from anywhere, wrapping; works in any sort mode
    and across workspaces.
-4. **Statusbar chip** (`✋ N`) — count of needs-you worktrees (tiers T0–T2),
+3. **Statusbar chip** (`✋ N`) — count of needs-you worktrees (tiers T0–T2),
    red when anything is blocked/failing; its detail popup lists them with
    reasons/ages and Enter focuses one.
 
@@ -58,3 +56,11 @@ never influenced ordering; the old Activity sort ranked only by the CPU dot.
 The attention model turns them into one explainable, stable ordering plus a
 one-key jump, without new pollers or refresh channels (everything rides the
 existing Model/Pr/Ci ticks on the hydration thread).
+
+## Amendments
+
+- **Reason hint dropped** (d9384f0b): the focused-row detail-line attention
+  reason text ("agent needs input", …) shipped and was then removed as visual
+  noise — the tier is already visible via the dot/chip and `Alt a`. The delta
+  requirement was deleted to match; the attention glyph remains in use by the
+  statusbar chip.
