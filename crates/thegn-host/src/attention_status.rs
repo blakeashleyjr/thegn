@@ -156,6 +156,14 @@ pub(crate) fn collect_attention(
                 thegn_core::ci::CiState::Running | thegn_core::ci::CiState::Pending
             );
         }
+        // A real agent is bound iff `status.agent` has a non-shell entry: the
+        // map is already tool-filtered in `hydrate` (yazi/lazygit/… skipped via
+        // `tool_command`), so only the `"shell"`/`"local"` default sentinels
+        // remain to exclude here.
+        let has_agent = status
+            .agent
+            .get(path)
+            .is_some_and(|a| !a.is_empty() && a != "shell" && a != "local");
         let inputs = AttentionInputs {
             activity: activity_kind,
             activity_since,
@@ -165,6 +173,7 @@ pub(crate) fn collect_attention(
             ci_running,
             merge_queue: mq.get(path).copied(),
             dirty: status.git.get(path).is_some_and(|g| g.dirty),
+            has_agent,
         };
         scores.insert(path.clone(), attention::score(&inputs));
     }

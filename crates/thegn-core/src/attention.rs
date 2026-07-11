@@ -303,6 +303,10 @@ pub struct AttentionInputs {
     pub merge_queue: Option<MqFacts>,
     /// Uncommitted changes — never a tier of its own, only an idle sub-rank.
     pub dirty: bool,
+    /// A real agent (not a plain shell / tool drawer) is bound to this worktree.
+    /// Gates the activity-derived "waiting on you" demand: a bare shell going
+    /// idle is not a task waiting on the user.
+    pub has_agent: bool,
 }
 
 /// Score one worktree: evaluate every signal, keep the most urgent
@@ -378,12 +382,17 @@ pub fn score(inputs: &AttentionInputs) -> AttentionScore {
     }
 
     match inputs.activity {
-        ActivityKind::Waiting => consider(T::Waiting, 0, R::AgentWaiting, inputs.activity_since),
-        // Seen-but-stuck sub-ranks below every unread Waiting signal.
-        ActivityKind::Read => consider(T::Waiting, 2, R::StillStuck, inputs.activity_since),
+        // Idle-after-active only demands the user when a real agent is bound: a
+        // plain shell going quiet is not a task waiting on you. Seen-but-stuck
+        // (`Read`) never nags at all — glancing at the tab clears the demand;
+        // the sidebar's hollow-red dot (driven separately by `status.activity`)
+        // still shows the worktree is stuck.
+        ActivityKind::Waiting if inputs.has_agent => {
+            consider(T::Waiting, 0, R::AgentWaiting, inputs.activity_since)
+        }
         ActivityKind::Active => consider(T::Working, 0, R::AgentWorking, inputs.activity_since),
         ActivityKind::Loading => consider(T::Working, 1, R::Building, None),
-        ActivityKind::None => {}
+        ActivityKind::Waiting | ActivityKind::Read | ActivityKind::None => {}
     }
 
     best.unwrap_or(AttentionScore {
@@ -554,10 +563,13 @@ mod tests {
     }
 
     #[test]
-    fn waiting_read_sub_ranks_below_unread() {
+    fn agent_waiting_needs_user_shell_and_read_do_not() {
+        // An agent that went idle (unread) demands the user, and sub-ranks below
+        // an unread AgentDone notification of the same tier.
         let waiting = score(&AttentionInputs {
             activity: ActivityKind::Waiting,
             activity_since: Some(500),
+            has_agent: true,
             ..Default::default()
         });
         assert_eq!(
@@ -566,22 +578,33 @@ mod tests {
         );
         assert_eq!(waiting.since, Some(500));
         assert!(waiting.needs_user());
-
         let done = score(&AttentionInputs {
             unread: vec![note(NotificationKind::AgentDone, 500)],
             ..Default::default()
         });
-        let read = score(&AttentionInputs {
-            activity: ActivityKind::Read,
-            activity_since: Some(1),
+        assert!(waiting.sort_key() < done.sort_key());
+
+        // A plain shell (no agent) going idle is NOT a demand.
+        let shell = score(&AttentionInputs {
+            activity: ActivityKind::Waiting,
+            activity_since: Some(500),
+            has_agent: false,
             ..Default::default()
         });
-        assert_eq!(read.reason, R::StillStuck);
-        assert!(waiting.sort_key() < done.sort_key());
-        assert!(
-            done.sort_key() < read.sort_key(),
-            "seen-but-stuck ranks below unread signals even when older"
-        );
+        assert_eq!(shell.tier, T::Idle);
+        assert!(!shell.needs_user());
+
+        // Seen-but-stuck (`Read`) never nags — agent bound or not.
+        for has_agent in [true, false] {
+            let read = score(&AttentionInputs {
+                activity: ActivityKind::Read,
+                activity_since: Some(1),
+                has_agent,
+                ..Default::default()
+            });
+            assert_eq!(read.tier, T::Idle);
+            assert!(!read.needs_user());
+        }
     }
 
     #[test]

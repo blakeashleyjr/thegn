@@ -104,6 +104,18 @@ glyphs = "auto"
 # (env: THEGN_THEME_AGENT_GLYPHS)
 agent_glyphs = "letter"
 
+# Loading-splash mascot drawn above the wordmark when the center is tall
+# enough. "owl" (default) — the perched sentinel, whose plumage recolors with
+# the active preset; "knight" — the Sutton Hoo helm bust; "off" — no sprite,
+# plain wordmark splash.
+mascot = "owl"
+
+# Splash-mascot motion. "blink" (default) lets the owl blink, but only on
+# wakes that are already repainting the splash — nothing schedules a redraw
+# for it, so an idle loop stays at 0% CPU and an idle owl holds its stare.
+# "still" pins the eyes open.
+mascot_motion = "blink"
+
 # Optional: override any chrome surface/text color (all "#rrggbb"; unset keys
 # keep the preset's palette). Invalid hex warns and keeps the default.
 [theme.colors]
