@@ -133,6 +133,9 @@ pub struct DetailRow {
     /// The action keeps the overlay open (see [`DetailAction::keeps_overlay`]);
     /// the loop dims the row in place after applying it.
     pub on_highlight: Option<DetailAction>,
+    /// A non-selectable dim group-heading row (used to split one list into
+    /// labelled sections). The row cursor skips these; they carry no actions.
+    pub header: bool,
 }
 
 impl DetailRow {
@@ -146,6 +149,15 @@ impl DetailRow {
             enter: None,
             actions: Vec::new(),
             on_highlight: None,
+            header: false,
+        }
+    }
+    /// A dim, non-selectable group heading — a section label inside a list. The
+    /// row cursor skips it and it fires no actions.
+    pub fn header(label: impl Into<String>) -> DetailRow {
+        DetailRow {
+            header: true,
+            ..DetailRow::new(Tok::Slot(S::Dim), "", label)
         }
     }
     pub fn note(mut self, note: impl Into<String>) -> DetailRow {
@@ -382,6 +394,12 @@ pub enum DetailOutcome {
 }
 
 impl DetailOverlay {
+    /// The overlay's title bar text — lets the loop recognise an already-open
+    /// surface (e.g. to toggle the unified notifications overlay shut).
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
     /// Total scrollable rows (list rows, table body rows, or filtered log lines;
     /// 0 otherwise), for scroll clamping.
     fn content_len(&self) -> usize {
@@ -416,6 +434,34 @@ impl DetailOverlay {
     fn actionable(&self) -> bool {
         matches!(&self.content, DetailContent::List(l)
             if l.rows.iter().any(|r| r.enter.is_some() || !r.actions.is_empty()))
+    }
+
+    /// Row indices the cursor may land on — every list row except dim group
+    /// [`DetailRow::header`]s. Empty for non-list content.
+    fn selectable_indices(&self) -> Vec<usize> {
+        match &self.content {
+            DetailContent::List(l) => l
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !r.header)
+                .map(|(i, _)| i)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Move the row cursor by `delta` *selectable* rows (skipping headers),
+    /// clamped to the selectable range, then keep it in the scroll window.
+    fn move_sel(&mut self, delta: i32) {
+        let idx = self.selectable_indices();
+        if idx.is_empty() {
+            return;
+        }
+        let cur = idx.iter().position(|&i| i == self.sel).unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, idx.len() as i32 - 1) as usize;
+        self.sel = idx[next];
+        self.scroll_to_sel();
     }
 
     /// Visible body rows for a list (one row is reserved for the hint footer
@@ -508,8 +554,7 @@ impl DetailOverlay {
             }
             KeyCode::DownArrow | KeyCode::Char('j') => {
                 if actionable {
-                    self.sel = (self.sel + 1).min(max);
-                    self.scroll_to_sel();
+                    self.move_sel(1);
                     self.highlight_outcome()
                 } else {
                     self.scroll = (self.scroll + 1).min(max);
@@ -518,8 +563,7 @@ impl DetailOverlay {
             }
             KeyCode::UpArrow | KeyCode::Char('k') => {
                 if actionable {
-                    self.sel = self.sel.saturating_sub(1);
-                    self.scroll_to_sel();
+                    self.move_sel(-1);
                     self.highlight_outcome()
                 } else {
                     self.scroll = self.scroll.saturating_sub(1);
@@ -528,8 +572,7 @@ impl DetailOverlay {
             }
             KeyCode::PageDown => {
                 if actionable {
-                    self.sel = (self.sel + 8).min(max);
-                    self.scroll_to_sel();
+                    self.move_sel(8);
                     self.highlight_outcome()
                 } else {
                     self.scroll = (self.scroll + 8).min(max);
@@ -538,8 +581,7 @@ impl DetailOverlay {
             }
             KeyCode::PageUp => {
                 if actionable {
-                    self.sel = self.sel.saturating_sub(8);
-                    self.scroll_to_sel();
+                    self.move_sel(-8);
                     self.highlight_outcome()
                 } else {
                     self.scroll = self.scroll.saturating_sub(8);
@@ -1031,6 +1073,18 @@ fn render_list(
     // plain lists keep their original layout (no extra indent).
     let cursored = sel.is_some();
     for (row, item) in l.rows.iter().skip(scroll).take(body_rows).enumerate() {
+        // A dim group heading: no cursor column, no marker — just the label.
+        if item.header {
+            seg::draw_line(
+                surface,
+                inner.x,
+                inner.y + row,
+                inner.cols,
+                &Line::segs(vec![seg(Tok::Slot(S::Dim), item.text.clone())]),
+                panel(),
+            );
+            continue;
+        }
         let selected = sel == Some(scroll + row);
         let pad = if selected { Tok::SelAccent } else { panel() };
         let mut left = Vec::new();
@@ -1473,6 +1527,9 @@ fn list(
     cols: usize,
     height: usize,
 ) -> DetailOverlay {
+    // Open the cursor on the first selectable row — a grouped list leads with a
+    // dim header the cursor must never sit on (plain lists start at 0).
+    let sel = rows.iter().position(|r| !r.header).unwrap_or(0);
     DetailOverlay {
         title: title.to_string(),
         content: DetailContent::List(ListDetail {
@@ -1483,7 +1540,7 @@ fn list(
         rows: height,
         placement: Placement::Center,
         scroll: 0,
-        sel: 0,
+        sel,
         hint: None,
         pending_ci: None,
         live_ci: None,
@@ -1936,104 +1993,9 @@ fn widget_detail(
 
 fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<DetailOverlay> {
     match b {
-        BarBadge::Notifications => {
-            let mut notes: Vec<_> = model.panel.notifications.clone();
-            notes.sort_by_key(|n| std::cmp::Reverse(n.created_at_ms));
-            let rows: Vec<DetailRow> = notes
-                .iter()
-                .map(|n| {
-                    let (glyph, marker) = notif_glyph(n.kind);
-                    let marker = if n.read { Tok::Slot(S::Ghost) } else { marker };
-                    // `created_at_ms` is epoch *seconds* (legacy misnomer), so
-                    // `util::age` — not a millisecond clock — gives the real age.
-                    let mut row = DetailRow::new(marker, glyph, n.message.clone())
-                        .note(format!("{} ago", superzej_core::util::age(n.created_at_ms)));
-                    // Enter drills in: a log error opens the log modal in place;
-                    // anything tied to a worktree jumps to that worktree's tab.
-                    if n.source_ref == "log:szhost" {
-                        row = row
-                            .on_enter(DetailAction::ShowLog(model.panel.log_tail.clone()))
-                            .action('o', DetailAction::OpenLogPager);
-                    } else if !n.worktree_path.is_empty() {
-                        row = row.on_enter(DetailAction::FocusWorktree(n.worktree_path.clone()));
-                    }
-                    // Inbox management on any row: x dismisses this one, X/R/a
-                    // clear all. Highlighting an unread row marks it read in place.
-                    if n.id != 0 {
-                        row = row.action('x', DetailAction::DismissNotification { id: n.id });
-                        if !n.read {
-                            row = row.on_highlight(DetailAction::MarkNotificationRead { id: n.id });
-                        }
-                    }
-                    row.action('X', DetailAction::ClearNotifications)
-                        .action('R', DetailAction::ClearNotifications)
-                        .action('a', DetailAction::ClearNotifications)
-                })
-                .collect();
-            let mut ov = list("Notifications", rows, "no notifications", 60, 16);
-            ov.hint = Some("↵ open · x dismiss · a mark all read · o log".into());
-            Some(ov)
-        }
-        BarBadge::Attention => {
-            use superzej_core::attention::AttentionTier;
-            let g = crate::caps::active_glyphs();
-            let rows: Vec<DetailRow> = crate::handlers::attention::needs_user_ordered(model)
-                .into_iter()
-                .map(|(path, score)| {
-                    // Branch label from the tree when the row exists; else the
-                    // path's basename (registered-but-unlisted edge).
-                    let label = model
-                        .sidebar_rows
-                        .iter()
-                        .find(|r| r.worktree_path.as_deref() == Some(path.as_str()))
-                        .map(|r| r.label.clone())
-                        .unwrap_or_else(|| {
-                            std::path::Path::new(&path)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.clone())
-                        });
-                    let (glyph, marker) = match score.tier {
-                        AttentionTier::Blocked => (g.attention, Tok::Hue(Hue::Red)),
-                        AttentionTier::Failure => (g.cross, Tok::Hue(Hue::Red)),
-                        _ => (g.dot_filled, Tok::Hue(Hue::Amber)),
-                    };
-                    let text = format!("{label} \u{2014} {}", score.reason.label());
-                    // Enter resolves the sidebar row's target (live tab OR a
-                    // dormant-workspace switch) so activation never dead-ends on
-                    // "isn't open"; only the no-row edge falls back to the
-                    // open-tab-only `FocusWorktree`. Same machinery as `Alt a`.
-                    let enter = model
-                        .sidebar_rows
-                        .iter()
-                        .find(|r| {
-                            r.kind == crate::sidebar::RowKind::Worktree
-                                && r.worktree_path.as_deref() == Some(path.as_str())
-                                && r.tab_target.is_some()
-                        })
-                        .and_then(|r| r.tab_target.clone())
-                        .map(DetailAction::ActivateTarget)
-                        .unwrap_or_else(|| DetailAction::FocusWorktree(path.clone()));
-                    let mut row = DetailRow::new(marker, glyph, text)
-                        .on_enter(enter)
-                        // Highlighting quiets this episode; a/R quiet them all.
-                        .on_highlight(DetailAction::AckAttention {
-                            path: path.clone(),
-                            reason: score.reason,
-                            since: score.since,
-                        })
-                        .action('a', DetailAction::AckAllAttention)
-                        .action('R', DetailAction::AckAllAttention);
-                    if let Some(at) = score.since {
-                        row = row.note(format!("{} ago", superzej_core::util::age(at)));
-                    }
-                    row
-                })
-                .collect();
-            let mut ov = list("Needs you", rows, "nothing needs you", 60, 14);
-            ov.hint = Some("↵ focus \u{00b7} a mark all read \u{00b7} Alt a next".into());
-            Some(ov)
-        }
+        // Both the inbox chip (⚑ / N unread) and the needs-you chip (✋) open the
+        // single unified surface: Needs you · Alerts · Notifications · Logs.
+        BarBadge::Notifications | BarBadge::Attention => unified_detail(model),
         BarBadge::Agent => {
             let a = model.agent_activity.as_ref()?;
             let conn = match a.conn {
@@ -2313,6 +2275,183 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
             near,
         )),
     }
+}
+
+/// The one unified notification surface, opened by both statusbar chips (the
+/// inbox `⚑`/unread chip and the needs-you `✋` chip). It folds what used to be
+/// two separate popups plus a logs section into a single grouped list:
+///
+/// - **Needs you** — the live, per-worktree attention rollup (what needs a
+///   decision now).
+/// - **Alerts** — unread failure-priority notifications *not* already covered by
+///   a Needs-you row (host-global / orphan alerts only — no double-show).
+/// - **Notifications** — the rest of the inbox (Notice/Info history).
+/// - **Logs** — one quiet entry point into szhost.log (never a red alert;
+///   self-diagnostics are gated off by default, see `surface_self_log_errors`).
+fn unified_detail(model: &FrameModel) -> Option<DetailOverlay> {
+    use superzej_core::notification::Priority;
+    let mut rows: Vec<DetailRow> = Vec::new();
+
+    // 1. Needs you — the actionable per-worktree rollup. Its paths drive the
+    //    de-dup: a worktree failure surfaced here is suppressed in Alerts.
+    let (needs_rows, needs_paths) = needs_you_rows(model);
+    if !needs_rows.is_empty() {
+        rows.push(DetailRow::header("Needs you"));
+        rows.extend(needs_rows);
+    }
+
+    // The inbox, newest-first. `log:szhost` rows are pulled into the Logs group;
+    // everything else splits by severity into Alerts vs Notifications.
+    let mut notes: Vec<_> = model.panel.notifications.clone();
+    notes.sort_by_key(|n| std::cmp::Reverse(n.created_at_ms));
+
+    // 2. Alerts — failure-priority, not a log row, and not already a Needs-you
+    //    worktree (dedup). Priority uses the built-in default so the render layer
+    //    needs no config; overrides still drive the badge counts.
+    let alerts: Vec<DetailRow> = notes
+        .iter()
+        .filter(|n| {
+            n.source_ref != "log:szhost"
+                && n.kind.default_priority() == Priority::Alert
+                && (n.worktree_path.is_empty() || !needs_paths.contains(&n.worktree_path))
+        })
+        .map(notification_row)
+        .collect();
+    if !alerts.is_empty() {
+        rows.push(DetailRow::header("Alerts"));
+        rows.extend(alerts);
+    }
+
+    // 3. Notifications — the Notice/Info history (never log rows).
+    let inbox: Vec<DetailRow> = notes
+        .iter()
+        .filter(|n| n.source_ref != "log:szhost" && n.kind.default_priority() < Priority::Alert)
+        .map(notification_row)
+        .collect();
+    if !inbox.is_empty() {
+        rows.push(DetailRow::header("Notifications"));
+        rows.extend(inbox);
+    }
+
+    // 4. Logs — always one dim entry point into szhost.log.
+    rows.push(DetailRow::header("Logs"));
+    rows.push(logs_row(model, &notes));
+
+    let mut ov = list("Notifications", rows, "all clear", 62, 18);
+    ov.hint = Some("↵ open · x dismiss · a mark all read · o log · Alt a next".into());
+    Some(ov)
+}
+
+/// The "Needs you" rows (live attention rollup) plus the set of worktree paths
+/// they cover — the caller uses the set to suppress duplicate Alert rows.
+fn needs_you_rows(model: &FrameModel) -> (Vec<DetailRow>, std::collections::HashSet<String>) {
+    use superzej_core::attention::AttentionTier;
+    let g = crate::caps::active_glyphs();
+    let mut paths = std::collections::HashSet::new();
+    let rows = crate::handlers::attention::needs_user_ordered(model)
+        .into_iter()
+        .map(|(path, score)| {
+            paths.insert(path.clone());
+            // Branch label from the tree when the row exists; else the path's
+            // basename (registered-but-unlisted edge).
+            let label = model
+                .sidebar_rows
+                .iter()
+                .find(|r| r.worktree_path.as_deref() == Some(path.as_str()))
+                .map(|r| r.label.clone())
+                .unwrap_or_else(|| {
+                    std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.clone())
+                });
+            let (glyph, marker) = match score.tier {
+                AttentionTier::Blocked => (g.attention, Tok::Hue(Hue::Red)),
+                AttentionTier::Failure => (g.cross, Tok::Hue(Hue::Red)),
+                _ => (g.dot_filled, Tok::Hue(Hue::Amber)),
+            };
+            let text = format!("{label} \u{2014} {}", score.reason.label());
+            // Enter resolves the sidebar row's target (live tab OR a
+            // dormant-workspace switch) so activation never dead-ends on
+            // "isn't open"; only the no-row edge falls back to the open-tab-only
+            // `FocusWorktree`. Same machinery as `Alt a`.
+            let enter = model
+                .sidebar_rows
+                .iter()
+                .find(|r| {
+                    r.kind == crate::sidebar::RowKind::Worktree
+                        && r.worktree_path.as_deref() == Some(path.as_str())
+                        && r.tab_target.is_some()
+                })
+                .and_then(|r| r.tab_target.clone())
+                .map(DetailAction::ActivateTarget)
+                .unwrap_or_else(|| DetailAction::FocusWorktree(path.clone()));
+            let mut row = DetailRow::new(marker, glyph, text)
+                .on_enter(enter)
+                // Highlighting quiets this episode; a/R quiet them all.
+                .on_highlight(DetailAction::AckAttention {
+                    path: path.clone(),
+                    reason: score.reason,
+                    since: score.since,
+                })
+                .action('a', DetailAction::AckAllAttention)
+                .action('R', DetailAction::AckAllAttention);
+            if let Some(at) = score.since {
+                row = row.note(format!("{} ago", superzej_core::util::age(at)));
+            }
+            row
+        })
+        .collect();
+    (rows, paths)
+}
+
+/// One inbox row for the Alerts / Notifications groups (log rows are handled by
+/// [`logs_row`]). Enter jumps to the worktree; `x` dismisses; `X`/`R`/`a` clear
+/// all; highlighting an unread row marks it read in place.
+fn notification_row(n: &superzej_core::notification::Notification) -> DetailRow {
+    let (glyph, marker) = notif_glyph(n.kind);
+    let marker = if n.read { Tok::Slot(S::Ghost) } else { marker };
+    // `created_at_ms` is epoch *seconds* (legacy misnomer), so `util::age` —
+    // not a millisecond clock — gives the real age.
+    let mut row = DetailRow::new(marker, glyph, n.message.clone())
+        .note(format!("{} ago", superzej_core::util::age(n.created_at_ms)));
+    if !n.worktree_path.is_empty() {
+        row = row.on_enter(DetailAction::FocusWorktree(n.worktree_path.clone()));
+    }
+    if n.id != 0 {
+        row = row.action('x', DetailAction::DismissNotification { id: n.id });
+        if !n.read {
+            row = row.on_highlight(DetailAction::MarkNotificationRead { id: n.id });
+        }
+    }
+    row.action('X', DetailAction::ClearNotifications)
+        .action('R', DetailAction::ClearNotifications)
+        .action('a', DetailAction::ClearNotifications)
+}
+
+/// The single dim Logs entry point. In dev mode (`surface_self_log_errors`) a
+/// `log:szhost` notification exists and labels the row ("N errors in
+/// szhost.log"); by default there is none, so it reads "open szhost.log". Always
+/// dim — self-diagnostics are never a red user alert — and only ever one row
+/// (the newest), so a flapping log can't stack duplicates.
+fn logs_row(model: &FrameModel, notes: &[superzej_core::notification::Notification]) -> DetailRow {
+    let log = notes.iter().find(|n| n.source_ref == "log:szhost");
+    let text = log
+        .map(|n| n.message.clone())
+        .unwrap_or_else(|| "open szhost.log".into());
+    let mut row = DetailRow::new(Tok::Slot(S::Dim), "\u{2261}", text)
+        .on_enter(DetailAction::ShowLog(model.panel.log_tail.clone()))
+        .action('o', DetailAction::OpenLogPager);
+    if let Some(n) = log {
+        row = row.note(format!("{} ago", superzej_core::util::age(n.created_at_ms)));
+        if n.id != 0 {
+            row = row.action('x', DetailAction::DismissNotification { id: n.id });
+            if !n.read {
+                row = row.on_highlight(DetailAction::MarkNotificationRead { id: n.id });
+            }
+        }
+    }
+    row
 }
 
 fn notif_glyph(kind: superzej_core::notification::NotificationKind) -> (&'static str, Tok) {

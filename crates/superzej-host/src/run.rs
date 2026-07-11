@@ -6464,6 +6464,7 @@ async fn event_loop<T: Terminal>(
         waker: waker.clone(),
     };
     let mut host_runtime = crate::handlers::host::HostRuntime::new(host_ui_rx);
+    let mut host_heal = crate::handlers::host_heal::HealState::default();
     let mut pending_host_consent: Option<String> = None;
     // Materialize requests in flight, keyed (group name, tab). A SET (not a single
     // slot) that PERSISTS across worktree switches: switching away from a
@@ -8094,11 +8095,12 @@ async fn event_loop<T: Terminal>(
                     if seed_materialize_steps(loading_state.get(&key).map(Vec::as_slice)) {
                         loading_state.insert(
                             key,
-                            vec![
-                                LoadStep::active("sandbox"),
-                                LoadStep::pending("container"),
-                                LoadStep::pending("shell"),
-                            ],
+                            crate::loading::plan::LoadPlan::from_cursor(
+                                &["sandbox", "container", "shell"],
+                                0,
+                                false,
+                            )
+                            .into_steps(),
                         );
                     }
                     dirty = true;
@@ -9913,6 +9915,7 @@ async fn event_loop<T: Terminal>(
         let mut ci_refresh_force = false;
         let mut want_disk_refresh = false;
         let mut want_main_sync = false;
+        let mut want_host_heal = false;
         // Fold-actor results (batch fold + agent-driven drain): toast outcomes,
         // patch queue rows in place, route settled transitions to the inbox, and
         // re-hydrate so the advanced tip and cleared dots show immediately.
@@ -9957,6 +9960,7 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
                 // Branch ref moved elsewhere; heal the canonical checkout off-loop.
                 RefreshKind::MainRefMoved => want_main_sync = true,
+                RefreshKind::HostHeal => want_host_heal = true,
             }
         }
         // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s, off-loop).
@@ -9970,6 +9974,14 @@ async fn event_loop<T: Terminal>(
                 waker.clone(),
             );
         }
+        dirty |= want_host_heal
+            && crate::handlers::host_heal::on_heal_tick(
+                &mut host_heal,
+                &mut model,
+                &host_runtime,
+                keymap.config(),
+                &host_ui,
+            );
         // Semantic blast-radius (313/316): rebuild the graph off-loop on diff refresh.
         crate::blast_radius::maybe_spawn_build(
             current_config.lsp.enabled && want_model_refresh,
@@ -16643,35 +16655,47 @@ async fn event_loop<T: Terminal>(
                                 focus.zone = crate::focus::Zone::Panel;
                             }
                             Action::ToggleNotifications => {
-                                panel_auto_revealed = None;
-                                // Already parked on Notifications with the panel
-                                // focused → toggle back to the center terminal.
-                                if focus.panel()
-                                    && panel_ui.open == crate::panel::Section::Notifications
+                                // Open (or toggle shut) the one unified surface —
+                                // Needs you · Alerts · Notifications · Logs — the
+                                // same modal both statusbar chips summon.
+                                let id = crate::chrome::BarItemId::Badge(
+                                    crate::chrome::BarBadge::Notifications,
+                                );
+                                if bar_detail
+                                    .as_ref()
+                                    .is_some_and(|d| d.title() == "Notifications")
                                 {
-                                    focus.zone = crate::focus::Zone::Center;
+                                    bar_detail = None;
                                 } else {
-                                    if chrome.panel.is_none() {
-                                        want_panel = true;
-                                        panel_forced = cols < layout::PANEL_MIN_COLS;
-                                        chrome = recompute_chrome!();
-                                        need_relayout = true;
-                                    }
-                                    panel_ui.switch_tab(crate::panel::PanelTab::System);
-                                    open_panel_section(
-                                        crate::panel::Section::Notifications,
-                                        &mut panel_ui,
-                                        &mut hydration_gen,
-                                        &model_tx,
-                                        &session,
-                                        &waker,
-                                        PanelDocsWiring {
-                                            model: &model,
-                                            generation: docs_gen,
-                                            tx: &docs_tx,
-                                        },
+                                    let screen = Rect {
+                                        x: 0,
+                                        y: 0,
+                                        cols,
+                                        rows,
+                                    };
+                                    // Anchor on the statusbar chip when present,
+                                    // else the screen centre (the overlay centres
+                                    // itself regardless).
+                                    let rect = crate::chrome::statusbar_item_spans(
+                                        &model,
+                                        chrome.statusbar,
+                                    )
+                                    .into_iter()
+                                    .find(|(i, _)| *i == id)
+                                    .map(|(_, r)| r)
+                                    .unwrap_or(Rect {
+                                        x: cols / 2,
+                                        y: rows / 2,
+                                        cols: 0,
+                                        rows: 0,
+                                    });
+                                    bar_detail = crate::detail::open_detail_for(
+                                        &id,
+                                        rect,
+                                        screen,
+                                        &model,
+                                        &panel_ui.docs.telemetry,
                                     );
-                                    focus.zone = crate::focus::Zone::Panel;
                                 }
                             }
                             Action::OpenCi => {

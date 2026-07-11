@@ -30,8 +30,13 @@
 
 pub mod model;
 
+pub mod aggregate;
 #[cfg(target_os = "macos")]
 pub mod applescript;
+#[cfg(target_os = "macos")]
+pub mod mediaremote;
+pub mod mpd;
+mod mpd_parse;
 #[cfg(target_os = "linux")]
 pub mod mpris;
 #[cfg(target_os = "linux")]
@@ -44,6 +49,8 @@ pub mod smtc;
 // into the Linux test bin).
 #[cfg(any(target_os = "macos", test))]
 mod applescript_parse;
+#[cfg(any(target_os = "macos", test))]
+mod mediaremote_parse;
 #[cfg(any(windows, test))]
 mod smtc_decode;
 
@@ -219,6 +226,8 @@ pub enum BackendKind {
     Mpris,
     /// mpv JSON IPC.
     Mpv,
+    /// Native MPD protocol (`localhost:6600`) — covers mpd/mpc/rmpc/ncmpcpp.
+    Mpd,
     /// Windows System Media Transport Controls.
     Smtc,
     /// macOS `osascript` (Music.app + Spotify).
@@ -236,6 +245,11 @@ pub struct ResolveOpts {
     pub players_priority: Vec<String>,
     /// mpv JSON-IPC socket path (only consulted for the mpv backend).
     pub mpv_socket: String,
+    /// MPD endpoint: a `host:port` or an absolute unix-socket path (consulted for
+    /// the MPD backend and by `auto`). Empty ⇒ MPD source is skipped.
+    pub mpd_socket: String,
+    /// Optional MPD password.
+    pub mpd_password: Option<String>,
 }
 
 /// The concrete, statically-dispatched media backend chosen for this session.
@@ -248,12 +262,20 @@ pub enum MediaClient {
     MprisCli(MprisCli),
     /// mpv JSON IPC.
     Mpv(MpvIpc),
+    /// Native MPD protocol.
+    Mpd(mpd::Mpd),
     #[cfg(windows)]
     /// Windows System Media Transport Controls.
     Smtc(smtc::Smtc),
     #[cfg(target_os = "macos")]
     /// macOS `osascript`.
     AppleScript(applescript::AppleScript),
+    #[cfg(target_os = "macos")]
+    /// macOS universal now-playing via the MediaRemote adapter.
+    MediaRemote(mediaremote::MediaRemote),
+    /// Several sources multiplexed into one — `auto` on Linux composes MPRIS,
+    /// MPD, and mpv so whatever is actually playing wins.
+    Aggregate(aggregate::Aggregate),
 }
 
 /// Resolve the media backend from lowered config. `None` when disabled, the
@@ -266,6 +288,7 @@ pub async fn client_for(opts: &ResolveOpts) -> Option<MediaClient> {
         BackendKind::Auto => auto_client(opts).await,
         BackendKind::Mpris => mpris_client(opts).await,
         BackendKind::Mpv => mpv_client(opts),
+        BackendKind::Mpd => mpd_client(opts).await,
         BackendKind::Smtc => smtc_client(opts).await,
         BackendKind::AppleScript => applescript_client(opts),
         BackendKind::Jellyfin => {
@@ -275,19 +298,64 @@ pub async fn client_for(opts: &ResolveOpts) -> Option<MediaClient> {
     }
 }
 
-/// Pick the native backend for the current OS.
+/// Pick the native backend for the current OS. On Linux this composes *every*
+/// reachable source (MPRIS + native MPD + a live mpv socket) into an
+/// [`aggregate::Aggregate`] so anything actually playing shows up out of the box;
+/// with a single source it returns that source directly. Windows/macOS keep one
+/// universal backend (SMTC / MediaRemote→AppleScript).
 async fn auto_client(opts: &ResolveOpts) -> Option<MediaClient> {
     #[cfg(target_os = "linux")]
-    return mpris_client(opts).await;
+    return linux_auto_client(opts).await;
     #[cfg(windows)]
     return smtc_client(opts).await;
     #[cfg(target_os = "macos")]
-    return applescript_client(opts);
+    return macos_auto_client(opts).await;
     #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
         let _ = opts;
         None
     }
+}
+
+/// Compose the reachable Linux sources. MPRIS (native or `playerctl`) always
+/// leads; MPD joins when the daemon answers; mpv joins only when its IPC socket
+/// exists on disk (so we never poll a dead default path). One source ⇒ that
+/// source alone; several ⇒ an [`aggregate::Aggregate`].
+#[cfg(target_os = "linux")]
+async fn linux_auto_client(opts: &ResolveOpts) -> Option<MediaClient> {
+    let mut sources: Vec<MediaClient> = Vec::new();
+    if let Some(c) = mpris_client(opts).await {
+        sources.push(c);
+    }
+    if let Some(c) = mpd_client(opts).await {
+        sources.push(c);
+    }
+    // Only add mpv when its socket is actually present, else it just fails every
+    // poll. mpv-via-`mpv-mpris` still shows up through the MPRIS source above.
+    if !opts.mpv_socket.is_empty() && std::path::Path::new(&opts.mpv_socket).exists() {
+        sources.push(MediaClient::Mpv(MpvIpc::new(opts.mpv_socket.clone())));
+    }
+    match sources.len() {
+        0 => None,
+        1 => sources.pop(),
+        _ => Some(MediaClient::Aggregate(aggregate::Aggregate::new(
+            sources,
+            opts.players_priority.clone(),
+        ))),
+    }
+}
+
+/// macOS `auto`: the universal MediaRemote adapter when present, else the
+/// per-app AppleScript path.
+#[cfg(target_os = "macos")]
+async fn macos_auto_client(opts: &ResolveOpts) -> Option<MediaClient> {
+    if let Some(c) = mediaremote::MediaRemote::connect().await.map(|m| {
+        tracing::debug!(target: "szhost::media", "media backend: MediaRemote adapter");
+        MediaClient::MediaRemote(m)
+    }) {
+        return Some(c);
+    }
+    applescript_client(opts)
 }
 
 #[cfg(target_os = "linux")]
@@ -347,6 +415,22 @@ fn mpv_client(opts: &ResolveOpts) -> Option<MediaClient> {
     Some(MediaClient::Mpv(MpvIpc::new(opts.mpv_socket.clone())))
 }
 
+/// Build the native MPD backend, probing that the daemon actually answers so a
+/// dead endpoint doesn't sit in the aggregator. `None` when unreachable.
+async fn mpd_client(opts: &ResolveOpts) -> Option<MediaClient> {
+    let endpoint = mpd::MpdEndpoint::resolve(&opts.mpd_socket, opts.mpd_password.clone());
+    match mpd::Mpd::connect(endpoint).await {
+        Ok(m) => {
+            tracing::debug!(target: "szhost::media", "media backend: native MPD");
+            Some(MediaClient::Mpd(m))
+        }
+        Err(e) => {
+            tracing::debug!(target: "szhost::media", error = %e, "MPD unreachable; skipping");
+            None
+        }
+    }
+}
+
 #[cfg(windows)]
 async fn smtc_client(_opts: &ResolveOpts) -> Option<MediaClient> {
     smtc::Smtc::connect().await.map(MediaClient::Smtc)
@@ -374,10 +458,14 @@ macro_rules! dispatch {
             #[cfg(target_os = "linux")]
             MediaClient::MprisCli($b) => $call,
             MediaClient::Mpv($b) => $call,
+            MediaClient::Mpd($b) => $call,
             #[cfg(windows)]
             MediaClient::Smtc($b) => $call,
             #[cfg(target_os = "macos")]
             MediaClient::AppleScript($b) => $call,
+            #[cfg(target_os = "macos")]
+            MediaClient::MediaRemote($b) => $call,
+            MediaClient::Aggregate($b) => $call,
         }
     };
 }
@@ -455,6 +543,24 @@ impl MediaClient {
                 .await
                 .ok()
                 .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>),
+            MediaClient::Mpd(b) => b
+                .watch()
+                .await
+                .ok()
+                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>),
+            #[cfg(windows)]
+            MediaClient::Smtc(b) => b
+                .watch()
+                .await
+                .ok()
+                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>),
+            #[cfg(target_os = "macos")]
+            MediaClient::MediaRemote(b) => b
+                .watch()
+                .await
+                .ok()
+                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>),
+            MediaClient::Aggregate(b) => b.watch().await,
             _ => None,
         }
     }
@@ -467,10 +573,14 @@ impl MediaClient {
             #[cfg(target_os = "linux")]
             MediaClient::MprisCli(b) => b.list_players().await.unwrap_or_default(),
             MediaClient::Mpv(_) => vec!["mpv".to_string()],
+            MediaClient::Mpd(_) => vec!["mpd".to_string()],
             #[cfg(windows)]
             MediaClient::Smtc(b) => b.list_players().await,
             #[cfg(target_os = "macos")]
             MediaClient::AppleScript(b) => b.list_players().await,
+            #[cfg(target_os = "macos")]
+            MediaClient::MediaRemote(b) => b.list_players().await,
+            MediaClient::Aggregate(b) => b.players().await,
         }
     }
 }

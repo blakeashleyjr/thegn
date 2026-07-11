@@ -2000,5 +2000,25 @@ fn profile_overlay_path_none_for_default_some_for_named() {
     assert!(p.ends_with("superzej/profiles/work/config.toml"));
 }
 
+#[test]
+fn surface_self_log_errors_defaults_off_and_overlay_applies() {
+    // Default: szhost's own log errors are not surfaced as user notifications.
+    let mut base = NotificationsConfig::default();
+    assert!(!base.surface_self_log_errors);
+    // A per-profile overlay flips it on (dev mode); absent inherits.
+    NotificationsOverlay {
+        surface_self_log_errors: Some(true),
+        ..Default::default()
+    }
+    .apply(&mut base);
+    assert!(base.surface_self_log_errors);
+    // An overlay that only sets this field is not "empty".
+    let ov = NotificationsOverlay {
+        surface_self_log_errors: Some(false),
+        ..Default::default()
+    };
+    assert!(!ov.is_empty());
+}
+
 #[path = "config_tests_coverage.rs"]
 mod coverage;

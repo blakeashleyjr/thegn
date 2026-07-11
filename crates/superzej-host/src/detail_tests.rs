@@ -91,7 +91,9 @@ fn absent_data_yields_no_modal() {
 }
 
 #[test]
-fn notifications_badge_is_a_list_even_when_empty() {
+fn notifications_badge_is_the_unified_surface_with_a_logs_entry() {
+    // The unified surface always offers at least the Logs group's quiet entry
+    // point, even when nothing needs the user and the inbox is empty.
     let model = FrameModel::default();
     let ov = open_detail_for(
         &BarItemId::Badge(BarBadge::Notifications),
@@ -101,9 +103,13 @@ fn notifications_badge_is_a_list_even_when_empty() {
         &TelemetryHistory::default(),
     )
     .expect("notifications always opens");
+    assert_eq!(ov.title(), "Notifications");
     match ov.content {
         DetailContent::List(l) => {
-            assert!(l.rows.is_empty());
+            let texts: Vec<&str> = l.rows.iter().map(|r| r.text.as_str()).collect();
+            assert_eq!(texts, ["Logs", "open szhost.log"]);
+            assert!(l.rows[0].header, "the Logs label is a heading row");
+            assert!(!l.rows[1].header, "the log entry point is selectable");
             assert!(!l.empty_hint.is_empty());
         }
         _ => panic!("expected a list"),
@@ -446,7 +452,13 @@ fn notification_note_is_a_real_age_not_a_millisecond_bug() {
     let DetailContent::List(l) = &ov.content else {
         panic!("expected a list");
     };
-    let note = l.rows[0].note.as_deref().unwrap();
+    // The row lives under the "Notifications" group heading now — find it by text.
+    let row = l
+        .rows
+        .iter()
+        .find(|r| !r.header && r.text == "ready")
+        .expect("the notification row");
+    let note = row.note.as_deref().unwrap();
     assert!(note.ends_with("ago"), "note: {note}");
     assert!(!note.contains("20617"), "note: {note}");
     assert!(note.starts_with('3'), "note: {note}");
@@ -597,6 +609,149 @@ fn log_view_renders_legibly() {
     let mut s = Surface::new(120, 40);
     ov.render(&mut s, screen());
     assert!(seg::text_contrast_violations(&mut s, 3.0).is_empty());
+}
+
+// --- unified surface: grouping, dedup, cursor-skip, log gate -----------
+
+/// Attach a needs-you (Failure-tier) attention signal for `path` to `model`.
+fn needs_you(model: &mut FrameModel, path: &str) {
+    use superzej_core::attention::{AttentionReason, AttentionScore, AttentionTier};
+    model.sidebar_status.attention.insert(
+        path.into(),
+        AttentionScore {
+            tier: AttentionTier::Failure,
+            sub: 2,
+            reason: AttentionReason::ProcessFailed,
+            since: Some(60),
+        },
+    );
+}
+
+#[test]
+fn unified_surface_groups_by_section_and_dedups_worktree_alerts() {
+    // A per-worktree failure that already shows under "Needs you" must NOT be
+    // repeated in "Alerts"; a host-global alert (no worktree) still shows there.
+    let mut model = notif_model(
+        vec![
+            Notification {
+                worktree_path: "/wt/a".into(),
+                ..notif(NotificationKind::ProcessFailed, "proc", "a failed", 60)
+            },
+            notif(NotificationKind::AgentFailed, "agent", "global boom", 120),
+            notif(
+                NotificationKind::Assigned,
+                "linear:1",
+                "assigned to you",
+                200,
+            ),
+        ],
+        vec![],
+    );
+    needs_you(&mut model, "/wt/a");
+    let ov = open_notifications(&model);
+    let DetailContent::List(l) = &ov.content else {
+        panic!("expected a list");
+    };
+    let headers: Vec<&str> = l
+        .rows
+        .iter()
+        .filter(|r| r.header)
+        .map(|r| r.text.as_str())
+        .collect();
+    assert_eq!(headers, ["Needs you", "Alerts", "Notifications", "Logs"]);
+    let body: Vec<&str> = l
+        .rows
+        .iter()
+        .filter(|r| !r.header)
+        .map(|r| r.text.as_str())
+        .collect();
+    // /wt/a surfaces once — the Needs-you rollup row — and its raw alert is gone.
+    assert!(
+        body.iter().any(|t| t.contains("process failed")),
+        "needs-you row present: {body:?}"
+    );
+    assert!(
+        !body.contains(&"a failed"),
+        "worktree alert deduped: {body:?}"
+    );
+    // The host-global alert and the notice history both survive.
+    assert!(
+        body.contains(&"global boom"),
+        "global alert in Alerts: {body:?}"
+    );
+    assert!(
+        body.contains(&"assigned to you"),
+        "notice history: {body:?}"
+    );
+    assert!(body.contains(&"open szhost.log"), "logs entry: {body:?}");
+}
+
+#[test]
+fn cursor_skips_group_headers() {
+    // Walk the whole surface: the row cursor is never allowed to rest on a dim
+    // group heading.
+    let mut model = notif_model(
+        vec![
+            notif(NotificationKind::AgentFailed, "agent", "boom", 10),
+            notif(NotificationKind::Assigned, "linear:1", "assigned", 20),
+        ],
+        vec![],
+    );
+    needs_you(&mut model, "/wt/a");
+    let mut ov = open_notifications(&model);
+    let on_header = |ov: &DetailOverlay| {
+        let DetailContent::List(l) = &ov.content else {
+            panic!("expected a list");
+        };
+        l.rows[ov.sel].header
+    };
+    assert!(!on_header(&ov), "opens on a selectable row, not a header");
+    for _ in 0..8 {
+        ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+        assert!(!on_header(&ov), "cursor landed on a header");
+    }
+    for _ in 0..8 {
+        ov.handle_key(&KeyCode::UpArrow, Modifiers::NONE);
+        assert!(!on_header(&ov), "cursor landed on a header");
+    }
+}
+
+#[test]
+fn logs_group_is_a_single_quiet_entry_folding_dev_log_errors() {
+    // In dev mode a `log:szhost` notification exists; it folds into the one Logs
+    // entry (labelled by its message) and never becomes a red Alerts row — so a
+    // flapping log can't stack duplicate rows.
+    let model = notif_model(
+        vec![notif(
+            NotificationKind::LogError,
+            "log:szhost",
+            "2 errors in szhost.log",
+            30,
+        )],
+        vec![err_line("boom")],
+    );
+    let ov = open_notifications(&model);
+    let DetailContent::List(l) = &ov.content else {
+        panic!("expected a list");
+    };
+    let headers: Vec<&str> = l
+        .rows
+        .iter()
+        .filter(|r| r.header)
+        .map(|r| r.text.as_str())
+        .collect();
+    assert_eq!(
+        headers,
+        ["Logs"],
+        "a lone log error is Logs-only, never Alerts"
+    );
+    let log_rows: Vec<&str> = l
+        .rows
+        .iter()
+        .filter(|r| matches!(r.enter, Some(DetailAction::ShowLog(_))))
+        .map(|r| r.text.as_str())
+        .collect();
+    assert_eq!(log_rows, ["2 errors in szhost.log"]);
 }
 
 /// A model with disk + network + gpu + battery populated, for the sectioned

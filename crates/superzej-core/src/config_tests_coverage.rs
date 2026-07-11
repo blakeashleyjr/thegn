@@ -97,15 +97,20 @@ fn notification_priority_defaults_and_overrides() {
         Priority::Notice
     );
 
-    // Alert set: failures + agent-attention + the queue's give-up; unread
-    // excludes Info.
+    // Alert set: real failures + agent-attention + the queue's give-up; unread
+    // excludes Info. `log_error` is NOT here — szhost's own diagnostics are Info
+    // (quiet), never a red alert.
     let alerts = cfg.alert_kind_names();
-    assert_eq!(alerts.len(), 6);
-    let want = "agent_failed agent_attention test_failed log_error \
+    assert_eq!(alerts.len(), 5);
+    let want = "agent_failed agent_attention test_failed \
                     process_failed queue_needs_human";
     for k in want.split_whitespace() {
         assert!(alerts.contains(&k), "missing {k}");
     }
+    assert!(
+        !alerts.contains(&"log_error"),
+        "log_error is quiet Info, never an alert"
+    );
     let counted = cfg.counted_unread_kind_names();
     assert!(!counted.contains(&"worktree_created"));
     assert!(!counted.contains(&"process_exited"));
@@ -248,6 +253,7 @@ fn notifications_overlay_apply_covers_every_field() {
         desktop: Some(false),
         desktop_min_urgency: Some("critical".into()),
         process_exit: Some("all".into()),
+        surface_self_log_errors: Some(true),
         priority: Some(priority),
         rules: Some(vec![NotificationRule {
             drop: true,
@@ -270,6 +276,7 @@ fn notifications_overlay_apply_covers_every_field() {
     assert!(!base.desktop);
     assert_eq!(base.desktop_min_urgency, "critical");
     assert_eq!(base.process_exit, "all");
+    assert!(base.surface_self_log_errors);
     assert_eq!(base.priority.get("agent_done").unwrap(), "alert");
     assert!(base.has_rules());
     assert!(base.dnd.enabled);
@@ -631,6 +638,23 @@ fn media_config_defaults_and_enums() {
         MediaBackendKind::from_str_validated("osascript").unwrap(),
         MediaBackendKind::AppleScript
     );
+
+    // Native MPD backend: alias parses, config exposes a default endpoint, and
+    // resolve_opts lowers the backend + endpoint into the leaf's ResolveOpts.
+    assert_eq!(
+        MediaBackendKind::from_str_validated("mpc").unwrap(),
+        MediaBackendKind::Mpd
+    );
+    assert_eq!(m.mpd.socket, "127.0.0.1:6600");
+    assert!(m.mpd.password.is_none());
+    let mut mpd_cfg = MediaConfig::default();
+    mpd_cfg.backend = MediaBackendKind::Mpd;
+    mpd_cfg.mpd.socket = "music.lan:6601".into();
+    mpd_cfg.mpd.password = Some("hunter2".into());
+    let opts = mpd_cfg.resolve_opts();
+    assert_eq!(opts.backend, superzej_media::BackendKind::Mpd);
+    assert_eq!(opts.mpd_socket, "music.lan:6601");
+    assert_eq!(opts.mpd_password.as_deref(), Some("hunter2"));
 
     // Default Config keeps media enabled and round-trips through TOML.
     assert!(Config::default().media.enabled);

@@ -826,16 +826,18 @@ config_enum! {
     /// default) picks the right backend for the current OS: Linux → MPRIS,
     /// Windows → SMTC, macOS → AppleScript. `"none"` disables. `"mpris"` is the
     /// Linux D-Bus standard (native `zbus`, `playerctl` CLI fallback) covering
-    /// Spotify desktop, mpv, ncspot, spotify-player, musikcube, moc, VLC, cmus, …
-    /// `"mpv"` drives a single mpv instance over its JSON IPC socket. `"smtc"` is
-    /// the Windows System Media Transport Controls session manager.
-    /// `"applescript"` drives macOS Music.app + Spotify via `osascript`.
-    /// `"jellyfin"` is reserved. A backend selected on the wrong OS is inert.
+    /// Spotify desktop, mpv, ncspot, VLC, cmus, …; `"mpd"` (alias `"mpc"`) talks
+    /// MPD directly (mpd/mpc/rmpc/ncmpcpp, no `mpd-mpris` bridge); `"mpv"` drives
+    /// one mpv over JSON IPC. `"smtc"` = Windows SMTC; `"applescript"` = macOS
+    /// Music/Spotify. `"jellyfin"` reserved. `"auto"` composes every source on the
+    /// OS (Linux: MPRIS + MPD + mpv) and shows whatever is actually playing; a
+    /// backend on the wrong OS is inert.
     pub enum MediaBackendKind: "media backend" {
         Auto = "auto",
         None = "none" | "off",
         Mpris = "mpris" | "dbus" | "playerctl",
         Mpv = "mpv",
+        Mpd = "mpd" | "mpc",
         Smtc = "smtc" | "windows" | "gsmtc",
         AppleScript = "applescript" | "macos" | "osascript",
         Jellyfin = "jellyfin",
@@ -893,6 +895,7 @@ pub struct MediaConfig {
     /// so this never fires for it (preserving the ~0%-idle contract).
     pub poll_interval_secs: u64,
     pub mpv: MpvMediaConfig,
+    pub mpd: MpdMediaConfig,
 }
 
 impl Default for MediaConfig {
@@ -909,6 +912,7 @@ impl Default for MediaConfig {
             overlay_on_badge_click: true,
             poll_interval_secs: 3,
             mpv: MpvMediaConfig::default(),
+            mpd: MpdMediaConfig::default(),
         }
     }
 }
@@ -931,6 +935,10 @@ impl Default for MpvMediaConfig {
         }
     }
 }
+
+// `[media.mpd]`'s `MpdMediaConfig` lives in the `config_media` sibling module to
+// keep this ratcheted god-file from growing.
+pub use crate::config_media::MpdMediaConfig;
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct NamedCommand {
@@ -3571,6 +3579,9 @@ pub struct NotificationsConfig {
     /// `"failures"` (only non-zero exits), `"all"` (every exit incl. clean
     /// shells), or `"off"`.
     pub process_exit: String,
+    /// Surface szhost's own log errors as user notifications (dev flag; off by default, stays quiet Info).
+    #[serde(skip_serializing_if = "is_false")]
+    pub surface_self_log_errors: bool,
     /// Per-kind attention priority overrides: maps a notification kind
     /// (snake_case, e.g. `"agent_done"`) to `"alert"`, `"notice"`, or `"info"`.
     /// Unset kinds use their built-in `NotificationKind::default_priority`;
@@ -3608,6 +3619,7 @@ impl Default for NotificationsConfig {
             desktop: true,
             desktop_min_urgency: "normal".into(),
             process_exit: "failures_and_tasks".into(),
+            surface_self_log_errors: false,
             priority: std::collections::BTreeMap::new(),
             rules: Vec::new(),
             dnd: DndConfig::default(),
@@ -3816,6 +3828,8 @@ pub struct NotificationsOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_exit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface_self_log_errors: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<std::collections::BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<NotificationRule>>,
@@ -3835,6 +3849,7 @@ impl NotificationsOverlay {
         self.desktop.is_none()
             && self.desktop_min_urgency.is_none()
             && self.process_exit.is_none()
+            && self.surface_self_log_errors.is_none()
             && self.priority.is_none()
             && self.rules.is_none()
             && self.dnd.is_none()
@@ -3853,6 +3868,9 @@ impl NotificationsOverlay {
         }
         if let Some(v) = self.process_exit {
             base.process_exit = v;
+        }
+        if let Some(v) = self.surface_self_log_errors {
+            base.surface_self_log_errors = v;
         }
         if let Some(v) = self.priority {
             base.priority = v;
@@ -4113,6 +4131,8 @@ pub struct Config {
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
+    /// `[remote]` — ssh keepalive/retry/heal tuning. See [`crate::config_remote`].
+    pub remote: crate::config_remote::RemoteConfig,
     /// `[share]` — expose a worktree port at a public URL. Disabled by default.
     pub share: ShareConfig,
     /// `[forward]` — auto-forward sandbox-internal dev-server ports to the host's
@@ -4240,6 +4260,7 @@ impl Default for Config {
             merge_queue: MergeQueueConfig::default(),
             replay: ReplayConfig::default(),
             media: MediaConfig::default(),
+            remote: crate::config_remote::RemoteConfig::default(),
             share: ShareConfig::default(),
             forward: ForwardConfig::default(),
             lifecycle: LifecycleConfig::default(),
@@ -4725,6 +4746,9 @@ impl Config {
     }
 
     pub(crate) fn post_process(&mut self) {
+        // Install the resolved [remote] tuning into the process-global holders
+        // (ssh keepalives / control-plane retry / heal cadence); first set wins.
+        self.remote.install();
         if self.agents.is_empty() {
             self.agents = vec![
                 NamedCommand {
