@@ -11,9 +11,11 @@
 
 use std::path::Path;
 
-use superzej_core::config::Config;
+use superzej_core::config::{Config, SandboxConfig};
 use superzej_core::config_resolve::{Approvals, ClampEvent, GatedRequest, summarize_events};
 use superzej_core::db::Db;
+use superzej_core::devcontainer::{self, SubstCtx};
+use superzej_core::devcontainer_overlay;
 use superzej_core::env::Environment;
 use superzej_core::remote::GitLoc;
 use superzej_core::store::{NotificationStore, RepoTrustStore, ZoneStore};
@@ -57,8 +59,89 @@ pub(crate) fn resolve_env_trusted(
         &approvals,
     );
     surface(&db, &root_s, worktree, &resolved.events, &resolved.pending);
+    // Fold a repo `devcontainer.json` onto the resolved sandbox, trust-gated
+    // exactly like the `.superzej.toml` overlay above. The worktree is bind-
+    // mounted at its real path, so the devcontainer's workspace folder is that
+    // same path. No-op without a devcontainer.json.
+    overlay_devcontainer(repo_root, worktree, &mut env.sandbox);
     apply_zone(&db, cfg, worktree, &mut env);
     env
+}
+
+/// A [`SubstCtx`] for a worktree that superzej bind-mounts at its **real path**
+/// (the local-sandbox invariant): the host and in-container workspace folders
+/// are the same path, so devcontainer `${localWorkspaceFolder}` and
+/// `${containerWorkspaceFolder}` both resolve to `worktree`.
+fn subst_ctx(worktree: &str) -> SubstCtx<'static> {
+    let wt = worktree.to_string();
+    SubstCtx {
+        local_workspace_folder: wt.clone(),
+        container_workspace_folder: wt,
+        local_env: &|k| std::env::var(k).ok(),
+        container_env: &|_| None,
+    }
+}
+
+/// Overlay a repo's `devcontainer.json` onto the resolved sandbox, trust-gated.
+/// Mutates `sb` (image/build/compose/mounts/ports/env/init_script/prepare),
+/// logs any warnings, and surfaces pending `devcontainer.*` approvals the same
+/// way a `.superzej.toml` overlay does. No-op when there's no devcontainer.json.
+fn overlay_devcontainer(repo_root: &Path, worktree: &str, sb: &mut SandboxConfig) {
+    let dc = match devcontainer::detect_and_parse(Path::new(worktree)) {
+        Some(Ok(dc)) => dc,
+        Some(Err(e)) => {
+            tracing::warn!(target: "szhost::config_trust", "devcontainer.json ignored: {e}");
+            return;
+        }
+        None => return,
+    };
+    let Ok(db) = Db::open() else { return };
+    let root_s = repo_root.to_string_lossy().to_string();
+    let approvals = approvals_for(&db, &root_s);
+    let ctx = subst_ctx(worktree);
+    let outcome = devcontainer_overlay::apply_gated(&dc, sb, &ctx, worktree, &approvals);
+    for w in &outcome.warnings {
+        tracing::warn!(target: "szhost::config_trust", "{w}");
+    }
+    surface(&db, &root_s, worktree, &[], &outcome.pending);
+}
+
+/// The trust-gated devcontainer one-time lifecycle steps
+/// (`onCreate`/`updateContent`/`postCreate`) for the provisioner to append
+/// after `envplan::plan`. Empty when there's no devcontainer.json or the
+/// lifecycle category isn't approved.
+pub(crate) fn devcontainer_lifecycle_steps(
+    repo_root: &Path,
+    worktree: &str,
+    workdir: &str,
+) -> Vec<superzej_core::envplan::ProvisionStep> {
+    let Some(Ok(dc)) = devcontainer::detect_and_parse(Path::new(worktree)) else {
+        return Vec::new();
+    };
+    let Ok(db) = Db::open() else {
+        return Vec::new();
+    };
+    let approvals = approvals_for(&db, &repo_root.to_string_lossy());
+    let ctx = subst_ctx(worktree);
+    devcontainer_overlay::gated_steps(&dc, workdir, &ctx, &approvals)
+}
+
+/// The trust-gated devcontainer feature-install steps (run after the toolchain,
+/// before lifecycle commands). Empty without a devcontainer.json, without
+/// `features`, or until the `devcontainer.features` category is approved.
+pub(crate) fn devcontainer_feature_steps(
+    repo_root: &Path,
+    worktree: &str,
+) -> Vec<superzej_core::envplan::ProvisionStep> {
+    let Some(Ok(dc)) = devcontainer::detect_and_parse(Path::new(worktree)) else {
+        return Vec::new();
+    };
+    let Ok(db) = Db::open() else {
+        return Vec::new();
+    };
+    let approvals = approvals_for(&db, &repo_root.to_string_lossy());
+    let remote_user = dc.remote_user.as_deref().unwrap_or("root");
+    devcontainer_overlay::gated_feature_steps(&dc, remote_user, &approvals)
 }
 
 /// Apply the worktree's zone ceilings (egress intersect, block union, sandbox
