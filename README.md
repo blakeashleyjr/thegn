@@ -128,10 +128,14 @@ tg              # dedicated Alacritty window with the bundled profile
 tg-tui          # same TUI in the current terminal window
 ```
 
-`./install.sh` needs Rust/Cargo, and an `alacritty` binary for the `tg`
-dedicated-window launcher; `tg-tui` and `thegn` run directly in
-the current terminal. thegn shells out to `git` (and `gh`/`ssh` as
-fallbacks where native support has gaps); `lazygit` is optional.
+`./install.sh` needs Rust/Cargo. Alacritty is optional — it only backs the
+`tg` dedicated-window launcher; `tg-tui` and `thegn` run directly in
+the current terminal, whatever it is. thegn shells out to `git` (and
+`gh`/`ssh` as fallbacks where native support has gaps); `lazygit` is optional.
+
+**macOS:** `./setup-macos.sh` checks every prerequisite (Xcode CLT, Nix or
+rustup + Homebrew deps) and offers to install what's missing, then builds.
+Nothing is installed without asking.
 
 ## How it works
 
@@ -223,6 +227,10 @@ path**, so host-side git reads (sidebar, panel, PR) keep working.
   `env_passthrough` forwards `SSH_AUTH_SOCK`/tokens.
 
 ## Development
+
+New contributor? Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) —
+prerequisites per platform (Linux + macOS), quick start, and the dev loop.
+`just doctor` diagnoses a broken dev environment.
 
 Run inside `nix develop` (rust toolchain + tools).
 
