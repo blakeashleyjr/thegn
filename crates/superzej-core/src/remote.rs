@@ -34,6 +34,7 @@ pub struct SshTarget {
 /// on a captured (non-interactive) channel and stealing the pane's stdin. The
 /// interactive pane (mosh/ssh) passes `batch = false` so auth prompts still work.
 pub fn ssh_base(port: u16, forward_agent: bool, batch: bool) -> Vec<String> {
+    let tune = crate::remote_tune::ssh_tune();
     let mut v = vec!["ssh".to_string()];
     if port != 22 {
         v.push("-p".into());
@@ -47,30 +48,57 @@ pub fn ssh_base(port: u16, forward_agent: bool, batch: bool) -> Vec<String> {
         v.push("BatchMode=yes".into());
     }
     v.push("-o".into());
-    v.push("ConnectTimeout=10".into());
+    v.push(format!("ConnectTimeout={}", tune.connect_timeout_secs));
+    // Keepalives so a lossy link (cellular, flappy Tailscale relay) is detected
+    // as *dead* by ssh in ~interval×count seconds instead of hanging a
+    // control-plane exec until the caller's deadline kills it — and so a
+    // healthy-but-quiet multiplexed master isn't dropped by a NAT timeout.
+    v.extend(crate::remote_tune::keepalive_args(tune));
     // Multiplex so the panel's frequent git polls reuse one connection (and the
     // interactive pane's master serves later control-plane calls without re-auth).
     // The ControlPath's parent (`<superzej_dir>/run`) is created by the compositor
     // at startup, but a headless CLI (`superzej host provision`, `pr`, `diff`, …)
     // can run before that ever happens — ensure it once so ssh can bind the socket
     // (otherwise ControlMaster fails with "cannot bind to path … No such file").
-    let run_dir = util::superzej_dir().join("run");
     {
         static RUN_DIR_ONCE: std::sync::Once = std::sync::Once::new();
-        let rd = run_dir.clone();
+        let rd = util::superzej_dir().join("run");
         // best-effort: if the mkdir fails, ssh reports the bind error as before.
         RUN_DIR_ONCE.call_once(move || {
             let _ = std::fs::create_dir_all(rd);
         });
     }
-    let ctl = run_dir.join("ssh-%r@%h:%p");
     v.push("-o".into());
     v.push("ControlMaster=auto".into());
     v.push("-o".into());
-    v.push(format!("ControlPath={}", ctl.display()));
+    v.push(format!("ControlPath={}", control_path_template().display()));
     v.push("-o".into());
-    v.push("ControlPersist=300".into());
+    v.push(format!("ControlPersist={}", tune.control_persist_secs));
     v
+}
+
+/// The ControlPath *template* handed to ssh (`%r@%h:%p` placeholders intact).
+fn control_path_template() -> PathBuf {
+    util::superzej_dir().join("run").join("ssh-%r@%h:%p")
+}
+
+/// The concrete ControlMaster socket path for a `user@host` + port pair —
+/// the expansion of the `ssh-%r@%h:%p` template ssh binds. Used by master
+/// hygiene (`ssh -O check` / stale-socket unlink); must stay in lockstep with
+/// [`ssh_base`]'s ControlPath.
+///
+/// `host` may be `user@host` or a bare host; ssh expands `%r` to the *remote
+/// user*, which for a bare host is the local username — matching ssh's own
+/// expansion there would require resolving ssh_config, so callers pass the
+/// same `user@host` string they hand to ssh and we mirror the common case.
+pub fn control_path(host: &str, port: u16) -> PathBuf {
+    let (user, bare_host) = match host.split_once('@') {
+        Some((u, h)) => (u.to_string(), h),
+        None => (std::env::var("USER").unwrap_or_default(), host),
+    };
+    util::superzej_dir()
+        .join("run")
+        .join(format!("ssh-{user}@{bare_host}:{port}"))
 }
 
 /// Resolve the remote `$HOME` over ssh, so we can store absolute remote paths
@@ -557,6 +585,43 @@ pub fn provision_repo_script(origin: &str, branch: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_base_has_keepalives_and_multiplexing() {
+        let joined = ssh_base(22, false, true).join(" ");
+        // Keepalives (the flaky-link hardening) ride every control-plane ssh.
+        assert!(joined.contains("-o ServerAliveInterval="), "{joined}");
+        assert!(joined.contains("-o ServerAliveCountMax="), "{joined}");
+        assert!(joined.contains("-o TCPKeepAlive=yes"), "{joined}");
+        // The historical contract holds.
+        assert!(joined.contains("-o BatchMode=yes"), "{joined}");
+        assert!(joined.contains("-o ConnectTimeout="), "{joined}");
+        assert!(joined.contains("-o ControlMaster=auto"), "{joined}");
+        assert!(joined.contains("-o ControlPersist="), "{joined}");
+        assert!(joined.contains("ControlPath="), "{joined}");
+        assert!(joined.contains("ssh-%r@%h:%p"), "{joined}");
+    }
+
+    #[test]
+    fn control_path_expands_the_template() {
+        // user@host form mirrors ssh's %r@%h:%p expansion exactly.
+        let p = control_path("targe@ageless-studio", 22);
+        assert!(
+            p.to_string_lossy()
+                .ends_with("run/ssh-targe@ageless-studio:22"),
+            "{}",
+            p.display()
+        );
+        // Non-default port lands in the :%p slot.
+        let p = control_path("u@h", 2222);
+        assert!(
+            p.to_string_lossy().ends_with("run/ssh-u@h:2222"),
+            "{}",
+            p.display()
+        );
+        // Same parent dir as the template ssh_base hands out.
+        assert_eq!(p.parent(), control_path_template().parent());
+    }
 
     #[test]
     fn local_roundtrip() {

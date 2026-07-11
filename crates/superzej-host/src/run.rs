@@ -7036,6 +7036,7 @@ async fn event_loop<T: Terminal>(
         waker: waker.clone(),
     };
     let mut host_runtime = crate::handlers::host::HostRuntime::new(host_ui_rx);
+    let mut host_heal = crate::handlers::host_heal::HealState::default();
     let mut pending_host_consent: Option<String> = None;
     // Materialize requests in flight, keyed (group name, tab). A SET (not a single
     // slot) that PERSISTS across worktree switches: switching away from a
@@ -10159,6 +10160,7 @@ async fn event_loop<T: Terminal>(
         let mut ci_refresh_force = false;
         let mut want_disk_refresh = false;
         let mut want_main_sync = false;
+        let mut want_host_heal = false;
         // Fold-actor results (batch fold + agent-driven drain): toast outcomes,
         // patch queue rows in place, route settled transitions to the inbox, and
         // re-hydrate so the advanced tip and cleared dots show immediately.
@@ -10203,6 +10205,7 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
                 // Branch ref moved elsewhere; heal the canonical checkout off-loop.
                 RefreshKind::MainRefMoved => want_main_sync = true,
+                RefreshKind::HostHeal => want_host_heal = true,
             }
         }
         // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s, off-loop).
@@ -10216,6 +10219,14 @@ async fn event_loop<T: Terminal>(
                 waker.clone(),
             );
         }
+        dirty |= want_host_heal
+            && crate::handlers::host_heal::on_heal_tick(
+                &mut host_heal,
+                &mut model,
+                &host_runtime,
+                keymap.config(),
+                &host_ui,
+            );
         // Semantic blast-radius (313/316): rebuild the graph off-loop on diff refresh.
         crate::blast_radius::maybe_spawn_build(
             current_config.lsp.enabled && want_model_refresh,
