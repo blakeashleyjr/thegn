@@ -22,7 +22,7 @@ use termwiz::terminal::{Terminal, TerminalWaker, new_terminal};
 use tokio::task;
 
 use crate::actions::{CiActionCtx, open_command_pane, open_command_tab, open_url_detached};
-use crate::chrome::{FrameModel, LoadStep, render_tab};
+use crate::chrome::{BarBadge, BarItemId, FrameModel, LoadStep, render_tab};
 use crate::compositor::Rect;
 use crate::detail::apply_ci_detail;
 // Re-exported so pre-split call sites (`crate::run::…` in sibling modules and
@@ -6268,7 +6268,6 @@ async fn ensure_app_loaded(
 // the event-loop call sites read unchanged.
 use crate::media_ctl::{
     MediaOp, MediaPick, media_effective_cfg, restart_media_watch, spawn_media_op, spawn_media_pick,
-    spawn_media_queue,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -7148,6 +7147,21 @@ async fn event_loop<T: Terminal>(
                 },
             );
         }};
+    }
+
+    // Open the full Now-Playing overlay (transport/queue/art) — shared by the
+    // Alt+m action and media-badge activation (statusbar click / Enter).
+    macro_rules! open_media_overlay {
+        () => {
+            media_overlay = Some(crate::media_ctl::open_media_overlay(
+                model.panel.media.clone(),
+                &current_config.media,
+                &media_player_override,
+                &media_queue_tx,
+                &media_art_tx,
+                &waker,
+            ))
+        };
     }
 
     // Activate a resolved sidebar row target (live tab or dormant-workspace
@@ -11543,17 +11557,15 @@ async fn event_loop<T: Terminal>(
                         if let Some((idx, (id, rect))) = hit {
                             focus.zone = crate::focus::Zone::Statusbar;
                             model.statusbar_sel = idx;
-                            if id.has_detail() {
-                                let screen = Rect {
-                                    x: 0,
-                                    y: 0,
-                                    cols,
-                                    rows,
-                                };
+                            if id == BarItemId::Badge(BarBadge::Media)
+                                && current_config.media.enabled
+                            {
+                                open_media_overlay!();
+                            } else if id.has_detail() {
                                 bar_detail = crate::detail::open_detail_for(
                                     &id,
                                     rect,
-                                    screen,
+                                    Rect::full(cols, rows),
                                     &model,
                                     &panel_ui.docs.telemetry,
                                 );
@@ -14012,22 +14024,20 @@ async fn event_loop<T: Terminal>(
                                 .into_iter()
                                 .nth(model.statusbar_sel)
                         };
-                        if let Some((id, rect)) = hit
-                            && id.has_detail()
-                        {
-                            let screen = Rect {
-                                x: 0,
-                                y: 0,
-                                cols,
-                                rows,
-                            };
-                            bar_detail = crate::detail::open_detail_for(
-                                &id,
-                                rect,
-                                screen,
-                                &model,
-                                &panel_ui.docs.telemetry,
-                            );
+                        if let Some((id, rect)) = hit {
+                            if id == BarItemId::Badge(BarBadge::Media)
+                                && current_config.media.enabled
+                            {
+                                open_media_overlay!();
+                            } else if id.has_detail() {
+                                bar_detail = crate::detail::open_detail_for(
+                                    &id,
+                                    rect,
+                                    Rect::full(cols, rows),
+                                    &model,
+                                    &panel_ui.docs.telemetry,
+                                );
+                            }
                         }
                     }
                     dirty = true;
@@ -18059,26 +18069,7 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::MediaOpenPanel => {
                                 if current_config.media.enabled {
-                                    // Open the Now-Playing overlay, then eagerly
-                                    // fetch its up-next queue and cover art.
-                                    let ov = crate::media_overlay::MediaOverlay::open(
-                                        model.panel.media.clone(),
-                                    );
-                                    let cfg = media_effective_cfg(
-                                        &current_config.media,
-                                        &media_player_override,
-                                    );
-                                    spawn_media_queue(cfg, media_queue_tx.clone(), waker.clone());
-                                    if let Some(url) = ov.wants_art(current_config.media.show_art) {
-                                        crate::media_art::spawn_fetch(
-                                            url,
-                                            crate::media_overlay::ART_COLS,
-                                            crate::media_overlay::ART_ROWS,
-                                            media_art_tx.clone(),
-                                            waker.clone(),
-                                        );
-                                    }
-                                    media_overlay = Some(ov);
+                                    open_media_overlay!();
                                 } else {
                                     model.status = "Media is off ([media] enabled = false)".into();
                                 }

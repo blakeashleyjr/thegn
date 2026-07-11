@@ -172,6 +172,33 @@ pub(crate) fn spawn_media_pick(
     });
 }
 
+/// Open the Now-Playing overlay and eagerly kick its up-next queue and cover-art
+/// fetches — shared by the `MediaOpenPanel` action (Alt+m) and media-badge
+/// activation (statusbar click / Enter), so the badge opens the full transport
+/// surface, not just the one-line detail popup.
+pub(crate) fn open_media_overlay(
+    snapshot: Option<thegn_core::media::MediaState>,
+    base_cfg: &thegn_core::config::MediaConfig,
+    player_override: &Option<String>,
+    queue_tx: &tokio_mpsc::UnboundedSender<Vec<thegn_core::media::QueueItem>>,
+    art_tx: &tokio_mpsc::UnboundedSender<crate::media_art::ArtMosaic>,
+    waker: &TerminalWaker,
+) -> crate::media_overlay::MediaOverlay {
+    let ov = crate::media_overlay::MediaOverlay::open(snapshot);
+    let cfg = media_effective_cfg(base_cfg, player_override);
+    spawn_media_queue(cfg, queue_tx.clone(), waker.clone());
+    if let Some(url) = ov.wants_art(base_cfg.show_art) {
+        crate::media_art::spawn_fetch(
+            url,
+            crate::media_overlay::ART_COLS,
+            crate::media_overlay::ART_ROWS,
+            art_tx.clone(),
+            waker.clone(),
+        );
+    }
+    ov
+}
+
 /// Fetch the play queue / up-next list off-thread for the Now-Playing overlay.
 pub(crate) fn spawn_media_queue(
     cfg: thegn_core::config::MediaConfig,
