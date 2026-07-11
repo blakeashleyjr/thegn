@@ -1,214 +1,118 @@
-L0| ◆ superzej v0.1.0   dashboard   work   comms   chat 34.1/94G · 󰾲 35% · 󰂄 100% · Fri Jun 19 · 22:56
-R0 0 1 fg=default bg=idxea attrs=
+L0| þ thegn work    17.5/94G ·   7% ·  37% ·  ↓    4K ↑    0B ·  100% · 22:41
+R0 0 1 fg=idxff bg=idxea attrs=
 R0 1 2 fg=idx50 bg=idxea attrs=
-R0 3 8 fg=idxff bg=idxea attrs=
-R0 11 1 fg=default bg=idxea attrs=
-R0 12 6 fg=idxf0 bg=idxea attrs=
-R0 18 2 fg=default bg=idxea attrs=
-R0 20 11 fg=idx92 bg=idxea attrs=
-R0 31 1 fg=default bg=idxea attrs=
-R0 32 6 fg=idx50 bg=idxee attrs=
-R0 38 1 fg=default bg=idxea attrs=
-R0 39 7 fg=idx92 bg=idxea attrs=
-R0 46 1 fg=default bg=idxea attrs=
-R0 47 14 fg=idx92 bg=idxea attrs=
-R0 61 3 fg=idxf0 bg=idxea attrs=
-R0 64 5 fg=idx92 bg=idxea attrs=
-R0 69 3 fg=idxf0 bg=idxea attrs=
-R0 72 6 fg=idx92 bg=idxea attrs=
-R0 78 3 fg=idxf0 bg=idxea attrs=
-R0 81 10 fg=idx92 bg=idxea attrs=
-R0 91 3 fg=idxf0 bg=idxea attrs=
-R0 94 5 fg=idx92 bg=idxea attrs=
-R0 99 1 fg=default bg=idxea attrs=
-L1|────────────────────────────────────────────────────────────────────────────────────────────────────
-R1 0 100 fg=idxf0 bg=idxea attrs=
-L2| WORKSPACES           REGCLAUDE ▸ home · Sandbox: None   git  work  system
+R0 3 5 fg=idxff bg=idxea attrs=
+R0 8 6 fg=idx50 bg=idxee attrs=BOLD
+R0 14 2 fg=idxff bg=idxea attrs=
+R0 16 10 fg=idxfc bg=idxea attrs=
+R0 26 3 fg=idx42 bg=idxea attrs=
+R0 29 5 fg=idxd2 bg=idxea attrs=
+R0 34 3 fg=idx42 bg=idxea attrs=
+R0 37 5 fg=idxfc bg=idxea attrs=
+R0 42 3 fg=idx42 bg=idxea attrs=
+R0 45 17 fg=idxfc bg=idxea attrs=
+R0 62 3 fg=idx42 bg=idxea attrs=
+R0 65 6 fg=idxd7 bg=idxea attrs=
+R0 71 3 fg=idx42 bg=idxea attrs=
+R0 74 5 fg=idxfc bg=idxea attrs=
+R0 79 1 fg=idxff bg=idxea attrs=
+L1|────────────────────────────────────────────────────────────────────────────────
+R1 0 80 fg=idx42 bg=idxea attrs=
+L2| WORKSPACES                       HOME ▸ home   1
 R2 0 11 fg=idxff bg=idxea attrs=BOLD
-R2 11 9 fg=default bg=idxea attrs=
-R2 20 2 fg=default bg=default attrs=
-R2 22 9 fg=idx92 bg=idxe9 attrs=
-R2 31 3 fg=idxf0 bg=idxe9 attrs=
-R2 34 4 fg=idx50 bg=idxe9 attrs=
-R2 38 12 fg=idx92 bg=idxe9 attrs=
-R2 50 4 fg=idxd2 bg=idxe9 attrs=
-R2 54 2 fg=default bg=default attrs=
-R2 56 1 fg=idxff bg=idxea attrs=
-R2 57 3 fg=idxff bg=idxea attrs=BOLD
-R2 60 2 fg=idxec bg=idxea attrs=
-R2 62 4 fg=idxee bg=idxea attrs=
-R2 66 2 fg=idxec bg=idxea attrs=
-R2 68 6 fg=idxee bg=idxea attrs=
-R2 74 26 fg=idxff bg=idxea attrs=
-L3|                     ╭─ bwrap · home ─────────────────╮  —
-R3 0 20 fg=default bg=idxea attrs=
-R3 20 1 fg=default bg=default attrs=
-R3 21 34 fg=idx50 bg=idxea attrs=
-R3 55 1 fg=default bg=default attrs=
-R3 56 1 fg=idxff bg=idxea attrs=
-R3 57 1 fg=idxff bg=idxea attrs=BOLD
-R3 58 42 fg=idxff bg=idxea attrs=
-L4| ▾ regclaude         │blake@ws-3:~/ >                 │ ────────────────────────────────────────────
-R4 0 1 fg=default bg=idxea attrs=
-R4 1 11 fg=idx92 bg=idxea attrs=
-R4 12 8 fg=default bg=idxea attrs=
-R4 20 1 fg=default bg=default attrs=
-R4 21 1 fg=idx50 bg=idxea attrs=
-R4 22 32 fg=default bg=idxea attrs=
-R4 54 1 fg=idx50 bg=idxea attrs=
-R4 55 1 fg=default bg=default attrs=
-R4 56 44 fg=idxec bg=idxea attrs=
-L5|   ● home            │                                │  1 changes                            clean
-R5 0 1 fg=default bg=idxeb attrs=
-R5 1 8 fg=idx50 bg=idxeb attrs=
-R5 9 11 fg=default bg=idxeb attrs=
-R5 20 1 fg=default bg=default attrs=
-R5 21 1 fg=idx50 bg=idxea attrs=
-R5 22 32 fg=default bg=idxea attrs=
-R5 54 1 fg=idx50 bg=idxea attrs=
-R5 55 1 fg=default bg=default attrs=
-R5 56 1 fg=idxff bg=idxe9 attrs=
-R5 57 1 fg=idx50 bg=idxe9 attrs=BOLD
-R5 58 1 fg=idxff bg=idxe9 attrs=
-R5 59 7 fg=idx50 bg=idxe9 attrs=BOLD
-R5 66 28 fg=idxff bg=idxe9 attrs=
-R5 94 5 fg=idxf0 bg=idxe9 attrs=
-R5 99 1 fg=idxff bg=idxe9 attrs=
-L6|                     │                                │
-R6 0 20 fg=default bg=idxea attrs=
-R6 20 1 fg=default bg=default attrs=
-R6 21 1 fg=idx50 bg=idxea attrs=
-R6 22 32 fg=default bg=idxea attrs=
-R6 54 1 fg=idx50 bg=idxea attrs=
-R6 55 1 fg=default bg=default attrs=
-R6 56 44 fg=idxff bg=idxea attrs=
-L7|                     │                                │   working tree clean
-R7 0 20 fg=default bg=idxea attrs=
-R7 20 1 fg=default bg=default attrs=
-R7 21 1 fg=idx50 bg=idxea attrs=
-R7 22 32 fg=default bg=idxea attrs=
-R7 54 1 fg=idx50 bg=idxea attrs=
-R7 55 1 fg=default bg=default attrs=
-R7 56 2 fg=idxff bg=idxea attrs=
-R7 58 18 fg=idxf0 bg=idxea attrs=
-R7 76 24 fg=idxff bg=idxea attrs=
-L8|                     │                                │
-R8 0 20 fg=default bg=idxea attrs=
-R8 20 1 fg=default bg=default attrs=
-R8 21 1 fg=idx50 bg=idxea attrs=
-R8 22 32 fg=default bg=idxea attrs=
-R8 54 1 fg=idx50 bg=idxea attrs=
-R8 55 1 fg=default bg=default attrs=
-R8 56 44 fg=idxff bg=idxea attrs=
-L9|                     │                                │  2 commits                                —
-R9 0 20 fg=default bg=idxea attrs=
-R9 20 1 fg=default bg=default attrs=
-R9 21 1 fg=idx50 bg=idxea attrs=
-R9 22 32 fg=default bg=idxea attrs=
-R9 54 1 fg=idx50 bg=idxea attrs=
-R9 55 1 fg=default bg=default attrs=
-R9 56 1 fg=idxff bg=idxea attrs=
-R9 57 1 fg=idxee bg=idxea attrs=BOLD
-R9 58 1 fg=idxff bg=idxea attrs=
-R9 59 7 fg=idx92 bg=idxea attrs=
-R9 66 32 fg=idxff bg=idxea attrs=
-R9 98 1 fg=idxee bg=idxea attrs=
-R9 99 1 fg=idxff bg=idxea attrs=
-L10|                     │                                │
-R10 0 20 fg=default bg=idxea attrs=
-R10 20 1 fg=default bg=default attrs=
-R10 21 1 fg=idx50 bg=idxea attrs=
-R10 22 32 fg=default bg=idxea attrs=
-R10 54 1 fg=idx50 bg=idxea attrs=
-R10 55 1 fg=default bg=default attrs=
-R10 56 44 fg=idxff bg=idxea attrs=
-L11|                     │                                │  3 branches                               —
-R11 0 20 fg=default bg=idxea attrs=
-R11 20 1 fg=default bg=default attrs=
-R11 21 1 fg=idx50 bg=idxea attrs=
-R11 22 32 fg=default bg=idxea attrs=
-R11 54 1 fg=idx50 bg=idxea attrs=
-R11 55 1 fg=default bg=default attrs=
-R11 56 1 fg=idxff bg=idxea attrs=
-R11 57 1 fg=idxee bg=idxea attrs=BOLD
-R11 58 1 fg=idxff bg=idxea attrs=
-R11 59 8 fg=idx92 bg=idxea attrs=
-R11 67 31 fg=idxff bg=idxea attrs=
-R11 98 1 fg=idxee bg=idxea attrs=
-R11 99 1 fg=idxff bg=idxea attrs=
-L12|                     │                                │
-R12 0 20 fg=default bg=idxea attrs=
-R12 20 1 fg=default bg=default attrs=
-R12 21 1 fg=idx50 bg=idxea attrs=
-R12 22 32 fg=default bg=idxea attrs=
-R12 54 1 fg=idx50 bg=idxea attrs=
-R12 55 1 fg=default bg=default attrs=
-R12 56 44 fg=idxff bg=idxea attrs=
-L13|                     │                                │  4 stash                                  —
-R13 0 20 fg=default bg=idxea attrs=
-R13 20 1 fg=default bg=default attrs=
-R13 21 1 fg=idx50 bg=idxea attrs=
-R13 22 32 fg=default bg=idxea attrs=
-R13 54 1 fg=idx50 bg=idxea attrs=
-R13 55 1 fg=default bg=default attrs=
-R13 56 1 fg=idxff bg=idxea attrs=
-R13 57 1 fg=idxee bg=idxea attrs=BOLD
-R13 58 1 fg=idxff bg=idxea attrs=
-R13 59 5 fg=idx92 bg=idxea attrs=
-R13 64 34 fg=idxff bg=idxea attrs=
-R13 98 1 fg=idxee bg=idxea attrs=
-R13 99 1 fg=idxff bg=idxea attrs=
-L14|                     │                                │
-R14 0 20 fg=default bg=idxea attrs=
-R14 20 1 fg=default bg=default attrs=
-R14 21 1 fg=idx50 bg=idxea attrs=
-R14 22 32 fg=default bg=idxea attrs=
-R14 54 1 fg=idx50 bg=idxea attrs=
-R14 55 1 fg=default bg=default attrs=
-R14 56 44 fg=idxff bg=idxea attrs=
-L15|                     │                                │  5 files                              0 loc
-R15 0 20 fg=default bg=idxea attrs=
-R15 20 1 fg=default bg=default attrs=
-R15 21 1 fg=idx50 bg=idxea attrs=
-R15 22 32 fg=default bg=idxea attrs=
-R15 54 1 fg=idx50 bg=idxea attrs=
-R15 55 1 fg=default bg=default attrs=
-R15 56 1 fg=idxff bg=idxea attrs=
-R15 57 1 fg=idxee bg=idxea attrs=BOLD
-R15 58 1 fg=idxff bg=idxea attrs=
-R15 59 5 fg=idx92 bg=idxea attrs=
-R15 64 30 fg=idxff bg=idxea attrs=
-R15 94 5 fg=idxf0 bg=idxea attrs=
-R15 99 1 fg=idxff bg=idxea attrs=
-L16|                     │                                │
-R16 0 20 fg=default bg=idxea attrs=
-R16 20 1 fg=default bg=default attrs=
-R16 21 1 fg=idx50 bg=idxea attrs=
-R16 22 32 fg=default bg=idxea attrs=
-R16 54 1 fg=idx50 bg=idxea attrs=
-R16 55 1 fg=default bg=default attrs=
-R16 56 44 fg=idxff bg=idxea attrs=
-L17|                     │                                │
-R17 0 20 fg=default bg=idxea attrs=
-R17 20 1 fg=default bg=default attrs=
-R17 21 1 fg=idx50 bg=idxea attrs=
-R17 22 32 fg=default bg=idxea attrs=
-R17 54 1 fg=idx50 bg=idxea attrs=
-R17 55 1 fg=default bg=default attrs=
-R17 56 44 fg=default bg=idxea attrs=
-L18|                     │                                │
-R18 0 20 fg=default bg=idxea attrs=
-R18 20 1 fg=default bg=default attrs=
-R18 21 1 fg=idx50 bg=idxea attrs=
-R18 22 32 fg=default bg=idxea attrs=
-R18 54 1 fg=idx50 bg=idxea attrs=
-R18 55 1 fg=default bg=default attrs=
-R18 56 44 fg=default bg=idxea attrs=
-L19|                     │                                │
-R19 0 20 fg=default bg=idxea attrs=
-R19 20 1 fg=default bg=default attrs=
-R19 21 1 fg=idx50 bg=idxea attrs=
-R19 22 32 fg=default bg=idxea attrs=
-R19 54 1 fg=idx50 bg=idxea attrs=
-R19 55 1 fg=default bg=default attrs=
-R19 56 44 fg=default bg=idxea attrs=
+R2 11 21 fg=default bg=idxea attrs=
+R2 32 2 fg=default bg=default attrs=
+R2 34 4 fg=idxfc bg=idxe9 attrs=
+R2 38 3 fg=idx42 bg=idxe9 attrs=
+R2 41 4 fg=idx50 bg=idxe9 attrs=
+R2 45 2 fg=default bg=default attrs=
+R2 47 3 fg=idx50 bg=idxee attrs=
+L3|                                          ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
+R3 0 32 fg=default bg=idxea attrs=
+R3 32 10 fg=default bg=default attrs=
+R3 42 29 fg=idx50 bg=idxe9 attrs=
+L4| ▾ 📁 home                                  █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
+R4 0 1 fg=idxff bg=idxe9 attrs=
+R4 1 1 fg=idx66 bg=idxe9 attrs=
+R4 2 4 fg=idxff bg=idxe9 attrs=
+R4 6 4 fg=idxff bg=idxe9 attrs=BOLD
+R4 10 22 fg=idxff bg=idxe9 attrs=
+R4 32 10 fg=default bg=default attrs=
+R4 42 29 fg=idx50 bg=idxe9 attrs=
+L5|▐   └ ● home                                █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
+R5 0 1 fg=idx42 bg=idxeb attrs=
+R5 1 3 fg=idxff bg=idxeb attrs=
+R5 4 2 fg=idx3c bg=idxeb attrs=
+R5 6 2 fg=idxff bg=idxeb attrs=
+R5 8 4 fg=idx50 bg=idxeb attrs=
+R5 12 20 fg=idxff bg=idxeb attrs=
+R5 32 10 fg=default bg=default attrs=
+R5 42 29 fg=idx50 bg=idxe9 attrs=
+L6|
+R6 0 32 fg=idxff bg=idxea attrs=
+L7| TERMINALS                                  v0.1.0 · git worktree IDE
+R7 0 1 fg=idxff bg=idxea attrs=
+R7 1 9 fg=idxff bg=idxea attrs=BOLD
+R7 10 22 fg=idxff bg=idxea attrs=
+R7 32 12 fg=default bg=default attrs=
+R7 44 6 fg=idxfc bg=idxe9 attrs=
+R7 50 19 fg=idx66 bg=idxe9 attrs=
+L8| ▾ 💻 local
+R8 0 1 fg=idxff bg=idxe9 attrs=
+R8 1 1 fg=idx66 bg=idxe9 attrs=
+R8 2 1 fg=idxff bg=idxe9 attrs=
+R8 3 3 fg=idxfc bg=idxe9 attrs=
+R8 6 5 fg=idxff bg=idxe9 attrs=BOLD
+R8 11 21 fg=idxff bg=idxe9 attrs=
+L9|   └ 💻 local                                      ↻ sandbox
+R9 0 3 fg=idxff bg=idxea attrs=
+R9 3 2 fg=idx3c bg=idxea attrs=
+R9 5 8 fg=idxfc bg=idxea attrs=
+R9 13 19 fg=idxff bg=idxea attrs=
+R9 32 19 fg=default bg=default attrs=
+R9 51 1 fg=idx50 bg=idxe9 attrs=
+R9 52 1 fg=default bg=default attrs=
+R9 53 7 fg=idxff bg=idxe9 attrs=
+L10|                                                   ◇ container
+R10 0 32 fg=default bg=idxea attrs=
+R10 32 19 fg=default bg=default attrs=
+R10 51 1 fg=idx42 bg=idxe9 attrs=
+R10 52 1 fg=default bg=default attrs=
+R10 53 9 fg=idx42 bg=idxe9 attrs=
+L11|                                                   ◇ shell
+R11 0 32 fg=default bg=idxea attrs=
+R11 32 19 fg=default bg=default attrs=
+R11 51 1 fg=idx42 bg=idxe9 attrs=
+R11 52 1 fg=default bg=default attrs=
+R11 53 5 fg=idx42 bg=idxe9 attrs=
+L12|
+R12 0 32 fg=default bg=idxea attrs=
+L13|
+R13 0 32 fg=default bg=idxea attrs=
+L14|
+R14 0 32 fg=default bg=idxea attrs=
+L15|
+R15 0 32 fg=default bg=idxea attrs=
+L16|
+R16 0 32 fg=default bg=idxea attrs=
+L17|
+R17 0 32 fg=default bg=idxea attrs=
+L18|
+R18 0 32 fg=default bg=idxea attrs=
+L19|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav 0 LOC   7% free
+R19 0 1 fg=idxff bg=idxea attrs=
+R19 1 8 fg=idxe9 bg=idx50 attrs=BOLD
+R19 9 2 fg=idxff bg=idxea attrs=
+R19 11 10 fg=idx66 bg=idxea attrs=
+R19 21 5 fg=idx42 bg=idxea attrs=
+R19 26 3 fg=idxff bg=idxea attrs=
+R19 29 6 fg=idx66 bg=idxea attrs=
+R19 35 5 fg=idx42 bg=idxea attrs=
+R19 40 3 fg=idxff bg=idxea attrs=
+R19 43 14 fg=idx66 bg=idxea attrs=
+R19 57 4 fg=idx42 bg=idxea attrs=
+R19 61 1 fg=idxff bg=idxea attrs=
+R19 62 5 fg=idxfc bg=idxea attrs=
+R19 67 1 fg=idxff bg=idxea attrs=
+R19 68 11 fg=idxe9 bg=idxcb attrs=BOLD
+R19 79 1 fg=idxff bg=idxea attrs=

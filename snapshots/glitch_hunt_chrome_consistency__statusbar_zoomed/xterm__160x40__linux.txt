@@ -1,40 +1,40 @@
- ◆ superzej v0.1.0   dashboard   work   comms   chat                                                            34.1/94G · 󰾲 26% · 󰂄 100% · Fri Jun 19 · 22:56
+ þ thegn v0.1.0 work                                               85% ·  17.7/94G ·   7% ·  36% ·  96°C ·  ↓   77K ↑   70K ·  100% · Fri Jul 10 · 22:41
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
- REGCLAUDE ▸ home · Sandbox: None   1
-╭─ bwrap · home ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│zsh-newuser-install.                                                                                                                                          │
-│You are seeing this message because you have no zsh startup files                                                                                             │
-│(the files .zshenv, .zprofile, .zshrc, .zlogin in the directory                                                                                               │
-│~).  This function can help you with a few settings that should                                                                                               │
-│make your use of the shell easier.                                                                                                                            │
-│                                                                                                                                                              │
-│You can:                                                                                                                                                      │
-│                                                                                                                                                              │
-│(q)  Quit and do nothing.  The function will be run again next time.                                                                                          │
-│                                                                                                                                                              │
-│(0)  Exit, creating the file ~/.zshrc containing just a comment.                                                                                              │
-│     That will prevent this function being run again.                                                                                                         │
-│                                                                                                                                                              │
-│(1)  Continue to the main menu.                                                                                                                               │
-│                                                                                                                                                              │
-│--- Type one of the keys in parentheses ---                                                                                                                   │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-│                                                                                                                                                              │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab   Alt-p smart split   Alt-n split↓   A… 0 LOC │ Zoomed — Ctrl+Alt+z to restore  ⛶ ZOOM
+ HOME ▸ home   1
+
+                                                                             ▄▀▀▀▀▄
+                                                                       ▄▄▀▀▀▀▀▀▀▀▀▀▀▀▀▀▄▄
+                                                                     ▄▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▄
+                                                                     ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                     ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                     ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                     ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                      ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                         ▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                    ▄▄▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▄▄
+
+                                                                 ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
+                                                                   █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
+                                                                   █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
+
+                                                                   v0.1.0 · git worktree IDE
+
+                                                                          ↻ sandbox
+                                                                          ◇ container
+                                                                          ◇ shell
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→               0 LOC │ Zoomed — Ctrl+Alt+z to restore  ✋ 1    7% free   ⛶ ZOOM

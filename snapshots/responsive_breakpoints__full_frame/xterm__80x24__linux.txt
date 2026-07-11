@@ -1,24 +1,24 @@
- ◆ superzej   dashboard   work  comms 4 chat 15% · 󰂄 100% · Fri Jun 19 · 22:56
+ þ thegn work    17.1/94G ·   7% ·  36% ·  ↓   40K ↑   17K ·  100% · 22:41
+────────────────────────────────────────────────────────────────────────────────
+ WORKSPACES                       HOME ▸ home   1
 
-┌ System ──────────────────┐┌ Hacker News ─────────────────────────────────────┐
-│OS:                       ││No HN stories yet (offline or loading).           │
-│Uptime: 0s                ││                                                  │
-│Memory: 0.00 GB / 0.00 GB ││                                                  │
-│CPUs: 0                   ││                                                  │
-└──────────────────────────┘│                                                  │
-┌ Resources ───────────────┐└──────────────────────────────────────────────────┘
-│CPU: 0.0%                 │┌ Recent Repos ────────────────────────────────────┐
-│Mem: 0.0% (0.0/0.0G)      ││No recent repos.                                  │
-│Load: 0.00                ││                                                  │
-│Processes: 0              ││                                                  │
-│                          │└──────────────────────────────────────────────────┘
-└──────────────────────────┘┌ Workspaces ──────────────────────────────────────┐
-┌ Metrics ─────────────────┐│No open workspaces.                               │
-│No metric targets configur││                                                  │
-│                          ││                                                  │
-│                          │└──────────────────────────────────────────────────┘
-│                          │┌ Superzej Dashboard ──────────────────────────────┐
-│                          ││Last updated: 0  |  Refresh interval: 0s  |  Press│
-│                          ││                                                  │
-└──────────────────────────┘└──────────────────────────────────────────────────┘
-  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab   Alt…
+ ▾    home
+▐   └   home
+
+ TERMINALS
+   No terminals — Alt T to add            ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
+ ╭─ Choose a keymap ────────────────────────────────────────────────── menu ──╮
+ │ Familiar shortcuts on top of the defaults. Change later with keymap_prese… │
+ │ ❯  d  thegn defaults                                       Alt/Ctrl chords │
+ │    v  VS Code                                 Ctrl+P, Ctrl+Shift+P, Ctrl+B │
+ │    i  JetBrains                                       Ctrl+Shift+A, Ctrl+E │
+ ╰────────────────────────────────────────────────────────────────────────────╯
+                                         Alt-↑↓      prev/next worktree
+                                         Ctrl-g      lock keys to pane
+
+
+
+
+
+
+  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav         7% free
