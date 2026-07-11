@@ -155,6 +155,7 @@ mod tests {
             limits: SandboxLimits::default(),
             volumes: vec![],
             compose: None,
+            build: None,
             init_script: None,
             file_access: FileAccess::Worktree,
             devenv: false,
