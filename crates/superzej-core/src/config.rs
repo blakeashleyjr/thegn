@@ -4123,6 +4123,8 @@ pub struct Config {
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
+    /// `[remote]` — ssh keepalive/retry/heal tuning. See [`crate::config_remote`].
+    pub remote: crate::config_remote::RemoteConfig,
     /// `[share]` — expose a worktree port at a public URL. Disabled by default.
     pub share: ShareConfig,
     /// `[forward]` — auto-forward sandbox-internal dev-server ports to the host's
@@ -4250,6 +4252,7 @@ impl Default for Config {
             merge_queue: MergeQueueConfig::default(),
             replay: ReplayConfig::default(),
             media: MediaConfig::default(),
+            remote: crate::config_remote::RemoteConfig::default(),
             share: ShareConfig::default(),
             forward: ForwardConfig::default(),
             lifecycle: LifecycleConfig::default(),
@@ -4735,6 +4738,9 @@ impl Config {
     }
 
     pub(crate) fn post_process(&mut self) {
+        // Install the resolved [remote] tuning into the process-global holders
+        // (ssh keepalives / control-plane retry / heal cadence); first set wins.
+        self.remote.install();
         if self.agents.is_empty() {
             self.agents = vec![
                 NamedCommand {

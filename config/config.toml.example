@@ -1552,6 +1552,25 @@ oci_host = ""
 # node-modules   = "/root/.npm"
 # pip-cache      = "/root/.cache/pip"
 
+# ── Remote transport tuning ───────────────────────────────────────────────────
+# Hardening for EVERY control-plane ssh connection (host bring-up, remote git
+# reads, delivery, probes) against flaky links: keepalives detect a dead path
+# in ~interval×count seconds; transient failures (ssh exit 255, timeouts)
+# retry with exponential backoff instead of failing the host; a host that
+# still lands on Failed is re-probed in the background on `heal_backoff_secs`
+# until it recovers (stuck worktree splashes then resume on their own).
+# Resolved once at startup (like the theme); a change needs a restart.
+[remote]
+# keepalive_interval_secs = 15   # ssh ServerAliveInterval (0 = off)
+# keepalive_count_max = 4        # ssh ServerAliveCountMax (~60s to declare dead)
+# connect_timeout_secs = 10      # ssh ConnectTimeout
+# control_persist_secs = 300     # idle ControlMaster lifetime
+# tcp_keepalive = true           # kernel-level probes alongside ServerAlive
+# retry_attempts = 4             # transient retries per bring-up step
+# retry_base_delay_ms = 1000     # first backoff; doubles per attempt…
+# retry_max_delay_ms = 15000     # …capped here
+# heal_backoff_secs = [15, 30, 60, 300]  # failed-host re-probe cadence (last repeats)
+
 # ── Remote worktrees ──────────────────────────────────────────────────────────
 # Run worktrees on a remote machine over SSH. Leave host empty for local use.
 # Control-plane operations (git reads, container lifecycle) always use ssh;
