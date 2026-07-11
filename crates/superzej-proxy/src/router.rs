@@ -2,8 +2,11 @@
 //! exhausted/over-context/saturated lanes, classifying each response, cooling
 //! down genuine availability failures, and falling through soft failures
 //! without a cooldown. Port of `routeRequest`/`attemptBackend` (non-streaming),
-//! plus spend attribution + audit logging (group V).
+//! plus spend attribution + audit logging (group V), per-request latency /
+//! tokens-per-second measurement, upstream-account pinning (scoped accounts),
+//! and the optional cross-route last-resort tier.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,12 +16,14 @@ use superzej_core::config::RoutingStrategy;
 use superzej_core::db::ProxyRequestRow;
 use superzej_core::proxy::classify::{FailKind, classify_response};
 use superzej_core::proxy::cost::{PriceTable, Usage, cost_usd};
+use superzej_core::proxy::creds::provider_base;
 use superzej_core::proxy::transform;
 use superzej_core::store::ProxyStore;
 
 use crate::anthropic_stream::AnthropicSink;
 use crate::budget::Identity;
-use crate::model::{Backend, Route};
+use crate::headers::{header_cost, retry_after_ms};
+use crate::model::{Backend, ProxyConfig, Route};
 use crate::relay::{self, OpenAiSink, Peek, RelayStats};
 use crate::reset::parse_reset_from_body;
 use crate::shared::{now_ms, now_unix};
@@ -131,6 +136,43 @@ fn rand_start() -> usize {
         .unwrap_or(0)
 }
 
+/// The ordered lane list for one attempt pass over `route`, with the identity's
+/// upstream account binding pinned to the front. Pinning is a stable partition
+/// — the bound provider's lanes lead in their strategy order, everything else
+/// follows as fallback — so a workspace's traffic sticks to the account scoped
+/// to it without losing failover.
+fn attempt_lanes(route: &Route, identity: &Identity, prices: &PriceTable) -> Vec<Backend> {
+    let order = ordered_priority(route, rand_start(), prices);
+    let mut lanes: Vec<Backend> = order
+        .into_iter()
+        .map(|i| route.priority[i].clone())
+        .collect();
+    if let Some(up) = identity.upstream.as_deref() {
+        lanes.sort_by_key(|b| provider_base(&b.name) != up);
+    }
+    lanes
+}
+
+/// The deduped union of every OTHER route's backends (skipping identities in
+/// `tried`), for the last-resort tier. Natural config order, first occurrence
+/// wins.
+fn last_resort_lanes(
+    config: &ProxyConfig,
+    route_name: &str,
+    tried: &HashSet<String>,
+) -> Vec<Backend> {
+    let mut seen: HashSet<String> = tried.clone();
+    let mut out = Vec::new();
+    for r in config.routes.iter().filter(|r| r.name != route_name) {
+        for b in &r.priority {
+            if seen.insert(b.identity()) {
+                out.push(b.clone());
+            }
+        }
+    }
+    out
+}
+
 /// The result of routing a non-streaming request.
 pub struct RouteResult {
     pub status: u16,
@@ -149,43 +191,80 @@ pub async fn route_nonstreaming(
     route: &Route,
     body: &[u8],
 ) -> RouteResult {
+    let started = Instant::now();
     let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-    let has_tools = transform::request_has_tools(&parsed);
     let est_tokens = transform::estimated_request_tokens(body.len());
+    let mut tried: HashSet<String> = HashSet::new();
 
-    let order = ordered_priority(route, rand_start(), &state.price_table);
-    let n = order.len();
-    for (pos, &idx) in order.iter().enumerate() {
-        let backend = &route.priority[idx];
+    let lanes = attempt_lanes(route, identity, &state.price_table);
+    if let Some(r) = try_chain(
+        state, identity, protocol, route, &lanes, &parsed, body, est_tokens, started, &mut tried,
+    )
+    .await
+    {
+        return r;
+    }
+    if state.config.last_resort {
+        let fallback = last_resort_lanes(&state.config, &route.name, &tried);
+        if !fallback.is_empty() {
+            tracing::info!(route = %route.name, lanes = fallback.len(), "last-resort tier engaged");
+            if let Some(r) = try_chain(
+                state, identity, protocol, route, &fallback, &parsed, body, est_tokens, started,
+                &mut tried,
+            )
+            .await
+            {
+                return r;
+            }
+        }
+    }
+
+    // Whole chain (and any last-resort tier) failed.
+    state.metrics.inc_request(&route.name, "none", "all_failed");
+    audit_failure(state, identity, protocol, route, started);
+    RouteResult {
+        status: 503,
+        body: br#"{"error":{"message":"all backends failed","type":"proxy_error"}}"#.to_vec(),
+        served_by: "none".to_string(),
+    }
+}
+
+/// One ordered pass over `lanes` for a non-streaming request. Returns `Some`
+/// when a lane served; records every identity it attempted into `tried`.
+#[allow(clippy::too_many_arguments)]
+async fn try_chain(
+    state: &AppState,
+    identity: &Identity,
+    protocol: &str,
+    route: &Route,
+    lanes: &[Backend],
+    parsed: &Value,
+    body: &[u8],
+    est_tokens: usize,
+    started: Instant,
+    tried: &mut HashSet<String>,
+) -> Option<RouteResult> {
+    let n = lanes.len();
+    for (pos, backend) in lanes.iter().enumerate() {
         let is_last = pos + 1 == n;
         let now = now_ms();
+        let ident = backend.identity();
+        tried.insert(ident.clone());
 
         // Skip cooled-down backends.
-        if state
-            .health
-            .is_exhausted(&backend.identity(), &backend.model, now)
-        {
-            state
-                .metrics
-                .inc_fallthrough(&backend.identity(), "skipped_exhausted");
+        if state.health.is_exhausted(&ident, &backend.model, now) {
+            state.metrics.inc_fallthrough(&ident, "skipped_exhausted");
             continue;
         }
         // Skip backends whose context window can't fit the request.
         if transform::exceeds_context_limit(backend.context_limit, est_tokens) {
-            state
-                .metrics
-                .inc_fallthrough(&backend.identity(), "skipped_context");
+            state.metrics.inc_fallthrough(&ident, "skipped_context");
             continue;
         }
-        // Skip tool requests for backends with no tool support flagged via a 0
-        // context-limit sentinel is not modelled in M1; tool routing is honored
-        // by config ordering. (has_tools kept for the audit/metrics story.)
-        let _ = has_tools;
 
         // Rate-limit admission: a non-tail backend sheds to the next lane when
         // its identity is saturated; the tail backend waits instead of shedding
         // so the whole chain queues on the cheapest lane rather than 503-ing.
-        let ident = backend.identity();
         if !state
             .limiter
             .try_acquire(&ident, backend.rate, Instant::now())
@@ -206,7 +285,7 @@ pub async fn route_nonstreaming(
             continue;
         }
 
-        let (backend_body, saved) = apply_transforms(backend, &state.compression, &parsed, body);
+        let (backend_body, saved) = apply_transforms(backend, &state.compression, parsed, body);
         state.inflight.enter(&ident);
         let attempt = upstream::call_backend(&state.client, backend, &backend_body).await;
         state.inflight.leave(&ident);
@@ -226,28 +305,37 @@ pub async fn route_nonstreaming(
         let (kind, reason) = classify_response(resp.status, &resp.body);
         match kind {
             FailKind::Serve => {
-                state
-                    .health
-                    .record_success(&backend.identity(), &backend.model);
+                state.health.record_success(&ident, &backend.model);
                 state.metrics.inc_backend_attempt(&ident, "ok");
                 state.metrics.inc_request(&route.name, &ident, "ok");
                 state.metrics.add_tokens_saved(&ident, (saved / 4) as u64);
-                finalize_success(state, identity, protocol, route, backend, &resp.body);
-                return RouteResult {
+                let duration_ms = started.elapsed().as_millis() as i64;
+                state.metrics.observe_duration(duration_ms);
+                finalize_success(
+                    state,
+                    identity,
+                    protocol,
+                    route,
+                    backend,
+                    &resp.body,
+                    header_cost(&resp.headers),
+                    duration_ms,
+                    None,
+                );
+                return Some(RouteResult {
                     status: resp.status,
                     body: resp.body,
                     served_by: ident,
-                };
+                });
             }
             FailKind::Exhausted => {
-                let until = parse_reset_from_body(&resp.body, now);
-                state.health.mark_exhausted(
-                    &backend.identity(),
-                    &backend.model,
-                    &reason,
-                    until,
-                    now,
-                );
+                // Body reset hints are the most precise; the standard
+                // Retry-After header is the fallback signal.
+                let until = parse_reset_from_body(&resp.body, now)
+                    .or_else(|| retry_after_ms(&resp.headers, now));
+                state
+                    .health
+                    .mark_exhausted(&ident, &backend.model, &reason, until, now);
                 state.metrics.inc_backend_attempt(&ident, "exhausted");
                 state.metrics.inc_fallthrough(&ident, "exhausted");
             }
@@ -257,15 +345,7 @@ pub async fn route_nonstreaming(
             }
         }
     }
-
-    // Whole chain failed.
-    state.metrics.inc_request(&route.name, "none", "all_failed");
-    audit_failure(state, identity, protocol, route);
-    RouteResult {
-        status: 503,
-        body: br#"{"error":{"message":"all backends failed","type":"proxy_error"}}"#.to_vec(),
-        served_by: "none".to_string(),
-    }
+    None
 }
 
 /// The result of routing a streaming request: a committed client body or a
@@ -290,32 +370,81 @@ pub async fn route_streaming(
     client_model: &str,
     body: &[u8],
 ) -> StreamOutcome {
+    let started = Instant::now();
+    let mut tried: HashSet<String> = HashSet::new();
+    let lanes = attempt_lanes(route, &identity, &state.price_table);
+    if let Some(b) = try_stream_chain(
+        &state,
+        &identity,
+        surface,
+        route,
+        &lanes,
+        client_model,
+        body,
+        started,
+        &mut tried,
+    )
+    .await
+    {
+        return StreamOutcome::Body(b);
+    }
+    if state.config.last_resort {
+        let fallback = last_resort_lanes(&state.config, &route.name, &tried);
+        if !fallback.is_empty() {
+            tracing::info!(route = %route.name, lanes = fallback.len(), "last-resort tier engaged (stream)");
+            if let Some(b) = try_stream_chain(
+                &state,
+                &identity,
+                surface,
+                route,
+                &fallback,
+                client_model,
+                body,
+                started,
+                &mut tried,
+            )
+            .await
+            {
+                return StreamOutcome::Body(b);
+            }
+        }
+    }
+    state.metrics.inc_request(&route.name, "none", "all_failed");
+    StreamOutcome::Failed
+}
+
+/// One ordered pass over `lanes` for a streaming request. Returns the committed
+/// client body when a lane served.
+#[allow(clippy::too_many_arguments)]
+async fn try_stream_chain(
+    state: &SharedState,
+    identity: &Identity,
+    surface: Surface,
+    route: &Route,
+    lanes: &[Backend],
+    client_model: &str,
+    body: &[u8],
+    started: Instant,
+    tried: &mut HashSet<String>,
+) -> Option<Body> {
     let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let est_tokens = transform::estimated_request_tokens(body.len());
     let cfg = state.relay_config;
-    let order = ordered_priority(route, rand_start(), &state.price_table);
-    let n = order.len();
+    let n = lanes.len();
 
-    for (pos, &idx) in order.iter().enumerate() {
-        let backend = &route.priority[idx];
+    for (pos, backend) in lanes.iter().enumerate() {
         let is_last = pos + 1 == n;
         let now = now_ms();
-        if state
-            .health
-            .is_exhausted(&backend.identity(), &backend.model, now)
-        {
-            state
-                .metrics
-                .inc_fallthrough(&backend.identity(), "skipped_exhausted");
+        let ident = backend.identity();
+        tried.insert(ident.clone());
+        if state.health.is_exhausted(&ident, &backend.model, now) {
+            state.metrics.inc_fallthrough(&ident, "skipped_exhausted");
             continue;
         }
         if transform::exceeds_context_limit(backend.context_limit, est_tokens) {
-            state
-                .metrics
-                .inc_fallthrough(&backend.identity(), "skipped_context");
+            state.metrics.inc_fallthrough(&ident, "skipped_context");
             continue;
         }
-        let ident = backend.identity();
         if !state
             .limiter
             .try_acquire(&ident, backend.rate, Instant::now())
@@ -341,16 +470,19 @@ pub async fn route_streaming(
                     let (kind, reason) = classify_response(resp.status, &resp.body);
                     match kind {
                         FailKind::Serve => {
-                            state
-                                .health
-                                .record_success(&backend.identity(), &backend.model);
+                            state.health.record_success(&ident, &backend.model);
+                            let duration_ms = started.elapsed().as_millis() as i64;
+                            state.metrics.observe_duration(duration_ms);
                             finalize_success(
-                                &state,
-                                &identity,
+                                state,
+                                identity,
                                 surface.protocol(),
                                 route,
                                 backend,
                                 &resp.body,
+                                header_cost(&resp.headers),
+                                duration_ms,
+                                None,
                             );
                             state.metrics.inc_request(&route.name, &ident, "ok");
                             state.metrics.add_tokens_saved(&ident, (saved / 4) as u64);
@@ -368,15 +500,13 @@ pub async fn route_streaming(
                                     est_tokens as u64,
                                 )),
                             };
-                            return match sse {
-                                Some(bytes) => StreamOutcome::Body(Body::from(bytes)),
-                                None => StreamOutcome::Failed,
-                            };
+                            return sse.map(Body::from);
                         }
                         FailKind::Exhausted => {
-                            let until = parse_reset_from_body(&resp.body, now);
+                            let until = parse_reset_from_body(&resp.body, now)
+                                .or_else(|| retry_after_ms(&resp.headers, now));
                             state.health.mark_exhausted(
-                                &backend.identity(),
+                                &ident,
                                 &backend.model,
                                 &reason,
                                 until,
@@ -400,17 +530,15 @@ pub async fn route_streaming(
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
                 let status = r.status().as_u16();
+                let headers = r.headers().clone();
                 let bytes = r.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
                 let (kind, reason) = classify_response(status, &bytes);
                 if kind == FailKind::Exhausted {
-                    let until = parse_reset_from_body(&bytes, now);
-                    state.health.mark_exhausted(
-                        &backend.identity(),
-                        &backend.model,
-                        &reason,
-                        until,
-                        now,
-                    );
+                    let until = parse_reset_from_body(&bytes, now)
+                        .or_else(|| retry_after_ms(&headers, now));
+                    state
+                        .health
+                        .mark_exhausted(&ident, &backend.model, &reason, until, now);
                     state.metrics.inc_fallthrough(&ident, "exhausted");
                 } else {
                     state.metrics.inc_fallthrough(&ident, "soft_fail");
@@ -423,6 +551,7 @@ pub async fn route_streaming(
                 continue;
             }
         };
+        let upstream_cost = header_cost(resp.headers());
 
         // Peek before committing: only a stream with usable output is returned to
         // the client; an empty/timed-out stream soft-cools the backend and falls
@@ -435,17 +564,19 @@ pub async fn route_streaming(
                     sink,
                 } => {
                     let fin = finalize_closure(
-                        &state,
-                        &identity,
+                        state,
+                        identity,
                         surface.protocol(),
                         &route.name,
                         backend,
                         &ident,
+                        upstream_cost,
+                        started,
                     );
                     Some(relay::spawn_relay(prefix_out, rest, sink, cfg, fin))
                 }
                 other => {
-                    note_stream_fallthrough(&state, backend, &ident, &other);
+                    note_stream_fallthrough(state, backend, &ident, &other);
                     None
                 }
             },
@@ -462,17 +593,19 @@ pub async fn route_streaming(
                         sink,
                     } => {
                         let fin = finalize_closure(
-                            &state,
-                            &identity,
+                            state,
+                            identity,
                             surface.protocol(),
                             &route.name,
                             backend,
                             &ident,
+                            upstream_cost,
+                            started,
                         );
                         Some(relay::spawn_relay(prefix_out, rest, sink, cfg, fin))
                     }
                     other => {
-                        note_stream_fallthrough(&state, backend, &ident, &other);
+                        note_stream_fallthrough(state, backend, &ident, &other);
                         None
                     }
                 }
@@ -480,18 +613,14 @@ pub async fn route_streaming(
         };
 
         if let Some(body) = commit {
-            state
-                .health
-                .record_success(&backend.identity(), &backend.model);
+            state.health.record_success(&ident, &backend.model);
             state.set_resolved(&route.name, &ident);
             state.metrics.inc_request(&route.name, &ident, "ok_stream");
             state.metrics.add_tokens_saved(&ident, (saved / 4) as u64);
-            return StreamOutcome::Body(body);
+            return Some(body);
         }
     }
-
-    state.metrics.inc_request(&route.name, "none", "all_failed");
-    StreamOutcome::Failed
+    None
 }
 
 /// Records the right health/metrics signal for a pre-commit stream that did not
@@ -535,7 +664,9 @@ fn note_stream_fallthrough<S: relay::StreamSink>(
 }
 
 /// Builds the finalize callback the relay task runs once a committed stream
-/// completes: reconcile usage → cost → spend → audit row + metrics.
+/// completes: reconcile usage → cost → spend → audit row + metrics. The commit
+/// moment (now) is the stream's TTFB; the callback stamps the total duration.
+#[allow(clippy::too_many_arguments)]
 fn finalize_closure(
     state: &SharedState,
     identity: &Identity,
@@ -543,6 +674,8 @@ fn finalize_closure(
     route_name: &str,
     backend: &Backend,
     ident: &str,
+    upstream_cost: Option<f64>,
+    started: Instant,
 ) -> impl FnOnce(RelayStats) + Send + 'static {
     let state = state.clone();
     let identity = identity.clone();
@@ -550,9 +683,11 @@ fn finalize_closure(
     let bname = backend.name.clone();
     let bmodel = backend.model.clone();
     let ident = ident.to_string();
+    let ttfb_ms = started.elapsed().as_millis() as i64;
     move |stats: RelayStats| {
         let usage = stats.usage;
-        let (cost, source) = cost_usd(&state.price_table, &bname, &bmodel, usage, None);
+        let duration_ms = started.elapsed().as_millis() as i64;
+        let (cost, source) = cost_usd(&state.price_table, &bname, &bmodel, usage, upstream_cost);
         state
             .metrics
             .add_tokens(&ident, "prompt", usage.prompt_tokens);
@@ -560,6 +695,7 @@ fn finalize_closure(
             .metrics
             .add_tokens(&ident, "completion", usage.completion_tokens);
         state.metrics.add_cost(&ident, source.as_str(), cost);
+        state.metrics.observe_duration(duration_ms);
         crate::budget::record_spend(&state.db, &identity, usage.total() as i64, cost);
         let row = ProxyRequestRow {
             ts_ms: now_ms(),
@@ -568,7 +704,7 @@ fn finalize_closure(
             virtual_key: identity.virtual_key.clone(),
             agent: identity.agent(),
             worktree: identity.worktree(),
-            workspace: None,
+            workspace: identity.workspace_label(),
             client_model: format!("model-proxy/{route_name}"),
             backend: bname.clone(),
             backend_model: bmodel.clone(),
@@ -578,6 +714,8 @@ fn finalize_closure(
             cost_source: source.as_str().to_string(),
             outcome: "ok_stream".to_string(),
             error_code: None,
+            duration_ms,
+            ttfb_ms: Some(ttfb_ms),
         };
         if let Ok(db) = state.db.lock() {
             let _ = db.put_proxy_request(&row);
@@ -605,10 +743,11 @@ fn synthesize_anthropic_sse(completion: &[u8], client_model: &str, input_est: u6
     out
 }
 
-/// Applies the per-backend body transforms (min max_tokens, injected defaults,
-/// in-flight tool-output compression) and re-serializes. Returns the dispatch
-/// body and the number of characters token-reduction removed (0 when disabled).
-/// Falls back to the original bytes on any parse failure.
+/// Applies the per-backend body transforms (model rewrite, min max_tokens,
+/// injected defaults, in-flight tool-output compression) and re-serializes.
+/// Returns the dispatch body and the number of characters token-reduction
+/// removed (0 when disabled). Falls back to the original bytes on any parse
+/// failure.
 fn apply_transforms(
     backend: &Backend,
     compression: &transform::CompressPolicy,
@@ -617,6 +756,11 @@ fn apply_transforms(
 ) -> (Vec<u8>, usize) {
     let mut body = parsed.clone();
     if body.is_object() {
+        // The client requested a proxy route id (`model-proxy/<route>`); the
+        // upstream must see this lane's real model.
+        if !backend.model.is_empty() {
+            body["model"] = Value::String(backend.model.clone());
+        }
         transform::ensure_max_tokens(&mut body);
         transform::apply_backend_defaults(&mut body, &backend.defaults);
         let saved = transform::compress_tool_messages(&mut body, compression);
@@ -629,8 +773,9 @@ fn apply_transforms(
     }
 }
 
-/// Extracts usage, computes cost, attributes spend, and writes the audit row for
-/// a served response.
+/// Extracts usage, computes cost (preferring an upstream cost header), attributes
+/// spend, and writes the audit row for a served response.
+#[allow(clippy::too_many_arguments)]
 fn finalize_success(
     state: &AppState,
     identity: &Identity,
@@ -638,6 +783,9 @@ fn finalize_success(
     route: &Route,
     backend: &Backend,
     body: &[u8],
+    upstream_cost: Option<f64>,
+    duration_ms: i64,
+    ttfb_ms: Option<i64>,
 ) {
     let usage = parse_usage(body);
     let (cost, source) = cost_usd(
@@ -645,7 +793,7 @@ fn finalize_success(
         &backend.name,
         &backend.model,
         usage,
-        None,
+        upstream_cost,
     );
     state
         .metrics
@@ -667,7 +815,7 @@ fn finalize_success(
         virtual_key: identity.virtual_key.clone(),
         agent: identity.agent(),
         worktree: identity.worktree(),
-        workspace: None,
+        workspace: identity.workspace_label(),
         client_model: format!("model-proxy/{}", route.name),
         backend: backend.name.clone(),
         backend_model: backend.model.clone(),
@@ -677,6 +825,8 @@ fn finalize_success(
         cost_source: source.as_str().to_string(),
         outcome: "ok".to_string(),
         error_code: None,
+        duration_ms,
+        ttfb_ms,
     };
     if let Ok(db) = state.db.lock() {
         let _ = db.put_proxy_request(&row);
@@ -684,7 +834,13 @@ fn finalize_success(
     state.set_resolved(&route.name, &backend.identity());
 }
 
-fn audit_failure(state: &AppState, identity: &Identity, protocol: &str, route: &Route) {
+fn audit_failure(
+    state: &AppState,
+    identity: &Identity,
+    protocol: &str,
+    route: &Route,
+    started: Instant,
+) {
     let row = ProxyRequestRow {
         ts_ms: now_ms(),
         protocol: protocol.to_string(),
@@ -692,10 +848,12 @@ fn audit_failure(state: &AppState, identity: &Identity, protocol: &str, route: &
         virtual_key: identity.virtual_key.clone(),
         agent: identity.agent(),
         worktree: identity.worktree(),
+        workspace: identity.workspace_label(),
         client_model: format!("model-proxy/{}", route.name),
         backend: "none".to_string(),
         outcome: "all_failed".to_string(),
         error_code: Some("503".to_string()),
+        duration_ms: started.elapsed().as_millis() as i64,
         ..Default::default()
     };
     if let Ok(db) = state.db.lock() {
@@ -906,5 +1064,75 @@ mod tests {
             None,
         );
         assert_eq!(ordered_priority(&route, 0, &prices()), vec![0, 1]);
+    }
+
+    #[test]
+    fn upstream_pin_leads_with_bound_provider() {
+        let route = route_with(vec![
+            lane("openrouter", "", None),
+            lane("nano-gpt", "#0", None),
+            lane("nano-gpt", "#1", None),
+        ]);
+        let id = Identity {
+            upstream: Some("nano-gpt".into()),
+            ..Identity::global()
+        };
+        let lanes = attempt_lanes(&route, &id, &prices());
+        // The bound provider's lanes lead (stable order preserved); the rest
+        // stay as failover.
+        assert_eq!(lanes[0].identity(), "nano-gpt#0");
+        assert_eq!(lanes[1].identity(), "nano-gpt#1");
+        assert_eq!(lanes[2].identity(), "openrouter");
+    }
+
+    #[test]
+    fn upstream_pin_matches_keyed_lane_base() {
+        // The binding names the provider base; a `#N`-keyed identity still pins.
+        let route = route_with(vec![lane("a", "", None), lane("p", "#3", None)]);
+        let id = Identity {
+            upstream: Some("p".into()),
+            ..Identity::global()
+        };
+        let lanes = attempt_lanes(&route, &id, &prices());
+        assert_eq!(lanes[0].identity(), "p#3");
+    }
+
+    #[test]
+    fn no_pin_keeps_strategy_order() {
+        let route = route_with(vec![lane("a", "", None), lane("b", "", None)]);
+        let lanes = attempt_lanes(&route, &Identity::global(), &prices());
+        assert_eq!(lanes[0].name, "a");
+        assert_eq!(lanes[1].name, "b");
+    }
+
+    #[test]
+    fn last_resort_unions_other_routes_and_dedups() {
+        let cfg = ProxyConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            routes: vec![
+                route_with(vec![lane("a", "", None)]),
+                Route {
+                    name: "fast".into(),
+                    priority: vec![lane("b", "", None), lane("a", "", None)],
+                    strategy: RoutingStrategy::Sequential,
+                    order_pool: None,
+                },
+                Route {
+                    name: "free".into(),
+                    priority: vec![lane("c", "", None), lane("b", "", None)],
+                    strategy: RoutingStrategy::Sequential,
+                    order_pool: None,
+                },
+            ],
+            relay: crate::relay::RelayConfig::default(),
+            compression: superzej_core::proxy::transform::CompressPolicy::off(),
+            aliases: Default::default(),
+            last_resort: true,
+        };
+        // "a" was already tried on the primary route → only b and c, deduped.
+        let tried: HashSet<String> = ["a".to_string()].into();
+        let lanes = last_resort_lanes(&cfg, "standard", &tried);
+        let names: Vec<&str> = lanes.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["b", "c"]);
     }
 }

@@ -2438,9 +2438,14 @@ routing = "sequential"
 # On a budget-cap breach: refuse the request (true) or downgrade to a cheaper
 # tier (false). The kill-switch always refuses regardless of this setting.
 refuse_on_breach = true
-# Path to the proxy's routes document (JSON: { "routes": [ { "name", "backends":
-# [ { "name", "base_url", "model", "api_key_env", "anthropic", "rpm", "burst",
-# "context_limit", "defaults" } ] } ] }). Passed to szproxy as SZPROXY_CONFIG.
+# Path to the proxy's routes document (JSON: { "routes": [ { "name", "strategy",
+# "backends": [ { "name", "base_url", "model", "api_key_env" (or multi-key
+# "api_key_envs" + "key_strategy" roundrobin|failover|random|weighted +
+# "key_weights"), "anthropic", "rpm", "burst", "inflight_cap", "context_limit",
+# "defaults" } ] } ], "aliases": { "<client-model-id>": "<route>" },
+# "last_resort": false }). `aliases` maps extra client model ids onto routes
+# (U 281); `last_resort` lets a fully-failed route borrow every OTHER route's
+# backends as a final tier. Passed to szproxy as SZPROXY_CONFIG.
 config_path = ""
 # Streaming tunables (seconds). first_byte_timeout: wait for a backend's first
 # usable token before falling through; idle_timeout: kill a stream gone silent
@@ -2480,6 +2485,12 @@ route_agent = false
 route_claude = false
 agent_api = "anthropic-messages"
 agent_model = "model-proxy/standard"
+# Pin this scope's model traffic to one upstream provider's lanes (scoped
+# accounts, V 287). Layered like every key, so a WORKSPACE overlay can bind its
+# worktrees to a dedicated account: minted per-worktree virtual keys carry the
+# binding and the proxy leads with that provider (other lanes stay as failover).
+# The value is the provider `name` from the routes document. Empty = no pinning.
+upstream = ""
 # "The bouncer" (opt-in). When true, a launched agent runs inside its sealed
 # `[sandbox] agent_profile` container and its built-in bash/read/edit/write tools
 # are routed back through superzej over a bind-mounted unix-socket ACP channel.

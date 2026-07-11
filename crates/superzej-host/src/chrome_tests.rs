@@ -629,14 +629,17 @@ fn statusbar_disk_badge_trips_on_low_free_space() {
         draw_statusbar(&mut s, chrome.statusbar, &model);
         s.screen_chars_to_string()
     };
+    // The chip glyph is configurable (`[stats] disk_icon`); assert on the
+    // resolved default rather than a hard-coded codepoint.
+    let icon = superzej_core::config::StatsConfig::default().disk_icon;
     // Ample free → silent (clean is quiet).
-    assert!(!mk(Some(72)).contains('\u{26c1}'), "silent when ample free");
-    // At/below the warn line → the ⛁ chip appears.
-    assert!(mk(Some(12)).contains('\u{26c1}'), "trips at low free");
+    assert!(!mk(Some(72)).contains(&icon), "silent when ample free");
+    // At/below the warn line → the disk chip appears.
+    assert!(mk(Some(12)).contains(&icon), "trips at low free");
     // Critically low → still shows (color asserted elsewhere).
-    assert!(mk(Some(3)).contains('\u{26c1}'), "trips at critical free");
+    assert!(mk(Some(3)).contains(&icon), "trips at critical free");
     // Not yet sampled → silent.
-    assert!(!mk(None).contains('\u{26c1}'), "silent until sampled");
+    assert!(!mk(None).contains(&icon), "silent until sampled");
 }
 
 #[test]

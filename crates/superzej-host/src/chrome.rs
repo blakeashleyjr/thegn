@@ -1840,7 +1840,7 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
     } else {
         let hint_h = sidebar_hint_rows().len() + 1; // rule/title + one row per tip
         // Require a one-row gap between the last row and the footer.
-        (bottom.saturating_sub(y) >= hint_h + 1).then_some(Rect {
+        (bottom.saturating_sub(y) > hint_h).then_some(Rect {
             x: rect.x,
             y: bottom - hint_h,
             cols: rect.cols,
@@ -1986,13 +1986,9 @@ fn draw_sidebar_hints(surface: &mut Surface, rect: Rect) {
         .map(|(c, _)| c.chars().count())
         .max()
         .unwrap_or(0);
-    let mut y = rect.y + 1;
     let max_y = rect.y + rect.rows;
     let right = rect.x + rect.cols;
-    for (chord, label) in tips {
-        if y >= max_y {
-            break;
-        }
+    for (y, (chord, label)) in (rect.y + 1..max_y).zip(tips) {
         draw_text(
             surface,
             rect.x + 1,
@@ -2014,7 +2010,6 @@ fn draw_sidebar_hints(surface: &mut Surface, rect: Rect) {
                 right - lx,
             );
         }
-        y += 1;
     }
 }
 

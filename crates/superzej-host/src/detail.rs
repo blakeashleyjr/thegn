@@ -115,7 +115,9 @@ impl DetailAction {
 /// `crate::detail::{apply_ci_detail, CiDetailPayload}`.
 mod ci_drill;
 pub use ci_drill::{CiDetailPayload, apply_ci_detail};
+mod proxy_dash;
 use ci_drill::{ci_fmt_secs, ci_glyph_marker, ci_state_word};
+pub use proxy_dash::{ProxyDashPayload, apply_proxy_dash, proxy_dash_loading};
 
 /// One scrollable list row: a colored marker glyph, the body text, and an
 /// optional dim right-aligned note (relative time, count, …). Rows may carry an
@@ -2313,7 +2315,7 @@ fn unified_detail(model: &FrameModel) -> Option<DetailOverlay> {
         .filter(|n| {
             n.source_ref != "log:szhost"
                 && n.kind.default_priority() == Priority::Alert
-                && !(!n.worktree_path.is_empty() && needs_paths.contains(&n.worktree_path))
+                && (n.worktree_path.is_empty() || !needs_paths.contains(&n.worktree_path))
         })
         .map(notification_row)
         .collect();

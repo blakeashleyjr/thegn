@@ -11,10 +11,12 @@ use crate::shared::now_unix;
 /// Anthropic API version pinned for the `/v1/messages` surface.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// A normalized backend reply in OpenAI shape.
+/// A normalized backend reply in OpenAI shape. `headers` carries the upstream
+/// response headers for cost / Retry-After extraction (see [`crate::headers`]).
 pub struct BackendResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    pub headers: reqwest::header::HeaderMap,
 }
 
 /// Issues a non-streaming request to a backend and returns the response as
@@ -50,10 +52,12 @@ async fn call_openai(
         .await
         .with_context(|| format!("POST {url}"))?;
     let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
     let bytes = resp.bytes().await.context("read upstream body")?;
     Ok(BackendResponse {
         status,
         body: bytes.to_vec(),
+        headers,
     })
 }
 
@@ -78,12 +82,14 @@ async fn call_anthropic(
         .await
         .with_context(|| format!("POST {url}"))?;
     let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
     let raw = resp.bytes().await.context("read anthropic body")?;
     if !(200..300).contains(&status) {
         // Pass the upstream error through unchanged so the router can classify it.
         return Ok(BackendResponse {
             status,
             body: raw.to_vec(),
+            headers,
         });
     }
     let openai = bridge::anthropic_to_openai_completion(&raw, &backend.model, now_unix())
@@ -91,6 +97,7 @@ async fn call_anthropic(
     Ok(BackendResponse {
         status,
         body: serde_json::to_vec(&openai)?,
+        headers,
     })
 }
 
