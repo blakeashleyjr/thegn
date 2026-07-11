@@ -2607,10 +2607,15 @@ persist = false                 # mirror rings to $XDG_STATE_HOME/superzej/repla
 # make every media-* keybind inert — zero idle cost.
 [media]
 enabled = true
-backend = "auto"            # auto | none | mpris | mpv | smtc | applescript | jellyfin
-# Preferred players (MPRIS bus-name tails) when several are running at once; the
-# first match wins. Empty = pick whatever is actively playing, else the first.
-players_priority = []        # e.g. ["spotify", "mpv"]
+# auto | none | mpris | mpv | mpd | smtc | applescript | jellyfin
+# "auto" composes EVERY source reachable on this OS and shows whatever is actually
+# playing — on Linux that's MPRIS (browsers/Spotify/VLC/mpv-with-mpv-mpris) + native
+# MPD (mpd/mpc/rmpc/ncmpcpp, no mpd-mpris bridge needed) + a live mpv IPC socket, all
+# at once. Windows uses SMTC (every app), macOS the MediaRemote adapter → AppleScript.
+backend = "auto"
+# Preferred players (name tails) when several are playing at once; the first match
+# wins across all sources. Empty = pick whatever is actively playing, else the first.
+players_priority = []        # e.g. ["mpd", "spotify", "mpv"]
 # Reserved single "media key" action (each transport op already has its own
 # bindable action id: media-play-pause, media-next, …).
 default_action = "play_pause"  # play_pause | next | previous | volume_up | volume_down
@@ -2625,10 +2630,16 @@ seek_step_video_secs = 30
 show_art = true
 # Open the Now-Playing overlay when the statusbar media badge is clicked.
 overlay_on_badge_click = true
-# Fallback poll cadence (seconds) for backends WITHOUT a push stream (mpv IPC /
-# playerctl). The native MPRIS path uses D-Bus PropertiesChanged signals
-# instead, so this never fires for it (the ~0%-idle contract holds).
+# Fallback poll cadence (seconds) for backends WITHOUT a push stream (a live mpv
+# IPC socket / playerctl). Native MPRIS (D-Bus signals), native MPD (`idle`),
+# SMTC session events, and the MediaRemote `stream` are all push, so this never
+# fires for them (the ~0%-idle contract holds).
 poll_interval_secs = 3
 
-# [media.mpv]   # backend = "mpv": launch mpv with --input-ipc-server=<socket>
-# socket = "/tmp/mpvsocket"
+# [media.mpv]   # backend = "mpv" (or auto, when the socket exists): launch mpv
+# socket = "/tmp/mpvsocket"    # with --input-ipc-server=<socket>
+
+# [media.mpd]   # native MPD — picks up mpd/mpc/rmpc/ncmpcpp with no mpd-mpris bridge.
+# socket = "127.0.0.1:6600"    # host:port, or an absolute path to MPD's unix socket.
+                               # $MPD_HOST / $MPD_PORT override when left at default.
+# password = "hunter2"         # only if your MPD requires one

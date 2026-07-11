@@ -639,6 +639,23 @@ fn media_config_defaults_and_enums() {
         MediaBackendKind::AppleScript
     );
 
+    // Native MPD backend: alias parses, config exposes a default endpoint, and
+    // resolve_opts lowers the backend + endpoint into the leaf's ResolveOpts.
+    assert_eq!(
+        MediaBackendKind::from_str_validated("mpc").unwrap(),
+        MediaBackendKind::Mpd
+    );
+    assert_eq!(m.mpd.socket, "127.0.0.1:6600");
+    assert!(m.mpd.password.is_none());
+    let mut mpd_cfg = MediaConfig::default();
+    mpd_cfg.backend = MediaBackendKind::Mpd;
+    mpd_cfg.mpd.socket = "music.lan:6601".into();
+    mpd_cfg.mpd.password = Some("hunter2".into());
+    let opts = mpd_cfg.resolve_opts();
+    assert_eq!(opts.backend, superzej_media::BackendKind::Mpd);
+    assert_eq!(opts.mpd_socket, "music.lan:6601");
+    assert_eq!(opts.mpd_password.as_deref(), Some("hunter2"));
+
     // Default Config keeps media enabled and round-trips through TOML.
     assert!(Config::default().media.enabled);
     let toml = toml::to_string(&MediaConfig::default()).unwrap();
