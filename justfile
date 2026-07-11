@@ -339,7 +339,7 @@ coverage-html:
 lint: _apps
     @for t in shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
     cargo clippy --workspace --all-targets -- -D warnings
-    shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/file-size-ratchet.sh test/git-hooks/post-checkout.sh test/git-hooks/heal-worktree.sh
+    shellcheck -x install.sh test/smoke.sh test/brand-guard.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/file-size-ratchet.sh test/git-hooks/post-checkout.sh test/git-hooks/heal-worktree.sh
     yamllint .
     taplo lint
     # Guardrail: all git must route through util::git_cmd / GitLoc so GIT_ENV_VARS
@@ -350,6 +350,9 @@ lint: _apps
     # Guardrail: god-file ratchet — legacy oversized files may only shrink, new
     # files are hard-capped at 3000 lines. See test/file-size-ratchet.sh.
     bash test/file-size-ratchet.sh
+    # Guardrail: pre-rename brand tokens must not come back — this is thegn.
+    # Token list + allowlist live in the script. See test/brand-guard.sh.
+    bash test/brand-guard.sh
 
 # Repair a wedged checkout: strip a stray `core.worktree` that an external
 # worktree tool (herdr) or a GIT_*-exporting child leaked into the shared
