@@ -27,7 +27,7 @@ start_plan="$(just --dry-run start-term dev 2>&1)"
   exit 1
 }
 # (The pre-rename check that the plan does not launch the LEGACY zellij-wrapper
-# binary is gone: the legacy binary's name (`superzej`) no longer exists as a
+# binary is gone: the legacy binary's pre-rename name no longer exists as a
 # distinct spelling after the thegn rename, so the check had become a literal
 # contradiction of the native-binary assertion above.)
 [[ $start_plan != *'THEGN_ZELLIJ_BIN'* ]] || {

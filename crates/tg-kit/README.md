@@ -30,7 +30,7 @@ it**, never a direct `ratatui` dep at a different version. The shared
 repos consume it as a git dependency on the thegn repo, pinned by tag:
 
 ```toml
-tg-kit = { git = "ssh://git@github.com/blakeashleyjr/superzej.git", package = "tg-kit", tag = "tg-kit-v0.1.0" }
+tg-kit = { git = "ssh://git@github.com/blakeashleyjr/thegn.git", package = "tg-kit", tag = "tg-kit-v0.1.0" }
 ```
 
 (thegn is private, so the ssh URL is used — cargo resolves it via the git
@@ -40,7 +40,7 @@ When building thegn itself, the workspace `[patch]` redirects that git dep
 back to the in-tree path, so one version compiles everywhere:
 
 ```toml
-[patch."ssh://git@github.com/blakeashleyjr/superzej.git"]
+[patch."ssh://git@github.com/blakeashleyjr/thegn.git"]
 tg-kit = { path = "crates/tg-kit" }
 ```
 

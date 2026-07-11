@@ -7,7 +7,7 @@
 #   GH_PAT=<admin PAT> bash scripts/ci/ageless-runner-uninstall.sh
 set -euo pipefail
 
-GH_REPO="${GH_REPO:-blakeashleyjr/superzej}"
+GH_REPO="${GH_REPO:-blakeashleyjr/thegn}"
 RUNNER_USER="${RUNNER_USER:-targe}"
 RUNNER_COUNT="${RUNNER_COUNT:-4}"
 RUNNER_BASE="${RUNNER_BASE:-/home/$RUNNER_USER/actions-runners}"
