@@ -4,6 +4,8 @@
 //! prewarm-vs-materialize arbitration that keeps a pre-warm from attaching a
 //! pane to a half-provisioned sandbox.
 
+pub mod plan;
+
 use crate::chrome::LoadStep;
 
 /// The startup-shell watchdog deadline: how long a just-attached login shell may
@@ -51,21 +53,21 @@ pub(crate) fn is_shell_wait(steps: &[LoadStep]) -> bool {
 /// splash's [`LoadStep`]s for a live "setting up your environment" loading screen.
 pub(crate) fn provision_load_steps(views: &[crate::agent::ProvisionStepView]) -> Vec<LoadStep> {
     use crate::agent::ProvisionState;
-    views
-        .iter()
-        .map(|v| {
-            let step = match v.state {
-                ProvisionState::Pending => LoadStep::pending(v.label.clone()),
-                ProvisionState::Active => LoadStep::active(v.label.clone()),
-                ProvisionState::Done => LoadStep::done(v.label.clone()),
-                ProvisionState::Failed => LoadStep::failed(v.label.clone()),
-            };
-            match &v.detail {
-                Some(d) => step.with_detail(d.clone()),
-                None => step,
-            }
-        })
-        .collect()
+    use crate::chrome::StepState;
+    let mut plan = plan::LoadPlan::new();
+    for v in views {
+        let state = match v.state {
+            ProvisionState::Pending => StepState::Pending,
+            ProvisionState::Active => StepState::Active,
+            ProvisionState::Done => StepState::Done,
+            ProvisionState::Failed => StepState::Failed,
+        };
+        plan = match &v.detail {
+            Some(d) => plan.step_detail(v.label.clone(), state, d.clone()),
+            None => plan.step(v.label.clone(), state),
+        };
+    }
+    plan.into_steps()
 }
 
 /// Whether the materialize path may seed its `[sandbox, container, shell]`
