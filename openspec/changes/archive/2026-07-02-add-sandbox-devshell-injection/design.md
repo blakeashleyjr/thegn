@@ -1,13 +1,13 @@
 # Design
 
-## Resolver (superzej-core, new `devenv.rs`)
+## Resolver (thegn-core, new `devenv.rs`)
 
 A substrate-agnostic resolver with one job: repo path → map of exported env vars.
 
 - Run `nix print-dev-env --json` **on the host** for the repo root; extract the
   `exported` variables (primarily `PATH`, plus shellHook exports like
-  `SUPERZEJ_YAZI_BIN`). JSON avoids fragile shell parsing.
-- Cache at `$XDG_STATE_HOME/superzej/devenv/<hash>.json`, `<hash>` = content hash
+  `THEGN_YAZI_BIN`). JSON avoids fragile shell parsing.
+- Cache at `$XDG_STATE_HOME/thegn/devenv/<hash>.json`, `<hash>` = content hash
   of `flake.lock` + `flake.nix`; any flake change invalidates.
 - Degrade silently: no `nix`, no `devShell`, or non-zero → return `None`, log info.
 

@@ -3,10 +3,10 @@ case_tmp_env: XDG_STATE_HOME
 matrix:
   profiles: [xterm, vt220]
   sizes: ["100x30"]
-spawn: ["szhost"]
+spawn: ["thegn"]
 env:
   XDG_STATE_HOME: "{case_tmp}"
-  SUPERZEJ_LOG: warn
+  THEGN_LOG: warn
   MUSE_READY: "1"
   TERM: xterm-256color
 sync:
@@ -20,7 +20,7 @@ snapshot_defaults:
     - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
 steps:
   - begin_step: "startup"
-  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 8000}
   # Exit the dashboard tile to access the Work tab.
   - key: {key: q}
   - sleep_ms: 200
@@ -64,23 +64,23 @@ steps:
   - snapshot: {name: after_panel_escape_from_nav}
   - key: {key: p, mods: [ctrl, alt]}
   - sleep_ms: 80
-  # ── Ctrl+C must not quit szhost (only the active process) ────────────────────
-  - begin_step: "ctrl-c stays in szhost"
+  # ── Ctrl+C must not quit thegn (only the active process) ────────────────────
+  - begin_step: "ctrl-c stays in thegn"
   - key: {key: c, mods: [ctrl]}
   - sleep_ms: 100
   - snapshot: {name: after_ctrl_c}
-  # szhost must still be running
-  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 2000}
+  # thegn must still be running
+  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 2000}
   # ── Ctrl+Q must trigger quit confirm (not instant quit) ───────────────────────
   - begin_step: "ctrl-q requires confirm"
   # We don't actually quit here — just check it doesn't hard-exit without confirm
   # (This test is tricky — if it DID hard-exit, the expect_visible below would fail)
   # We skip sending Ctrl+Q here since 16-quit.yaml covers the full quit flow.
-  # Instead test that pressing Ctrl+\ (SIGQUIT) does not crash szhost.
+  # Instead test that pressing Ctrl+\ (SIGQUIT) does not crash thegn.
   - key: {key: "\\", mods: [ctrl]}
   - sleep_ms: 100
   - snapshot: {name: after_ctrl_backslash}
-  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 2000}
+  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 2000}
   # ── F-key passthrough: F1–F12 should reach the active pane ──────────────────
   - begin_step: "f-key passthrough"
   - key: {key: f1}
@@ -101,5 +101,5 @@ steps:
   - sleep_ms: 80
   - begin_step: "verify no errors"
   - check_file:
-      path: "{case_tmp}/superzej/logs/szhost.log"
+      path: "{case_tmp}/thegn/logs/thegn.log"
       reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

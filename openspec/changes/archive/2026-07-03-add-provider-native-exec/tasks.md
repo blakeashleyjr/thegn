@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Provider seam (superzej-svc)
+## 1. Provider seam (thegn-svc)
 
 - [x] 1.1 `ExecSpec`/`ExecFrame`/`ExecControl`/`ExecSession` (channel handle, no
       `dyn` async trait); `Provider::open_exec`/`attach_exec` match-dispatch;
@@ -50,7 +50,7 @@
 The resident bridge intercepts every control-plane op at the `git::run`/`run_w`
 seam once registered; the bridge agent is now started over native exec.
 
-- [x] 6.1 `connect_native` in `bridge_sup.rs`: start `szhost bridge` via
+- [x] 6.1 `connect_native` in `bridge_sup.rs`: start `thegn bridge` via
       `provider.open_exec(tty=false)`; `connect_worktree_bridge` (`run.rs`) prefers
       it for an exec_api provider (`exec != cli`), else the CLI `bridge_command`.
 - [x] 6.2 `ExecSession`→`Read`/`Write` adapter (`FramesReader`/`ControlWriter`,
@@ -59,7 +59,7 @@ seam once registered; the bridge agent is now started over native exec.
 - [x] 6.3 `provision_provider_repo` routes the clone through the bridge when up,
       else the CLI fallback.
 - [ ] 6.4 Live-verify on a real sprite with a musl bridge binary
-      (`nix build .#szhost-musl`, `SUPERZEJ_BRIDGE_BINARY`).
+      (`nix build .#thegn-musl`, `THEGN_BRIDGE_BINARY`).
 
 ## 8. Polish (Phase D) — LANDED
 
@@ -70,8 +70,8 @@ seam once registered; the bridge agent is now started over native exec.
 - [x] 8.2 Bounded mid-session reconnect: `relay_session` returns a `SessionEnd`;
       `relay_exec` reattaches via `attach_exec` on a transient drop (replays
       scrollback), capped at `MAX_DEAD_RECONNECTS` no-progress attempts.
-- [x] 8.3 Trace span on the relay task (`szhost::frame` / `native_pane`) for the
-      live pass. (Full `szhost::perf` wake-source attribution deferred.)
+- [x] 8.3 Trace span on the relay task (`thegn::frame` / `native_pane`) for the
+      live pass. (Full `thegn::perf` wake-source attribution deferred.)
 
 ## 7. Out of scope — agent pane in a provider env
 

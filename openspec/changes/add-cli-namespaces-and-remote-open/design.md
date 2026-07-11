@@ -17,7 +17,7 @@ byte-identical between the two spellings.
 `add_checked` (serial git-mutation lock, `.git/info/exclude`) → `put_worktree`
 (+ best-effort `set_worktree_env`). Sandbox prep and direnv warm are skipped —
 the compositor prepares lazily on first open. Plain output is the absolute path
-only, so `cd $(szhost wt new x)` works.
+only, so `cd $(thegn wt new x)` works.
 
 `wt rm` mirrors `delete_groups`: env-precedence teardown run **synchronously**
 (a CLI exiting would orphan the detached thread the TUI uses), then
@@ -36,7 +36,7 @@ DBs stamped by parallel branches — and the run-loop model drain applies the
 **last** `focus_workspace` intent via the existing `switch_workspace`. Pickup
 latency is the model-refresh tick (~1s), same as notifications.
 
-Live-instance detection: the per-profile flock (`<root>/run/szhost.lock`) is
+Live-instance detection: the per-profile flock (`<root>/run/thegn.lock`) is
 currently a no-op for the default profile. `acquire_singleton` now always takes
 the lock, but default-profile contention still returns `Acquired` silently —
 observably identical (the lock was advisory-warn only; nested dev instances

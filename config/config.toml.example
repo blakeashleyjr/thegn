@@ -1,12 +1,12 @@
-# superzej config — copy to ~/.config/superzej/config.toml and edit.
+# thegn config — copy to ~/.config/thegn/config.toml and edit.
 # All keys are optional (sane defaults apply). Home-manager users get this
-# generated automatically from programs.superzej.
+# generated automatically from programs.thegn.
 
 # Where worktrees live (grouped per repo) and where remote URLs are cloned.
-worktrees_dir = "~/.superzej/worktrees"
+worktrees_dir = "~/.thegn/worktrees"
 workspaces_dir = "~/code"
 
-# Roots scanned by the workspace repo picker (new-workspace / bare `sj`).
+# Roots scanned by the workspace repo picker (new-workspace / bare `thegn`).
 # Defaults to [workspaces_dir] if omitted.
 repo_roots = ["~/code", "~/src"]
 repo_scan_depth = 5
@@ -14,7 +14,7 @@ repo_scan_depth = 5
 # Base ref for new worktrees: "auto" = current branch, else the repo default.
 base_branch = "auto"
 window_margin = 0
-branch_prefix = "sz/"
+branch_prefix = "tg/"
 
 # Picker UI: "auto" | "gum" | "fzf" | "select"
 picker = "auto"
@@ -31,12 +31,12 @@ auto_remove_worktree = false
 confirm_delete = true
 
 # ── Overriding any setting at runtime ─────────────────────────────────────────
-# Precedence (low → high): built-in defaults < this file < SUPERZEJ_* env vars
-#   < CLI flags. Override any key for one run with SUPERZEJ_<SECTION>_<KEY>, e.g.
-#     SUPERZEJ_PICKER=fzf        SUPERZEJ_SANDBOX_BACKEND=docker
-#     SUPERZEJ_LOG_LEVEL=debug   SUPERZEJ_PR_TTL=10
-# `superzej config show` prints the effective merged config; `superzej config
-# get <dotted.key>` prints one value; `superzej config validate` checks it.
+# Precedence (low → high): built-in defaults < this file < THEGN_* env vars
+#   < CLI flags. Override any key for one run with THEGN_<SECTION>_<KEY>, e.g.
+#     THEGN_PICKER=fzf        THEGN_SANDBOX_BACKEND=docker
+#     THEGN_LOG_LEVEL=debug   THEGN_PR_TTL=10
+# `thegn config show` prints the effective merged config; `thegn config
+# get <dotted.key>` prints one value; `thegn config validate` checks it.
 
 [ui]
 # UI language: a BCP-47 code (e.g. "en-US", "ja-JP") or "auto" to detect.
@@ -60,7 +60,7 @@ dismiss_overlay_on_click_outside = true
 # manual/name/recent/attention; attention — most-urgent-first — is the default).
 sidebar_workspace_sort = "manual"
 
-# Visual tuning. The focus accent recolors every superzej surface (plugins,
+# Visual tuning. The focus accent recolors every thegn surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused
 # pane's border ring, the active tab chip, the active worktree row, and the
 # focused chrome edge. Unfocused frames use `colors.border`.
@@ -80,13 +80,13 @@ undercurl = "auto"
 # Color fidelity. "auto" sniffs the terminal (COLORTERM / $TERM / WT_SESSION /
 # NO_COLOR) and degrades truecolor -> 256 -> 16 -> mono as needed; pin a level
 # with "truecolor", "256", "16", or "none"/"mono". The NO_COLOR env var forces
-# "none" unless you set an explicit value here. (env: SUPERZEJ_THEME_COLOR)
+# "none" unless you set an explicit value here. (env: THEGN_THEME_COLOR)
 color = "auto"
 # Glyph fidelity for chrome (box drawing, status dots, arrows, the logotype).
 # "auto" sniffs the locale (UTF-8?) and terminal; "unicode" forces the rounded
 # Unicode look; "ascii" forces 7-bit fallbacks (+ - | * o ^ v) for bare
-# terminals / fonts without box-drawing glyphs. Run `superzej doctor` to see
-# what your terminal resolves to. (env: SUPERZEJ_THEME_GLYPHS)
+# terminals / fonts without box-drawing glyphs. Run `thegn doctor` to see
+# what your terminal resolves to. (env: THEGN_THEME_GLYPHS)
 glyphs = "auto"
 # Marker style for the per-worktree agent indicator in the sidebar tree.
 # "letter" (default) uses universal 1-2 letter marks (C=claude, Cx=codex,
@@ -95,7 +95,7 @@ glyphs = "auto"
 # Nerd-Font / rich terminals, degrading to letters on ASCII-only terminals;
 # "auto" uses symbols only on a confirmed-modern emulator. The focused sidebar
 # row spells the agent's name out beside its glyph either way.
-# (env: SUPERZEJ_THEME_AGENT_GLYPHS)
+# (env: THEGN_THEME_AGENT_GLYPHS)
 agent_glyphs = "letter"
 
 # Optional: override any chrome surface/text color (all "#rrggbb"; unset keys
@@ -141,7 +141,7 @@ gpu = "nvtop"    # GPU monitor
 
 # The customizable widget bars framing the workspace. Each slot is an ordered
 # list of widget ids; unknown ids are skipped. Top-bar widgets: "brand"
-# (superzej + version), "cpu", "mem", "disk" (free space on the worktrees' fs,
+# (thegn + version), "cpu", "mem", "disk" (free space on the worktrees' fs,
 # color-coded; see [stats]), "gpu" (NVIDIA only; hidden if absent), "net",
 # "date", "clock". Bottom-bar widgets: "keyhints" (context-dependent keybinds
 # for the focused zone), "pr" (forge + PR number, state-colored), "tests"
@@ -185,11 +185,11 @@ disk_free_critical = 5          # disk widget turns red at/below this free %
 # disk_path = "~/projects"      # fs the disk widget measures; "" = worktrees_dir's fs
 refresh_rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
 
-# Prometheus scrape targets for the sidebar METRICS section. superzej scrapes
+# Prometheus scrape targets for the sidebar METRICS section. thegn scrapes
 # each /metrics endpoint directly; no Prometheus server is required. Values are
 # filtered by the allowlist below before reaching the UI.
 [metrics]
-interval_secs = 5        # Scrape interval in seconds (SUPERZEJ_METRICS_INTERVAL_SECS)
+interval_secs = 5        # Scrape interval in seconds (THEGN_METRICS_INTERVAL_SECS)
 timeout_ms = 500         # Request timeout in milliseconds
 max_body_bytes = 1048576 # Max response size (1 MiB)
 # (kebab-case spellings — interval-secs, timeout-ms, max-body-bytes — are
@@ -212,15 +212,15 @@ max_body_bytes = 1048576 # Max response size (1 MiB)
 [drawer]
 # File manager to run. Empty = the bundled, pinned yazi.
 command = ""
-# yazi config dir (YAZI_CONFIG_HOME). Empty = a private ~/.superzej/yazi, seeded
-# with superzej's bundled config and recolored to match [theme] accent. Use
+# yazi config dir (YAZI_CONFIG_HOME). Empty = a private ~/.thegn/yazi, seeded
+# with thegn's bundled config and recolored to match [theme] accent. Use
 # "system" to point at your own ~/.config/yazi instead, or give an explicit path.
 config_home = ""
 # Drawer geometry. height: "35%" or a row count. width: "full" | "center".
 height = "35%"
 width = "full"
 # Image previews are off by default in the bundled/private yazi config. Text/code
-# previews remain on. With config_home = "system", superzej does not rewrite your
+# previews remain on. With config_home = "system", thegn does not rewrite your
 # yazi config, so containment below is still the safety net.
 image_previews = false
 # Show git status as a linemode in the drawer (added/modified/deleted/etc.).
@@ -243,7 +243,7 @@ prewarm = true
 
 # GitHub PR data feeding the right panel.
 [pr]
-ttl_secs = 30          # cache TTL before a live `gh` re-fetch (SUPERZEJ_PR_TTL)
+ttl_secs = 30          # cache TTL before a live `gh` re-fetch (THEGN_PR_TTL)
 
 # Issue-tracker integration — surfaces assigned issues in the Work tab's `issues`
 # section. Multiple trackers aggregate into one list, so you can run, say, Linear
@@ -277,7 +277,7 @@ move_on_merge = false        # when a worktree's PR merges, move its linked issu
 # The "My Work" (Mine) panel is scoped to the ACTIVE worktree's repo by default:
 # GitHub issues/PRs are auto-filtered to the repo's `origin` remote, so no config
 # is needed. To scope Linear/Jira per repo, put an `[issues]` overlay in that
-# repo's root `.superzej.toml` — only the keys you set override the global config:
+# repo's root `.thegn.toml` — only the keys you set override the global config:
 #   [issues.linear]
 #   team_id = "TEAM-123"          # this repo's Linear team
 #   [issues.jira]
@@ -316,7 +316,7 @@ token = "env:ARGOCD_TOKEN"
 # "Observe" tab appears when [observe] enabled = true (below). Unknown ids ignored.
 # Valid ids: "work".
 [apps]
-default_tab = "work" # initial tab (SUPERZEJ_APPS_DEFAULT_TAB); "work" = your worktree
+default_tab = "work" # initial tab (THEGN_APPS_DEFAULT_TAB); "work" = your worktree
 tab_order = ["work"]
 
 # The embedded "Observe" observability app tab: a Grafana-style in-terminal
@@ -338,7 +338,7 @@ dashboard_path = ""           # "" = built-in host dashboard; else a dashboard T
 
 # The per-session daemon that pushes live diff/PR updates to the panel.
 [watch]
-pr_interval_secs = 20  # PR refresh cadence (SUPERZEJ_WATCH_PR_INTERVAL)
+pr_interval_secs = 20  # PR refresh cadence (THEGN_WATCH_PR_INTERVAL)
 
 # Git write-operation knobs for the panel's lazygit-style features
 # (line staging, interactive rebase, cherry-pick, bisect, undo, …).
@@ -349,8 +349,8 @@ override_gpg = false   # true => history rewrites pass -c commit.gpgSign=false
 merge_guard = true     # install a pre-merge-commit hook that refuses `git merge`
                        # in the canonical checkout from inside a sandbox (where
                        # its FS view can be incoherent and corrupt the merge);
-                       # points at `szhost integrate`. No-op outside a sandbox or
-                       # in linked worktrees. Escape hatch: SUPERZEJ_MERGE_GUARD_OFF=1
+                       # points at `thegn integrate`. No-op outside a sandbox or
+                       # in linked worktrees. Escape hatch: THEGN_MERGE_GUARD_OFF=1
 
 # User-defined git commands, surfaced in the git panel's custom-commands menu
 # (`x`). `command` is a template expanded against the current selection — see
@@ -371,21 +371,21 @@ merge_guard = true     # install a pre-merge-commit hook that refuses `git merge
 # prompts = [{ type = "input", title = "Confirm branch", key = "Branch" }]
 
 # Diagnostics. stderr is always on (level-gated, branded, colored on a TTY); the
-# file sink is opt-in. SUPERZEJ_LOG is a tracing-style filter that refines the
-# level per-module, e.g. SUPERZEJ_LOG=debug,superzej::db=trace
+# file sink is opt-in. THEGN_LOG is a tracing-style filter that refines the
+# level per-module, e.g. THEGN_LOG=debug,thegn::db=trace
 [log]
 level = "info"            # error | warn | info | debug | trace
 file = false              # mirror to a rotating file under `dir`
-dir = ""                  # "" => $XDG_STATE_HOME/superzej/logs
+dir = ""                  # "" => $XDG_STATE_HOME/thegn/logs
 rotation_size_mb = 5
 max_files = 5
 format = "text"           # text | json
 
 # ── Keybindings ───────────────────────────────────────────────────────────────
-# superzej owns its keybinds. Inspect with `superzej keys list`; check with
-# `superzej keys validate`.
+# thegn owns its keybinds. Inspect with `thegn keys list`; check with
+# `thegn keys validate`.
 #
-# By default, szhost has four modes: Normal, VimNormal, VimInsert, and Emacs.
+# By default, thegn has four modes: Normal, VimNormal, VimInsert, and Emacs.
 # - Normal: The classic `Ctrl` and `Alt` chorded UI.
 # - VimNormal: `h j k l` focus moves, `g g`/`G` scrolling, `i` to insert.
 #   Also features a `Space` leader layer (e.g. `Space p` for panel).
@@ -405,7 +405,7 @@ format = "text"           # text | json
 # `Alt x` is a smart "close this": the focused pane if the tab is split, else
 # the tab. `close-tab` / `close-pane` are explicit, rebindable, no default chord.
 #
-# Rebind a built-in by its id (see `superzej keys list` for ids).
+# Rebind a built-in by its id (see `thegn keys list` for ids).
 # Flat entries override chords globally.
 # IDE keymap preset overlaid on the built-in defaults: "default" (none),
 # "vscode", or "jetbrains". Maps familiar chords (Ctrl+P quick-open, Ctrl+Shift+P
@@ -472,7 +472,7 @@ format = "text"           # text | json
 # close_on_exit = true   # close the pane when the command exits
 
 # Composite actions invoke a built-in operation in-process (a shell `run`
-# cannot — superzej is a single session with no IPC). Supported `action`s:
+# cannot — thegn is a single session with no IPC). Supported `action`s:
 #
 #   new-worktree — create a worktree non-interactively (the Alt+w wizard,
 #     headless). params: `name` (a tail, or omit/"random" for an adjective-noun
@@ -524,7 +524,7 @@ format = "text"           # text | json
 # menu = true
 
 # Keybind profiles: a named layer selected by `profile = "<name>"` (or the
-# SUPERZEJ_PROFILE env var / --profile flag). Applied *under* [keybinds], so a
+# THEGN_PROFILE env var / --profile flag). Applied *under* [keybinds], so a
 # global rebind still wins. `default_mode` sets the host mode on launch. The
 # names `vim`/`emacs` also start in the matching mode without an explicit
 # default_mode. For the full keybinding cheatsheet, focus the panel and press 9.
@@ -535,17 +535,17 @@ format = "text"           # text | json
 # focus-down = "j"
 
 # ── Profiles: whole-process firewall (H) ────────────────────────────────────
-# `szhost --profile work` (or SUPERZEJ_PROFILE=work) runs a NAMED profile — a
+# `thegn --profile work` (or THEGN_PROFILE=work) runs a NAMED profile — a
 # whole-process work/personal firewall. A named profile reroots its own world
-# under ~/.superzej/profiles/<name>/: separate state DB + logs, its own worktrees
+# under ~/.thegn/profiles/<name>/: separate state DB + logs, its own worktrees
 # dir, and profile-scoped credentials (GIT_CONFIG_GLOBAL / GH_CONFIG_DIR /
 # GNUPGHOME under the profile, forge tokens dropped so they can't cross profiles;
 # GIT_SSH_COMMAND pinned with IdentitiesOnly=yes only when profiles/<name>/ssh/id
 # exists). The DEFAULT profile keeps today's shared paths untouched — no
 # migration. A named profile also loads an optional full-config overlay from the
-# REAL config home (never rerooted) at <XDG_CONFIG_HOME>/superzej/profiles/<name>/
+# REAL config home (never rerooted) at <XDG_CONFIG_HOME>/thegn/profiles/<name>/
 # config.toml, layered below env/`--set`. Switch/launch with Ctrl+Alt+g (spawns a
-# new terminal window running szhost --profile=<name>); one advisory window per
+# new terminal window running thegn --profile=<name>); one advisory window per
 # profile (a second is warned-about, not refused — profile DBs are WAL-safe).
 #
 # CAVEAT: the firewall is only as strong as the loosest sandbox setting —
@@ -553,7 +553,7 @@ format = "text"           # text | json
 # defeat credential isolation.
 
 # Per-workspace overrides, keyed by repo slug (the workspace tab prefix). Applied
-# above [keybinds] but below a repo-root `.superzej.{toml,yaml,json}` overlay,
+# above [keybinds] but below a repo-root `.thegn.{toml,yaml,json}` overlay,
 # which may also carry its own [keybinds] table — the most specific layer wins.
 # [workspace.my-repo.keybinds]
 # new-worktree = "Alt w"
@@ -580,7 +580,7 @@ format = "text"           # text | json
 # else its command's program basename — kinds dedup (e.g. a managed-pi "Agent" +
 # a "Vanilla Pi" → one `pi`). `[sandbox.home] agents = [...]` overrides this with an
 # explicit install list; only when NO `[[agents]]` are configured at all does
-# superzej fall back to detecting the host's agents.
+# thegn fall back to detecting the host's agents.
 #
 # `provider` (optional) tags an agent for client-side account switching
 # (CODEX_HOME / CLAUDE_CONFIG_DIR) AND fixes its provisioning kind. When omitted,
@@ -599,42 +599,42 @@ name = "aider"
 command = "aider --model sonnet"
 
 # The MANAGED pi coding agent, embedded over ACP (the upper control plane). pi runs
-# its own tools natively; superzej is ADDITIVE — it observes activity (the statusbar
+# its own tools natively; thegn is ADDITIVE — it observes activity (the statusbar
 # chip), routes pi's model through the proxy, and exposes its house tools
 # (budget / fleet / worktree status) to pi via MCP-over-ACP.
 #
-# superzej OWNS this pi under `~/.superzej/pi`: a pinned binary + a managed agent
-# dir (PI_CODING_AGENT_DIR) seeded with the superzej-acp extension package. Run
-# `szhost agent setup` once (superzej also self-heals it on launch when this entry
+# thegn OWNS this pi under `~/.thegn/pi`: a pinned binary + a managed agent
+# dir (PI_CODING_AGENT_DIR) seeded with the thegn-acp extension package. Run
+# `thegn agent setup` once (thegn also self-heals it on launch when this entry
 # is present). The command sets PI_CODING_AGENT_DIR and runs the pinned binary;
 # `$HOME` resolves per-context, so the SAME entry works on the host AND inside a
-# sprite (where the managed pi is provisioned to `<home>/.superzej/pi`). The
-# superzej-acp extension registers the proxy-routed model from the SUPERZEJ_PROXY_*
+# sprite (where the managed pi is provisioned to `<home>/.thegn/pi`). The
+# thegn-acp extension registers the proxy-routed model from the THEGN_PROXY_*
 # env when [llm_proxy].route_agent is on. (A "Vanilla Pi" entry that does NOT set
 # PI_CODING_AGENT_DIR — e.g. `command = "npx -y @earendil-works/pi-coding-agent"` —
 # stays unmanaged, using the default ~/.pi.)
 [[agents]]
 name = "Agent"
-command = 'PI_CODING_AGENT_DIR="$HOME/.superzej/pi/agent" exec "$HOME/.superzej/pi/node_modules/.bin/pi"'
+command = 'PI_CODING_AGENT_DIR="$HOME/.thegn/pi/agent" exec "$HOME/.thegn/pi/node_modules/.bin/pi"'
 provider = "pi"
 
 # ── Managed tools ([managed_tools.<name>]) ──────────────────────────────────
-# Per-tool overrides for superzej's managed-tool resolver (the pinned external
+# Per-tool overrides for thegn's managed-tool resolver (the pinned external
 # binaries it acquires: the pi agent, the `bs` debugger, MCP servers). The
 # resolver picks a binary in a fixed order — this override → the tool's name on
-# PATH → superzej's own pinned download under `~/.superzej`. Declare an override
+# PATH → thegn's own pinned download under `~/.thegn`. Declare an override
 # only to force a specific binary; omit the table to use PATH/managed. Inspect
-# resolution with `szhost doctor`.
+# resolution with `thegn doctor`.
 # [managed_tools.pi]
 # path = "/usr/local/bin/pi"      # explicit binary (highest-priority tier)
 # args = ["--flag"]               # optional extra launch arguments
 
 # ── MCP servers ([mcp_servers.<name>]) ──────────────────────────────────────
-# User-declared Model Context Protocol servers the agent consumes. `szhost agent
+# User-declared Model Context Protocol servers the agent consumes. `thegn agent
 # setup` merges these into the managed pi's settings (the de-facto `mcpServers`
-# key) alongside the built-in superzej-acp house tools. Inspect with `szhost mcp
-# list` / `szhost mcp emit`; install a server's binary (grant-checked) with
-# `szhost mcp install <name>`.
+# key) alongside the built-in thegn-acp house tools. Inspect with `thegn mcp
+# list` / `thegn mcp emit`; install a server's binary (grant-checked) with
+# `thegn mcp install <name>`.
 # [mcp_servers.git]
 # command = ["npx", "-y", "@modelcontextprotocol/server-git"]  # launch argv
 # args    = ["--repo", "."]                                     # extra args
@@ -664,7 +664,7 @@ command = "lazygit"
 name = "yazi"
 command = "yazi"
 
-# "editor" is special: with the default below, superzej resolves your editor
+# "editor" is special: with the default below, thegn resolves your editor
 # from $VISUAL/$EDITOR (falling back to vi). Graphical editors are detected by
 # name (code, cursor, zed, subl, gvim, …) and launched detached. Set an explicit
 # command here to override, e.g. command = "code ." or command = "hx .".
@@ -678,17 +678,17 @@ command = "git diff"
 
 # Coding-agent subscription accounts (client-side account switching, item 656).
 # Keep N logins per provider (e.g. personal + work) and pick which one a newly
-# launched agent uses. superzej points the agent's credential-home env var
+# launched agent uses. thegn points the agent's credential-home env var
 # (CODEX_HOME for codex, CLAUDE_CONFIG_DIR for claude) at the chosen account on
 # launch — your real ~/.codex / ~/.claude is never modified, and a switch only
 # affects agents started *after* it (running ones keep their account).
 #
 # Switch with Ctrl+Alt+a (or the "Switch agent account" palette entry). The
 # picker also has "Add <provider> account…", which runs the provider's login in
-# the focused pane against a fresh superzej-managed dir.
+# the focused pane against a fresh thegn-managed dir.
 #
-# Omit `dir` to let superzej manage the dir under
-# $XDG_STATE_HOME/superzej/accounts/<provider>/<name>/ (then log in via the
+# Omit `dir` to let thegn manage the dir under
+# $XDG_STATE_HOME/thegn/accounts/<provider>/<name>/ (then log in via the
 # picker); set `dir` to adopt an existing login dir.
 #
 # [[accounts]]
@@ -734,7 +734,7 @@ command = "git diff"
 # mode   = "symlink"                              # "symlink" | "template"
 #
 # Secret values never sit in this file in plaintext — reference them through a
-# resolver scheme and superzej runs the command at launch (off-loop, never
+# resolver scheme and thegn runs the command at launch (off-loop, never
 # persisted; a failure degrades to skipping the key):
 # [secrets.resolvers]
 # pass = "pass show {ref}"        # value "pass:work/anthropic" → runs `pass show work/anthropic`
@@ -753,7 +753,7 @@ command = "git diff"
 # between per-profile process firewalls ([profiles.*]) and per-workspace config.
 #
 # Split: POLICY lives here in config; MEMBERSHIP lives in the DB (assign with
-# `superzej zone assign <zone> [repo]`, never inferred from a filesystem path).
+# `thegn zone assign <zone> [repo]`, never inferred from a filesystem path).
 # A zone CLAMPS its members — it never widens: egress intersects down, blocks
 # union, sandbox hardening only rises, budget caps roll up. A zone-owned bundle
 # (`[bundle.<n>] zone = "..."`) is a credential sub-vault only its members compose.
@@ -774,18 +774,18 @@ command = "git diff"
 #                                                #   autoscaled hosts + spillover; separate
 #                                                #   from the model-spend caps above)
 #
-# Manage zones from the CLI: `superzej zone list|create <name>|rm <name> [--force]|
+# Manage zones from the CLI: `thegn zone list|create <name>|rm <name> [--force]|
 # assign <zone> [repo]`. Reassignment takes effect on the next worktree launch.
 
 # ── Repo overlay trust ──────────────────────────────────────────────────────
-# A repo-root `.superzej.{toml,yaml,yml,json}` is checked into a repository you
+# A repo-root `.thegn.{toml,yaml,yml,json}` is checked into a repository you
 # may have cloned, so its `[sandbox]` block is treated as a CLAMPED REQUEST, not
 # an override: it may only tighten constraints (network, profile, file_access —
 # toward stricter), never widen them (backend/network=host/env_passthrough/
 # remote/vpn are denied). Additive requests (mounts, init_script, image, ports)
-# are trust-on-first-use gated: review with `superzej repo-trust [path]` and
+# are trust-on-first-use gated: review with `thegn repo-trust [path]` and
 # approve with `--approve <id>`. Denials/pending are surfaced, never silent, and
-# the worktree still opens. `superzej config explain sandbox.<key> --repo <path>`
+# the worktree still opens. `thegn config explain sandbox.<key> --repo <path>`
 # shows the full resolution + clamp trace.
 
 # General tasks: surfaced in the Tests panel and, later, Problems/Timeline/Search
@@ -799,7 +799,7 @@ command = "git diff"
 #   3. semantic aliases such as dev/test/lint/build/up that resolve to the best
 #      explicit or discovered task in the current workspace/worktree.
 #
-# Discovery parses files only; superzej does not execute arbitrary project code
+# Discovery parses files only; thegn does not execute arbitrary project code
 # while switching worktrees. Commands run only after an explicit user action.
 #
 # [tasks.discovery]
@@ -825,7 +825,7 @@ command = "git diff"
 # up = ["compose:up", "just:up"]
 # logs = ["compose:logs", "just:logs"]
 #
-# If no test task is configured, superzej falls back to the discovered `test`
+# If no test task is configured, thegn falls back to the discovered `test`
 # alias/provider chain instead of requiring manual config.
 # [[tasks]]
 # name = "cargo test"
@@ -871,7 +871,7 @@ command = "git diff"
 # layout = ""              # a saved named layout ("Save layout as…"); wins over `commands`
 # commands = ["nvim", "cargo watch -x test"]
 
-# Resource ceilings. superzej NEVER auto-runs tests; these only cap an *explicit*
+# Resource ceilings. thegn NEVER auto-runs tests; these only cap an *explicit*
 # run/discovery so a heavy suite can't pin the machine. When `systemd-run` is
 # available, runs go in a transient `--user --scope` with these caps; otherwise
 # they fall back to `nice`. Empty quota/mem = uncapped; test_nice = 0 disables.
@@ -883,7 +883,7 @@ command = "git diff"
 # test_timeout_secs = 1800   # kill a wedged test run after N seconds (0 disables)
 # discover_timeout_secs = 45 # discovery should be instant; cap it so a held
 #                            #   cargo build-lock surfaces an error, not a spinner
-# isolated_target_dir = true # run superzej's cargo under <worktree>/target/superzej
+# isolated_target_dir = true # run thegn's cargo under <worktree>/target/thegn
 #                            #   so discovery/tests never block on the user's build lock
 
 # Per-worktree disk-usage visibility, cleanup, and shared build caches. Each
@@ -1123,7 +1123,7 @@ max_results = 1000
 # corner pin is live at a time. Great for a video player; audio plays through your
 # normal system audio, and YouTube works via mpv's yt-dlp integration (pass a URL).
 #   - On a kitty-graphics terminal (Ghostty, kitty, WezTerm) use `mpv --vo=kitty`
-#     for CRISP pixel video: superzej relays the corner's kitty images to the outer
+#     for CRISP pixel video: thegn relays the corner's kitty images to the outer
 #     terminal, offset to the corner rect (auto-detected).
 #   - Elsewhere use `mpv --vo=tct` — colored Unicode half-blocks (text+truecolor),
 #     blocky but works on any terminal.
@@ -1159,8 +1159,8 @@ max_results = 1000
 # How a sandbox/remote gets its language toolchains when the repo declares
 # nothing but language manifests (package.json, pyproject.toml, go.mod, …) —
 # i.e. no flake devShell / devenv / shell.nix / .tool-versions. By default
-# superzej SYNTHESIZES a Nix devShell covering the detected languages (written
-# to $HOME/.superzej/synth/<hash> in the sandbox and warmed during
+# thegn SYNTHESIZES a Nix devShell covering the detected languages (written
+# to $HOME/.thegn/synth/<hash> in the sandbox and warmed during
 # provisioning), instead of crude best-effort apt installs. Repos that declare
 # their own environment are untouched — this table only governs the fallback.
 [toolchain]
@@ -1192,19 +1192,19 @@ max_results = 1000
 #   podman-rootless — OCI image (Debian, Ubuntu, custom). Reproducible env,
 #                     persistent named container, but ~50-200 ms per spawn and
 #                     the host shell path (/run/current-system/sw/bin/zsh)
-#                     doesn't exist inside the image — superzej probes for
+#                     doesn't exist inside the image — thegn probes for
 #                     zsh/bash/sh at runtime and uses the first one found.
 #   host            — no sandbox; process runs directly in the worktree dir.
 #
-# Per-repo overrides go in `.superzej.{toml,yaml,yml,json}` at the repo root
+# Per-repo overrides go in `.thegn.{toml,yaml,yml,json}` at the repo root
 # under a `[sandbox]` table — only the keys you set override these globals.
 [sandbox]
 enabled = true
 
 # ── Hardening preset ─────────────────────────────────────────────────────────
 # A named bundle of OS-isolation knobs applied to the worktree's container.
-# Selectable per level: here (global), per workspace/repo via a `.superzej.toml`
-# overlay, or the SUPERZEJ_SANDBOX_PROFILE env var.
+# Selectable per level: here (global), per workspace/repo via a `.thegn.toml`
+# overlay, or the THEGN_SANDBOX_PROFILE env var.
 #   open     — no hardening; pre-preset behavior (escape hatch / back-compat).
 #   hardened — read-only root + no-new-privileges + a process (pids) cap, with
 #              networking and Linux capabilities left intact so interactive dev
@@ -1233,7 +1233,7 @@ profile = "hardened"
 
 # Hardening preset for the embedded agent's tool container. When it differs from
 # `profile`, the agent runs in its OWN separate, more-locked-down container
-# (named `superzej-<slug>-szagent`); when equal, it reuses the worktree
+# (named `thegn-<slug>-szagent`); when equal, it reuses the worktree
 # container. Defaults to `sealed` so agent-run commands have no network egress.
 agent_profile = "sealed"
 
@@ -1258,7 +1258,7 @@ default_env = ""
 backend_chain = ["podman-rootless", "podman-rootful", "docker", "bwrap", "host"]
 
 # ── OCI image (podman / docker only) ────────────────────────────────────────
-# Empty  = superzej's built-in default (debian:stable).
+# Empty  = thegn's built-in default (debian:stable).
 # Named  = pulled on first use (e.g. "ghcr.io/org/devenv:latest").
 # bwrap / systemd ignore this — they use the host filesystem directly.
 image = ""
@@ -1298,7 +1298,7 @@ network_audit = false
 # everything outside the worktree/caches READ-ONLY (see `profile` above). To get
 # a fully writable host filesystem use `file_access = "all"`; for the strictest
 # scoping use `"custom"`/`"none"`. Both file_access and profile are overridable
-# per-repo via a `.superzej.toml` overlay.
+# per-repo via a `.thegn.toml` overlay.
 file_access = "worktree_plus_caches"
 
 # Mount common language build caches from the host when file_access is
@@ -1321,7 +1321,7 @@ auto_caches = true
 # "~/.gitconfig:ro") is served read-only by the $HOME bind.
 # This is the GLOBAL ("all workspaces") scope for default bind dirs. For a
 # single workspace, add `sandbox_mounts` under `[workspace.<slug>]` (see above);
-# those extend this list. A repo-root `.superzej.toml` `[sandbox] mounts` can
+# those extend this list. A repo-root `.thegn.toml` `[sandbox] mounts` can
 # also override per repo.
 mounts = ["~/.gitconfig:ro"]
 
@@ -1337,7 +1337,7 @@ mounts = ["~/.gitconfig:ro"]
 # additional credentials or toolchain vars.
 #
 # NOTE: separately, EVERY pane (sandboxed or not) is spawned clear-then-allowlist
-# — it does NOT inherit szhost's whole environment, so the launching shell's
+# — it does NOT inherit thegn's whole environment, so the launching shell's
 # GH_TOKEN / ANTHROPIC_API_KEY / SSH_AUTH_SOCK etc. do not leak into panes. A
 # curated infrastructure base (PATH/HOME/locale/terminal/display + the XDG/DBus
 # vars a rootless runtime needs) is seeded, then the pane's bundle/profile
@@ -1356,7 +1356,7 @@ env_passthrough = [
 
 # ── Shell ─────────────────────────────────────────────────────────────────────
 # Shell for plain "shell" panes inside the sandbox.
-# ""   = auto: for OCI containers superzej probes zsh → bash → sh at runtime
+# ""   = auto: for OCI containers thegn probes zsh → bash → sh at runtime
 #        so it works even when the image doesn't have the host shell installed
 #        (e.g. a Debian image has bash but not /run/current-system/sw/bin/zsh).
 #        For bwrap / host the host's $SHELL path is used directly.
@@ -1398,9 +1398,9 @@ devenv = false
 
 # ── Nix devShell tooling ──────────────────────────────────────────────────────
 # Tier A (read-only, safe): inject the repo's Nix flake `devShell` toolchain
-# (its PATH + safe exported vars) into worktree panes. superzej resolves the
+# (its PATH + safe exported vars) into worktree panes. thegn resolves the
 # devShell on the HOST (writable store + daemon) via `nix print-dev-env`, caches
-# it under $XDG_STATE_HOME/superzej/devenv/, and prepends it to the pane's PATH —
+# it under $XDG_STATE_HOME/thegn/devenv/, and prepends it to the pane's PATH —
 # so a sandboxed pane that can't reach the Nix daemon still gets the project's
 # linters/formatters/tools out of the box. No-op for repos without a devShell.
 inject_devshell = true
@@ -1408,8 +1408,8 @@ inject_devshell = true
 # host dev). Set to a leaner attr (e.g. "sandbox" → `.#devShells.sandbox`) so a
 # remote sprite builds/seeds a much smaller closure — only what's needed to build
 # the project, not the full lint/test/preview toolset. Exported as
-# SUPERZEJ_DEVSHELL into the sandbox; the repo's `.envrc` must read it
-# (`use flake ".#${SUPERZEJ_DEVSHELL:-default}"`). Missing tools are then a
+# THEGN_DEVSHELL into the sandbox; the repo's `.envrc` must read it
+# (`use flake ".#${THEGN_DEVSHELL:-default}"`). Missing tools are then a
 # `nix shell nixpkgs#<tool>` away in-pane.
 # devshell = "sandbox"
 # Tier B: bind-mount the host Nix daemon socket into the sandbox so full
@@ -1433,7 +1433,7 @@ on_missing = "warn"
 # Distinct from on_missing (which governs only the local Auto backend chain).
 # When a *named* [env.<name>] or an explicit non-local placement (provider/k8s/
 # ssh) fails to come up — e.g. a managed provider rejects the token, or a pod
-# won't schedule — should superzej quietly fall back to another backend / the
+# won't schedule — should thegn quietly fall back to another backend / the
 # host, or stop?
 #   false — (default) HALT that worktree's pane and show a warning overlay. A
 #           remote/managed env is often required for correctness or safety, so a
@@ -1564,7 +1564,7 @@ transport = "mosh"
 # local_exec — experimental: agent runs locally against the remote filesystem.
 mode = "remote"
 # Where worktrees are stored on the remote host.
-remote_dir = "~/superzej-worktrees"
+remote_dir = "~/thegn-worktrees"
 # Forward the local SSH agent (ssh -A) so git push uses your local keys.
 # Disable if the remote host has its own deploy key.
 forward_agent = true
@@ -1574,7 +1574,7 @@ forward_agent = true
 # identity, leaving the host's networking (including any host tailscaled)
 # completely untouched. Off by default (provider = "none").
 #
-# How it works: superzej runs the tunnel daemon as a per-worktree *sidecar* (it
+# How it works: thegn runs the tunnel daemon as a per-worktree *sidecar* (it
 # never embeds a tunnel datapath in-process, and never touches your host VPN).
 # In the default `sidecar` mode the worktree container joins the sidecar's
 # network namespace, so its ONLY egress is the tunnel and its own capabilities
@@ -1675,7 +1675,7 @@ ephemeral = true
 #               the worktree's [sandbox.vpn] tailscale tunnel — NO new auth
 #   iroh      — peer-to-peer (dumbpipe): a teammate connects with a ticket; never
 #               touches the public web, NAT-traversing
-# Disabled by default. Open one with `superzej share start <port>` or Alt+Shift+S.
+# Disabled by default. Open one with `thegn share start <port>` or Alt+Shift+S.
 [share]
 provider = "none"   # none | bore | frp | tailscale | iroh
 # Requested reach: public | private. Authoritative only where the backend can do
@@ -1726,7 +1726,7 @@ ready_timeout_secs = 20
 
 # ── Automatic port forwarding / browser preview (`[forward]`) ───────────────
 # The outbound-localhost sibling of [share]: when a dev server binds a port INSIDE
-# a worktree's sandbox (container / ssh host / k8s pod), superzej auto-detects it
+# a worktree's sandbox (container / ssh host / k8s pod), thegn auto-detects it
 # and forwards it to the host so it's previewable at http://localhost:<port>.
 # Active forwards appear in the System panel; press `o` to open the focused one in
 # your browser. On by default — forwards bind loopback only, so this is safe.
@@ -1749,10 +1749,10 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # isolation OVERLAY on top of `[sandbox]` (`[env.<name>.sandbox]`), and a DATA
 # mode (where the worktree files live). A workspace/repo/worktree then selects
 # one by name. Selection precedence (most specific wins):
-#   worktree `env_name` (DB) → workspace `env_name` (DB) → repo `.superzej.*`
+#   worktree `env_name` (DB) → workspace `env_name` (DB) → repo `.thegn.*`
 #   `env = "…"` → global `default_env` (below) → the implicit `"default"`.
 # The `"default"` env is this `[sandbox]` + `[sandbox.remote]` block — so with
-# no `[env.*]` defined, nothing changes. Manage selections with `superzej env`.
+# no `[env.*]` defined, nothing changes. Manage selections with `thegn env`.
 #
 # Pick the default env for every worktree that hasn't chosen one (empty ⇒
 # "default"). Lives under `[sandbox]`; shown here for context.
@@ -1778,10 +1778,10 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # namespace = "dev-blake"
 # pod = "sz-dev"             # target pod name (exec'd into)
 # container = ""             # optional `-c <container>`
-# pod_template = "~/.sz/dev-pod.yaml"   # `superzej env up` applies this (spawn custom env)
+# pod_template = "~/.sz/dev-pod.yaml"   # `thegn env up` applies this (spawn custom env)
 # image = "registry.example.com/dev:latest"  # OR template-less `kubectl run`
-# remote_access = true       # `superzej env forward 8080:80` (kubectl port-forward)
-# # `superzej env up` spawns the pod + waits Ready; `env down` deletes it.
+# remote_access = true       # `thegn env forward 8080:80` (kubectl port-forward)
+# # `thegn env up` spawns the pod + waits Ready; `env down` deletes it.
 #
 # Example 3 — a hosted agent sandbox provider (e.g. Daytona). Two modes:
 # (a) static/CLI — `exec_command` is an argv template, `{id}` → the sandbox id:
@@ -1791,10 +1791,10 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # provider = "daytona"
 # id = "sb-1234"
 # exec_command = ["daytona", "ssh", "{id}", "--"]
-# up_command = ["daytona", "create", "--id", "{id}"]   # run by `superzej env up`
-# down_command = ["daytona", "delete", "{id}"]         # run by `superzej env down`
-# # (b) API — `superzej env provision` creates a sandbox over Daytona's REST API
-# # (then set `id` to attach); `superzej env deprovision <id>` destroys it:
+# up_command = ["daytona", "create", "--id", "{id}"]   # run by `thegn env up`
+# down_command = ["daytona", "delete", "{id}"]         # run by `thegn env down`
+# # (b) API — `thegn env provision` creates a sandbox over Daytona's REST API
+# # (then set `id` to attach); `thegn env deprovision <id>` destroys it:
 # # api_base = "https://app.daytona.io/api"
 # # api_key_env = "DAYTONA_API_KEY"    # env var holding the Bearer token
 # # template = "debian:stable"         # snapshot/image to create from
@@ -1822,10 +1822,10 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # identity = "~/.ssh/id_work"         # ssh -i
 # extra_args = []
 # # data = "sshfs" FUSE-mounts [sandbox.remote] remote_dir at
-# # <superzej-dir>/mounts/<host-slug>; data = "sync" keeps a local working copy
+# # <thegn-dir>/mounts/<host-slug>; data = "sync" keeps a local working copy
 # # there, kept coherent with the remote via an rsync delta. BOTH now mount/sync
 # # AUTOMATICALLY on pane spawn and unmount/push on close (no manual `env up`),
-# # and run the pane LOCALLY at the mountpoint. `superzej env up/down` still works
+# # and run the pane LOCALLY at the mountpoint. `thegn env up/down` still works
 # # for an explicit one-off. Intended with `backend = "none"`/host.
 #
 # ── [host.<name>] — machines as first-class resources ────────────────────────
@@ -1835,8 +1835,8 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # then shared by EVERY env/worktree that lands on it — the 20-minute-class
 # setup cost is paid per host, not per sandbox. `[env.<name>] host = "<name>"`
 # binds an env to a host; several envs may share one. Hosts are GLOBAL config
-# only (a repo .superzej.toml can select a host-backed env, never define a
-# host). Inspect + drive with `superzej host list|status|provision|probe`.
+# only (a repo .thegn.toml can select a host-backed env, never define a
+# host). Inspect + drive with `thegn host list|status|provision|probe`.
 #
 # [host.gpu-box]
 # reach = "ssh"                # ssh | iroh | cloud | local
@@ -1874,7 +1874,7 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 #                              #   ceiling = min(declared, probed) x overcommit
 #                              #   x independent_safety_pct.
 # trust_egress_enforced = false # ATTESTATION (taken on faith, never verified):
-#                              #   this box enforces the posture a superzej-built
+#                              #   this box enforces the posture a thegn-built
 #                              #   image guarantees, restoring the one-notch
 #                              #   trust drop unattested user-owned hosts get
 #                              #   for packing (a probe proves PRESENCE of
@@ -1895,12 +1895,12 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # [host.nat-laptop]
 # reach = "iroh"
 # [host.nat-laptop.iroh]
-# ticket = "env:SZ_LAPTOP_TICKET"
+# ticket = "env:TG_LAPTOP_TICKET"
 # ssh_port = 22
 # user = "me"
 #
 # # An idle Windows box (on your tailnet, running Docker) as a worktree host.
-# # superzej's remote path is POSIX (/bin/sh, git, dtach, …), so point the ssh
+# # thegn's remote path is POSIX (/bin/sh, git, dtach, …), so point the ssh
 # # endpoint at a WSL2 distro — a real Linux shell with the Windows Docker
 # # daemon exposed (Docker Desktop WSL integration, or docker-ce inside WSL).
 # # Two entry methods, same landing: run sshd INSIDE the distro, or set the
@@ -1908,7 +1908,7 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # session drops straight into Linux. Use the Tailscale MagicDNS name as host.
 # # install_runtime = "never" (Docker is already there — do not install podman);
 # # the bound env sets backend = "docker" so the container runs on that daemon.
-# # Worktrees live under ~/superzej-worktrees in the WSL FS — NOT /mnt/c (a git
+# # Worktrees live under ~/thegn-worktrees in the WSL FS — NOT /mnt/c (a git
 # # worktree needs a real Linux filesystem for symlinks/inodes/perf).
 # [host.win1]
 # reach = "ssh"
@@ -1944,7 +1944,7 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # provider = "sprites"         # sprites | daytona
 # api_base = ""                # empty = the provider's default endpoint
 # api_key_env = "SPRITES_TOKEN"   # env var holding the API token
-# template = "superzej-base"   # template/snapshot the base image registers under
+# template = "thegn-base"   # template/snapshot the base image registers under
 #
 # Example 5 — a managed sandbox provider: Sprites (sprites.dev, Firecracker
 # microVMs with a persistent fs + ~300ms checkpoints). One-time setup:
@@ -1953,7 +1953,7 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 #   2. Install + auth the CLI (used for the pane exec bridge):
 #        curl -fsSL https://sprites.dev/install.sh | sh
 #        sprite auth setup --token "$SPRITES_TOKEN"
-#   3. Create the sprite once:  superzej env provider create --env sprites
+#   3. Create the sprite once:  thegn env provider create --env sprites
 #      (or `sprite create my-worktree`), then set `id` below to its name.
 # [env.sprites]
 # placement = "provider"
@@ -2018,7 +2018,7 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # #                                 #   than push_devshell's one-shot devShell upload,
 # #                                 #   which it SUPERSEDES when set. Unsigned + loopback-
 # #                                 #   tunnel-only (require-sigs=false in the sprite). The
-# #                                 #   host serves it from the szhost process; needs a
+# #                                 #   host serves it from the thegn process; needs a
 # #                                 #   resident-bridge provider (sprites). Recommended.
 # # push_devshell = false           # Use your HOST as the devShell cache (nix users).
 # #                                 #   Seeds the repo's closure — ALREADY BUILT on your
@@ -2059,17 +2059,17 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # Wired axes (capability-gated, generic across providers):
 # #  • EGRESS — [sandbox] network_allow/network_block are lowered to the sprite's
 # #    DNS policy (POST /policy/network {rules:[{domain,action}]}) automatically
-# #    on `superzej env provider create`.
-# #  • SNAPSHOT — `superzej env snapshot [--label]` / `env snapshots` / `env restore <id>`
+# #    on `thegn env provider create`.
+# #  • SNAPSHOT — `thegn env snapshot [--label]` / `env snapshots` / `env restore <id>`
 # #    (Sprites checkpoints).
 # #  • FILE-SYNC — `data = "sync"` pushes the worktree into `workdir` on spawn and
 # #    pulls it back on close (via the sprite /fs API; `.git` is skipped).
 # #  • DATA PLANE — a provider worktree's git/diff/branches/files resolve INTO the
 # #    sandbox (the chrome shows real state); a fresh sprite is repo-provisioned on
 # #    open (clone for data=in_env, upload for data=sync).
-# #  • RESIDENT BRIDGE — when a static-musl `szhost` is available (build:
-# #    `nix build .#szhost-musl` or `just build-musl`; point SUPERZEJ_BRIDGE_BINARY
-# #    at it), it's pushed into the sprite and run as `szhost bridge`, so git is
+# #  • RESIDENT BRIDGE — when a static-musl `thegn` is available (build:
+# #    `nix build .#thegn-musl` or `just build-musl`; point THEGN_BRIDGE_BINARY
+# #    at it), it's pushed into the sprite and run as `thegn bridge`, so git is
 # #    fast (no per-op latency), file edits stream back live (fs.watch), activity
 # #    dots reflect in-env CPU, and tests/jobs run in the sandbox.
 # #  • NATIVE EXEC — with `exec = "auto"` (default) the interactive pane attaches
@@ -2083,23 +2083,23 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # failover = true            # this env may degrade to host; omit/false ⇒ halt+warn
 #
 # ── Example: a cheap commodity VPS (Hetzner Cloud) ─────────────────────────
-# The budget alternative to a managed sandbox provider: superzej provisions a
-# VPS via the vendor API, reaches it over plain ssh (a `szhost vps-ssh`
+# The budget alternative to a managed sandbox provider: thegn provisions a
+# VPS via the vendor API, reaches it over plain ssh (a `thegn vps-ssh`
 # self-bridge — no vendor CLI), and runs the same provisioning pipeline on it.
 # THE COST MODEL DIFFERS FROM SPRITES: a VPS has no suspend/checkpoint — a
 # powered-off instance still bills — so the only free state is DESTROYED.
-# superzej therefore: never offers stop-on-idle (idle pool spares are
+# thegn therefore: never offers stop-on-idle (idle pool spares are
 # destroyed, not suspended), ledgers every create before the API call, and
 # runs a label-scoped reaper that destroys orphans/over-lifetime instances.
 # Speed comes from a baked base image + (optionally) the warm pool:
 #   cold, stock image   ~2-4 min  (create ~10s + nix install + repo steps)
-#   cold, baked image   ~30-90 s  (`superzej env image-bake` → template below)
+#   cold, baked image   ~30-90 s  (`thegn env image-bake` → template below)
 #   warm-pool claim     ~5 s      ([lifecycle.pool] size = 1; the spare bills
 #                                  ~€4/mo while idle — the speed/budget knob)
 #
 #   1. Create an API token in the Hetzner Cloud console (project scope).
 #   2. export HCLOUD_TOKEN=...
-#   3. Optional but recommended: superzej env image-bake  → paste the template.
+#   3. Optional but recommended: thegn env image-bake  → paste the template.
 #
 # [env.hetzner]
 # placement = "provider"
@@ -2127,7 +2127,7 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # nix_installer = "determinate"  # the faster installer is a good VPS default
 # # The workload runs directly on the VPS by default (the VPS is the isolation
 # # boundary, like a sprite). To containerize INSIDE it instead (docker is on
-# # every image superzej boots):
+# # every image thegn boots):
 # # [env.hetzner.sandbox]
 # # backend = "docker"
 # # NOT available on a VPS (no provider support): checkpoints/snapshot-restore
@@ -2159,7 +2159,7 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # max_lifetime_secs = 0
 #
 # ── Fly.io machines (CLI-free — no flyctl) ─────────────────────────────────
-# A Fly machine is container-native (NOT a VPS): superzej drives the Machines
+# A Fly machine is container-native (NOT a VPS): thegn drives the Machines
 # REST API directly and reaches INTO the machine over a WireGuard tunnel to
 # Fly's private 6PN network + `hallpass` ssh — the `fly ssh console` path,
 # without the flyctl CLI. Unlike a VPS, a stopped machine is near-free, so it is
@@ -2167,12 +2167,12 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 #   1. Create a deploy/org token: `fly tokens create org` (or the dashboard).
 #   2. export FLY_API_TOKEN=...
 #
-# superzej reaches the machine over ssh on a per-app dedicated IPv4 (~$2/mo,
+# thegn reaches the machine over ssh on a per-app dedicated IPv4 (~$2/mo,
 # prorated, released when the sandbox is destroyed): each sandbox is its own Fly
 # app, so destroy = delete the app (cascades the machine + IP).
 #
 # TWO speeds, via `template`:
-#   - stock "" ⇒ ubuntu:24.04, and superzej installs sshd + prereqs at boot
+#   - stock "" ⇒ ubuntu:24.04, and thegn installs sshd + prereqs at boot
 #     (~40-90s cold — the convenient default).
 #   - baked "image:<ref>" ⇒ boot STRAIGHT into a reachable shell with the whole
 #     toolchain (nix + rust + just) already in the image — no per-VM install, the
@@ -2201,7 +2201,7 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # Budget-governed warm policy for managed-provider sandboxes (sprites/ssh/k8s).
 # A provider sandbox only stays *running* while a live exec session into it exists
 # (a pane or the resident bridge); idle ones suspend for free (filesystem kept).
-# Defaults are budget-safe — superzej's own sidebar/activity polling never wakes a
+# Defaults are budget-safe — thegn's own sidebar/activity polling never wakes a
 # suspended sandbox, idle ones suspend after the TTL, and the few most-recently-
 # used (plus any busy or pane-held) stay warm for instant resume. All optional.
 [lifecycle]
@@ -2260,7 +2260,7 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # [lifecycle.snapshot]        # WHERE hibernation snapshots live
 # backend = "local"           # local (this host's disk; zero config) | s3
 # dir = ""                    # local: root override; empty ⇒
-#                             #   $XDG_STATE_HOME/superzej/snapshots
+#                             #   $XDG_STATE_HOME/thegn/snapshots
 # keep = 3                    # snapshots retained per (repo, worktree, env)
 # max_artifact_mb = 512       # abort the hibernate (keep the VM, warn) if any
 #                             #   single artifact exceeds this; 0 ⇒ no ceiling
@@ -2268,24 +2268,24 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # endpoint = ""               # s3: endpoint URL for S3-compatibles (R2/B2/
 #                             #   MinIO…); empty ⇒ AWS S3
 # region = "us-east-1"        # s3: region
-# prefix = "superzej"         # s3: key prefix inside the bucket
+# prefix = "thegn"         # s3: key prefix inside the bucket
 # access_key = "env:AWS_ACCESS_KEY_ID"      # secret ref: env:VAR | keyring:<n>
 # secret_key = "env:AWS_SECRET_ACCESS_KEY"  #   | file:/path | bare env-var name
 
 # ── Placement engine ─────────────────────────────────────────────────────────
 # WHERE each worktree sandbox runs: Dedicated (one sandbox, exclusive host),
-# Packed (bin-packed with others onto a shared Ready [host.*] via superzej's own
+# Packed (bin-packed with others onto a shared Ready [host.*] via thegn's own
 # container engine), or a freshly autoscaled Managed VPS. OFF by default — with
 # `enabled = false` every existing spawn path is byte-identical. Explicit
 # `[env.<n>] host = "..."` pins always bypass the broker (but are still
 # accounted in the capacity ledger). Decisions are pure + deterministic; ask
-# `superzej placement plan --json` why a spawn would land where.
+# `thegn placement plan --json` why a spawn would land where.
 #
 # RESOURCE VIEW: every host — managed and independent — carries three layers:
 # the DECLARED spec (authoritative for managed hosts), the RESERVED totals
 # (Σ of live tenants' declared floors), and the latest MEASURED sample
 # (observational; display + ranking hints, never a capacity source where a
-# spec exists). `superzej placement list` renders all three.
+# spec exists). `thegn placement list` renders all three.
 [placement]
 enabled = false
 # preset = "none"             # preference bundle: cost_optimized (pack hard,
@@ -2303,7 +2303,7 @@ enabled = false
 # pack_strategy = "bin-pack"  # bin-pack (consolidate: most-utilized first, idle
 #                             #   hosts drain + scale down) | spread (least-
 #                             #   utilized first: latency headroom, blast radius)
-# on_exhaustion = "queue"     # queue (fall through this once; superzej nudges
+# on_exhaustion = "queue"     # queue (fall through this once; thegn nudges
 #                             #   when capacity frees — re-open to place) |
 #                             #   reject (silently use the env's non-engine
 #                             #   path) | error (halt loudly)
@@ -2341,7 +2341,7 @@ enabled = false
 # memory_max = ""             #   [env.<n>.resources] cpu_max/memory_max)
 # [placement.autoscale]       # create Managed VPS hosts on pool exhaustion.
 # enabled = false             #   Enabling this IS the create+install consent for
-#                             #   engine-created hosts (superzej owns those boxes).
+#                             #   engine-created hosts (thegn owns those boxes).
 # max_hosts = 3               #   ceiling on engine-created hosts (0 ⇒ default 3)
 # min_hosts = 0               #   floor kept alive by scale-down (warm capacity)
 # scale_down_idle_secs = 900  #   a Managed host with zero tenants this long is
@@ -2364,15 +2364,15 @@ enabled = false
 # memory = "8g"
 # max = 2
 # ── Control plane (pane daemon + serve) ────────────────────────────────────
-# The pane daemon: a `szhost daemon` process that owns the portable-pty panes
+# The pane daemon: a `thegn daemon` process that owns the portable-pty panes
 # so they survive the UI exiting — quit the compositor, relaunch, and
 # warm-reattach to a still-running agent. OPT-IN: with `enabled = false` (the
-# default) bare `szhost` behaves exactly as today (in-process PTYs).
+# default) bare `thegn` behaves exactly as today (in-process PTYs).
 [daemon]
 enabled = false
 # Control-socket override. Empty (default) resolves to
-# $XDG_RUNTIME_DIR/superzej/daemon.sock, falling back to
-# $XDG_STATE_HOME/superzej/run/daemon.sock (so isolated state dirs — `just
+# $XDG_RUNTIME_DIR/thegn/daemon.sock, falling back to
+# $XDG_STATE_HOME/thegn/run/daemon.sock (so isolated state dirs — `just
 # start`, smoke tests — get isolated daemons).
 socket = ""
 # The daemon exits after this long with no sessions and no attached clients.
@@ -2383,25 +2383,25 @@ idle_exit_secs = 1800
 # expiry reaps the process.
 lease_grace_secs = 3600
 
-# `szhost serve`: pair remote thin clients (desktop/web/mobile) over a pairing
+# `thegn serve`: pair remote thin clients (desktop/web/mobile) over a pairing
 # URL and let them attach through the scoped control API. v1 serves PLAINTEXT —
 # bind to a trusted network interface (tailscale/wireguard) or reach it over
 # `ssh -L`; every request is still token-gated.
 [serve]
-# Default TCP bind (override per-run with `szhost serve --bind`).
+# Default TCP bind (override per-run with `thegn serve --bind`).
 bind = "0.0.0.0:5380"
-# Require in-app / `szhost pair approve` approval before a redeemed pairing
+# Require in-app / `thegn pair approve` approval before a redeemed pairing
 # token becomes usable. Default off: possession of the single-use pairing URL
 # is the credential.
 require_approval = false
 # Local unix-socket peers (same uid) get implicit admin, so local CLI verbs
-# (`szhost session …`) need no token. Tokens are always required on TCP.
+# (`thegn session …`) need no token. Tokens are always required on TCP.
 local_admin = true
 
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────
-# The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
+# The AI-traffic chokepoint daemon (binary `tgproxy`). The shell never hard-
 # depends on this — AI is strictly additive — so it is OFF by default. When
-# enabled, the host launches szproxy and agents point OPENAI_BASE_URL /
+# enabled, the host launches tgproxy and agents point OPENAI_BASE_URL /
 # ANTHROPIC_BASE_URL at `listen`.
 [llm_proxy]
 enabled = false
@@ -2415,7 +2415,7 @@ routing = "sequential"
 refuse_on_breach = true
 # Path to the proxy's routes document (JSON: { "routes": [ { "name", "backends":
 # [ { "name", "base_url", "model", "api_key_env", "anthropic", "rpm", "burst",
-# "context_limit", "defaults" } ] } ] }). Passed to szproxy as SZPROXY_CONFIG.
+# "context_limit", "defaults" } ] } ] }). Passed to tgproxy as TGPROXY_CONFIG.
 config_path = ""
 # Streaming tunables (seconds). first_byte_timeout: wait for a backend's first
 # usable token before falling through; idle_timeout: kill a stream gone silent
@@ -2432,14 +2432,14 @@ token_reduction = false
 token_reduction_level = "conservative"
 # Route a launched agent's model traffic through the proxy at `listen` by
 # injecting provider config into the agent's environment at spawn. `route_agent`
-# and `enabled` are ORTHOGONAL: `enabled` launches superzej's OWN szproxy;
-# `route_agent` only injects the env — the pi extension's SUPERZEJ_PROXY_* vars
+# and `enabled` are ORTHOGONAL: `enabled` launches thegn's OWN tgproxy;
+# `route_agent` only injects the env — the pi extension's THEGN_PROXY_* vars
 # (NOT ANTHROPIC_BASE_URL; see `route_claude`) → `listen`, and for a
 # remote/provider sandbox an empty/"auto" `remote_base_url` stands up the reverse
 # tunnel to it. So point agents at an EXTERNAL proxy already on `listen` (e.g. a
-# separate model-proxy) with `route_agent = true` + `enabled = false` (superzej
-# won't try to bind the same port); run superzej's own proxy with `enabled = true`
-# (+ a `config_path` routes file, else it 404s — superzej warns at startup).
+# separate model-proxy) with `route_agent = true` + `enabled = false` (thegn
+# won't try to bind the same port); run thegn's own proxy with `enabled = true`
+# (+ a `config_path` routes file, else it 404s — thegn warns at startup).
 # `agent_api` is the pi-side API id for that endpoint — the proxy serves
 # the Anthropic Messages API (/v1/messages), and pi's OpenAI client speaks the
 # Responses API (which the proxy doesn't implement), so keep "anthropic-messages".
@@ -2450,14 +2450,14 @@ route_agent = false
 # ANTHROPIC_BASE_URL) through the proxy. OFF by default: claude talks to Anthropic
 # directly, so a down/racing proxy tunnel can't break it (a forced
 # ANTHROPIC_BASE_URL pointing at a dead loopback port yields ConnectionRefused with
-# no upstream fallback). pi routes regardless via SUPERZEJ_PROXY_*; flip this on
+# no upstream fallback). pi routes regardless via THEGN_PROXY_*; flip this on
 # only if you also want claude's traffic on the proxy. Requires `route_agent`.
 route_claude = false
 agent_api = "anthropic-messages"
 agent_model = "model-proxy/standard"
 # "The bouncer" (opt-in). When true, a launched agent runs inside its sealed
 # `[sandbox] agent_profile` container and its built-in bash/read/edit/write tools
-# are routed back through superzej over a bind-mounted unix-socket ACP channel.
+# are routed back through thegn over a bind-mounted unix-socket ACP channel.
 # The consequential ones — shell, edit, write — are gated behind an interactive
 # allow/deny overlay (read is auto-served). If `agent_profile` forces no network
 # (the default `sealed`), the agent's only egress is the proxy, relayed over a
@@ -2466,14 +2466,14 @@ agent_model = "model-proxy/standard"
 # pi runs its own tools in-process and edits auto-apply.
 bouncer = false
 # Base URL an agent running INSIDE a remote/provider sandbox (a sprite VM that
-# can't reach host loopback) uses to reach szproxy — a tunnel/public endpoint.
-# With `route_agent`, superzej injects the SUPERZEJ_PROXY_* vars (and, when
+# can't reach host loopback) uses to reach tgproxy — a tunnel/public endpoint.
+# With `route_agent`, thegn injects the THEGN_PROXY_* vars (and, when
 # `route_claude` is also on, ANTHROPIC_BASE_URL + the per-worktree virtual key)
 # into the sprite's shell so pi (and, with route_claude, claude code / the SDK)
 # routes through the proxy. (Local/OCI agents already reach the proxy via
-# loopback/gateway/unix.) EMPTY (the default) under `route_agent` ⇒ "auto": superzej
+# loopback/gateway/unix.) EMPTY (the default) under `route_agent` ⇒ "auto": thegn
 # stands up a reverse tunnel (the in-sandbox resident bridge ⇄ host) so the sprite
-# reaches szproxy at http://127.0.0.1:<listen-port> with ZERO public exposure. Set
+# reaches tgproxy at http://127.0.0.1:<listen-port> with ZERO public exposure. Set
 # an explicit reachable URL (e.g. a tailnet/proxy endpoint) to skip the tunnel.
 # remote_base_url = ""   # "" or "auto" = reverse tunnel; or an explicit URL
 
@@ -2482,7 +2482,7 @@ bouncer = false
 # queued worktree branch onto `target_branch` entirely in the git object
 # database (no checkout, milliseconds): branches that merge clean land
 # automatically as sequential merge commits, and only genuine conflicts are
-# deferred for you (or an agent) to resolve. Fire it once with `superzej
+# deferred for you (or an agent) to resolve. Fire it once with `thegn
 # integrate` / the palette action.
 #
 # Manage the queue from the TUI: Ctrl+Alt+q (or the palette's "Merge queue")
@@ -2490,7 +2490,7 @@ bouncer = false
 # `l` lands a ready branch, `c` clears landed rows, and `D` drains the queue
 # with the agent autopilot — transitions stream into the panel live, and the
 # settled ones (queue_landed / queue_ready / queue_needs_human) toast and land
-# in the notifications inbox. CLI equivalent: `superzej merge …`.
+# in the notifications inbox. CLI equivalent: `thegn merge …`.
 #
 # Because ten clean *textual* merges say nothing about whether their *union*
 # builds, the fold is test-gated: the folded tip is checked out into a throwaway
@@ -2513,10 +2513,10 @@ regenerate_command = ""        # e.g. "cargo update --workspace"; rebuilds regen
 conflict_handoff = "agent"    # agent | notify | manual — fate of a deferred branch
 #
 # Agent autopilot: with conflict_handoff = "agent" and agent_command set, the
-# queue driver (`superzej merge queue drain`) grinds queued branches one by one —
+# queue driver (`thegn merge queue drain`) grinds queued branches one by one —
 # dispatching a headless CLI agent INSIDE the branch's own worktree to rebase onto
 # the target, resolve conflicts, and fix a red gate, then re-attempting the fold
-# and auto-landing on green. The agent never touches main; superzej does the
+# and auto-landing on green. The agent never touches main; thegn does the
 # object-DB fold + CAS itself. {prompt}/{branch}/{target} are substituted.
 agent_command = ""            # e.g. 'claude -p "{prompt}" --permission-mode acceptEdits'; "" ⇒ agent handoff degrades to notify
 auto_land = true              # queue driver: CAS-advance on green; false ⇒ stop at "ready" for a manual land
@@ -2556,10 +2556,10 @@ max_duration_secs = 1800        # per-pane time budget (30 m); older events evic
 keyframe_interval_ms = 4000     # capture a scrub-timeline marker after this much activity …
 keyframe_interval_bytes = 262144 # … or after this many bytes, whichever first (256 KiB)
 idle_threshold_ms = 1000        # during playback, gaps longer than this are collapsed (skip-inactivity)
-persist = false                 # mirror rings to $XDG_STATE_HOME/superzej/replay/<session>/<pane>.szr for cross-restart scrubbing
+persist = false                 # mirror rings to $XDG_STATE_HOME/thegn/replay/<session>/<pane>.szr for cross-restart scrubbing
 
 # ── Media player control (optional) ────────────────────────────────────────
-# Drive your music/media player from superzej: play/pause, next/previous,
+# Drive your music/media player from thegn: play/pause, next/previous,
 # shuffle, loop, volume, and a playlist/player picker — plus a now-playing
 # statusbar badge and panel section. The shell never depends on this; it is
 # strictly additive.

@@ -38,7 +38,7 @@ the loop and are I/O-free; inbox records are themselves written on
 ## Quit-mid-drain
 
 The fixing agent runs in its own process group under a plain-thread watchdog;
-if szhost exits, the agent is orphaned (keeps running, unsupervised) and the
+if thegn exits, the agent is orphaned (keeps running, unsupervised) and the
 queue row is left at `folding`/`agent_running`. Accepted for this change:
 retry/re-add resets the row via the enqueue upsert, and hydration must NOT
 auto-reset transient rows (a concurrent CLI drain owns them). Documented in
@@ -55,6 +55,6 @@ the handler module doc.
 
 A pr_view.rs-style full-screen `MergeQueueView` (Queue / Branch / Logs tabs)
 entered by Enter on a section row. Prerequisite: capture capped gate/agent log
-tails to `$XDG_STATE_HOME/superzej/logs/merge/<hash>-{agent,gate}.log` from
+tails to `$XDG_STATE_HOME/thegn/logs/merge/<hash>-{agent,gate}.log` from
 `run_agent` (deterministic path ⇒ no DB schema bump); its action keys reuse
 this change's executors so it adds no new mutation paths.

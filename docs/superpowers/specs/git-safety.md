@@ -1,12 +1,12 @@
-# Git safety: how superzej avoids `.git/config` pollution
+# Git safety: how thegn avoids `.git/config` pollution
 
 ## Threat model
 
-superzej is a multi-worktree IDE. Git worktrees **share one `.git`**: a linked
+thegn is a multi-worktree IDE. Git worktrees **share one `.git`**: a linked
 worktree's `.git` is a _file_ (`gitdir: <canonical>/.git/worktrees/<name>`), and
 all worktrees write the same `<canonical>/.git/{config,objects,refs}`. Each
 worktree's interactive process can run sandboxed (podman → docker → bwrap →
-none), and superzej can run several agents at once.
+none), and thegn can run several agents at once.
 
 Two failure modes have bitten us repeatedly:
 
@@ -18,22 +18,22 @@ Two failure modes have bitten us repeatedly:
    wrong worktree — phantom whole-repo diffs, "the changes pane shows another
    worktree", a merge that "diverges". `git config --get/--unset` themselves
    abort (`fatal: Invalid path`) once the value points at a missing dir.
-2. **Concurrent-agent races.** Multiple szhost/agent processes mutating the same
+2. **Concurrent-agent races.** Multiple thegn/agent processes mutating the same
    `.git` at once (two `git worktree add`, two commits to `main`) clobber the
    shared index/refs or thrash the branch.
 
 ## The rule
 
-**All git goes through `superzej_core::util::git_cmd` or `GitLoc`.** Both build
+**All git goes through `thegn_core::util::git_cmd` or `GitLoc`.** Both build
 `git -C <dir>` with `GIT_ENV_VARS` scrubbed. Raw `Command::new("git")` is
 forbidden everywhere except the one builder in `util.rs` — `just lint` enforces
 this with a grep guardrail.
 
-## The layered defense (`crates/superzej-core/src/util.rs` unless noted)
+## The layered defense (`crates/thegn-core/src/util.rs` unless noted)
 
 1. **Process env scrub** — `scrub_git_env()` at the top of `main()`
-   (`superzej-host/src/main.rs`) removes `GIT_ENV_VARS` before any thread spawns,
-   so nothing superzej launches inherits a poisoned git env.
+   (`thegn-host/src/main.rs`) removes `GIT_ENV_VARS` before any thread spawns,
+   so nothing thegn launches inherits a poisoned git env.
 2. **Per-invocation scrub** — `git_cmd(dir)` and the `GitLoc` local builders
    (`remote.rs` `git_command`/`git_command_env`/`sh_command`) `env_remove` the
    same vars on every git/custom-command invocation — robust even if the process
@@ -54,9 +54,9 @@ this with a grep guardrail.
    so the wrapped script `unset`s them before the shell/agent runs (bwrap/systemd
    inherit the host env; OCI already passes only a whitelist).
 6. **Cross-process git lock** — `lock_git_mutations(worktree)` takes a `flock` on
-   `<git-common>/superzej-git.lock` (advisory, auto-released on Drop and process
+   `<git-common>/thegn-git.lock` (advisory, auto-released on Drop and process
    death — no stale locks). The svc write runners (`run_w`/`run_stdin`/`run_root`
-   in `superzej-svc/src/git/mod.rs`) and `worktree::{add_checked,remove}` hold it
+   in `thegn-svc/src/git/mod.rs`) and `worktree::{add_checked,remove}` hold it
    for the mutation, serializing concurrent agents on the same repo. Reads stay
    lock-free; remote locs lock on their own machine.
 
@@ -65,10 +65,10 @@ this with a grep guardrail.
 - **Each agent works in its own worktree.** Do **not** run multiple agents
   driving git against the canonical checkout — that is what triggers the races
   and pollution. Funnel merges to `main` through one actor.
-- **Restart szhost after a rebuild.** A live _old_ binary keeps re-polluting on
+- **Restart thegn after a rebuild.** A live _old_ binary keeps re-polluting on
   every commit; the fixes (and the startup heal) only take effect once the new
   binary is running and stale agents are stopped.
 - Tests run git hermetically (`git_cmd` + `GIT_CONFIG_GLOBAL=/dev/null` + a temp
   `HOME`); never add a test that runs git in the real repo.
 
-See the `superzej-gitconfig-pollution` history for the incident this hardens.
+See the `thegn-gitconfig-pollution` history for the incident this hardens.

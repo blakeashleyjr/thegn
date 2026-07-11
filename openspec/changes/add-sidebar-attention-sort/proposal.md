@@ -4,7 +4,7 @@
 
 Order worktrees (and, opt-in, workspaces) by **pending action** so the sidebar
 always leads with whatever needs the user next. A pure, tiered attention model
-in `superzej-core::attention` scores every worktree from signals the app
+in `thegn-core::attention` scores every worktree from signals the app
 already tracks — the activity FSM, unread notifications, the PR/CI caches, and
 the merge queue — into six tiers: blocked-on-user > failure > finished-awaiting
 -user > ready-to-land > working > idle (longest-waiting first within a tier).

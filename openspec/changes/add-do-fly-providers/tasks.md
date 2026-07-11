@@ -6,7 +6,7 @@
       bodies + URLs, ssh-key register, snapshot, tag selector, parse envelopes);
       make Hetzner one impl — **unit tests** stay green (URL/body shapes).
 - [x] 1.2 `vps/digitalocean.rs` — the DO `VpsShaper` impl (droplets,
-      `tag:superzej-managed` selector, snapshot-by-action-poll, key register) —
+      `tag:thegn-managed` selector, snapshot-by-action-poll, key register) —
       **unit tests**: URL shapes, body fields, tag selector, parse envelopes.
 - [x] 1.3 `VpsKind::parse` recognizes `digitalocean`; `token_env_default` →
       `DIGITALOCEAN_TOKEN`; `tests/vps_do_mock.rs` replay test.

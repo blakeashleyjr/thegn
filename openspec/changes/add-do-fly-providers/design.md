@@ -8,20 +8,20 @@ Both new backends satisfy `files` over the managed-ssh exec/files shim, so no
 pipeline code changes. Neither touches the event loop's render damage channels
 (all network work is off-loop, on spawned threads or `spawn_blocking`), and
 neither adds a SQLite schema change — the instance ledger stays file-based
-under `$XDG_STATE/superzej/vps/`.
+under `$XDG_STATE/thegn/vps/`.
 
 ## DigitalOcean: a second VpsKind
 
 `vps/mod.rs` factors the vendor-specific request shaping behind a `VpsShaper`
 trait (create/list/destroy bodies + URLs, ssh-key registration, snapshot,
 label/tag selector, parse envelopes). Hetzner's existing shaping becomes one
-impl; `vps/digitalocean.rs` is a second (droplets, `tag:superzej-managed`
+impl; `vps/digitalocean.rs` is a second (droplets, `tag:thegn-managed`
 selector, snapshot-by-action-poll). `VpsKind::parse` recognizes `digitalocean`;
 everything else (ledger, reaper, self-bridge, bake) is shared and unchanged.
 
 **Live gotchas already resolved:** Hetzner `cx22` is deprecated → default
 `cx23`; ssh-key registration is 409-idempotent by naming the key
-`superzej-managed-<fingerprint>` (re-use, don't recreate).
+`thegn-managed-<fingerprint>` (re-use, don't recreate).
 
 ## Fly: a distinct RemoteProvider
 

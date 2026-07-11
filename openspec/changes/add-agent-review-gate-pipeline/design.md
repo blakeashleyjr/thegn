@@ -27,7 +27,7 @@ Every node has a kind, an id, and kind-specific policy:
 - **`approval-gate`** — a pause node that parks the run awaiting a resolution
   (approve / fix / skip). This is where the finding model's `ask-user` findings
   collect. Can hand parked findings to `add-agent-steerable-review`'s panel.
-- **`pr`** — opens/updates the pull request via the existing `superzej pr create`
+- **`pr`** — opens/updates the pull request via the existing `thegn pr create`
   path, using change-intent for the body.
 
 ### Edge kinds
@@ -49,7 +49,7 @@ Edges wire nodes and carry the control flow:
 
 ### TOML authoring (layered config, `config_enum!` idiom)
 
-The graph is authored in superzej's layered TOML, node kinds/edge kinds are
+The graph is authored in thegn's layered TOML, node kinds/edge kinds are
 `config_enum!` variants, and the whole `[pipeline]` table is optional:
 
 ```toml
@@ -93,7 +93,7 @@ ethos as `render_plan::plan`:
   `Park`, or a terminal `Done`/`Failed`).
 - **All I/O is injected** — running a check command, invoking the agent, creating
   the worktree, persisting to SQLite — so the state machine itself is
-  deterministic and side-effect-free. It lives in `superzej-core`, is
+  deterministic and side-effect-free. It lives in `thegn-core`, is
   exhaustively **unit-tested**, and is **coverage-gated** (95% lines) exactly like
   `render_plan`.
 - Determinism gives us a regression gate analogous to render-plan's: given the
@@ -104,14 +104,14 @@ ethos as `render_plan::plan`:
 ## Why not copy the `no-mistakes` transport
 
 `no-mistakes` intercepts `git push` via a bare gate repo + a pinned post-receive
-hook, orchestrated by a background daemon. superzej is **already** the
+hook, orchestrated by a background daemon. thegn is **already** the
 long-running compositor and owns the UI, so none of that is needed:
 
 - The graph is triggered by a panel/palette action ("Validate branch") or
   automatically on agent-task completion.
 - There is no second remote, no `core.hooksPath` pinning, and no
   systemd/launchd/schtasks service — those would be redundant moving parts that
-  fight superzej's one-process / one-session model.
+  fight thegn's one-process / one-session model.
 
 ## Render impact
 
@@ -159,7 +159,7 @@ The finding model is preserved verbatim and attached to nodes:
   while carving out the intent-touching class for explicit review.
 - Resolution actions: **approve** (accept as-is), **fix** (apply the suggested
   change), **skip** (drop the finding). Surfaced to the human via the review pane
-  (and `add-agent-steerable-review`'s panel) and exposed to superzej's **own
+  (and `add-agent-steerable-review`'s panel) and exposed to thegn's **own
   embedded agent** through an ACP-shaped structured contract (aligns with R 232) —
   not a separate standalone CLI.
 - `conditional-on-severity` edges read the same severity, so the graph's routing
@@ -167,7 +167,7 @@ The finding model is preserved verbatim and attached to nodes:
 
 ## Change-intent
 
-- Derived from the **agent-session↔worktree binding** superzej already maintains
+- Derived from the **agent-session↔worktree binding** thegn already maintains
   (the embedded agent runs bound to a worktree; sessions persist/resurrect). The
   intent is the agent's task/prompt for the session that produced the change —
   available directly, with **no transcript-scraping or file-overlap heuristics**.
@@ -175,7 +175,7 @@ The finding model is preserved verbatim and attached to nodes:
   simply absent; the review/PR proceeds without it (degrade, don't fail).
 - Consumed by review/gate nodes (findings are judged against intent) and by the
   `pr` node (generates the intent/changes/risk/evidence sections of the PR body),
-  reusing the existing `superzej pr create` path.
+  reusing the existing `thegn pr create` path.
 
 ## AI-additive invariant
 

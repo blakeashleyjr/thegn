@@ -3,10 +3,10 @@ case_tmp_env: XDG_STATE_HOME
 matrix:
   profiles: [xterm]
   sizes: ["100x30"]
-spawn: ["szhost"]
+spawn: ["thegn"]
 env:
   XDG_STATE_HOME: "{case_tmp}"
-  SUPERZEJ_LOG: warn
+  THEGN_LOG: warn
   MUSE_READY: "1"
   TERM: xterm-256color
 sync:
@@ -20,7 +20,7 @@ snapshot_defaults:
     - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
 steps:
   - begin_step: "startup"
-  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 8000}
   # Exit the dashboard tile to access the Work tab.
   - key: {key: q}
   - sleep_ms: 200
@@ -87,7 +87,7 @@ steps:
   - sleep_ms: 80
   - snapshot: {name: after_repeated_cancel}
   # Tab count must still be 4
-  - expect_count: {regex: "\\bsuperzej\\b|[0-9]+:", min: 1, timeout_ms: 1000}
+  - expect_count: {regex: "\\bthegn\\b|[0-9]+:", min: 1, timeout_ms: 1000}
   # ── Tabbar overflow: many tabs on small screen ────────────────────────────────
   - begin_step: "tabbar overflow"
   - resize: "60x20"
@@ -109,5 +109,5 @@ steps:
   - sleep_ms: 80
   - begin_step: "verify no errors"
   - check_file:
-      path: "{case_tmp}/superzej/logs/szhost.log"
+      path: "{case_tmp}/thegn/logs/thegn.log"
       reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

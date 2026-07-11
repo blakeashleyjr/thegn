@@ -12,12 +12,12 @@ __pycache__/
 
 # Machine-local per-repo backend overlay written by `just start-term[-release]
 # backend=<x>` (dogfood switch); not committed — see `_apply-backend` in justfile.
-.superzej.toml
+.thegn.toml
 
 # Machine-local secrets sourced by .envrc (e.g. SPRITES_TOKEN); never committed.
 .envrc.local
 # Local-CI (act) secrets — NIX_GITHUB_TOKEN etc.; see .secrets.example.
 .secrets
-.superzej.yaml
-.superzej.yml
-.superzej.json
+.thegn.yaml
+.thegn.yml
+.thegn.json

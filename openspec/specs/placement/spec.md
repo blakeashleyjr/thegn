@@ -8,7 +8,7 @@ TBD - created by archiving change add-placement-engine. Update Purpose after arc
 
 ### Requirement: Placement decisions are pure, deterministic, and explainable
 
-superzej SHALL compute every placement decision (dedicated / packed /
+thegn SHALL compute every placement decision (dedicated / packed /
 provision / queue / reject) as a pure function of a snapshot of host
 capacities, tenancies, policy, and the clock — the same inputs MUST always
 produce the same decision — and SHALL record each decision with per-candidate
@@ -27,7 +27,7 @@ ineligibility reasons so a user can ask why a sandbox landed where it did.
 
 ### Requirement: Trust gates packing before cost
 
-superzej SHALL evaluate isolation and zone constraints before any
+thegn SHALL evaluate isolation and zone constraints before any
 capacity or cost ranking: a sandbox MUST NOT be packed onto a host whose
 isolation class does not satisfy the request's requirements, and MUST NOT be
 packed onto a host whose current tenants belong to a different zone,
@@ -42,7 +42,7 @@ regardless of free capacity.
 
 ### Requirement: Capacity reservations are atomic across processes
 
-superzej SHALL reserve a sandbox's declared resource floor on its chosen host
+thegn SHALL reserve a sandbox's declared resource floor on its chosen host
 via a single guarded SQL statement enforcing the capacity ceiling, zone
 co-tenancy, and dedicated exclusivity, so that two concurrent spawns racing
 for the last slot resolve to exactly one winner; the loser MUST re-rank and
@@ -58,7 +58,7 @@ whose driver dies MUST be swept after a TTL.
 
 ### Requirement: Hosts with unknown specs never pack
 
-superzej SHALL treat a host without an authoritative resource spec as
+thegn SHALL treat a host without an authoritative resource spec as
 ineligible for packing (it MAY still serve a dedicated placement), because an
 overcommit ceiling computed from an unknown base is meaningless.
 
@@ -71,7 +71,7 @@ overcommit ceiling computed from an unknown base is meaningless.
 
 ### Requirement: Autoscale creates Managed hosts through ordered template lanes with fail-back
 
-superzej SHALL, when no eligible host exists and autoscale is enabled and
+thegn SHALL, when no eligible host exists and autoscale is enabled and
 under its ceilings, provision a new Managed host from the first viable entry
 of the ordered template list; a create failure SHALL cool that lane down and
 subsequent requests SHALL try the next lane, with the cooled lane
@@ -86,7 +86,7 @@ automatically eligible again when its cooldown expires. Budget/count ceilings
 
 ### Requirement: Only Managed hosts are ever destroyed
 
-superzej MUST NOT destroy or scale down a host it did not create: scale-down
+thegn MUST NOT destroy or scale down a host it did not create: scale-down
 decisions SHALL be structurally restricted to Managed hosts, and an
 Independent host has no destroy capability by construction.
 
@@ -98,7 +98,7 @@ Independent host has no destroy capability by construction.
 
 ### Requirement: The engine is inert when disabled and bypassed by pins
 
-superzej SHALL keep every existing spawn path byte-identical while
+thegn SHALL keep every existing spawn path byte-identical while
 `[placement] enabled = false` (the default), and SHALL bypass the broker for
 an env explicitly pinned to a host (`[env.<n>] host = "..."`) while still
 recording the pinned tenancy so capacity accounting stays truthful.
@@ -117,19 +117,19 @@ recording the pinned tenancy so capacity accounting stays truthful.
 
 ### Requirement: Every host's resources are visible in one place — declared, reserved, and measured
 
-superzej SHALL maintain a per-host resource view covering ALL hosts — managed
+thegn SHALL maintain a per-host resource view covering ALL hosts — managed
 and independent alike — with three layers: the declared spec (authoritative
 for managed hosts), the reserved totals (Σ of live tenants' floors from the
 tenancy ledger), and the latest measured sample (observational load from a
 lightweight probe over the host's existing control channel). The view MUST be
-renderable (`szhost placement list`, the Hosts panel) and MUST be the same
+renderable (`thegn placement list`, the Hosts panel) and MUST be the same
 data the broker snapshots for assignment — display and scheduling never
 diverge. Measured samples SHALL refresh lazily with a TTL at decision/render
 time, never via idle polling (the 0%-idle invariant).
 
 #### Scenario: placement list shows all three layers for every host
 
-- **WHEN** the user runs `szhost placement list` with a managed VPS and a
+- **WHEN** the user runs `thegn placement list` with a managed VPS and a
   pinned ssh host registered
 - **THEN** each row shows the declared spec (or "unknown"), reserved
   cpu/mem + tenant count, and the last measured load with its age
@@ -143,7 +143,7 @@ time, never via idle polling (the 0%-idle invariant).
 
 ### Requirement: Warm-pool spares occupy capacity for their whole life
 
-superzej SHALL reserve tenancy for a pool spare when it is minted, rebind the
+thegn SHALL reserve tenancy for a pool spare when it is minted, rebind the
 same reservation to the claiming worktree at claim time, and release it only
 at destroy — a spare MUST never be invisible to the capacity index and MUST
 never be double-counted across the claim transition.
@@ -156,7 +156,7 @@ never be double-counted across the claim transition.
 
 ### Requirement: Independent hosts join the pool with probed capacity behind a conservative haircut
 
-superzej SHALL admit user-owned (`[host.*]` ssh/iroh/local) machines to the
+thegn SHALL admit user-owned (`[host.*]` ssh/iroh/local) machines to the
 packing pool only with a capacity source: the declared `capacity` and/or a
 headroom probe over the host's existing control channel. For these hosts the
 effective packing ceiling MUST compound the uncertainty conservatively —
@@ -181,7 +181,7 @@ proceed on a Ready host).
 
 ### Requirement: Trust classes gate co-tenancy, with independent hosts one notch down unless attested
 
-superzej SHALL rank co-tenancy boundaries on one ladder (host shell <
+thegn SHALL rank co-tenancy boundaries on one ladder (host shell <
 container < rootless container < guest kernel), derive a host's class from
 what the probe actually found, and require sealed-profile sandboxes to pack
 only at rootless-container strength or above. An independent host's effective
@@ -206,28 +206,28 @@ and never verified.
 
 ### Requirement: De-registration drains — it never kills or cleans another machine silently
 
-superzej SHALL move a de-registered host to a durable `draining` state that
+thegn SHALL move a de-registered host to a durable `draining` state that
 excludes it from every placement lane while existing sandboxes run to
 completion, finalizing (forgetting state + inventory) only at zero live
-tenants. Forced removal SHALL stop only superzej-labelled containers, only on
+tenants. Forced removal SHALL stop only thegn-labelled containers, only on
 explicit request, and on-host artifacts MUST only ever be offered for cleanup,
 never removed implicitly.
 
 #### Scenario: Drain with live tenants parks the host
 
-- **WHEN** `superzej host drain gpu-box` runs while two sandboxes live there
+- **WHEN** `thegn host drain gpu-box` runs while two sandboxes live there
 - **THEN** the host disappears from placement candidates immediately, both
   sandboxes keep running, and the host finalizes only after both release
 
 #### Scenario: Draining survives restarts
 
-- **WHEN** superzej restarts while a host is draining
+- **WHEN** thegn restarts while a host is draining
 - **THEN** the host resumes in `draining` (never re-provisions) and stays out
   of the pool
 
 ### Requirement: The measured resource layer covers every host without idle polling
 
-superzej SHALL refresh a host's measured sample lazily — at placement decision
+thegn SHALL refresh a host's measured sample lazily — at placement decision
 or explicit view time, guarded by a TTL — over the host's existing control
 channel, persist it, and render it in the per-host resource view alongside the
 declared and reserved layers. The idle event loop MUST NOT probe hosts.
@@ -237,11 +237,11 @@ declared and reserved layers. The idle event loop MUST NOT probe hosts.
 - **WHEN** a placement decision considers a host whose sample is older than
   the TTL
 - **THEN** one headroom exec refreshes it before eligibility is evaluated,
-  and an idle superzej issues no probes at all
+  and an idle thegn issues no probes at all
 
 ### Requirement: Spillover is the last paid lane, ordered and health-tracked
 
-superzej SHALL burst to an external sandbox vendor only after the owned pool
+thegn SHALL burst to an external sandbox vendor only after the owned pool
 and autoscale lanes are exhausted, walking the ordered `spillover_envs` list
 (provider-placement envs riding the existing provider pipeline; the list is
 global/profile config only — a repo overlay structurally cannot name
@@ -269,7 +269,7 @@ sticky: fail-back affects new placements only.
 
 ### Requirement: Compute spend is capped by its own ledger with fixed and metered categories
 
-superzej SHALL track placement cost in a compute ledger separate from the
+thegn SHALL track placement cost in a compute ledger separate from the
 LLM proxy's but identical in shape (scope → zone → global caps, monthly
 window, kill-switch): managed hosts accrue fixed hourly cost from create to
 destroy via idempotent watermark accrual (vendor-metered spillover accrual is
@@ -285,12 +285,12 @@ onto already-paid hosts keeps serving.
 
 #### Scenario: Accrual is idempotent across gaps
 
-- **WHEN** superzej is closed for a week while a managed host lives
+- **WHEN** thegn is closed for a week while a managed host lives
 - **THEN** the next accrual tick adds exactly the gap's cost, once
 
 ### Requirement: Presets set preferences, never constraints
 
-superzej SHALL expand a named placement preset into only the preference keys
+thegn SHALL expand a named placement preset into only the preference keys
 still at their built-in defaults — an explicitly-set key always wins — and a
 preset MUST be structurally unable to touch constraint keys; every expansion
 still flows through the zone floor and mode clamp.
@@ -304,16 +304,16 @@ still flows through the zone floor and mode clamp.
 
 ### Requirement: Repo overlays cannot touch fleet placement policy
 
-superzej SHALL keep every `[placement]` key out of the repo overlay schema
+thegn SHALL keep every `[placement]` key out of the repo overlay schema
 entirely (the `[host.*]` structural-exclusion precedent): a checked-in
-`.superzej.*` file cannot set overcommit, spend caps, autoscale lanes,
+`.thegn.*` file cannot set overcommit, spend caps, autoscale lanes,
 prices, or spillover targets, because the overlay simply has no such table —
 packing economics for shared hosts are never authorable from the
 least-trusted layer.
 
 #### Scenario: Hostile repo overlay cannot reach placement config
 
-- **WHEN** a cloned repo's `.superzej.toml` smuggles a `[placement]` table
+- **WHEN** a cloned repo's `.thegn.toml` smuggles a `[placement]` table
   with `overcommit = 16.0` and its own spillover list
 - **THEN** none of it reaches the resolved config (the overlay schema has no
   placement table) and the worktree still opens

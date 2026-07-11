@@ -4,7 +4,7 @@
 
 ### Requirement: An issue can be turned into a worktree tab in one action
 
-superzej SHALL provide an action, from the unified work surface, that creates a
+thegn SHALL provide an action, from the unified work surface, that creates a
 worktree for a selected issue — deriving its branch from the issue via a
 configurable session-name template, creating the worktree off the event loop, and
 adding and focusing its tab — and records the issue↔worktree binding in the
@@ -31,7 +31,7 @@ restart. This worktree-creation path MUST NOT depend on the AI layer.
 
 ### Requirement: An agent can optionally be launched seeded with the issue's context
 
-superzej SHALL, when `auto_launch_agent` is enabled and an agent is configured,
+thegn SHALL, when `auto_launch_agent` is enabled and an agent is configured,
 launch an agent as a visible pane in the new worktree seeded with the issue's
 title, body, and URL as initial context; when the option is off or no agent is
 configured, no agent is launched and the worktree-creation action still completes.

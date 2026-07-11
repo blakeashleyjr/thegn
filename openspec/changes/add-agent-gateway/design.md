@@ -2,7 +2,7 @@
 
 ## Identity: the per-worktree virtual key
 
-The gateway keys every decision off **agent identity**, and superzej already has
+The gateway keys every decision off **agent identity**, and thegn already has
 one: `route_agent` wires a foreign agent through the proxy under a **per-worktree
 virtual key**. That key (plus the worktree/repo it belongs to) _is_ the identity.
 No new identity concept, no schema: the relay already carries it on the request,
@@ -12,8 +12,8 @@ applies it at the two I/O seams below.
 
 ## The policy (declarative layered TOML)
 
-Policy is a declarative document — layered like the rest of superzej config
-(global → repo `.superzej.*` → per-agent front-matter), resolved into a pure
+Policy is a declarative document — layered like the rest of thegn config
+(global → repo `.thegn.*` → per-agent front-matter), resolved into a pure
 `GatewayPolicy` value:
 
 ```toml
@@ -29,7 +29,7 @@ across). Absent a policy for an identity, the gateway is a **transparent
 pass-through** — every tool visible, nothing injected, no guardrail beyond the
 existing ones — so the current behavior is the zero-policy default.
 
-The pure core module (`superzej-core::gateway`) owns: parse+layer the TOML,
+The pure core module (`thegn-core::gateway`) owns: parse+layer the TOML,
 build `GatewayPolicy`, and the two pure evaluators —
 `filter_tools(policy, advertised) -> allowed` and
 `plan_injection(policy, request) -> InjectionPlan {system_blocks, tool_blocks}`.
@@ -109,11 +109,11 @@ injected-block index.
 
 ## Pure-core vs proxy/host I/O split
 
-- **superzej-core** (`gateway` module + a `proxy/transform.rs` helper): policy
+- **thegn-core** (`gateway` module + a `proxy/transform.rs` helper): policy
   parse/layer, `GatewayPolicy`, `filter_tools`, `plan_injection`, the cache-safe
   splice, and the guardrail-chain _matchers_ (regex/secret/PII detectors as pure
   functions). All unit-tested, 95% gate.
-- **superzej-proxy / superzej-host** (I/O wiring): resolve identity→policy from
+- **thegn-proxy / thegn-host** (I/O wiring): resolve identity→policy from
   the request's virtual key, call the pure evaluators, apply the plan to the live
   body, run the guardrail chain on egress, and enforce deny-unlisted in the MCP
   router. No policy _logic_ here — just the seam.

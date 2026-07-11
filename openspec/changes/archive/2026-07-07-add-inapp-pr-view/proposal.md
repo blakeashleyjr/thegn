@@ -3,9 +3,9 @@
 ## Summary
 
 Selecting a PR in the panel today does one thing: `xdg-open`s it in the browser.
-This change makes the full pull-request workflow happen inside `szhost`. The
+This change makes the full pull-request workflow happen inside `thegn`. The
 panel's `Section::Pr` stays the at-a-glance summary, but pressing **Enter** now
-opens a new near-full-screen **PR view** modal (`crates/superzej-host/src/pr_view.rs`)
+opens a new near-full-screen **PR view** modal (`crates/thegn-host/src/pr_view.rs`)
 with four tabs — **Overview**, **Checks**, **Conversation**, **Files** — that
 lets the user read CI checks, the comment/review timeline, review threads, and
 the unified diff, and act on all of it without leaving the app: merge, approve,
@@ -14,10 +14,10 @@ re-run failed checks, and inline line-level review comments. `o` still opens the
 browser as an escape hatch.
 
 The service layer gains the missing write and read seams (in
-`superzej-core::github` and the `GhBackend` trait): post comment, submit review
+`thegn-core::github` and the `GhBackend` trait): post comment, submit review
 with state, reply to a thread, fetch and parse the unified diff, post an inline
 line comment, and a one-round-trip conversation fetch (comments + reviews +
-threads). Every seam has CLI parity (`superzej pr comment|review|diff`), so the
+threads). Every seam has CLI parity (`thegn pr comment|review|diff`), so the
 capability exists headless too. Diff and conversation load off the event loop;
 every write runs off-thread and pulses a `RefreshKind::Pr` that re-hydrates the
 panel cache and, when the view is open, re-fetches its data so a just-posted
@@ -27,7 +27,7 @@ comment shows up.
 
 - **Panel capability** — the `PR` section becomes a launch point for a full
   workflow surface, not just a browser shortcut.
-- **GitHub seam (`superzej-svc` GitBackend / `superzej-core::github`)** — six new
+- **GitHub seam (`thegn-svc` GitBackend / `thegn-core::github`)** — six new
   operations (comment, submit_review, reply_thread, pr_diff, add_line_comment,
   conversation). Reads may go native (octocrab) later; **writes stay CLI-only**
   (delegate to `gh`), preserving the "every native path falls back to CLI"
@@ -44,7 +44,7 @@ comment shows up.
 
 ## Rationale
 
-superzej is a git-worktree IDE whose whole point is staying in one terminal
+thegn is a git-worktree IDE whose whole point is staying in one terminal
 surface. PR review is the one workflow that still ejected the user to a browser,
 breaking that promise. The data seam was already half-built — `pr_status`,
 `review_threads`, `reviews`, `approve`, `merge`, `rerun_failed` exist — so the

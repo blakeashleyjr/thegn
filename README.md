@@ -1,22 +1,21 @@
-# superzej
+# thegn
 
 A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
 One process, one session: each git repo is a **workspace**, each git
 **worktree** is a **tab**, and the chrome — a left sidebar tree, a right
 diff/PR panel, tabbar, statusbar, and a pinned-program strip — is rendered
 in-process by a native compositor. No plugins, no IPC, no external multiplexer.
-(superzej was originally built on zellij; that architecture was fully stripped
+(thegn was originally built on zellij; that architecture was fully stripped
 and it is now a from-scratch native compositor.)
 
-A single **Rust** binary (`szhost`, installed as `superzej` with `sj`/`szhost`
-aliases) drives portable-pty panes, composites them with the chrome into a
+A single **Rust** binary (`thegn`, with a short `tg` alias) drives portable-pty panes, composites them with the chrome into a
 termwiz surface, and diff-flushes to your terminal. A bundled SQLite store
 keeps repo history, worktree state, session layout, and a PR cache. Everything
 is instant by construction: sub-300ms launch, <16ms renders, ~0% idle CPU.
 
 ## Mental model
 
-superzej is **one session**; switching repos or worktrees is a tab switch,
+thegn is **one session**; switching repos or worktrees is a tab switch,
 never a session change.
 
 | Concept       | Maps to                       | Created / toggled by                                                    |
@@ -102,11 +101,11 @@ familiar IDE chords._
 
 ```nix
 # flake.nix inputs
-superzej.url = "github:youruser/superzej";
+thegn.url = "github:youruser/thegn";
 
 # home-manager config
-imports = [ inputs.superzej.homeManagerModules.default ];
-programs.superzej = {
+imports = [ inputs.thegn.homeManagerModules.default ];
+programs.thegn = {
   enable = true;
   worktreesDir = "/home/you/worktrees";
   repoRoots = [ "/home/you/code" "/home/you/src" ];  # scanned by the repo picker
@@ -124,38 +123,38 @@ Or just the binary: `nix profile install .#default`.
 ### Standalone
 
 ```sh
-./install.sh    # builds szhost; installs sj (Alacritty), sj-tui (current terminal), superzej, szhost
-sj              # dedicated Alacritty window with the bundled profile
-sj-tui          # same TUI in the current terminal window
+./install.sh    # builds thegn; installs tg (Alacritty), tg-tui (current terminal), thegn
+tg              # dedicated Alacritty window with the bundled profile
+tg-tui          # same TUI in the current terminal window
 ```
 
-`./install.sh` needs Rust/Cargo, and an `alacritty` binary for the `sj`
-dedicated-window launcher; `sj-tui`, `superzej`, and `szhost` run directly in
-the current terminal. superzej shells out to `git` (and `gh`/`ssh` as
+`./install.sh` needs Rust/Cargo, and an `alacritty` binary for the `tg`
+dedicated-window launcher; `tg-tui` and `thegn` run directly in
+the current terminal. thegn shells out to `git` (and `gh`/`ssh` as
 fallbacks where native support has gaps); `lazygit` is optional.
 
 ## How it works
 
-- **Three crates.** `superzej-core` (substrate-agnostic domain logic: layered
-  config, SQLite, keymap registry, theme, sandbox backends), `superzej-svc`
+- **Three crates.** `thegn-core` (substrate-agnostic domain logic: layered
+  config, SQLite, keymap registry, theme, sandbox backends), `thegn-svc`
   (service seams with graceful degradation: gix-native git reads with CLI
   fallback, GitHub via octocrab/`gh`, SSH via russh/`ssh`), and
-  `superzej-host` (the compositor: tokio, portable-pty panes, termwiz
+  `thegn-host` (the compositor: tokio, portable-pty panes, termwiz
   diff-flush rendering, in-process chrome).
 - **Fully event-driven.** The loop blocks on terminal input with no tick or
   timeout; PTY readers, hydration, and fs-watchers wake it over channels. A
   damage-region render planner repaints only what changed — pane output costs
   a bounded diff, not a chrome recompose. Idle CPU is ~0% by contract.
-- **State.** SQLite at `$XDG_STATE_HOME/superzej/superzej.db` (WAL): repos,
+- **State.** SQLite at `$XDG_STATE_HOME/thegn/thegn.db` (WAL): repos,
   workspaces, worktrees, PR cache, layouts, session state. **git is the source
   of truth** for worktrees; the DB is a cache + resurrection layer. Restarting
   restores your exact workspace/worktree/pane position.
-- **Worktrees** default to `~/.superzej/worktrees/<repo>/<branch-slug>`;
+- **Worktrees** default to `~/.thegn/worktrees/<repo>/<branch-slug>`;
   `worktree_mode = "in_repo"` uses `<repo>/.worktrees`.
 
 ### CLI
 
-Bare `superzej` launches the compositor; subcommands run non-interactively:
+Bare `thegn` launches the compositor; subcommands run non-interactively:
 `pr`, `issue`, `ci`, `diff`, `list`, `integrate` (drain the local merge
 queue), `disk` / `clean` (per-worktree disk usage / reclaim `target/`),
 `repos`, `recent`, `config`, `env` (named execution environments), `theme`,
@@ -164,10 +163,10 @@ runs everything under a separate whole-process profile (own state/DB/config).
 
 ## Config
 
-Behavior is configured in `~/.config/superzej/config.toml` — see
+Behavior is configured in `~/.config/thegn/config.toml` — see
 [`config/config.toml.example`](config/config.toml.example) for every key,
-documented. Home-manager users configure via `programs.superzej.*`. A
-repo-root `.superzej.{toml,yaml,yml,json}` overlays per-repo settings
+documented. Home-manager users configure via `programs.thegn.*`. A
+repo-root `.thegn.{toml,yaml,yml,json}` overlays per-repo settings
 (sandbox, keybinds, env selection). Highlights:
 
 - `[theme]` — `accent` recolors every surface; named theme presets cycle with
@@ -183,7 +182,7 @@ repo-root `.superzej.{toml,yaml,yml,json}` overlays per-repo settings
 
 ## Terminal compatibility
 
-superzej renders to whatever terminal it runs in and **degrades gracefully** —
+thegn renders to whatever terminal it runs in and **degrades gracefully** —
 from bare shells (Linux console, plain `xterm`, `screen`/`tmux`, CI capture,
 anything honoring `NO_COLOR`) up to fully-featured emulators (ghostty,
 wezterm, kitty, foot, …). Color quantizes truecolor → 256 → 16 → mono;
@@ -194,11 +193,11 @@ XTVERSION) catches modern emulators behind `ssh`/`tmux` that report a generic
 
 ```toml
 [theme]
-color  = "auto"   # auto | truecolor | 256 | 16 | none/mono   (SUPERZEJ_THEME_COLOR)
-glyphs = "auto"   # auto | unicode | ascii                    (SUPERZEJ_THEME_GLYPHS)
+color  = "auto"   # auto | truecolor | 256 | 16 | none/mono   (THEGN_THEME_COLOR)
+glyphs = "auto"   # auto | unicode | ascii                    (THEGN_THEME_GLYPHS)
 ```
 
-Run **`superzej doctor`** (add `--json` for scripts) to see the detected
+Run **`thegn doctor`** (add `--json` for scripts) to see the detected
 environment and exactly which features are enabled vs degraded.
 
 ## Sandboxing worktrees
@@ -214,7 +213,7 @@ path**, so host-side git reads (sidebar, panel, PR) keep working.
   `wsl` are also selectable. Hardening presets: `open` / `hardened` (default)
   / `sealed` (no network, read-only root, all caps dropped).
 - **Named environments** (`[env.<name>]`) place a worktree locally, over
-  `ssh`, on Kubernetes, or on a managed provider; `superzej env` inspects and
+  `ssh`, on Kubernetes, or on a managed provider; `thegn env` inspects and
   selects them.
 - **Remote** (`[sandbox.remote]`) runs worktrees on another machine — the
   interactive pane over **mosh** by default, git reads and lifecycle over

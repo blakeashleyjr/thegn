@@ -1,13 +1,13 @@
 # Tasks
 
-## 1. Registry (superzej-proxy)
+## 1. Registry (thegn-proxy)
 
 - [ ] 1.1 Define `ProviderInfo { id, base_url, auth_env, default_model, transforms }`
       and a `providers()` registry table + `lookup(id)` — **unit tests**: every
       entry has non-empty id/base_url/auth_env, ids are unique, known id resolves,
       unknown id errors cleanly.
 
-## 2. Derive config + client from the registry (superzej-proxy)
+## 2. Derive config + client from the registry (thegn-proxy)
 
 - [ ] 2.1 Validate/complete the `[proxy]`/route config against the registry (a
       route inherits its provider's default model + base URL unless overridden) —

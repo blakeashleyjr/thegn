@@ -10,7 +10,7 @@
 
 ## 2. Affirm against existing surfaces
 
-- [ ] 2.1 Confirm `crates/superzej-core/src/sandbox.rs` backend selection
+- [ ] 2.1 Confirm `crates/thegn-core/src/sandbox.rs` backend selection
       (`podman` → `docker` → `bwrap` → `none`) and the `--no-sandbox` opt-out
       (item 362) match the sandbox-by-default requirement; note the explicit + logged
       opt-out path.

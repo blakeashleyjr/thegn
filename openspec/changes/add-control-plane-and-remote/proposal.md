@@ -5,8 +5,8 @@
 Split compute from UI. Introduce a long-lived **daemon** that owns the
 `portable-pty` panes so the terminal UI can attach/detach and **warm-reattach**
 to agents that are still running; a **control API** (HTTP/gRPC + SSE/WebSocket
-event feed) plus `szhost` verbs that drive a _running_ instance instead of only
-resurrecting from SQLite; a `szhost serve` host with thin desktop/web/mobile
+event feed) plus `thegn` verbs that drive a _running_ instance instead of only
+resurrecting from SQLite; a `thegn serve` host with thin desktop/web/mobile
 clients paired over a URL; a **persistent relay** that keeps remote PTYs alive
 across client disconnects via a grace-period lease; and a **mobile companion**
 that monitors and lightly controls a paired instance.
@@ -27,14 +27,14 @@ seams, never a hard requirement of the shell.
   and AI **422/423** push notifications).
 - Relates: AK **445/451/454**, J **133**, AP **501** (federation alignment for
   the thin-client model), AI **422/423** (push).
-- New capability `control-plane`. Touches `superzej-host` (daemon split,
-  attach/detach), `superzej-svc` (API/relay transport seams), and the SQLite
+- New capability `control-plane`. Touches `thegn-host` (daemon split,
+  attach/detach), `thegn-svc` (API/relay transport seams), and the SQLite
   `state-db` (daemon registry + lease records; `user_version` bump).
 
 ## Rationale
 
-TODAY superzej is a foreground compositor that **resurrects** session state from
-SQLite (`$XDG_STATE_HOME/superzej/superzej.db`), not a live PTY-owning daemon.
+TODAY thegn is a foreground compositor that **resurrects** session state from
+SQLite (`$XDG_STATE_HOME/thegn/thegn.db`), not a live PTY-owning daemon.
 When the UI exits, its panes die with it; a running agent cannot be left and
 rejoined. A 769 daemon that owns the PTYs is the enabler for everything else:
 the UI becomes one attachable client, the CLI (770) and thin remote/mobile

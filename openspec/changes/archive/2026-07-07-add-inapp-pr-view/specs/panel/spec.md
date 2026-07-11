@@ -6,7 +6,7 @@
 
 The panel SHALL open a full-screen PR view when the user activates (Enter) the
 `PR` section for a worktree that has a pull request, so the complete review
-workflow happens inside `szhost` without a browser. The view MUST present the
+workflow happens inside `thegn` without a browser. The view MUST present the
 PR's checks, conversation (comments + submitted reviews + review threads), and
 unified diff, and MUST let the user act on the PR — merge, approve,
 request-changes / comment reviews (each with a body), post a PR-level comment,

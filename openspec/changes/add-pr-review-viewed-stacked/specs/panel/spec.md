@@ -13,7 +13,7 @@ panic, and a `user_version` bump provides the viewed-state table.
 
 #### Scenario: Viewed state persists across restart
 
-- **WHEN** a reviewer marks a file viewed and later restarts superzej
+- **WHEN** a reviewer marks a file viewed and later restarts thegn
 - **THEN** that file is still shown as viewed in the PR panel
 
 #### Scenario: Viewed state syncs with GitHub

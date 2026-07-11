@@ -1,19 +1,19 @@
-# superzej drawer keymap — PREPENDED to yazi's presets, so these win for their
+# thegn drawer keymap — PREPENDED to yazi's presets, so these win for their
 # keys while every default yazi binding still works. If this file fails to parse
 # yazi falls back to its presets (so the drawer still works; only these extras
 # are lost).
 #
-# Both bindings drive the superzej host over a private OSC channel emitted by the
+# Both bindings drive the thegn host over a private OSC channel emitted by the
 # bundled sz-drawer plugins (see plugins/sz-drawer-*.yazi and
-# superzej-core/src/yazi.rs). Living under [mgr] they fire only in yazi's manager
+# thegn-core/src/yazi.rs). Living under [mgr] they fire only in yazi's manager
 # mode, so `q`/`<C-e>` stay literal while typing in rename/filter/find inputs —
 # the host no longer intercepts keys, yazi owns them all.
 
 [mgr]
 prepend_keymap = [
-  # Close the superzej drawer. yazi keeps running, hidden in the keep-alive pool,
+  # Close the thegn drawer. yazi keeps running, hidden in the keep-alive pool,
   # so its cursor position survives the next open.
-  { on = "q", run = "plugin sz-drawer-close", desc = "Close the superzej drawer" },
-  # Open the hovered file in the superzej editor surface (a fresh center tab).
-  { on = "<C-e>", run = "plugin sz-drawer-editor", desc = "Open in the superzej editor" },
+  { on = "q", run = "plugin sz-drawer-close", desc = "Close the thegn drawer" },
+  # Open the hovered file in the thegn editor surface (a fresh center tab).
+  { on = "<C-e>", run = "plugin sz-drawer-editor", desc = "Open in the thegn editor" },
 ]

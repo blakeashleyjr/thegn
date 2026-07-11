@@ -2,7 +2,7 @@ name: sandbox-image
 # Build + publish the multi-arch base sandbox image (hosts-as-resources):
 # per-arch nix builds on native runners → push per-arch tags → assemble +
 # push the manifest list → print its digest, which release commits pin as
-# DEFAULT_BASE_DIGEST (crates/superzej-core/src/image.rs).
+# DEFAULT_BASE_DIGEST (crates/thegn-core/src/image.rs).
 #
 # Registry pull is the ALTERNATE delivery route (the default is registry-less
 # transfer from the dev machine), so this publishes on demand / on tag — it is
@@ -21,7 +21,7 @@ permissions:
   contents: read
   packages: write
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/superzej-sandbox
+  IMAGE: ghcr.io/${{ github.repository_owner }}/thegn-sandbox
 jobs:
   build:
     strategy:
@@ -49,7 +49,7 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
           ref="$IMAGE:${{ steps.tag.outputs.tag }}-${{ matrix.oci_arch }}"
-          podman tag superzej-sandbox:latest "$ref"
+          podman tag thegn-sandbox:latest "$ref"
           podman push "$ref"
   manifest:
     needs: build

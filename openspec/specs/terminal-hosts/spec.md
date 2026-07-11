@@ -8,7 +8,7 @@ First-class terminal groups (local, ssh, mosh, container) persisted and rendered
 
 ### Requirement: Terminals are first-class sidebar groups outside git
 
-superzej SHALL manage terminal environments (local, ssh, mosh, container) persisted in a `terminals` table and rendered as a Terminals section in the sidebar, where selecting a terminal row behaves like a worktree row (activate the group, show its tabs, spawn if not running); git-only queries (PR counts, branch) MUST return empty/None for terminal groups rather than erroring.
+thegn SHALL manage terminal environments (local, ssh, mosh, container) persisted in a `terminals` table and rendered as a Terminals section in the sidebar, where selecting a terminal row behaves like a worktree row (activate the group, show its tabs, spawn if not running); git-only queries (PR counts, branch) MUST return empty/None for terminal groups rather than erroring.
 
 #### Scenario: Select a terminal row
 

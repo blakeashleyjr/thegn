@@ -1,5 +1,5 @@
 {pkgs, ...}: {
-  # Developer environment for superzej. `devenv shell` to enter, `devenv test`
+  # Developer environment for thegn. `devenv shell` to enter, `devenv test`
   # to run the git-hooks + smoke test.
 
   packages = with pkgs; [
@@ -10,7 +10,7 @@
     # + CI compile/test cost.
     cargo-nextest
     mold
-    # compilation cache (RUSTC_WRAPPER below). superzej is a many-worktree
+    # compilation cache (RUSTC_WRAPPER below). thegn is a many-worktree
     # workflow and each `git worktree` has its own cold target/; sccache shares
     # compiled crate artifacts across all of them (and across branch switches),
     # so a fresh worktree's first build is warm instead of from-scratch.
@@ -37,7 +37,7 @@
     # dependency gates (`just deps-audit`)
     cargo-deny
     cargo-machete
-    # runtime tools superzej shells out to
+    # runtime tools thegn shells out to
     git
     fzf
     gum
@@ -46,7 +46,7 @@
     delta
     gh
     # spec-driven development CLI (hermetic, pinned; see nix/openspec.nix).
-    # superzej manages its own development with OpenSpec — `just openspec*`.
+    # thegn manages its own development with OpenSpec — `just openspec*`.
     nodejs
     (pkgs.callPackage ./nix/openspec.nix {})
   ];
@@ -146,14 +146,14 @@
     # git hooks run with GIT_DIR and GIT_INDEX_FILE set. This leaks into the
     # git subprocesses spawned by `cargo test`, causing spurious failures in
     # repository manipulation tests. Strip them via `env -u` so tests run in a
-    # clean git environment. Likewise drop SUPERZEJ_SANDBOX: committing from a
-    # shell running inside a live superzej bwrap sandbox leaks the =1 marker
+    # clean git environment. Likewise drop THEGN_SANDBOX: committing from a
+    # shell running inside a live thegn bwrap sandbox leaks the =1 marker
     # into the runner and false-fails the sandbox argv tests. `just test` runs
     # cargo-nextest (faster) + a doctest pass — one source of truth with CI.
     cargo-test = {
       enable = true;
       name = "cargo test";
-      entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u SUPERZEJ_SANDBOX just test";
+      entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u THEGN_SANDBOX just test";
       language = "system";
       pass_filenames = false;
       stages = ["pre-push"];
@@ -169,7 +169,7 @@
   };
 
   enterShell = ''
-    echo "superzej devenv — cargo build | just smoke | nix fmt"
+    echo "thegn devenv — cargo build | just smoke | nix fmt"
 
     # Leave headroom so heavy builds don't peg the machine. CARGO_BUILD_JOBS
     # caps the parallel rustc/codegen jobs cargo spawns; computed at shell entry
@@ -202,6 +202,6 @@
   # `devenv test` runs the hooks, then this.
   enterTest = ''
     cargo build --workspace
-    ./test/smoke.sh target/debug/szhost
+    ./test/smoke.sh target/debug/thegn
   '';
 }

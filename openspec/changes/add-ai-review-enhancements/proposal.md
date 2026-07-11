@@ -38,8 +38,8 @@ Relates to:
 
 - **T 262** — Inline comments → follow-up prompt (763 extends it)
 - **AR 654** — agent review/repair surface
-- **U** (group) — the `superzej-proxy` LLM proxy used for every model call
-- **AV** (group) — CI: `crates/superzej-svc/src/ci.rs` `CiRun`/`CiLog`
+- **U** (group) — the `thegn-proxy` LLM proxy used for every model call
+- **AV** (group) — CI: `crates/thegn-svc/src/ci.rs` `CiRun`/`CiLog`
 - **AF 399** — graphics preview (kitty/iTerm/sixel) reused for image-diff
 - **Y** (group) — commit/push flow in `gitmut.rs`
 
@@ -60,7 +60,7 @@ New capability introduced (ADDED spec): `agent-review`.
 
 ## Non-goals
 
-- No new model transport — every model call goes through `superzej-proxy`
+- No new model transport — every model call goes through `thegn-proxy`
   (group U); no direct provider SDK calls.
 - No `--no-verify` bypass and no auto-commit — the user still confirms the commit;
   the agent edits the tree and checks re-run.

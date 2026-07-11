@@ -8,12 +8,12 @@
 Branch worktrees under a repo in the sidebar shuffle order between launches and
 refreshes. The root cause is non-deterministic ordering:
 
-- `db.worktrees()` (`crates/superzej-core/src/db.rs:709`) has **no `ORDER BY`**,
+- `db.worktrees()` (`crates/thegn-core/src/db.rs:709`) has **no `ORDER BY`**,
   so SQLite returns rows in an unspecified order.
 - The unloaded-workspace branch in `build_rows`
-  (`crates/superzej-host/src/sidebar.rs:309`) lists those rows in raw DB order,
+  (`crates/thegn-host/src/sidebar.rs:309`) lists those rows in raw DB order,
   bypassing `sort_groups` entirely.
-- The resurrect adopt loop (`crates/superzej-host/src/session.rs:180`) appends
+- The resurrect adopt loop (`crates/thegn-host/src/session.rs:180`) appends
   worktrees not yet in `tab_groups` in that same arbitrary order.
 
 Loaded worktrees inside an open workspace are already stable (default
@@ -108,7 +108,7 @@ unconditionally with the error ignored). Bump `SCHEMA_VERSION` 7 → 8.
 
 ### 5. Testing
 
-- **Core (`superzej-core`, 95% line gate):**
+- **Core (`thegn-core`, 95% line gate):**
   - migration backfill assigns deterministic positions by `created_at, worktree`;
   - `worktrees()` returns rows in `position` order;
   - new-worktree insert appends (`MAX(position)+1`);
@@ -130,14 +130,14 @@ unconditionally with the error ignored). Bump `SCHEMA_VERSION` 7 → 8.
 
 ## Affected files (anticipated)
 
-- `crates/superzej-core/src/db.rs` — migration (column + `SCHEMA_VERSION` 8 +
+- `crates/thegn-core/src/db.rs` — migration (column + `SCHEMA_VERSION` 8 +
   backfill), `worktrees()` `ORDER BY position`, `put_worktree` position
   assignment, a position-swap/move helper.
-- `crates/superzej-host/src/sidebar.rs` — `SortMode::Manual` (new default),
+- `crates/thegn-host/src/sidebar.rs` — `SortMode::Manual` (new default),
   `sort_groups` handling, unloaded-branch ordering.
-- `crates/superzej-host/src/session.rs` — resurrect sorts by `position`;
+- `crates/thegn-host/src/session.rs` — resurrect sorts by `position`;
   `persist()` writes `position`.
-- `crates/superzej-host/src/keymap.rs` — `MoveWorktreeUp`/`MoveWorktreeDown` +
+- `crates/thegn-host/src/keymap.rs` — `MoveWorktreeUp`/`MoveWorktreeDown` +
   `Shift Alt Up`/`Shift Alt Down` chords.
-- `crates/superzej-host/src/run.rs` — action handlers wiring the move + persist.
+- `crates/thegn-host/src/run.rs` — action handlers wiring the move + persist.
 - `config/config.toml.example` — document the new keybinds / `manual` sort mode.

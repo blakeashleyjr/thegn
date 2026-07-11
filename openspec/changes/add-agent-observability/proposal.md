@@ -39,7 +39,7 @@ The activity-dot state machine, the per-provider `account.rs` registry, the
 accordion already exist. Agent observability rides all of them: provider state
 and OSC titles are _read locally_ (no API, no proxy round-trip), refreshes run
 **off the event loop** on the existing ticker and wake the loop on a result so
-the 0%-idle contract holds, and the read-only model stays in `superzej-core`
+the 0%-idle contract holds, and the read-only model stays in `thegn-core`
 behind testable parsers. Because every signal is read from disk or the terminal,
 the AI-free shell gains the observability surface as pure additive chrome —
 nothing here becomes a hard dependency on the AI/proxy layer.

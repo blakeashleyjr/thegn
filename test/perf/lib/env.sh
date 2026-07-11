@@ -3,7 +3,7 @@
 #
 # Mirrors the justfile `_e2e_env` block: redirect HOME, the XDG dirs, and git
 # config into a throwaway temp dir so the harness can neither read the
-# developer's real config/gitconfig nor leak state into the daily superzej DB.
+# developer's real config/gitconfig nor leak state into the daily thegn DB.
 # A memory note is explicit that zellij-era tests leaked into the daily DB
 # unless XDG_STATE_HOME (not just HOME) was sandboxed — so isolate all of them.
 #

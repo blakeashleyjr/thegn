@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Persistence: daemon + lease + pairing registry (superzej-core)
+## 1. Persistence: daemon + lease + pairing registry (thegn-core)
 
 - [x] 1.1 — Add `daemons`, `session_leases`, `pairings` tables + CRUD
       (`put_daemon`/`daemons`/`del_daemon`/`touch_daemon_heartbeat`,
@@ -26,14 +26,14 @@
       sessions, send-to-terminal, snapshot, drive-browser, with SSE/WebSocket
       event feed and scoped-token auth — **unit tests** (scope enforcement;
       event-frame fan-out; off-loop transport).
-- [x] 3.2 — `szhost` verbs that talk to a running instance (open worktree,
+- [x] 3.2 — `thegn` verbs that talk to a running instance (open worktree,
       send-to-terminal, snapshot, drive-browser) as thin API callers extending
       the 454 headless CLI; graceful no-daemon fallback — **unit tests** (verb →
       API request mapping; no-daemon degradation).
 
 ## 4. `serve` + pairing-URL thin clients (svc + host)
 
-- [x] 4.1 — `szhost serve` advertises a pairing URL; clients pair (token in
+- [x] 4.1 — `thegn serve` advertises a pairing URL; clients pair (token in
       `pairings`, hashed) and attach over the control API; pairing/approval
       surfaces as a chrome overlay (maps to `Full`) — **unit tests** (pairing
       issue/redeem/revoke; scope binding).

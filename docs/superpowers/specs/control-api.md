@@ -1,18 +1,18 @@
-# The superzej control API (v1)
+# The thegn control API (v1)
 
 The contract a thin client — desktop, web, or the mobile companion — builds
-against. One service seam (`superzej_svc::control::ControlApi`, implemented by
+against. One service seam (`thegn_svc::control::ControlApi`, implemented by
 the pane daemon) exposed over three transports:
 
 - **HTTP + WebSocket** (primary): the routes below, served on the daemon's
   unix socket (local; same-uid peers are implicitly admin unless
-  `[serve] local_admin = false`) and on `szhost serve`'s TCP listener
+  `[serve] local_admin = false`) and on `thegn serve`'s TCP listener
   (bearer token **required**).
 - **SSE** (`GET /v1/events/sse`): the same feed as JSON envelopes
   (pane bytes base64) — a curl-friendly convenience; WS is primary.
-- **gRPC** (`superzej.control.v1.Control`, same TCP port): a mechanical
+- **gRPC** (`thegn.control.v1.Control`, same TCP port): a mechanical
   mirror for external tooling. See
-  `crates/superzej-svc/proto/superzej/control/v1/control.proto`.
+  `crates/thegn-svc/proto/thegn/control/v1/control.proto`.
 
 Transport security (v1): the TCP listener is **plaintext** — bind it to a
 trusted network (tailscale/wireguard) or tunnel over `ssh -L`. Every request
@@ -22,7 +22,7 @@ so TLS + pinning lands later without a format break.
 ## Scopes
 
 Every token holds a scope set (csv in `pairings.scope`). The verb→scope table
-is `superzej_core::control::required_scope` — the single tested policy source.
+is `thegn_core::control::required_scope` — the single tested policy source.
 
 | Scope   | Grants                                                                                 |
 | ------- | -------------------------------------------------------------------------------------- |
@@ -41,13 +41,13 @@ an under-scoped request is rejected **before any action runs** (403 /
 - Control token: `szc1_<id:8hex>_<secret:64hex>` — the bearer credential
   (`Authorization: Bearer …` or `x-api-key`). Only `sha256(secret)` is stored.
 - Pairing code: `szp1_…` — single-use, short-TTL, embedded in a pairing URL:
-  - app scheme: `superzej://pair?host=H&port=P&t=szp1_…[&fp=…]`
+  - app scheme: `thegn://pair?host=H&port=P&t=szp1_…[&fp=…]`
   - web form: `http://H:P/pair#t=szp1_…` (fragment ⇒ never in server logs)
 - Redeem: `POST /v1/pair {code, label}` (unauthenticated — possession of the
   single-use code is the credential) → `{token, pairing_id, scopes, approved}`.
   With `[serve] require_approval` the token parks (`approved: false`) until
-  `szhost pair approve <id>` / an in-app approval.
-- Revoke: `DELETE /v1/pairings/{id}` (admin) or `szhost pair revoke <id>`.
+  `thegn pair approve <id>` / an in-app approval.
+- Revoke: `DELETE /v1/pairings/{id}` (admin) or `thegn pair revoke <id>`.
 
 ## Routes
 
@@ -80,7 +80,7 @@ an under-scoped request is rejected **before any action runs** (403 /
 
 ## The event wire
 
-WS binary messages carry `superzej_core::control_wire::EventFrame`
+WS binary messages carry `thegn_core::control_wire::EventFrame`
 (`[tag:u8][len:u32 BE][payload]`, 1 MiB cap): `Hello` (proto version, server,
 your scopes), `PaneSnapshot` (ANSI repaint at `seq`), `PaneDelta` (raw PTY
 bytes, `seq`), `Activity` (JSON), `Lease` (opened/refreshed/released/reaped),
@@ -99,5 +99,5 @@ Accounts/scopes: hold one token per pairing and switch client-side; `/v1/me`
 reflects the presented token. Push: reserved (`/v1/push/register`), not in v1.
 
 The scope-enforcement guarantees are pinned by
-`crates/superzej-svc/src/control/tests.rs` (router-level, with a recording
+`crates/thegn-svc/src/control/tests.rs` (router-level, with a recording
 fake proving rejected requests perform zero actions).

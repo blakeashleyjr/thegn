@@ -2,11 +2,11 @@
 
 ## Context
 
-superzej runs each worktree's interactive process in a sandbox (podman → docker
+thegn runs each worktree's interactive process in a sandbox (podman → docker
 → bwrap → none), with the host toolchain (`/nix/store`, `$HOME`) bind-mounted
 **read-only** and — for OCI/bwrap backends — **no nix daemon socket** mounted
 (`sandbox.rs:566` already documents this as a known limitation). The compositor
-(`szhost`) itself runs on the host with full nix access.
+(`thegn`) itself runs on the host with full nix access.
 
 Two friction points fall out of this:
 
@@ -20,7 +20,7 @@ Two friction points fall out of this:
    clippy/cargo worked (global profile) but shellcheck/yamllint/taplo did not.
 
 2. **Contributor onboarding assumes manual `nix develop`.** There is no
-   auto-activation (no direnv, no superzej-native injection) and no
+   auto-activation (no direnv, no thegn-native injection) and no
    environment-doctor, so a fresh clone runs `just ci`/lint/fmt only after the
    contributor knows to enter `nix develop` first.
 
@@ -36,7 +36,7 @@ without relaxing sandbox isolation by default.
 - **Tier B (opt-in):** a config flag that bind-mounts the nix daemon socket into
   the sandbox so full `nix develop`/`build`/`fmt` work inside it. Off by default
   (preserves the hardening model).
-- **Mechanism:** Approach 1 — **superzej-native dev-env injection** (resolve on
+- **Mechanism:** Approach 1 — **thegn-native dev-env injection** (resolve on
   host, inject into pane). Not direnv-dependent (a committed `.envrc` is a
   convenience only). Not a GC-rooted profile (that is Approach 1 plus an extra
   moving part).
@@ -45,7 +45,7 @@ without relaxing sandbox isolation by default.
 
 ## Architecture
 
-A new **dev-env resolver** in `superzej-core` (substrate-agnostic, testable) that
+A new **dev-env resolver** in `thegn-core` (substrate-agnostic, testable) that
 the host consults when spawning a worktree pane:
 
 ```
@@ -54,7 +54,7 @@ repo has flake devShell?  ──no──▶  no-op (today's behaviour)
         ▼
 host: nix print-dev-env --json   (writable store + daemon live here)
         ▼
-cache: $XDG_STATE_HOME/superzej/devenv/<hash>.json   (hash = flake.lock + flake.nix)
+cache: $XDG_STATE_HOME/thegn/devenv/<hash>.json   (hash = flake.lock + flake.nix)
         ▼
 host: merge exported vars (PATH first) into pane env   ← before the sandbox exec
         ▼
@@ -73,14 +73,14 @@ about panes, sandboxes, or the event loop.
 - Run `nix print-dev-env --json` **on the host** for the repo root. The JSON
   shape is `{ "variables": { NAME: { "type": "exported"|"var"|…, "value": … } } }`.
   Extract the **exported** variables — primarily `PATH`, plus project vars the
-  shellHook exports (e.g. `SUPERZEJ_YAZI_BIN`). JSON avoids fragile shell-script
+  shellHook exports (e.g. `THEGN_YAZI_BIN`). JSON avoids fragile shell-script
   parsing and is language-agnostic (no assumption the pane runs bash).
 - Degrade silently: if `nix` is absent, the repo has no `devShell`, or the
   command fails/non-zero, return `None` and log at `info`. No user-facing error.
 
 ### Cache
 
-- Path: `$XDG_STATE_HOME/superzej/devenv/<hash>.json`.
+- Path: `$XDG_STATE_HOME/thegn/devenv/<hash>.json`.
 - `<hash>` = content hash of `flake.lock` + `flake.nix`. Any flake change
   invalidates; otherwise a warm read is ~free.
 - Stale entries are harmless (overwritten on the next hash change); a simple
@@ -130,9 +130,9 @@ about panes, sandboxes, or the event loop.
 - **`just doctor`** (new recipe): checks for `nix`, the devShell tools
   (`shellcheck`/`yamllint`/`taplo`/`treefmt`/`cargo-llvm-cov`), and a writable
   store; prints one actionable line per gap (e.g. "not in nix develop — run
-  `nix develop`, or rely on superzej `[dev] inject_devshell`").
+  `nix develop`, or rely on thegn `[dev] inject_devshell`").
 - **Committed `.envrc`** (`use flake`): a convenience for contributors who
-  already use direnv. superzej never depends on it.
+  already use direnv. thegn never depends on it.
 - **Friendlier `just` failures:** lint/fmt recipes detect a missing tool and
   print "run inside `nix develop`" instead of a bare `command not found`.
 
@@ -160,7 +160,7 @@ Both documented in `config/config.toml.example`.
 
 ## Testing
 
-- **Core unit tests** (`superzej-core`, 95% line gate): the `print-dev-env --json`
+- **Core unit tests** (`thegn-core`, 95% line gate): the `print-dev-env --json`
   output parser (exported-var extraction, malformed/empty input) and the
   cache-key derivation + invalidation logic. These are pure and do not shell out.
 - **Subprocess seam:** the actual `nix print-dev-env` invocation sits behind the
@@ -174,10 +174,10 @@ Both documented in `config/config.toml.example`.
 
 ## Source map (where this lands)
 
-- `crates/superzej-core/src/` — new `devenv.rs` (resolver + cache + parser);
+- `crates/thegn-core/src/` — new `devenv.rs` (resolver + cache + parser);
   config keys in `config.rs` (`[sandbox] inject_devshell`, `[sandbox] nix_daemon`).
-- `crates/superzej-core/src/sandbox.rs` — Tier B daemon-socket mount + env.
-- `crates/superzej-host/src/` — pane-spawn env merge (the inject point near the
+- `crates/thegn-core/src/sandbox.rs` — Tier B daemon-socket mount + env.
+- `crates/thegn-host/src/` — pane-spawn env merge (the inject point near the
   existing sandbox spec build); background-resolve wiring + startup prewarm in
   `run.rs`.
 - `justfile` — `doctor` recipe; tool-presence guards in `lint`/`fmt`.

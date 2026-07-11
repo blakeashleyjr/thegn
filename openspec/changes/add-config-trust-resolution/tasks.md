@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Pure engine (superzej-core)
+## 1. Pure engine (thegn-core)
 
 - [x] 1.1 `config_resolve.rs`: `TrustLevel`, `MergeClass`, `RepoFieldRule`,
       restrictiveness lattices (Network/SandboxProfile/OnMissing/WarmDirenv +
@@ -28,13 +28,13 @@
 - [x] 3.2 `repo_trust` table (v32) via additive schema + `RepoTrustStore`
       (`db_trust.rs`): decide/revoke/list/approved — **unit + migration tests**.
 - [x] 3.3 Launch path loads approvals from the DB and applies approved gated
-      requests; CLI `superzej repo-trust [path] [--approve <id>] [--revoke <id>]`.
+      requests; CLI `thegn repo-trust [path] [--approve <id>] [--revoke <id>]`.
 
 ## 4. Explain
 
 - [x] 4.1 `config_resolve::explain`: cold-path layer replay (defaults → file →
       profile → env → `--set`), diff at the dotted key, report origin — **tests**.
-- [x] 4.2 CLI `superzej config explain <key> [--repo <path>] [--json]` renders the
+- [x] 4.2 CLI `thegn config explain <key> [--repo <path>] [--json]` renders the
       value, origin trace, and (for `sandbox.*` with `--repo`) the clamp trace.
 
 ## 5. Docs + validate

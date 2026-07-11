@@ -7,8 +7,8 @@
 **Architecture:**
 
 1. **Frontend Integration:** Store the `sandbox_backend` per worktree in the SQLite database so UI components (like the status bar) can render the active backend (🐳, 📦, etc.).
-2. **Resource Monitoring API:** Parse `podman stats`/`docker stats` to surface the CPU and Memory metrics of active sandboxes. We will add a `stats()` function to `crates/superzej-core/src/sandbox.rs` and plumb it into `crates/superzej-cli/src/commands/stats.rs`.
-3. **Orphan Garbage Collection:** OCI persistent containers (`superzej-*`) can be leaked if a user bypasses the Superzej CLI (e.g., `git worktree remove` manually). We will add a `sandbox::run_gc()` routine and invoke it asynchronously on startup in `crates/superzej-cli/src/commands/launch.rs` (the host daemon entrypoint).
+2. **Resource Monitoring API:** Parse `podman stats`/`docker stats` to surface the CPU and Memory metrics of active sandboxes. We will add a `stats()` function to `crates/thegn-core/src/sandbox.rs` and plumb it into `crates/thegn-cli/src/commands/stats.rs`.
+3. **Orphan Garbage Collection:** OCI persistent containers (`thegn-*`) can be leaked if a user bypasses the Thegn CLI (e.g., `git worktree remove` manually). We will add a `sandbox::run_gc()` routine and invoke it asynchronously on startup in `crates/thegn-cli/src/commands/launch.rs` (the host daemon entrypoint).
 
 **Tech Stack:** Rust, SQLite, Podman/Docker CLI.
 
@@ -20,13 +20,13 @@
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/db.rs`
-- Modify: `crates/superzej-cli/src/commands/pick_agent.rs`
+- Modify: `crates/thegn-core/src/db.rs`
+- Modify: `crates/thegn-cli/src/commands/pick_agent.rs`
 
 **Step 1: Write failing DB schema test**
 
 ```rust
-// In crates/superzej-core/src/db.rs -> mod tests { ... }
+// In crates/thegn-core/src/db.rs -> mod tests { ... }
 #[test]
 fn test_db_stores_sandbox_backend() {
     let db = Db::open_memory().unwrap();
@@ -42,7 +42,7 @@ fn test_db_stores_sandbox_backend() {
 **Step 3: Write minimal implementation**
 
 ```rust
-// In crates/superzej-core/src/db.rs
+// In crates/thegn-core/src/db.rs
 // 1. In `ensure_tables`, alter `worktrees` table to add `sandbox_backend TEXT`:
 //    Since modifying existing deployed schemas without full migrations is risky,
 //    add a conditional ALTER TABLE:
@@ -72,7 +72,7 @@ pub fn worktree_sandbox(&self, wt: &str) -> Result<Option<String>> {
     }
 }
 
-// In crates/superzej-cli/src/commands/pick_agent.rs (inside the sandbox resolution block)
+// In crates/thegn-cli/src/commands/pick_agent.rs (inside the sandbox resolution block)
 // if let Some(spec) = sandbox::resolve(...) {
 //     if let Ok(db) = Db::open() {
 //         let _ = db.set_worktree_sandbox(&worktree, spec.backend.binary());
@@ -85,7 +85,7 @@ pub fn worktree_sandbox(&self, wt: &str) -> Result<Option<String>> {
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-core/src/db.rs crates/superzej-cli/src/commands/pick_agent.rs
+git add crates/thegn-core/src/db.rs crates/thegn-cli/src/commands/pick_agent.rs
 git commit -m "feat(sandbox): track resolved sandbox backend in sqlite"
 ```
 
@@ -97,12 +97,12 @@ git commit -m "feat(sandbox): track resolved sandbox backend in sqlite"
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 1: Write failing parsing test**
 
 ```rust
-// In crates/superzej-core/src/sandbox.rs tests
+// In crates/thegn-core/src/sandbox.rs tests
 #[test]
 fn test_parse_sandbox_stats() {
     let output = "1.5%|50MiB / 16GiB";
@@ -117,7 +117,7 @@ fn test_parse_sandbox_stats() {
 **Step 3: Write minimal implementation**
 
 ```rust
-// In crates/superzej-core/src/sandbox.rs
+// In crates/thegn-core/src/sandbox.rs
 
 #[derive(Debug, Default, Clone)]
 pub struct SandboxStats {
@@ -154,7 +154,7 @@ fn parse_sandbox_stats(output: &str) -> Option<SandboxStats> {
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-core/src/sandbox.rs
+git add crates/thegn-core/src/sandbox.rs
 git commit -m "feat(sandbox): parse cpu and memory utilization from oci runtimes"
 ```
 
@@ -162,11 +162,11 @@ git commit -m "feat(sandbox): parse cpu and memory utilization from oci runtimes
 
 ### Task 3: Expose Sandbox Stats to CLI (`stats.rs`)
 
-**Objective:** Append the sandbox stats to the `superzej stats` JSON dump so WASM plugins can fetch it.
+**Objective:** Append the sandbox stats to the `thegn stats` JSON dump so WASM plugins can fetch it.
 
 **Files:**
 
-- Modify: `crates/superzej-cli/src/commands/stats.rs`
+- Modify: `crates/thegn-cli/src/commands/stats.rs`
 
 **Step 1: Inspect and Modify `stats.rs`**
 _(Since `stats.rs` already exists, inject the `sandbox::stats` call if the active tab is a worktree.)_
@@ -174,7 +174,7 @@ _(Since `stats.rs` already exists, inject the `sandbox::stats` call if the activ
 ```rust
 // Pseudo-logic to add inside `stats.rs` (which returns JSON payload to plugins):
 
-use superzej_core::sandbox;
+use thegn_core::sandbox;
 
 // Look up active worktree...
 // if let Some(spec) = sandbox::resolve(...) {
@@ -187,7 +187,7 @@ use superzej_core::sandbox;
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-cli/src/commands/stats.rs
+git add crates/thegn-cli/src/commands/stats.rs
 git commit -m "feat(sandbox): expose live container stats to wasm plugins via cli"
 ```
 
@@ -195,28 +195,28 @@ git commit -m "feat(sandbox): expose live container stats to wasm plugins via cl
 
 ### Task 4: Orphan Garbage Collection
 
-**Objective:** Find `superzej-*` containers that lack a backing worktree in SQLite, and `rm -f` them.
+**Objective:** Find `thegn-*` containers that lack a backing worktree in SQLite, and `rm -f` them.
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/sandbox.rs`
-- Modify: `crates/superzej-cli/src/commands/launch.rs` (Daemon startup)
+- Modify: `crates/thegn-core/src/sandbox.rs`
+- Modify: `crates/thegn-cli/src/commands/launch.rs` (Daemon startup)
 
 **Step 1: Write failing GC logic test**
 
 ```rust
-// In crates/superzej-core/src/sandbox.rs tests
+// In crates/thegn-core/src/sandbox.rs tests
 #[test]
 fn test_gc_identifies_orphans() {
     let active_wts = vec!["/wt/live".to_string()];
     let containers = vec![
-        "superzej-live".to_string(),
-        "superzej-dead".to_string(),
+        "thegn-live".to_string(),
+        "thegn-dead".to_string(),
         "other-container".to_string()
     ];
     let orphans = identify_orphans(&active_wts, &containers);
     assert_eq!(orphans.len(), 1);
-    assert_eq!(orphans[0], "superzej-dead");
+    assert_eq!(orphans[0], "thegn-dead");
 }
 ```
 
@@ -230,7 +230,7 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
         .collect();
 
     containers.iter()
-        .filter(|c| c.starts_with("superzej-"))
+        .filter(|c| c.starts_with("thegn-"))
         .filter(|c| !active_names.contains(c))
         .cloned()
         .collect()
@@ -262,7 +262,7 @@ pub fn run_gc(db_worktrees: &[String]) -> Result<(), String> {
 **Step 5: Hook into Daemon Startup**
 
 ```rust
-// In crates/superzej-cli/src/commands/launch.rs
+// In crates/thegn-cli/src/commands/launch.rs
 
 // Fire-and-forget thread so we don't block startup
 std::thread::spawn(|| {
@@ -278,7 +278,7 @@ std::thread::spawn(|| {
 **Step 6: Commit**
 
 ```bash
-git add crates/superzej-core/src/sandbox.rs crates/superzej-cli/src/commands/launch.rs
+git add crates/thegn-core/src/sandbox.rs crates/thegn-cli/src/commands/launch.rs
 git commit -m "feat(sandbox): asynchronous orphan garbage collector on daemon launch"
 ```
 

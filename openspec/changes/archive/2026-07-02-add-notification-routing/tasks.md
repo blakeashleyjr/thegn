@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Core config (superzej-core)
+## 1. Core config (thegn-core)
 
 - [x] 1.1 Extend `NotificationsConfig` with `rules`, `dnd`, `sound`, `modes`,
       `active_mode` (all `serde(default)`); new sub-structs `NotificationRule`,
@@ -10,7 +10,7 @@
       `apply(&mut NotificationsConfig)` + `Config::effective_notifications(repo_root)`
       layering (profile → global → repo overlay) — **unit tests** for precedence + every-field apply.
 
-## 2. Core decision (superzej-core)
+## 2. Core decision (thegn-core)
 
 - [x] 2.1 `notification_route.rs`: `RouteDecision`, `SoundEmit`, `RouteCtx`,
       `decide()` — **unit tests**: each selector (kind/worktree glob/source
@@ -22,7 +22,7 @@
 - [x] 2.3 `sound_emit` gating (`mode`, `min_priority`, per-priority override) —
       **unit tests**.
 
-## 3. Host (superzej-host)
+## 3. Host (thegn-host)
 
 - [x] 3.1 `notify.rs` `NotifyState` chokepoint (`decide` + `record`); route the
       live emit sites (run.rs agent/process/test/worktree) through it — record

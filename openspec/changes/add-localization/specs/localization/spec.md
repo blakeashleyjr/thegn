@@ -4,11 +4,11 @@
 
 ### Requirement: Translations are compiled in with zero runtime I/O
 
-Chrome strings SHALL be looked up through a `t!` macro against Fluent locale files compiled into the binary, and the active locale MUST be resolved exactly once during the `szhost::startup` waterfall before the first render (no runtime filesystem reads).
+Chrome strings SHALL be looked up through a `t!` macro against Fluent locale files compiled into the binary, and the active locale MUST be resolved exactly once during the `thegn::startup` waterfall before the first render (no runtime filesystem reads).
 
 #### Scenario: Locale resolves before first frame
 
-- **WHEN** szhost starts
+- **WHEN** thegn starts
 - **THEN** the active locale is resolved once (from `[ui] language`, else the host
   locale) before the first frame, with no per-string file I/O
 

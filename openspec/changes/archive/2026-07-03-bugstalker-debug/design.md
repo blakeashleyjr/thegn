@@ -1,12 +1,12 @@
 ## Context
 
-Phase 1 landed a managed-tool resolver (`superzej-core::managed_tool`) with two
+Phase 1 landed a managed-tool resolver (`thegn-core::managed_tool`) with two
 sources (`Npm`, `GithubRelease`) and a host-side fetch seam
-(`superzej-host::managed_tool::{acquire, mark_installed, run_setup_cmd}`, plus a
+(`thegn-host::managed_tool::{acquire, mark_installed, run_setup_cmd}`, plus a
 deferred generic `install`). This change (Phase 2) is its first new consumer: a
 debugger.
 
-Superzej hosts external TUIs as **PTY panes** wrapped by the worktree's sandbox
+Thegn hosts external TUIs as **PTY panes** wrapped by the worktree's sandbox
 (`sandbox::enter_argv`) and remote placement (`placement::interactive_argv`).
 BugStalker (`bs`) is exactly such an external TUI (console↔TUI, standard DAP),
 Linux-x86-64-only, installed via `cargo install bugstalker`.
@@ -21,8 +21,8 @@ verb is the low-churn, testable entry point.
 
 - Acquire + pin `bs` through the shared resolver (new `Cargo` source).
 - A pure, tested platform gate and session-argv builders in core.
-- A `szhost debug` CLI (`setup`/`path`/`run`/`attach`) that starts a session by
-  exec-replacing the current process, so a session started in a superzej pane
+- A `thegn debug` CLI (`setup`/`path`/`run`/`attach`) that starts a session by
+  exec-replacing the current process, so a session started in a thegn pane
   inherits that pane's sandbox/placement for free.
 - `doctor` reports `bs`.
 
@@ -63,7 +63,7 @@ pub fn attach_argv(bin: &str, pid: i64) -> Vec<String>                          
 All pure → unit-tested (the coverage-gated core). `bs`'s real attach flag is
 confirmed against its docs before shipping; the builder keeps it in one place.
 
-### `szhost debug` CLI (`cmd/debug.rs`)
+### `thegn debug` CLI (`cmd/debug.rs`)
 
 - `setup [--force]`: platform gate → `managed_tool::install(bs_tool(), force)` →
   report. Unsupported ⇒ a clear message, exit non-zero, no install.
@@ -76,12 +76,12 @@ confirmed against its docs before shipping; the builder keeps it in one place.
 
 ### doctor + known()
 
-`superzej_core::debug::bs_tool()` is added to host `managed_tool::known()`, so it
+`thegn_core::debug::bs_tool()` is added to host `managed_tool::known()`, so it
 appears in the doctor managed-tools section; doctor also notes the platform gate.
 
 ## Risks / Trade-offs
 
-- **[no in-app tab]** Users start debugging via `szhost debug run` in a pane, not
+- **[no in-app tab]** Users start debugging via `thegn debug run` in a pane, not
   a dedicated tab. → Documented; the CLI-in-a-pane path already yields the
   sandbox/placement-aware session the plan wanted; the richer tab is the DAP
   panel follow-on.
@@ -90,7 +90,7 @@ appears in the doctor managed-tools section; doctor also notes the platform gate
   it; the message says what's happening; it runs off the loop (CLI foreground).
 - **[platform]** Non-Linux hosts can't run `bs`. → Pure gate refuses early with a
   message pointing at distro/nix installs; `doctor` shows it as unsupported.
-- **[exec vs spawn]** `run` exec-replaces the `szhost debug` process. → Correct
+- **[exec vs spawn]** `run` exec-replaces the `thegn debug` process. → Correct
   for a CLI that hands the terminal to `bs`; never reached on the compositor loop.
 
 ## Migration Plan

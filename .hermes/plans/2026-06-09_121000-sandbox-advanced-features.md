@@ -1,8 +1,8 @@
-# Superzej Advanced Sandbox Capabilities Implementation Plan
+# Thegn Advanced Sandbox Capabilities Implementation Plan
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Expand Superzej's sandbox architecture to support resource limits, GPU passthrough, image prefetching, named volumes, health checks, multi-container compose, and audit logging. Support declarative definitions via `.superzej.toml`.
+**Goal:** Expand Thegn's sandbox architecture to support resource limits, GPU passthrough, image prefetching, named volumes, health checks, multi-container compose, and audit logging. Support declarative definitions via `.thegn.toml`.
 
 **Architecture:**
 Expand the `SandboxConfig` and `SandboxOverlay` structs to map to new OCI configuration parameters. Modify `sandbox::oci_create_opts` to translate these configurations into exact `podman`/`docker` CLI flags (like `--cpus`, `--memory`, `--device`, `-v volume:dest`). Add logic for new hooks (like health checks and prefetching). Provide a compose translation layer.
@@ -17,13 +17,13 @@ Expand the `SandboxConfig` and `SandboxOverlay` structs to map to new OCI config
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/config.rs`
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/config.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 1: Write failing config parsing test**
 
 ```rust
-// In crates/superzej-core/src/config.rs
+// In crates/thegn-core/src/config.rs
 #[test]
 fn test_sandbox_limits_parse() {
     let toml = r#"
@@ -44,7 +44,7 @@ Expected: FAIL
 **Step 3: Write minimal implementation**
 
 ```rust
-// In crates/superzej-core/src/config.rs
+// In crates/thegn-core/src/config.rs
 #[derive(Debug, Clone, Default, serde::Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SandboxLimits {
@@ -55,7 +55,7 @@ pub struct SandboxLimits {
 // Add `pub limits: SandboxLimits` to SandboxConfig and SandboxOverlay
 // Update `impl Default for SandboxConfig` and `apply` logic.
 
-// In crates/superzej-core/src/sandbox.rs
+// In crates/thegn-core/src/sandbox.rs
 // Inside SandboxSpec add `pub limits: SandboxLimits`
 
 // In `oci_create_opts`
@@ -74,7 +74,7 @@ Expected: PASS
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-core/src/config.rs crates/superzej-core/src/sandbox.rs
+git add crates/thegn-core/src/config.rs crates/thegn-core/src/sandbox.rs
 git commit -m "feat(sandbox): support cpu and memory resource limits"
 ```
 
@@ -86,13 +86,13 @@ git commit -m "feat(sandbox): support cpu and memory resource limits"
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/config.rs`
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/config.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 1: Write failing test**
 
 ```rust
-// In crates/superzej-core/src/sandbox.rs
+// In crates/thegn-core/src/sandbox.rs
 #[test]
 fn test_oci_create_opts_gpu() {
     let mut spec = spec(Backend::Docker);
@@ -122,7 +122,7 @@ if let Some(gpu) = &spec.gpu {
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-core/src/config.rs crates/superzej-core/src/sandbox.rs
+git add crates/thegn-core/src/config.rs crates/thegn-core/src/sandbox.rs
 git commit -m "feat(sandbox): add gpu passthrough support"
 ```
 
@@ -134,8 +134,8 @@ git commit -m "feat(sandbox): add gpu passthrough support"
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/config.rs`
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/config.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 1: Write failing test**
 
@@ -165,7 +165,7 @@ for (vol_name, dest) in &spec.volumes {
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-core/src/config.rs crates/superzej-core/src/sandbox.rs
+git add crates/thegn-core/src/config.rs crates/thegn-core/src/sandbox.rs
 git commit -m "feat(sandbox): support declarative named volumes"
 ```
 
@@ -177,7 +177,7 @@ git commit -m "feat(sandbox): support declarative named volumes"
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 1: Write failing test**
 
@@ -208,7 +208,7 @@ pub fn prefetch_image(spec: &SandboxSpec) -> Result<()> {
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-core/src/sandbox.rs
+git add crates/thegn-core/src/sandbox.rs
 git commit -m "feat(sandbox): add image prefetching logic"
 ```
 
@@ -220,7 +220,7 @@ git commit -m "feat(sandbox): add image prefetching logic"
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 3: Write minimal implementation**
 
@@ -239,7 +239,7 @@ pub fn health_check(spec: &SandboxSpec) -> bool {
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-core/src/sandbox.rs
+git add crates/thegn-core/src/sandbox.rs
 git commit -m "feat(sandbox): add pre-entry container health check"
 ```
 
@@ -247,13 +247,13 @@ git commit -m "feat(sandbox): add pre-entry container health check"
 
 ### Task 6: Compose / Multi-Container Translation Layer
 
-**Objective:** Add `sandbox.compose` boolean. If true, translate `.superzej.toml` into a dynamic `docker-compose.yml` or `podman-compose` run.
+**Objective:** Add `sandbox.compose` boolean. If true, translate `.thegn.toml` into a dynamic `docker-compose.yml` or `podman-compose` run.
 _Note:_ This is complex. The MVP will be a configuration flag that simply delegates to a `docker-compose up -d` script on `ensure()`.
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/config.rs`
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/config.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 3: Write minimal implementation**
 
@@ -270,7 +270,7 @@ if let Some(compose_file) = &spec.compose {
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-core/src/config.rs crates/superzej-core/src/sandbox.rs
+git add crates/thegn-core/src/config.rs crates/thegn-core/src/sandbox.rs
 git commit -m "feat(sandbox): initial docker-compose delegation support"
 ```
 
@@ -278,12 +278,12 @@ git commit -m "feat(sandbox): initial docker-compose delegation support"
 
 ### Task 7: Audit Logging
 
-**Objective:** Append `exec` and `ensure` events to an `audit.log` in `$SUPERZEJ_DIR`.
+**Objective:** Append `exec` and `ensure` events to an `audit.log` in `$THEGN_DIR`.
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/log.rs`
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/log.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 3: Write minimal implementation**
 

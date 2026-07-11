@@ -23,13 +23,13 @@ far the automation goes.
 
 ## Rationale
 
-superzej already aggregates issues across providers (`IssueRouter`, Linear/GitHub/
+thegn already aggregates issues across providers (`IssueRouter`, Linear/GitHub/
 Jira), renders them in the My Work panel with a linked-worktree marker, and has
 the primitives to create a worktree (`worktree::branch_name`/`add_checked`), add a
 tab (`session::add_group`), and launch an agent (`agent::launch_spec`). What's
 missing is the one action that composes them and the seeding of issue context into
 the agent. emdash frames this as "the only parallel-agent app with issue-tracker
-integration, bridging task management and orchestration" — superzej's
+integration, bridging task management and orchestration" — thegn's
 worktree-per-tab model makes the binding natural. Keeping the two halves separate
 preserves the core invariant: **issue→worktree is shell-level (AI-free); the agent
 auto-launch is the additive AI layer** and is skipped entirely when no agent is
@@ -37,7 +37,7 @@ configured.
 
 ## Non-goals
 
-- **Building an issue tracker** — superzej consumes issues via the existing
+- **Building an issue tracker** — thegn consumes issues via the existing
   IssueRouter; this change is the action on top.
 - **Requiring an agent** — with `auto_launch_agent` off (or no agent configured),
   the action just creates and opens the worktree tab; the shell path stands alone.

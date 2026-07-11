@@ -1,4 +1,4 @@
-# The `superzej` CLI contract
+# The `thegn` CLI contract
 
 The TUI is the product; the CLI is the launcher, the remote control, and the
 automation surface. This page is the stable contract scripts and agents can
@@ -24,9 +24,9 @@ keep working forever with byte-identical output; they are merely hidden from
 ## Headless worktree lifecycle
 
 ```sh
-wt=$(superzej wt new fix-parser --repo ~/code/app)   # prints the path only
+wt=$(thegn wt new fix-parser --repo ~/code/app)   # prints the path only
 cd "$wt"
-superzej wt rm fix-parser --force                    # teardown + git + DB
+thegn wt rm fix-parser --force                    # teardown + git + DB
 ```
 
 `wt new` reuses the TUI wizard's pipeline (branch naming templates, base
@@ -57,7 +57,7 @@ object.)
 
 ## Remote control (`open`)
 
-`superzej open <repo>` resolves its argument (a path anywhere inside the repo,
+`thegn open <repo>` resolves its argument (a path anywhere inside the repo,
 or a unique repo basename) and:
 
 - **live instance running** — enqueues a `focus_workspace` intent in the
@@ -69,5 +69,5 @@ or a unique repo basename) and:
 
 ## Completions
 
-`superzej completions bash|zsh|fish|elvish|powershell` generates completions
-for the invoked binary name (`szhost`, `superzej`, or `sj`).
+`thegn completions bash|zsh|fish|elvish|powershell` generates completions
+for the invoked binary name (`thegn` or `tg`).
