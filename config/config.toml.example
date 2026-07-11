@@ -932,6 +932,12 @@ desktop_min_urgency = "normal"
 #   "all"                — every non-agent exit, including clean interactive shells
 #   "off"                — never route pane exits
 process_exit = "failures_and_tasks"
+# Surface szhost's own log errors ("N errors in szhost.log") as user
+# notifications. Off by default — they are internal diagnostics, always written
+# to szhost.log on disk regardless. A dev flag; even when on they stay quiet
+# (informational, never the red flag, never in "Needs you") and appear as a
+# single entry point under the unified surface's Logs group.
+surface_self_log_errors = false
 # Startup routing mode ("" = default). Named modes are defined below in
 # [notifications.modes.<name>]; switch at runtime with Ctrl+Alt+m.
 active_mode = ""
@@ -941,9 +947,9 @@ active_mode = ""
 #              mapped to "critical" urgency, a desktop toast
 #   "notice" — counts toward the neutral "N unread" badge, never the red flag
 #   "info"   — inbox history only; never counted toward any badge
-# Defaults: failures (agent_failed, test_failed, log_error, process_failed,
-# queue_needs_human) are "alert"; lifecycle events (worktree_created,
-# process_exited, queue_landed) are "info"; everything else (assigned,
+# Defaults: failures (agent_failed, test_failed, process_failed,
+# queue_needs_human) are "alert"; lifecycle/diagnostic events (log_error,
+# worktree_created, process_exited, queue_landed) are "info"; everything else (assigned,
 # mentioned, status_changed, blocker_resolved, pr_linked, overdue,
 # pr_state_changed, agent_done, queue_ready) is "notice". Override any kind
 # below (keys are the snake_case kind names). Unknown keys/values are ignored.
