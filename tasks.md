@@ -813,13 +813,13 @@ keys (287) are the `providers/set` credential target._
 - [~] 278. Per-upstream circuit breaker _(exhaustion + cooldown state per backend/model)_
 - [~] 279. Retries with backoff
 - [x] 280. Key/upstream load balancing _(multi-key lanes + pool rotation)_
-- [ ] 281. Model/tier aliasing
+- [x] 281. Model/tier aliasing _(routes-doc `aliases` map: client model id → route)_
 - [~] 282. Auto-downgrade under pressure
 - [ ] 283. Local model upstreams (Ollama/vLLM)
 - [ ] 284. Prompt-cache preservation (native Anthropic path)
 - [x] 285. Streaming passthrough (no buffering)
 - [~] 286. Tool-call field preservation
-- [~] 287. Per-agent virtual keys _(virtual-key identity resolution + per-identity budgets)_
+- [x] 287. Per-agent virtual keys _(worktree/workspace/agent/zone-scoped keys, upstream account pinning, per-identity budgets; `thegn proxy keys`)_
 - [x] 288. Proxy managed as daemon/pinned program _(host auto-launch)_
 - [~] 656. Interactive per-agent account/credential switcher — status-bar chip to hot-swap which subscription/account (or virtual key) a harness uses without re-auth; UX layer over the proxy's key load-balancing (280) + per-agent virtual keys (287); running sessions keep their account until restart (Orca hot-swap)
 
@@ -835,11 +835,11 @@ via **R 693**), reconciled against proxy-measured spend._
 - [x] 292. Budget caps ($/tokens) per scope
 - [x] 293. Enforce caps (refuse/downgrade) _(refuse-on-breach)_
 - [ ] 294. RPM/TPM rate limiting
-- [ ] 295. Daily/weekly/monthly ceilings
-- [~] 296. Kill-switch on breach
+- [x] 295. Daily/weekly/monthly ceilings _(rolling windows: anchor advance on rollover + window-aware checks)_
+- [x] 296. Kill-switch on breach _(`thegn proxy budget kill` + enforcement)_
 - [ ] 297. Cache-hit-ratio tracking
-- [~] 298. Spend history + export _(spend persisted to DB)_
-- [ ] 299. Cost dashboards/charts
+- [x] 298. Spend history + export _(audit rows incl. duration/TTFB; `thegn proxy stats --json`)_
+- [x] 299. Cost dashboards/charts _(TUI proxy dashboard `Ctrl Alt l` + `/stats` endpoint + CLI: spend, tokens/sec, p50/p95, per-backend/route/scope)_
 - [~] 300. Quota refresh tracking/forecast _(reset-window tracking)_
 
 ### W. Token reduction (rtk)

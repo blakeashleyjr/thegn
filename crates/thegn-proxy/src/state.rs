@@ -30,6 +30,8 @@ pub struct AppState {
     resolved: Mutex<HashMap<String, String>>,
     /// Whether a budget breach refuses (true) or downgrades (false).
     pub refuse_on_breach: bool,
+    /// Daemon start (epoch ms) — `/metrics` uptime + `/stats`.
+    pub started_ms: i64,
 }
 
 /// Handlers receive `State<SharedState>`.
@@ -53,6 +55,7 @@ impl AppState {
             db,
             resolved: Mutex::new(HashMap::new()),
             refuse_on_breach: true,
+            started_ms: now_ms,
         })
     }
 

@@ -129,6 +129,8 @@ pub enum Action {
     OpenCi,
     /// Open the right panel to the Work ▸ Merge queue section (fold-actor).
     OpenMergeQueue,
+    /// Summon the LLM-proxy dashboard overlay (spend, tokens/sec, budgets).
+    OpenProxyDash,
     /// Prompt for a port and expose it from the active worktree (`[share]`).
     ShareWorktreePort,
     /// Stop all ingress shares on the active worktree.
@@ -393,6 +395,7 @@ impl Action {
             Action::FocusPanel => "focus-panel",
             Action::OpenCi => "open-ci",
             Action::OpenMergeQueue => "open-merge-queue",
+            Action::OpenProxyDash => "open-proxy-dash",
             Action::ShareWorktreePort => "share-worktree-port",
             Action::StopWorktreeShare => "stop-worktree-share",
             Action::OpenShares => "open-shares",
@@ -504,6 +507,7 @@ impl Action {
             "focus-panel" => Action::FocusPanel,
             "open-ci" => Action::OpenCi,
             "open-merge-queue" => Action::OpenMergeQueue,
+            "open-proxy-dash" => Action::OpenProxyDash,
             "share-worktree-port" => Action::ShareWorktreePort,
             "stop-worktree-share" => Action::StopWorktreeShare,
             "open-shares" => Action::OpenShares,

@@ -26,11 +26,10 @@ start_plan="$(just --dry-run start-term dev 2>&1)"
   echo "$start_plan" >&2
   exit 1
 }
-[[ $start_plan != *'target/debug/thegn'* ]] || {
-  echo "start-term should not launch the legacy zellij thegn binary" >&2
-  echo "$start_plan" >&2
-  exit 1
-}
+# (The pre-rename check that the plan does not launch the LEGACY zellij-wrapper
+# binary is gone: the legacy binary's name (`superzej`) no longer exists as a
+# distinct spelling after the thegn rename, so the check had become a literal
+# contradiction of the native-binary assertion above.)
 [[ $start_plan != *'THEGN_ZELLIJ_BIN'* ]] || {
   echo "start-term should not configure the zellij/WASM path" >&2
   echo "$start_plan" >&2

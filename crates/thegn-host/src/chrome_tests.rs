@@ -725,6 +725,9 @@ fn statusbar_disk_badge_trips_on_low_free_space() {
         draw_statusbar(&mut s, chrome.statusbar, &model);
         s.screen_chars_to_string()
     };
+    // The chip glyph is configurable (`[stats] disk_icon`); assert on the
+    // resolved default rather than a hard-coded codepoint.
+    let icon = thegn_core::config::StatsConfig::default().disk_icon;
     // Ample free → silent (clean is quiet).
     assert!(!mk(Some(72)).contains(&icon), "silent when ample free");
     // At/below the warn line → the disk chip appears.

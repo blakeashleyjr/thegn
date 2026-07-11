@@ -78,17 +78,30 @@ pub struct ProxyConfig {
     pub relay: crate::relay::RelayConfig,
     /// In-flight token-reduction policy (group W).
     pub compression: thegn_core::proxy::transform::CompressPolicy,
+    /// Model/tier aliasing (U 281): extra client model ids that select a route
+    /// (e.g. `"claude-sonnet-4-6" → "standard"`), checked before route names.
+    pub aliases: std::collections::HashMap<String, String>,
+    /// When a route's whole chain fails, try the deduped union of every OTHER
+    /// route's backends as a last resort (skipping identities already tried).
+    pub last_resort: bool,
 }
 
 impl ProxyConfig {
-    /// Resolves a client-requested model to a route. A `model-proxy/<name>` or
-    /// bare `<name>` matching a route name selects it; otherwise the first route
-    /// is the default. Mirrors the Go `lookupRoute` intent.
+    /// Resolves a client-requested model to a route: alias map first (exact
+    /// client id, then with the `model-proxy/` prefix stripped), then a
+    /// `model-proxy/<name>`/bare `<name>` route-name match, then the first
+    /// route as the default. Mirrors the Go `lookupRoute` intent plus U 281.
     pub fn lookup_route(&self, model: &str) -> Option<&Route> {
         let name = model.strip_prefix("model-proxy/").unwrap_or(model);
+        let target = self
+            .aliases
+            .get(model)
+            .or_else(|| self.aliases.get(name))
+            .map(String::as_str)
+            .unwrap_or(name);
         self.routes
             .iter()
-            .find(|r| r.name == name)
+            .find(|r| r.name == target)
             .or_else(|| self.routes.first())
     }
 
@@ -159,6 +172,8 @@ mod tests {
             ],
             relay: crate::relay::RelayConfig::default(),
             compression: thegn_core::proxy::transform::CompressPolicy::off(),
+            aliases: std::collections::HashMap::new(),
+            last_resort: false,
         };
         assert_eq!(cfg.lookup_route("model-proxy/fast").unwrap().name, "fast");
         assert_eq!(
@@ -166,5 +181,20 @@ mod tests {
             "standard"
         );
         assert_eq!(cfg.route_names(), vec!["standard", "fast"]);
+
+        // Aliases resolve before route names, with and without the prefix.
+        let mut cfg = cfg;
+        cfg.aliases
+            .insert("claude-sonnet-4-6".to_string(), "fast".to_string());
+        assert_eq!(cfg.lookup_route("claude-sonnet-4-6").unwrap().name, "fast");
+        assert_eq!(
+            cfg.lookup_route("model-proxy/claude-sonnet-4-6")
+                .unwrap()
+                .name,
+            "fast"
+        );
+        // An alias to a nonexistent route falls back to the default.
+        cfg.aliases.insert("x".to_string(), "nope".to_string());
+        assert_eq!(cfg.lookup_route("x").unwrap().name, "standard");
     }
 }

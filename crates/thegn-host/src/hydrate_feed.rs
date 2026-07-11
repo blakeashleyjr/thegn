@@ -109,6 +109,18 @@ pub(crate) fn populate_notifications(
     }
 }
 
+/// Sidebar sort weight for an issue priority (urgent → high → … → none).
+pub(crate) fn issue_urgency(p: thegn_core::issue::IssuePriority) -> u8 {
+    use thegn_core::issue::IssuePriority as P;
+    match p {
+        P::Urgent => 4,
+        P::High => 3,
+        P::Medium => 2,
+        P::Low => 1,
+        P::None => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

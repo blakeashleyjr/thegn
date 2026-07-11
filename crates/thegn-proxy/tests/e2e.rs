@@ -42,13 +42,30 @@ async fn spawn_mock(status: u16, body: Value) -> String {
 }
 
 /// Spawns a mock upstream that streams a fixed OpenAI SSE body for
-/// `/chat/completions`. Returns its base URL.
+/// `/chat/completions`. Returns its base URL. Rejects requests that don't ask
+/// for `stream: true` — a live-relay dispatch that forgot the flag must fail
+/// here (real upstreams would return a JSON completion, not SSE).
 async fn spawn_mock_sse(body: &'static str) -> String {
-    async fn handler(State(body): State<&'static str>) -> impl axum::response::IntoResponse {
+    async fn handler(
+        State(body): State<&'static str>,
+        req: axum::body::Bytes,
+    ) -> axum::response::Response {
+        let streaming = serde_json::from_slice::<Value>(&req)
+            .ok()
+            .and_then(|v| v.get("stream").and_then(Value::as_bool))
+            .unwrap_or(false);
+        if !streaming {
+            return (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"expected stream:true"}}"#,
+            )
+                .into_response();
+        }
         (
             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
             body,
         )
+            .into_response()
     }
     let app = Router::new()
         .route("/chat/completions", post(handler))
@@ -98,6 +115,8 @@ async fn spawn_proxy_cfg(routes: Vec<Route>, db: SharedDb, compression: Compress
         routes,
         relay: thegn_proxy::relay::RelayConfig::default(),
         compression,
+        aliases: Default::default(),
+        last_resort: false,
     };
     // Bind first so we know the port, then hand the listener to axum::serve.
     let listener = tokio::net::TcpListener::bind(config.listen).await.unwrap();
@@ -416,6 +435,8 @@ async fn compresses_tool_output_in_flight() {
     assert_eq!(resp.status(), 200);
 
     let got = captured.lock().unwrap().clone().unwrap();
+    // The client's `model-proxy/standard` was rewritten to the lane's model.
+    assert_eq!(got["model"], "test-model");
     let tool_content = got["messages"][2]["content"].as_str().unwrap();
     assert!(
         !tool_content.contains('\u{1b}'),
@@ -986,6 +1007,476 @@ async fn network_error_falls_through_to_next_backend() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resolved_backend(&proxy).await, "secondary");
+}
+
+// ── stats / latency / tokens-per-second ─────────────────────────────────────
+
+/// Waits until `pred` over the DB's recent audit rows holds (rows are written
+/// off the request path for streams).
+async fn wait_for_rows(
+    db: &SharedDb,
+    n: usize,
+    pred: impl Fn(&[thegn_core::db::ProxyRequestRow]) -> bool,
+) -> Vec<thegn_core::db::ProxyRequestRow> {
+    for _ in 0..50 {
+        let rows = db
+            .lock()
+            .unwrap()
+            .proxy_requests_since(0, 100)
+            .unwrap_or_default();
+        if rows.len() >= n && pred(&rows) {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    db.lock().unwrap().proxy_requests_since(0, 100).unwrap()
+}
+
+#[tokio::test]
+async fn audit_rows_record_duration_and_stream_ttfb() {
+    let up = spawn_mock(200, completion_body()).await;
+    let sse = spawn_mock_sse(OPENAI_SSE).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let routes = vec![
+        Route {
+            name: "standard".into(),
+            strategy: thegn_core::config::RoutingStrategy::Sequential,
+            order_pool: None,
+            priority: vec![backend("plain", &up)],
+        },
+        Route {
+            name: "fast".into(),
+            strategy: thegn_core::config::RoutingStrategy::Sequential,
+            order_pool: None,
+            priority: vec![backend("streamy", &sse)],
+        },
+    ];
+    let proxy = spawn_proxy(routes, db.clone()).await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .unwrap();
+    let stream_req = json!({"model": "model-proxy/fast", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+    client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&stream_req)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    let rows = wait_for_rows(&db, 2, |rows| rows.iter().any(|r| r.outcome == "ok_stream")).await;
+    let plain = rows.iter().find(|r| r.backend == "plain").unwrap();
+    // Non-streaming: duration measured, no TTFB.
+    assert!(plain.duration_ms >= 0);
+    assert!(plain.ttfb_ms.is_none());
+    let stream = rows.iter().find(|r| r.backend == "streamy").unwrap();
+    // Streaming: both measured; generation time = duration - ttfb.
+    assert!(stream.ttfb_ms.is_some());
+    assert!(stream.duration_ms >= stream.ttfb_ms.unwrap());
+    assert_eq!(stream.outcome, "ok_stream");
+}
+
+#[tokio::test]
+async fn stats_endpoint_rolls_up_tokens_per_second_and_budgets() {
+    let up = spawn_mock(200, completion_body()).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let routes = vec![Route {
+        name: "standard".into(),
+        strategy: thegn_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
+        priority: vec![backend("primary", &up)],
+    }];
+    let proxy = spawn_proxy(routes, db.clone()).await;
+
+    for _ in 0..2 {
+        reqwest::Client::new()
+            .post(format!("{proxy}/v1/chat/completions"))
+            .json(&chat_request())
+            .send()
+            .await
+            .unwrap();
+    }
+    wait_for_rows(&db, 2, |_| true).await;
+
+    let v: Value = reqwest::get(format!("{proxy}/stats"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["stats"]["totals"]["requests"], 2);
+    assert_eq!(v["stats"]["totals"]["ok"], 2);
+    assert_eq!(v["stats"]["totals"]["output_tokens"], 10); // 2 × 5
+    assert_eq!(v["stats"]["by_backend"][0]["name"], "primary");
+    assert_eq!(v["stats"]["by_route"][0]["name"], "standard");
+    // Throughput is measured (mock responds instantly → clamped ≥ huge tok/s).
+    assert!(v["stats"]["totals"]["tokens_per_sec"].as_f64().unwrap() > 0.0);
+    // Budgets include the global rollup with the spend attributed.
+    let budgets = v["budgets"].as_array().unwrap();
+    let global = budgets.iter().find(|b| b["scope"] == "global").unwrap();
+    assert_eq!(global["spent_tokens"], 30); // 2 × 15
+    assert!(v["uptime_secs"].as_i64().unwrap() >= 0);
+}
+
+#[tokio::test]
+async fn metrics_include_duration_histogram_and_uptime() {
+    let up = spawn_mock(200, completion_body()).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let routes = vec![Route {
+        name: "standard".into(),
+        strategy: thegn_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
+        priority: vec![backend("primary", &up)],
+    }];
+    let proxy = spawn_proxy(routes, db).await;
+    reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .unwrap();
+
+    let metrics = reqwest::get(format!("{proxy}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("model_proxy_request_duration_seconds_count 1"));
+    assert!(metrics.contains("model_proxy_request_duration_seconds_bucket{le=\"+Inf\"} 1"));
+    assert!(metrics.contains("model_proxy_uptime_seconds"));
+}
+
+// ── upstream cost headers ────────────────────────────────────────────────────
+
+/// Mock returning a completion plus an upstream cost header.
+async fn spawn_cost_header_mock(cost: &'static str) -> String {
+    async fn handler(State(cost): State<&'static str>) -> impl IntoResponse {
+        (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (axum::http::HeaderName::from_static("x-nanogpt-cost"), cost),
+            ],
+            completion_body().to_string(),
+        )
+    }
+    let app = Router::new()
+        .route("/chat/completions", post(handler))
+        .with_state(cost);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn upstream_cost_header_wins_over_estimate() {
+    let up = spawn_cost_header_mock("0.42").await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let routes = vec![Route {
+        name: "standard".into(),
+        strategy: thegn_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
+        // "openrouter" is a cost-bearing provider, so the header applies.
+        priority: vec![backend("openrouter", &up)],
+    }];
+    let proxy = spawn_proxy(routes, db.clone()).await;
+
+    reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .unwrap();
+    let rows = wait_for_rows(&db, 1, |_| true).await;
+    assert_eq!(rows[0].cost_source, "header");
+    assert!((rows[0].cost_usd - 0.42).abs() < 1e-9);
+}
+
+// ── Retry-After header ───────────────────────────────────────────────────────
+
+/// Mock that 429s with a Retry-After header (no body reset hint).
+async fn spawn_retry_after_mock(secs: &'static str) -> String {
+    async fn handler(State(secs): State<&'static str>) -> impl IntoResponse {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                axum::http::HeaderName::from_static("retry-after"),
+                axum::http::HeaderValue::from_static(secs),
+            )],
+            json!({"error": {"message": "rate limited"}}).to_string(),
+        )
+    }
+    let app = Router::new()
+        .route("/chat/completions", post(handler))
+        .with_state(secs);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn retry_after_header_sets_cooldown_deadline() {
+    let bad = spawn_retry_after_mock("3600").await;
+    let good = spawn_mock(200, completion_body()).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let routes = vec![Route {
+        name: "standard".into(),
+        strategy: thegn_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
+        priority: vec![backend("limited", &bad), backend("secondary", &good)],
+    }];
+    let proxy = spawn_proxy(routes, db).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // /health reports the cooled backend with a re-probe ≈1h out (way past the
+    // default rate-limit backoff's 30s initial step).
+    let health: Value = reqwest::get(format!("{proxy}/health"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = &health["backends"]["limited:test-model"];
+    assert_eq!(entry["status"], "cooling");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let probe = entry["next_probe_ms"].as_i64().unwrap();
+    assert!(
+        probe > now_ms + 3_000_000,
+        "expected ~1h cooldown, got {}s",
+        (probe - now_ms) / 1000
+    );
+}
+
+// ── model aliasing (U 281) ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn model_alias_selects_route() {
+    let std_up = spawn_mock(200, completion_body()).await;
+    let fast_up = spawn_mock(200, completion_body()).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let doc = format!(
+        r#"{{"aliases":{{"claude-sonnet-4-6":"fast"}},"routes":[
+            {{"name":"standard","backends":[{{"name":"std","base_url":"{std_up}","model":"m","api_key":"k"}}]}},
+            {{"name":"fast","backends":[{{"name":"quick","base_url":"{fast_up}","model":"m","api_key":"k"}}]}}
+        ]}}"#
+    );
+    let cfg = thegn_proxy::config::parse_config(&doc).unwrap();
+    assert!(!cfg.last_resort);
+    let proxy = spawn_proxy_full(cfg, db).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(
+            &json!({"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resolved: Value = reqwest::get(format!("{proxy}/resolved"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // The aliased model routed to `fast`, not the default first route.
+    assert_eq!(resolved["fast"], "quick");
+    assert!(resolved.get("standard").is_none());
+}
+
+// ── last-resort cross-route fallback ─────────────────────────────────────────
+
+#[tokio::test]
+async fn last_resort_borrows_other_routes_backends() {
+    let dead = spawn_mock(500, json!({"error": {"message": "boom"}})).await;
+    let alive = spawn_mock(200, completion_body()).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let doc = format!(
+        r#"{{"last_resort":true,"routes":[
+            {{"name":"standard","backends":[{{"name":"dead","base_url":"{dead}","model":"m","api_key":"k"}}]}},
+            {{"name":"fast","backends":[{{"name":"rescue","base_url":"{alive}","model":"m","api_key":"k"}}]}}
+        ]}}"#
+    );
+    let cfg = thegn_proxy::config::parse_config(&doc).unwrap();
+    assert!(cfg.last_resort);
+    let proxy = spawn_proxy_full(cfg, db.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .unwrap();
+    // The standard route is dead, but the fast route's backend rescues it.
+    assert_eq!(resp.status(), 200);
+    let resolved: Value = reqwest::get(format!("{proxy}/resolved"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resolved["standard"], "rescue");
+}
+
+#[tokio::test]
+async fn last_resort_off_still_fails() {
+    let dead = spawn_mock(500, json!({"error": {"message": "boom"}})).await;
+    let alive = spawn_mock(200, completion_body()).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let doc = format!(
+        r#"{{"routes":[
+            {{"name":"standard","backends":[{{"name":"dead","base_url":"{dead}","model":"m","api_key":"k"}}]}},
+            {{"name":"fast","backends":[{{"name":"rescue","base_url":"{alive}","model":"m","api_key":"k"}}]}}
+        ]}}"#
+    );
+    let cfg = thegn_proxy::config::parse_config(&doc).unwrap();
+    let proxy = spawn_proxy_full(cfg, db).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+}
+
+// ── workspace-scoped accounts (V 287) ────────────────────────────────────────
+
+/// Spawns the proxy against a fully-parsed config (aliases/last_resort intact).
+async fn spawn_proxy_full(mut config: ProxyConfig, db: SharedDb) -> String {
+    config.listen = "127.0.0.1:0".parse().unwrap();
+    let listener = tokio::net::TcpListener::bind(config.listen).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = AppState::new(config, db, now_ms());
+    let app = server::app(state);
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn workspace_virtual_key_pins_upstream_and_attributes_spend() {
+    use thegn_core::store::WorkspaceStore;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let up = spawn_keyed_mock(None, seen.clone()).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    {
+        let g = db.lock().unwrap();
+        g.put_workspace("/repo", "ws", "repo").unwrap();
+        g.put_worktree("t", "/repo", "/repo/wt", "main", None, None)
+            .unwrap();
+        // The worktree's key is bound to provider "pinned" — its account.
+        g.put_proxy_virtual_key(
+            "szk_test",
+            "h",
+            "wt key",
+            "worktree:/repo/wt",
+            Some("pinned"),
+            1,
+        )
+        .unwrap();
+    }
+    // Config order puts "first" ahead; the binding must still win.
+    let doc = format!(
+        r#"{{"routes":[{{"name":"standard","backends":[
+            {{"name":"first","base_url":"{up}","model":"m","api_key":"kf"}},
+            {{"name":"pinned","base_url":"{up}","model":"m","api_key":"kp"}}
+        ]}}]}}"#
+    );
+    let cfg = thegn_proxy::config::parse_config(&doc).unwrap();
+    let proxy = spawn_proxy_full(cfg, db.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .bearer_auth("szk_test")
+        .json(&chat_request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The pinned provider's key was used first.
+    assert_eq!(seen.lock().unwrap().first().map(String::as_str), Some("kp"));
+
+    // Spend attributed up the chain: worktree → workspace → global.
+    let rows = wait_for_rows(&db, 1, |_| true).await;
+    assert_eq!(rows[0].worktree.as_deref(), Some("/repo/wt"));
+    assert_eq!(rows[0].workspace.as_deref(), Some("/repo"));
+    let g = db.lock().unwrap();
+    for scope in ["worktree:/repo/wt", "workspace:/repo", "global"] {
+        assert_eq!(
+            g.proxy_budget(scope).unwrap().unwrap().spent_tokens,
+            15,
+            "scope {scope}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn workspace_cap_refuses_worktree_member_e2e() {
+    use thegn_core::store::WorkspaceStore;
+    let up = spawn_mock(200, completion_body()).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    {
+        let g = db.lock().unwrap();
+        g.put_workspace("/repo", "ws", "repo").unwrap();
+        g.put_worktree("t", "/repo", "/repo/wt", "main", None, None)
+            .unwrap();
+        g.put_proxy_virtual_key("szk_capped", "h", "wt", "worktree:/repo/wt", None, 1)
+            .unwrap();
+        // The WORKSPACE cap is exhausted; the worktree itself has no cap.
+        g.set_proxy_budget_limits("workspace:/repo", "monthly", Some(10), None, 0)
+            .unwrap();
+        g.add_proxy_spend("workspace:/repo", 20, 0.0, 1).unwrap();
+    }
+    let routes = vec![Route {
+        name: "standard".into(),
+        strategy: thegn_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
+        priority: vec![backend("primary", &up)],
+    }];
+    let proxy = spawn_proxy(routes, db).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .bearer_auth("szk_capped")
+        .json(&chat_request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 402);
+    let v: Value = resp.json().await.unwrap();
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("workspace:/repo")
+    );
 }
 
 #[tokio::test]

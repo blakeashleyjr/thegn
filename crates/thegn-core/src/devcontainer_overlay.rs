@@ -668,8 +668,10 @@ mod tests {
         assert_eq!(sb.image, "node:20");
 
         // A user-pinned image wins.
-        let mut sb2 = SandboxConfig::default();
-        sb2.image = "debian:stable".into();
+        let mut sb2 = SandboxConfig {
+            image: "debian:stable".into(),
+            ..Default::default()
+        };
         apply_to_sandbox(&dc, &mut sb2, &ctx());
         assert_eq!(sb2.image, "debian:stable");
     }
@@ -741,8 +743,10 @@ mod tests {
     #[test]
     fn init_script_appends_to_existing() {
         let dc = parse(r#"{ "image": "x", "postStartCommand": "svc" }"#).unwrap();
-        let mut sb = SandboxConfig::default();
-        sb.init_script = "existing".into();
+        let mut sb = SandboxConfig {
+            init_script: "existing".into(),
+            ..Default::default()
+        };
         apply_to_sandbox(&dc, &mut sb, &ctx());
         assert!(sb.init_script.starts_with("existing"));
         assert!(sb.init_script.contains("svc"));
@@ -903,8 +907,10 @@ mod tests {
             r#"{ "build": { "dockerfile": "Dockerfile" } }"#,
             "/home/u/proj/.devcontainer",
         );
-        let mut sb = SandboxConfig::default();
-        sb.image = "debian:stable".into();
+        let mut sb = SandboxConfig {
+            image: "debian:stable".into(),
+            ..Default::default()
+        };
         apply_to_sandbox(&dc, &mut sb, &ctx());
         assert_eq!(sb.image, "debian:stable");
         assert!(sb.build.is_none());

@@ -645,28 +645,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // agents launched there discover it (best-effort; new worktrees seeded on
     // create — see `cmd/wt.rs`/`wizard.rs`). Gated on `[merge_queue] enabled`.
     crate::mq_assets::seed_persisted_worktrees(&cfg);
-    // Auto-launch the LLM-proxy daemon when enabled OR routing agents through it
-    // (disabled by default — AI is additive). Held for the lifetime of `main`; the
-    // supervisor thread keeps it alive and `Drop` stops it on graceful return
-    // (process-group exit otherwise).
-    let _proxy_daemon = cfg
-        .llm_proxy
-        .launch_spec()
-        .and_then(crate::proxy_daemon::launch);
-    // Diagnose the common silent-failure: thegn is launching ITS OWN proxy
-    // (`enabled`) and routing agents to it, but no routes are configured, so it
-    // 404s every agent request. (When `route_agent` points at an EXTERNAL proxy —
-    // `enabled = false` — routes live there, so this doesn't apply.)
-    if cfg.llm_proxy.enabled
-        && cfg.llm_proxy.route_agent
-        && cfg.llm_proxy.config_path.trim().is_empty()
-    {
-        tracing::warn!(
-            target: "thegn::startup",
-            "[llm_proxy] enabled + route_agent but config_path is empty — the proxy will \
-             answer /health but 404 agent requests until you point config_path at a routes file."
-        );
-    }
+    // Auto-launch the LLM-proxy daemon when enabled (disabled by default — AI is
+    // additive). Held for the lifetime of `main`; the supervisor thread keeps it
+    // alive and `Drop` stops it on graceful return (process-group exit otherwise).
+    let _proxy_daemon = crate::proxy_daemon::launch_from_config(&cfg);
     // Embedded host nix cache: when any env opts into `[env.<name>.provider]
     // host_cache`, serve the host /nix/store on an ephemeral loopback port for the
     // whole session. Each provider worktree's reverse tunnel then forwards a fixed
@@ -1627,7 +1609,7 @@ pub(crate) fn active_cwd(session: &crate::session::Session) -> Option<std::path:
 }
 
 /// Render-facing share snapshot for the active worktree (badge + Share panel).
-fn current_share_views(
+pub(crate) fn current_share_views(
     sup: &crate::share::ShareSupervisor,
     session: &crate::session::Session,
 ) -> Vec<crate::share::ShareView> {
@@ -5771,7 +5753,7 @@ fn attach_agent_pane(
                     let finish = |conn| {
                         emit(conn);
                         if let Some(key) = &revoke_key {
-                            crate::agent::revoke_agent_proxy_key(key);
+                            crate::proxy_keys::revoke_agent_proxy_key(key);
                         }
                     };
                     let mut backoff = std::time::Duration::from_millis(500);
@@ -9944,6 +9926,9 @@ async fn event_loop<T: Terminal>(
                 // Sizes land on the next hydrate; the scan doesn't force one.
                 RefreshKind::Disk => want_disk_refresh = true,
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
+                RefreshKind::ProxyDash(p) => {
+                    dirty |= crate::detail::apply_proxy_dash(&mut bar_detail, *p)
+                }
                 // Branch ref moved elsewhere; heal the canonical checkout off-loop.
                 RefreshKind::MainRefMoved => want_main_sync = true,
                 RefreshKind::HostHeal => want_host_heal = true,
@@ -16748,20 +16733,16 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::StopWorktreeShare => {
-                                if let Some(wt) = session.active_group().map(|g| g.path.clone()) {
-                                    let n = share_supervisor.stop(&wt, None);
-                                    if let Ok(db) = thegn_core::db::Db::open() {
-                                        for v in &model.shares {
-                                            let _ = db.delete_share(&wt, v.port);
-                                        }
-                                    }
-                                    model.shares = current_share_views(&share_supervisor, &session);
-                                    model.status = if n == 0 {
-                                        "No active shares on this worktree".into()
-                                    } else {
-                                        format!("Stopped {n} share(s)")
-                                    };
-                                }
+                                crate::handlers::host::stop_worktree_share(
+                                    &mut model,
+                                    &mut share_supervisor,
+                                    &session,
+                                );
+                            }
+                            Action::OpenProxyDash => {
+                                // Loading shell now; DB gather lands off-loop.
+                                bar_detail = Some(crate::detail::proxy_dash_loading(cols, rows));
+                                crate::actions::spawn_proxy_dash(&refresh_tx, &waker);
                             }
                             Action::OpenShares => {
                                 panel_auto_revealed = None;

@@ -100,9 +100,10 @@ pub(crate) fn resolve_agent_channel(
         // Stable id derived deterministically — matches what the launch path minted.
         cfg.llm_proxy
             .route_agent
-            .then(|| crate::agent::agent_proxy_key_id(wt_path))
+            .then(|| crate::proxy_keys::agent_proxy_key_id(wt_path))
     } else if cfg.llm_proxy.route_agent {
-        let key = crate::agent::mint_agent_proxy_key(wt_path);
+        let key =
+            crate::proxy_keys::mint_agent_proxy_key(wt_path, cfg.llm_proxy.upstream_binding());
         env.push((
             "THEGN_PROXY_BASE_URL".to_string(),
             format!("http://{}", cfg.llm_proxy.listen),
