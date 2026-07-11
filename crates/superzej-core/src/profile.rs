@@ -212,6 +212,9 @@ pub enum Singleton {
 
 /// Try to take the exclusive, non-blocking `flock` at `path`. `Ok(Some(file))`
 /// = acquired (keep the file to hold it); `Ok(None)` = already held elsewhere.
+// The `fcntl::Flock` replacement takes ownership of the file (RAII guard);
+// this seam hands the raw File to SingletonGuard — migrate both together.
+#[allow(deprecated)]
 #[cfg(not(windows))]
 fn try_lock_nb(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
     use std::os::unix::io::AsRawFd;

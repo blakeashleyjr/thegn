@@ -157,7 +157,7 @@ fn snapshot_host(
             .is_none_or(|t| unix_now().saturating_sub(t) > headroom_ttl_secs as i64);
         if stale {
             match superzej_svc::host::runner_for(&binding.reach)
-                .and_then(|mut r| r.probe_headroom())
+                .and_then(|mut r| r.probe_headroom().map_err(|e| e.msg))
             {
                 Ok(h) => {
                     let now = unix_now();

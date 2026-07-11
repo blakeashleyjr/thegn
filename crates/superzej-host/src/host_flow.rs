@@ -31,6 +31,7 @@ use superzej_core::host_machine::{
 };
 use superzej_core::image::managed_tag;
 use superzej_core::inventory::ArtifactKind;
+use superzej_core::retry::{ReconnectPolicy, StepBudget, with_retry};
 use superzej_core::store::{HostStore, WorkspaceStore};
 use superzej_svc::host::{HostRunner, local_caps, runner_for};
 
@@ -657,19 +658,43 @@ fn run_effect(
             let _ = db.host_heartbeat(&binding.id, "connect", now);
             board.start(HostStep::Connect, None);
             publish(board);
-            match runner.connect() {
+            // Transient transport failures retry with backoff — a single flap
+            // must not checkpoint the host to Failed (the sticky-state bug).
+            let res = with_retry(
+                "connect",
+                &StepBudget::new(ReconnectPolicy::control_plane(), Duration::from_secs(120)),
+                &mut |s| {
+                    board.start(HostStep::Connect, Some(s));
+                    publish(board);
+                    let _ = db.host_heartbeat(&binding.id, "connect", unix_now());
+                },
+                &mut || {},
+                &mut || runner.connect(),
+            );
+            match res {
                 Ok(()) => {
                     board.finish(HostStep::Connect, None);
                     MachineEvent::Connected
                 }
-                Err(error) => MachineEvent::ConnectFailed { error },
+                Err(error) => MachineEvent::ConnectFailed { error: error.msg },
             }
         }
         HostEffect::Probe => {
             let _ = db.host_heartbeat(&binding.id, "probe", now);
             board.start(HostStep::Probe, None);
             publish(board);
-            match runner.probe() {
+            let res = with_retry(
+                "probe",
+                &StepBudget::new(ReconnectPolicy::probe(), Duration::from_secs(180)),
+                &mut |s| {
+                    board.start(HostStep::Probe, Some(s));
+                    publish(board);
+                    let _ = db.host_heartbeat(&binding.id, "probe", unix_now());
+                },
+                &mut || {},
+                &mut || runner.probe(),
+            );
+            match res {
                 Ok(caps) => {
                     let _ = db.host_touch_probe(&binding.id, unix_now());
                     let detail = caps
@@ -679,7 +704,7 @@ fn run_effect(
                     board.finish(HostStep::Probe, detail);
                     MachineEvent::Probed(caps)
                 }
-                Err(error) => MachineEvent::ProbeFailed { error },
+                Err(error) => MachineEvent::ProbeFailed { error: error.msg },
             }
         }
         HostEffect::AskConsent { runtime } => {
@@ -711,32 +736,57 @@ fn run_effect(
                 board.start(HostStep::Install, Some(s));
                 publish(board);
             };
+            // No retry: a package install is not idempotent enough to blindly
+            // re-run on a flap — the background healer re-drives a failed
+            // install as a whole step instead.
             match runner.install_runtime(runtime, &mut note) {
                 Ok(rt) => MachineEvent::Installed(rt),
-                Err(error) => MachineEvent::InstallFailed { error },
+                Err(error) => MachineEvent::InstallFailed { error: error.msg },
             }
         }
         HostEffect::ResolveImage { reference } => {
             let _ = db.host_heartbeat(&binding.id, "resolve_image", now);
             board.start(HostStep::ResolveImage, Some(format!("resolve {reference}")));
             publish(board);
-            match runner.resolve_image(&reference) {
+            let res = with_retry(
+                "resolve image",
+                &StepBudget::new(ReconnectPolicy::probe(), Duration::from_secs(120)),
+                &mut |s| {
+                    board.start(HostStep::ResolveImage, Some(s));
+                    publish(board);
+                    let _ = db.host_heartbeat(&binding.id, "resolve_image", unix_now());
+                },
+                &mut || {},
+                &mut || runner.resolve_image(&reference),
+            );
+            match res {
                 Ok(r) => MachineEvent::ImageResolved(r),
-                Err(error) => MachineEvent::ResolveFailed { error },
+                Err(error) => MachineEvent::ResolveFailed { error: error.msg },
             }
         }
         HostEffect::CheckImage { digest } => {
             let _ = db.host_heartbeat(&binding.id, "verify", now);
             board.start(HostStep::Verify, Some(format!("check {}", digest.short())));
             publish(board);
-            match runner.image_present(&binding.image, &digest) {
+            let res = with_retry(
+                "image check",
+                &StepBudget::new(ReconnectPolicy::probe(), Duration::from_secs(120)),
+                &mut |s| {
+                    board.start(HostStep::Verify, Some(s));
+                    publish(board);
+                    let _ = db.host_heartbeat(&binding.id, "verify", unix_now());
+                },
+                &mut || {},
+                &mut || runner.image_present(&binding.image, &digest),
+            );
+            match res {
                 Ok(true) => {
                     record_image(db, binding, ctx, &digest, true);
                     board.finish(HostStep::Deliver, Some("image present".into()));
                     MachineEvent::ImagePresent
                 }
                 Ok(false) => MachineEvent::ImageAbsent,
-                Err(error) => MachineEvent::ResolveFailed { error },
+                Err(error) => MachineEvent::ResolveFailed { error: error.msg },
             }
         }
         HostEffect::Deliver { strategy, digest } => {
@@ -762,7 +812,28 @@ fn run_effect(
                 publish(board);
                 let _ = db.host_heartbeat(&binding.id, "deliver", unix_now());
             };
-            match runner.deliver(strategy, &binding.image, &digest, &mut on_bytes) {
+            // Same-strategy retry on transient transport failures: resume
+            // offsets make a second pass cheap, and the machine's strategy
+            // ladder only demotes on a real (or exhausted) failure. Retry
+            // notes go to host_events (the board is owned by the byte
+            // progress callback).
+            let res = with_retry(
+                "deliver",
+                &StepBudget::new(
+                    ReconnectPolicy {
+                        max_attempts: 2,
+                        base_delay_ms: 2_000,
+                        max_delay_ms: 10_000,
+                    },
+                    Duration::from_secs(3600),
+                ),
+                &mut |s| {
+                    let _ = db.host_event(&binding.id, HostStep::Deliver.as_str(), &s, unix_now());
+                },
+                &mut || {},
+                &mut || runner.deliver(strategy, &binding.image, &digest, &mut on_bytes),
+            );
+            match res {
                 Ok(verified) => {
                     record_image(db, binding, ctx, &verified, false);
                     let _ = db.host_event(
@@ -776,7 +847,7 @@ fn run_effect(
                         verified_digest: verified,
                     }
                 }
-                Err(error) => MachineEvent::DeliverFailed { error },
+                Err(error) => MachineEvent::DeliverFailed { error: error.msg },
             }
         }
         HostEffect::SeedVolume { spec } => {
@@ -796,14 +867,32 @@ fn run_effect(
                     // fails the seed with a clear error
                     superzej_core::image::Digest::from_hex(&"0".repeat(64)).expect("static")
                 });
-            match runner.seed_volume(&spec, &binding.image, &digest) {
+            let res = with_retry(
+                "volume seed",
+                &StepBudget::new(
+                    ReconnectPolicy {
+                        max_attempts: 2,
+                        base_delay_ms: 2_000,
+                        max_delay_ms: 10_000,
+                    },
+                    Duration::from_secs(3600),
+                ),
+                &mut |s| {
+                    board.start(HostStep::SeedVolume, Some(s));
+                    publish(board);
+                    let _ = db.host_heartbeat(&binding.id, "seed_volume", unix_now());
+                },
+                &mut || {},
+                &mut || runner.seed_volume(&spec, &binding.image, &digest),
+            );
+            match res {
                 Ok(()) => {
                     record_volume(db, binding, ctx, &spec.name, &digest);
                     MachineEvent::VolumeSeeded { volume: spec.name }
                 }
                 Err(error) => MachineEvent::VolumeSeedFailed {
                     volume: spec.name,
-                    error,
+                    error: error.msg,
                 },
             }
         }
@@ -1234,6 +1323,7 @@ mod tests {
     use super::*;
     use superzej_core::host::{Arch, HostId, RuntimeInfo, VolumeSpec};
     use superzej_core::image::{DeliveryStrategy, Digest, ImageRef, ResolvedImage};
+    use superzej_core::transport_error::ClassifiedErr;
 
     const D_AMD: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     const D_LIST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1259,22 +1349,23 @@ mod tests {
     }
 
     impl HostRunner for MockRunner {
-        fn connect(&mut self) -> Result<(), String> {
+        fn connect(&mut self) -> Result<(), ClassifiedErr> {
             Ok(())
         }
-        fn probe(&mut self) -> Result<HostCaps, String> {
+        fn probe(&mut self) -> Result<HostCaps, ClassifiedErr> {
             self.probes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             HostCaps::parse_probe("ARCH=x86_64\nOS=linux\nPODMAN=5.0\nPKGMGR=apt\nEGRESS=full\n")
+                .map_err(ClassifiedErr::from)
         }
         fn install_runtime(
             &mut self,
             _kind: RuntimeKind,
             _note: &mut dyn FnMut(String),
-        ) -> Result<RuntimeInfo, String> {
+        ) -> Result<RuntimeInfo, ClassifiedErr> {
             unreachable!("runtime present in mock probe")
         }
-        fn resolve_image(&mut self, reference: &ImageRef) -> Result<ResolvedImage, String> {
+        fn resolve_image(&mut self, reference: &ImageRef) -> Result<ResolvedImage, ClassifiedErr> {
             Ok(ResolvedImage {
                 reference: reference.clone(),
                 list_digest: Digest::parse(D_LIST).unwrap(),
@@ -1283,7 +1374,11 @@ mod tests {
                     .collect(),
             })
         }
-        fn image_present(&mut self, _image: &ImageRef, _digest: &Digest) -> Result<bool, String> {
+        fn image_present(
+            &mut self,
+            _image: &ImageRef,
+            _digest: &Digest,
+        ) -> Result<bool, ClassifiedErr> {
             Ok(self.present_after_deliver.get())
         }
         fn deliver(
@@ -1292,7 +1387,7 @@ mod tests {
             _image: &ImageRef,
             digest: &Digest,
             progress: &mut dyn FnMut(u64, Option<u64>),
-        ) -> Result<Digest, String> {
+        ) -> Result<Digest, ClassifiedErr> {
             self.delivers
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             progress(512, Some(1024));
@@ -1305,7 +1400,7 @@ mod tests {
             _spec: &VolumeSpec,
             _image: &ImageRef,
             _digest: &Digest,
-        ) -> Result<(), String> {
+        ) -> Result<(), ClassifiedErr> {
             Ok(())
         }
         fn oci_url(&self) -> Option<String> {
@@ -1399,23 +1494,24 @@ mod tests {
         // consent; Headless{assume_yes:false} answers no.
         struct BareRunner;
         impl HostRunner for BareRunner {
-            fn connect(&mut self) -> Result<(), String> {
+            fn connect(&mut self) -> Result<(), ClassifiedErr> {
                 Ok(())
             }
-            fn probe(&mut self) -> Result<HostCaps, String> {
+            fn probe(&mut self) -> Result<HostCaps, ClassifiedErr> {
                 HostCaps::parse_probe("ARCH=x86_64\nOS=linux\nPKGMGR=apt\n")
+                    .map_err(ClassifiedErr::from)
             }
             fn install_runtime(
                 &mut self,
                 _k: RuntimeKind,
                 _n: &mut dyn FnMut(String),
-            ) -> Result<RuntimeInfo, String> {
+            ) -> Result<RuntimeInfo, ClassifiedErr> {
                 panic!("must not install without consent")
             }
-            fn resolve_image(&mut self, _r: &ImageRef) -> Result<ResolvedImage, String> {
+            fn resolve_image(&mut self, _r: &ImageRef) -> Result<ResolvedImage, ClassifiedErr> {
                 unreachable!()
             }
-            fn image_present(&mut self, _i: &ImageRef, _d: &Digest) -> Result<bool, String> {
+            fn image_present(&mut self, _i: &ImageRef, _d: &Digest) -> Result<bool, ClassifiedErr> {
                 unreachable!()
             }
             fn deliver(
@@ -1424,7 +1520,7 @@ mod tests {
                 _i: &ImageRef,
                 _d: &Digest,
                 _p: &mut dyn FnMut(u64, Option<u64>),
-            ) -> Result<Digest, String> {
+            ) -> Result<Digest, ClassifiedErr> {
                 unreachable!()
             }
             fn seed_volume(
@@ -1432,7 +1528,7 @@ mod tests {
                 _s: &VolumeSpec,
                 _i: &ImageRef,
                 _d: &Digest,
-            ) -> Result<(), String> {
+            ) -> Result<(), ClassifiedErr> {
                 unreachable!()
             }
             fn oci_url(&self) -> Option<String> {
@@ -1461,23 +1557,24 @@ mod tests {
         let b = binding("bg-box");
         struct BareRunner;
         impl HostRunner for BareRunner {
-            fn connect(&mut self) -> Result<(), String> {
+            fn connect(&mut self) -> Result<(), ClassifiedErr> {
                 Ok(())
             }
-            fn probe(&mut self) -> Result<HostCaps, String> {
+            fn probe(&mut self) -> Result<HostCaps, ClassifiedErr> {
                 HostCaps::parse_probe("ARCH=x86_64\nOS=linux\nPKGMGR=apt\n")
+                    .map_err(ClassifiedErr::from)
             }
             fn install_runtime(
                 &mut self,
                 _k: RuntimeKind,
                 _n: &mut dyn FnMut(String),
-            ) -> Result<RuntimeInfo, String> {
+            ) -> Result<RuntimeInfo, ClassifiedErr> {
                 panic!("background must never install")
             }
-            fn resolve_image(&mut self, _r: &ImageRef) -> Result<ResolvedImage, String> {
+            fn resolve_image(&mut self, _r: &ImageRef) -> Result<ResolvedImage, ClassifiedErr> {
                 unreachable!()
             }
-            fn image_present(&mut self, _i: &ImageRef, _d: &Digest) -> Result<bool, String> {
+            fn image_present(&mut self, _i: &ImageRef, _d: &Digest) -> Result<bool, ClassifiedErr> {
                 unreachable!()
             }
             fn deliver(
@@ -1486,7 +1583,7 @@ mod tests {
                 _i: &ImageRef,
                 _d: &Digest,
                 _p: &mut dyn FnMut(u64, Option<u64>),
-            ) -> Result<Digest, String> {
+            ) -> Result<Digest, ClassifiedErr> {
                 unreachable!()
             }
             fn seed_volume(
@@ -1494,7 +1591,7 @@ mod tests {
                 _s: &VolumeSpec,
                 _i: &ImageRef,
                 _d: &Digest,
-            ) -> Result<(), String> {
+            ) -> Result<(), ClassifiedErr> {
                 unreachable!()
             }
             fn oci_url(&self) -> Option<String> {
