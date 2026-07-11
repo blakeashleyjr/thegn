@@ -1,209 +1,131 @@
-L0| ◆ superzej v0.1.0   dashboard   work   comms   chat 34.2/94G · 󰾲 20% · 󰂄 100% · Fri Jun 19 · 22:56
-R0 0 1 fg=default bg=idx00 attrs=
+L0| ◆ superzej v0.1.0 work     15.4/94G ·   7% ·  50% ·  96°C ·  ↓  1.3M ↑  764K ·  100% · 22:07
+R0 0 1 fg=idx07 bg=idx00 attrs=
 R0 1 2 fg=idx06 bg=idx00 attrs=
-R0 3 8 fg=idx07 bg=idx00 attrs=
-R0 11 1 fg=default bg=idx00 attrs=
+R0 3 9 fg=idx07 bg=idx00 attrs=
 R0 12 6 fg=idx08 bg=idx00 attrs=
-R0 18 2 fg=default bg=idx00 attrs=
-R0 20 11 fg=idx07 bg=idx00 attrs=
-R0 31 1 fg=default bg=idx00 attrs=
-R0 32 6 fg=idx06 bg=idx08 attrs=
-R0 38 1 fg=default bg=idx00 attrs=
-R0 39 7 fg=idx07 bg=idx00 attrs=
-R0 46 1 fg=default bg=idx00 attrs=
-R0 47 14 fg=idx07 bg=idx00 attrs=
-R0 61 3 fg=idx08 bg=idx00 attrs=
-R0 64 5 fg=idx07 bg=idx00 attrs=
-R0 69 3 fg=idx08 bg=idx00 attrs=
-R0 72 6 fg=idx07 bg=idx00 attrs=
-R0 78 3 fg=idx08 bg=idx00 attrs=
-R0 81 10 fg=idx07 bg=idx00 attrs=
+R0 18 6 fg=idx06 bg=idx08 attrs=BOLD
+R0 24 13 fg=idx07 bg=idx00 attrs=
+R0 37 11 fg=idx08 bg=idx00 attrs=
+R0 48 5 fg=idx07 bg=idx00 attrs=
+R0 53 12 fg=idx08 bg=idx00 attrs=
+R0 65 17 fg=idx07 bg=idx00 attrs=
+R0 82 3 fg=idx08 bg=idx00 attrs=
+R0 85 6 fg=idx03 bg=idx00 attrs=
 R0 91 3 fg=idx08 bg=idx00 attrs=
-R0 94 5 fg=idx07 bg=idx00 attrs=
-R0 99 1 fg=default bg=idx00 attrs=
+R0 94 6 fg=idx07 bg=idx00 attrs=
 L1|────────────────────────────────────────────────────────────────────────────────────────────────────
 R1 0 100 fg=idx08 bg=idx00 attrs=
-L2| WORKSPACES           REGCLAUDE ▸ home · Sandbox: None   1
+L2| WORKSPACES                       HOME ▸ home   1
 R2 0 11 fg=idx07 bg=idx00 attrs=BOLD
-R2 11 9 fg=default bg=idx00 attrs=
-R2 20 2 fg=default bg=default attrs=
-R2 22 9 fg=idx07 bg=idx00 attrs=
-R2 31 3 fg=idx08 bg=idx00 attrs=
-R2 34 4 fg=idx06 bg=idx00 attrs=
-R2 38 12 fg=idx07 bg=idx00 attrs=
-R2 50 4 fg=idx08 bg=idx00 attrs=
-R2 54 2 fg=default bg=default attrs=
-R2 56 3 fg=idx06 bg=idx08 attrs=
-R2 59 41 fg=default bg=idx00 attrs=
-L3|                     ╭─ bwrap · home ──────────────────────────────────────────────────────────────╮
-R3 0 20 fg=default bg=idx00 attrs=
-R3 20 1 fg=default bg=default attrs=
-R3 21 79 fg=idx06 bg=idx00 attrs=
-L4| ▾ regclaude         │blake@ws-3:~/ >                                                              │
-R4 0 1 fg=default bg=idx00 attrs=
-R4 1 11 fg=idx07 bg=idx00 attrs=
-R4 12 8 fg=default bg=idx00 attrs=
-R4 20 1 fg=default bg=default attrs=
-R4 21 1 fg=idx06 bg=idx00 attrs=
-R4 22 77 fg=default bg=idx00 attrs=
-R4 99 1 fg=idx06 bg=idx00 attrs=
-L5|   ● home            │                                                                             │
-R5 0 1 fg=default bg=idx00 attrs=
-R5 1 8 fg=idx06 bg=idx00 attrs=
-R5 9 11 fg=default bg=idx00 attrs=
-R5 20 1 fg=default bg=default attrs=
-R5 21 1 fg=idx06 bg=idx00 attrs=
-R5 22 77 fg=default bg=idx00 attrs=
-R5 99 1 fg=idx06 bg=idx00 attrs=
-L6|                     │                                                                             │
-R6 0 20 fg=default bg=idx00 attrs=
-R6 20 1 fg=default bg=default attrs=
-R6 21 1 fg=idx06 bg=idx00 attrs=
-R6 22 77 fg=default bg=idx00 attrs=
-R6 99 1 fg=idx06 bg=idx00 attrs=
-L7|                     │                                                                             │
-R7 0 20 fg=default bg=idx00 attrs=
-R7 20 1 fg=default bg=default attrs=
-R7 21 1 fg=idx06 bg=idx00 attrs=
-R7 22 77 fg=default bg=idx00 attrs=
-R7 99 1 fg=idx06 bg=idx00 attrs=
-L8|                     │                                                                             │
-R8 0 20 fg=default bg=idx00 attrs=
-R8 20 1 fg=default bg=default attrs=
-R8 21 1 fg=idx06 bg=idx00 attrs=
-R8 22 77 fg=default bg=idx00 attrs=
-R8 99 1 fg=idx06 bg=idx00 attrs=
-L9|                     │                                                                             │
-R9 0 20 fg=default bg=idx00 attrs=
-R9 20 1 fg=default bg=default attrs=
-R9 21 1 fg=idx06 bg=idx00 attrs=
-R9 22 77 fg=default bg=idx00 attrs=
-R9 99 1 fg=idx06 bg=idx00 attrs=
-L10|                     │                                                                             │
-R10 0 20 fg=default bg=idx00 attrs=
-R10 20 1 fg=default bg=default attrs=
-R10 21 1 fg=idx06 bg=idx00 attrs=
-R10 22 77 fg=default bg=idx00 attrs=
-R10 99 1 fg=idx06 bg=idx00 attrs=
-L11|                     │                                                                             │
-R11 0 20 fg=default bg=idx00 attrs=
-R11 20 1 fg=default bg=default attrs=
-R11 21 1 fg=idx06 bg=idx00 attrs=
-R11 22 77 fg=default bg=idx00 attrs=
-R11 99 1 fg=idx06 bg=idx00 attrs=
-L12|                     │                                                                             │
-R12 0 20 fg=default bg=idx00 attrs=
-R12 20 1 fg=default bg=default attrs=
-R12 21 1 fg=idx06 bg=idx00 attrs=
-R12 22 77 fg=default bg=idx00 attrs=
-R12 99 1 fg=idx06 bg=idx00 attrs=
-L13|                     │                                                                             │
-R13 0 20 fg=default bg=idx00 attrs=
-R13 20 1 fg=default bg=default attrs=
-R13 21 1 fg=idx06 bg=idx00 attrs=
-R13 22 77 fg=default bg=idx00 attrs=
-R13 99 1 fg=idx06 bg=idx00 attrs=
-L14|                     │                                                                             │
-R14 0 20 fg=default bg=idx00 attrs=
-R14 20 1 fg=default bg=default attrs=
-R14 21 1 fg=idx06 bg=idx00 attrs=
-R14 22 77 fg=default bg=idx00 attrs=
-R14 99 1 fg=idx06 bg=idx00 attrs=
-L15|                     │                                                                             │
-R15 0 20 fg=default bg=idx00 attrs=
-R15 20 1 fg=default bg=default attrs=
-R15 21 1 fg=idx06 bg=idx00 attrs=
-R15 22 77 fg=default bg=idx00 attrs=
-R15 99 1 fg=idx06 bg=idx00 attrs=
-L16|                     │                                                                             │
-R16 0 20 fg=default bg=idx00 attrs=
-R16 20 1 fg=default bg=default attrs=
-R16 21 1 fg=idx06 bg=idx00 attrs=
-R16 22 77 fg=default bg=idx00 attrs=
-R16 99 1 fg=idx06 bg=idx00 attrs=
-L17|                     │                                                                             │
-R17 0 20 fg=default bg=idx00 attrs=
-R17 20 1 fg=default bg=default attrs=
-R17 21 1 fg=idx06 bg=idx00 attrs=
-R17 22 77 fg=default bg=idx00 attrs=
-R17 99 1 fg=idx06 bg=idx00 attrs=
-L18|                     │                                                                             │
-R18 0 20 fg=default bg=idx00 attrs=
-R18 20 1 fg=default bg=default attrs=
-R18 21 1 fg=idx06 bg=idx00 attrs=
-R18 22 77 fg=default bg=idx00 attrs=
-R18 99 1 fg=idx06 bg=idx00 attrs=
-L19|                     │                                                                             │
-R19 0 20 fg=default bg=idx00 attrs=
-R19 20 1 fg=default bg=default attrs=
-R19 21 1 fg=idx06 bg=idx00 attrs=
-R19 22 77 fg=default bg=idx00 attrs=
-R19 99 1 fg=idx06 bg=idx00 attrs=
-L20|                     │                                                                             │
-R20 0 20 fg=default bg=idx00 attrs=
-R20 20 1 fg=default bg=default attrs=
-R20 21 1 fg=idx06 bg=idx00 attrs=
-R20 22 77 fg=default bg=idx00 attrs=
-R20 99 1 fg=idx06 bg=idx00 attrs=
-L21|                     │                                                                             │
-R21 0 20 fg=default bg=idx00 attrs=
-R21 20 1 fg=default bg=default attrs=
-R21 21 1 fg=idx06 bg=idx00 attrs=
-R21 22 77 fg=default bg=idx00 attrs=
-R21 99 1 fg=idx06 bg=idx00 attrs=
-L22|                     │                                                                             │
-R22 0 20 fg=default bg=idx00 attrs=
-R22 20 1 fg=default bg=default attrs=
-R22 21 1 fg=idx06 bg=idx00 attrs=
-R22 22 77 fg=default bg=idx00 attrs=
-R22 99 1 fg=idx06 bg=idx00 attrs=
-L23|                     │                                                                             │
-R23 0 20 fg=default bg=idx00 attrs=
-R23 20 1 fg=default bg=default attrs=
-R23 21 1 fg=idx06 bg=idx00 attrs=
-R23 22 77 fg=default bg=idx00 attrs=
-R23 99 1 fg=idx06 bg=idx00 attrs=
-L24|                     │                                                                             │
-R24 0 20 fg=default bg=idx00 attrs=
-R24 20 1 fg=default bg=default attrs=
-R24 21 1 fg=idx06 bg=idx00 attrs=
-R24 22 77 fg=default bg=idx00 attrs=
-R24 99 1 fg=idx06 bg=idx00 attrs=
-L25|                     │                                                                             │
-R25 0 20 fg=default bg=idx00 attrs=
-R25 20 1 fg=default bg=default attrs=
-R25 21 1 fg=idx06 bg=idx00 attrs=
-R25 22 77 fg=default bg=idx00 attrs=
-R25 99 1 fg=idx06 bg=idx00 attrs=
-L26|                     │                                                                             │
-R26 0 20 fg=default bg=idx00 attrs=
-R26 20 1 fg=default bg=default attrs=
-R26 21 1 fg=idx06 bg=idx00 attrs=
-R26 22 77 fg=default bg=idx00 attrs=
-R26 99 1 fg=idx06 bg=idx00 attrs=
-L27|                     │                                                                             │
-R27 0 20 fg=default bg=idx00 attrs=
-R27 20 1 fg=default bg=default attrs=
-R27 21 1 fg=idx06 bg=idx00 attrs=
-R27 22 77 fg=default bg=idx00 attrs=
-R27 99 1 fg=idx06 bg=idx00 attrs=
-L28|                     ╰─────────────────────────────────────────────────────────────────────────────╯
-R28 0 20 fg=default bg=idx00 attrs=
-R28 20 1 fg=default bg=default attrs=
-R28 21 79 fg=idx06 bg=idx00 attrs=
-L29|  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab   Alt-p smart split … 0 LOC
+R2 11 21 fg=default bg=idx00 attrs=
+R2 32 2 fg=default bg=default attrs=
+R2 34 4 fg=idx07 bg=idx00 attrs=
+R2 38 3 fg=idx08 bg=idx00 attrs=
+R2 41 4 fg=idx06 bg=idx00 attrs=
+R2 45 2 fg=default bg=default attrs=
+R2 47 3 fg=idx06 bg=idx08 attrs=
+L3|
+R3 0 32 fg=default bg=idx00 attrs=
+L4| ▾ ⌂ home
+R4 0 1 fg=idx07 bg=idx00 attrs=
+R4 1 1 fg=idx08 bg=idx00 attrs=
+R4 2 3 fg=idx07 bg=idx00 attrs=
+R4 5 4 fg=idx07 bg=idx00 attrs=BOLD
+R4 9 23 fg=idx07 bg=idx00 attrs=
+L5|▐   └ ○ home                               ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
+R5 0 1 fg=idx08 bg=idx00 attrs=
+R5 1 3 fg=idx07 bg=idx00 attrs=
+R5 4 2 fg=idx08 bg=idx00 attrs=
+R5 6 1 fg=idx09 bg=idx00 attrs=
+R5 7 1 fg=idx07 bg=idx00 attrs=
+R5 8 4 fg=idx06 bg=idx00 attrs=
+R5 12 20 fg=idx07 bg=idx00 attrs=
+R5 32 11 fg=default bg=default attrs=
+R5 43 47 fg=idx06 bg=idx00 attrs=
+L6|                                            ▀▀▀▄ █   █ █▄▄▄▀ █▀▀▀  █▄▄▄▀  ▄▀   █▀▀▀     █
+R6 0 32 fg=idx07 bg=idx00 attrs=
+R6 32 11 fg=default bg=default attrs=
+R6 43 47 fg=idx06 bg=idx00 attrs=
+L7| TERMINALS                                 ▄▄▄▄▀ ▀▄▄▄▀ █     █▄▄▄▄ █  ▀▄ █▄▄▄▄ █▄▄▄▄ ▀▄▄▀
+R7 0 1 fg=idx07 bg=idx00 attrs=
+R7 1 9 fg=idx07 bg=idx00 attrs=BOLD
+R7 10 22 fg=idx07 bg=idx00 attrs=
+R7 32 11 fg=default bg=default attrs=
+R7 43 47 fg=idx06 bg=idx00 attrs=
+L8| ▾ ≡ local
+R8 0 1 fg=idx07 bg=idx00 attrs=
+R8 1 1 fg=idx08 bg=idx00 attrs=
+R8 2 3 fg=idx07 bg=idx00 attrs=
+R8 5 5 fg=idx07 bg=idx00 attrs=BOLD
+R8 10 22 fg=idx07 bg=idx00 attrs=
+L9|   └ ≡ local                                          v0.1.0 · git worktree IDE
+R9 0 3 fg=idx07 bg=idx00 attrs=
+R9 3 2 fg=idx08 bg=idx00 attrs=
+R9 5 27 fg=idx07 bg=idx00 attrs=
+R9 32 22 fg=default bg=default attrs=
+R9 54 6 fg=idx07 bg=idx00 attrs=
+R9 60 19 fg=idx08 bg=idx00 attrs=
+L10|
+R10 0 32 fg=default bg=idx00 attrs=
+L11|                                                             ↻ sandbox
+R11 0 32 fg=default bg=idx00 attrs=
+R11 32 29 fg=default bg=default attrs=
+R11 61 1 fg=idx06 bg=idx00 attrs=
+R11 62 1 fg=default bg=default attrs=
+R11 63 7 fg=idx07 bg=idx00 attrs=
+L12|                                                             ◇ container
+R12 0 32 fg=default bg=idx00 attrs=
+R12 32 29 fg=default bg=default attrs=
+R12 61 1 fg=idx08 bg=idx00 attrs=
+R12 62 1 fg=default bg=default attrs=
+R12 63 9 fg=idx08 bg=idx00 attrs=
+L13|                                                             ◇ shell
+R13 0 32 fg=default bg=idx00 attrs=
+R13 32 29 fg=default bg=default attrs=
+R13 61 1 fg=idx08 bg=idx00 attrs=
+R13 62 1 fg=default bg=default attrs=
+R13 63 5 fg=idx08 bg=idx00 attrs=
+L14|
+R14 0 32 fg=default bg=idx00 attrs=
+L15|
+R15 0 32 fg=default bg=idx00 attrs=
+L16|
+R16 0 32 fg=default bg=idx00 attrs=
+L17|
+R17 0 32 fg=default bg=idx00 attrs=
+L18|
+R18 0 32 fg=default bg=idx00 attrs=
+L19|
+R19 0 32 fg=default bg=idx00 attrs=
+L20|
+R20 0 32 fg=default bg=idx00 attrs=
+L21|
+R21 0 32 fg=default bg=idx00 attrs=
+L22|
+R22 0 32 fg=default bg=idx00 attrs=
+L23|
+R23 0 32 fg=default bg=idx00 attrs=
+L24|
+R24 0 32 fg=default bg=idx00 attrs=
+L25|
+R25 0 32 fg=default bg=idx00 attrs=
+L26|
+R26 0 32 fg=default bg=idx00 attrs=
+L27|
+R27 0 32 fg=default bg=idx00 attrs=
+L28|
+R28 0 32 fg=default bg=idx00 attrs=
+L29|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav              0 LOC  ✋ 1    7% free
 R29 0 1 fg=idx07 bg=idx00 attrs=
-R29 1 3 fg=idx00 bg=idx06 attrs=BOLD
-R29 4 2 fg=idx07 bg=idx00 attrs=
-R29 6 14 fg=idx08 bg=idx00 attrs=
-R29 20 3 fg=idx07 bg=idx00 attrs=
-R29 23 12 fg=idx08 bg=idx00 attrs=
-R29 35 3 fg=idx07 bg=idx00 attrs=
-R29 38 15 fg=idx08 bg=idx00 attrs=
-R29 53 3 fg=idx07 bg=idx00 attrs=
-R29 56 15 fg=idx08 bg=idx00 attrs=
-R29 71 3 fg=idx07 bg=idx00 attrs=
-R29 74 17 fg=idx08 bg=idx00 attrs=
-R29 91 1 fg=idx07 bg=idx00 attrs=
-R29 92 1 fg=idx08 bg=idx00 attrs=
-R29 93 7 fg=idx07 bg=idx00 attrs=
+R29 1 8 fg=idx00 bg=idx06 attrs=BOLD
+R29 9 2 fg=idx07 bg=idx00 attrs=
+R29 11 15 fg=idx08 bg=idx00 attrs=
+R29 26 3 fg=idx07 bg=idx00 attrs=
+R29 29 11 fg=idx08 bg=idx00 attrs=
+R29 40 3 fg=idx07 bg=idx00 attrs=
+R29 43 18 fg=idx08 bg=idx00 attrs=
+R29 61 20 fg=idx07 bg=idx00 attrs=
+R29 81 6 fg=idx00 bg=idx03 attrs=BOLD
+R29 87 1 fg=idx07 bg=idx00 attrs=
+R29 88 11 fg=idx00 bg=idx09 attrs=BOLD
+R29 99 1 fg=idx07 bg=idx00 attrs=

@@ -1,24 +1,24 @@
- ◆ superzej   dashboard   work  comms 4 chat 27% · 󰂄 100% · Fri Jun 19 · 22:56
+ ◆ superzej work         77% ·  15.4/94G ·  ↓  1.3M ↑  848K ·  100% · 22:07
 ────────────────────────────────────────────────────────────────────────────────
- WORKSPACES           REGCLAUDE ▸ home · Sandbox: None   1
-                     ╭─ bwrap · home ──────────────────────────────────────────╮
- ▾ regclaude         │blake@ws-3:~/ >                                          │
-   ● home            │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     ╰─────────────────────────────────────────────────────────╯
-                     ╭─ bwrap · home ──────────────────────────────────────────╮
-                     │blake@ws-3:~/ >                                          │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     ╰─────────────────────────────────────────────────────────╯
-  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktre… 0 LOC │ Keybinds unlocked
+ HOME ▸ home   1
+                ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
+                 ▀▀▀▄ █   █ █▄▄▄▀ █▀▀▀  █▄▄▄▀  ▄▀   █▀▀▀     █
+                ▄▄▄▄▀ ▀▄▄▄▀ █     █▄▄▄▄ █  ▀▄ █▄▄▄▄ █▄▄▄▄ ▀▄▄▀
+
+                           v0.1.0 · git worktree IDE
+
+                                  ↻ sandbox
+                                  ◇ container
+                                  ◇ shell
+
+
+
+
+
+
+
+
+
+
+
+  N… 0 LOC │ Keybinds unlocked  ✋ 1    7% free   ❚❚ Justin Hurwitz — Houston

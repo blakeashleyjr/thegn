@@ -8,7 +8,10 @@ all-features = false
 [advisories]
 # Fail on any advisory (vulnerabilities, unmaintained, unsound, notices are
 # warnings by default; vulnerabilities error).
-db-path = "$CARGO_HOME/advisory-dbs"
+# Workspace-local DB path: $CARGO_HOME is read-only in the dev sandboxes
+# (bwrap RO-$HOME), which blocked the advisory-db fetch/lock; target/ is
+# always writable and CI runners simply keep the clone in their target cache.
+db-path = "target/advisory-dbs"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
 # Documented exceptions — each needs a reason and an exit condition.

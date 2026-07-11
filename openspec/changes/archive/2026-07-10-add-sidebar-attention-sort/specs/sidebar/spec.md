@@ -46,18 +46,6 @@ before the first hydration pass the mode MUST degrade to the manual order.
 - **WHEN** the user manually reorders a worktree while Attention sort is active
 - **THEN** the sort mode flips to Manual so the move is visible and persists
 
-### Requirement: The focused row explains its attention placement
-
-The focused worktree row's detail line SHALL spell out the row's most urgent
-attention reason as a short label with a tier-hued, capability-degraded glyph
-(e.g. "agent needs input", "CI failed", "ready to land"), and MUST show
-nothing for an idle row.
-
-#### Scenario: Blocked row shows its reason
-
-- **WHEN** the cursor rests on a worktree whose agent asked for input
-- **THEN** the detail line shows an attention glyph with "agent needs input"
-
 ### Requirement: One-key jump to the next worktree needing the user
 
 A bindable action (`attention-next`, default `Alt a`) SHALL focus the most

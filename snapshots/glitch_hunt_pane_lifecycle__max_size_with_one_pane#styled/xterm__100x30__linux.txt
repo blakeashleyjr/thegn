@@ -1,52 +1,28 @@
-L0| ◆ superzej v0.1.0   dashboard   work
-R0 0 1 fg=default bg=#151a28 attrs=
-R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
-R0 3 8 fg=#edf0f8 bg=#151a28 attrs=
-R0 11 1 fg=default bg=#151a28 attrs=
-R0 12 6 fg=#4e556e bg=#151a28 attrs=
-R0 18 2 fg=default bg=#151a28 attrs=
-R0 20 11 fg=#aab1c5 bg=#151a28 attrs=
-R0 31 1 fg=default bg=#151a28 attrs=
-R0 32 6 fg=#6ee7d8 bg=#2e5359 attrs=
-R0 38 1 fg=default bg=#151a28 attrs=
-R0 39 1 fg=#aab1c5 bg=#151a28 attrs=
+L0| 81% ·  15.4/94G ·  ↓  1.1M ↑  698K …
+R0 0 5 fg=#f0c674 bg=#151a28 attrs=
+R0 5 3 fg=#6f788e bg=#151a28 attrs=
+R0 8 10 fg=#c6ccdb bg=#151a28 attrs=
+R0 18 3 fg=#6f788e bg=#151a28 attrs=
+R0 21 17 fg=#c6ccdb bg=#151a28 attrs=
+R0 38 2 fg=#6f788e bg=#151a28 attrs=
 L1|────────────────────────────────────────
-R1 0 40 fg=#4e556e bg=#151a28 attrs=
-L2| WORKSPACES           REGCLAUDE ▸ home ·
-R2 0 11 fg=#edf0f8 bg=#151a28 attrs=BOLD
-R2 11 9 fg=default bg=#151a28 attrs=
-R2 20 2 fg=default bg=#0b0e16 attrs=
-R2 22 9 fg=#aab1c5 bg=#0b0e16 attrs=
-R2 31 3 fg=#4e556e bg=#0b0e16 attrs=
-R2 34 4 fg=#6ee7d8 bg=#0b0e16 attrs=
-R2 38 2 fg=#aab1c5 bg=#0b0e16 attrs=
-L3|                     ╭─ bwrap · home ───
-R3 0 20 fg=default bg=#151a28 attrs=
-R3 20 1 fg=default bg=#0b0e16 attrs=
-R3 21 2 fg=#4e556e bg=#151a28 attrs=
-R3 23 14 fg=#aab1c5 bg=#151a28 attrs=
-R3 37 3 fg=#4e556e bg=#151a28 attrs=
-L4| ▾ regclaude         │blake@ws-3:~/ >
-R4 0 1 fg=default bg=#151a28 attrs=
-R4 1 11 fg=#aab1c5 bg=#151a28 attrs=
-R4 12 8 fg=default bg=#151a28 attrs=
-R4 20 1 fg=default bg=#0b0e16 attrs=
-R4 21 1 fg=#4e556e bg=#151a28 attrs=
-R4 22 18 fg=default bg=#151a28 attrs=
-L5|   ● home            │
-R5 0 1 fg=default bg=#1a2031 attrs=
-R5 1 8 fg=#6ee7d8 bg=#1a2031 attrs=
-R5 9 11 fg=default bg=#1a2031 attrs=
-R5 20 1 fg=default bg=#0b0e16 attrs=
-R5 21 1 fg=#4e556e bg=#151a28 attrs=
-R5 22 18 fg=default bg=#151a28 attrs=
-L6|                     │
-R6 0 20 fg=default bg=#151a28 attrs=
-R6 20 1 fg=default bg=#0b0e16 attrs=
-R6 21 1 fg=#4e556e bg=#151a28 attrs=
-R6 22 18 fg=default bg=#151a28 attrs=
-L7|                     │
-R7 0 20 fg=default bg=#151a28 attrs=
-R7 20 1 fg=default bg=#0b0e16 attrs=
-R7 21 1 fg=#4e556e bg=#151a28 attrs=
-R7 22 18 fg=default bg=#151a28 attrs=
+R1 0 40 fg=#6f788e bg=#151a28 attrs=
+L2| HOME ▸ home   1
+R2 0 1 fg=default bg=default attrs=
+R2 1 4 fg=#c6ccdb bg=#0b0e16 attrs=
+R2 5 3 fg=#6f788e bg=#0b0e16 attrs=
+R2 8 4 fg=#6ee7d8 bg=#0b0e16 attrs=
+R2 12 2 fg=default bg=default attrs=
+R2 14 3 fg=#6ee7d8 bg=#2e5359 attrs=
+L3|
+L4|            superzej v0.1.0
+R4 0 12 fg=default bg=default attrs=
+R4 12 9 fg=#6ee7d8 bg=#0b0e16 attrs=
+R4 21 6 fg=#c6ccdb bg=#0b0e16 attrs=
+L5|
+L6|
+L7|0 LOC │ ⚠ Sandbox fallback: sandbox pod…
+R7 0 5 fg=#c6ccdb bg=#151a28 attrs=
+R7 5 3 fg=#60687b bg=#151a28 attrs=
+R7 8 31 fg=#c6ccdb bg=#151a28 attrs=
+R7 39 1 fg=#6f788e bg=#151a28 attrs=

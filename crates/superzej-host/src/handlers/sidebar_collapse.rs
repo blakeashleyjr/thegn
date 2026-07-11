@@ -42,10 +42,11 @@ impl SidebarState {
     }
 
     /// Un-collapse whatever group(s) hide the session's active worktree — its
-    /// workspace, and (if the worktree is filed) its 📂 folder — persist both
-    /// "0", rebuild rows, and land the cursor on the now-visible active row.
-    /// No-op when the active group isn't a worktree (e.g. a terminal) or nothing
-    /// was collapsed. Returns whether any collapse key was cleared.
+    /// workspace, and (if the worktree is filed) its 📂 folder — delete the
+    /// persisted collapse keys, rebuild rows, and land the cursor on the
+    /// now-visible active row. No-op when the active group isn't a worktree
+    /// (e.g. a terminal) or nothing was collapsed. Returns whether any collapse
+    /// key was cleared.
     pub(crate) fn reveal_active_worktree(
         &mut self,
         model: &mut FrameModel,
@@ -58,7 +59,8 @@ impl SidebarState {
         let mut changed = false;
         for key in keys {
             if self.view.collapsed.remove(&key) {
-                self.persist(&format!("collapse:{key}"), "0");
+                // Expanded is the default state: delete the key, don't tombstone.
+                self.unpersist(&format!("collapse:{key}"));
                 changed = true;
             }
         }

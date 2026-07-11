@@ -2313,7 +2313,7 @@ fn unified_detail(model: &FrameModel) -> Option<DetailOverlay> {
         .filter(|n| {
             n.source_ref != "log:szhost"
                 && n.kind.default_priority() == Priority::Alert
-                && !(!n.worktree_path.is_empty() && needs_paths.contains(&n.worktree_path))
+                && (n.worktree_path.is_empty() || !needs_paths.contains(&n.worktree_path))
         })
         .map(notification_row)
         .collect();

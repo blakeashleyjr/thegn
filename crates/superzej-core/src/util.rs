@@ -545,8 +545,9 @@ pub struct GitLock(std::fs::File);
 /// same `.git`. Best-effort: returns `None` (degrading to today's unlocked
 /// behavior) if the lock file can't be opened/locked, so a permissions quirk
 /// never wedges the user out of git. Call only on background threads — it blocks.
-// The `fcntl::Flock` replacement takes ownership of the file (RAII guard);
-// GitLock wraps the raw File + an explicit Drop unlock — migrate both together.
+// The `fcntl::Flock` replacement takes ownership of the file (RAII guard),
+// which doesn't fit this guard's separate Drop unlock; the raw call is still
+// sound here — migrate both together.
 #[allow(deprecated)]
 #[cfg(not(windows))]
 pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {

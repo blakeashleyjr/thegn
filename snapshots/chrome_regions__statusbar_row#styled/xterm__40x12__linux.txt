@@ -1,57 +1,89 @@
-L0|  dashboard 4 work 1 comms 1 chat 22:56
-R0 0 1 fg=default bg=#151a28 attrs=
-R0 1 11 fg=#6ee7d8 bg=#2e5359 attrs=
-R0 12 27 fg=#aab1c5 bg=#151a28 attrs=
-R0 39 1 fg=default bg=#151a28 attrs=
-L1|
-L2|┌ System ────┐┌ Hacker News ───────────┐
-R2 0 40 fg=#4e556e bg=default attrs=
-L3|│OS:         │└────────────────────────┘
-R3 0 1 fg=#4e556e bg=default attrs=
-R3 1 4 fg=#aab1c5 bg=default attrs=
-R3 5 8 fg=default bg=default attrs=
-R3 13 27 fg=#4e556e bg=default attrs=
-L4|│Uptime: 0s  │┌ Recent Repos ──────────┐
-R4 0 1 fg=#4e556e bg=default attrs=
-R4 1 8 fg=#aab1c5 bg=default attrs=
-R4 9 2 fg=#edf0f8 bg=default attrs=
-R4 11 2 fg=default bg=default attrs=
-R4 13 27 fg=#4e556e bg=default attrs=
-L5|│Memory: 0.00│┌ Workspaces ────────────┐
-R5 0 1 fg=#4e556e bg=default attrs=
-R5 1 8 fg=#aab1c5 bg=default attrs=
-R5 9 4 fg=#edf0f8 bg=default attrs=
-R5 13 27 fg=#4e556e bg=default attrs=
-L6|└────────────┘└────────────────────────┘
-R6 0 40 fg=#4e556e bg=default attrs=
-L7|┌ Resources ─┐┌ Superzej Dashboard ────┐
-R7 0 40 fg=#4e556e bg=default attrs=
-L8|│CPU: 0.0%   ││Last updated: 0  |  Refr│
-R8 0 1 fg=#4e556e bg=default attrs=
-R8 1 5 fg=#aab1c5 bg=default attrs=
-R8 6 4 fg=#7fdca0 bg=default attrs=
-R8 10 3 fg=default bg=default attrs=
-R8 13 2 fg=#4e556e bg=default attrs=
-R8 15 24 fg=#aab1c5 bg=default attrs=
-R8 39 1 fg=#4e556e bg=default attrs=
-L9|│Mem: 0.0% (0││                        │
-R9 0 1 fg=#4e556e bg=default attrs=
-R9 1 5 fg=#aab1c5 bg=default attrs=
-R9 6 7 fg=#6ee7d8 bg=default attrs=
-R9 13 2 fg=#4e556e bg=default attrs=
-R9 15 24 fg=#aab1c5 bg=default attrs=
-R9 39 1 fg=#4e556e bg=default attrs=
-L10|└────────────┘└────────────────────────┘
-R10 0 40 fg=#4e556e bg=default attrs=
-L11|  N   Ctrl-Left pane   Alt-Left tab  …
-R11 0 1 fg=#edf0f8 bg=#151a28 attrs=
-R11 1 3 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
-R11 4 2 fg=#edf0f8 bg=#151a28 attrs=
-R11 6 9 fg=#7a8197 bg=#151a28 attrs=
-R11 15 5 fg=#4e556e bg=#151a28 attrs=
-R11 20 3 fg=#edf0f8 bg=#151a28 attrs=
-R11 23 8 fg=#7a8197 bg=#151a28 attrs=
-R11 31 4 fg=#4e556e bg=#151a28 attrs=
-R11 35 2 fg=#edf0f8 bg=#151a28 attrs=
-R11 37 1 fg=#4e556e bg=#151a28 attrs=
-R11 38 2 fg=#edf0f8 bg=#151a28 attrs=
+L0| 16.2/94G ·  ↓    0B ↑    0B ·  100%…
+R0 0 10 fg=#4c505a bg=#0f131e attrs=
+R0 10 3 fg=#2e3340 bg=#0f131e attrs=
+R0 13 17 fg=#4c505a bg=#0f131e attrs=
+R0 30 3 fg=#2e3340 bg=#0f131e attrs=
+R0 33 6 fg=#5b4033 bg=#0f131e attrs=
+R0 39 1 fg=#2e3340 bg=#0f131e attrs=
+L1|────────────────────────────────────────
+R1 0 40 fg=#2e3340 bg=#0f131e attrs=
+L2| HOME ▸ home   1
+R2 0 1 fg=#677084 bg=#0b0e16 attrs=
+R2 1 4 fg=#4c505a bg=#0b0e16 attrs=
+R2 5 3 fg=#2e3340 bg=#0b0e16 attrs=
+R2 8 4 fg=#2d5959 bg=#0b0e16 attrs=
+R2 12 2 fg=#677084 bg=#0b0e16 attrs=
+R2 14 3 fg=#2d5959 bg=#1a2d34 attrs=
+R2 17 23 fg=#677084 bg=#0b0e16 attrs=
+L3| ╭─ Choose a keymap ────────── menu ──╮
+R3 0 1 fg=#677084 bg=#0b0e16 attrs=
+R3 1 2 fg=#7a8197 bg=#151a28 attrs=
+R3 3 17 fg=#edf0f8 bg=#151a28 attrs=
+R3 20 10 fg=#7a8197 bg=#151a28 attrs=
+R3 30 6 fg=#edf0f8 bg=#222942 attrs=BOLD
+R3 36 3 fg=#7a8197 bg=#151a28 attrs=
+R3 39 1 fg=#677084 bg=#0b0e16 attrs=
+L4| │ Familiar shortcuts on top of the … │
+R4 0 1 fg=#677084 bg=#0b0e16 attrs=
+R4 1 1 fg=#7a8197 bg=#151a28 attrs=
+R4 2 1 fg=default bg=#151a28 attrs=
+R4 3 33 fg=#c6ccdb bg=#151a28 attrs=
+R4 36 1 fg=#6f788e bg=#151a28 attrs=
+R4 37 1 fg=default bg=#151a28 attrs=
+R4 38 1 fg=#7a8197 bg=#151a28 attrs=
+R4 39 1 fg=#1c2233 bg=#05070c attrs=
+L5| │ ❯  d  superzej de… Alt/Ctrl chords │
+R5 0 1 fg=#677084 bg=#0b0e16 attrs=
+R5 1 1 fg=#7a8197 bg=#151a28 attrs=
+R5 2 1 fg=default bg=#151a28 attrs=
+R5 3 2 fg=#6ee7d8 bg=#1f363d attrs=BOLD
+R5 5 3 fg=#edf0f8 bg=#222942 attrs=BOLD
+R5 8 1 fg=#edf0f8 bg=#1f363d attrs=
+R5 9 11 fg=#edf0f8 bg=#1f363d attrs=BOLD
+R5 20 1 fg=#6f788e bg=#1f363d attrs=
+R5 21 1 fg=#edf0f8 bg=#1f363d attrs=
+R5 22 15 fg=#6f788e bg=#1f363d attrs=
+R5 37 1 fg=default bg=#151a28 attrs=
+R5 38 1 fg=#7a8197 bg=#151a28 attrs=
+R5 39 1 fg=#1c2233 bg=#05070c attrs=
+L6| │    v… Ctrl+P, Ctrl+Shift+P, Ctrl+B │
+R6 0 1 fg=#677084 bg=#0b0e16 attrs=
+R6 1 1 fg=#7a8197 bg=#151a28 attrs=
+R6 2 1 fg=default bg=#151a28 attrs=
+R6 3 2 fg=#edf0f8 bg=#151a28 attrs=
+R6 5 2 fg=#edf0f8 bg=#222942 attrs=BOLD
+R6 7 1 fg=#6f788e bg=#151a28 attrs=
+R6 8 1 fg=#edf0f8 bg=#151a28 attrs=
+R6 9 28 fg=#6f788e bg=#151a28 attrs=
+R6 37 1 fg=default bg=#151a28 attrs=
+R6 38 1 fg=#7a8197 bg=#151a28 attrs=
+R6 39 1 fg=#1c2233 bg=#05070c attrs=
+L7| │    i  JetBra… Ctrl+Shift+A, Ctrl+E │
+R7 0 1 fg=#677084 bg=#0b0e16 attrs=
+R7 1 1 fg=#7a8197 bg=#151a28 attrs=
+R7 2 1 fg=default bg=#151a28 attrs=
+R7 3 2 fg=#edf0f8 bg=#151a28 attrs=
+R7 5 3 fg=#edf0f8 bg=#222942 attrs=BOLD
+R7 8 1 fg=#edf0f8 bg=#151a28 attrs=
+R7 9 6 fg=#c6ccdb bg=#151a28 attrs=
+R7 15 1 fg=#6f788e bg=#151a28 attrs=
+R7 16 1 fg=#edf0f8 bg=#151a28 attrs=
+R7 17 20 fg=#6f788e bg=#151a28 attrs=
+R7 37 1 fg=default bg=#151a28 attrs=
+R7 38 1 fg=#7a8197 bg=#151a28 attrs=
+R7 39 1 fg=#1c2233 bg=#05070c attrs=
+L8| ╰────────────────────────────────────╯
+R8 0 1 fg=#677084 bg=#0b0e16 attrs=
+R8 1 38 fg=#7a8197 bg=#151a28 attrs=
+R8 39 1 fg=#1c2233 bg=#05070c attrs=
+L9|    Ctrl-Space palette · Ctrl-g lock
+R9 0 3 fg=#677084 bg=#0b0e16 attrs=
+R9 3 37 fg=#1c2233 bg=#05070c attrs=
+L10|
+R10 0 40 fg=#677084 bg=#0b0e16 attrs=
+L11|   7% free   ❚❚ Justin Hurwitz — Houst…
+R11 0 1 fg=#5a5d65 bg=#0f131e attrs=
+R11 1 11 fg=#0b0e16 bg=#71393e attrs=
+R11 12 1 fg=#5a5d65 bg=#0f131e attrs=
+R11 13 26 fg=#0b0e16 bg=#3f5876 attrs=
+R11 39 1 fg=#2e3340 bg=#0f131e attrs=

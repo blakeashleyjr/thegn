@@ -227,6 +227,11 @@ pub trait WorkspaceStore {
     /// Delete a persisted UI-state value (e.g. unpinning). No-op if absent.
     fn del_ui_state(&self, scope: &str, key: &str) -> Result<()>;
 
+    /// Delete every persisted UI-state key in `scope` starting with `prefix` —
+    /// the orphan-pruning hook for entity removal (a deleted workspace/worktree/
+    /// folder takes its `collapse:`/`pin:` keys with it). No-op if none match.
+    fn del_ui_state_prefix(&self, scope: &str, prefix: &str) -> Result<()>;
+
     /// All `(key, value)` pairs in a scope — used to load every collapse/pin
     /// entry at once on sidebar build.
     fn ui_state_in_scope(&self, scope: &str) -> Result<Vec<(String, String)>>;

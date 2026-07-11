@@ -1,24 +1,24 @@
- ◆ superzej   dashboard   work  comms 4 chat 16% · 󰂄 100% · Fri Jun 19 · 22:56
+ ◆ superzej v0.1.0 work                                                    15.
 ────────────────────────────────────────────────────────────────────────────────
- WORKSPACES           REGCLAUDE ▸ home · Sandbox: None   1
-                     ╭─ bwrap · home ──────────────────────────────────────────╮
- ▾ regclaude         │blake@ws-3:~/ >                                          │
-   ● home            │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     ╰─────────────────────────────────────────────────────────╯
-  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab … 0 LOC
+ WORKSPACES                       HOME ▸ home   1
+
+ ▾ ⌂ home                                                                      ─
+▐   └ ○ home
+
+ TERMINALS
+ ▾ ≡ local
+   └ ≡ local
+                                                  ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄
+                                                   ▀▀▀▄ █   █ █▄▄▄▀ █▀▀▀  █▄▄▄▀
+                                                  ▄▄▄▄▀ ▀▄▄▄▀ █     █▄▄▄▄ █  ▀▄
+
+                                                             v0.1.0 · git workt
+
+                                                                    ↻ sandbox
+                                                                    ◇ container
+                                                                    ◇ shell
+
+
+
+
+  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→
