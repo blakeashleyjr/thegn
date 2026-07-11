@@ -96,6 +96,7 @@ pub mod media;
 pub mod merge_guard;
 pub mod merge_lifecycle;
 pub mod metrics;
+pub mod migrate_brand;
 pub mod models;
 pub mod msg;
 pub mod notification;

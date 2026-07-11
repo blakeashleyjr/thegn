@@ -106,9 +106,9 @@ host *args: build
 bench: release
     hyperfine --warmup 3 'target/release/thegn --version'
     hyperfine --warmup 3 --prepare 'rm -rf /tmp/tg-bench-state' \
-      "script -qec 'env XDG_STATE_HOME=/tmp/tg-bench-state THEGN_BENCH_FIRST_FRAME_EXIT=1 target/release/thegn' /dev/null"
+      "script -qec 'env XDG_STATE_HOME=/tmp/tg-bench-state THEGN_NO_MIGRATE=1 THEGN_BENCH_FIRST_FRAME_EXIT=1 target/release/thegn' /dev/null"
     hyperfine --warmup 3 \
-      "script -qec 'env XDG_STATE_HOME=/tmp/tg-bench-state THEGN_BENCH_FIRST_FRAME_EXIT=1 target/release/thegn' /dev/null"
+      "script -qec 'env XDG_STATE_HOME=/tmp/tg-bench-state THEGN_NO_MIGRATE=1 THEGN_BENCH_FIRST_FRAME_EXIT=1 target/release/thegn' /dev/null"
 
 # Guard run by every perf recipe: refuse to measure a debug or stale binary.
 # The debug-vs-release CPU gap is ~2.5x (and cargo test/clippy don't rebuild
@@ -494,7 +494,7 @@ smoke-pkg:
 
 # Run a subcommand against the debug build, e.g. `just run list`.
 run *args: build
-    {{bin}} {{args}}
+    env THEGN_NO_MIGRATE=1 {{bin}} {{args}}
 
 # Build and run the native host locally in an isolated state root.
 start name="dev": build
@@ -503,6 +503,7 @@ start name="dev": build
       echo $$ > "$pidfile"; exec env \
       "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
+      "THEGN_NO_MIGRATE=1" \
       {{bin}}
 
 # Alias for `start`.
@@ -602,6 +603,7 @@ start-mq name="dev" gate="cargo build --workspace": build
       echo $$ > "$pidfile"; exec env \
       "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
+      "THEGN_NO_MIGRATE=1" \
       {{bin}} --set merge_queue.enabled=true \
               --set 'merge_queue.gate_command={{gate}}' \
               --set merge_queue.regenerate_command="cargo update --workspace"
