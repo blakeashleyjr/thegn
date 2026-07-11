@@ -484,21 +484,14 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
     }
 }
 
-/// Returns the glyph and color for a step based on its state.
+/// Returns the glyph and color for a step based on its state. Thin wrapper over
+/// the shared [`crate::loading::plan::visual_glyph`] vocabulary so the splash
+/// and the clone modal can never draw a different "working" glyph.
 fn step_glyph(
     step: &crate::chrome::LoadStep,
     accent: ColorAttribute,
 ) -> (&'static str, ColorAttribute) {
-    use crate::chrome::StepState;
-    let g = crate::caps::active_glyphs();
-    match step.state {
-        StepState::Done => (g.check, col(S::Dim)),
-        // The in-progress step gets a distinct "working" glyph (↻ / ascii @), not
-        // another dot/diamond, so it reads as actively loading vs the pending rows.
-        StepState::Active => (g.refresh, accent),
-        StepState::Pending => (g.diamond_hollow, col(S::Ghost)),
-        StepState::Failed => (g.cross, col(S::Ghost)),
-    }
+    crate::loading::plan::visual_glyph(step.state, accent)
 }
 
 /// Number of rows [`draw_steps`] will occupy: one per step plus one per step
@@ -537,12 +530,7 @@ fn draw_steps(
         }
         let (glyph, glyph_fg) = step_glyph(step, accent);
         chrome::draw_text(surface, bx, y, glyph, glyph_fg, bg, 1);
-        let label_fg = match step.state {
-            StepState::Done => col(S::Dim),
-            StepState::Active => col(S::Text),
-            StepState::Pending => col(S::Ghost),
-            StepState::Failed => col(S::Ghost),
-        };
+        let label_fg = crate::loading::plan::label_color(step.state);
         chrome::draw_text(
             surface,
             bx + 2,

@@ -185,7 +185,10 @@ impl Approvals {
         }
     }
 
-    fn is_approved(&self, req: &GatedRequest) -> bool {
+    /// Whether a gated request is covered by the approved canonical set.
+    /// Matching is by [`GatedRequest::canonical`] string equality (see
+    /// [`crate::repo_trust`]).
+    pub fn is_approved(&self, req: &GatedRequest) -> bool {
         self.approved.contains(&req.canonical())
     }
 }

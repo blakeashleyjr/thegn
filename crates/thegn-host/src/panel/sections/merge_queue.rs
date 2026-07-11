@@ -13,16 +13,19 @@ use crate::seg::{Line, Seg, seg};
 
 use super::{PanelHit, PanelRow, Section, SectionCtx, d, g, g2, hint_row, hue};
 
-/// The hued glyph for a queue row's status string.
+/// The hued glyph for a queue row's status string: the shared
+/// [`thegn_core::attention::MqStatus::glyph`] vocabulary (also the sidebar
+/// detail chip's), capability-degraded like the rest of the chrome. Unknown
+/// statuses render like `queued`.
 pub(super) fn status_glyph(status: &str) -> Seg {
-    match status {
-        "landed" => seg(hue(Hue::Green), "✓"),
-        "ready" => seg(hue(Hue::Green), "◆"), // gated green, awaiting a land
-        "deferred" | "gate_failed" => seg(hue(Hue::Red), "⚑"),
-        "needs_human" => seg(hue(Hue::Red), "✋"), // agent tried and gave up
-        "folding" | "verifying" => seg(hue(Hue::Amber), "●"),
-        "agent_running" => seg(hue(Hue::Amber), "◐"), // agent fixing the branch
-        _ => seg(g(), "○"),                           // queued / unknown
+    use thegn_core::attention::MqStatus;
+    let gl = crate::caps::active_glyphs();
+    match MqStatus::parse(status) {
+        Some(mq) => {
+            let (glyph, h) = mq.glyph(gl);
+            seg(hue(h), glyph)
+        }
+        None => seg(g(), gl.dot_hollow), // unknown ≈ queued
     }
 }
 

@@ -1,4 +1,4 @@
- 17.2/94G ·  ↓    8K ↑    4K ·  100%…
+ 19.0/94G ·  ↓  877K ↑  703K ·  100%…
 ────────────────────────────────────────
  HOME ▸ home   1
  ╭─ Choose a keymap ────────── menu ──╮
@@ -9,4 +9,4 @@
  ╰────────────────────────────────────╯
     Ctrl-Space palette · Ctrl-g lock
 
-  NORMAL   Ctrl Space menu    7% free
+   7% free   ❚❚ Justin Hurwitz — Houst…

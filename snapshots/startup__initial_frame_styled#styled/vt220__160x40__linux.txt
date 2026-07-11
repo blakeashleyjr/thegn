@@ -1,4 +1,4 @@
-L0| þ thegn v0.1.0 work                                                       16.3/94G ·   7% ·  35% ·  94°C ·  ↓   75K ↑    5K ·  100% · Fri Jul 10 · 22:41
+L0| þ thegn v0.1.0  work                                                      21.3/94G ·   7% ·  36% ·  97°C ·  ↓    0B ↑    5K ·  100% · Sat Jul 11 · 02:20
 R0 0 9 fg=idx08 bg=idx00 attrs=
 R0 9 6 fg=idx00 bg=idx00 attrs=
 R0 15 69 fg=idx08 bg=idx00 attrs=
@@ -26,7 +26,7 @@ R2 120 14 fg=idx00 bg=idx00 attrs=
 R2 134 26 fg=idx08 bg=idx00 attrs=
 L3|                                                                                                                     home/home
 R3 0 160 fg=idx08 bg=idx00 attrs=
-L4| ▾    home                                                                                                          ────────────────────────────────────────────
+L4| ▾ ⌂ home                                                                                                           ────────────────────────────────────────────
 R4 0 1 fg=idx08 bg=idx00 attrs=
 R4 1 1 fg=idx00 bg=idx00 attrs=
 R4 2 114 fg=idx08 bg=idx00 attrs=
@@ -44,7 +44,7 @@ L7| TERMINALS                                                                   
 R7 0 118 fg=idx08 bg=idx00 attrs=
 R7 118 18 fg=idx00 bg=idx00 attrs=
 R7 136 24 fg=idx08 bg=idx00 attrs=
-L8|   No terminals — Alt T to add
+L8|   No terminals — Enter to add
 R8 0 3 fg=idx08 bg=idx00 attrs=
 R8 3 27 fg=idx00 bg=idx00 attrs=
 R8 30 130 fg=idx08 bg=idx00 attrs=
@@ -203,7 +203,7 @@ L37|
 R37 0 160 fg=idx08 bg=idx00 attrs=
 L38|
 R38 0 160 fg=idx08 bg=idx00 attrs=
-L39|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓   Alt N split→   Alt s focus-sidebar                    7% free
+L39|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓   Alt N split→            7% free   ❚❚ Justin Hurwitz — Houston
 R39 0 1 fg=idx08 bg=idx00 attrs=
 R39 1 8 fg=idx00 bg=idx08 attrs=
 R39 9 2 fg=idx08 bg=idx00 attrs=
@@ -218,8 +218,8 @@ R39 78 3 fg=idx08 bg=idx00 attrs=
 R39 81 12 fg=idx00 bg=idx00 attrs=
 R39 93 3 fg=idx08 bg=idx00 attrs=
 R39 96 12 fg=idx00 bg=idx00 attrs=
-R39 108 3 fg=idx08 bg=idx00 attrs=
-R39 111 19 fg=idx00 bg=idx00 attrs=
-R39 130 18 fg=idx08 bg=idx00 attrs=
-R39 148 11 fg=idx00 bg=idx08 attrs=
+R39 108 10 fg=idx08 bg=idx00 attrs=
+R39 118 11 fg=idx00 bg=idx08 attrs=
+R39 129 1 fg=idx08 bg=idx00 attrs=
+R39 130 29 fg=idx00 bg=idx08 attrs=
 R39 159 1 fg=idx08 bg=idx00 attrs=

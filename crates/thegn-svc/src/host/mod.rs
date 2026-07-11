@@ -17,32 +17,38 @@ use thegn_core::host::{
 };
 use thegn_core::image::{DeliveryStrategy, Digest, ImageRef, LocalCaps, ResolvedImage};
 use thegn_core::placement::Placement;
+use thegn_core::transport_error::{
+    ClassifiedErr, ErrorClass, classify_exec, describe_exec_failure,
+};
 
 mod cloud;
 mod deliver;
+mod retry;
 
 pub use cloud::cloud_runner_for;
 pub use deliver::stream_archive_over_ssh;
 
 /// Everything the host-flow driver needs to execute effects against one host.
-/// Implementations own their per-step deadlines; errors are plain strings that
-/// flow into `HostEvent::*Failed` (and from there into actionable failures).
+/// Implementations own their per-step deadlines; errors are [`ClassifiedErr`]s
+/// (transient network flap vs durable refusal) so the driver's retry ladder
+/// knows what's worth another attempt before an error flows into
+/// `HostEvent::*Failed` (and from there into actionable failures).
 pub trait HostRunner: Send {
     /// Open (or re-verify) the control channel. For ssh this warms the
     /// ControlMaster so every later exec rides one TCP/auth handshake.
-    fn connect(&mut self) -> Result<(), String>;
+    fn connect(&mut self) -> Result<(), ClassifiedErr>;
     /// Run the single-shot probe and parse its `KEY=VALUE` contract.
-    fn probe(&mut self) -> Result<HostCaps, String>;
+    fn probe(&mut self) -> Result<HostCaps, ClassifiedErr>;
     /// Bootstrap a runtime. The driver only calls this with consent granted.
     fn install_runtime(
         &mut self,
         kind: RuntimeKind,
         note: &mut dyn FnMut(String),
-    ) -> Result<RuntimeInfo, String>;
+    ) -> Result<RuntimeInfo, ClassifiedErr>;
     /// Resolve the image reference to its per-arch digests.
-    fn resolve_image(&mut self, reference: &ImageRef) -> Result<ResolvedImage, String>;
+    fn resolve_image(&mut self, reference: &ImageRef) -> Result<ResolvedImage, ClassifiedErr>;
     /// Is `name@digest` already in the host's image storage?
-    fn image_present(&mut self, image: &ImageRef, digest: &Digest) -> Result<bool, String>;
+    fn image_present(&mut self, image: &ImageRef, digest: &Digest) -> Result<bool, ClassifiedErr>;
     /// Execute one delivery strategy; returns the digest VERIFIED on the host.
     fn deliver(
         &mut self,
@@ -50,20 +56,20 @@ pub trait HostRunner: Send {
         image: &ImageRef,
         digest: &Digest,
         progress: &mut dyn FnMut(u64, Option<u64>),
-    ) -> Result<Digest, String>;
+    ) -> Result<Digest, ClassifiedErr>;
     /// Idempotently seed one warm volume (exists ⇒ no-op success).
     fn seed_volume(
         &mut self,
         spec: &VolumeSpec,
         image: &ImageRef,
         digest: &Digest,
-    ) -> Result<(), String>;
+    ) -> Result<(), ClassifiedErr>;
     /// The remote OCI daemon URL sandbox spawn should pin (`None` ⇒ the
     /// placement transport wraps the whole argv, as today).
     fn oci_url(&self) -> Option<String>;
     /// One cheap live-resources sample (the placement engine's measured
     /// layer). Default: unsupported — cloud runners have no shell to ask.
-    fn probe_headroom(&mut self) -> Result<thegn_core::host_probe::Headroom, String> {
+    fn probe_headroom(&mut self) -> Result<thegn_core::host_probe::Headroom, ClassifiedErr> {
         Err("headroom probe unsupported for this reach".into())
     }
 }
@@ -187,7 +193,7 @@ pub fn local_caps() -> LocalCaps {
             &["sh".into(), "-c".into(), format!("command -v {bin}")],
             Duration::from_secs(5),
         )
-        .map(|(ok, _, _)| ok)
+        .map(|o| o.ok)
         .unwrap_or(false)
     };
     LocalCaps {
@@ -250,9 +256,83 @@ fi
 true
 "#;
 
-/// Run `argv` to completion with a hard deadline, capturing stdout + stderr.
-/// `Err` on spawn failure or timeout (child killed + reaped).
-fn exec_argv(argv: &[String], timeout: Duration) -> Result<(bool, String, String), String> {
+/// A finished control-plane exec: the command ran to completion (successfully
+/// or not) before the deadline. Carries the exit code so transport drops
+/// (ssh exit 255) stay distinguishable from real remote-command failures.
+#[derive(Debug, Clone)]
+pub(crate) struct ExecOut {
+    pub ok: bool,
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl ExecOut {
+    /// One-line failure message naming the real cause (exit code + stderr tail
+    /// + transport classification) — never the old useless `"(no output)"`.
+    pub(crate) fn msg(&self, label: &str) -> String {
+        describe_exec_failure(label, self.code, false, &self.stderr)
+    }
+
+    /// Transient (network flap — retry) vs permanent (durable refusal).
+    pub(crate) fn class(&self) -> ErrorClass {
+        classify_exec(self.code, false, &self.stderr)
+    }
+
+    /// The message + classification as one [`ClassifiedErr`].
+    pub(crate) fn cerr(&self, label: &str) -> ClassifiedErr {
+        ClassifiedErr {
+            class: self.class(),
+            msg: self.msg(label),
+        }
+    }
+
+    fn tuple(self) -> (bool, String, String) {
+        (self.ok, self.stdout, self.stderr)
+    }
+}
+
+/// The exec never completed: spawn error, deadline kill, or wait error.
+#[derive(Debug, Clone)]
+pub(crate) enum ExecFail {
+    Spawn(String),
+    Timeout { secs: u64 },
+    Wait(String),
+}
+
+impl ExecFail {
+    pub(crate) fn msg(&self, label: &str) -> String {
+        match self {
+            ExecFail::Spawn(e) => format!("{label}: spawn: {e}"),
+            ExecFail::Timeout { secs } => {
+                format!("{label}: timed out after {secs}s — slow or lossy link?")
+            }
+            ExecFail::Wait(e) => format!("{label}: wait: {e}"),
+        }
+    }
+
+    pub(crate) fn class(&self) -> ErrorClass {
+        match self {
+            // A deadline kill on a flaky link is worth retrying; a spawn/wait
+            // failure is local breakage no retry fixes.
+            ExecFail::Timeout { .. } => ErrorClass::Transient,
+            ExecFail::Spawn(_) | ExecFail::Wait(_) => ErrorClass::Permanent,
+        }
+    }
+
+    /// The message + classification as one [`ClassifiedErr`].
+    pub(crate) fn cerr(&self, label: &str) -> ClassifiedErr {
+        ClassifiedErr {
+            class: self.class(),
+            msg: self.msg(label),
+        }
+    }
+}
+
+/// Run `argv` to completion with a hard deadline, capturing stdout + stderr
+/// and the exit code. `Err` only when the exec never completed (spawn failure,
+/// deadline kill, wait error) — a nonzero exit is an `Ok(ExecOut)` answer.
+fn exec_argv(argv: &[String], timeout: Duration) -> Result<ExecOut, ExecFail> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut child = Command::new(&argv[0])
@@ -261,7 +341,7 @@ fn exec_argv(argv: &[String], timeout: Duration) -> Result<(bool, String, String
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("spawn {}: {e}", argv[0]))?;
+        .map_err(|e| ExecFail::Spawn(format!("{}: {e}", argv[0])))?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -274,19 +354,22 @@ fn exec_argv(argv: &[String], timeout: Duration) -> Result<(bool, String, String
                 if let Some(mut r) = child.stderr.take() {
                     let _ = r.read_to_string(&mut err);
                 }
-                return Ok((status.success(), out, err));
+                return Ok(ExecOut {
+                    ok: status.success(),
+                    code: status.code(),
+                    stdout: out,
+                    stderr: err,
+                });
             }
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!(
-                    "timed out after {}s: {}",
-                    timeout.as_secs(),
-                    argv.join(" ")
-                ));
+                return Err(ExecFail::Timeout {
+                    secs: timeout.as_secs(),
+                });
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(e) => return Err(format!("wait: {e}")),
+            Err(e) => return Err(ExecFail::Wait(e.to_string())),
         }
     }
 }
@@ -297,7 +380,7 @@ fn exec_argv(argv: &[String], timeout: Duration) -> Result<(bool, String, String
 /// /run/containers: permission denied" — when run rootless). `None` if local
 /// podman isn't available (callers then fall back to docker-daemon / registry).
 pub(super) fn local_containers_storage_prefix() -> Option<String> {
-    let (ok, out, _) = exec_argv(
+    let out = exec_argv(
         &[
             "podman".into(),
             "info".into(),
@@ -307,9 +390,10 @@ pub(super) fn local_containers_storage_prefix() -> Option<String> {
         Duration::from_secs(10),
     )
     .ok()?;
-    if !ok {
+    if !out.ok {
         return None;
     }
+    let out = out.stdout;
     let mut parts = out.lines().next()?.trim().split('|');
     let drv = parts.next()?.trim();
     let gr = parts.next()?.trim();
@@ -318,16 +402,6 @@ pub(super) fn local_containers_storage_prefix() -> Option<String> {
         return None;
     }
     Some(format!("containers-storage:[{drv}@{gr}+{rr}]"))
-}
-
-/// Shorten a stderr blob into a one-line error tail.
-fn err_tail(err: &str) -> String {
-    err.lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("(no output)")
-        .trim()
-        .to_string()
 }
 
 /// The subprocess-backed runner for local and ssh reaches. Every remote
@@ -354,9 +428,18 @@ impl OciRunner {
         matches!(self.placement, Placement::Local)
     }
 
-    /// Run a shell command on the host with a deadline.
-    fn exec(&self, cmd: &str, timeout: Duration) -> Result<(bool, String, String), String> {
-        exec_argv(&self.control_shell_argv(cmd), timeout)
+    /// Run a shell command on the host with a deadline. On transport-failure
+    /// evidence (exit 255 / deadline kill) the ControlMaster is health-checked
+    /// and a dead socket cleared, so the caller's *next* attempt builds a
+    /// fresh connection instead of failing identically against a wedged master.
+    fn exec(&self, cmd: &str, timeout: Duration) -> Result<ExecOut, ExecFail> {
+        let r = exec_argv(&self.control_shell_argv(cmd), timeout);
+        match &r {
+            Ok(o) if o.code == Some(255) => retry::master_hygiene(&self.placement),
+            Err(ExecFail::Timeout { .. }) => retry::master_hygiene(&self.placement),
+            _ => {}
+        }
+        r
     }
 
     /// The full local argv that runs `cmd` in a shell ON the host (identity
@@ -381,6 +464,8 @@ impl OciRunner {
         timeout: Duration,
     ) -> Result<(bool, String, String), String> {
         self.exec(cmd, timeout)
+            .map(ExecOut::tuple)
+            .map_err(|f| f.msg("host exec"))
     }
 
     /// Run a shell command INSIDE a container on this host (the per-worktree
@@ -400,6 +485,8 @@ impl OciRunner {
             ),
             timeout,
         )
+        .map(ExecOut::tuple)
+        .map_err(|f| f.msg("container exec"))
     }
 
     /// Pipe a locally-produced stream into a command on the host: spawn
@@ -445,7 +532,12 @@ impl OciRunner {
                         use std::io::Read;
                         let _ = r.read_to_string(&mut err);
                     }
-                    return Err(format!("pipe: host cmd failed: {}", err_tail(&err)));
+                    return Err(describe_exec_failure(
+                        "pipe: host cmd",
+                        status.code(),
+                        false,
+                        &err,
+                    ));
                 }
                 Ok(None) if Instant::now() >= deadline => {
                     let _ = consumer.kill();
@@ -486,7 +578,7 @@ impl OciRunner {
     }
 
     /// Run a shell command LOCALLY with a deadline.
-    fn exec_local(cmd: &str, timeout: Duration) -> Result<(bool, String, String), String> {
+    fn exec_local(cmd: &str, timeout: Duration) -> Result<ExecOut, ExecFail> {
         exec_argv(
             &["sh".to_string(), "-lc".to_string(), cmd.to_string()],
             timeout,
@@ -589,7 +681,8 @@ impl OciRunner {
                 self.exec(cmd, Duration::from_secs(60))
             };
             match run {
-                Ok((true, json, _)) if !json.trim().is_empty() => {
+                Ok(o) if o.ok && !o.stdout.trim().is_empty() => {
+                    let json = o.stdout;
                     let digest = if *local {
                         sha256_local(&json)?
                     } else {
@@ -597,8 +690,8 @@ impl OciRunner {
                     };
                     return Ok((json, digest));
                 }
-                Ok((_, _, err)) => last_err = err_tail(&err),
-                Err(e) => last_err = e,
+                Ok(o) => last_err = o.msg("inspect"),
+                Err(f) => last_err = f.msg("inspect"),
             }
         }
         Err(format!("manifest inspect {target}: {last_err}"))
@@ -637,14 +730,16 @@ impl OciRunner {
 
 /// sha256 of a local FILE via `sha256sum` (streaming; archives are GBs).
 fn sha256_file_local(path: &std::path::Path) -> Result<Digest, String> {
-    let (ok, out, err) = exec_argv(
+    let label = format!("sha256sum {}", path.display());
+    let out = exec_argv(
         &["sha256sum".to_string(), path.to_string_lossy().into_owned()],
         Duration::from_secs(600),
-    )?;
-    if !ok {
-        return Err(format!("sha256sum {}: {}", path.display(), err_tail(&err)));
+    )
+    .map_err(|f| f.msg(&label))?;
+    if !out.ok {
+        return Err(out.msg(&label));
     }
-    Digest::from_hex(out.split_whitespace().next().unwrap_or(""))
+    Digest::from_hex(out.stdout.split_whitespace().next().unwrap_or(""))
 }
 
 /// sha256 of a string via the local `sha256sum` (also the cloud adapter's
@@ -695,26 +790,29 @@ podman --version
 "#;
 
 impl HostRunner for OciRunner {
-    fn connect(&mut self) -> Result<(), String> {
+    fn connect(&mut self) -> Result<(), ClassifiedErr> {
         if self.is_local() {
             return Ok(());
         }
+        // A wedged ControlMaster makes every exec fail identically — check it
+        // (and clear a dead socket) before the connect proves reachability.
+        retry::master_hygiene(&self.placement);
         // Warm the multiplexed master; one cheap exec proves reachability.
         match self.exec("true", Duration::from_secs(30)) {
-            Ok((true, _, _)) => Ok(()),
-            Ok((false, _, err)) => Err(format!("connect: {}", err_tail(&err))),
-            Err(e) => Err(format!("connect: {e}")),
+            Ok(o) if o.ok => Ok(()),
+            Ok(o) => Err(o.cerr("connect")),
+            Err(f) => Err(f.cerr("connect")),
         }
     }
 
-    fn probe(&mut self) -> Result<HostCaps, String> {
-        let (ok, out, err) = self
+    fn probe(&mut self) -> Result<HostCaps, ClassifiedErr> {
+        let out = self
             .exec(PROBE_SCRIPT, Duration::from_secs(60))
-            .map_err(|e| format!("probe: {e}"))?;
-        if !ok {
-            return Err(format!("probe: {}", err_tail(&err)));
+            .map_err(|f| f.cerr("probe"))?;
+        if !out.ok {
+            return Err(out.cerr("probe"));
         }
-        let mut caps = HostCaps::parse_probe(&out).map_err(|e| format!("probe: {e}"))?;
+        let mut caps = HostCaps::parse_probe(&out.stdout).map_err(|e| format!("probe: {e}"))?;
         // A local host can't SshStream to itself; local delivery is a plain
         // pull / local storage share.
         if self.is_local() {
@@ -725,38 +823,39 @@ impl HostRunner for OciRunner {
         Ok(caps)
     }
 
-    fn probe_headroom(&mut self) -> Result<thegn_core::host_probe::Headroom, String> {
-        let (ok, out, err) = self
+    fn probe_headroom(&mut self) -> Result<thegn_core::host_probe::Headroom, ClassifiedErr> {
+        let out = self
             .exec(HEADROOM_SCRIPT, Duration::from_secs(15))
-            .map_err(|e| format!("headroom: {e}"))?;
-        if !ok {
-            return Err(format!("headroom: {}", err_tail(&err)));
+            .map_err(|f| f.cerr("headroom"))?;
+        if !out.ok {
+            return Err(out.cerr("headroom"));
         }
-        thegn_core::host_probe::parse_headroom(&out).map_err(|e| format!("headroom: {e}"))
+        thegn_core::host_probe::parse_headroom(&out.stdout)
+            .map_err(|e| format!("headroom: {e}").into())
     }
 
     fn install_runtime(
         &mut self,
         kind: RuntimeKind,
         note: &mut dyn FnMut(String),
-    ) -> Result<RuntimeInfo, String> {
+    ) -> Result<RuntimeInfo, ClassifiedErr> {
         if kind != RuntimeKind::Podman {
             return Err("only podman bootstrap is supported".into());
         }
         note("installing podman via the detected package manager".into());
-        let (ok, _out, err) = self
+        let out = self
             .exec(INSTALL_PODMAN_SCRIPT, Duration::from_secs(900))
-            .map_err(|e| format!("install: {e}"))?;
-        if !ok {
-            return Err(format!("install: {}", err_tail(&err)));
+            .map_err(|f| f.cerr("install"))?;
+        if !out.ok {
+            return Err(out.cerr("install"));
         }
         note("verifying the installed runtime".into());
         let caps = self.probe()?;
         caps.runtime
-            .ok_or_else(|| "install completed but podman still not found".to_string())
+            .ok_or_else(|| "install completed but podman still not found".into())
     }
 
-    fn resolve_image(&mut self, reference: &ImageRef) -> Result<ResolvedImage, String> {
+    fn resolve_image(&mut self, reference: &ImageRef) -> Result<ResolvedImage, ClassifiedErr> {
         let arch = self.caps.as_ref().map(|c| c.arch).unwrap_or(Arch::Amd64);
         let (json, self_digest) = self.fetch_manifest(reference)?;
         // A digest-pinned reference must hash to its pin.
@@ -767,12 +866,14 @@ impl HostRunner for OciRunner {
                 "manifest digest mismatch: pinned {}, fetched {}",
                 pin.short(),
                 self_digest.short()
-            ));
+            )
+            .into());
         }
         ResolvedImage::parse_manifest_index(reference, &json, self_digest, arch)
+            .map_err(ClassifiedErr::from)
     }
 
-    fn image_present(&mut self, image: &ImageRef, digest: &Digest) -> Result<bool, String> {
+    fn image_present(&mut self, image: &ImageRef, digest: &Digest) -> Result<bool, ClassifiedErr> {
         let bin = self.runtime_bin()?;
         let target = format!("{}@{}", image.name, digest);
         // The managed digest tag is the uniform run reference (stream-loaded
@@ -789,8 +890,8 @@ impl HostRunner for OciRunner {
             ),
             Duration::from_secs(30),
         ) {
-            Ok((ok, _, _)) => Ok(ok),
-            Err(e) => Err(format!("image check: {e}")),
+            Ok(o) => Ok(o.ok),
+            Err(f) => Err(f.cerr("image check")),
         }
     }
 
@@ -800,25 +901,25 @@ impl HostRunner for OciRunner {
         image: &ImageRef,
         digest: &Digest,
         progress: &mut dyn FnMut(u64, Option<u64>),
-    ) -> Result<Digest, String> {
+    ) -> Result<Digest, ClassifiedErr> {
         let bin = self.runtime_bin()?;
         let target = format!("{}@{}", image.name, digest);
         match strategy {
             DeliveryStrategy::RegistryPull => {
                 // Pull the per-arch digest exactly; podman verifies content.
-                let (ok, _, err) = self
+                let out = self
                     .exec(
                         &format!("{bin} pull -q {target}"),
                         Duration::from_secs(1800),
                     )
-                    .map_err(|e| format!("pull: {e}"))?;
-                if !ok {
-                    return Err(format!("pull: {}", err_tail(&err)));
+                    .map_err(|f| f.cerr("pull"))?;
+                if !out.ok {
+                    return Err(out.cerr("pull"));
                 }
             }
             DeliveryStrategy::SkopeoRemoteCopy => {
                 let transport = self.storage_transport()?;
-                let (ok, _, err) = self
+                let out = self
                     .exec(
                         &format!(
                             "skopeo copy --retry-times 3 docker://{target} \
@@ -827,9 +928,9 @@ impl HostRunner for OciRunner {
                         ),
                         Duration::from_secs(1800),
                     )
-                    .map_err(|e| format!("skopeo copy: {e}"))?;
-                if !ok {
-                    return Err(format!("skopeo copy: {}", err_tail(&err)));
+                    .map_err(|f| f.cerr("skopeo copy"))?;
+                if !out.ok {
+                    return Err(out.cerr("skopeo copy"));
                 }
             }
             DeliveryStrategy::SshStream { rsync } => {
@@ -850,7 +951,8 @@ impl HostRunner for OciRunner {
             Err(format!(
                 "delivered but {} not present on the host (digest mismatch?)",
                 digest.short()
-            ))
+            )
+            .into())
         }
     }
 
@@ -859,14 +961,18 @@ impl HostRunner for OciRunner {
         spec: &VolumeSpec,
         image: &ImageRef,
         digest: &Digest,
-    ) -> Result<(), String> {
+    ) -> Result<(), ClassifiedErr> {
         let bin = self.runtime_bin()?;
         // Idempotent: an existing volume is a seeded volume (copy-up happened
         // on its first mount).
-        if let Ok((true, _, _)) = self.exec(
-            &self.exists_test("volume", &spec.name)?,
-            Duration::from_secs(30),
-        ) {
+        if self
+            .exec(
+                &self.exists_test("volume", &spec.name)?,
+                Duration::from_secs(30),
+            )
+            .map(|o| o.ok)
+            .unwrap_or(false)
+        {
             return Ok(());
         }
         match &spec.seed {
@@ -880,17 +986,18 @@ impl HostRunner for OciRunner {
                        -v {}:{} {target} true",
                     spec.name, spec.name, spec.name, spec.dest
                 );
-                let (ok, _, err) = self
+                let label = format!("volume seed {}", spec.name);
+                let out = self
                     .exec(&cmd, Duration::from_secs(1800))
-                    .map_err(|e| format!("volume seed: {e}"))?;
-                if !ok {
+                    .map_err(|f| f.cerr(&label))?;
+                if !out.ok {
                     // Never leave a half-seeded volume: a later run would see
                     // `volume exists` and trust it.
                     let _ = self.exec(
                         &format!("{bin} volume rm -f {}", spec.name),
                         Duration::from_secs(60),
                     );
-                    return Err(format!("volume seed {}: {}", spec.name, err_tail(&err)));
+                    return Err(out.cerr(&label));
                 }
                 Ok(())
             }
@@ -1015,17 +1122,48 @@ mod tests {
         )
         .expect("pipe succeeds");
         assert_eq!(std::fs::read(dst.join("hello.txt")).unwrap(), b"hi");
-        // A failing host command surfaces its stderr tail.
+        // A failing host command surfaces the classified failure with its
+        // label and exit code (describe_exec_failure shapes the message).
         let err = r
             .pipe_local_to_host(&local, "exit 3", Duration::from_secs(10))
             .unwrap_err();
-        assert!(err.contains("host cmd failed"), "{err}");
+        assert!(
+            err.contains("pipe: host cmd") && err.contains("exit 3"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn err_tail_takes_last_nonempty_line() {
-        assert_eq!(err_tail("a\nb\n\n"), "b");
-        assert_eq!(err_tail(""), "(no output)");
+    fn exec_failure_messages_name_the_real_cause() {
+        // A transport drop (255, silent) names the drop — never "(no output)".
+        let drop = ExecOut {
+            ok: false,
+            code: Some(255),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let msg = drop.msg("connect");
+        assert!(msg.contains("transport dropped"), "{msg}");
+        assert!(!msg.contains("(no output)"), "{msg}");
+        assert_eq!(drop.class(), ErrorClass::Transient);
+        // A real remote failure carries the exit code + stderr tail.
+        let real = ExecOut {
+            ok: false,
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "a\nthe cause\n\n".into(),
+        };
+        let msg = real.msg("probe");
+        assert!(msg.contains("exit 1") && msg.contains("the cause"), "{msg}");
+        assert_eq!(real.class(), ErrorClass::Permanent);
+        // Timeouts are transient; spawn failures are not.
+        let to = ExecFail::Timeout { secs: 30 };
+        assert!(to.msg("pull").contains("timed out after 30s"));
+        assert_eq!(to.class(), ErrorClass::Transient);
+        assert_eq!(
+            ExecFail::Spawn("ssh: not found".into()).class(),
+            ErrorClass::Permanent
+        );
     }
 
     #[test]

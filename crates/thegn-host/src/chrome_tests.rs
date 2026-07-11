@@ -1,6 +1,7 @@
 use super::*;
 use crate::emulator::AlacrittyEmulator;
 use crate::layout;
+use crate::sidebar_view::{build_sidebar, clamp_sidebar_scroll, draw_sidebar, hit_rows, row_at};
 
 fn lines(s: &Surface) -> Vec<String> {
     s.screen_chars_to_string()
@@ -12,32 +13,13 @@ fn lines(s: &Surface) -> Vec<String> {
 /// Build a minimal sidebar row for renderer tests.
 fn row(kind: crate::sidebar::RowKind, label: &str) -> crate::sidebar::SidebarRow {
     crate::sidebar::SidebarRow {
-        kind,
-        depth: (kind != crate::sidebar::RowKind::Workspace) as u8,
-        label: label.into(),
-        workspace_slug: "app".into(),
-        tab_target: None,
-        active: false,
-        worktree_path: None,
         pin_key: label.into(),
-        branch: None,
-        git: None,
-        agent: None,
-        sandbox_backend: None,
-        env_name: None,
-        activity: crate::sidebar::ActivityState::None,
-        visible: true,
-        collapsed: false,
-        dir: false,
-        pr_count: None,
-        pr_number: None,
-        unread_count: 0,
-        alert_count: 0,
-        disk_bytes: None,
-        target_bytes: None,
-        terminal_connection: None,
-        attention: None,
-        mq_status: None,
+        ..crate::sidebar::SidebarRow::base(
+            kind,
+            (kind != crate::sidebar::RowKind::Workspace) as u8,
+            label,
+            "app",
+        )
     }
 }
 
@@ -487,9 +469,6 @@ fn sidebar_renders_glyphs_caret_and_dirty() {
         ahead: 2,
         behind: 1,
     });
-    // The agent/app indicator was dropped from the row entirely: a set
-    // `agent` must render no trailing glyph.
-    wt.agent = Some("claude".into());
     wt.activity = ActivityState::Active;
     let model = FrameModel {
         sidebar_rows: vec![ws, wt],
@@ -504,15 +483,128 @@ fn sidebar_renders_glyphs_caret_and_dirty() {
     assert!(text.contains("feat"));
     assert!(text.contains('\u{2191}'), "ahead glyph ↑: {text:?}");
     assert!(text.contains('\u{2193}'), "behind glyph ↓: {text:?}");
-    // No agent/app glyph on the worktree row: "claude" would render as a
-    // trailing letter-default 'C', which must not appear on the "feat" line.
-    let feat_line = text
-        .lines()
-        .find(|l| l.contains("feat"))
-        .expect("feat row present");
+}
+
+#[test]
+fn sidebar_ascii_caps_render_pure_ascii() {
+    // The one test that retires the "glyph missing its fallback" bug class:
+    // render a fully-populated sidebar (workspace kinds, folder, worktree with
+    // git/alert/activity + the expanded detail line with env/backend/PR/MQ/
+    // unread badges, terminal host groups, the banner and its hint) under
+    // ASCII caps, and require the entire frame to be 7-bit ASCII.
+    use crate::sidebar::{ActivityState, GitGlyphs, RowKind};
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 44,
+        rows: 18,
+    };
+    let mut dir_ws = row(RowKind::Workspace, "notes");
+    dir_ws.dir = true;
+    let mut wt = row(RowKind::Worktree, "feat");
+    wt.git = Some(GitGlyphs {
+        dirty: true,
+        ahead: 2,
+        behind: 1,
+    });
+    wt.activity = ActivityState::Active;
+    wt.alert_count = 3;
+    wt.env_name = Some("gpu".into());
+    wt.sandbox_backend = Some("podman".into());
+    wt.pr_count = Some(1);
+    wt.unread_count = 2;
+    wt.disk_bytes = Some(4 * 1024 * 1024 * 1024);
+    wt.mq_status = Some(thegn_core::attention::MqStatus::NeedsHuman);
+    let mut term = row(RowKind::Terminal, "prodbox");
+    term.terminal_connection = Some("ssh dave@prod".into());
+    let rows = vec![
+        row(RowKind::Workspace, "app"),
+        dir_ws,
+        row(RowKind::Folder, "Backend (2)"),
+        wt,
+        row(RowKind::SectionHeading, "TERMINALS"),
+        row(RowKind::TerminalHost, "prod"),
+        term,
+        row(RowKind::EmptyHint, "No terminals - Enter to add"),
+    ];
+    // Cursor on the worktree row so its two-line detail tier renders too.
+    let cursor = 3;
+    crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
+        let model = FrameModel {
+            sidebar_rows: rows.clone(),
+            sidebar_selected: cursor,
+            sidebar_focused: true,
+            ..Default::default()
+        };
+        let mut s = Surface::new(rect.cols, rect.rows);
+        draw_sidebar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        assert!(text.contains("feat"), "sanity: rows rendered: {text:?}");
+        for (i, line) in text.lines().enumerate() {
+            assert!(
+                line.is_ascii(),
+                "non-ASCII cell under Ascii caps on line {i}: {line:?}"
+            );
+        }
+        // The rail must degrade too.
+        let rail = FrameModel {
+            sidebar_rows: rows.clone(),
+            sidebar_selected: cursor,
+            sidebar_rail: true,
+            ..Default::default()
+        };
+        let mut s = Surface::new(4, rect.rows);
+        draw_sidebar(
+            &mut s,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 4,
+                rows: rect.rows,
+            },
+            &rail,
+        );
+        let text = s.screen_chars_to_string();
+        for (i, line) in text.lines().enumerate() {
+            assert!(line.is_ascii(), "rail non-ASCII on line {i}: {line:?}");
+        }
+    });
+}
+
+#[test]
+fn sidebar_rail_keeps_workspace_and_terminal_identity() {
+    // Rail regression: workspaces show a bold initial, terminals show
+    // dot+initial like worktrees, and EmptyHint rows render nothing.
+    use crate::sidebar::RowKind;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 4,
+        rows: 8,
+    };
+    let mut term = row(RowKind::Terminal, "zsh-box");
+    term.terminal_connection = Some("ssh box".into());
+    let model = FrameModel {
+        sidebar_rows: vec![
+            row(RowKind::Workspace, "app"),
+            row(RowKind::Worktree, "feat"),
+            row(RowKind::SectionHeading, "TERMINALS"),
+            term,
+            row(RowKind::EmptyHint, "No terminals"),
+        ],
+        sidebar_rail: true,
+        ..Default::default()
+    };
+    let mut s = Surface::new(rect.cols, rect.rows);
+    draw_sidebar(&mut s, rect, &model);
+    let text = s.screen_chars_to_string();
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].contains('a'), "workspace initial: {lines:?}");
+    assert!(lines[1].contains('f'), "worktree initial: {lines:?}");
+    assert!(lines[3].contains('z'), "terminal initial: {lines:?}");
     assert!(
-        !feat_line.contains('C'),
-        "agent/app indicator must be gone: {feat_line:?}"
+        lines[4].trim().is_empty(),
+        "EmptyHint renders nothing in rail: {lines:?}"
     );
 }
 
@@ -621,6 +713,10 @@ fn bottombar_disk_widget_shows_active_worktree_size() {
 #[test]
 fn statusbar_disk_badge_trips_on_low_free_space() {
     let chrome = layout::compute(160, 10, false, false);
+    // The badge glyph is configurable (`[stats] disk_icon`); assert on the
+    // model's own icon so the test tracks the default instead of hardcoding it.
+    let icon = FrameModel::default().stats_icons.disk_icon.clone();
+    assert!(!icon.is_empty(), "default disk icon configured");
     // Default thresholds: warn 15%, critical 10% free.
     let mk = |free_pct: Option<u8>| -> String {
         let mut model = FrameModel::default();
@@ -629,16 +725,14 @@ fn statusbar_disk_badge_trips_on_low_free_space() {
         draw_statusbar(&mut s, chrome.statusbar, &model);
         s.screen_chars_to_string()
     };
-    // Assert on the chip's text, not the icon glyph — `ic.disk_icon` is
-    // user-configurable, so the glyph is not a stable contract.
     // Ample free → silent (clean is quiet).
-    assert!(!mk(Some(72)).contains("% free"), "silent when ample free");
+    assert!(!mk(Some(72)).contains(&icon), "silent when ample free");
     // At/below the warn line → the disk chip appears.
-    assert!(mk(Some(12)).contains("12% free"), "trips at low free");
+    assert!(mk(Some(12)).contains(&icon), "trips at low free");
     // Critically low → still shows (color asserted elsewhere).
-    assert!(mk(Some(3)).contains("3% free"), "trips at critical free");
+    assert!(mk(Some(3)).contains(&icon), "trips at critical free");
     // Not yet sampled → silent.
-    assert!(!mk(None).contains("% free"), "silent until sampled");
+    assert!(!mk(None).contains(&icon), "silent until sampled");
 }
 
 #[test]
@@ -698,8 +792,9 @@ fn dir_workspace_renders_folder_glyph() {
     let mut s = Surface::new(30, 4);
     draw_sidebar(&mut s, rect, &model);
     let text = s.screen_chars_to_string();
-    // The dir workspace carries the folder glyph; the repo one does not.
-    assert!(text.contains('\u{1f4c1}'), "dir folder glyph 📁: {text:?}");
+    // The dir workspace carries the home/dir glyph; the repo one does not.
+    // (BMP ⌂ from the caps table — no emoji in chrome.)
+    assert!(text.contains('\u{2302}'), "dir glyph ⌂: {text:?}");
     assert!(text.contains("scratch") && text.contains("repo-ws"));
 }
 
@@ -714,10 +809,78 @@ fn many_rows(n: usize) -> Vec<crate::sidebar::SidebarRow> {
 }
 
 #[test]
+fn nav_hints_footer_shown_only_when_focused_with_spare_room() {
+    // The navigation-tips footer rides the empty tail of the column, so it must
+    // appear only when (a) the sidebar is focused and (b) the laid-out rows
+    // leave genuine blank space below them — never pushing a row or scrolling.
+    let tall = Rect {
+        x: 0,
+        y: 0,
+        cols: 30,
+        rows: 40,
+    };
+    let rows = many_rows(3); // a short list under a very tall column → lots of tail
+
+    // Focused + spare room → footer present, anchored to the tail, above metrics.
+    let focused = FrameModel {
+        sidebar_rows: rows.clone(),
+        sidebar_selected: 0,
+        sidebar_focused: true,
+        ..Default::default()
+    };
+    let frame = build_sidebar(&focused, tall, focused.sidebar_scroll);
+    let hints = frame
+        .hints
+        .expect("focused tall column reveals the hints footer");
+    // It sits below the last rendered row (fills the blank tail, no overlap).
+    let last_row_bottom = frame.rows.iter().map(|p| p.y + p.height).max().unwrap_or(0);
+    assert!(
+        hints.y >= last_row_bottom,
+        "footer clears the rows: {hints:?}"
+    );
+    assert_eq!(
+        hints.y + hints.rows,
+        tall.y + tall.rows,
+        "footer anchors to the bottom"
+    );
+
+    // Unfocused → no footer (resting view stays uncluttered).
+    let unfocused = FrameModel {
+        sidebar_focused: false,
+        ..focused.clone()
+    };
+    assert!(
+        build_sidebar(&unfocused, tall, unfocused.sidebar_scroll)
+            .hints
+            .is_none(),
+        "an unfocused sidebar shows no hints"
+    );
+
+    // Focused but the list fills the column → no blank tail → no footer.
+    let short = Rect {
+        x: 0,
+        y: 0,
+        cols: 30,
+        rows: 8,
+    };
+    let packed = FrameModel {
+        sidebar_rows: many_rows(20),
+        sidebar_focused: true,
+        ..Default::default()
+    };
+    assert!(
+        build_sidebar(&packed, short, packed.sidebar_scroll)
+            .hints
+            .is_none(),
+        "a full list leaves no room for hints"
+    );
+}
+
+#[test]
 fn build_sidebar_and_click_hit_test_round_trip() {
     // Every rendered row's [y, y+height) maps back to its own visible index
-    // via `sidebar_hits` — the contract that keeps clicks aligned with paint
-    // even when the cursor row expands to two lines.
+    // via `hit_rows`/`row_at` — the contract that keeps clicks aligned with
+    // paint even when the cursor row expands to two lines.
     let rect = Rect {
         x: 0,
         y: 0,
@@ -739,13 +902,10 @@ fn build_sidebar_and_click_hit_test_round_trip() {
     assert_eq!(cursor_row.height, 2, "selected row with detail expands");
     assert!(cursor_row.cursor_bar, "focused cursor draws the bar");
 
-    let hits = sidebar_hits(&model, rect);
+    let hits = hit_rows(&model, rect);
     for p in &frame.rows {
         for dy in 0..p.height {
-            let found = hits
-                .iter()
-                .find(|(_, y, h)| (p.y + dy) >= *y && (p.y + dy) < *y + *h)
-                .map(|(i, _, _)| *i);
+            let found = row_at(&hits, p.y + dy).map(|h| h.visible_index);
             assert_eq!(
                 found,
                 Some(p.visible_index),

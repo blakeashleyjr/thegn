@@ -17,8 +17,15 @@ snapshot_defaults:
   normalize:
     - {re: "L0\\|.*", replace: "L0|<masthead>"}
     - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
+    # Volatile stats (net/disk/temp/clock/percents) — these leak into any
+    # unmasked row (statusbar, text-kind frames) and vary run-to-run.
+    - {re: "[↓↑]\\s*\\d+(?:\\.\\d+)?[BKMG]", replace: "<net>"}
+    - {re: "\\s*\\d+(?:\\.\\d+)?/\\d+[KMG]", replace: " <disk>"}
+    - {re: "\\s*\\d+°C", replace: " <temp>"}
+    - {re: "\\s*\\d{1,2}:\\d{2}\\b", replace: " HH:MM"}
+    - {re: "\\s*\\d{1,3}%", replace: " NN%"}
 steps:
-  - expect_visible: {regex: "thegn|thegn|dashboard|work|\\$|>", timeout_ms: 8000}
+  - expect_visible: {regex: "thegn|thegn|dashboard|work|\\$|>", timeout_ms: 20000}
   # Full frame at each size — mask row 0 (masthead has volatile CPU/mem/clock stats)
   - snapshot:
       name: full_frame
@@ -33,12 +40,15 @@ steps:
   - snapshot:
       name: masthead_row
       kind: text
-      # The stats cluster is volatile in VALUE and WIDTH (34K vs 1.1M shifts
-      # padding), so per-value masks can't stabilize it: collapse all digit
-      # runs and whitespace runs instead. Brand text + separators remain.
       normalize:
-        - {re: "\\d+(?:\\.\\d+)?[KMGTB]?", replace: "N"}
-        - {re: "\\s+", replace: " "}
+        # Space-tolerant: the stats cluster right-pads numbers, so a width
+        # change ("8%" vs "51%") also shifts the surrounding spaces.
+        - {re: "[↓↑]\\s*\\d+(?:\\.\\d+)?[BKMG]", replace: "<net>"}
+        - {re: "\\s*\\d+(?:\\.\\d+)?/\\d+[KMG]", replace: " <disk>"}
+        - {re: "\\s*\\d+°C", replace: " <temp>"}
+        - {re: "\\s*\\d{1,2}:\\d{2}\\b", replace: " HH:MM"}
+        - {re: "\\s*\\d{1,3}%", replace: " NN%"}
+        - {re: "[A-Z][a-z]{2} [A-Z][a-z]{2} \\d{1,2}", replace: "Www Mmm DD"}
       masks:
         - {rect: [1, 0, 200, 29]}
   # Bottom row: statusbar

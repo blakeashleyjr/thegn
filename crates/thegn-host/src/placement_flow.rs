@@ -156,7 +156,9 @@ fn snapshot_host(
             .and_then(|r| r.last_headroom)
             .is_none_or(|t| unix_now().saturating_sub(t) > headroom_ttl_secs as i64);
         if stale {
-            match thegn_svc::host::runner_for(&binding.reach).and_then(|mut r| r.probe_headroom()) {
+            match thegn_svc::host::runner_for(&binding.reach)
+                .and_then(|mut r| r.probe_headroom().map_err(|e| e.msg))
+            {
                 Ok(h) => {
                     let now = unix_now();
                     let _ = db.host_set_headroom(&id, &h, now);

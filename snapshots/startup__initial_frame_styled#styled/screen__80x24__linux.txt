@@ -1,12 +1,10 @@
-L0| þ thegn work    16.3/94G ·   7% ·  23% ·  ↓   19K ↑  110K ·  100% · 22:41
+L0| þ thegn  work           21.5/94G ·  36% ·  ↓    5K ↑   57K ·  100% · 02:20
 R0 0 1 fg=idx3b bg=idxe9 attrs=
 R0 1 2 fg=idxef bg=idxe9 attrs=
-R0 3 5 fg=idx3b bg=idxe9 attrs=
-R0 8 6 fg=idxef bg=idxeb attrs=
-R0 14 2 fg=idx3b bg=idxe9 attrs=
-R0 16 10 fg=idxef bg=idxe9 attrs=
-R0 26 3 fg=idxed bg=idxe9 attrs=
-R0 29 5 fg=idxee bg=idxe9 attrs=
+R0 3 6 fg=idx3b bg=idxe9 attrs=
+R0 9 6 fg=idxef bg=idxeb attrs=
+R0 15 9 fg=idx3b bg=idxe9 attrs=
+R0 24 10 fg=idxef bg=idxe9 attrs=
 R0 34 3 fg=idxed bg=idxe9 attrs=
 R0 37 5 fg=idxef bg=idxe9 attrs=
 R0 42 3 fg=idxed bg=idxe9 attrs=
@@ -29,7 +27,7 @@ R2 47 3 fg=idxef bg=idxeb attrs=
 R2 50 30 fg=idx3c bg=idxe9 attrs=
 L3|
 R3 0 80 fg=idx3c bg=idxe9 attrs=
-L4| ▾    home
+L4| ▾ ⌂ home
 R4 0 1 fg=idx3b bg=idxe9 attrs=
 R4 1 1 fg=idxed bg=idxe9 attrs=
 R4 2 30 fg=idx3b bg=idxe9 attrs=
@@ -48,7 +46,7 @@ R6 32 48 fg=idx3c bg=idxe9 attrs=
 L7| TERMINALS
 R7 0 32 fg=idx3b bg=idxe9 attrs=
 R7 32 48 fg=idx3c bg=idxe9 attrs=
-L8|   No terminals — Alt T to add            ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
+L8|   No terminals — Enter to add            ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
 R8 0 3 fg=idx3b bg=idxe9 attrs=
 R8 3 27 fg=idxed bg=idxe9 attrs=
 R8 30 2 fg=idx3b bg=idxe9 attrs=
@@ -136,15 +134,13 @@ L21|
 R21 0 80 fg=idx3c bg=idxe9 attrs=
 L22|
 R22 0 80 fg=idx3c bg=idxe9 attrs=
-L23|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav         7% free
+L23|  NORMAL   Ctrl Space menu              7% free   ❚❚ Justin Hurwitz — Houston
 R23 0 1 fg=idx3b bg=idxe9 attrs=
 R23 1 8 fg=idxe9 bg=idx3b attrs=
 R23 9 2 fg=idx3b bg=idxe9 attrs=
 R23 11 15 fg=idxed bg=idxe9 attrs=
-R23 26 3 fg=idx3b bg=idxe9 attrs=
-R23 29 11 fg=idxed bg=idxe9 attrs=
-R23 40 3 fg=idx3b bg=idxe9 attrs=
-R23 43 18 fg=idxed bg=idxe9 attrs=
-R23 61 7 fg=idx3b bg=idxe9 attrs=
-R23 68 11 fg=idxe9 bg=idxef attrs=
+R23 26 12 fg=idx3b bg=idxe9 attrs=
+R23 38 11 fg=idxe9 bg=idxef attrs=
+R23 49 1 fg=idx3b bg=idxe9 attrs=
+R23 50 29 fg=idxe9 bg=idx3c attrs=
 R23 79 1 fg=idx3b bg=idxe9 attrs=

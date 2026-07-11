@@ -1,10 +1,11 @@
-L0| þ thegn v0.1.0 work         81% ·  16.3/94G ·   7% ·  34% ·  ↓  155K ↑  271K ·  100% · 22:41
+L0| þ thegn v0.1.0  work        90% ·  21.6/94G ·   6% ·  38% ·  ↓   24K ↑   12K ·  100% · 02:21
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
 R0 9 6 fg=#6f788e bg=#151a28 attrs=
-R0 15 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 21 7 fg=#edf0f8 bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 6 fg=#edf0f8 bg=#151a28 attrs=
 R0 28 5 fg=#f0c674 bg=#151a28 attrs=
 R0 33 3 fg=#6f788e bg=#151a28 attrs=
 R0 36 10 fg=#c6ccdb bg=#151a28 attrs=
@@ -102,7 +103,7 @@ L27|
 R27 0 100 fg=default bg=#0b0e16 attrs=
 L28|
 R28 0 100 fg=default bg=#0b0e16 attrs=
-L29|  NORMAL   Ctrl Space menu              0 LOC │ Zoomed — Ctrl+Alt+z to restore   7% free   ⛶ ZOOM
+L29|  NORMAL   Ctrl Space menu              0 LOC │ Zoomed — Ctrl+Alt+z to restore   6% free   ⛶ ZOOM
 R29 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R29 1 8 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
 R29 9 2 fg=#edf0f8 bg=#151a28 attrs=

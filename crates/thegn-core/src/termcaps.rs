@@ -268,6 +268,24 @@ pub struct GlyphSet {
     pub mail: &'static str,           // ✉ unread-notification badge
     pub moon: &'static str,           // ⏾ hibernated worktree badge
     pub attention: &'static str,      // ✋ needs-you chip / blocked-on-user marker
+    // Tree / sidebar chrome. POLICY: no astral-plane or emoji-presentation
+    // glyphs in chrome — `Basic` terminals are BMP-only and emoji cell width
+    // is font-dependent (the U+26C1 disk-badge bug class). Everything below is
+    // BMP with display width 1 (asserted in tests).
+    pub caret_closed: &'static str, // ▸ collapsed header
+    pub caret_open: &'static str,   // ▾ expanded header
+    pub tree_tee: &'static str,     // ├ tree connector (mid child)
+    pub tree_corner: &'static str,  // └ tree connector (last child)
+    pub half_block_r: &'static str, // ▐ sidebar cursor bar
+    pub chevron: &'static str,      // › menu row lead
+    pub folder: &'static str,       // ▪ sidebar folder marker
+    pub dir: &'static str,          // ⌂ non-git "dir" workspace
+    pub host_local: &'static str,   // ≡ local terminal / host group
+    pub host_remote: &'static str,  // ⇅ remote (ssh/mosh) terminal / host group
+    pub flag: &'static str,         // ⚑ merge-queue deferred / gate-failed
+    pub half_dot: &'static str,     // ◐ merge-queue agent-running
+    pub quote_open: &'static str,   // « env-name chip
+    pub quote_close: &'static str,  // » env-name chip
     // Half-block pixel-font cells (logotype).
     pub block_full: &'static str, // █
     pub block_top: &'static str,  // ▀
@@ -301,6 +319,20 @@ pub const UNICODE: GlyphSet = GlyphSet {
     mail: "\u{2709}",           // ✉
     moon: "\u{23fe}",           // ⏾
     attention: "\u{270b}",      // ✋ (one-line swap to `⚠` if emoji width misbehaves)
+    caret_closed: "\u{25b8}",   // ▸
+    caret_open: "\u{25be}",     // ▾
+    tree_tee: "\u{251c}",       // ├
+    tree_corner: "\u{2514}",    // └
+    half_block_r: "\u{2590}",   // ▐
+    chevron: "\u{203a}",        // ›
+    folder: "\u{25aa}",         // ▪
+    dir: "\u{2302}",            // ⌂
+    host_local: "\u{2261}",     // ≡
+    host_remote: "\u{21c5}",    // ⇅
+    flag: "\u{2691}",           // ⚑
+    half_dot: "\u{25d0}",       // ◐
+    quote_open: "\u{00ab}",     // «
+    quote_close: "\u{00bb}",    // »
     block_full: "\u{2588}",     // █
     block_top: "\u{2580}",      // ▀
     block_bot: "\u{2584}",      // ▄
@@ -334,6 +366,20 @@ pub const ASCII: GlyphSet = GlyphSet {
     mail: "@",
     moon: "z",
     attention: "!",
+    caret_closed: ">",
+    caret_open: "v",
+    tree_tee: "|",
+    tree_corner: "+",
+    half_block_r: "|",
+    chevron: ">",
+    folder: "-",
+    dir: "~",
+    host_local: "=",
+    host_remote: "@",
+    flag: "!",
+    half_dot: "*",
+    quote_open: "<",
+    quote_close: ">",
     // The pixel-font cannot render in ASCII; callers route to the text splash
     // instead, but provide safe stand-ins so a stray cell never emits a block.
     block_full: "#",
@@ -718,6 +764,21 @@ mod tests {
             g.hex,
             g.mail,
             g.moon,
+            g.attention,
+            g.caret_closed,
+            g.caret_open,
+            g.tree_tee,
+            g.tree_corner,
+            g.half_block_r,
+            g.chevron,
+            g.folder,
+            g.dir,
+            g.host_local,
+            g.host_remote,
+            g.flag,
+            g.half_dot,
+            g.quote_open,
+            g.quote_close,
             g.block_full,
             g.block_top,
             g.block_bot,
@@ -725,6 +786,66 @@ mod tests {
             assert!(s.is_ascii(), "non-ASCII fallback glyph: {s:?}");
             assert!(!s.is_empty(), "empty fallback glyph");
         }
+    }
+
+    #[test]
+    fn unicode_glyphs_are_bmp_and_single_width() {
+        // The chrome glyph policy (see the GlyphSet field docs): no astral
+        // plane, no emoji-presentation width surprises. Every Unicode-table
+        // glyph must be BMP and display-width 1 — the invariant that retires
+        // the U+26C1 "wide checker shifts the badge" bug class. `attention`
+        // (✋, U+270B) is the one sanctioned width-2 glyph: it is classified
+        // East-Asian-Wide, so the seg layout already accounts for it.
+        use unicode_width::UnicodeWidthStr;
+        let g = glyphs(UnicodeLevel::Full);
+        for s in [
+            g.box_tl,
+            g.box_tr,
+            g.box_bl,
+            g.box_br,
+            g.box_h,
+            g.box_v,
+            g.dot_filled,
+            g.dot_hollow,
+            g.cross_heavy,
+            g.arrow_up,
+            g.arrow_down,
+            g.diamond_filled,
+            g.diamond_hollow,
+            g.check,
+            g.cross,
+            g.ellipsis,
+            g.middot,
+            g.refresh,
+            g.emdash,
+            g.warn,
+            g.hex,
+            g.mail,
+            g.moon,
+            g.caret_closed,
+            g.caret_open,
+            g.tree_tee,
+            g.tree_corner,
+            g.half_block_r,
+            g.chevron,
+            g.folder,
+            g.dir,
+            g.host_local,
+            g.host_remote,
+            g.flag,
+            g.half_dot,
+            g.quote_open,
+            g.quote_close,
+            g.block_full,
+            g.block_top,
+            g.block_bot,
+        ] {
+            let c = s.chars().next().unwrap();
+            assert!(s.chars().count() == 1, "multi-char glyph: {s:?}");
+            assert!((c as u32) <= 0xFFFF, "astral-plane glyph in chrome: {s:?}");
+            assert_eq!(s.width(), 1, "glyph must be display-width 1: {s:?}");
+        }
+        assert_eq!(g.attention.width(), 2, "✋ is the sanctioned wide glyph");
     }
 
     #[test]

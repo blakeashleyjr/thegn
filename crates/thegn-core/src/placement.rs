@@ -457,7 +457,8 @@ impl Placement {
     }
 
     /// Three-state runtime presence probe (Local: PATH; remote: a login-shell
-    /// probe through the placement's control primitive). Unlike [`has_binary`],
+    /// probe through the placement's control primitive). Unlike
+    /// [`has_binary`](Self::has_binary),
     /// this separates a genuinely-absent binary from an unreachable host so the
     /// caller never degrades a reachable remote to `Backend::None`. The probe is
     /// ssh-only even when the pane transport is mosh — mosh bootstraps over ssh,
@@ -465,7 +466,7 @@ impl Placement {
     /// non-interactive command output).
     ///
     /// Subprocess seam (cov_ignore); the decision logic lives in the pure,
-    /// unit-tested [`classify_probe`].
+    /// unit-tested `classify_probe`.
     pub fn probe_runtime(&self, bin: &str) -> RuntimeProbe {
         match self {
             Placement::Local => {
@@ -491,7 +492,8 @@ impl Placement {
     /// Is the named binary present in this placement? (Local: PATH; remote: a
     /// login-shell probe through the placement's control primitive.) A remote
     /// `Unreachable` answer collapses to `false` here — callers that must not
-    /// degrade on an unreachable host should use [`probe_runtime`] instead.
+    /// degrade on an unreachable host should use
+    /// [`probe_runtime`](Self::probe_runtime) instead.
     pub fn has_binary(&self, bin: &str) -> bool {
         match self {
             Placement::Local => util::have(bin),
@@ -556,50 +558,9 @@ fn run_argv(argv: &[String]) -> Result<(), String> {
     }
 }
 
-/// Reconnect policy for a dropped remote transport (ssh/mosh/k8s-exec pane).
-/// Pure — decides whether a re-spawn is warranted and the backoff before each
-/// attempt — so the host can wrap a remote pane in a reconnect loop without
-/// hard-coding the cadence. mosh self-heals roaming; this covers the ssh/exec
-/// case where the channel drops and the pane process exits 255.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReconnectPolicy {
-    pub max_attempts: u32,
-    pub base_delay_ms: u64,
-    pub max_delay_ms: u64,
-}
-
-impl Default for ReconnectPolicy {
-    fn default() -> Self {
-        ReconnectPolicy {
-            max_attempts: 5,
-            base_delay_ms: 500,
-            max_delay_ms: 10_000,
-        }
-    }
-}
-
-impl ReconnectPolicy {
-    /// Exponential backoff before `attempt` (1-based), capped at `max_delay_ms`;
-    /// `None` once attempts are exhausted (`attempt > max_attempts`) or zero.
-    pub fn backoff(&self, attempt: u32) -> Option<std::time::Duration> {
-        if attempt == 0 || attempt > self.max_attempts {
-            return None;
-        }
-        let shift = (attempt - 1).min(20);
-        let ms = self
-            .base_delay_ms
-            .saturating_mul(1u64 << shift)
-            .min(self.max_delay_ms);
-        Some(std::time::Duration::from_millis(ms))
-    }
-
-    /// Whether a remote pane that exited with `exit_code` on its `attempt`-th
-    /// run should reconnect. ssh/mosh report a connection drop as 255; a clean
-    /// or application exit (anything else) is terminal — the user quit the shell.
-    pub fn should_reconnect(&self, exit_code: i32, attempt: u32) -> bool {
-        attempt <= self.max_attempts && exit_code == 255
-    }
-}
+/// Re-export: the reconnect/retry policy moved to [`crate::retry`] when the
+/// control plane learned to retry too (it was pane-specific here).
+pub use crate::retry::ReconnectPolicy;
 
 #[cfg(test)]
 mod tests {
@@ -979,30 +940,6 @@ mod tests {
         assert!(m.iter().any(|a| a == "IdentityFile=/id"));
         let u = SshPlacement::sshfs_unmount_argv("/local/mnt");
         assert_eq!(u, vec!["fusermount3", "-u", "/local/mnt"]);
-    }
-
-    #[test]
-    fn reconnect_policy_backoff_and_decision() {
-        let p = ReconnectPolicy::default();
-        // Exponential, capped, then exhausted.
-        assert_eq!(p.backoff(1).unwrap().as_millis(), 500);
-        assert_eq!(p.backoff(2).unwrap().as_millis(), 1000);
-        assert_eq!(p.backoff(5).unwrap().as_millis(), 8000);
-        assert_eq!(p.backoff(0), None);
-        assert_eq!(p.backoff(6), None);
-        // Only a connection drop (255) reconnects, and only within budget.
-        assert!(p.should_reconnect(255, 1));
-        assert!(p.should_reconnect(255, 5));
-        assert!(!p.should_reconnect(255, 6));
-        assert!(!p.should_reconnect(0, 1));
-        assert!(!p.should_reconnect(130, 1));
-        // A cap that bites.
-        let capped = ReconnectPolicy {
-            max_attempts: 10,
-            base_delay_ms: 1000,
-            max_delay_ms: 3000,
-        };
-        assert_eq!(capped.backoff(8).unwrap().as_millis(), 3000);
     }
 
     #[test]

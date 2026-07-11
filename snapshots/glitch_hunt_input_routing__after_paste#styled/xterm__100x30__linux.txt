@@ -1,17 +1,18 @@
-L0| þ thegn v0.1.0 work        17.6/94G ·   7% ·  37% ·  96°C ·  ↓  1.2M ↑  103K ·  100% · 22:41
+L0| þ thegn v0.1.0  work        90% ·  18.4/94G ·   7% ·  36% ·  ↓  1.2M ↑  718K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
 R0 9 6 fg=#6f788e bg=#151a28 attrs=
-R0 15 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 21 6 fg=#edf0f8 bg=#151a28 attrs=
-R0 27 10 fg=#c6ccdb bg=#151a28 attrs=
-R0 37 3 fg=#6f788e bg=#151a28 attrs=
-R0 40 5 fg=#f7768e bg=#151a28 attrs=
-R0 45 3 fg=#6f788e bg=#151a28 attrs=
-R0 48 5 fg=#c6ccdb bg=#151a28 attrs=
-R0 53 3 fg=#6f788e bg=#151a28 attrs=
-R0 56 6 fg=#f7768e bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 28 5 fg=#f0c674 bg=#151a28 attrs=
+R0 33 3 fg=#6f788e bg=#151a28 attrs=
+R0 36 10 fg=#c6ccdb bg=#151a28 attrs=
+R0 46 3 fg=#6f788e bg=#151a28 attrs=
+R0 49 5 fg=#f7768e bg=#151a28 attrs=
+R0 54 3 fg=#6f788e bg=#151a28 attrs=
+R0 57 5 fg=#c6ccdb bg=#151a28 attrs=
 R0 62 3 fg=#6f788e bg=#151a28 attrs=
 R0 65 17 fg=#c6ccdb bg=#151a28 attrs=
 R0 82 3 fg=#6f788e bg=#151a28 attrs=

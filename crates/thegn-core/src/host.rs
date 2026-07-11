@@ -799,6 +799,7 @@ mod tests {
             limits: crate::sandbox::SandboxLimits::default(),
             volumes: Vec::new(),
             compose: None,
+            build: None,
             init_script: None,
             file_access: crate::config::FileAccess::Worktree,
             devenv: false,

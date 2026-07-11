@@ -545,6 +545,10 @@ pub struct GitLock(std::fs::File);
 /// same `.git`. Best-effort: returns `None` (degrading to today's unlocked
 /// behavior) if the lock file can't be opened/locked, so a permissions quirk
 /// never wedges the user out of git. Call only on background threads — it blocks.
+// The `fcntl::Flock` replacement takes ownership of the file (RAII guard),
+// which doesn't fit this guard's separate Drop unlock; the raw call is still
+// sound here — migrate both together.
+#[allow(deprecated)]
 #[cfg(not(windows))]
 pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
     let path = git_common_dir(worktree).join("thegn-git.lock");
@@ -578,6 +582,7 @@ pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
 
 #[cfg(not(windows))]
 impl Drop for GitLock {
+    #[allow(deprecated)] // see lock_git_mutations — migrate to fcntl::Flock together
     fn drop(&mut self) {
         // best-effort: closing the fd releases the lock anyway.
         let _ = self.0.unlock();

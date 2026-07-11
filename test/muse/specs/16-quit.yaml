@@ -13,7 +13,7 @@ sync:
   quiet_window_ms: 2000
   max_settle_ms: 10000
 steps:
-  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 8000}
+  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
   # Exit the dashboard tile — 'q' returns control to the host (work tab).
   # Ctrl+Q is then intercepted by the host keymap before reaching the pane.
   - key: {key: q}

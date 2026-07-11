@@ -1,10 +1,11 @@
-L0| þ thegn v0.1.0 work         80% ·  17.7/94G ·   7% ·  37% ·  ↓  133K ↑  115K ·  100% · 22:41
+L0| þ thegn v0.1.0  work        45% ·  18.3/94G ·   7% ·  35% ·  ↓   15K ↑   10K ·  100% · 02:22
 R0 0 1 fg=idx07 bg=idx00 attrs=
 R0 1 2 fg=idx06 bg=idx00 attrs=
 R0 3 6 fg=idx07 bg=idx00 attrs=
 R0 9 6 fg=idx08 bg=idx00 attrs=
-R0 15 6 fg=idx06 bg=idx08 attrs=BOLD
-R0 21 12 fg=idx07 bg=idx00 attrs=
+R0 15 1 fg=idx07 bg=idx00 attrs=
+R0 16 6 fg=idx06 bg=idx08 attrs=BOLD
+R0 22 11 fg=idx07 bg=idx00 attrs=
 R0 33 3 fg=idx08 bg=idx00 attrs=
 R0 36 10 fg=idx07 bg=idx00 attrs=
 R0 46 11 fg=idx08 bg=idx00 attrs=
@@ -35,12 +36,12 @@ R3 0 56 fg=default bg=idx00 attrs=
 R3 56 1 fg=idx07 bg=idx00 attrs=
 R3 57 1 fg=idx07 bg=idx00 attrs=BOLD
 R3 58 42 fg=idx07 bg=idx00 attrs=
-L4| ▾ 📁 home                                              ────────────────────────────────────────────
+L4| ▾ ⌂ home                                               ────────────────────────────────────────────
 R4 0 1 fg=idx07 bg=idx00 attrs=
 R4 1 1 fg=idx08 bg=idx00 attrs=
-R4 2 4 fg=idx07 bg=idx00 attrs=
-R4 6 4 fg=idx07 bg=idx00 attrs=BOLD
-R4 10 22 fg=idx07 bg=idx00 attrs=
+R4 2 3 fg=idx07 bg=idx00 attrs=
+R4 5 4 fg=idx07 bg=idx00 attrs=BOLD
+R4 9 23 fg=idx07 bg=idx00 attrs=
 R4 32 24 fg=default bg=idx00 attrs=
 R4 56 44 fg=idx08 bg=idx00 attrs=
 L5|▐   └ ○ home                                             1 changes                            clean
@@ -71,15 +72,15 @@ R7 32 24 fg=default bg=idx00 attrs=
 R7 56 2 fg=idx07 bg=idx00 attrs=
 R7 58 18 fg=idx08 bg=idx00 attrs=
 R7 76 24 fg=idx07 bg=idx00 attrs=
-L8| ▾ 💻 local
+L8| ▾ ≡ local
 R8 0 1 fg=idx07 bg=idx00 attrs=
 R8 1 1 fg=idx08 bg=idx00 attrs=
-R8 2 4 fg=idx07 bg=idx00 attrs=
-R8 6 5 fg=idx07 bg=idx00 attrs=BOLD
-R8 11 21 fg=idx07 bg=idx00 attrs=
+R8 2 3 fg=idx07 bg=idx00 attrs=
+R8 5 5 fg=idx07 bg=idx00 attrs=BOLD
+R8 10 22 fg=idx07 bg=idx00 attrs=
 R8 32 24 fg=default bg=idx00 attrs=
 R8 56 44 fg=idx07 bg=idx00 attrs=
-L9|   └ 💻 local                                            2 commits                                —
+L9|   └ ≡ local                                             2 commits                                —
 R9 0 3 fg=idx07 bg=idx00 attrs=
 R9 3 2 fg=idx08 bg=idx00 attrs=
 R9 5 27 fg=idx07 bg=idx00 attrs=
@@ -149,16 +150,16 @@ L27|
 R27 0 100 fg=default bg=idx00 attrs=
 L28|
 R28 0 100 fg=default bg=idx00 attrs=
-L29|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav              0 LOC  ✋ 1    7% free
+L29|  NORMAL   Ctrl Space menu   Ctrl g lock               0 LOC │ Keybinds unlocked  ✋ 1    7% free
 R29 0 1 fg=idx07 bg=idx00 attrs=
 R29 1 8 fg=idx00 bg=idx06 attrs=BOLD
 R29 9 2 fg=idx07 bg=idx00 attrs=
 R29 11 15 fg=idx08 bg=idx00 attrs=
 R29 26 3 fg=idx07 bg=idx00 attrs=
 R29 29 11 fg=idx08 bg=idx00 attrs=
-R29 40 3 fg=idx07 bg=idx00 attrs=
-R29 43 18 fg=idx08 bg=idx00 attrs=
-R29 61 20 fg=idx07 bg=idx00 attrs=
+R29 40 20 fg=idx07 bg=idx00 attrs=
+R29 60 3 fg=idx08 bg=idx00 attrs=
+R29 63 18 fg=idx07 bg=idx00 attrs=
 R29 81 6 fg=idx00 bg=idx03 attrs=BOLD
 R29 87 1 fg=idx07 bg=idx00 attrs=
 R29 88 11 fg=idx00 bg=idx09 attrs=BOLD

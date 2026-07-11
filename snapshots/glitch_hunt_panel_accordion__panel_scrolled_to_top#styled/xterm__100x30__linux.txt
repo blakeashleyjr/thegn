@@ -1,10 +1,11 @@
-L0| þ thegn v0.1.0 work         85% ·  17.7/94G ·   7% ·  37% ·  ↓  128K ↑  210K ·  100% · 22:41
+L0| þ thegn v0.1.0  work        90% ·  18.4/94G ·   7% ·  37% ·  ↓  1.2M ↑  717K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
 R0 9 6 fg=#6f788e bg=#151a28 attrs=
-R0 15 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 21 7 fg=#edf0f8 bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 6 fg=#edf0f8 bg=#151a28 attrs=
 R0 28 5 fg=#f0c674 bg=#151a28 attrs=
 R0 33 3 fg=#6f788e bg=#151a28 attrs=
 R0 36 10 fg=#c6ccdb bg=#151a28 attrs=
@@ -34,12 +35,12 @@ R2 50 50 fg=default bg=#0b0e16 attrs=
 L3|
 R3 0 32 fg=default bg=#151a28 attrs=
 R3 32 68 fg=default bg=#0b0e16 attrs=
-L4| ▾ 📁 home
+L4| ▾ ⌂ home
 R4 0 1 fg=#edf0f8 bg=#0b0e16 attrs=
 R4 1 1 fg=#7a8197 bg=#0b0e16 attrs=
-R4 2 4 fg=#edf0f8 bg=#0b0e16 attrs=
-R4 6 4 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
-R4 10 22 fg=#edf0f8 bg=#0b0e16 attrs=
+R4 2 3 fg=#edf0f8 bg=#0b0e16 attrs=
+R4 5 4 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
+R4 9 23 fg=#edf0f8 bg=#0b0e16 attrs=
 R4 32 68 fg=default bg=#0b0e16 attrs=
 L5|▐   └ ○ home                                        ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
 R5 0 1 fg=#428180 bg=#1a2031 attrs=
@@ -64,19 +65,19 @@ R7 10 22 fg=#edf0f8 bg=#151a28 attrs=
 R7 32 20 fg=default bg=#0b0e16 attrs=
 R7 52 29 fg=#6ee7d8 bg=#0b0e16 attrs=
 R7 81 19 fg=default bg=#0b0e16 attrs=
-L8| ▾ 💻 local
+L8| ▾ ≡ local
 R8 0 1 fg=#edf0f8 bg=#0b0e16 attrs=
 R8 1 1 fg=#7a8197 bg=#0b0e16 attrs=
 R8 2 1 fg=#edf0f8 bg=#0b0e16 attrs=
-R8 3 3 fg=#c6ccdb bg=#0b0e16 attrs=
-R8 6 5 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
-R8 11 21 fg=#edf0f8 bg=#0b0e16 attrs=
+R8 3 2 fg=#c6ccdb bg=#0b0e16 attrs=
+R8 5 5 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
+R8 10 22 fg=#edf0f8 bg=#0b0e16 attrs=
 R8 32 68 fg=default bg=#0b0e16 attrs=
-L9|   └ 💻 local                                         v0.1.0 · git worktree IDE
+L9|   └ ≡ local                                          v0.1.0 · git worktree IDE
 R9 0 3 fg=#edf0f8 bg=#151a28 attrs=
 R9 3 2 fg=#677084 bg=#151a28 attrs=
-R9 5 8 fg=#c6ccdb bg=#151a28 attrs=
-R9 13 19 fg=#edf0f8 bg=#151a28 attrs=
+R9 5 7 fg=#c6ccdb bg=#151a28 attrs=
+R9 12 20 fg=#edf0f8 bg=#151a28 attrs=
 R9 32 22 fg=default bg=#0b0e16 attrs=
 R9 54 6 fg=#c6ccdb bg=#0b0e16 attrs=
 R9 60 19 fg=#7a8197 bg=#0b0e16 attrs=

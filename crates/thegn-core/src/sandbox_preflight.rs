@@ -12,7 +12,7 @@
 //!
 //! [`preflight_exec`] closes that gap: after `ensure` succeeds we run the *same*
 //! exec path with a trivial `true`, capturing stderr. The caller
-//! ([`agent::prepare_sandbox_env`]) turns a failure into a legible error — a hard
+//! (the host's `agent::prepare_sandbox_env`) turns a failure into a legible error — a hard
 //! block for an explicit backend, or a visible fall-through to the next chain
 //! entry (bwrap) for `auto`. Bwrap and `none` are no-ops (single-command
 //! backends with nothing to exec into).
@@ -155,6 +155,7 @@ mod tests {
             limits: SandboxLimits::default(),
             volumes: vec![],
             compose: None,
+            build: None,
             init_script: None,
             file_access: FileAccess::Worktree,
             devenv: false,

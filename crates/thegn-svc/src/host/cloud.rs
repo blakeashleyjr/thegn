@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use thegn_core::host::{Arch, CloudReach, HostCaps, RuntimeInfo, RuntimeKind, VolumeSpec};
 use thegn_core::image::{DeliveryStrategy, Digest, ImageRef, ResolvedImage};
+use thegn_core::transport_error::ClassifiedErr;
 
 use super::HostRunner;
 use crate::provider::{Provider, SpritesProvider};
@@ -195,38 +196,44 @@ fn post_json(
 }
 
 impl HostRunner for CloudRunner {
-    fn connect(&mut self) -> Result<(), String> {
+    fn connect(&mut self) -> Result<(), ClassifiedErr> {
         if self.token.is_none() {
             let var = &self.reach.api_key_env;
             let tok = std::env::var(var)
                 .ok()
                 .filter(|t| !t.trim().is_empty())
                 .ok_or_else(|| {
-                    format!(
+                    ClassifiedErr::permanent(format!(
                         "cloud host ({}): API token env var {var} is not set",
                         self.reach.provider
-                    )
+                    ))
                 })?;
             self.token = Some(tok);
         }
         let url = self.ping_url();
+        // Network-layer failures (DNS blip, timeout, reset) are transient.
         let (status, _body) = get_json(&url, self.token()?, CONNECT_TIMEOUT)
-            .map_err(|e| format!("cloud connect: {e}"))?;
+            .map_err(|e| ClassifiedErr::transient(format!("cloud connect: {e}")))?;
         match status {
             // Bad credentials won't fix themselves — sound non-retryable.
-            401 | 403 => Err(format!(
+            401 | 403 => Err(ClassifiedErr::permanent(format!(
                 "cloud connect: token rejected by {} ({status}) — check ${}",
                 self.reach.provider, self.reach.api_key_env
-            )),
+            ))),
             s if (200..300).contains(&s) => Ok(()),
-            s => Err(format!(
+            // A 5xx is the provider having a moment; 4xx is on us.
+            s if s >= 500 => Err(ClassifiedErr::transient(format!(
                 "cloud connect: {} answered HTTP {s} on {url}",
                 self.reach.provider
-            )),
+            ))),
+            s => Err(ClassifiedErr::permanent(format!(
+                "cloud connect: {} answered HTTP {s} on {url}",
+                self.reach.provider
+            ))),
         }
     }
 
-    fn probe(&mut self) -> Result<HostCaps, String> {
+    fn probe(&mut self) -> Result<HostCaps, ClassifiedErr> {
         // No shell to probe: the provider manages the machine. Cloud fleets
         // are amd64 today (Sprites/Daytona both boot x86_64 microVMs); revisit
         // when a provider exposes arm64 templates.
@@ -237,13 +244,13 @@ impl HostRunner for CloudRunner {
         &mut self,
         _kind: RuntimeKind,
         _note: &mut dyn FnMut(String),
-    ) -> Result<RuntimeInfo, String> {
+    ) -> Result<RuntimeInfo, ClassifiedErr> {
         // Unreachable in practice: probe() always reports a CloudManaged
         // runtime, so the machine never walks Installing.
         Err("cloud-managed hosts have no runtime to install".into())
     }
 
-    fn resolve_image(&mut self, reference: &ImageRef) -> Result<ResolvedImage, String> {
+    fn resolve_image(&mut self, reference: &ImageRef) -> Result<ResolvedImage, ClassifiedErr> {
         // Cloud registration is by REFERENCE, not per-arch bytes: the provider
         // pulls/boots the image itself, so there is no manifest list to fan
         // out. A digest-pinned reference keeps its pin; an unpinned one gets a
@@ -263,11 +270,15 @@ impl HostRunner for CloudRunner {
         })
     }
 
-    fn image_present(&mut self, _image: &ImageRef, _digest: &Digest) -> Result<bool, String> {
+    fn image_present(
+        &mut self,
+        _image: &ImageRef,
+        _digest: &Digest,
+    ) -> Result<bool, ClassifiedErr> {
         // "Present" for a cloud host = the provider already has the named
         // template/snapshot (`reach.template`); the digest only keys inventory.
         let (status, body) = get_json(&self.template_list_url(), self.token()?, LIST_TIMEOUT)
-            .map_err(|e| format!("cloud image check: {e}"))?;
+            .map_err(|e| ClassifiedErr::transient(format!("cloud image check: {e}")))?;
         if !(200..300).contains(&status) {
             // Reachable but unhelpful (odd status/shape): report absent and
             // let deliver() register idempotently.
@@ -284,12 +295,13 @@ impl HostRunner for CloudRunner {
         image: &ImageRef,
         digest: &Digest,
         progress: &mut dyn FnMut(u64, Option<u64>),
-    ) -> Result<Digest, String> {
+    ) -> Result<Digest, ClassifiedErr> {
         if strategy != DeliveryStrategy::ProviderTemplate {
             return Err(format!(
                 "cloud delivery only supports provider-template (got {})",
                 strategy.as_str()
-            ));
+            )
+            .into());
         }
         match self.kind {
             ProviderKind::Daytona => {
@@ -303,12 +315,14 @@ impl HostRunner for CloudRunner {
                 });
                 let (status, resp) =
                     post_json(&self.snapshot_url(), self.token()?, &body, REGISTER_TIMEOUT)
-                        .map_err(|e| format!("daytona snapshot registration: {e}"))?;
+                        .map_err(|e| {
+                            ClassifiedErr::transient(format!("daytona snapshot registration: {e}"))
+                        })?;
                 // 409 = already registered — idempotent success.
                 if !(200..300).contains(&status) && status != 409 {
-                    return Err(format!(
-                        "daytona snapshot registration failed ({status}): {resp}"
-                    ));
+                    return Err(
+                        format!("daytona snapshot registration failed ({status}): {resp}").into(),
+                    );
                 }
             }
             ProviderKind::Sprites => {
@@ -339,7 +353,7 @@ impl HostRunner for CloudRunner {
         _spec: &VolumeSpec,
         _image: &ImageRef,
         _digest: &Digest,
-    ) -> Result<(), String> {
+    ) -> Result<(), ClassifiedErr> {
         // Cloud providers fold warm state into checkpoints/snapshots — there
         // are no named volumes to pre-seed, so seeding is a no-op success.
         Ok(())
@@ -479,8 +493,8 @@ mod tests {
             let mock = mock_http(&[(status, r#"{"error":"nope"}"#)]);
             let mut r = CloudRunner::with_token(reach("sprites", &mock.base), "bad");
             let err = r.connect().unwrap_err();
-            assert!(err.contains("token rejected"), "{status}: {err}");
-            assert!(err.contains("THEGN_TEST_CLOUD_TOKEN"), "{err}");
+            assert!(err.msg.contains("token rejected"), "{status}: {err}");
+            assert!(err.msg.contains("THEGN_TEST_CLOUD_TOKEN"), "{err}");
         }
     }
 
@@ -489,8 +503,8 @@ mod tests {
         // A port nothing listens on: transport error, not an auth complaint.
         let mut r = CloudRunner::with_token(reach("sprites", "http://127.0.0.1:9"), "tok");
         let err = r.connect().unwrap_err();
-        assert!(err.contains("cloud connect:"), "{err}");
-        assert!(!err.contains("token rejected"), "{err}");
+        assert!(err.msg.contains("cloud connect:"), "{err}");
+        assert!(!err.msg.contains("token rejected"), "{err}");
     }
 
     #[test]
@@ -501,7 +515,8 @@ mod tests {
         let mut r = CloudRunner::new(re).unwrap();
         let err = r.connect().unwrap_err();
         assert!(
-            err.contains("THEGN_TEST_CLOUD_TOKEN_DEFINITELY_UNSET_7Q"),
+            err.msg
+                .contains("THEGN_TEST_CLOUD_TOKEN_DEFINITELY_UNSET_7Q"),
             "{err}"
         );
     }
@@ -528,7 +543,7 @@ mod tests {
         let err = r
             .install_runtime(RuntimeKind::Podman, &mut |_| {})
             .unwrap_err();
-        assert!(err.contains("no runtime to install"), "{err}");
+        assert!(err.msg.contains("no runtime to install"), "{err}");
         let spec = VolumeSpec::by_name("cargo").unwrap();
         r.seed_volume(&spec, &img(), &Digest::parse(D1).unwrap())
             .unwrap();
@@ -607,7 +622,11 @@ mod tests {
             DeliveryStrategy::RemoteBuild,
         ] {
             let err = r.deliver(s, &img(), &d, &mut |_, _| {}).unwrap_err();
-            assert!(err.contains("provider-template"), "{}: {err}", s.as_str());
+            assert!(
+                err.msg.contains("provider-template"),
+                "{}: {err}",
+                s.as_str()
+            );
         }
     }
 

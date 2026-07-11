@@ -1,10 +1,11 @@
-L0| þ thegn v0.1.0 work                                                                                               16.8/94G ·   7% ·  37% ·  95°C ·  ↓   28K ↑    6K ·  100% · Fri Jul 10 · 22:41
+L0| þ thegn v0.1.0  work                                                                                              19.0/94G ·   7% ·  35% ·  96°C ·  ↓  1.6M ↑  957K ·  100% · Sat Jul 11 · 02:21
 R0 0 1 fg=#5a5d65 bg=#0f131e attrs=
 R0 1 2 fg=#2d5959 bg=#0f131e attrs=
 R0 3 6 fg=#5a5d65 bg=#0f131e attrs=
 R0 9 6 fg=#2e3340 bg=#0f131e attrs=
-R0 15 6 fg=#2d5959 bg=#1a2d34 attrs=
-R0 21 93 fg=#5a5d65 bg=#0f131e attrs=
+R0 15 1 fg=#5a5d65 bg=#0f131e attrs=
+R0 16 6 fg=#2d5959 bg=#1a2d34 attrs=
+R0 22 92 fg=#5a5d65 bg=#0f131e attrs=
 R0 114 10 fg=#4c505a bg=#0f131e attrs=
 R0 124 3 fg=#2e3340 bg=#0f131e attrs=
 R0 127 5 fg=#5d3240 bg=#0f131e attrs=
@@ -43,7 +44,7 @@ L3|                                                                             
 R3 0 32 fg=#677084 bg=#0f131e attrs=
 R3 32 124 fg=#677084 bg=#0b0e16 attrs=
 R3 156 44 fg=#5a5d65 bg=#0f131e attrs=
-L4| ▾    home                                                                                                                                                  ────────────────────────────────────────────
+L4| ▾ ⌂ home                                                                                                                                                   ────────────────────────────────────────────
 R4 0 1 fg=#5a5d65 bg=#0b0e16 attrs=
 R4 1 1 fg=#313643 bg=#0b0e16 attrs=
 R4 2 30 fg=#5a5d65 bg=#0b0e16 attrs=
@@ -74,7 +75,7 @@ R7 32 124 fg=#677084 bg=#0b0e16 attrs=
 R7 156 2 fg=#5a5d65 bg=#0f131e attrs=
 R7 158 18 fg=#2e3340 bg=#0f131e attrs=
 R7 176 24 fg=#5a5d65 bg=#0f131e attrs=
-L8|   No terminals — Alt T to add
+L8|   No terminals — Enter to add
 R8 0 3 fg=#5a5d65 bg=#0f131e attrs=
 R8 3 27 fg=#313643 bg=#0f131e attrs=
 R8 30 2 fg=#5a5d65 bg=#0f131e attrs=
@@ -393,7 +394,7 @@ L48|
 R48 0 32 fg=#677084 bg=#0f131e attrs=
 R48 32 124 fg=#677084 bg=#0b0e16 attrs=
 R48 156 44 fg=#677084 bg=#0f131e attrs=
-L49|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓   Alt N split→   Alt s focus-sidebar   Alt . focus-panel   Alt Left tabs   Alt Up worktrees     7% free
+L49|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓   Alt N split→   Alt s focus-sidebar   Alt . focus-panel          7% free   ❚❚ Justin Hurwitz — Houston
 R49 0 1 fg=#5a5d65 bg=#0f131e attrs=
 R49 1 8 fg=#0b0e16 bg=#376f6d attrs=
 R49 9 2 fg=#5a5d65 bg=#0f131e attrs=
@@ -420,12 +421,8 @@ R49 116 14 fg=#2e3340 bg=#0f131e attrs=
 R49 130 3 fg=#5a5d65 bg=#0f131e attrs=
 R49 133 5 fg=#313643 bg=#0f131e attrs=
 R49 138 12 fg=#2e3340 bg=#0f131e attrs=
-R49 150 3 fg=#5a5d65 bg=#0f131e attrs=
-R49 153 8 fg=#313643 bg=#0f131e attrs=
-R49 161 5 fg=#2e3340 bg=#0f131e attrs=
-R49 166 3 fg=#5a5d65 bg=#0f131e attrs=
-R49 169 6 fg=#313643 bg=#0f131e attrs=
-R49 175 10 fg=#2e3340 bg=#0f131e attrs=
-R49 185 3 fg=#5a5d65 bg=#0f131e attrs=
-R49 188 11 fg=#0b0e16 bg=#71393e attrs=
+R49 150 8 fg=#5a5d65 bg=#0f131e attrs=
+R49 158 11 fg=#0b0e16 bg=#71393e attrs=
+R49 169 1 fg=#5a5d65 bg=#0f131e attrs=
+R49 170 29 fg=#0b0e16 bg=#3f5876 attrs=
 R49 199 1 fg=#5a5d65 bg=#0f131e attrs=

@@ -103,6 +103,8 @@ impl SidebarState {
                 session.worktrees[a].path.clone(),
                 session.worktrees[b].path.clone(),
             );
+            // best-effort: the DB is a cache — a failed persist only loses the
+            // order across restart; the live session swap below still applies
             let _ = db.swap_worktree_positions(&pa, &pb);
         }
         // …and the live session order, preserving which group stays active
@@ -187,6 +189,8 @@ impl SidebarState {
         let (ib, repo_b) = order[np].clone();
 
         if let Ok(db) = thegn_core::db::Db::open() {
+            // best-effort: same cache rule as the worktree swap above — the
+            // live model swap below is the user-visible move
             let _ = db.swap_workspace_positions(&repo_a, &repo_b);
         }
         model.sidebar_workspaces.swap(ia, ib);
@@ -427,8 +431,10 @@ mod tests {
     }
 
     fn focused(model: &mut FrameModel, session: &Session) -> SidebarState {
-        let mut sb = SidebarState::default();
-        sb.focused = true;
+        let mut sb = SidebarState {
+            focused: true,
+            ..Default::default()
+        };
         sb.rebuild(model, session);
         sb
     }

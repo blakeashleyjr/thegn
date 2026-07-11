@@ -1,11 +1,12 @@
-L0| þ thegn v0.1.0 work         91% ·  16.8/94G ·   7% ·  37% ·  ↓  102K ↑  244K ·  100% · 22:41
+L0| þ thegn v0.1.0  work        59% ·  19.9/94G ·   7% ·  37% ·  ↓   38K ↑   32K ·  100% · 02:21
 R0 0 1 fg=#5a5d65 bg=#0f131e attrs=
 R0 1 2 fg=#2d5959 bg=#0f131e attrs=
 R0 3 6 fg=#5a5d65 bg=#0f131e attrs=
 R0 9 6 fg=#2e3340 bg=#0f131e attrs=
-R0 15 6 fg=#2d5959 bg=#1a2d34 attrs=
-R0 21 7 fg=#5a5d65 bg=#0f131e attrs=
-R0 28 5 fg=#5b4e36 bg=#0f131e attrs=
+R0 15 1 fg=#5a5d65 bg=#0f131e attrs=
+R0 16 6 fg=#2d5959 bg=#1a2d34 attrs=
+R0 22 6 fg=#5a5d65 bg=#0f131e attrs=
+R0 28 5 fg=#4c505a bg=#0f131e attrs=
 R0 33 3 fg=#2e3340 bg=#0f131e attrs=
 R0 36 10 fg=#4c505a bg=#0f131e attrs=
 R0 46 3 fg=#2e3340 bg=#0f131e attrs=
@@ -41,7 +42,7 @@ L3|                                                         —
 R3 0 32 fg=#677084 bg=#0f131e attrs=
 R3 32 24 fg=#677084 bg=#0b0e16 attrs=
 R3 56 44 fg=#5a5d65 bg=#0f131e attrs=
-L4| ▾    home                                              ────────────────────────────────────────────
+L4| ▾ ⌂ home                                               ────────────────────────────────────────────
 R4 0 1 fg=#5a5d65 bg=#0b0e16 attrs=
 R4 1 1 fg=#313643 bg=#0b0e16 attrs=
 R4 2 30 fg=#5a5d65 bg=#0b0e16 attrs=
@@ -74,12 +75,12 @@ R7 20 60 fg=#7a8197 bg=#151a28 attrs=
 R7 80 5 fg=#edf0f8 bg=#222942 attrs=BOLD
 R7 85 3 fg=#7a8197 bg=#151a28 attrs=
 R7 88 12 fg=#5a5d65 bg=#0f131e attrs=
-L8| ▾    local │ ❯ toggle sidebartheme                                                    │
+L8| ▾ ≡ local  │ ❯ toggle sidebartheme                                                    │
 R8 0 1 fg=#5a5d65 bg=#0b0e16 attrs=
 R8 1 1 fg=#313643 bg=#0b0e16 attrs=
 R8 2 1 fg=#5a5d65 bg=#0b0e16 attrs=
-R8 3 3 fg=#4c505a bg=#0b0e16 attrs=
-R8 6 6 fg=#5a5d65 bg=#0b0e16 attrs=
+R8 3 2 fg=#4c505a bg=#0b0e16 attrs=
+R8 5 7 fg=#5a5d65 bg=#0b0e16 attrs=
 R8 12 1 fg=#7a8197 bg=#151a28 attrs=
 R8 13 1 fg=default bg=#151a28 attrs=
 R8 14 2 fg=#6ee7d8 bg=#151a28 attrs=BOLD
@@ -88,7 +89,7 @@ R8 86 1 fg=default bg=#151a28 attrs=
 R8 87 1 fg=#7a8197 bg=#151a28 attrs=
 R8 88 2 fg=#1c2233 bg=#05070c attrs=
 R8 90 10 fg=#5a5d65 bg=#0f131e attrs=
-L9|   └    loca│ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │          —
+L9|   └ ≡ local│ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │          —
 R9 0 3 fg=#5a5d65 bg=#0f131e attrs=
 R9 3 2 fg=#2b303c bg=#0f131e attrs=
 R9 5 7 fg=#4c505a bg=#0f131e attrs=

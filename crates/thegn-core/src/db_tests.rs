@@ -1450,9 +1450,11 @@ fn get_alert_counts_by_worktree_filters_by_kind() {
         .unwrap();
     db.put_notification("agent_failed", "ref:3", "agent died", "/wt/app")
         .unwrap();
-    db.put_notification("log_error", "ref:4", "error log", "/wt/other")
+    db.put_notification("process_failed", "ref:4", "cargo died", "/wt/other")
         .unwrap();
-    db.put_notification("assigned", "ref:5", "msg", "/wt/other")
+    db.put_notification("log_error", "ref:5", "error log", "/wt/other")
+        .unwrap(); // NOT an alert — log errors are quiet Info
+    db.put_notification("assigned", "ref:6", "msg", "/wt/other")
         .unwrap(); // not an alert
 
     let cfg = crate::config::NotificationsConfig::default();
@@ -1460,7 +1462,7 @@ fn get_alert_counts_by_worktree_filters_by_kind() {
         .get_alert_counts_by_worktree(&cfg.alert_kind_names())
         .unwrap();
     // /wt/app has 2 alerts (test_failed + agent_failed)
-    // /wt/other has 1 alert (log_error)
+    // /wt/other has 1 alert (process_failed) — the log_error does NOT count.
     assert_eq!(counts.get("/wt/app"), Some(&2));
     assert_eq!(counts.get("/wt/other"), Some(&1));
 }

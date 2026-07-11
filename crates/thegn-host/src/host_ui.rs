@@ -45,6 +45,9 @@ pub struct HostSnapshot {
     pub active_step: Option<String>,
     /// `failure_reason` when the durable state is failed; `""` otherwise.
     pub error: String,
+    /// Whether a failed state is worth an automatic background re-drive
+    /// (from `HostFailure.retryable`) — the host-heal handler's gate.
+    pub retryable: bool,
     /// Inventory lines: "kind digest-short ref".
     pub inventory: Vec<String>,
     /// Recent event lines (newest first, capped at 5): "step — detail".
@@ -163,6 +166,7 @@ pub fn host_snapshots(cfg: &Config, db: &Db) -> Vec<HostSnapshot> {
             };
             if let Some(HostState::Failed(f)) = row.map(|r| &r.state) {
                 snap.error = crate::host_flow::failure_reason(f);
+                snap.retryable = f.retryable;
             }
             snap.inventory = db
                 .host_inventory(&id)
@@ -206,9 +210,11 @@ pub fn merge_live(hosts: &mut [HostSnapshot], rt: &HostRuntime) {
         if let Some(f) = &v.failed {
             h.state = "failed".into();
             h.error = crate::host_flow::failure_reason(f);
+            h.retryable = f.retryable;
         } else if v.ready {
             h.state = "ready".into();
             h.error.clear();
+            h.retryable = false;
         }
     }
 }

@@ -25,6 +25,9 @@ use thegn_core::store::NotificationStore;
 /// background dispatch closures and read by the event loop.
 pub struct NotifyState {
     cfg: Mutex<NotificationsConfig>,
+    /// Burst suppression for repeat process-failure alerts (a crash-respawning
+    /// remote pane must not storm the inbox) — see `record`.
+    debounce: Mutex<thegn_core::notify_debounce::NotifyDebounce>,
     /// Manual DND override: `None` defers to the schedule.
     dnd_forced: Mutex<Option<bool>>,
     /// Active routing mode (`""` = the default/no-mode rule set).
@@ -48,6 +51,7 @@ impl NotifyState {
         let active_mode = cfg.active_mode.clone();
         std::sync::Arc::new(NotifyState {
             cfg: Mutex::new(cfg),
+            debounce: Mutex::new(thegn_core::notify_debounce::NotifyDebounce::default()),
             dnd_forced: Mutex::new(None),
             active_mode: Mutex::new(active_mode),
             active_profile,
@@ -176,6 +180,24 @@ pub fn record(
     message: &str,
     worktree: &str,
 ) -> (RouteDecision, Option<i64>) {
+    // Burst suppression for repeat failure alerts: a crash-respawning pane on
+    // a flaky remote fires an identical process_failed every few seconds; one
+    // per window is signal, the rest are inbox noise.
+    if kind == "process_failed" {
+        let now = chrono::Local::now().timestamp();
+        if !state.debounce.lock().unwrap().allow(worktree, kind, now) {
+            return (
+                RouteDecision {
+                    record: false,
+                    effective_priority: thegn_core::notification::Priority::Notice,
+                    desktop: false,
+                    toast: false,
+                    sound: None,
+                },
+                None,
+            );
+        }
+    }
     let decision = state.decide(kind, source_ref, message, worktree);
     let id = if decision.record {
         db.put_notification(kind, source_ref, message, worktree)

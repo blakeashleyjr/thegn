@@ -1,12 +1,10 @@
-L0| þ thegn work    17.7/94G ·   7% ·  37% ·  ↓   89K ↑   84K ·  100% · 22:41
+L0| þ thegn  work           18.9/94G ·  36% ·  ↓  1.5M ↑  738K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
-R0 3 5 fg=#edf0f8 bg=#151a28 attrs=
-R0 8 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 14 2 fg=#edf0f8 bg=#151a28 attrs=
-R0 16 10 fg=#c6ccdb bg=#151a28 attrs=
-R0 26 3 fg=#6f788e bg=#151a28 attrs=
-R0 29 5 fg=#f7768e bg=#151a28 attrs=
+R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 9 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 15 9 fg=#edf0f8 bg=#151a28 attrs=
+R0 24 10 fg=#c6ccdb bg=#151a28 attrs=
 R0 34 3 fg=#6f788e bg=#151a28 attrs=
 R0 37 5 fg=#c6ccdb bg=#151a28 attrs=
 R0 42 3 fg=#6f788e bg=#151a28 attrs=

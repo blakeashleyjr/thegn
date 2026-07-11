@@ -179,6 +179,24 @@
       if [ "$_jobs" -gt 2 ]; then export CARGO_BUILD_JOBS=$((_jobs - 2)); else export CARGO_BUILD_JOBS=1; fi
     fi
 
+    # Pin the sccache server to a per-mount-namespace socket. thegn dev happens
+    # inside sandboxes (bwrap; the AI agent's own bwrap) that bind-mount this
+    # worktree writable into a fresh mount namespace. sccache's default server is
+    # a long-lived daemon reached over the shared loopback endpoint, so a sandbox
+    # reuses a server left from a *different* (often now-defunct) namespace whose
+    # view of target/ is stale/read-only — and every compile dies with "Read-only
+    # file system (os error 30)". Keying the server socket to our mount-namespace
+    # inode gives each namespace its own server (lazily spawned where target/ is
+    # writable) and never contacts a foreign one. Mirrors the flake dev shell.
+    if command -v sccache >/dev/null 2>&1 \
+      && [ -z "''${SCCACHE_SERVER_UDS:-}" ] && [ -z "''${SCCACHE_SERVER_PORT:-}" ]; then
+      _mnt_ns=$(readlink /proc/self/ns/mnt 2>/dev/null | tr -dc '0-9')
+      if [ -n "$_mnt_ns" ]; then
+        export SCCACHE_SERVER_UDS="/tmp/sccache-$(id -u)-$_mnt_ns.sock"
+      fi
+      unset _mnt_ns
+    fi
+
     # Install the post-checkout hook into the effective (shared) hooks dir so the
     # prek hooks work in EVERY worktree. prek needs .pre-commit-config.yaml in
     # each worktree root, but devenv only materializes that gitignored store

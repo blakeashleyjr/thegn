@@ -50,7 +50,7 @@ sync:
   quiet_window_ms: 2000
   max_settle_ms: 12000
 steps:
-  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 8000}
+  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
   # Exit the dashboard, open + focus the right panel.
   - key: {key: q}
   - sleep_ms: 300

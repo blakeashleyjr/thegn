@@ -12,6 +12,12 @@ description = "thegn native service layer: git/GitHub/ssh behind traits with CLI
 # The HTTP+WS surface is always built; gRPC is additive for external tooling.
 control-grpc = ["dep:tonic", "dep:prost"]
 
+[package.metadata.cargo-machete]
+# prost is referenced only by tonic-build's GENERATED proto bindings
+# (`include_proto!` expands to `::prost::…` under the control-grpc feature),
+# which machete's source scan can't see.
+ignored = ["prost"]
+
 [build-dependencies]
 # Proto codegen for `control-grpc` (build.rs no-ops without the feature).
 tonic-build.workspace = true

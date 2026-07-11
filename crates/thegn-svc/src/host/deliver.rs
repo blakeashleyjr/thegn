@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use thegn_core::image::{Digest, ImageRef, managed_tag};
 use thegn_core::placement::Placement;
 
-use super::{OciRunner, err_tail, exec_argv, sha256_file_local};
+use thegn_core::transport_error::{ClassifiedErr, classify_exec, describe_exec_failure};
+
+use super::{OciRunner, exec_argv, sha256_file_local};
 
 /// Remote staging directory for in-flight archives.
 const REMOTE_STAGE_DIR: &str = "$HOME/.cache/thegn/oci";
@@ -94,7 +96,7 @@ fn stage_local_archive(
     let mut staged = false;
     for cmd in attempts {
         match exec_argv(&["sh".into(), "-lc".into(), cmd], Duration::from_secs(1800)) {
-            Ok((true, _, _)) if tmp.is_file() => {
+            Ok(o) if o.ok && tmp.is_file() => {
                 staged = true;
                 break;
             }
@@ -125,25 +127,40 @@ pub(super) fn ssh_stream(
     digest: &Digest,
     rsync: bool,
     progress: &mut dyn FnMut(u64, Option<u64>),
-) -> Result<(), String> {
+) -> Result<(), ClassifiedErr> {
     let (tar, archive_sha, total) = stage_local_archive(image, digest)?;
     let hex = &digest.as_str()["sha256:".len()..];
     let remote_partial = format!("{REMOTE_STAGE_DIR}/{hex}.tar.partial");
 
-    // Resume offset: how much of the archive the host already holds.
-    let (ok, out, err) = runner
-        .exec(
-            &format!(
-                "mkdir -p {REMOTE_STAGE_DIR} && \
-                 stat -c %s {remote_partial} 2>/dev/null || echo 0"
-            ),
-            Duration::from_secs(30),
-        )
-        .map_err(|e| format!("offset query: {e}"))?;
-    if !ok {
-        return Err(format!("offset query: {}", err_tail(&err)));
-    }
+    // Resume offset: how much of the archive the host already holds. A flap
+    // here must not burn a whole delivery attempt — retry the cheap query
+    // inline (an unparsable answer already falls back to offset 0 below).
+    let out = thegn_core::retry::with_retry(
+        "offset query",
+        &thegn_core::retry::StepBudget::new(
+            thegn_core::retry::ReconnectPolicy::probe(),
+            Duration::from_secs(120),
+        ),
+        &mut |_| {},
+        &mut || {},
+        &mut || {
+            let o = runner
+                .exec(
+                    &format!(
+                        "mkdir -p {REMOTE_STAGE_DIR} && \
+                         stat -c %s {remote_partial} 2>/dev/null || echo 0"
+                    ),
+                    Duration::from_secs(30),
+                )
+                .map_err(|f| f.cerr("offset query"))?;
+            if !o.ok {
+                return Err(o.cerr("offset query"));
+            }
+            Ok(o)
+        },
+    )?;
     let mut offset: u64 = out
+        .stdout
         .trim()
         .lines()
         .last()
@@ -167,25 +184,26 @@ pub(super) fn ssh_stream(
     }
 
     // Verify the assembled archive before anything trusts it.
-    let (ok, out, err) = runner
+    let out = runner
         .exec(
             &format!("sha256sum {remote_partial} | awk '{{print $1}}'"),
             Duration::from_secs(300),
         )
-        .map_err(|e| format!("verify: {e}"))?;
-    if !ok {
-        return Err(format!("verify: {}", err_tail(&err)));
+        .map_err(|f| f.cerr("verify"))?;
+    if !out.ok {
+        return Err(out.cerr("verify"));
     }
-    let remote_sha = Digest::from_hex(out.trim().lines().last().unwrap_or("").trim())
+    let remote_sha = Digest::from_hex(out.stdout.trim().lines().last().unwrap_or("").trim())
         .map_err(|e| format!("verify: {e}"))?;
     if remote_sha != archive_sha {
-        // Corrupt assembly: discard so the retry restarts clean.
+        // Corrupt assembly: discard so the retry restarts clean — retryable by
+        // construction (the next attempt streams a fresh archive).
         let _ = runner.exec(&format!("rm -f {remote_partial}"), Duration::from_secs(30));
-        return Err(format!(
+        return Err(ClassifiedErr::transient(format!(
             "transferred archive hash mismatch (want {}, got {}) — partial discarded",
             archive_sha.short(),
             remote_sha.short()
-        ));
+        )));
     }
 
     // Load into the host runtime's image storage under the managed digest tag.
@@ -193,11 +211,11 @@ pub(super) fn ssh_stream(
     // binary) — see `OciRunner::load_archive_cmd`.
     let tag = managed_tag(digest);
     let load = runner.load_archive_cmd(&remote_partial, &tag)?;
-    let (ok, _, err) = runner
+    let out = runner
         .exec(&load, Duration::from_secs(900))
-        .map_err(|e| format!("load: {e}"))?;
-    if !ok {
-        return Err(format!("load: {}", err_tail(&err)));
+        .map_err(|f| f.cerr("load"))?;
+    if !out.ok {
+        return Err(out.cerr("load"));
     }
     Ok(())
 }
@@ -212,7 +230,7 @@ fn cat_append(
     offset: u64,
     total: u64,
     progress: &mut dyn FnMut(u64, Option<u64>),
-) -> Result<(), String> {
+) -> Result<(), ClassifiedErr> {
     use std::process::{Command, Stdio};
     let argv = runner.control_shell_argv(&format!("cat >> {remote_partial}"));
     let mut child = Command::new(&argv[0])
@@ -221,8 +239,11 @@ fn cat_append(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("transfer: spawn: {e}"))?;
-    let mut stdin = child.stdin.take().ok_or("transfer: no stdin")?;
+        .map_err(|e| ClassifiedErr::permanent(format!("transfer: spawn: {e}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ClassifiedErr::permanent("transfer: no stdin"))?;
 
     // Stall watchdog: a side thread kills the child when the byte counter
     // hasn't moved for STALL_LIMIT (a blocked write can't time itself out).
@@ -254,32 +275,41 @@ fn cat_append(
         })
     };
 
-    let stream = (|| -> Result<(), String> {
-        let mut f = std::fs::File::open(tar).map_err(|e| format!("transfer: open: {e}"))?;
+    let stream = (|| -> Result<(), ClassifiedErr> {
+        let mut f = std::fs::File::open(tar)
+            .map_err(|e| ClassifiedErr::permanent(format!("transfer: open: {e}")))?;
         f.seek(SeekFrom::Start(offset))
-            .map_err(|e| format!("transfer: seek: {e}"))?;
+            .map_err(|e| ClassifiedErr::permanent(format!("transfer: seek: {e}")))?;
         let mut buf = vec![0u8; CHUNK];
         let mut cursor = offset;
         loop {
             let n = f
                 .read(&mut buf)
-                .map_err(|e| format!("transfer: read: {e}"))?;
+                .map_err(|e| ClassifiedErr::permanent(format!("transfer: read: {e}")))?;
             if n == 0 {
                 break;
             }
+            // A mid-stream write failure IS the flaky-link case (channel died,
+            // stall-watchdog kill): transient — the partial resumes next try.
             stdin.write_all(&buf[..n]).map_err(|e| {
-                format!("transfer stalled or channel died at {cursor}/{total} bytes: {e}")
+                ClassifiedErr::transient(format!(
+                    "transfer stalled or channel died at {cursor}/{total} bytes: {e}"
+                ))
             })?;
             cursor += n as u64;
             sent.store(cursor, Ordering::Relaxed);
             progress(cursor, Some(total));
         }
-        stdin.flush().map_err(|e| format!("transfer: flush: {e}"))?;
+        stdin
+            .flush()
+            .map_err(|e| ClassifiedErr::transient(format!("transfer: flush: {e}")))?;
         Ok(())
     })();
     drop(stdin); // close the pipe so the remote cat finishes
     done.store(1, Ordering::Relaxed);
-    let status = child.wait().map_err(|e| format!("transfer: wait: {e}"))?;
+    let status = child
+        .wait()
+        .map_err(|e| ClassifiedErr::permanent(format!("transfer: wait: {e}")))?;
     let _ = watchdog.join();
     stream?;
     if !status.success() {
@@ -287,23 +317,33 @@ fn cat_append(
         if let Some(mut r) = child.stderr.take() {
             let _ = r.read_to_string(&mut err);
         }
-        return Err(format!(
-            "transfer: remote append failed: {}",
-            err_tail(&err)
-        ));
+        return Err(ClassifiedErr {
+            class: classify_exec(status.code(), false, &err),
+            msg: describe_exec_failure("transfer: remote append", status.code(), false, &err),
+        });
     }
     Ok(())
 }
 
 /// rsync `--partial --inplace` variant: sturdier resume; progress scraped from
 /// `--info=progress2` lines.
+/// rsync exit codes that mean the *transport* (not the data) failed — worth a
+/// retry on a flaky link: 10 socket I/O, 12 protocol stream, 30 timeout, plus
+/// ssh's own 255.
+fn rsync_class(code: Option<i32>, stderr: &str) -> thegn_core::transport_error::ErrorClass {
+    match code {
+        Some(10) | Some(12) | Some(30) => thegn_core::transport_error::ErrorClass::Transient,
+        _ => classify_exec(code, false, stderr),
+    }
+}
+
 fn rsync_append(
     runner: &OciRunner,
     tar: &Path,
     remote_partial: &str,
     total: u64,
     progress: &mut dyn FnMut(u64, Option<u64>),
-) -> Result<(), String> {
+) -> Result<(), ClassifiedErr> {
     use std::io::BufRead;
     use std::process::{Command, Stdio};
     let Placement::Ssh(p) = runner.placement() else {
@@ -329,7 +369,7 @@ fn rsync_append(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("rsync: spawn: {e}"))?;
+        .map_err(|e| ClassifiedErr::permanent(format!("rsync: spawn: {e}")))?;
     if let Some(out) = child.stdout.take() {
         // progress2 lines: "  123,456,789  42%  ..." (\r-separated).
         let reader = std::io::BufReader::new(out);
@@ -349,13 +389,18 @@ fn rsync_append(
             }
         }
     }
-    let status = child.wait().map_err(|e| format!("rsync: wait: {e}"))?;
+    let status = child
+        .wait()
+        .map_err(|e| ClassifiedErr::permanent(format!("rsync: wait: {e}")))?;
     if !status.success() {
         let mut err = String::new();
         if let Some(mut r) = child.stderr.take() {
             let _ = r.read_to_string(&mut err);
         }
-        return Err(format!("rsync: {}", err_tail(&err)));
+        return Err(ClassifiedErr {
+            class: rsync_class(status.code(), &err),
+            msg: describe_exec_failure("rsync", status.code(), false, &err),
+        });
     }
     progress(total, Some(total));
     Ok(())
@@ -370,16 +415,17 @@ pub fn stream_archive_over_ssh(
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<(), String> {
     let total = local.metadata().map_err(|e| e.to_string())?.len();
-    let (ok, out, _) = runner
+    let out = runner
         .exec(
             &format!(
                 "mkdir -p $(dirname {remote_path}) && stat -c %s {remote_path} 2>/dev/null || echo 0"
             ),
             Duration::from_secs(30),
         )
-        .map_err(|e| format!("offset query: {e}"))?;
-    let offset: u64 = if ok {
-        out.trim()
+        .map_err(|f| f.msg("offset query"))?;
+    let offset: u64 = if out.ok {
+        out.stdout
+            .trim()
             .lines()
             .last()
             .unwrap_or("0")
@@ -393,7 +439,7 @@ pub fn stream_archive_over_ssh(
         progress(total, Some(total));
         return Ok(());
     }
-    cat_append(runner, local, remote_path, offset, total, progress)
+    cat_append(runner, local, remote_path, offset, total, progress).map_err(|e| e.msg)
 }
 
 #[cfg(test)]

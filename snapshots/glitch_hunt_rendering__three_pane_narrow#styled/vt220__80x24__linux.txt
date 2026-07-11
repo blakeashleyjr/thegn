@@ -1,13 +1,11 @@
-L0| þ thegn work    88% ·  17.6/94G ·  37% ·  ↓  111K ↑   65K ·  100% · 22:41
+L0| þ thegn  work           99% ·  18.2/94G ·  ↓  2.5M ↑  2.6M ·  100% · 02:22
 R0 0 1 fg=idx07 bg=idx00 attrs=
 R0 1 2 fg=idx06 bg=idx00 attrs=
-R0 3 5 fg=idx07 bg=idx00 attrs=
-R0 8 6 fg=idx06 bg=idx08 attrs=BOLD
-R0 14 7 fg=idx07 bg=idx00 attrs=
-R0 21 3 fg=idx08 bg=idx00 attrs=
-R0 24 10 fg=idx07 bg=idx00 attrs=
-R0 34 3 fg=idx08 bg=idx00 attrs=
-R0 37 5 fg=idx07 bg=idx00 attrs=
+R0 3 6 fg=idx07 bg=idx00 attrs=
+R0 9 6 fg=idx06 bg=idx08 attrs=BOLD
+R0 15 9 fg=idx07 bg=idx00 attrs=
+R0 24 8 fg=idx08 bg=idx00 attrs=
+R0 32 10 fg=idx07 bg=idx00 attrs=
 R0 42 3 fg=idx08 bg=idx00 attrs=
 R0 45 17 fg=idx07 bg=idx00 attrs=
 R0 62 3 fg=idx08 bg=idx00 attrs=
@@ -29,19 +27,19 @@ L3|                                          ▀▀█▀▀ █   █ █▀▀
 R3 0 32 fg=default bg=idx00 attrs=
 R3 32 10 fg=default bg=default attrs=
 R3 42 29 fg=idx06 bg=idx00 attrs=
-L4| ▾ 📁 home                                  █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
+L4|  1 ▾ ⌂ home                                █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
 R4 0 1 fg=idx07 bg=idx00 attrs=
-R4 1 1 fg=idx08 bg=idx00 attrs=
-R4 2 4 fg=idx07 bg=idx00 attrs=
-R4 6 4 fg=idx07 bg=idx00 attrs=BOLD
-R4 10 22 fg=idx07 bg=idx00 attrs=
+R4 1 4 fg=idx08 bg=idx00 attrs=
+R4 5 3 fg=idx07 bg=idx00 attrs=
+R4 8 4 fg=idx07 bg=idx00 attrs=BOLD
+R4 12 20 fg=idx07 bg=idx00 attrs=
 R4 32 10 fg=default bg=default attrs=
 R4 42 29 fg=idx06 bg=idx00 attrs=
-L5|▐   └ ● home                                █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
-R5 0 1 fg=idx08 bg=idx00 attrs=
-R5 1 3 fg=idx07 bg=idx00 attrs=
-R5 4 2 fg=idx08 bg=idx00 attrs=
-R5 6 2 fg=idx07 bg=idx00 attrs=
+L5|▐ 1 └ ○ home                                █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
+R5 0 1 fg=idx06 bg=idx00 attrs=
+R5 1 5 fg=idx08 bg=idx00 attrs=
+R5 6 1 fg=idx09 bg=idx00 attrs=
+R5 7 1 fg=idx07 bg=idx00 attrs=
 R5 8 4 fg=idx06 bg=idx00 attrs=
 R5 12 20 fg=idx07 bg=idx00 attrs=
 R5 32 10 fg=default bg=default attrs=
@@ -55,13 +53,13 @@ R7 10 22 fg=idx07 bg=idx00 attrs=
 R7 32 12 fg=default bg=default attrs=
 R7 44 6 fg=idx07 bg=idx00 attrs=
 R7 50 19 fg=idx08 bg=idx00 attrs=
-L8| ▾ 💻 local
+L8| ▾ ≡ local
 R8 0 1 fg=idx07 bg=idx00 attrs=
 R8 1 1 fg=idx08 bg=idx00 attrs=
-R8 2 4 fg=idx07 bg=idx00 attrs=
-R8 6 5 fg=idx07 bg=idx00 attrs=BOLD
-R8 11 21 fg=idx07 bg=idx00 attrs=
-L9|   └ 💻 local                                      ↻ sandbox
+R8 2 3 fg=idx07 bg=idx00 attrs=
+R8 5 5 fg=idx07 bg=idx00 attrs=BOLD
+R8 10 22 fg=idx07 bg=idx00 attrs=
+L9|   └ ≡ local                                       ↻ sandbox
 R9 0 3 fg=idx07 bg=idx00 attrs=
 R9 3 2 fg=idx08 bg=idx00 attrs=
 R9 5 27 fg=idx07 bg=idx00 attrs=
@@ -89,29 +87,48 @@ L14|
 R14 0 32 fg=default bg=idx00 attrs=
 L15|
 R15 0 32 fg=default bg=idx00 attrs=
-L16|
-R16 0 32 fg=default bg=idx00 attrs=
-L17|
-R17 0 32 fg=default bg=idx00 attrs=
-L18|
-R18 0 32 fg=default bg=idx00 attrs=
-L19|
-R19 0 32 fg=default bg=idx00 attrs=
-L20|
-R20 0 32 fg=default bg=idx00 attrs=
-L21|
-R21 0 32 fg=default bg=idx00 attrs=
-L22|
-R22 0 32 fg=default bg=idx00 attrs=
-L23|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav 0 LOC   7% free
-R23 0 1 fg=idx07 bg=idx00 attrs=
-R23 1 8 fg=idx00 bg=idx06 attrs=BOLD
-R23 9 2 fg=idx07 bg=idx00 attrs=
-R23 11 15 fg=idx08 bg=idx00 attrs=
-R23 26 3 fg=idx07 bg=idx00 attrs=
-R23 29 11 fg=idx08 bg=idx00 attrs=
-R23 40 3 fg=idx07 bg=idx00 attrs=
-R23 43 18 fg=idx08 bg=idx00 attrs=
-R23 61 7 fg=idx07 bg=idx00 attrs=
-R23 68 11 fg=idx00 bg=idx09 attrs=BOLD
-R23 79 1 fg=idx07 bg=idx00 attrs=
+L16|─ NAVIGATE ─────────────────────
+R16 0 1 fg=idx08 bg=idx00 attrs=
+R16 1 10 fg=idx07 bg=idx00 attrs=BOLD
+R16 11 21 fg=idx08 bg=idx00 attrs=
+L17| Alt+1-9  jump worktree
+R17 0 1 fg=default bg=idx00 attrs=
+R17 1 7 fg=idx08 bg=idx00 attrs=
+R17 8 2 fg=default bg=idx00 attrs=
+R17 10 13 fg=idx08 bg=idx00 attrs=
+R17 23 9 fg=default bg=idx00 attrs=
+L18| Ctrl+1-9 jump workspace
+R18 0 1 fg=default bg=idx00 attrs=
+R18 1 8 fg=idx08 bg=idx00 attrs=
+R18 9 1 fg=default bg=idx00 attrs=
+R18 10 14 fg=idx08 bg=idx00 attrs=
+R18 24 8 fg=default bg=idx00 attrs=
+L19| j / k    move up/down
+R19 0 1 fg=default bg=idx00 attrs=
+R19 1 5 fg=idx08 bg=idx00 attrs=
+R19 6 4 fg=default bg=idx00 attrs=
+R19 10 12 fg=idx08 bg=idx00 attrs=
+R19 22 10 fg=default bg=idx00 attrs=
+L20| Enter    open / fold
+R20 0 1 fg=default bg=idx00 attrs=
+R20 1 5 fg=idx08 bg=idx00 attrs=
+R20 6 4 fg=default bg=idx00 attrs=
+R20 10 11 fg=idx08 bg=idx00 attrs=
+R20 21 11 fg=default bg=idx00 attrs=
+L21| /        filter
+R21 0 1 fg=default bg=idx00 attrs=
+R21 1 1 fg=idx08 bg=idx00 attrs=
+R21 2 8 fg=default bg=idx00 attrs=
+R21 10 6 fg=idx08 bg=idx00 attrs=
+R21 16 16 fg=default bg=idx00 attrs=
+L22| ?        all keys
+R22 0 1 fg=default bg=idx00 attrs=
+R22 1 1 fg=idx08 bg=idx00 attrs=
+R22 2 8 fg=default bg=idx00 attrs=
+R22 10 8 fg=idx08 bg=idx00 attrs=
+R22 18 14 fg=default bg=idx00 attrs=
+L23|0 LOC │ worktree creation failed (resolve base): 'HEAD' has no commits yet — ma…
+R23 0 5 fg=idx07 bg=idx00 attrs=
+R23 5 3 fg=idx08 bg=idx00 attrs=
+R23 8 71 fg=idx07 bg=idx00 attrs=
+R23 79 1 fg=idx08 bg=idx00 attrs=

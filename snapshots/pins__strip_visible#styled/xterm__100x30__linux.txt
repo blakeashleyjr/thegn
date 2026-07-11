@@ -1,10 +1,11 @@
-L0| þ thegn v0.1.0 work        16.4/94G ·   7% ·  36% ·  94°C ·  ↓  737K ↑  110K ·  100% · 22:41
+L0| þ thegn v0.1.0  work       19.4/94G ·   7% ·  35% ·  96°C ·  ↓    4K ↑   29K ·  100% · 02:21
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
 R0 9 6 fg=#6f788e bg=#151a28 attrs=
-R0 15 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 21 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 5 fg=#edf0f8 bg=#151a28 attrs=
 R0 27 10 fg=#c6ccdb bg=#151a28 attrs=
 R0 37 3 fg=#6f788e bg=#151a28 attrs=
 R0 40 5 fg=#f7768e bg=#151a28 attrs=
@@ -44,12 +45,12 @@ R3 32 24 fg=default bg=#0b0e16 attrs=
 R3 56 1 fg=#edf0f8 bg=#151a28 attrs=
 R3 57 1 fg=#edf0f8 bg=#151a28 attrs=BOLD
 R3 58 42 fg=#edf0f8 bg=#151a28 attrs=
-L4| ▾ 📁 home                                              ────────────────────────────────────────────
+L4| ▾ ⌂ home                                               ────────────────────────────────────────────
 R4 0 1 fg=#edf0f8 bg=#0b0e16 attrs=
 R4 1 1 fg=#7a8197 bg=#0b0e16 attrs=
-R4 2 4 fg=#edf0f8 bg=#0b0e16 attrs=
-R4 6 4 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
-R4 10 22 fg=#edf0f8 bg=#0b0e16 attrs=
+R4 2 3 fg=#edf0f8 bg=#0b0e16 attrs=
+R4 5 4 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
+R4 9 23 fg=#edf0f8 bg=#0b0e16 attrs=
 R4 32 24 fg=default bg=#0b0e16 attrs=
 R4 56 44 fg=#60687b bg=#151a28 attrs=
 L5|▐   └ ● home                                             1 changes                            clean
@@ -79,20 +80,20 @@ R7 32 24 fg=default bg=#0b0e16 attrs=
 R7 56 2 fg=#edf0f8 bg=#151a28 attrs=
 R7 58 18 fg=#6f788e bg=#151a28 attrs=
 R7 76 24 fg=#edf0f8 bg=#151a28 attrs=
-L8| ▾ 💻 local
+L8| ▾ ≡ local
 R8 0 1 fg=#edf0f8 bg=#0b0e16 attrs=
 R8 1 1 fg=#7a8197 bg=#0b0e16 attrs=
 R8 2 1 fg=#edf0f8 bg=#0b0e16 attrs=
-R8 3 3 fg=#c6ccdb bg=#0b0e16 attrs=
-R8 6 5 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
-R8 11 21 fg=#edf0f8 bg=#0b0e16 attrs=
+R8 3 2 fg=#c6ccdb bg=#0b0e16 attrs=
+R8 5 5 fg=#edf0f8 bg=#0b0e16 attrs=BOLD
+R8 10 22 fg=#edf0f8 bg=#0b0e16 attrs=
 R8 32 24 fg=default bg=#0b0e16 attrs=
 R8 56 44 fg=#edf0f8 bg=#151a28 attrs=
-L9|   └ 💻 local                                            2 commits                                —
+L9|   └ ≡ local                                             2 commits                                —
 R9 0 3 fg=#edf0f8 bg=#151a28 attrs=
 R9 3 2 fg=#677084 bg=#151a28 attrs=
-R9 5 8 fg=#c6ccdb bg=#151a28 attrs=
-R9 13 19 fg=#edf0f8 bg=#151a28 attrs=
+R9 5 7 fg=#c6ccdb bg=#151a28 attrs=
+R9 12 20 fg=#edf0f8 bg=#151a28 attrs=
 R9 32 24 fg=default bg=#0b0e16 attrs=
 R9 56 1 fg=#edf0f8 bg=#151a28 attrs=
 R9 57 1 fg=#677084 bg=#151a28 attrs=BOLD

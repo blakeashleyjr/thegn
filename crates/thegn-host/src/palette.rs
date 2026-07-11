@@ -457,7 +457,7 @@ pub(crate) fn build_palette(
         if items.iter().any(|i| i.key == key) {
             continue;
         }
-        items.push(PaletteItem::new(key, format!("📁 File into: {folder}")));
+        items.push(PaletteItem::new(key, format!("Move to folder: {folder}")));
     }
 
     // Configured pins (scope-filtered to the current workspace): summon by name.

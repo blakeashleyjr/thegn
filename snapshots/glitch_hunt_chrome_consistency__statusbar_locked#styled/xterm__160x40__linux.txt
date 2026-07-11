@@ -1,11 +1,12 @@
-L0| þ thegn v0.1.0 work                                               85% ·  17.7/94G ·   7% ·  36% ·  96°C ·  ↓   77K ↑   70K ·  100% · Fri Jul 10 · 22:41
+L0| þ thegn v0.1.0  work                                              35% ·  18.5/94G ·   7% ·  31% ·  97°C ·  ↓   45K ↑   38K ·  100% · Sat Jul 11 · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
 R0 9 6 fg=#6f788e bg=#151a28 attrs=
-R0 15 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 21 45 fg=#edf0f8 bg=#151a28 attrs=
-R0 66 5 fg=#f0c674 bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 44 fg=#edf0f8 bg=#151a28 attrs=
+R0 66 5 fg=#c6ccdb bg=#151a28 attrs=
 R0 71 3 fg=#6f788e bg=#151a28 attrs=
 R0 74 10 fg=#c6ccdb bg=#151a28 attrs=
 R0 84 3 fg=#6f788e bg=#151a28 attrs=
