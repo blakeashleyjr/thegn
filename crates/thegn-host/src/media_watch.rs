@@ -39,27 +39,96 @@ pub(crate) fn spawn(
     Some(tokio::spawn(run(cfg, tx, waker)))
 }
 
-/// Send a fresh snapshot, logging read errors instead of swallowing them.
-/// Returns `Some(active)` (whether a track is currently displayed) on success,
-/// or `None` when the receiver is gone and the task should stop.
-async fn push_snapshot(
-    client: &thegn_media::MediaClient,
-    tx: &tokio_mpsc::UnboundedSender<Option<MediaState>>,
-    waker: &TerminalWaker,
-) -> Option<bool> {
-    let snap = match client.snapshot().await {
+/// Grace applied on the badge active→inactive edge before we believe a player
+/// really went away. A single transient empty/`Stopped` read — a D-Bus race, a
+/// one-cycle miss from the multi-source aggregate, a brief inter-track `Stopped`
+/// blip — would otherwise hide the badge for a whole safety-poll interval
+/// (`[media] poll_interval_secs`, ~3s), making it *flash in and out*. On that
+/// edge we re-read once after this delay and only clear the badge if it is
+/// *still* gone; a recovered read is emitted instead of the transient empty.
+/// Kept short so a genuine stop still clears the badge promptly.
+const CONFIRM_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// What to do with a freshly read snapshot given whether a badge was already up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlapAction {
+    /// Emit the snapshot as-is.
+    Emit,
+    /// The badge was showing and this read is empty — confirm before believing
+    /// the disappearance (anti-flap hysteresis).
+    Confirm,
+}
+
+/// Decide whether a newly read snapshot can be emitted directly or whether a
+/// *disappearance* needs confirming first. Pure so the flap-suppression contract
+/// (confirm **only** on the showing→empty edge, never otherwise) is unit-tested.
+fn flap_action(was_showing: bool, new_active: bool) -> FlapAction {
+    if was_showing && !new_active {
+        FlapAction::Confirm
+    } else {
+        FlapAction::Emit
+    }
+}
+
+/// Read one snapshot, logging read errors instead of swallowing them.
+async fn read_snapshot(client: &thegn_media::MediaClient) -> Option<MediaState> {
+    match client.snapshot().await {
         Ok(snap) => snap,
         Err(e) => {
             tracing::debug!(target: "thegn::media", error = %e, "media snapshot failed");
             None
         }
-    };
-    let active = snap.as_ref().and_then(|s| s.badge()).is_some();
+    }
+}
+
+/// Whether a snapshot would render a badge (i.e. an active player).
+fn shows_badge(snap: &Option<MediaState>) -> bool {
+    snap.as_ref().and_then(|s| s.badge()).is_some()
+}
+
+/// Read a snapshot and push it to the loop, suppressing a *transient*
+/// disappearance. `was_showing` is whether a badge is currently displayed: when
+/// it is and the fresh read has no badge, we re-read once after [`CONFIRM_DELAY`]
+/// and only propagate the empty state if it persists — so a one-off empty read no
+/// longer flashes the badge off until the next safety poll. Returns `Some(active)`
+/// (whether a track is now displayed) on success, or `None` when the receiver is
+/// gone and the task should stop.
+async fn push_snapshot(
+    client: &thegn_media::MediaClient,
+    tx: &tokio_mpsc::UnboundedSender<Option<MediaState>>,
+    waker: &TerminalWaker,
+    was_showing: bool,
+) -> Option<bool> {
+    let mut snap = read_snapshot(client).await;
+    if flap_action(was_showing, shows_badge(&snap)) == FlapAction::Confirm {
+        tokio::time::sleep(CONFIRM_DELAY).await;
+        let confirm = read_snapshot(client).await;
+        if shows_badge(&confirm) {
+            tracing::debug!(target: "thegn::media", "media badge held (transient empty ignored)");
+        } else {
+            tracing::debug!(target: "thegn::media", "media badge cleared (empty confirmed)");
+        }
+        snap = confirm;
+    }
+    let active = shows_badge(&snap);
     if tx.send(snap).is_err() {
         return None;
     }
     let _ = waker.wake();
     Some(active)
+}
+
+/// Log the badge-clearing transition (a track was showing, this push hides it).
+/// `Ok(None)` pushes are otherwise silent — e.g. the aggregate when every child
+/// failed, or MPD answering "daemon away" — so without this a vanishing badge
+/// leaves no trace in `THEGN_LOG=thegn::media=debug` logs.
+fn note_cleared(prev_active: bool, now_active: bool) {
+    if prev_active && !now_active {
+        tracing::debug!(
+            target: "thegn::media",
+            "now-playing cleared (snapshot returned none/stopped)"
+        );
+    }
 }
 
 async fn run(
@@ -82,8 +151,8 @@ async fn run(
         };
         backoff = std::time::Duration::from_secs(1);
 
-        // Initial snapshot.
-        let mut active = match push_snapshot(&client, &tx, &waker).await {
+        // Initial snapshot. Nothing is shown yet, so no disappear to confirm.
+        let mut active = match push_snapshot(&client, &tx, &waker, false).await {
             Some(a) => a,
             None => return, // receiver gone
         };
@@ -107,8 +176,11 @@ async fn run(
                 if !changed {
                     break true; // signal stream ended → reconnect
                 }
-                match push_snapshot(&client, &tx, &waker).await {
-                    Some(a) => active = a,
+                match push_snapshot(&client, &tx, &waker, active).await {
+                    Some(a) => {
+                        note_cleared(active, a);
+                        active = a;
+                    }
                     None => return, // receiver gone
                 }
             };
@@ -124,10 +196,95 @@ async fn run(
             ticker.tick().await; // consume the immediate first tick
             loop {
                 ticker.tick().await;
-                if push_snapshot(&client, &tx, &waker).await.is_none() {
-                    return; // receiver gone
+                match push_snapshot(&client, &tx, &waker, active).await {
+                    Some(a) => {
+                        note_cleared(active, a);
+                        active = a;
+                    }
+                    None => return, // receiver gone
                 }
             }
         }
+    }
+}
+
+/// Drain pending now-playing snapshots into the model — the event loop's
+/// `media_rx` handler, extracted from the ratchet-pinned `run.rs`.
+///
+/// Repaint discipline: a `Playing` snapshot ticks its position several times a
+/// second, and a full chrome recompose per tick is a self-sustaining flicker
+/// storm (and an idle-CPU violation). So repaint only what the snapshot moves
+/// on screen: while the Media panel section or Now-Playing overlay is open
+/// (`coalesce_full` — they show the live position stamp) coalesce full frames
+/// to ~1/s, repainting immediately only when the statusbar badge text changed;
+/// with both closed, a badge change takes the cheap bars path and a
+/// position-only change repaints nothing.
+///
+/// Returns `(full, bars)` repaint intent for the loop's `dirty` / `bars_dirty`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drain_snapshots(
+    rx: &mut tokio_mpsc::UnboundedReceiver<Option<MediaState>>,
+    perf: &mut crate::perf::LoopPerf,
+    enabled: bool,
+    show_art: bool,
+    media: &mut Option<MediaState>,
+    overlay: &mut Option<crate::media_overlay::MediaOverlay>,
+    art_tx: &tokio_mpsc::UnboundedSender<crate::media_art::ArtMosaic>,
+    waker: &TerminalWaker,
+    coalesce_full: bool,
+    last_full: &mut Option<std::time::Instant>,
+) -> (bool, bool) {
+    let (mut full, mut bars) = (false, false);
+    while let Ok(snap) = rx.try_recv() {
+        perf.tick(crate::perf::WakeSource::Refresh);
+        let shown = if enabled { snap } else { None };
+        if *media == shown {
+            continue;
+        }
+        let badge_changed =
+            media.as_ref().and_then(|m| m.badge()) != shown.as_ref().and_then(|m| m.badge());
+        *media = shown;
+        if let Some(ov) = overlay.as_mut() {
+            ov.snapshot = media.clone();
+            if let Some(url) = ov.wants_art(show_art) {
+                crate::media_art::spawn_fetch(
+                    url,
+                    crate::media_overlay::ART_COLS,
+                    crate::media_overlay::ART_ROWS,
+                    art_tx.clone(),
+                    waker.clone(),
+                );
+            }
+        }
+        if coalesce_full {
+            if badge_changed
+                || last_full
+                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(900))
+                    .unwrap_or(true)
+            {
+                full = true;
+                *last_full = Some(std::time::Instant::now());
+            }
+        } else if badge_changed {
+            bars = true;
+        }
+    }
+    (full, bars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FlapAction, flap_action};
+
+    #[test]
+    fn confirms_only_on_the_disappear_edge() {
+        // Badge is up and the read went empty → confirm before hiding it.
+        assert_eq!(flap_action(true, false), FlapAction::Confirm);
+        // Still playing → emit straight through (no cost while active).
+        assert_eq!(flap_action(true, true), FlapAction::Emit);
+        // A player appearing → emit; nothing to confirm.
+        assert_eq!(flap_action(false, true), FlapAction::Emit);
+        // Already hidden and still empty → emit (no repeated re-confirm loop).
+        assert_eq!(flap_action(false, false), FlapAction::Emit);
     }
 }

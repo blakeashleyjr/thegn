@@ -12,18 +12,33 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::chrome::FrameModel;
 use crate::hydrate::RefreshKind;
 
+/// The focused worktree's path, if any — the sidebar row currently marked
+/// active. The needs-you set excludes it: you can't need to *go attend to* the
+/// worktree you are already in (and Enter="focus" on it would be a no-op).
+pub(crate) fn active_worktree_path(model: &FrameModel) -> Option<&str> {
+    model
+        .sidebar_rows
+        .iter()
+        .find(|r| r.active && r.kind == crate::sidebar::RowKind::Worktree)
+        .and_then(|r| r.worktree_path.as_deref())
+}
+
 /// The worktrees currently needing the user (tiers T0–T2), most urgent first
 /// — the hysteresis-stable hydration order, so the jump ring matches what the
 /// Attention sort displays.
 pub(crate) fn needs_user_ordered(model: &FrameModel) -> Vec<(String, AttentionScore)> {
     let status = &model.sidebar_status;
+    let active = active_worktree_path(model);
     let mut v: Vec<(String, AttentionScore)> = status
         .attention
         .iter()
-        // Acknowledged (quieted) worktrees drop out of the needs-you set: the
-        // "Needs you" popup, the `✋` badge, and the `Alt a` jump ring all read
-        // this, so acking silences every nag surface at once.
-        .filter(|(p, s)| s.needs_user() && !status.acked.contains(p.as_str()))
+        // Acknowledged (quieted) worktrees drop out of the needs-you set, as
+        // does the focused worktree itself: the "Needs you" popup, the `✋`
+        // badge, and the `Alt a` jump ring all read this, so acking silences
+        // every nag surface at once and the tab you're on never self-nags.
+        .filter(|(p, s)| {
+            s.needs_user() && !status.acked.contains(p.as_str()) && Some(p.as_str()) != active
+        })
         .map(|(p, s)| (p.clone(), *s))
         .collect();
     v.sort_by_key(|(p, s)| {

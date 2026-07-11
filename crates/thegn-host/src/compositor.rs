@@ -23,6 +23,16 @@ impl Rect {
     pub fn contains(&self, x: usize, y: usize) -> bool {
         x >= self.x && x < self.x + self.cols && y >= self.y && y < self.y + self.rows
     }
+
+    /// The whole screen as a rect (origin 0,0).
+    pub fn full(cols: usize, rows: usize) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            cols,
+            rows,
+        }
+    }
 }
 
 fn color_attr(c: CellColor) -> ColorAttribute {

@@ -22,7 +22,7 @@ use termwiz::terminal::{Terminal, TerminalWaker, new_terminal};
 use tokio::task;
 
 use crate::actions::{CiActionCtx, open_command_pane, open_command_tab, open_url_detached};
-use crate::chrome::{FrameModel, LoadStep, render_tab};
+use crate::chrome::{BarBadge, BarItemId, FrameModel, LoadStep, render_tab};
 use crate::compositor::Rect;
 use crate::detail::apply_ci_detail;
 // Re-exported so pre-split call sites (`crate::run::…` in sibling modules and
@@ -6268,7 +6268,6 @@ async fn ensure_app_loaded(
 // the event-loop call sites read unchanged.
 use crate::media_ctl::{
     MediaOp, MediaPick, media_effective_cfg, restart_media_watch, spawn_media_op, spawn_media_pick,
-    spawn_media_queue,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -7148,6 +7147,21 @@ async fn event_loop<T: Terminal>(
                 },
             );
         }};
+    }
+
+    // Open the full Now-Playing overlay (transport/queue/art) — shared by the
+    // Alt+m action and media-badge activation (statusbar click / Enter).
+    macro_rules! open_media_overlay {
+        () => {
+            media_overlay = Some(crate::media_ctl::open_media_overlay(
+                model.panel.media.clone(),
+                &current_config.media,
+                &media_player_override,
+                &media_queue_tx,
+                &media_art_tx,
+                &waker,
+            ))
+        };
     }
 
     // Activate a resolved sidebar row target (live tab or dormant-workspace
@@ -9022,6 +9036,12 @@ async fn event_loop<T: Terminal>(
             if let Some(row) = next_model.intents.drain(..).next_back() {
                 pending_focus = Some(row);
             }
+            // Now-playing is loop-owned (the media watcher pushes it); hydration
+            // never carries it. Seed it across the swap BEFORE the equality
+            // checks below, or every hydration wipes the badge (it flashes back
+            // on the next media push) and the `Some` vs `None` panel diff defeats
+            // both the idle guard and the hunk-preview cache on every tick.
+            next_model.panel.media = model.panel.media.take();
             // Idle guard: the 2s safety tick re-hydrates identical git/db data.
             // Compute up front (before `model` is mutated) whether this result
             // carries any render-affecting change; if not, we still apply it
@@ -9718,66 +9738,25 @@ async fn event_loop<T: Terminal>(
 
         // Media now-playing snapshots (watcher + control ops). Apply only while
         // the feature is enabled, so toggling `[media] enabled = false` clears the
-        // badge/section without a restart. Mark dirty only on an actual change.
-        //
-        // `MediaState`'s `position` ticks continuously while a track plays, so the
-        // MPRIS push watcher fires a fresh snapshot on every `Position`/metadata
-        // signal — many players emit these several times a second. Repainting the
-        // whole chrome on each one is a self-sustaining ~10/s full-frame storm
-        // (it reads as flicker, and violates the idle-CPU contract) whenever a
-        // media player is running. So repaint only what the snapshot actually
-        // moves on screen, mirroring the stats bars-path guard above: the open
-        // Media panel section shows the position stamp (a real chrome change →
-        // full frame); the always-on statusbar badge tracks only state/title/
-        // artist via `badge()` (the cheap bars path); a position-only change with
-        // the section closed moves nothing visible and repaints nothing.
-        let media_section_open =
-            chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Media;
-        // The Now-Playing overlay, like the section, shows the live position — so
-        // it opts into the same coalesced repaint (and refreshes art on a track
-        // change).
-        let media_overlay_open = media_overlay.is_some();
-        while let Ok(snap) = media_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Refresh);
-            let shown = if current_config.media.enabled {
-                snap
-            } else {
-                None
-            };
-            if model.panel.media != shown {
-                let badge_changed = model.panel.media.as_ref().and_then(|m| m.badge())
-                    != shown.as_ref().and_then(|m| m.badge());
-                model.panel.media = shown;
-                if let Some(ov) = &mut media_overlay {
-                    ov.snapshot = model.panel.media.clone();
-                    if let Some(url) = ov.wants_art(current_config.media.show_art) {
-                        crate::media_art::spawn_fetch(
-                            url,
-                            crate::media_overlay::ART_COLS,
-                            crate::media_overlay::ART_ROWS,
-                            media_art_tx.clone(),
-                            waker.clone(),
-                        );
-                    }
-                }
-                if media_section_open || media_overlay_open {
-                    // Coalesce: a playing track ticks ~4/s, and a full chrome
-                    // recompose per tick is a flicker storm. Repaint at most ~1/s
-                    // (the data above is already current); a non-position change
-                    // (track/play-state, surfaced via the badge) repaints at once.
-                    if badge_changed
-                        || last_media_full
-                            .map(|t| t.elapsed() >= std::time::Duration::from_millis(900))
-                            .unwrap_or(true)
-                    {
-                        dirty = true;
-                        last_media_full = Some(std::time::Instant::now());
-                    }
-                } else if badge_changed {
-                    bars_dirty = true;
-                }
-            }
-        }
+        // badge/section without a restart. Repaint discipline (why position-only
+        // ticks don't storm the chrome) is documented on `drain_snapshots`.
+        let media_position_visible = (chrome.panel.is_some()
+            && panel_ui.open == crate::panel::Section::Media)
+            || media_overlay.is_some();
+        let (media_full, media_bars) = crate::media_watch::drain_snapshots(
+            &mut media_rx,
+            &mut loop_perf,
+            current_config.media.enabled,
+            current_config.media.show_art,
+            &mut model.panel.media,
+            &mut media_overlay,
+            &media_art_tx,
+            &waker,
+            media_position_visible,
+            &mut last_media_full,
+        );
+        dirty |= media_full;
+        bars_dirty |= media_bars;
         // Media picker results: open a secondary palette of playlists / players.
         while let Ok(pick) = media_pick_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
@@ -11578,17 +11557,15 @@ async fn event_loop<T: Terminal>(
                         if let Some((idx, (id, rect))) = hit {
                             focus.zone = crate::focus::Zone::Statusbar;
                             model.statusbar_sel = idx;
-                            if id.has_detail() {
-                                let screen = Rect {
-                                    x: 0,
-                                    y: 0,
-                                    cols,
-                                    rows,
-                                };
+                            if id == BarItemId::Badge(BarBadge::Media)
+                                && current_config.media.enabled
+                            {
+                                open_media_overlay!();
+                            } else if id.has_detail() {
                                 bar_detail = crate::detail::open_detail_for(
                                     &id,
                                     rect,
-                                    screen,
+                                    Rect::full(cols, rows),
                                     &model,
                                     &panel_ui.docs.telemetry,
                                 );
@@ -14047,22 +14024,20 @@ async fn event_loop<T: Terminal>(
                                 .into_iter()
                                 .nth(model.statusbar_sel)
                         };
-                        if let Some((id, rect)) = hit
-                            && id.has_detail()
-                        {
-                            let screen = Rect {
-                                x: 0,
-                                y: 0,
-                                cols,
-                                rows,
-                            };
-                            bar_detail = crate::detail::open_detail_for(
-                                &id,
-                                rect,
-                                screen,
-                                &model,
-                                &panel_ui.docs.telemetry,
-                            );
+                        if let Some((id, rect)) = hit {
+                            if id == BarItemId::Badge(BarBadge::Media)
+                                && current_config.media.enabled
+                            {
+                                open_media_overlay!();
+                            } else if id.has_detail() {
+                                bar_detail = crate::detail::open_detail_for(
+                                    &id,
+                                    rect,
+                                    Rect::full(cols, rows),
+                                    &model,
+                                    &panel_ui.docs.telemetry,
+                                );
+                            }
                         }
                     }
                     dirty = true;
@@ -18094,26 +18069,7 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::MediaOpenPanel => {
                                 if current_config.media.enabled {
-                                    // Open the Now-Playing overlay, then eagerly
-                                    // fetch its up-next queue and cover art.
-                                    let ov = crate::media_overlay::MediaOverlay::open(
-                                        model.panel.media.clone(),
-                                    );
-                                    let cfg = media_effective_cfg(
-                                        &current_config.media,
-                                        &media_player_override,
-                                    );
-                                    spawn_media_queue(cfg, media_queue_tx.clone(), waker.clone());
-                                    if let Some(url) = ov.wants_art(current_config.media.show_art) {
-                                        crate::media_art::spawn_fetch(
-                                            url,
-                                            crate::media_overlay::ART_COLS,
-                                            crate::media_overlay::ART_ROWS,
-                                            media_art_tx.clone(),
-                                            waker.clone(),
-                                        );
-                                    }
-                                    media_overlay = Some(ov);
+                                    open_media_overlay!();
                                 } else {
                                     model.status = "Media is off ([media] enabled = false)".into();
                                 }
