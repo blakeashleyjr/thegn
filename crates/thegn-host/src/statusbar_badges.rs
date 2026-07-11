@@ -14,14 +14,14 @@ use thegn_core::theme::Hue;
 pub(crate) fn push_attention_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
     use thegn_core::attention::AttentionTier;
     let status = &model.sidebar_status;
+    let active = crate::handlers::attention::active_worktree_path(model);
     let (mut n, mut urgent) = (0usize, false);
-    // Acknowledged (quieted) worktrees don't count — the badge tracks the same
-    // needs-you set the "Needs you" popup shows (see `needs_user_ordered`).
-    for (_, s) in status
-        .attention
-        .iter()
-        .filter(|(p, s)| s.needs_user() && !status.acked.contains(p.as_str()))
-    {
+    // Acknowledged (quieted) worktrees and the focused worktree don't count —
+    // the badge tracks the same needs-you set the "Needs you" popup shows (see
+    // `needs_user_ordered`).
+    for (_, s) in status.attention.iter().filter(|(p, s)| {
+        s.needs_user() && !status.acked.contains(p.as_str()) && Some(p.as_str()) != active
+    }) {
         n += 1;
         urgent |= s.tier <= AttentionTier::Failure;
     }
