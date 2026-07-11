@@ -1,0 +1,97 @@
+# Contributing to thegn
+
+Welcome! This gets you from clone to a running dev build in a few minutes.
+For the product tour see [`README.md`](README.md); for architecture and
+invariants see [`CLAUDE.md`](CLAUDE.md).
+
+## Prerequisites
+
+**The recommended path on every platform is [Nix](https://nixos.org/download/)
+with flakes** — `nix develop` provides the exact toolchain, linters, and
+runtime tools the project is built and CI-tested with. On macOS the
+[Determinate installer](https://install.determinate.systems/) is the least
+fuss (flakes on by default).
+
+|           | Nix path (recommended)                         | Bare path                                                                                |
+| --------- | ---------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| **macOS** | Xcode CLT (`xcode-select --install`), then Nix | Xcode CLT + [rustup](https://rustup.rs) (stable ≥ 1.89) + `brew install pkg-config just` |
+| **Linux** | Nix                                            | rustup (stable ≥ 1.89) + `just` + a C toolchain                                          |
+
+On macOS you can skip the table entirely and run `./setup-macos.sh` — it
+checks each prerequisite and offers to install what's missing (nothing is
+installed without asking).
+
+> Intel Macs: the pinned nixpkgs (unstable) has dropped `x86_64-darwin`, so
+> the Nix path is Apple-silicon only — use the bare rustup path instead.
+
+Optional tools thegn shells out to when present: `gh` (PR/CI panels), `ssh`,
+`lazygit`, `fzf`, `gum`, `delta`, `yazi` (file drawer). The Nix shell has all
+of them; on a bare Mac: `brew install gh lazygit fzf gum git-delta yazi`.
+
+## Quick start
+
+```sh
+git clone https://github.com/blakeashleyjr/thegn && cd thegn
+nix develop        # or: direnv allow   (auto-enters the shell per-cd)
+just build         # debug build of the workspace
+just start name=dev  # run the compositor with isolated state (safe to poke)
+```
+
+No Nix? `cargo build --workspace` and `cargo run -p thegn-host` work too —
+you just supply the tools above yourself. To install a real binary for daily
+use, `./install.sh` (see the README's Install section).
+
+If something is off, `just doctor` diagnoses the dev environment.
+
+## Dev loop
+
+The heavy gates are full-workspace compiles — don't run them per-edit:
+
+- **While iterating:** `just quick [crate]` — clippy on lib/bin code only,
+  seconds not minutes.
+- **Before pushing:** `just test` and `just smoke` (pre-push hooks run these).
+- **Once, before opening a PR:** `just ci` — fmt-check + lint + build + test +
+  coverage + smoke + nix-build. This is the merge gate; save it for the end.
+
+`just` with no arguments lists every recipe. Commits follow conventional
+style (`feat(scope):`, `fix(scope):`); branch off `main`.
+
+Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
+`openspec/specs/` and in-flight changes in `openspec/changes/` (the
+`openspec` CLI is in the dev shell; agent slash-commands regenerate with
+`just openspec-setup`). Every config key is documented in
+[`config/config.toml.example`](config/config.toml.example).
+
+## macOS notes
+
+- **Any terminal works.** `thegn` / `tg-tui` run in whatever terminal you
+  use (Ghostty, iTerm2, Terminal.app, …). Alacritty is only needed for the
+  `tg` dedicated-window launcher, and is optional.
+- **Sandboxing degrades gracefully.** The worktree-sandbox probe order is
+  `podman → docker → bwrap → host`; `bwrap`/`systemd-run` are Linux-only, so
+  with no container runtime installed everything still works — panes just run
+  directly on the host. `[sandbox] backend = "apple"` selects the macOS
+  `container` backend explicitly.
+- **Cross-checks run on every PR.** CI type-checks `aarch64-apple-darwin` on
+  Linux (`just check-cross`), so compile breakage is caught automatically.
+  The full macOS build+test job (`macos-14`) is opt-in because GitHub bills
+  those minutes at 10x: add `[ci-macos]` to a commit message (or dispatch the
+  workflow manually) for any platform-sensitive change.
+- **State paths** follow XDG conventions (`~/.config/thegn`,
+  `~/.local/state/thegn`) on macOS too; set `XDG_CONFIG_HOME`/
+  `XDG_STATE_HOME` if you prefer `~/Library`.
+- A few justfile recipes are Linux-centric (`start-term` assumes Ghostty on
+  PATH; font tooling uses `fc-list`) — none are needed for the core loop.
+
+## Where things live
+
+- `crates/thegn-core` — substrate-agnostic domain logic (config, DB, keymap,
+  theme, sandbox). New core logic needs unit tests (95% line-coverage gate).
+- `crates/thegn-svc` — service seams (git, GitHub, SSH) with subprocess
+  fallbacks.
+- `crates/thegn-host` — the compositor: event loop (`src/run.rs`), chrome,
+  panes, handlers.
+
+Read [`CLAUDE.md`](CLAUDE.md) before touching the event loop or render path —
+the 0%-idle and render-plan invariants are enforced by tests, and source
+files are size-capped by a ratchet (`test/file-size-ratchet.sh`).
