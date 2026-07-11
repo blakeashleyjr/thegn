@@ -386,6 +386,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         palette: true,
     },
     ActionSpec {
+        id: "open-proxy-dash",
+        label: "LLM proxy dashboard",
+        hint: "proxy",
+        default_chords: &["Ctrl Alt l"],
+        palette: true,
+    },
+    ActionSpec {
         id: "open-merge-queue",
         label: "Merge queue",
         hint: "merge queue",

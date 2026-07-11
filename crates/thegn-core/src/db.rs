@@ -69,7 +69,7 @@ use std::path::PathBuf;
 /// [`crate::store::HibernationStore`] — DDL in `db_migrate`).
 /// v40: adds `daemons`/`session_leases`/`pairings` (the control-plane registry;
 /// see [`crate::store::ControlStore`] — DDL in `db_control`).
-pub const SCHEMA_VERSION: i64 = 42;
+pub const SCHEMA_VERSION: i64 = 43;
 
 pub struct Db {
     conn: Connection,
@@ -140,6 +140,24 @@ pub struct ProxyRequestRow {
     pub cost_source: String,
     pub outcome: String,
     pub error_code: Option<String>,
+    /// Wall-clock request duration (dispatch → last byte). 0 = not measured.
+    pub duration_ms: i64,
+    /// Streaming time-to-first-byte (dispatch → commit); `None` for
+    /// non-streaming requests. `duration_ms - ttfb_ms` is the generation time
+    /// behind the tokens-per-second stats (v43).
+    pub ttfb_ms: Option<i64>,
+}
+
+/// A registered virtual key (metadata only — the token itself is never stored,
+/// only its hash, and the hash is not returned by list queries).
+#[derive(Debug, Clone)]
+pub struct ProxyVirtualKeyRow {
+    pub key_id: String,
+    pub label: String,
+    pub scope: String,
+    pub upstream: Option<String>,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
 }
 
 /// A per-scope spend/budget row.
@@ -563,7 +581,9 @@ impl Db {
               cost_usd      REAL    NOT NULL DEFAULT 0,
               cost_source   TEXT    NOT NULL DEFAULT 'unknown',
               outcome       TEXT    NOT NULL DEFAULT '',
-              error_code    TEXT
+              error_code    TEXT,
+              duration_ms   INTEGER NOT NULL DEFAULT 0,
+              ttfb_ms       INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_proxy_requests_ts
               ON proxy_requests (ts_ms DESC);

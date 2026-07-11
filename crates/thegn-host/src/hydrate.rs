@@ -152,7 +152,7 @@ pub(crate) fn merge_glyph_scan(
 /// safety-net intervals.
 // Not `Copy`: the `CiDetail` variant boxes a `CiDetailPayload`. Every send is a
 // literal and the loop drains by value, so `Copy` was never relied upon.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum RefreshKind {
     Model,
     Pr,
@@ -171,6 +171,9 @@ pub(crate) enum RefreshKind {
     /// off-loop, delivered into the live modal overlay by
     /// [`crate::detail::apply_ci_detail`].
     CiDetail(Box<crate::detail::CiDetailPayload>),
+    /// The proxy dashboard's off-loop DB gather (stats/budgets/health),
+    /// delivered into the live overlay by `crate::detail::apply_proxy_dash`.
+    ProxyDash(Box<crate::detail::ProxyDashPayload>),
     /// The repo's branch ref (e.g. `refs/heads/main`) moved out from under a
     /// checkout — an external `git update-ref` or a fold-actor CAS land in
     /// another process. Drives an off-loop, guarded fast-forward of the canonical
@@ -2182,19 +2185,6 @@ pub(crate) fn spawn_issue_cache_refresh(
     });
 }
 
-/// Map an issue's triage priority to a `WorkRow` urgency weight (higher = more
-/// urgent), so the unified feed sorts the same way the Issues section does.
-fn issue_urgency(p: thegn_core::issue::IssuePriority) -> u8 {
-    use thegn_core::issue::IssuePriority as P;
-    match p {
-        P::Urgent => 4,
-        P::High => 3,
-        P::Medium => 2,
-        P::Low => 1,
-        P::None => 0,
-    }
-}
-
 fn pr_search_row(
     p: thegn_core::github::PrSearchRow,
     group: thegn_core::work::WorkGroup,
@@ -2301,7 +2291,7 @@ pub(crate) fn spawn_my_work_refresh(
                         title: i.title,
                         repo,
                         url: i.url,
-                        urgency: issue_urgency(i.priority),
+                        urgency: crate::hydrate_feed::issue_urgency(i.priority),
                         issue_id: Some(i.id),
                         branch_hint: i.branch_hint,
                         worktree_path: None,

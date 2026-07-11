@@ -29,6 +29,12 @@ struct ConfigDoc {
     /// Optional token-reduction settings (group W).
     #[serde(default)]
     compression: Option<CompressionDoc>,
+    /// Model/tier aliases (U 281): client model id → route name.
+    #[serde(default)]
+    aliases: std::collections::HashMap<String, String>,
+    /// Enable the last-resort cross-route fallback tier.
+    #[serde(default)]
+    last_resort: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -115,6 +121,17 @@ pub fn from_env() -> Result<ProxyConfig> {
     let listen = resolve_listen()?;
     let doc = load_doc()?;
     let compression = resolve_compression(doc.as_ref().and_then(|d| d.compression.as_ref()), true);
+    let aliases = doc.as_ref().map(|d| d.aliases.clone()).unwrap_or_default();
+    // Env override: TGPROXY_LAST_RESORT=1 enables the cross-route tier even
+    // when the routes doc doesn't ask for it (mirrors MODEL_PROXY_LAST_RESORT).
+    let last_resort = doc.as_ref().is_some_and(|d| d.last_resort)
+        || matches!(
+            std::env::var("TGPROXY_LAST_RESORT")
+                .or_else(|_| std::env::var("MODEL_PROXY_LAST_RESORT"))
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        );
     let routes = doc
         .map(|d| build_routes(d, global_routing_from_env()))
         .transpose()?
@@ -124,6 +141,8 @@ pub fn from_env() -> Result<ProxyConfig> {
         routes,
         relay: relay_from_env(),
         compression,
+        aliases,
+        last_resort,
     })
 }
 
@@ -255,6 +274,8 @@ fn load_doc() -> Result<Option<ConfigDoc>> {
 pub fn parse_config(raw: &str) -> Result<ProxyConfig> {
     let doc = parse_doc(raw)?;
     let compression = resolve_compression(doc.compression.as_ref(), false);
+    let aliases = doc.aliases.clone();
+    let last_resort = doc.last_resort;
     // parse_config is env-free (tests/validation): per-route `strategy` still
     // applies; the global default is sequential.
     Ok(ProxyConfig {
@@ -262,6 +283,8 @@ pub fn parse_config(raw: &str) -> Result<ProxyConfig> {
         routes: build_routes(doc, RoutingStrategy::default())?,
         relay: RelayConfig::default(),
         compression,
+        aliases,
+        last_resort,
     })
 }
 

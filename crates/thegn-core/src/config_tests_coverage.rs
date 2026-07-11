@@ -647,8 +647,10 @@ fn media_config_defaults_and_enums() {
     );
     assert_eq!(m.mpd.socket, "127.0.0.1:6600");
     assert!(m.mpd.password.is_none());
-    let mut mpd_cfg = MediaConfig::default();
-    mpd_cfg.backend = MediaBackendKind::Mpd;
+    let mut mpd_cfg = MediaConfig {
+        backend: MediaBackendKind::Mpd,
+        ..Default::default()
+    };
     mpd_cfg.mpd.socket = "music.lan:6601".into();
     mpd_cfg.mpd.password = Some("hunter2".into());
     let opts = mpd_cfg.resolve_opts();
