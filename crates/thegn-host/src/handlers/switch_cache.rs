@@ -57,7 +57,12 @@ impl WorktreeSlice {
 
     /// Paint this slice into the live model (worktree switch, cache hit).
     pub(crate) fn apply(&self, model: &mut FrameModel) {
+        // Now-playing is loop-owned and player-global, not per-worktree —
+        // carry it across the panel swap or a switch blinks the badge off
+        // until the next media push.
+        let media = model.panel.media.take();
         model.panel = self.panel.clone();
+        model.panel.media = media;
         model.active_sandbox_backend = self.sandbox_backend.clone();
         model.active_placement_kind = self.placement_kind.clone();
         model.active_placement_label = self.placement_label.clone();
