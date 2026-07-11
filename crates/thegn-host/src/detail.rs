@@ -2390,12 +2390,17 @@ fn needs_you_rows(model: &FrameModel) -> (Vec<DetailRow>, std::collections::Hash
                 .unwrap_or_else(|| DetailAction::FocusWorktree(path.clone()));
             let mut row = DetailRow::new(marker, glyph, text)
                 .on_enter(enter)
-                // Highlighting quiets this episode; a/R quiet them all.
-                .on_highlight(DetailAction::AckAttention {
-                    path: path.clone(),
-                    reason: score.reason,
-                    since: score.since,
-                })
+                // `x` quiets this episode explicitly; a/R quiet them all.
+                // No quiet-on-highlight: navigating the list must never
+                // silently ack an item the user only meant to inspect.
+                .action(
+                    'x',
+                    DetailAction::AckAttention {
+                        path: path.clone(),
+                        reason: score.reason,
+                        since: score.since,
+                    },
+                )
                 .action('a', DetailAction::AckAllAttention)
                 .action('R', DetailAction::AckAllAttention);
             if let Some(at) = score.since {
