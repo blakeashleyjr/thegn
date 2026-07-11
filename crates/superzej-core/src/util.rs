@@ -546,6 +546,10 @@ pub struct GitLock(std::fs::File);
 /// behavior) if the lock file can't be opened/locked, so a permissions quirk
 /// never wedges the user out of git. Call only on background threads — it blocks.
 #[cfg(not(windows))]
+// The raw-fd `flock` is deprecated in favor of `nix::fcntl::Flock`, but that
+// API *owns* the file (unlock consumes it), which doesn't fit this guard's
+// separate Drop impl; the raw call is still sound here.
+#[allow(deprecated)]
 pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
     use std::os::unix::io::AsRawFd;
     let path = git_common_dir(worktree).join("superzej-git.lock");
@@ -579,6 +583,7 @@ pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
 
 #[cfg(not(windows))]
 impl Drop for GitLock {
+    #[allow(deprecated)] // see `lock_git_mutations`
     fn drop(&mut self) {
         use std::os::unix::io::AsRawFd;
         nix::fcntl::flock(self.0.as_raw_fd(), nix::fcntl::FlockArg::Unlock).ok();

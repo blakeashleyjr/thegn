@@ -25,10 +25,8 @@ use crate::hydrate::RefreshKind;
 use crate::run::{SidebarState, active_worktree_repo, now_secs};
 use crate::sidebar::DbWorktree;
 
-/// File the active worktree into `folder` (created if absent), updating the
-/// sidebar model in place so the move shows immediately. The durable DB write
-/// is deferred off-loop. Returns a status line on success or a human-readable
-/// reason on failure.
+/// File the active worktree into `folder` — the thin active-worktree wrapper
+/// over [`file_worktree_path`].
 pub(crate) fn file_active_worktree(
     session: &crate::session::Session,
     sb: &mut SidebarState,
@@ -37,20 +35,41 @@ pub(crate) fn file_active_worktree(
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &termwiz::terminal::TerminalWaker,
 ) -> Result<String, String> {
+    let (wt_path, repo_path) =
+        active_worktree_repo(session).ok_or("No worktree to file into a folder")?;
+    file_worktree_path(
+        session, sb, model, &wt_path, &repo_path, folder, refresh_tx, waker,
+    )
+}
+
+/// File the worktree at `wt_path` (in `repo_path`'s workspace) into `folder`
+/// (created if absent), updating the sidebar model in place so the move shows
+/// immediately. The durable DB write is deferred off-loop. Returns a status
+/// line on success or a human-readable reason on failure. Shared by the
+/// active-worktree action, the sidebar's cursor-row `f`, and drag-drop filing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn file_worktree_path(
+    session: &crate::session::Session,
+    sb: &mut SidebarState,
+    model: &mut FrameModel,
+    wt_path: &str,
+    repo_path: &str,
+    folder: &str,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &termwiz::terminal::TerminalWaker,
+) -> Result<String, String> {
     let folder = folder.trim();
     if folder.is_empty() {
         return Err("Folder name is empty".into());
     }
-    let (wt_path, repo_path) =
-        active_worktree_repo(session).ok_or("No worktree to file into a folder")?;
 
     // Optimistic regroup: resolve/synthesize the folder id and move the worktree
     // under it in the model, then rebuild the sidebar so it shows this frame.
     apply_optimistic_move(
         &mut model.sidebar_db_folders,
         &mut model.sidebar_db_worktrees,
-        &repo_path,
-        &wt_path,
+        repo_path,
+        wt_path,
         folder,
         now_secs(),
     );
@@ -59,6 +78,8 @@ pub(crate) fn file_active_worktree(
     // Defer the durable write. Best-effort per the DB-is-a-cache rule; the
     // refresh (sent *after* the write) reconciles a synthetic new-folder id.
     let folder_owned = folder.to_string();
+    let wt_path = wt_path.to_string();
+    let repo_path = repo_path.to_string();
     let refresh_tx = refresh_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
@@ -73,6 +94,44 @@ pub(crate) fn file_active_worktree(
     });
 
     Ok(format!("Filed worktree into \"{folder}\""))
+}
+
+/// Un-file the worktree at `wt_path` back to its workspace root, optimistically
+/// (same pattern as [`file_worktree_path`]): the model regroups this frame, the
+/// DB write is deferred. Used by drag-to-workspace-header filing.
+#[allow(dead_code)] // wired by the sidebar mouse (drag-drop) handler
+pub(crate) fn unfile_worktree_path(
+    session: &crate::session::Session,
+    sb: &mut SidebarState,
+    model: &mut FrameModel,
+    wt_path: &str,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &termwiz::terminal::TerminalWaker,
+) -> String {
+    if let Some(w) = model
+        .sidebar_db_worktrees
+        .iter_mut()
+        .find(|w| w.path == wt_path)
+    {
+        w.folder_id = None;
+    }
+    sb.rebuild(model, session);
+
+    let wt_path = wt_path.to_string();
+    let refresh_tx = refresh_tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Ok(db) = superzej_core::db::Db::open() {
+            // best-effort: the DB is a cache; the optimistic model move above
+            // is the user-visible change
+            let _ = db.set_worktree_folder(&wt_path, None);
+        }
+        if refresh_tx.send(RefreshKind::Model).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+
+    "Moved worktree out of its folder".into()
 }
 
 /// Pure in-memory regroup shared by the loop path and its tests: resolve the

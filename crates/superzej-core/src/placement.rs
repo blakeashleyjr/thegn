@@ -457,7 +457,8 @@ impl Placement {
     }
 
     /// Three-state runtime presence probe (Local: PATH; remote: a login-shell
-    /// probe through the placement's control primitive). Unlike [`has_binary`],
+    /// probe through the placement's control primitive). Unlike
+    /// [`has_binary`](Self::has_binary),
     /// this separates a genuinely-absent binary from an unreachable host so the
     /// caller never degrades a reachable remote to `Backend::None`. The probe is
     /// ssh-only even when the pane transport is mosh — mosh bootstraps over ssh,
@@ -465,7 +466,7 @@ impl Placement {
     /// non-interactive command output).
     ///
     /// Subprocess seam (cov_ignore); the decision logic lives in the pure,
-    /// unit-tested [`classify_probe`].
+    /// unit-tested `classify_probe`.
     pub fn probe_runtime(&self, bin: &str) -> RuntimeProbe {
         match self {
             Placement::Local => {
@@ -491,7 +492,8 @@ impl Placement {
     /// Is the named binary present in this placement? (Local: PATH; remote: a
     /// login-shell probe through the placement's control primitive.) A remote
     /// `Unreachable` answer collapses to `false` here — callers that must not
-    /// degrade on an unreachable host should use [`probe_runtime`] instead.
+    /// degrade on an unreachable host should use
+    /// [`probe_runtime`](Self::probe_runtime) instead.
     pub fn has_binary(&self, bin: &str) -> bool {
         match self {
             Placement::Local => util::have(bin),
