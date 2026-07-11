@@ -254,8 +254,9 @@ pub struct GlyphSet {
     pub cross_heavy: &'static str,    // ✖ pin failed
     pub arrow_up: &'static str,       // ↑ ahead
     pub arrow_down: &'static str,     // ↓ behind
-    pub diamond_filled: &'static str, // ◆ masthead
+    pub diamond_filled: &'static str, // ◆ generic emphasis marker
     pub diamond_hollow: &'static str, // ◇ pending step
+    pub brand_sigil: &'static str,    // þ masthead brand mark (OE thorn, "þegn")
     pub check: &'static str,          // ✓ pass
     pub cross: &'static str,          // ✗ fail
     pub ellipsis: &'static str,       // … truncation
@@ -288,6 +289,7 @@ pub const UNICODE: GlyphSet = GlyphSet {
     arrow_down: "\u{2193}",     // ↓
     diamond_filled: "\u{25c6}", // ◆
     diamond_hollow: "\u{25c7}", // ◇
+    brand_sigil: "\u{00fe}",    // þ — Latin-1, width 1, safe at Full AND Basic
     check: "\u{2713}",          // ✓
     cross: "\u{2717}",          // ✗
     ellipsis: "\u{2026}",       // …
@@ -320,6 +322,7 @@ pub const ASCII: GlyphSet = GlyphSet {
     arrow_down: "v",
     diamond_filled: "*",
     diamond_hollow: "o",
+    brand_sigil: "*",
     check: "+",
     cross: "x",
     ellipsis: "...",
@@ -679,6 +682,15 @@ mod tests {
     }
 
     #[test]
+    fn brand_sigil_is_single_cell_in_both_sets() {
+        // Masthead layout assumes a 1-col sigil. þ (U+00FE) is Latin-1 and
+        // display-width 1 everywhere; keep it a single narrow scalar.
+        assert_eq!(UNICODE.brand_sigil, "\u{00fe}");
+        assert_eq!(UNICODE.brand_sigil.chars().count(), 1);
+        assert_eq!(ASCII.brand_sigil.chars().count(), 1);
+    }
+
+    #[test]
     fn ascii_glyphs_are_all_ascii() {
         let g = glyphs(UnicodeLevel::Ascii);
         for s in [
@@ -695,6 +707,7 @@ mod tests {
             g.arrow_down,
             g.diamond_filled,
             g.diamond_hollow,
+            g.brand_sigil,
             g.check,
             g.cross,
             g.ellipsis,

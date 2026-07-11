@@ -526,6 +526,22 @@ async fn sprite_proxy_relay(
     Ok(())
 }
 
+/// Report the one-time brand migration. Runs before any tracing subscriber
+/// exists (and before the compositor takes the terminal), so stderr is the
+/// only sink that reaches the user — hence the local allow.
+#[allow(clippy::disallowed_macros)]
+fn report_migration(migration: &thegn_core::migrate_brand::MigrationReport) {
+    for w in &migration.warnings {
+        eprintln!("thegn migrate: {w}");
+    }
+    if migration.migrated_anything() {
+        eprintln!(
+            "thegn: migrated superzej state to its new home ({} path(s) renamed)",
+            migration.moved.len()
+        );
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // Cap glibc's per-thread arena count before the runtime spawns any threads,
     // so the host can't sprawl across dozens of never-trimmed arenas (an audit
@@ -557,16 +573,7 @@ fn main() -> anyhow::Result<()> {
     // under the app home being moved) and before the first Db::open (the WAL
     // sidecars move while no connection is open). No-op cost once migrated:
     // three stats. THEGN_NO_MIGRATE=1 (dev/bench recipes) skips it entirely.
-    let migration = thegn_core::migrate_brand::run_startup_migration();
-    for w in &migration.warnings {
-        eprintln!("thegn migrate: {w}");
-    }
-    if migration.migrated_anything() {
-        eprintln!(
-            "thegn: migrated superzej state to its new home ({} path(s) renamed)",
-            migration.moved.len()
-        );
-    }
+    report_migration(&thegn_core::migrate_brand::run_startup_migration());
 
     // Reroot the process environment for the active profile (H) BEFORE the tokio
     // runtime or any thread starts — a whole-process firewall enforced via
