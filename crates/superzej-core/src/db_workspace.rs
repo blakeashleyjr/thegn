@@ -807,6 +807,21 @@ impl WorkspaceStore for Db {
         Ok(())
     }
 
+    /// Delete every persisted UI-state key in `scope` starting with `prefix`.
+    /// `ESCAPE` guards the LIKE pattern so a prefix containing `%`/`_` (both
+    /// legal in slugs/branch names) matches literally.
+    fn del_ui_state_prefix(&self, scope: &str, prefix: &str) -> Result<()> {
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        self.conn().execute(
+            "DELETE FROM ui_state WHERE scope=?1 AND key LIKE ?2 ESCAPE '\\'",
+            params![scope, format!("{escaped}%")],
+        )?;
+        Ok(())
+    }
+
     /// All `(key, value)` pairs in a scope — used to load every collapse/pin
     /// entry at once on sidebar build.
     fn ui_state_in_scope(&self, scope: &str) -> Result<Vec<(String, String)>> {

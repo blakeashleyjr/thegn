@@ -66,6 +66,8 @@ nix.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+# Display-width invariant tests for the chrome glyph tables.
+unicode-width = "0.2"
 
 # Theme/palette construction — runs at startup and on every theme cycle.
 [[bench]]

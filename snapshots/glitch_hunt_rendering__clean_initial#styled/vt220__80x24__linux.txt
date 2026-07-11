@@ -1,85 +1,89 @@
-L0| ◆ superzej   dashboard   work  comms 4 chat 30% · 󰂄 100% · Fri Jun 19 · 22:56
-R0 0 1 fg=default bg=idx00 attrs=
+L0| ◆ superzej work         15.4/94G ·  49% ·  ↓ 1014K ↑  571K ·  100% · 22:07
+R0 0 1 fg=idx07 bg=idx00 attrs=
 R0 1 2 fg=idx06 bg=idx00 attrs=
 R0 3 8 fg=idx07 bg=idx00 attrs=
-R0 11 2 fg=default bg=idx00 attrs=
-R0 13 11 fg=idx07 bg=idx00 attrs=
-R0 24 1 fg=default bg=idx00 attrs=
-R0 25 6 fg=idx06 bg=idx08 attrs=
-R0 31 18 fg=idx07 bg=idx00 attrs=
-R0 49 3 fg=idx08 bg=idx00 attrs=
-R0 52 6 fg=idx07 bg=idx00 attrs=
-R0 58 3 fg=idx08 bg=idx00 attrs=
-R0 61 10 fg=idx07 bg=idx00 attrs=
+R0 11 6 fg=idx06 bg=idx08 attrs=BOLD
+R0 17 17 fg=idx07 bg=idx00 attrs=
+R0 34 3 fg=idx08 bg=idx00 attrs=
+R0 37 5 fg=idx07 bg=idx00 attrs=
+R0 42 3 fg=idx08 bg=idx00 attrs=
+R0 45 17 fg=idx07 bg=idx00 attrs=
+R0 62 3 fg=idx08 bg=idx00 attrs=
+R0 65 6 fg=idx03 bg=idx00 attrs=
 R0 71 3 fg=idx08 bg=idx00 attrs=
-R0 74 5 fg=idx07 bg=idx00 attrs=
-R0 79 1 fg=default bg=idx00 attrs=
+R0 74 6 fg=idx07 bg=idx00 attrs=
 L1|────────────────────────────────────────────────────────────────────────────────
 R1 0 80 fg=idx08 bg=idx00 attrs=
-L2| WORKSPACES           REGCLAUDE ▸ home · Sandbox: None   1
+L2| WORKSPACES                       HOME ▸ home   1
 R2 0 11 fg=idx07 bg=idx00 attrs=BOLD
-R2 11 11 fg=default bg=idx00 attrs=
-R2 22 9 fg=idx07 bg=idx00 attrs=
-R2 31 3 fg=idx08 bg=idx00 attrs=
-R2 34 4 fg=idx06 bg=idx00 attrs=
-R2 38 12 fg=idx07 bg=idx00 attrs=
-R2 50 4 fg=idx08 bg=idx00 attrs=
-R2 54 2 fg=default bg=idx00 attrs=
-R2 56 3 fg=idx06 bg=idx08 attrs=
-R2 59 21 fg=default bg=idx00 attrs=
+R2 11 23 fg=default bg=idx00 attrs=
+R2 34 4 fg=idx07 bg=idx00 attrs=
+R2 38 3 fg=idx08 bg=idx00 attrs=
+R2 41 4 fg=idx06 bg=idx00 attrs=
+R2 45 2 fg=default bg=idx00 attrs=
+R2 47 3 fg=idx06 bg=idx08 attrs=
+R2 50 30 fg=default bg=idx00 attrs=
 L3|
 R3 0 80 fg=default bg=idx00 attrs=
-L4| ▾ regclaude
-R4 0 1 fg=default bg=idx00 attrs=
-R4 1 11 fg=idx07 bg=idx00 attrs=
-R4 12 68 fg=default bg=idx00 attrs=
-L5|   home
-R5 0 1 fg=default bg=idx00 attrs=
-R5 1 6 fg=idx06 bg=idx00 attrs=
-R5 7 73 fg=default bg=idx00 attrs=
+L4| ▾ ⌂ home
+R4 0 1 fg=idx07 bg=idx00 attrs=
+R4 1 1 fg=idx08 bg=idx00 attrs=
+R4 2 3 fg=idx07 bg=idx00 attrs=
+R4 5 4 fg=idx07 bg=idx00 attrs=BOLD
+R4 9 23 fg=idx07 bg=idx00 attrs=
+R4 32 48 fg=default bg=idx00 attrs=
+L5|▐   └ ○ home
+R5 0 1 fg=idx08 bg=idx00 attrs=
+R5 1 3 fg=idx07 bg=idx00 attrs=
+R5 4 2 fg=idx08 bg=idx00 attrs=
+R5 6 1 fg=idx09 bg=idx00 attrs=
+R5 7 1 fg=idx07 bg=idx00 attrs=
+R5 8 4 fg=idx06 bg=idx00 attrs=
+R5 12 20 fg=idx07 bg=idx00 attrs=
+R5 32 48 fg=default bg=idx00 attrs=
 L6|
-R6 0 80 fg=default bg=idx00 attrs=
-L7|
-R7 0 80 fg=default bg=idx00 attrs=
-L8|                           ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
-R8 0 27 fg=default bg=idx00 attrs=
-R8 27 47 fg=idx06 bg=idx00 attrs=
-R8 74 6 fg=default bg=idx00 attrs=
-L9|                            ▀▀▀▄ █   █ █▄▄▄▀ █▀▀▀  █▄▄▄▀  ▄▀   █▀▀▀     █
-R9 0 27 fg=default bg=idx00 attrs=
-R9 27 47 fg=idx06 bg=idx00 attrs=
-R9 74 6 fg=default bg=idx00 attrs=
-L10|                           ▄▄▄▄▀ ▀▄▄▄▀ █     █▄▄▄▄ █  ▀▄ █▄▄▄▄ █▄▄▄▄ ▀▄▄▀
-R10 0 27 fg=default bg=idx00 attrs=
-R10 27 47 fg=idx06 bg=idx00 attrs=
-R10 74 6 fg=default bg=idx00 attrs=
-L11|
-R11 0 80 fg=default bg=idx00 attrs=
-L12|                                      v0.1.0 · git worktree IDE
-R12 0 38 fg=default bg=idx00 attrs=
-R12 38 6 fg=idx07 bg=idx00 attrs=
-R12 44 19 fg=idx08 bg=idx00 attrs=
-R12 63 17 fg=default bg=idx00 attrs=
-L13|
-R13 0 80 fg=default bg=idx00 attrs=
-L14|                                             ◆ sandbox
-R14 0 45 fg=default bg=idx00 attrs=
-R14 45 1 fg=idx06 bg=idx00 attrs=
-R14 46 1 fg=default bg=idx00 attrs=
-R14 47 7 fg=idx07 bg=idx00 attrs=
-R14 54 26 fg=default bg=idx00 attrs=
-L15|                                             ◇ container
-R15 0 45 fg=default bg=idx00 attrs=
-R15 45 1 fg=idx08 bg=idx00 attrs=
-R15 46 1 fg=default bg=idx00 attrs=
-R15 47 9 fg=idx08 bg=idx00 attrs=
-R15 56 24 fg=default bg=idx00 attrs=
-L16|                                             ◇ shell
-R16 0 45 fg=default bg=idx00 attrs=
-R16 45 1 fg=idx08 bg=idx00 attrs=
-R16 46 1 fg=default bg=idx00 attrs=
-R16 47 5 fg=idx08 bg=idx00 attrs=
-R16 52 28 fg=default bg=idx00 attrs=
+R6 0 32 fg=idx07 bg=idx00 attrs=
+R6 32 48 fg=default bg=idx00 attrs=
+L7| TERMINALS
+R7 0 1 fg=idx07 bg=idx00 attrs=
+R7 1 9 fg=idx07 bg=idx00 attrs=BOLD
+R7 10 22 fg=idx07 bg=idx00 attrs=
+R7 32 48 fg=default bg=idx00 attrs=
+L8| ▾ ≡ local
+R8 0 1 fg=idx07 bg=idx00 attrs=
+R8 1 1 fg=idx08 bg=idx00 attrs=
+R8 2 3 fg=idx07 bg=idx00 attrs=
+R8 5 5 fg=idx07 bg=idx00 attrs=BOLD
+R8 10 22 fg=idx07 bg=idx00 attrs=
+R8 32 48 fg=default bg=idx00 attrs=
+L9|   └ ≡ local
+R9 0 3 fg=idx07 bg=idx00 attrs=
+R9 3 2 fg=idx08 bg=idx00 attrs=
+R9 5 27 fg=idx07 bg=idx00 attrs=
+R9 32 48 fg=default bg=idx00 attrs=
+L10|                                         █▀▀ █ █ █▀█ ██▀ █▀█ ▀▀█ ██▀ ▀█▀
+R10 0 41 fg=default bg=idx00 attrs=
+R10 41 31 fg=idx06 bg=idx00 attrs=
+R10 72 8 fg=default bg=idx00 attrs=
+L11|                                         ▄▄█ █▄█ █▀▀ █▄▄ █▀▄ █▄▄ █▄▄ ▄█
+R11 0 41 fg=default bg=idx00 attrs=
+R11 41 31 fg=idx06 bg=idx00 attrs=
+R11 72 8 fg=default bg=idx00 attrs=
+L12|
+R12 0 80 fg=default bg=idx00 attrs=
+L13|                                            v0.1.0 · git worktree IDE
+R13 0 44 fg=default bg=idx00 attrs=
+R13 44 6 fg=idx07 bg=idx00 attrs=
+R13 50 19 fg=idx08 bg=idx00 attrs=
+R13 69 11 fg=default bg=idx00 attrs=
+L14|
+R14 0 80 fg=default bg=idx00 attrs=
+L15|                                                    ↻ sandbox
+R15 0 52 fg=default bg=idx00 attrs=
+R15 52 9 fg=idx06 bg=idx00 attrs=
+R15 61 19 fg=default bg=idx00 attrs=
+L16|
+R16 0 80 fg=default bg=idx00 attrs=
 L17|
 R17 0 80 fg=default bg=idx00 attrs=
 L18|
@@ -92,17 +96,15 @@ L21|
 R21 0 80 fg=default bg=idx00 attrs=
 L22|
 R22 0 80 fg=default bg=idx00 attrs=
-L23|  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab   Alt…
+L23|  NORMAL   Ctrl Space menu   Ctrl g lock               0 LOC  ✋ 1    7% free
 R23 0 1 fg=idx07 bg=idx00 attrs=
-R23 1 3 fg=idx00 bg=idx06 attrs=BOLD
-R23 4 2 fg=idx07 bg=idx00 attrs=
-R23 6 14 fg=idx08 bg=idx00 attrs=
-R23 20 3 fg=idx07 bg=idx00 attrs=
-R23 23 12 fg=idx08 bg=idx00 attrs=
-R23 35 3 fg=idx07 bg=idx00 attrs=
-R23 38 15 fg=idx08 bg=idx00 attrs=
-R23 53 3 fg=idx07 bg=idx00 attrs=
-R23 56 15 fg=idx08 bg=idx00 attrs=
-R23 71 3 fg=idx07 bg=idx00 attrs=
-R23 74 4 fg=idx08 bg=idx00 attrs=
-R23 78 2 fg=idx07 bg=idx00 attrs=
+R23 1 8 fg=idx00 bg=idx06 attrs=BOLD
+R23 9 2 fg=idx07 bg=idx00 attrs=
+R23 11 15 fg=idx08 bg=idx00 attrs=
+R23 26 3 fg=idx07 bg=idx00 attrs=
+R23 29 11 fg=idx08 bg=idx00 attrs=
+R23 40 21 fg=idx07 bg=idx00 attrs=
+R23 61 6 fg=idx00 bg=idx03 attrs=BOLD
+R23 67 1 fg=idx07 bg=idx00 attrs=
+R23 68 11 fg=idx00 bg=idx09 attrs=BOLD
+R23 79 1 fg=idx07 bg=idx00 attrs=

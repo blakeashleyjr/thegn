@@ -8944,6 +8944,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "unic-langid",
+ "unicode-width 0.2.2",
  "walkdir",
 ]
 
