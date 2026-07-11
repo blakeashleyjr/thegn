@@ -552,6 +552,22 @@ fn main() -> anyhow::Result<()> {
         cli.overrides.push(format!("log.level={lvl}"));
     }
 
+    // One-time superzej → thegn state migration (renames the old state/config/
+    // app-home roots). MUST run before profile::reroot (profile roots live
+    // under the app home being moved) and before the first Db::open (the WAL
+    // sidecars move while no connection is open). No-op cost once migrated:
+    // three stats. THEGN_NO_MIGRATE=1 (dev/bench recipes) skips it entirely.
+    let migration = thegn_core::migrate_brand::run_startup_migration();
+    for w in &migration.warnings {
+        eprintln!("thegn migrate: {w}");
+    }
+    if migration.migrated_anything() {
+        eprintln!(
+            "thegn: migrated superzej state to its new home ({} path(s) renamed)",
+            migration.moved.len()
+        );
+    }
+
     // Reroot the process environment for the active profile (H) BEFORE the tokio
     // runtime or any thread starts — a whole-process firewall enforced via
     // `std::env::set_var` of profile-scoped roots (state/DB/logs), which every

@@ -9236,6 +9236,7 @@ dependencies = [
  "similar",
  "syntect",
  "sys-locale",
+ "tempfile",
  "thegn-media",
  "toml 0.8.23",
  "toml_edit 0.25.12+spec-1.1.0",

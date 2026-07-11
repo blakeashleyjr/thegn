@@ -45,6 +45,12 @@ impl EnvGuard {
         Self::mutate(keys.iter().map(|k| ((*k).to_string(), None)))
     }
 
+    /// Mixed set/unset in one guard (`Some` sets, `None` unsets). Use this
+    /// instead of stacking two guards — [`ENV_LOCK`] is not reentrant.
+    pub(crate) fn mutate_pairs(vars: &[(&str, Option<&str>)]) -> Self {
+        Self::mutate(vars.iter().map(|(k, v)| ((*k).to_string(), *v)))
+    }
+
     fn mutate<'a>(ops: impl Iterator<Item = (String, Option<&'a str>)>) -> Self {
         let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut restore = Vec::new();

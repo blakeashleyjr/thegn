@@ -66,6 +66,7 @@ nix.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+tempfile.workspace = true
 
 # Theme/palette construction — runs at startup and on every theme cycle.
 [[bench]]

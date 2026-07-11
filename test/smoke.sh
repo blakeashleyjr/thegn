@@ -569,6 +569,27 @@ fi
 check "no daemon is spawned by default (opt-in contract)" \
   "[[ ! -S \"$XDG_STATE_HOME/thegn/run/daemon.sock\" ]]"
 
+# --- one-time superzej -> thegn migration -----------------------------------
+# Seed old-brand state/config/app-home in a fresh throwaway HOME, run any CLI
+# verb, and assert the startup migration renamed everything (marker included).
+MIG="$(mktemp -d)"
+mkdir -p "$MIG/.local/state/superzej" "$MIG/.config/superzej" "$MIG/.superzej/worktrees"
+printf 'stale' >"$MIG/.local/state/superzej/superzej.db"
+printf 'worktrees_dir = "%s/wt"\n' "$MIG" >"$MIG/.config/superzej/config.toml"
+env HOME="$MIG" XDG_CONFIG_HOME="$MIG/.config" XDG_STATE_HOME="$MIG/.local/state" \
+  "$SZ" repos >/dev/null 2>&1 || true
+check "migration moved the state dir + db" \
+  "[[ -f '$MIG/.local/state/thegn/thegn.db' && ! -e '$MIG/.local/state/superzej' ]]"
+check "migration moved the config dir" \
+  "[[ -f '$MIG/.config/thegn/config.toml' && ! -e '$MIG/.config/superzej' ]]"
+check "migration moved the app home" \
+  "[[ -d '$MIG/.thegn/worktrees' && ! -e '$MIG/.superzej' ]]"
+check "migration wrote its forensics marker" \
+  "[[ -f '$MIG/.thegn/.migrated-from-superzej' ]]"
+check "migration honors THEGN_NO_MIGRATE" \
+  "mkdir -p '$MIG/.config/superzej' && env HOME='$MIG' XDG_CONFIG_HOME='$MIG/.config' XDG_STATE_HOME='$MIG/.local/state' THEGN_NO_MIGRATE=1 '$SZ' repos >/dev/null 2>&1 || true; [[ -d '$MIG/.config/superzej' ]]"
+rm -rf "$MIG"
+
 echo
 if [[ $fail -eq 0 ]]; then
   printf '\033[32mall smoke checks passed\033[0m\n'
