@@ -16842,36 +16842,49 @@ async fn event_loop<T: Terminal>(
                                 focus.zone = crate::focus::Zone::Panel;
                             }
                             Action::ToggleNotifications => {
-                                panel_auto_revealed = None;
-                                // Already parked on Notifications with the panel
-                                // focused → toggle back to the center terminal.
-                                if focus.panel()
-                                    && panel_ui.open == crate::panel::Section::Notifications
+                                // Open (or toggle shut) the one unified surface —
+                                // Needs you · Alerts · Notifications · Logs — the
+                                // same modal both statusbar chips summon.
+                                let id = crate::chrome::BarItemId::Badge(
+                                    crate::chrome::BarBadge::Notifications,
+                                );
+                                if bar_detail
+                                    .as_ref()
+                                    .is_some_and(|d| d.title() == "Notifications")
                                 {
-                                    focus.zone = crate::focus::Zone::Center;
+                                    bar_detail = None;
                                 } else {
-                                    if chrome.panel.is_none() {
-                                        want_panel = true;
-                                        panel_forced = cols < layout::PANEL_MIN_COLS;
-                                        chrome = recompute_chrome!();
-                                        need_relayout = true;
-                                    }
-                                    panel_ui.switch_tab(crate::panel::PanelTab::System);
-                                    open_panel_section(
-                                        crate::panel::Section::Notifications,
-                                        &mut panel_ui,
-                                        &mut hydration_gen,
-                                        &model_tx,
-                                        &session,
-                                        &waker,
-                                        PanelDocsWiring {
-                                            model: &model,
-                                            generation: docs_gen,
-                                            tx: &docs_tx,
-                                        },
+                                    let screen = Rect {
+                                        x: 0,
+                                        y: 0,
+                                        cols,
+                                        rows,
+                                    };
+                                    // Anchor on the statusbar chip when present,
+                                    // else the screen centre (the overlay centres
+                                    // itself regardless).
+                                    let rect = crate::chrome::statusbar_item_spans(
+                                        &model,
+                                        chrome.statusbar,
+                                    )
+                                    .into_iter()
+                                    .find(|(i, _)| *i == id)
+                                    .map(|(_, r)| r)
+                                    .unwrap_or(Rect {
+                                        x: cols / 2,
+                                        y: rows / 2,
+                                        cols: 0,
+                                        rows: 0,
+                                    });
+                                    bar_detail = crate::detail::open_detail_for(
+                                        &id,
+                                        rect,
+                                        screen,
+                                        &model,
+                                        &panel_ui.docs.telemetry,
                                     );
-                                    focus.zone = crate::focus::Zone::Panel;
                                 }
+                                dirty = true;
                             }
                             Action::OpenCi => {
                                 panel_auto_revealed = None;
