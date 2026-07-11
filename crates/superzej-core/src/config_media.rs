@@ -3,7 +3,31 @@
 //! the backend-resolution input the `superzej-media` leaf consumes, and picks the
 //! per-kind seek step.
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::{MediaBackendKind, MediaConfig};
+
+/// `[media.mpd]` — native MPD backend. Talks the MPD line protocol directly, so
+/// any MPD client (mpd, mpc, rmpc, ncmpcpp, cantata) is picked up with no
+/// `mpd-mpris` bridge. `socket` is a `host:port` (default `127.0.0.1:6600`) or an
+/// absolute path to MPD's unix socket. `$MPD_HOST`/`$MPD_PORT` override at runtime
+/// when `socket` is left at its default. `password` is sent if MPD requires one.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MpdMediaConfig {
+    pub socket: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl Default for MpdMediaConfig {
+    fn default() -> Self {
+        MpdMediaConfig {
+            socket: "127.0.0.1:6600".into(),
+            password: None,
+        }
+    }
+}
 
 impl MediaConfig {
     /// The seek step for the given media kind: coarser for video.
@@ -29,6 +53,7 @@ impl MediaConfig {
                 MediaBackendKind::None => BackendKind::None,
                 MediaBackendKind::Mpris => BackendKind::Mpris,
                 MediaBackendKind::Mpv => BackendKind::Mpv,
+                MediaBackendKind::Mpd => BackendKind::Mpd,
                 MediaBackendKind::Smtc => BackendKind::Smtc,
                 MediaBackendKind::AppleScript => BackendKind::AppleScript,
                 MediaBackendKind::Jellyfin => BackendKind::Jellyfin,
@@ -38,6 +63,8 @@ impl MediaConfig {
             backend,
             players_priority: self.players_priority.clone(),
             mpv_socket: self.mpv.socket.clone(),
+            mpd_socket: self.mpd.socket.clone(),
+            mpd_password: self.mpd.password.clone(),
         }
     }
 }

@@ -157,7 +157,18 @@ pub(crate) fn available(placement: &Placement, backend: Backend) -> RuntimeProbe
     {
         return v;
     }
-    let v = available_probe(placement, backend);
+    // A remote probe rides ssh: retry an `Unreachable` answer through a short
+    // backoff before believing it — a one-off transport flap must not abort a
+    // provisioning run with "runtime not detected" (the false-negative bug).
+    let v = if placement.is_local() {
+        available_probe(placement, backend)
+    } else {
+        probe_with_retry(
+            &crate::retry::ReconnectPolicy::probe(),
+            &mut std::thread::sleep,
+            &mut || available_probe(placement, backend),
+        )
+    };
     if avail_cacheable(v) {
         cache
             .lock()
@@ -165,6 +176,28 @@ pub(crate) fn available(placement: &Placement, backend: Backend) -> RuntimeProbe
             .insert(key, (v, std::time::Instant::now()));
     }
     v
+}
+
+/// Retry an `Unreachable` probe per the policy before accepting it; a definite
+/// `Present`/`Absent` returns immediately. Pure loop over injected closures —
+/// the sleep is the only side effect (unit-tested with a recording sleeper).
+fn probe_with_retry(
+    policy: &crate::retry::ReconnectPolicy,
+    sleep: &mut dyn FnMut(std::time::Duration),
+    probe: &mut dyn FnMut() -> RuntimeProbe,
+) -> RuntimeProbe {
+    let mut attempt: u32 = 1;
+    loop {
+        let v = probe();
+        if v != RuntimeProbe::Unreachable || attempt >= policy.max_attempts {
+            return v;
+        }
+        let Some(delay) = policy.backoff(attempt) else {
+            return v;
+        };
+        sleep(delay);
+        attempt += 1;
+    }
 }
 
 /// Cache policy for a memoized probe result: `Present` is stored forever,
@@ -243,5 +276,52 @@ mod tests {
             !cache_is_fresh(RuntimeProbe::Unreachable, now),
             "unreachable is never stored, so never considered fresh"
         );
+    }
+
+    #[test]
+    fn probe_retry_rides_through_a_transient_flap() {
+        // Unreachable → Unreachable → Present: the flap is retried away.
+        let policy = crate::retry::ReconnectPolicy::probe();
+        let mut calls = 0;
+        let mut slept = Vec::new();
+        let v = probe_with_retry(&policy, &mut |d| slept.push(d), &mut || {
+            calls += 1;
+            if calls < 3 {
+                RuntimeProbe::Unreachable
+            } else {
+                RuntimeProbe::Present
+            }
+        });
+        assert_eq!(v, RuntimeProbe::Present);
+        assert_eq!(calls, 3);
+        assert_eq!(slept.len(), 2, "slept between attempts");
+    }
+
+    #[test]
+    fn probe_retry_definite_answer_returns_immediately() {
+        let policy = crate::retry::ReconnectPolicy::probe();
+        let mut calls = 0;
+        let v = probe_with_retry(&policy, &mut |_| panic!("no sleep"), &mut || {
+            calls += 1;
+            RuntimeProbe::Absent
+        });
+        assert_eq!(v, RuntimeProbe::Absent);
+        assert_eq!(calls, 1, "a definite answer needs no retry");
+    }
+
+    #[test]
+    fn probe_retry_gives_up_after_budget() {
+        let policy = crate::retry::ReconnectPolicy::probe(); // 3 attempts
+        let mut calls = 0;
+        let v = probe_with_retry(&policy, &mut |_| {}, &mut || {
+            calls += 1;
+            RuntimeProbe::Unreachable
+        });
+        assert_eq!(
+            v,
+            RuntimeProbe::Unreachable,
+            "still unreachable after budget"
+        );
+        assert_eq!(calls, 3, "exactly max_attempts probes");
     }
 }

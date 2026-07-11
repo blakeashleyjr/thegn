@@ -69,7 +69,8 @@ pub(crate) fn ssh_none_guard(
 pub(crate) fn no_backend_reason(reachable: bool, warnings: &[String]) -> String {
     if !reachable {
         "couldn't reach the host to detect a container runtime (ssh transport \
-         failed) — check connectivity, then retry"
+         failed, retried 3×) — check connectivity; superzej keeps retrying in \
+         the background"
             .to_string()
     } else if warnings.is_empty() {
         "no usable backend produced a runnable sandbox".to_string()

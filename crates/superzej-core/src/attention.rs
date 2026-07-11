@@ -331,7 +331,8 @@ pub fn score(inputs: &AttentionInputs) -> AttentionScore {
             NotificationKind::AgentFailed => consider(T::Failure, 0, R::AgentFailed, at),
             NotificationKind::TestFailed => consider(T::Failure, 1, R::TestsFailed, at),
             NotificationKind::ProcessFailed => consider(T::Failure, 2, R::ProcessFailed, at),
-            NotificationKind::LogError => consider(T::Failure, 3, R::LogError, at),
+            // LogError (szhost's own diagnostics) is deliberately quiet — it never
+            // scores into any tier, so it can't put a worktree in "Needs you".
             NotificationKind::AgentDone => consider(T::Waiting, 1, R::AgentDone, at),
             _ => {}
         }
@@ -524,7 +525,6 @@ mod tests {
             (NotificationKind::AgentFailed, R::AgentFailed),
             (NotificationKind::TestFailed, R::TestsFailed),
             (NotificationKind::ProcessFailed, R::ProcessFailed),
-            (NotificationKind::LogError, R::LogError),
         ] {
             let s = score(&AttentionInputs {
                 unread: vec![note(kind, 42)],
@@ -538,6 +538,19 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(s.tier, T::Idle);
+    }
+
+    #[test]
+    fn log_error_is_quiet_and_never_needs_user() {
+        // szhost's own log errors are diagnostics, not user attention: a LogError
+        // must never score into a tier, so it can't drag a worktree into
+        // "Needs you".
+        let s = score(&AttentionInputs {
+            unread: vec![note(NotificationKind::LogError, 42)],
+            ..Default::default()
+        });
+        assert_eq!(s.tier, T::Idle);
+        assert!(!s.needs_user());
     }
 
     #[test]

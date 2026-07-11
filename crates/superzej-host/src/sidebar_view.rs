@@ -166,6 +166,10 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         draw_metrics_section(surface, mrect, model);
     }
 
+    if let Some(hrect) = frame.hints {
+        draw_sidebar_hints(surface, hrect);
+    }
+
     // Live drag affordance: an accent insertion rule at the drop boundary
     // (the target-row highlight rides `row_bg`). Painted over the rows but
     // under the menu.
@@ -266,6 +270,9 @@ pub(crate) struct SidebarFrame {
     pub rows: Vec<SidebarPlacement>,
     pub scroll: usize,
     pub metrics: Option<Rect>,
+    /// The navigation-hints footer rect — revealed only while the sidebar is
+    /// focused (and the list has room), sitting above the metrics section.
+    pub hints: Option<Rect>,
 }
 
 /// Lay out the sidebar rows for `rect`, starting from `desired_scroll` (clamped
@@ -396,10 +403,110 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
         });
         y += heights[i];
     }
+    // Navigation-hints footer: revealed only while the sidebar is focused (the
+    // same "reveal on focus" language as the Alt/Ctrl+N digit hints), and only
+    // when the laid-out list leaves genuine blank space below it. Anchoring to
+    // the tail means it fills the empty column bottom without ever pushing a row
+    // or forcing a scroll — a full list simply shows no hints. It sits just
+    // above the metrics section (the list `bottom`).
+    let hints = if rail || !model.sidebar_focused {
+        None
+    } else {
+        let hint_h = sidebar_hint_rows().len() + 1; // rule/title + one row per tip
+        // Require a one-row gap between the last row and the footer. `then`
+        // (not `then_some`): the rect math must stay lazy — `bottom - hint_h`
+        // underflows on a column shorter than the footer.
+        (bottom.saturating_sub(y) > hint_h).then(|| Rect {
+            x: rect.x,
+            y: bottom - hint_h,
+            cols: rect.cols,
+            rows: hint_h,
+        })
+    };
     SidebarFrame {
         rows,
         scroll,
         metrics,
+        hints,
+    }
+}
+
+/// The navigation tips shown at the foot of the focused sidebar, as
+/// `(chord, label)` pairs. Kept ASCII so they survive glyph degradation and
+/// stay legible in a narrow column; the chords mirror the real keymap
+/// (`Alt/Ctrl+N` jumps, tree motion, filter, the `?` card — see
+/// `handlers/sidebar_keys.rs`).
+fn sidebar_hint_rows() -> [(&'static str, &'static str); 6] {
+    [
+        ("Alt+1-9", "jump worktree"),
+        ("Ctrl+1-9", "jump workspace"),
+        ("j / k", "move up/down"),
+        ("Enter", "open / fold"),
+        ("/", "filter"),
+        ("?", "all keys"),
+    ]
+}
+
+/// Paint the navigation-hints footer: a rule + " NAVIGATE " title (matching the
+/// metrics section) over a column of dim chord / label pairs.
+fn draw_sidebar_hints(surface: &mut Surface, rect: Rect) {
+    if rect.rows < 2 || rect.cols == 0 {
+        return;
+    }
+    let line = crate::caps::active_glyphs().box_h.repeat(rect.cols);
+    draw_text(
+        surface,
+        rect.x,
+        rect.y,
+        &line,
+        col(S::Border),
+        col(S::Panel),
+        rect.cols,
+    );
+    draw_text_bold(
+        surface,
+        rect.x + 1,
+        rect.y,
+        " NAVIGATE ",
+        col(S::Dim),
+        col(S::Panel),
+        rect.cols.saturating_sub(1),
+    );
+
+    let tips = sidebar_hint_rows();
+    let chord_w = tips
+        .iter()
+        .map(|(c, _)| c.chars().count())
+        .max()
+        .unwrap_or(0);
+    let max_y = rect.y + rect.rows;
+    let right = rect.x + rect.cols;
+    for (i, (chord, label)) in tips.iter().enumerate() {
+        let y = rect.y + 1 + i;
+        if y >= max_y {
+            break;
+        }
+        draw_text(
+            surface,
+            rect.x + 1,
+            y,
+            chord,
+            col(S::Faint),
+            col(S::Panel),
+            rect.cols.saturating_sub(1),
+        );
+        let lx = rect.x + 1 + chord_w + 1;
+        if lx < right {
+            draw_text(
+                surface,
+                lx,
+                y,
+                label,
+                col(S::Ghost),
+                col(S::Panel),
+                right - lx,
+            );
+        }
     }
 }
 

@@ -179,6 +179,9 @@ pub(crate) enum RefreshKind {
     /// instance whose live checkout is on that branch syncs itself instead of
     /// showing the advance as pending "changes".
     MainRefMoved,
+    /// Background host-heal tick ([`crate::handlers::host_heal`]): the handler
+    /// no-ops from hydrated model state unless a Failed(retryable) host exists.
+    HostHeal,
 }
 
 const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -222,6 +225,7 @@ pub(crate) fn spawn_refresh_ticker(
         let issue_every = ISSUE_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let disk_every = DISK_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let heal_every = 30; // 15s host-heal consideration (backoff: core::heal)
         let mut ticks: u64 = 0;
         // System stats for the top bar ride the same thread/cadence — the
         // /proc reads never touch the event loop.
@@ -259,6 +263,14 @@ pub(crate) fn spawn_refresh_ticker(
             }
             if ticks.is_multiple_of(disk_every) {
                 if tx.send(RefreshKind::Disk).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            // Host-heal consideration: O(1) send; the handler no-ops unless a
+            // Failed(retryable) host exists (0%-idle invariant preserved).
+            if ticks.is_multiple_of(heal_every) {
+                if tx.send(RefreshKind::HostHeal).is_err() {
                     break;
                 }
                 wake = true;
@@ -1718,7 +1730,12 @@ pub(crate) fn build_panel(
             .iter()
             .filter(|l| l.level == superzej_core::log_view::LogLevel::Error)
             .count();
-        crate::hydrate_feed::maybe_emit_log_error(db, &panel.notifications, error_count);
+        crate::hydrate_feed::maybe_emit_log_error(
+            db,
+            &panel.notifications,
+            error_count,
+            app_cfg.notifications.surface_self_log_errors,
+        );
 
         if hints.open == crate::panel::Section::Logs {
             let start = all_lines.len().saturating_sub(500);
