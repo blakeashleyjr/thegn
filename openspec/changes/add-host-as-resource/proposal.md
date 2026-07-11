@@ -27,14 +27,14 @@ shared across every worktree that lands there.
   `sandbox.rs` is unchanged.
 - **UI/CLI** — hosts appear in the sidebar, a System-tab panel section with
   actions (provision/probe/retry/rm-cache/consent), tabbar placement-chip
-  decoration, wizard host readiness badges, and a new `szhost host` subcommand.
+  decoration, wizard host readiness badges, and a new `thegn host` subcommand.
 - **tasks.md**: group AE (container provisioning) items 385 (CoW/base image),
   386 (prewarmed pool), 392 (image build cache), 394 (base image catalog);
   group J (remote access); group AB 355 (BYO image substitution).
 
 ## Rationale
 
-superzej already has the pieces this composes: `Placement::{Local,Ssh,K8s,Provider}`
+thegn already has the pieces this composes: `Placement::{Local,Ssh,K8s,Provider}`
 with multiplexed SSH control (`ssh_base` ControlMaster), a warm-spare pool with
 an atomic `provisioning → ready → claimed` DB state machine, single-flight
 provisioning gates (`provision_gate.rs`), an eventing model (progress channel +

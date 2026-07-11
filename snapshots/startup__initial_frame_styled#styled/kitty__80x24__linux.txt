@@ -1,9 +1,9 @@
-L0| ◆ superzej work         16.1/94G ·  50% ·  ↓    0B ↑    0B ·  100% · 22:06
+L0| þ thegn  work           21.5/94G ·  36% ·  ↓   17K ↑    5K ·  100% · 02:20
 R0 0 1 fg=#5a5d65 bg=#0f131e attrs=
 R0 1 2 fg=#2d5959 bg=#0f131e attrs=
-R0 3 8 fg=#5a5d65 bg=#0f131e attrs=
-R0 11 6 fg=#2d5959 bg=#1a2d34 attrs=
-R0 17 7 fg=#5a5d65 bg=#0f131e attrs=
+R0 3 6 fg=#5a5d65 bg=#0f131e attrs=
+R0 9 6 fg=#2d5959 bg=#1a2d34 attrs=
+R0 15 9 fg=#5a5d65 bg=#0f131e attrs=
 R0 24 10 fg=#4c505a bg=#0f131e attrs=
 R0 34 3 fg=#2e3340 bg=#0f131e attrs=
 R0 37 5 fg=#4c505a bg=#0f131e attrs=
@@ -48,11 +48,13 @@ R6 32 48 fg=#677084 bg=#0b0e16 attrs=
 L7| TERMINALS
 R7 0 32 fg=#5a5d65 bg=#0f131e attrs=
 R7 32 48 fg=#677084 bg=#0b0e16 attrs=
-L8|   No terminals — Enter to add
+L8|   No terminals — Enter to add            ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
 R8 0 3 fg=#5a5d65 bg=#0f131e attrs=
 R8 3 27 fg=#313643 bg=#0f131e attrs=
 R8 30 2 fg=#5a5d65 bg=#0f131e attrs=
-R8 32 48 fg=#677084 bg=#0b0e16 attrs=
+R8 32 10 fg=#677084 bg=#0b0e16 attrs=
+R8 42 29 fg=#2d5959 bg=#0b0e16 attrs=
+R8 71 9 fg=#677084 bg=#0b0e16 attrs=
 L9| ╭─ Choose a keymap ────────────────────────────────────────────────── menu ──╮
 R9 0 1 fg=#677084 bg=#0f131e attrs=
 R9 1 2 fg=#7a8197 bg=#151a28 attrs=
@@ -70,15 +72,15 @@ R10 76 1 fg=#6f788e bg=#151a28 attrs=
 R10 77 1 fg=default bg=#151a28 attrs=
 R10 78 1 fg=#7a8197 bg=#151a28 attrs=
 R10 79 1 fg=#1c2233 bg=#05070c attrs=
-L11| │ ❯  d  superzej defaults                                    Alt/Ctrl chords │
+L11| │ ❯  d  thegn defaults                                       Alt/Ctrl chords │
 R11 0 1 fg=#677084 bg=#0f131e attrs=
 R11 1 1 fg=#7a8197 bg=#151a28 attrs=
 R11 2 1 fg=default bg=#151a28 attrs=
 R11 3 2 fg=#6ee7d8 bg=#1f363d attrs=BOLD
 R11 5 3 fg=#edf0f8 bg=#222942 attrs=BOLD
 R11 8 1 fg=#edf0f8 bg=#1f363d attrs=
-R11 9 17 fg=#edf0f8 bg=#1f363d attrs=BOLD
-R11 26 36 fg=#edf0f8 bg=#1f363d attrs=
+R11 9 14 fg=#edf0f8 bg=#1f363d attrs=BOLD
+R11 23 39 fg=#edf0f8 bg=#1f363d attrs=
 R11 62 15 fg=#6f788e bg=#1f363d attrs=
 R11 77 1 fg=default bg=#151a28 attrs=
 R11 78 1 fg=#7a8197 bg=#151a28 attrs=
@@ -113,12 +115,16 @@ L14| ╰────────────────────────
 R14 0 1 fg=#677084 bg=#0f131e attrs=
 R14 1 78 fg=#7a8197 bg=#151a28 attrs=
 R14 79 1 fg=#1c2233 bg=#05070c attrs=
-L15|                                        Ctrl-Space palette · Ctrl-g lock
+L15|                                         Alt-↑↓      prev/next worktree
 R15 0 3 fg=#677084 bg=#0f131e attrs=
 R15 3 77 fg=#1c2233 bg=#05070c attrs=
-L16|
+L16|                                         Ctrl-g      lock keys to pane
 R16 0 32 fg=#677084 bg=#0f131e attrs=
-R16 32 48 fg=#677084 bg=#0b0e16 attrs=
+R16 32 9 fg=#677084 bg=#0b0e16 attrs=
+R16 41 6 fg=#4c505a bg=#0b0e16 attrs=
+R16 47 6 fg=#677084 bg=#0b0e16 attrs=
+R16 53 17 fg=#313643 bg=#0b0e16 attrs=
+R16 70 10 fg=#677084 bg=#0b0e16 attrs=
 L17|
 R17 0 32 fg=#677084 bg=#0f131e attrs=
 R17 32 48 fg=#677084 bg=#0b0e16 attrs=

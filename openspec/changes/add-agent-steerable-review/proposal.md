@@ -32,11 +32,11 @@ the human drive together**, borrowing from
 
 hunk's model — the diff viewer is the _shared artifact_ between human and agent,
 driven out-of-band while both watch — is the sharpest idea in the audit that
-superzej doesn't have. superzej is already an in-process compositor with a
+thegn doesn't have. thegn is already an in-process compositor with a
 worktree-scoped panel (`PanelMsg`/`PanelUi`/`PanelData`, `ReviewThreadRow`) and
 already parses structured diffs in core (`diff_sbs::parse_unified` →
 `SbsFile`/`SbsHunk`), so the projection is nearly free and the steering is just
-mapping ACP/MCP verbs onto the existing `PanelMsg` intents. Because superzej owns
+mapping ACP/MCP verbs onto the existing `PanelMsg` intents. Because thegn owns
 the compositor, there is **no shell escape** (lumen routes through `/dev/tty`; hunk
 runs a loopback daemon) — the agent and human share the same live panel directly.
 
@@ -53,7 +53,7 @@ interactive surface, the gate owns the pipeline.)
 - **Granting the agent new authority** — the agent can already run git/shell via
   the bouncer; review comments post through the existing forge path and the
   bouncer's approval gate still applies.
-- **A bespoke daemon/socket** — superzej is already the long-running compositor;
+- **A bespoke daemon/socket** — thegn is already the long-running compositor;
   steering rides the existing ACP/MCP transport, not a new loopback server.
 - **AI-free-shell dependency** — the panel remains fully usable by the human with
   no agent connected; steering is strictly additive.

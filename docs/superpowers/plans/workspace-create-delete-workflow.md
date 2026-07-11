@@ -2,7 +2,7 @@
 
 ## Current State Assessment
 
-### What's working (native host / szhost)
+### What's working (native host / thegn)
 
 | Component                                                                    | Status                     |
 | ---------------------------------------------------------------------------- | -------------------------- | ----------- |
@@ -13,7 +13,7 @@
 | DB: `touch_repo()` / `recent_repos()` for recents                            | ✅ Complete                |
 | DB: `known_repos()` union across workspaces/worktrees/repos                  | ✅ Complete                |
 | DB: `is_known_repo()` exists check                                           | ✅ Complete                |
-| CLI: `superzej new-workspace [path                                           | url]` (legacy zellij path) | ✅ Complete |
+| CLI: `thegn new-workspace [path                                              | url]` (legacy zellij path) | ✅ Complete |
 | Session: `switch_to_workspace()` persist-old → resurrect-new → seed-if-empty | ✅ Complete                |
 | Sidebar: builds workspace list from `db.workspaces()` + session tabs         | ✅ Complete                |
 | Palette: "new-workspace", "switch-workspace" entries                         | ✅ Exists                  |
@@ -51,7 +51,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        superzej (szhost)                         │
+│                        thegn (thegn)                         │
 │                                                                   │
 │  ┌──────────┐  ┌──────────────┐  ┌─────────────┐               │
 │  │ Sidebar  │  │   Palette    │  │  Keymap      │               │
@@ -89,7 +89,7 @@
 
 ### Phase 1: Core DB + Session Infrastructure (P0)
 
-#### 1.1 Add `delete_workspace()` to `crates/superzej-core/src/db.rs`
+#### 1.1 Add `delete_workspace()` to `crates/thegn-core/src/db.rs`
 
 ```rust
 /// Remove a workspace registration. This is non-destructive: it only
@@ -116,14 +116,14 @@ pub fn delete_workspace(&self, repo_path: &str) -> Result<u32> {
 }
 ```
 
-**Files touched:** `crates/superzej-core/src/db.rs`
+**Files touched:** `crates/thegn-core/src/db.rs`
 
 - Add method `delete_workspace(&self, repo_path: &str) -> Result<u32>`
 - Add unit test `workspace_delete_removes_row_and_reports_orphans()`
 
 #### 1.2 Add `DeleteWorkspace` to host keymap
 
-**Files touched:** `crates/superzej-host/src/keymap.rs`
+**Files touched:** `crates/thegn-host/src/keymap.rs`
 
 - Add `DeleteWorkspace` variant to `Action` enum
 - Add `"delete-workspace"` key to `Action::key()` / `Action::from_key()`
@@ -132,13 +132,13 @@ pub fn delete_workspace(&self, repo_path: &str) -> Result<u32> {
 
 #### 1.3 Add `DeleteWorkspace` dispatch in event loop
 
-**Files touched:** `crates/superzej-host/src/run.rs`
+**Files touched:** `crates/thegn-host/src/run.rs`
 
 - Add `Action::DeleteWorkspace` arm in the matched action dispatch (inside `crate::sequence::MatchResult::Matched(action)` block)
 - Logic:
   1. Open DB
   2. Call `db.delete_workspace(&session.id)`
-  3. If orphan count > 0: display status warning ("⚠ Deleted workspace. N orphaned worktrees remain at ~/.superzej/worktrees/...")
+  3. If orphan count > 0: display status warning ("⚠ Deleted workspace. N orphaned worktrees remain at ~/.thegn/worktrees/...")
   4. Switch to the next available workspace (first from `db.workspaces()`)
   5. Refresh sidebar
 - Add palette entry: `PaletteItem::new("delete-workspace", "Delete workspace ✕")`
@@ -157,7 +157,7 @@ Currently both `NewWorkspace` and `SwitchWorkspace` open the palette with worksp
 - Show prompt in status bar: `"Create workspace — enter path or URL (Esc to cancel)"`
 - Key input goes to an accumulating prompt buffer until Enter/Esc
 
-**Files touched:** `crates/superzej-host/src/run.rs`
+**Files touched:** `crates/thegn-host/src/run.rs`
 
 - Add `prompt: Option<String>` to the event loop mutable state
 - Add `prompt_mode: PromptMode` enum (`None`, `NewWorkspace`, `DeleteConfirm`)
@@ -234,11 +234,11 @@ fn create_workspace_from_input(
         return Err(anyhow::anyhow!("no path given"));
     }
 
-    let root = if superzej_core::util::is_url(input) {
+    let root = if thegn_core::util::is_url(input) {
         // Clone from URL
-        let repo_name = superzej_core::util::basename(input)
+        let repo_name = thegn_core::util::basename(input)
             .trim_end_matches(".git").to_string();
-        let dest = superzej_core::config::workspaces_dir().join(&repo_name);
+        let dest = thegn_core::config::workspaces_dir().join(&repo_name);
         if !dest.join(".git").is_dir() {
             std::fs::create_dir_all(dest.parent().unwrap())?;
             let status = std::process::Command::new("git")
@@ -261,7 +261,7 @@ fn create_workspace_from_input(
     };
 
     let root_s = root.to_string_lossy().into_owned();
-    let name = superzej_core::repo::repo_name(&root);
+    let name = thegn_core::repo::repo_name(&root);
     db.put_workspace(&root_s, &name)?;
     db.touch_repo(&root_s, &name)?;
 
@@ -272,7 +272,7 @@ fn create_workspace_from_input(
 }
 ```
 
-**Files touched:** `crates/superzej-core/src/util.rs` (add `is_url()` if not present), `crates/superzej-host/src/run.rs`
+**Files touched:** `crates/thegn-core/src/util.rs` (add `is_url()` if not present), `crates/thegn-host/src/run.rs`
 
 ---
 
@@ -329,7 +329,7 @@ if prompt.as_deref() == Some("yes") {
             need_relayout = true;
             if orphan_count > 0 {
                 model.status = format!(
-                    "⚠ Deleted workspace. {} orphaned worktree(s) remain at ~/.superzej/worktrees/",
+                    "⚠ Deleted workspace. {} orphaned worktree(s) remain at ~/.thegn/worktrees/",
                     orphan_count
                 );
             } else {
@@ -451,14 +451,14 @@ User presses Alt-o (SwitchWorkspace)
 
 ### Modified files
 
-| File                                  | Changes                                                                                                                                                                                                     |
-| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `crates/superzej-core/src/db.rs`      | Add `delete_workspace(&self, repo_path: &str) -> Result<u32>`. Add unit test.                                                                                                                               |
-| `crates/superzej-core/src/util.rs`    | Add `is_url(s: &str) -> bool` helper (moved from CLI crate).                                                                                                                                                |
-| `crates/superzej-host/src/keymap.rs`  | Add `DeleteWorkspace` action, keybind (`Alt Shift X`, `Space X`).                                                                                                                                           |
-| `crates/superzej-host/src/run.rs`     | Add prompt mode system. Add `Action::DeleteWorkspace` dispatch. Rework `Action::NewWorkspace` to use prompt (not palette). Add sidebar delete keys. Add `create_workspace_from_input()`. Add palette items. |
-| `crates/superzej-host/src/session.rs` | No changes needed (switch_to_workspace already works).                                                                                                                                                      |
-| `crates/superzej-host/src/chrome.rs`  | Add status bar rendering for prompt mode when visible.                                                                                                                                                      |
+| File                               | Changes                                                                                                                                                                                                     |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/thegn-core/src/db.rs`      | Add `delete_workspace(&self, repo_path: &str) -> Result<u32>`. Add unit test.                                                                                                                               |
+| `crates/thegn-core/src/util.rs`    | Add `is_url(s: &str) -> bool` helper (moved from CLI crate).                                                                                                                                                |
+| `crates/thegn-host/src/keymap.rs`  | Add `DeleteWorkspace` action, keybind (`Alt Shift X`, `Space X`).                                                                                                                                           |
+| `crates/thegn-host/src/run.rs`     | Add prompt mode system. Add `Action::DeleteWorkspace` dispatch. Rework `Action::NewWorkspace` to use prompt (not palette). Add sidebar delete keys. Add `create_workspace_from_input()`. Add palette items. |
+| `crates/thegn-host/src/session.rs` | No changes needed (switch_to_workspace already works).                                                                                                                                                      |
+| `crates/thegn-host/src/chrome.rs`  | Add status bar rendering for prompt mode when visible.                                                                                                                                                      |
 
 ### Test changes
 
@@ -477,7 +477,7 @@ User presses Alt-o (SwitchWorkspace)
 - `put_workspace` already handles idempotent re-creation (upsert on `repo_path`)
 - `delete_workspace` is non-destructive — only removes DB row, worktrees on disk survive
 - No schema migration needed (no new columns)
-- Legacy zellij path (`crates/superzej-cli/src/commands/new_workspace.rs`) is unaffected
+- Legacy zellij path (`crates/thegn-cli/src/commands/new_workspace.rs`) is unaffected
 - Existing keybindings preserved; only additive changes
 
 ---

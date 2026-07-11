@@ -2,7 +2,7 @@
 
 ## 1. Workflow-graph model (TOML)
 
-- [ ] 1.1 Add the node/edge model in `superzej-core`: node kinds
+- [ ] 1.1 Add the node/edge model in `thegn-core`: node kinds
       (`agent-exec | check{test,lint,fmt} | approval-gate | pr`) and edge kinds
       (`sequence | conditional-on-severity | parallel | loop`) as `config_enum!`
       variants, plus the `[[pipeline.node]]` / `[[pipeline.edge]]` layered-TOML
@@ -15,7 +15,7 @@
 ## 2. Pure graph executor
 
 - [ ] 2.1 Add the pipeline engine as a **pure state machine** over the graph in
-      `superzej-core` (I/O injected), same shape as `render_plan::plan`: inputs =
+      `thegn-core` (I/O injected), same shape as `render_plan::plan`: inputs =
       graph + run state + event; output = next nodes / park / done / failed. No
       side effects. **Unit tests** for deterministic node ordering on the default
       graph and terminal transitions (95% line gate).
@@ -26,7 +26,7 @@
 
 ## 3. Review-gate finding model (node-level policy)
 
-- [ ] 3.1 Add the finding type in `superzej-core`: `severity` × `action` +
+- [ ] 3.1 Add the finding type in `thegn-core`: `severity` × `action` +
       per-**node** `auto_fix_limit` + resolution (`approve`/`fix`/`skip`). **Unit
       tests** for the auto-fix-vs-park decision across the severity/action/limit
       matrix (review node limit `0` ⇒ park).
@@ -60,7 +60,7 @@
       transcript-scraping); absent when no bound session. **Unit tests** for
       present/absent intent.
 - [ ] 5.2 Feed intent into review/gate nodes (findings judged against intent) and
-      into the `pr` node's PR-body generation via the existing `superzej pr create`
+      into the `pr` node's PR-body generation via the existing `thegn pr create`
       path. **Unit test** PR-body section assembly from intent.
 
 ## 6. Follow-on control flow (model defined now; ship later)

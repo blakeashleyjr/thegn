@@ -2,7 +2,7 @@
 
 ## Frecency score (core, pure)
 
-A pure function in `superzej-core` scores an entry from its `frecency`/`repos`
+A pure function in `thegn-core` scores an entry from its `frecency`/`repos`
 row: `score(count, last_used, now) = count * decay(now - last_used)` with a
 bounded half-life decay (the classic frecency curve). It is **pure + unit-tested**
 (more-recent beats older at equal count; higher count beats lower at equal age;
@@ -58,7 +58,7 @@ worktree-template/layout source; it does not mutate the source files.
 
 - **Raw-recency ordering (status quo, `seq DESC`)** — kept as a fallback but
   frecency better matches "the place I actually work in."
-- **Shelling out to `zoxide` as the store** — rejected as a hard dep; superzej's
+- **Shelling out to `zoxide` as the store** — rejected as a hard dep; thegn's
   own table is the source of truth, with optional zoxide enrichment later.
 - **A live filesystem crawl for repos** — rejected; the `repos`/workspace registry
   is authoritative and cheap.

@@ -36,14 +36,14 @@ host-mediated privileged ops — a worker asking the broker to perform a network
 action on its behalf — but its current worker doesn't use them; everything inside
 the jail is network-free by construction.)
 
-## Why this fits superzej specifically
+## Why this fits thegn specifically
 
 - The **LLM proxy is already the single network chokepoint and key-holder**
-  (`crates/superzej-core/src/config.rs` `LlmProxyConfig`;
-  `crates/superzej-host/src/proxy_daemon.rs`). A broker that owns model traffic
+  (`crates/thegn-core/src/config.rs` `LlmProxyConfig`;
+  `crates/thegn-host/src/proxy_daemon.rs`). A broker that owns model traffic
   is most of the way built.
 - `SandboxSpec` already carries `env_overrides` / `env_block`
-  (`crates/superzej-core/src/sandbox.rs`) for injecting a per-agent **virtual
+  (`crates/thegn-core/src/sandbox.rs`) for injecting a per-agent **virtual
   key** and suppressing the master key — exactly the host-keeps-the-key shape
   this mode needs.
 

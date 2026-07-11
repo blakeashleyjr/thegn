@@ -4,7 +4,7 @@
 
 ### Requirement: An agent can steer the live review panel the human is watching
 
-superzej SHALL let an agent, over its existing ACP/MCP transport, navigate the
+thegn SHALL let an agent, over its existing ACP/MCP transport, navigate the
 worktree-scoped review panel — open the changes/PR section, focus a file, move to
 a hunk — by mapping review verbs onto the panel's existing interaction intents and
 applying them on the event loop, so the human sees the same panel move live. The
@@ -24,7 +24,7 @@ not a pane recompose).
 
 ### Requirement: The diff is available to agents as a token-lean structured projection
 
-superzej SHALL expose an agent-facing structured projection of the diff — files,
+thegn SHALL expose an agent-facing structured projection of the diff — files,
 hunk headers, and line ranges — derived from the existing unified-diff parser,
 with the raw patch text included only on explicit opt-in, so an agent gets cheap
 structure without a full patch dump. An empty diff MUST yield an empty projection.
@@ -41,7 +41,7 @@ structure without a full patch dump. An empty diff MUST yield an empty projectio
 
 ### Requirement: Review comments flow both ways between agent and human
 
-superzej SHALL let an agent attach a review comment at a file/line that posts
+thegn SHALL let an agent attach a review comment at a file/line that posts
 through the existing forge path (subject to the bouncer's approval gate) and
 appears beside the code in the panel, and it SHALL feed the human's replies on
 those threads back to the agent as its next turn. No new persistence is required —

@@ -4,7 +4,7 @@
 
 Adopt three ideas — validated against the external tool
 [`no-mistakes`](https://github.com/kunchenguid/no-mistakes) — that give shape to
-superzej's planned-but-unstarted agent review/merge work, but generalize the
+thegn's planned-but-unstarted agent review/merge work, but generalize the
 fixed stage chain into a **workflow graph** authored in layered TOML:
 
 1. **Agent validation as a workflow graph in an ephemeral worktree** — a graph of
@@ -12,7 +12,7 @@ fixed stage chain into a **workflow graph** authored in layered TOML:
    (`sequence | conditional-on-severity | parallel | loop`), executed in a
    throwaway, non-tab worktree so the user's working directory and open tabs are
    never disturbed. The graph is authored in TOML (`[[pipeline.node]]` /
-   `[[pipeline.edge]]`) using superzej's `config_enum!` layered-config idiom.
+   `[[pipeline.edge]]`) using thegn's `config_enum!` layered-config idiom.
    **When unconfigured, the default graph is exactly today's linear pipeline**
    (intent → review → test → lint → document → approval → PR), so nothing
    regresses — the linear chain is just the default instance of the graph model.
@@ -22,18 +22,18 @@ fixed stage chain into a **workflow graph** authored in layered TOML:
    approve / fix / skip decision. The finding model is preserved verbatim and
    attached as **node-level policy** on the graph.
 3. **Change-intent attached to review/PR** — "what this change was trying to do,"
-   derived deterministically from superzej's native agent-session↔worktree
+   derived deterministically from thegn's native agent-session↔worktree
    binding (not by scraping transcripts), surfaced in review and used to generate
    the PR body.
 
 The transport layer that `no-mistakes` uses (a bare gate repo, a pinned
 post-receive hook, and a background daemon) is deliberately **not** adopted:
-superzej is already the long-running compositor and owns the UI, so it triggers
+thegn is already the long-running compositor and owns the UI, so it triggers
 the graph from a panel/palette action or on agent-task completion.
 
 The executor is a **pure state machine** over the node graph — same shape and
 ethos as `render_plan::plan` — with I/O injected at the edges so it is
-deterministic, unit-tested, and coverage-gated in `superzej-core`.
+deterministic, unit-tested, and coverage-gated in `thegn-core`.
 
 ## Impact
 
@@ -69,13 +69,13 @@ New capabilities introduced (ADDED specs): `agent-pipeline`, `review-gate`,
   stages (run test+lint concurrently, loop fix→re-review, gate on risk) without a
   code change. Modeling the pipeline as TOML-authored nodes+edges — with the
   linear chain as the default instance — makes control flow data, keeps the
-  executor a small pure state machine, and matches superzej's existing
+  executor a small pure state machine, and matches thegn's existing
   layered-TOML config idiom (`config_enum!`).
-- **superzej is _inside_ the agent.** `no-mistakes` works hard to _recover_
+- **thegn is _inside_ the agent.** `no-mistakes` works hard to _recover_
   intent from outside (transcript readers + file-overlap scoring + disambiguation).
-  superzej already binds agent sessions to worktrees, so intent attaches
+  thegn already binds agent sessions to worktrees, so intent attaches
   deterministically and cheaply — the highest value-to-effort transfer.
-- **The ephemeral worktree keeps the user undisturbed.** superzej is
+- **The ephemeral worktree keeps the user undisturbed.** thegn is
   worktree-native and already spins per-worktree sandboxes; running the graph in a
   reserved, non-tab worktree is a natural fit and reuses the existing
   stale-worktree GC seam.
@@ -91,7 +91,7 @@ action` with an auto-fix limit keeps mechanical fixes automatic (the current
   with the single-process compositor model.
 - **No DOT / Graphviz or a bespoke graph DSL** — the graph is plain layered TOML
   (`[[pipeline.node]]` / `[[pipeline.edge]]`), consistent with the rest of
-  superzej config; no new file format is introduced.
+  thegn config; no new file format is introduced.
 - No heuristic transcript-scraping for intent — only relevant when the tool lives
   outside the agent.
 - No AI hard-dependency: the graph MUST degrade to the non-AI nodes (test/lint/

@@ -4,7 +4,7 @@ Date: 2026-06-25
 
 ## Goal
 
-Provide a robust, type-safe, and zero-runtime-I/O localization (i18n) layer for the `superzej` terminal IDE. The solution must respect the project's strict sub-300ms startup bounds, provide expressive pluralization, and be fully aware of the strict cell-width requirements of the terminal UI.
+Provide a robust, type-safe, and zero-runtime-I/O localization (i18n) layer for the `thegn` terminal IDE. The solution must respect the project's strict sub-300ms startup bounds, provide expressive pluralization, and be fully aware of the strict cell-width requirements of the terminal UI.
 
 ## Non-goals
 
@@ -16,7 +16,7 @@ Provide a robust, type-safe, and zero-runtime-I/O localization (i18n) layer for 
 
 Mozilla's Fluent system (`.ftl` files) provides the needed expressiveness for pluralization, gender, and interpolation. To meet the zero-I/O invariant, translations are compiled directly into the binary using `fluent-templates` and `rust-embed`.
 
-### Core Mechanism (`crates/superzej-core/src/i18n.rs`)
+### Core Mechanism (`crates/thegn-core/src/i18n.rs`)
 
 1. **Embedded Assets:** Locale files (e.g., `locales/en-US/main.ftl`) are baked into the binary.
 2. **Global Resolver:** A thread-safe static (`ArcSwap` or `OnceLock`) holds the active `LanguageIdentifier`.
@@ -30,7 +30,7 @@ Mozilla's Fluent system (`.ftl` files) provides the needed expressiveness for pl
    [ui]
    language = "ja-JP"  # "auto" by default
    ```
-3. **Initialization:** The locale is resolved exactly once during the `szhost::startup` waterfall, prior to the first render.
+3. **Initialization:** The locale is resolved exactly once during the `thegn::startup` waterfall, prior to the first render.
 
 ## The TUI Layout Invariant (Grid Cells vs Bytes)
 
@@ -49,13 +49,13 @@ While the UI translates its own chrome, the proxy must communicate the user's ac
 
 ## File Structure
 
-- `crates/superzej-core/src/i18n.rs`: The translation resolver and `t!` macro.
-- `crates/superzej-core/locales/<lang>/main.ftl`: The fluent strings.
-- `crates/superzej-core/src/config.rs`: Added `UiConfig` and `language` parsing.
+- `crates/thegn-core/src/i18n.rs`: The translation resolver and `t!` macro.
+- `crates/thegn-core/locales/<lang>/main.ftl`: The fluent strings.
+- `crates/thegn-core/src/config.rs`: Added `UiConfig` and `language` parsing.
 
 ## Summary of Crate Additions
 
 - `fluent-templates` (and `fluent-bundle`, `unic-langid`) for compile-time `.ftl` embedding.
 - `sys-locale` for fast, zero-dependency host OS language discovery.
 
-All dependencies go into `superzej-core`, hiding the complexity from `superzej-host`.
+All dependencies go into `thegn-core`, hiding the complexity from `thegn-host`.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# superzej: strip a stray `core.worktree` from a MAIN checkout's shared
+# thegn: strip a stray `core.worktree` from a MAIN checkout's shared
 # `.git/config`.
 #
 # A non-bare main checkout must NEVER carry core.worktree: it silently
@@ -15,8 +15,8 @@
 # This is the pure-text repair: it never invokes git, resolves the shared
 # `.git/config` from any worktree by reading `.git` / `commondir` directly, and
 # drops only the `worktree` key inside the `[core]` section, preserving every
-# other byte. It mirrors `superzej_core::util::strip_core_worktree` so the
-# in-process (szhost) heal and this out-of-process heal agree.
+# other byte. It mirrors `thegn_core::util::strip_core_worktree` so the
+# in-process (thegn) heal and this out-of-process heal agree.
 #
 # Usage: run from anywhere inside the checkout. `-v` prints when it heals.
 #   sh test/git-hooks/heal-worktree.sh [-v] [dir]

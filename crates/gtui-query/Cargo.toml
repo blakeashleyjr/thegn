@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 gtui-core = { path = "../gtui-core" }
-superzej-metrics = { path = "../superzej-metrics" }
+thegn-metrics = { path = "../thegn-metrics" }
 chrono = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }

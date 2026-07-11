@@ -2,7 +2,7 @@
 
 ## Summary
 
-superzej's sandbox boundary is currently binary — a process is either sealed in a
+thegn's sandbox boundary is currently binary — a process is either sealed in a
 container (bouncer: `network=none`, tools brokered over unix-socket ACP with
 approval) or it runs on the host. This change adds a **declarative, fine-grained
 policy layer** _inside_ that boundary: a `[policy]` config of ordered
@@ -31,7 +31,7 @@ not a new table.
 
 Forge ships a policy rules engine (`forge_domain/src/policies/`) doing path-based
 `deny`/`allow`/`require-approval` plus a restricted-shell mode — but Forge has no
-real sandbox, so the policy _is_ its only protection. superzej has the inverse:
+real sandbox, so the policy _is_ its only protection. thegn has the inverse:
 strong container isolation but a coarse, binary approval gate. The two compose
 well — keep the container as the hard floor, add a declarative policy for the
 _graduated_ decisions inside it (which reads are free, which writes need a
@@ -46,7 +46,7 @@ ACP permission flow that already exists on the roadmap.
   boundary; policy is a _finer_ gate inside it, never a substitute for
   `network=none` / sealing.
 - **A general OS sandbox profile language (seccomp/AppArmor authoring)** — policy
-  is over the ACP/tool-broker file & shell operations superzej mediates, not
+  is over the ACP/tool-broker file & shell operations thegn mediates, not
   arbitrary syscalls.
 - **Network policy** — egress/tunnel policy is the sandbox-VPN/sealed-tunnel
   feature's concern; this change is file + shell operations only.

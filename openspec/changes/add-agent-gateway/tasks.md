@@ -8,7 +8,7 @@ guardrails**. Core policy-eval logic is pure and unit-tested (95% gate).
 
 ### 1. Policy model (core, pure)
 
-- [ ] 1.1 `superzej-core::gateway` — `GatewayPolicy` value + layered-TOML
+- [ ] 1.1 `thegn-core::gateway` — `GatewayPolicy` value + layered-TOML
       parse/merge (`[gateway.agent.<id>]`: `tools.allow`, `skills`,
       `system_prompt`, `model.route`), resolved global → repo → per-agent
       front-matter; reuse the `grants.rs` glob matcher.

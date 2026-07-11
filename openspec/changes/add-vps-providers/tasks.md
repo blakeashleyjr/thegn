@@ -5,7 +5,7 @@
 - [x] 1.1 `vps/hetzner.rs` — pure request shaping (URLs, create/list/destroy,
       ssh keys, snapshot/create_image, label selector) — **unit tests**: URL
       shapes, body fields, snapshot-id-as-number, parse envelopes, pubkey match.
-- [x] 1.2 `vps/registry.rs` — file ledger under `$XDG_STATE/superzej/vps/`
+- [x] 1.2 `vps/registry.rs` — file ledger under `$XDG_STATE/thegn/vps/`
       (intent → ready → removed; per-instance known_hosts) — **unit tests**:
       round trip, corrupt/foreign files skipped, idempotent remove.
 - [x] 1.3 `vps/ssh_shim.rs` — exec (secrets over stdin, ControlMaster,
@@ -25,7 +25,7 @@
 
 - [x] 2.1 `EnvProviderConfig`: `region`, `size`, `max_instances`,
       `max_lifetime_secs`; `vps_provider_kind()`;
-      `control_command_template()` (the `szhost vps-ssh {id} --` default).
+      `control_command_template()` (the `thegn vps-ssh {id} --` default).
 - [x] 2.2 `envbuild`: VPS envs with no `exec_command` get the self-bridge as
       control/interactive prefix — **unit test**: prefix shape, explicit
       exec_command wins, non-VPS unchanged.
@@ -37,7 +37,7 @@
 - [x] 3.1 `provider_factory.rs` (extracted from the pinned `agent.rs`; ratchet
       re-baselined lower) with the hetzner arm over the managed keypair;
       `cmd/env.rs::api_provider` VPS arm.
-- [x] 3.2 `vps_bridge.rs` + hidden `szhost vps-ssh` subcommand (ledger → API
+- [x] 3.2 `vps_bridge.rs` + hidden `thegn vps-ssh` subcommand (ledger → API
       fallback IP resolve, `-tt` under a PTY, process exec).
 - [x] 3.3 Checkpoint plan step gated on `caps().checkpoints`; warm-pool claim
       rebind uses `control_command_template` — **unit test**
@@ -46,7 +46,7 @@
 - [x] 3.4 `vps_reaper.rs` — label+host-scoped orphan/lifetime reaper on the
       hydration cadence (self-throttled 5 min, network on its own thread),
       called from `hydrate::build_model`.
-- [x] 3.5 `cmd/env_image.rs` + `superzej env image-bake` (bake → poweroff →
+- [x] 3.5 `cmd/env_image.rs` + `thegn env image-bake` (bake → poweroff →
       snapshot → destroy → print `template = "snapshot:<id>"`).
 
 ## 4. Docs + validate

@@ -1,14 +1,14 @@
 # Tasks
 
-## 1. Hook config + contract (superzej-core)
+## 1. Hook config + contract (thegn-core)
 
 - [ ] 1.1 Add `[env.<name>.provision]`/`[env.<name>.teardown]` config (ordered
       `hooks`, `timeout_secs`) and a resolver that builds the ordered hook plan
-      with task-context env (`SUPERZEJ_TASK_ID`/`_REPO`/`_BRANCH` + worktree path)
+      with task-context env (`THEGN_TASK_ID`/`_REPO`/`_BRANCH` + worktree path)
       — **unit tests**: parse + ordering, defaults, task-context env assembly,
       empty hooks = no-op.
 
-## 2. Lifecycle integration (superzej-host / superzej-core)
+## 2. Lifecycle integration (thegn-host / thegn-core)
 
 - [ ] 2.1 Run provision hooks inside `Placement::ensure()` and teardown hooks in
       `teardown()`, sequentially with per-hook timeout; non-zero exit fails
@@ -17,7 +17,7 @@
 - [ ] 2.2 Compose with the warm pool: a claimed spare skips provision; a fresh
       task runs it; teardown respects pool-return vs destroy.
 
-## 3. Output surfacing (superzej-host)
+## 3. Output surfacing (thegn-host)
 
 - [ ] 3.1 Capture hook stdout/stderr off-loop and surface provisioning status
       (status line / notification path); persist per-task results in a small table

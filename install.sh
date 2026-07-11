@@ -2,10 +2,9 @@
 # install.sh — standalone (non-Nix) install of the native compositor host.
 #
 # Installs:
-#   sj       — opens superzej in a dedicated alacritty window with the bundled profile
-#   sj-tui   — opens superzej in the current terminal window
-#   superzej — direct native host binary for CLI verbs/current-terminal use
-#   szhost   — direct native host binary alias
+#   tg      — opens thegn in a dedicated alacritty window with the bundled profile
+#   tg-tui  — opens thegn in the current terminal window
+#   thegn   — direct native host binary for CLI verbs/current-terminal use
 set -euo pipefail
 
 usage() {
@@ -55,16 +54,15 @@ done
 bindir="${bindir:-$HOME/.local/bin}"
 : "${XDG_CONFIG_HOME:=$HOME/.config}"
 
-release_bin="$here/target/release/szhost"
+release_bin="$here/target/release/thegn"
 alacritty_config="$here/config/alacritty.toml"
-sj_tui="$bindir/sj-tui"
+tg_tui="$bindir/tg-tui"
 
 if ((dry_run)); then
   echo "dry-run: no files will be changed"
-  echo "$bindir/szhost -> $release_bin"
-  echo "$bindir/superzej -> $release_bin"
-  echo "$bindir/sj-tui wrapper -> $release_bin (current terminal)"
-  echo "$bindir/sj wrapper -> alacritty --config-file $alacritty_config -e $sj_tui"
+  echo "$bindir/thegn -> $release_bin"
+  echo "$bindir/tg-tui wrapper -> $release_bin (current terminal)"
+  echo "$bindir/tg wrapper -> alacritty --config-file $alacritty_config -e $tg_tui"
   exit 0
 fi
 
@@ -77,61 +75,62 @@ echo "building release binary…"
 (cd "$here" && cargo build --release --workspace)
 
 mkdir -p "$bindir"
-ln -sfn "$release_bin" "$bindir/superzej"
-ln -sfn "$release_bin" "$bindir/szhost"
+ln -sfn "$release_bin" "$bindir/thegn"
 
 release_bin_q="$(shell_quote "$release_bin")"
 alacritty_config_q="$(shell_quote "$alacritty_config")"
-sj_tui_q="$(shell_quote "$sj_tui")"
+tg_tui_q="$(shell_quote "$tg_tui")"
 
 # Remove any existing wrappers first: a leftover dangling symlink (e.g. from a
 # pruned worktree) would make the heredoc redirect below fail with "No such
 # file or directory" as bash follows it to a non-existent target.
-rm -f "$sj_tui" "$bindir/sj"
+# Also sweep the pre-rename superzej-era entry points.
+rm -f "$tg_tui" "$bindir/tg" \
+  "$bindir/sj" "$bindir/sj-tui" "$bindir/superzej" "$bindir/szhost"
 
-cat >"$sj_tui" <<EOF
+cat >"$tg_tui" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-export SUPERZEJ_ALACRITTY_CONFIG=$alacritty_config_q
+export THEGN_ALACRITTY_CONFIG=$alacritty_config_q
 exec $release_bin_q "\$@"
 EOF
-chmod 0755 "$sj_tui"
+chmod 0755 "$tg_tui"
 
-cat >"$bindir/sj" <<EOF
+cat >"$bindir/tg" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
 if ((\$# > 0)); then
-  exec $sj_tui_q "\$@"
+  exec $tg_tui_q "\$@"
 fi
 
 if ! command -v alacritty >/dev/null 2>&1; then
-  echo "sj: alacritty not found; install alacritty or run 'sj-tui' to open superzej in the current terminal." >&2
+  echo "tg: alacritty not found; install alacritty or run 'tg-tui' to open thegn in the current terminal." >&2
   exit 127
 fi
 
-exec alacritty --config-file $alacritty_config_q -e $sj_tui_q
+exec alacritty --config-file $alacritty_config_q -e $tg_tui_q
 EOF
-chmod 0755 "$bindir/sj"
+chmod 0755 "$bindir/tg"
 
-if [[ ! -f "$XDG_CONFIG_HOME/superzej/config.toml" ]]; then
-  mkdir -p "$XDG_CONFIG_HOME/superzej"
-  cp "$here/config/config.toml.example" "$XDG_CONFIG_HOME/superzej/config.toml"
-  echo "wrote default config: $XDG_CONFIG_HOME/superzej/config.toml"
+if [[ ! -f "$XDG_CONFIG_HOME/thegn/config.toml" ]]; then
+  mkdir -p "$XDG_CONFIG_HOME/thegn"
+  cp "$here/config/config.toml.example" "$XDG_CONFIG_HOME/thegn/config.toml"
+  echo "wrote default config: $XDG_CONFIG_HOME/thegn/config.toml"
 fi
 
 # Warn about missing runtime deps (delta is used for diff output; alacritty is
-# used by the `sj` dedicated-window launcher).
+# used by the `tg` dedicated-window launcher).
 command -v delta >/dev/null || echo "warning: 'delta' not found — diff output will lack syntax highlighting (install: https://github.com/dandavison/delta)" >&2
-command -v alacritty >/dev/null || echo "warning: 'alacritty' not found — 'sj' opens a dedicated alacritty window; use 'sj-tui' for the current terminal" >&2
+command -v alacritty >/dev/null || echo "warning: 'alacritty' not found — 'tg' opens a dedicated alacritty window; use 'tg-tui' for the current terminal" >&2
 
 echo "installed:"
-echo "  $bindir/sj      -> dedicated alacritty window using $alacritty_config"
-echo "  $bindir/sj-tui  -> current-terminal native host ($release_bin)"
-echo "  $bindir/{superzej,szhost} -> $release_bin"
+echo "  $bindir/tg      -> dedicated alacritty window using $alacritty_config"
+echo "  $bindir/tg-tui  -> current-terminal native host ($release_bin)"
+echo "  $bindir/thegn   -> $release_bin"
 echo
-echo "Ensure $bindir is on PATH, then run:  sj      # dedicated alacritty window"
-echo "                              or:  sj-tui  # current terminal"
-echo "superzej shells out to:  git fzf (or gum) lazygit yazi delta gh"
+echo "Ensure $bindir is on PATH, then run:  tg      # dedicated alacritty window"
+echo "                              or:  tg-tui  # current terminal"
+echo "thegn shells out to:  git fzf (or gum) lazygit yazi delta gh"
 echo
 echo "Nix users: 'nix profile install $here#default' bundles the native host."

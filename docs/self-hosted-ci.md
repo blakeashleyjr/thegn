@@ -13,12 +13,12 @@ GitHub-hosted (no Apple hardware on ageless).
 
 ## One-time setup
 
-Run **on ageless-studio, as `targe`** (SSH in over Tailscale, or use a superzej
+Run **on ageless-studio, as `targe`** (SSH in over Tailscale, or use a thegn
 `env=ageless` shell):
 
 ```sh
 git clone https://github.com/blakeashleyjr/superzej   # or cd an existing checkout
-cd superzej
+cd thegn
 
 NIX_GITHUB_TOKEN=<classic PAT, repo scope> \  # private flake inputs (muse, termite-chat)
 GH_PAT=<PAT with repo admin> \                # to auto-register the runners
@@ -120,7 +120,7 @@ no-ops onto the warm host caches.
 
 ```sh
 # restart / stop a runner
-sudo systemctl restart actions.runner.blakeashleyjr-superzej.ageless-1.service
+sudo systemctl restart actions.runner.blakeashleyjr-thegn.ageless-1.service
 
 # update the runner binary (GitHub auto-updates runners, but to force it):
 bash scripts/ci/ageless-runner-setup.sh        # re-run; picks the latest release

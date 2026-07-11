@@ -28,7 +28,7 @@ the hostile-repo suite) and `placement budget` / `explain` CLI surfaces.
 - **Config** — `[placement]` gains `preset`, `allowed_providers` (ceiling),
   `spillover_provider_order` (preference filtered to the allow-list),
   `max_monthly_spend`, `[placement.price.<provider[:size]>]` rate table;
-  `[zone.<name>.placement]` clamp block; repo `.superzej.*` gains a clamped
+  `[zone.<name>.placement]` clamp block; repo `.thegn.*` gains a clamped
   `[placement]` preference subset (everything fleet-scoped is Forbidden with
   loud ClampEvents).
 - **DB** — v36: `compute_budgets` (mirror of `proxy_budgets` minus tokens),
@@ -51,7 +51,7 @@ placement.*` clamp traces.
 
 ## Rationale
 
-The engine so far chooses among machines superzej pays for regardless of use.
+The engine so far chooses among machines thegn pays for regardless of use.
 The billing research this design rests on says vendors charge a 5–15×
 per-vCPU markup but bill only active time — so spillover is the correct _last_
 lane (after packing onto sunk-cost hosts and before refusing work), and it

@@ -1,4 +1,4 @@
-L0| ◆…  82% ·  15.5/94G ·  ↓    7K ↑    7K ·  100% · 22:07
+L0| þ…  91% ·  18.9/94G ·  ↓  1.6M ↑  967K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 1 fg=#6ee7d8 bg=#151a28 attrs=
 R0 2 1 fg=#6f788e bg=#151a28 attrs=
@@ -22,15 +22,15 @@ R2 5 3 fg=#6f788e bg=#0b0e16 attrs=
 R2 8 4 fg=#6ee7d8 bg=#0b0e16 attrs=
 R2 12 2 fg=default bg=default attrs=
 R2 14 3 fg=#6ee7d8 bg=#2e5359 attrs=
-L3|      ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
-R3 0 6 fg=default bg=default attrs=
-R3 6 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-L4|       ▀▀▀▄ █   █ █▄▄▄▀ █▀▀▀  █▄▄▄▀  ▄▀   █▀▀▀     █
-R4 0 6 fg=default bg=default attrs=
-R4 6 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-L5|      ▄▄▄▄▀ ▀▄▄▄▀ █     █▄▄▄▄ █  ▀▄ █▄▄▄▄ █▄▄▄▄ ▀▄▄▀
-R5 0 6 fg=default bg=default attrs=
-R5 6 47 fg=#6ee7d8 bg=#0b0e16 attrs=
+L3|               ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
+R3 0 15 fg=default bg=default attrs=
+R3 15 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+L4|                 █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
+R4 0 15 fg=default bg=default attrs=
+R4 15 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+L5|                 █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
+R5 0 15 fg=default bg=default attrs=
+R5 15 29 fg=#6ee7d8 bg=#0b0e16 attrs=
 L6|
 L7|                 v0.1.0 · git worktree IDE
 R7 0 17 fg=default bg=default attrs=

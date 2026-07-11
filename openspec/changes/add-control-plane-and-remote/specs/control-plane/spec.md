@@ -32,11 +32,11 @@ A client SHALL be able to warm-reattach to a daemon-owned session and MUST recei
 
 ### Requirement: Control API drives a running instance
 
-The daemon SHALL expose a control API (HTTP/gRPC plus an SSE/WebSocket event feed) gated by scoped tokens, and `szhost` CLI verbs (open worktree, send-to-terminal, snapshot, drive-browser) MUST drive a running instance through this API, degrading gracefully when no daemon is running; the API transport runs entirely off the render loop and never introduces a polling timeout.
+The daemon SHALL expose a control API (HTTP/gRPC plus an SSE/WebSocket event feed) gated by scoped tokens, and `thegn` CLI verbs (open worktree, send-to-terminal, snapshot, drive-browser) MUST drive a running instance through this API, degrading gracefully when no daemon is running; the API transport runs entirely off the render loop and never introduces a polling timeout.
 
 #### Scenario: CLI verb reaches the live instance
 
-- **WHEN** the user runs a `szhost` send-to-terminal verb against a running daemon
+- **WHEN** the user runs a `thegn` send-to-terminal verb against a running daemon
 - **THEN** the input is delivered to the live pane over the control API and reflected in the attached UI
 
 #### Scenario: Scope is enforced
@@ -46,12 +46,12 @@ The daemon SHALL expose a control API (HTTP/gRPC plus an SSE/WebSocket event fee
 
 #### Scenario: No daemon present
 
-- **WHEN** a `szhost` control verb runs and no daemon is running
+- **WHEN** a `thegn` control verb runs and no daemon is running
 - **THEN** the CLI degrades gracefully with a clear message rather than crashing
 
 ### Requirement: Serve mode pairs thin clients over a pairing URL
 
-`szhost serve` SHALL advertise a pairing URL that desktop, web, or mobile thin clients use to pair and attach over the control API, where each pairing issues a scoped token stored hashed in the `pairings` table, and the pairing/approval prompt MUST render as a chrome overlay (resolving to a `Full` frame) without adding any polling timeout to the event loop.
+`thegn serve` SHALL advertise a pairing URL that desktop, web, or mobile thin clients use to pair and attach over the control API, where each pairing issues a scoped token stored hashed in the `pairings` table, and the pairing/approval prompt MUST render as a chrome overlay (resolving to a `Full` frame) without adding any polling timeout to the event loop.
 
 #### Scenario: Thin client pairs and attaches
 

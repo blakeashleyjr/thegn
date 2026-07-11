@@ -1,10 +1,11 @@
-L0| ◆ superzej v0.1.0 work      75% ·  15.4/94G ·   7% ·  50% ·  ↓  1.3M ↑  792K ·  100% · 22:08
+L0| þ thegn v0.1.0  work        44% ·  18.3/94G ·   7% ·  34% ·  ↓  180K ↑  1.4M ·  100% · 02:22
 R0 0 1 fg=idx07 bg=idx00 attrs=
 R0 1 2 fg=idx06 bg=idx00 attrs=
-R0 3 9 fg=idx07 bg=idx00 attrs=
-R0 12 6 fg=idx08 bg=idx00 attrs=
-R0 18 6 fg=idx06 bg=idx08 attrs=BOLD
-R0 24 9 fg=idx07 bg=idx00 attrs=
+R0 3 6 fg=idx07 bg=idx00 attrs=
+R0 9 6 fg=idx08 bg=idx00 attrs=
+R0 15 1 fg=idx07 bg=idx00 attrs=
+R0 16 6 fg=idx06 bg=idx08 attrs=BOLD
+R0 22 11 fg=idx07 bg=idx00 attrs=
 R0 33 3 fg=idx08 bg=idx00 attrs=
 R0 36 10 fg=idx07 bg=idx00 attrs=
 R0 46 11 fg=idx08 bg=idx00 attrs=
@@ -70,7 +71,7 @@ R5 59 7 fg=idx06 bg=idx00 attrs=BOLD
 R5 66 28 fg=idx07 bg=idx00 attrs=
 R5 94 5 fg=idx08 bg=idx00 attrs=
 R5 99 1 fg=idx07 bg=idx00 attrs=
-L6|                                 │~]$\[\]             │
+L6|                                 │~]$\[\] ^C          │
 R6 0 32 fg=idx07 bg=idx00 attrs=
 R6 32 1 fg=default bg=idx00 attrs=
 R6 33 1 fg=idx06 bg=idx00 attrs=
@@ -91,7 +92,7 @@ R7 55 1 fg=default bg=idx00 attrs=
 R7 56 2 fg=idx07 bg=idx00 attrs=
 R7 58 18 fg=idx08 bg=idx00 attrs=
 R7 76 24 fg=idx07 bg=idx00 attrs=
-L8| ▾ ≡ local                       │                    │
+L8| ▾ ≡ local                       │\[\][\[\]blake@ws-3:│
 R8 0 1 fg=idx07 bg=idx00 attrs=
 R8 1 1 fg=idx08 bg=idx00 attrs=
 R8 2 3 fg=idx07 bg=idx00 attrs=
@@ -99,17 +100,19 @@ R8 5 5 fg=idx07 bg=idx00 attrs=BOLD
 R8 10 22 fg=idx07 bg=idx00 attrs=
 R8 32 1 fg=default bg=idx00 attrs=
 R8 33 1 fg=idx06 bg=idx00 attrs=
-R8 34 20 fg=default bg=default attrs=
+R8 34 2 fg=default bg=default attrs=
+R8 36 18 fg=idx02 bg=default attrs=BOLD
 R8 54 1 fg=idx06 bg=idx00 attrs=
 R8 55 1 fg=default bg=idx00 attrs=
 R8 56 44 fg=idx07 bg=idx00 attrs=
-L9|   └ ≡ local                     │                    │  2 commits                                —
+L9|   └ ≡ local                     │~]$\[\] ^\          │  2 commits                                —
 R9 0 3 fg=idx07 bg=idx00 attrs=
 R9 3 2 fg=idx08 bg=idx00 attrs=
 R9 5 27 fg=idx07 bg=idx00 attrs=
 R9 32 1 fg=default bg=idx00 attrs=
 R9 33 1 fg=idx06 bg=idx00 attrs=
-R9 34 20 fg=default bg=default attrs=
+R9 34 5 fg=idx02 bg=default attrs=BOLD
+R9 39 15 fg=default bg=default attrs=
 R9 54 1 fg=idx06 bg=idx00 attrs=
 R9 55 1 fg=default bg=idx00 attrs=
 R9 56 1 fg=idx07 bg=idx00 attrs=

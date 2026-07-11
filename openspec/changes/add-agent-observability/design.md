@@ -2,7 +2,7 @@
 
 ## Reused seams (no new substrate)
 
-- **`crates/superzej-core/src/account.rs`** — `struct Provider { id, home_env,
+- **`crates/thegn-core/src/account.rs`** — `struct Provider { id, home_env,
 default_dir, login_argv, auth_marker }` + the `const PROVIDERS` registry.
   Each `Provider` gains a **usage-file parser** seam: given the resolved
   credential-home dir (`account::resolve_dir`, already worktree/workspace/global
@@ -10,7 +10,7 @@ default_dir, login_argv, auth_marker }` + the `const PROVIDERS` registry.
   `~/.claude`, `~/.codex`) into a typed `UsageState { plan_pct, reset_at,
 window }`. Pure, fully unit-tested against fixture files; reads only, never
   writes. Unknown / absent files yield `None` (widget hides) — never an error.
-- **`crates/superzej-host/src/hydrate.rs`** — `enum RefreshKind` gains
+- **`crates/thegn-host/src/hydrate.rs`** — `enum RefreshKind` gains
   `RefreshKind::Usage`. `spawn_refresh_ticker` emits it on a coarse ~30–60s
   cadence (a whole multiple of the 500ms half-tick, like `Disk`); a
   `spawn_usage_cache_refresh` worker does the off-loop disk read and pulses the
@@ -22,10 +22,10 @@ window }`. Pure, fully unit-tested against fixture files; reads only, never
   title text → `ActivityState`, and `activity::poll_and_save_with` consults it
   first, falling back to the existing CPU-jiffy heuristic only when no title
   signal is present. The sticky-red `waiting`/`read` semantics are unchanged.
-- **`EventBus`** (`crates/superzej-core/src/event_bus.rs`) — the agents feed is a
+- **`EventBus`** (`crates/thegn-core/src/event_bus.rs`) — the agents feed is a
   view over existing `Event` variants (`AgentDone`, `AgentFailed`, plus a new
   agent state-change event), grouped per worktree into threads.
-- **Panel `Section`** (`crates/superzej-host/src/panel/mod.rs`) — a new
+- **Panel `Section`** (`crates/thegn-host/src/panel/mod.rs`) — a new
   `Section::Agents` feed section plus the L-group statusbar widgets (usage chip,
   agent-state chip, feed badge).
 - **Session history** — transcripts live in provider-native dirs (`~/.claude`,

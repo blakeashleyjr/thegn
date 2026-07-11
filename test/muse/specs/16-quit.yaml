@@ -3,17 +3,17 @@ case_tmp_env: XDG_STATE_HOME
 matrix:
   profiles: [xterm]
   sizes: ["100x30"]
-spawn: ["szhost"]
+spawn: ["thegn"]
 env:
   XDG_STATE_HOME: "{case_tmp}"
-  SUPERZEJ_LOG: warn
+  THEGN_LOG: warn
   MUSE_READY: "1"
   TERM: xterm-256color
 sync:
   quiet_window_ms: 2000
   max_settle_ms: 10000
 steps:
-  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 20000}
+  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
   # Exit the dashboard tile — 'q' returns control to the host (work tab).
   # Ctrl+Q is then intercepted by the host keymap before reaching the pane.
   - key: {key: q}
@@ -21,5 +21,5 @@ steps:
   - key: {key: q, mods: [ctrl]}
   - expect_exit: {code: 0, timeout_ms: 4000}
   - check_file:
-      path: "{case_tmp}/superzej/logs/szhost.log"
+      path: "{case_tmp}/thegn/logs/thegn.log"
       reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"

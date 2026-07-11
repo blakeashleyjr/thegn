@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Core harness registry + sanitizer (superzej-core)
+## 1. Core harness registry + sanitizer (thegn-core)
 
 - [ ] 1.1 `agent_session.rs`: `HarnessSpec` registry (claude/codex/gemini) with
       argv `detect` and `resume(session_id, safe_argv)` reconstruction —
@@ -11,22 +11,22 @@
       removed in `--k v` and `--k=v` forms, allow-listed survive, no secret
       substring in the round-tripped resume command.
 
-## 2. Persistence (state-db, superzej-core)
+## 2. Persistence (state-db, thegn-core)
 
 - [ ] 2.1 `agent_sessions` table + `user_version` bump + forward migration; upsert
       / query-by-worktree helpers — **unit tests** on an isolated `XDG_STATE_HOME`:
       upsert, end-session, query latest per worktree, only sanitized argv stored.
 
-## 3. Capture + installer (superzej-host)
+## 3. Capture + installer (thegn-host)
 
-- [ ] 3.1 `szhost agent hooks setup`: idempotent merge of a superzej hook into
+- [ ] 3.1 `thegn agent hooks setup`: idempotent merge of a thegn hook into
       `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.gemini/settings.json`;
       report detected harnesses; re-run is a no-op.
-- [ ] 3.2 `szhost agent record --harness … --session-id … [--worktree|--pane]`:
-      resolve target from flags or `$SUPERZEJ_WORKTREE`/`$SUPERZEJ_PANE`, sanitize
+- [ ] 3.2 `thegn agent record --harness … --session-id … [--worktree|--pane]`:
+      resolve target from flags or `$THEGN_WORKTREE`/`$THEGN_PANE`, sanitize
       argv, upsert the record over the control path (`spawn_blocking` write).
 
-## 4. Restore (superzej-host)
+## 4. Restore (thegn-host)
 
 - [ ] 4.1 On resurrection, reconstruct the resume argv for restored agent panes
       via `HarnessSpec::resume` and launch through the existing restore consent
@@ -35,7 +35,7 @@
 
 ## 5. Docs + validate
 
-- [ ] 5.1 Document `szhost agent hooks setup` / `agent record` and the resume
+- [ ] 5.1 Document `thegn agent hooks setup` / `agent record` and the resume
       behavior in the CLI/agent doc section + `config/config.toml.example` deny/allow
       overrides.
 - [ ] 5.2 Run `just ci` (fmt-check + lint + build + test + coverage ≥95% core +

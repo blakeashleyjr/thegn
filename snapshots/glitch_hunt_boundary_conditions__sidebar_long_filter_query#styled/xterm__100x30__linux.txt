@@ -1,11 +1,12 @@
-L0| ◆ superzej v0.1.0 work      84% ·  15.5/94G ·   7% ·  51% ·  ↓  1.4M ↑  758K ·  100% · 22:08
+L0| þ thegn v0.1.0  work        56% ·  18.6/94G ·   7% ·  35% ·  ↓   32K ↑   30K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
-R0 3 9 fg=#edf0f8 bg=#151a28 attrs=
-R0 12 6 fg=#6f788e bg=#151a28 attrs=
-R0 18 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 24 4 fg=#edf0f8 bg=#151a28 attrs=
-R0 28 5 fg=#f0c674 bg=#151a28 attrs=
+R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 9 6 fg=#6f788e bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 28 5 fg=#c6ccdb bg=#151a28 attrs=
 R0 33 3 fg=#6f788e bg=#151a28 attrs=
 R0 36 10 fg=#c6ccdb bg=#151a28 attrs=
 R0 46 3 fg=#6f788e bg=#151a28 attrs=
@@ -113,12 +114,12 @@ L14|
 R14 0 32 fg=default bg=#151a28 attrs=
 R14 32 24 fg=default bg=#0b0e16 attrs=
 R14 56 44 fg=#edf0f8 bg=#151a28 attrs=
-L15|                                    superzej v0.1.0      5 files                              0 loc
+L15|                                      thegn v0.1.0       5 files                              0 loc
 R15 0 32 fg=default bg=#151a28 attrs=
-R15 32 4 fg=default bg=#0b0e16 attrs=
-R15 36 9 fg=#6ee7d8 bg=#0b0e16 attrs=
-R15 45 6 fg=#c6ccdb bg=#0b0e16 attrs=
-R15 51 5 fg=default bg=#0b0e16 attrs=
+R15 32 6 fg=default bg=#0b0e16 attrs=
+R15 38 6 fg=#6ee7d8 bg=#0b0e16 attrs=
+R15 44 6 fg=#c6ccdb bg=#0b0e16 attrs=
+R15 50 6 fg=default bg=#0b0e16 attrs=
 R15 56 1 fg=#edf0f8 bg=#151a28 attrs=
 R15 57 1 fg=#677084 bg=#151a28 attrs=BOLD
 R15 58 1 fg=#edf0f8 bg=#151a28 attrs=
@@ -150,35 +151,61 @@ L21|
 R21 0 32 fg=default bg=#151a28 attrs=
 R21 32 24 fg=default bg=#0b0e16 attrs=
 R21 56 44 fg=default bg=#151a28 attrs=
-L22|
-R22 0 32 fg=default bg=#151a28 attrs=
+L22|─ NAVIGATE ─────────────────────
+R22 0 1 fg=#6f788e bg=#151a28 attrs=
+R22 1 10 fg=#c6ccdb bg=#151a28 attrs=BOLD
+R22 11 21 fg=#6f788e bg=#151a28 attrs=
 R22 32 24 fg=default bg=#0b0e16 attrs=
 R22 56 44 fg=default bg=#151a28 attrs=
-L23|
-R23 0 32 fg=default bg=#151a28 attrs=
+L23| Alt+1-9  jump worktree
+R23 0 1 fg=default bg=#151a28 attrs=
+R23 1 7 fg=#7a8197 bg=#151a28 attrs=
+R23 8 2 fg=default bg=#151a28 attrs=
+R23 10 13 fg=#6f788e bg=#151a28 attrs=
+R23 23 9 fg=default bg=#151a28 attrs=
 R23 32 24 fg=default bg=#0b0e16 attrs=
 R23 56 44 fg=default bg=#151a28 attrs=
-L24|
-R24 0 32 fg=default bg=#151a28 attrs=
+L24| Ctrl+1-9 jump workspace
+R24 0 1 fg=default bg=#151a28 attrs=
+R24 1 8 fg=#7a8197 bg=#151a28 attrs=
+R24 9 1 fg=default bg=#151a28 attrs=
+R24 10 14 fg=#6f788e bg=#151a28 attrs=
+R24 24 8 fg=default bg=#151a28 attrs=
 R24 32 24 fg=default bg=#0b0e16 attrs=
 R24 56 44 fg=default bg=#151a28 attrs=
-L25|
-R25 0 32 fg=default bg=#151a28 attrs=
+L25| j / k    move up/down
+R25 0 1 fg=default bg=#151a28 attrs=
+R25 1 5 fg=#7a8197 bg=#151a28 attrs=
+R25 6 4 fg=default bg=#151a28 attrs=
+R25 10 12 fg=#6f788e bg=#151a28 attrs=
+R25 22 10 fg=default bg=#151a28 attrs=
 R25 32 24 fg=default bg=#0b0e16 attrs=
 R25 56 44 fg=default bg=#151a28 attrs=
-L26|
-R26 0 32 fg=default bg=#151a28 attrs=
+L26| Enter    open / fold
+R26 0 1 fg=default bg=#151a28 attrs=
+R26 1 5 fg=#7a8197 bg=#151a28 attrs=
+R26 6 4 fg=default bg=#151a28 attrs=
+R26 10 11 fg=#6f788e bg=#151a28 attrs=
+R26 21 11 fg=default bg=#151a28 attrs=
 R26 32 24 fg=default bg=#0b0e16 attrs=
 R26 56 44 fg=default bg=#151a28 attrs=
-L27|
-R27 0 32 fg=default bg=#151a28 attrs=
+L27| /        filter
+R27 0 1 fg=default bg=#151a28 attrs=
+R27 1 1 fg=#7a8197 bg=#151a28 attrs=
+R27 2 8 fg=default bg=#151a28 attrs=
+R27 10 6 fg=#6f788e bg=#151a28 attrs=
+R27 16 16 fg=default bg=#151a28 attrs=
 R27 32 24 fg=default bg=#0b0e16 attrs=
 R27 56 44 fg=default bg=#151a28 attrs=
-L28|
-R28 0 32 fg=default bg=#151a28 attrs=
+L28| ?        all keys
+R28 0 1 fg=default bg=#151a28 attrs=
+R28 1 1 fg=#7a8197 bg=#151a28 attrs=
+R28 2 8 fg=default bg=#151a28 attrs=
+R28 10 8 fg=#6f788e bg=#151a28 attrs=
+R28 18 14 fg=default bg=#151a28 attrs=
 R28 32 24 fg=default bg=#0b0e16 attrs=
 R28 56 44 fg=default bg=#151a28 attrs=
-L29|  NORMAL   ↵ open   n new   d delete         0 LOC  ✋ 1    7% free   ❚❚ Justin Hurwitz — Houston
+L29|  NORMAL   ↵ open   n new   d delete   m menu   ? help   Ctrl g lock       0 LOC  ✋ 1    7% free
 R29 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R29 1 8 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
 R29 9 2 fg=#edf0f8 bg=#151a28 attrs=
@@ -190,12 +217,19 @@ R29 21 4 fg=#6f788e bg=#151a28 attrs=
 R29 25 3 fg=#edf0f8 bg=#151a28 attrs=
 R29 28 1 fg=#7a8197 bg=#151a28 attrs=
 R29 29 7 fg=#6f788e bg=#151a28 attrs=
-R29 36 9 fg=#edf0f8 bg=#151a28 attrs=
-R29 45 5 fg=#c6ccdb bg=#151a28 attrs=
-R29 50 1 fg=#edf0f8 bg=#151a28 attrs=
-R29 51 6 fg=#0b0e16 bg=#e6c264 attrs=BOLD
-R29 57 1 fg=#edf0f8 bg=#151a28 attrs=
-R29 58 11 fg=#0b0e16 bg=#ef6f6f attrs=BOLD
-R29 69 1 fg=#edf0f8 bg=#151a28 attrs=
-R29 70 29 fg=#0b0e16 bg=#7fb4ec attrs=BOLD
+R29 36 3 fg=#edf0f8 bg=#151a28 attrs=
+R29 39 1 fg=#7a8197 bg=#151a28 attrs=
+R29 40 5 fg=#6f788e bg=#151a28 attrs=
+R29 45 3 fg=#edf0f8 bg=#151a28 attrs=
+R29 48 1 fg=#7a8197 bg=#151a28 attrs=
+R29 49 5 fg=#6f788e bg=#151a28 attrs=
+R29 54 3 fg=#edf0f8 bg=#151a28 attrs=
+R29 57 6 fg=#7a8197 bg=#151a28 attrs=
+R29 63 5 fg=#6f788e bg=#151a28 attrs=
+R29 68 7 fg=#edf0f8 bg=#151a28 attrs=
+R29 75 5 fg=#c6ccdb bg=#151a28 attrs=
+R29 80 1 fg=#edf0f8 bg=#151a28 attrs=
+R29 81 6 fg=#0b0e16 bg=#e6c264 attrs=BOLD
+R29 87 1 fg=#edf0f8 bg=#151a28 attrs=
+R29 88 11 fg=#0b0e16 bg=#ef6f6f attrs=BOLD
 R29 99 1 fg=#edf0f8 bg=#151a28 attrs=

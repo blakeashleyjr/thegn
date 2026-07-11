@@ -8,7 +8,7 @@
   # builds its C via the `cc` crate (stdenv compiler, no extra input).
   pkg-config,
   zlib,
-  # runtime tools superzej shells out to
+  # runtime tools thegn shells out to
   git,
   fzf,
   gum,
@@ -36,7 +36,7 @@
   runtimeDeps = [git fzf gum lazygit yazi delta gh coreutils] ++ yaziDeps;
 in
   rustPlatform.buildRustPackage {
-    pname = "superzej";
+    pname = "thegn";
     version = "0.1.0";
 
     inherit src;
@@ -56,25 +56,23 @@ in
     doCheck = false;
 
     postInstall = ''
-      # The native host (`szhost`) is the user-facing program. Install it as
-      # `superzej`, with `sj`/`szhost` aliases.
-      mv $out/bin/szhost $out/bin/superzej
-      ln -s superzej $out/bin/sj
-      ln -s superzej $out/bin/szhost
+      # The native host (`thegn`) is the user-facing program, with a short
+      # `tg` alias.
+      ln -s thegn $out/bin/tg
 
-      # Expose the pinned yazi under a superzej-private name for the file drawer.
-      ln -s ${yazi}/bin/yazi $out/bin/superzej-yazi
+      # Expose the pinned yazi under a thegn-private name for the file drawer.
+      ln -s ${yazi}/bin/yazi $out/bin/thegn-yazi
 
       # Wrap the binary so it finds the pinned yazi + the tools it shells out to
       # (git/lazygit/delta/gh) regardless of the user's PATH.
-      wrapProgram $out/bin/superzej \
-        --set SUPERZEJ_YAZI_BIN ${yazi}/bin/yazi \
+      wrapProgram $out/bin/thegn \
+        --set THEGN_YAZI_BIN ${yazi}/bin/yazi \
         --prefix PATH : ${lib.makeBinPath runtimeDeps}
     '';
 
     meta = {
       description = "Terminal-native git-worktree IDE";
-      mainProgram = "superzej";
+      mainProgram = "thegn";
       license = lib.licenses.mit;
       platforms = lib.platforms.linux;
     };

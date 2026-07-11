@@ -1,7 +1,7 @@
---- superzej drawer control. Emits a private OSC 5379 "editor;<abs-path>" for the
---- hovered file on yazi's own PTY; the superzej host sniffs it (see
---- superzej-host/src/queries.rs `drawer_command`) and opens that file in a fresh
---- center editor tab. Bundled + seeded by superzej-core/src/yazi.rs alongside the
+--- thegn drawer control. Emits a private OSC 5379 "editor;<abs-path>" for the
+--- hovered file on yazi's own PTY; the thegn host sniffs it (see
+--- thegn-host/src/queries.rs `drawer_command`) and opens that file in a fresh
+--- center editor tab. Bundled + seeded by thegn-core/src/yazi.rs alongside the
 --- pinned yazi; do not edit by hand.
 --- @since 26.5.6
 local hovered = ya.sync(function()

@@ -1,10 +1,11 @@
-L0| ◆ superzej v0.1.0 work                                            86% ·  15.5/94G ·   7% ·  53% ·  94°C ·  ↓    6K ↑    7K ·  100% · Fri Jul 10 · 22:07
+L0| þ thegn v0.1.0  work                                              89% ·  18.9/94G ·   7% ·  37% ·  97°C ·  ↓  1.5M ↑  839K ·  100% · Sat Jul 11 · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
-R0 3 9 fg=#edf0f8 bg=#151a28 attrs=
-R0 12 6 fg=#6f788e bg=#151a28 attrs=
-R0 18 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 24 42 fg=#edf0f8 bg=#151a28 attrs=
+R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 9 6 fg=#6f788e bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 44 fg=#edf0f8 bg=#151a28 attrs=
 R0 66 5 fg=#f0c674 bg=#151a28 attrs=
 R0 71 3 fg=#6f788e bg=#151a28 attrs=
 R0 74 10 fg=#c6ccdb bg=#151a28 attrs=

@@ -2,7 +2,7 @@
 
 > **For Hermes:** Use subagent-driven_development skill to implement this plan task-by-task.
 
-**Goal:** Add live config reload to `szhost` (the native terminal host in `crates/superzej-host`) so changes to `~/.config/superzej/config.toml` are picked up without restarting.
+**Goal:** Add live config reload to `thegn` (the native terminal host in `crates/thegn-host`) so changes to `~/.config/thegn/config.toml` are picked up without restarting.
 
 **Architecture:** Background thread watches the config file via `notify`; signals the main event loop via an mpsc channel; event loop reloads config and rebuilds the keymap.
 
@@ -10,13 +10,13 @@
 
 ---
 
-## Task 1: Add `notify` dependency to superzej-host
+## Task 1: Add `notify` dependency to thegn-host
 
 **Objective:** Enable `notify` crate usage in the host binary.
 
 **Files:**
 
-- Modify: `crates/superzej-host/Cargo.toml`
+- Modify: `crates/thegn-host/Cargo.toml`
 
 **Step 1: Add notify dependency**
 
@@ -27,7 +27,7 @@ notify = { workspace = true, default-features = false, features = ["macos_kqueue
 ```
 
 Note: Workspace default features might include `serde`, which we don't need here, so we disable defaults and explicitly enable the kqueue feature for macOS support if needed, though the default should work on Linux. Let's check if the workspace has a `notify` definition.
-Actually, let's just add it as `notify = "6"` to keep it simple, matching `superzej-cli`.
+Actually, let's just add it as `notify = "6"` to keep it simple, matching `thegn-cli`.
 
 ```toml
 notify = "6"
@@ -35,7 +35,7 @@ notify = "6"
 
 **Step 2: Verify build**
 
-Run: `cargo build -p superzej-host`
+Run: `cargo build -p thegn-host`
 Expected: SUCCESS
 
 ---
@@ -46,7 +46,7 @@ Expected: SUCCESS
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/run.rs`
+- Modify: `crates/thegn-host/src/run.rs`
 
 **Step 1: Add imports and channel**
 
@@ -61,10 +61,10 @@ use std::sync::mpsc::{channel as mpsc_channel, Sender as MpscSender};
 In `run()` function (around line 614-615, before `event_loop` call), add:
 
 ```rust
-let (config_tx, config_rx) = mpsc_channel::<superzej_core::config::Config>();
+let (config_tx, config_rx) = mpsc_channel::<thegn_core::config::Config>();
 
 // Spawn config watcher thread
-let config_path = superzej_core::config::Config::path();
+let config_path = thegn_core::config::Config::path();
 std::thread::spawn(move || {
     if let Some(parent) = config_path.parent() {
         if let Ok(mut watcher) = recommended_watcher(move |res: notify::Result<Event>| {
@@ -76,8 +76,8 @@ std::thread::spawn(move || {
                     notify::EventKind::Remove(_)
                 ) {
                     // Attempt to reload config
-                    let new_cfg = superzej_core::config::Config::load_layered(
-                        &superzej_core::config::ProcessEnv,
+                    let new_cfg = thegn_core::config::Config::load_layered(
+                        &thegn_core::config::ProcessEnv,
                         None,
                         None
                     );
@@ -95,7 +95,7 @@ std::thread::spawn(move || {
 });
 ```
 
-Wait, `Config::load_layered` takes `&dyn EnvSource`. `ProcessEnv` is a unit struct. But `ProcessEnv` is defined in `superzej_core::config`. We need to import it.
+Wait, `Config::load_layered` takes `&dyn EnvSource`. `ProcessEnv` is a unit struct. But `ProcessEnv` is defined in `thegn_core::config`. We need to import it.
 
 Wait, `Config::load_layered` takes references to env source. We can't easily move it to a thread without cloning or referencing. We need to clone `ProcessEnv` or use a `'static` lifetime.
 Actually, `ProcessEnv` is a zero-sized type (unit struct) or simple struct. Let's check.
@@ -117,14 +117,14 @@ Revised Plan for Task 2:
 
 Actually, `recommended_watcher` needs `Send` to be used in a thread? It's usually fine.
 The config file path: `Config::path()` returns `PathBuf`.
-We need to make sure we import `superzej_core::config::ProcessEnv` in `run.rs` if we want to use it inside the thread, or just re-create it.
+We need to make sure we import `thegn_core::config::ProcessEnv` in `run.rs` if we want to use it inside the thread, or just re-create it.
 
 Let's refine the thread code:
 
 ```rust
 std::thread::spawn(move || {
-    let env = superzej_core::config::ProcessEnv;
-    let config_path = superzej_core::config::Config::path();
+    let env = thegn_core::config::ProcessEnv;
+    let config_path = thegn_core::config::Config::path();
     // ... watcher setup ...
 });
 ```
@@ -165,7 +165,7 @@ event_loop(
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/run.rs`
+- Modify: `crates/thegn-host/src/run.rs`
 
 **Step 1: Poll channel in loop**
 
@@ -174,8 +174,8 @@ In `event_loop`, inside the main `loop { ... }`, after the `model_rx` polling (a
 ```rust
 // Check for config reload
 if let Ok(()) = config_rx.try_recv() {
-    let new_cfg = superzej_core::config::Config::load_layered(
-        &superzej_core::config::ProcessEnv,
+    let new_cfg = thegn_core::config::Config::load_layered(
+        &thegn_core::config::ProcessEnv,
         None,
         None
     );
@@ -192,7 +192,7 @@ Wait, what about error handling? If `Config::load_layered` fails (e.g. parse err
 
 **Step 2: Verify build**
 
-Run: `cargo build -p superzej-host`
+Run: `cargo build -p thegn-host`
 Expected: SUCCESS
 
 ---
@@ -203,7 +203,7 @@ Expected: SUCCESS
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/run.rs`
+- Modify: `crates/thegn-host/src/run.rs`
 
 The `notify` crate has `recommended_watcher` which is raw events. We can add a simple debounce in the channel receiver or use a timeout in the thread.
 
@@ -226,13 +226,13 @@ Add this to the watcher callback.
 
 **Objective:** Verify the reload works manually.
 
-**Step 1: Run szhost**
+**Step 1: Run thegn**
 
-Run: `cargo run -p superzej-host --bin szhost`
+Run: `cargo run -p thegn-host --bin thegn`
 
 **Step 2: Modify config**
 
-Edit `~/.config/superzej/config.toml` (or create if missing).
+Edit `~/.config/thegn/config.toml` (or create if missing).
 Add a custom action or keybind.
 
 **Step 3: Verify**
@@ -241,15 +241,15 @@ Check if the new keybind works (if implemented in keymap) or if status shows "Co
 
 **Step 4: Cleanup**
 
-Kill the szhost process.
+Kill the thegn process.
 
 ---
 
 ## Summary
 
 - **Files changed:**
-  - `crates/superzej-host/Cargo.toml`
-  - `crates/superzej-host/src/run.rs`
+  - `crates/thegn-host/Cargo.toml`
+  - `crates/thegn-host/src/run.rs`
 
 - **Risks:**
   - Thread safety: `notify` watcher is not `Send` (it is). `Config` loading is cheap enough.

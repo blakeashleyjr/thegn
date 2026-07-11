@@ -6,10 +6,10 @@
 # The interactive compositor (worktree/agent/pin actions) is exercised by the
 # host's own unit tests; this covers the shell-invocable surface.
 #
-# Usage: test/smoke.sh [path-to-szhost]   (defaults to ./target/debug/szhost)
+# Usage: test/smoke.sh [path-to-thegn]   (defaults to ./target/debug/thegn)
 set -euo pipefail
 
-SZ="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/szhost}"
+SZ="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/thegn}"
 # Resolve to an absolute path — the test cd's into a temp repo before running it.
 SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
 [[ -x $SZ ]] || {
@@ -23,8 +23,8 @@ trap 'rm -rf "$TMP"' EXIT
 export HOME="$TMP" XDG_CONFIG_HOME="$TMP/.config" XDG_STATE_HOME="$TMP/.local/state"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
-mkdir -p "$XDG_CONFIG_HOME/superzej"
-cat >"$XDG_CONFIG_HOME/superzej/config.toml" <<EOF
+mkdir -p "$XDG_CONFIG_HOME/thegn"
+cat >"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
 worktrees_dir = "$TMP/wt"
 name_scheme = "numbered"
 repo_roots = ["$TMP/code"]
@@ -50,7 +50,7 @@ dns = "tunnel"
 auth_key = "env:TS_AUTHKEY"
 
 # Hosts-as-resources: a local-reach host + a host-backed env must parse,
-# validate, and drive the superzej-host CLI (state stays in this temp HOME).
+# validate, and drive the thegn-host CLI (state stays in this temp HOME).
 [host.smoke-local]
 reach = "local"
 install_runtime = "never"
@@ -94,7 +94,7 @@ git -C "$R" commit -q --allow-empty -m init
 git -C "$R" branch -M main
 cd "$R"
 
-echo "superzej smoke test"
+echo "thegn smoke test"
 
 # Directory-agnostic repo discovery: finds the two repos under the scan root,
 # and not the one outside it — regardless of $PWD.
@@ -156,11 +156,11 @@ check "host rm-cache --force succeeds" \
 
 # GOLDEN PATH (gated: needs podman + registry egress): a first provision does
 # the work; the second must be a DB-only no-op that reports zero transfers
-# (its event trail gains no new 'deliver' rows). SZ_SMOKE_HOST_LIVE=1 enables.
-if [[ ${SZ_SMOKE_HOST_LIVE:-} == "1" ]] && command -v podman >/dev/null 2>&1; then
+# (its event trail gains no new 'deliver' rows). TG_SMOKE_HOST_LIVE=1 enables.
+if [[ ${TG_SMOKE_HOST_LIVE:-} == "1" ]] && command -v podman >/dev/null 2>&1; then
   check "host provision reaches ready (live)" \
     "'$SZ' host provision smoke-local </dev/null"
-  DBH="$XDG_STATE_HOME/superzej/superzej.db"
+  DBH="$XDG_STATE_HOME/thegn/thegn.db"
   delivers_before="$(sqlite3 "$DBH" "SELECT count(*) FROM host_events WHERE step='deliver'")"
   check "second host provision is a no-op (live)" \
     "'$SZ' host provision smoke-local </dev/null"
@@ -168,7 +168,7 @@ if [[ ${SZ_SMOKE_HOST_LIVE:-} == "1" ]] && command -v podman >/dev/null 2>&1; th
   check "second provision transferred nothing (golden path)" \
     "[[ '$delivers_before' -eq '$delivers_after' ]]"
 else
-  echo "  skip live host golden-path (set SZ_SMOKE_HOST_LIVE=1 with podman + egress)"
+  echo "  skip live host golden-path (set TG_SMOKE_HOST_LIVE=1 with podman + egress)"
 fi
 
 # ci (AV group): detection finds a seeded workflow file; runs/detect degrade
@@ -216,7 +216,7 @@ check "wt rm --delete-branch drops the branch" \
 check "wt rm unknown target exits 3" \
   "'$SZ' wt rm no-such-thing --force >/dev/null 2>&1; [[ \$? -eq 3 ]]"
 if command -v sqlite3 >/dev/null 2>&1; then
-  DBS="$XDG_STATE_HOME/superzej/superzej.db"
+  DBS="$XDG_STATE_HOME/thegn/thegn.db"
   check "wt rm cleaned the DB worktree rows" \
     "[[ \$(sqlite3 \"$DBS\" \"SELECT count(*) FROM worktrees WHERE worktree LIKE '%smoke-cli%'\") -eq 0 ]]"
   check "wt rm left no tab_groups rows" \
@@ -261,7 +261,7 @@ check "open unknown repo exits 3" \
   "'$SZ' open no-such-repo --no-launch >/dev/null 2>&1; [[ \$? -eq 3 ]]"
 if command -v sqlite3 >/dev/null 2>&1; then
   check "open recorded alpha as the active workspace" \
-    "sqlite3 \"$XDG_STATE_HOME/superzej/superzej.db\" \
+    "sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
        \"SELECT value FROM ui_state WHERE key='active_workspace'\" | grep -q alpha"
 fi
 
@@ -288,7 +288,7 @@ check "merge list shows the queued branch" \
   "'$SZ' merge list | grep -q '$MB'"
 if command -v sqlite3 >/dev/null 2>&1; then
   check "merge add wrote a queued row" \
-    "[[ \$(sqlite3 \"$XDG_STATE_HOME/superzej/superzej.db\" \
+    "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
        \"SELECT count(*) FROM merge_queue WHERE branch='$MB' AND status='queued'\") -eq 1 ]]"
 fi
 check "merge drain lands the clean branch" \
@@ -310,7 +310,7 @@ check "placement events is empty while the engine is off" \
 # Engine ON with a declared-capacity host: the broker's dry-run is
 # deterministic — an unprobed host can't pack (no known runtime), so `auto`
 # falls back to a dedicated placement on the empty box.
-cat >>"$XDG_CONFIG_HOME/superzej/config.toml" <<EOF
+cat >>"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
 
 [host.pool-box]
 reach = "local"
@@ -378,7 +378,7 @@ done
 check "share frp derives the per-worktree https URL" \
   "grep -q 'https://feature-3000.share.example.com' '$TMP/frp.out'"
 check "share frp materializes frpc.toml in the state dir" \
-  "ls $XDG_STATE_HOME/superzej/share/*-3000/frpc.toml >/dev/null 2>&1"
+  "ls $XDG_STATE_HOME/thegn/share/*-3000/frpc.toml >/dev/null 2>&1"
 kill "$FRP_PID" 2>/dev/null || true
 wait "$FRP_PID" 2>/dev/null || true
 
@@ -447,7 +447,7 @@ check "forward list runs and reports an empty set" \
 # Seed a forward record and assert `forward list` renders the mapping + URL
 # (exercises Db::upsert/list_forwards through the CLI read path).
 if command -v sqlite3 >/dev/null 2>&1; then
-  FDB="$XDG_STATE_HOME/superzej/superzej.db"
+  FDB="$XDG_STATE_HOME/thegn/thegn.db"
   "$SZ" forward list >/dev/null 2>&1 || true # ensure the DB + schema exist
   sqlite3 "$FDB" \
     "INSERT INTO forwards(worktree,container_port,host_port,url,created_at)
@@ -466,7 +466,7 @@ fi
 # suffixes) into the state DB, open it once, and assert it transformed into
 # worktree groups (tabs-within-a-worktree) with the legacy table dropped.
 if command -v sqlite3 >/dev/null 2>&1; then
-  DB="$XDG_STATE_HOME/superzej/superzej.db"
+  DB="$XDG_STATE_HOME/thegn/thegn.db"
   mkdir -p "$(dirname "$DB")"
   sqlite3 "$DB" <<'SQL'
 PRAGMA user_version = 5;
@@ -498,7 +498,7 @@ echo "control plane:"
 # the no-daemon message contains backticks, which eval would execute.
 pair_out="$("$SZ" pair new --scope read,git --label smoke 2>&1)"
 pair_url_ok=1
-grep -q 'superzej://pair?' <<<"$pair_out" || pair_url_ok=0
+grep -q 'thegn://pair?' <<<"$pair_out" || pair_url_ok=0
 pair_hash_ok=1
 grep -q 'only its hash is stored' <<<"$pair_out" || pair_hash_ok=0
 check "pair new mints a code and prints the pairing URL" "[[ $pair_url_ok -eq 1 ]]"
@@ -518,7 +518,7 @@ nodaemon_rc=$?
 nodaemon_json="$("$SZ" session list --json 2>/dev/null)"
 set -e
 nodaemon_msg_ok=1
-[[ $nodaemon_rc -eq 1 ]] && grep -q 'no superzej pane daemon' <<<"$nodaemon_out" || nodaemon_msg_ok=0
+[[ $nodaemon_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$nodaemon_out" || nodaemon_msg_ok=0
 nodaemon_json_ok=1
 grep -q 'no_daemon' <<<"$nodaemon_json" || nodaemon_json_ok=0
 check "session list without a daemon exits 1 with a clear message" \
@@ -557,7 +557,7 @@ if command -v curl >/dev/null 2>&1; then
   done
   check "daemon cleanup unlinks the socket" "[[ ! -S '$DSOCK' ]]"
   if command -v sqlite3 >/dev/null 2>&1; then
-    rows="$(sqlite3 "$XDG_STATE_HOME/superzej/superzej.db" 'SELECT count(*) FROM daemons' 2>/dev/null || echo 0)"
+    rows="$(sqlite3 "$XDG_STATE_HOME/thegn/thegn.db" 'SELECT count(*) FROM daemons' 2>/dev/null || echo 0)"
     check "daemon cleanup removes its registry row" "[[ '$rows' -eq 0 ]]"
   fi
 else
@@ -567,7 +567,28 @@ fi
 # Bare compositor config: with [daemon] absent nothing may spawn a daemon
 # (opt-in contract) — the verbs above ran without one and no socket exists.
 check "no daemon is spawned by default (opt-in contract)" \
-  "[[ ! -S \"$XDG_STATE_HOME/superzej/run/daemon.sock\" ]]"
+  "[[ ! -S \"$XDG_STATE_HOME/thegn/run/daemon.sock\" ]]"
+
+# --- one-time superzej -> thegn migration -----------------------------------
+# Seed old-brand state/config/app-home in a fresh throwaway HOME, run any CLI
+# verb, and assert the startup migration renamed everything (marker included).
+MIG="$(mktemp -d)"
+mkdir -p "$MIG/.local/state/superzej" "$MIG/.config/superzej" "$MIG/.superzej/worktrees"
+printf 'stale' >"$MIG/.local/state/superzej/superzej.db"
+printf 'worktrees_dir = "%s/wt"\n' "$MIG" >"$MIG/.config/superzej/config.toml"
+env HOME="$MIG" XDG_CONFIG_HOME="$MIG/.config" XDG_STATE_HOME="$MIG/.local/state" \
+  "$SZ" repos >/dev/null 2>&1 || true
+check "migration moved the state dir + db" \
+  "[[ -f '$MIG/.local/state/thegn/thegn.db' && ! -e '$MIG/.local/state/superzej' ]]"
+check "migration moved the config dir" \
+  "[[ -f '$MIG/.config/thegn/config.toml' && ! -e '$MIG/.config/superzej' ]]"
+check "migration moved the app home" \
+  "[[ -d '$MIG/.thegn/worktrees' && ! -e '$MIG/.superzej' ]]"
+check "migration wrote its forensics marker" \
+  "[[ -f '$MIG/.thegn/.migrated-from-superzej' ]]"
+check "migration honors THEGN_NO_MIGRATE" \
+  "mkdir -p '$MIG/.config/superzej' && env HOME='$MIG' XDG_CONFIG_HOME='$MIG/.config' XDG_STATE_HOME='$MIG/.local/state' THEGN_NO_MIGRATE=1 '$SZ' repos >/dev/null 2>&1 || true; [[ -d '$MIG/.config/superzej' ]]"
+rm -rf "$MIG"
 
 echo
 if [[ $fail -eq 0 ]]; then

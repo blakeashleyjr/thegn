@@ -1,6 +1,6 @@
 --- Vendored from yazi-rs/plugins (git.yazi), MIT License, Copyright (c) 2023
 --- yazi-rs. Bundled verbatim and seeded into the drawer's private config by
---- superzej-core/src/yazi.rs (item 606). Pinned alongside the pinned yazi
+--- thegn-core/src/yazi.rs (item 606). Pinned alongside the pinned yazi
 --- (>= 26.5.6); update both together. Do not edit by hand.
 --- @since 26.5.6
 

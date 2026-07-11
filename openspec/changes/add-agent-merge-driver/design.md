@@ -1,6 +1,6 @@
 # Design — agent-driven merge-queue driver
 
-## Where the agent works vs. where superzej lands
+## Where the agent works vs. where thegn lands
 
 The invariant that makes the fold-actor safe is that `main` only ever advances
 through a pure object-DB fold + atomic CAS, never a working-tree merge (that's
@@ -11,7 +11,7 @@ keeps that intact by splitting the work:
   the branch clean against the target: rebase onto the latest target, resolve
   conflicts, fix whatever the gate flagged, commit (no push). Rebasing a linked
   worktree is allowed — the guard only fires in the canonical checkout.
-- **superzej** does the land: `attempt_land` re-reads the branch tip, folds it
+- **thegn** does the land: `attempt_land` re-reads the branch tip, folds it
   onto the current target with `fold::fold`, gates the result, and CAS-advances
   the ref + fast-forwards the main checkout (`resync_ff_checkout`).
 
@@ -62,5 +62,5 @@ only in this worktree, commit, do not push, do not touch the target.
 ceilings, so a new `Action` variant + loop wiring + `auto_drain`-on-`AgentEnd`
 can't be added without first extracting an existing block into a sibling module.
 The driver is written off-loop and callable from a future `spawn_drive`; until
-that extraction lands, `superzej merge add`/`drain` is the (fully programmatic)
+that extraction lands, `thegn merge add`/`drain` is the (fully programmatic)
 entry point.

@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/superzej-core",
-  "crates/superzej-svc",
-  "crates/superzej-agent",
-  "crates/superzej-metrics",
-  "crates/superzej-media",
-  "crates/superzej-host",
-  "crates/superzej-proxy",
-  "crates/sz-kit",
+  "crates/thegn-core",
+  "crates/thegn-svc",
+  "crates/thegn-agent",
+  "crates/thegn-metrics",
+  "crates/thegn-media",
+  "crates/thegn-host",
+  "crates/thegn-proxy",
+  "crates/tg-kit",
   "crates/gtui-core",
   "crates/gtui-query",
   "crates/gtui-render",
@@ -16,8 +16,8 @@ members = [
   "crates/gtui-embed",
 ]
 # Integrated app repos live under apps/ as git submodules, each with its OWN
-# cargo workspace; keep these out of superzej's workspace so commands run from
-# an arbitrary cwd don't try to absorb them. (superzej-host reaches their
+# cargo workspace; keep these out of thegn's workspace so commands run from
+# an arbitrary cwd don't try to absorb them. (thegn-host reaches their
 # crates via explicit path deps — that resolves against each submodule's own
 # [workspace], not this one.)
 exclude = ["apps", "vendor"]
@@ -26,10 +26,11 @@ exclude = ["apps", "vendor"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-# MSRV floor: edition 2024 + stable let-chains. The dev shell pins
-# stable.latest via rust-overlay; this field documents the oldest compiler
-# expected to work and lets cargo/cargo-deny flag deps that outrun it.
-rust-version = "1.88"
+# MSRV floor: edition 2024 + stable let-chains + std file locks
+# (`File::{lock,try_lock,unlock}`, 1.89). The dev shell pins stable.latest via
+# rust-overlay; this field documents the oldest compiler expected to work and
+# lets cargo/cargo-deny flag deps that outrun it.
+rust-version = "1.89"
 
 [workspace.dependencies]
 # --- shared domain/runtime deps ---
@@ -103,7 +104,7 @@ termwiz = "0.23"
 # --- iroh p2p auto-tunnel (call-home reach; roadmap 124-126) ---
 # Pure-Rust QUIC p2p dialed by NodeId (ed25519 pubkey) with NAT hole-punch +
 # relay fallback (n0 public relays by default). This is the compiled-in
-# transport a remote sandbox uses to *dial home* to superzej — no external
+# transport a remote sandbox uses to *dial home* to thegn — no external
 # daemon/coordinator (unlike Tailscale), so it works out of the box. Traffic is
 # E2E-encrypted (QUIC+TLS by pubkey); relays only rendezvous. Rides the same
 # rustls/ring stack as reqwest (single rustls in tree).
@@ -125,18 +126,18 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = [
 russh = "0.61"
 # MPRIS media control over D-Bus (the Linux media backend). tokio-integrated so
 # the host's runtime drives it; default async-io backend disabled. Lives in the
-# C-dep-free `superzej-media` leaf, target-gated to Linux.
+# C-dep-free `thegn-media` leaf, target-gated to Linux.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 # Windows System Media Transport Controls — the Windows media backend, target-
-# gated to `cfg(windows)` in the `superzej-media` leaf (cross-checked, never
+# gated to `cfg(windows)` in the `thegn-media` leaf (cross-checked, never
 # linked on Linux).
 windows = "0.58"
 # --- LLM proxy (group U/V): the one new HTTP-server dependency. tokio/reqwest
-# are widened with extra features inside the superzej-proxy crate's own manifest
+# are widened with extra features inside the thegn-proxy crate's own manifest
 # (cargo merges them with the workspace base). ---
 axum = "0.8"
 # --- Control plane (add-control-plane-and-remote): the gRPC surface, feature-
-# gated behind superzej-svc's `control-grpc`. `protox` compiles the .proto in
+# gated behind thegn-svc's `control-grpc`. `protox` compiles the .proto in
 # pure Rust — no protoc anywhere in the build (keeps `nix develop`, the lean
 # sandbox devshell, and bare `cargo build` all protoc-free). ---
 tonic = { version = "0.13", default-features = false, features = [
@@ -176,10 +177,10 @@ sysinfo = { version = "0.39", default-features = false, features = [
 # reader (+ adapter `online` flag); other platforms use this cross-platform crate.
 starship-battery = "0.11"
 # --- internal crates ---
-superzej-core = { path = "crates/superzej-core" }
-superzej-svc = { path = "crates/superzej-svc" }
-superzej-metrics = { path = "crates/superzej-metrics" }
-superzej-media = { path = "crates/superzej-media" }
+thegn-core = { path = "crates/thegn-core" }
+thegn-svc = { path = "crates/thegn-svc" }
+thegn-metrics = { path = "crates/thegn-metrics" }
+thegn-media = { path = "crates/thegn-media" }
 # --- dev/bench tooling ---
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"

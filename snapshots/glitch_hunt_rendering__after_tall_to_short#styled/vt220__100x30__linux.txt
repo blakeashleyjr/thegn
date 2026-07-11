@@ -1,10 +1,11 @@
-L0| ◆ superzej v0.1.0 work     15.4/94G ·   7% ·  50% ·  96°C ·  ↓  1.3M ↑  764K ·  100% · 22:07
+L0| þ thegn v0.1.0  work       18.1/94G ·   7% ·  36% ·  97°C ·  ↓  1.2M ↑  714K ·  100% · 02:22
 R0 0 1 fg=idx07 bg=idx00 attrs=
 R0 1 2 fg=idx06 bg=idx00 attrs=
-R0 3 9 fg=idx07 bg=idx00 attrs=
-R0 12 6 fg=idx08 bg=idx00 attrs=
-R0 18 6 fg=idx06 bg=idx08 attrs=BOLD
-R0 24 13 fg=idx07 bg=idx00 attrs=
+R0 3 6 fg=idx07 bg=idx00 attrs=
+R0 9 6 fg=idx08 bg=idx00 attrs=
+R0 15 1 fg=idx07 bg=idx00 attrs=
+R0 16 6 fg=idx06 bg=idx08 attrs=BOLD
+R0 22 15 fg=idx07 bg=idx00 attrs=
 R0 37 11 fg=idx08 bg=idx00 attrs=
 R0 48 5 fg=idx07 bg=idx00 attrs=
 R0 53 12 fg=idx08 bg=idx00 attrs=

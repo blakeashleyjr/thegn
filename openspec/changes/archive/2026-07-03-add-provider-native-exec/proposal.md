@@ -14,7 +14,7 @@ its scrollback.
 
 ## Impact
 
-- **Provider/placement layer** — `superzej-svc::provider` gains the `exec_api`
+- **Provider/placement layer** — `thegn-svc::provider` gains the `exec_api`
   capability + `open_exec`/`attach_exec`; the host pane gains a stream transport.
 - Closes the long-noted follow-up in `config/config.toml.example` ("an API-exec
   (WSS) bridge that removes that CLI dependency is a follow-up").
@@ -25,7 +25,7 @@ its scrollback.
 
 Sprites (and similar microVM providers) expose **no SSH**; the only documented
 interactive door besides their REST/WS API is the vendor CLI. Routing every pane
-through `sprite exec` makes the CLI a hard dependency of dogfooding superzej on a
+through `sprite exec` makes the CLI a hard dependency of dogfooding thegn on a
 remote backend. The provider already does its control plane (create/checkpoint/fs)
 natively over the API; native exec extends that to the interactive shell, so a
 remote-backed worktree needs only an API token — no vendor binary — and gains

@@ -3,7 +3,7 @@
 #
 # Reproduces the shape the idle-CPU regression was found in: a repo with many
 # worktrees, each of which the 2s model-refresh ticker fans a git scan over.
-# The Rust micro-bench fixture (crates/superzej-svc/benches/support/fixture.rs)
+# The Rust micro-bench fixture (crates/thegn-svc/benches/support/fixture.rs)
 # builds the same layout — keep the two in sync.
 #
 # Requires the isolated env from env.sh to already be sourced + perf_make_tmp run

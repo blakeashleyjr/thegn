@@ -26,7 +26,7 @@ both touch the same sidebar/session model.
 Hand-rolled micro pixel font, no deps; only S U P E R Z J. Even pixel heights
 so half-blocks (`▀▄█`) never leave a ragged row:
 
-- **Small** 3×4 px → 2 rows; `measure(Small, "SUPERZEJ") == (31, 2)`.
+- **Small** 3×4 px → 2 rows; `measure(Small, "THEGN") == (31, 2)`.
 - **Large** 5×6 px → 3 rows (1-px corner cuts); `== (47, 3)`.
 
 `draw()` maps each (top, bottom) pixel pair to `█ ▀ ▄ ␣` with explicit fg AND
@@ -39,7 +39,7 @@ per row, drawn in the normal damage-tracked pass. No timers, no animation.
   **Center geometry is unchanged** (y=2, rows−3) → the upgrade resizes no PTY.
   Sidebar/panel start at y=2 (each lost the old shared title row).
 - Brand breakpoints: ≥96 cols → wordmark (34-col slot); 72–95 → compact
-  `superzej` text; <72 → none. `tab_strip(brand_cols)` clips the nav row
+  `thegn` text; <72 → none. `tab_strip(brand_cols)` clips the nav row
   between brand and panel edge.
 - Nav row: `WASHU ▸ home ⟨1⟩ ⟨2⟩` — slug prefix uppercased (Faint), leaf in
   accent, chips in `⟨⟩` (active = focus color on a `blend_over(focus, panel,
@@ -81,11 +81,11 @@ BG0) so tints never punch dark holes in tinted surfaces.
   materialize (no PTY forked while the splash shows — first frame gets
   cheaper). First Key or center click dismisses; `Wake`/`Resized` never do
   (hydration pulses the waker constantly). Hardware cursor hides while no
-  focused pane rect exists. `SUPERZEJ_BENCH_FIRST_FRAME_EXIT` skips dormancy
+  focused pane rect exists. `THEGN_BENCH_FIRST_FRAME_EXIT` skips dormancy
   so `just bench` semantics are unchanged.
 - Variants by center size: Large (≥51×11): 3-row wordmark + version + 3 hint
   lines; Small (≥35×6): 2-row wordmark + 1 hint line; Text (≥12×1):
-  `superzej vX`; else bg only. Re-centered per frame from the rect.
+  `thegn vX`; else bg only. Re-centered per frame from the rect.
 - Flagged follow-up (not in this change): route sole-pane-exit to the splash
   instead of instant shell respawn.
 
@@ -176,7 +176,7 @@ change logs are trimmed each frame (they previously grew unbounded).
 
 - **Single-row masthead, regular-font logo**: the pixel wordmark left the
   masthead (it lives on only the empty-state splash now); the bar is one row —
-  `◆ superzej v0.1.0` (glyph accent, name Text, version Faint) left, stats
+  `◆ thegn v0.1.0` (glyph accent, name Text, version Faint) left, stats
   right. Stats restyled: natural-width values (no padded gaps), base color
   Dim instead of Faint (more presence), threshold colors unchanged.
 - **Tab bars live under the divider, in their columns**: the worktree label +
@@ -251,7 +251,7 @@ HEAD -- path | $PAGER`) on the Diff tab, its `bat` view on the Files tab —
   fallback) with 256-color ANSI support in the span parser; hover preloading
   (diff + bat for the hovered file and the next, `doc_inflight`-deduped);
   syntect warmed at startup; SANDBOXES section in the bottom quarter
-  (`panel_split`, podman/docker `ps` parsed in core, superzej-owned first);
+  (`panel_split`, podman/docker `ps` parsed in core, thegn-owned first);
   a TESTS tab (key 5) detecting just/cargo/go/pytest/jest/vitest, running on
   `r` off-thread, with ✓/✗/○ per-test indicators and a summary.
 - **Panes**: Alt+e/Alt+g/Alt+/ tools open as center tabs (drawer retired for

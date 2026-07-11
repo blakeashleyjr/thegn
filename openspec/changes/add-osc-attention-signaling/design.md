@@ -10,7 +10,7 @@ OSC dispatch is surfaced (or intercepted) at that seam:
 title: Some(title), body }` (the `777` sub-command is `notify`; other
   sub-commands are ignored/passed through).
 
-Parsing is a **pure function** in `superzej-core`
+Parsing is a **pure function** in `thegn-core`
 (`attention::parse_osc(params: &[&[u8]]) -> Option<AttentionSignal>`) so it is
 unit-tested against the 95% core gate (well-formed `9`/`777`, missing body,
 non-`notify` `777`, oversized payload truncation, non-UTF-8 → lossy). The host
@@ -19,8 +19,8 @@ event.
 
 ## The CLI verb (host)
 
-`szhost notify [--title T] [--worktree PATH | --pane ID] <body>` resolves the
-target worktree/pane (defaulting to `$SUPERZEJ_WORKTREE` / `$SUPERZEJ_PANE`
+`thegn notify [--title T] [--worktree PATH | --pane ID] <body>` resolves the
+target worktree/pane (defaulting to `$THEGN_WORKTREE` / `$THEGN_PANE`
 env, mirroring the per-pane env-firewall wiring already exported into panes) and
 raises the _same_ `AttentionSignal` over the running host's control path. When no
 host is running it exits non-zero with a clear message (it is a live-session
@@ -32,7 +32,7 @@ The signal is mapped to an `EventBus` event (`Event::Attention { worktree,
 pane, title, body }`) at the point of emission, then flows through the
 **unchanged** consumer chain:
 
-- The **activity state machine** (`superzej-core::activity`) gains an explicit
+- The **activity state machine** (`thegn-core::activity`) gains an explicit
   `AttentionRequested` transition that sets the pane/worktree dot to the
   waiting/needs-attention state and makes it **sticky** (reusing the existing
   `RESUME_GRACE_SECS` sticky-state logic) until the process resumes output or the
@@ -80,6 +80,6 @@ under the attention sort, also floated to the top. The sort is **opt-in** (a
 
 - **Only screen-phrase matching (S 253)** — kept as the fallback, but it is
   fragile (localized/animated agent UIs) and can't fire for headless processes.
-- **A bespoke superzej escape sequence** — rejected; `OSC 9`/`OSC 777` are
+- **A bespoke thegn escape sequence** — rejected; `OSC 9`/`OSC 777` are
   already emitted by real tools and terminals, so adopting them means zero
   producer-side work for the ecosystem.

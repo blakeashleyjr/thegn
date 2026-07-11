@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Every superzej action is reachable through a rebindable keymap registry that
+Every thegn action is reachable through a rebindable keymap registry that
 supports modal keymaps, a leader/prefix layer, and chorded sequences. Bindings
 layer from presets through user, profile, and workspace overrides; conflicts are
 detected at load; and pending sequences surface which-key hints.

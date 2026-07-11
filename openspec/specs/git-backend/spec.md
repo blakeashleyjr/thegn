@@ -2,7 +2,7 @@
 
 ## Purpose
 
-superzej reads and writes git state through a service seam that prefers fast,
+thegn reads and writes git state through a service seam that prefers fast,
 native (gix) reads but always degrades to the git CLI for writes and for any
 operation the native path does not cover. git remains the source of truth for
 worktrees.
@@ -61,22 +61,22 @@ Every git invocation SHALL go through the `util::git_cmd`/`GitLoc` builders that
 
 ### Requirement: Self-heal shared .git/config pollution
 
-superzej SHALL surgically strip a stray `core.worktree` from a main checkout's shared `.git/config` at startup and again on each worktree switch, so a poisoned shared config never retargets repo-wide git operations at the wrong worktree.
+thegn SHALL surgically strip a stray `core.worktree` from a main checkout's shared `.git/config` at startup and again on each worktree switch, so a poisoned shared config never retargets repo-wide git operations at the wrong worktree.
 
 #### Scenario: Stray core.worktree at startup
 
 - **WHEN** a main checkout's `.git/config` contains an invalid `core.worktree`
-- **THEN** superzej removes it (text edit) across cwd, session worktrees, and the
+- **THEN** thegn removes it (text edit) across cwd, session worktrees, and the
   `--git-common-dir` parent before serving git reads
 
 #### Scenario: Mid-session pollution heals
 
-- **WHEN** another process writes a stray `core.worktree` while superzej runs
+- **WHEN** another process writes a stray `core.worktree` while thegn runs
 - **THEN** the next worktree switch heals it off-thread
 
 ### Requirement: Serialize concurrent git mutations with a cross-process lock
 
-Mutating git operations SHALL take an advisory `flock` on `<git-common>/superzej-git.lock` so concurrent szhost/agent processes on the same repo serialize their writes, while reads remain lock-free.
+Mutating git operations SHALL take an advisory `flock` on `<git-common>/thegn-git.lock` so concurrent thegn/agent processes on the same repo serialize their writes, while reads remain lock-free.
 
 #### Scenario: Two writers serialize
 

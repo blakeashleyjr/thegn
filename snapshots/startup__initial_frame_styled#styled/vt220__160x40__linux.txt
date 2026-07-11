@@ -1,7 +1,7 @@
-L0| ◆ superzej v0.1.0 work                                                    16.2/94G ·   7% ·  51% ·  95°C ·  ↓    0B ↑    0B ·  100% · Fri Jul 10 · 22:06
-R0 0 12 fg=idx08 bg=idx00 attrs=
-R0 12 6 fg=idx00 bg=idx00 attrs=
-R0 18 66 fg=idx08 bg=idx00 attrs=
+L0| þ thegn v0.1.0  work                                                      21.3/94G ·   7% ·  36% ·  97°C ·  ↓    0B ↑    5K ·  100% · Sat Jul 11 · 02:20
+R0 0 9 fg=idx08 bg=idx00 attrs=
+R0 9 6 fg=idx00 bg=idx00 attrs=
+R0 15 69 fg=idx08 bg=idx00 attrs=
 R0 84 3 fg=idx00 bg=idx00 attrs=
 R0 87 5 fg=idx08 bg=idx00 attrs=
 R0 92 3 fg=idx00 bg=idx00 attrs=
@@ -56,30 +56,58 @@ R9 158 1 fg=idx00 bg=idx00 attrs=
 R9 159 1 fg=idx08 bg=idx00 attrs=
 L10|
 R10 0 160 fg=idx08 bg=idx00 attrs=
-L11|                                                                                                                     3 branches                               —
-R11 0 117 fg=idx08 bg=idx00 attrs=
+L11|                                                                       ▄▀▀▀▀▄                                        3 branches                               —
+R11 0 60 fg=idx08 bg=idx00 attrs=
+R11 60 12 fg=idx00 bg=idx00 attrs=
+R11 72 4 fg=idx08 bg=idx08 attrs=
+R11 76 12 fg=idx00 bg=idx00 attrs=
+R11 88 29 fg=idx08 bg=idx00 attrs=
 R11 117 1 fg=idx00 bg=idx00 attrs=
 R11 118 40 fg=idx08 bg=idx00 attrs=
 R11 158 1 fg=idx00 bg=idx00 attrs=
 R11 159 1 fg=idx08 bg=idx00 attrs=
-L12|
-R12 0 160 fg=idx08 bg=idx00 attrs=
-L13|                                                                                                                     4 stash                                  —
-R13 0 117 fg=idx08 bg=idx00 attrs=
+L12|                                                                 ▄▄▀▀▀▀▀▀▀▀▀▀▀▀▀▀▄▄
+R12 0 60 fg=idx08 bg=idx00 attrs=
+R12 60 6 fg=idx00 bg=idx00 attrs=
+R12 66 1 fg=idx08 bg=idx00 attrs=
+R12 67 5 fg=idx08 bg=idx08 attrs=
+R12 72 4 fg=idx00 bg=idx08 attrs=
+R12 76 5 fg=idx08 bg=idx08 attrs=
+R12 81 1 fg=idx08 bg=idx00 attrs=
+R12 82 6 fg=idx00 bg=idx00 attrs=
+R12 88 72 fg=idx08 bg=idx00 attrs=
+L13|                                                               ▄▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▄                                4 stash                                  —
+R13 0 60 fg=idx08 bg=idx00 attrs=
+R13 60 28 fg=idx00 bg=idx00 attrs=
+R13 88 29 fg=idx08 bg=idx00 attrs=
 R13 117 1 fg=idx00 bg=idx00 attrs=
 R13 118 40 fg=idx08 bg=idx00 attrs=
 R13 158 1 fg=idx00 bg=idx00 attrs=
 R13 159 1 fg=idx08 bg=idx00 attrs=
-L14|
-R14 0 160 fg=idx08 bg=idx00 attrs=
-L15|                                                                                                                     5 files                          0 changed
-R15 0 117 fg=idx08 bg=idx00 attrs=
+L14|                                                               ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+R14 0 60 fg=idx08 bg=idx00 attrs=
+R14 60 28 fg=idx00 bg=idx00 attrs=
+R14 88 72 fg=idx08 bg=idx00 attrs=
+L15|                                                               ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀                                5 files                          0 changed
+R15 0 60 fg=idx08 bg=idx00 attrs=
+R15 60 12 fg=idx00 bg=idx00 attrs=
+R15 72 1 fg=idx00 bg=idx08 attrs=
+R15 73 2 fg=idx08 bg=idx08 attrs=
+R15 75 1 fg=idx00 bg=idx08 attrs=
+R15 76 12 fg=idx00 bg=idx00 attrs=
+R15 88 29 fg=idx08 bg=idx00 attrs=
 R15 117 1 fg=idx00 bg=idx00 attrs=
 R15 118 32 fg=idx08 bg=idx00 attrs=
 R15 150 9 fg=idx00 bg=idx00 attrs=
 R15 159 1 fg=idx08 bg=idx00 attrs=
-L16|                                                  ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
-R16 0 160 fg=idx08 bg=idx00 attrs=
+L16|                                                               ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+R16 0 60 fg=idx08 bg=idx00 attrs=
+R16 60 12 fg=idx00 bg=idx00 attrs=
+R16 72 1 fg=idx00 bg=idx08 attrs=
+R16 73 2 fg=idx00 bg=idx00 attrs=
+R16 75 1 fg=idx00 bg=idx08 attrs=
+R16 76 12 fg=idx00 bg=idx00 attrs=
+R16 88 72 fg=idx08 bg=idx00 attrs=
 L17|                                        ╭─ Choose a keymap ─────────────────────────────────────────────────── menu ──╮
 R17 0 42 fg=idx08 bg=idx00 attrs=
 R17 42 17 fg=idx07 bg=idx00 attrs=
@@ -94,14 +122,14 @@ R18 117 1 fg=default bg=idx00 attrs=
 R18 118 1 fg=idx08 bg=idx00 attrs=
 R18 119 2 fg=idx00 bg=idx00 attrs=
 R18 121 39 fg=idx08 bg=idx00 attrs=
-L19|                                        │ ❯  d  superzej defaults                                     Alt/Ctrl chords │
+L19|                                        │ ❯  d  thegn defaults                                        Alt/Ctrl chords │
 R19 0 41 fg=idx08 bg=idx00 attrs=
 R19 41 1 fg=default bg=idx00 attrs=
 R19 42 2 fg=idx06 bg=idx00 attrs=BOLD
 R19 44 3 fg=idx07 bg=idx00 attrs=BOLD
 R19 47 1 fg=idx07 bg=idx00 attrs=
-R19 48 17 fg=idx07 bg=idx00 attrs=BOLD
-R19 65 37 fg=idx07 bg=idx00 attrs=
+R19 48 14 fg=idx07 bg=idx00 attrs=BOLD
+R19 62 40 fg=idx07 bg=idx00 attrs=
 R19 102 15 fg=idx08 bg=idx00 attrs=
 R19 117 1 fg=default bg=idx00 attrs=
 R19 118 1 fg=idx08 bg=idx00 attrs=
@@ -133,26 +161,32 @@ L22|                                        ╰───────────
 R22 0 119 fg=idx08 bg=idx00 attrs=
 R22 119 2 fg=idx00 bg=idx00 attrs=
 R22 121 39 fg=idx08 bg=idx00 attrs=
-L23|                                                           Alt-↑↓      prev/next worktree
+L23|                                                             █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
 R23 0 42 fg=idx08 bg=idx00 attrs=
 R23 42 79 fg=idx00 bg=idx00 attrs=
 R23 121 39 fg=idx08 bg=idx00 attrs=
-L24|                                                           Ctrl-g      lock keys to pane
-R24 0 71 fg=idx08 bg=idx00 attrs=
-R24 71 17 fg=idx00 bg=idx00 attrs=
-R24 88 72 fg=idx08 bg=idx00 attrs=
+L24|                                                             █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
+R24 0 160 fg=idx08 bg=idx00 attrs=
 L25|
 R25 0 160 fg=idx08 bg=idx00 attrs=
-L26|
-R26 0 160 fg=idx08 bg=idx00 attrs=
+L26|                                                             v0.1.0 · git worktree IDE
+R26 0 67 fg=idx08 bg=idx00 attrs=
+R26 67 19 fg=idx00 bg=idx00 attrs=
+R26 86 74 fg=idx08 bg=idx00 attrs=
 L27|
 R27 0 160 fg=idx08 bg=idx00 attrs=
-L28|
-R28 0 160 fg=idx08 bg=idx00 attrs=
-L29|
-R29 0 160 fg=idx08 bg=idx00 attrs=
-L30|
-R30 0 160 fg=idx08 bg=idx00 attrs=
+L28|                                                           Ctrl-Space  command palette
+R28 0 71 fg=idx08 bg=idx00 attrs=
+R28 71 15 fg=idx00 bg=idx00 attrs=
+R28 86 74 fg=idx08 bg=idx00 attrs=
+L29|                                                           Alt-↑↓      prev/next worktree
+R29 0 71 fg=idx08 bg=idx00 attrs=
+R29 71 18 fg=idx00 bg=idx00 attrs=
+R29 89 71 fg=idx08 bg=idx00 attrs=
+L30|                                                           Ctrl-g      lock keys to pane
+R30 0 71 fg=idx08 bg=idx00 attrs=
+R30 71 17 fg=idx00 bg=idx00 attrs=
+R30 88 72 fg=idx08 bg=idx00 attrs=
 L31|
 R31 0 160 fg=idx08 bg=idx00 attrs=
 L32|

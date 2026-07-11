@@ -2,7 +2,7 @@
 
 ## 1. Annotate-AI-diff batch loop (T 763)
 
-- [ ] 1.1 — Add a pinned-annotation model in `superzej-core` keyed by
+- [ ] 1.1 — Add a pinned-annotation model in `thegn-core` keyed by
       `(path, hunk-anchor)` with re-anchoring on diff refresh and drop-on-missing,
       pure and unit-testable. **unit tests** for anchor survival across an edit and
       drop when the hunk disappears (95% core gate).
@@ -20,7 +20,7 @@
 ## 2. AI commit-message draft (T 764)
 
 - [ ] 2.1 — Add commit-message drafting that sends the staged diff through
-      `superzej-proxy` and pre-fills the commit editor (no auto-commit; user
+      `thegn-proxy` and pre-fills the commit editor (no auto-commit; user
       confirms). **unit tests** for the prompt assembly from a staged diff.
 - [ ] 2.2 — AI-off fallback in `gitmut.rs`: open the editor with the deterministic
       template/empty body; hooks run normally and `--no-verify` is untouched.

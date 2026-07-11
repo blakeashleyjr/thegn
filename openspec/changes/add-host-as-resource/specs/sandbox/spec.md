@@ -4,7 +4,7 @@
 
 ### Requirement: A host is provisioned once via a resumable state machine and reused by every sandbox on it
 
-superzej SHALL model each container-capable machine as a host that walks a
+thegn SHALL model each container-capable machine as a host that walks a
 provisioning state machine (connect → probe runtime → ensure base image by
 digest → seed warm volumes → Ready), persisting only durable checkpoints so an
 interrupted provision resumes from the last completed step rather than
@@ -33,7 +33,7 @@ with a fresh probe MUST perform zero transfers and zero installs.
 
 ### Requirement: Concurrent provisioning of one host is single-flight
 
-superzej SHALL serialize provisioning per host: when N worktrees (or the CLI)
+thegn SHALL serialize provisioning per host: when N worktrees (or the CLI)
 request a host that is mid-provision, later callers MUST await the same
 in-flight run — each still receiving live step progress — rather than starting
 a duplicate install or transfer.
@@ -47,7 +47,7 @@ a duplicate install or transfer.
 
 ### Requirement: Installing a container runtime on a host requires explicit consent
 
-superzej MUST NOT install software on a host without a per-host grant: a probe
+thegn MUST NOT install software on a host without a per-host grant: a probe
 finding no runtime SHALL proceed to installation only via config
 (`install_runtime = "auto"`), an interactive confirmation, or an explicit CLI
 flag; background provisioning (eager, warm pool) MUST never prompt and never
@@ -70,7 +70,7 @@ message instead of installing.
 
 ### Requirement: Base images are delivered by the best available route and verified by digest before boot
 
-superzej SHALL resolve the multi-arch base image to the target host's
+thegn SHALL resolve the multi-arch base image to the target host's
 per-architecture digest, skip delivery entirely when that digest is already in
 the host's inventory, and otherwise deliver it by the best available strategy —
 defaulting to a resumable registry-less transfer over the existing SSH channel,
@@ -100,7 +100,7 @@ boots from it; a mismatch refuses to boot.
 
 ### Requirement: Hosts are declared globally and referenced by envs
 
-superzej SHALL read host definitions only from global configuration
+thegn SHALL read host definitions only from global configuration
 (`[host.<name>]`); repo overlays MUST NOT be able to define hosts. An
 `[env.<name>]` MAY reference a host by name so multiple envs share one host's
 provisioning; an ssh env without a host reference SHALL keep today's behavior
@@ -121,8 +121,8 @@ via an implicit anonymous host whose install consent is `never`.
 
 ### Requirement: Host state is inspectable and failures are actionable
 
-superzej SHALL surface each host's state (state-machine position, runtime info,
-inventory, last error) in the panel and via `szhost host list|status`, and
+thegn SHALL surface each host's state (state-machine position, runtime info,
+inventory, last error) in the panel and via `thegn host list|status`, and
 every failure MUST carry its step, message, and whether retry can succeed —
 mapped to actionable UI text and CLI exit codes (0 ready, 1 fatal, 2
 retryable). Retrying a failed host resumes from the failed step.
@@ -135,15 +135,15 @@ retryable). Retrying a failed host resumes from the failed step.
 
 #### Scenario: CLI provisions headlessly
 
-- **WHEN** `szhost host provision <name>` runs in a terminal
+- **WHEN** `thegn host provision <name>` runs in a terminal
 - **THEN** each step prints progress (including transfer bytes) and the exit
   code distinguishes ready, fatal, and retryable outcomes
 
 ### Requirement: Hosts are addable without editing configuration
 
-superzej SHALL let a user add a host by typing its target (`user@host[:port]`
+thegn SHALL let a user add a host by typing its target (`user@host[:port]`
 or a dumbpipe ticket) in the new-worktree wizard's "+ add host…" row or via
-`superzej host add`; the definition persists in the state DB, becomes a
+`thegn host add`; the definition persists in the state DB, becomes a
 selectable env immediately, and is shadowed by a declarative `[host.<name>]`
 of the same name.
 
@@ -157,12 +157,12 @@ of the same name.
 
 - **WHEN** a `[host.<name>]` exists in config.toml with the same name as a
   DB-added host
-- **THEN** the config definition wins and `superzej host add`/`rm` refuse to
+- **THEN** the config definition wins and `thegn host add`/`rm` refuse to
   override it
 
 ### Requirement: Repo toolchains materialize automatically on hosts
 
-superzej SHALL detect a repo's stack (nix flake/devenv/shell.nix, tool-version
+thegn SHALL detect a repo's stack (nix flake/devenv/shell.nix, tool-version
 pins, or plain language manifests including package.json, pyproject,
 deno.json, build.sbt) and materialize a working toolchain inside the host
 sandbox — the repo's own devshell when it has one, an explicitly pinned mise
@@ -186,7 +186,7 @@ mode and per-language package sets.
 
 ### Requirement: The personal layer applies to host-backed sandboxes
 
-superzej SHALL apply the user's `[sandbox.home]` personal layer (dotfiles,
+thegn SHALL apply the user's `[sandbox.home]` personal layer (dotfiles,
 setup commands, agent CLIs + their logins, atuin) to host-backed sandboxes by
 default, over the host's generic exec channel, honoring the existing shell
 strategy knobs; personal-layer failures MUST be best-effort (warned, never
@@ -200,7 +200,7 @@ blocking the pane).
 
 ### Requirement: Sprite checkpoints are captured and spares recycle in place
 
-superzej SHALL persist the checkpoint id created at the end of sprite
+thegn SHALL persist the checkpoint id created at the end of sprite
 provisioning (base snapshot + pool spare rows) and SHALL recycle stale or
 delete-released spares by restoring them to their checkpoint in place instead
 of destroying and rebuilding, guarded by lockfile freshness, falling back to

@@ -11,7 +11,7 @@ persist it. This change adds four layers, built bottom-up, unifying everything
 the user picks as one **"Environment"** (`‹ local › ssh fly digitalocean
 hetzner daytona`), the wizard branching by kind.
 
-1. **Layered secret backend** (`superzej-core/secret.rs`) — a `SecretRef`
+1. **Layered secret backend** (`thegn-core/secret.rs`) — a `SecretRef`
    resolved through a priority chain that extends the existing `env:`/`file:`
    refs with `keyring:` (OS keyring via the pure-Rust `keyring` crate) and bare
    back-compat. Writer side `secret::store` prefers the OS keyring, falls back
@@ -19,12 +19,12 @@ hetzner daytona`), the wizard branching by kind.
    reads route through `secret::resolve` (provider factory + `cmd/env`), so a
    collected token has a durable home and headless boxes degrade gracefully
    (keyring → file → env, never wedging a launch).
-2. **Config write path** (`superzej-core/config_write.rs`) — comment-preserving
+2. **Config write path** (`thegn-core/config_write.rs`) — comment-preserving
    `toml_edit` upsert: `upsert_env`/`remove_env`/`set_key`/`select_env_in_repo`
-   from a typed `EnvSpec`. Repos may only _select_ an env (`.superzej.toml`
+   from a typed `EnvSpec`. Repos may only _select_ an env (`.thegn.toml`
    `env = "…"`), never define one — the write path enforces the existing
    trust-clamp model (envs are global).
-3. **CLI authoring** (`cmd/env.rs`, `cmd/config.rs`) — `superzej env create`
+3. **CLI authoring** (`cmd/env.rs`, `cmd/config.rs`) — `thegn env create`
    (with `--token`/`--token-env`/`--token-file`), `env rm`, `env test` (a cheap
    provider `list()` to verify the token), and `config set <dotted.key>
 <value>` — scriptable and the backing for the TUI.
@@ -39,10 +39,10 @@ hetzner daytona`), the wizard branching by kind.
 - tasks.md: **AE 757** (Self-serve environment setup UX); pairs with **AE 749**
   (VPS core) and `add-do-fly-providers` (the providers this authors) and reuses
   the `[env.<name>]` named-execution-environments spine.
-- **superzej-core** — new `secret.rs` (feature `keyring`, pure-Rust
+- **thegn-core** — new `secret.rs` (feature `keyring`, pure-Rust
   `async-secret-service`/`crypto-rust` so no C `libdbus`) and `config_write.rs`
   (`toml_edit`); no DB schema change.
-- **superzej-host** — `env_wizard.rs`, `env_ui.rs`, `panel/sections/
+- **thegn-host** — `env_wizard.rs`, `env_ui.rs`, `panel/sections/
 environments.rs` + `Section::Environments`; provider token reads rerouted
   through `secret::resolve`; `cmd/env.rs` (`create`/`rm`/`test`) + `cmd/
 config.rs` (`set`).
@@ -54,7 +54,7 @@ config.rs` (`set`).
 ## Rationale
 
 The provider seam and named-execution-environments already exist; the only gap
-between "superzej can run on Fly" and "a user can set that up" is authoring +
+between "thegn can run on Fly" and "a user can set that up" is authoring +
 secret persistence. Layers 1–2 are independently useful (any config key becomes
 writable; any token gets a safe home) and are the foundation the CLI and TUI
 both reuse, so the surface stays consistent whether scripted or clicked.

@@ -3,7 +3,7 @@
 Full implementation plan (types, signatures, flows) lives with the change; this
 records the load-bearing decisions.
 
-## State machine (pure, superzej-core)
+## State machine (pure, thegn-core)
 
 ```
 Unknown → Connecting → Probing ─ runtime present ─────────────→ RuntimeReady*
@@ -23,7 +23,7 @@ sticks until explicit user action.
 
 ## Single-flight
 
-The driver lives in `superzej-host/src/host_flow.rs` (blocking, spawn_blocking
+The driver lives in `thegn-host/src/host_flow.rs` (blocking, spawn_blocking
 context — matching all existing provisioning), not an async supervisor:
 `provision_gate`-style `host_lock(host_id)` plus a Flight registry
 (leader/follower on a Condvar; followers forward each progress snapshot to
@@ -63,7 +63,7 @@ install — they defer to focused materialize.
 
 ## Warm volumes
 
-`superzej-nix-store → /nix` and `superzej-cargo → ~/.cargo` as named volumes,
+`thegn-nix-store → /nix` and `thegn-cargo → ~/.cargo` as named volumes,
 seeded by **image copy-up** by default (the base image's /nix IS the seed; zero
 extra transfer) with a tarball `volume import` variant for big stores.
 Per-worktree `target/` stays inside the worktree mount.

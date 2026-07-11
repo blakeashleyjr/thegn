@@ -1,4 +1,4 @@
- ◆ superzej v0.1.0 work                                                                                            16.3/94G ·   7% ·  51% ·  95°C ·  ↓  189K ↑    5K ·  100% · Fri Jul 10 · 22:07
+ þ thegn v0.1.0  work                                                                                              19.0/94G ·   7% ·  35% ·  96°C ·  ↓  1.6M ↑  957K ·  100% · Sat Jul 11 · 02:21
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  WORKSPACES                       HOME ▸ home   1                                                                                                            git  work  system
                                                                                                                                                              home/home
@@ -14,26 +14,26 @@
                                                                                                                                                              4 stash                                  —
 
                                                                                                                                                              5 files                          0 changed
-
-
-
-
-
-                                                                      ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
+                                                                                           ▄▀▀▀▀▄
+                                                                                     ▄▄▀▀▀▀▀▀▀▀▀▀▀▀▀▀▄▄
+                                                                                   ▄▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▄
+                                                                                   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                                   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                                   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
                                                             ╭─ Choose a keymap ─────────────────────────────────────────────────── menu ──╮
                                                             │ Familiar shortcuts on top of the defaults. Change later with keymap_preset. │
-                                                            │ ❯  d  superzej defaults                                     Alt/Ctrl chords │
+                                                            │ ❯  d  thegn defaults                                        Alt/Ctrl chords │
                                                             │    v  VS Code                                  Ctrl+P, Ctrl+Shift+P, Ctrl+B │
                                                             │    i  JetBrains                                        Ctrl+Shift+A, Ctrl+E │
                                                             ╰─────────────────────────────────────────────────────────────────────────────╯
+                                                                                 █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
+                                                                                 █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
+
+                                                                                 v0.1.0 · git worktree IDE
+
+                                                                               Ctrl-Space  command palette
                                                                                Alt-↑↓      prev/next worktree
                                                                                Ctrl-g      lock keys to pane
-
-
-
-
-
-
 
 
 

@@ -2,7 +2,7 @@
 
 ## The templater (core, pure, deterministic)
 
-A new `superzej-core::compact` module implements a Drain-style templater:
+A new `thegn-core::compact` module implements a Drain-style templater:
 
 - **Tokenize** each line (with a character-class fallback for punctuation-heavy /
   compact-JSON lines, per codag-drain's adaptation).

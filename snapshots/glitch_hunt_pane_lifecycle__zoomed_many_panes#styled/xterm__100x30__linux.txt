@@ -1,10 +1,11 @@
-L0| ◆ superzej v0.1.0 work     15.4/94G ·   7% ·  49% ·  96°C ·  ↓  1.2M ↑  606K ·  100% · 22:07
+L0| þ thegn v0.1.0  work       18.5/94G ·   7% ·  35% ·  98°C ·  ↓  1.5M ↑  839K ·  100% · 02:22
 R0 0 1 fg=#edf0f8 bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
-R0 3 9 fg=#edf0f8 bg=#151a28 attrs=
-R0 12 6 fg=#6f788e bg=#151a28 attrs=
-R0 18 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
-R0 24 3 fg=#edf0f8 bg=#151a28 attrs=
+R0 3 6 fg=#edf0f8 bg=#151a28 attrs=
+R0 9 6 fg=#6f788e bg=#151a28 attrs=
+R0 15 1 fg=#edf0f8 bg=#151a28 attrs=
+R0 16 6 fg=#6ee7d8 bg=#2e5359 attrs=BOLD
+R0 22 5 fg=#edf0f8 bg=#151a28 attrs=
 R0 27 10 fg=#c6ccdb bg=#151a28 attrs=
 R0 37 3 fg=#6f788e bg=#151a28 attrs=
 R0 40 5 fg=#f7768e bg=#151a28 attrs=
@@ -33,18 +34,18 @@ L3|
 R3 0 100 fg=default bg=#0b0e16 attrs=
 L4|
 R4 0 100 fg=default bg=#0b0e16 attrs=
-L5|                          ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
-R5 0 26 fg=default bg=#0b0e16 attrs=
-R5 26 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R5 73 27 fg=default bg=#0b0e16 attrs=
-L6|                           ▀▀▀▄ █   █ █▄▄▄▀ █▀▀▀  █▄▄▄▀  ▄▀   █▀▀▀     █
-R6 0 26 fg=default bg=#0b0e16 attrs=
-R6 26 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R6 73 27 fg=default bg=#0b0e16 attrs=
-L7|                          ▄▄▄▄▀ ▀▄▄▄▀ █     █▄▄▄▄ █  ▀▄ █▄▄▄▄ █▄▄▄▄ ▀▄▄▀
-R7 0 26 fg=default bg=#0b0e16 attrs=
-R7 26 47 fg=#6ee7d8 bg=#0b0e16 attrs=
-R7 73 27 fg=default bg=#0b0e16 attrs=
+L5|                                   ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
+R5 0 35 fg=default bg=#0b0e16 attrs=
+R5 35 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R5 64 36 fg=default bg=#0b0e16 attrs=
+L6|                                     █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
+R6 0 35 fg=default bg=#0b0e16 attrs=
+R6 35 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R6 64 36 fg=default bg=#0b0e16 attrs=
+L7|                                     █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
+R7 0 35 fg=default bg=#0b0e16 attrs=
+R7 35 29 fg=#6ee7d8 bg=#0b0e16 attrs=
+R7 64 36 fg=default bg=#0b0e16 attrs=
 L8|
 R8 0 100 fg=default bg=#0b0e16 attrs=
 L9|                                     v0.1.0 · git worktree IDE

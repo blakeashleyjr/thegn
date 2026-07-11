@@ -2,7 +2,7 @@
 
 ## Summary
 
-Fold **independent hosts** — machines the user owns and pointed superzej at
+Fold **independent hosts** — machines the user owns and pointed thegn at
 (`[host.<name>]` with ssh/iroh/local reach) — into the placement engine's pool
 as first-class, resource-managed citizens, without ever granting the engine a
 destroy handle over them. Three additions make that safe and useful: a
@@ -14,7 +14,7 @@ container < T3 guest kernel) projected from what the probe actually found,
 with independent hosts defaulting **one notch below** an equivalently-equipped
 managed host unless the user explicitly attests
 (`trust_egress_enforced = true`); and a **drain** lifecycle
-(`superzej host drain`) so de-registering a box with live sandboxes parks it
+(`thegn host drain`) so de-registering a box with live sandboxes parks it
 out of every candidate list and finalizes only when the last tenant leaves —
 never a forced kill, never an implicit cleanup of someone else's machine.
 
@@ -36,7 +36,7 @@ never a forced kill, never an implicit cleanup of someone else's machine.
   bwrap); a new `HEADROOM_SCRIPT` + `probe_headroom` on the host runner, with
   the script↔parser contract test extended to cover it.
 - **Flows** — placement refreshes a candidate host's headroom lazily (TTL'd,
-  at decision time — never the idle ticker); `superzej host drain <name>` +
+  at decision time — never the idle ticker); `thegn host drain <name>` +
   `host rm` refusing/draining with live tenants; the Hosts/placement views
   show the measured layer for every host.
 - **tasks.md**: group J (remote access), AE (container provisioning), 244
@@ -48,12 +48,12 @@ The engine (add-placement-engine) packs onto hosts with declared specs and
 structurally never destroys anything it didn't create — but an independent
 host today is a black box: no measured load, a config-declared size taken on
 faith, and a pack gate that can't tell a hardened box from a bare one. Every
-mechanism this change adds exists precisely because superzej does NOT control
+mechanism this change adds exists precisely because thegn does NOT control
 these machines: the probe is the only capacity source available, the haircut
 compounds two guesses (declared × overcommit) conservatively, the trust notch
 encodes that a probe proves presence but never enforcement, and drain-not-kill
 respects that the sandboxes on that box may be hours-deep agent sessions on
-hardware superzej is a guest on.
+hardware thegn is a guest on.
 
 ## Non-goals
 
@@ -63,7 +63,7 @@ hardware superzej is a guest on.
   by design; collapsing the asymmetry would mean inferring a guarantee a
   probe cannot confirm.
 - **Migration of running sandboxes off a draining host** — drain waits;
-  `--force` stops superzej-labelled containers only, explicitly.
+  `--force` stops thegn-labelled containers only, explicitly.
 - **A degraded bare-SSH participation tier** — an independent host walks the
   same full state machine to `Ready`; inline `[env.*.ssh]` already covers
   "just exec over ssh".

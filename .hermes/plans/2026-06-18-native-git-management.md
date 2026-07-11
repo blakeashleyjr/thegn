@@ -70,7 +70,7 @@ Architecture is 95% complete. Core ops (staging, commits, branches, stash, rebas
 
 ## Testing Strategy
 
-- `superzej-core` coverage gate: 95% lines — new core logic needs unit tests.
+- `thegn-core` coverage gate: 95% lines — new core logic needs unit tests.
 - Service layer: integration tests using `TestRepo` (existing pattern in `*_test` modules).
 - `panel/` unit tests: pure render functions are easy to test in isolation (existing pattern).
 - New `GitOpResult::NoUpstream` variant: test in branch.rs.

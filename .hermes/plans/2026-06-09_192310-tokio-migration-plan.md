@@ -2,12 +2,12 @@
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Migrate the core native host event loop in `szhost` from a single-threaded blocking loop with `std::sync::mpsc` to a fully asynchronous `tokio` multi-tasking architecture with bounded backpressure.
+**Goal:** Migrate the core native host event loop in `thegn` from a single-threaded blocking loop with `std::sync::mpsc` to a fully asynchronous `tokio` multi-tasking architecture with bounded backpressure.
 
 **Architecture:**
 
 1. Upgrade `run::main` and `run::event_loop` to be `async fn`.
-2. Wrap synchronous legacy code (e.g. DB reads, Git calls, Github proxy calls) with `tokio::task::spawn_blocking` to prevent blocking the `tokio` runtime, avoiding the need to make `superzej-svc` completely async yet.
+2. Wrap synchronous legacy code (e.g. DB reads, Git calls, Github proxy calls) with `tokio::task::spawn_blocking` to prevent blocking the `tokio` runtime, avoiding the need to make `thegn-svc` completely async yet.
 3. Replace the `std::sync::mpsc` unbounded channels feeding the PTY data with a bounded `tokio::sync::mpsc::channel(1024)`.
 4. Update the `[String]` arguments in `panes.spawn_argv` closures to `Vec<String>` to resolve async closure bounds inference issues.
 
@@ -21,11 +21,11 @@
 
 **Files:**
 
-- Modify: `crates/superzej-host/Cargo.toml`
+- Modify: `crates/thegn-host/Cargo.toml`
 
 **Step 1: Check build**
 
-Run: `cargo check -p superzej-host`
+Run: `cargo check -p thegn-host`
 Expected: PASS
 
 **Step 2: Update `Cargo.toml`**
@@ -35,7 +35,7 @@ Add `tokio` to dependencies if missing.
 
 ```toml
 [package]
-name = "superzej-host"
+name = "thegn-host"
 version.workspace = true
 edition = "2021"
 license.workspace = true
@@ -47,13 +47,13 @@ tokio = { workspace = true, features = ["full"] }
 
 **Step 3: Run check**
 
-Run: `cargo check -p superzej-host`
+Run: `cargo check -p thegn-host`
 Expected: PASS
 
 **Step 4: Commit**
 
 ```bash
-git add crates/superzej-host/Cargo.toml
+git add crates/thegn-host/Cargo.toml
 git commit -m "build: explicitly specify 2021 edition and tokio feature"
 ```
 
@@ -65,8 +65,8 @@ git commit -m "build: explicitly specify 2021 edition and tokio feature"
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/main.rs`
-- Modify: `crates/superzej-host/src/run.rs`
+- Modify: `crates/thegn-host/src/main.rs`
+- Modify: `crates/thegn-host/src/run.rs`
 
 **Step 1: Update `main.rs`**
 
@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
 
 **Step 2: Update `run::main` and `run::event_loop` signatures**
 
-In `crates/superzej-host/src/run.rs`:
+In `crates/thegn-host/src/run.rs`:
 
 ```rust
 // Change main
@@ -125,7 +125,7 @@ In `Action::ToggleDrawer` and `Action::Yazi`, update the closure to explicitly t
 
 **Step 5: Run tests**
 
-Run: `cargo check -p superzej-host`
+Run: `cargo check -p thegn-host`
 Expected: Failures likely related to `PaneEvent` channels which we fix in Task 3.
 
 ---
@@ -136,8 +136,8 @@ Expected: Failures likely related to `PaneEvent` channels which we fix in Task 3
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/run.rs`
-- Modify: `crates/superzej-host/src/pane.rs`
+- Modify: `crates/thegn-host/src/run.rs`
+- Modify: `crates/thegn-host/src/pane.rs`
 
 **Step 1: Update Hydration Functions**
 
@@ -145,7 +145,7 @@ Expected: Failures likely related to `PaneEvent` channels which we fix in Task 3
 // In run.rs
 fn spawn_model_hydration(tx: tokio::sync::mpsc::UnboundedSender<FrameModel>, session: crate::session::Session) {
     tokio::task::spawn_blocking(move || {
-        if let Ok(db) = superzej_core::db::Db::open() {
+        if let Ok(db) = thegn_core::db::Db::open() {
             let _ = tx.send(build_model(&session, &db));
         }
     });
@@ -207,7 +207,7 @@ while let Ok(ev) = rx.try_recv() {
 
 **Step 5: Test and Commit**
 
-Run: `cargo test -p superzej-host`
+Run: `cargo test -p thegn-host`
 
 ```bash
 git commit -am "perf(host): migrate event loop to tokio runtime and bounded channels"

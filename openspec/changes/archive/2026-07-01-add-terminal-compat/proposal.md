@@ -2,7 +2,7 @@
 
 ## Summary
 
-superzej rendered its chrome assuming a modern emulator: 24-bit color, full
+thegn rendered its chrome assuming a modern emulator: 24-bit color, full
 Unicode, Nerd-Font glyphs. On the long tail of terminals we want to support —
 bare `xterm`/`rxvt`, the Linux/BSD console, Termux, the Windows console,
 `screen`/`tmux` passthrough, CI capture, and anything honoring `NO_COLOR` — that
@@ -12,9 +12,9 @@ math by char-count, so wide glyphs overflowed).
 
 This change adds a unified terminal-capability layer that detects what the outer
 terminal can do and **dynamically enables/disables features with graceful
-fallbacks**, plus a `superzej doctor` command to make the result inspectable.
+fallbacks**, plus a `thegn doctor` command to make the result inspectable.
 
-1. **`TermCaps` detection** (`superzej_core::termcaps`) — pure, env-based
+1. **`TermCaps` detection** (`thegn_core::termcaps`) — pure, env-based
    (`COLORTERM`/`$TERM`/`TERM_PROGRAM`/`VTE_VERSION`/`NO_COLOR`/`WT_SESSION`/
    locale) resolving a color depth (truecolor/256/16/none) and glyph level
    (full/basic/ascii), plus undercurl/mouse/osc52/sync flags.
@@ -29,14 +29,14 @@ fallbacks**, plus a `superzej doctor` command to make the result inspectable.
    a generic `$TERM`. Runs before the input reader exists, so it never spills
    into the loop and the first frame already reflects it.
 6. **Config + diagnostics** — `[theme] color` / `glyphs` (auto|explicit) and
-   `superzej doctor [--json]`.
+   `thegn doctor [--json]`.
 
 ## Impact
 
 Roadmap items (tasks.md) this gives concrete behavior to:
 
-- **Cross-platform reach** — complements the cross-platform `superzej-metrics` /
-  `superzej-media` leaf crates and the `just check-cross` (darwin/windows) gate
+- **Cross-platform reach** — complements the cross-platform `thegn-metrics` /
+  `thegn-media` leaf crates and the `just check-cross` (darwin/windows) gate
   by making the _rendering_ substrate degrade rather than assume.
 - **AI-free workspace shell** — strictly additive to the shell; no AI coupling.
 

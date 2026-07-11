@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Core scoring (superzej-core)
+## 1. Core scoring (thegn-core)
 
 - [x] 1.1 `attention.rs`: `AttentionTier`/`AttentionReason`/`AttentionScore`,
       `score()`, `stable_order()` hysteresis, `next_attention()` wrap,
@@ -10,7 +10,7 @@
 - [x] 1.3 `CacheStore::list_pr_cache()` (trait + `db_cache.rs` impl + test;
       db.rs untouched).
 
-## 2. Hydration (superzej-host)
+## 2. Hydration (thegn-host)
 
 - [x] 2.1 `attention_status.rs`: join notifications/PR/MQ/CI/activity/dirty →
       per-path scores + hysteresis-stable ranks + workspace rollups; wired at

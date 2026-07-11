@@ -2,11 +2,11 @@
 
 ## Summary
 
-superzej's config layers cascade most-specific-wins, and a repo-root
-`.superzej.*` overlay is applied **last and unclamped** over the global/profile
+thegn's config layers cascade most-specific-wins, and a repo-root
+`.thegn.*` overlay is applied **last and unclamped** over the global/profile
 sandbox config. Because that file is checked into a repository the user may have
 cloned, this is a live sandbox-escape / code-exec-on-open hole: a hostile
-`.superzej.toml` can set `enabled = false`, choose `backend`/`network = "host"`,
+`.thegn.toml` can set `enabled = false`, choose `backend`/`network = "host"`,
 replace the egress allow-list, bind arbitrary host paths, pass through host env
 tokens, and run `init_script`/`prepare` on the host.
 
@@ -16,7 +16,7 @@ _trust_: a more-trusted level sets a bound and less-trusted levels may only move
 _inward_). The repo layer becomes a **clamped request**: constraints may only
 tighten, additive requests (mounts, scripts, image, ports) are **trust-on-first-
 use** gated, and every denial is surfaced (never silent). A new
-`superzej config explain <key>` shows the effective value, the layer that set
+`thegn config explain <key>` shows the effective value, the layer that set
 it, and the clamp trace.
 
 ## Impact

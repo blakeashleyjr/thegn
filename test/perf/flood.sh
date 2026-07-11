@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Input/switch latency under a multi-pane PTY flood ("keystroke during flood").
 #
-# Launches szhost in a PTY over the worktree fixture (like cpu-sample.sh),
+# Launches thegn in a PTY over the worktree fixture (like cpu-sample.sh),
 # starts a full-speed output flood (`seq`) in the shells of several worktrees,
 # then fires a burst of worktree switches (Alt+Down) mid-flood and reads the
-# perf rollup's switch/input/drain/flush percentiles from the szhost log.
+# perf rollup's switch/input/drain/flush percentiles from the thegn log.
 #
 # Advisory (machine-dependent) — NOT a CI gate. Use it to capture before/after
 # evidence for loop-scheduling changes: the numbers to watch are
 # switch_p99_us (worktree-switch → first frame) and input_p99_us (keystroke →
-# frame) staying under SUPERZEJ_INPUT_BUDGET_US while pty_bytes_per_s is high.
+# frame) staying under THEGN_INPUT_BUDGET_US while pty_bytes_per_s is high.
 #
 # Usage: flood.sh [--bin PATH] [--worktrees N] [--floods N] [--switches N] [--json]
 #
@@ -22,8 +22,8 @@ source "$HERE/lib/env.sh"
 # shellcheck source=test/perf/lib/fixture.sh disable=SC1091
 source "$HERE/lib/fixture.sh"
 
-BIN="${SZ_PERF_BIN:-target/release/szhost}"
-WORKTREES="${SZ_PERF_WORKTREES:-8}"
+BIN="${TG_PERF_BIN:-target/release/thegn}"
+WORKTREES="${TG_PERF_WORKTREES:-8}"
 FLOODS=3    # how many worktrees' shells run a flood
 SWITCHES=30 # Alt+Down burst size, fired mid-flood
 JSON_ONLY=0
@@ -79,21 +79,21 @@ command -v script >/dev/null 2>&1 || {
   exit 1
 }
 
-PIDFILE="$PERF_TMP/szhost.pid"
+PIDFILE="$PERF_TMP/thegn.pid"
 # settle + (per-flood: type+switch) + burst + rollup tail. The perf interval is
 # forced low so at least two rollups land inside the window. Big-fixture runs
 # need a longer settle (startup hydration of N worktrees), or the first typed
 # keys land mid-storm and pollute the input percentiles.
-SETTLE_MS="${SZ_PERF_SETTLE_MS:-3000}"
+SETTLE_MS="${TG_PERF_SETTLE_MS:-3000}"
 BURST_GAP_MS=120
 RUN_MS=$((SETTLE_MS + FLOODS * 800 + SWITCHES * BURST_GAP_MS + 4000))
 DEADLINE_S=$(((RUN_MS / 1000) + 15))
 
 printf -v INNER \
-  'cd %q; stty rows 50 cols 200; env SUPERZEJ_BENCH_RUN_MS=%q SUPERZEJ_PERF=1 SUPERZEJ_PERF_INTERVAL_MS=2000 SUPERZEJ_LOG=szhost::perf=debug %q & echo $! > %q; wait' \
+  'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q THEGN_PERF=1 THEGN_PERF_INTERVAL_MS=2000 THEGN_LOG=thegn::perf=debug %q & echo $! > %q; wait' \
   "$REPO" "$RUN_MS" "$BIN_ABS" "$PIDFILE"
 # Key injection goes through script(1)'s STDIN (it forwards to the pty
-# MASTER). Writing to szhost's /proc fd/0 would hit the pty *slave* — that's
+# MASTER). Writing to thegn's /proc fd/0 would hit the pty *slave* — that's
 # pane output, not input. A held-open FIFO keeps script from seeing EOF.
 FIFO="$PERF_TMP/keys.fifo"
 mkfifo "$FIFO"
@@ -107,7 +107,7 @@ for _ in $(seq 1 100); do
 done
 PID="$(cat "$PIDFILE" 2>/dev/null || true)"
 [ -n "$PID" ] && [ -d "/proc/$PID" ] || {
-  echo "flood: szhost did not start" >&2
+  echo "flood: thegn did not start" >&2
   kill "$LAUNCHER" 2>/dev/null || true
   exit 1
 }
@@ -139,12 +139,12 @@ for _ in $(seq 1 "$SWITCHES"); do
   sleep "$(awk "BEGIN{print $BURST_GAP_MS/1000}")"
 done
 
-exec 3>&- # close the key channel; szhost exits on its bench window
+exec 3>&- # close the key channel; thegn exits on its bench window
 wait "$LAUNCHER" 2>/dev/null || true
 
-LOG="$XDG_STATE_HOME/superzej/logs/szhost.log"
+LOG="$XDG_STATE_HOME/thegn/logs/thegn.log"
 [ -f "$LOG" ] || {
-  echo "flood: no szhost log at $LOG" >&2
+  echo "flood: no thegn log at $LOG" >&2
   exit 1
 }
 

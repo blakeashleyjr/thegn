@@ -1,8 +1,8 @@
-# Fly.io boot image: the superzej sandbox toolchain (nix + direnv + a baked rust
+# Fly.io boot image: the thegn sandbox toolchain (nix + direnv + a baked rust
 # + just + the daily substrate) that runs **sshd as its entrypoint**, so a Fly
 # machine boots straight into an ssh-reachable shell with the toolchain already
 # present — no per-VM apt/nix install (the ~40s cold path the stock-ubuntu init
-# pays). superzej's `FlyProvider` injects `/root/.ssh/authorized_keys` via the
+# pays). thegn's `FlyProvider` injects `/root/.ssh/authorized_keys` via the
 # Machines `files` API and exposes `tcp/22`; this image supplies the sshd + tools.
 #
 #   nix build .#fly-sandbox-image     # streamLayeredImage -> a tar streamer
@@ -18,19 +18,19 @@
 }: let
   inherit (pkgs) lib;
 
-  # The lean iroh call-home agent (`sz-agent`, crate `superzej-agent`), baked into
+  # The lean iroh call-home agent (`tg-agent`, crate `thegn-agent`), baked into
   # the image so a Fly machine dials the compositor over iroh **alongside** sshd.
   # Built with the SAME stable toolchain the rest of the flake uses, scoped to the
-  # one crate (`-p superzej-agent`) so we don't drag in the full host/svc build.
-  # The compositor injects SUPERZEJ_HOME_NODE / SUPERZEJ_SANDBOX_AUTH /
-  # SUPERZEJ_SANDBOX_ID into the machine env (see `FlyProvider`'s `IrohInject`);
+  # one crate (`-p thegn-agent`) so we don't drag in the full host/svc build.
+  # The compositor injects THEGN_HOME_NODE / THEGN_SANDBOX_AUTH /
+  # THEGN_SANDBOX_ID into the machine env (see `FlyProvider`'s `IrohInject`);
   # the entrypoint launches this binary, which reads them on boot.
   szAgentPlatform = pkgs.makeRustPlatform {
     cargo = rustToolchain;
     rustc = rustToolchain;
   };
   szAgent = szAgentPlatform.buildRustPackage {
-    pname = "sz-agent";
+    pname = "tg-agent";
     version = "0.1.0";
     src = lib.cleanSourceWith {
       src = ../.;
@@ -46,8 +46,8 @@
     };
     cargoLock.lockFile = ../Cargo.lock;
     # Compile only the lean agent binary (not the host/svc/coverage targets).
-    cargoBuildFlags = ["-p" "superzej-agent" "--bin" "sz-agent"];
-    # superzej-core (the agent's one workspace dep) pulls the same vendored C
+    cargoBuildFlags = ["-p" "thegn-agent" "--bin" "tg-agent"];
+    # thegn-core (the agent's one workspace dep) pulls the same vendored C
     # (libgit2/LMDB via fff-search → libz-sys), so mirror package.nix's inputs.
     nativeBuildInputs = [pkgs.pkg-config];
     buildInputs = [pkgs.zlib];
@@ -61,7 +61,7 @@
   # buildEnv collisions), present immediately with no rustup network dance. `just`
   # rounds out the lean sandbox shell (rust + just).
   toolEnv = pkgs.buildEnv {
-    name = "superzej-fly-sandbox-env";
+    name = "thegn-fly-sandbox-env";
     paths = with pkgs; [
       # nix-first workflow
       nix
@@ -94,7 +94,7 @@
   };
 
   # PID-1 entrypoint: set up + exec sshd. Host keys are generated on first boot;
-  # superzej's injected /root/.ssh/authorized_keys authenticates root by key only.
+  # thegn's injected /root/.ssh/authorized_keys authenticates root by key only.
   entrypoint = pkgs.writeShellScript "sz-fly-entrypoint" ''
     set -e
     # Privilege-separation dir modern sshd requires (owned root, 0755).
@@ -114,19 +114,19 @@
     UsePAM no
     Subsystem sftp internal-sftp
     EOF
-    # iroh call-home: when the compositor injected the three SUPERZEJ_* env vars
+    # iroh call-home: when the compositor injected the three THEGN_* env vars
     # (see FlyProvider's IrohInject), start the baked agent in the BACKGROUND so
     # its iroh reach comes up alongside sshd. sshd stays PID 1 (the reachability
     # model is unchanged). On an ssh-only machine the vars are absent, so we skip
     # the launch entirely rather than crash-loop a dial with no home.
-    if [ -n "''${SUPERZEJ_HOME_NODE:-}" ]; then
-      ${szAgent}/bin/sz-agent &
+    if [ -n "''${THEGN_HOME_NODE:-}" ]; then
+      ${szAgent}/bin/tg-agent &
     fi
     # -e logs to stderr (→ Fly logs) so a startup failure is diagnosable.
     exec ${pkgs.openssh}/bin/sshd -D -e -f /etc/ssh/sshd_config
   '';
 
-  etcFiles = pkgs.runCommand "superzej-fly-etc" {} ''
+  etcFiles = pkgs.runCommand "thegn-fly-etc" {} ''
     mkdir -p $out/etc/nix
     # Include the unprivileged `sshd` privsep user/group — without it modern
     # OpenSSH refuses to start ("Privilege separation user sshd does not exist").
@@ -144,11 +144,11 @@
   '';
 in
   pkgs.dockerTools.streamLayeredImage {
-    name = "superzej-fly-sandbox";
+    name = "thegn-fly-sandbox";
     tag = "latest";
     contents = [
       toolEnv
-      # The baked iroh call-home agent — also on PATH as `sz-agent` for debugging
+      # The baked iroh call-home agent — also on PATH as `tg-agent` for debugging
       # (the entrypoint launches it by absolute store path).
       szAgent
       etcFiles
@@ -167,9 +167,9 @@ in
       ];
       ExposedPorts = {"22/tcp" = {};};
       Labels = {
-        "superzej.managed" = "true";
-        "superzej.image.role" = "fly-sandbox";
-        "org.opencontainers.image.description" = "superzej Fly sandbox: sshd entrypoint + baked nix/rust/just toolchain";
+        "thegn.managed" = "true";
+        "thegn.image.role" = "fly-sandbox";
+        "org.opencontainers.image.description" = "thegn Fly sandbox: sshd entrypoint + baked nix/rust/just toolchain";
       };
     };
   }

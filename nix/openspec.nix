@@ -1,6 +1,6 @@
 # Hermetic build of the OpenSpec CLI (@fission-ai/openspec) — the spec-driven
-# development tool superzej uses to manage its OWN development (not a runtime
-# dependency of szhost). Pinned and built from source with pnpm so both
+# development tool thegn uses to manage its OWN development (not a runtime
+# dependency of thegn). Pinned and built from source with pnpm so both
 # `nix develop` and `devenv shell` get an identical, offline-reproducible
 # `openspec` with NO global npm install and telemetry off by construction.
 #

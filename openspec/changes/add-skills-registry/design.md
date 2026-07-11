@@ -14,7 +14,7 @@ cached in the DB so install-on-demand survives offline.
 
 ## Selection + injection seam — `skills::select_and_render()`
 
-A single core seam (`crates/superzej-core/src/skills.rs`) takes
+A single core seam (`crates/thegn-core/src/skills.rs`) takes
 `(task_context, harness, policy)` and returns an ordered list of rendered
 capability blocks. Selection is deterministic: match a skill's `triggers`
 against the task/context, filter by per-scope enablement, sort by a **stable
