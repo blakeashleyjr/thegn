@@ -2,10 +2,10 @@
 
 ## ADDED Requirements
 
-### Requirement: A repo `.superzej.*` overlay is a clamped request, not an override
+### Requirement: A repo `.thegn.*` overlay is a clamped request, not an override
 
 The effective sandbox for a worktree SHALL be resolved by clamping the repo-root
-`.superzej.{toml,yaml,yml,json}` `[sandbox]` overlay against the trusted base
+`.thegn.{toml,yaml,yml,json}` `[sandbox]` overlay against the trusted base
 (global config plus the active profile overlay). The repo layer, being the
 least-trusted authorship layer, MAY only _request within_ the trusted bound: a
 constraint field may tighten but never weaken, and a field the repo may not set
@@ -61,13 +61,13 @@ canonical form, so a later edit that changes the requested set re-prompts.
 
 ### Requirement: A key's resolution is explainable
 
-The system SHALL provide `superzej config explain <key>` reporting the effective
+The system SHALL provide `thegn config explain <key>` reporting the effective
 value, the trust layer that set it, and — for `sandbox.*` keys with a repo path
 — the clamp trace (which requests were denied or are pending, and why).
 
 #### Scenario: Explain shows why egress was clamped
 
-- **WHEN** `superzej config explain sandbox.network --repo <path>` is run against
+- **WHEN** `thegn config explain sandbox.network --repo <path>` is run against
   a repo whose overlay requested `network = "host"`
 - **THEN** the output shows the effective value, its origin layer, and the denial
   reason for the repo request

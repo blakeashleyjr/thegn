@@ -3,12 +3,12 @@
 ## Summary
 
 Add cheap commodity-VPS vendors as managed sandbox providers, starting with
-**Hetzner Cloud** (CX22 ≈ €4/mo, ~10 s create→running): superzej provisions an
-instance via the vendor's REST API, reaches it over plain ssh (a `szhost
+**Hetzner Cloud** (CX22 ≈ €4/mo, ~10 s create→running): thegn provisions an
+instance via the vendor's REST API, reaches it over plain ssh (a `thegn
 vps-ssh` self-bridge — no vendor CLI), and runs the standard provisioning
 pipeline on it. Native REST (reqwest, mirroring `SpritesProvider`/
 `DaytonaProvider`) was chosen over Pulumi/OpenTofu: the operation is one
-authenticated POST + a status poll, superzej already owns sandbox state, and
+authenticated POST + a status poll, thegn already owns sandbox state, and
 Pulumi has no Rust SDK (CLI + language host + plugins + a second state store).
 
 The cost model differs structurally from Sprites: **a VPS has no
@@ -16,7 +16,7 @@ suspend/checkpoint — a powered-off instance still bills — so the only free
 state is destroyed.** The design therefore never offers stop-on-idle, ledgers
 every create _before_ the API call, runs a label-scoped orphan reaper, and
 replaces the checkpoint speed-path with a baked base image
-(`superzej env image-bake`) plus the existing warm pool (whose recycle path
+(`thegn env image-bake`) plus the existing warm pool (whose recycle path
 falls through to destroy for checkpoint-less spares).
 
 ## Impact
@@ -26,17 +26,17 @@ falls through to destroy for checkpoint-less spares).
   execution environments; complements
   `add-remote-provision-hooks` (BYO-infra hooks) with a first-class budget
   backend.
-- **superzej-svc** — new `vps` module: `VpsProvider` (`Provider::Vps` variant;
+- **thegn-svc** — new `vps` module: `VpsProvider` (`Provider::Vps` variant;
   caps `files` only), pure Hetzner shaping, ssh exec/files shim, cloud-init
-  builder, file-based instance ledger under `$XDG_STATE/superzej/vps/`.
-- **superzej-core** — `EnvProviderConfig` gains `region`, `size`,
+  builder, file-based instance ledger under `$XDG_STATE/thegn/vps/`.
+- **thegn-core** — `EnvProviderConfig` gains `region`, `size`,
   `max_instances`, `max_lifetime_secs`; `vps_provider_kind()`;
-  `control_command_template()` (the `szhost vps-ssh {id} --` default prefix);
+  `control_command_template()` (the `thegn vps-ssh {id} --` default prefix);
   `envplan::bake_scripts()`.
-- **superzej-host** — `provider_factory.rs` (extracted from the pinned
-  `agent.rs`), `vps_bridge.rs` (`szhost vps-ssh`), `vps_reaper.rs`
+- **thegn-host** — `provider_factory.rs` (extracted from the pinned
+  `agent.rs`), `vps_bridge.rs` (`thegn vps-ssh`), `vps_reaper.rs`
   (hydration-cadence, self-throttled), `cmd/env_image.rs`
-  (`superzej env image-bake`).
+  (`thegn env image-bake`).
 - **No DB schema change** — the instance ledger is file-based (svc and the CLI
   bridge both read it; every create/destroy flows through the provider).
 

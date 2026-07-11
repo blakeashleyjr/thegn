@@ -27,7 +27,7 @@ Harden session restore with two details borrowed from
 
 ## Rationale
 
-superzej already persists worktrees, tab layouts, pane cwds/cmds, and provider
+thegn already persists worktrees, tab layouts, pane cwds/cmds, and provider
 sessions, and restores to the exact position. Two gaps remain versus jmux, which
 captures per-pane scrollback and runs `coerceStaleAgentState` (a "running" agent
 with no lifecycle signal past ~10 min is treated as complete on restore). Without
@@ -39,7 +39,7 @@ harden the restore path the one-session model depends on.
 ## Non-goals
 
 - **Full unbounded scrollback persistence** — only a bounded tail (configurable
-  cap) is captured; superzej is not a session recorder (that is the separate
+  cap) is captured; thegn is not a session recorder (that is the separate
   time-travel replay feature).
 - **Reviving the process itself** — scrollback is repainted for context; whether a
   pane re-spawns its command follows the existing restore rules, unchanged.

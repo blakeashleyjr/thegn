@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Contract parse + mapping (superzej-core)
+## 1. Contract parse + mapping (thegn-core)
 
 - [ ] 1.1 Pure parser for the `<command>/<explanation>/<warning>` contract →
       `{ command, explanation, warning? }` and a mapper onto the typed `GitOp` —
@@ -10,7 +10,7 @@
       branch, squash needs ≥2 commits, force-push flagged) — **unit tests**: each
       guard fires on the unsafe state and passes on the safe state.
 
-## 2. Flow + overlay (superzej-host)
+## 2. Flow + overlay (thegn-host)
 
 - [ ] 2.1 Host-side model call through the proxy: prose + repo context → contract;
       parse + validate. Add an explain-only mode that returns command + explanation + safety and never executes.

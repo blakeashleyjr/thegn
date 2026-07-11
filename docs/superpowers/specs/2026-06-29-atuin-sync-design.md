@@ -14,7 +14,7 @@ the same sync so history flows host ↔ sprite ↔ sprite.
 
 **Carry the host's existing atuin credentials + config into the sandbox** (opt-in)
 and let **atuin's own sync** (`auto_sync`, default 5 min) reconcile history via the
-sync server. superzej does NOT run `atuin login` (the host is already logged in)
+sync server. thegn does NOT run `atuin login` (the host is already logged in)
 and does NOT copy the history DBs (the server syncs those).
 
 Rejected alternatives:

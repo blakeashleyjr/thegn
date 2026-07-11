@@ -3,9 +3,9 @@
 ## 1. Schema & seed model (Q 768, Q 226)
 
 - [ ] 1.1 — Add the `scheduled_tasks` table and bump `user_version` 21 → 22 in
-      `superzej-core/src/db.rs` (additive migration). **unit tests**
+      `thegn-core/src/db.rs` (additive migration). **unit tests**
 - [ ] 1.2 — Add CRUD + `next_fire_at` recompute helpers over `scheduled_tasks`
-      in `superzej-core`. **unit tests**
+      in `thegn-core`. **unit tests**
 - [ ] 1.3 — Extend the orchestration message type
       (`status`/`dispatch`/`worker_done`/`decision_gate`) seeded from
       `AgentDispatch` / `agent_dispatches`, with `@group` addressing. **unit tests**
@@ -37,7 +37,7 @@
 - [ ] 4.2 — Target a repo (fresh worktree) or an existing worktree;
       `--reuse-session` continues in the same live terminal. **unit tests**
 - [ ] 4.3 — Create-disabled → test-trigger (manual fire-now) → enable lifecycle
-      via `superzej` CLI + palette. **unit tests**
+      via `thegn` CLI + palette. **unit tests**
 
 ## 5. AI-additive guards
 

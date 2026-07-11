@@ -8,7 +8,7 @@ Scoped, brokered capability grants that let an agent use a tool or resource with
 
 ### Requirement: Capabilities are glob-scoped grants checked before side effects
 
-superzej SHALL model a permission as a `Grant` with a kind (`process:exec`,
+thegn SHALL model a permission as a `Grant` with a kind (`process:exec`,
 `download_file`, `npm:install`, `cargo:install`) and a glob scope, and expose a
 pure `allows(action)` that returns true only when some grant of the matching
 kind has a scope glob that matches the action's resource. The glob matcher MUST

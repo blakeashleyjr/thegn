@@ -2,17 +2,17 @@
 
 > **For Hermes:** Use `subagent-driven-development` skill to implement this plan task-by-task.
 
-**Goal:** Create a terminal-native metrics and status dashboard tab integrated into superzej, with identical UX to existing `chat` and `comms` embedded applications. The dashboard will utilize the existing `[metrics]` and `[dashboard]` configuration blocks, providing an overview similar to `WTF` but built on the superzej/ratatui foundation.
+**Goal:** Create a terminal-native metrics and status dashboard tab integrated into thegn, with identical UX to existing `chat` and `comms` embedded applications. The dashboard will utilize the existing `[metrics]` and `[dashboard]` configuration blocks, providing an overview similar to `WTF` but built on the thegn/ratatui foundation.
 
 **Architecture:**
 
-1. Add a new `dashboard` embedded app (`crates/superzej-host/src/apps/dashboard.rs`) that satisfies the `sz_kit::AppTile` contract.
-2. The UI structure will use standard `ratatui` primitives, matching the existing `sz_kit::Theme` integration.
+1. Add a new `dashboard` embedded app (`crates/thegn-host/src/apps/dashboard.rs`) that satisfies the `tg_kit::AppTile` contract.
+2. The UI structure will use standard `ratatui` primitives, matching the existing `tg_kit::Theme` integration.
 3. Hook up the existing `Action::Dashboard` keybinding to open the dashboard app tab.
 
 **Tech Stack:**
 
-- Rust (existing `superzej-host`, `sz-kit`)
+- Rust (existing `thegn-host`, `tg-kit`)
 - `ratatui` for TUI components
 - `reqwest` / `serde` (or existing metrics components) for data fetching
 
@@ -20,22 +20,22 @@
 
 ### Task 1: Create the Dashboard App Tile Module
 
-**Objective:** Add `crates/superzej-host/src/apps/dashboard.rs` implementing `AppTile` and configure it as an app slot.
+**Objective:** Add `crates/thegn-host/src/apps/dashboard.rs` implementing `AppTile` and configure it as an app slot.
 
 **Files:**
 
-- Create: `crates/superzej-host/src/apps/dashboard.rs`
-- Modify: `crates/superzej-host/src/apps/mod.rs`
-- Modify: `crates/superzej-host/src/run.rs`
+- Create: `crates/thegn-host/src/apps/dashboard.rs`
+- Modify: `crates/thegn-host/src/apps/mod.rs`
+- Modify: `crates/thegn-host/src/run.rs`
 
 **Step 1: Write the minimal module and tile structure**
 
 ```rust
-// crates/superzej-host/src/apps/dashboard.rs
-use sz_kit::ratatui::buffer::Buffer;
-use sz_kit::ratatui::layout::Rect;
-use sz_kit::ratatui::widgets::{Block, Borders, Paragraph};
-use sz_kit::{AppTile, ChangeHook, InputEvent, InputResult, Theme};
+// crates/thegn-host/src/apps/dashboard.rs
+use tg_kit::ratatui::buffer::Buffer;
+use tg_kit::ratatui::layout::Rect;
+use tg_kit::ratatui::widgets::{Block, Borders, Paragraph};
+use tg_kit::{AppTile, ChangeHook, InputEvent, InputResult, Theme};
 
 pub struct DashboardUi {
     theme: Theme,
@@ -72,10 +72,10 @@ impl AppTile for DashboardUi {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Dashboard ")
-            .border_style(sz_kit::ratatui::style::Style::default().fg(self.theme.panel.into()));
+            .border_style(tg_kit::ratatui::style::Style::default().fg(self.theme.panel.into()));
 
         let p = Paragraph::new("Dashboard placeholder").block(block);
-        sz_kit::ratatui::widgets::Widget::render(p, area, buf);
+        tg_kit::ratatui::widgets::Widget::render(p, area, buf);
     }
 }
 
@@ -90,7 +90,7 @@ pub async fn build(
 
 **Step 2: Export it and add to app slots**
 
-Modify `crates/superzej-host/src/apps/mod.rs`:
+Modify `crates/thegn-host/src/apps/mod.rs`:
 
 ```rust
 pub mod chat;
@@ -99,7 +99,7 @@ pub mod dashboard; // <--- ADD THIS
 pub mod input;
 ```
 
-Modify `crates/superzej-host/src/run.rs` (around line 4547):
+Modify `crates/thegn-host/src/run.rs` (around line 4547):
 
 ```rust
     let mut app_host = crate::apps::AppHost::new(vec![
@@ -109,7 +109,7 @@ Modify `crates/superzej-host/src/run.rs` (around line 4547):
     ]);
 ```
 
-Modify `crates/superzej-host/src/run.rs` (around line 6806):
+Modify `crates/thegn-host/src/run.rs` (around line 6806):
 
 ```rust
                             let tile = match app_host.slots[i].id {
@@ -120,13 +120,13 @@ Modify `crates/superzej-host/src/run.rs` (around line 6806):
 ```
 
 **Step 3: Test compile**
-Run: `cargo check -p superzej-host`
+Run: `cargo check -p thegn-host`
 Expected: Passes.
 
 **Step 4: Commit**
 
 ```bash
-git add crates/superzej-host/src/apps/dashboard.rs crates/superzej-host/src/apps/mod.rs crates/superzej-host/src/run.rs
+git add crates/thegn-host/src/apps/dashboard.rs crates/thegn-host/src/apps/mod.rs crates/thegn-host/src/run.rs
 git commit -m "feat(apps): add placeholder dashboard app tile"
 ```
 
@@ -138,11 +138,11 @@ git commit -m "feat(apps): add placeholder dashboard app tile"
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/run.rs`
+- Modify: `crates/thegn-host/src/run.rs`
 
 **Step 1: Wire the action dispatch**
 
-Search `crates/superzej-host/src/run.rs` for `crate::keymap::Action::CloseTab` and find the main action matching block (around line 6930 or wherever `forced_palette_action.take().unwrap_or(a)` resolves).
+Search `crates/thegn-host/src/run.rs` for `crate::keymap::Action::CloseTab` and find the main action matching block (around line 6930 or wherever `forced_palette_action.take().unwrap_or(a)` resolves).
 
 Add an arm for `Action::Dashboard`:
 
@@ -158,7 +158,7 @@ Add an arm for `Action::Dashboard`:
                             // Switch to dashboard.
                             // Same lazy-load logic as the top-level app-tab switcher.
                             if matches!(app_host.slots[i].state, crate::apps::SlotState::Unloaded) {
-                                let hook: sz_kit::ChangeHook = {
+                                let hook: tg_kit::ChangeHook = {
                                     let tx = app_tx.clone();
                                     let wk = waker.clone();
                                     std::sync::Arc::new(move || {
@@ -178,18 +178,18 @@ Add an arm for `Action::Dashboard`:
 ```
 
 **Step 2: Verify dispatch logic compiles**
-Run: `cargo check -p superzej-host`
+Run: `cargo check -p thegn-host`
 Expected: Passes.
 
 **Step 3: Test execution**
-Run: `cargo run -p superzej-host --bin szhost`
+Run: `cargo run -p thegn-host --bin thegn`
 Test: Press `Alt+D`.
 Expected: `dashboard` app tab opens and shows the placeholder paragraph. Pressing `Alt+D` again closes it.
 
 **Step 4: Commit**
 
 ```bash
-git add crates/superzej-host/src/run.rs
+git add crates/thegn-host/src/run.rs
 git commit -m "feat(apps): route Action::Dashboard to toggle dashboard tab"
 ```
 
@@ -201,16 +201,16 @@ git commit -m "feat(apps): route Action::Dashboard to toggle dashboard tab"
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/apps/dashboard.rs`
+- Modify: `crates/thegn-host/src/apps/dashboard.rs`
 
 **Step 1: Add layout and widget rendering logic**
 
 ```rust
-// Update crates/superzej-host/src/apps/dashboard.rs
-use sz_kit::ratatui::buffer::Buffer;
-use sz_kit::ratatui::layout::{Constraint, Direction, Layout, Rect};
-use sz_kit::ratatui::widgets::{Block, Borders, Paragraph, Widget};
-use sz_kit::{AppTile, ChangeHook, InputEvent, InputResult, Theme};
+// Update crates/thegn-host/src/apps/dashboard.rs
+use tg_kit::ratatui::buffer::Buffer;
+use tg_kit::ratatui::layout::{Constraint, Direction, Layout, Rect};
+use tg_kit::ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use tg_kit::{AppTile, ChangeHook, InputEvent, InputResult, Theme};
 
 pub struct DashboardUi {
     theme: Theme,
@@ -225,7 +225,7 @@ impl DashboardUi {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" System ")
-            .border_style(sz_kit::ratatui::style::Style::default().fg(self.theme.panel2.into()));
+            .border_style(tg_kit::ratatui::style::Style::default().fg(self.theme.panel2.into()));
         Paragraph::new("OS: Linux\nUptime: 2 days").block(block).render(area, buf);
     }
 
@@ -233,7 +233,7 @@ impl DashboardUi {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Recent Repos ")
-            .border_style(sz_kit::ratatui::style::Style::default().fg(self.theme.panel2.into()));
+            .border_style(tg_kit::ratatui::style::Style::default().fg(self.theme.panel2.into()));
         Paragraph::new("No repos listed.").block(block).render(area, buf);
     }
 }
@@ -265,8 +265,8 @@ impl AppTile for DashboardUi {
         let right_block = Block::default()
             .borders(Borders::ALL)
             .title(" Overview ")
-            .border_style(sz_kit::ratatui::style::Style::default().fg(self.theme.panel.into()));
-        Paragraph::new("Welcome to the Superzej Dashboard").block(right_block).render(chunks[1], buf);
+            .border_style(tg_kit::ratatui::style::Style::default().fg(self.theme.panel.into()));
+        Paragraph::new("Welcome to the Thegn Dashboard").block(right_block).render(chunks[1], buf);
     }
 }
 
@@ -274,13 +274,13 @@ impl AppTile for DashboardUi {
 ```
 
 **Step 2: Test compile**
-Run: `cargo check -p superzej-host`
+Run: `cargo check -p thegn-host`
 Expected: Passes.
 
 **Step 3: Commit**
 
 ```bash
-git add crates/superzej-host/src/apps/dashboard.rs
+git add crates/thegn-host/src/apps/dashboard.rs
 git commit -m "feat(apps): implement standard wtf-style dashboard grid layout"
 ```
 
@@ -288,21 +288,21 @@ git commit -m "feat(apps): implement standard wtf-style dashboard grid layout"
 
 ### Task 4: Hook Up Live Data (Recents / Metrics)
 
-**Objective:** Fetch real data from `superzej-core` (like `Db::known_repos()` or `sysinfo`) and trigger redraws safely from background tasks via `ChangeHook`.
+**Objective:** Fetch real data from `thegn-core` (like `Db::known_repos()` or `sysinfo`) and trigger redraws safely from background tasks via `ChangeHook`.
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/apps/dashboard.rs`
+- Modify: `crates/thegn-host/src/apps/dashboard.rs`
 
-**Step 1: Integrate `sysinfo` and `superzej_core::db` fetching**
+**Step 1: Integrate `sysinfo` and `thegn_core::db` fetching**
 
 ```rust
-// Update crates/superzej-host/src/apps/dashboard.rs
+// Update crates/thegn-host/src/apps/dashboard.rs
 use std::sync::{Arc, Mutex};
-use sz_kit::ratatui::buffer::Buffer;
-use sz_kit::ratatui::layout::{Constraint, Direction, Layout, Rect};
-use sz_kit::ratatui::widgets::{Block, Borders, Paragraph, Widget};
-use sz_kit::{AppTile, ChangeHook, InputEvent, InputResult, Theme};
+use tg_kit::ratatui::buffer::Buffer;
+use tg_kit::ratatui::layout::{Constraint, Direction, Layout, Rect};
+use tg_kit::ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use tg_kit::{AppTile, ChangeHook, InputEvent, InputResult, Theme};
 
 #[derive(Clone, Default)]
 struct DashboardData {
@@ -323,7 +323,7 @@ impl DashboardUi {
         rt.spawn(async move {
             // Initial data fetch
             let mut repos = vec![];
-            if let Ok(db) = superzej_core::db::Db::open() {
+            if let Ok(db) = thegn_core::db::Db::open() {
                 if let Ok(recent) = db.recent_repos(10) {
                     repos = recent;
                 }
@@ -359,7 +359,7 @@ impl DashboardUi {
 // ...
 ```
 
-**Note:** Ensure `sysinfo` dependency handles are valid in `Cargo.toml`. `sysinfo` is already present in `superzej-core`. You may need to add it to `superzej-host` dependencies if not already inherited or exported.
+**Note:** Ensure `sysinfo` dependency handles are valid in `Cargo.toml`. `sysinfo` is already present in `thegn-core`. You may need to add it to `thegn-host` dependencies if not already inherited or exported.
 
 **Step 2: Commit**
 

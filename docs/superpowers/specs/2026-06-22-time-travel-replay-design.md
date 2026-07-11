@@ -8,7 +8,7 @@ feature is that it records the _full event stream_ of every pane and lets you
 scrub it like a video player — pause, play forwards/backwards, skip idle gaps,
 and search for any string that **ever appeared on screen**, including inside
 full-screen apps (vim/htop) where output never reaches the scrollback. This doc
-architects that capability onto superzej's existing seams, plus three smaller
+architects that capability onto thegn's existing seams, plus three smaller
 cy borrowings (search-across-time, vim-style registers, alt/main screen swap).
 
 Ordered by value. Phases 1–2 are one feature and the reason to do any of this;
@@ -23,7 +23,7 @@ Ordered by value. Phases 1–2 are one feature and the reason to do any of this;
   fallback (`wl-copy`/`xclip`/`pbcopy`). Already more robust than cy's.
 - **Scrollback** — `emulator.rs`: vt100 history ring (10 000 lines), viewport
   scroll via `scroll_up/down/reset`.
-- **History search** — `search.rs` + `superzej-core::search`: `SearchOverlay`
+- **History search** — `search.rs` + `thegn-core::search`: `SearchOverlay`
   modal, nucleo over the per-pane ANSI-stripped `HistoryBuffer`, scoped
   Pane→Tab→Worktree→Workspace→Profile.
 
@@ -59,7 +59,7 @@ but seeking to time _T_ by replaying from byte 0 is O(history). cy solves this;
 we use the standard keyframe approach:
 
 ```rust
-// crates/superzej-host/src/replay.rs  (new)
+// crates/thegn-host/src/replay.rs  (new)
 
 /// One recorded pane session. Lives beside the PtyPane.
 pub struct Recording {
@@ -133,7 +133,7 @@ keyframe, that keyframe is dropped too (its byte range no longer exists).
 
 Cost when `enabled = false`: the `Option<Recording>` is `None`, `feed` does one
 null check. Zero allocation, matches the "instrumentation is free when off"
-pattern from `SUPERZEJ_LOG`.
+pattern from `THEGN_LOG`.
 
 ### 1.4 Where it lives & the event-loop contract
 
@@ -157,7 +157,7 @@ goes off-thread.)
 ### 1.5 Optional disk persistence (off-loop)
 
 When `persist = true`, each pane's ring is mirrored to
-`$XDG_STATE_HOME/superzej/replay/<session_id>/<pane_id>.szr`. Writes happen on
+`$XDG_STATE_HOME/thegn/replay/<session_id>/<pane_id>.szr`. Writes happen on
 a **dedicated writer thread** fed by an mpsc channel (the exact pattern the diff
 fs-watcher uses for its ~1 s inotify registration — expensive work off the
 loop, results/acks back over a channel). Format: a length-prefixed event log
@@ -271,14 +271,14 @@ the palette-style channel, so a long search never blocks the loop.
 ## Phase 3 — vim-style registers
 
 cy generalizes the clipboard into named registers (`"a`–`"z`, `"0`–`"9`, plus
-`"+` = system clipboard, `""` = default), persisted to its store. superzej is
+`"+` = system clipboard, `""` = default), persisted to its store. thegn is
 one-session/one-client so "global across clients" is moot, but
 **persist-across-restart** is the real win.
 
 ### 3.1 Store
 
 ```rust
-// crates/superzej-core/src/registers.rs  (new — pure, testable, coverage-gated)
+// crates/thegn-core/src/registers.rs  (new — pure, testable, coverage-gated)
 pub struct Registers { map: BTreeMap<char, String> }
 impl Registers {
     pub fn yank(&mut self, name: char, text: String);  // '"' = default
@@ -318,7 +318,7 @@ register char then writes `get(name)` into the focused pane via
 `bracketed_paste()`). Without a prefix, yank/paste use `""` — i.e. today's
 behavior is unchanged, registers are strictly additive.
 
-Scope note: superzej's copy mode is mouse-drag + keyboard-cursor, not full vim
+Scope note: thegn's copy mode is mouse-drag + keyboard-cursor, not full vim
 visual motions. Registers ride on top of the _existing_ selection model; we are
 not importing vim's motion grammar. Modest by design.
 
@@ -402,7 +402,7 @@ confirm at implementation time.
 - **Not** importing cy's Janet API / scripting, multiplayer/multi-client
   registers, or its node-graph model — those are cy's architecture, not ours.
   We're borrowing the _capabilities_ (replay, time-search, registers,
-  screen-swap), implemented natively on superzej's seams.
+  screen-swap), implemented natively on thegn's seams.
 
 ## Sequencing
 

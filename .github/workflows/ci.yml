@@ -18,7 +18,7 @@ name: ci
 # doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db
 # e2e nix-build. Stages NOT in the routine server-side gate:
 #  - e2e (muse visual suite): OPT-IN via `[ci-e2e]` commit marker or dispatch.
-#    The muse specs spawn szhost in a PTY (which does work on ubuntu runners),
+#    The muse specs spawn thegn in a PTY (which does work on ubuntu runners),
 #    but the visual baselines in test/muse/snapshots/ were never committed and
 #    a few specs carry stale `toBeVisible` expectations from main's UI drift,
 #    so routine runs would always be red. `[gen-baselines]` runs the one-shot
@@ -103,8 +103,8 @@ jobs:
       - name: git defaults for the svc git tests
         run: |
           git config --global init.defaultBranch main
-          git config --global user.email ci@superzej.local
-          git config --global user.name "superzej CI"
+          git config --global user.email ci@thegn.local
+          git config --global user.name "thegn CI"
       - run: nix develop --command bash -lc "just build && just test"
   doc:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
@@ -182,7 +182,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     # A cold `nix build .#default` compiles the whole app + deps from source
     # (a Cargo.lock change misses the nix-store cache). It was killed at 45m with
-    # only the final `superzej-host` compile+link left, so give it 60m; once it
+    # only the final `thegn-host` compile+link left, so give it 60m; once it
     # succeeds the nix-store cache warms and later runs are far quicker.
     timeout-minutes: 60
     steps:
@@ -228,8 +228,8 @@ jobs:
       - name: git defaults for the svc git tests
         run: |
           git config --global init.defaultBranch main
-          git config --global user.email ci@superzej.local
-          git config --global user.name "superzej CI"
+          git config --global user.email ci@thegn.local
+          git config --global user.name "thegn CI"
       - run: nix develop --command bash -lc "just build && just test"
   # One-shot baseline generator: muse visual baselines were never committed, so
   # `e2e` can't pass until they exist. Push a commit whose message contains
@@ -254,8 +254,8 @@ jobs:
       - run: nix develop --command just e2e-update || true
       - name: commit regenerated baselines
         run: |
-          git config user.name "superzej CI"
-          git config user.email ci@superzej.local
+          git config user.name "thegn CI"
+          git config user.email ci@thegn.local
           if [ -n "$(git status --porcelain test/muse/snapshots/)" ]; then
             git add test/muse/snapshots/
             git commit -m "test(e2e): generate muse visual baselines in CI"

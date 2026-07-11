@@ -1,7 +1,7 @@
 edition = "2024"
 # Pin the formatting style explicitly so it never derives from a crate's parse
 # `edition`. `cargo fmt` formats each crate with its own Cargo.toml edition
-# (sz-kit is 2021), while `nix fmt`/treefmt passes `--edition 2024` uniformly;
+# (tg-kit is 2021), while `nix fmt`/treefmt passes `--edition 2024` uniformly;
 # without this pin the two disagree on import ordering for the 2021 crate.
 style_edition = "2024"
 max_width = 100

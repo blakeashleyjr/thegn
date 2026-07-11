@@ -171,7 +171,7 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
   [ -n "$svc_name" ] || die "  could not determine systemd service name for $name"
   dropin="/etc/systemd/system/${svc_name}.d"
   sudo mkdir -p "$dropin"
-  sudo tee "$dropin/10-superzej-ci.conf" >/dev/null <<EOF
+  sudo tee "$dropin/10-thegn-ci.conf" >/dev/null <<EOF
 [Service]
 # Pin this runner to ${RUNNER_CPUS} cores' worth of CPU (4×${RUNNER_CPUS} across the box).
 CPUQuota=$((RUNNER_CPUS * 100))%

@@ -2,17 +2,17 @@
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Add a Grafana-compatible observability frontend ("Observe" app-tab) to superzej for metrics/logs/traces with an ad-hoc query REPL and TOML-persisted dashboard layouts.
+**Goal:** Add a Grafana-compatible observability frontend ("Observe" app-tab) to thegn for metrics/logs/traces with an ad-hoc query REPL and TOML-persisted dashboard layouts.
 
-**Architecture:** A set of new crates (`gtui-core`, `gtui-query`, `gtui-render`, `gtui-app`, `gtui-embed`) that implement a typed columnar `Frame` data model (using Polars), backend-agnostic `DataSource` traits, async off-loop query execution, and terminal rendering (braille fallback via `ratatui` + potential sixel/kitty support). It embeds into superzej via `sz-kit`.
+**Architecture:** A set of new crates (`gtui-core`, `gtui-query`, `gtui-render`, `gtui-app`, `gtui-embed`) that implement a typed columnar `Frame` data model (using Polars), backend-agnostic `DataSource` traits, async off-loop query execution, and terminal rendering (braille fallback via `ratatui` + potential sixel/kitty support). It embeds into thegn via `tg-kit`.
 
-**Tech Stack:** Rust, tokio, ratatui (via `sz-kit`), Polars, reqwest.
+**Tech Stack:** Rust, tokio, ratatui (via `tg-kit`), Polars, reqwest.
 
 ---
 
 ### Task 1: Create new crates and update Cargo.toml
 
-**Objective:** Scaffold the five new `gtui-*` crates and add them to the superzej workspace.
+**Objective:** Scaffold the five new `gtui-*` crates and add them to the thegn workspace.
 
 **Files:**
 
@@ -302,7 +302,7 @@ git commit -m "feat: synthetic test data source (0.3)"
 
 - Create: `crates/gtui-render/src/timeseries.rs`
 - Modify: `crates/gtui-render/src/lib.rs`
-- Modify: `crates/gtui-render/Cargo.toml` (depend on `gtui-core`, `sz-kit`, `ratatui`)
+- Modify: `crates/gtui-render/Cargo.toml` (depend on `gtui-core`, `tg-kit`, `ratatui`)
 
 **Step 1: Write test for downsample/render**
 (Write a unit test that verifies the output bounds of a downsampled series)

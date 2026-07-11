@@ -46,7 +46,7 @@ the hunk it's working. Pure and unit-tested (structure without patch is compact;
 ## Alternatives considered
 
 - **A loopback HTTP daemon (hunk) / `/dev/tty` routing (lumen)** — rejected;
-  superzej is in-process and owns the panel, so steering is a direct `PanelMsg`
+  thegn is in-process and owns the panel, so steering is a direct `PanelMsg`
   injection with no external server.
 - **Dumping the full unified diff to the agent** — rejected; the structured
   projection with opt-in patch is the token-lean default (hunk/codag discipline).

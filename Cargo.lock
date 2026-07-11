@@ -3704,8 +3704,8 @@ dependencies = [
  "gtui-core",
  "gtui-query",
  "gtui-render",
- "superzej-core",
- "sz-kit",
+ "tg-kit",
+ "thegn-core",
  "tokio",
  "toml 0.8.23",
 ]
@@ -3719,7 +3719,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "superzej-metrics",
+ "thegn-metrics",
  "tokio",
 ]
 
@@ -8899,181 +8899,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
-name = "superzej-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "iroh",
- "portable-pty",
- "superzej-core",
- "superzej-svc",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "superzej-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap 4.6.1",
- "criterion",
- "fluent-templates",
- "neo_frizbee",
- "nix 0.29.0",
- "once_cell",
- "regex",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "serde_yaml",
- "similar",
- "superzej-media",
- "syntect",
- "sys-locale",
- "toml 0.8.23",
- "toml_edit 0.25.12+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-go",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "unic-langid",
- "walkdir",
-]
-
-[[package]]
-name = "superzej-host"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "axum",
- "base64",
- "chrono",
- "clap 4.6.1",
- "clap_complete",
- "fff-search",
- "futures",
- "getrandom 0.3.4",
- "gtui-embed",
- "ignore",
- "image",
- "iroh",
- "keyring",
- "libc",
- "neo_frizbee",
- "nix 0.29.0",
- "notify 6.1.1",
- "portable-pty",
- "pprof",
- "regex",
- "reqwest 0.12.28",
- "schemars",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "superzej-core",
- "superzej-media",
- "superzej-metrics",
- "superzej-svc",
- "sz-kit",
- "termwiz",
- "tokei",
- "tokio",
- "tokio-util",
- "toml 0.8.23",
- "toml_edit 0.25.12+spec-1.1.0",
- "tonic",
- "tracing",
- "unicode-width 0.2.2",
-]
-
-[[package]]
-name = "superzej-media"
-version = "0.1.0"
-dependencies = [
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "windows 0.58.0",
- "zbus 5.17.0",
-]
-
-[[package]]
-name = "superzej-metrics"
-version = "0.1.0"
-dependencies = [
- "nix 0.29.0",
- "starship-battery",
- "sysinfo 0.39.5",
- "tempfile",
-]
-
-[[package]]
-name = "superzej-proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "futures",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "superzej-core",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "superzej-svc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "chrono",
- "criterion",
- "futures-channel",
- "futures-util",
- "getrandom 0.3.4",
- "gix",
- "http-body-util",
- "hyper",
- "hyper-util",
- "ignore",
- "iroh",
- "notify 6.1.1",
- "octocrab",
- "prost",
- "protox",
- "reqwest 0.12.28",
- "rusty-s3",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "superzej-core",
- "tempfile",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "tokio-util",
- "tonic",
- "tonic-build",
- "tower",
- "tracing",
-]
-
-[[package]]
 name = "symbolic-common"
 version = "12.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9230,16 +9055,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sz-kit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ratatui",
- "serde",
- "toml 0.8.23",
-]
-
-[[package]]
 name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9375,6 +9190,191 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d326610f408c7a4eb6f51c37c330e496b08506c9457c9d34287ecc38809fb060"
 dependencies = [
  "unicode-width 0.1.14",
+]
+
+[[package]]
+name = "tg-kit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ratatui",
+ "serde",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "thegn-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "iroh",
+ "portable-pty",
+ "thegn-core",
+ "thegn-svc",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "thegn-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap 4.6.1",
+ "criterion",
+ "fluent-templates",
+ "neo_frizbee",
+ "nix 0.29.0",
+ "once_cell",
+ "regex",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "similar",
+ "syntect",
+ "sys-locale",
+ "thegn-media",
+ "toml 0.8.23",
+ "toml_edit 0.25.12+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "unic-langid",
+ "walkdir",
+]
+
+[[package]]
+name = "thegn-host"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "axum",
+ "base64",
+ "chrono",
+ "clap 4.6.1",
+ "clap_complete",
+ "fff-search",
+ "futures",
+ "getrandom 0.3.4",
+ "gtui-embed",
+ "ignore",
+ "image",
+ "iroh",
+ "keyring",
+ "libc",
+ "neo_frizbee",
+ "nix 0.29.0",
+ "notify 6.1.1",
+ "portable-pty",
+ "pprof",
+ "regex",
+ "reqwest 0.12.28",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "termwiz",
+ "tg-kit",
+ "thegn-core",
+ "thegn-media",
+ "thegn-metrics",
+ "thegn-svc",
+ "tokei",
+ "tokio",
+ "tokio-util",
+ "toml 0.8.23",
+ "toml_edit 0.25.12+spec-1.1.0",
+ "tonic",
+ "tracing",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "thegn-media"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "windows 0.58.0",
+ "zbus 5.17.0",
+]
+
+[[package]]
+name = "thegn-metrics"
+version = "0.1.0"
+dependencies = [
+ "nix 0.29.0",
+ "starship-battery",
+ "sysinfo 0.39.5",
+ "tempfile",
+]
+
+[[package]]
+name = "thegn-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "futures",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thegn-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "thegn-svc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "chrono",
+ "criterion",
+ "futures-channel",
+ "futures-util",
+ "getrandom 0.3.4",
+ "gix",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ignore",
+ "iroh",
+ "notify 6.1.1",
+ "octocrab",
+ "prost",
+ "protox",
+ "reqwest 0.12.28",
+ "rusty-s3",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thegn-core",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tokio-util",
+ "tonic",
+ "tonic-build",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

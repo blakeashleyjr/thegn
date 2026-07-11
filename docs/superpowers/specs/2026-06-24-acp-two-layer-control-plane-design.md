@@ -20,41 +20,41 @@ instructive.
 2. The difference is **where the interception happens**:
    - **ACP proxies sit _above_ the harness** — in the client↔agent JSON-RPC
      stream (prompts, tool calls, session updates, permissions).
-   - **Our `szproxy` (U/V/W) sits _below_ the harness** — in the agent↔model
+   - **Our `tgproxy` (U/V/W) sits _below_ the harness** — in the agent↔model
      HTTP stream (Anthropic/OpenAI traffic).
      These are **two complementary layers of one control plane**, not competitors.
 3. Our roadmap's ACP treatment (**group R**) is a stale 14-item stub written
    before half of today's ACP surface stabilized, and the embedded-first pivot
-   _demoted_ it to "secondary/additive." It only ever models superzej as an ACP
+   _demoted_ it to "secondary/additive." It only ever models thegn as an ACP
    **client** — never as an ACP **agent** (a distribution play) or an ACP
    **proxy** (the upper-layer realization of AR).
 
 The maximal move is to name the two planes explicitly, make ACP a co-primary
 **upper** plane with three roles (client / agent / proxy), and wire it to
-`szproxy` at two well-defined seams.
+`tgproxy` at two well-defined seams.
 
 ## The two-layer control plane
 
 ```
-        ┌────────────────────── superzej (the Client / IDE) ──────────────────────┐
+        ┌────────────────────── thegn (the Client / IDE) ──────────────────────┐
         │                                                                          │
  user ─►│  ACP CLIENT ──(UPPER plane: ACP proxy / AR — R3)──►  AGENT (harness)     │
         │      ▲                                                     │             │
         │      │                                                     │             │
-        │      │  providers/set(baseUrl = szproxy)   MCP-over-ACP    ▼             │
-        │   szproxy ◄───────(LOWER plane: U/V/W model traffic)─────  model API     │
+        │      │  providers/set(baseUrl = tgproxy)   MCP-over-ACP    ▼             │
+        │   tgproxy ◄───────(LOWER plane: U/V/W model traffic)─────  model API     │
         │                                                                          │
         └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Lower plane — `szproxy` (U/V/W → AR).** _Already built._ Owns model traffic:
+- **Lower plane — `tgproxy` (U/V/W → AR).** _Already built._ Owns model traffic:
   dual-protocol relay, failover, per-scope budgets, spend attribution, in-flight
   token reduction. Agnostic to _which_ harness produced the request.
 - **Upper plane — ACP (group R).** Owns the agent _conversation_: sessions, tool
   calls, permissions, diffs, plans, config options, slash commands, telemetry.
 - **Two convergence seams join them:**
   - **`providers/set`** (Configurable LLM Providers RFD) — point _any_ ACP
-    agent's model traffic at `szproxy` by setting `baseUrl` + brokered
+    agent's model traffic at `tgproxy` by setting `baseUrl` + brokered
     `headers`. This is the literal bridge between R and U.
   - **MCP-over-ACP** — advertise AR's central MCP registry / house tools _up_ to
     any agent over the ACP channel (`mcp/connect`/`message`/`disconnect`), with
@@ -82,7 +82,7 @@ making ACP co-primary instead of an afterthought.
 
 | RFD                                                   | What it adds                                                                                                                                                     | Our analog                                                     |
 | ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| **Configurable LLM Providers**                        | `agentCapabilities.providers`; `providers/list`/`set`/`disable` (id/apiType/baseUrl/headers)                                                                     | **The R↔U bridge** — point any ACP agent at `szproxy`          |
+| **Configurable LLM Providers**                        | `agentCapabilities.providers`; `providers/list`/`set`/`disable` (id/apiType/baseUrl/headers)                                                                     | **The R↔U bridge** — point any ACP agent at `tgproxy`          |
 | **Agent Extensions via ACP Proxies** (`proxy-chains`) | proxies in the message flow; `proxy/initialize` + `proxy/successor` via a conductor; subsumes AGENTS.md, hooks, plugins, MCP                                     | **Upper-layer twin of AR** (541–551)                           |
 | **MCP-over-ACP**                                      | `{type:"acp"}` servers; `mcp/connect`/`message`/`disconnect`; `mcpCapabilities.acp`                                                                              | AR central MCP registry (541–543) + AL exposed up to any agent |
 | **Session Context Size & Cost**                       | `usage_update` (`used`/`size` tokens + optional `cost{amount,currency}`)                                                                                         | S 246/249/250 + V 289/290 spend attribution                    |
@@ -100,7 +100,7 @@ most ACP clients are — but it is the _model_ layer, not the _protocol_ layer.
 
 **What we under-built (upper plane, group R):**
 
-- Modeled superzej only as an ACP **client**; never as an **agent** (export
+- Modeled thegn only as an ACP **client**; never as an **agent** (export
   termite to Zed/other editors via the Registry) or a **proxy** (AR for any
   agent).
 - Group R's "session management" (item 230) is one line; ACP now has
@@ -143,11 +143,11 @@ U/V/AL/S so the two-plane framing reads consistently.
 
 ## Implementation seam (for when R is built — not built here)
 
-- **JSON-RPC transport**: `crates/superzej-svc/src/lsp/` is an existing
+- **JSON-RPC transport**: `crates/thegn-svc/src/lsp/` is an existing
   LSP/DAP-style JSON-RPC client seam — the model for the ACP client/agent
   transport; `src/bin/fake_lsp.rs` is the fixture pattern for an ACP test
   double.
-- **Harness embedding / agent role**: `crates/superzej-host/src/apps/agent.rs`
+- **Harness embedding / agent role**: `crates/thegn-host/src/apps/agent.rs`
   (`AppTile`/`AgentRuntime`, `mint_proxy_key`, `SandboxTerminalTool`) — R2 wraps
   the same `AgentRuntime`; the terminal surface reuses `sandbox::enter_argv`.
 - **Permission + elicitation UI**: native iocraft palette (`src/palette/`).
@@ -156,6 +156,6 @@ U/V/AL/S so the two-plane framing reads consistently.
 - **Session lifecycle ↔ persistence**: worktree-tab + session
   snapshot/resurrection (DB `tab_groups`/`session_state`) maps to
   `session/resume`/`fork`; align with the time-travel-replay spec.
-- **Provider seam**: DB `put_proxy_virtual_key`/`mint_proxy_key` + `szproxy` are
+- **Provider seam**: DB `put_proxy_virtual_key`/`mint_proxy_key` + `tgproxy` are
   already the `providers/set` target.
 - **Events**: `EventBus` (`AgentDone`/`AgentFailed`) carries ACP session updates.

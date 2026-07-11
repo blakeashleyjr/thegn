@@ -19,7 +19,7 @@ is a credential sub-vault that only its members may compose.
 ## Impact
 
 - **workspace** — adds a nullable `workspaces.zone_id` (exclusive membership) and
-  a `[zone.<name>]` policy table; a `superzej zone` CLI manages both.
+  a `[zone.<name>]` policy table; a `thegn zone` CLI manages both.
 - **env-bundles** — bundles gain an owning `zone`; the compose fold denies a
   zone-owned bundle to a foreign/unzoned worktree (covering direct, workspace,
   global, and `extends`-reachable bindings) and surfaces the denial.

@@ -2,7 +2,7 @@
 
 ## 1. Foundation (core)
 
-- [x] 1.1 `superzej_core::termcaps`: `TermEnv`, `ColorDepth`, `UnicodeLevel`,
+- [x] 1.1 `thegn_core::termcaps`: `TermEnv`, `ColorDepth`, `UnicodeLevel`,
       `TermCaps`, pure `detect`, `GlyphSet` + `UNICODE`/`ASCII` + `glyphs(level)`;
       move `undercurl_supported_env` into core (re-export from `wire`).
 - [x] 1.2 Host `caps.rs` render-time holder (atomics + `RwLock`), `resolve_termcaps`
@@ -33,9 +33,9 @@
 
 ## 6. Config + diagnostics
 
-- [x] 6.1 `[theme] color` / `glyphs` `config_enum!`s + `SUPERZEJ_THEME_*` env
+- [x] 6.1 `[theme] color` / `glyphs` `config_enum!`s + `THEGN_THEME_*` env
       overrides, documented in `config.toml.example`.
-- [x] 6.2 `superzej doctor [--json]` (`cmd/doctor.rs`).
+- [x] 6.2 `thegn doctor [--json]` (`cmd/doctor.rs`).
 
 ## 7. Docs
 

@@ -2,11 +2,11 @@
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Add a new "Agent" accordion section to superzej's side panel that exposes real-time data from AI coding agent harnesses (Claude Code, Codex CLI, OpenCode, Hermes, PI, Antigravity), replicating all abtop data plus additional metrics.
+**Goal:** Add a new "Agent" accordion section to thegn's side panel that exposes real-time data from AI coding agent harnesses (Claude Code, Codex CLI, OpenCode, Hermes, PI, Antigravity), replicating all abtop data plus additional metrics.
 
-**Architecture:** Two-phase approach: (1) Create `superzej-core` crate with agent session collection + serialization types, (2) Expose via plugin API / side panel using existing PanelData infrastructure. Reuse existing hydration thread for periodic collection.
+**Architecture:** Two-phase approach: (1) Create `thegn-core` crate with agent session collection + serialization types, (2) Expose via plugin API / side panel using existing PanelData infrastructure. Reuse existing hydration thread for periodic collection.
 
-**Tech Stack:** Rust (existing superzej codebase), serde for JSON, existing process/port discovery from abtop (adapted).
+**Tech Stack:** Rust (existing thegn codebase), serde for JSON, existing process/port discovery from abtop (adapted).
 
 ---
 
@@ -58,15 +58,15 @@ The [abtop](https://github.com/graykode/abtop) project exposes:
 
 ---
 
-## Phase 1: Core Agent Data Collection (superzej-core)
+## Phase 1: Core Agent Data Collection (thegn-core)
 
-### Task 1: Create Agent Data Types in superzej-core
+### Task 1: Create Agent Data Types in thegn-core
 
-**Objective:** Define serializable types for agent session data in `superzej-core`.
+**Objective:** Define serializable types for agent session data in `thegn-core`.
 
 **Files:**
 
-- Create: `crates/superzej-core/src/agent.rs` (new file)
+- Create: `crates/thegn-core/src/agent.rs` (new file)
 
 **Step 1: Define core enums and structs**
 
@@ -212,7 +212,7 @@ pub struct AgentAggregate {
 
 **Step 3: Run test to verify compilation**
 
-Run: `cargo build -p superzej-core`
+Run: `cargo build -p thegn-core`
 Expected: SUCCESS
 
 ---
@@ -223,7 +223,7 @@ Expected: SUCCESS
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/agent.rs` (add collector code)
+- Modify: `crates/thegn-core/src/agent.rs` (add collector code)
 
 **Step 1: Add ClaudeCollector struct**
 
@@ -254,7 +254,7 @@ struct TranscriptResult {
 
 **Step 3: Run test**
 
-Run: `cargo test -p superzej-core agent::claude`
+Run: `cargo test -p thegn-core agent::claude`
 Expected: Tests pass (write unit tests for parsing)
 
 ---
@@ -265,7 +265,7 @@ Expected: Tests pass (write unit tests for parsing)
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/agent.rs`
+- Modify: `crates/thegn-core/src/agent.rs`
 
 **Step 1: Add CodexCollector**
 
@@ -289,7 +289,7 @@ pub struct CodexCollector {
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/agent.rs`
+- Modify: `crates/thegn-core/src/agent.rs`
 
 **Step 1: Add OpenCodeCollector**
 
@@ -313,7 +313,7 @@ pub struct OpenCodeCollector {
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/agent.rs`
+- Modify: `crates/thegn-core/src/agent.rs`
 
 **Step 1: Add process info types**
 
@@ -340,7 +340,7 @@ pub struct ProcInfo {
 
 ---
 
-## Phase 2: Panel Integration (superzej-host)
+## Phase 2: Panel Integration (thegn-host)
 
 ### Task 6: Add Agent Section to Panel
 
@@ -348,7 +348,7 @@ pub struct ProcInfo {
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/panel/mod.rs`
+- Modify: `crates/thegn-host/src/panel/mod.rs`
 
 **Step 1: Add Section variant**
 
@@ -387,17 +387,17 @@ pub const SECTION_ORDER: [Section; 13] = [
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/panel/mod.rs`
+- Modify: `crates/thegn-host/src/panel/mod.rs`
 
 **Step 1: Extend PanelData**
 
 ```rust
 pub struct PanelData {
     // ... existing fields
-    pub agent_sessions: Vec<superzej_core::agent::AgentSession>,
-    pub agent_aggregate: superzej_core::agent::AgentAggregate,
-    pub rate_limits: Vec<superzej_core::agent::RateLimitInfo>,
-    pub orphan_ports: Vec<superzej_core::agent::OrphanPort>,
+    pub agent_sessions: Vec<thegn_core::agent::AgentSession>,
+    pub agent_aggregate: thegn_core::agent::AgentAggregate,
+    pub rate_limits: Vec<thegn_core::agent::RateLimitInfo>,
+    pub orphan_ports: Vec<thegn_core::agent::OrphanPort>,
 }
 ```
 
@@ -409,13 +409,13 @@ pub struct PanelData {
 
 **Files:**
 
-- Create: `crates/superzej-host/src/panel/sections/agent.rs`
-- Modify: `crates/superzej-host/src/panel/sections/mod.rs`
+- Create: `crates/thegn-host/src/panel/sections/agent.rs`
+- Modify: `crates/thegn-host/src/panel/sections/mod.rs`
 
 **Step 1: Create section content**
 
 ```rust
-use superzej_core::agent::{AgentSession, AgentAggregate, RateLimitInfo};
+use thegn_core::agent::{AgentSession, AgentAggregate, RateLimitInfo};
 use crate::seg::{Line, Seg, Tok, seg, sp};
 use super::{PanelRow, SectionCtx, PanelHit};
 
@@ -470,14 +470,14 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/hydrate.rs`
+- Modify: `crates/thegn-host/src/hydrate.rs`
 
 **Step 1: Add agent collection to model refresh**
 
 ```rust
 fn refresh_panel_data(
     // ... existing params
-    agent_sessions: Vec<superzej_core::agent::AgentSession>,
+    agent_sessions: Vec<thegn_core::agent::AgentSession>,
 ) -> PanelData {
     let mut panel = existing_panel_data;
 
@@ -496,7 +496,7 @@ fn refresh_panel_data(
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/config.rs`
+- Modify: `crates/thegn-core/src/config.rs`
 
 **Step 1: Add agent config**
 
@@ -532,14 +532,14 @@ impl Default for AgentConfig {
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/agent.rs`
+- Modify: `crates/thegn-core/src/agent.rs`
 
 **Step 1: Add HermesCollector**
 
 ```rust
-/// Hermes-specific session data from superzej's own DB/activity system
+/// Hermes-specific session data from thegn's own DB/activity system
 pub struct HermesCollector {
-    // Read from superzej's SQLite DB for active worktree agent assignments
+    // Read from thegn's SQLite DB for active worktree agent assignments
 }
 ```
 
@@ -556,7 +556,7 @@ pub struct HermesCollector {
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/agent.rs`
+- Modify: `crates/thegn-core/src/agent.rs`
 
 **Step 1: Add generic collector interface**
 
@@ -590,14 +590,14 @@ cargo build --workspace
 ### Test 2: Unit Tests
 
 ```bash
-cargo test -p superzej-core agent
-cargo test -p superzej-host panel::sections::agent
+cargo test -p thegn-core agent
+cargo test -p thegn-host panel::sections::agent
 ```
 
 ### Test 3: Manual Test
 
 ```bash
-# Run superzej and verify "agent" section appears in panel
+# Run thegn and verify "agent" section appears in panel
 just dev
 # Press key to open agent section (if mapped)
 ```
@@ -618,7 +618,7 @@ just dev
 
 ## Open Questions
 
-1. **Should agent panel show ALL sessions or only those in the current workspace?** — abtop shows global; superzej may benefit from workspace-scoped view.
+1. **Should agent panel show ALL sessions or only those in the current workspace?** — abtop shows global; thegn may benefit from workspace-scoped view.
 
 2. **How to handle Hermes agents specifically?** — Hermes is the host itself; should we show internal agent state differently?
 
@@ -630,10 +630,10 @@ just dev
 
 ## Files Likely to Change
 
-- `crates/superzej-core/src/agent.rs` (new)
-- `crates/superzej-core/src/lib.rs` (add `pub mod agent`)
-- `crates/superzej-core/src/config.rs` (add AgentConfig)
-- `crates/superzej-host/src/panel/mod.rs` (add Section::Agent, PanelData fields)
-- `crates/superzej-host/src/panel/sections/agent.rs` (new)
-- `crates/superzej-host/src/panel/sections/mod.rs` (register agent section)
-- `crates/superzej-host/src/hydrate.rs` (hook agent collection)
+- `crates/thegn-core/src/agent.rs` (new)
+- `crates/thegn-core/src/lib.rs` (add `pub mod agent`)
+- `crates/thegn-core/src/config.rs` (add AgentConfig)
+- `crates/thegn-host/src/panel/mod.rs` (add Section::Agent, PanelData fields)
+- `crates/thegn-host/src/panel/sections/agent.rs` (new)
+- `crates/thegn-host/src/panel/sections/mod.rs` (register agent section)
+- `crates/thegn-host/src/hydrate.rs` (hook agent collection)

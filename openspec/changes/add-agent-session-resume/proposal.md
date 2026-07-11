@@ -2,13 +2,13 @@
 
 ## Summary
 
-When superzej restores a session after detach or reboot, it restores the pane
+When thegn restores a session after detach or reboot, it restores the pane
 layout and cwd — but a coding agent that was running in a pane comes back as a
 _fresh_ agent with no memory. This change captures each agent's **native session
 id** and relaunch parameters when it starts, persists them alongside the session
 layout, and on restore **rebuilds a resume command** (`claude --resume <id>`,
 `codex resume <id>`, `gemini … <id>`) so the agent picks up its own conversation
-where it left off. A `szhost agent hooks setup` installer wires the capture into
+where it left off. A `thegn agent hooks setup` installer wires the capture into
 each supported harness's own hook mechanism, and a **secret sanitizer** ensures
 no credentials are ever persisted or replayed.
 
@@ -34,7 +34,7 @@ config files (`~/.claude/settings.json`, `~/.codex/hooks.json`,
 session-start; on restore they reconstruct the resume invocation. limux's
 `agent_hooks.rs` additionally **strips secrets** (`--api-key`, `--token`, inline
 prompts) while preserving safe flags (`--model`, `--sandbox`,
-`--dangerously-bypass-approvals-and-sandbox`) — a clean reference. superzej
+`--dangerously-bypass-approvals-and-sandbox`) — a clean reference. thegn
 already has session detach/attach and reboot resurrection (I 111–113) and
 per-pane cwd restore (v14); this closes the "half a restore" gap where the
 terminal comes back but the agent's context does not. It is harness-agnostic and

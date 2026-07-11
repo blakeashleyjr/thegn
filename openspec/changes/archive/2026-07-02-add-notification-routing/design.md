@@ -30,7 +30,7 @@ Steps:
 including wrap-past-midnight and optional weekday tokens. All pure, unit-tested
 against the 95% core gate.
 
-## Config (superzej-core, config.rs)
+## Config (thegn-core, config.rs)
 
 `NotificationsConfig` gains `serde(default)` fields — existing configs keep
 working: `rules: Vec<NotificationRule>`, `dnd: DndConfig`, `sound: SoundConfig`,

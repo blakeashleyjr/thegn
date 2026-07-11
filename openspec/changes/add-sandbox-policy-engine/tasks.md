@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Core config (superzej-core)
+## 1. Core config (thegn-core)
 
 - [ ] 1.1 `PolicyConfig` (`default_read`/`default_write`/`default_shell` +
       `rules: Vec<PolicyRule>`, all `serde(default)`); `PolicyAction`
@@ -8,7 +8,7 @@
       (global → profile → workspace → repo) — **unit tests**: defaults parse, empty
       policy = permissive-under-worktree default, precedence + every-field apply.
 
-## 2. Core decision (superzej-core)
+## 2. Core decision (thegn-core)
 
 - [ ] 2.1 `policy.rs`: `Operation`, `PolicyDecision`, `PolicyCtx`, `decide()` with
       ordered first-match, `under:`/`outside:` worktree-relative globs, command
@@ -18,7 +18,7 @@
       evaluated first and non-overridable — **unit tests**: user `allow` cannot
       override a hard deny.
 
-## 3. Enforcement seam (superzej-host / bouncer)
+## 3. Enforcement seam (thegn-host / bouncer)
 
 - [ ] 3.1 Call `policy::decide` before the bouncer services each brokered
       `fs`/`edit`/`write`/`terminal` op: `Allow` services silently, `Deny` refuses

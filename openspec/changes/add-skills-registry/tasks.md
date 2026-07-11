@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Registry model + store (superzej-core)
+## 1. Registry model + store (thegn-core)
 
 - [ ] 1.1 `SkillPackage` (name, semver `version`, body, metadata: `triggers`,
       `requires`, `harnesses`, `tools`) + `[skills]` config (sources, policy,
@@ -10,7 +10,7 @@
       hash, version pin, per-scope enablement in `ui_state` — **unit tests** for
       register / install-on-demand / pin-resolve round-trip and offline cache hit.
 
-## 2. Selection + render seam (superzej-core)
+## 2. Selection + render seam (thegn-core)
 
 - [ ] 2.1 `skills.rs`: `select_and_render(task_context, harness, policy)` —
       deterministic trigger match + scope filter + **stable (name, version)

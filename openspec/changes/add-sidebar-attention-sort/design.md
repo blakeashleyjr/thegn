@@ -2,7 +2,7 @@
 
 ## Urgency model (core, pure, coverage-gated)
 
-`superzej_core::attention` — all branching lives here; the host only maps
+`thegn_core::attention` — all branching lives here; the host only maps
 model/DB state into `AttentionInputs`.
 
 | Tier | Name    | Signals                                                                                                                                                                                           | Reasons                                      |

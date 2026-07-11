@@ -2,10 +2,10 @@
 
 ### Requirement: A managed tool is described by a declarative spec
 
-superzej SHALL represent each externally-acquired tool as a declarative
+thegn SHALL represent each externally-acquired tool as a declarative
 `ManagedTool` spec carrying a stable name, an acquisition source, a pinned
 version, an update policy, and PATH fallback command names. The spec MUST be
-substrate-agnostic domain data in `superzej-core` (no HTTP client, no tokio, no
+substrate-agnostic domain data in `thegn-core` (no HTTP client, no tokio, no
 side effects), so its resolution logic is unit-testable and coverage-gated.
 
 The source MUST be one of: a GitHub release (repository plus a per-platform,
@@ -31,7 +31,7 @@ Resolving a managed tool SHALL follow a fixed, pure decision order and return
 which tier satisfied it: (1) an explicit user override (a configured binary path
 and optional extra arguments), then (2) a lookup on the project shell PATH by any
 of the tool's fallback command names, then (3) the managed download-and-pin
-location under `~/.superzej`. The decision MUST be computable without performing
+location under `~/.thegn`. The decision MUST be computable without performing
 the download; the actual fetch is a separate side-effecting step.
 
 #### Scenario: User override wins
@@ -51,7 +51,7 @@ the download; the actual fetch is a separate side-effecting step.
 
 - **WHEN** no override is configured and no fallback name is on PATH
 - **THEN** resolution selects the managed tier at the deterministic
-  `~/.superzej` location for that tool
+  `~/.thegn` location for that tool
 
 ### Requirement: Pinned tools install once and re-verify by policy
 
@@ -75,7 +75,7 @@ recheck.
 
 ### Requirement: Core decides, host fetches
 
-The download/install side effects SHALL live in `superzej-host`, driven by the
+The download/install side effects SHALL live in `thegn-host`, driven by the
 core spec: npm-sourced tools install via an `npm` subprocess and GitHub-release
 tools download the selected asset and mark it executable. The fetch MUST NOT run
 on the event loop (it runs on the CLI path or `spawn_blocking`, as the managed pi
@@ -90,13 +90,13 @@ primary action.
 
 ### Requirement: doctor reports managed tools
 
-`szhost doctor` SHALL report each managed tool: which resolution tier applies,
+`thegn doctor` SHALL report each managed tool: which resolution tier applies,
 the resolved path, and the pinned-versus-installed version state, so a user can
 see whether a tool is overridden, found on PATH, or managed — and whether the
 managed copy is current.
 
 #### Scenario: doctor lists a managed tool's resolution
 
-- **WHEN** `szhost doctor` runs with a managed tool configured
+- **WHEN** `thegn doctor` runs with a managed tool configured
 - **THEN** its output names the tool, the tier that resolves it, its path, and
   whether the managed copy matches the pinned version

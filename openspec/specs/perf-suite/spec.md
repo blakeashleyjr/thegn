@@ -2,7 +2,7 @@
 
 ## Purpose
 
-superzej ships a performance toolkit — a runtime self-profiler, a steady-state
+thegn ships a performance toolkit — a runtime self-profiler, a steady-state
 idle harness, micro-benchmarks, a live telemetry overlay, and an in-process
 flame-graph profiler — that is entirely free when disabled. The machine-dependent
 benchmarks are excluded from CI; the render-decision invariants are instead locked
@@ -12,7 +12,7 @@ as pure unit tests that CI does run.
 
 ### Requirement: The runtime self-profiler is free when off
 
-Profiling SHALL be gated (e.g. `SUPERZEJ_PERF` / a build feature) so it imposes zero cost when disabled, and when enabled it MUST emit a `szhost::perf` rollup with wake-source and per-subsystem CPU attribution plus a wake-storm warning.
+Profiling SHALL be gated (e.g. `THEGN_PERF` / a build feature) so it imposes zero cost when disabled, and when enabled it MUST emit a `thegn::perf` rollup with wake-source and per-subsystem CPU attribution plus a wake-storm warning.
 
 #### Scenario: Disabled imposes no cost
 
@@ -22,12 +22,12 @@ Profiling SHALL be gated (e.g. `SUPERZEJ_PERF` / a build feature) so it imposes 
 #### Scenario: Enabled emits a rollup
 
 - **WHEN** the profiler is enabled
-- **THEN** a `szhost::perf` rollup with wake-source and per-subsystem CPU
+- **THEN** a `thegn::perf` rollup with wake-source and per-subsystem CPU
   attribution is produced, warning on a wake storm
 
 ### Requirement: Slow-frame warning on cost-per-frame regressions
 
-The runtime SHALL emit a slow-frame warning when `render_p50_us` exceeds `SUPERZEJ_FRAME_BUDGET_US` (default 16ms) and report a render busy ratio.
+The runtime SHALL emit a slow-frame warning when `render_p50_us` exceeds `THEGN_FRAME_BUDGET_US` (default 16ms) and report a render busy ratio.
 
 #### Scenario: Frames exceed the budget
 

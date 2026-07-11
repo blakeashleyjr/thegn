@@ -31,7 +31,7 @@ Data sources are the backend abstraction behind every Observe query. Each implem
 
 ### Requirement: Built-in sources
 
-[M] Observe SHALL ship Prometheus (instant + range, step derived from panel width), Loki (LogQL range + tail), a `host` source backed by `superzej-metrics`, and a synthetic test source; [S] a generic SQL source via `sqlx`; [S] result caching keyed by (source, query, range, step) with TTL and [S] label/metric discovery for autocomplete.
+[M] Observe SHALL ship Prometheus (instant + range, step derived from panel width), Loki (LogQL range + tail), a `host` source backed by `thegn-metrics`, and a synthetic test source; [S] a generic SQL source via `sqlx`; [S] result caching keyed by (source, query, range, step) with TTL and [S] label/metric discovery for autocomplete.
 
 #### Scenario: First run with no backend
 

@@ -2,12 +2,12 @@
 
 ## Context to reuse
 
-- **Preview pane** lives in `crates/superzej-host/src/` alongside the yazi file
+- **Preview pane** lives in `crates/thegn-host/src/` alongside the yazi file
   drawer. Text preview (AF 396) routes through tree-sitter highlighting; image
   preview (AF 399) routes raster output through the terminal graphics path
   (kitty / iTerm / sixel); hex view (AF 400) and file management (AF 606) are
   sibling preview/explorer behaviors.
-- **Palette** lives in `crates/superzej-host/src/palette/` — a native iocraft
+- **Palette** lives in `crates/thegn-host/src/palette/` — a native iocraft
   TUI backed by nucleo and embedded ripgrep, with `PaletteMode` routing in
   `search_everywhere.rs`. Fuzzy file open is M 166.
 

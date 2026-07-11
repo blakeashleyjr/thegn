@@ -2,11 +2,11 @@
 
 ## Summary
 
-A single verb — `szhost team <task>` — fans one task out to **N agents, each in
+A single verb — `thegn team <task>` — fans one task out to **N agents, each in
 its own isolated git worktree + sandbox**, launched as **visible panes**, with
 the caller's pane kept as the orchestrator. This is the multi-agent workflow
 cmux ("Claude Code Teams") and limux (`agent-team`) demonstrate — spawn agents as
-visible panes, never hidden background processes — but grounded on superzej's
+visible panes, never hidden background processes — but grounded on thegn's
 isolation substrate, which they lack: each teammate runs on its own branch in its
 own worktree, optionally sandboxed, so their edits never collide. An optional
 `--best-of-N` mode runs the _same_ task in N isolated attempts and surfaces them
@@ -33,7 +33,7 @@ existing worktree/session tables (a team is a set of worktrees + a grouping tag)
 The hard part of multi-agent work is not spawning agents — it is keeping their
 changes from stepping on each other and knowing which one to keep. cmux/limux
 spawn agents into a _shared checkout_ (worktree isolation is an open request in
-cmux, absent in limux), so parallel agents on the same repo conflict. superzej
+cmux, absent in limux), so parallel agents on the same repo conflict. thegn
 already ships **worktree-per-tab + podman/docker/bwrap sandboxing + a warm
 sandbox pool + a diff/review pane**. Composing those into a one-verb fan-out is
 mostly wiring existing primitives, and it yields a _strictly stronger_ version of

@@ -1,6 +1,6 @@
 # Tasks
 
-## 1. Model + compose (superzej-core)
+## 1. Model + compose (thegn-core)
 
 - [x] 1.1 `[bundle.*]` schema (`Bundle` struct), `[secrets].resolvers`,
       `[workspace.<slug>].env_bundle` in `config.rs`; extend `expand_env_ref`.

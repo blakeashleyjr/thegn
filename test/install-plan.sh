@@ -6,23 +6,18 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 out="$("$repo"/install.sh --dry-run "$tmp/bin")"
-[[ $out == *"$tmp/bin/szhost -> $repo/target/release/szhost"* ]] || {
-  echo "dry-run did not plan szhost alias" >&2
+[[ $out == *"$tmp/bin/thegn -> $repo/target/release/thegn"* ]] || {
+  echo "dry-run did not plan the thegn symlink" >&2
   echo "$out" >&2
   exit 1
 }
-[[ $out == *"$tmp/bin/superzej -> $repo/target/release/szhost"* ]] || {
-  echo "dry-run did not plan superzej -> szhost" >&2
+[[ $out == *"$tmp/bin/tg-tui wrapper -> $repo/target/release/thegn (current terminal)"* ]] || {
+  echo "dry-run did not plan tg-tui current-terminal wrapper" >&2
   echo "$out" >&2
   exit 1
 }
-[[ $out == *"$tmp/bin/sj-tui wrapper -> $repo/target/release/szhost (current terminal)"* ]] || {
-  echo "dry-run did not plan sj-tui current-terminal wrapper" >&2
-  echo "$out" >&2
-  exit 1
-}
-[[ $out == *"$tmp/bin/sj wrapper -> alacritty --config-file $repo/config/alacritty.toml -e $tmp/bin/sj-tui"* ]] || {
-  echo "dry-run did not plan sj dedicated alacritty wrapper" >&2
+[[ $out == *"$tmp/bin/tg wrapper -> alacritty --config-file $repo/config/alacritty.toml -e $tmp/bin/tg-tui"* ]] || {
+  echo "dry-run did not plan tg dedicated alacritty wrapper" >&2
   echo "$out" >&2
   exit 1
 }
@@ -47,40 +42,35 @@ EOF
 chmod 0755 "$fakebin/delta"
 cat >"$fakebin/alacritty" <<'EOF'
 #!/usr/bin/env sh
-printf '%s\n' "$@" >"${SJ_ALACRITTY_LOG:?}"
+printf '%s\n' "$@" >"${TG_ALACRITTY_LOG:?}"
 EOF
 chmod 0755 "$fakebin/alacritty"
 
 install_out="$(PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" "$repo/install.sh" "$tmp/bin")"
-[[ -L $tmp/bin/superzej && $(readlink "$tmp/bin/superzej") == "$repo/target/release/szhost" ]] || {
-  echo "install did not symlink superzej to szhost" >&2
+[[ -L $tmp/bin/thegn && $(readlink "$tmp/bin/thegn") == "$repo/target/release/thegn" ]] || {
+  echo "install did not symlink thegn to the release binary" >&2
   echo "$install_out" >&2
   exit 1
 }
-[[ -L $tmp/bin/szhost && $(readlink "$tmp/bin/szhost") == "$repo/target/release/szhost" ]] || {
-  echo "install did not symlink szhost to release binary" >&2
+[[ -x $tmp/bin/tg && -x $tmp/bin/tg-tui ]] || {
+  echo "install did not create executable tg and tg-tui wrappers" >&2
   echo "$install_out" >&2
   exit 1
 }
-[[ -x $tmp/bin/sj && -x $tmp/bin/sj-tui ]] || {
-  echo "install did not create executable sj and sj-tui wrappers" >&2
-  echo "$install_out" >&2
+[[ $(<"$tmp/bin/tg-tui") == *"exec $repo/target/release/thegn"* ]] || {
+  echo "tg-tui should exec thegn directly in the current terminal" >&2
+  sed -n '1,120p' "$tmp/bin/tg-tui" >&2
   exit 1
 }
-[[ $(<"$tmp/bin/sj-tui") == *"exec $repo/target/release/szhost"* ]] || {
-  echo "sj-tui should exec szhost directly in the current terminal" >&2
-  sed -n '1,120p' "$tmp/bin/sj-tui" >&2
+[[ $(<"$tmp/bin/tg") == *"exec alacritty --config-file $repo/config/alacritty.toml -e $tmp/bin/tg-tui"* ]] || {
+  echo "tg should launch the dedicated alacritty profile" >&2
+  sed -n '1,120p' "$tmp/bin/tg" >&2
   exit 1
 }
-[[ $(<"$tmp/bin/sj") == *"exec alacritty --config-file $repo/config/alacritty.toml -e $tmp/bin/sj-tui"* ]] || {
-  echo "sj should launch the dedicated alacritty profile" >&2
-  sed -n '1,120p' "$tmp/bin/sj" >&2
-  exit 1
-}
-SJ_ALACRITTY_LOG="$tmp/alacritty.args" PATH="$fakebin:$PATH" "$tmp/bin/sj"
+TG_ALACRITTY_LOG="$tmp/alacritty.args" PATH="$fakebin:$PATH" "$tmp/bin/tg"
 alacritty_args="$(<"$tmp/alacritty.args")"
-[[ $alacritty_args == *$'--config-file\n'"$repo/config/alacritty.toml"*$'\n-e\n'"$tmp/bin/sj-tui"* ]] || {
-  echo "sj did not invoke alacritty with the bundled config and sj-tui" >&2
+[[ $alacritty_args == *$'--config-file\n'"$repo/config/alacritty.toml"*$'\n-e\n'"$tmp/bin/tg-tui"* ]] || {
+  echo "tg did not invoke alacritty with the bundled config and tg-tui" >&2
   printf '%s\n' "$alacritty_args" >&2
   exit 1
 }

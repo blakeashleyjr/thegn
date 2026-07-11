@@ -2,7 +2,7 @@
 
 ## Summary
 
-superzej today models external trackers as a flat list of `Issue`s behind a
+thegn today models external trackers as a flat list of `Issue`s behind a
 single `IssueBackend` trait. This change generalizes that into a capability-gated
 `TrackerBackend` provider model with a richer datamodel: a `Project`/`Epic` tier,
 a `Cycle`/sprint tier, a `WorkItem` (superseding `Issue`) carrying `kind`,
@@ -41,6 +41,6 @@ not a rewrite.
   function with all AI layers absent.
 - No new provider SDKs beyond the named four (Linear, Jira, GitHub, GitLab); other
   providers remain future work.
-- No bidirectional _project/cycle_ creation from superzej — write-back in this
+- No bidirectional _project/cycle_ creation from thegn — write-back in this
   change is scoped to work-item comments, status transitions, and assignee.
 - No change to PR/diff/CI panels beyond the shared capability-gate alignment.

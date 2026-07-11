@@ -4,7 +4,7 @@
 
 ### Requirement: A per-identity policy governs each agent's tools and injected context
 
-superzej SHALL resolve every agent's identity — its per-worktree virtual key (plus
+thegn SHALL resolve every agent's identity — its per-worktree virtual key (plus
 the worktree/repo it belongs to) — to a declarative `GatewayPolicy` describing its
 allowed tool set, injected skills, injected system-prompt layer, and model route.
 The policy MUST be expressed as layered TOML (`[gateway.agent.<id>]`), resolved

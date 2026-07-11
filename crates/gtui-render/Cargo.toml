@@ -8,6 +8,6 @@ license.workspace = true
 
 [dependencies]
 gtui-core = { path = "../gtui-core" }
-# Match sz-kit's pin exactly (no default features ⇒ no crossterm) so the host,
-# sz-kit, and the renderers all share one ratatui build and `Buffer` type.
+# Match tg-kit's pin exactly (no default features ⇒ no crossterm) so the host,
+# tg-kit, and the renderers all share one ratatui build and `Buffer` type.
 ratatui = { version = "0.30", default-features = false, features = ["std"] }

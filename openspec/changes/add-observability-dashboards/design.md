@@ -8,13 +8,13 @@
 - **`gtui-query`** — async execution: tokio + a pooled `reqwest` client, cancellation
   tied to time-range change + panel teardown, structured `QueryError`, TTL result
   cache. Source impls: Prometheus, Loki, SQL (`sqlx`), `host` (over
-  `superzej-metrics`), synthetic test source.
+  `thegn-metrics`), synthetic test source.
 - **`gtui-render`** — ratatui 0.30 + `ratatui-image`; braille/block fallback,
   LTTB/min-max downsampling, unit-aware axes, terminal capability detection,
   graphics-protocol (sixel/kitty) renderer, stable series-color hashing.
 - **`gtui-app`** — Explore + Dashboards modes, grid layout, focus model, command
   palette, time controls, variables.
-- **`gtui-embed`** — sz-kit `AppTile` adapter; `superzej-host` gains the Observe tab.
+- **`gtui-embed`** — tg-kit `AppTile` adapter; `thegn-host` gains the Observe tab.
 
 ## Rendering & the 0%-idle contract
 
@@ -28,15 +28,15 @@ cardinality; high cardinality caps to top-N with a warning; streaming uses ring
 buffers with retention caps. Capability detection at tile attach picks
 graphics-protocol → braille → block and truecolor → 256 → 16 → mono.
 
-## superzej integration
+## thegn integration
 
-Mounted as an **"Observe" app-tab** via sz-kit (ratatui 0.30 tile). The tile is
+Mounted as an **"Observe" app-tab** via tg-kit (ratatui 0.30 tile). The tile is
 wrapped in a **`catch_unwind` boundary**: a panel render/query panic degrades that
-panel (or the tile), never the host — superzej owns terminal restore. A built-in
-**`host` DataSource** exposes `superzej-metrics` as frames for a zero-config
-first-run view. Config layers into superzej TOML (`[observe]`, `[observe.source.
+panel (or the tile), never the host — thegn owns terminal restore. A built-in
+**`host` DataSource** exposes `thegn-metrics` as frames for a zero-config
+first-run view. Config layers into thegn TOML (`[observe]`, `[observe.source.
 <name>]` with URL/auth/TLS/timeout); secrets via `env:`/file/keyring, never inline;
-dashboards load from a directory under the superzej config tree.
+dashboards load from a directory under the thegn config tree.
 
 ## Data model
 

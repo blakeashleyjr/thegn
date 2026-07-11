@@ -73,7 +73,7 @@ The host MAY query the outer terminal (Device Attributes + XTVERSION) before the
 
 ### Requirement: Capabilities are configurable and inspectable
 
-`[theme] color` and `[theme] glyphs` (each `auto` or an explicit value, with matching `SUPERZEJ_THEME_*` env overrides) SHALL override detection, and `superzej doctor [--json]` SHALL report the raw environment, the effective config modes, and the resolved capabilities with an enabled-vs-degraded summary.
+`[theme] color` and `[theme] glyphs` (each `auto` or an explicit value, with matching `THEGN_THEME_*` env overrides) SHALL override detection, and `thegn doctor [--json]` SHALL report the raw environment, the effective config modes, and the resolved capabilities with an enabled-vs-degraded summary.
 
 #### Scenario: Explicit config beats detection and probe
 
@@ -82,5 +82,5 @@ The host MAY query the outer terminal (Device Attributes + XTVERSION) before the
 
 #### Scenario: Doctor reports the resolution
 
-- **WHEN** `superzej doctor` runs
+- **WHEN** `thegn doctor` runs
 - **THEN** it prints the detected environment, the resolved capabilities, and which features are enabled vs degraded

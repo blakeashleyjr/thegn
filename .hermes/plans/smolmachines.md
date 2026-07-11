@@ -2,11 +2,11 @@
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Add full support for `smolmachines.com` (`smolvm`) as a sandbox provider to the Superzej IDE, enabling sub-second microVM isolation natively without Docker or Podman overhead.
+**Goal:** Add full support for `smolmachines.com` (`smolvm`) as a sandbox provider to the Thegn IDE, enabling sub-second microVM isolation natively without Docker or Podman overhead.
 
 **Architecture:** We will integrate `smolvm` as a first-class OCI-compatible sandbox backend within the existing fallback chain. The `SandboxBackend` enum will gain a `Smol` variant, mapped to `smolvm` runtime binary. Container lifecycle (`ensure`, `enter_argv`, `teardown`, etc.) will generate `smolvm` CLI commands (`machine create`, `machine exec`, `machine stop`, `machine delete`). The default network (`--net`) and volume binding semantics map cleanly.
 
-**Tech Stack:** Rust (`crates/superzej-core`), TOML config (`crates/superzej-core/src/config.rs`), OCI execution semantics.
+**Tech Stack:** Rust (`crates/thegn-core`), TOML config (`crates/thegn-core/src/config.rs`), OCI execution semantics.
 
 ---
 
@@ -16,7 +16,7 @@
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/config.rs`
+- Modify: `crates/thegn-core/src/config.rs`
 
 **Step 1: Write failing test**
 Update the `config_enum_every_variant_roundtrips_canon_and_aliases` test to include:
@@ -26,7 +26,7 @@ Update the `config_enum_every_variant_roundtrips_canon_and_aliases` test to incl
 ("smolvm", SandboxBackend::Smol),
 ```
 
-Run `cargo test -p superzej-core --lib config::tests`
+Run `cargo test -p thegn-core --lib config::tests`
 
 **Step 2: Minimal Implementation**
 Add `Smol` to the `SandboxBackend` enum:
@@ -47,7 +47,7 @@ Update `as_str()` assertions if needed.
 Run tests, ensure PASS.
 
 **Step 4: Commit**
-`git add crates/superzej-core/src/config.rs`
+`git add crates/thegn-core/src/config.rs`
 `git commit -m "feat(sandbox): add Smol to SandboxBackend enum"`
 
 ---
@@ -58,13 +58,13 @@ Run tests, ensure PASS.
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 1: Write failing test**
 Create/Update backend string parsing tests if they exist, or verify compiler errors catch the non-exhaustive match in `Backend` methods.
 
 **Step 2: Minimal Implementation**
-In `crates/superzej-core/src/sandbox.rs`:
+In `crates/thegn-core/src/sandbox.rs`:
 Add variant:
 
 ```rust
@@ -107,7 +107,7 @@ Add to `is_oci()`: (smol uses images and persistent named machines, so treat as 
 ```
 
 **Step 3: Verify Pass**
-Run `cargo check -p superzej-core` and fix any other `match backend { ... }` exhaustiveness errors in `sandbox.rs` (there will be several, e.g. `stats`, `available`, `teardown`). For now, just add placeholder `Backend::Smol => { ... }` or group with Docker/Podman if applicable. For `available`, check `util::have("smolvm")`. For `stats`, add a minimal struct or return empty stats.
+Run `cargo check -p thegn-core` and fix any other `match backend { ... }` exhaustiveness errors in `sandbox.rs` (there will be several, e.g. `stats`, `available`, `teardown`). For now, just add placeholder `Backend::Smol => { ... }` or group with Docker/Podman if applicable. For `available`, check `util::have("smolvm")`. For `stats`, add a minimal struct or return empty stats.
 
 **Step 4: Commit**
 `git commit -a -m "feat(sandbox): add Backend::Smol runtime variant"`
@@ -120,7 +120,7 @@ Run `cargo check -p superzej-core` and fix any other `match backend { ... }` exh
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 1: Design CLI Map**
 `smolvm` uses `smolvm machine create --name <container_name> --image <image> [--net] [-v host:guest]`
@@ -153,7 +153,7 @@ Add a unit test `test_smolvm_create_opts` mirroring `oci_create_opts_map_userns_
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/sandbox.rs`
+- Modify: `crates/thegn-core/src/sandbox.rs`
 
 **Step 1: Enter ARGV**
 Update `enter_argv`:
@@ -197,7 +197,7 @@ Run all tests.
 
 **Files:**
 
-- Modify: `crates/superzej-core/src/config.rs`
+- Modify: `crates/thegn-core/src/config.rs`
 
 **Step 1: Update Default Chain**
 Update `impl Default for SandboxConfig`:

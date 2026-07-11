@@ -4,7 +4,7 @@
 
 ### Requirement: A remote workspace can run user-authored per-task provision and teardown hooks
 
-superzej SHALL run an ordered set of user-authored provision hooks when bringing
+thegn SHALL run an ordered set of user-authored provision hooks when bringing
 up a remote (sprite) workspace for a task, and matching teardown hooks when it is
 torn down, passing each hook the task context (task id, repo, branch, worktree
 path) in its environment. Hooks MUST run off the event loop with a per-hook
@@ -37,7 +37,7 @@ provider-only behavior.
 
 ### Requirement: Provision hooks compose with the warm sandbox pool
 
-superzej SHALL skip provision hooks for a task that claims a warm pool spare
+thegn SHALL skip provision hooks for a task that claims a warm pool spare
 (already provisioned) and run them for a task that starts fresh, so hooks do not
 re-provision an already-live spare.
 

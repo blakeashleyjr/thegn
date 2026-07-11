@@ -10,21 +10,21 @@ probe is the I/O seam (exercised by smoke, per the coverage split).
 
 ## Registration (idempotent, non-clobbering)
 
-For each detected agent, `szhost agent register` (extending the `cmd/agent.rs`
+For each detected agent, `thegn agent register` (extending the `cmd/agent.rs`
 setup surface):
 
-1. Prefer the agent's own CLI (`claude mcp add superzej -- szhost mcp serve`).
+1. Prefer the agent's own CLI (`claude mcp add thegn -- thegn mcp serve`).
 2. Fall back to a **merge** of the agent's config file: parse it, insert/update
-   only superzej's server entry, write it back — never touching other entries.
+   only thegn's server entry, write it back — never touching other entries.
    Re-running is a no-op (idempotent).
 
-`szhost agent unregister`/`disable` removes only superzej's entry via the same
+`thegn agent unregister`/`disable` removes only thegn's entry via the same
 merge. The MCP surface served is the existing `mcp/router.rs` house tools.
 
 ## Error markers (bouncer / proxy)
 
-Stable marker strings (e.g. `SUPERZEJ_APPROVAL_REQUIRED`, `SUPERZEJ_QUOTA_EXHAUSTED`,
-`SUPERZEJ_TOOL_DENIED`) are emitted in the agent-facing error text at the bouncer
+Stable marker strings (e.g. `THEGN_APPROVAL_REQUIRED`, `THEGN_QUOTA_EXHAUSTED`,
+`THEGN_TOOL_DENIED`) are emitted in the agent-facing error text at the bouncer
 approval seam and the proxy quota/route-failure seam, each paired with a
 machine-readable next-step. The vocabulary is a small enum, unit-tested (each
 marker renders its stable string + guidance; unknown conditions fall back to a

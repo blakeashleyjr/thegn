@@ -4,7 +4,7 @@
 
 ### Requirement: The merge queue is manageable from the panel section
 
-superzej SHALL let a user manage the merge queue from the Work ▸ Merge queue
+thegn SHALL let a user manage the merge queue from the Work ▸ Merge queue
 panel section without leaving the TUI: enqueue the active worktree's branch or
 every eligible branch, remove an entry, retry a blocked (deferred /
 gate-failed / needs-human) entry, land a `ready` entry, clear landed entries,
@@ -36,7 +36,7 @@ addressable so per-row actions target the selected entry.
 
 ### Requirement: An in-app drain streams live status transitions
 
-superzej SHALL run the full agent-driven queue drain (the same driver as
+thegn SHALL run the full agent-driven queue drain (the same driver as
 `merge drain`, including headless-agent conflict handoff) from inside the TUI,
 off the event loop. Every per-branch status transition SHALL be streamed back
 to the loop and painted on the next frame by patching the panel's queue row in
@@ -62,7 +62,7 @@ second dispatch while one is running MUST be refused with an explanation.
 
 ### Requirement: Queue state is visible outside the section
 
-superzej SHALL surface merge-queue state ambiently: a statusbar chip that is
+thegn SHALL surface merge-queue state ambiently: a statusbar chip that is
 red when any entry is blocked (deferred / gate-failed / needs-human), amber
 while the queue is working (folding / verifying / agent running), and quietly
 dim when entries are merely queued or held at ready — silent only when the

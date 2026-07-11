@@ -2,7 +2,7 @@
 
 ## Purpose
 
-superzej is a single process, single session compositor whose central event loop
+thegn is a single process, single session compositor whose central event loop
 must consume ~0% CPU when idle while still reacting immediately to PTY output,
 input, filesystem changes, and background hydration. This is achieved by blocking
 on terminal input with no timeout and waking the loop explicitly from off-thread

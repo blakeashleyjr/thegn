@@ -2,15 +2,15 @@
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Build a unified CLI reporting tool and a live background sidecar that aggregates metrics from our newly created agent adapters (Claude, Codex, OpenCode, Hermes, Pi) and streams them to the Superzej UI chrome.
+**Goal:** Build a unified CLI reporting tool and a live background sidecar that aggregates metrics from our newly created agent adapters (Claude, Codex, OpenCode, Hermes, Pi) and streams them to the Thegn UI chrome.
 
 **Architecture:**
 
 - A Python CLI (`src/report.py`) that queries all adapter endpoints on-demand and prints a consolidated cost/usage report.
 - A Python background daemon (`src/sidecar.py`) that continuously tails the agent log directories (`~/.pi/agent/sessions/`, `~/.codex/sessions/`) using `inotify` or polling, and emits live JSON updates.
-- A small Rust integration in `crates/superzej-host/src/chrome.rs` (or similar) that reads the sidecar's JSON stream and updates the status bar.
+- A small Rust integration in `crates/thegn-host/src/chrome.rs` (or similar) that reads the sidecar's JSON stream and updates the status bar.
 
-**Tech Stack:** Python (CLI & daemon), `watchdog` (for file tailing), Rust (Superzej integration).
+**Tech Stack:** Python (CLI & daemon), `watchdog` (for file tailing), Rust (Thegn integration).
 
 ---
 
@@ -133,19 +133,19 @@ git commit -m "feat: add live metrics sidecar event emitter" --no-verify
 
 ---
 
-### Task 3: Rust Status Bar Integration (Superzej)
+### Task 3: Rust Status Bar Integration (Thegn)
 
-**Objective:** Add a struct and a background Tokio task in `superzej-host` to spawn the `sidecar.py` process, read its stdout, and update a shared state `Arc<Mutex<AiMetrics>>`.
+**Objective:** Add a struct and a background Tokio task in `thegn-host` to spawn the `sidecar.py` process, read its stdout, and update a shared state `Arc<Mutex<AiMetrics>>`.
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/chrome.rs` (or equivalent status bar file)
-- Modify: `crates/superzej-host/src/run.rs` (to spawn the task)
+- Modify: `crates/thegn-host/src/chrome.rs` (or equivalent status bar file)
+- Modify: `crates/thegn-host/src/run.rs` (to spawn the task)
 
 **Step 1: Write failing test**
 
 ```rust
-// In crates/superzej-host/src/chrome.rs
+// In crates/thegn-host/src/chrome.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,13 +160,13 @@ mod tests {
 ```
 
 **Step 2: Run test to verify failure**
-Run: `cargo test -p superzej-host --lib chrome`
+Run: `cargo test -p thegn-host --lib chrome`
 Expected: FAIL — `AiMetrics` not found.
 
 **Step 3: Write minimal implementation**
 
 ```rust
-// Add to crates/superzej-host/src/chrome.rs
+// Add to crates/thegn-host/src/chrome.rs
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -185,13 +185,13 @@ pub struct AiMetrics {
 ```
 
 **Step 4: Run test to verify pass**
-Run: `cargo test -p superzej-host --lib chrome`
+Run: `cargo test -p thegn-host --lib chrome`
 Expected: PASS
 
 **Step 5: Commit**
 
 ```bash
-git add crates/superzej-host/src/chrome.rs
+git add crates/thegn-host/src/chrome.rs
 git commit -m "feat(host): add AiMetrics struct for sidecar IPC" --no-verify
 ```
 
@@ -203,7 +203,7 @@ git commit -m "feat(host): add AiMetrics struct for sidecar IPC" --no-verify
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/run.rs`
+- Modify: `crates/thegn-host/src/run.rs`
 
 **Step 1: Write failing test**
 (No direct unit test for Tokio I/O loops; verify via compiler type checking).
@@ -211,7 +211,7 @@ git commit -m "feat(host): add AiMetrics struct for sidecar IPC" --no-verify
 **Step 2: Write minimal implementation**
 
 ```rust
-// In crates/superzej-host/src/run.rs
+// In crates/thegn-host/src/run.rs
 use tokio::process::Command;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use std::process::Stdio;
@@ -240,13 +240,13 @@ pub async fn spawn_ai_sidecar(waker: TerminalWaker) {
 ```
 
 **Step 3: Run compiler checks**
-Run: `cargo check -p superzej-host`
+Run: `cargo check -p thegn-host`
 Expected: PASS
 
 **Step 4: Commit**
 
 ```bash
-git add crates/superzej-host/src/run.rs
+git add crates/thegn-host/src/run.rs
 git commit -m "feat(host): spawn Python sidecar and pulse terminal waker" --no-verify
 ```
 
@@ -254,11 +254,11 @@ git commit -m "feat(host): spawn Python sidecar and pulse terminal waker" --no-v
 
 ### Task 5: Render Metrics in Status Bar
 
-**Objective:** Display the active AI metrics in the `superzej` UI chrome (status bar).
+**Objective:** Display the active AI metrics in the `thegn` UI chrome (status bar).
 
 **Files:**
 
-- Modify: `crates/superzej-host/src/chrome.rs`
+- Modify: `crates/thegn-host/src/chrome.rs`
 
 **Step 1: Implementation**
 
@@ -275,12 +275,12 @@ pub fn render_ai_status(surface: &mut termwiz::surface::Surface, metrics: &Optio
 ```
 
 **Step 2: Run compiler checks**
-Run: `cargo check -p superzej-host`
+Run: `cargo check -p thegn-host`
 Expected: PASS
 
 **Step 3: Commit**
 
 ```bash
-git add crates/superzej-host/src/chrome.rs
+git add crates/thegn-host/src/chrome.rs
 git commit -m "feat(host): render AI metrics in status bar" --no-verify
 ```

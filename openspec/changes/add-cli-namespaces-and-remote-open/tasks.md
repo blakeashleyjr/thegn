@@ -1,13 +1,13 @@
 # Tasks
 
-## 1. Foundations (superzej-host/cmd)
+## 1. Foundations (thegn-host/cmd)
 
 - [x] 1.1 Exit-code constants (`EXIT_OK/ERROR/RETRYABLE/NOT_FOUND`) + doc
       contract in `cmd/mod.rs`; refactor `host.rs` retryable `exit(2)` onto them.
 - [x] 1.2 `emit_json<T: Serialize>` helper (single compact JSON doc, no ANSI) +
       typed `NotFound` error downcast to exit 3 in `main()`.
 
-## 2. Namespaces (superzej-host)
+## 2. Namespaces (thegn-host)
 
 - [x] 2.1 `DiffArgs`/`DiskArgs`/`CleanArgs` flattened arg structs shared by
       legacy and namespaced variants.
@@ -18,7 +18,7 @@
       (`hide = true`) but byte-identical in behavior — **smoke**: legacy and
       namespaced outputs match.
 
-## 3. Core additions (superzej-core — coverage-gated)
+## 3. Core additions (thegn-core — coverage-gated)
 
 - [x] 3.1 db v34: `intents` table (additive `IF NOT EXISTS`);
       `store/intent.rs` `IntentStore { put_intent, take_intents }`
@@ -30,7 +30,7 @@
       still `Acquired`, silent) + `instance_running()` probe — **unit test**
       via `try_lock_nb` on a scratch file.
 
-## 4. Headless lifecycle (superzej-host)
+## 4. Headless lifecycle (thegn-host)
 
 - [x] 4.1 `wt new [name] [--repo] [--base] [--env] [--json]` — wizard pipeline
       minus UI/sandbox; prints the created path; rollback on failure —
@@ -41,7 +41,7 @@
       branch kept by default / dropped with `--delete-branch`, tab_groups rows
       cleaned, unknown target exits 3.
 
-## 5. Machine output (superzej-host)
+## 5. Machine output (thegn-host)
 
 - [x] 5.1 `--json` on `list`/`wt list`, `env list`, `host list`, `ci runs`,
       `share list`, `forward list`, `disk` (derived `Serialize` structs via
@@ -49,7 +49,7 @@
 - [ ] 5.2 ~~(stretch, cuttable) `diff --stat --json` via `--numstat`~~ — CUT
       (deferred; the other nine surfaces cover the scripting need).
 
-## 6. Help + completions (superzej-host)
+## 6. Help + completions (thegn-host)
 
 - [x] 6.1 `cli_help.rs`: `GROUPS` table + `attach()` top-level help template
       rendering grouped commands from the live clap tree — **unit test**:
@@ -58,7 +58,7 @@
 - [x] 6.2 `completions <shell>` via `clap_complete` (workspace dep), binary
       name from argv[0] — **smoke**: `completions bash` emits a script.
 
-## 7. Remote open (superzej-host)
+## 7. Remote open (thegn-host)
 
 - [x] 7.1 `cmd/open.rs`: resolve repo (path or basename/slug; miss → exit 3
       with candidates); running instance → `put_intent`; else

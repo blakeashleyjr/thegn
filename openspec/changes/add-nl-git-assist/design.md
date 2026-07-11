@@ -10,7 +10,7 @@ The model is prompted to answer in an XML-tagged contract:
 <warning>Rewrites history; avoid if already pushed.</warning>  <!-- optional -->
 ```
 
-A **pure** parser in `superzej-core` extracts `{ command, explanation, warning? }`
+A **pure** parser in `thegn-core` extracts `{ command, explanation, warning? }`
 from the tagged response and maps `command` onto the typed `GitOp` where possible
 — unit-tested: well-formed parse, missing optional warning, unmapped command
 surfaces as "unrecognized" (not executed), malformed XML errors cleanly.
@@ -47,6 +47,6 @@ never executes.
 - **Executing model output directly** — rejected; unsafe. The explain+warn+confirm
   gate and mapping to typed `GitOp` are the safety story.
 - **Running proposals as raw shell** — rejected; mapping to `GitOp` validates
-  against superzej's own ops and keeps the bouncer in charge of any shell.
+  against thegn's own ops and keeps the bouncer in charge of any shell.
 - **Agent-side translation** — rejected; the host owns the translation + confirm so
   the safety gate is enforced regardless of which agent asked.

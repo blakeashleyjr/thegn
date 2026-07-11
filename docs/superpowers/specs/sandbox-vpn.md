@@ -12,18 +12,18 @@ WireGuard, OpenVPN, NetBird, ZeroTier, plus a custom-command escape hatch.
 
 ## Design in one paragraph
 
-superzej does **not** embed a tunnel datapath (that would fight the 0%-idle
+thegn does **not** embed a tunnel datapath (that would fight the 0%-idle
 event loop and mean re-implementing a control plane). Instead each tunnel daemon
 runs as a per-worktree **sidecar container**; the worktree OCI container joins
 the sidecar's network namespace via `--network container:<sidecar>`, so its only
 egress is the tunnel and its own capabilities stay untouched (NET_ADMIN/TUN live
 in the sidecar). This mirrors how the sandbox already shells out to `podman`
-rather than embedding a runtime, and how `superzej-svc` uses service seams with
+rather than embedding a runtime, and how `thegn-svc` uses service seams with
 subprocess fallback.
 
 ## Layering
 
-- **`superzej-core` (data, pure, unit-tested, counts toward the 95% gate)**
+- **`thegn-core` (data, pure, unit-tested, counts toward the 95% gate)**
   - `config.rs`: `[sandbox.vpn]` — `VpnConfig` + a per-provider sub-table
     (`VpnProviderKind`/`VpnMode`/`VpnOnError`/`VpnDnsMode` config-enums).
     Discriminant + sub-table shape (like `IssuesConfig`), not a flat struct.
@@ -41,15 +41,15 @@ subprocess fallback.
     `in_container` mode adds NET_ADMIN + `/dev/net/tun` to the worktree itself.
     `teardown`/`teardown_by_path` also `rm -f` the `-szvpn` sidecar.
     `oci_runtime_prefix()` exposes the container-CLI prefix to the host.
-- **`superzej-svc::vpn` (behavior, subprocess seam, smoke-tested)**
+- **`thegn-svc::vpn` (behavior, subprocess seam, smoke-tested)**
   - `VpnProvider` trait + `BuiltinProvider` dispatching on `VpnParams`.
   - Pure, unit-tested per-provider plan builders → `SidecarPlan` (image, run
     flags, env with resolved secrets, mounts, materialized files, command,
     readiness probe, optional proxy). `requirements()`, `dns()`.
   - `up`/`ready`/`down` (sync, blocking subprocess — run off the event loop by
     the host, like `sandbox::ensure`). Secrets resolve only here; secret files
-    are written 0600 under `$XDG_STATE_HOME/superzej/vpn/<sidecar>/`.
-- **`superzej-host`**
+    are written 0600 under `$XDG_STATE_HOME/thegn/vpn/<sidecar>/`.
+- **`thegn-host`**
   - `agent.rs::attach_vpn()` sequences it: `provider.up()` → `ready()` BEFORE
     `sandbox::ensure()` (the worktree joins the sidecar netns), injects userspace
     proxy `ALL_PROXY`/`HTTPS_PROXY` into `env_overrides`, and applies `on_error`
@@ -88,8 +88,8 @@ plain `sealed`.
 
 ## Verification
 
-- Unit: `cargo test -p superzej-core --lib vpn`, `... dns_filter`,
-  `cargo test -p superzej-svc vpn` (provider plan builders, reconciliation
+- Unit: `cargo test -p thegn-core --lib vpn`, `... dns_filter`,
+  `cargo test -p thegn-svc vpn` (provider plan builders, reconciliation
   matrix, profile floors, sidecar-join/dns/ports suppression, upstream wiring).
 - Manual (per provider, against a throwaway/ephemeral identity):
   `just start name=vpn-dev` with `[sandbox] enabled=true`, `[sandbox.vpn]

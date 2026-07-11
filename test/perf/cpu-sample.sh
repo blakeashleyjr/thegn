@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Steady-state / idle CPU harness for szhost.
+# Steady-state / idle CPU harness for thegn.
 #
-# Launches szhost inside a PTY (via script(1), like test/pty-smoke.sh) in a
+# Launches thegn inside a PTY (via script(1), like test/pty-smoke.sh) in a
 # fully isolated environment with a fixture repo of N worktrees, lets it settle,
 # then samples the process's CPU (utime+stime from /proc) over a fixed window
 # and reports cores-used with a per-thread breakdown. This finally measures the
@@ -22,9 +22,9 @@ source "$HERE/lib/env.sh"
 source "$HERE/lib/fixture.sh"
 
 SCENARIO=idle
-BIN="${SZ_PERF_BIN:-target/release/szhost}"
-WORKTREES="${SZ_PERF_WORKTREES:-14}"
-DIRTY="${SZ_PERF_DIRTY:-4}"
+BIN="${TG_PERF_BIN:-target/release/thegn}"
+WORKTREES="${TG_PERF_WORKTREES:-14}"
+DIRTY="${TG_PERF_DIRTY:-4}"
 SETTLE_MS=2500
 WINDOW_MS=8000 # long enough to average the dashboard's 4s sysinfo cadence
 # cores; the encoded 0%-idle guard (FIXED, not baseline-derived). Observed idle
@@ -109,28 +109,28 @@ command -v script >/dev/null 2>&1 || {
   exit 1
 }
 
-PIDFILE="$PERF_TMP/szhost.pid"
+PIDFILE="$PERF_TMP/thegn.pid"
 RUN_MS=$((SETTLE_MS + WINDOW_MS + 1500)) # generous tail past the sample window
 DEADLINE_S=$(((RUN_MS / 1000) + 10))     # hard safety net
 
-# Launch szhost in a PTY. `script -qec` gives termwiz a real terminal (mirrors
-# test/pty-smoke.sh); the inner shell backgrounds szhost and records its PID so
-# we can sample /proc directly. SUPERZEJ_BENCH_RUN_MS makes szhost run the full
+# Launch thegn in a PTY. `script -qec` gives termwiz a real terminal (mirrors
+# test/pty-smoke.sh); the inner shell backgrounds thegn and records its PID so
+# we can sample /proc directly. THEGN_BENCH_RUN_MS makes thegn run the full
 # loop — ticker, hydration, tokio pool — then exit cleanly on its own.
 printf -v INNER \
-  'cd %q; stty rows 50 cols 200; env SUPERZEJ_BENCH_RUN_MS=%q %q & echo $! > %q; wait' \
+  'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %q & echo $! > %q; wait' \
   "$REPO" "$RUN_MS" "$BIN_ABS" "$PIDFILE"
 timeout "${DEADLINE_S}s" script -qec "$INNER" /dev/null >/dev/null 2>&1 &
 LAUNCHER=$!
 
-# Wait for the PID file (szhost up).
+# Wait for the PID file (thegn up).
 for _ in $(seq 1 100); do
   [ -s "$PIDFILE" ] && break
   sleep 0.05
 done
 PID="$(cat "$PIDFILE" 2>/dev/null || true)"
 [ -n "$PID" ] && [ -d "/proc/$PID" ] || {
-  echo "cpu-sample: szhost did not start" >&2
+  echo "cpu-sample: thegn did not start" >&2
   kill "$LAUNCHER" 2>/dev/null || true
   exit 1
 }
@@ -164,7 +164,7 @@ WINDOW_S="$(awk "BEGIN{print $WINDOW_MS/1000}")"
 CORES_TOTAL="$(awk "BEGIN{printf \"%.4f\", ($J1-$J0)/($CLK_TCK*$WINDOW_S)}")"
 
 # Per-thread deltas. Capture a sorted "comm cores" table for display and a JSON
-# array for the result. Read t1 BEFORE szhost exits (we're still inside the window
+# array for the result. Read t1 BEFORE thegn exits (we're still inside the window
 # tail). Done set -e-safe — a vanished tid just contributes nothing.
 THREAD_JSON=""
 THREAD_TABLE=""
@@ -179,7 +179,7 @@ for tid in "${!T0[@]}"; do
 done
 THREAD_JSON="[${THREAD_JSON%,}]"
 
-# Let szhost exit on its own (bench window), then reap the launcher.
+# Let thegn exit on its own (bench window), then reap the launcher.
 wait "$LAUNCHER" 2>/dev/null || true
 
 RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"window_ms\":$WINDOW_MS,\"cores_total\":$CORES_TOTAL,\"threads\":$THREAD_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"

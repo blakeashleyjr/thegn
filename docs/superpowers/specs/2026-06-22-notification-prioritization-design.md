@@ -5,7 +5,7 @@
 
 ## Problem
 
-superzej has no real notification priority model. Priority is fragmented across
+thegn has no real notification priority model. Priority is fragmented across
 three ad-hoc mechanisms that disagree:
 
 - **Desktop toasts** gate on `NotificationUrgency` (Low/Normal/Critical) computed
@@ -48,7 +48,7 @@ Decisions:
 
 Priority is **derived from `kind` at read time**, not stored. No DB schema change:
 notifications already persist `kind`. A `Priority` enum + `NotificationKind::
-default_priority()` table live in `superzej-core`; config can remap any kind. The
+default_priority()` table live in `thegn-core`; config can remap any kind. The
 per-worktree count queries take config-derived kind-name sets, so a config remap
 reclassifies counts live (including historical rows) while keeping the grouped
 counts in SQL.
@@ -59,28 +59,28 @@ bucketing (loses the efficient grouped-by-worktree counts hydrate relies on).
 
 ## Changes (by file)
 
-- **`superzej-core/src/notification.rs`** — `enum Priority { Info, Notice, Alert }`
+- **`thegn-core/src/notification.rs`** — `enum Priority { Info, Notice, Alert }`
   (`rank`, `parse`); `NotificationKind::ALL` + `as_str` (serde snake_case names);
   `NotificationKind::default_priority`.
-- **`superzej-core/src/event_bus.rs`** — `Priority::urgency()` (Alert→Critical,
+- **`thegn-core/src/event_bus.rs`** — `Priority::urgency()` (Alert→Critical,
   Notice→Normal, Info→Low). Keep the `Event`-based desktop path; add a test that the
   kind-derived priority agrees with `NotificationUrgency::from_event` for the
   overlapping events.
-- **`superzej-core/src/config.rs`** (`NotificationsConfig`) — `priority:
+- **`thegn-core/src/config.rs`** (`NotificationsConfig`) — `priority:
 BTreeMap<String,String>`; `priority_of(kind) -> Priority`; helpers
   `alert_kind_names()` and `counted_unread_kind_names()` (= Alert+Notice, Info
   excluded) that classify `NotificationKind::ALL` via `priority_of`.
-- **`superzej-core/src/db.rs`** — `get_alert_counts_by_worktree(alert_kinds:
+- **`thegn-core/src/db.rs`** — `get_alert_counts_by_worktree(alert_kinds:
 &[&str])` and `get_unread_counts_by_worktree(counted_kinds: &[&str])` build a
   dynamic `kind IN (?, …)` clause from the passed slice (empty slice → empty map).
-- **`superzej-host/src/hydrate.rs`** — pass the config-derived sets to the two
+- **`thegn-host/src/hydrate.rs`** — pass the config-derived sets to the two
   queries; compute `panel.alert_notifications` (unread Alert) and
   `panel.unread_notifications` (unread Alert+Notice) via `priority_of` over the
   loaded inbox.
-- **`superzej-host/src/panel/mod.rs`** — add `alert_notifications: usize`.
-- **`superzej-host/src/panel/sections/mod.rs`** — header shows red `⚑ {alert}` when
+- **`thegn-host/src/panel/mod.rs`** — add `alert_notifications: usize`.
+- **`thegn-host/src/panel/sections/mod.rs`** — header shows red `⚑ {alert}` when
   alerts exist, else neutral `{unread} unread`, else `inbox zero`.
-- **`superzej-host/src/panel/sections/notifications.rs`** — full-view header sources
+- **`thegn-host/src/panel/sections/notifications.rs`** — full-view header sources
   "needs attention" from `alert_notifications`.
 - **`config/config.toml.example`** — document `[notifications.priority]`.
 

@@ -14,13 +14,13 @@
 ## Phase 1 — MVP [M]
 
 - [x] 1.1 `gtui-query`: Prometheus (instant + range, step from panel width), Loki
-      (LogQL range + tail), `host` source over `superzej-metrics` — fixture-tested parsers.
+      (LogQL range + tail), `host` source over `thegn-metrics` — fixture-tested parsers.
 - [x] 1.2 Explore mode: split editor/viz, auto-detect viz, session history.
 - [x] 1.3 Core panels: time-series, stat, table, logs + field config + legend toggle.
 - [x] 1.4 Auto-refresh ticker (alive only while active + refresh>0; pause/resume);
       time-range change cancels in-flight queries — **test** cancellation + no idle ticker.
 - [x] 1.5 Native TOML dashboard format + load-from-directory + command palette.
-- [x] 1.6 `gtui-embed`: Observe app-tab via sz-kit + `catch_unwind` panic boundary —
+- [x] 1.6 `gtui-embed`: Observe app-tab via tg-kit + `catch_unwind` panic boundary —
       **test** a panicking panel degrades, host survives.
 
 ## Phase 2 — [S]

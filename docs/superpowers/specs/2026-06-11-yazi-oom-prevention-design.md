@@ -4,19 +4,19 @@ Date: 2026-06-11
 
 ## Problem
 
-Superzej-spawned yazi drawers can launch image preview helper processes such as `ueberzugpp`. On this host, several yazi/ueberzugpp process trees consumed nearly all RAM and swap, causing a global OOM kill and leaving the desktop/session unstable. `szhost` itself was small in the OOM table; the failure mode is unbounded helper processes spawned by superzej-managed drawers.
+Thegn-spawned yazi drawers can launch image preview helper processes such as `ueberzugpp`. On this host, several yazi/ueberzugpp process trees consumed nearly all RAM and swap, causing a global OOM kill and leaving the desktop/session unstable. `thegn` itself was small in the OOM table; the failure mode is unbounded helper processes spawned by thegn-managed drawers.
 
-The drawer is convenient but too trusting: superzej-spawned yazi is launched as a normal child process, and image preview helpers can grow outside any product-owned resource boundary. In the zellij-backed branch this applies to both `superzej files` and `superzej tool yazi`; in the native host branch it also applies to pooled/prewarmed drawer panes.
+The drawer is convenient but too trusting: thegn-spawned yazi is launched as a normal child process, and image preview helpers can grow outside any product-owned resource boundary. In the zellij-backed branch this applies to both `thegn files` and `thegn tool yazi`; in the native host branch it also applies to pooled/prewarmed drawer panes.
 
 ## Goals
 
-- Superzej-spawned yazi must not be able to exhaust host RAM or swap.
-- Image previews stay off by default in superzej's bundled/private yazi config.
+- Thegn-spawned yazi must not be able to exhaust host RAM or swap.
+- Image previews stay off by default in thegn's bundled/private yazi config.
 - Text/code previews remain available by default.
 - Users can explicitly opt into image previews and tune limits.
-- Every superzej-spawned yazi path is wrapped in a product-owned resource boundary when systemd-run is available.
+- Every thegn-spawned yazi path is wrapped in a product-owned resource boundary when systemd-run is available.
 - Native-host hidden drawer pooling is bounded so invisible yazi instances cannot grow without limit.
-- The solution covers current zellij launch paths (`superzej files`, `superzej tool yazi`) and the native host drawer/prewarm model.
+- The solution covers current zellij launch paths (`thegn files`, `thegn tool yazi`) and the native host drawer/prewarm model.
 
 ## Non-goals
 
@@ -62,7 +62,7 @@ prewarm = false
 
 Default behavior is safe and boring: no image helpers from the bundled config, hard process-tree limits when systemd-run is usable, no current zellij hidden drawer pool, and no automatic yazi prewarm in native hosts.
 
-`image_previews = false` only controls superzej's bundled/private yazi config. If the user selects `config_home = "system"`, superzej does not rewrite the user's yazi config; containment remains the safety net.
+`image_previews = false` only controls thegn's bundled/private yazi config. If the user selects `config_home = "system"`, thegn does not rewrite the user's yazi config; containment remains the safety net.
 
 ## Launch flow
 
@@ -76,7 +76,7 @@ yazi action
   -> record visible drawer state when applicable
 ```
 
-The PTY and emulator implementation stay unchanged. The wrapper must not request a second pseudo-terminal from systemd; superzej already owns the PTY. The containment command should run inside the existing PTY and exec the configured yazi command under the transient scope.
+The PTY and emulator implementation stay unchanged. The wrapper must not request a second pseudo-terminal from systemd; thegn already owns the PTY. The containment command should run inside the existing PTY and exec the configured yazi command under the transient scope.
 
 ## Exit and cleanup
 
@@ -129,8 +129,8 @@ Manual verification:
 
 - With default config, open/close the files drawer across several worktrees and confirm no `ueberzugpp` process is spawned.
 - Enable image previews and browse image-heavy directories; confirm yazi/preview helpers live under a user systemd scope with the configured memory/swap/CPU properties.
-- Force a low memory limit and confirm only the drawer dies, not the terminal or `szhost`.
+- Force a low memory limit and confirm only the drawer dies, not the terminal or `thegn`.
 
 ## Success criteria
 
-A default superzej session can use yazi drawers/tools without launching image preview helpers from the bundled config, cannot accumulate native hidden yazi panes without an explicit limit, and cannot let an explicitly preview-enabled yazi process tree consume unbounded RAM/swap when systemd-run containment is available.
+A default thegn session can use yazi drawers/tools without launching image preview helpers from the bundled config, cannot accumulate native hidden yazi panes without an explicit limit, and cannot let an explicitly preview-enabled yazi process tree consume unbounded RAM/swap when systemd-run containment is available.

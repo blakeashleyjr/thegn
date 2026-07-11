@@ -4,7 +4,7 @@ Date: 2026-06-10 · Status: proposed
 
 ## Problem
 
-superzej is now a native terminal worktree IDE, not just a multiplexer. The
+thegn is now a native terminal worktree IDE, not just a multiplexer. The
 current roadmap already contains many IDE-shaped pieces — git panels, files,
 palette, notifications, editor handoff, pins, session layouts — but the work is
 spread across groups and a few graphical-IDE affordances are missing entirely.
@@ -25,7 +25,7 @@ additive.
 
 ### Tier 1 — IDE parity for the AI-free shell
 
-Tier 1 is the set of IDE affordances that make superzej feel like a complete
+Tier 1 is the set of IDE affordances that make thegn feel like a complete
 terminal-native development workspace even when no agent/proxy/LLM layer is
 configured.
 
@@ -50,7 +50,7 @@ Included features:
 
 Tier 2 adds language-server and runtime-debugger integration after Tier 1 has a
 stable task/panel/palette foundation. These features can be powerful, but should
-not make superzej an editor or require language tooling for the shell to boot.
+not make thegn an editor or require language tooling for the shell to boot.
 
 Included features:
 
@@ -67,7 +67,7 @@ Included features:
 already represented.
 
 The goal is to make the right panel a complete git workbench, not only a diff
-viewer. superzej already has per-worktree status/diff, PR tracking, checks,
+viewer. thegn already has per-worktree status/diff, PR tracking, checks,
 review/approve/create/merge through `gh`, and `lazygit` as a fallback. Tier 1
 makes the native path coherent:
 
@@ -81,11 +81,11 @@ makes the native path coherent:
 
 Architectural seam:
 
-- `crates/superzej-svc/src/git.rs` remains the service trait boundary.
+- `crates/thegn-svc/src/git.rs` remains the service trait boundary.
 - Native reads prefer gix; mutating writes can delegate to CLI git first.
-- UI lives in `crates/superzej-host/src/panel.rs` and
-  `crates/superzej-host/src/chrome.rs` as panel drill-ins/actions.
-- Background refresh stays in `crates/superzej-host/src/hydrate.rs`.
+- UI lives in `crates/thegn-host/src/panel.rs` and
+  `crates/thegn-host/src/chrome.rs` as panel drill-ins/actions.
+- Background refresh stays in `crates/thegn-host/src/hydrate.rs`.
 
 ### Test explorer and test status
 
@@ -104,7 +104,7 @@ works for common project commands before any LSP/DAP integration exists:
 Architectural seam:
 
 - Add a future `PanelTab::Tests` following the existing `PanelData`/`PanelUi`
-  pattern in `crates/superzej-host/src/panel.rs`.
+  pattern in `crates/thegn-host/src/panel.rs`.
 - Test commands should use the same task registry as run configurations.
 - Results hydrate off-thread and wake the host exactly like diff/check refresh.
 
@@ -123,7 +123,7 @@ Problems are compiler/linter/config/runtime diagnostics gathered into one panel:
 Architectural seam:
 
 - Add a future `PanelTab::Problems` beside Diff/Files/PR/Checks.
-- Use `crates/superzej-core/src/plugin_api.rs` alert/data-source concepts as the
+- Use `crates/thegn-core/src/plugin_api.rs` alert/data-source concepts as the
   vocabulary, even before external plugin transports are wired.
 - Avoid turning diagnostics into a polling subsystem; diagnostics are produced by
   task completions, file-watch-triggered refreshes, or explicit user actions.
@@ -133,7 +133,7 @@ Architectural seam:
 **Roadmap mapping:** new AQ items 520–522, related to worktree templates (54),
 pins (E), actions (M), and session/layout groups.
 
-Graphical IDEs usually have run configurations. superzej's terminal-native
+Graphical IDEs usually have run configurations. thegn's terminal-native
 version should be a small task registry with three sources:
 
 - **explicit tasks** from `[[tasks]]` config entries: command, args, cwd, env,
@@ -167,7 +167,7 @@ untrusted data, and run commands only after an explicit user action.
 
 Architectural seam:
 
-- `crates/superzej-core/src/config.rs` already has rich program-like config in
+- `crates/thegn-core/src/config.rs` already has rich program-like config in
   `[[pins]]`; `[[tasks]]` should reuse that shape rather than inventing a new
   command DSL.
 - Task discovery should live behind pure provider functions that return normalized
@@ -176,7 +176,7 @@ Architectural seam:
 - Alias resolution should be a small, testable policy layer over explicit and
   discovered tasks, with config overrides for provider order and disabled aliases.
 - Launching should reuse pure `LaunchSpec` composition from
-  `crates/superzej-host/src/agent.rs` and pane spawning from the host.
+  `crates/thegn-host/src/agent.rs` and pane spawning from the host.
 - Palette entries should be generated from the normalized task registry, including
   both concrete provider rows (`cargo:test`, `compose:up`) and semantic aliases
   (`Run test`, `Run dev`).
@@ -199,18 +199,18 @@ navigation/action surface:
 
 Architectural seam:
 
-- `crates/superzej-host/src/palette.rs` already provides fuzzy matching,
+- `crates/thegn-host/src/palette.rs` already provides fuzzy matching,
   frecency, rendering, and item dispatch.
-- `crates/superzej-host/src/keymap.rs` should become the source for action rows
+- `crates/thegn-host/src/keymap.rs` should become the source for action rows
   instead of duplicating palette command entries.
-- `crates/superzej-core/src/plugin_api.rs` already names `PaletteAction` as an
+- `crates/thegn-core/src/plugin_api.rs` already names `PaletteAction` as an
   extension point for future external providers.
 
 ### Agent/process attention routing
 
 **Roadmap mapping:** AI (419–430), S (243–258), T (259), and AQ item 524.
 
-Herdr-style attention state is useful, but superzej should generalize it beyond
+Herdr-style attention state is useful, but thegn should generalize it beyond
 agents so plain shell tasks and pinned processes can also ask for attention:
 
 - worktree is active/running;
@@ -223,10 +223,10 @@ agents so plain shell tasks and pinned processes can also ask for attention:
 
 Architectural seam:
 
-- `crates/superzej-core/src/activity.rs` already provides the lightweight
+- `crates/thegn-core/src/activity.rs` already provides the lightweight
   `none → active → quiet → acked` worktree FSM.
-- Sidebar rollups live in `crates/superzej-host/src/sidebar.rs` and statusbar
-  widgets in `crates/superzej-host/src/chrome.rs`.
+- Sidebar rollups live in `crates/thegn-host/src/sidebar.rs` and statusbar
+  widgets in `crates/thegn-host/src/chrome.rs`.
 - Notifications should grow through AI group items 420/421/430 and the plugin
   API `NotificationSource` surface, without requiring the AI proxy.
 
@@ -248,7 +248,7 @@ DAP support should be a runtime/debug surface, not an editor replacement:
 
 Architectural seam:
 
-- A future DAP client belongs in `crates/superzej-svc`, next to git/GitHub/SSH
+- A future DAP client belongs in `crates/thegn-svc`, next to git/GitHub/SSH
   service boundaries.
 - Debug views belong in right-panel tabs/drill-ins.
 - Launch configurations should share the Tier 1 task registry.
@@ -271,7 +271,7 @@ LSP should provide navigation/context while `$EDITOR` remains the editing tool:
 Architectural seam:
 
 - A future LSP client should share a JSON-RPC-over-stdio substrate with DAP in
-  `crates/superzej-svc`.
+  `crates/thegn-svc`.
 - Palette symbol providers live behind the Search Everywhere source model.
 - Diagnostics flow into the Problems panel and attention routing.
 - Opening/editing still hands off to `$EDITOR` through existing editor/pane
@@ -316,8 +316,8 @@ Templates should compose existing concepts:
 
 Architectural seam:
 
-- `crates/superzej-host/src/center.rs` already owns serializable `CenterTree`.
-- `crates/superzej-host/src/session.rs` and `crates/superzej-core/src/db.rs`
+- `crates/thegn-host/src/center.rs` already owns serializable `CenterTree`.
+- `crates/thegn-host/src/session.rs` and `crates/thegn-core/src/db.rs`
   already persist worktree/tab state.
 - Task templates depend on the Tier 1 task registry.
 - The native `CenterTree` model is the target; do not extend legacy zellij KDL
@@ -353,7 +353,7 @@ Architectural seam:
 
 ## Non-goals
 
-- Do not make superzej a text editor; keep `$EDITOR` handoff central.
+- Do not make thegn a text editor; keep `$EDITOR` handoff central.
 - Do not require LSP, DAP, or AI for the shell to be useful.
 - Do not add idle render ticks, background polling loops, or blocking I/O on the
   host loop.

@@ -1,0 +1,31 @@
+[package]
+name = "thegn-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+description = "thegn lean in-sandbox agent: dials home to the compositor over iroh and serves shells/exec"
+
+# The lean dialer baked into a workspace image. Kept intentionally small (iroh +
+# tokio + a PTY) so the image stays tiny and boots fast — it must NOT pull the
+# full host/svc crates. Shared pure protocol (revtunnel, exec frames) comes from
+# thegn-core only.
+[dependencies]
+# Pure shared wire protocol (iroh_wire) only — NOT the full svc/host crates.
+thegn-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+iroh.workspace = true
+portable-pty.workspace = true
+tracing.workspace = true
+
+[[bin]]
+name = "tg-agent"
+path = "src/main.rs"
+
+[dev-dependencies]
+# In-process transport proof: drive the home side (svc) against this crate's
+# serve side over two loopback iroh endpoints. Dev-only — never in the binary.
+thegn-svc.workspace = true
+tokio.workspace = true

@@ -4,7 +4,7 @@
 
 ### Requirement: A fleet view presents authoritative per-worktree agent metrics
 
-superzej SHALL present a fleet view showing, per worktree running an agent, its
+thegn SHALL present a fleet view showing, per worktree running an agent, its
 context-window usage, token split (input / output / cache-read / cache-create),
 turn count, current task, child processes with open ports, and a live tool-call
 timeline. Token and context metrics MUST be sourced authoritatively from the LLM
@@ -31,7 +31,7 @@ empty and MUST NOT affect the AI-free shell.
 
 ### Requirement: The fleet view detects context compaction
 
-superzej SHALL flag a context compaction for a worktree when its context tokens
+thegn SHALL flag a context compaction for a worktree when its context tokens
 drop between consecutive turns by more than a configured threshold, so a reviewer
 can see when an agent compacted its context. A small dip below the threshold and a
 worktree's first turn MUST NOT be flagged.
@@ -49,11 +49,11 @@ worktree's first turn MUST NOT be flagged.
 
 ### Requirement: The fleet snapshot is available as machine-readable JSON
 
-superzej SHALL provide a `szhost fleet --json` subcommand that emits the current
+thegn SHALL provide a `thegn fleet --json` subcommand that emits the current
 per-worktree fleet metrics as JSON for external tools, read-only and without
 issuing a model call.
 
 #### Scenario: JSON snapshot emits the rollup
 
-- **WHEN** the user runs `szhost fleet --json`
+- **WHEN** the user runs `thegn fleet --json`
 - **THEN** the current per-worktree metrics are printed as JSON with no model call

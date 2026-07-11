@@ -8,8 +8,8 @@ running an agent: context-window %, token split (input / output / cache-read /
 cache-create), a token-rate sparkline, **compaction detection** (a context drop
 between turns), turn count, current task, child processes + their open ports, and
 a live **tool-call timeline** (a Thinking/Executing row that grows as work
-happens). A `szhost fleet --json` snapshot exposes the same model to external
-tools. Where abtop can only scrape agent transcripts, superzej sources the token
+happens). A `thegn fleet --json` snapshot exposes the same model to external
+tools. Where abtop can only scrape agent transcripts, thegn sources the token
 metrics **authoritatively through the LLM proxy**.
 
 ## Impact
@@ -26,8 +26,8 @@ metrics **authoritatively through the LLM proxy**.
 
 ## Rationale
 
-superzej's per-worktree indicator today is a heuristic activity dot (CPU-derived).
-abtop shows what a rich row looks like and proves the value. superzej is uniquely
+thegn's per-worktree indicator today is a heuristic activity dot (CPU-derived).
+abtop shows what a rich row looks like and proves the value. thegn is uniquely
 positioned to do it _better_: the LLM proxy already writes a `ProxyRequestRow`
 (input/output tokens, cost, agent, worktree) per request, so token/context metrics
 are **authoritative**, not scraped. The proxy just needs to also parse the cache

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-superzej provides per-worktree file browsing, preview, and search through a yazi
+thegn provides per-worktree file browsing, preview, and search through a yazi
 drawer carved into the chrome as a reserved, focusable panel, plus project-wide
 fuzzy find and ripgrep search. File-management actions run from the tree, and the
 external file tools are memory-capped so a runaway preview process cannot take

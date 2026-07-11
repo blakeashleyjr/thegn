@@ -1,4 +1,4 @@
-//! `ObserveTile` — the host-facing [`sz_kit::AppTile`] for the Observe app.
+//! `ObserveTile` — the host-facing [`tg_kit::AppTile`] for the Observe app.
 //!
 //! It constructs the [`ObserveApp`] view-model (which spawns the off-loop query
 //! engine), then each frame: `pump()` drains engine results, `render()` lays the
@@ -19,13 +19,13 @@ use gtui_core::frame::Frame;
 use gtui_query::host::HostSource;
 use gtui_query::loki::LokiSource;
 use gtui_query::prometheus::PrometheusSource;
-use superzej_core::config_observe::ObserveConfig;
-use sz_kit::input::{InputEvent, InputResult, Key};
-use sz_kit::ratatui::buffer::Buffer;
-use sz_kit::ratatui::layout::Rect;
-use sz_kit::ratatui::style::{Color, Style};
-use sz_kit::ratatui::widgets::{Block, Borders, Paragraph, Widget};
-use sz_kit::tile::{AppTile, ChangeHook};
+use tg_kit::input::{InputEvent, InputResult, Key};
+use tg_kit::ratatui::buffer::Buffer;
+use tg_kit::ratatui::layout::Rect;
+use tg_kit::ratatui::style::{Color, Style};
+use tg_kit::ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use tg_kit::tile::{AppTile, ChangeHook};
+use thegn_core::config_observe::ObserveConfig;
 
 pub struct ObserveTile {
     app: ObserveApp,
@@ -42,12 +42,12 @@ impl ObserveTile {
 
         // The built-in host datasource is always present (local metrics, zero
         // config). Prometheus/Loki register only when an endpoint is configured;
-        // tokens resolve through superzej's `env:`/`file:` indirection.
+        // tokens resolve through thegn's `env:`/`file:` indirection.
         let mut sources: HashMap<String, Arc<dyn DataSource>> = HashMap::new();
         sources.insert("host".to_string(), Arc::new(HostSource::new()));
         if !cfg.prometheus.base_url.trim().is_empty() {
             let token =
-                superzej_core::config::expand_env_ref(&cfg.prometheus.token).unwrap_or_default();
+                thegn_core::config::expand_env_ref(&cfg.prometheus.token).unwrap_or_default();
             sources.insert(
                 "prometheus".to_string(),
                 Arc::new(PrometheusSource::new(
@@ -57,7 +57,7 @@ impl ObserveTile {
             );
         }
         if !cfg.loki.base_url.trim().is_empty() {
-            let token = superzej_core::config::expand_env_ref(&cfg.loki.token).unwrap_or_default();
+            let token = thegn_core::config::expand_env_ref(&cfg.loki.token).unwrap_or_default();
             sources.insert(
                 "loki".to_string(),
                 Arc::new(LokiSource::new(cfg.loki.base_url.clone(), token)),

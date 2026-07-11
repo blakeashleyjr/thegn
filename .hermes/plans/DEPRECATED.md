@@ -1,7 +1,7 @@
 # DEPRECATED — superseded by OpenSpec
 
 This directory held ad-hoc, agent-executable task breakdowns from the old
-"subagent-driven-development" flow. As of the OpenSpec adoption, superzej's
+"subagent-driven-development" flow. As of the OpenSpec adoption, thegn's
 development is managed with **OpenSpec** instead.
 
 **Do not add new plans here.** Start new work with the OpenSpec workflow:

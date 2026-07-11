@@ -42,7 +42,7 @@ flagged as orphaned.
 
 - A fleet **panel/overlay** rendering the per-worktree rows + the animated
   timeline for the focused agent.
-- `szhost fleet [--json]` CLI subcommand (the `cmd/issue.rs`/`config.rs` `--json`
+- `thegn fleet [--json]` CLI subcommand (the `cmd/issue.rs`/`config.rs` `--json`
   pattern) emitting the rollup for external tools — read-only, quota-free.
 
 ## Invariants

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-superzej composites its entire UI (PTY panes plus in-process chrome) to the
+thegn composites its entire UI (PTY panes plus in-process chrome) to the
 terminal through a damage-region compositor. Rendering must produce the cheapest
 correct frame for any given change so that streaming pane output never forces a
 full chrome recompose and an idle wake paints nothing. The frame decision is a
@@ -83,7 +83,7 @@ On a genuine first launch or fresh workspace the center SHALL start dormant — 
 
 #### Scenario: Fresh launch is dormant
 
-- **WHEN** superzej launches a fresh workspace
+- **WHEN** thegn launches a fresh workspace
 - **THEN** a splash is drawn and no center PTY is forked until the first input
 
 #### Scenario: No live pane shows the splash

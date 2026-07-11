@@ -3,10 +3,10 @@ case_tmp_env: XDG_STATE_HOME
 matrix:
   profiles: [xterm]
   sizes: ["100x30", "80x24", "160x40", "40x12"]
-spawn: ["szhost"]
+spawn: ["thegn"]
 env:
   XDG_STATE_HOME: "{case_tmp}"
-  SUPERZEJ_LOG: warn
+  THEGN_LOG: warn
   MUSE_READY: "1"
   TERM: xterm-256color
 sync:
@@ -18,7 +18,7 @@ snapshot_defaults:
     - {re: "L0\\|.*", replace: "L0|<masthead>"}
     - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
 steps:
-  - expect_visible: {regex: "szhost|superzej|dashboard|work|\\$|>", timeout_ms: 8000}
+  - expect_visible: {regex: "thegn|thegn|dashboard|work|\\$|>", timeout_ms: 8000}
   # Full frame at each size — mask row 0 (masthead has volatile CPU/mem/clock stats)
   - snapshot:
       name: full_frame
@@ -47,5 +47,5 @@ steps:
       masks:
         - rect: [0, 0, 200, 28]
   - check_file:
-      path: "{case_tmp}/superzej/logs/szhost.log"
+      path: "{case_tmp}/thegn/logs/thegn.log"
       reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"

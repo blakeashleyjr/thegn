@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test/gen-test-fixtures.sh — capture REAL test-runner output per ecosystem into
-# crates/superzej-host/testdata/, used as golden fixtures by the parser tests.
+# crates/thegn-host/testdata/, used as golden fixtures by the parser tests.
 #
 # Each ecosystem gets a minimal but REAL project (a passing + a failing test),
 # the REAL tool runs (fetched ephemerally via `nix shell nixpkgs#…` when not on
@@ -13,7 +13,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="$ROOT/crates/superzej-host/testdata"
+OUT="$ROOT/crates/thegn-host/testdata"
 mkdir -p "$OUT"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -122,6 +122,8 @@ fi
 if sel bats; then
   d="$WORK/bats"
   mkdir -p "$d/test"
+  # bats source: the $((…)) expressions must reach the file verbatim.
+  # shellcheck disable=SC2016
   printf '@test "adds" { [ $((2+2)) -eq 4 ]; }\n@test "breaks" { [ $((2+2)) -eq 5 ]; }\n' >"$d/test/calc.bats"
   (cd "$d" && nix shell nixpkgs#bats -c bats --formatter tap test) >"$OUT/bats.tap" 2>/dev/null
   check bats bats.tap
