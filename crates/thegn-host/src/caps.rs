@@ -113,15 +113,17 @@ pub fn active_glyphs() -> &'static GlyphSet {
 
 /// Install the resolved capabilities together with the config's themed glyph
 /// preferences. The single install entry point used by the loop at startup and
-/// on config reload — [`install`] handles the color/glyph atomics, and the
+/// on config reload — [`install`] handles the color/glyph atomics, the
 /// `[theme] agent_glyphs` preference is a cheap extra atomic store read back by
-/// [`agent_glyph_style`].
+/// [`agent_glyph_style`], and the splash-mascot settings ride along into
+/// [`crate::owl`]'s atomics.
 pub fn install_themed(cfg: &thegn_core::config::Config, caps: TermCaps) {
     install(caps);
     AGENT_GLYPHS.store(
         agent_glyphs_to_u8(cfg.theme.agent_glyphs),
         Ordering::Relaxed,
     );
+    crate::owl::install(&cfg.theme);
 }
 
 /// The resolved agent-marker style for the sidebar — the configured preference

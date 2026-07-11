@@ -10,6 +10,29 @@
 //! `crate::termcaps` (glyph level) and `crate::theme` (agent-marker style).
 
 use crate::config::{config_enum, config_warn};
+use serde::{Deserialize, Serialize};
+
+config_enum! {
+    /// Which mascot the loading splash draws above the wordmark (when the
+    /// center is tall enough): "owl" (default — the perched sentinel),
+    /// "knight" (the Sutton Hoo helm bust), or "off" to disable the sprite
+    /// and keep the plain wordmark splash.
+    pub enum MascotKind: "mascot" {
+        Owl = "owl",
+        Knight = "knight",
+        Off = "off" | "none" | "disabled",
+    } default = Owl;
+}
+config_enum! {
+    /// Splash-mascot motion. "blink" lets the owl blink — evaluated only
+    /// when a wake already redraws the splash, so an idle loop stays idle
+    /// (the 0%-idle invariant; the owl holds perfectly still until
+    /// something happens, which is the joke). "still" pins the eyes open.
+    pub enum MascotMotion: "mascot motion" {
+        Blink = "blink",
+        Still = "still" | "static",
+    } default = Blink;
+}
 
 config_enum! {
     /// Whether the outer terminal renders curly underlines (conflict
@@ -52,9 +75,123 @@ config_enum! {
     } default = Letter;
 }
 
+/// `[theme.colors]` — all optional "#rrggbb" overrides; unset keys keep the
+/// built-in storm-blue defaults (src/theme.rs).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ThemeColors {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bg0: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bg1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panel2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raise: Option<String>,
+    /// Frame lines around unfocused panes and chrome edges (light grey).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub faint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ghost: Option<String>,
+    /// Foreground ramp step below ghost (structural glyphs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ghost2: Option<String>,
+    /// Deepest structural foreground (rules, fills, tracks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ghost3: Option<String>,
+    /// Background of layer shadow cells.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_bg: Option<String>,
+    /// Foreground of layer shadow cells.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_fg: Option<String>,
+    /// Text inside inverse chips (defaults to bg0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chip_fg: Option<String>,
+    /// Sidebar activity dot when a worktree is busy / its agent is working
+    /// (defaults to the text tone, "white").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_active: Option<String>,
+    /// Sidebar activity dot when an agent is waiting for the user's input
+    /// (defaults to the red status hue).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_waiting: Option<String>,
+}
+
+/// `[theme.hues]` — all optional "#rrggbb" overrides for the eight semantic
+/// hues (identity + status colors); unset keys keep the preset's hues.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ThemeHues {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub magenta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purple: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub green: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amber: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub red: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orange: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mascot_kind_parse_aliases_default_and_error() {
+        assert_eq!(MascotKind::default(), MascotKind::Owl);
+        for (s, want) in [
+            ("owl", MascotKind::Owl),
+            ("knight", MascotKind::Knight),
+            ("off", MascotKind::Off),
+            ("none", MascotKind::Off),
+            ("DISABLED", MascotKind::Off),
+        ] {
+            assert_eq!(MascotKind::from_str_validated(s).unwrap(), want, "{s}");
+        }
+        assert!(MascotKind::from_str_validated("dragon").is_err());
+    }
+
+    #[test]
+    fn mascot_motion_parse_aliases_default_and_error() {
+        assert_eq!(MascotMotion::default(), MascotMotion::Blink);
+        for (s, want) in [
+            ("blink", MascotMotion::Blink),
+            ("still", MascotMotion::Still),
+            ("static", MascotMotion::Still),
+        ] {
+            assert_eq!(MascotMotion::from_str_validated(s).unwrap(), want, "{s}");
+        }
+        assert!(MascotMotion::from_str_validated("dance").is_err());
+    }
+
+    #[test]
+    fn mascot_enums_canonical_string_round_trip() {
+        for k in [MascotKind::Owl, MascotKind::Knight, MascotKind::Off] {
+            assert_eq!(MascotKind::from_str_validated(k.as_str()).unwrap(), k);
+            assert_eq!(k.to_string(), k.as_str());
+        }
+        for m in [MascotMotion::Blink, MascotMotion::Still] {
+            assert_eq!(MascotMotion::from_str_validated(m.as_str()).unwrap(), m);
+            assert_eq!(m.to_string(), m.as_str());
+        }
+    }
 
     #[test]
     fn agent_glyphs_parse_aliases_default_and_error() {
