@@ -363,9 +363,13 @@ impl MediaWatch for MpdWatch {
                 return false;
             };
             match conn.command("idle player mixer options").await {
-                Ok(_) => true,
-                Err(_) => {
+                Ok(changed) => {
+                    tracing::debug!(target: "thegn::media", ?changed, "MPD idle tick");
+                    true
+                }
+                Err(e) => {
                     // Connection lost — end the stream so the host reconnects.
+                    tracing::debug!(target: "thegn::media", error = %e, "MPD idle stream ended");
                     self.conn = None;
                     false
                 }

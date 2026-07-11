@@ -62,6 +62,19 @@ async fn push_snapshot(
     Some(active)
 }
 
+/// Log the badge-clearing transition (a track was showing, this push hides it).
+/// `Ok(None)` pushes are otherwise silent — e.g. the aggregate when every child
+/// failed, or MPD answering "daemon away" — so without this a vanishing badge
+/// leaves no trace in `THEGN_LOG=thegn::media=debug` logs.
+fn note_cleared(prev_active: bool, now_active: bool) {
+    if prev_active && !now_active {
+        tracing::debug!(
+            target: "thegn::media",
+            "now-playing cleared (snapshot returned none/stopped)"
+        );
+    }
+}
+
 async fn run(
     cfg: MediaConfig,
     tx: tokio_mpsc::UnboundedSender<Option<MediaState>>,
@@ -108,7 +121,10 @@ async fn run(
                     break true; // signal stream ended → reconnect
                 }
                 match push_snapshot(&client, &tx, &waker).await {
-                    Some(a) => active = a,
+                    Some(a) => {
+                        note_cleared(active, a);
+                        active = a;
+                    }
                     None => return, // receiver gone
                 }
             };
@@ -124,10 +140,78 @@ async fn run(
             ticker.tick().await; // consume the immediate first tick
             loop {
                 ticker.tick().await;
-                if push_snapshot(&client, &tx, &waker).await.is_none() {
-                    return; // receiver gone
+                match push_snapshot(&client, &tx, &waker).await {
+                    Some(a) => {
+                        note_cleared(active, a);
+                        active = a;
+                    }
+                    None => return, // receiver gone
                 }
             }
         }
     }
+}
+
+/// Drain pending now-playing snapshots into the model — the event loop's
+/// `media_rx` handler, extracted from the ratchet-pinned `run.rs`.
+///
+/// Repaint discipline: a `Playing` snapshot ticks its position several times a
+/// second, and a full chrome recompose per tick is a self-sustaining flicker
+/// storm (and an idle-CPU violation). So repaint only what the snapshot moves
+/// on screen: while the Media panel section or Now-Playing overlay is open
+/// (`coalesce_full` — they show the live position stamp) coalesce full frames
+/// to ~1/s, repainting immediately only when the statusbar badge text changed;
+/// with both closed, a badge change takes the cheap bars path and a
+/// position-only change repaints nothing.
+///
+/// Returns `(full, bars)` repaint intent for the loop's `dirty` / `bars_dirty`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drain_snapshots(
+    rx: &mut tokio_mpsc::UnboundedReceiver<Option<MediaState>>,
+    perf: &mut crate::perf::LoopPerf,
+    enabled: bool,
+    show_art: bool,
+    media: &mut Option<MediaState>,
+    overlay: &mut Option<crate::media_overlay::MediaOverlay>,
+    art_tx: &tokio_mpsc::UnboundedSender<crate::media_art::ArtMosaic>,
+    waker: &TerminalWaker,
+    coalesce_full: bool,
+    last_full: &mut Option<std::time::Instant>,
+) -> (bool, bool) {
+    let (mut full, mut bars) = (false, false);
+    while let Ok(snap) = rx.try_recv() {
+        perf.tick(crate::perf::WakeSource::Refresh);
+        let shown = if enabled { snap } else { None };
+        if *media == shown {
+            continue;
+        }
+        let badge_changed =
+            media.as_ref().and_then(|m| m.badge()) != shown.as_ref().and_then(|m| m.badge());
+        *media = shown;
+        if let Some(ov) = overlay.as_mut() {
+            ov.snapshot = media.clone();
+            if let Some(url) = ov.wants_art(show_art) {
+                crate::media_art::spawn_fetch(
+                    url,
+                    crate::media_overlay::ART_COLS,
+                    crate::media_overlay::ART_ROWS,
+                    art_tx.clone(),
+                    waker.clone(),
+                );
+            }
+        }
+        if coalesce_full {
+            if badge_changed
+                || last_full
+                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(900))
+                    .unwrap_or(true)
+            {
+                full = true;
+                *last_full = Some(std::time::Instant::now());
+            }
+        } else if badge_changed {
+            bars = true;
+        }
+    }
+    (full, bars)
 }

@@ -156,9 +156,15 @@ impl MprisZbus {
 
     /// Build a push watcher over MPRIS-relevant D-Bus signals.
     pub async fn watch(&self) -> Result<MprisWatch, MediaError> {
+        // Scope the properties rule to the MPRIS object path — the spec fixes
+        // every player at `/org/mpris/MediaPlayer2`. Without it this matches
+        // EVERY `PropertiesChanged` on the session bus (e.g. `systemd --user`
+        // broadcasting podman unit churn caused by our own container polling),
+        // waking the watcher ~20×/5s for a full aggregate re-snapshot each time.
         let props_rule = MatchRule::builder()
             .msg_type(MsgType::Signal)
-            .interface("org.freedesktop.DBus.Properties")
+            .path(MPRIS_PATH)
+            .and_then(|b| b.interface("org.freedesktop.DBus.Properties"))
             .and_then(|b| b.member("PropertiesChanged"))
             .map_err(|e| MediaError::Backend(e.to_string()))?
             .build();
