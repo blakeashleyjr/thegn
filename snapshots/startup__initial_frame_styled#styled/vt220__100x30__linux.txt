@@ -1,185 +1,155 @@
-L0| ◆ superzej v0.1.0   dashboard   work   comms   chat 35.3/94G · 󰾲 16% · 󰂄 100% · Fri Jun 19 · 22:56
-R0 0 1 fg=default bg=idx00 attrs=
-R0 1 2 fg=idx06 bg=idx00 attrs=
-R0 3 8 fg=idx07 bg=idx00 attrs=
-R0 11 1 fg=default bg=idx00 attrs=
-R0 12 6 fg=idx08 bg=idx00 attrs=
-R0 18 2 fg=default bg=idx00 attrs=
-R0 20 11 fg=idx06 bg=idx08 attrs=
-R0 31 1 fg=default bg=idx00 attrs=
-R0 32 6 fg=idx07 bg=idx00 attrs=
-R0 38 1 fg=default bg=idx00 attrs=
-R0 39 7 fg=idx07 bg=idx00 attrs=
-R0 46 1 fg=default bg=idx00 attrs=
-R0 47 14 fg=idx07 bg=idx00 attrs=
-R0 61 3 fg=idx08 bg=idx00 attrs=
-R0 64 5 fg=idx07 bg=idx00 attrs=
-R0 69 3 fg=idx08 bg=idx00 attrs=
-R0 72 6 fg=idx07 bg=idx00 attrs=
-R0 78 3 fg=idx08 bg=idx00 attrs=
-R0 81 10 fg=idx07 bg=idx00 attrs=
-R0 91 3 fg=idx08 bg=idx00 attrs=
-R0 94 5 fg=idx07 bg=idx00 attrs=
-R0 99 1 fg=default bg=idx00 attrs=
-L1|
-L2|┌ System ─────────────────────────┐┌ Hacker News ──────────────────────────────────────────────────┐
-R2 0 100 fg=idx08 bg=default attrs=
-L3|│OS:                              ││No HN stories yet (offline or loading).                        │
-R3 0 1 fg=idx08 bg=default attrs=
-R3 1 4 fg=idx07 bg=default attrs=
-R3 5 29 fg=default bg=default attrs=
-R3 34 41 fg=idx08 bg=default attrs=
-R3 75 24 fg=default bg=default attrs=
-R3 99 1 fg=idx08 bg=default attrs=
-L4|│Uptime: 0s                       ││                                                               │
-R4 0 1 fg=idx08 bg=default attrs=
-R4 1 10 fg=idx07 bg=default attrs=
-R4 11 23 fg=default bg=default attrs=
-R4 34 2 fg=idx08 bg=default attrs=
-R4 36 63 fg=default bg=default attrs=
-R4 99 1 fg=idx08 bg=default attrs=
-L5|│Memory: 0.00 GB / 0.00 GB        ││                                                               │
-R5 0 1 fg=idx08 bg=default attrs=
-R5 1 25 fg=idx07 bg=default attrs=
-R5 26 8 fg=default bg=default attrs=
-R5 34 2 fg=idx08 bg=default attrs=
-R5 36 63 fg=default bg=default attrs=
-R5 99 1 fg=idx08 bg=default attrs=
-L6|│CPUs: 0                          ││                                                               │
-R6 0 1 fg=idx08 bg=default attrs=
-R6 1 7 fg=idx07 bg=default attrs=
-R6 8 26 fg=default bg=default attrs=
-R6 34 2 fg=idx08 bg=default attrs=
-R6 36 63 fg=default bg=default attrs=
-R6 99 1 fg=idx08 bg=default attrs=
-L7|└─────────────────────────────────┘│                                                               │
-R7 0 36 fg=idx08 bg=default attrs=
-R7 36 63 fg=default bg=default attrs=
-R7 99 1 fg=idx08 bg=default attrs=
-L8|┌ Resources ──────────────────────┐│                                                               │
-R8 0 36 fg=idx08 bg=default attrs=
-R8 36 63 fg=default bg=default attrs=
-R8 99 1 fg=idx08 bg=default attrs=
-L9|│CPU: 0.0%                        ││                                                               │
-R9 0 1 fg=idx08 bg=default attrs=
-R9 1 5 fg=idx07 bg=default attrs=
-R9 6 4 fg=idx08 bg=default attrs=
-R9 10 24 fg=default bg=default attrs=
-R9 34 2 fg=idx08 bg=default attrs=
-R9 36 63 fg=default bg=default attrs=
-R9 99 1 fg=idx08 bg=default attrs=
-L10|│Mem: 0.0% (0.0/0.0G)             ││                                                               │
-R10 0 1 fg=idx08 bg=default attrs=
-R10 1 5 fg=idx07 bg=default attrs=
-R10 6 15 fg=idx06 bg=default attrs=
-R10 21 13 fg=default bg=default attrs=
-R10 34 2 fg=idx08 bg=default attrs=
-R10 36 63 fg=default bg=default attrs=
-R10 99 1 fg=idx08 bg=default attrs=
-L11|│Load: 0.00                       │└───────────────────────────────────────────────────────────────┘
-R11 0 1 fg=idx08 bg=default attrs=
-R11 1 6 fg=idx07 bg=default attrs=
-R11 7 4 fg=idx03 bg=default attrs=
-R11 11 23 fg=default bg=default attrs=
-R11 34 66 fg=idx08 bg=default attrs=
-L12|│Processes: 0                     │┌ Recent Repos ─────────────────────────────────────────────────┐
-R12 0 1 fg=idx08 bg=default attrs=
-R12 1 12 fg=idx07 bg=default attrs=
-R12 13 21 fg=default bg=default attrs=
-R12 34 66 fg=idx08 bg=default attrs=
-L13|│                                 ││No recent repos.                                               │
-R13 0 1 fg=idx08 bg=default attrs=
-R13 1 33 fg=default bg=default attrs=
-R13 34 18 fg=idx08 bg=default attrs=
-R13 52 47 fg=default bg=default attrs=
-R13 99 1 fg=idx08 bg=default attrs=
-L14|└─────────────────────────────────┘│                                                               │
-R14 0 36 fg=idx08 bg=default attrs=
-R14 36 63 fg=default bg=default attrs=
-R14 99 1 fg=idx08 bg=default attrs=
-L15|┌ Metrics ────────────────────────┐│                                                               │
-R15 0 36 fg=idx08 bg=default attrs=
-R15 36 63 fg=default bg=default attrs=
-R15 99 1 fg=idx08 bg=default attrs=
-L16|│No metric targets configured.    ││                                                               │
-R16 0 30 fg=idx08 bg=default attrs=
-R16 30 4 fg=default bg=default attrs=
-R16 34 2 fg=idx08 bg=default attrs=
-R16 36 63 fg=default bg=default attrs=
-R16 99 1 fg=idx08 bg=default attrs=
-L17|│                                 ││                                                               │
-R17 0 1 fg=idx08 bg=default attrs=
-R17 1 33 fg=default bg=default attrs=
-R17 34 2 fg=idx08 bg=default attrs=
-R17 36 63 fg=default bg=default attrs=
-R17 99 1 fg=idx08 bg=default attrs=
-L18|│                                 │└───────────────────────────────────────────────────────────────┘
-R18 0 1 fg=idx08 bg=default attrs=
-R18 1 33 fg=default bg=default attrs=
-R18 34 66 fg=idx08 bg=default attrs=
-L19|│                                 │┌ Workspaces ───────────────────────────────────────────────────┐
-R19 0 1 fg=idx08 bg=default attrs=
-R19 1 33 fg=default bg=default attrs=
-R19 34 66 fg=idx08 bg=default attrs=
-L20|│                                 ││No open workspaces.                                            │
-R20 0 1 fg=idx08 bg=default attrs=
-R20 1 33 fg=default bg=default attrs=
-R20 34 21 fg=idx08 bg=default attrs=
-R20 55 44 fg=default bg=default attrs=
-R20 99 1 fg=idx08 bg=default attrs=
-L21|│                                 ││                                                               │
-R21 0 1 fg=idx08 bg=default attrs=
-R21 1 33 fg=default bg=default attrs=
-R21 34 2 fg=idx08 bg=default attrs=
-R21 36 63 fg=default bg=default attrs=
-R21 99 1 fg=idx08 bg=default attrs=
-L22|│                                 ││                                                               │
-R22 0 1 fg=idx08 bg=default attrs=
-R22 1 33 fg=default bg=default attrs=
-R22 34 2 fg=idx08 bg=default attrs=
-R22 36 63 fg=default bg=default attrs=
-R22 99 1 fg=idx08 bg=default attrs=
-L23|│                                 ││                                                               │
-R23 0 1 fg=idx08 bg=default attrs=
-R23 1 33 fg=default bg=default attrs=
-R23 34 2 fg=idx08 bg=default attrs=
-R23 36 63 fg=default bg=default attrs=
-R23 99 1 fg=idx08 bg=default attrs=
-L24|│                                 │└───────────────────────────────────────────────────────────────┘
-R24 0 1 fg=idx08 bg=default attrs=
-R24 1 33 fg=default bg=default attrs=
-R24 34 66 fg=idx08 bg=default attrs=
-L25|│                                 │┌ Superzej Dashboard ───────────────────────────────────────────┐
-R25 0 1 fg=idx08 bg=default attrs=
-R25 1 33 fg=default bg=default attrs=
-R25 34 66 fg=idx08 bg=default attrs=
-L26|│                                 ││Last updated: 0  |  Refresh interval: 0s  |  Press 'q' or 'Esc'│
-R26 0 1 fg=idx08 bg=default attrs=
-R26 1 33 fg=default bg=default attrs=
-R26 34 2 fg=idx08 bg=default attrs=
-R26 36 63 fg=idx07 bg=default attrs=
-R26 99 1 fg=idx08 bg=default attrs=
-L27|│                                 ││                                                               │
-R27 0 1 fg=idx08 bg=default attrs=
-R27 1 33 fg=default bg=default attrs=
-R27 34 2 fg=idx08 bg=default attrs=
-R27 36 63 fg=idx07 bg=default attrs=
-R27 99 1 fg=idx08 bg=default attrs=
-L28|└─────────────────────────────────┘└───────────────────────────────────────────────────────────────┘
-R28 0 100 fg=idx08 bg=default attrs=
-L29|  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab   Alt-p smart split   Alt…
-R29 0 1 fg=idx07 bg=idx00 attrs=
-R29 1 3 fg=idx00 bg=idx06 attrs=BOLD
-R29 4 2 fg=idx07 bg=idx00 attrs=
-R29 6 14 fg=idx08 bg=idx00 attrs=
-R29 20 3 fg=idx07 bg=idx00 attrs=
-R29 23 12 fg=idx08 bg=idx00 attrs=
-R29 35 3 fg=idx07 bg=idx00 attrs=
-R29 38 15 fg=idx08 bg=idx00 attrs=
-R29 53 3 fg=idx07 bg=idx00 attrs=
-R29 56 15 fg=idx08 bg=idx00 attrs=
-R29 71 3 fg=idx07 bg=idx00 attrs=
-R29 74 17 fg=idx08 bg=idx00 attrs=
-R29 91 3 fg=idx07 bg=idx00 attrs=
-R29 94 4 fg=idx08 bg=idx00 attrs=
-R29 98 2 fg=idx07 bg=idx00 attrs=
+L0| þ thegn v0.1.0 work        16.3/94G ·   7% ·  21% ·  92°C ·  ↓  130K ↑  192K ·  100% · 22:41
+R0 0 9 fg=idx08 bg=idx00 attrs=
+R0 9 6 fg=idx00 bg=idx00 attrs=
+R0 15 22 fg=idx08 bg=idx00 attrs=
+R0 37 3 fg=idx00 bg=idx00 attrs=
+R0 40 5 fg=idx08 bg=idx00 attrs=
+R0 45 3 fg=idx00 bg=idx00 attrs=
+R0 48 5 fg=idx08 bg=idx00 attrs=
+R0 53 3 fg=idx00 bg=idx00 attrs=
+R0 56 6 fg=idx08 bg=idx00 attrs=
+R0 62 3 fg=idx00 bg=idx00 attrs=
+R0 65 17 fg=idx08 bg=idx00 attrs=
+R0 82 3 fg=idx00 bg=idx00 attrs=
+R0 85 6 fg=idx08 bg=idx00 attrs=
+R0 91 3 fg=idx00 bg=idx00 attrs=
+R0 94 6 fg=idx08 bg=idx00 attrs=
+L1|────────────────────────────────────────────────────────────────────────────────────────────────────
+R1 0 100 fg=idx00 bg=idx00 attrs=
+L2| WORKSPACES                       HOME ▸ home   1        git  work  system
+R2 0 38 fg=idx08 bg=idx00 attrs=
+R2 38 3 fg=idx00 bg=idx00 attrs=
+R2 41 19 fg=idx08 bg=idx00 attrs=
+R2 60 14 fg=idx00 bg=idx00 attrs=
+R2 74 26 fg=idx08 bg=idx00 attrs=
+L3|                                                         home/home
+R3 0 100 fg=idx08 bg=idx00 attrs=
+L4| ▾    home                                              ────────────────────────────────────────────
+R4 0 1 fg=idx08 bg=idx00 attrs=
+R4 1 1 fg=idx00 bg=idx00 attrs=
+R4 2 54 fg=idx08 bg=idx00 attrs=
+R4 56 44 fg=idx00 bg=idx00 attrs=
+L5|▐   └   home                                             1 changes                            clean
+R5 0 1 fg=idx00 bg=idx00 attrs=
+R5 1 3 fg=idx08 bg=idx00 attrs=
+R5 4 2 fg=idx00 bg=idx00 attrs=
+R5 6 88 fg=idx08 bg=idx00 attrs=
+R5 94 5 fg=idx00 bg=idx00 attrs=
+R5 99 1 fg=idx08 bg=idx00 attrs=
+L6|
+R6 0 100 fg=idx08 bg=idx00 attrs=
+L7| TERMINALS                                                working tree clean
+R7 0 58 fg=idx08 bg=idx00 attrs=
+R7 58 18 fg=idx00 bg=idx00 attrs=
+R7 76 24 fg=idx08 bg=idx00 attrs=
+L8|   No terminals — Alt T to add
+R8 0 3 fg=idx08 bg=idx00 attrs=
+R8 3 27 fg=idx00 bg=idx00 attrs=
+R8 30 70 fg=idx08 bg=idx00 attrs=
+L9|                                                         2 commits                                —
+R9 0 57 fg=idx08 bg=idx00 attrs=
+R9 57 1 fg=idx00 bg=idx00 attrs=
+R9 58 40 fg=idx08 bg=idx00 attrs=
+R9 98 1 fg=idx00 bg=idx00 attrs=
+R9 99 1 fg=idx08 bg=idx00 attrs=
+L10|
+R10 0 100 fg=idx08 bg=idx00 attrs=
+L11|                                                         3 branches                               —
+R11 0 57 fg=idx08 bg=idx00 attrs=
+R11 57 1 fg=idx00 bg=idx00 attrs=
+R11 58 40 fg=idx08 bg=idx00 attrs=
+R11 98 1 fg=idx00 bg=idx00 attrs=
+R11 99 1 fg=idx08 bg=idx00 attrs=
+L12|          ╭─ Choose a keymap ─────────────────────────────────────────────────── menu ──╮
+R12 0 12 fg=idx08 bg=idx00 attrs=
+R12 12 17 fg=idx07 bg=idx00 attrs=
+R12 29 51 fg=idx08 bg=idx00 attrs=
+R12 80 6 fg=idx07 bg=idx00 attrs=BOLD
+R12 86 14 fg=idx08 bg=idx00 attrs=
+L13|          │ Familiar shortcuts on top of the defaults. Change later with keymap_preset. │         —
+R13 0 11 fg=idx08 bg=idx00 attrs=
+R13 11 1 fg=default bg=idx00 attrs=
+R13 12 75 fg=idx07 bg=idx00 attrs=
+R13 87 1 fg=default bg=idx00 attrs=
+R13 88 1 fg=idx08 bg=idx00 attrs=
+R13 89 2 fg=idx00 bg=idx00 attrs=
+R13 91 7 fg=idx08 bg=idx00 attrs=
+R13 98 1 fg=idx00 bg=idx00 attrs=
+R13 99 1 fg=idx08 bg=idx00 attrs=
+L14|          │ ❯  d  thegn defaults                                        Alt/Ctrl chords │
+R14 0 11 fg=idx08 bg=idx00 attrs=
+R14 11 1 fg=default bg=idx00 attrs=
+R14 12 2 fg=idx06 bg=idx00 attrs=BOLD
+R14 14 3 fg=idx07 bg=idx00 attrs=BOLD
+R14 17 1 fg=idx07 bg=idx00 attrs=
+R14 18 14 fg=idx07 bg=idx00 attrs=BOLD
+R14 32 40 fg=idx07 bg=idx00 attrs=
+R14 72 15 fg=idx08 bg=idx00 attrs=
+R14 87 1 fg=default bg=idx00 attrs=
+R14 88 1 fg=idx08 bg=idx00 attrs=
+R14 89 2 fg=idx00 bg=idx00 attrs=
+R14 91 9 fg=idx08 bg=idx00 attrs=
+L15|          │    v  VS Code                                  Ctrl+P, Ctrl+Shift+P, Ctrl+B │ 0 changed
+R15 0 11 fg=idx08 bg=idx00 attrs=
+R15 11 1 fg=default bg=idx00 attrs=
+R15 12 2 fg=idx07 bg=idx00 attrs=
+R15 14 3 fg=idx07 bg=idx00 attrs=BOLD
+R15 17 42 fg=idx07 bg=idx00 attrs=
+R15 59 28 fg=idx08 bg=idx00 attrs=
+R15 87 1 fg=default bg=idx00 attrs=
+R15 88 1 fg=idx08 bg=idx00 attrs=
+R15 89 10 fg=idx00 bg=idx00 attrs=
+R15 99 1 fg=idx08 bg=idx00 attrs=
+L16|          │    i  JetBrains                                        Ctrl+Shift+A, Ctrl+E │
+R16 0 11 fg=idx08 bg=idx00 attrs=
+R16 11 1 fg=default bg=idx00 attrs=
+R16 12 2 fg=idx07 bg=idx00 attrs=
+R16 14 3 fg=idx07 bg=idx00 attrs=BOLD
+R16 17 50 fg=idx07 bg=idx00 attrs=
+R16 67 20 fg=idx08 bg=idx00 attrs=
+R16 87 1 fg=default bg=idx00 attrs=
+R16 88 1 fg=idx08 bg=idx00 attrs=
+R16 89 2 fg=idx00 bg=idx00 attrs=
+R16 91 9 fg=idx08 bg=idx00 attrs=
+L17|          ╰─────────────────────────────────────────────────────────────────────────────╯
+R17 0 89 fg=idx08 bg=idx00 attrs=
+R17 89 2 fg=idx00 bg=idx00 attrs=
+R17 91 9 fg=idx08 bg=idx00 attrs=
+L18|
+R18 0 12 fg=idx08 bg=idx00 attrs=
+R18 12 79 fg=idx00 bg=idx00 attrs=
+R18 91 9 fg=idx08 bg=idx00 attrs=
+L19|
+R19 0 100 fg=idx08 bg=idx00 attrs=
+L20|
+R20 0 100 fg=idx08 bg=idx00 attrs=
+L21|
+R21 0 100 fg=idx08 bg=idx00 attrs=
+L22|
+R22 0 100 fg=idx08 bg=idx00 attrs=
+L23|
+R23 0 100 fg=idx08 bg=idx00 attrs=
+L24|
+R24 0 100 fg=idx08 bg=idx00 attrs=
+L25|
+R25 0 100 fg=idx08 bg=idx00 attrs=
+L26|
+R26 0 100 fg=idx08 bg=idx00 attrs=
+L27|
+R27 0 100 fg=idx08 bg=idx00 attrs=
+L28|
+R28 0 100 fg=idx08 bg=idx00 attrs=
+L29|  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→            7% free
+R29 0 1 fg=idx08 bg=idx00 attrs=
+R29 1 8 fg=idx00 bg=idx08 attrs=
+R29 9 2 fg=idx08 bg=idx00 attrs=
+R29 11 15 fg=idx00 bg=idx00 attrs=
+R29 26 3 fg=idx08 bg=idx00 attrs=
+R29 29 11 fg=idx00 bg=idx00 attrs=
+R29 40 3 fg=idx08 bg=idx00 attrs=
+R29 43 18 fg=idx00 bg=idx00 attrs=
+R29 61 3 fg=idx08 bg=idx00 attrs=
+R29 64 14 fg=idx00 bg=idx00 attrs=
+R29 78 10 fg=idx08 bg=idx00 attrs=
+R29 88 11 fg=idx00 bg=idx08 attrs=
+R29 99 1 fg=idx08 bg=idx00 attrs=

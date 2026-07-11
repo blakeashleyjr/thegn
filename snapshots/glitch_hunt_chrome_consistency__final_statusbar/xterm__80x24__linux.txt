@@ -1,24 +1,24 @@
- ◆ superzej   dashboard   work  comms 4 chat 27% · 󰂄 100% · Fri Jun 19 · 22:56
+ þ thegn work    17.7/94G ·   7% ·  37% ·  ↓   89K ↑   84K ·  100% · 22:41
 ────────────────────────────────────────────────────────────────────────────────
- WORKSPACES           REGCLAUDE ▸ home · Sandbox: None   1
-                     ╭─ bwrap · home ──────────────────────────────────────────╮
- ▾ regclaude         │blake@build-host:~/ >                                          │
-   ● home            │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     ╰─────────────────────────────────────────────────────────╯
-                     ╭─ bwrap · home ──────────────────────────────────────────╮
-                     │blake@build-host:~/ >                                          │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     │                                                         │
-                     ╰─────────────────────────────────────────────────────────╯
-  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktre… 0 LOC │ Keybinds unlocked
+ HOME ▸ home   1
+                         ▀▀█▀▀ █   █ █▀▀▀▀ ▄▀▀▀▀ █▄  █
+                           █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
+                           █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
+
+                           v0.1.0 · git worktree IDE
+
+                                  ↻ sandbox
+                                  ◇ container
+                                  ◇ shell
+
+
+
+
+
+
+
+
+
+
+
+  NORMAL   Ctrl Space menu         0 LOC │ Keybinds unlocked  ✋ 1    7% free

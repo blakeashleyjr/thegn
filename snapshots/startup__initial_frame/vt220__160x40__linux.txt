@@ -1,40 +1,40 @@
- ◆ superzej v0.1.0   dashboard   work   comms   chat                                                            35.5/94G · 󰾲 17% · 󰂄 100% · Fri Jun 19 · 22:56
+ þ thegn v0.1.0 work                                                       16.3/94G ·   7% ·  35% ·  94°C ·  ↓   75K ↑    5K ·  100% · Fri Jul 10 · 22:41
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ WORKSPACES                       HOME ▸ home   1                                                                    git  work  system
+                                                                                                                     home/home
+ ▾    home                                                                                                          ────────────────────────────────────────────
+▐   └   home                                                                                                         1 changes                            clean
 
-┌ System ──────────────────────────────────────────────┐┌ Hacker News ─────────────────────────────────────────────────────────────────────────────────────────┐
-│OS:                                                   ││No HN stories yet (offline or loading).                                                               │
-│Uptime: 0s                                            ││                                                                                                      │
-│Memory: 0.00 GB / 0.00 GB                             ││                                                                                                      │
-│CPUs: 0                                               ││                                                                                                      │
-└──────────────────────────────────────────────────────┘│                                                                                                      │
-┌ Resources ───────────────────────────────────────────┐│                                                                                                      │
-│CPU: 0.0%                                             ││                                                                                                      │
-│Mem: 0.0% (0.0/0.0G)                                  ││                                                                                                      │
-│Load: 0.00                                            ││                                                                                                      │
-│Processes: 0                                          ││                                                                                                      │
-│                                                      ││                                                                                                      │
-└──────────────────────────────────────────────────────┘│                                                                                                      │
-┌ Metrics ─────────────────────────────────────────────┐└──────────────────────────────────────────────────────────────────────────────────────────────────────┘
-│No metric targets configured.                         │┌ Recent Repos ────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                      ││No recent repos.                                                                                      │
-│                                                      ││                                                                                                      │
-│                                                      ││                                                                                                      │
-│                                                      ││                                                                                                      │
-│                                                      ││                                                                                                      │
-│                                                      ││                                                                                                      │
-│                                                      ││                                                                                                      │
-│                                                      │└──────────────────────────────────────────────────────────────────────────────────────────────────────┘
-│                                                      │┌ Workspaces ──────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                      ││No open workspaces.                                                                                   │
-│                                                      ││                                                                                                      │
-│                                                      ││                                                                                                      │
-│                                                      ││                                                                                                      │
-│                                                      ││                                                                                                      │
-│                                                      ││                                                                                                      │
-│                                                      ││                                                                                                      │
-│                                                      │└──────────────────────────────────────────────────────────────────────────────────────────────────────┘
-│                                                      │┌ Superzej Dashboard ──────────────────────────────────────────────────────────────────────────────────┐
-│                                                      ││Last updated: 0  |  Refresh interval: 0s  |  Press 'q' or 'Esc' or 'Alt-d' to close                   │
-│                                                      ││                                                                                                      │
-│                                                      ││                                                                                                      │
-└──────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────────────────┘
-  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab   Alt-p smart split   Alt-n split↓   Alt-N split→   Ctrl-Alt-z zoom   Ctrl-Space menu
+ TERMINALS                                                                                                            working tree clean
+   No terminals — Alt T to add
+                                                                                                                     2 commits                                —
+
+                                                                       ▄▀▀▀▀▄                                        3 branches                               —
+                                                                 ▄▄▀▀▀▀▀▀▀▀▀▀▀▀▀▀▄▄
+                                                               ▄▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▄                                4 stash                                  —
+                                                               ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                               ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀                                5 files                          0 changed
+                                                               ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                        ╭─ Choose a keymap ─────────────────────────────────────────────────── menu ──╮
+                                        │ Familiar shortcuts on top of the defaults. Change later with keymap_preset. │
+                                        │ ❯  d  thegn defaults                                        Alt/Ctrl chords │
+                                        │    v  VS Code                                  Ctrl+P, Ctrl+Shift+P, Ctrl+B │
+                                        │    i  JetBrains                                        Ctrl+Shift+A, Ctrl+E │
+                                        ╰─────────────────────────────────────────────────────────────────────────────╯
+                                                             █   █▀▀▀█ █▀▀▀  █  ▄▄ █ ▀▄█
+                                                             █   █   █ █▄▄▄▄ ▀▄▄▄▀ █   █
+
+                                                             v0.1.0 · git worktree IDE
+
+                                                           Ctrl-Space  command palette
+                                                           Alt-↑↓      prev/next worktree
+                                                           Ctrl-g      lock keys to pane
+
+
+
+
+
+
+
+
+  NORMAL   Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→   Alt n split↓   Alt N split→   Alt s focus-sidebar                    7% free

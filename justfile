@@ -13,6 +13,10 @@ set -euo pipefail
 _tmp="$(mktemp -d)"; trap 'rm -rf "$_tmp"' EXIT
 export HOME="$_tmp/home" XDG_CONFIG_HOME="$_tmp/config" XDG_STATE_HOME="$_tmp/state"
 export GIT_CONFIG_GLOBAL="$_tmp/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
+# Cut the session D-Bus: otherwise the developer's live media player leaks
+# into the statusbar/masthead media badge and every snapshot goes
+# nondeterministic as tracks change.
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null/e2e-no-dbus"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 printf '[user]\nname = e2e\nemail = e2e@example.invalid\n' > "$_tmp/gitconfig"
 '''

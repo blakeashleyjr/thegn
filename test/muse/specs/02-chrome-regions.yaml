@@ -33,11 +33,12 @@ steps:
   - snapshot:
       name: masthead_row
       kind: text
+      # The stats cluster is volatile in VALUE and WIDTH (34K vs 1.1M shifts
+      # padding), so per-value masks can't stabilize it: collapse all digit
+      # runs and whitespace runs instead. Brand text + separators remain.
       normalize:
-        - {re: "\\d{2}:\\d{2}", replace: "HH:MM"}
-        - {re: "\\d+(?:\\.\\d+)?/\\d+[KMG]", replace: "NN/NNG"}
-        - {re: "\\d+%", replace: "NN%"}
-        - {re: "[A-Z][a-z]{2} [A-Z][a-z]{2} \\d{1,2}", replace: "Www Mmm DD"}
+        - {re: "\\d+(?:\\.\\d+)?[KMGTB]?", replace: "N"}
+        - {re: "\\s+", replace: " "}
       masks:
         - {rect: [1, 0, 200, 29]}
   # Bottom row: statusbar
