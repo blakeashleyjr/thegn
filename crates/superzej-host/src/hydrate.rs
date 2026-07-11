@@ -1718,7 +1718,12 @@ pub(crate) fn build_panel(
             .iter()
             .filter(|l| l.level == superzej_core::log_view::LogLevel::Error)
             .count();
-        crate::hydrate_feed::maybe_emit_log_error(db, &panel.notifications, error_count);
+        crate::hydrate_feed::maybe_emit_log_error(
+            db,
+            &panel.notifications,
+            error_count,
+            app_cfg.notifications.surface_self_log_errors,
+        );
 
         if hints.open == crate::panel::Section::Logs {
             let start = all_lines.len().saturating_sub(500);
