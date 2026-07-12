@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,17 +113,9 @@ fn registry() -> &'static Mutex<HashMap<String, (u64, i32)>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(unix)]
 fn kill_group(pgid: i32) {
-    nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pgid),
-        nix::sys::signal::Signal::SIGTERM,
-    )
-    .ok();
+    crate::platform::kill_tree(pgid);
 }
-
-#[cfg(not(unix))]
-fn kill_group(_pgid: i32) {}
 
 /// Kill whatever is currently registered in `slot` (used when a newer job
 /// supersedes an in-flight one). Public for the supersede path in `run.rs`.
@@ -217,10 +208,7 @@ fn build_capped_command(argv: &[String], worktree: &Path, limits: &LimitsConfig)
     if let Some(target) = isolated_cargo_target(worktree, limits) {
         cmd.env("CARGO_TARGET_DIR", target);
     }
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
+    crate::platform::set_process_group(&mut cmd);
     cmd
 }
 
@@ -237,10 +225,7 @@ fn task_command(loc: &GitLoc, inner: &[String], worktree: &Path, limits: &Limits
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
+        crate::platform::set_process_group(&mut cmd);
         return cmd;
     }
     build_capped_command(

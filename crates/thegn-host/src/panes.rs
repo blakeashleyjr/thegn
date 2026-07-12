@@ -205,11 +205,7 @@ fn shell_words_join(argv: &[String]) -> String {
 }
 
 pub(crate) fn tool_drawer_argv(command: &str) -> Vec<String> {
-    vec![
-        thegn_core::util::shell(),
-        "-lc".into(),
-        format!("exec {}", command.trim()),
-    ]
+    thegn_core::shellinv::exec_argv(&thegn_core::util::shell(), command.trim())
 }
 
 /// Env for spawning yazi: an isolated `YAZI_CONFIG_HOME` so the user's own

@@ -1467,14 +1467,17 @@ _A native, zero-IPC structured log viewer providing `hl`-like capabilities for w
 
 ### AX. Native Windows Support
 
-_The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 for a native sub-300ms, zero-IPC experience. Core features (multiplexing, rendering, git) already map cleanly to Windows thanks to the `portable-pty`/`termwiz` foundation._
+_The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 for a native sub-300ms, zero-IPC experience. Core features (multiplexing, rendering, git) already map cleanly to Windows thanks to the `portable-pty`/`termwiz` foundation. Phased port in flight — phase 1 (workspace compiles for `cfg(windows)`, platform seams, CI gates) is openspec change `add-windows-native-compile`; scope: Windows Terminal only, daemon/relay via named pipes (phase 2), Job Objects for process scoping (phase 3; container sandboxes are declined on Windows — a Linux container in a VM can't honor the same-absolute-path bind invariant), compositor validation on a real box (phase 4), parity + CI/dist (phases 5–6)._
 
+- [x] 728a. Workspace compiles for `cfg(windows)` — `nix`/`libc` target-gated, `thegn_core::shellinv` + `thegn-host::platform` seams, unix-substrate features stub with explicit errors; per-PR windows-gnu workspace cross-check + opt-in `windows-latest` msvc job (openspec: `add-windows-native-compile`)
 - [ ] 729. Cross-platform filesystem watching — replace `inotify` with `notify` (`ReadDirectoryChangesW`) for diff watchers
-- [ ] 730. Native Sandboxing: AppContainers — low-integrity process isolation granting read/write ACLs only to the specific worktree path
-- [ ] 731. Native Sandboxing: Job Objects — prevent fork-bombs, block UI popups, and ensure child process trees die instantly on tab close
-- [ ] 732. Standardized paths — migrate from Unix `$XDG_STATE_HOME` to `directories` crate resolving to `%LOCALAPPDATA%\thegn`
+- [ ] 730. Native Sandboxing: AppContainers — low-integrity process isolation granting read/write ACLs only to the specific worktree path (stretch; Job Objects are the shipped scoping)
+- [ ] 731. Native Sandboxing: Job Objects — prevent fork-bombs, block UI popups, and ensure child process trees die instantly on tab close (phase 3; lands behind `platform::set_process_group`/`kill_tree`)
+- [ ] 732. Standardized paths — migrate from Unix `$XDG_STATE_HOME` to `directories` crate resolving to `%LOCALAPPDATA%\thegn` (util.rs already branches USERPROFILE/APPDATA/LOCALAPPDATA)
 - [ ] 733. Signals mapping — map Unix profiling triggers (`SIGUSR2`) to internal keymaps or named events for Windows flame-graphs
-- [ ] 734. PowerShell / NuShell defaults — default pane spawning to native Windows shells over `cmd.exe`
+- [ ] 734. PowerShell / NuShell defaults — default pane spawning to native Windows shells over `cmd.exe` (`util::shell()` resolves pwsh → powershell → COMSPEC; dialect via `shellinv`)
+- [ ] 735. Daemon IPC + relay on named pipes — `IpcEndpoint`/`IpcListener` seam in thegn-svc, single-instance via `first_pipe_instance`, remote attach from Windows (phase 2)
+- [ ] 736. Compositor validation on Windows Terminal — waker/ConPTY/termcaps/path-separator sweep + CONTRIBUTING "Windows (native)" dev loop (phase 4)
 
 ### AI-free mode (audience-widener)
 

@@ -232,11 +232,7 @@ impl PinSupervisor {
             v.extend(pin.args.iter().cloned());
             v
         } else {
-            vec![
-                thegn_core::util::shell(),
-                "-lc".into(),
-                format!("exec {}", pin.command.trim()),
-            ]
+            thegn_core::shellinv::exec_argv(&thegn_core::util::shell(), pin.command.trim())
         }
     }
 

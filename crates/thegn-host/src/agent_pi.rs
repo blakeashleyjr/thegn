@@ -67,6 +67,7 @@ pub(crate) fn provision_managed_pi(
          npm install --prefix \"$HOME/.thegn/pi\" @earendil-works/pi-coding-agent@{pin} \
          --fetch-retries=3 --fetch-retry-mintimeout=2000 --fetch-timeout=60000 2>&1"
     );
+    // remote/sandbox target is Linux; POSIX sh is correct here
     let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script];
     let to = provision_step_timeout("managed_pi");
     block_on_provider(|| async {

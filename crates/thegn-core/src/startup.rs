@@ -105,7 +105,7 @@ fn repair_gitconfig(gitconfig: &Path, home: &Path) {
 
     if xdg_git_config.exists() || xdg_git_dir.is_dir() {
         // XDG location is canonical; point ~/.gitconfig at it.
-        match std::os::unix::fs::symlink(&xdg_git_config, gitconfig) {
+        match symlink_file(&xdg_git_config, gitconfig) {
             Ok(()) => {
                 crate::msg::warn("startup: restored ~/.gitconfig → ~/.config/git/config symlink");
             }
@@ -132,6 +132,18 @@ fn repair_gitconfig(gitconfig: &Path, home: &Path) {
             }
         }
     }
+}
+
+/// Cross-platform file symlink. On Windows `symlink_file` needs Developer Mode
+/// or elevation; failure lands in the caller's existing warn-and-continue path.
+#[cfg(unix)]
+fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
+}
+
+#[cfg(windows)]
+fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(original, link)
 }
 
 #[cfg(test)]

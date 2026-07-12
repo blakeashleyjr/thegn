@@ -9,7 +9,7 @@
 //! `pprof` dependency isn't compiled and [`install`] is an empty stub, so a
 //! normal build pays nothing. See `just profile` for the wrapper.
 
-#[cfg(feature = "profiling")]
+#[cfg(all(feature = "profiling", unix))]
 mod imp {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, OnceLock};
@@ -108,12 +108,13 @@ mod imp {
     }
 }
 
-#[cfg(feature = "profiling")]
+#[cfg(all(feature = "profiling", unix))]
 pub(crate) use imp::{install, poll};
 
-/// No-op stubs when the `profiling` feature is off (the default).
-#[cfg(not(feature = "profiling"))]
+/// No-op stubs when the `profiling` feature is off (the default) or the
+/// platform has no SIGUSR2 (Windows).
+#[cfg(not(all(feature = "profiling", unix)))]
 pub(crate) fn install() {}
-#[cfg(not(feature = "profiling"))]
+#[cfg(not(all(feature = "profiling", unix)))]
 #[inline]
 pub(crate) fn poll() {}

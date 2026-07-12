@@ -231,6 +231,21 @@ jobs:
           git config --global user.email ci@thegn.local
           git config --global user.name "thegn CI"
       - run: nix develop --command bash -lc "just build && just test"
+  windows:
+    # OPT-IN (2x minute cost): runs only via dispatch or a `[ci-windows]` commit
+    # message marker. windows-latest = GitHub-hosted x86_64 MSVC; the msvc truth
+    # gate for the native Windows port (the per-PR windows-gnu cross-*check*
+    # lives in `just check-cross`). No nix on Windows — bare rustup + cargo.
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-windows]') }}
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --locked
   # One-shot baseline generator: muse visual baselines were never committed, so
   # `e2e` can't pass until they exist. Push a commit whose message contains
   # `[gen-baselines]` to (re)generate them in the CI env where `e2e` checks
