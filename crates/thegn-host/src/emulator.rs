@@ -85,6 +85,13 @@ pub trait PaneEmulator: Send {
     fn size(&self) -> (u16, u16);
     /// Cell at `(row, col)`, or `None` if out of range.
     fn cell(&self, row: u16, col: u16) -> Option<GridCell>;
+    /// Read a cell by absolute grid line (alacritty `Line`: 0 = top of the live
+    /// screen, negative = scrollback history), independent of the current
+    /// viewport. Copy-mode uses this so a selection can span rows that have
+    /// scrolled off screen. Default `None` for emulators without scrollback.
+    fn cell_abs(&self, _line: i32, _col: u16) -> Option<GridCell> {
+        None
+    }
     /// Borrowing view of the cell at `(row, col)` — the allocation-free path the
     /// compositor uses. Defaults to `None`; emulators that can expose the glyph
     /// as a borrow override it (the compositor falls back to [`Self::cell`] when
@@ -289,6 +296,23 @@ impl PaneEmulator for AlacrittyEmulator {
             alacritty_terminal::index::Column(col as usize),
         );
         Some(conv_cell(&term.grid()[point]))
+    }
+
+    fn cell_abs(&self, line: i32, col: u16) -> Option<GridCell> {
+        let term = self.term.lock();
+        let grid = term.grid();
+        let (cols, screen, total) = (grid.columns(), grid.screen_lines(), grid.total_lines());
+        let history = total.saturating_sub(screen); // == grid.history_size()
+        // Valid Line range is -(history) ..= screen-1. Out-of-range indexing into
+        // alacritty's ring storage silently returns the WRONG row, so guard first.
+        if col as usize >= cols || line < -(history as i32) || line > screen as i32 - 1 {
+            return None;
+        }
+        let point = alacritty_terminal::index::Point::new(
+            alacritty_terminal::index::Line(line),
+            alacritty_terminal::index::Column(col as usize),
+        );
+        Some(conv_cell(&grid[point]))
     }
 
     fn grid_snapshot(&self) -> Option<Vec<Vec<GridCell>>> {
