@@ -3,9 +3,10 @@
 //!
 //! One daemon per state dir (`$XDG_STATE_HOME/thegn`) — the DB, session
 //! table, and worktree registry are all per-state-dir, so `just start` /
-//! smoke-test isolation gets an isolated daemon for free. **The unix socket is
-//! the lock**: whoever binds it is the daemon; a second instance exits 0 and
-//! the racing client just connects to the winner.
+//! smoke-test isolation gets an isolated daemon for free. **The IPC endpoint
+//! is the lock** (unix socket / Windows named pipe — `thegn_svc::ipc`):
+//! whoever binds it is the daemon; a second instance exits 0 and the racing
+//! client just connects to the winner.
 //!
 //! All timers here (heartbeat, lease reaper, idle-exit) are daemon-process
 //! tokio tasks — the compositor's 0%-idle event-loop contract binds the UI
@@ -100,18 +101,6 @@ pub(crate) fn serve_blocking(cfg: &Config, opts: ServeOpts) -> Result<()> {
     rt.block_on(run(cfg, None, Some(opts)))
 }
 
-/// Phase-1 Windows stub: the daemon's IPC + single-instance lock are a unix
-/// socket today; the named-pipe port (IpcListener seam) replaces this stub.
-#[cfg(not(unix))]
-async fn run(
-    _cfg: &Config,
-    _socket_override: Option<PathBuf>,
-    _serve: Option<ServeOpts>,
-) -> Result<()> {
-    anyhow::bail!("thegn daemon is not yet supported on Windows (unix-socket IPC)")
-}
-
-#[cfg(unix)]
 async fn run(
     cfg: &Config,
     socket_override: Option<PathBuf>,
@@ -133,27 +122,20 @@ async fn run(
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent).ok();
     }
+    let ep = thegn_svc::ipc::IpcEndpoint::for_socket_path(&sock);
 
-    // The socket is the lock. A connectable socket ⇒ a live daemon ⇒ exit 0
-    // (the spawn race's loser); a stale file (bind would fail) is unlinked.
-    if sock.exists() {
-        match tokio::net::UnixStream::connect(&sock).await {
-            Ok(_) => {
-                tracing::info!(target: "thegn::daemon", "daemon already running on {}", sock.display());
-                return Ok(());
-            }
-            Err(_) => {
-                let _ = std::fs::remove_file(&sock);
-            }
-        }
-    }
-    let listener = match tokio::net::UnixListener::bind(&sock) {
-        Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            tracing::info!(target: "thegn::daemon", "lost the daemon bind race; exiting");
+    // The endpoint is the lock (unix socket / Windows named pipe — see
+    // `thegn_svc::ipc`). A connectable endpoint ⇒ a live daemon ⇒ exit 0
+    // (the spawn race's loser); a stale socket file is unlinked in the seam.
+    let listener = match thegn_svc::ipc::IpcListener::bind_exclusive(&ep)
+        .await
+        .with_context(|| format!("bind {}", ep.display()))?
+    {
+        thegn_svc::ipc::BindOutcome::Bound(l) => l,
+        thegn_svc::ipc::BindOutcome::AlreadyRunning => {
+            tracing::info!(target: "thegn::daemon", "daemon already running on {}", ep.display());
             return Ok(());
         }
-        Err(e) => return Err(e).with_context(|| format!("bind {}", sock.display())),
     };
 
     let db: service::SharedDb = Arc::new(Mutex::new(Db::open()?));
@@ -178,7 +160,9 @@ async fn run(
             daemon_id: daemon_id.clone(),
             pid: std::process::id() as i64,
             scope: scope.clone(),
-            endpoint: sock.to_string_lossy().into_owned(),
+            // The endpoint's stable string form: the socket path on unix, the
+            // `\\.\pipe\…` name on Windows. Discovery classifies by prefix.
+            endpoint: ep.display(),
             tcp_addr: None,
             hostname: hostname(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -303,7 +287,7 @@ async fn run(
         }
     }
 
-    tracing::info!(target: "thegn::daemon", %daemon_id, "pane daemon serving on {}", sock.display());
+    tracing::info!(target: "thegn::daemon", %daemon_id, "pane daemon serving on {}", ep.display());
     let shutdown_wait = shutdown.clone();
     let serve = axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown_wait.notified().await });
@@ -316,11 +300,12 @@ async fn run(
         let _ = db.clear_daemon_leases(&daemon_id);
         let _ = db.del_daemon(&daemon_id);
     }
+    // best-effort: unlink the unix socket file; on Windows `sock` is only the
+    // pipe-name seed (no fs entry), so this is a harmless no-op failure.
     let _ = std::fs::remove_file(&sock);
     result.context("daemon serve")
 }
 
-#[cfg(unix)]
 fn pid_alive(pid: i64) -> bool {
     crate::platform::pid_alive(pid)
 }

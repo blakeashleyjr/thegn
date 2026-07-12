@@ -82,18 +82,12 @@ impl ControlClient {
     /// from the server's `{"error": …}` envelope.
     async fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
         let (status, value) = match &self.addr {
-            #[cfg(unix)]
             ControlAddr::Unix(sock) => {
-                let stream = tokio::net::UnixStream::connect(sock)
+                let ep = crate::ipc::IpcEndpoint::for_socket_path(sock);
+                let stream = crate::ipc::connect(&ep)
                     .await
-                    .with_context(|| format!("connect control socket {}", sock.display()))?;
+                    .with_context(|| format!("connect control endpoint {}", ep.display()))?;
                 send_request(stream, method, path, self.token(), body).await?
-            }
-            // Phase-1 Windows stub: named-pipe transport lands with the daemon
-            // IPC port (see plan); until then local control is unix-only.
-            #[cfg(not(unix))]
-            ControlAddr::Unix(_) => {
-                anyhow::bail!("thegn daemon IPC is not yet supported on Windows")
             }
             ControlAddr::Tcp { addr, .. } => {
                 let stream = tokio::net::TcpStream::connect(addr)
@@ -259,20 +253,15 @@ impl ControlClient {
         let req = req.body(()).context("build attach request")?;
 
         let ws = match &self.addr {
-            #[cfg(unix)]
             ControlAddr::Unix(sock) => {
-                let stream = tokio::net::UnixStream::connect(sock)
+                let ep = crate::ipc::IpcEndpoint::for_socket_path(sock);
+                let stream = crate::ipc::connect(&ep)
                     .await
-                    .with_context(|| format!("connect control socket {}", sock.display()))?;
+                    .with_context(|| format!("connect control endpoint {}", ep.display()))?;
                 let (ws, _) = tokio_tungstenite::client_async(req, stream)
                     .await
                     .context("attach websocket handshake")?;
-                WsEither::Unix(ws)
-            }
-            // Phase-1 Windows stub — see `request()`.
-            #[cfg(not(unix))]
-            ControlAddr::Unix(_) => {
-                anyhow::bail!("thegn daemon IPC is not yet supported on Windows")
+                WsEither::Ipc(ws)
             }
             ControlAddr::Tcp { addr, .. } => {
                 let stream = tokio::net::TcpStream::connect(addr)
@@ -299,8 +288,8 @@ type Ws<S> = tokio_tungstenite::WebSocketStream<S>;
 
 /// The two attach transports, unified for the pump.
 enum WsEither {
-    #[cfg(unix)]
-    Unix(Ws<tokio::net::UnixStream>),
+    /// Local daemon IPC (unix socket / Windows named pipe).
+    Ipc(Ws<crate::ipc::IpcStream>),
     Tcp(Ws<tokio::net::TcpStream>),
 }
 
@@ -310,8 +299,7 @@ async fn pump_attach_ws(
     ctrl: tokio_mpsc::Receiver<AttachControl>,
 ) {
     match ws {
-        #[cfg(unix)]
-        WsEither::Unix(ws) => pump_attach_inner(ws, frames, ctrl).await,
+        WsEither::Ipc(ws) => pump_attach_inner(ws, frames, ctrl).await,
         WsEither::Tcp(ws) => pump_attach_inner(ws, frames, ctrl).await,
     }
 }

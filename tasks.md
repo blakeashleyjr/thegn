@@ -1476,7 +1476,7 @@ _The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 fo
 - [ ] 732. Standardized paths — migrate from Unix `$XDG_STATE_HOME` to `directories` crate resolving to `%LOCALAPPDATA%\thegn` (util.rs already branches USERPROFILE/APPDATA/LOCALAPPDATA)
 - [ ] 733. Signals mapping — map Unix profiling triggers (`SIGUSR2`) to internal keymaps or named events for Windows flame-graphs
 - [ ] 734. PowerShell / NuShell defaults — default pane spawning to native Windows shells over `cmd.exe` (`util::shell()` resolves pwsh → powershell → COMSPEC; dialect via `shellinv`)
-- [ ] 735. Daemon IPC + relay on named pipes — `IpcEndpoint`/`IpcListener` seam in thegn-svc, single-instance via `first_pipe_instance`, remote attach from Windows (phase 2)
+- [x] 735. Daemon IPC on named pipes — `IpcEndpoint`/`IpcListener` seam in thegn-svc (`ipc.rs`), single-instance via `first_pipe_instance`, control client + daemon rewired, real-pipe tests in the windows CI job; sealed-sandbox relay stays unix-only by design (openspec: `add-windows-daemon-ipc`)
 - [ ] 736. Compositor validation on Windows Terminal — waker/ConPTY/termcaps/path-separator sweep + CONTRIBUTING "Windows (native)" dev loop (phase 4)
 
 ### AI-free mode (audience-widener)
