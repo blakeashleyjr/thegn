@@ -95,15 +95,15 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows
 }
 
-/// The semantic-impact footer row plus, when expanded, its per-file / per-entity
-/// breakdown. The collapsed line is rebuilt from the structured per-file entity
-/// data (rather than the pre-baked `impact.summary` string) so it carries a clear
-/// `semantic` label and clips cleanly to the panel width instead of mid-word.
-fn impact_footer(data: &crate::panel::PanelData, ui: &PanelUi, cols: usize) -> Vec<PanelRow> {
-    let Some(entities) = data.entities.as_ref() else {
-        return Vec::new();
-    };
-    let mut rows: Vec<PanelRow> = Vec::new();
+/// The one-line semantic-impact summary: the `◈ semantic` label, the intra-diff
+/// entity churn counts, and — when the persisted graph knows callers and the line
+/// is wide enough — the blast-radius tail (fan-out + untested surface + risk band).
+/// Shared by the accordion footer (Normal/Half) and the full-screen git frame so
+/// both render an identical summary from the same structured data.
+pub(crate) fn impact_summary_segs(
+    entities: &thegn_core::semantic::EntitySummary,
+    cols: usize,
+) -> Vec<Seg> {
     let mut line = vec![seg(hue(Hue::Purple), "◈ "), seg(f(), "semantic")];
     line.extend(impact_counts_segs(&entities.per_file, cols));
     // Blast-radius tail (items 313/316): the inter-entity fan-out + untested
@@ -130,6 +130,19 @@ fn impact_footer(data: &crate::panel::PanelData, ui: &PanelUi, cols: usize) -> V
         line.push(seg(f(), " · risk:"));
         line.push(seg(risk_tok, br.risk.as_str()));
     }
+    line
+}
+
+/// The semantic-impact footer row plus, when expanded, its per-file / per-entity
+/// breakdown. The collapsed line is rebuilt from the structured per-file entity
+/// data (rather than the pre-baked `impact.summary` string) so it carries a clear
+/// `semantic` label and clips cleanly to the panel width instead of mid-word.
+fn impact_footer(data: &crate::panel::PanelData, ui: &PanelUi, cols: usize) -> Vec<PanelRow> {
+    let Some(entities) = data.entities.as_ref() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<PanelRow> = Vec::new();
+    let line = impact_summary_segs(entities, cols);
     let mut footer = PanelRow::plain(Line::segs(line))
         .with_hit(PanelHit::Row(Section::Changes, data.changes.len()));
     if ui.impact_open {

@@ -1022,6 +1022,28 @@ pub fn git_key(key: &KeyCode, mods: Modifiers, ui: &crate::panel::PanelUi) -> Op
     }
 }
 
+/// [`git_key`], but the Changes section's semantic-impact footer and its expanded
+/// entity rows (cursor at or past the file-row count) are NOT git file rows —
+/// suppress the git claim there so Enter/activation falls through to the accordion
+/// `Select` (which toggles the breakdown / drills into the entity), matching a
+/// mouse click. `chg` = short for `changes`, kept terse so the single call site in
+/// the size-ratcheted `run.rs` stays one line under `max_width`.
+///
+/// When the cursor sits at or past the file-row count in Changes, the only rows are
+/// the footer + entity rows, which the renderer emits solely when `entities.is_some()`,
+/// so the row-count check alone identifies them.
+pub fn git_key_chg(
+    key: &KeyCode,
+    mods: Modifiers,
+    ui: &crate::panel::PanelUi,
+    model: &crate::chrome::FrameModel,
+) -> Option<GitMsg> {
+    if ui.open == crate::panel::Section::Changes && ui.cursor >= model.panel.changes.len() {
+        return None;
+    }
+    git_key(key, mods, ui)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,6 +1105,52 @@ mod tests {
         assert_eq!(
             git_key(&KeyCode::Char(' '), none, &ui_at(GitView::Stash, full)),
             Some(GitMsg::StashApply)
+        );
+    }
+
+    #[test]
+    fn changes_semantic_rows_release_enter_to_the_accordion() {
+        use crate::chrome::FrameModel;
+        use crate::panel::{ChangeRow, PanelData, Stage};
+        let none = Modifiers::NONE;
+        let change = |name: &str| ChangeRow {
+            status: "M".into(),
+            stage: Stage::Unstaged,
+            dir: String::new(),
+            name: name.into(),
+            path: name.into(),
+            added: 1,
+            deleted: 0,
+            incoming: false,
+        };
+        let model = FrameModel {
+            panel: PanelData {
+                changes: vec![change("a.rs"), change("b.rs")],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut ui = ui_at(GitView::Files, PanelWidth::Half);
+        ui.open = Section::Changes;
+        // On a file row (cursor < 2) Enter still drills into staging.
+        ui.cursor = 1;
+        assert_eq!(
+            git_key_chg(&KeyCode::Enter, none, &ui, &model),
+            Some(GitMsg::Drill)
+        );
+        // On the semantic footer (cursor == 2) and entity rows (> 2) the git
+        // claim is released so the accordion `Select` toggles the breakdown /
+        // drills the entity, matching a mouse click.
+        ui.cursor = 2;
+        assert_eq!(git_key_chg(&KeyCode::Enter, none, &ui, &model), None);
+        assert_eq!(git_key_chg(&KeyCode::Char(' '), none, &ui, &model), None);
+        ui.cursor = 3;
+        assert_eq!(git_key_chg(&KeyCode::Enter, none, &ui, &model), None);
+        // A non-Changes git list is unaffected: the wrapper defers to `git_key`.
+        let commits = ui_at(GitView::Commits, PanelWidth::Half);
+        assert_eq!(
+            git_key_chg(&KeyCode::Enter, none, &commits, &model),
+            git_key(&KeyCode::Enter, none, &commits)
         );
     }
 
