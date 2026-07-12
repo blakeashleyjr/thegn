@@ -2662,20 +2662,7 @@ impl Default for SandboxConfig {
             backend: SandboxBackend::Auto,
             default_backend: SandboxBackend::Auto,
             default_env: String::new(),
-            backend_chain: [
-                "podman-rootless",
-                "podman-rootful",
-                "docker",
-                "bwrap",
-                // Native Windows: kill-on-close Job Object scoping (the OCI
-                // entries above decline there — Linux containers can't mount
-                // the worktree at its real path). Probes Absent elsewhere.
-                "jobobject",
-                "host",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+            backend_chain: crate::config_defaults::default_backend_chain(),
             image: String::new(),
             profile: SandboxProfile::Hardened,
             agent_profile: SandboxProfile::Sealed,
