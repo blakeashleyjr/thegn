@@ -24,12 +24,15 @@ pub(crate) fn begin_worktree_wizard(
     create_gen: &mut u64,
     create_tx: &tokio_mpsc::UnboundedSender<wizard::CreateEvent>,
     waker: &TerminalWaker,
-    creating: &mut Option<wizard::CreationProgress>,
+    inflight: &mut crate::handlers::creating::InFlight,
     wizard_cmd_tx: &mut Option<std::sync::mpsc::Sender<wizard::WizardCmd>>,
     wizard_ui: &mut Option<wizard::NewWorktreeWizard>,
     model: &mut FrameModel,
 ) {
-    if wizard_ui.is_some() || creating.is_some() {
+    // Only the modal wizard form is single-flight — a committed background
+    // creation (its slow remote sandbox provisioning) no longer blocks opening
+    // a new wizard, so worktree creation is concurrent.
+    if wizard_ui.is_some() {
         model.status = "worktree creation already in progress".into();
         return;
     }
@@ -62,7 +65,10 @@ pub(crate) fn begin_worktree_wizard(
             let _ = wk.wake();
         });
     });
-    *creating = Some(wizard::CreationProgress::new(w.candidate()));
+    inflight
+        .progress
+        .insert(*create_gen, wizard::CreationProgress::new(w.candidate()));
+    inflight.wizard_gen = Some(*create_gen);
     *wizard_cmd_tx = Some(cmd_tx);
     *wizard_ui = Some(w);
 }
@@ -78,8 +84,7 @@ pub(crate) fn leave_for_setup(
     cfg: &thegn_core::config::Config,
     wizard_cmd_tx: &mut Option<std::sync::mpsc::Sender<wizard::WizardCmd>>,
     wizard_ui: &mut Option<wizard::NewWorktreeWizard>,
-    creating: &mut Option<wizard::CreationProgress>,
-    create_gen: &mut u64,
+    inflight: &mut crate::handlers::creating::InFlight,
     host_input: &mut Option<(crate::menu::InputOverlay, crate::run::HostInputKind)>,
     env_wizard_ui: &mut Option<crate::env_wizard::EnvWizard>,
     model: &mut FrameModel,
@@ -89,8 +94,11 @@ pub(crate) fn leave_for_setup(
         let _ = tx.send(wizard::WizardCmd::Cancel);
     }
     *wizard_ui = None;
-    *creating = None;
-    *create_gen += 1;
+    // Drop only THIS wizard's speculative creation; committed background
+    // creations keep their own generation and run to completion.
+    if let Some(g) = inflight.wizard_gen.take() {
+        inflight.progress.remove(&g);
+    }
     match outcome {
         wizard::WizardOutcome::AddHost => {
             let Some(repo_root) = root else { return };
