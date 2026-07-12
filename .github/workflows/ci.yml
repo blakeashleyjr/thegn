@@ -246,6 +246,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --locked
+      # Named-pipe IPC round-trip + bind-lock semantics (cfg(windows) tests) —
+      # the real-pipe truth gate for the daemon IPC seam. Scoped to the ipc
+      # module until the full suite is validated on Windows (phase 4/6).
+      - run: cargo test -p thegn-svc --lib --locked ipc
   # One-shot baseline generator: muse visual baselines were never committed, so
   # `e2e` can't pass until they exist. Push a commit whose message contains
   # `[gen-baselines]` to (re)generate them in the CI env where `e2e` checks
