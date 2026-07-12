@@ -727,7 +727,11 @@ impl PtyPane {
     /// Build a `Stream` pane around a ready control channel, for tests that drive
     /// the relay directly (no provider/socket).
     #[cfg(test)]
-    fn test_stream(control: tokio_mpsc::Sender<ExecControl>, rows: u16, cols: u16) -> Self {
+    pub(crate) fn test_stream(
+        control: tokio_mpsc::Sender<ExecControl>,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
         Self {
             io: PaneIo::Stream {
                 control,

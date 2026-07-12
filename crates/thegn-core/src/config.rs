@@ -1514,6 +1514,12 @@ pub struct SessionConfig {
     pub restore_grace_secs: u64,
     /// Whether creating a worktree (Alt+w) jumps to its new tab vs. background.
     pub focus_on_create: bool,
+    /// Max **parked** workspaces kept resident (panes alive) for instant
+    /// switch-back, beyond the active one. Past this the least-recently-used
+    /// parked workspace is evicted and its panes reaped (it re-resurrects on the
+    /// next visit), bounding PTY fd/thread growth over a long multi-workspace
+    /// session. `0` = no pooling (reap on every switch); default is generous.
+    pub resident_pool_limit: usize,
 }
 
 impl Default for SessionConfig {
@@ -1522,6 +1528,7 @@ impl Default for SessionConfig {
             scrollback_lines: 500,
             restore_grace_secs: 600,
             focus_on_create: true,
+            resident_pool_limit: 16,
         }
     }
 }
