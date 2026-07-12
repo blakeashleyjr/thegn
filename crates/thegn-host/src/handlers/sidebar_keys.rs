@@ -143,7 +143,7 @@ impl SidebarState {
 
     /// Whether the cursor row lives in the TERMINALS region (the banner, a host
     /// group, a terminal leaf, or the empty hint).
-    fn cursor_in_terminals(&self, model: &FrameModel) -> bool {
+    pub(crate) fn cursor_in_terminals(&self, model: &FrameModel) -> bool {
         self.selected_row(model)
             .map(|r| r.workspace_slug == "terminals" || r.workspace_slug.starts_with("terminals/"))
             .unwrap_or(false)
