@@ -353,7 +353,7 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 - [ ] 4. ~~Daemon↔plugin IPC~~ — **N/A after strip**: no separate plugin process; the future native plugin API contract lives in `core/plugin_api.rs` (unwired)
 - [x] 5. Single-binary distribution — one `thegn`(=`thegn`); no side artifacts
 - [~] 6. One core, many front doors — TUI (host) + CLI verbs share `thegn-core`; API/MCP still aspirational (AK/AL) _(CLI surface v2 — `wt`/`repo` namespaces, headless `wt new`/`rm`, blanket `--json`, grouped help, completions, `open` remote control: `openspec/changes/add-cli-namespaces-and-remote-open/`)_
-- [ ] 7. Headless daemon — UI attaches/detaches _(not yet; host is a foreground compositor, state resurrects from SQLite)_
+- [x] 7. Headless daemon — UI attaches/detaches _(pane daemon: `thegn daemon` owns PTYs behind the control socket; DEFAULT-ON — quit detaches, bare `thegn` warm-reattaches; `openspec/specs/control-plane`)_
 - [ ] 8. Daemon supervision — crash recovery _(state resurrection only; no supervisor)_
 - [x] 9. Internal event bus — normalized events _(first-class `EventBus` in `thegn-core`: subscribe/publish, urgency ranking, desktop-notification derivation)_
 - [x] 10. Embedded state store — sqlite
@@ -522,7 +522,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 
 ### I. Session persistence
 
-- [x] 111. Detach/attach
+- [x] 111. Detach/attach _(daemon-backed default: quit detaches center panes; explicit close kills; palette Detach / Quit-and-kill)_
 - [x] 112. Resurrection after reboot
 - [x] 113. Restore tree + layouts + pins
 - [x] 114. Per-session snapshots _(`session.rs` `persist()` → v6 `tab_groups`/`session_state`)_
@@ -531,7 +531,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [ ] 117. Restore agent state where possible
 - [x] 118. Session list/switcher _(palette + sidebar over persisted worktrees/tabs)_
 - [ ] 119. Export/import session config
-- [ ] 120. Background keep-alive
+- [x] 120. Background keep-alive _(never-reap relay leases by default — `lease_grace_secs = 0`; detached sessions live until killed)_
 
 ### J. Remote access
 

@@ -8,6 +8,7 @@ pub(crate) mod attention;
 pub(crate) mod close;
 pub(crate) mod crash;
 pub(crate) mod creating;
+pub(crate) mod daemon_lifecycle;
 pub(crate) mod host;
 pub(crate) mod host_heal;
 pub(crate) mod materialize;

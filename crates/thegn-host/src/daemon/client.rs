@@ -25,10 +25,11 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Find a live daemon for this state dir, or spawn one detached and wait for
-/// its socket. The registry row is a hint; a successful `/health` round-trip
-/// is the truth.
-pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> {
+/// Find a live daemon for this state dir WITHOUT spawning one: registry
+/// discovery, then a probe of the configured socket. `None` = no daemon is
+/// running (so there is nothing to kill/list — callers must not spawn one as
+/// a side effect).
+pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient> {
     let scope = super::scope_key();
     // 1. Registry discovery (freshest live heartbeat), verified by connect.
     let discovered = tokio::task::spawn_blocking({
@@ -44,17 +45,29 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     if let Some(addr) = discovered {
         let client = ControlClient::new(addr);
         if client.health().await.is_ok() {
-            return Ok(client);
+            return Some(client);
         }
     }
 
     // 2. The configured socket may host a daemon the registry missed (e.g. a
-    //    fresh DB): probe it before spawning.
+    //    fresh DB): probe it before giving up.
     let sock = super::socket_path(dcfg);
-    let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
+    let client = ControlClient::new(ControlAddr::Unix(sock));
     if client.health().await.is_ok() {
+        return Some(client);
+    }
+    None
+}
+
+/// Find a live daemon for this state dir, or spawn one detached and wait for
+/// its socket. The registry row is a hint; a successful `/health` round-trip
+/// is the truth.
+pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> {
+    if let Some(client) = connect_daemon(dcfg).await {
         return Ok(client);
     }
+    let sock = super::socket_path(dcfg);
+    let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
 
     // 3. Spawn detached (own process group, null stdio — the compositor must
     //    not adopt the daemon on its tty) and wait for the socket. The daemon
@@ -111,6 +124,16 @@ impl DaemonSource {
     }
 }
 
+impl DaemonSource {
+    /// The session's PTY child pid from the daemon's listing. One extra local
+    /// HTTP round-trip per (re)connect — attach/open are rare, and the pid is
+    /// what makes `/proc`-based cwd/cmd capture work for daemon panes.
+    async fn lookup_pid(&self, session: &str) -> Option<u32> {
+        let sessions = self.client.sessions().await.ok()?;
+        sessions.iter().find(|s| s.id == session)?.pid
+    }
+}
+
 impl ExecSource for DaemonSource {
     fn open<'a>(&'a self, spec: &'a ExecSpec) -> BoxFuture<'a, Result<ExecSession>> {
         Box::pin(self.open_and_attach(spec))
@@ -123,6 +146,14 @@ impl ExecSource for DaemonSource {
         rows: u16,
     ) -> BoxFuture<'a, Result<ExecSession>> {
         Box::pin(self.attach_session(session, cols, rows))
+    }
+
+    fn kill_session<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(self.client.kill(session))
+    }
+
+    fn session_pid<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(self.lookup_pid(session))
     }
 }
 
@@ -222,5 +253,13 @@ impl ExecSource for LazyDaemonSource {
                 .attach_session(session, cols, rows)
                 .await
         })
+    }
+
+    fn kill_session<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.source().await?.client.kill(session).await })
+    }
+
+    fn session_pid<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async move { self.source().await.ok()?.lookup_pid(session).await })
     }
 }

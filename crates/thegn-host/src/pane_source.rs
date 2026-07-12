@@ -31,6 +31,20 @@ pub(crate) trait ExecSource: Send + Sync {
     /// Health feedback after an open/attach outcome (e.g. flips `exec=auto`
     /// panes to the CLI fallback during a cooldown). Default: no-op.
     fn report_health(&self, _ok: bool) {}
+    /// Kill a persisted session server-side. The relay fires this on pane drop
+    /// when the pane was NOT marked detached — an explicitly closed pane must
+    /// not leak a live process into a relay lease. Default: no-op (provider
+    /// panes keep their own lifecycle semantics).
+    fn kill_session<'a>(&'a self, _session: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    /// The session's PTY child pid on the *local* host, when the source can
+    /// know it (the pane daemon). A same-host pid lets persist-time
+    /// cwd/foreground-command capture work for daemon panes. Default: `None`
+    /// (remote/provider sessions have no host-meaningful pid).
+    fn session_pid<'a>(&'a self, _session: &'a str) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async { None })
+    }
 }
 
 /// The managed-sandbox case: a [`Provider`] + sandbox id.

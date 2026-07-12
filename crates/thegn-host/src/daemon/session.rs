@@ -77,6 +77,9 @@ pub(crate) struct SessionMeta {
     pub program: String,
     pub cwd: Option<String>,
     pub created_at_ms: i64,
+    /// The PTY child's pid, exposed in listings so a same-host compositor can
+    /// capture the pane's live cwd/foreground command from `/proc`.
+    pub pid: Option<u32>,
 }
 
 impl SessionMeta {
@@ -91,6 +94,7 @@ impl SessionMeta {
             created_at_ms: self.created_at_ms,
             attached_clients: live.attached,
             lease_expires_at,
+            pid: self.pid,
         }
     }
 }
@@ -176,6 +180,8 @@ impl SessionActor {
                 ev = pane_rx.recv() => match ev {
                     Some(PaneEvent::Output(_, bytes)) => self.on_output(&bytes),
                     Some(PaneEvent::Exit(_, code)) => break code,
+                    // Compositor-relay-only event; a PTY reader never emits it.
+                    Some(PaneEvent::SessionFallback(_)) => {}
                     None => break None, // reader thread gone without an Exit
                 },
                 msg = msg_rx.recv() => match msg {
@@ -439,6 +445,7 @@ mod tests {
             program: "sh".into(),
             cwd: None,
             created_at_ms: 0,
+            pid: None,
         }
     }
 
