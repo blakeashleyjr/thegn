@@ -47,6 +47,11 @@ pub struct UiConfig {
     pub sidebar_workspace_sort: WorkspaceSort,
     /// Sidebar TERMINALS section visibility (see [`TerminalsSection`]).
     pub sidebar_terminals_section: TerminalsSection,
+    /// In full-window pane fullscreen (the third stop of Ctrl+Alt+z, which
+    /// hides the sidebar/panel/strip), keep the top masthead bar visible.
+    pub fullscreen_keep_masthead: bool,
+    /// In full-window pane fullscreen, keep the bottom status bar visible.
+    pub fullscreen_keep_statusbar: bool,
 }
 
 impl Default for UiConfig {
@@ -58,6 +63,8 @@ impl Default for UiConfig {
             dismiss_overlay_on_click_outside: true,
             sidebar_workspace_sort: WorkspaceSort::default(),
             sidebar_terminals_section: TerminalsSection::default(),
+            fullscreen_keep_masthead: true,
+            fullscreen_keep_statusbar: true,
         }
     }
 }
@@ -111,5 +118,26 @@ mod tests {
         let cfg: UiConfig = toml::from_str("").unwrap();
         assert!(cfg.confirm_delete_workspace);
         assert_eq!(cfg.language, "auto");
+    }
+
+    #[test]
+    fn fullscreen_bar_keys_default_on_and_parse() {
+        // Both bars are kept by default (matches the "except top and bottom
+        // bars" contract) and survive an empty table.
+        let cfg = UiConfig::default();
+        assert!(cfg.fullscreen_keep_masthead);
+        assert!(cfg.fullscreen_keep_statusbar);
+        let cfg: UiConfig = toml::from_str("").unwrap();
+        assert!(cfg.fullscreen_keep_masthead);
+        assert!(cfg.fullscreen_keep_statusbar);
+        // Either bar can be turned off independently.
+        let cfg: UiConfig =
+            toml::from_str("fullscreen_keep_masthead = false\nfullscreen_keep_statusbar = false")
+                .unwrap();
+        assert!(!cfg.fullscreen_keep_masthead);
+        assert!(!cfg.fullscreen_keep_statusbar);
+        let cfg: UiConfig = toml::from_str("fullscreen_keep_masthead = false").unwrap();
+        assert!(!cfg.fullscreen_keep_masthead);
+        assert!(cfg.fullscreen_keep_statusbar);
     }
 }
