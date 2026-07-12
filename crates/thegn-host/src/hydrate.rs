@@ -61,8 +61,8 @@ pub(crate) type GlyphRow = (bool, usize, usize, Option<String>, String);
 /// threading through `spawn_model_hydration`'s ~dozen call sites. The `Mutex`
 /// covers the (rare) case of overlapping hydrations; it's just a cache, so a
 /// racing miss only costs a redundant scan.
-fn glyph_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (GlyphRow, Instant)>>
-{
+pub(crate) fn glyph_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, (GlyphRow, Instant)>> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, (GlyphRow, Instant)>>,
     > = std::sync::OnceLock::new();
@@ -851,6 +851,12 @@ fn collect_sidebar_status(
         .map(|g| g.path.clone())
         .filter(|p| seen.insert(p.clone()) && std::path::Path::new(p).is_dir())
         .collect();
+    // All registered worktree paths (every workspace): the retain + seed passes
+    // below use them to keep/serve other workspaces' glyphs across a switch.
+    let all_wt_paths: Vec<String> = db
+        .worktrees()
+        .map(|r| r.into_iter().map(|w| w.worktree).filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
 
     // Partition into paths that must be rescanned now vs. served from cache.
     let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
@@ -951,7 +957,11 @@ fn collect_sidebar_status(
                 let _ = db.put_glyph_cache(p, &serde_json::to_string(row).unwrap_or_default());
             }
         }
-        cache.retain(|k, _| paths.iter().any(|p| p == k));
+        // Keep every registered worktree's glyph resident, not just the active
+        // session's — the DB copy is only re-read at start, so a session-scoped
+        // retain would evict (and blank on switch) other workspaces. Dead rows
+        // still get pruned.
+        cache.retain(|k, _| paths.iter().any(|p| p == k) || all_wt_paths.iter().any(|p| p == k));
     }
 
     let scanned_n = scanned.len();
@@ -987,6 +997,10 @@ fn collect_sidebar_status(
             status.pr_counts.insert(path.clone(), n);
         }
     }
+    // Serve other workspaces' last-known glyphs from cache (never scanning, never
+    // wakes a sandbox) so a switch shows them instantly instead of blank.
+    crate::glyph_refresh::seed_from_global_cache(&mut status.git, all_wt_paths.iter().cloned());
+
     // Attention scores + hysteresis-stable ranks (pure DB/snapshot reads; the
     // branching lives in core). After the git pass so `dirty` is fresh.
     crate::attention_status::collect_attention(session, db, &mut status);
@@ -1079,6 +1093,9 @@ pub(crate) struct HydrateHints {
     pub expanded: bool,
     /// Active profile slug for per-profile container naming (empty = default).
     pub profile: String,
+    /// Pre-warm the active worktree's `git log` commit cache on a switch even
+    /// with the Commits section closed, so opening it is instant. Off the ticker.
+    pub warm_commits: bool,
 }
 
 impl HydrateHints {
@@ -1769,19 +1786,23 @@ pub(crate) fn spawn_model_hydration(
             let _g = crate::perf::measure(crate::perf::Subsys::Hydrate);
             build_model(&session, &db, hints.clone())
         };
-        let refresh_commits = first.panel.commits_loading;
+        // `commits_loading` = the open Commits section needs a fresh list;
+        // `warm_commits` (set on a switch) also pre-warms a *closed* section.
+        let show_commits = first.panel.commits_loading;
+        let warm = hints.warm_commits;
         if tx.send((generation, first)).is_ok()
             && let Some(w) = &waker
         {
             let _ = w.wake();
         }
 
-        // `git log` can be expensive on large repos. Run it only after the
-        // cache-backed model has already landed, then send a second model from
-        // the refreshed cache. Generation tagging in the event loop drops this
-        // safely if the user switched worktrees meanwhile.
-        if refresh_commits
+        // `git log` can be expensive; run it only after the cache-backed model
+        // landed. Resend a refreshed model only when the list is on screen; a
+        // closed-section warm just leaves the DB cache fresh for the next open.
+        // Generation tagging drops the resend if the user switched meanwhile.
+        if (show_commits || warm)
             && refresh_commit_cache(&db, &session)
+            && show_commits
             && tx
                 .send((generation, build_model(&session, &db, hints)))
                 .is_ok()

@@ -50,6 +50,7 @@ mod frame_write;
 mod frame_writer;
 mod git_watch;
 mod gitmut;
+mod glyph_refresh;
 mod graphics;
 mod handlers;
 mod hibernator;
