@@ -2035,14 +2035,7 @@ pub enum FileAccess {
     None,
 }
 
-#[derive(
-    Debug, Clone, Default, serde::Deserialize, PartialEq, Eq, serde::Serialize, schemars::JsonSchema,
-)]
-#[serde(default)]
-pub struct SandboxLimits {
-    pub cpu: Option<String>,
-    pub memory: Option<String>,
-}
+pub use crate::config_sandbox::SandboxLimits;
 
 config_enum! {
     /// `[sandbox.vpn] provider` — which overlay/tunnel a sandbox attaches to.

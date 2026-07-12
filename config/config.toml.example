@@ -1551,14 +1551,26 @@ oci_host = ""
 # [env.sprite.sandbox.home]
 # strategy = "clean"
 
-# ── Resource limits (OCI only) ────────────────────────────────────────────────
-# Cap CPU and memory for the container (Docker/Podman units).
-#   cpu    — fractional cores: "0.5" = half a core, "2" = two cores.
-#   memory — bytes with suffix: "512m", "2g".
-# Both default to unlimited when unset.
+# ── Resource limits (cross-backend) ───────────────────────────────────────────
+# Cap CPU/memory for worktree panes so heavy work (a big `cargo build`) can't
+# peg the machine. Enforced on every backend:
+#   • OCI (podman/docker) — per-container `--cpus` / `--memory`.
+#   • bwrap / systemd / none — a systemd user-scope `CPUQuota` (cgroup v2). When
+#     the host lacks cgroup `cpu` delegation, thegn falls back to a soft `nice`
+#     (priority only, not a hard cap); `thegn doctor` shows which is in effect.
+#
+#   cpu       — PER-PANE ceiling, fractional cores: "0.5" = half a core, "2" = two.
+#   memory    — per-pane memory: "512m", "2g".
+#   cpu_total — AGGREGATE ceiling across ALL panes combined, in cores. Every pane
+#               joins a shared `thegn.slice` bounded by this. Default "auto" =
+#               leave 2 cores free (ncpu − 2). Set "off" (or "") to disable, or a
+#               number ("6") for an explicit aggregate. Applied to host-toolchain
+#               backends (bwrap/systemd/none); remote/OCI aggregate is not yet
+#               wired (per-pane `cpu`/`memory` still apply remotely via OCI).
 [sandbox.limits]
-# cpu    = "2"
-# memory = "4g"
+# cpu       = "2"
+# memory    = "4g"
+# cpu_total = "auto"
 
 # ── Named volumes (OCI only) ──────────────────────────────────────────────────
 # Persistent volumes that survive container recreations.
