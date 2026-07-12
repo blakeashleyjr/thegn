@@ -1079,6 +1079,15 @@ pub(super) fn build_git_full(
     };
     out.extend(header.into_iter().take(keep));
     out.extend(status_rows(model, ui, focused));
+    // The semantic-impact summary — normally the Changes accordion footer, which
+    // the full-screen frame doesn't render — surfaced as a one-line strip under
+    // STATUS so it stays visible whichever side-list is focused.
+    if let Some(entities) = model.panel.entities.as_ref()
+        && entities.impact.is_some()
+    {
+        let segs = super::sections::changes::impact_summary_segs(entities, cols.saturating_sub(2));
+        out.push(PanelRow::plain(Line::segs(segs)));
+    }
     let body = rows.saturating_sub(out.len() + 1);
     if body > 0 {
         let side_w = SIDE_W.saturating_sub(1).min(cols.saturating_sub(2));
@@ -1339,6 +1348,33 @@ mod tests {
                 "{s:?} header hit missing"
             );
         }
+    }
+
+    #[test]
+    fn semantic_impact_summary_rides_the_full_frame() {
+        use thegn_core::semantic::{EntityChange, EntityKind, EntitySummary, Touch};
+        let mut m = model();
+        // The accordion Changes footer isn't rendered in the full frame; its
+        // one-line semantic summary is surfaced under STATUS instead.
+        m.panel.entities = Some(EntitySummary::new(vec![(
+            "src/a.rs".into(),
+            vec![EntityChange {
+                kind: EntityKind::Function,
+                name: "handle".into(),
+                added: 12,
+                deleted: 2,
+                touch: Touch::Modified,
+                start_line: 1,
+            }],
+        )]));
+        let frame = build_git_full(&m, &ui(GitView::Files), 120, 40, true);
+        let all = all_text(&frame);
+        assert!(all.contains("semantic"), "semantic summary missing:\n{all}");
+        // Absent when there's no impact data — no stray empty strip.
+        let mut clean = model();
+        clean.panel.entities = None;
+        let bare = all_text(&build_git_full(&clean, &ui(GitView::Files), 120, 40, true));
+        assert!(!bare.contains("semantic"), "unexpected summary:\n{bare}");
     }
 
     #[test]
