@@ -213,10 +213,16 @@ pub struct Mount {
     pub cache: bool,
 }
 
+/// Resolved per-pane / aggregate ceilings for a spec. See
+/// [`crate::sandbox_cpucap`] for how each field maps onto the backend argv.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxLimits {
+    /// Per-pane CPU ceiling, in cores. OCI `--cpus`; `CPUQuota` elsewhere.
     pub cpu: Option<String>,
+    /// Per-pane memory ceiling (`"512m"`, `"4g"`). `--memory` / `MemoryMax`.
     pub memory: Option<String>,
+    /// Aggregate CPU ceiling across all panes (cores). `None` = auto.
+    pub cpu_total: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -657,6 +663,7 @@ pub fn resolve_placed(
         limits: SandboxLimits {
             cpu: cfg.limits.cpu.clone(),
             memory: cfg.limits.memory.clone(),
+            cpu_total: cfg.limits.cpu_total.clone(),
         },
         volumes: cfg
             .volumes
@@ -1265,6 +1272,9 @@ pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Vec<String> {
             crate::sandbox_compose::exec_argv(&spec.name, &c, workdir.as_deref(), &script, true)
         })
         .unwrap_or_else(|| backend_enter_argv(spec, &script));
+    // Cap the pane's CPU on host-toolchain backends (no-op unless configured; see
+    // [`crate::sandbox_cpucap`]). OCI/Systemd cap inline in their backend argv.
+    let backend_argv = crate::sandbox_cpucap::wrap_pane_argv(spec, backend_argv);
     spec.placement.interactive_argv(&backend_argv)
 }
 
@@ -1458,6 +1468,8 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             if spec.network == Network::None {
                 v.extend(["-p".into(), "PrivateNetwork=yes".into()]);
             }
+            // Aggregate slice + per-pane CPU/memory ceiling (inline systemd props).
+            v.extend(crate::sandbox_cpucap::systemd_cap_args(&spec.limits));
             // Hardening (systemd unit properties). ProtectSystem=yes keeps /usr
             // & /boot read-only; ProtectHome=read-only closes the $HOME gap so a
             // sandboxed process can't `cd` out of the worktree and modify/delete
@@ -2245,7 +2257,13 @@ mod tests {
             add_capabilities: Vec::new(),
             ports: vec!["8080:8080".into()],
             gpu: None,
-            limits: SandboxLimits::default(),
+            // Disable CPU capping so argv-shape assertions are host-independent
+            // (the aggregate cap is on-by-default and would scope-wrap on a host
+            // with cgroup delegation); capping itself is tested in sandbox_cpucap.
+            limits: SandboxLimits {
+                cpu_total: Some("off".into()),
+                ..SandboxLimits::default()
+            },
             volumes: vec![],
             compose: None,
             build: None,
@@ -2479,6 +2497,7 @@ mod tests {
         s.limits = SandboxLimits {
             cpu: Some("2".into()),
             memory: Some("4GB".into()),
+            cpu_total: None,
         };
         s.volumes = vec![("data-vol".into(), "/mnt/data".into())];
 
