@@ -387,6 +387,33 @@ impl Panes {
                 }
             }
         }
+        self.spawn_in_process(argv, cwd, env, center)
+    }
+
+    /// As [`Panes::spawn_argv_env`], but ALWAYS in-process — never
+    /// daemon-routed. For ephemeral chrome panes (pins, the tool drawer, the
+    /// corner overlay): they belong to no tab's persisted center tree, so a
+    /// daemon session backing one would outlive the UI as an orphan lease
+    /// nobody ever reattaches.
+    pub(crate) fn spawn_argv_env_local(
+        &mut self,
+        argv: &[String],
+        cwd: Option<&std::path::Path>,
+        env: &[(String, String)],
+        center: Rect,
+    ) -> Result<u32> {
+        self.spawn_in_process(argv, cwd, env, center)
+    }
+
+    /// The in-process PTY spawn shared by the chokepoint's fallback and the
+    /// ephemeral-local path.
+    fn spawn_in_process(
+        &mut self,
+        argv: &[String],
+        cwd: Option<&std::path::Path>,
+        env: &[(String, String)],
+        center: Rect,
+    ) -> Result<u32> {
         let id = self.next_id;
         self.next_id += 1;
         let pane = PtyPane::spawn_with_env(
@@ -633,6 +660,21 @@ impl Panes {
                     Some(session),
                 ) {
                     Ok(fresh) => {
+                        // Stash the restore payload the loop applies if the
+                        // reattach turns out to be dead (lease expired / the
+                        // daemon restarted — e.g. after a reboot) and the
+                        // relay degrades to a fresh session
+                        // (`PaneEvent::SessionFallback`): the persisted
+                        // scrollback tail + the recorded foreground command.
+                        if let Some(p) = self.table.get_mut(&fresh) {
+                            p.set_fallback_restore(
+                                tab.pane_scrollback.get(old).cloned(),
+                                tab.pane_cmds
+                                    .get(old)
+                                    .map(|c| c.display())
+                                    .filter(|s| !s.is_empty()),
+                            );
+                        }
                         map.insert(*old, fresh);
                         continue;
                     }
@@ -1276,5 +1318,34 @@ mod tests {
         let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
         let panes = Panes::new(tx);
         assert!(panes.pane_age(999).is_none());
+    }
+
+    #[test]
+    fn ephemeral_local_spawn_bypasses_daemon_route() {
+        // Pins/drawer/corner spawn through `spawn_argv_env_local`: even with
+        // `[daemon]` enabled (the default), they must stay in-process PTYs —
+        // a daemon session backing chrome would outlive the UI as an orphan
+        // lease nobody reattaches.
+        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", "/bin/sh")]);
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = Panes::new(tx);
+        panes.set_daemon_config(thegn_core::config::DaemonConfig {
+            enabled: true,
+            socket: "/nonexistent/never.sock".into(),
+            ..Default::default()
+        });
+        let chrome = layout::compute(80, 24, false, false);
+        let id = panes
+            .spawn_argv_env_local(
+                &["/bin/sh".into(), "-c".into(), "true".into()],
+                None,
+                &[],
+                chrome.center,
+            )
+            .expect("local spawn");
+        assert!(
+            !panes.table.get(&id).unwrap().is_daemon_backed(),
+            "ephemeral panes must stay in-process with the daemon enabled"
+        );
     }
 }

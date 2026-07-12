@@ -222,6 +222,11 @@ pub enum Action {
     /// gesture; also available as `a` / `Shift+R` inside either popup.
     MarkAllRead,
     Quit,
+    /// Quit, keeping daemon-backed panes running (an explicit-detach alias of
+    /// Quit — same behavior, palette discoverability).
+    Detach,
+    /// Quit AND kill the daemon-backed sessions (nothing left running).
+    QuitKill,
     Custom(u16),
 }
 
@@ -449,6 +454,8 @@ impl Action {
             Action::JumpAttention => "attention-next",
             Action::MarkAllRead => "mark-all-read",
             Action::Quit => "quit",
+            Action::Detach => "detach",
+            Action::QuitKill => "quit-kill",
             Action::Custom(_) => "custom-action",
         }
     }
@@ -530,6 +537,8 @@ impl Action {
             "search-global" => Action::SearchGlobal,
             "toggle-key-lock" | "key-lock" | "lock" => Action::ToggleKeyLock,
             "quit" => Action::Quit,
+            "detach" => Action::Detach,
+            "quit-kill" | "quit-and-kill" => Action::QuitKill,
             "mode-normal" => Action::SwitchMode(Mode::Normal),
             "mode-vim-normal" | "vim-normal" => Action::SwitchMode(Mode::VimNormal),
             "mode-vim-insert" | "vim-insert" => Action::SwitchMode(Mode::VimInsert),

@@ -2,15 +2,16 @@
 //! `config.rs` (the god-file ratchet) like `config_theme`.
 //!
 //! `[daemon]` gates the pane daemon (a `thegn daemon` process owning the
-//! portable-pty panes so they survive UI exit; opt-in). `[serve]` shapes
-//! `thegn serve`: remote thin-client listening and the pairing policy.
+//! portable-pty panes so they survive UI exit; on by default). `[serve]`
+//! shapes `thegn serve`: remote thin-client listening and the pairing policy.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// `[daemon]` — the pane daemon. Off by default: bare `thegn` keeps today's
-/// in-process PTYs; when enabled (or under `thegn serve`, which implies it),
-/// new panes route through the daemon and survive a client detach.
+/// `[daemon]` — the pane daemon. ON by default: new local center panes route
+/// through the daemon and survive quitting the UI (bare `thegn`
+/// warm-reattaches them — tmux semantics). `enabled = false` restores plain
+/// in-process PTYs that die with the compositor.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct DaemonConfig {
@@ -20,17 +21,19 @@ pub struct DaemonConfig {
     pub socket: String,
     /// Exit after this long with no sessions and no clients; `0` = never.
     pub idle_exit_secs: u64,
-    /// Keep a detached session's PTY warm this long (the relay lease grace).
+    /// Keep a detached session's PTY warm this long (the relay lease grace);
+    /// `0` = never reap — a detached session lives until explicitly killed
+    /// (or the machine restarts).
     pub lease_grace_secs: u64,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             socket: String::new(),
             idle_exit_secs: 1800,
-            lease_grace_secs: 3600,
+            lease_grace_secs: 0,
         }
     }
 }
@@ -83,12 +86,15 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn daemon_defaults_are_opt_in_and_bounded() {
+    fn daemon_defaults_are_on_never_reap_and_idle_bounded() {
         let d = DaemonConfig::default();
-        assert!(!d.enabled, "the daemon must be opt-in");
+        assert!(d.enabled, "persistence is the default (tmux semantics)");
         assert!(d.socket.is_empty());
-        assert_eq!(d.idle_exit_secs, 1800);
-        assert_eq!(d.lease_grace_secs, 3600);
+        assert_eq!(d.idle_exit_secs, 1800, "an EMPTY daemon still exits");
+        assert_eq!(
+            d.lease_grace_secs, 0,
+            "0 = never reap: a detached session lives until killed"
+        );
     }
 
     #[test]

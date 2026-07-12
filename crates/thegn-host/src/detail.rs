@@ -2276,6 +2276,16 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
             44,
             near,
         )),
+        BarBadge::Persist => Some(keyval(
+            "Persistent pane",
+            vec![(
+                "state".into(),
+                "daemon-backed: quit keeps it running; relaunch reattaches".into(),
+                Tok::Hue(Hue::Teal),
+            )],
+            52,
+            near,
+        )),
     }
 }
 

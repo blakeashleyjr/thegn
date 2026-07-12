@@ -537,6 +537,21 @@ async fn sprite_proxy_relay(
     Ok(())
 }
 
+/// The quit-detached exit line. Printed AFTER the compositor tore down the
+/// alt screen (a raw-mode UI can't print an exit line) — stderr is the only
+/// sink that reaches the user, hence the local allow. Daemon-backed panes
+/// live in the daemon's process group, so the process::exit doesn't touch
+/// them.
+#[allow(clippy::disallowed_macros)]
+fn report_kept_sessions(kept: usize) {
+    if kept > 0 {
+        eprintln!(
+            "kept {kept} session{} running — run `thegn` to reattach, `thegn session list` to inspect",
+            if kept == 1 { "" } else { "s" }
+        );
+    }
+}
+
 /// Report the one-time brand migration. Runs before any tracing subscriber
 /// exists (and before the compositor takes the terminal), so stderr is the
 /// only sink that reaches the user — hence the local allow.
@@ -664,6 +679,7 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let result = rt.block_on(run::main(cli));
     rt.shutdown_background();
+    report_kept_sessions(handlers::daemon_lifecycle::kept_sessions());
     // termwiz opens /dev/tty without O_CLOEXEC; child pane shells inherit that
     // FD and keep the outer PTY open after thegn exits, preventing the parent
     // from seeing EOF. process::exit is the correct terminal-emulator exit: it
