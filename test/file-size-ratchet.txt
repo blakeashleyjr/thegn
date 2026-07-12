@@ -1,4 +1,4 @@
 # lines path — ceilings for legacy files over 3000 lines (see file-size-ratchet.sh)
 5118 crates/thegn-core/src/config.rs
 3264 crates/thegn-host/src/agent.rs
-18503 crates/thegn-host/src/run.rs
+18438 crates/thegn-host/src/run.rs

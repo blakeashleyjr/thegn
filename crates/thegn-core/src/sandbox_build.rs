@@ -102,6 +102,9 @@ pub fn build_image(spec: &SandboxSpec) -> anyhow::Result<()> {
     let mut argv = oci_prefix(spec);
     argv.extend(build_argv(tag, build));
     let argv = spec.placement.control_argv(&argv);
+    crate::progress::emit(crate::progress::SandboxPhase::ImageBuild {
+        tag: tag.to_string(),
+    });
     // Run via `output()` — it drains stdout+stderr, so a verbose build doesn't
     // deadlock a fixed-size pipe (which is why we don't reuse the timeout-based
     // `run_control_owned` here). Builds are legitimately slow; no artificial cap.
@@ -117,8 +120,12 @@ pub fn build_image(spec: &SandboxSpec) -> anyhow::Result<()> {
             .rev()
             .find(|l| !l.trim().is_empty())
             .unwrap_or("build failed");
+        crate::progress::emit(crate::progress::SandboxPhase::PhaseFailed {
+            err: last.to_string(),
+        });
         anyhow::bail!("{rt} build of {tag} failed: {last}");
     }
+    crate::progress::emit(crate::progress::SandboxPhase::PhaseDone);
     Ok(())
 }
 

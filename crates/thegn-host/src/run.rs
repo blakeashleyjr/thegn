@@ -22,7 +22,7 @@ use termwiz::terminal::{Terminal, TerminalWaker, new_terminal};
 use tokio::task;
 
 use crate::actions::{CiActionCtx, open_command_pane, open_command_tab, open_url_detached};
-use crate::chrome::{BarBadge, BarItemId, FrameModel, LoadStep, render_tab};
+use crate::chrome::{BarBadge, BarItemId, FrameModel, render_tab};
 use crate::compositor::Rect;
 use crate::detail::apply_ci_detail;
 // Re-exported so pre-split call sites (`crate::run::…` in sibling modules and
@@ -43,8 +43,7 @@ use crate::hydrate::{
 use crate::input::key_bytes;
 use crate::layout;
 use crate::loading::{
-    SpecOrigin, active_watchdog_deadline, is_shell_wait, provision_load_steps, provision_owns_tab,
-    seed_materialize_steps, watchdog_deadline,
+    SpecOrigin, active_watchdog_deadline, is_shell_wait, provision_owns_tab, watchdog_deadline,
 };
 use crate::menu::{self, MenuChoice, MenuOverlay};
 use crate::palette::build_palette;
@@ -5114,7 +5113,7 @@ fn smart_split_dir(cols: usize, rows: usize) -> crate::center::Dir {
 /// Returns `("", "")` when the row is gone or the DB can't be opened — a safe
 /// fall back to a local, uncontained shell. Call this off the event loop (it
 /// opens the DB).
-fn terminal_launch_for(name: &str) -> (String, String) {
+pub(crate) fn terminal_launch_for(name: &str) -> (String, String) {
     thegn_core::db::Db::open()
         .ok()
         .and_then(|db| db.terminals().ok())
@@ -6433,8 +6432,20 @@ async fn event_loop<T: Terminal>(
     // preserves each one's provisioning progress instead of resetting it. Written
     // by the lazy-materialize seed + `provision_rx`/`spec_rx`; an entry is dropped
     // on the owning pane's first PTY output (loading done) or on a hard failure.
-    let mut loading_state: std::collections::HashMap<(String, usize), Vec<LoadStep>> =
-        std::collections::HashMap::new();
+    // The tracker (not a bare map) is the one write path: it stamps/carries each
+    // step's `started_at` across whole-Vec replacement so per-step elapsed time
+    // renders correctly however chatty the producer is.
+    let mut loading_state = crate::loading::track::LoadingTracker::default();
+    // Splash-scoped animation ticker: exists (as a thread) ONLY while a splash
+    // is visible; `set_visible` is called after the splash derive each frame.
+    let splash_ticker = {
+        let tx = refresh_tx.clone();
+        let wk = waker.clone();
+        crate::loading::ticker::SplashTicker::new(move || {
+            let _ = tx.send(RefreshKind::SplashTick);
+            let _ = wk.wake();
+        })
+    };
     // Keys (group name, tab) of worktrees whose tab is open for the loading
     // splash while the create worker finishes (`TabOpened` → `Done`/`Failed`).
     // The materialize path skips these so it never races the worker.
@@ -8056,126 +8067,33 @@ async fn event_loop<T: Terminal>(
             } else {
                 // Two-phase materialize: request launch specs off-thread (the
                 // sandbox ensure inside `launch_spec` can block on podman for
-                // seconds to minutes), spawn when they land. One request per
-                // (group, tab) at a time, keyed by the unique group name.
+                // seconds to minutes), spawn when they land. Extracted to
+                // `handlers::materialize` (which also streams the core's
+                // sandbox bring-up phases into the splash).
                 let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
-                let key = (name.clone(), ti);
-                if !missing.is_empty()
-                    && !materialize_inflight.contains(&key)
-                    && !materialize_failed.contains(&key)
-                    // A worktree mid-creation owns its splash; don't race it.
-                    && !creating_tabs.contains(&key)
-                {
-                    materialize_inflight.insert(key.clone());
-                    // A fresh materialize is a genuine (re)bring-up: un-retire.
-                    loading_retired.remove(&key);
-                    loading_remote.insert(
-                        key.clone(),
-                        thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&path))
-                            .is_remote(),
-                    );
-                    // Seed the splash — but never overwrite LIVE provisioning
-                    // steps (an eager stream may already own this key; the seed's
-                    // shell-wait shape would briefly misclassify the tab).
-                    if seed_materialize_steps(loading_state.get(&key).map(Vec::as_slice)) {
-                        loading_state.insert(
-                            key,
-                            crate::loading::plan::LoadPlan::from_cursor(
-                                &["sandbox", "container", "shell"],
-                                0,
-                                false,
-                            )
-                            .into_steps(),
-                        );
-                    }
-                    dirty = true;
-                    let cfg = keymap.config().clone();
-                    let tx = spec_tx.clone();
-                    let ptx = provision_tx.clone();
-                    let wk = waker.clone();
-                    let wt = path.clone();
-                    let gname = name.clone();
-                    let hui = Some(host_ui.clone());
-                    task::spawn_blocking(move || {
-                        let specs = if is_terminal {
-                            let (conn, sandbox) = terminal_launch_for(&gname);
-                            let spec = crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox);
-                            Ok(missing.into_iter().map(|id| (id, spec.clone())).collect())
-                        } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
-                            // Non-local env, failover off, known-down (token unset
-                            // / exec cooldown): halt rather than degrade to host.
-                            Err(SpecError::Halt(halt))
-                        } else {
-                            // FAST PATH: claim a pre-provisioned warm spare for this
-                            // (repo, env) — an instant hand-over (bind + branch
-                            // checkout) instead of a from-scratch provision. Skipped
-                            // while a provision for this worktree is already in
-                            // flight (eager) — the claim would clear the live splash
-                            // and flip the binding under it. Falls through to a full
-                            // provision when no spare is ready (which serializes on
-                            // the per-sandbox lock and marker-short-circuits).
-                            if crate::provision_gate::try_claim_spare(&cfg, &wt) {
-                                // Bound to a ready spare — clear any loading lock and
-                                // open the pane straight against it (no provisioning).
-                                tracing::debug!(
-                                    target: "thegn::loading",
-                                    worktree = %gname,
-                                    "splash cleared: warm spare claimed (no provisioning)"
-                                );
-                                let _ = ptx.send((gname.clone(), ti, Vec::new()));
-                                let _ = wk.wake();
-                                crate::direnv_warm::launch_spec_synced(&cfg, &wt, None, "shell")
-                                    .map(|spec| {
-                                        missing.into_iter().map(|id| (id, spec.clone())).collect()
-                                    })
-                                    .map_err(spec_err)
-                            } else {
-                                // Provision the env first (provider only; no-op
-                                // otherwise): clone the repo + reproduce the declared
-                                // toolchain + personal layer, streaming live steps to
-                                // the splash. Then resolve the pane's launch spec so
-                                // the pane only attaches once the env is ready.
-                                let gname_p = gname.clone();
-                                let wk_p = wk.clone();
-                                let prov = crate::host_flow::provision_worktree(
-                                    &cfg,
-                                    &wt,
-                                    crate::host_flow::ConsentPolicy::Interactive,
-                                    |views| {
-                                        let _ = ptx.send((
-                                            gname_p.clone(),
-                                            ti,
-                                            provision_load_steps(views),
-                                        ));
-                                        let _ = wk_p.wake();
-                                    },
-                                    hui.as_ref(),
-                                );
-                                match prov {
-                                    Ok(_) => crate::direnv_warm::launch_spec_synced(
-                                        &cfg, &wt, None, "shell",
-                                    )
-                                    .map(|spec| {
-                                        missing.into_iter().map(|id| (id, spec.clone())).collect()
-                                    })
-                                    .map_err(spec_err),
-                                    Err(e) => Err(match sandbox_halt_in(&e) {
-                                        Some(h) => SpecError::Halt(h.clone()),
-                                        None => SpecError::Other(format!(
-                                            "environment setup failed: {e}"
-                                        )),
-                                    }),
-                                }
-                            }
-                        };
-                        if tx
-                            .send((gname, wt, ti, SpecOrigin::Materialize, specs))
-                            .is_ok()
-                        {
-                            let _ = wk.wake();
-                        }
-                    });
-                }
+                crate::handlers::materialize::maybe_materialize(
+                    &mut crate::handlers::materialize::MaterializeCtx {
+                        materialize_inflight: &mut materialize_inflight,
+                        materialize_failed: &materialize_failed,
+                        creating_tabs: &creating_tabs,
+                        loading_retired: &mut loading_retired,
+                        loading_remote: &mut loading_remote,
+                        loading_state: &mut loading_state,
+                        dirty: &mut dirty,
+                    },
+                    keymap.config(),
+                    &crate::handlers::materialize::MaterializeTx {
+                        spec_tx: spec_tx.clone(),
+                        provision_tx: provision_tx.clone(),
+                        waker: waker.clone(),
+                        host_ui: host_ui.clone(),
+                    },
+                    missing,
+                    &name,
+                    &path,
+                    ti,
+                    is_terminal,
+                );
             }
         }
         // The accordion's width (Normal → Half → Full) drives the chrome
@@ -9914,6 +9832,19 @@ async fn event_loop<T: Terminal>(
                 // Branch ref moved elsewhere; heal the canonical checkout off-loop.
                 RefreshKind::MainRefMoved => want_main_sync = true,
                 RefreshKind::HostHeal => want_host_heal = true,
+                // Animate the visible splash (spinner frame / elapsed / hints):
+                // a repaint-only tick. Gated on a live active step so a
+                // straggler tick after the splash cleared stays damage-free
+                // (render_plan Skips it).
+                RefreshKind::SplashTick => {
+                    if model
+                        .load_steps
+                        .iter()
+                        .any(|s| s.state == crate::chrome::StepState::Active)
+                    {
+                        dirty = true;
+                    }
+                }
             }
         }
         // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s, off-loop).
@@ -10038,6 +9969,10 @@ async fn event_loop<T: Terminal>(
                 };
                 dirty = true;
             }
+            // Keep the splash-scoped animation ticker alive exactly while a
+            // splash is visible (spinner/elapsed repaints); it self-retires
+            // within one period of the splash clearing — 0%-idle preserved.
+            splash_ticker.set_visible(!model.load_steps.is_empty());
         }
 
         // Startup-shell watchdog: while the loading splash is up (clears on first

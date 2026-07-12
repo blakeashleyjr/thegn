@@ -1104,6 +1104,10 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     // Build the image now (synchronous, correct ordering) when a Dockerfile
     // build was requested — the tag is `spec.image`, so the run below finds it.
     crate::sandbox_build::build_image(spec)?;
+    use crate::progress::{SandboxPhase, emit};
+    emit(SandboxPhase::ContainerCreate {
+        backend: spec.backend.label(),
+    });
     let mut argv: Vec<String> = oci_prefix(spec);
     argv.extend([
         "run".into(),
@@ -1119,6 +1123,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     // --userns keep-id, crun exits 0 but leaves the container in "created"
     // state. Verify it is actually running before declaring success.
     if container_status(spec).0 {
+        emit(SandboxPhase::PhaseDone);
         return Ok(());
     }
 
@@ -1152,11 +1157,14 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
             msg::warn(
                 "podman --userns keep-id failed; continuing with rootless podman default user namespace",
             );
+            emit(SandboxPhase::PhaseDone);
             return Ok(());
         }
     }
 
-    anyhow::bail!("could not start {rt} container '{}'", spec.name)
+    let err = format!("could not start {rt} container '{}'", spec.name);
+    emit(SandboxPhase::PhaseFailed { err: err.clone() });
+    anyhow::bail!(err)
 }
 
 /// Tear down the container for a worktree identified only by its local path.

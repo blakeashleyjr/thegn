@@ -72,7 +72,7 @@ pub(crate) struct SpecDrainCtx<'a> {
     pub active_menu: &'a mut Option<MenuOverlay>,
     pub current_config: &'a thegn_core::config::Config,
     pub center: Rect,
-    pub loading_state: &'a mut std::collections::HashMap<(String, usize), Vec<LoadStep>>,
+    pub loading_state: &'a mut crate::loading::track::LoadingTracker,
     pub loading_remote: &'a mut std::collections::HashMap<(String, usize), bool>,
     pub materialize_inflight: &'a mut std::collections::HashSet<(String, usize)>,
     pub prewarm_inflight: &'a mut std::collections::HashSet<(String, usize)>,
@@ -172,7 +172,7 @@ pub(crate) fn kick_eager(
 pub(crate) fn drain_provision(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<ProvisionProgress>,
     session: &crate::session::Session,
-    loading_state: &mut std::collections::HashMap<(String, usize), Vec<LoadStep>>,
+    loading_state: &mut crate::loading::track::LoadingTracker,
     loading_remote: &mut std::collections::HashMap<(String, usize), bool>,
     loading_retired: &std::collections::HashSet<(String, usize)>,
     loop_perf: &mut crate::perf::LoopPerf,
@@ -194,10 +194,15 @@ pub(crate) fn drain_provision(
             .iter()
             .position(|g| g.name == key.0)
             .is_some_and(|gi| gi == session.active && session.worktrees[gi].active_tab == key.1);
-        // Eager provisioning only runs for a provider (remote) env, so this
-        // stream is unconditionally remote — the 300s watchdog window.
-        loading_remote.insert(key.clone(), true);
-        loading_state.insert(key, steps);
+        // This channel used to carry ONLY provider (remote) streams, so
+        // remoteness was hardcoded `true`. The materialize observer now
+        // streams local bring-ups here too — its seed site already recorded
+        // the correct per-tab remoteness, which must NOT be clobbered (a
+        // local tab marked remote gets the 300s watchdog, letting a genuinely
+        // hung local shell linger for minutes). Default only a MISSING entry
+        // to the safe long window.
+        loading_remote.entry(key.clone()).or_insert(true);
+        loading_state.set(key, steps);
         if active {
             dirty = true;
         }
@@ -259,20 +264,17 @@ pub(crate) fn drain_specs(
         }
         let specs = match specs {
             Ok(specs) => {
-                // sandbox done → container active; label shows backend.
+                // Provisioning finished — only the shell attach remains.
+                // Advance the tab's live plan (a rich backend-aware list keeps
+                // its rows + timings); a missing/stale entry falls back to the
+                // classic three-step shape inside `advance_to_shell`.
                 let backend = specs
                     .first()
                     .map(|(_, s)| s.backend.clone())
                     .unwrap_or_else(|| "host".into());
                 ctx.loading_remote.insert(tab_key.clone(), tab_remote);
-                ctx.loading_state.insert(
-                    tab_key.clone(),
-                    vec![
-                        LoadStep::done("sandbox"),
-                        LoadStep::active(format!("container  ({backend})")),
-                        LoadStep::pending("shell"),
-                    ],
-                );
+                ctx.loading_state
+                    .advance_to_shell(tab_key.clone(), &backend);
                 if is_active {
                     *ctx.dirty = true;
                 }
@@ -282,7 +284,7 @@ pub(crate) fn drain_specs(
                 // Failover off + non-local env couldn't come up: raise the
                 // warning modal instead of just a status line. Otherwise a
                 // plain blocked-launch status.
-                match e {
+                let err_detail = match e {
                     // Benign prewarm skip (provider env not provisioned yet):
                     // no failed splash, no failed mark — the tab is left for
                     // the focused materialize to provision + open.
@@ -293,14 +295,17 @@ pub(crate) fn drain_specs(
                         if is_active {
                             *ctx.active_menu = Some(sandbox_halt_overlay(&halt));
                         }
+                        halt.reason.clone()
                     }
                     SpecError::Other(s) => {
                         ctx.model.status = format!("Pane launch blocked: {s}");
+                        s
                     }
-                }
+                };
                 ctx.loading_remote.insert(tab_key.clone(), tab_remote);
-                ctx.loading_state
-                    .insert(tab_key.clone(), vec![LoadStep::failed("sandbox")]);
+                // Mark the step that was actually running as failed (the live
+                // plan's rows stay intact) with the error as its sub-line.
+                ctx.loading_state.fail_active(tab_key.clone(), &err_detail);
                 match origin {
                     SpecOrigin::Materialize => {
                         if is_active {
@@ -326,20 +331,16 @@ pub(crate) fn drain_specs(
             continue;
         };
         {
-            // container done → shell active
+            // Everything but the shell attach is done → shell active. (The
+            // Ok-arm already advanced the plan; this re-advance is a no-op
+            // for it and covers the early-continue paths.)
             let backend = specs
                 .first()
                 .map(|(_, s)| s.backend.clone())
                 .unwrap_or_else(|| "host".into());
             ctx.loading_remote.insert(tab_key.clone(), tab_remote);
-            ctx.loading_state.insert(
-                tab_key.clone(),
-                vec![
-                    LoadStep::done("sandbox"),
-                    LoadStep::done(format!("container  ({backend})")),
-                    LoadStep::active("shell"),
-                ],
-            );
+            ctx.loading_state
+                .advance_to_shell(tab_key.clone(), &backend);
         }
         if let Err(e) =
             ctx.panes
@@ -347,14 +348,9 @@ pub(crate) fn drain_specs(
         {
             ctx.model.status = format!("Pane spawn failed: {e}");
             ctx.loading_remote.insert(tab_key.clone(), tab_remote);
-            ctx.loading_state.insert(
-                tab_key.clone(),
-                vec![
-                    LoadStep::done("sandbox"),
-                    LoadStep::done("container"),
-                    LoadStep::failed("shell"),
-                ],
-            );
+            // The shell step is the active one after `advance_to_shell`.
+            ctx.loading_state
+                .fail_active(tab_key.clone(), &format!("{e}"));
         } else {
             // Keep the loading entry until first PTY output arrives (cleared in
             // the PaneEvent::Output handler above) so the loading screen

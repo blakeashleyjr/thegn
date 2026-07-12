@@ -490,6 +490,54 @@ pub struct LoadStep {
     /// Optional dim sub-line under the step — a live status for the active step
     /// or the captured error for a failed one. Rendered indented below `label`.
     pub detail: Option<String>,
+    /// What the step *is* — a stable identity that survives label refinement
+    /// (`"container"` → `"container (podman)"`), used by the loop-side tracker
+    /// to carry timing across whole-Vec replacement and by the splash to pick
+    /// a slow-step hint. Producers that predate kinds default to `Other`.
+    pub kind: StepKind,
+    /// When the step last became `Active`. Stamped by the loop-side
+    /// `LoadingTracker` at drain time (never by producers), frozen on the
+    /// transition out of `Active`, so the splash can render per-step elapsed
+    /// time. Changes only on state transitions — an idle wake still compares
+    /// equal, keeping the render-plan `Skip` contract.
+    pub started_at: Option<std::time::Instant>,
+    /// How long the step ran, measured by the tracker at the `Active` →
+    /// `Done`/`Failed` transition. The splash's elapsed column shows this for
+    /// finished steps (a frozen `started_at` alone would keep counting).
+    pub took: Option<std::time::Duration>,
+    /// Byte progress `(done, total)` for a network-bound step (image pull);
+    /// `total` is `None` until the runtime reports sizes. Drawn as a bar
+    /// under the active step.
+    pub progress: Option<(u64, Option<u64>)>,
+}
+
+/// The step-identity vocabulary for [`LoadStep::kind`] — what phase of a
+/// bring-up a step represents, independent of its display label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StepKind {
+    /// Backend/chain resolution ("sandbox").
+    Resolve,
+    /// Remote transport connect (ssh/mosh/provider).
+    Connect,
+    /// Image probe/pull.
+    Image,
+    /// Dockerfile/devcontainer image build.
+    Build,
+    /// Container / namespace create.
+    Create,
+    /// VPN sidecar bring-up.
+    Vpn,
+    /// Remote filesystem projection (sshfs/sync).
+    Mount,
+    /// Environment wrap warm-up (direnv/devenv/devShell).
+    Env,
+    /// A provider provisioning step (clone/nix/setup/… streams).
+    Provision,
+    /// The final login-shell attach (the `is_shell_wait` gate).
+    Shell,
+    /// Unclassified (legacy producers).
+    #[default]
+    Other,
 }
 
 /// Visual state of a [`LoadStep`].
@@ -506,38 +554,38 @@ pub enum StepState {
 }
 
 impl LoadStep {
-    pub fn pending(label: impl Into<String>) -> Self {
+    fn new(label: impl Into<String>, state: StepState) -> Self {
         Self {
             label: label.into(),
-            state: StepState::Pending,
+            state,
             detail: None,
+            kind: StepKind::Other,
+            started_at: None,
+            took: None,
+            progress: None,
         }
+    }
+    pub fn pending(label: impl Into<String>) -> Self {
+        Self::new(label, StepState::Pending)
     }
     pub fn active(label: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            state: StepState::Active,
-            detail: None,
-        }
+        Self::new(label, StepState::Active)
     }
     pub fn done(label: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            state: StepState::Done,
-            detail: None,
-        }
+        Self::new(label, StepState::Done)
     }
     pub fn failed(label: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            state: StepState::Failed,
-            detail: None,
-        }
+        Self::new(label, StepState::Failed)
     }
     /// Attach a dim sub-line (status / error) under the step.
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         let d = detail.into();
         self.detail = (!d.trim().is_empty()).then_some(d);
+        self
+    }
+    /// Tag the step's stable identity (see [`StepKind`]).
+    pub fn with_kind(mut self, kind: StepKind) -> Self {
+        self.kind = kind;
         self
     }
 }
