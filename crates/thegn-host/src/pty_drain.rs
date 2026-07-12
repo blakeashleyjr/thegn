@@ -34,7 +34,7 @@ use termwiz::terminal::buffered::BufferedTerminal;
 use thegn_core::store::NotificationStore;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::chrome::{FrameModel, LoadStep};
+use crate::chrome::FrameModel;
 use crate::compositor::Rect;
 use crate::pane::PaneEvent;
 use crate::panes::{Panes, replace_single_dead_center_pane};
@@ -183,7 +183,7 @@ pub(crate) struct DrainCtx<'a> {
     pub corner_gfx: &'a mut Vec<Vec<u8>>,
     pub corner_occluded: &'a mut bool,
     pub supervisor: &'a mut crate::pins::PinSupervisor,
-    pub loading_state: &'a mut HashMap<(String, usize), Vec<LoadStep>>,
+    pub loading_state: &'a mut crate::loading::track::LoadingTracker,
     pub loading_remote: &'a mut HashMap<(String, usize), bool>,
     pub loading_retired: &'a mut HashSet<(String, usize)>,
     pub respawn_crash_count: &'a mut HashMap<(usize, usize), u32>,

@@ -8,14 +8,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::chrome::{FrameModel, LoadStep};
+use crate::chrome::FrameModel;
 use crate::run::{SidebarState, refresh_tab_model};
 use crate::session::{GroupKind, Session, WorktreeGroup};
 use crate::wizard::CreationProgress;
 
 /// A `loading_state`/`creating_tabs` key: `(group_name, tab_index)`.
 type Key = (String, usize);
-type LoadingState = HashMap<Key, Vec<LoadStep>>;
+type LoadingState = crate::loading::track::LoadingTracker;
 /// `generation -> the tab key its splash lives under`. Populated when a
 /// creation's tab (or optimistic placeholder) opens, so later `Step`/abort
 /// events route to the right tab even when several creations are in flight.
@@ -81,7 +81,7 @@ pub(crate) fn open_tab(
     creating_tabs.insert(key.clone());
     gen_tab.insert(generation, key.clone());
     if let Some(p) = progress {
-        loading_state.insert(key, p.to_load_steps());
+        loading_state.set(key, p.to_load_steps());
     }
     sb.creating.insert(tab);
     refresh_tab_model(model, session, sb);
@@ -178,9 +178,7 @@ pub(crate) fn reconcile_name(
     let new_key = (tab.to_string(), 0);
     creating_tabs.remove(&old_key);
     creating_tabs.insert(new_key.clone());
-    if let Some(steps) = loading_state.remove(&old_key) {
-        loading_state.insert(new_key.clone(), steps);
-    }
+    loading_state.rename(&old_key, new_key.clone());
     sb.creating.remove(&old_name);
     sb.creating.insert(tab.to_string());
     gen_tab.insert(generation, new_key);
@@ -247,7 +245,7 @@ pub(crate) fn sync_steps(
     let Some(key) = gen_tab.get(&generation) else {
         return false;
     };
-    loading_state.insert(key.clone(), progress.to_load_steps());
+    loading_state.set(key.clone(), progress.to_load_steps());
     true
 }
 
@@ -509,7 +507,7 @@ mod tests {
             path.to_string(),
         ));
         sb.creating.insert(name.to_string());
-        loading.insert((name.to_string(), 0), Vec::new());
+        loading.set((name.to_string(), 0), Vec::new());
         creating_tabs.insert((name.to_string(), 0));
         gen_tab.insert(generation, (name.to_string(), 0));
     }
@@ -521,7 +519,7 @@ mod tests {
     fn reconcile_renames_placeholder_in_place() {
         let mut session = Session::default();
         let mut sb = SidebarState::default();
-        let mut loading: LoadingState = HashMap::new();
+        let mut loading = LoadingState::default();
         let mut creating_tabs: HashSet<Key> = HashSet::new();
         let mut gen_tab: GenTab = HashMap::new();
         seed_placeholder(
@@ -568,7 +566,7 @@ mod tests {
     fn reconcile_settles_when_name_matches() {
         let mut session = Session::default();
         let mut sb = SidebarState::default();
-        let mut loading: LoadingState = HashMap::new();
+        let mut loading = LoadingState::default();
         let mut creating_tabs: HashSet<Key> = HashSet::new();
         let mut gen_tab: GenTab = HashMap::new();
         seed_placeholder(
@@ -606,7 +604,7 @@ mod tests {
     fn reconcile_noop_without_placeholder() {
         let mut session = Session::default();
         let mut sb = SidebarState::default();
-        let mut loading: LoadingState = HashMap::new();
+        let mut loading = LoadingState::default();
         let mut creating_tabs: HashSet<Key> = HashSet::new();
         let mut gen_tab: GenTab = HashMap::new();
 
@@ -630,7 +628,7 @@ mod tests {
     fn reconcile_adopts_by_generation_when_two_in_flight() {
         let mut session = Session::default();
         let mut sb = SidebarState::default();
-        let mut loading: LoadingState = HashMap::new();
+        let mut loading = LoadingState::default();
         let mut creating_tabs: HashSet<Key> = HashSet::new();
         let mut gen_tab: GenTab = HashMap::new();
         seed_placeholder(
@@ -667,11 +665,11 @@ mod tests {
     /// creation A must not stomp creation B's splash.
     #[test]
     fn sync_steps_is_isolated_per_generation() {
-        let mut loading: LoadingState = HashMap::new();
+        let mut loading = LoadingState::default();
         let mut gen_tab: GenTab = HashMap::new();
         gen_tab.insert(1, ("repo/a".to_string(), 0));
         gen_tab.insert(2, ("repo/b".to_string(), 0));
-        loading.insert(("repo/b".to_string(), 0), Vec::new());
+        loading.set(("repo/b".to_string(), 0), Vec::new());
 
         let progress = CreationProgress::new("repo/a".to_string());
         let wrote = sync_steps(&progress, &mut loading, 1, &gen_tab);
@@ -696,7 +694,7 @@ mod tests {
         let mut session = Session::default();
         let mut model = FrameModel::default();
         let mut sb = SidebarState::default();
-        let mut loading: LoadingState = HashMap::new();
+        let mut loading = LoadingState::default();
         let mut creating_tabs: HashSet<Key> = HashSet::new();
         let mut gen_tab: GenTab = HashMap::new();
         seed_placeholder(
