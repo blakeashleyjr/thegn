@@ -6,8 +6,7 @@
 //! the configured minimum urgency are dropped here — they still live in the
 //! in-app inbox and as sidebar badges.
 
-// Only the Linux/macOS delivery arms shell out; Windows has no arm yet.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use std::process::Command;
 
 use thegn_core::event_bus::{DesktopNotification, NotificationUrgency};
@@ -51,7 +50,9 @@ fn deliver(notif: &DesktopNotification) {
     deliver_linux(notif);
     #[cfg(target_os = "macos")]
     deliver_macos(notif);
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    deliver_windows(notif);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     let _ = notif;
 }
 
@@ -94,6 +95,41 @@ fn deliver_macos(notif: &DesktopNotification) {
     let _ = Command::new("osascript")
         .arg("-e")
         .arg(script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Windows toast via the WinRT notification API driven from PowerShell — no
+/// extra crate/COM plumbing for a best-effort toast, mirroring the
+/// `notify-send`/`osascript` subprocess pattern. Runs on the dispatcher
+/// thread (never the loop); PowerShell startup latency is acceptable there.
+#[cfg(windows)]
+fn deliver_windows(notif: &DesktopNotification) {
+    // Single-quoted PowerShell literals: escaping is just ' → ''.
+    let title = notif.title.replace('\'', "''");
+    let body = notif.body.replace('\'', "''");
+    let script = format!(
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, \
+         ContentType = WindowsRuntime] | Out-Null; \
+         $x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(\
+         [Windows.UI.Notifications.ToastTemplateType]::ToastText02); \
+         $t = $x.GetElementsByTagName('text'); \
+         $t.Item(0).AppendChild($x.CreateTextNode('{title}')) | Out-Null; \
+         $t.Item(1).AppendChild($x.CreateTextNode('{body}')) | Out-Null; \
+         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('thegn')\
+         .Show([Windows.UI.Notifications.ToastNotification]::new($x))"
+    );
+    // The script is PowerShell — don't route through util::shell(), which may
+    // resolve to cmd.exe.
+    let Some(ps) = thegn_core::util::which_path("pwsh.exe")
+        .or_else(|| thegn_core::util::which_path("powershell.exe"))
+    else {
+        return;
+    };
+    let _ = Command::new(ps)
+        .args(["-NoProfile", "-Command", &script])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
