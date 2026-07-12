@@ -5,8 +5,10 @@
 //! shutdown notification listens to console control events (Ctrl+C / window
 //! close / system shutdown) instead of SIGTERM/SIGHUP.
 //!
-//! Phase 1 scopes process-tree kills to the direct child; Job Objects (whole-
-//! tree kill-on-close) land in Phase 3.
+//! Process-tree kills ride Job Objects with `KILL_ON_JOB_CLOSE`: terminating
+//! the job reaps the whole tree, and merely *dropping* the last
+//! [`GroupHandle`] does too — better orphan hygiene than unix pgids (a thegn
+//! that dies mid-run takes its spawned trees with it).
 
 use std::process::Command;
 use std::sync::Arc;
@@ -14,6 +16,11 @@ use std::sync::atomic::AtomicBool;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE};
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
+};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     TerminateProcess,
@@ -90,15 +97,131 @@ pub fn terminate_pid(pid: u32) {
     }
 }
 
-/// Phase-1 stub: no pgid on Windows. Phase 3 assigns the child to a Job
-/// Object here so [`kill_tree`] reaps the whole tree.
-pub fn set_process_group(_cmd: &mut Command) {}
+/// An owned kill-on-close Job Object handle. Closing the last clone (Drop)
+/// reaps every process still in the job.
+struct JobInner(HANDLE);
 
-/// Best-effort termination of the tree rooted at `pid`. Phase 1 kills only the
-/// direct child (grandchildren may survive); Job Objects fix that in Phase 3.
-pub fn kill_tree(pid: i32) {
-    if pid > 0 {
-        terminate_pid(pid as u32);
+// SAFETY: a Job Object HANDLE is process-global kernel state; using it from
+// any thread is fine (the watchdog thread terminates it, the spawner drops it).
+unsafe impl Send for JobInner {}
+unsafe impl Sync for JobInner {}
+
+impl Drop for JobInner {
+    fn drop(&mut self) {
+        // SAFETY: closing a handle we own; KILL_ON_JOB_CLOSE reaps the tree.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+/// A spawned child's Job Object (process group on unix) — what
+/// [`GroupHandle::terminate`] reaps in one call.
+#[derive(Clone)]
+pub struct GroupHandle {
+    pid: u32,
+    /// `None` = degraded (job creation/assignment failed): terminate falls
+    /// back to the direct child only.
+    job: Option<Arc<JobInner>>,
+}
+
+impl GroupHandle {
+    /// A handle over an already-known pid — for tests and callers that track
+    /// pids themselves. No job: terminate is direct-child only.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn from_pid(pid: i32) -> Self {
+        Self {
+            pid: pid.max(0) as u32,
+            job: None,
+        }
+    }
+
+    /// Terminate the whole job (hard kill — no SIGTERM window on Windows), or
+    /// just the direct child on the degraded path.
+    pub fn terminate(&self) {
+        match &self.job {
+            // SAFETY: terminating a job whose handle we own.
+            Some(j) => unsafe {
+                TerminateJobObject(j.0, 1);
+            },
+            None => terminate_pid(self.pid),
+        }
+    }
+}
+
+/// Spawn `cmd` and assign it to a fresh kill-on-close Job Object. Best-effort:
+/// if job creation/assignment fails the spawn still succeeds with a degraded
+/// (direct-child-only) handle. The spawn→assign window is tiny; grandchildren
+/// spawned inside it escape the job (accepted — same exposure as a unix child
+/// that changes its own pgid).
+pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    use std::os::windows::io::AsRawHandle;
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    // SAFETY: standard Job Object setup; every handle is closed on every path
+    // (JobInner owns the success case, the explicit CloseHandle the failure).
+    let job = unsafe {
+        let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if h.is_null() {
+            None
+        } else {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0
+                && AssignProcessToJobObject(h, child.as_raw_handle() as HANDLE) != 0;
+            if ok {
+                Some(Arc::new(JobInner(h)))
+            } else {
+                CloseHandle(h);
+                None
+            }
+        }
+    };
+    Ok((child, GroupHandle { pid, job }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole tree dies on `terminate()`: spawn `cmd /C ping -n 30 …`
+    /// (cmd.exe parent + ping child), terminate the job, and verify the
+    /// direct child is gone.
+    #[test]
+    fn job_terminate_reaps_the_tree() {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
+        let (mut child, group) = spawn_grouped(&mut cmd).expect("spawn under job");
+        assert!(group.job.is_some(), "job assignment must succeed on CI");
+        group.terminate();
+        let status = child.wait().expect("wait");
+        assert!(!status.success(), "terminated tree exits nonzero");
+    }
+
+    /// KILL_ON_JOB_CLOSE: dropping the last handle (no explicit terminate)
+    /// also reaps the tree — the orphan-hygiene guarantee.
+    #[test]
+    fn dropping_the_last_handle_reaps_the_tree() {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
+        let (child, group) = spawn_grouped(&mut cmd).expect("spawn under job");
+        assert!(group.job.is_some(), "job assignment must succeed on CI");
+        let pid = child.id() as i64;
+        drop(group);
+        drop(child); // not reaped via wait(); the job close must kill it
+        // The kernel reaps asynchronously; give it a moment.
+        for _ in 0..50 {
+            if !pid_alive(pid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("child survived job-handle drop");
     }
 }
 

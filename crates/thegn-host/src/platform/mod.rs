@@ -7,10 +7,11 @@
 //!
 //! Semantics notes for the per-OS impls:
 //! * "terminate" is best-effort and asynchronous — unix delivers `SIGTERM`
-//!   (catchable), Windows `TerminateProcess` (hard kill; no graceful window).
-//! * "process group" on unix is a real pgid (`setpgid` + `killpg`); on Windows
-//!   Phase 1 tracks only the direct child pid (`TerminateProcess`), upgraded to
-//!   Job Objects (whole-tree kill) in Phase 3.
+//!   (catchable), Windows `TerminateProcess`/`TerminateJobObject` (hard kill;
+//!   no graceful window).
+//! * [`spawn_grouped`] puts the child in a real pgid on unix (`setpgid` +
+//!   `killpg`) and a kill-on-close Job Object on Windows — there, dropping the
+//!   last [`GroupHandle`] also reaps the tree (orphan hygiene beyond pgids).
 
 #[cfg(unix)]
 mod unix;

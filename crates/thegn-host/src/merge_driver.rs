@@ -15,13 +15,19 @@
 //! `progress` callback the caller uses to print (CLI) or repaint (host).
 
 use std::path::Path;
+// Used only by the unix-gated `run_agent` (Windows stubs it — see below).
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use thegn_core::config::{ConflictHandoff, MergeQueueConfig};
 use thegn_core::db::Db;
 use thegn_core::store::WorktreeAuxStore;
+// Used only by the unix-gated `run_agent` chain (shell + sh_quote templating).
+#[cfg(any(unix, test))]
 use thegn_core::util;
 
 use crate::integrate::{self, AttemptOutcome};
@@ -235,6 +241,7 @@ pub(crate) fn drive_queue(
 
 /// Compose the task prompt handed to the fixing agent. Kept pure (and unit-tested)
 /// so the instructions the agent gets are stable and reviewable.
+#[cfg(any(unix, test))]
 fn build_prompt(branch: &str, target: &str, failure: &Failure) -> String {
     let mut p = String::new();
     p.push_str(&format!(
@@ -277,6 +284,7 @@ fn build_prompt(branch: &str, target: &str, failure: &Failure) -> String {
 /// Substitute the `{prompt}`/`{branch}`/`{target}` placeholders in the command
 /// template, shell-quoting each so a prompt full of quotes/newlines is safe. The
 /// template should use bare placeholders (`claude -p {prompt}`), not quoted ones.
+#[cfg(any(unix, test))]
 fn substitute(template: &str, prompt: &str, branch: &str, target: &str) -> String {
     template
         .replace("{prompt}", &util::sh_quote(prompt))
@@ -318,21 +326,20 @@ fn run_agent(
         .env("THEGN_BRANCH", branch)
         .env("THEGN_MERGE_PROMPT", &prompt)
         .env("THEGN_MERGE_TARGET", target);
-    crate::platform::set_process_group(&mut cmd);
     // Defense in depth: the agent's git must target its cwd, not an inherited
     // GIT_DIR/GIT_INDEX_FILE (mirrors task.rs::build_capped_command).
     for var in util::GIT_ENV_VARS {
         cmd.env_remove(var);
     }
 
-    let mut child = match cmd.spawn() {
+    // Own group/job so the watchdog reaps the agent's whole tree.
+    let (mut child, group) = match crate::platform::spawn_grouped(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(target: "thegn::merge", error = %e, "merge queue: agent failed to spawn");
             return false;
         }
     };
-    let pgid = child.id() as i32;
 
     // Watchdog: kill the process group if the agent overruns its deadline.
     let done = Arc::new(AtomicBool::new(false));
@@ -340,6 +347,9 @@ fn run_agent(
     let watchdog = (cfg.agent_timeout_secs > 0).then(|| {
         let done = done.clone();
         let timed_out = timed_out.clone();
+        // Clone (don't move) the group into the thread: on Windows the job is
+        // kill-on-close, so the spawner's handle must outlive the child.
+        let group = group.clone();
         let deadline = Duration::from_secs(cfg.agent_timeout_secs);
         std::thread::spawn(move || {
             let end = Instant::now() + deadline;
@@ -351,7 +361,7 @@ fn run_agent(
             }
             if !done.load(Ordering::Relaxed) {
                 timed_out.store(true, Ordering::Relaxed);
-                crate::platform::kill_tree(pgid);
+                group.terminate();
             }
         })
     });

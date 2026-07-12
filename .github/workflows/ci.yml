@@ -250,6 +250,9 @@ jobs:
       # the real-pipe truth gate for the daemon IPC seam. Scoped to the ipc
       # module until the full suite is validated on Windows (phase 4/6).
       - run: cargo test -p thegn-svc --lib --locked ipc
+      # Job Object semantics on a real kernel: terminate() reaps the tree and
+      # dropping the last handle (KILL_ON_JOB_CLOSE) reaps it too.
+      - run: cargo test -p thegn-host --locked platform::
   # One-shot baseline generator: muse visual baselines were never committed, so
   # `e2e` can't pass until they exist. Push a commit whose message contains
   # `[gen-baselines]` to (re)generate them in the CI env where `e2e` checks

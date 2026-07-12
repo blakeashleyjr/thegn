@@ -6,6 +6,8 @@
 //! the configured minimum urgency are dropped here — they still live in the
 //! in-app inbox and as sidebar badges.
 
+// Only the Linux/macOS delivery arms shell out; Windows has no arm yet.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 
 use thegn_core::event_bus::{DesktopNotification, NotificationUrgency};
