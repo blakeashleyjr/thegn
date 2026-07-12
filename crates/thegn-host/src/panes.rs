@@ -1041,12 +1041,17 @@ mod tests {
         let spec = terminal_launch_spec(&cfg, "", "bwrap");
         assert!(!spec.argv.is_empty());
         // When bwrap is the runtime that actually resolved, it must front the
-        // wrapping argv (the shell is exec'd inside). If it didn't resolve, the
-        // chain fell through — nothing bwrap-specific to prove on this host.
-        if spec.argv.iter().any(|a| a.contains("bwrap")) {
+        // wrapping argv (the shell is exec'd inside) — modulo the optional
+        // cpu-priority prefix (`ionice -c3 nice -n N`) that `sandbox_cpucap`
+        // prepends when the host lacks cgroup `cpu` delegation. If bwrap didn't
+        // resolve, the chain fell through — nothing bwrap-specific to prove.
+        if let Some(pos) = spec.argv.iter().position(|a| a.contains("bwrap")) {
+            let prefix_ok = spec.argv[..pos].iter().all(|a| {
+                matches!(a.as_str(), "ionice" | "-c3" | "nice" | "-n") || a.parse::<i64>().is_ok()
+            });
             assert!(
-                spec.argv[0].contains("bwrap"),
-                "bwrap must front the argv: {:?}",
+                prefix_ok,
+                "only a cpu-priority prefix may precede bwrap: {:?}",
                 spec.argv
             );
         }

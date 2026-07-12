@@ -25,6 +25,7 @@ use crate::placement::{Placement, RuntimeProbe, SshPlacement, TransportKind};
 use crate::remote::GitLoc;
 use crate::sandbox_mounts::{
     auto_cache_mounts, default_writable_carveouts, host_toolchain_mounts_ro_home, keep_cfg_mount,
+    parse_mount,
 };
 use crate::{msg, util};
 use std::path::PathBuf;
@@ -1891,58 +1892,6 @@ pub const BWRAP_SUBSTRATE: &[&str] = &[
 // SSH credential plumbing (flattened-config materialization, identity-key
 // mounts) lives in `crate::ssh_creds`; re-exported here for existing callers.
 pub use crate::ssh_creds::prepare_ssh_config;
-
-fn parse_mount(spec: &str) -> Mount {
-    // "host", "host:ro", or "host:dest" / "host:dest:ro".
-    // Paths starting with "~/" are expanded to the real home directory so the
-    // mount spec is valid as a filesystem path (bwrap does not do shell expansion).
-    let expand = |p: &str| crate::util::expand_tilde(p);
-    let parts: Vec<&str> = spec.split(':').collect();
-    match parts.as_slice() {
-        [host] => Mount {
-            host: expand(host),
-            dest: expand(host),
-            ro: false,
-            cache: false,
-        },
-        [host, "ro"] => Mount {
-            host: expand(host),
-            dest: expand(host),
-            ro: true,
-            cache: false,
-        },
-        [host, "cache"] => Mount {
-            host: expand(host),
-            dest: expand(host),
-            ro: false,
-            cache: true,
-        },
-        [host, dest] => Mount {
-            host: expand(host),
-            dest: expand(dest),
-            ro: false,
-            cache: false,
-        },
-        [host, dest, "ro"] => Mount {
-            host: expand(host),
-            dest: expand(dest),
-            ro: true,
-            cache: false,
-        },
-        [host, dest, "cache"] => Mount {
-            host: expand(host),
-            dest: expand(dest),
-            ro: false,
-            cache: true,
-        },
-        _ => Mount {
-            host: expand(spec),
-            dest: expand(spec),
-            ro: false,
-            cache: false,
-        },
-    }
-}
 
 #[derive(Debug, Default, Clone)]
 pub struct SandboxStats {

@@ -491,6 +491,7 @@ mod tests {
 
     /// Build a placeholder group + its per-tab markers for `gen`, as
     /// `open_optimistic`/`open_tab` would.
+    #[allow(clippy::too_many_arguments)]
     fn seed_placeholder(
         session: &mut Session,
         sb: &mut SidebarState,
@@ -721,7 +722,7 @@ mod tests {
             session.worktrees.iter().any(|g| g.name == "repo/b"),
             "the concurrent creation survives the sibling's failure"
         );
-        assert!(gen_tab.get(&1).is_none());
+        assert!(!gen_tab.contains_key(&1));
         assert_eq!(gen_tab.get(&2), Some(&("repo/b".to_string(), 0)));
         assert!(sb.creating.contains("repo/b"));
         assert!(!sb.creating.contains("repo/a"));
