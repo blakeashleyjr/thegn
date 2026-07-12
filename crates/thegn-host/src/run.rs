@@ -491,7 +491,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // scrolls the alt screen and corrupts the damage-tracked frame — ghost
     // tabbars / doubled panel headers. Redirect fd 2 to a file for the whole
     // session; the guard restores it on exit so post-exit errors still print.
-    let _stderr_guard = redirect_stderr_to_logfile();
+    let _stderr_guard = crate::platform::redirect_stderr_to_logfile();
 
     let caps = Capabilities::new_from_env().context("term capabilities")?;
     let mut term = new_terminal(caps).context("open terminal")?;
@@ -893,31 +893,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         thegn_core::event_bus::NotificationUrgency::parse(&cfg.notifications.desktop_min_urgency),
     );
 
-    // Graceful shutdown on SIGTERM / SIGHUP: set a flag and pulse the waker so
-    // the blocking poll_input returns and the loop exits at the top of its next
-    // iteration, persisting session state before returning.
+    // Graceful shutdown on SIGTERM/SIGHUP (unix) or console-close (Windows):
+    // set a flag and pulse the waker so the blocking poll_input returns and the
+    // loop exits at the top of its next iteration, persisting session state
+    // before returning.
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let flag = shutdown.clone();
-        let sig_waker = waker.clone();
-        tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut term = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut hup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            tokio::select! {
-                _ = term.recv() => {}
-                _ = hup.recv() => {}
-            }
-            flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = sig_waker.wake();
-        });
-    }
+    crate::platform::install_shutdown_signal(shutdown.clone(), waker.clone());
 
     // Steady-state bench window (`THEGN_BENCH_RUN_MS`): run the full loop —
     // ticker, hydration, tokio pool and all — for a fixed window then exit, so
@@ -977,37 +958,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Frame is torn down; branded `msg::*` may print to stderr again.
     thegn_core::msg::set_tui_active(false);
     result
-}
-
-/// Redirect process stderr to `$XDG_STATE_HOME/thegn/logs/thegn-stderr.log`
-/// for the compositor's lifetime. Returns a guard whose `Drop` restores the
-/// original fd. `None` (no redirect) if any step fails — never blocks startup.
-fn redirect_stderr_to_logfile() -> Option<StderrGuard> {
-    use std::os::unix::io::AsRawFd;
-    let dir = thegn_core::util::xdg_state_home().join("thegn/logs");
-    std::fs::create_dir_all(&dir).ok()?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("thegn-stderr.log"))
-        .ok()?;
-    let saved = nix::unistd::dup(2).ok()?;
-    if nix::unistd::dup2(file.as_raw_fd(), 2).is_err() {
-        nix::unistd::close(saved).ok();
-        return None;
-    }
-    Some(StderrGuard { saved })
-}
-
-struct StderrGuard {
-    saved: std::os::unix::io::RawFd,
-}
-
-impl Drop for StderrGuard {
-    fn drop(&mut self) {
-        nix::unistd::dup2(self.saved, 2).ok();
-        nix::unistd::close(self.saved).ok();
-    }
 }
 
 /// Persist the supervisor's live pin set to `session_state.pin_state` (best
@@ -15092,7 +15042,13 @@ async fn event_loop<T: Terminal>(
                                     &abs_path.to_string_lossy(),
                                     None,
                                 );
-                                let _ = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
+                                let argv = thegn_core::shellinv::run_argv(
+                                    &thegn_core::util::shell(),
+                                    &cmd,
+                                );
+                                let _ = std::process::Command::new(&argv[0])
+                                    .args(&argv[1..])
+                                    .spawn();
                             }
                             true
                         }
@@ -15906,10 +15862,13 @@ async fn event_loop<T: Terminal>(
                                     Some(crate::keymap::HostCustomAction::Shell {
                                         run, ..
                                     }) => {
-                                        let mut cmd = std::process::Command::new(
-                                            thegn_core::util::shell(),
+                                        let argv = thegn_core::shellinv::run_argv(
+                                            &thegn_core::util::shell(),
+                                            &run,
                                         );
-                                        cmd.arg("-c").arg(&run);
+                                        let mut cmd =
+                                            std::process::Command::new(&argv[0]);
+                                        cmd.args(&argv[1..]);
                                         if let Some(dir) = active_cwd(&session) {
                                             cmd.current_dir(dir);
                                         }
@@ -16015,11 +15974,10 @@ async fn event_loop<T: Terminal>(
                                             };
                                             let spawned = match &run {
                                                 Some(cmdline) => {
-                                                    let argv = vec![
-                                                        thegn_core::util::shell(),
-                                                        "-c".to_string(),
-                                                        cmdline.clone(),
-                                                    ];
+                                                    let argv = thegn_core::shellinv::run_argv(
+                                                        &thegn_core::util::shell(),
+                                                        cmdline,
+                                                    );
                                                     panes.spawn_argv(
                                                         &argv,
                                                         pane_cwd.as_deref(),

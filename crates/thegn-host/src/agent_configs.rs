@@ -493,6 +493,7 @@ mod tests {
     /// store. The sync must follow those symlinks — otherwise `settings.json`
     /// (a regular file) uploads while the hook scripts it references (symlinks)
     /// are skipped, and the in-sandbox agent errors with `…-hook.sh: not found`.
+    #[cfg(unix)] // exercises unix symlinks + exec bits
     #[test]
     fn agent_config_follows_symlinked_config_files() {
         let root = std::env::temp_dir().join(format!("sz-claude-sym-{}", std::process::id()));

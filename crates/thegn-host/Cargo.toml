@@ -66,8 +66,6 @@ image = { version = "0.25", default-features = false, features = [
   "jpeg",
 ] }
 termwiz.workspace = true
-libc.workspace = true
-nix.workspace = true
 chrono.workspace = true
 ignore.workspace = true
 # fff file-search engine (src/fff_backend.rs) + its pure-Rust SIMD matcher for
@@ -103,3 +101,13 @@ sha2 = "0.10"
 base64 = "0.22"
 # Serve mode mounts the control-plane gRPC service into the TCP axum router.
 tonic.workspace = true
+
+# --- platform seams (src/platform/) ---
+# All OS-conditional syscall wrappers live in src/platform/{unix,windows}.rs;
+# these deps are gated so the other platform's graph never compiles them.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+nix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

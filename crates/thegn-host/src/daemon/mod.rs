@@ -49,6 +49,7 @@ fn hostname() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok()) // Windows
         .unwrap_or_else(|| "localhost".into())
 }
 
@@ -99,6 +100,18 @@ pub(crate) fn serve_blocking(cfg: &Config, opts: ServeOpts) -> Result<()> {
     rt.block_on(run(cfg, None, Some(opts)))
 }
 
+/// Phase-1 Windows stub: the daemon's IPC + single-instance lock are a unix
+/// socket today; the named-pipe port (IpcListener seam) replaces this stub.
+#[cfg(not(unix))]
+async fn run(
+    _cfg: &Config,
+    _socket_override: Option<PathBuf>,
+    _serve: Option<ServeOpts>,
+) -> Result<()> {
+    anyhow::bail!("thegn daemon is not yet supported on Windows (unix-socket IPC)")
+}
+
+#[cfg(unix)]
 async fn run(
     cfg: &Config,
     socket_override: Option<PathBuf>,
@@ -188,21 +201,10 @@ async fn run(
         merge_queue: cfg.merge_queue.clone(),
     });
 
-    // SIGTERM/SIGINT → the same graceful-shutdown path as the shutdown RPC,
-    // so `kill <daemon>` still deregisters and unlinks the socket.
-    {
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("install SIGTERM handler");
-            tokio::select! {
-                _ = term.recv() => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
-            shutdown.notify_waiters();
-        });
-    }
+    // SIGTERM/SIGINT (console-close on Windows) → the same graceful-shutdown
+    // path as the shutdown RPC, so `kill <daemon>` still deregisters and
+    // unlinks the socket.
+    crate::platform::spawn_shutdown_notifier(shutdown.clone());
     // Heartbeat (registry freshness for discovery).
     tokio::spawn(heartbeat_loop(db.clone(), daemon_id.clone()));
     // Lease bookkeeping: idle/busy transitions + expiry reaping.
@@ -318,8 +320,9 @@ async fn run(
     result.context("daemon serve")
 }
 
+#[cfg(unix)]
 fn pid_alive(pid: i64) -> bool {
-    pid > 0 && nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+    crate::platform::pid_alive(pid)
 }
 
 async fn heartbeat_loop(db: service::SharedDb, daemon_id: String) {

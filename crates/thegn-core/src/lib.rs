@@ -142,6 +142,7 @@ pub mod search;
 pub mod semantic;
 pub mod semantic_graph;
 pub mod share;
+pub mod shellinv;
 pub mod snapshot_meta;
 pub mod spillover;
 pub mod ssh_creds;

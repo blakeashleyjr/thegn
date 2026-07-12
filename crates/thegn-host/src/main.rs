@@ -115,6 +115,7 @@ mod perf;
 mod pi_assets;
 mod pins;
 mod placement_flow;
+mod platform;
 mod pr_view;
 mod predict;
 mod preview_gfx;

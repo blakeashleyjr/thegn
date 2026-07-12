@@ -300,7 +300,6 @@ fn run_agent(
     failure: &Failure,
 ) -> bool {
     use std::io::Read;
-    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     let prompt = build_prompt(branch, target, failure);
@@ -318,8 +317,8 @@ fn run_agent(
         .env("THEGN_WORKTREE", worktree)
         .env("THEGN_BRANCH", branch)
         .env("THEGN_MERGE_PROMPT", &prompt)
-        .env("THEGN_MERGE_TARGET", target)
-        .process_group(0);
+        .env("THEGN_MERGE_TARGET", target);
+    crate::platform::set_process_group(&mut cmd);
     // Defense in depth: the agent's git must target its cwd, not an inherited
     // GIT_DIR/GIT_INDEX_FILE (mirrors task.rs::build_capped_command).
     for var in util::GIT_ENV_VARS {
@@ -352,11 +351,7 @@ fn run_agent(
             }
             if !done.load(Ordering::Relaxed) {
                 timed_out.store(true, Ordering::Relaxed);
-                nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pgid),
-                    nix::sys::signal::Signal::SIGTERM,
-                )
-                .ok();
+                crate::platform::kill_tree(pgid);
             }
         })
     });
@@ -392,6 +387,9 @@ fn run_agent(
     status.map(|s| s.success()).unwrap_or(false)
 }
 
+/// Windows stub: `agent_command` templating quotes prompts with POSIX
+/// `sh_quote` and runs through `$SHELL -lc`, neither of which maps onto
+/// pwsh/cmd. Port the quoting before enabling this path on Windows.
 #[cfg(not(unix))]
 fn run_agent(
     _cfg: &MergeQueueConfig,
@@ -400,6 +398,10 @@ fn run_agent(
     _target: &str,
     _failure: &Failure,
 ) -> bool {
+    tracing::warn!(
+        target: "thegn::merge",
+        "merge queue: headless agent runs are not yet supported on Windows"
+    );
     false
 }
 
