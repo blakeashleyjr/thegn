@@ -2256,6 +2256,16 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
             40,
             near,
         )),
+        BarBadge::Maximized => Some(keyval(
+            "Maximize",
+            vec![(
+                "state".into(),
+                "pane maximized within the chrome".into(),
+                Tok::Hue(Hue::Teal),
+            )],
+            44,
+            near,
+        )),
         BarBadge::Lock => Some(keyval(
             "Keybind lock",
             vec![(

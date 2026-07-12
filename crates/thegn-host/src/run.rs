@@ -995,122 +995,6 @@ impl Drop for StderrGuard {
     }
 }
 
-/// Compute the chrome cross with the strip reserved iff the supervisor wants it
-/// shown and has live strip panes, at the runtime sidebar width. Single place so
-/// every recompute agrees.
-#[allow(clippy::too_many_arguments)]
-fn compute_chrome(
-    cols: usize,
-    rows: usize,
-    want_sidebar: bool,
-    want_panel: bool,
-    panel_forced: bool,
-    panel_width: layout::PanelWidth,
-    sidebar_cols: usize,
-    zoom: Option<crate::focus::Zone>,
-    supervisor: &crate::pins::PinSupervisor,
-    // Bottom drawer reservation: `drawer_rows` (> 0) carves a slice off the band
-    // bottom; `drawer_full_width` spans the whole width vs. the center column.
-    // Zoom suppresses the drawer along with the rest of the chrome.
-    drawer_rows: usize,
-    drawer_full_width: bool,
-) -> layout::ChromeLayout {
-    use crate::focus::Zone;
-    let strip = supervisor.strip_visible() && supervisor.has_strip_panes();
-    match zoom {
-        // Center zoom: full-width center (chrome columns suppressed); the
-        // focused pane alone renders into it (see the render block).
-        Some(Zone::Center) => layout::compute_full(
-            cols,
-            rows,
-            false,
-            false,
-            false,
-            layout::PanelWidth::Normal,
-            sidebar_cols,
-            false,
-            0.0,
-            0,
-            false,
-        ),
-        // Sidebar / panel zoom: the zone takes (nearly) the whole width; a
-        // 1-col center keeps the pane math alive.
-        Some(Zone::Sidebar) => {
-            let mut l = layout::compute_full(
-                cols,
-                rows,
-                true,
-                false,
-                false,
-                layout::PanelWidth::Normal,
-                sidebar_cols,
-                false,
-                0.0,
-                0,
-                false,
-            );
-            let w = cols.saturating_sub(2).max(1);
-            if let Some(sb) = l.sidebar.as_mut() {
-                sb.cols = w;
-            }
-            l.sep_left = Some(w);
-            for r in [&mut l.center_tabs, &mut l.center] {
-                r.x = (w + 1).min(cols.saturating_sub(1));
-                r.cols = 1;
-            }
-            l.strip = None;
-            l
-        }
-        Some(Zone::Panel) => {
-            let mut l = layout::compute_full(
-                cols,
-                rows,
-                false,
-                true,
-                true,
-                layout::PanelWidth::Full,
-                sidebar_cols,
-                false,
-                0.0,
-                0,
-                false,
-            );
-            let w = cols.saturating_sub(2).max(1);
-            if let Some(pn) = l.panel.as_mut() {
-                pn.x = cols - w;
-                pn.cols = w;
-            }
-            l.sep_right = Some((cols - w).saturating_sub(1));
-            for r in [&mut l.center_tabs, &mut l.center] {
-                r.x = 0;
-                r.cols = 1;
-            }
-            l.strip = None;
-            l
-        }
-        // The bars are single rows, and the drawer / corner overlay are never
-        // zoom targets — zooming them makes no sense; fall back to the normal
-        // layout (zoom is never set to these zones; this arm is for exhaustiveness).
-        Some(Zone::Masthead)
-        | Some(Zone::Statusbar)
-        | Some(Zone::Drawer)
-        | Some(Zone::Corner)
-        | None => layout::compute_full(
-            cols,
-            rows,
-            want_sidebar,
-            want_panel,
-            panel_forced,
-            panel_width,
-            sidebar_cols,
-            strip,
-            supervisor.strip_ratio(),
-            drawer_rows,
-            drawer_full_width,
-        ),
-    }
-}
-
 /// Working directory for a pin: explicit `cwd`, else the active tab's worktree,
 /// else `$HOME` / cwd.
 pub(crate) fn pin_cwd(
@@ -6743,6 +6627,14 @@ async fn event_loop<T: Terminal>(
     // Fullscreen zoom: the zone that owns the whole screen, if any. Toggled
     // by Ctrl+Alt+z for the CURRENT zone; any zone change clears it.
     let mut zoom: Option<crate::focus::Zone> = None;
+    // Level-2 pane maximize (the middle stop of Ctrl+Alt+z): the focused pane
+    // fills the center region while all chrome stays. Mutually exclusive with a
+    // `zoom` (the full-window / zone zoom). See `handlers::pane_zoom`.
+    let mut maximized = false;
+    // Which bars survive a full-window (`Center`) zoom — seeded from `[ui]` and
+    // re-seeded on config reload; consumed by the `recompute_chrome!` macro.
+    let mut zoom_keep_masthead = keymap.config().ui.fullscreen_keep_masthead;
+    let mut zoom_keep_statusbar = keymap.config().ui.fullscreen_keep_statusbar;
     // Sync-panes (item 96): when true, typed input is broadcast to every pane in
     // the focused tab (tmux `synchronize-panes`).
     let mut sync_panes = false;
@@ -6753,7 +6645,7 @@ async fn event_loop<T: Terminal>(
     // 12-line argument block, and there's a single place to keep the arg list.
     macro_rules! recompute_chrome {
         () => {
-            compute_chrome(
+            crate::handlers::pane_zoom::compute_chrome(
                 cols,
                 rows,
                 want_sidebar,
@@ -6765,6 +6657,8 @@ async fn event_loop<T: Terminal>(
                 &supervisor,
                 drawer_rows,
                 drawer_full,
+                zoom_keep_masthead,
+                zoom_keep_statusbar,
             )
         };
     }
@@ -7712,6 +7606,16 @@ async fn event_loop<T: Terminal>(
             need_relayout = true;
             dirty = true;
         }
+        // Leaving the center un-maximizes (its chrome is normal, so only the
+        // tiled tree needs restoring — no chrome recompute).
+        if prev_zone == crate::focus::Zone::Center
+            && focus.zone != crate::focus::Zone::Center
+            && maximized
+        {
+            maximized = false;
+            need_relayout = true;
+            dirty = true;
+        }
         prev_zone = focus.zone;
         sb.focused = focus.sidebar();
 
@@ -8209,14 +8113,12 @@ async fn event_loop<T: Terminal>(
 
         if need_relayout {
             let _relayout_span = crate::perf::measure(crate::perf::Subsys::Relayout);
-            let tree = if zoom == Some(crate::focus::Zone::Center) {
-                crate::center::CenterTree::Leaf(focused_pane_id(&session))
-            } else {
-                session
-                    .active_tab()
-                    .map(|t| t.center.clone())
-                    .unwrap_or(crate::center::CenterTree::Leaf(0))
-            };
+            let tree = crate::handlers::pane_zoom::grown_tree(
+                zoom,
+                maximized,
+                focused_pane_id(&session),
+                session.active_tab().map(|t| t.center.clone()),
+            );
             relayout(&mut panes, &tree, chrome.center);
             if let Some(strip_rect) = chrome.strip {
                 relayout_strip(&mut panes, &supervisor, strip_rect);
@@ -9810,6 +9712,14 @@ async fn event_loop<T: Terminal>(
                     keymap = rebuild_keymap(&new_cfg, &session);
                     sb.view.workspace_sort = new_cfg.ui.sidebar_workspace_sort;
                     sb.view.terminals_section = new_cfg.ui.sidebar_terminals_section;
+                    // Live fullscreen-bar reload: recompute the chrome now if the
+                    // user is currently in full-window zoom so the kept/dropped
+                    // bars apply immediately (the reload relayouts below anyway).
+                    zoom_keep_masthead = new_cfg.ui.fullscreen_keep_masthead;
+                    zoom_keep_statusbar = new_cfg.ui.fullscreen_keep_statusbar;
+                    if zoom == Some(crate::focus::Zone::Center) {
+                        chrome = recompute_chrome!();
+                    }
                     model.status = keybind_conflict_summary(&new_cfg)
                         .unwrap_or_else(|| "Config reloaded".into());
                     // Live theme reload: colors apply on the next repaint.
@@ -10168,6 +10078,7 @@ async fn event_loop<T: Terminal>(
         model.masthead_sel = model.masthead_sel.min(mh_items.saturating_sub(1));
         model.key_locked = focus.locked;
         model.zoomed = zoom.is_some();
+        model.maximized = maximized;
         model.sync_panes = sync_panes;
         model.keyhints = context_hints(&focus, &panel_ui, keymap.config());
         // The ticker samples at live (500ms) cadence while the telemetry
@@ -10462,14 +10373,12 @@ async fn event_loop<T: Terminal>(
             // render time — no timer).
             model.notify_dnd = notify_state.dnd_active();
             model.notify_mode = notify_state.active_mode();
-            let tree = if zoom == Some(crate::focus::Zone::Center) {
-                crate::center::CenterTree::Leaf(focused)
-            } else {
-                session
-                    .active_tab()
-                    .map(|t| t.center.clone())
-                    .unwrap_or(crate::center::CenterTree::Leaf(0))
-            };
+            let tree = crate::handlers::pane_zoom::grown_tree(
+                zoom,
+                maximized,
+                focused,
+                session.active_tab().map(|t| t.center.clone()),
+            );
             // Layout changes (panel toggles/expansion, zoom) need NO physical
             // explicit clear: `front` mirrors the wire exactly, so the diff repaints
             // precisely the changed cells — clearing here only caused a
@@ -17215,18 +17124,14 @@ async fn event_loop<T: Terminal>(
                                     format!("Theme: {name} (set [theme] preset to keep)");
                             }
                             Action::ToggleZoom => {
-                                // Toggle: zoom the focused zone, unless already
-                                // zoomed or focused on a single-row bar (can't zoom).
-                                zoom = if zoom.is_none() && !focus.bar() {
-                                    Some(focus.zone)
-                                } else {
-                                    None
-                                };
-                                model.status = if zoom.is_some() {
-                                    "Zoomed — Ctrl+Alt+z to restore".into()
-                                } else {
-                                    String::new()
-                                };
+                                // On the center, cycle tiled → maximize-in-chrome
+                                // → full-window fullscreen → tiled; on the
+                                // sidebar/panel, the older zone-zoom toggle.
+                                model.status = crate::handlers::pane_zoom::cycle_or_zoom(
+                                    &mut zoom,
+                                    &mut maximized,
+                                    &focus,
+                                );
                                 chrome = recompute_chrome!();
                                 need_relayout = true;
                             }
@@ -17427,6 +17332,11 @@ async fn event_loop<T: Terminal>(
                                         FocusMove::CenterPane(n) => {
                                             if let Some(tab) = session.active_tab_mut() {
                                                 tab.focused_pane = n;
+                                            }
+                                            // Follow-focus while grown: the newly
+                                            // focused pane must fill the screen.
+                                            if maximized {
+                                                need_relayout = true;
                                             }
                                         }
                                         FocusMove::Enter(zone) => {
