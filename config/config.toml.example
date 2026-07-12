@@ -65,6 +65,12 @@ sidebar_workspace_sort = "manual"
 # "no terminals" hint when empty) so the entry point never vanishes;
 # "nonempty" hides the whole section until a terminal exists.
 sidebar_terminals_section = "always"
+# Pane fullscreen (Ctrl+Alt+z cycles tiled → maximize-in-chrome → full-window):
+# in the full-window stop the sidebar/panel/strip are hidden. These keep the
+# top masthead and bottom status bars respectively — set either false for a
+# more immersive (or fully borderless) fullscreen.
+fullscreen_keep_masthead = true
+fullscreen_keep_statusbar = true
 
 # Visual tuning. The focus accent recolors every thegn surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused

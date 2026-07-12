@@ -285,6 +285,43 @@ pub fn compute_full(
     drawer_rows: usize,
     drawer_full_width: bool,
 ) -> ChromeLayout {
+    compute_full_bars(
+        cols,
+        rows,
+        want_sidebar,
+        want_panel,
+        panel_forced,
+        panel_width,
+        sidebar_cols,
+        want_strip,
+        strip_ratio,
+        drawer_rows,
+        drawer_full_width,
+        true,
+        true,
+    )
+}
+
+/// [`compute_full`] with explicit control over the top/bottom bars: pane
+/// fullscreen can hide the masthead and/or statusbar (`want_masthead` /
+/// `want_statusbar` = false), and the band below reclaims the freed row. Every
+/// other caller keeps both bars via [`compute_full`].
+#[allow(clippy::too_many_arguments)]
+pub fn compute_full_bars(
+    cols: usize,
+    rows: usize,
+    want_sidebar: bool,
+    want_panel: bool,
+    panel_forced: bool,
+    panel_width: PanelWidth,
+    sidebar_cols: usize,
+    want_strip: bool,
+    strip_ratio: f32,
+    drawer_rows: usize,
+    drawer_full_width: bool,
+    want_masthead: bool,
+    want_statusbar: bool,
+) -> ChromeLayout {
     // A full-width panel claims the whole band — the sidebar steps aside. The
     // slim rail (width ≤ RAIL_COLS) is cheap, so it survives below the
     // auto-hide width threshold that the full panel honors.
@@ -293,13 +330,24 @@ pub fn compute_full(
         want_sidebar && (rail || cols >= SIDEBAR_MIN_COLS) && panel_width != PanelWidth::Full;
     let show_panel = want_panel && (cols >= PANEL_MIN_COLS || panel_forced);
 
+    // The top/bottom bars are normally always up (1 row each). Pane fullscreen
+    // can drop either — a 0-row bar collapses cleanly and the band below
+    // reclaims the row (every downstream `y`/`rows` derives from these).
     let masthead = Rect {
         x: 0,
         y: 0,
         cols,
-        rows: MASTHEAD_ROWS.min(rows),
+        rows: if want_masthead {
+            MASTHEAD_ROWS.min(rows)
+        } else {
+            0
+        },
     };
-    let status_rows = rows.saturating_sub(masthead.rows).min(STATUSBAR_ROWS);
+    let status_rows = if want_statusbar {
+        rows.saturating_sub(masthead.rows).min(STATUSBAR_ROWS)
+    } else {
+        0
+    };
     let status_y = rows.saturating_sub(status_rows);
     let statusbar = Rect {
         x: 0,
@@ -922,6 +970,104 @@ mod tests {
             Some(RAIL_COLS),
             "rail stays visible when narrow"
         );
+    }
+
+    /// `compute_full_bars` with both bars kept must be identical to `compute`.
+    #[test]
+    fn compute_full_bars_keeps_both_bars_by_default() {
+        let plain = compute(160, 40, true, true);
+        let bars = compute_full_bars(
+            160,
+            40,
+            true,
+            true,
+            false,
+            PanelWidth::Normal,
+            SIDEBAR_COLS,
+            false,
+            0.0,
+            0,
+            false,
+            true,
+            true,
+        );
+        assert_eq!(plain, bars);
+    }
+
+    #[test]
+    fn hiding_masthead_reclaims_the_top_row_for_the_band() {
+        let full = compute_full_bars(
+            160,
+            40,
+            false,
+            false,
+            false,
+            PanelWidth::Normal,
+            SIDEBAR_COLS,
+            false,
+            0.0,
+            0,
+            false,
+            false,
+            true,
+        );
+        // No masthead and no divider under it; the column band starts at row 0.
+        assert_eq!(full.masthead.rows, 0);
+        assert_eq!(full.divider.y, 0);
+        // Statusbar still pinned to the bottom row.
+        assert_eq!(full.statusbar.rows, 1);
+        assert_eq!(full.statusbar.y, 39);
+        // Everything shifts up one row; the center gains the masthead's row
+        // (37 rows vs the usual 36, starting one row higher).
+        assert_eq!(full.center.y, 2);
+        assert_eq!(full.center.rows, 37);
+    }
+
+    #[test]
+    fn hiding_statusbar_reclaims_the_bottom_row_for_the_band() {
+        let full = compute_full_bars(
+            160,
+            40,
+            false,
+            false,
+            false,
+            PanelWidth::Normal,
+            SIDEBAR_COLS,
+            false,
+            0.0,
+            0,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(full.statusbar.rows, 0);
+        assert_eq!(full.masthead.rows, 1);
+        // The center now runs to the last row (no statusbar underneath).
+        assert_eq!(full.center.y + full.center.rows, 40);
+    }
+
+    #[test]
+    fn hiding_both_bars_gives_the_band_the_whole_height() {
+        let full = compute_full_bars(
+            160,
+            40,
+            false,
+            false,
+            false,
+            PanelWidth::Normal,
+            SIDEBAR_COLS,
+            false,
+            0.0,
+            0,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(full.masthead.rows, 0);
+        assert_eq!(full.statusbar.rows, 0);
+        // Divider caps the columns at the very top; center runs to the last row.
+        assert_eq!(full.divider.y, 0);
+        assert_eq!(full.center.y + full.center.rows, 40);
     }
 
     #[test]

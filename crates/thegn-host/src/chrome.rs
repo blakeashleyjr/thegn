@@ -396,6 +396,9 @@ pub struct FrameModel {
     pub key_locked: bool,
     /// True while a zone is zoomed fullscreen (statusbar indicator).
     pub zoomed: bool,
+    /// True while the focused pane is maximized within the chrome — the middle
+    /// stop of Ctrl+Alt+z (statusbar indicator, distinct from `zoomed`).
+    pub maximized: bool,
     /// True while sync-panes broadcast is active (statusbar indicator, item 96).
     pub sync_panes: bool,
     /// Transient message (errors, "Config reloaded", copy confirmations).
@@ -923,6 +926,7 @@ pub enum BarBadge {
     AiCost,
     Agent,
     Zoom,
+    Maximized,
     Lock,
     Sync,
 }
@@ -1396,6 +1400,17 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
             vec![Seg::chip(
                 Tok::Hue(thegn_core::theme::Hue::Purple),
                 " \u{26f6} ZOOM ",
+            )],
+        ));
+    }
+    // Maximize-in-chrome (mutually exclusive with `zoomed`): a framed square
+    // reads as "pane filling its region", distinct from the fullscreen chip.
+    if model.maximized {
+        items.push((
+            BarItemId::Badge(BarBadge::Maximized),
+            vec![Seg::chip(
+                Tok::Hue(thegn_core::theme::Hue::Teal),
+                " \u{25a3} MAX ",
             )],
         ));
     }
