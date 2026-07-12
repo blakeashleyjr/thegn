@@ -184,15 +184,20 @@ pub fn overlay_selection(
     surface: &mut Surface,
     content: Rect,
     sel: &crate::copymode::Selection,
+    display_offset: usize,
     bg: termwiz::color::ColorAttribute,
 ) {
     let (sr, sc, er, ec) = sel.ordered();
     let last_col = content.cols.saturating_sub(1);
+    // Selection rows are absolute grid lines; the highlight is screen-relative,
+    // so map back through the current viewport offset and skip lines scrolled
+    // out of view (a partial highlight when the selection spans off-screen).
+    let last_row = content.rows.saturating_sub(1) as i32;
     // Read the composed cells back first (screen_cells borrows mutably).
     let mut patches: Vec<(usize, usize, String, termwiz::color::ColorAttribute)> = Vec::new();
     {
         let cells = surface.screen_cells();
-        for r in sr..=er.min(content.rows.saturating_sub(1) as u16) {
+        for r in sr..=er {
             let (from, to) = if sr == er {
                 (sc, ec)
             } else if r == sr {
@@ -202,7 +207,11 @@ pub fn overlay_selection(
             } else {
                 (0, last_col as u16)
             };
-            let y = content.y + r as usize;
+            let screen_row = r + display_offset as i32;
+            if screen_row < 0 || screen_row > last_row {
+                continue;
+            }
+            let y = content.y + screen_row as usize;
             for c in from..=to.min(last_col as u16) {
                 let x = content.x + c as usize;
                 if let Some(cell) = cells.get(y).and_then(|row| row.get(x)) {
