@@ -41,21 +41,40 @@ pub fn terminate_pid(pid: u32) {
     .ok();
 }
 
-/// Put the child in its own process group so [`kill_tree`] can reap the whole
-/// tree (e.g. a `cargo test` and its spawned test binaries) in one call.
-pub fn set_process_group(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    cmd.process_group(0);
+/// A spawned child's process group — what [`GroupHandle::terminate`] reaps
+/// (e.g. a `cargo test` and every test binary it spawned) in one call.
+#[derive(Clone)]
+pub struct GroupHandle {
+    pgid: i32,
 }
 
-/// Best-effort termination of the process tree rooted at a child spawned with
-/// [`set_process_group`] (`pid` == the child's pid == its pgid).
-pub fn kill_tree(pid: i32) {
-    nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGTERM,
-    )
-    .ok();
+impl GroupHandle {
+    /// A handle over an already-known pid/pgid — for tests and callers that
+    /// track pids themselves. (On Windows this is also the degraded no-job
+    /// path, so it's part of the seam's shared API.)
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn from_pid(pid: i32) -> Self {
+        Self { pgid: pid }
+    }
+
+    /// Best-effort `SIGTERM` to the whole group.
+    pub fn terminate(&self) {
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(self.pgid),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .ok();
+    }
+}
+
+/// Spawn `cmd` in its own process group (Job Object on Windows) and return the
+/// child plus the group handle that reaps the whole tree.
+pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+    let child = cmd.spawn()?;
+    let pgid = child.id() as i32;
+    Ok((child, GroupHandle { pgid }))
 }
 
 /// Compositor shutdown: on SIGTERM/SIGHUP set `flag` and pulse `waker` so the

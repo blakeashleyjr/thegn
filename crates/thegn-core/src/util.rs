@@ -548,7 +548,11 @@ pub fn git_common_dir(worktree: &Path) -> PathBuf {
 /// `Drop` AND on process death — there are never stale locks. Reads stay
 /// lock-free; only the svc write runners acquire this.
 #[must_use = "the lock releases as soon as the guard is dropped"]
-pub struct GitLock(std::fs::File);
+pub struct GitLock(
+    // Held purely for RAII: the unix Drop unlocks explicitly; on Windows the
+    // exclusive share mode releases when the handle closes (field unread).
+    #[cfg_attr(windows, allow(dead_code))] std::fs::File,
+);
 
 /// Acquire the per-repo git-mutation lock (blocking) at
 /// `<git-common>/thegn-git.lock`, serializing concurrent mutations on the
