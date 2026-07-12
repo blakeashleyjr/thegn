@@ -2421,10 +2421,14 @@ enabled = false
 # ── Control plane (pane daemon + serve) ────────────────────────────────────
 # The pane daemon: a `thegn daemon` process that owns the portable-pty panes
 # so they survive the UI exiting — quit the compositor, relaunch, and
-# warm-reattach to a still-running agent. OPT-IN: with `enabled = false` (the
-# default) bare `thegn` behaves exactly as today (in-process PTYs).
+# warm-reattach to a still-running agent (tmux semantics). ON by default:
+# quitting detaches your worktree panes (they keep running; the exit message
+# says how many were kept), while explicitly CLOSING a pane/tab kills its
+# process. Pins, the tool drawer, and the corner overlay stay in-process and
+# die with the UI. Set `enabled = false` for plain in-process PTYs that die
+# with the compositor.
 [daemon]
-enabled = false
+enabled = true
 # Control-socket override. Empty (default) resolves to
 # $XDG_RUNTIME_DIR/thegn/daemon.sock, falling back to
 # $XDG_STATE_HOME/thegn/run/daemon.sock (so isolated state dirs — `just
@@ -2435,8 +2439,12 @@ socket = ""
 idle_exit_secs = 1800
 # When the last client detaches from a session, keep its PTY warm this long
 # (the relay lease). Reconnect within the grace resumes the same live screen;
-# expiry reaps the process.
-lease_grace_secs = 3600
+# expiry reaps the process. 0 (the default) = never reap: a detached session
+# lives until you close its pane, kill it (`thegn session list`), or the
+# machine restarts — that's what makes "come back tomorrow" work.
+# (Env kill-switch: THEGN_NO_DAEMON=1 force-disables daemon routing for one
+# run — test/bench harnesses that kill the compositor without a quit use it.)
+lease_grace_secs = 0
 
 # `thegn serve`: pair remote thin clients (desktop/web/mobile) over a pairing
 # URL and let them attach through the scoped control API. v1 serves PLAINTEXT —

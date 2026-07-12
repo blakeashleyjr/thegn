@@ -368,6 +368,10 @@ pub struct FrameModel {
     /// Do-not-disturb active (item 426): drives the statusbar DND chip. Set each
     /// frame from the notification runtime.
     pub notify_dnd: bool,
+    /// Focused pane is daemon-backed — quitting detaches it (the process keeps
+    /// running; the next launch reattaches). Drives the "persistent" chip.
+    /// Set each frame from the live panes table.
+    pub persistent_pane: bool,
     /// Active notification routing mode (item 427; `""` = default). Shown as a
     /// statusbar chip when non-empty.
     pub notify_mode: String,
@@ -911,6 +915,8 @@ pub enum BarBadge {
     Attention,
     Ci,
     MergeQueue,
+    /// Focused pane is daemon-backed (survives quitting the UI).
+    Persist,
     DiskWarn,
     Ingress,
     Media,
@@ -1254,6 +1260,7 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
     // Needs-you / CI rollup / merge-queue chips live in `statusbar_badges.rs`
     // (extracted from this ratchet-pinned file).
     crate::statusbar_badges::push_attention_badge(model, &mut items);
+    crate::statusbar_badges::push_daemon_chip(model, &mut items);
     crate::statusbar_badges::push_ci_badge(model, &mut items);
     crate::statusbar_badges::push_mq_badge(model, &mut items);
     // Low-free-space badge: trips when the worktrees' filesystem drops to/below

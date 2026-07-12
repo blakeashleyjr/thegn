@@ -1110,22 +1110,6 @@ fn compute_chrome(
     }
 }
 
-/// Working directory for a pin: explicit `cwd`, else the active tab's worktree,
-/// else `$HOME` / cwd.
-pub(crate) fn pin_cwd(
-    pin: &thegn_core::config::Pin,
-    active_dir: Option<std::path::PathBuf>,
-) -> std::path::PathBuf {
-    if let Some(c) = &pin.cwd {
-        let expanded = thegn_core::util::expand_tilde(c);
-        return std::path::PathBuf::from(expanded);
-    }
-    active_dir
-        .or_else(|| std::env::current_dir().ok())
-        .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
-        .unwrap_or_else(|| std::path::PathBuf::from("/"))
-}
-
 /// Persist the supervisor's live pin set to `session_state.pin_state` (best
 /// effort; pin persistence never blocks the loop).
 pub(crate) fn persist_pin_state(supervisor: &crate::pins::PinSupervisor, session_id: &str) {
@@ -1167,32 +1151,9 @@ fn summon_pin(
     }
     let active_dir = active_cwd(session);
     let pin = (*pin).clone();
-    match spawn_pin(&pin, panes, supervisor, active_dir, center) {
+    match crate::pins::spawn_pin(&pin, panes, supervisor, active_dir, center) {
         Some(_) => Some(format!("Launched pin '{}'", pin.display_label())),
         None => Some(format!("Pin '{}' failed to launch", pin.display_label())),
-    }
-}
-
-/// Spawn a pin's program into a pane and register it with the supervisor.
-/// Sized to the strip body for strip pins, else the center. Returns the pane id.
-fn spawn_pin(
-    pin: &thegn_core::config::Pin,
-    panes: &mut Panes,
-    supervisor: &mut crate::pins::PinSupervisor,
-    active_dir: Option<std::path::PathBuf>,
-    center: Rect,
-) -> Option<u32> {
-    let argv = crate::pins::PinSupervisor::argv(pin);
-    let env: Vec<(String, String)> = crate::pins::PinSupervisor::spawn_env(pin)
-        .into_iter()
-        .collect();
-    let cwd = pin_cwd(pin, active_dir);
-    match panes.spawn_argv_env(&argv, Some(&cwd), &env, center) {
-        Ok(id) => {
-            supervisor.attach(pin, id);
-            Some(id)
-        }
-        Err(_) => None,
     }
 }
 
@@ -7549,8 +7510,8 @@ async fn event_loop<T: Terminal>(
                     let env: Vec<(String, String)> = crate::pins::PinSupervisor::spawn_env(pin)
                         .into_iter()
                         .collect();
-                    let cwd = pin_cwd(pin, active_dir.clone());
-                    if let Ok(id) = panes.spawn_argv_env(&argv, Some(&cwd), &env, content) {
+                    let cwd = crate::pins::pin_cwd(pin, active_dir.clone());
+                    if let Ok(id) = panes.spawn_argv_env_local(&argv, Some(&cwd), &env, content) {
                         supervisor.attach(pin, id);
                         corner = Some(id);
                         corner_name = Some(pin.name.clone());
@@ -7563,7 +7524,7 @@ async fn event_loop<T: Terminal>(
                 }
                 continue;
             }
-            spawn_pin(
+            crate::pins::spawn_pin(
                 pin,
                 &mut panes,
                 &mut supervisor,
@@ -7644,6 +7605,8 @@ async fn event_loop<T: Terminal>(
             share_supervisor.shutdown_all();
             forward_supervisor.shutdown_all();
             persist_session_layout(&mut session, &panes);
+            // SIGTERM/SIGINT quit is a detach too — see Action::Quit.
+            crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
             return Ok(());
         }
         // Writer-thread health: a transient write failure means the terminal's
@@ -8257,6 +8220,8 @@ async fn event_loop<T: Terminal>(
             loop_perf.input_preempt();
         }
         if drain_summary.disconnected {
+            // Teardown, not an explicit close: keep daemon panes running.
+            crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
             return Ok(());
         }
         if session.worktrees.is_empty() {
@@ -9601,10 +9566,13 @@ async fn event_loop<T: Terminal>(
                                             crate::pins::PinSupervisor::spawn_env(&pin)
                                                 .into_iter()
                                                 .collect();
-                                        let cwd = pin_cwd(&pin, active_dir.clone());
-                                        if let Ok(id) =
-                                            panes.spawn_argv_env(&argv, Some(&cwd), &env, content)
-                                        {
+                                        let cwd = crate::pins::pin_cwd(&pin, active_dir.clone());
+                                        if let Ok(id) = panes.spawn_argv_env_local(
+                                            &argv,
+                                            Some(&cwd),
+                                            &env,
+                                            content,
+                                        ) {
                                             supervisor.attach(&pin, id);
                                             corner = Some(id);
                                             corner_name = Some(pin.name.clone());
@@ -9617,7 +9585,7 @@ async fn event_loop<T: Terminal>(
                                     }
                                     continue;
                                 }
-                                spawn_pin(
+                                crate::pins::spawn_pin(
                                     &pin,
                                     &mut panes,
                                     &mut supervisor,
@@ -10403,6 +10371,11 @@ async fn event_loop<T: Terminal>(
             // render time — no timer).
             model.notify_dnd = notify_state.dnd_active();
             model.notify_mode = notify_state.active_mode();
+            // Persistent chip: the focused pane is daemon-backed (survives quit).
+            model.persistent_pane = panes
+                .table
+                .get(&focused)
+                .is_some_and(|p| p.is_daemon_backed());
             let tree = if zoom == Some(crate::focus::Zone::Center) {
                 crate::center::CenterTree::Leaf(focused)
             } else {
@@ -13665,6 +13638,10 @@ async fn event_loop<T: Terminal>(
                                         "Clone and open: paste a git URL or path (Esc cancels)"
                                             .into();
                                 } else if key == "quit" {
+                                    // Palette quit is a detach — see Action::Quit.
+                                    crate::handlers::daemon_lifecycle::mark_session_panes_detached(
+                                        &session, &panes,
+                                    );
                                     return Ok(());
                                 } else if let Some(payload) = key.strip_prefix("wt:") {
                                     if let Some((repo_path, tab_name)) = payload.split_once('\t')
@@ -16279,8 +16256,25 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
-                            Action::Quit => {
+                            Action::Quit | Action::Detach => {
                                 persist_session_layout(&mut session, &panes);
+                                // Quit is a detach: daemon-backed center panes
+                                // keep running; the next launch reattaches.
+                                crate::handlers::daemon_lifecycle::mark_session_panes_detached(
+                                    &session, &panes,
+                                );
+                                return Ok(());
+                            }
+                            Action::QuitKill => {
+                                persist_session_layout(&mut session, &panes);
+                                // One-time bounded wait on the quit path so the
+                                // kills land before shutdown_background() aborts
+                                // in-flight tasks. Panes stay kill-on-drop.
+                                crate::handlers::daemon_lifecycle::kill_daemon_sessions_blocking(
+                                    &panes,
+                                    &current_config.daemon,
+                                    std::time::Duration::from_secs(3),
+                                );
                                 return Ok(());
                             }
                             Action::SwitchFont => match crate::font::font_palette_items() {
@@ -16441,9 +16435,13 @@ async fn event_loop<T: Terminal>(
                                             crate::pins::PinSupervisor::spawn_env(&pin)
                                                 .into_iter()
                                                 .collect();
-                                        let cwd = pin_cwd(&pin, active_cwd(&session));
-                                        match panes.spawn_argv_env(&argv, Some(&cwd), &env, content)
-                                        {
+                                        let cwd = crate::pins::pin_cwd(&pin, active_cwd(&session));
+                                        match panes.spawn_argv_env_local(
+                                            &argv,
+                                            Some(&cwd),
+                                            &env,
+                                            content,
+                                        ) {
                                             Ok(id) => {
                                                 supervisor.attach(&pin, id);
                                                 corner = Some(id);

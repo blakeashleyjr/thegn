@@ -17,7 +17,13 @@ export GIT_CONFIG_GLOBAL="$_tmp/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
 # into the statusbar/masthead media badge and every snapshot goes
 # nondeterministic as tracks change.
 export DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null/e2e-no-dbus"
-mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
+# In-process panes: muse kills compositors without a quit path — daemon-backed
+# panes would detach into never-reaped sessions (a leaked daemon + shell per
+# case), and the async "persist" chip would flake the statusbar snapshots.
+# The runtime dir is isolated for the same reason smoke isolates it: the
+# daemon socket path prefers $XDG_RUNTIME_DIR.
+export THEGN_NO_DAEMON=1 XDG_RUNTIME_DIR="$_tmp/run"
+mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
 printf '[user]\nname = e2e\nemail = e2e@example.invalid\n' > "$_tmp/gitconfig"
 '''
 
@@ -521,6 +527,7 @@ start name="dev": build
       echo $$ > "$pidfile"; exec env \
       "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
+      "XDG_RUNTIME_DIR=$run" \
       "THEGN_NO_MIGRATE=1" \
       {{bin}}
 
@@ -621,6 +628,7 @@ start-mq name="dev" gate="cargo build --workspace": build
       echo $$ > "$pidfile"; exec env \
       "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
+      "XDG_RUNTIME_DIR=$run" \
       "THEGN_NO_MIGRATE=1" \
       {{bin}} --set merge_queue.enabled=true \
               --set 'merge_queue.gate_command={{gate}}' \

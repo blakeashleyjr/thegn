@@ -71,6 +71,20 @@ pub enum PaneEvent {
     /// status was unavailable — e.g. a PTY read error), so the event loop can
     /// distinguish a clean exit from a crash (item 524).
     Exit(u32, Option<i32>),
+    /// Pane `id`'s warm reattach found its persisted session gone (lease
+    /// expired / daemon restarted — e.g. after a reboot) and degraded to a
+    /// fresh session. The loop applies the pane's [`FallbackRestore`]:
+    /// repaint the persisted scrollback tail + arm the relaunch overlay.
+    SessionFallback(u32),
+}
+
+/// What a stream pane restores when its warm reattach falls back to a fresh
+/// session (see [`PaneEvent::SessionFallback`]): the persisted scrollback tail
+/// to repaint and the recorded foreground command to offer relaunching.
+/// Stashed on the pane at materialize time, taken by the loop on the event.
+pub struct FallbackRestore {
+    pub scrollback: String,
+    pub relaunch: Option<String>,
 }
 
 pub struct PtyPane {
@@ -104,6 +118,19 @@ pub struct PtyPane {
     /// once the server announces it, read at persist time for reattach. `None`
     /// for a PTY pane (and until the announcement lands).
     session_cell: Option<Arc<Mutex<Option<String>>>>,
+    /// For a `Stream` pane: whether dropping the pane DETACHES its session
+    /// (keeps the server-side process running) instead of killing it. Default
+    /// false — an explicit close must not leak a live process into a relay
+    /// lease; quit marks its center-tree panes detached before returning.
+    detach_on_drop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// For a `Stream` pane: the session's PTY child pid on the local host
+    /// (the pane daemon's child; 0 = unknown), published by the relay task.
+    /// Lets the `/proc`-based cwd/foreground-command capture work for daemon
+    /// panes. `None` for a PTY pane (which carries `pid` directly).
+    pid_cell: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// Restore payload applied when this pane's warm reattach degrades to a
+    /// fresh session (see [`PaneEvent::SessionFallback`]).
+    fallback_restore: Option<FallbackRestore>,
     /// Predictive local-echo state — instant keystroke echo on a high-latency
     /// remote pane (the srtt gate auto-enables only on a slow link). See `predict`.
     predictor: crate::predict::Predictor,
@@ -312,6 +339,9 @@ impl PtyPane {
             pid: pty.pid,
             pending_relaunch: None,
             session_cell: None,
+            detach_on_drop: None,
+            pid_cell: None,
+            fallback_restore: None,
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
@@ -344,6 +374,8 @@ impl PtyPane {
     ) -> Self {
         let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<ExecControl>(256);
         let session_cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let detach_on_drop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pid_cell = Arc::new(std::sync::atomic::AtomicU32::new(0));
         rt.spawn(relay_exec(
             id,
             source,
@@ -354,6 +386,8 @@ impl PtyPane {
             waker,
             ctrl_rx,
             session_cell.clone(),
+            detach_on_drop.clone(),
+            pid_cell.clone(),
         ));
         Self {
             io: PaneIo::Stream {
@@ -371,6 +405,9 @@ impl PtyPane {
             pid: None,
             pending_relaunch: None,
             session_cell: Some(session_cell),
+            detach_on_drop: Some(detach_on_drop),
+            pid_cell: Some(pid_cell),
+            fallback_restore: None,
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
@@ -382,13 +419,31 @@ impl PtyPane {
         }
     }
 
+    /// The pane's child pid on the local host: the PTY child directly, or —
+    /// for a daemon-backed stream pane — the daemon session's child as
+    /// published by the relay (0 in the cell = not announced yet). `None` for
+    /// remote/provider streams, whose pid isn't host-meaningful.
+    fn live_pid(&self) -> Option<u32> {
+        if self.pid.is_some() {
+            return self.pid;
+        }
+        match self
+            .pid_cell
+            .as_ref()?
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            p => Some(p),
+        }
+    }
+
     /// The pane's current working directory, read live from `/proc/<pid>/cwd`.
     /// `None` when the pid is unknown, the process is gone, or the symlink can't
     /// be resolved (e.g. a sandbox runtime whose cwd isn't host-meaningful — the
     /// caller gates capture on the host backend regardless). Linux-only; other
     /// platforms (where thegn does not run) return `None`.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
-        let pid = self.pid?;
+        let pid = self.live_pid()?;
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
@@ -398,7 +453,7 @@ impl PtyPane {
     /// an unknown pid, or non-Linux. Captured at persist time so a resurrected
     /// or crashed pane can offer to relaunch what was running.
     pub fn foreground_command(&self) -> Option<crate::session::PaneCmd> {
-        let shell = self.pid?;
+        let shell = self.live_pid()?;
         let child = newest_child(shell)?;
         let argv = read_cmdline(child)?;
         let name = std::path::Path::new(argv.first()?)
@@ -436,6 +491,36 @@ impl PtyPane {
     /// Take the pending relaunch command, clearing the overlay (on Enter).
     pub fn take_pending_relaunch(&mut self) -> Option<String> {
         self.pending_relaunch.take()
+    }
+
+    /// Mark this pane detached-on-drop: dropping it DETACHES its server-side
+    /// session (the process keeps running, reattachable by the next launch)
+    /// instead of killing it. Quit marks its center-tree panes; the default
+    /// (kill) is what every explicit close path needs. No-op for PTY panes.
+    pub fn set_detach_on_drop(&self, on: bool) {
+        if let Some(flag) = &self.detach_on_drop {
+            flag.store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Whether this pane is backed by the pane daemon (survives UI exit).
+    pub fn is_daemon_backed(&self) -> bool {
+        matches!(&self.io, PaneIo::Stream { provider, .. } if provider == "daemon")
+    }
+
+    /// Stash the restore payload for a possible reattach fallback (set at
+    /// materialize time from the tab's persisted scrollback/command hints).
+    pub fn set_fallback_restore(&mut self, scrollback: Option<String>, relaunch: Option<String>) {
+        self.fallback_restore =
+            (scrollback.is_some() || relaunch.is_some()).then(|| FallbackRestore {
+                scrollback: scrollback.unwrap_or_default(),
+                relaunch,
+            });
+    }
+
+    /// Take the fallback-restore payload (on [`PaneEvent::SessionFallback`]).
+    pub fn take_fallback_restore(&mut self) -> Option<FallbackRestore> {
+        self.fallback_restore.take()
     }
 
     /// Feed PTY output into the emulator grid (loop-fed panes only — a
@@ -659,6 +744,9 @@ impl PtyPane {
             pid: None,
             pending_relaunch: None,
             session_cell: Some(Arc::new(Mutex::new(None))),
+            detach_on_drop: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            pid_cell: Some(Arc::new(std::sync::atomic::AtomicU32::new(0))),
+            fallback_restore: None,
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
@@ -758,6 +846,8 @@ async fn relay_exec(
     waker: Option<TerminalWaker>,
     mut ctrl_rx: tokio_mpsc::Receiver<ExecControl>,
     session_cell: Arc<Mutex<Option<String>>>,
+    detach_on_drop: Arc<std::sync::atomic::AtomicBool>,
+    pid_cell: Arc<std::sync::atomic::AtomicU32>,
 ) {
     let wake = || {
         if let Some(w) = &waker {
@@ -782,14 +872,36 @@ async fn relay_exec(
         attach = matches!(open, ExecOpen::Attach { .. }),
         "native exec: opening interactive session"
     );
+    let mut fell_back = false;
     let opened = match open {
         ExecOpen::Open(spec) => source.open(&spec).await,
         ExecOpen::Attach {
             session,
             cols,
             rows,
-            ..
-        } => source.attach(&session, cols, rows).await,
+            fallback,
+        } => match source.attach(&session, cols, rows).await {
+            Ok(s) => Ok(s),
+            // The persisted session is gone (lease expired / the daemon
+            // restarted — e.g. after a reboot). Degrade to a FRESH session
+            // instead of an error husk; `SessionFallback` tells the loop to
+            // repaint the persisted scrollback tail + arm the relaunch
+            // overlay. Only both failing surfaces the husk below.
+            Err(attach_err) => {
+                tracing::debug!(
+                    target: "thegn::sandbox",
+                    pane = id, sandbox = %sandbox_id, %attach_err,
+                    "initial reattach failed; opening a fresh session"
+                );
+                match source.open(&fallback).await {
+                    Ok(s) => {
+                        fell_back = true;
+                        Ok(s)
+                    }
+                    Err(open_err) => Err(open_err),
+                }
+            }
+        },
     };
     let mut session = match opened {
         Ok(s) => {
@@ -813,10 +925,26 @@ async fn relay_exec(
         }
     };
 
+    if fell_back {
+        let _ = tx.send(PaneEvent::SessionFallback(id)).await;
+        wake();
+    }
+
     // Reconnect loop: a transient socket drop with a known session id reattaches
     // (replaying scrollback). Bounded so a permanently-dead session still exits.
     let mut dead = 0u32;
     loop {
+        // Publish the (re)connected session's local child pid, when the source
+        // knows it (the pane daemon) — persist-time cwd/cmd capture reads it.
+        // The daemon adapter announces the id at construction, so it's already
+        // in the watch here; provider sources just answer `None`. (Bound
+        // before the await: the watch's borrow guard is !Send.)
+        let sid_now = session.session_id.borrow().clone();
+        if let Some(sid) = sid_now
+            && let Some(pid) = source.session_pid(&sid).await
+        {
+            pid_cell.store(pid, std::sync::atomic::Ordering::Relaxed);
+        }
         match relay_session(id, session, &tx, &waker, &mut ctrl_rx, &session_cell).await {
             SessionEnd::Exited(code) => {
                 tracing::debug!(
@@ -828,7 +956,24 @@ async fn relay_exec(
                 wake();
                 return;
             }
-            SessionEnd::PaneGone => return,
+            SessionEnd::PaneGone => {
+                // The pane was dropped. Unless it was marked detached (quit
+                // keeps center-tree panes running), this is an explicit close:
+                // kill the server-side session so it can't leak a live
+                // process into a relay lease. Best-effort — the daemon also
+                // reaps on its own terms.
+                if !detach_on_drop.load(std::sync::atomic::Ordering::Relaxed)
+                    && let Some(sid) = session_cell.lock().ok().and_then(|c| c.clone())
+                    && let Err(e) = source.kill_session(&sid).await
+                {
+                    tracing::debug!(
+                        target: "thegn::daemon",
+                        pane = id, session = %sid,
+                        "close-time session kill failed: {e}"
+                    );
+                }
+                return;
+            }
             SessionEnd::Dropped { progressed } => {
                 dead = if progressed { 0 } else { dead + 1 };
                 tracing::debug!(
@@ -905,7 +1050,19 @@ async fn relay_session(
         mut session_id,
     } = session;
 
+    // Seed from the CURRENT watch value: a watch's initial value is born
+    // "seen", so `changed()` below never fires for a source that announces
+    // the id at construction (the pane daemon's adapter) — only for one that
+    // sends it later (providers). Without this the daemon sid never reached
+    // `session_cell`: sessions weren't persisted for reattach, and the
+    // close-time kill had no id to kill.
     let mut sid_done = false;
+    if let Some(sid) = session_id.borrow().clone()
+        && let Ok(mut cell) = session_cell.lock()
+    {
+        *cell = Some(sid);
+        sid_done = true;
+    }
     let mut progressed = false;
     loop {
         tokio::select! {
@@ -965,6 +1122,7 @@ pub fn drain_until_exit(
         match rx.blocking_recv() {
             Some(PaneEvent::Output(_, b)) => pane.feed(&b),
             Some(PaneEvent::Exit(..)) => return true,
+            Some(PaneEvent::SessionFallback(_)) => {}
             None => return false,
         }
         if start.elapsed().as_millis() as u64 >= deadline_ms {
@@ -1295,6 +1453,198 @@ mod tests {
         assert_eq!(
             done_rx.recv_timeout(Duration::from_secs(2)),
             Ok(SessionEnd::Exited(0))
+        );
+    }
+
+    /// A hand-built [`crate::pane_source::ExecSource`] for relay tests:
+    /// `attach` always fails (a reaped/expired session), `open` hands out the
+    /// stashed session once, and `kill_session` records what it was asked to
+    /// kill.
+    struct TestSource {
+        session: Mutex<Option<ExecSession>>,
+        kills: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl crate::pane_source::ExecSource for TestSource {
+        fn open<'a>(
+            &'a self,
+            _spec: &'a thegn_svc::provider::ExecSpec,
+        ) -> futures::future::BoxFuture<'a, Result<ExecSession>> {
+            Box::pin(async move {
+                self.session
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("open exhausted"))
+            })
+        }
+        fn attach<'a>(
+            &'a self,
+            _session: &'a str,
+            _cols: u16,
+            _rows: u16,
+        ) -> futures::future::BoxFuture<'a, Result<ExecSession>> {
+            Box::pin(async move { Err(anyhow::anyhow!("session gone (reaped)")) })
+        }
+        fn kill_session<'a>(
+            &'a self,
+            session: &'a str,
+        ) -> futures::future::BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.kills.lock().unwrap().push(session.to_string());
+                Ok(())
+            })
+        }
+    }
+
+    /// Drive `relay_exec` with a dead persisted session: the initial attach
+    /// fails, the relay falls back to a FRESH open (no error husk), announces
+    /// it with `SessionFallback`, seeds `session_cell` from the watch's
+    /// initial value, and — because the pane was dropped without a detach
+    /// mark — kills the fresh session server-side on `PaneGone`.
+    #[test]
+    fn dead_reattach_falls_back_fresh_then_close_kills() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (frames_tx, frames_rx) = tokio_mpsc::channel::<ExecFrame>(8);
+        let (prov_ctrl_tx, _prov_ctrl_rx) = tokio_mpsc::channel::<ExecControl>(8);
+        // The daemon adapter's shape: the sid is announced at construction.
+        let (_sid_tx, sid_rx) = tokio::sync::watch::channel(Some("fresh-sid".to_string()));
+        let kills = Arc::new(Mutex::new(Vec::new()));
+        let source = Arc::new(TestSource {
+            session: Mutex::new(Some(ExecSession {
+                frames: frames_rx,
+                control: prov_ctrl_tx,
+                session_id: sid_rx,
+            })),
+            kills: kills.clone(),
+        });
+
+        let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<ExecControl>(8);
+        let cell = Arc::new(Mutex::new(None));
+        let detach = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pid_cell = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let spec = thegn_svc::provider::ExecSpec {
+            argv: vec!["/bin/sh".into()],
+            tty: true,
+            cols: 80,
+            rows: 24,
+            env: vec![],
+            cwd: None,
+        };
+        rt.spawn(relay_exec(
+            9,
+            source,
+            "daemon".into(),
+            "local".into(),
+            ExecOpen::Attach {
+                session: "dead-sid".into(),
+                cols: 80,
+                rows: 24,
+                fallback: spec,
+            },
+            tx,
+            None,
+            ctrl_rx,
+            cell.clone(),
+            detach,
+            pid_cell,
+        ));
+
+        // 1. The degraded reattach is announced (no husk, no Exit).
+        match rx.blocking_recv() {
+            Some(PaneEvent::SessionFallback(9)) => {}
+            other => panic!("expected SessionFallback, got {other:?}"),
+        }
+        // 2. The fresh session's output relays normally.
+        frames_tx
+            .blocking_send(ExecFrame::Stdout(b"fresh".to_vec()))
+            .unwrap();
+        match rx.blocking_recv() {
+            Some(PaneEvent::Output(9, b)) => assert_eq!(b, b"fresh"),
+            other => panic!("expected Output, got {other:?}"),
+        }
+        // 3. The construction-announced sid was seeded into the cell (a
+        //    watch's initial value never fires `changed()`).
+        assert_eq!(
+            cell.lock().unwrap().as_deref(),
+            Some("fresh-sid"),
+            "sid must seed from the watch's initial value"
+        );
+        // 4. Dropping the pane WITHOUT a detach mark = explicit close: the
+        //    relay kills the server-side session.
+        drop(ctrl_tx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while kills.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            kills.lock().unwrap().as_slice(),
+            ["fresh-sid".to_string()],
+            "close must kill the session, not leak a lease"
+        );
+    }
+
+    /// The quit path marks panes detached — dropping one must NOT kill its
+    /// session (it keeps running for the next launch to reattach).
+    #[test]
+    fn detached_pane_drop_does_not_kill_session() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (frames_tx, frames_rx) = tokio_mpsc::channel::<ExecFrame>(8);
+        let (prov_ctrl_tx, _prov_ctrl_rx) = tokio_mpsc::channel::<ExecControl>(8);
+        let (_sid_tx, sid_rx) = tokio::sync::watch::channel(Some("kept-sid".to_string()));
+        let kills = Arc::new(Mutex::new(Vec::new()));
+        let source = Arc::new(TestSource {
+            session: Mutex::new(Some(ExecSession {
+                frames: frames_rx,
+                control: prov_ctrl_tx,
+                session_id: sid_rx,
+            })),
+            kills: kills.clone(),
+        });
+        let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<ExecControl>(8);
+        let detach = Arc::new(std::sync::atomic::AtomicBool::new(true)); // quit marked it
+        let spec = thegn_svc::provider::ExecSpec {
+            argv: vec!["/bin/sh".into()],
+            tty: true,
+            cols: 80,
+            rows: 24,
+            env: vec![],
+            cwd: None,
+        };
+        rt.spawn(relay_exec(
+            3,
+            source,
+            "daemon".into(),
+            "local".into(),
+            ExecOpen::Open(spec),
+            tx,
+            None,
+            ctrl_rx,
+            Arc::new(Mutex::new(None)),
+            detach,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        ));
+        // Prove the relay is live, then drop the pane.
+        frames_tx
+            .blocking_send(ExecFrame::Stdout(b"up".to_vec()))
+            .unwrap();
+        assert!(matches!(rx.blocking_recv(), Some(PaneEvent::Output(3, _))));
+        drop(ctrl_tx);
+        // The relay ends on PaneGone; give it a beat, then assert no kill.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            kills.lock().unwrap().is_empty(),
+            "a detached pane's drop must keep the session running"
         );
     }
 

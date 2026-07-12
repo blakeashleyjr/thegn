@@ -21,6 +21,11 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 export HOME="$TMP" XDG_CONFIG_HOME="$TMP/.config" XDG_STATE_HOME="$TMP/.local/state"
+# Isolate the runtime dir too: the daemon control socket prefers
+# $XDG_RUNTIME_DIR/thegn/daemon.sock, so leaving the real one exported would
+# let the socket probe cross-connect these checks to a live daemon.
+export XDG_RUNTIME_DIR="$TMP/run"
+mkdir -p "$XDG_RUNTIME_DIR"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
 mkdir -p "$XDG_CONFIG_HOME/thegn"
@@ -564,10 +569,37 @@ else
   echo "  skip daemon lifecycle (curl not on PATH)"
 fi
 
-# Bare compositor config: with [daemon] absent nothing may spawn a daemon
-# (opt-in contract) — the verbs above ran without one and no socket exists.
-check "no daemon is spawned by default (opt-in contract)" \
-  "[[ ! -S \"$XDG_STATE_HOME/thegn/run/daemon.sock\" ]]"
+# CLI verbs never spawn a daemon as a side effect — only PANE spawns lazily
+# ensure one (the default-on [daemon] routes panes, not verbs). Every verb
+# above ran daemon-less; no socket may exist on either default path.
+check "CLI verbs never spawn a daemon" \
+  "[[ ! -S \"$XDG_RUNTIME_DIR/thegn/daemon.sock\" && ! -S \"$XDG_STATE_HOME/thegn/run/daemon.sock\" ]]"
+
+# Explicit close kills: DELETE on a session reaps it from the listing (the
+# close-a-pane contract at the API level).
+if command -v curl >/dev/null 2>&1; then
+  DSOCK2="$TMP/d2.sock"
+  "$SZ" daemon --socket "$DSOCK2" &
+  D2PID=$!
+  for _ in $(seq 1 40); do
+    [[ -S $DSOCK2 ]] && break
+    sleep 0.1
+  done
+  curl -s --unix-socket "$DSOCK2" -X POST http://d/v1/sessions \
+    -H 'content-type: application/json' \
+    -d '{"argv":["/bin/sh","-c","sleep 30"],"rows":24,"cols":80}' >/dev/null
+  sleep 0.3
+  ksid="$("$SZ" session list --json | sed -n 's/.*"id": "\([a-f0-9]*\)".*/\1/p' | head -1)"
+  curl -s --unix-socket "$DSOCK2" -X DELETE "http://d/v1/sessions/$ksid" >/dev/null
+  sleep 0.3
+  kill_ok=1
+  "$SZ" session list --json 2>/dev/null | grep -q "$ksid" && kill_ok=0
+  check "DELETE kills the session (explicit close = kill)" "[[ $kill_ok -eq 1 ]]"
+  kill "$D2PID" 2>/dev/null || true
+  wait "$D2PID" 2>/dev/null || true
+else
+  echo "  skip close-kill check (curl not on PATH)"
+fi
 
 # --- one-time superzej -> thegn migration -----------------------------------
 # Seed old-brand state/config/app-home in a fresh throwaway HOME, run any CLI

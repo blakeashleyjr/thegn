@@ -281,8 +281,10 @@ pub(crate) fn open_resolved(
     rect: Rect,
 ) -> Option<u32> {
     match launch {
+        // The drawer is ephemeral chrome — never daemon-routed (see
+        // spawn_argv_env_local).
         DrawerLaunch::Yazi { argv, cwd, env } => panes
-            .spawn_argv_env(&argv, cwd.as_deref().or(Some(dir)), &env, rect)
+            .spawn_argv_env_local(&argv, cwd.as_deref().or(Some(dir)), &env, rect)
             .ok(),
         DrawerLaunch::ShellFallback => {
             crate::run::spawn_worktree_shell_pane(panes, cfg, Some(dir), rect, false, None, "").ok()

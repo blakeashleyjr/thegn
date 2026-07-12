@@ -14,7 +14,18 @@ pub(crate) fn install_pane_services(
     cfg: &thegn_core::config::Config,
 ) {
     panes.set_replay_config(cfg.replay.clone());
-    panes.set_daemon_config(cfg.daemon.clone());
+    // Harness kill-switch: the first-frame benchmark and the e2e snapshot
+    // suite kill the compositor without a quit path — their panes would
+    // detach into never-reaped daemon sessions (one leaked daemon + shell
+    // per iteration/case), and the racy "persist" chip would flake the
+    // snapshots. Those harnesses run in-process panes instead.
+    let mut daemon = cfg.daemon.clone();
+    if std::env::var_os("THEGN_BENCH_FIRST_FRAME_EXIT").is_some()
+        || std::env::var_os("THEGN_NO_DAEMON").is_some()
+    {
+        daemon.enabled = false;
+    }
+    panes.set_daemon_config(daemon);
     set_aggregate_cpu_cap(cfg);
 }
 

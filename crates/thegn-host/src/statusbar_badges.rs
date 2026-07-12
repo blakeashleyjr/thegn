@@ -36,6 +36,20 @@ pub(crate) fn push_attention_badge(model: &FrameModel, items: &mut Vec<(BarItemI
     ));
 }
 
+/// Persistent-pane chip: a quiet dim `◆ persist` while the focused pane is
+/// daemon-backed — quitting the UI detaches it (the process keeps running;
+/// the next launch warm-reattaches). ASCII terminals get `* persist`.
+pub(crate) fn push_daemon_chip(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
+    if !model.persistent_pane {
+        return;
+    }
+    let mark = crate::caps::active_glyphs().diamond_filled;
+    items.push((
+        BarItemId::Badge(BarBadge::Persist),
+        vec![Seg::chip(Tok::Hue(Hue::Teal), format!(" {mark} persist "))],
+    ));
+}
+
 /// CI rollup badge (AV group, item 158): a red ✗ chip when workflows are
 /// *currently* failing, an amber ● chip while runs are in flight; silent when
 /// all green (mirrors the "clean is quiet" notification posture). Only when CI
