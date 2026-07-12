@@ -74,6 +74,7 @@ pub mod fold;
 pub mod forge;
 pub mod forward;
 pub mod frecency;
+pub mod fsperm;
 pub mod github;
 pub mod gitrefs;
 pub mod gitviz;

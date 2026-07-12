@@ -2667,6 +2667,10 @@ impl Default for SandboxConfig {
                 "podman-rootful",
                 "docker",
                 "bwrap",
+                // Native Windows: kill-on-close Job Object scoping (the OCI
+                // entries above decline there — Linux containers can't mount
+                // the worktree at its real path). Probes Absent elsewhere.
+                "jobobject",
                 "host",
             ]
             .iter()
