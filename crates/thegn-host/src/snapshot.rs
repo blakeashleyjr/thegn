@@ -92,11 +92,14 @@ fn capture_pane_sessions(session: &mut Session, panes: &Panes) {
     }
 }
 
-/// Capture a bounded plain-text scrollback tail of each live **host PTY** pane
-/// into its tab's `pane_scrollback`, so a resurrected pane repaints its recent
-/// history instead of a blank screen. Native-exec streams replay scrollback
-/// server-side on reattach, so their tail is not stored (any stale entry is
-/// cleared). `max_lines == 0` disables capture (blank restore, as before).
+/// Capture a bounded plain-text scrollback tail of each live **host PTY or
+/// daemon-backed** pane into its tab's `pane_scrollback`, so a resurrected
+/// pane repaints its recent history instead of a blank screen. Remote
+/// native-exec streams replay scrollback server-side on reattach, so their
+/// tail is not stored (any stale entry is cleared) — but a daemon pane's tail
+/// IS stored: after a reboot the daemon is gone and the reattach falls back
+/// to a fresh shell, which repaints this tail. `max_lines == 0` disables
+/// capture (blank restore, as before).
 fn capture_pane_scrollback(session: &mut Session, panes: &Panes, max_lines: usize) {
     for g in &mut session.worktrees {
         for tab in &mut g.tabs {
@@ -104,9 +107,10 @@ fn capture_pane_scrollback(session: &mut Session, panes: &Panes, max_lines: usiz
                 let Some(p) = panes.table.get(&id) else {
                     continue;
                 };
-                // A stream pane replays its own scrollback on reattach — don't
-                // double-store the host-side mirror.
-                let tail = if max_lines == 0 || p.provider_session().is_some() {
+                // A remote stream pane replays its own scrollback on reattach
+                // — don't double-store the host-side mirror.
+                let replays_server_side = !p.is_daemon_backed() && p.provider_session().is_some();
+                let tail = if max_lines == 0 || replays_server_side {
                     String::new()
                 } else {
                     p.history_tail(max_lines)

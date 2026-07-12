@@ -446,6 +446,44 @@ pub fn inset1(r: Rect) -> Rect {
     }
 }
 
+/// Working directory for a pin: explicit `cwd`, else the active tab's worktree,
+/// else `$HOME` / cwd.
+pub(crate) fn pin_cwd(
+    pin: &thegn_core::config::Pin,
+    active_dir: Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if let Some(c) = &pin.cwd {
+        let expanded = thegn_core::util::expand_tilde(c);
+        return std::path::PathBuf::from(expanded);
+    }
+    active_dir
+        .or_else(|| std::env::current_dir().ok())
+        .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
+/// Spawn a pin's program into a pane and register it with the supervisor.
+/// Sized to the strip body for strip pins, else the center. Returns the pane id.
+pub(crate) fn spawn_pin(
+    pin: &thegn_core::config::Pin,
+    panes: &mut crate::panes::Panes,
+    supervisor: &mut PinSupervisor,
+    active_dir: Option<std::path::PathBuf>,
+    center: Rect,
+) -> Option<u32> {
+    let argv = PinSupervisor::argv(pin);
+    let env: Vec<(String, String)> = PinSupervisor::spawn_env(pin).into_iter().collect();
+    let cwd = pin_cwd(pin, active_dir);
+    // Pins are ephemeral chrome — never daemon-routed (see spawn_argv_env_local).
+    match panes.spawn_argv_env_local(&argv, Some(&cwd), &env, center) {
+        Ok(id) => {
+            supervisor.attach(pin, id);
+            Some(id)
+        }
+        Err(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

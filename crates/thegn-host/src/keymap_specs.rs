@@ -595,6 +595,22 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         default_chords: &["Ctrl q"],
         palette: true,
     },
+    // The persistent-lifecycle pair (daemon-backed panes): quit is already a
+    // detach; these make the two intents explicit and palette-discoverable.
+    ActionSpec {
+        id: "detach",
+        label: "Detach — quit, keep panes running",
+        hint: "detach",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
+        id: "quit-kill",
+        label: "Quit and kill sessions",
+        hint: "quit+kill",
+        default_chords: &[],
+        palette: true,
+    },
     // Media transport (optional [media] feature). Leader: `Alt m`. All inert when
     // media is disabled; surfaced in the palette so they're discoverable.
     ActionSpec {

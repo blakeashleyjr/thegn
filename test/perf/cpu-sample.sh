@@ -117,8 +117,10 @@ DEADLINE_S=$(((RUN_MS / 1000) + 10))     # hard safety net
 # test/pty-smoke.sh); the inner shell backgrounds thegn and records its PID so
 # we can sample /proc directly. THEGN_BENCH_RUN_MS makes thegn run the full
 # loop — ticker, hydration, tokio pool — then exit cleanly on its own.
+# THEGN_NO_DAEMON: the bench-window exit detaches daemon panes — each run
+# would strand a never-reaped session (and its daemon) in the bench state dir.
 printf -v INNER \
-  'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %q & echo $! > %q; wait' \
+  'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q THEGN_NO_DAEMON=1 %q & echo $! > %q; wait' \
   "$REPO" "$RUN_MS" "$BIN_ABS" "$PIDFILE"
 timeout "${DEADLINE_S}s" script -qec "$INNER" /dev/null >/dev/null 2>&1 &
 LAUNCHER=$!

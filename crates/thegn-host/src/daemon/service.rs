@@ -98,15 +98,18 @@ impl DaemonService {
 
     /// Open a relay lease for a now-idle session (the actor signaled the last
     /// subscriber left). Called from the daemon run loop's idle listener.
+    /// `grace_ms == 0` opens an UNTIMED lease (`expires_at: None`) — the
+    /// reaper's `plan_leases` skips those, so the session lives until it is
+    /// explicitly killed or reattached (the never-reap default).
     pub(crate) async fn on_session_idle(&self, session: &str) {
         let daemon_id = self.daemon_id.clone();
         let sid = session.to_string();
-        let expires = relay_expiry(now_ms(), self.grace_ms);
+        let expires = (self.grace_ms > 0).then(|| relay_expiry(now_ms(), self.grace_ms));
         let put = self
             .with_db(move |db| {
                 // Replace any prior lease for this session (re-detach refreshes).
                 db.release_session_leases(&sid)?;
-                db.put_lease(&sid, &daemon_id, None, "relay", Some(expires), now_ms())?;
+                db.put_lease(&sid, &daemon_id, None, "relay", expires, now_ms())?;
                 Ok(())
             })
             .await;
@@ -114,7 +117,7 @@ impl DaemonService {
             self.emit(EventFrame::Lease {
                 session: session.to_string(),
                 kind: LeaseEventKind::Opened,
-                expires_at: Some(expires),
+                expires_at: expires,
             });
         }
     }
@@ -191,6 +194,7 @@ impl ControlApi for DaemonService {
                 program: crate::pane::program_name(&spec.argv),
                 cwd: spec.cwd.clone(),
                 created_at_ms: now_ms(),
+                pid: pty.pid,
             };
             let live = Arc::new(Mutex::new(LiveMeta {
                 rows,

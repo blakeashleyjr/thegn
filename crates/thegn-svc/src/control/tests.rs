@@ -59,6 +59,7 @@ impl ControlApi for FakeApi {
                 created_at_ms: 0,
                 attached_clients: 0,
                 lease_expires_at: None,
+                pid: None,
             })
         })
     }

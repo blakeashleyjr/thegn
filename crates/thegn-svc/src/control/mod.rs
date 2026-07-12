@@ -42,6 +42,10 @@ pub struct SessionInfo {
     pub attached_clients: u32,
     /// Set while a relay lease is keeping this detached session warm.
     pub lease_expires_at: Option<i64>,
+    /// The PTY child's pid on the daemon's host. A same-host compositor uses
+    /// it for `/proc`-based cwd/foreground-command capture at persist time.
+    #[serde(default)]
+    pub pid: Option<u32>,
 }
 
 /// What to run when opening a fresh session.

@@ -38,9 +38,10 @@ use crate::chrome::FrameModel;
 use crate::compositor::Rect;
 use crate::pane::PaneEvent;
 use crate::panes::{Panes, replace_single_dead_center_pane};
+use crate::pins::pin_cwd;
 use crate::run::{
-    DrawerPool, SidebarState, active_cwd, group_cwd, persist_pin_state, pin_cwd,
-    prospective_corner_rect, spawn_worktree_shell_pane, update_crash_count,
+    DrawerPool, SidebarState, active_cwd, group_cwd, persist_pin_state, prospective_corner_rect,
+    spawn_worktree_shell_pane, update_crash_count,
 };
 
 /// A pane that exits within this of being spawned is a "fast crash" —
@@ -211,6 +212,7 @@ pub(crate) fn drain<T: Terminal>(
     // 1. Receive — stash raw chunks, no parsing. Stop at the high-water so the
     // bounded channel backpressures the reader threads (and the child).
     let mut exits: Vec<(u32, Option<i32>)> = Vec::new();
+    let mut fallbacks: Vec<u32> = Vec::new();
     while backlog.total < crate::loop_policy::BACKLOG_HIGH_WATER {
         match rx.try_recv() {
             Ok(PaneEvent::Output(id, chunk)) => {
@@ -219,12 +221,20 @@ pub(crate) fn drain<T: Terminal>(
                 backlog.push(id, chunk);
             }
             Ok(PaneEvent::Exit(id, code)) => exits.push((id, code)),
+            Ok(PaneEvent::SessionFallback(id)) => fallbacks.push(id),
             Err(tokio_mpsc::error::TryRecvError::Empty) => break,
             Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
                 summary.disconnected = true;
                 break;
             }
         }
+    }
+
+    // A warm reattach degraded to a fresh session: repaint the persisted
+    // scrollback tail + arm the relaunch overlay (before parsing the fresh
+    // session's output, so the restored history lands underneath it).
+    for id in fallbacks {
+        crate::handlers::daemon_lifecycle::handle_session_fallback(ctx, id);
     }
 
     // 2. Exits — flush the pane's stashed tail into its emulator first, so
@@ -503,7 +513,10 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
                     .into_iter()
                     .collect();
                 let cwd = pin_cwd(&pin, active_dir);
-                if let Ok(fresh) = ctx.panes.spawn_argv_env(&argv, Some(&cwd), &env, content) {
+                if let Ok(fresh) = ctx
+                    .panes
+                    .spawn_argv_env_local(&argv, Some(&cwd), &env, content)
+                {
                     ctx.supervisor.reattach(&name, fresh);
                     *ctx.corner = Some(fresh);
                     *ctx.corner_name = Some(name);
@@ -543,7 +556,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
                     let cwd = pin_cwd(&pin, active_dir);
                     if let Ok(fresh) =
                         ctx.panes
-                            .spawn_argv_env(&argv, Some(&cwd), &env, ctx.chrome_center)
+                            .spawn_argv_env_local(&argv, Some(&cwd), &env, ctx.chrome_center)
                     {
                         ctx.supervisor.reattach(&name, fresh);
                     }
