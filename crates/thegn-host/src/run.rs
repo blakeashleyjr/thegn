@@ -3045,12 +3045,13 @@ fn begin_worktree_preset(
     create_gen: &mut u64,
     create_tx: &tokio_mpsc::UnboundedSender<wizard::CreateEvent>,
     waker: &TerminalWaker,
-    creating: &mut Option<wizard::CreationProgress>,
-    wizard_cmd_tx: &mut Option<std::sync::mpsc::Sender<wizard::WizardCmd>>,
+    inflight: &mut crate::handlers::creating::InFlight,
     wizard_ui: &mut Option<wizard::NewWorktreeWizard>,
     model: &mut FrameModel,
 ) {
-    if wizard_ui.is_some() || creating.is_some() {
+    // Headless creation is born committed (no modal form); only an open wizard
+    // form blocks it. Concurrent presets each get their own generation.
+    if wizard_ui.is_some() {
         model.status = "worktree creation already in progress".into();
         return;
     }
@@ -3079,17 +3080,22 @@ fn begin_worktree_preset(
             let _ = wk.wake();
         });
     });
-    // Drive the worker headlessly: Submit alone preps (no user to overlap).
+    // Drive the worker headlessly: Submit alone preps (no user to overlap). The
+    // buffered Submit survives dropping `cmd_tx` at end of scope (the worker
+    // needs no further commands — it can't be cancelled, having no UI), so we
+    // don't stash it in the shared `wizard_cmd_tx` (which belongs to any open
+    // modal wizard).
     let _ = cmd_tx.send(wizard::WizardCmd::Submit(wizard::WizardChoices {
         name: name_choice,
         env,
         sandbox,
         agent,
     }));
-    *wizard_cmd_tx = Some(cmd_tx);
     // No interactive overlay (`wizard_ui` stays None); the worker's `TabOpened`
     // event opens the tab + loading splash, same as the wizard's submit path.
-    *creating = Some(wizard::CreationProgress::new(candidate));
+    inflight
+        .progress
+        .insert(*create_gen, wizard::CreationProgress::new(candidate));
     model.status = "Creating worktree…".into();
 }
 
@@ -6512,10 +6518,11 @@ async fn event_loop<T: Terminal>(
     let mut shell_watchdog_fired: std::collections::HashSet<(usize, usize)> =
         std::collections::HashSet::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
-    // speculatively creates the worktree under the pregenerated name while
-    // the wizard is open; `wizard_cmd_tx` carries the wizard's decisions to
-    // it, `create_rx` carries progress events back. One creation at a time;
-    // `create_gen` kills a cancelled run's stragglers on arrival.
+    // speculatively creates the worktree while the wizard is open; `wizard_cmd_tx`
+    // carries decisions to it, `create_rx` carries progress back. Creation is
+    // CONCURRENT: `inflight` keys each in-flight creation by `create_gen`, so a
+    // slow remote sandbox bring-up runs in the background while a fresh wizard
+    // opens. Only the modal `wizard_ui`/`wizard_cmd_tx` are single-instance.
     let (create_tx, mut create_rx) = tokio_mpsc::unbounded_channel::<wizard::CreateEvent>();
     let mut wizard_ui: Option<wizard::NewWorktreeWizard> = None;
     // The new-terminal wizard (Alt T / palette); no creation worker (synchronous).
@@ -6523,10 +6530,12 @@ async fn event_loop<T: Terminal>(
     // The "Add environment" wizard (palette); submit writes config via create_env.
     let mut env_wizard_ui: Option<crate::env_wizard::EnvWizard> = None;
     let mut wizard_cmd_tx: Option<std::sync::mpsc::Sender<wizard::WizardCmd>> = None;
-    let mut creating: Option<wizard::CreationProgress> = None;
+    let mut inflight = crate::handlers::creating::InFlight::default();
     // When a worktree is created from a template (item 54), the template is held
-    // here until the worktree-ready event applies its layout + starts its pins.
-    let mut pending_template: Option<thegn_core::config::WorktreeTemplate> = None;
+    // here (keyed by creation generation) until that worktree's `Done` applies
+    // its layout + starts its pins.
+    let mut pending_template: std::collections::HashMap<u64, thegn_core::config::WorktreeTemplate> =
+        std::collections::HashMap::new();
     // Branch-from-issue: `(creation generation, issue_id)`. When the matching
     // `CreateEvent::Done` arrives, the new worktree is linked to this issue.
     let mut pending_issue_link: Option<(u64, String)> = None;
@@ -7377,7 +7386,7 @@ async fn event_loop<T: Terminal>(
                         &mut create_gen,
                         &create_tx,
                         &waker,
-                        &mut creating,
+                        &mut inflight,
                         &mut wizard_cmd_tx,
                         &mut wizard_ui,
                         &mut model,
@@ -7494,7 +7503,7 @@ async fn event_loop<T: Terminal>(
                         &mut create_gen,
                         &create_tx,
                         &waker,
-                        &mut creating,
+                        &mut inflight,
                         &mut wizard_cmd_tx,
                         &mut wizard_ui,
                         &mut model,
@@ -9430,16 +9439,14 @@ async fn event_loop<T: Terminal>(
                     generation,
                     suggested,
                 } => {
-                    if generation != create_gen {
-                        continue;
+                    if crate::handlers::creating::on_preflight(
+                        &mut inflight,
+                        &mut wizard_ui,
+                        generation,
+                        &suggested,
+                    ) {
+                        dirty = true;
                     }
-                    if let Some(w) = wizard_ui.as_mut() {
-                        w.apply_name_suggestion(&suggested);
-                    }
-                    if let Some(cp) = creating.as_mut() {
-                        cp.branch = suggested;
-                    }
-                    dirty = true;
                 }
                 wizard::CreateEvent::Step {
                     generation,
@@ -9447,20 +9454,15 @@ async fn event_loop<T: Terminal>(
                     state,
                     detail,
                 } => {
-                    if generation != create_gen {
-                        continue;
-                    }
-                    if let Some(cp) = creating.as_mut() {
-                        cp.apply(step, state, detail);
-                        // Mirror into the tab's loading splash (no-op until the
-                        // tab has opened).
-                        if crate::handlers::creating::sync_steps(
-                            cp,
-                            &mut loading_state,
-                            &creating_tabs,
-                        ) {
-                            dirty = true;
-                        }
+                    if crate::handlers::creating::on_step(
+                        &mut inflight,
+                        &mut loading_state,
+                        generation,
+                        step,
+                        state,
+                        detail,
+                    ) {
+                        dirty = true;
                     }
                 }
                 wizard::CreateEvent::TabOpened {
@@ -9468,59 +9470,57 @@ async fn event_loop<T: Terminal>(
                     tab,
                     path,
                 } => {
-                    if generation != create_gen {
-                        continue;
-                    }
-                    // Reconcile the placeholder the Submit path opened (rename in
-                    // place to the authoritative name), or open fresh when there
-                    // was none. Splash in its center; jump to it by default.
-                    let jump = keymap.config().session.focus_on_create;
-                    crate::handlers::creating::open_or_reconcile(
+                    if crate::handlers::creating::on_tab_opened(
                         &mut session,
                         &mut model,
                         &mut sb,
                         &mut loading_state,
                         &mut creating_tabs,
-                        creating.as_ref(),
+                        &mut inflight,
+                        generation,
                         tab,
                         path,
-                        jump,
-                    );
-                    need_relayout = true;
-                    dirty = true;
+                        keymap.config().session.focus_on_create,
+                    ) {
+                        need_relayout = true;
+                        dirty = true;
+                    }
                 }
                 wizard::CreateEvent::Failed {
                     generation,
                     step,
                     error,
                 } => {
-                    if generation != create_gen {
-                        continue;
-                    }
-                    // Worker cleaned up + exited; surface it, drop any open tab.
-                    wizard_ui = None;
-                    wizard_cmd_tx = None;
-                    crate::handlers::creating::abort(
+                    // Worker cleaned up + exited; surface it, drop only THIS
+                    // creation's tab. Clears the modal only if it owns this gen.
+                    if crate::handlers::creating::on_failed(
                         &mut session,
                         &mut model,
                         &mut sb,
                         &mut loading_state,
                         &mut creating_tabs,
-                    );
-                    creating = None;
-                    model.status = format!("worktree creation failed ({}): {error}", step.label());
-                    need_relayout = true;
-                    dirty = true;
+                        &mut inflight,
+                        &mut wizard_ui,
+                        &mut wizard_cmd_tx,
+                        generation,
+                    ) {
+                        model.status =
+                            format!("worktree creation failed ({}): {error}", step.label());
+                        need_relayout = true;
+                        dirty = true;
+                    }
                 }
                 wizard::CreateEvent::Done {
                     generation,
                     payload,
                 } => {
-                    if generation != create_gen {
-                        continue;
-                    }
+                    // No staleness gate: a committed creation's `Done` is always
+                    // valid. Cancel removes its entry and the worker never sends
+                    // `Done` afterwards, so a stale `Done` can't reach here. (The
+                    // agent-dispatch path sends `Done` with no `progress` entry;
+                    // `adopt` opens its tab fresh.)
                     let payload = *payload;
-                    if let Some(cp) = creating.as_mut() {
+                    if let Some(cp) = inflight.progress.get_mut(&generation) {
                         cp.apply(
                             wizard::CreateStep::LaunchAgent,
                             wizard::StepState::Running,
@@ -9534,6 +9534,8 @@ async fn event_loop<T: Terminal>(
                         &mut sb,
                         &mut loading_state,
                         &mut creating_tabs,
+                        &mut inflight.gen_tab,
+                        generation,
                         &payload.tab,
                         &payload.path,
                     );
@@ -9621,13 +9623,20 @@ async fn event_loop<T: Terminal>(
                             });
                         }
                     }
-                    creating = None;
-                    wizard_cmd_tx = None;
+                    inflight.progress.remove(&generation);
+                    // Only clear the modal if it still owns this generation
+                    // (defensive — Submit already closed it before `Done`); never
+                    // clobber a *different* wizard opened while this creation ran.
+                    if inflight.wizard_gen == Some(generation) {
+                        wizard_ui = None;
+                        wizard_cmd_tx = None;
+                        inflight.wizard_gen = None;
+                    }
                     // Worktree template (item 54): apply the initial layout
                     // (named snapshot, else `commands` even-split) and start the
                     // template's pins. The layout replaces the default agent pane;
                     // pins are orthogonal strip/float daemons.
-                    if let Some(tmpl) = pending_template.take() {
+                    if let Some(tmpl) = pending_template.remove(&generation) {
                         if let Some(gi) =
                             session.worktrees.iter().position(|g| g.name == payload.tab)
                         {
@@ -12229,8 +12238,11 @@ async fn event_loop<T: Terminal>(
                                 let _ = tx.send(wizard::WizardCmd::Cancel);
                             }
                             wizard_ui = None;
-                            creating = None;
-                            create_gen += 1;
+                            // Drop only this wizard's speculative creation; any
+                            // committed background creation keeps running.
+                            if let Some(g) = inflight.wizard_gen.take() {
+                                inflight.progress.remove(&g);
+                            }
                             model.status = "worktree creation cancelled".into();
                         }
                         wizard::WizardOutcome::PrepChosen { env, sandbox } => {
@@ -12245,40 +12257,27 @@ async fn event_loop<T: Terminal>(
                                 keymap.config(),
                                 &mut wizard_cmd_tx,
                                 &mut wizard_ui,
-                                &mut creating,
-                                &mut create_gen,
+                                &mut inflight,
                                 &mut host_input,
                                 &mut env_wizard_ui,
                                 &mut model,
                             );
                         }
                         wizard::WizardOutcome::Submit(choices) => {
-                            if let wizard::NameChoice::Human(tail) = &choices.name
-                                && let Some(cp) = creating.as_mut()
-                            {
-                                cp.branch = format!("{}{}", keymap.config().branch_prefix, tail);
-                            }
-                            if let Some(tx) = wizard_cmd_tx.as_ref() {
-                                let _ = tx.send(wizard::WizardCmd::Submit(choices));
-                            }
-                            // Optimistic open: reveal the tab + sidebar loading
-                            // dot NOW so a remote host's slow bring-up doesn't
-                            // leave the sidebar empty until the worker reaches
-                            // `TabOpened` (which then reconciles the name).
-                            if let (Some(w), Some(cp)) = (wizard_ui.as_ref(), creating.as_ref()) {
-                                crate::handlers::creating::open_optimistic(
-                                    &mut session,
-                                    &mut model,
-                                    &mut sb,
-                                    &mut loading_state,
-                                    &mut creating_tabs,
-                                    cp,
-                                    w,
-                                    keymap.config(),
-                                );
+                            if crate::handlers::creating::on_submit(
+                                &mut session,
+                                &mut model,
+                                &mut sb,
+                                &mut loading_state,
+                                &mut creating_tabs,
+                                &mut inflight,
+                                &mut wizard_ui,
+                                &mut wizard_cmd_tx,
+                                choices,
+                                keymap.config(),
+                            ) {
                                 need_relayout = true;
                             }
-                            wizard_ui = None;
                         }
                     }
                     dirty = true;
@@ -12348,7 +12347,7 @@ async fn event_loop<T: Terminal>(
                                                     &mut create_gen,
                                                     &create_tx,
                                                     &waker,
-                                                    &mut creating,
+                                                    &mut inflight,
                                                     &mut wizard_cmd_tx,
                                                     &mut wizard_ui,
                                                     &mut model,
@@ -12565,8 +12564,6 @@ async fn event_loop<T: Terminal>(
                                             Some(tmpl) => {
                                                 let base =
                                                     tmpl.base.clone().filter(|b| !b.is_empty());
-                                                // Held for the post-create layout + pins apply.
-                                                pending_template = Some(tmpl.clone());
                                                 begin_worktree_wizard(
                                                     std::path::PathBuf::from(&repo_root),
                                                     base,
@@ -12575,11 +12572,17 @@ async fn event_loop<T: Terminal>(
                                                     &mut create_gen,
                                                     &create_tx,
                                                     &waker,
-                                                    &mut creating,
+                                                    &mut inflight,
                                                     &mut wizard_cmd_tx,
                                                     &mut wizard_ui,
                                                     &mut model,
                                                 );
+                                                // Held (keyed by this creation's
+                                                // generation) for the post-create
+                                                // layout + pins apply on `Done`.
+                                                if let Some(g) = inflight.wizard_gen {
+                                                    pending_template.insert(g, tmpl.clone());
+                                                }
                                             }
                                             None => {
                                                 model.status =
@@ -15477,8 +15480,7 @@ async fn event_loop<T: Terminal>(
                                         &mut create_gen,
                                         &create_tx,
                                         &waker,
-                                        &mut creating,
-                                        &mut wizard_cmd_tx,
+                                        &mut inflight,
                                         &mut wizard_ui,
                                         &mut model,
                                     );
@@ -15558,11 +15560,10 @@ async fn event_loop<T: Terminal>(
                                 .get(panel_ui.issues_cursor)
                                 .cloned()
                             {
-                                // Cancel any in-progress wizard so the Done event
-                                // we send below is the newest generation.
-                                wizard_cmd_tx = None;
-                                creating = None;
-                                wizard_ui = None;
+                                // Fresh generation for this headless dispatch: it
+                                // sends `Done` directly (no worker channel /
+                                // progress entry) and leaves concurrent creations
+                                // undisturbed.
                                 create_gen += 1;
                                 let dispatch_gen = create_gen;
 
@@ -16209,8 +16210,7 @@ async fn event_loop<T: Terminal>(
                                                     &mut create_gen,
                                                     &create_tx,
                                                     &waker,
-                                                    &mut creating,
-                                                    &mut wizard_cmd_tx,
+                                                    &mut inflight,
                                                     &mut wizard_ui,
                                                     &mut model,
                                                 );
@@ -17718,7 +17718,7 @@ async fn event_loop<T: Terminal>(
                                         &mut create_gen,
                                         &create_tx,
                                         &waker,
-                                        &mut creating,
+                                        &mut inflight,
                                         &mut wizard_cmd_tx,
                                         &mut wizard_ui,
                                         &mut model,
