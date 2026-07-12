@@ -70,7 +70,54 @@ pub(crate) fn refresh_tab_model_switch(
             .map(|g| g.path.as_str())
             .unwrap_or(""),
     );
+    // No glyph re-seed here: this fast path only fires for in-workspace pointer
+    // moves, whose worktrees' glyphs are already resident in `sidebar_status`.
+    // Cross-workspace switches (which need the re-seed) route through the full
+    // `refresh_tab_model`, keeping this path pure/zero-alloc.
     retarget_active(sb, model, session);
+}
+
+/// The full sidebar/model rebuild for a switch (extracted from the ratchet-pinned
+/// `run.rs`; re-exported as `crate::run::refresh_tab_model`). Unlike the light
+/// [`refresh_tab_model_switch`], this re-derives the workspace list and rebuilds
+/// every row — used whenever more than the active pointer changed (workspace
+/// switch, worktree create/delete, hydration arrival, filter/sort).
+pub(crate) fn refresh_tab_model(
+    model: &mut FrameModel,
+    session: &Session,
+    sb: &mut SidebarState,
+) {
+    let _g = crate::perf::measure(crate::perf::Subsys::Switch);
+    let (worktree, tabs, active_tab) = crate::hydrate::tab_strip(session);
+    let active_path = crate::hydrate::active_tab_path(session);
+    model.worktree = worktree;
+    model.tabs = tabs;
+    model.active_tab = active_tab;
+    model.active_container_name =
+        thegn_core::sandbox::container_name(&active_path.to_string_lossy());
+    // The workspace list can change when worktrees are added/closed or the
+    // workspace switches: keep the DB-backed entries (refreshed by the next
+    // hydration), re-derive the live fallbacks from the current session, and
+    // drop stale fallbacks — replace semantics, never append-only (appending
+    // duplicated workspaces whose live prefix didn't match their DB slug).
+    let prev = std::mem::take(&mut model.sidebar_workspaces);
+    model.sidebar_workspaces = crate::hydrate::merge_workspace_lists(
+        prev,
+        crate::hydrate::workspace_list(session, None),
+    );
+    // Overlay the incoming workspace's last-known-good git glyphs from the
+    // persistent cache so dirty-dots / ahead-behind arrows persist instantly
+    // across a switch instead of blanking until the async hydration lands (the
+    // stale map still holds the outgoing workspace's paths). In-memory only.
+    crate::glyph_refresh::seed_from_global_cache(
+        &mut model.sidebar_status.git,
+        session
+            .worktrees
+            .iter()
+            .filter(|g| !g.path.is_empty())
+            .map(|g| g.path.clone()),
+    );
+    sb.rebuild(model, session);
 }
 
 /// Patch the active highlight onto the existing sidebar rows — the
