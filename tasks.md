@@ -1475,9 +1475,9 @@ _The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 fo
 - [x] 731. Job Objects process lifecycle — `platform::spawn_grouped` + cloneable `GroupHandle` (pgid on unix, kill-on-close Job Object on Windows: terminate reaps the tree, dropping the last handle reaps it too); task runner + merge-driver watchdogs rewired; singleton lock now cross-platform via std `File::try_lock` (openspec: `add-windows-job-objects`). Sandbox-backend resource limits ride this in the parity phase.
 - [ ] 732. Standardized paths — migrate from Unix `$XDG_STATE_HOME` to `directories` crate resolving to `%LOCALAPPDATA%\thegn` (util.rs already branches USERPROFILE/APPDATA/LOCALAPPDATA)
 - [ ] 733. Signals mapping — map Unix profiling triggers (`SIGUSR2`) to internal keymaps or named events for Windows flame-graphs
-- [ ] 734. PowerShell / NuShell defaults — default pane spawning to native Windows shells over `cmd.exe` (`util::shell()` resolves pwsh → powershell → COMSPEC; dialect via `shellinv`)
+- [x] 734. PowerShell defaults — pane shells resolve pwsh → powershell → COMSPEC on Windows (`resolve_pane_shell` delegates to `util::shell()`); POSIX `-i`/`-l` flags applied only to POSIX flavors (openspec: `add-windows-compositor-validation`). NuShell rides the same seam when installed as `$SHELL`/COMSPEC.
 - [x] 735. Daemon IPC on named pipes — `IpcEndpoint`/`IpcListener` seam in thegn-svc (`ipc.rs`), single-instance via `first_pipe_instance`, control client + daemon rewired, real-pipe tests in the windows CI job; sealed-sandbox relay stays unix-only by design (openspec: `add-windows-daemon-ipc`)
-- [ ] 736. Compositor validation on Windows Terminal — waker/ConPTY/termcaps/path-separator sweep + CONTRIBUTING "Windows (native)" dev loop (phase 4)
+- [~] 736. Compositor readiness on Windows Terminal — WT_SESSION termcaps (Full Unicode/undercurl/sync without POSIX locale), conhost refused with a clear error, separator-agnostic display basenames, `examples/waker_spike.rs` event-model proof, CONTRIBUTING "Windows (native)" section (openspec: `add-windows-compositor-validation`). Remaining: the on-machine interactive checklist (see the change's tasks.md §2) on a real Windows box.
 
 ### AI-free mode (audience-widener)
 
