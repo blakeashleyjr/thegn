@@ -4,7 +4,12 @@
 //! prewarm-vs-materialize arbitration that keeps a pre-warm from attaching a
 //! pane to a half-provisioned sandbox.
 
+pub mod catalog;
+pub mod observe;
 pub mod plan;
+pub mod screen;
+pub mod ticker;
+pub mod track;
 
 use crate::chrome::LoadStep;
 
@@ -67,7 +72,12 @@ pub(crate) fn provision_load_steps(views: &[crate::agent::ProvisionStepView]) ->
             None => plan.step(v.label.clone(), state),
         };
     }
+    // Provisioning steps share one kind: the tracker matches them by label
+    // (stable within a stream) and the splash picks the cold-boot slow hint.
     plan.into_steps()
+        .into_iter()
+        .map(|s| s.with_kind(crate::chrome::StepKind::Provision))
+        .collect()
 }
 
 /// Whether the materialize path may seed its `[sandbox, container, shell]`

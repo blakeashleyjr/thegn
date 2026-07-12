@@ -619,12 +619,14 @@ impl WorkspacePicker {
         let Some(inner) = open_layer(surface, screen, &spec) else {
             return;
         };
-        // The "working" glyph comes from the shared loading vocabulary (the same
-        // ↻ / ascii @ the center-pane splash draws for an active step), so the
+        // The "working" glyph comes from the shared loading vocabulary — the
+        // same animated spinner frames the center-pane splash draws for an
+        // active step (repaints arrive with each clone-progress line), so the
         // modal and the splash can never drift apart or fall out of ASCII sync.
-        let (spin, _) = crate::loading::plan::visual_glyph(
+        let (spin, _) = crate::loading::plan::visual_glyph_live(
             crate::chrome::StepState::Active,
             termwiz::color::ColorAttribute::Default,
+            true,
         );
         let title = Line::segs(vec![
             seg(Tok::Slot(S::Accent), format!("{spin} ")).bold(),
@@ -782,19 +784,17 @@ fn parse_percent(line: &str) -> Option<u8> {
 }
 
 /// A fixed-width block bar for the clone panel (indeterminate when `pct` is
-/// unknown — git hasn't emitted a percentage yet).
+/// unknown — git hasn't emitted a percentage yet). Cell glyphs come from the
+/// shared loading vocabulary ([`crate::loading::plan::bar`]) so the modal's
+/// bar matches the splash's and degrades to `=`/`-` on ASCII terminals
+/// (previously hardcoded `▓░`, which leaked Unicode there).
 fn bar_segs(pct: Option<u8>) -> Vec<Seg> {
     const W: usize = 12;
-    match pct {
-        Some(p) => {
-            let filled = (p as usize * W / 100).min(W);
-            vec![
-                seg(Tok::Slot(S::Accent), "▓".repeat(filled)),
-                seg(Tok::Slot(S::Ghost3), "░".repeat(W - filled)),
-            ]
-        }
-        None => vec![seg(Tok::Slot(S::Ghost3), "░".repeat(W))],
-    }
+    let (fill, empty) = crate::loading::plan::bar(W, pct.map(|p| p as f64 / 100.0));
+    vec![
+        seg(Tok::Slot(S::Accent), fill),
+        seg(Tok::Slot(S::Ghost3), empty),
+    ]
 }
 
 #[cfg(test)]

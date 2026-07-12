@@ -290,6 +290,12 @@ pub struct GlyphSet {
     pub block_full: &'static str, // █
     pub block_top: &'static str,  // ▀
     pub block_bot: &'static str,  // ▄
+    // Loading-splash liveness (spinner frames + progress bar). The spinner is
+    // the quarter-circle family (same East-Asian-Ambiguous exposure as the
+    // shipped `half_dot` ◐, BMP width-1) so `Basic` terminals render it too.
+    pub spin: &'static [&'static str], // ◐◓◑◒ animated active-step frames
+    pub bar_fill: &'static str,        // ▓ progress-bar filled cell
+    pub bar_empty: &'static str,       // ░ progress-bar empty cell
 }
 
 /// Full-Unicode / Nerd-Font glyphs — the current chrome look.
@@ -336,6 +342,9 @@ pub const UNICODE: GlyphSet = GlyphSet {
     block_full: "\u{2588}",     // █
     block_top: "\u{2580}",      // ▀
     block_bot: "\u{2584}",      // ▄
+    spin: &["\u{25d0}", "\u{25d3}", "\u{25d1}", "\u{25d2}"], // ◐ ◓ ◑ ◒
+    bar_fill: "\u{2593}",       // ▓
+    bar_empty: "\u{2591}",      // ░
 };
 
 /// 7-bit ASCII fallbacks for terminals/fonts that can't render [`UNICODE`].
@@ -385,6 +394,9 @@ pub const ASCII: GlyphSet = GlyphSet {
     block_full: "#",
     block_top: "^",
     block_bot: "_",
+    spin: &["|", "/", "-", "\\"],
+    bar_fill: "=",
+    bar_empty: "-",
 };
 
 /// The glyph table for a given level. `Full` and `Basic` share the Unicode set
@@ -782,7 +794,12 @@ mod tests {
             g.block_full,
             g.block_top,
             g.block_bot,
-        ] {
+            g.bar_fill,
+            g.bar_empty,
+        ]
+        .into_iter()
+        .chain(g.spin.iter().copied())
+        {
             assert!(s.is_ascii(), "non-ASCII fallback glyph: {s:?}");
             assert!(!s.is_empty(), "empty fallback glyph");
         }
@@ -839,13 +856,26 @@ mod tests {
             g.block_full,
             g.block_top,
             g.block_bot,
-        ] {
+            g.bar_fill,
+            g.bar_empty,
+        ]
+        .into_iter()
+        .chain(g.spin.iter().copied())
+        {
             let c = s.chars().next().unwrap();
             assert!(s.chars().count() == 1, "multi-char glyph: {s:?}");
             assert!((c as u32) <= 0xFFFF, "astral-plane glyph in chrome: {s:?}");
             assert_eq!(s.width(), 1, "glyph must be display-width 1: {s:?}");
         }
         assert_eq!(g.attention.width(), 2, "✋ is the sanctioned wide glyph");
+    }
+
+    #[test]
+    fn spinner_frames_match_across_sets() {
+        // The frame arrays must be the same length so a frame index derived
+        // from elapsed time points at a valid frame in either set.
+        assert_eq!(UNICODE.spin.len(), ASCII.spin.len());
+        assert!(!UNICODE.spin.is_empty());
     }
 
     #[test]
