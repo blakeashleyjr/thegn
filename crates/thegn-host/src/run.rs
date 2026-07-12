@@ -14132,7 +14132,7 @@ async fn event_loop<T: Terminal>(
                     && !k.modifiers.contains(Modifiers::ALT)
                     && (!k.modifiers.contains(Modifiers::CTRL)
                         || gitui::git_claims_ctrl(&panel_ui, &k.key))
-                    && let Some(msg) = gitui::git_key(&k.key, k.modifiers, &panel_ui)
+                    && let Some(msg) = gitui::git_key_chg(&k.key, k.modifiers, &panel_ui, &model)
                 {
                     let wires = GitWires {
                         session: &session,
@@ -14295,25 +14295,17 @@ async fn event_loop<T: Terminal>(
                                 if let Some(ev) = leftover {
                                     pending_input.push_back(ev);
                                 }
-                                // Full-view scroll documents (the side-by-side
-                                // diff, the git log, the cheatsheet): j/k move
-                                // the viewport, not a row cursor.
+                                // Full-view scroll documents (the git log, the
+                                // cheatsheet): j/k move the viewport, not a row
+                                // cursor. Changes is EXCLUDED — at Full it renders
+                                // the lazygit git frame (a navigable FILES list +
+                                // staging main region), so its arrows drive the
+                                // list cursor / section flow like every other
+                                // git-family list (Commits/Branches/Stash).
                                 if panel_ui.width == layout::PanelWidth::Full
-                                    && matches!(
-                                        panel_ui.open,
-                                        Section::Changes | Section::Pr | Section::Keys
-                                    )
+                                    && matches!(panel_ui.open, Section::Pr | Section::Keys)
                                 {
                                     let max = match panel_ui.open {
-                                        Section::Changes => panel_ui
-                                            .docs
-                                            .diff
-                                            .as_ref()
-                                            .map(|d| {
-                                                crate::panel::docs::diff_flat_len(&d.file)
-                                                    .saturating_sub(1)
-                                            })
-                                            .unwrap_or(0),
                                         Section::Pr => panel_ui
                                             .docs
                                             .git
@@ -14339,16 +14331,6 @@ async fn event_loop<T: Terminal>(
                                     } else {
                                         (panel_ui.scroll + repeat).min(max)
                                     };
-                                    if panel_ui.open == Section::Changes
-                                        && let Some(doc) = &panel_ui.docs.diff
-                                    {
-                                        let starts =
-                                            crate::panel::docs::diff_hunk_starts(&doc.file);
-                                        panel_ui.diff_hunk = crate::panel::docs::diff_hunk_at(
-                                            &starts,
-                                            panel_ui.scroll,
-                                        );
-                                    }
                                     dirty = true;
                                     continue;
                                 }
