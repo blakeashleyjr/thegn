@@ -308,6 +308,62 @@ pub fn keep_cfg_mount(existing: &[Mount], m: &Mount) -> bool {
     }
 }
 
+/// Parse one `[sandbox].mounts` entry — `"host"`, `"host:ro"`, `"host:dest"`,
+/// `"host:dest:ro"`, or the `cache` variants — into a [`Mount`]. `~/`-prefixed
+/// paths are tilde-expanded so the spec is a valid filesystem path (bwrap does
+/// no shell expansion). Extracted from `sandbox.rs` (god-file ratchet ceiling).
+pub(crate) fn parse_mount(spec: &str) -> Mount {
+    // "host", "host:ro", or "host:dest" / "host:dest:ro".
+    // Paths starting with "~/" are expanded to the real home directory so the
+    // mount spec is valid as a filesystem path (bwrap does not do shell expansion).
+    let expand = |p: &str| crate::util::expand_tilde(p);
+    let parts: Vec<&str> = spec.split(':').collect();
+    match parts.as_slice() {
+        [host] => Mount {
+            host: expand(host),
+            dest: expand(host),
+            ro: false,
+            cache: false,
+        },
+        [host, "ro"] => Mount {
+            host: expand(host),
+            dest: expand(host),
+            ro: true,
+            cache: false,
+        },
+        [host, "cache"] => Mount {
+            host: expand(host),
+            dest: expand(host),
+            ro: false,
+            cache: true,
+        },
+        [host, dest] => Mount {
+            host: expand(host),
+            dest: expand(dest),
+            ro: false,
+            cache: false,
+        },
+        [host, dest, "ro"] => Mount {
+            host: expand(host),
+            dest: expand(dest),
+            ro: true,
+            cache: false,
+        },
+        [host, dest, "cache"] => Mount {
+            host: expand(host),
+            dest: expand(dest),
+            ro: false,
+            cache: true,
+        },
+        _ => Mount {
+            host: expand(spec),
+            dest: expand(spec),
+            ro: false,
+            cache: false,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
