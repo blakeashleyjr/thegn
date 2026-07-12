@@ -1331,11 +1331,13 @@ mod tests {
         b.limits = SandboxLimits {
             cpu: Some("2".into()),
             memory: Some("2g".into()),
+            cpu_total: None,
         };
         let mut o = overlay();
         o.limits = Some(SandboxLimits {
             cpu: Some("8".into()),
             memory: Some("512m".into()),
+            cpu_total: None,
         });
         let r = classify_repo_overlay(o, &b, &Approvals::deny_all());
         let lim = r.sanctioned.limits.unwrap();
