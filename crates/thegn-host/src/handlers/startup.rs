@@ -15,6 +15,58 @@ pub(crate) fn install_pane_services(
 ) {
     panes.set_replay_config(cfg.replay.clone());
     panes.set_daemon_config(cfg.daemon.clone());
+    set_aggregate_cpu_cap(cfg);
+}
+
+/// Establish the aggregate CPU ceiling for all worktree panes: set the shared
+/// [`thegn_core::sandbox_cpucap::CPU_SLICE`] quota once, off-loop. Panes join it
+/// in `sandbox::enter_argv`; this sets its bound. Best-effort and idempotent —
+/// runs once per process (a `Once` guard, so the live-config-reload path can't
+/// re-spawn it), and an older/missing systemd or no cgroup `cpu` delegation just
+/// means the cap silently doesn't bite (surfaced by `thegn doctor`).
+fn set_aggregate_cpu_cap(cfg: &thegn_core::config::Config) {
+    use thegn_core::sandbox_cpucap as sandbox;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // Only touch systemd when a real cgroup hard cap is available.
+    if sandbox::detect_cpu_cap() != sandbox::CpuCap::ScopeHard {
+        return;
+    }
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let raw = cfg.sandbox.limits.cpu_total.as_deref().unwrap_or("auto");
+    let Some(quota) = sandbox::resolve_cpu_total(raw, ncpu) else {
+        return;
+    };
+    ONCE.call_once(move || {
+        tokio::task::spawn_blocking(move || {
+            // off-loop: blocking child wait runs on the spawn_blocking pool.
+            #[expect(clippy::disallowed_methods)]
+            let status = std::process::Command::new("systemctl")
+                .args([
+                    "--user",
+                    "set-property",
+                    "--runtime",
+                    sandbox::CPU_SLICE,
+                    &format!("CPUQuota={quota}"),
+                ])
+                .status();
+            match status {
+                Ok(s) if s.success() => tracing::info!(
+                    target: "thegn::startup", slice = sandbox::CPU_SLICE, %quota,
+                    "aggregate CPU cap set"
+                ),
+                Ok(s) => tracing::warn!(
+                    target: "thegn::startup", code = ?s.code(),
+                    "systemctl set-property for aggregate CPU cap failed"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "thegn::startup", error = %e,
+                    "systemctl set-property for aggregate CPU cap failed"
+                ),
+            }
+        });
+    });
 }
 
 /// Ensure a default `local` terminal exists so the sidebar's TERMINALS section

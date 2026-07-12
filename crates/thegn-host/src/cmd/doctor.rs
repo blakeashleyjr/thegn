@@ -98,7 +98,23 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
             "name": cfg.sandbox.agent_profile.as_str(),
             "policy": profile_policy(cfg.sandbox.agent_profile),
         },
+        "limits": limits_json(cfg),
         "home": home_json(cfg),
+    })
+}
+
+/// The resolved CPU/memory caps + enforcement mechanism for `--json`.
+fn limits_json(cfg: &Config) -> serde_json::Value {
+    let limits = &cfg.sandbox.limits;
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    serde_json::json!({
+        "cpu_per_pane": limits.cpu,
+        "cpu_total": thegn_core::sandbox_cpucap::resolve_cpu_total(
+            limits.cpu_total.as_deref().unwrap_or("auto"), ncpu),
+        "memory": limits.memory,
+        "cpu_enforcement": cpu_cap_key(thegn_core::sandbox_cpucap::detect_cpu_cap()),
     })
 }
 
@@ -548,10 +564,52 @@ fn sandbox_report(cfg: &Config) {
         cfg.sandbox.agent_profile.as_str(),
         profile_policy(cfg.sandbox.agent_profile)
     );
+    cpu_cap_report(cfg);
     if all_weak {
         outln!("  note          even the strongest preset here shares the host kernel; for a");
         outln!("                stronger boundary on agent code use a guest-kernel backend");
         outln!("                (gVisor/libkrun) in agent_backend_chain.");
+    }
+}
+
+/// Machine-readable key for the CPU-cap enforcement mechanism.
+fn cpu_cap_key(m: thegn_core::sandbox_cpucap::CpuCap) -> &'static str {
+    use thegn_core::sandbox_cpucap::CpuCap;
+    match m {
+        CpuCap::ScopeHard => "cgroup-hard",
+        CpuCap::NiceSoft => "nice-soft",
+        CpuCap::None => "none",
+    }
+}
+
+/// Report the resolved CPU/memory caps and the enforcement mechanism that would
+/// apply on THIS host, so a user can see whether the cap is a hard cgroup
+/// ceiling or a soft `nice` fallback (or unset). Detection only.
+fn cpu_cap_report(cfg: &Config) {
+    let limits = &cfg.sandbox.limits;
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let per_pane = limits.cpu.as_deref().filter(|s| !s.trim().is_empty());
+    let total = thegn_core::sandbox_cpucap::resolve_cpu_total(
+        limits.cpu_total.as_deref().unwrap_or("auto"),
+        ncpu,
+    );
+    if per_pane.is_none() && total.is_none() {
+        outln!("  cpu cap       (unset)");
+        return;
+    }
+    let mut parts = Vec::new();
+    if let Some(c) = per_pane {
+        parts.push(format!("{c} cores/pane"));
+    }
+    if let Some(q) = &total {
+        parts.push(format!("{q} total"));
+    }
+    let mech = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    outln!("  cpu cap       {}  ({})", parts.join(" · "), mech.label());
+    if let Some(m) = limits.memory.as_deref().filter(|s| !s.trim().is_empty()) {
+        outln!("  mem cap       {m}/pane");
     }
 }
 
