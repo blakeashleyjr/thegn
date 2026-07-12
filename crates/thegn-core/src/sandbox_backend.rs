@@ -163,11 +163,30 @@ pub(crate) fn available(placement: &Placement, backend: Backend) -> RuntimeProbe
     let v = if placement.is_local() {
         available_probe(placement, backend)
     } else {
-        probe_with_retry(
-            &crate::retry::ReconnectPolicy::probe(),
-            &mut std::thread::sleep,
-            &mut || available_probe(placement, backend),
-        )
+        use crate::progress::{SandboxPhase, emit};
+        emit(SandboxPhase::Connect {
+            host: placement.label(),
+        });
+        let policy = crate::retry::ReconnectPolicy::probe();
+        let mut attempt: u32 = 0;
+        let v = probe_with_retry(&policy, &mut std::thread::sleep, &mut || {
+            attempt += 1;
+            if attempt > 1 {
+                emit(SandboxPhase::ConnectRetry {
+                    attempt,
+                    max: policy.max_attempts,
+                });
+            }
+            available_probe(placement, backend)
+        });
+        if v == RuntimeProbe::Unreachable {
+            emit(SandboxPhase::PhaseFailed {
+                err: format!("{} unreachable", placement.label()),
+            });
+        } else {
+            emit(SandboxPhase::PhaseDone);
+        }
+        v
     };
     if avail_cacheable(v) {
         cache

@@ -225,11 +225,10 @@ fn glyph(face: Face, c: char) -> Option<&'static Glyph> {
 /// The wordmark text. One brand, one place.
 pub const WORDMARK: &str = "THEGN";
 
-/// Stable content-height reserve for the loading splash (steps + context rows).
-/// Centering uses `max(actual, this)` so the wordmark holds a fixed position as
-/// steps tick and the context block appears — no vertical "bounce". Sized for a
-/// typical provision plan (~10 steps) plus its context block (~6 lines).
-const LOADING_RESERVE_ROWS: usize = 16;
+/// Rows the idle (non-loading) splash body occupies below the wordmark+version
+/// header: worktree line, gaps, and the ruled keybind-hint block. Constant so
+/// the anchor math is state-free.
+const IDLE_BODY_ROWS: usize = 6;
 
 /// (cols, rows) `text` occupies in `face`: glyph widths + 1-px letter spacing.
 /// Unknown characters are skipped and contribute nothing (no gap either).
@@ -314,17 +313,24 @@ pub fn splash_variant(cols: usize, rows: usize) -> SplashVariant {
     }
 }
 
-/// The empty-center splash: wordmark in the accent color, version line, and
-/// keybind hints, centered in `rect` on the deep background. Pure function of
-/// `rect` + the live palette — resize re-centers it for free.
+/// The empty-center splash: wordmark in the accent color, version line, and —
+/// loading — the live step timeline ([`crate::loading::screen`]) or — idle —
+/// the worktree identity + ruled keybind hints. Pure function of `rect` + the
+/// model + the live palette + the ambient clock (spinner frames); resize
+/// re-centers it for free, and the splash-scoped ticker repaints it while
+/// loading.
+///
+/// An ASCII-only terminal keeps the FULL layout — only the half-block pixel
+/// wordmark swaps for a letter-spaced text masthead. (It used to collapse the
+/// whole splash to the one-line Text variant, hiding all step progress.)
 pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::FrameModel) {
-    use crate::chrome::StepState;
     chrome::fill(surface, rect, col(S::Bg0));
     let accent = chrome::theme_color(model.accent_or_default());
     let bg = col(S::Bg0);
     let version = concat!("v", env!("CARGO_PKG_VERSION"));
     let tagline = " · git worktree IDE";
     let loading = !model.load_steps.is_empty();
+    let pixel_ok = crate::caps::unicode_level() != thegn_core::termcaps::UnicodeLevel::Ascii;
 
     // Center one line made of (text, fg) parts.
     let centered_parts = |surface: &mut Surface, y: usize, parts: &[(&str, ColorAttribute)]| {
@@ -336,38 +342,18 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
         }
     };
 
-    // The Large/Small wordmarks are a half-block (`▀▄█`) pixel font that an
-    // ASCII-only terminal can't render; fall back to the plain text wordmark.
-    let variant = match splash_variant(rect.cols, rect.rows) {
-        v @ (SplashVariant::Large | SplashVariant::Small)
-            if crate::caps::unicode_level() == thegn_core::termcaps::UnicodeLevel::Ascii =>
-        {
-            let _ = v;
-            SplashVariant::Text
-        }
-        v => v,
-    };
-    match variant {
+    match splash_variant(rect.cols, rect.rows) {
         SplashVariant::Large => {
-            // Loading: wordmark(3) + gap(1) + version(1) + gap(1) + steps(N) +
-            //          gap(1) + context(M). Idle: …hints(3) = 9 rows total.
-            let ctx_rows = if model.load_context.is_empty() {
-                0
-            } else {
-                1 + model.load_context.len()
-            };
+            // Header: wordmark(3) + gap(1) + version(1) + gap(1) = 6 rows,
+            // then the body. Loading reserves `screen::reserved_rows` (a pure
+            // function of the PLAN, not of tick-by-tick state, so the anchor
+            // never bounces); idle reserves the constant hint block.
             let content_rows = if loading {
-                // STABLE reserve: the wordmark must NOT re-center as steps tick
-                // through (done→active→done), as a failed step's error sub-line
-                // appears, or as the context block lands — a moving anchor reads as
-                // the splash "bouncing". Reserve a fixed height that fits a typical
-                // provision plan + its context, so `y0` is constant for the whole
-                // session; only genuine overflow (rare, very many steps) grows it.
-                (steps_rows(&model.load_steps) + ctx_rows).max(LOADING_RESERVE_ROWS)
+                crate::loading::screen::reserved_rows(&model.load_steps, &model.load_context)
             } else {
-                3
+                IDLE_BODY_ROWS
             };
-            let base_rows = 9.max(3 + 3 + content_rows); // always at least 9 for stable centering
+            let base_rows = 3 + 3 + content_rows;
             // Mascot above the wordmark when the center is tall enough for the
             // whole block plus a row of margin top and bottom; small centers
             // keep the compact splash unchanged. Uniform math — no per-state
@@ -398,86 +384,73 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
                 }
             }
             let y0 = top + if with_mascot { mascot_block } else { 0 };
-            let (w, _) = measure(Face::Large, WORDMARK);
-            let x = rect.x + rect.cols.saturating_sub(w) / 2;
-            draw(
-                surface,
-                x,
-                y0,
-                WORDMARK,
-                Face::Large,
-                accent,
-                bg,
-                rect.cols,
-                3,
-            );
+            if pixel_ok {
+                let (w, _) = measure(Face::Large, WORDMARK);
+                let x = rect.x + rect.cols.saturating_sub(w) / 2;
+                draw(
+                    surface,
+                    x,
+                    y0,
+                    WORDMARK,
+                    Face::Large,
+                    accent,
+                    bg,
+                    rect.cols,
+                    3,
+                );
+            } else {
+                // Letter-spaced text masthead in the middle wordmark row.
+                centered_parts(surface, y0 + 1, &[("T H E G N", accent)]);
+            }
             centered_parts(
                 surface,
                 y0 + 4,
                 &[(version, col(S::Dim)), (tagline, col(S::Faint))],
             );
             if loading {
-                let next = draw_steps(surface, rect, &model.load_steps, y0 + 6, bg, accent);
-                // Context block (env / placement / sandbox / connect / workdir) a
-                // row below the steps.
-                draw_context(surface, rect, &model.load_context, next + 1, bg);
+                crate::loading::screen::draw_body(
+                    surface,
+                    rect,
+                    y0 + 6,
+                    &model.load_steps,
+                    &model.load_context,
+                    accent,
+                    bg,
+                );
             } else {
-                let hints = [
-                    ("Ctrl-Space", "command palette"),
-                    ("Alt-↑↓", "prev/next worktree"),
-                    ("Ctrl-g", "lock keys to pane"),
-                ];
-                let key_w = 10;
-                let block_w = key_w + 2 + 18;
-                let hx = rect.x + rect.cols.saturating_sub(block_w) / 2;
-                for (i, (key, label)) in hints.iter().enumerate() {
-                    let y = y0 + 6 + i;
-                    chrome::draw_text(surface, hx, y, key, col(S::Dim), bg, rect.cols);
-                    let lx = hx + key_w + 2;
-                    chrome::draw_text(
-                        surface,
-                        lx,
-                        y,
-                        label,
-                        col(S::Faint),
-                        bg,
-                        (rect.x + rect.cols).saturating_sub(lx),
-                    );
-                }
+                draw_idle_body(surface, rect, y0 + 6, model, bg, &centered_parts);
             }
         }
         SplashVariant::Small => {
             let y0 = rect.y + rect.rows.saturating_sub(6) / 2;
-            let (w, _) = measure(Face::Small, WORDMARK);
-            let x = rect.x + rect.cols.saturating_sub(w) / 2;
-            draw(
-                surface,
-                x,
-                y0,
-                WORDMARK,
-                Face::Small,
-                accent,
-                bg,
-                rect.cols,
-                2,
-            );
+            if pixel_ok {
+                let (w, _) = measure(Face::Small, WORDMARK);
+                let x = rect.x + rect.cols.saturating_sub(w) / 2;
+                draw(
+                    surface,
+                    x,
+                    y0,
+                    WORDMARK,
+                    Face::Small,
+                    accent,
+                    bg,
+                    rect.cols,
+                    2,
+                );
+            } else {
+                centered_parts(surface, y0, &[("T H E G N", accent)]);
+            }
             centered_parts(
                 surface,
                 y0 + 3,
                 &[(version, col(S::Dim)), (tagline, col(S::Faint))],
             );
             if loading {
-                // Compact: show only the active step on y0+5.
-                if let Some(step) = model
-                    .load_steps
-                    .iter()
-                    .find(|s| s.state == StepState::Active)
-                    .or_else(|| model.load_steps.last())
-                {
-                    let (glyph, fg) = step_glyph(step, accent);
-                    let text = format!("{glyph} {}", step.label);
-                    centered_parts(surface, y0 + 5, &[(&text, fg)]);
-                }
+                // Compact one-line status: `◐ 3/5 pull image · 37% · 38s`.
+                let parts = crate::loading::screen::compact_line(&model.load_steps, accent);
+                let borrowed: Vec<(&str, ColorAttribute)> =
+                    parts.iter().map(|(t, fg)| (t.as_str(), *fg)).collect();
+                centered_parts(surface, y0 + 5, &borrowed);
             } else {
                 centered_parts(
                     surface,
@@ -494,138 +467,64 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
         }
         SplashVariant::Text => {
             let y = rect.y + rect.rows.saturating_sub(1) / 2;
-            centered_parts(surface, y, &[("thegn ", accent), (version, col(S::Dim))]);
+            if loading {
+                let parts = crate::loading::screen::compact_line(&model.load_steps, accent);
+                let mut all: Vec<(&str, ColorAttribute)> = vec![("thegn ", accent)];
+                all.extend(parts.iter().map(|(t, fg)| (t.as_str(), *fg)));
+                centered_parts(surface, y, &all);
+            } else {
+                centered_parts(surface, y, &[("thegn ", accent), (version, col(S::Dim))]);
+            }
         }
         SplashVariant::None => {}
     }
 }
 
-/// Returns the glyph and color for a step based on its state. Thin wrapper over
-/// the shared [`crate::loading::plan::visual_glyph`] vocabulary so the splash
-/// and the clone modal can never draw a different "working" glyph.
-fn step_glyph(
-    step: &crate::chrome::LoadStep,
-    accent: ColorAttribute,
-) -> (&'static str, ColorAttribute) {
-    crate::loading::plan::visual_glyph(step.state, accent)
-}
+/// A line painter: centers `(text, fg)` parts on a row (see `draw_splash`'s
+/// local `centered_parts`).
+type PartsPainter<'a> = dyn Fn(&mut Surface, usize, &[(&str, ColorAttribute)]) + 'a;
 
-/// Number of rows [`draw_steps`] will occupy: one per step plus one per step
-/// that carries a `detail` sub-line. Used for vertical centering.
-fn steps_rows(steps: &[crate::chrome::LoadStep]) -> usize {
-    steps.len() + steps.iter().filter(|s| s.detail.is_some()).count()
-}
-
-/// Render a step list centered as a block below `y_start`. A step's optional
-/// `detail` (a failed step's error / an active step's status) renders as a dim
-/// indented sub-line right below it. Returns the next free row.
-fn draw_steps(
+/// The idle splash body below the header: the active worktree's identity and
+/// the keybind-hint block bracketed by thin rules. Occupies [`IDLE_BODY_ROWS`].
+fn draw_idle_body(
     surface: &mut Surface,
     rect: Rect,
-    steps: &[crate::chrome::LoadStep],
-    y_start: usize,
+    y0: usize,
+    model: &crate::chrome::FrameModel,
     bg: ColorAttribute,
-    accent: ColorAttribute,
-) -> usize {
-    use crate::chrome::StepState;
-    // Find the width of the widest label to left-align the block as a whole.
-    let max_label = steps
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.label.as_str()))
-        .max()
-        .unwrap_or(0);
-    // glyph(1) + space(1) + label
-    let block_w = 2 + max_label;
-    let bx = rect.x + rect.cols.saturating_sub(block_w) / 2;
-    let bottom = rect.y + rect.rows;
-
-    let mut y = y_start;
-    for step in steps {
-        if y >= bottom {
-            break;
-        }
-        let (glyph, glyph_fg) = step_glyph(step, accent);
-        chrome::draw_text(surface, bx, y, glyph, glyph_fg, bg, 1);
-        let label_fg = crate::loading::plan::label_color(step.state);
-        chrome::draw_text(
-            surface,
-            bx + 2,
-            y,
-            &step.label,
-            label_fg,
-            bg,
-            (rect.x + rect.cols).saturating_sub(bx + 2),
-        );
-        y += 1;
-        // Detail sub-line (failed step's error / active step's status), dim, under
-        // the label and clamped to the frame width.
-        if let Some(detail) = &step.detail {
-            if y >= bottom {
-                break;
-            }
-            let fg = if step.state == StepState::Failed {
-                chrome::theme_color(thegn_core::theme::RED)
-            } else {
-                col(S::Faint)
-            };
-            chrome::draw_text(
-                surface,
-                bx + 2,
-                y,
-                detail,
-                fg,
-                bg,
-                (rect.x + rect.cols).saturating_sub(bx + 2),
-            );
-            y += 1;
-        }
-    }
-    y
-}
-
-/// Render the `(key, value)` loading-context facts (env / placement / sandbox /
-/// connect / workdir) as dim, right-of-key aligned lines centered below the
-/// steps. Returns nothing; clamped to the frame.
-fn draw_context(
-    surface: &mut Surface,
-    rect: Rect,
-    ctx: &[(String, String)],
-    y_start: usize,
-    bg: ColorAttribute,
+    centered_parts: &PartsPainter<'_>,
 ) {
-    if ctx.is_empty() {
-        return;
+    let g = crate::caps::active_glyphs();
+    let hints = [
+        ("Ctrl-Space", "command palette"),
+        ("Alt-↑↓", "prev/next worktree"),
+        ("Ctrl-g", "lock keys to pane"),
+    ];
+    let key_w = 10;
+    let block_w = key_w + 2 + 18;
+    let hx = rect.x + rect.cols.saturating_sub(block_w) / 2;
+    // Row 0: worktree identity (blank when unknown — the height is constant).
+    if !model.worktree.is_empty() {
+        centered_parts(surface, y0, &[(model.worktree.as_str(), col(S::Dim))]);
     }
-    let key_w = ctx
-        .iter()
-        .map(|(k, _)| UnicodeWidthStr::width(k.as_str()))
-        .max()
-        .unwrap_or(0);
-    let val_w = ctx
-        .iter()
-        .map(|(_, v)| UnicodeWidthStr::width(v.as_str()))
-        .max()
-        .unwrap_or(0);
-    let block_w = key_w + 2 + val_w;
-    let bx = rect.x + rect.cols.saturating_sub(block_w) / 2;
-    let bottom = rect.y + rect.rows;
-    for (i, (k, v)) in ctx.iter().enumerate() {
-        let y = y_start + i;
-        if y >= bottom {
-            break;
-        }
-        chrome::draw_text(surface, bx, y, k, col(S::Ghost), bg, key_w);
-        let vx = bx + key_w + 2;
+    // Row 1: rule · rows 2..4: hints · row 5: rule.
+    let rule = g.box_h.repeat(block_w);
+    chrome::draw_text(surface, hx, y0 + 1, &rule, col(S::Ghost), bg, block_w);
+    for (i, (key, label)) in hints.iter().enumerate() {
+        let y = y0 + 2 + i;
+        chrome::draw_text(surface, hx, y, key, col(S::Dim), bg, rect.cols);
+        let lx = hx + key_w + 2;
         chrome::draw_text(
             surface,
-            vx,
+            lx,
             y,
-            v,
-            col(S::Dim),
+            label,
+            col(S::Faint),
             bg,
-            (rect.x + rect.cols).saturating_sub(vx),
+            (rect.x + rect.cols).saturating_sub(lx),
         );
     }
+    chrome::draw_text(surface, hx, y0 + 5, &rule, col(S::Ghost), bg, block_w);
 }
 
 #[cfg(test)]
@@ -721,7 +620,7 @@ mod tests {
     #[test]
     fn draw_splash_large_centers_content() {
         // 14 rows: enough for the Large splash (≥11) but not the mascot block
-        // (9 + 11 + 2 = 22), so the compact 9-row layout is unchanged.
+        // (12 + 12 + 2 = 26), so the compact 12-row idle layout renders.
         let mut s = Surface::new(80, 14);
         let rect = Rect {
             x: 0,
@@ -732,36 +631,60 @@ mod tests {
         let model = crate::chrome::FrameModel::default();
         draw_splash(&mut s, rect, &model);
         let l = lines(&mut s);
-        // Block of 9 rows centered: wordmark starts at (14-9)/2 = 2.
+        // Block of 12 rows centered: wordmark starts at (14-12)/2 = 1.
         assert!(
-            l[2].contains('▀') || l[2].contains('▄'),
+            l[1].contains('▀') || l[1].contains('▄'),
             "wordmark row: {:?}",
-            l[2]
+            l[1]
         );
-        assert!(l[6].contains(env!("CARGO_PKG_VERSION")));
-        assert!(l[6].contains("git worktree IDE"));
-        assert!(l[8].contains("Ctrl-Space"));
-        assert!(l[10].contains("Ctrl-g"));
+        assert!(l[5].contains(env!("CARGO_PKG_VERSION")));
+        assert!(l[5].contains("git worktree IDE"));
+        // Idle body: rule(8), hints(9..11), rule(12).
+        assert!(l[8].contains(crate::caps::active_glyphs().box_h), "top rule");
+        assert!(l[9].contains("Ctrl-Space"));
+        assert!(l[11].contains("Ctrl-g"));
+        assert!(l[12].contains(crate::caps::active_glyphs().box_h), "bottom rule");
         // Wordmark horizontally centered: 29 cols in 80 → starts near col 25.
-        let start = l[2].find(['▀', '▄', '█']).unwrap();
+        let start = l[1].find(['▀', '▄', '█']).unwrap();
         assert!((24..=26).contains(&start), "start {start}");
     }
 
     #[test]
-    fn draw_splash_large_shows_mascot_when_tall() {
-        // 24 rows fits base(9) + mascot block(11) + margin(2): mascot on top,
-        // wordmark shifted below it.
-        let mut s = Surface::new(80, 24);
+    fn draw_splash_large_shows_worktree_identity_when_known() {
+        let mut s = Surface::new(80, 14);
         let rect = Rect {
             x: 0,
             y: 0,
             cols: 80,
-            rows: 24,
+            rows: 14,
+        };
+        let model = crate::chrome::FrameModel {
+            worktree: "repo/sz-vivid-eagle".into(),
+            ..Default::default()
+        };
+        draw_splash(&mut s, rect, &model);
+        let l = lines(&mut s);
+        // Identity on the body's first row (y0+6 = 7); geometry otherwise
+        // identical to the anonymous splash (constant IDLE_BODY_ROWS).
+        assert!(l[7].contains("repo/sz-vivid-eagle"), "{:?}", l[7]);
+        assert!(l[9].contains("Ctrl-Space"));
+    }
+
+    #[test]
+    fn draw_splash_large_shows_mascot_when_tall() {
+        // 28 rows fits base(12) + mascot block(11+1) + margin(2): mascot on
+        // top, wordmark shifted below it.
+        let mut s = Surface::new(80, 28);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 28,
         };
         let model = crate::chrome::FrameModel::default();
         draw_splash(&mut s, rect, &model);
         let l = lines(&mut s);
-        // total 20 rows centered at top=(24-20)/2=2: mascot rows 2..12.
+        // total 24 rows centered at top=(28-24)/2=2: mascot rows 2..12.
         assert!(
             l[2].contains('▀') || l[2].contains('▄'),
             "mascot crest row: {:?}",
@@ -771,14 +694,42 @@ mod tests {
         // this row's leftmost opaque pixel is inset 3, so blocks start at 29.
         let mstart = l[5].find(['▀', '▄', '█']).unwrap();
         assert!((28..=30).contains(&mstart), "mascot start {mstart}");
-        // Wordmark lands after the mascot block: rows 13..16.
+        // Wordmark lands after the mascot block: rows 14..16.
         assert!(
-            l[13].contains('▀') || l[13].contains('▄'),
+            l[14].contains('▀') || l[14].contains('▄'),
             "wordmark row: {:?}",
-            l[13]
+            l[14]
         );
-        assert!(l[17].contains(env!("CARGO_PKG_VERSION")));
-        assert!(l[19].contains("Ctrl-Space"));
+        assert!(l[18].contains(env!("CARGO_PKG_VERSION")));
+        assert!(l[22].contains("Ctrl-Space"));
+    }
+
+    #[test]
+    fn draw_splash_large_loading_renders_the_timeline_body() {
+        use crate::chrome::LoadStep;
+        let mut s = Surface::new(80, 24);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 24,
+        };
+        let model = crate::chrome::FrameModel {
+            load_steps: vec![
+                LoadStep::done("sandbox"),
+                LoadStep::active("image debian:stable"),
+                LoadStep::pending("container (podman)"),
+                LoadStep::pending("shell"),
+            ],
+            load_context: vec![("env".into(), "local".into())],
+            ..Default::default()
+        };
+        draw_splash(&mut s, rect, &model);
+        let all = lines(&mut s).join("\n");
+        assert!(all.contains("1/4"), "gauge: {all}");
+        assert!(all.contains("image debian:stable"), "steps: {all}");
+        assert!(all.contains("env"), "context block");
+        assert!(!all.contains("Ctrl-Space"), "no idle hints while loading");
     }
 
     #[test]
@@ -799,10 +750,13 @@ mod tests {
     }
 
     #[test]
-    fn ascii_terminal_forces_text_splash_even_when_large() {
+    fn ascii_terminal_swaps_masthead_but_keeps_the_layout() {
         use thegn_core::termcaps::UnicodeLevel;
         crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
-            // A generously large area would normally draw the half-block wordmark.
+            // A generously large area: the pixel wordmark degrades to the
+            // letter-spaced text masthead, but the LAYOUT survives — this
+            // locks the fix for the old behavior of collapsing the whole
+            // splash (and every loading step) to a single text line.
             let mut s = Surface::new(80, 24);
             let rect = Rect {
                 x: 0,
@@ -810,13 +764,24 @@ mod tests {
                 cols: 80,
                 rows: 24,
             };
-            let model = crate::chrome::FrameModel::default();
+            let model = crate::chrome::FrameModel {
+                load_steps: vec![
+                    crate::chrome::LoadStep::done("sandbox"),
+                    crate::chrome::LoadStep::active("image debian:stable"),
+                    crate::chrome::LoadStep::pending("shell"),
+                ],
+                ..Default::default()
+            };
             draw_splash(&mut s, rect, &model);
             let all = lines(&mut s).join("\n");
-            assert!(all.contains("thegn"), "text wordmark present");
+            assert!(all.contains("T H E G N"), "text masthead present");
             assert!(
                 !all.contains('▀') && !all.contains('▄') && !all.contains('█'),
                 "no half-block pixel font on an ASCII terminal"
+            );
+            assert!(
+                all.contains("image debian:stable"),
+                "step progress stays visible on ASCII terminals: {all}"
             );
         });
     }

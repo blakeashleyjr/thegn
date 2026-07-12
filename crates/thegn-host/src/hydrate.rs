@@ -185,6 +185,12 @@ pub(crate) enum RefreshKind {
     /// Background host-heal tick ([`crate::handlers::host_heal`]): the handler
     /// no-ops from hydrated model state unless a Failed(retryable) host exists.
     HostHeal,
+    /// A splash-scoped animation tick ([`crate::loading::ticker::SplashTicker`]):
+    /// repaint the visible loading splash (spinner frame / elapsed / hints).
+    /// The ticker thread exists ONLY while a splash is visible — the 0%-idle
+    /// contract — and a straggler tick after the splash cleared leaves damage
+    /// empty, so `render_plan` still Skips.
+    SplashTick,
 }
 
 const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
