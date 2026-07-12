@@ -5163,7 +5163,7 @@ fn build_search_sources<'a>(
         SearchScope::Workspace => {
             // All worktrees in the active session.
             for g in &session.worktrees {
-                let wt_name = g.path.rsplit('/').next().unwrap_or(&g.name).to_string();
+                let wt_name = thegn_core::util::basename(&g.path).to_string();
                 for (ti, tab) in g.tabs.iter().enumerate() {
                     let label = format!("tab {} · {}", ti + 1, wt_name);
                     for pid in tab.center.pane_ids() {
@@ -5178,7 +5178,7 @@ fn build_search_sources<'a>(
             // Same as Workspace for now (profile == session in the current model;
             // when profiles land this will walk across sessions).
             for g in &session.worktrees {
-                let wt_name = g.path.rsplit('/').next().unwrap_or(&g.name).to_string();
+                let wt_name = thegn_core::util::basename(&g.path).to_string();
                 for (ti, tab) in g.tabs.iter().enumerate() {
                     let label = format!("tab {} · {}", ti + 1, wt_name);
                     for pid in tab.center.pane_ids() {
@@ -5762,11 +5762,7 @@ fn dispatch_acp_inbound(
 /// Build the approval overlay for a pending bouncer request: a 2-item allow/deny
 /// menu titled with the worktree + action, bodied with the command/path summary.
 fn approval_overlay<R>(req: &crate::bouncer::ApprovalRequest<R>) -> MenuOverlay {
-    let wt_name = req
-        .worktree
-        .rsplit('/')
-        .next()
-        .unwrap_or(req.worktree.as_str());
+    let wt_name = thegn_core::util::basename(&req.worktree);
     let title = format!(
         "{} {wt_name} · agent wants to {}",
         req.kind.glyph(),
@@ -10315,11 +10311,7 @@ async fn event_loop<T: Terminal>(
             // app sets, else the program name derived from the spawn argv. Hoisted
             // above the if-chain so the partial paths (which repaint a pane's card
             // after recomposing its content) and the full path share one closure.
-            let title_leaf = model
-                .worktree
-                .rsplit_once('/')
-                .map(|(_, l)| l.to_string())
-                .unwrap_or_else(|| model.worktree.clone());
+            let title_leaf = thegn_core::util::basename(&model.worktree).to_string();
             let title_of = |id| {
                 panes
                     .table

@@ -639,7 +639,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
                     // through item-524 process attention.
                     if let Ok(Some((dispatch_id, issue_id))) = db.dispatch_info_for_worktree(&wt) {
                         let kind = if failed { "agent_failed" } else { "agent_done" };
-                        let base = wt.rsplit('/').next().unwrap_or(&wt);
+                        let base = thegn_core::util::basename(&wt);
                         let msg = format!(
                             "agent {} in {base}",
                             if failed { "crashed" } else { "finished" }

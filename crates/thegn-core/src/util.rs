@@ -652,9 +652,12 @@ pub fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// The last path component of a string (no trailing-slash handling needed here).
+/// The last path component of a string (no trailing-slash handling needed
+/// here). Splits on both separators so Windows paths (`C:\…\worktree`) and
+/// unix paths resolve the same — display strings flow through here on every
+/// platform (tab titles, sidebar rows, pin cwds).
 pub fn basename(s: &str) -> &str {
-    s.rsplit('/').next().unwrap_or(s)
+    s.rsplit(['/', '\\']).next().unwrap_or(s)
 }
 
 #[cfg(not(windows))]
@@ -832,6 +835,15 @@ pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn basename_splits_both_separators() {
+        assert_eq!(basename("/home/u/wt/feature-x"), "feature-x");
+        assert_eq!(basename(r"C:\Users\u\wt\feature-x"), "feature-x");
+        assert_eq!(basename(r"C:\Users\u/mixed\style/leaf"), "leaf");
+        assert_eq!(basename("bare"), "bare");
+        assert_eq!(basename(""), "");
+    }
 
     #[test]
     fn managed_pi_dirs_nest_under_thegn_dir() {
