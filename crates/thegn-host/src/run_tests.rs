@@ -2107,6 +2107,8 @@ fn prune_vanished_group_lands_on_home_and_returns_pane_ids() {
 
 #[test]
 fn workspace_pool_stash_take_roundtrips_trees() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
     let mut pool = WorkspacePool::default();
     assert!(!pool.contains("/r/a"));
     pool.stash(
@@ -2115,6 +2117,7 @@ fn workspace_pool_stash_take_roundtrips_trees() {
             worktrees: vec![WorktreeGroup::new("a/home", GroupKind::Home, "/r/a")],
             active: 0,
         },
+        &mut panes,
     );
     assert!(pool.contains("/r/a"));
     let rw = pool.take("/r/a").expect("stashed");
@@ -2122,6 +2125,65 @@ fn workspace_pool_stash_take_roundtrips_trees() {
     assert_eq!(rw.worktrees[0].name, "a/home");
     assert!(!pool.contains("/r/a"), "take removes the entry");
     assert!(pool.take("/r/a").is_none());
+}
+
+/// Build a one-tab workspace whose single leaf pane has id `pane_id`, and
+/// register a live `PtyPane` for it in `panes` so eviction has something to reap.
+#[cfg(test)]
+fn resident_with_live_pane(
+    panes: &mut Panes,
+    repo: &str,
+    name: &str,
+    pane_id: u32,
+) -> ResidentWorkspace {
+    let mut g = WorktreeGroup::new(name, GroupKind::Home, repo);
+    g.tabs[0].center = crate::center::CenterTree::Leaf(pane_id);
+    panes.insert_test_pane(pane_id);
+    ResidentWorkspace {
+        worktrees: vec![g],
+        active: 0,
+    }
+}
+
+#[test]
+fn workspace_pool_evicts_lru_and_reaps_its_panes_past_the_limit() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+    let mut pool = WorkspacePool::default();
+    pool.set_limit(2);
+
+    // Park three workspaces (limit 2): the least-recently parked ("/r/a") is
+    // evicted and its live pane reaped from the table; the other two survive.
+    let a = resident_with_live_pane(&mut panes, "/r/a", "a/home", 1);
+    let b = resident_with_live_pane(&mut panes, "/r/b", "b/home", 2);
+    let c = resident_with_live_pane(&mut panes, "/r/c", "c/home", 3);
+    pool.stash("/r/a".into(), a, &mut panes);
+    pool.stash("/r/b".into(), b, &mut panes);
+    pool.stash("/r/c".into(), c, &mut panes);
+
+    assert!(!pool.contains("/r/a"), "LRU workspace evicted");
+    assert!(pool.contains("/r/b"));
+    assert!(pool.contains("/r/c"));
+    assert!(
+        !panes.table.contains_key(&1),
+        "evicted workspace's pane reaped"
+    );
+    assert!(panes.table.contains_key(&2), "resident pane kept alive");
+    assert!(panes.table.contains_key(&3));
+}
+
+#[test]
+fn workspace_pool_limit_zero_reaps_on_every_stash() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+    let mut pool = WorkspacePool::default();
+    pool.set_limit(0);
+
+    let a = resident_with_live_pane(&mut panes, "/r/a", "a/home", 1);
+    pool.stash("/r/a".into(), a, &mut panes);
+
+    assert!(!pool.contains("/r/a"), "limit 0 disables pooling");
+    assert!(!panes.table.contains_key(&1), "pane reaped immediately");
 }
 
 #[test]
