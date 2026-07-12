@@ -6846,6 +6846,8 @@ async fn event_loop<T: Terminal>(
     // layout may survive. Tab/worktree switches reuse the same rects and must
     // NOT trigger this: a full repaint flashes the whole center.
     let mut full_repaint = true;
+    // Same-size resize: re-sync the diff baseline without a ClearScreen (below).
+    let mut resync_baseline = false;
     // Consecutive transient terminal-write failures (EIO); reset on a clean
     // flush, torn down only when it persists past `frame_write::RETRY_MAX`.
     let mut frame_write_errs: u32 = 0;
@@ -11018,6 +11020,11 @@ async fn event_loop<T: Terminal>(
                 wire.push(clear);
                 wire_renderer.invalidate();
                 full_repaint = false;
+            } else if resync_baseline {
+                // Same-size resize: reset baseline so diff_screens re-emits over
+                // garbage; no ClearScreen (no orphaned cells; the escape flashes).
+                front = Surface::new(cols, rows);
+                resync_baseline = false;
             }
             // Bounded diff: the incremental path recomposed just a few rects
             // (changed panes and/or the bars) over the reused `scratch`, so diff
@@ -18302,18 +18309,11 @@ async fn event_loop<T: Terminal>(
             }
             Ok(Some(InputEvent::Resized { rows: r, cols: c })) => {
                 if r == rows && c == cols {
-                    // Same-dimension resize: nothing about the geometry changed,
-                    // so panes must NOT be re-laid-out / re-resized — that would
-                    // SIGWINCH every child and make full-screen TUIs clear+redraw
-                    // (a ~1s black flash in the pane area). Wayland compositors
-                    // (e.g. niri) re-emit a `configure` when the window is
-                    // re-activated on workspace refocus, which the outer terminal
-                    // turns into a same-size SIGWINCH → this arm. We still
-                    // `full_repaint` so that if the physical screen was scrambled
-                    // by a coalesced same-size drag (160→120→160), our already-
-                    // composed frame is re-flushed over the garbage — but without
-                    // disturbing the panes.
-                    full_repaint = true;
+                    // Same-size SIGWINCH (niri re-`configure` on window refocus):
+                    // geometry unchanged, so don't relayout / SIGWINCH panes. Re-sync
+                    // the diff baseline (re-flush over any coalesced-drag garbage) but
+                    // with NO ClearScreen — no orphaned cells, and it flashes ghostty.
+                    resync_baseline = true;
                     dirty = true;
                 } else {
                     rows = r;
