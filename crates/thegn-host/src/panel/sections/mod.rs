@@ -13,7 +13,7 @@ use super::{ChangeRow, PanelData, PanelHit, PanelUi, Section, Stage};
 
 mod across;
 mod branches;
-mod changes;
+pub(crate) mod changes;
 mod ci;
 pub(crate) mod commits;
 mod environments;
