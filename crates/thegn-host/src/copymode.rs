@@ -6,16 +6,19 @@
 
 use crate::emulator::PaneEmulator;
 
-/// A half-open-free inclusive cell selection in `(row, col)` grid coordinates.
+/// A half-open-free inclusive cell selection. The row is an **absolute grid
+/// line** (alacritty `Line`: 0 = top of the live screen, negative = scrollback
+/// history) so the selection stays glued to its content as the viewport
+/// scrolls; the col is a plain screen column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
-    pub anchor: (u16, u16),
-    pub cursor: (u16, u16),
+    pub anchor: (i32, u16),
+    pub cursor: (i32, u16),
 }
 
 impl Selection {
-    /// Begin a selection at `anchor` (the mouse-down point).
-    pub fn new(anchor: (u16, u16)) -> Self {
+    /// Begin a selection at `anchor` (the mouse-down point, in absolute lines).
+    pub fn new(anchor: (i32, u16)) -> Self {
         Self {
             anchor,
             cursor: anchor,
@@ -23,12 +26,12 @@ impl Selection {
     }
 
     /// Ordered bounds for the mouse-selection overlay renderer.
-    pub fn ordered(&self) -> (u16, u16, u16, u16) {
+    pub fn ordered(&self) -> (i32, u16, i32, u16) {
         self.bounds()
     }
 
     /// Ordered bounds `(start_row, start_col, end_row, end_col)` with start ≤ end.
-    fn bounds(&self) -> (u16, u16, u16, u16) {
+    fn bounds(&self) -> (i32, u16, i32, u16) {
         let (a, c) = (self.anchor, self.cursor);
         if (a.0, a.1) <= (c.0, c.1) {
             (a.0, a.1, c.0, c.1)
@@ -38,12 +41,15 @@ impl Selection {
     }
 }
 
-/// A full-grid selection (used by "copy whole pane").
+/// A full-grid selection (used by "copy whole pane") — the currently visible
+/// screen, expressed in absolute lines so it copies what's on screen even when
+/// scrolled into history.
 pub fn whole(emu: &dyn PaneEmulator) -> Selection {
     let (rows, cols) = emu.size();
+    let off = emu.scrollback() as i32;
     Selection {
-        anchor: (0, 0),
-        cursor: (rows.saturating_sub(1), cols.saturating_sub(1)),
+        anchor: (-off, 0),
+        cursor: (rows.saturating_sub(1) as i32 - off, cols.saturating_sub(1)),
     }
 }
 
@@ -65,7 +71,7 @@ pub fn extract(emu: &dyn PaneEmulator, sel: &Selection) -> String {
         };
         let mut line = String::new();
         for col in from..to.min(cols) {
-            match emu.cell(r, col) {
+            match emu.cell_abs(r, col) {
                 Some(c) if !c.text.is_empty() => line.push_str(&c.text),
                 _ => line.push(' '),
             }
@@ -159,6 +165,24 @@ mod tests {
             cursor: (0, 1),
         };
         assert_eq!(s.bounds(), (0, 1, 2, 5));
+    }
+
+    #[test]
+    fn extract_reaches_rows_scrolled_off_into_history() {
+        // 3 visible rows, 10-line scrollback. After 5 lines, `aaa`/`bbb` have
+        // scrolled off the tail into history (absolute Lines -2 / -1); `ccc`/
+        // `ddd`/`eee` are the visible Lines 0..2.
+        let mut e = AlacrittyEmulator::new(3, 20, 10);
+        e.advance(b"aaa\r\nbbb\r\nccc\r\nddd\r\neee");
+        // Scroll the viewport up into history — the bug was that copying then
+        // only kept on-screen rows. Absolute-line extraction must still reach
+        // the scrolled-off lines regardless of viewport offset.
+        e.scroll_up(2);
+        let sel = Selection {
+            anchor: (-2, 0), // history line `aaa`
+            cursor: (0, 2),  // first visible line `ccc`
+        };
+        assert_eq!(extract(&e, &sel), "aaa\nbbb\nccc");
     }
 
     #[test]

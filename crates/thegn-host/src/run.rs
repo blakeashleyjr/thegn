@@ -10631,6 +10631,7 @@ async fn event_loop<T: Terminal>(
                             &mut scratch,
                             content,
                             sel,
+                            p.emulator().scrollback(),
                             crate::chrome::col(crate::chrome::S::Panel2),
                         );
                         // Repaint the pane's card so a wide glyph composed at the
@@ -10668,6 +10669,7 @@ async fn event_loop<T: Terminal>(
                                 &mut scratch,
                                 content,
                                 sel,
+                                p.emulator().scrollback(),
                                 crate::chrome::col(crate::chrome::S::Panel2),
                             );
                         }
@@ -10832,10 +10834,16 @@ async fn event_loop<T: Terminal>(
                             .map(|(_, _, c)| *c)
                     }
                 {
+                    let off = panes
+                        .table
+                        .get(sel_pane)
+                        .map(|p| p.emulator().scrollback())
+                        .unwrap_or(0);
                     crate::compositor::overlay_selection(
                         &mut scratch,
                         content,
                         sel,
+                        off,
                         crate::chrome::col(crate::chrome::S::Panel2),
                     );
                 }
@@ -11498,7 +11506,18 @@ async fn event_loop<T: Terminal>(
                         if let Some(tab) = session.active_tab_mut() {
                             tab.focused_pane = id;
                         }
-                        let cell = ((my - content.y) as u16, (mx - content.x) as u16);
+                        // Anchor in absolute grid lines (screen row - viewport
+                        // offset) so the selection stays glued to its content as
+                        // the pane scrolls during/after the drag.
+                        let off = panes
+                            .table
+                            .get(&id)
+                            .map(|p| p.emulator().scrollback())
+                            .unwrap_or(0);
+                        let cell = (
+                            (my - content.y) as i32 - off as i32,
+                            (mx - content.x) as u16,
+                        );
                         mouse_sel = Some((id, crate::copymode::Selection::new(cell)));
                         mouse_selecting = true;
                     } else if chrome.masthead_stats_row().contains(mx, my) {
@@ -11845,7 +11864,15 @@ async fn event_loop<T: Terminal>(
                             - content.y;
                         let col = mx.clamp(content.x, content.x + content.cols.saturating_sub(1))
                             - content.x;
-                        sel.cursor = (row as u16, col as u16);
+                        // Autoscroll above moved the viewport; read the fresh
+                        // offset so the cursor tracks the newly revealed line in
+                        // absolute (scroll-stable) coordinates.
+                        let off = panes
+                            .table
+                            .get(&pane_id)
+                            .map(|p| p.emulator().scrollback())
+                            .unwrap_or(0);
+                        sel.cursor = (row as i32 - off as i32, col as u16);
                         dirty = true;
                         // Request the cheap selection-only render: only the
                         // highlight moved, so the full frame need not recompose.
