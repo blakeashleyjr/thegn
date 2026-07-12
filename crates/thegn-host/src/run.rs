@@ -38,7 +38,7 @@ use crate::handlers::provision::{
 use crate::hydrate::{
     RefreshKind, active_tab_path, build_initial_model, load_or_seed_session,
     neighbor_worktree_paths, retarget_diff_watcher, spawn_model_hydration, spawn_panel_prefetch,
-    spawn_pr_cache_refresh, spawn_refresh_ticker, workspace_list,
+    spawn_pr_cache_refresh, spawn_refresh_ticker,
 };
 use crate::input::key_bytes;
 use crate::layout;
@@ -1247,29 +1247,11 @@ fn collect_window_titles(
     out
 }
 
-pub(crate) fn refresh_tab_model(
-    model: &mut FrameModel,
-    session: &crate::session::Session,
-    sb: &mut SidebarState,
-) {
-    let _g = crate::perf::measure(crate::perf::Subsys::Switch);
-    let (worktree, tabs, active_tab) = crate::hydrate::tab_strip(session);
-    let active_path = crate::hydrate::active_tab_path(session);
-    model.worktree = worktree;
-    model.tabs = tabs;
-    model.active_tab = active_tab;
-    model.active_container_name =
-        thegn_core::sandbox::container_name(&active_path.to_string_lossy());
-    // The workspace list can change when worktrees are added/closed or the
-    // workspace switches: keep the DB-backed entries (refreshed by the next
-    // hydration), re-derive the live fallbacks from the current session, and
-    // drop stale fallbacks — replace semantics, never append-only (appending
-    // duplicated workspaces whose live prefix didn't match their DB slug).
-    let prev = std::mem::take(&mut model.sidebar_workspaces);
-    model.sidebar_workspaces =
-        crate::hydrate::merge_workspace_lists(prev, workspace_list(session, None));
-    sb.rebuild(model, session);
-}
+// The full sidebar/model rebuild for a switch lives beside its light sibling
+// `refresh_tab_model_switch` in `handlers/switch.rs` (keeps this ratchet-pinned
+// file from growing); re-exported so `crate::run::refresh_tab_model` call sites
+// read unchanged.
+pub(crate) use crate::handlers::switch::refresh_tab_model;
 
 // Sidebar interaction state + its persisted view state live in
 // `handlers/sidebar_persist.rs`, and key/menu handling in
@@ -7119,6 +7101,10 @@ async fn event_loop<T: Terminal>(
     // storm or rapid-switch burst can't stack them. In-flight gen (not a bool).
     let mut inflight_hydration_gen: Option<u64> = None;
     let mut model_refresh_pending = false;
+    // One-shot: set on a worktree switch so the coalesced hydration pre-warms the
+    // active worktree's `git log` commit cache (see `HydrateHints::warm_commits`);
+    // consumed by the spawn so the periodic ticker sharing it never warms.
+    let mut warm_commits_next = false;
     // Input dispatch time; next render measures dispatch→frame latency + drives the input-priority PTY budget.
     let mut input_at: Option<std::time::Instant> = None;
     // Tab/worktree-switch action time; the first post-switch frame records
@@ -7152,6 +7138,9 @@ async fn event_loop<T: Terminal>(
                 crate::hydrate::HydrateHints {
                     open: panel_ui.open,
                     expanded: panel_ui.width.is_expanded(),
+                    // Discrete switch/activation event: pre-warm the active
+                    // worktree's commit cache so opening Commits is instant.
+                    warm_commits: true,
                     ..Default::default()
                 },
             );
@@ -7589,6 +7578,7 @@ async fn event_loop<T: Terminal>(
             open: panel_ui.open,
             expanded: panel_ui.width.is_expanded(),
             profile: current_config.profile.clone(),
+            ..Default::default()
         };
         for path in neighbor_worktree_paths(&session, &sidebar_worktree_order(&model)) {
             spawn_panel_prefetch(
@@ -7812,9 +7802,13 @@ async fn event_loop<T: Terminal>(
                 open: panel_ui.open,
                 expanded: panel_ui.width.is_expanded(),
                 profile: current_config.profile.clone(),
+                ..Default::default()
             };
             // D1: coalesce rapid switches — the gate hydrates only the settled worktree.
             model_refresh_pending = true;
+            // Pre-warm this worktree's commit cache so opening the Commits section
+            // is instant instead of waiting on an async `git log`.
+            warm_commits_next = true;
             // Warm the ACTIVE WORKSPACE's other worktrees into the cache, in
             // proximity order, so any follow-on in-workspace switch is a cache
             // hit — not just the two immediate neighbors. Rides the sched.rs
@@ -9966,6 +9960,9 @@ async fn event_loop<T: Terminal>(
                     open: panel_ui.open,
                     expanded: panel_ui.width.is_expanded(),
                     profile: current_config.profile.clone(),
+                    // One-shot: a worktree switch pre-warms the commit cache; the
+                    // periodic ticker (which shares this spawn) leaves it false.
+                    warm_commits: std::mem::take(&mut warm_commits_next),
                 },
             );
             inflight_hydration_gen = Some(hydration_gen);
