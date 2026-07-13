@@ -650,6 +650,123 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// Sidebar context-menu actions
+// ---------------------------------------------------------------------------
+
+/// A merge-queue action fired from the sidebar's row / workspace context menu.
+/// Mirrors the panel's `a/A/x/l/r/c/D`, but keyed by an explicit path rather
+/// than the panel cursor so the two surfaces behave identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidebarMq {
+    /// Queue the target worktree's branch (panel `a`).
+    Add,
+    /// Remove the target worktree from the queue (panel `x`).
+    Remove,
+    /// Land a `ready` worktree — fold + gate + CAS (panel `l`).
+    Land,
+    /// Requeue a blocked worktree back to `queued` (panel `r`).
+    Retry,
+    /// Queue every eligible branch in the target's repo (panel `A`).
+    AddAll,
+    /// Clear the target repo's whole queue (CLI `merge clear`).
+    Clear,
+    /// Drain the target repo's queue with the agent autopilot (panel `D`).
+    Drain,
+}
+
+/// Run a sidebar merge-queue action. `ctx.active_wt` is the target worktree
+/// (per-row actions) or any path inside the repo (workspace-wide actions).
+/// Every mutation runs on `spawn_blocking`, reports via [`NoteWire`] (toast +
+/// model refresh), and — for Land/Drain — respects the shared `fold_inflight`.
+pub(crate) fn sidebar_action(action: SidebarMq, ctx: MqKeyCtx) {
+    if !ctx.cfg.merge_queue.enabled {
+        ctx.model.status = "Merge queue disabled — set [merge_queue] enabled = true".into();
+        return;
+    }
+    let mq = ctx.cfg.merge_queue.clone();
+    let note = NoteWire {
+        drive_tx: ctx.drive_tx.clone(),
+        refresh_tx: ctx.refresh_tx.clone(),
+        waker: ctx.waker.clone(),
+    };
+    let wt = ctx.active_wt.clone();
+    match action {
+        SidebarMq::Add => {
+            ctx.model.status = "Merge queue: queueing worktree…".into();
+            tokio::task::spawn_blocking(move || note.send(add_worktree(&mq, &wt)));
+        }
+        SidebarMq::AddAll => {
+            ctx.model.status = "Merge queue: queueing all eligible branches…".into();
+            tokio::task::spawn_blocking(move || note.send(add_all(&mq, &wt)));
+        }
+        SidebarMq::Retry => {
+            // enqueue is an upsert that resets the row to `queued`, so requeuing a
+            // present row is exactly the add path.
+            ctx.model.status = "Merge queue: requeueing…".into();
+            tokio::task::spawn_blocking(move || note.send(add_worktree(&mq, &wt)));
+        }
+        SidebarMq::Remove => {
+            let wt_s = wt.to_string_lossy().to_string();
+            // Optimistic: drop the row now; the refresh confirms.
+            ctx.model.panel.merge_queue.retain(|r| r.worktree != wt_s);
+            tokio::task::spawn_blocking(move || {
+                note.send(
+                    match Db::open().and_then(|db| db.remove_merge_entry(&wt_s)) {
+                        Ok(()) => "Removed from queue".to_string(),
+                        Err(e) => format!("Remove failed: {e}"),
+                    },
+                );
+            });
+        }
+        SidebarMq::Land => {
+            // A land is a fold+gate+CAS — exclusive with any running drain.
+            if *ctx.fold_inflight {
+                ctx.model.status = "Merge queue: a drain is already running".into();
+                return;
+            }
+            *ctx.fold_inflight = true;
+            let cfg = ctx.cfg.clone();
+            let wt_s = wt.to_string_lossy().to_string();
+            ctx.toasts
+                .success("Landing…".to_string(), std::time::Instant::now());
+            tokio::task::spawn_blocking(move || note.send_msg(land_ready(&cfg, &wt_s)));
+        }
+        SidebarMq::Clear => {
+            ctx.model.status = "Merge queue: clearing…".into();
+            tokio::task::spawn_blocking(move || note.send(clear_repo_note(&wt)));
+        }
+        SidebarMq::Drain => {
+            dispatch_drain(
+                true, // enabled checked above
+                ctx.fold_inflight,
+                ctx.toasts,
+                ctx.drive_tx,
+                ctx.waker,
+                mq,
+                wt,
+            );
+        }
+    }
+}
+
+/// Clear every queue row for the repo `any_path` belongs to (the workspace
+/// menu's "Clear merge queue"). Mirrors the CLI `thegn merge clear`.
+fn clear_repo_note(any_path: &Path) -> String {
+    let Some(root) = integrate::main_checkout(any_path) else {
+        return "Clear failed: not inside a git repository".into();
+    };
+    let db = match Db::open() {
+        Ok(d) => d,
+        Err(e) => return format!("Clear failed: {e}"),
+    };
+    match crate::merge_ops::clear_repo(&db, &root) {
+        Ok(0) => "Merge queue already empty".into(),
+        Ok(n) => format!("Cleared {n} queued branch(es)"),
+        Err(e) => format!("Clear failed: {e}"),
+    }
+}
+
 /// The off-loop mutation helpers' way back to the loop: a `DriveMsg` (toast)
 /// plus a model-refresh kick, each with a waker pulse.
 struct NoteWire {
