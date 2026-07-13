@@ -1433,18 +1433,17 @@ pub fn provision_provider_env_named(
         // only as the fallback for providers without the reverse tunnel.
         push_devshell: pc.push_devshell && !pc.host_cache,
         // devShell warm policy:
-        //  • Real worktree: respect the configured `skip_devshell_warm`.
-        //  • SPARE (name_override): a spare provisions in the BACKGROUND, so it
-        //    would normally BUILD the devShell up front to make a claim instant.
-        //    BUT a spare can't reach the host nix cache (the reverse tunnel is
-        //    per-worktree, set up on focus), so with `host_cache` on it would build
-        //    the whole devShell FROM SOURCE — slow, so the pool can't refill fast
-        //    enough to stay warm. With the cache on, SKIP the spare's build: the
-        //    spare provisions fast (clone + checkpoint), and the claimed worktree's
-        //    in-pane `direnv` substitutes the devShell from the host cache (fast)
-        //    once its tunnel is up. Build up front only when there's no cache.
+        //  • Real worktree: respect the configured `skip_devshell_warm` (the
+        //    in-pane `direnv` realizes the devShell lazily).
+        //  • SPARE (name_override): ALWAYS fully realize the devShell into the
+        //    spare's own persistent fs, then checkpoint (the pipeline captures a
+        //    provisioned-base checkpoint) — a true golden a claim resumes to a
+        //    working shell in seconds, with NO per-worktree-tunnel dependency at
+        //    claim time. Paid once in the background, amortized by checkpoint reuse
+        //    (keyed on the flake.lock hash → self-refreshes on lock change); a
+        //    persistent `binary_cache_url` turns the bake into a fast download.
         skip_devshell_warm: if name_override.is_some() {
-            pc.host_cache
+            false
         } else {
             pc.skip_devshell_warm
         },

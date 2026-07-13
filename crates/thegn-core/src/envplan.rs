@@ -973,6 +973,25 @@ fn nix_install_script(
     if let Some(url) = host_cache_url.map(str::trim).filter(|u| !u.is_empty()) {
         conf.push_str(&format!("extra-substituters = {url}\\n"));
         conf.push_str("require-sigs = false\\n");
+        // Graceful degradation for a cache reachable ONLY over the per-sprite reverse
+        // tunnel. Two failure modes made `host_cache` unusable: (1) the in-sprite
+        // build can start BEFORE the tunnel is up, so nix would hang on the OS connect
+        // default dialing `127.0.0.1:8484`; (2) a large NAR can STALL if the mux
+        // desyncs mid-transfer, and — worse — nix HARD-FAILS a path the narinfo
+        // claimed but the substituter never delivered. These three make the host
+        // cache a fast, safe accelerator that degrades instead of wedging:
+        //   • connect-timeout        — fall through in 5s when the tunnel isn't
+        //                              listening yet (vs a multi-minute OS hang).
+        //   • stalled-download-timeout — abandon a desynced/stalled NAR in 30s (vs
+        //                              nix's 300s default) so the supervisor's tunnel
+        //                              reconnect + a retry can recover quickly.
+        //   • fallback = true        — on any substitution failure, build the path
+        //                              from source (or the next substituter) instead
+        //                              of erroring the whole `nix develop`/`direnv`.
+        // Scoped to the host-cache config so the public-cache-only path is untouched.
+        conf.push_str("connect-timeout = 5\\n");
+        conf.push_str("stalled-download-timeout = 30\\n");
+        conf.push_str("fallback = true\\n");
     }
     // Readiness wait (sudo + DNS + real egress) shared by both installers; the
     // sprite user has passwordless sudo and the installer creates /nix via sudo.
@@ -2611,8 +2630,17 @@ mod tests {
         assert!(hc.contains("extra-substituters = http://127.0.0.1:8484"));
         assert!(hc.contains("require-sigs = false"));
         assert!(hc.contains("extra-substituters = https://cache.example.org"));
-        // No host cache ⇒ no require-sigs line (signatures stay enforced).
+        // Host cache ⇒ graceful-degradation trio so a not-yet-up tunnel or a desynced
+        // NAR degrades (fast fall-through / from-source rebuild) instead of hanging or
+        // hard-failing the build.
+        assert!(hc.contains("connect-timeout = 5"));
+        assert!(hc.contains("stalled-download-timeout = 30"));
+        assert!(hc.contains("fallback = true"));
+        // No host cache ⇒ no require-sigs line (signatures stay enforced) and none of
+        // the degradation knobs (the public-cache path is untouched).
         assert!(!s.contains("require-sigs"));
+        assert!(!s.contains("fallback = true"));
+        assert!(!s.contains("connect-timeout"));
 
         // plan() adds a cache_push step (after devshell) only when push is set.
         let req = EnvRequirements {
