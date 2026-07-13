@@ -52,7 +52,7 @@ pub enum ShareParams {
 
 /// Sanitize a worktree path/name into a DNS/filesystem-safe label.
 pub fn label_for(worktree: &str) -> String {
-    let base = worktree.rsplit('/').next().unwrap_or(worktree);
+    let base = crate::util::basename(worktree);
     let s: String = base
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })

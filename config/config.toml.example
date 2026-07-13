@@ -1290,7 +1290,10 @@ default_env = ""
 # Probe order for "auto". First backend that is installed and usable wins.
 # "none"/"host" anywhere in the list = uncontained fallback from that point on.
 # NixOS users: move "bwrap" first if podman isn't installed.
-backend_chain = ["podman-rootless", "podman-rootful", "docker", "bwrap", "host"]
+# Native Windows: the OCI entries decline (Linux containers can't bind-mount
+# the worktree at its real path — use WSL2 for container sandboxes); panes are
+# scoped by "jobobject" (kill-on-close Job Objects) instead.
+backend_chain = ["podman-rootless", "podman-rootful", "docker", "bwrap", "jobobject", "host"]
 
 # ── OCI image (podman / docker only) ────────────────────────────────────────
 # Empty  = thegn's built-in default (debian:stable).

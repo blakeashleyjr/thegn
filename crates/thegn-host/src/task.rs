@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,32 +106,22 @@ pub fn wrap_capped(argv: &[String], limits: &LimitsConfig, backend: CapBackend) 
 
 /// Live child registry for single-flight + real cancellation. Keyed by a logical
 /// slot (`"<worktree>:run"` / `"<worktree>:disc"`); the value is `(generation,
-/// process-group id)`. Starting a newer job in the same slot kills the older
-/// group so a superseded `cargo test` stops burning CPU immediately.
-fn registry() -> &'static Mutex<HashMap<String, (u64, i32)>> {
-    static R: OnceLock<Mutex<HashMap<String, (u64, i32)>>> = OnceLock::new();
+/// group handle)` — a pgid on unix, a kill-on-close Job Object on Windows.
+/// Starting a newer job in the same slot kills the older group so a superseded
+/// `cargo test` stops burning CPU immediately.
+fn registry() -> &'static Mutex<HashMap<String, (u64, crate::platform::GroupHandle)>> {
+    static R: OnceLock<Mutex<HashMap<String, (u64, crate::platform::GroupHandle)>>> =
+        OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
-
-#[cfg(unix)]
-fn kill_group(pgid: i32) {
-    nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pgid),
-        nix::sys::signal::Signal::SIGTERM,
-    )
-    .ok();
-}
-
-#[cfg(not(unix))]
-fn kill_group(_pgid: i32) {}
 
 /// Kill whatever is currently registered in `slot` (used when a newer job
 /// supersedes an in-flight one). Public for the supersede path in `run.rs`.
 pub fn cancel_slot(slot: &str) {
     if let Ok(mut map) = registry().lock()
-        && let Some((_, pgid)) = map.remove(slot)
+        && let Some((_, group)) = map.remove(slot)
     {
-        kill_group(pgid);
+        group.terminate();
     }
 }
 
@@ -217,10 +206,6 @@ fn build_capped_command(argv: &[String], worktree: &Path, limits: &LimitsConfig)
     if let Some(target) = isolated_cargo_target(worktree, limits) {
         cmd.env("CARGO_TARGET_DIR", target);
     }
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
     cmd
 }
 
@@ -237,10 +222,6 @@ fn task_command(loc: &GitLoc, inner: &[String], worktree: &Path, limits: &Limits
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
         return cmd;
     }
     build_capped_command(
@@ -270,7 +251,8 @@ fn run_capped_argv(
 
     let mut cmd = task_command(loc, inner, worktree, limits);
 
-    let mut child = match cmd.spawn() {
+    // Own group/job so cancellation reaps the whole tree, not just the runner.
+    let (mut child, group) = match crate::platform::spawn_grouped(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
             return CapOutput {
@@ -281,9 +263,8 @@ fn run_capped_argv(
             };
         }
     };
-    let pgid = child.id() as i32;
     if let Ok(mut map) = registry().lock() {
-        map.insert(slot.to_string(), (generation, pgid));
+        map.insert(slot.to_string(), (generation, group.clone()));
     }
 
     // Watchdog: kill the whole process group if the deadline passes before the
@@ -293,6 +274,7 @@ fn run_capped_argv(
     let watchdog = timeout.filter(|d| !d.is_zero()).map(|deadline| {
         let done = done.clone();
         let timed_out = timed_out.clone();
+        let group = group.clone();
         std::thread::spawn(move || {
             let end = Instant::now() + deadline;
             while Instant::now() < end {
@@ -303,7 +285,7 @@ fn run_capped_argv(
             }
             if !done.load(Ordering::Relaxed) {
                 timed_out.store(true, Ordering::Relaxed);
-                kill_group(pgid);
+                group.terminate();
             }
         })
     });
@@ -2611,7 +2593,10 @@ mod discovery_tests {
         let wt = temp_dir2("slot");
         assert!(!slot_active(&wt), "no slot registered yet");
         let slot = format!("{}:run", wt.display());
-        registry().lock().unwrap().insert(slot.clone(), (1, 4242));
+        registry().lock().unwrap().insert(
+            slot.clone(),
+            (1, crate::platform::GroupHandle::from_pid(4242)),
+        );
         assert!(slot_active(&wt), "active while a run slot is registered");
         registry().lock().unwrap().remove(&slot);
         assert!(!slot_active(&wt), "inactive after the slot clears");

@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use tokio::net::{TcpStream, UnixListener};
 
 /// A running relay. Dropping it aborts the accept loop and removes the socket
@@ -44,6 +45,7 @@ impl Drop for RelayHandle {
 /// Bind `socket` and forward every accepted connection to `tcp_addr` (the model
 /// proxy's `host:port`). The socket's parent dir must exist + be bind-mountable
 /// into the sealed container. Returns a handle that tears the relay down on drop.
+#[cfg(unix)]
 pub fn spawn(socket: PathBuf, tcp_addr: String) -> std::io::Result<RelayHandle> {
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir)?;
@@ -78,8 +80,20 @@ pub fn spawn(socket: PathBuf, tcp_addr: String) -> std::io::Result<RelayHandle> 
     })
 }
 
+/// Windows stub: the relay's consumers are sealed *Linux* containers (the
+/// socket is bind-mounted into the sandbox), which don't exist on a native
+/// Windows host — there is nothing to relay for.
+#[cfg(not(unix))]
+pub fn spawn(_socket: PathBuf, _tcp_addr: String) -> std::io::Result<RelayHandle> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "sealed-sandbox model relay requires unix sockets (Linux containers)",
+    ))
+}
+
 /// Pipe one accepted unix connection to a fresh TCP connection to the proxy,
 /// copying in both directions until either side closes.
+#[cfg(unix)]
 async fn forward(mut unix: tokio::net::UnixStream, tcp_addr: &str) -> std::io::Result<()> {
     let mut tcp = TcpStream::connect(tcp_addr).await?;
     tokio::io::copy_bidirectional(&mut unix, &mut tcp).await?;
@@ -92,7 +106,7 @@ pub fn socket_dir_ready(socket: &Path) -> bool {
     socket.parent().is_some_and(|d| d.exists())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -83,6 +83,36 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
 - A few justfile recipes are Linux-centric (`start-term` assumes Ghostty on
   PATH; font tooling uses `fc-list`) — none are needed for the core loop.
 
+## Windows (native) notes
+
+Native Windows is a supported build target (no WSL required). The dev
+experience differs from unix — nix/devenv and the justfile don't apply:
+
+- **Toolchain:** [rustup](https://rustup.rs) with the default
+  `x86_64-pc-windows-msvc` toolchain + the Visual Studio Build Tools
+  ("Desktop development with C++" — the C deps: bundled sqlite, libgit2).
+  Then plain cargo: `cargo build`, `cargo run`, `cargo test`.
+- **Terminal:** run thegn inside [Windows Terminal](https://aka.ms/terminal)
+  (or another modern VT emulator — WezTerm, Alacritty). Legacy conhost.exe is
+  refused at startup with a pointer here.
+- **Before trusting the compositor on a new machine**, run the event-model
+  spike: `cargo run -p thegn-host --example waker_spike` — expect one tick per
+  second at ~0% CPU and instant key echo (see the file header for pass/fail).
+- **Shells:** panes default to `pwsh` → `powershell` → `%COMSPEC%`; pins/tool
+  commands run through the right dialect automatically
+  (`thegn_core::shellinv`).
+- **State paths:** `%APPDATA%\thegn` (config) and `%LOCALAPPDATA%\thegn`
+  (state/DB/logs).
+- **What's intentionally absent on Windows:** container sandboxing (Linux
+  containers in a VM can't bind-mount the worktree at its real path — use
+  WSL2 if you want sandboxed panes; native panes run on the host, scoped by
+  kill-on-close Job Objects), the sealed-agent model relay, the SIGUSR2
+  flamegraph profiler, and the merge-queue headless agent (POSIX quoting).
+- **CI:** every PR cross-checks the whole workspace for
+  `x86_64-pc-windows-gnu` on Linux (`just check-cross`); the full
+  `windows-latest` msvc job (check + IPC/Job-Object kernel tests) is opt-in —
+  add `[ci-windows]` to a commit message or dispatch the workflow.
+
 ## Where things live
 
 - `crates/thegn-core` — substrate-agnostic domain logic (config, DB, keymap,

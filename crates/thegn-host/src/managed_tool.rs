@@ -212,7 +212,7 @@ fn download_to(url: &str, dest: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn make_executable(path: &Path) -> Result<()> {
+pub(crate) fn make_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_mode(0o755);
@@ -220,6 +220,6 @@ fn make_executable(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn make_executable(_path: &Path) -> Result<()> {
+pub(crate) fn make_executable(_path: &Path) -> Result<()> {
     Ok(())
 }

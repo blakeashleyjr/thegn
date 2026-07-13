@@ -575,11 +575,8 @@ fn materialize_files(plan: &SharePlan, statedir: &std::path::Path) -> Result<()>
         let path = statedir.join(&f.dest);
         std::fs::write(&path, &f.contents)
             .with_context(|| format!("share: write {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+        // best-effort: shared-credential files are owner-only everywhere.
+        let _ = thegn_core::fsperm::restrict_to_owner(&path);
     }
     Ok(())
 }

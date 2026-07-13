@@ -68,18 +68,20 @@ quick pkg="": _apps
     if [ -n "{{pkg}}" ]; then scope="-p {{pkg}}"; else scope="--workspace"; fi
     cargo clippy $scope -- -D warnings
 
-# Cross-platform regression gate: typecheck the C-dep-free leaf crates' per-OS
-# code for macOS + Windows on this (Linux) box. `thegn-metrics` covers the
-# sysinfo/battery substrate; `thegn-media` covers the per-OS player backends
-# (Linux MPRIS/mpv, Windows SMTC, macOS AppleScript). `cargo check --target`
-# needs no cross C toolchain (check never links). Targets are provided by the
-# flake's rust toolchain. Catches the #1 cross-platform breakage — won't-compile
-# — without macOS/Windows runners.
+# Cross-platform regression gate: typecheck per-OS code for macOS + Windows on
+# this (Linux) box. macOS coverage stays scoped to the C-dep-free leaf crates
+# (`thegn-metrics`: sysinfo/battery; `thegn-media`: per-OS player backends) —
+# no darwin cross C toolchain here. Windows now checks the WHOLE workspace
+# (the native-Windows port): windows-gnu shares `cfg(windows)` with -msvc, so
+# this catches any newly ungated unix API use; the C build scripts in the graph
+# (bundled sqlite, libgit2, stacker) use the mingw-w64 cc the dev shell wires
+# via CC_x86_64_pc_windows_gnu (devenv.nix). The msvc truth gate is the opt-in
+# `windows` CI job (`[ci-windows]`). Catches the #1 cross-platform breakage —
+# won't-compile — without macOS/Windows runners.
 check-cross:
     cargo check -p thegn-metrics --target aarch64-apple-darwin
-    cargo check -p thegn-metrics --target x86_64-pc-windows-gnu
     cargo check -p thegn-media --target aarch64-apple-darwin
-    cargo check -p thegn-media --target x86_64-pc-windows-gnu
+    cargo check --workspace --target x86_64-pc-windows-gnu
 
 # Debug build of the host with the in-process sampling profiler compiled in
 # (the `profiling` feature → SIGUSR2 flamegraph capture). Same artifact path as

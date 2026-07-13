@@ -9236,6 +9236,7 @@ dependencies = [
  "similar",
  "syntect",
  "sys-locale",
+ "sysinfo 0.39.5",
  "tempfile",
  "thegn-media",
  "toml 0.8.23",
@@ -9298,6 +9299,7 @@ dependencies = [
  "tonic",
  "tracing",
  "unicode-width 0.2.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -1362,20 +1362,11 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
         Backend::WinAppContainer | Backend::WinJobObject => {
             // These native Windows backends run the standard command, optionally
             // wrapperized by internal logic if requested, but from the process builder
-            // perspective they just exec `sh -lc "script"` (or pwsh equivalent) in cwd.
+            // perspective they just run the script through the user shell in cwd.
             // When spawn_with_env runs it, we could intercept and wrap in a job object.
             // For argv generation, we just emit the plain shell command since the real
             // isolation happens in the OS process creation syscalls.
-            let shell = util::shell();
-            let mut v = vec![shell.clone()];
-            if shell.ends_with("pwsh.exe") || shell.ends_with("powershell.exe") {
-                v.extend(["-NoProfile".into(), "-Command".into(), script.to_string()]);
-            } else if shell.ends_with("cmd.exe") {
-                v.extend(["/C".into(), script.to_string()]);
-            } else {
-                v.extend(["-c".into(), script.to_string()]);
-            }
-            v
+            crate::shellinv::run_argv(&util::shell(), script)
         }
         Backend::Bwrap => {
             let mut v = vec!["bwrap".to_string()];
