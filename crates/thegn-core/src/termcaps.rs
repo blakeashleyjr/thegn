@@ -699,8 +699,10 @@ mod tests {
         assert!(modern_terminal_evidence(&wt));
         // Known-modern emulator name, truecolor advert, or a 256-color TERM.
         assert!(modern_terminal_evidence(&env("wezterm")));
-        let mut ct = TermEnv::default();
-        ct.colorterm = Some("truecolor".into());
+        let ct = TermEnv {
+            colorterm: Some("truecolor".into()),
+            ..Default::default()
+        };
         assert!(modern_terminal_evidence(&ct));
         assert!(modern_terminal_evidence(&env("xterm-256color")));
     }
