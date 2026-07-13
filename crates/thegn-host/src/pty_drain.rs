@@ -579,6 +579,16 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
         .find(|(_, _, t)| t.center.pane_ids().contains(&id))
         .map(|(gi, ti, t)| (gi, ti, t.center.pane_ids().len() == 1));
     if let Some((gi, ti, sole)) = owner {
+        // A standalone terminal's sole shell exited: close the terminal rather
+        // than respawning a fresh shell (a terminal's whole purpose IS that one
+        // shell). Worktrees keep respawning below; terminals divert here (before
+        // the crash/respawn/notification handling, which a terminal's empty
+        // `path` skips anyway) so the `terminals` registry row + sidebar entry
+        // are removed. The dead pane is already out of `panes.table` (top of fn).
+        if sole && ctx.session.worktrees[gi].kind == crate::session::GroupKind::Terminal {
+            close_exited_terminal(ctx, gi, ti);
+            return;
+        }
         let is_active_tab = gi == ctx.session.active && ti == ctx.session.worktrees[gi].active_tab;
         // A pane that exits within CRASH_THRESHOLD of being spawned is a
         // "fast crash" — bwrap/sandbox failures write their error to the PTY
@@ -761,9 +771,166 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
     *ctx.dirty = true;
 }
 
+/// A standalone terminal's last shell exited: tear the terminal down instead of
+/// respawning. Mirrors `handlers::sidebar_actions::close_terminal` for the drain
+/// context — a multi-tab terminal loses just the dead tab, and when its last tab
+/// goes the whole group is removed, its `terminals` registry row deleted, and the
+/// sidebar rebuilt so it stops rendering. Best-effort DB delete: the live session
+/// + model are the source of truth here; the DB is a cache.
+fn close_exited_terminal(ctx: &mut DrainCtx<'_>, gi: usize, ti: usize) {
+    if let Some((name, db_id)) =
+        detach_exited_terminal(ctx.session, &mut ctx.model.sidebar_db_terminals, gi, ti)
+    {
+        ctx.model.status = format!("Closed terminal \"{name}\"");
+        if let Some(id) = db_id {
+            tokio::task::spawn_blocking(move || {
+                use thegn_core::store::WorkspaceStore;
+                // best-effort: cache-only; the group is already gone from the
+                // live session + model above.
+                if let Ok(db) = thegn_core::db::Db::open() {
+                    let _ = db.del_terminal(id);
+                }
+            });
+        }
+    }
+    crate::run::persist_session_layout(ctx.session, ctx.panes);
+    crate::run::refresh_tab_model(ctx.model, ctx.session, ctx.sb);
+    ctx.sb.focus_active_row(ctx.model);
+    *ctx.need_relayout = true;
+    *ctx.dirty = true;
+}
+
+/// Detach an exited terminal's dead tab from the live `session` + the sidebar's
+/// `db_terminals` registry snapshot, restoring focus to the pre-exit active
+/// group when it survives. A multi-tab terminal loses only tab `ti` and returns
+/// `None`; the last tab removes the whole group and returns
+/// `Some((name, db_row_id))` so the caller can delete the DB registry row and
+/// set the status. Pure session/model bookkeeping so the last-tab vs multi-tab
+/// split is unit-tested without a `DrainCtx`.
+fn detach_exited_terminal(
+    session: &mut crate::session::Session,
+    db_terminals: &mut Vec<thegn_core::models::TerminalRow>,
+    gi: usize,
+    ti: usize,
+) -> Option<(String, Option<i64>)> {
+    // Keep focus on whatever group the user was on (the terminal may have been a
+    // background one); restore it by name after the remove shifts indices.
+    let prior_active = session.active_group().map(|g| g.name.clone());
+
+    let closed = if session.worktrees[gi].tabs.len() > 1 {
+        // Other tabs are still alive — close just this one, keep the terminal.
+        let g = &mut session.worktrees[gi];
+        g.tabs.remove(ti);
+        if g.active_tab >= g.tabs.len() {
+            g.active_tab = g.tabs.len().saturating_sub(1);
+        }
+        None
+    } else {
+        // Last tab: drop the group and its DB registry row (optimistic model
+        // removal first, so the sidebar rebuild no longer lists it).
+        let name = session.worktrees[gi].name.clone();
+        let db_id = db_terminals
+            .iter()
+            .position(|t| t.name == name)
+            .map(|i| db_terminals.remove(i).id);
+        session.switch_to(gi);
+        session.close_active_group();
+        Some((name, db_id))
+    };
+
+    // Restore the pre-exit active group if it survived the index shift (a closed
+    // active terminal won't be found — `close_active_group` already clamped).
+    if let Some(name) = prior_active
+        && let Some(idx) = session.worktrees.iter().position(|g| g.name == name)
+    {
+        session.switch_to(idx);
+    }
+
+    closed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    fn term_row(id: i64, name: &str) -> thegn_core::models::TerminalRow {
+        thegn_core::models::TerminalRow {
+            id,
+            name: name.to_string(),
+            kind: "local".into(),
+            connection_string: String::new(),
+            folder_id: None,
+            created_at: 0,
+            last_active: 0,
+            position: 0,
+            sandbox_backend: String::new(),
+            env_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn detach_exited_terminal_last_tab_removes_group_and_returns_db_id() {
+        // A single-tab terminal whose sole shell died: the whole group leaves the
+        // session, its registry snapshot row is dropped, and its DB id comes back
+        // for deletion — so the sidebar (built from that snapshot) stops showing it.
+        let mut session = Session::default();
+        session.add_group(WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app"));
+        session.add_group(WorktreeGroup::terminal("local")); // gi 1, single "main" tab
+        session.switch_to(1);
+        let mut db_terminals = vec![term_row(7, "local")];
+
+        let closed = detach_exited_terminal(&mut session, &mut db_terminals, 1, 0);
+
+        assert_eq!(closed, Some(("local".to_string(), Some(7))));
+        assert!(session.worktrees.iter().all(|g| g.name != "local"));
+        assert_eq!(session.worktrees.len(), 1, "only the home worktree remains");
+        assert!(db_terminals.is_empty(), "registry snapshot row removed");
+    }
+
+    #[test]
+    fn detach_exited_terminal_multi_tab_closes_only_the_dead_tab() {
+        // A terminal with a second tab keeps living when one tab's shell exits:
+        // just that tab goes, the group and its DB row stay.
+        let mut session = Session::default();
+        session.add_group(WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app"));
+        let mut term = WorktreeGroup::terminal("local");
+        term.add_tab(); // now 2 tabs
+        session.add_group(term); // gi 1
+        session.switch_to(1);
+        let mut db_terminals = vec![term_row(7, "local")];
+
+        let closed = detach_exited_terminal(&mut session, &mut db_terminals, 1, 0);
+
+        assert_eq!(closed, None, "the terminal survives, so nothing to delete");
+        let g = session
+            .worktrees
+            .iter()
+            .find(|g| g.name == "local")
+            .expect("terminal still present");
+        assert_eq!(g.tabs.len(), 1, "only the dead tab was closed");
+        assert_eq!(db_terminals.len(), 1, "DB registry row untouched");
+    }
+
+    #[test]
+    fn detach_exited_terminal_keeps_focus_on_the_prior_active_group() {
+        // A background terminal's shell dies while the user is on the home
+        // worktree: focus must stay on home, not jump to whatever slid into the
+        // removed slot.
+        let mut session = Session::default();
+        session.add_group(WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app"));
+        session.add_group(WorktreeGroup::terminal("local")); // gi 1 (background)
+        session.switch_to(0);
+        let mut db_terminals = vec![term_row(7, "local")];
+
+        detach_exited_terminal(&mut session, &mut db_terminals, 1, 0);
+
+        assert_eq!(
+            session.active_group().map(|g| g.name.as_str()),
+            Some("app/home"),
+            "focus restored to the pre-exit active group"
+        );
+    }
 
     #[test]
     fn backlog_take_fills_the_slice_exactly_and_carries_the_rest() {
