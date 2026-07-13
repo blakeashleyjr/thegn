@@ -1758,6 +1758,73 @@ fn panel_renders_accordion_sections_and_open_content() {
 }
 
 #[test]
+fn focused_panel_reveals_navigation_footer_from_live_keyhints() {
+    use crate::panel::PanelUi;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 44,
+        rows: 30,
+    };
+    // A short panel (one change) over a tall rect leaves blank tail rows for
+    // the footer. The pairs come from `model.keyhints` — the dynamic source.
+    let mut model = panel_model(); // panel_focused: true
+    model.keyhints = vec![
+        ("↵".to_string(), "open".to_string()),
+        ("j/k".to_string(), "row".to_string()),
+    ];
+    let mut s = Surface::new(44, 30);
+    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    let text = s.screen_chars_to_string();
+    assert!(text.contains("NAVIGATE"), "footer title missing: {text:?}");
+    assert!(text.contains("open"), "live keyhint label missing: {text:?}");
+    assert!(text.contains("j/k"), "live keyhint chord missing: {text:?}");
+}
+
+#[test]
+fn unfocused_panel_hides_navigation_footer() {
+    use crate::panel::PanelUi;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 44,
+        rows: 30,
+    };
+    let mut model = panel_model();
+    model.panel_focused = false;
+    model.keyhints = vec![("↵".to_string(), "open".to_string())];
+    let mut s = Surface::new(44, 30);
+    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    let text = s.screen_chars_to_string();
+    assert!(
+        !text.contains("NAVIGATE"),
+        "footer must hide when panel not focused: {text:?}"
+    );
+}
+
+#[test]
+fn dense_panel_shows_no_navigation_footer() {
+    use crate::panel::PanelUi;
+    // A short rect the accordion fills leaves no blank tail space, so the
+    // footer stays hidden (mirrors the sidebar's "full list shows no hints").
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 44,
+        rows: 8,
+    };
+    let mut model = panel_model();
+    model.keyhints = vec![("↵".to_string(), "open".to_string())];
+    let mut s = Surface::new(44, 8);
+    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    let text = s.screen_chars_to_string();
+    assert!(
+        !text.contains("NAVIGATE"),
+        "footer must hide when the panel body fills the rect: {text:?}"
+    );
+}
+
+#[test]
 fn panel_hits_expose_all_sections_at_distinct_rows() {
     use crate::panel::{PanelHit, PanelUi};
     let rect = Rect {
