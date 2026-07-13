@@ -302,6 +302,15 @@ impl Panes {
         }
     }
 
+    /// Insert a lightweight test-only pane under `id` so pane-reaping paths
+    /// (e.g. resident-pool eviction) have a real table entry to remove. No PTY
+    /// is spawned.
+    #[cfg(test)]
+    pub(crate) fn insert_test_pane(&mut self, id: u32) {
+        let (ctrl_tx, _ctrl_rx) = tokio_mpsc::channel::<thegn_svc::provider::ExecControl>(1);
+        self.table.insert(id, PtyPane::test_stream(ctrl_tx, 24, 80));
+    }
+
     pub(crate) fn with_waker(tx: tokio_mpsc::Sender<PaneEvent>, waker: TerminalWaker) -> Self {
         Self {
             table: std::collections::HashMap::new(),

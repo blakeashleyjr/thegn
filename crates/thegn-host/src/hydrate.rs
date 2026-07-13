@@ -1415,11 +1415,8 @@ pub(crate) fn build_panel(
         ls_files,
         incoming,
     ) = std::thread::scope(|s| {
-        let h_branch = s.spawn(|| {
-            GixGit::new()
-                .current_branch(&loc)
-                .unwrap_or_else(|_| "—".into())
-        });
+        // Raw `Result`s (branch/ahead/merge) merged post-scope: `panel_header_cache`.
+        let h_branch = s.spawn(|| GixGit::new().current_branch(&loc).map_err(|_| ()));
         // diff + the semantic entity summary share the diff result and need only
         // `loc`, so they ride one thread (entity parsing is CPU, kept off the rest).
         let h_diff = s.spawn(|| {
@@ -1428,8 +1425,8 @@ pub(crate) fn build_panel(
             (entries, entities)
         });
         let h_status = s.spawn(|| GixGit::new().status(&loc).unwrap_or_default());
-        let h_ahead = s.spawn(|| GixGit::new().ahead_behind(&loc).ok().flatten());
-        let h_merge = s.spawn(|| GixGit::new().merge_state(&loc).ok().flatten());
+        let h_ahead = s.spawn(|| GixGit::new().ahead_behind(&loc).map_err(|_| ()));
+        let h_merge = s.spawn(|| GixGit::new().merge_state(&loc).map_err(|_| ()));
         // While a merge/rebase is live, the working tree/index carries the whole
         // incoming diff staged, so the changes list is dominated by files the
         // *merge* brings in, not the user's own edits. Compute the incoming path
@@ -1503,6 +1500,9 @@ pub(crate) fn build_panel(
         "panel git fan-out done"
     );
 
+    // Retain last-known-good header on transient git-read failure (never "—").
+    let (branch, ahead_behind, merge_info) =
+        crate::panel_header_cache::merge_header(&loc.path(), branch, ahead_behind, merge_info);
     let mut panel = crate::panel::PanelData {
         branch,
         ..Default::default()

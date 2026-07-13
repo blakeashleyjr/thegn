@@ -463,6 +463,21 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // `THEGN_LOG` selects the `thegn::perf` target. Off by default, so every
     // instrumentation hook is a single relaxed atomic load.
     crate::perf::init();
+
+    // Lift the open-fd ceiling before any PTY/git work: as its own multiplexer,
+    // thegn holds one PTY master fd per live pane across every resident
+    // workspace, and fd exhaustion makes every git read fail at once (the panel
+    // header collapses to "—"). Best-effort; logged in the startup waterfall.
+    if let Some((soft, hard)) = crate::fd_limit::raise_fd_limit() {
+        tracing::info!(
+            target: "thegn::startup",
+            since_start_ms = start.elapsed().as_millis() as u64,
+            fd_soft = soft,
+            fd_hard = hard,
+            "raised RLIMIT_NOFILE"
+        );
+    }
+
     // Arm the in-process sampling profiler (no-op unless built `--features
     // profiling`): SIGUSR2 toggles a flamegraph capture from the live process.
     crate::profile::install();
@@ -2007,76 +2022,12 @@ fn prune_vanished_group(session: &mut crate::session::Session, gi: usize) -> Vec
     ids
 }
 
-/// A workspace parked in the [`WorkspacePool`]: just the center pane trees and
-/// the active group index. Its `PtyPane`s stay live in `Panes` (we never reap on
-/// a switch), so restoring it reattaches the still-running processes by id. The
-/// drawer rides the shared (dir-keyed) `DrawerPool`, so it isn't parked here.
-pub(crate) struct ResidentWorkspace {
-    pub(crate) worktrees: Vec<crate::session::WorktreeGroup>,
-    pub(crate) active: usize,
-}
-
-/// Keeps every visited workspace's panes alive in memory, keyed by `repo_path`
-/// (`Session::id`). Switching parks the outgoing workspace and restores the
-/// target's live panes instead of killing and respawning them.
-#[derive(Default)]
-pub(crate) struct WorkspacePool {
-    map: std::collections::HashMap<String, ResidentWorkspace>,
-}
-
-impl WorkspacePool {
-    fn contains(&self, repo: &str) -> bool {
-        self.map.contains_key(repo)
-    }
-    fn take(&mut self, repo: &str) -> Option<ResidentWorkspace> {
-        self.map.remove(repo)
-    }
-    pub(crate) fn stash(&mut self, repo: String, rw: ResidentWorkspace) {
-        self.map.insert(repo, rw);
-    }
-}
-
-/// Move a freshly cold-resurrected workspace's pane ids onto a disjoint range
-/// reserved past every live pane, so its persisted tree can't alias a live pane
-/// of another resident workspace (the bleed the old reap-on-switch prevented).
-/// `materialize_with_specs` then spawns real panes over these placeholders.
-pub(crate) fn remap_cold_workspace_ids(session: &mut crate::session::Session, panes: &mut Panes) {
-    for g in &mut session.worktrees {
-        for tab in &mut g.tabs {
-            let mut uniq = tab.center.pane_ids();
-            uniq.sort_unstable();
-            uniq.dedup();
-            if uniq.is_empty() {
-                continue;
-            }
-            let base = panes.reserve_ids(uniq.len() as u32);
-            let map: std::collections::HashMap<u32, u32> = uniq
-                .iter()
-                .enumerate()
-                .map(|(i, &old)| (old, base + i as u32))
-                .collect();
-
-            tab.center
-                .remap(&mut |id| map.get(&id).copied().unwrap_or(id));
-            tab.focused_pane = map
-                .get(&tab.focused_pane)
-                .copied()
-                .unwrap_or(tab.focused_pane);
-            tab.pane_cwds = std::mem::take(&mut tab.pane_cwds)
-                .into_iter()
-                .map(|(id, cwd)| (map.get(&id).copied().unwrap_or(id), cwd))
-                .collect();
-            tab.pane_cmds = std::mem::take(&mut tab.pane_cmds)
-                .into_iter()
-                .map(|(id, cmd)| (map.get(&id).copied().unwrap_or(id), cmd))
-                .collect();
-            tab.pane_sessions = std::mem::take(&mut tab.pane_sessions)
-                .into_iter()
-                .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
-                .collect();
-        }
-    }
-}
+/// The resident-workspace pool, the parked-workspace type, and the cold-
+/// resurrect id remap live in the [`crate::workspace_pool`] sibling module
+/// (bounded LRU eviction, pane reaping).
+pub(crate) use crate::workspace_pool::{
+    ResidentWorkspace, WorkspacePool, remap_cold_workspace_ids,
+};
 
 /// Switch the active workspace to `target` (optionally landing on the named
 /// group), keeping the outgoing workspace's panes alive in `pool`. Returns
@@ -2130,7 +2081,7 @@ pub(crate) fn switch_workspace(
         session.id = target.to_string();
         session.worktrees = rw.worktrees;
         session.active = rw.active;
-        pool.stash(prev_id, parked);
+        pool.stash(prev_id, parked, panes);
         land_on(session, group);
         let _ = db.set_active_workspace(target);
         return true;
@@ -2151,7 +2102,7 @@ pub(crate) fn switch_workspace(
     if !landed && session.switch_to_workspace(target, db).is_err() {
         return false;
     }
-    pool.stash(prev_id, snapshot);
+    pool.stash(prev_id, snapshot, panes);
     remap_cold_workspace_ids(session, panes);
     true
 }
@@ -6851,9 +6802,12 @@ async fn event_loop<T: Terminal>(
     let mut corner_relay = crate::kitty_relay::KittyRelay::new();
     let mut corner_gfx: Vec<Vec<u8>> = Vec::new();
     let mut corner_occluded = false;
-    // Keeps every visited workspace's panes alive in memory across switches, so
-    // a program left running in one repo is still there on return (no cap).
+    // Keeps recently-visited workspaces' panes alive in memory across switches,
+    // so a program left running in one repo is still there on return. Bounded by
+    // `[session] resident_pool_limit` (refreshed on config reload) so PTY
+    // fds/threads can't accumulate without limit over a long session.
     let mut workspace_pool = WorkspacePool::default();
+    workspace_pool.set_limit(keymap.config().session.resident_pool_limit);
 
     // Diff fs-watcher: bound to the active worktree, re-targeted on tab switch.
     // On a (debounced) change it pushes `RefreshKind::Model` into the shared
@@ -9626,6 +9580,8 @@ async fn event_loop<T: Terminal>(
                     panel_ui.set_order(crate::panel::resolve_order(&new_cfg));
                     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(&new_cfg);
                     current_config = new_cfg;
+                    // Live resident-pool cap reload: applies on the next park.
+                    workspace_pool.set_limit(current_config.session.resident_pool_limit);
                     // Live notification-routing reload: swap in the reloaded
                     // rules/DND/sound/modes (preserving the runtime mode/toggle).
                     notify_state.update_cfg(current_config.effective_notifications(None));
