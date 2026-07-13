@@ -96,6 +96,7 @@ mod metrics;
 mod model_eq;
 mod mousefilter;
 mod mq_assets;
+mod naming;
 mod nav;
 mod nixcache;
 mod notify;

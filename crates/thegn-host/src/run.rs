@@ -46,6 +46,7 @@ use crate::loading::{
     SpecOrigin, active_watchdog_deadline, is_shell_wait, provision_owns_tab, watchdog_deadline,
 };
 use crate::menu::{self, MenuChoice, MenuOverlay};
+use crate::naming::issue_branch_tail;
 use crate::palette::build_palette;
 use crate::pane::PaneEvent;
 use crate::panel::gitui::{self, GitFlow, GitMsg, GitView, StagePane};
@@ -2923,28 +2924,6 @@ fn begin_worktree_preset(
         .progress
         .insert(*create_gen, wizard::CreationProgress::new(candidate));
     model.status = "Creating worktree…".into();
-}
-
-/// The branch-name tail for a worktree created from an issue: the provider's
-/// branch hint when present (e.g. Linear's `abc-123-fix-foo`), else a slug of
-/// `<number>-<title>`. Capped and dash-collapsed so it is a valid ref tail.
-fn issue_branch_tail(number: &str, title: &str, hint: Option<&str>) -> String {
-    if let Some(h) = hint.filter(|h| !h.trim().is_empty()) {
-        return h.trim().to_string();
-    }
-    let raw = format!("{number}-{title}");
-    let mut out = String::new();
-    let mut prev_dash = false;
-    for c in raw.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash && !out.is_empty() {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    out.trim_matches('-').chars().take(48).collect()
 }
 
 /// A follow-up only the loop body can perform (it owns session/panes).
@@ -7317,6 +7296,23 @@ async fn event_loop<T: Terminal>(
                 }
                 SidebarOutcome::ShowHelp => {
                     sidebar_help_open = true;
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::Mq { action, path } => {
+                    crate::handlers::merge_queue::sidebar_action(
+                        action,
+                        crate::handlers::merge_queue::MqKeyCtx {
+                            model: &mut model,
+                            cfg: &current_config,
+                            active_wt: std::path::PathBuf::from(path),
+                            refresh_tx: &refresh_tx,
+                            waker: &waker,
+                            drive_tx: &drive_tx,
+                            fold_inflight: &mut fold_inflight,
+                            toasts: &mut toasts,
+                        },
+                    );
                     dirty = true;
                     continue;
                 }
