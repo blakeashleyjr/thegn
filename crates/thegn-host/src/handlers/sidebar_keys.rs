@@ -99,6 +99,41 @@ pub(crate) enum SidebarOutcome {
     SortMenu,
     /// Show the sidebar help overlay (`?`).
     ShowHelp,
+    /// A merge-queue action fired from the row/workspace context menu (mirrors
+    /// the panel's `a/A/x/l/r/c/D`). `path` is the target worktree (per-row
+    /// actions) or any path inside the repo (workspace-wide actions). The loop
+    /// runs the mutation off-thread via `handlers::merge_queue`.
+    Mq {
+        action: crate::handlers::merge_queue::SidebarMq,
+        path: String,
+    },
+}
+
+/// The merge-queue context-menu entries (`(id, label)`, in render order) for a
+/// worktree row given its queue status. Pure so the status→entry matrix is
+/// unit-testable: not-queued ⇒ Add; queued ⇒ Remove, plus Land when `ready` and
+/// Retry when blocked (deferred / gate-failed / needs-human). Mirrors the
+/// panel's `a/x/l/r` availability rules (`handlers::merge_queue::row_action_for`).
+fn worktree_mq_entries(
+    mq_status: Option<thegn_core::attention::MqStatus>,
+) -> Vec<(&'static str, &'static str)> {
+    use thegn_core::attention::MqStatus;
+    match mq_status {
+        None => vec![("mq-add", "Add to merge queue")],
+        Some(status) => {
+            let mut v = vec![("mq-remove", "Remove from merge queue")];
+            if status == MqStatus::Ready {
+                v.push(("mq-land", "Land branch"));
+            }
+            if matches!(
+                status,
+                MqStatus::Deferred | MqStatus::GateFailed | MqStatus::NeedsHuman
+            ) {
+                v.push(("mq-retry", "Retry"));
+            }
+            v
+        }
+    }
 }
 
 impl SidebarState {
@@ -248,6 +283,14 @@ impl SidebarState {
                 if row.worktree_path.is_some() {
                     entries.push(e("copy-path", "Copy path", Some("c")));
                 }
+                // Merge-queue controls (status-aware, mirroring the panel keys).
+                // Skipped for the home row (it sits on the target branch).
+                if !is_home && row.worktree_path.is_some() {
+                    entries.push(sep());
+                    for (id, label) in worktree_mq_entries(row.mq_status) {
+                        entries.push(e(id, label, None));
+                    }
+                }
                 if !is_home {
                     entries.push(sep());
                     entries.push(e("close", "Close — keep files on disk", None));
@@ -267,6 +310,11 @@ impl SidebarState {
                     entries.push(e("pin", "Pin / unpin", Some("p")));
                 }
                 entries.push(e("sort", "Sort worktrees by…", Some("s")));
+                // Workspace-wide merge-queue controls (panel `A` / clear / `D`).
+                entries.push(sep());
+                entries.push(e("mq-add-all", "Queue all worktrees", None));
+                entries.push(e("mq-clear", "Clear merge queue", None));
+                entries.push(e("mq-drain", "Drain merge queue", None));
                 if row.worktree_path.is_some() {
                     entries.push(sep());
                     entries.push(e("remove-workspace", "Remove workspace…", Some("d")).danger());
@@ -804,8 +852,84 @@ impl SidebarState {
                 }
             }
             "sort" => return SidebarOutcome::SortMenu,
+            "mq-add" | "mq-remove" | "mq-land" | "mq-retry" => {
+                use crate::handlers::merge_queue::SidebarMq;
+                if let Some(path) = self
+                    .selected_row(model)
+                    .and_then(|r| r.worktree_path.clone())
+                {
+                    let action = match id {
+                        "mq-add" => SidebarMq::Add,
+                        "mq-remove" => SidebarMq::Remove,
+                        "mq-land" => SidebarMq::Land,
+                        _ => SidebarMq::Retry,
+                    };
+                    return SidebarOutcome::Mq { action, path };
+                }
+            }
+            "mq-add-all" | "mq-clear" | "mq-drain" => {
+                use crate::handlers::merge_queue::SidebarMq;
+                if let Some(path) = self.cursor_repo_root(model) {
+                    let action = match id {
+                        "mq-add-all" => SidebarMq::AddAll,
+                        "mq-clear" => SidebarMq::Clear,
+                        _ => SidebarMq::Drain,
+                    };
+                    return SidebarOutcome::Mq { action, path };
+                }
+            }
             _ => {}
         }
         SidebarOutcome::Redraw
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worktree_mq_entries;
+    use thegn_core::attention::MqStatus;
+
+    fn ids(status: Option<MqStatus>) -> Vec<&'static str> {
+        worktree_mq_entries(status)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn not_queued_offers_only_add() {
+        assert_eq!(ids(None), vec!["mq-add"]);
+    }
+
+    #[test]
+    fn queued_offers_remove_without_land_or_retry() {
+        for s in [MqStatus::Queued, MqStatus::Folding, MqStatus::Verifying] {
+            assert_eq!(ids(Some(s)), vec!["mq-remove"], "{s:?}");
+        }
+    }
+
+    #[test]
+    fn ready_adds_land() {
+        assert_eq!(ids(Some(MqStatus::Ready)), vec!["mq-remove", "mq-land"]);
+    }
+
+    #[test]
+    fn blocked_statuses_add_retry() {
+        for s in [
+            MqStatus::Deferred,
+            MqStatus::GateFailed,
+            MqStatus::NeedsHuman,
+        ] {
+            assert_eq!(ids(Some(s)), vec!["mq-remove", "mq-retry"], "{s:?}");
+        }
+    }
+
+    #[test]
+    fn landed_and_agent_running_offer_only_remove() {
+        // Landed rows are shown in the panel, not the sidebar chip, but if the
+        // status is present the menu still offers a plain remove.
+        for s in [MqStatus::Landed, MqStatus::AgentRunning] {
+            assert_eq!(ids(Some(s)), vec!["mq-remove"], "{s:?}");
+        }
     }
 }
