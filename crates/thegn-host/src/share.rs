@@ -116,11 +116,7 @@ impl ShareInstance {
     fn kill(&self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
         if let Some(pid) = *self.shared.pid.lock().unwrap() {
-            nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            )
-            .ok();
+            crate::platform::terminate_pid(pid);
         }
         // Sidecar-serve teardown shells into the VPN sidecar; do it off the loop.
         if let Some(td) = self.shared.teardown.lock().unwrap().clone() {

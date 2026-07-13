@@ -115,6 +115,7 @@ mod perf;
 mod pi_assets;
 mod pins;
 mod placement_flow;
+mod platform;
 mod pr_view;
 mod predict;
 mod preview_gfx;
@@ -645,6 +646,17 @@ fn main() -> anyhow::Result<()> {
             Err(Some(e)) => return Err(e),
             Err(None) => {} // `open` with no live instance: launch the TUI
         }
+    }
+
+    // Native Windows targets Windows Terminal (or another modern VT emulator).
+    // Legacy conhost.exe renders the frame too poorly to degrade gracefully —
+    // refuse with a clear pointer instead of looking broken.
+    #[cfg(windows)]
+    if !thegn_core::termcaps::modern_terminal_evidence(&thegn_core::termcaps::TermEnv::from_env()) {
+        anyhow::bail!(
+            "thegn requires a modern terminal on Windows — run it inside Windows Terminal \
+             (https://aka.ms/terminal); legacy conhost.exe is not supported"
+        );
     }
 
     // Per-profile advisory singleton (H): one interactive window per named

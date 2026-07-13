@@ -2662,16 +2662,7 @@ impl Default for SandboxConfig {
             backend: SandboxBackend::Auto,
             default_backend: SandboxBackend::Auto,
             default_env: String::new(),
-            backend_chain: [
-                "podman-rootless",
-                "podman-rootful",
-                "docker",
-                "bwrap",
-                "host",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+            backend_chain: crate::config_defaults::default_backend_chain(),
             image: String::new(),
             profile: SandboxProfile::Hardened,
             agent_profile: SandboxProfile::Sealed,

@@ -3,7 +3,9 @@ use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use thegn_core::acp::types::JsonRpcMessage;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 // Boxed halves so the transport is stream-agnostic: TCP (non-sandboxed agent) and
@@ -53,9 +55,17 @@ impl AcpTransport {
 
     /// Connect over a unix-domain socket — works across a sandbox netns when the
     /// socket is bind-mounted into the container (no network required).
+    #[cfg(unix)]
     pub async fn connect_unix(path: &str) -> Result<(AcpReader, AcpWriter)> {
         let (r, w) = UnixStream::connect(path).await?.into_split();
         Ok(Self::frame(Box::new(r), Box::new(w)))
+    }
+
+    /// Windows stub: the socket-bind-mount path targets Linux sandboxes, which
+    /// don't exist on a native Windows host. Named-pipe IPC lands separately.
+    #[cfg(not(unix))]
+    pub async fn connect_unix(_path: &str) -> Result<(AcpReader, AcpWriter)> {
+        anyhow::bail!("ACP unix-socket transport is not supported on Windows")
     }
 
     fn frame(r: BoxRead, w: BoxWrite) -> (AcpReader, AcpWriter) {

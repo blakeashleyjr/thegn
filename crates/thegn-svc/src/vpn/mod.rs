@@ -769,13 +769,10 @@ fn state_dir() -> std::path::PathBuf {
     base.join("thegn").join("vpn")
 }
 
-#[cfg(unix)]
 fn set_0600(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    // best-effort: 0600 on unix, owner-only DACL on Windows.
+    let _ = thegn_core::fsperm::restrict_to_owner(path);
 }
-#[cfg(not(unix))]
-fn set_0600(_path: &std::path::Path) {}
 
 /// Is the sidecar already running? (`inspect` exits 0 only for live containers.)
 fn sidecar_running(rt: &OciRuntime, container: &str) -> bool {

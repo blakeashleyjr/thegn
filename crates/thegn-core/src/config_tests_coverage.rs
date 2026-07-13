@@ -813,6 +813,7 @@ fn sandbox_config_default_collections() {
             "podman-rootful",
             "docker",
             "bwrap",
+            "jobobject",
             "host"
         ]
     );

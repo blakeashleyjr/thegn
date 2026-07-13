@@ -139,17 +139,30 @@ fn is_transient_write_error(err: &anyhow::Error) -> bool {
 
 pub(crate) fn is_transient_io(io: &std::io::Error) -> bool {
     use std::io::ErrorKind;
-    matches!(io.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock)
-        || matches!(
+    if matches!(io.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) {
+        return true;
+    }
+    // Raw-errno tail: EIO from a briefly-disturbed tty is worth retrying on
+    // unix. Windows has no tty errno equivalent; the ErrorKind arm above is
+    // the whole classification there.
+    #[cfg(unix)]
+    {
+        matches!(
             io.raw_os_error(),
             Some(libc::EIO | libc::EINTR | libc::EAGAIN)
         )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)] // raw-errno classification is unix-only
     #[test]
     fn classifies_eio_as_transient() {
         let e = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EIO)).context("flush");

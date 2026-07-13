@@ -757,6 +757,7 @@ impl NativeShell {
             format!("cd {} 2>/dev/null; {}", self.workdir, self.inner)
         };
         thegn_svc::provider::ExecSpec {
+            // remote/sandbox target is Linux; POSIX sh is correct here
             argv: vec!["/bin/sh".to_string(), "-lc".to_string(), script],
             tty: true,
             cols,
@@ -1840,11 +1841,10 @@ fn host_shell_store_roots() -> Vec<String> {
 /// ProxyCommand (`<thegn> sprite-proxy <wt>`) can't go inline — the wrapper is a
 /// single token. Returns its path.
 fn write_proxy_wrapper(key: &Path, proxy_cmd: &str) -> anyhow::Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let dir = key.parent().unwrap_or_else(|| Path::new("."));
     let script = dir.join("nix-copy-proxy.sh");
     std::fs::write(&script, format!("#!/bin/sh\nexec {proxy_cmd}\n"))?;
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    crate::managed_tool::make_executable(&script)?;
     Ok(script)
 }
 

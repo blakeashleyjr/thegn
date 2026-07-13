@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 #[cfg(not(windows))]
@@ -304,8 +304,18 @@ pub fn detached(program: &str) -> Command {
     let mut c = Command::new(program);
     c.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .process_group(0);
+        .stderr(std::process::Stdio::null());
+    // Unix: own process group, so job control can't drag thegn into the tty's
+    // background group. Windows has no tty job control; the equivalent hygiene
+    // is CREATE_NO_WINDOW so a helper never flashes (or attaches to) a console.
+    #[cfg(unix)]
+    c.process_group(0);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
     c
 }
 
@@ -538,7 +548,11 @@ pub fn git_common_dir(worktree: &Path) -> PathBuf {
 /// `Drop` AND on process death — there are never stale locks. Reads stay
 /// lock-free; only the svc write runners acquire this.
 #[must_use = "the lock releases as soon as the guard is dropped"]
-pub struct GitLock(std::fs::File);
+pub struct GitLock(
+    // Held purely for RAII: the unix Drop unlocks explicitly; on Windows the
+    // exclusive share mode releases when the handle closes (field unread).
+    #[cfg_attr(windows, allow(dead_code))] std::fs::File,
+);
 
 /// Acquire the per-repo git-mutation lock (blocking) at
 /// `<git-common>/thegn-git.lock`, serializing concurrent mutations on the
@@ -638,9 +652,12 @@ pub fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// The last path component of a string (no trailing-slash handling needed here).
+/// The last path component of a string (no trailing-slash handling needed
+/// here). Splits on both separators so Windows paths (`C:\…\worktree`) and
+/// unix paths resolve the same — display strings flow through here on every
+/// platform (tab titles, sidebar rows, pin cwds).
 pub fn basename(s: &str) -> &str {
-    s.rsplit('/').next().unwrap_or(s)
+    s.rsplit(['/', '\\']).next().unwrap_or(s)
 }
 
 #[cfg(not(windows))]
@@ -650,13 +667,9 @@ pub fn shell() -> String {
 
 #[cfg(windows)]
 pub fn shell() -> String {
-    if let Ok(pwsh) = which_path("pwsh.exe") {
-        pwsh
-    } else if let Ok(ps) = which_path("powershell.exe") {
-        ps
-    } else {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
-    }
+    which_path("pwsh.exe")
+        .or_else(|| which_path("powershell.exe"))
+        .unwrap_or_else(|| std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()))
 }
 
 /// The user's preferred editor command (program plus any args), honoring
@@ -822,6 +835,15 @@ pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn basename_splits_both_separators() {
+        assert_eq!(basename("/home/u/wt/feature-x"), "feature-x");
+        assert_eq!(basename(r"C:\Users\u\wt\feature-x"), "feature-x");
+        assert_eq!(basename(r"C:\Users\u/mixed\style/leaf"), "leaf");
+        assert_eq!(basename("bare"), "bare");
+        assert_eq!(basename(""), "");
+    }
 
     #[test]
     fn managed_pi_dirs_nest_under_thegn_dir() {

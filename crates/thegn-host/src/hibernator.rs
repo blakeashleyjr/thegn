@@ -538,6 +538,7 @@ fn exec_capture(
     script: &str,
     timeout: Duration,
 ) -> anyhow::Result<String> {
+    // remote/sandbox target is Linux; POSIX sh is correct here
     let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script.to_string()];
     let (code, out) = block_on_provider(|| async {
         tokio::time::timeout(timeout, provider.run_exec(id, &argv, None, &[]))

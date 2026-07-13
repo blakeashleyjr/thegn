@@ -16,6 +16,7 @@ pub mod forward;
 pub mod gh;
 pub mod git;
 pub mod host;
+pub mod ipc;
 pub mod iroh_reach;
 pub mod issue;
 pub mod log;

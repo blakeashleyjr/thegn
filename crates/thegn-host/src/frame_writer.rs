@@ -290,6 +290,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)] // EIO-as-transient is unix errno classification
     #[test]
     fn transient_errors_escalate_to_fatal_after_retry_max() {
         let mut state = q();
@@ -311,6 +312,7 @@ mod tests {
         assert!(matches!(state.status, WriterStatus::Fatal(_)));
     }
 
+    #[cfg(unix)] // EIO-as-transient is unix errno classification
     #[test]
     fn success_resets_the_consecutive_counter() {
         let mut state = q();

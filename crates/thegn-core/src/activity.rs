@@ -375,7 +375,8 @@ fn poll(
 /// Sum utime+stime jiffies for every process whose cwd is under each path —
 /// the reusable core of the activity scan. Also served over the resident bridge
 /// (`proc.list`) so a remote env's *own* processes drive the activity dots.
-/// Longest-prefix wins (a nested worktree over its repo root). Empty off Linux.
+/// Longest-prefix wins (a nested worktree over its repo root). Linux reads
+/// /proc; Windows reads via sysinfo; other platforms return empty.
 pub fn cpu_jiffies_by_path(paths: &[String]) -> BTreeMap<String, u64> {
     let mut targets: Vec<(PathBuf, String)> = paths
         .iter()
@@ -414,7 +415,34 @@ fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
     sums
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows: same contract via sysinfo (PEB-read cwd + accumulated CPU time).
+/// Units are milliseconds rather than jiffies — fine, the activity state
+/// machine only ever *diffs* successive samples of the same counter.
+#[cfg(windows)]
+fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+    let mut sums: BTreeMap<String, u64> = BTreeMap::new();
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cwd(UpdateKind::Always)
+            .with_cpu(),
+    );
+    for proc in sys.processes().values() {
+        // Elevated/protected processes hide their cwd — skipped, same as
+        // unreadable /proc entries on Linux.
+        let Some(cwd) = proc.cwd() else { continue };
+        let Some((_, wt)) = targets.iter().find(|(p, _)| cwd.starts_with(p)) else {
+            continue;
+        };
+        *sums.entry(wt.clone()).or_insert(0) += proc.accumulated_cpu_time();
+    }
+    sums
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn scan_proc(_targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
     BTreeMap::new()
 }
