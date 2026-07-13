@@ -940,6 +940,11 @@ command = "git diff"
 #                              #   restore is downgraded to a settled state; live FSM untouched
 # focus_on_create = true       # creating a worktree (Alt+w) jumps to its new tab and shows the
 #                              #   loading splash; false = build in background with a sidebar dot
+# resident_pool_limit = 16     # max PARKED workspaces kept resident (panes alive) for instant
+#                              #   switch-back, beyond the active one; the least-recently-used is
+#                              #   evicted (its panes reaped, re-resurrected on next visit) past
+#                              #   this, bounding PTY fd/thread growth over a long session; 0 = no
+#                              #   pooling (reap on every switch)
 
 # Aggregated notification bus. Events (PR state, agent done/failed, test
 # failures, log errors, worktree created) surface as sidebar badges + the
