@@ -733,6 +733,13 @@ impl GitBackend for CliGit {
             .lines()
             .filter_map(|l| {
                 let (mark, name) = l.split_once('\t')?;
+                // A detached worktree (e.g. the merge-queue's throwaway gate
+                // worktree, which runs the test suite) makes `git branch` emit a
+                // synthetic `(no branch)` row. It is not a real branch and gix's
+                // ref walk omits it, so drop it to keep the two backends in sync.
+                if name == "(no branch)" {
+                    return None;
+                }
                 Some(Branch {
                     name: name.to_string(),
                     is_head: mark.trim() == "*",
@@ -1102,14 +1109,17 @@ mod tests {
         b_cli.sort();
         b_gix.sort();
         assert_eq!(b_cli, b_gix, "gix and git disagree on the branch set");
-        // exactly one head in each
+        // A worktree on a branch has exactly one HEAD branch; a detached worktree
+        // (e.g. the merge-queue's throwaway gate worktree, which runs this suite)
+        // has none. `current_branch` yields the "HEAD" sentinel when detached.
+        let expected_heads = usize::from(cb_cli != "HEAD");
         assert_eq!(
             gix.branches(&loc)
                 .unwrap()
                 .iter()
                 .filter(|b| b.is_head)
                 .count(),
-            1
+            expected_heads
         );
     }
 
