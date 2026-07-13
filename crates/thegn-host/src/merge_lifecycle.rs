@@ -42,17 +42,43 @@ pub(crate) fn apply(
     }
 }
 
+/// The exact `workspaces.repo_path` string the sidebar keys folders by, for the
+/// repo whose main checkout is `repo_root` (and whose worktree row records
+/// `recorded`). A folder MUST be created under this string or the sidebar —
+/// which matches `folders.repo_path == workspaces.repo_path` byte-for-byte —
+/// won't render it. Prefer an existing `workspaces` row matched exactly (on the
+/// recorded path or `repo_root`) then by canonicalized path; fall back to the
+/// recorded worktree path, then `repo_root`. Runs off-loop, so the `canonicalize`
+/// stat is fine.
+fn workspace_repo_path(db: &Db, repo_root: &Path, recorded: Option<&str>) -> String {
+    if let Ok(rows) = db.workspaces() {
+        let want = std::fs::canonicalize(repo_root).ok();
+        if let Some(w) = rows.iter().find(|w| {
+            Some(w.repo_path.as_str()) == recorded
+                || Path::new(&w.repo_path) == repo_root
+                || (want.is_some() && std::fs::canonicalize(&w.repo_path).ok() == want)
+        }) {
+            return w.repo_path.clone();
+        }
+    }
+    recorded
+        .map(str::to_owned)
+        .unwrap_or_else(|| repo_root.to_string_lossy().into_owned())
+}
+
 /// File `worktree` into the named sidebar folder (find-or-create), scoped to the
 /// worktree's own workspace so it lands under the right repo in the tree.
 fn file_into(db: &Db, repo_root: &Path, worktree: &str, branch: &str, folder: &str) {
     // `repo_root_for` doubles as the "is this worktree in the DB cache?" probe:
-    // it reads the row's `repo_path`, so `None` means there is no row. Prefer
-    // that recorded repo_path (the folder is workspace-scoped exactly as the
-    // sidebar filters it), falling back to the fold's repo root.
+    // it reads the row's `repo_path`, so `None` means there is no row.
     let recorded = db.repo_root_for(worktree).ok().flatten();
-    let repo_path = recorded
-        .clone()
-        .unwrap_or_else(|| repo_root.to_string_lossy().into_owned());
+    // File under the SAME `repo_path` string the sidebar keys folders by. The
+    // sidebar renders a folder only when `folders.repo_path == workspaces.repo_path`
+    // byte-for-byte (see `hydrate::workspace_list` + `sidebar::build_rows`), so a
+    // folder created under a divergent string (a worktree row registered by an
+    // external tool, a trailing slash, a symlinked path) yields no header and the
+    // filed worktree is orphaned. Resolve to the workspace's own string.
+    let repo_path = workspace_repo_path(db, repo_root, recorded.as_deref());
     // best-effort throughout: sidebar filing is cosmetic and must never fail a merge.
     let Ok(fid) = db.ensure_folder(&repo_path, folder) else {
         return;
@@ -203,6 +229,31 @@ mod tests {
             .into_iter()
             .find(|f| f.folder_id == fid)
             .map(|f| f.name)
+    }
+
+    #[test]
+    fn workspace_repo_path_prefers_registered_workspace_string() {
+        let db = Db::open_memory().unwrap();
+        db.put_workspace("/repos/app", "app", "git").unwrap();
+        // A worktree row whose recorded repo_path diverges (trailing slash) from
+        // the workspace's canonical string must still file under the workspace
+        // string, so the sidebar's byte-for-byte folder filter matches.
+        let got = workspace_repo_path(&db, Path::new("/repos/app"), Some("/repos/app/"));
+        assert_eq!(got, "/repos/app");
+    }
+
+    #[test]
+    fn workspace_repo_path_falls_back_when_no_workspace_row() {
+        let db = Db::open_memory().unwrap();
+        // No workspace registered: fall back to the recorded path, else repo_root.
+        assert_eq!(
+            workspace_repo_path(&db, Path::new("/repos/none"), Some("/repos/rec")),
+            "/repos/rec"
+        );
+        assert_eq!(
+            workspace_repo_path(&db, Path::new("/repos/none"), None),
+            "/repos/none"
+        );
     }
 
     #[test]

@@ -799,24 +799,39 @@ pub fn build_rows(
             }
         };
 
-        // Split into unfiled (rendered at root) and filed (rendered under
-        // folders). Unfiled keeps the sorted home-first order; filed worktrees
-        // are emitted later under their folder header at depth 2.
-        for gr in groups.iter().filter(|g| g.folder_id.is_none()) {
-            let pin_key = format!("{repo_slug}/{}", gr.label);
-            rows.push(mk_row(gr, 1, pin_key));
-        }
-
-        // Folders section: home → loose (above) → folders by `position`.
-        // Filed worktrees render at depth 2 under their folder header, in the
-        // order the user arranged them (Move Up/Down on the worktree row will
+        // Folders section: home → loose → folders by `position`. Filed
+        // worktrees render at depth 2 under their folder header, in the order
+        // the user arranged them (Move Up/Down on the worktree row will
         // eventually resequence via `swap_worktree_positions`; for now we
-        // preserve the existing sort for visibility).
+        // preserve the existing sort for visibility). Computed BEFORE the loose
+        // pass so it can see which folders will actually get a header.
         let mut workspace_folders: Vec<&thegn_core::models::FolderRow> = db_folders
             .iter()
             .filter(|f| f.repo_path == *repo_path)
             .collect();
         workspace_folders.sort_by_key(|f| f.position);
+        // The folder ids that render a header for this workspace. A worktree
+        // whose `folder_id` points *outside* this set has nowhere to nest —
+        // e.g. a merge-queue `file_into` that recorded the folder under a
+        // `repo_path` string that doesn't byte-match this workspace's, or a
+        // stale id — so it must fall back to the loose list below, or it would
+        // render neither loose (it has a `folder_id`) nor filed (no header
+        // matches) and silently vanish from the tree.
+        let rendered_folder_ids: std::collections::HashSet<i64> =
+            workspace_folders.iter().map(|f| f.folder_id).collect();
+
+        // Split into unfiled (rendered at root) and filed (rendered under
+        // folders). Unfiled keeps the sorted home-first order; filed worktrees
+        // are emitted later under their folder header at depth 2. A worktree
+        // whose `folder_id` has no matching header falls back to loose so it is
+        // never invisible.
+        for gr in groups
+            .iter()
+            .filter(|g| g.folder_id.is_none_or(|fid| !rendered_folder_ids.contains(&fid)))
+        {
+            let pin_key = format!("{repo_slug}/{}", gr.label);
+            rows.push(mk_row(gr, 1, pin_key));
+        }
 
         // Build a quick lookup from folder_id → worktree rows for this workspace.
         let filed_in_folders: std::collections::BTreeMap<i64, Vec<&Group>> = {
@@ -2014,6 +2029,48 @@ mod tests {
             rows.iter()
                 .any(|r| r.kind == RowKind::Worktree && r.label == "home" && r.visible)
         );
+    }
+
+    #[test]
+    fn worktree_with_orphaned_folder_id_falls_back_to_loose() {
+        // Regression: a worktree whose `folder_id` points at a folder that is
+        // NOT in this workspace's folder set (e.g. a merge-queue `file_into`
+        // that recorded the folder under a `repo_path` string that doesn't
+        // byte-match the workspace's, so the header is filtered out) must still
+        // render — as a loose row — never vanish.
+        let (s, ws, mut dbw, folders) = folder_fixture();
+        // The worktree is filed into folder 1, but the only folder row we pass
+        // belongs to a DIFFERENT repo_path, so it yields no header here.
+        dbw[0].folder_id = Some(1);
+        let mismatched = vec![thegn_core::models::FolderRow {
+            folder_id: 1,
+            repo_path: "/some/other/path".into(),
+            name: "Backend".into(),
+            position: 0,
+            created_at: 0,
+        }];
+        let _ = folders; // fixture's matching folder intentionally unused here.
+
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &dbw,
+            &mismatched,
+            &[],
+        );
+        // No folder header renders (repo_path mismatch)…
+        assert!(
+            !rows.iter().any(|r| r.kind == RowKind::Folder),
+            "mismatched folder must not render a header"
+        );
+        // …but the filed worktree is still visible, as a loose (depth 1) row.
+        let feat = rows
+            .iter()
+            .find(|r| r.kind == RowKind::Worktree && r.label == "feat")
+            .expect("filed worktree must not vanish when its folder has no header");
+        assert_eq!(feat.depth, 1, "orphaned-folder worktree falls back to loose");
     }
 
     #[test]
