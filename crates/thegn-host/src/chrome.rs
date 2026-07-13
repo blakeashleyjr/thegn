@@ -1631,6 +1631,97 @@ pub fn draw_panel(
             row.bg.unwrap_or(crate::seg::Tok::Slot(S::Panel)),
         );
     }
+
+    // Navigation-hints footer: the same "reveal on focus, only in blank tail
+    // space" language as the sidebar (`draw_sidebar_hints`), but sourced from
+    // the live `model.keyhints` — the config-resolved, context-sensitive
+    // hotkeys the statusbar already shows for the focused panel — so it tracks
+    // the real bindings (and any remaps) instead of a static table. Painting
+    // only over rows `build_panel` didn't produce means it never overlaps panel
+    // content and needs no change to `panel_hits`.
+    if model.panel_focused {
+        let pairs: Vec<(String, String)> =
+            model.keyhints.iter().take(6).cloned().collect();
+        let hint_h = pairs.len() + 1; // rule/title + one row per tip
+        let avail = rect.rows.saturating_sub(frame.rows.len());
+        // Require a one-row gap between the last panel row and the footer.
+        if !pairs.is_empty() && avail > hint_h {
+            draw_panel_hints(
+                surface,
+                Rect {
+                    x: rect.x,
+                    y: rect.y + rect.rows - hint_h,
+                    cols: rect.cols,
+                    rows: hint_h,
+                },
+                &pairs,
+            );
+        }
+    }
+}
+
+/// Paint the panel's navigation-hints footer: a rule + " NAVIGATE " title over a
+/// column of dim chord / label pairs. Mirrors the sidebar's `draw_sidebar_hints`
+/// so the two focus footers read identically; the pairs are the live
+/// `model.keyhints`, so the content is dynamic (see [`draw_panel`]).
+fn draw_panel_hints(surface: &mut Surface, rect: Rect, pairs: &[(String, String)]) {
+    if rect.rows < 2 || rect.cols == 0 {
+        return;
+    }
+    let line = crate::caps::active_glyphs().box_h.repeat(rect.cols);
+    draw_text(
+        surface,
+        rect.x,
+        rect.y,
+        &line,
+        col(S::Border),
+        col(S::Panel),
+        rect.cols,
+    );
+    draw_text_bold(
+        surface,
+        rect.x + 1,
+        rect.y,
+        " NAVIGATE ",
+        col(S::Dim),
+        col(S::Panel),
+        rect.cols.saturating_sub(1),
+    );
+
+    let chord_w = pairs
+        .iter()
+        .map(|(c, _)| c.chars().count())
+        .max()
+        .unwrap_or(0);
+    let max_y = rect.y + rect.rows;
+    let right = rect.x + rect.cols;
+    for (i, (chord, label)) in pairs.iter().enumerate() {
+        let y = rect.y + 1 + i;
+        if y >= max_y {
+            break;
+        }
+        draw_text(
+            surface,
+            rect.x + 1,
+            y,
+            chord,
+            col(S::Faint),
+            col(S::Panel),
+            rect.cols.saturating_sub(1),
+        );
+        let lx = rect.x + 1 + chord_w + 1;
+        if lx < right {
+            draw_text(
+                surface,
+                lx,
+                y,
+                label,
+                col(S::Ghost),
+                col(S::Panel),
+                right - lx,
+            );
+        }
+    }
 }
 
 /// The `(absolute row y, hit)` targets of the rendered panel — the exact
