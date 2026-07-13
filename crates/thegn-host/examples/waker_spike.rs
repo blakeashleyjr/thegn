@@ -12,6 +12,7 @@
 //! process at ~0% CPU between lines, and every keypress echoing immediately.
 //! FAIL looks like: no tick lines (waker lost — the loop never wakes without
 //! input) or pegged CPU (the backend degraded to polling). Press `q` to exit.
+#![allow(clippy::disallowed_macros)] // a diagnostic spike whose output IS raw terminal I/O
 
 use std::time::Duration;
 

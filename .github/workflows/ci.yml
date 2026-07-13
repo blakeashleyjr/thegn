@@ -256,7 +256,7 @@ jobs:
       - run: cargo test -p thegn-svc --lib --locked ipc
       # Job Object semantics on a real kernel: terminate() reaps the tree and
       # dropping the last handle (KILL_ON_JOB_CLOSE) reaps it too.
-      - run: cargo test -p thegn-host --locked platform::
+      - run: "cargo test -p thegn-host --locked platform::"
       # Distribution: a release thegn.exe from every run — the download for
       # native Windows installs until a tagged-release pipeline exists
       # (documented install path: `cargo install --path crates/thegn-host`).
