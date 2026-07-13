@@ -152,6 +152,27 @@ fn target_names(cx: &mut DeleteCtx<'_>, targets: &[usize]) -> (Vec<String>, Vec<
 /// dirty target forces the warning menu regardless of `confirm_delete`. Sets
 /// `model.status` on every path.
 pub(crate) fn request_group_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<usize>) {
+    // A standalone terminal isn't a git worktree: the delete path below only
+    // touches the `worktrees` table (a terminal's `path` is empty), so it would
+    // leave the `terminals` registry row + its sidebar entry behind. Route a
+    // terminal target to the terminal-close confirm — the `sidebar-close-terminal`
+    // menu handler calls `close_terminal`, which deletes the DB row and drops it
+    // from the model, exactly like the sidebar `d` flow. Alt-X on a terminal
+    // reaches here with the active group as the sole target.
+    if let [gi] = raw_targets[..]
+        && cx.session.worktrees.get(gi).map(|g| g.kind)
+            == Some(crate::session::GroupKind::Terminal)
+    {
+        let name = cx.session.worktrees[gi].name.clone();
+        *cx.active_menu = Some(menu::confirm_menu(
+            format!("Close terminal '{name}'?"),
+            "the shell process ends; scrollback is lost",
+            "sidebar-close-terminal",
+            name,
+            true,
+        ));
+        return;
+    }
     let (targets, skipped_home) = crate::run::deletable_group_targets(cx.session, raw_targets);
     if targets.is_empty() {
         cx.model.status = if skipped_home > 0 {
