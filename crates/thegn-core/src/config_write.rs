@@ -141,6 +141,41 @@ pub fn set_key(config_path: &Path, dotted: &str, val: &str) -> Result<()> {
     write_doc(config_path, &doc)
 }
 
+/// Set one dotted key to a string **array** (`repo_roots = ["a", "b"]`),
+/// creating intermediate tables. The array-valued sibling of [`set_key`].
+pub fn set_string_array(config_path: &Path, dotted: &str, items: &[String]) -> Result<()> {
+    let parts: Vec<&str> = dotted.split('.').filter(|s| !s.is_empty()).collect();
+    anyhow::ensure!(!parts.is_empty(), "empty key");
+    let mut doc = read_doc(config_path)?;
+    let mut tbl = doc.as_table_mut();
+    for seg in &parts[..parts.len() - 1] {
+        tbl = subtable(tbl, seg);
+    }
+    let mut arr = toml_edit::Array::new();
+    for it in items {
+        arr.push(it.as_str());
+    }
+    tbl.insert(parts[parts.len() - 1], value(arr));
+    write_doc(config_path, &doc)
+}
+
+/// Create or update a `[host.<name>]` ssh host (+ its `.ssh` subtable) in the
+/// global config, preserving comments. `ssh` is the `user@box[:port]` form the
+/// env/terminal wizards use; untouched sibling keys are kept on re-upsert.
+pub fn upsert_host(config_path: &Path, name: &str, ssh: &str) -> Result<()> {
+    anyhow::ensure!(!name.trim().is_empty(), "host name is empty");
+    anyhow::ensure!(!ssh.trim().is_empty(), "ssh target is empty");
+    let mut doc = read_doc(config_path)?;
+    let root = doc.as_table_mut();
+    let hosts = subtable(root, "host");
+    hosts.set_implicit(true);
+    let ht = subtable(hosts, name.trim());
+    ht.insert("reach", value("ssh"));
+    let st = subtable(ht, "ssh");
+    st.insert("host", value(ssh.trim()));
+    write_doc(config_path, &doc)
+}
+
 /// In a **repo** `.thegn.toml`, select an env with a top-level `env = "<name>"`
 /// (repos select, never define — this refuses to write any `[env.*]` table).
 pub fn select_env_in_repo(repo_toml: &Path, name: &str) -> Result<()> {
@@ -236,6 +271,69 @@ mod tests {
         let out = std::fs::read_to_string(&p).unwrap();
         assert_eq!(out.trim(), "env = \"fly-dev\"");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn set_string_array_round_trips_and_preserves_comments() {
+        let p = tmp("array.toml");
+        std::fs::write(&p, "# keep me\nworktrees_dir = \"~/wt\"\n").unwrap();
+        set_string_array(&p, "repo_roots", &["~/code".into(), "~/oss".into()]).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(out.contains("# keep me"), "comment preserved");
+        let doc = out.parse::<DocumentMut>().unwrap();
+        let arr = doc["repo_roots"].as_array().unwrap();
+        let items: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(items, ["~/code", "~/oss"]);
+        // Overwrite replaces the whole array.
+        set_string_array(&p, "repo_roots", &["~/work".into()]).unwrap();
+        let doc = std::fs::read_to_string(&p)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(doc["repo_roots"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn upsert_host_writes_reach_and_ssh_and_keeps_siblings() {
+        let p = tmp("host.toml");
+        std::fs::write(
+            &p,
+            "# cfg\n[host.other]\nreach = \"ssh\"\n[host.other.ssh]\nhost = \"me@old\"\n",
+        )
+        .unwrap();
+        upsert_host(&p, "build-box", "me@build.example.com:2222").unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(out.contains("# cfg"), "comment preserved");
+        let doc = out.parse::<DocumentMut>().unwrap();
+        assert_eq!(doc["host"]["build-box"]["reach"].as_str(), Some("ssh"));
+        assert_eq!(
+            doc["host"]["build-box"]["ssh"]["host"].as_str(),
+            Some("me@build.example.com:2222")
+        );
+        assert_eq!(
+            doc["host"]["other"]["ssh"]["host"].as_str(),
+            Some("me@old"),
+            "sibling host untouched"
+        );
+        // Re-upsert updates in place (no duplicate table).
+        upsert_host(&p, "build-box", "me@new").unwrap();
+        let doc = std::fs::read_to_string(&p)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            doc["host"]["build-box"]["ssh"]["host"].as_str(),
+            Some("me@new")
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn upsert_host_rejects_empty_inputs() {
+        let p = tmp("host-empty.toml");
+        assert!(upsert_host(&p, " ", "me@box").is_err());
+        assert!(upsert_host(&p, "box", "  ").is_err());
     }
 
     #[test]
