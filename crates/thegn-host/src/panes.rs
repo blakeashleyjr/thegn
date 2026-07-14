@@ -17,6 +17,14 @@ use thegn_core::store::WorkspaceStore;
 /// autostart logic inside the compositor. Set `THEGN_LOGIN_SHELL=1` to opt
 /// back into login-shell semantics.
 fn shell_argv_from(shell: &str, login: bool) -> Vec<String> {
+    // Login/interactive flags are POSIX-shell dialect; pwsh/cmd take a bare
+    // argv (there is no login mode to opt into).
+    if !matches!(
+        thegn_core::shellinv::flavor_of(shell),
+        thegn_core::shellinv::ShellFlavor::Posix
+    ) {
+        return vec![shell.into()];
+    }
     if login {
         return vec![shell.into(), "-l".into()];
     }
@@ -37,6 +45,7 @@ fn path_is_executable_file(path: &std::path::Path) -> bool {
     path.is_file()
 }
 
+#[cfg(not(windows))] // the windows resolver delegates to util::shell()
 fn command_on_path(name: &str) -> Option<String> {
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var)
@@ -53,27 +62,38 @@ fn resolve_pane_shell(shell_env: Option<String>) -> String {
         }
     }
 
-    for name in ["zsh", "bash", "fish", "sh"] {
-        if let Some(shell) = command_on_path(name) {
-            return shell;
-        }
+    // Windows has no `$SHELL` convention; the platform resolver (pwsh →
+    // powershell → %COMSPEC%) is the whole story — the unix probe chain
+    // below would bottom out at a nonexistent /bin/sh.
+    #[cfg(windows)]
+    {
+        thegn_core::util::shell()
     }
 
-    for shell in [
-        "/etc/profiles/per-user/blake/bin/zsh",
-        "/run/current-system/sw/bin/zsh",
-        "/bin/zsh",
-        "/run/current-system/sw/bin/bash",
-        "/bin/bash",
-        "/run/current-system/sw/bin/sh",
-        "/bin/sh",
-    ] {
-        if path_is_executable_file(std::path::Path::new(shell)) {
-            return shell.to_string();
+    #[cfg(not(windows))]
+    {
+        for name in ["zsh", "bash", "fish", "sh"] {
+            if let Some(shell) = command_on_path(name) {
+                return shell;
+            }
         }
-    }
 
-    "/bin/sh".into()
+        for shell in [
+            "/etc/profiles/per-user/blake/bin/zsh",
+            "/run/current-system/sw/bin/zsh",
+            "/bin/zsh",
+            "/run/current-system/sw/bin/bash",
+            "/bin/bash",
+            "/run/current-system/sw/bin/sh",
+            "/bin/sh",
+        ] {
+            if path_is_executable_file(std::path::Path::new(shell)) {
+                return shell.to_string();
+            }
+        }
+
+        "/bin/sh".into()
+    }
 }
 
 pub(crate) fn pane_shell_argv(
@@ -205,11 +225,7 @@ fn shell_words_join(argv: &[String]) -> String {
 }
 
 pub(crate) fn tool_drawer_argv(command: &str) -> Vec<String> {
-    vec![
-        thegn_core::util::shell(),
-        "-lc".into(),
-        format!("exec {}", command.trim()),
-    ]
+    thegn_core::shellinv::exec_argv(&thegn_core::util::shell(), command.trim())
 }
 
 /// Env for spawning yazi: an isolated `YAZI_CONFIG_HOME` so the user's own
@@ -300,6 +316,15 @@ impl Panes {
             replay_cfg: None,
             daemon_cfg: None,
         }
+    }
+
+    /// Insert a lightweight test-only pane under `id` so pane-reaping paths
+    /// (e.g. resident-pool eviction) have a real table entry to remove. No PTY
+    /// is spawned.
+    #[cfg(test)]
+    pub(crate) fn insert_test_pane(&mut self, id: u32) {
+        let (ctrl_tx, _ctrl_rx) = tokio_mpsc::channel::<thegn_svc::provider::ExecControl>(1);
+        self.table.insert(id, PtyPane::test_stream(ctrl_tx, 24, 80));
     }
 
     pub(crate) fn with_waker(tx: tokio_mpsc::Sender<PaneEvent>, waker: TerminalWaker) -> Self {
@@ -1281,6 +1306,21 @@ mod tests {
             shell_argv_from("/bin/bash", true),
             vec!["/bin/bash".to_string(), "-l".to_string()]
         );
+    }
+
+    #[test]
+    fn shell_argv_windows_shells_take_no_posix_flags() {
+        // pwsh/cmd have no login or `-i` mode: bare argv, login flag ignored.
+        for login in [false, true] {
+            assert_eq!(
+                shell_argv_from(r"C:\Program Files\PowerShell\7\pwsh.exe", login),
+                vec![r"C:\Program Files\PowerShell\7\pwsh.exe".to_string()]
+            );
+            assert_eq!(
+                shell_argv_from("cmd.exe", login),
+                vec!["cmd.exe".to_string()]
+            );
+        }
     }
 
     #[test]

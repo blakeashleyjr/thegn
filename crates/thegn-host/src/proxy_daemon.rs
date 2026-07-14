@@ -33,11 +33,7 @@ impl Drop for ProxyHandle {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
         if let Some(pid) = *self.shared.pid.lock().unwrap() {
-            nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            )
-            .ok();
+            crate::platform::terminate_pid(pid);
         }
     }
 }

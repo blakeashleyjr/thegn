@@ -36,7 +36,10 @@ pub const GROUPS: &[(&str, &[&str])] = &[
         &["notify", "logs", "share", "forward", "sandbox-argv"],
     ),
     ("Control plane", &["serve", "session", "pair"]),
-    ("Meta", &["config", "theme", "doctor", "completions"]),
+    (
+        "Meta",
+        &["config", "theme", "doctor", "setup", "completions"],
+    ),
 ];
 
 /// Render the grouped Commands block from the live clap command tree.

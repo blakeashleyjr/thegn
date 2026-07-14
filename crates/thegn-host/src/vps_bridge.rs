@@ -44,7 +44,6 @@ fn resolve_ip(cfg: &Config, name: &str) -> Result<String> {
 /// Replaces this process on success (the pane/exec owns the PTY directly).
 pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
     use std::io::IsTerminal;
-    use std::os::unix::process::CommandExt;
 
     let ip = resolve_ip(cfg, name)?;
     let (key, _pubkey) = crate::agent::sprite_ssh_keypair()?;
@@ -65,6 +64,20 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
         argv.extend(cmd.iter().cloned());
     }
     // CLI bridge process: exec replaces us, ssh owns the PTY/stdio from here.
-    let err = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
-    Err(err).with_context(|| format!("vps-ssh: exec {}", argv.join(" ")))
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
+        Err(err).with_context(|| format!("vps-ssh: exec {}", argv.join(" ")))
+    }
+    // No exec() on Windows: spawn, wait, and mirror the exit code — ssh still
+    // owns the console's stdio for its lifetime.
+    #[cfg(not(unix))]
+    {
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .status()
+            .with_context(|| format!("vps-ssh: run {}", argv.join(" ")))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }

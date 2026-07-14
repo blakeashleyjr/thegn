@@ -17,3 +17,22 @@ pub(crate) fn default_prompt_kind() -> String {
 pub(crate) fn default_git_context() -> String {
     "global".into()
 }
+
+/// Default `[sandbox] backend_chain` probe order. `"jobobject"` is the
+/// win-native kill-on-close Job Object scoping — the OCI entries decline on
+/// native Windows (Linux containers can't bind-mount the worktree at its real
+/// path; use WSL2 for container sandboxes) and `jobobject` probes Absent
+/// everywhere else, so the one chain serves every platform.
+pub(crate) fn default_backend_chain() -> Vec<String> {
+    [
+        "podman-rootless",
+        "podman-rootful",
+        "docker",
+        "bwrap",
+        "jobobject",
+        "host",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}

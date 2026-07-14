@@ -71,6 +71,17 @@
   # picks it up. Inert on macOS: the var is scoped to the linux-gnu triple.
   env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
 
+  # mingw-w64 cross C toolchain for `just check-cross`'s whole-workspace
+  # windows-gnu check (the native-Windows port's per-PR gate). `cargo check`
+  # still runs C-dep build scripts (bundled sqlite, vendored libgit2, stacker),
+  # and the `cc` crate resolves the target compiler from these vars. Scoped to
+  # the windows-gnu triple — never touches host builds. Binutils (ar/dlltool)
+  # ride along in the same wrapper bin dir.
+  env.CC_x86_64_pc_windows_gnu = "${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-cc";
+  env.CXX_x86_64_pc_windows_gnu = "${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-c++";
+  env.AR_x86_64_pc_windows_gnu = "${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-ar";
+  env.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-cc";
+
   # Compilation cache. sccache caches per-crate rustc invocations so cold
   # worktrees / branch switches reuse artifacts instead of recompiling from
   # scratch. sccache and Cargo incremental compilation are mutually exclusive

@@ -463,9 +463,8 @@ config_enum! {
     } default = Off;
 }
 
-/// `[merge_queue]` — the local "fold-actor": fold parallel worktree branches into
-/// `target_branch` in the object DB (no checkout), auto-landing clean merges and
-/// deferring conflicts. See `thegn_core::fold` + host `integrate`/`merge_driver`.
+/// `[merge_queue]` — the local "fold-actor": fold worktree branches onto
+/// `target_branch` in the object DB (no checkout); land clean, defer conflicts.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct MergeQueueConfig {
@@ -473,26 +472,28 @@ pub struct MergeQueueConfig {
     pub enabled: bool,
     /// Branch the fold advances. `"auto"` resolves it per repo (HEAD/default).
     pub target_branch: String,
-    /// Shell command gating the CAS-advance (throwaway worktree). Empty disables
-    /// it. E.g. `just ci` / `cargo test --workspace`.
+    /// Shell command gating the CAS-advance. Empty disables it. Keep it lean
+    /// (e.g. `just test`): pre-push already ran clippy + test before enqueue.
     pub gate_command: String,
     /// Whether to run `gate_command` at all.
     pub gate_on: bool,
+    /// Reuse a stable per-repo gate worktree + `target/` between folds (warm rebuild); `false` ⇒ throwaway `/tmp` (always cold).
+    pub gate_reuse_worktree: bool,
+    /// `CARGO_TARGET_DIR` for the gate. Empty ⇒ `$XDG_STATE_HOME/thegn/gate/<repo>/target`.
+    pub gate_target_dir: String,
     /// On a red gate, bisect to defer just the offending branch, not the batch.
     pub bisect_on_red: bool,
     /// Auto-commit uncommitted worktree work before folding (else skip dirty ones).
     pub snapshot_dirty: bool,
-    /// Conflicts confined to these paths (exact/basename) are regenerable, not
-    /// handed to a human (e.g. `Cargo.lock` matches `crates/x/Cargo.lock`).
+    /// Conflicts confined to these paths (exact/basename) are regenerable, not handed to a human (e.g. `Cargo.lock`).
     pub regenerate_paths: Vec<String>,
-    /// Command (throwaway worktree) that rebuilds `regenerate_paths` to auto-land a
+    /// Throwaway-worktree command rebuilding `regenerate_paths` to auto-land a
     /// lockfile-only conflict. Empty defers instead.
     pub regenerate_command: String,
     /// What to do with a deferred (conflicting) branch.
     pub conflict_handoff: ConflictHandoff,
-    /// Headless CLI agent the queue driver runs (in the branch's worktree) to
-    /// rebase/resolve/fix, then re-folds. Shell template with `{prompt}`/`{branch}`/
-    /// `{target}`; empty ⇒ agent handoff degrades to notify. E.g. `claude -p {prompt}`.
+    /// Headless CLI agent the driver runs in the branch's worktree to rebase/fix,
+    /// then re-folds. Template `{prompt}`/`{branch}`/`{target}`; empty ⇒ notify.
     pub agent_command: String,
     /// Queue driver: CAS-advance on green; off ⇒ stop at `ready` for a `merge land`.
     pub auto_land: bool,
@@ -500,18 +501,15 @@ pub struct MergeQueueConfig {
     pub agent_max_attempts: u32,
     /// Watchdog (seconds) for one agent invocation. 0 disables it.
     pub agent_timeout_secs: u64,
-    /// Master switch for organizing worktrees into sidebar folders as their
-    /// branches move through the queue. Off ⇒ none of the fields below apply.
+    /// Master switch for filing worktrees into sidebar folders as branches move through the queue. Off ⇒ fields below inert.
     pub organize_folders: bool,
-    /// Folder a worktree is filed into when its branch is enqueued (`queued`).
-    /// Empty ⇒ don't file on enqueue.
+    /// Folder for an enqueued (`queued`) worktree. Empty ⇒ don't file on enqueue.
     pub queued_folder: String,
     /// What to do when a branch lands. See [`OnLanded`].
     pub on_landed: OnLanded,
     /// Folder for a landed branch when `on_landed = "move"`. Empty ⇒ don't file.
     pub merged_folder: String,
-    /// Folder for a branch that fails to land (deferred/gate_failed/needs_human).
-    /// Empty ⇒ leave failed branches wherever they are.
+    /// Folder for a branch that fails to land. Empty ⇒ leave it in place.
     pub failed_folder: String,
 }
 
@@ -522,6 +520,8 @@ impl Default for MergeQueueConfig {
             target_branch: "auto".to_string(),
             gate_command: String::new(),
             gate_on: true,
+            gate_reuse_worktree: true,
+            gate_target_dir: String::new(),
             bisect_on_red: true,
             snapshot_dirty: false,
             regenerate_paths: vec!["Cargo.lock".to_string()],
@@ -1514,6 +1514,12 @@ pub struct SessionConfig {
     pub restore_grace_secs: u64,
     /// Whether creating a worktree (Alt+w) jumps to its new tab vs. background.
     pub focus_on_create: bool,
+    /// Max **parked** workspaces kept resident (panes alive) for instant
+    /// switch-back, beyond the active one. Past this the least-recently-used
+    /// parked workspace is evicted and its panes reaped (it re-resurrects on the
+    /// next visit), bounding PTY fd/thread growth over a long multi-workspace
+    /// session. `0` = no pooling (reap on every switch); default is generous.
+    pub resident_pool_limit: usize,
 }
 
 impl Default for SessionConfig {
@@ -1522,6 +1528,7 @@ impl Default for SessionConfig {
             scrollback_lines: 500,
             restore_grace_secs: 600,
             focus_on_create: true,
+            resident_pool_limit: 16,
         }
     }
 }
@@ -1995,8 +2002,7 @@ pub struct EnvConfig {
     /// global default allows failover. Resolved by [`Config::env_failover`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failover: Option<bool>,
-    /// Requested placement class for the engine (`None` ⇒ inherit
-    /// `[placement] mode`). Clamped by the resolved mode floor.
+    /// Requested placement class (`None` ⇒ inherit `[placement] mode`); clamped by the resolved mode floor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placement_mode: Option<PlacementModePref>,
     /// `[env.<name>.resources]` — the declared resource ask the placement
@@ -2656,16 +2662,7 @@ impl Default for SandboxConfig {
             backend: SandboxBackend::Auto,
             default_backend: SandboxBackend::Auto,
             default_env: String::new(),
-            backend_chain: [
-                "podman-rootless",
-                "podman-rootful",
-                "docker",
-                "bwrap",
-                "host",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+            backend_chain: crate::config_defaults::default_backend_chain(),
             image: String::new(),
             profile: SandboxProfile::Hardened,
             agent_profile: SandboxProfile::Sealed,

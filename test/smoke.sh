@@ -249,6 +249,8 @@ check "ci runs --json degrades gracefully" \
 # Grouped help + shell completions.
 check "--help shows the Workspace group" "'$SZ' --help | grep -q 'Workspace:'"
 check "--help shows the Forge group" "'$SZ' --help | grep -q 'Forge:'"
+check "setup appears in --help (onboarding wizard)" \
+  "'$SZ' --help | grep -q '^  setup '"
 check "--help hides the legacy verbs" \
   "! '$SZ' --help | grep -qE '^  (repos|recent) '"
 check "completions bash emits a script" \

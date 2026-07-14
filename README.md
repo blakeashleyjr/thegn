@@ -137,6 +137,13 @@ the current terminal, whatever it is. thegn shells out to `git` (and
 rustup + Homebrew deps) and offers to install what's missing, then builds.
 Nothing is installed without asking.
 
+**Windows (native, no WSL):** with [rustup](https://rustup.rs) + the VS Build
+Tools installed, `cargo install --path crates/thegn-host` (or grab the
+`thegn-x86_64-pc-windows-msvc` artifact from any CI run). Run it inside
+[Windows Terminal](https://aka.ms/terminal). Container sandboxing is a
+Linux/WSL2 feature — native panes run host-side, scoped by Job Objects. See
+CONTRIBUTING "Windows (native) notes" for details.
+
 ## How it works
 
 - **Three crates.** `thegn-core` (substrate-agnostic domain logic: layered

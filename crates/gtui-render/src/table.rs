@@ -11,22 +11,13 @@ impl TableRenderer {
         let mut rows = Vec::new();
         if !frame.fields.is_empty() {
             // Find max length among all series
-            let max_len = frame
-                .fields
-                .iter()
-                .map(|f| f.series.len())
-                .max()
-                .unwrap_or(0);
+            let max_len = frame.fields.iter().map(|f| f.len()).max().unwrap_or(0);
 
             for i in 0..max_len {
                 let mut row_data = Vec::new();
                 for field in &frame.fields {
                     // MVP naive string formatting for the table cell
-                    let val_str = match field.series.get(i) {
-                        Ok(val) => val.to_string(),
-                        Err(_) => "".to_string(),
-                    };
-                    row_data.push(val_str);
+                    row_data.push(field.cell(i));
                 }
                 rows.push(Row::new(row_data));
             }

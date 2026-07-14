@@ -154,6 +154,9 @@ pub(crate) struct DrainSummary {
     pub disconnected: bool,
     /// Input was discovered mid-drain and the drain aborted for it.
     pub preempted: bool,
+    /// Panes whose child exited this pass (the onboarding wizard watches for
+    /// its spawned `gh auth login` / agent-setup tab closing).
+    pub exited: Vec<u32>,
 }
 
 /// Everything the moved Output/Exit handlers touch, borrowed from the loop.
@@ -239,6 +242,7 @@ pub(crate) fn drain<T: Terminal>(
 
     // 2. Exits — flush the pane's stashed tail into its emulator first, so
     // its final output reaches scrollback before the pane leaves the table.
+    summary.exited = exits.iter().map(|(id, _)| *id).collect();
     for (id, code) in exits {
         let tail = backlog.drain_pane(id);
         if !tail.is_empty() {
@@ -639,7 +643,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
                     // through item-524 process attention.
                     if let Ok(Some((dispatch_id, issue_id))) = db.dispatch_info_for_worktree(&wt) {
                         let kind = if failed { "agent_failed" } else { "agent_done" };
-                        let base = wt.rsplit('/').next().unwrap_or(&wt);
+                        let base = thegn_core::util::basename(&wt);
                         let msg = format!(
                             "agent {} in {base}",
                             if failed { "crashed" } else { "finished" }

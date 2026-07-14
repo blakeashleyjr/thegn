@@ -84,8 +84,9 @@ pub fn provider(id: &str) -> Option<&'static Provider> {
 /// (`/usr/bin/codex --foo` → codex).
 pub fn infer_provider(command: &str) -> Option<&'static Provider> {
     let prog = command.split_whitespace().next()?;
-    let base = prog.rsplit('/').next().unwrap_or(prog);
-    provider(base)
+    // Both separators + `.exe` so `C:\…\codex.exe` infers like `/usr/bin/codex`.
+    let base = crate::util::basename(prog);
+    provider(base.strip_suffix(".exe").unwrap_or(base))
 }
 
 /// The provider for an agent `choice`: an explicit `provider` field on the

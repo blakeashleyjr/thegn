@@ -22,11 +22,27 @@ use crate::sandbox::{Backend, backend_prefix, run_local_output};
 /// for a remote placement, would ship a `cd <local-path>` to the wrong machine).
 pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option<Backend> {
     let suitable = |b: Backend| -> bool {
+        // Native Windows declines OCI runtimes even when Docker/Podman Desktop
+        // is installed: their Linux containers live in a WSL2 VM that cannot
+        // bind-mount the worktree at its real absolute path (git worktree
+        // metadata carries host paths), breaking the sandbox contract. WSL as
+        // an explicit backend stays eligible; win-native scoping is suitable.
+        if cfg!(windows) && b.is_oci() && b != Backend::Wsl {
+            return false;
+        }
         match b {
             Backend::None => true,
             _ if b.is_oci() => true,
             _ if b.is_host_toolchain() => true,
             _ => false,
+        }
+    };
+    let unsuitable_reason = |b: Backend| -> &'static str {
+        if cfg!(windows) && b.is_oci() && b != Backend::Wsl {
+            " on native Windows (Linux containers can't bind-mount the worktree \
+             at its real path — use WSL2 for container sandboxes)"
+        } else {
+            " for this image mode"
         }
     };
 
@@ -57,7 +73,7 @@ pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option
                         if suitable(b) {
                             ""
                         } else {
-                            " for this image mode"
+                            unsuitable_reason(b)
                         }
                     ),
                 );

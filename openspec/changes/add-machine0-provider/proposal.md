@@ -20,7 +20,7 @@ The provider is **VPS-shaped**: the control plane is MCP, the data plane is ssh.
 - **Data plane → ssh.** machine0's MCP `ssh_exec` tool is one-shot with no PTY,
   so the interactive pane, `run_exec`, file sync, and the NixOS flake apply ride
   **plain ssh with thegn's managed keypair** (`ExecKind::Ssh`) — reusing the VPS
-  ssh-shim (`vps/ssh_shim.rs`). We import *our own* public key (managed-key
+  ssh-shim (`vps/ssh_shim.rs`). We import _our own_ public key (managed-key
   private material is never returned over MCP), so we hold the private half.
 - **NixOS.** A machine0 NixOS image (`template = "nixos-25-11-loaded"`) plus a
   new `provision_flake` config key: after create, thegn applies the flake via
@@ -37,7 +37,7 @@ panes/chrome-reads/persisted-location route through the ssh transport.
   **AE 749** (`add-vps-providers`, the VPS core this ssh data plane reuses) and
   **AE 756** (`add-do-fly-providers`, the ssh-transport `Provider` precedent).
   Complements the **mcp-servers** capability (AL) by making thegn-svc an MCP
-  *client* for the first time.
+  _client_ for the first time.
 - **thegn-svc** — new `machine0` module (`machine0/mcp.rs` MCP-over-HTTP client,
   `machine0/mod.rs` `Machine0Provider`) with a `Provider::Machine0` variant
   (caps: `files`, `checkpoints`, `scale_to_zero`). Reuses `vps::ssh_shim::SshShim`

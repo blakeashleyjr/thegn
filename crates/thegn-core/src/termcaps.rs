@@ -203,6 +203,11 @@ fn detect_color(env: &TermEnv) -> ColorDepth {
 
 /// Resolve the terminal's glyph level from locale + terminal identity.
 fn detect_unicode(env: &TermEnv) -> UnicodeLevel {
+    // Windows Terminal renders full Unicode natively but sets no POSIX locale
+    // vars — don't let the locale check demote it to ASCII.
+    if env.wt_session.is_some() {
+        return UnicodeLevel::Full;
+    }
     if !locale_is_utf8(env) {
         // A non-UTF-8 (or unset) locale can't be trusted with multibyte glyphs.
         return UnicodeLevel::Ascii;
@@ -223,17 +228,38 @@ pub fn detect(env: &TermEnv) -> TermCaps {
     TermCaps {
         color: detect_color(env),
         unicode: detect_unicode(env),
+        // Windows Terminal renders undercurl + DECSET 2026 synchronized
+        // output (both since WT 1.18) but isn't named by $TERM/$TERM_PROGRAM.
         undercurl: undercurl_supported_env(
             env.term.as_deref(),
             env.term_program.as_deref(),
             env.vte_version.as_deref(),
-        ),
+        ) || env.wt_session.is_some(),
         // The Linux text console reports mouse poorly; dumb terminals not at all.
         mouse: !dumb && term_l != "linux",
         // OSC 52 always has the host-side system-clipboard fallback.
         osc52: true,
-        sync_output: is_modern(env),
+        sync_output: is_modern(env) || env.wt_session.is_some(),
     }
+}
+
+/// Whether the environment shows evidence of a modern terminal host: Windows
+/// Terminal, a known-modern emulator, an explicit truecolor advertisement, or
+/// at least a 256-color `$TERM`. The Windows host refuses to start the
+/// compositor without it — legacy conhost.exe renders VT sequences too poorly
+/// to degrade gracefully, and looking broken is worse than a clear error.
+pub fn modern_terminal_evidence(env: &TermEnv) -> bool {
+    if env.wt_session.is_some() || is_modern(env) {
+        return true;
+    }
+    if let Some(ct) = env.colorterm.as_deref() {
+        let ct = ct.to_ascii_lowercase();
+        if ct.contains("truecolor") || ct.contains("24bit") {
+            return true;
+        }
+    }
+    let term_l = env.term.as_deref().unwrap_or("").to_ascii_lowercase();
+    term_l.contains("256color") || term_l.contains("-256")
 }
 
 /// A table of every chrome glyph that has an ASCII fallback. Selected by
@@ -306,45 +332,45 @@ pub const UNICODE: GlyphSet = GlyphSet {
     box_br: "╯",
     box_h: "─",
     box_v: "│",
-    dot_filled: "\u{25cf}",     // ●
-    dot_hollow: "\u{25cb}",     // ○
-    cross_heavy: "\u{2716}",    // ✖
-    arrow_up: "\u{2191}",       // ↑
-    arrow_down: "\u{2193}",     // ↓
-    diamond_filled: "\u{25c6}", // ◆
-    diamond_hollow: "\u{25c7}", // ◇
-    brand_sigil: "\u{00fe}",    // þ — Latin-1, width 1, safe at Full AND Basic
-    check: "\u{2713}",          // ✓
-    cross: "\u{2717}",          // ✗
-    ellipsis: "\u{2026}",       // …
-    middot: "\u{00b7}",         // ·
-    refresh: "\u{21bb}",        // ↻
-    emdash: "\u{2014}",         // —
-    warn: "\u{26a0}",           // ⚠
-    hex: "\u{2b21}",            // ⬡
-    mail: "\u{2709}",           // ✉
-    moon: "\u{23fe}",           // ⏾
-    attention: "\u{270b}",      // ✋ (one-line swap to `⚠` if emoji width misbehaves)
-    caret_closed: "\u{25b8}",   // ▸
-    caret_open: "\u{25be}",     // ▾
-    tree_tee: "\u{251c}",       // ├
-    tree_corner: "\u{2514}",    // └
-    half_block_r: "\u{2590}",   // ▐
-    chevron: "\u{203a}",        // ›
-    folder: "\u{25aa}",         // ▪
-    dir: "\u{2302}",            // ⌂
-    host_local: "\u{2261}",     // ≡
-    host_remote: "\u{21c5}",    // ⇅
-    flag: "\u{2691}",           // ⚑
-    half_dot: "\u{25d0}",       // ◐
-    quote_open: "\u{00ab}",     // «
-    quote_close: "\u{00bb}",    // »
-    block_full: "\u{2588}",     // █
-    block_top: "\u{2580}",      // ▀
-    block_bot: "\u{2584}",      // ▄
+    dot_filled: "\u{25cf}",                                  // ●
+    dot_hollow: "\u{25cb}",                                  // ○
+    cross_heavy: "\u{2716}",                                 // ✖
+    arrow_up: "\u{2191}",                                    // ↑
+    arrow_down: "\u{2193}",                                  // ↓
+    diamond_filled: "\u{25c6}",                              // ◆
+    diamond_hollow: "\u{25c7}",                              // ◇
+    brand_sigil: "\u{00fe}",  // þ — Latin-1, width 1, safe at Full AND Basic
+    check: "\u{2713}",        // ✓
+    cross: "\u{2717}",        // ✗
+    ellipsis: "\u{2026}",     // …
+    middot: "\u{00b7}",       // ·
+    refresh: "\u{21bb}",      // ↻
+    emdash: "\u{2014}",       // —
+    warn: "\u{26a0}",         // ⚠
+    hex: "\u{2b21}",          // ⬡
+    mail: "\u{2709}",         // ✉
+    moon: "\u{23fe}",         // ⏾
+    attention: "\u{270b}",    // ✋ (one-line swap to `⚠` if emoji width misbehaves)
+    caret_closed: "\u{25b8}", // ▸
+    caret_open: "\u{25be}",   // ▾
+    tree_tee: "\u{251c}",     // ├
+    tree_corner: "\u{2514}",  // └
+    half_block_r: "\u{2590}", // ▐
+    chevron: "\u{203a}",      // ›
+    folder: "\u{25aa}",       // ▪
+    dir: "\u{2302}",          // ⌂
+    host_local: "\u{2261}",   // ≡
+    host_remote: "\u{21c5}",  // ⇅
+    flag: "\u{2691}",         // ⚑
+    half_dot: "\u{25d0}",     // ◐
+    quote_open: "\u{00ab}",   // «
+    quote_close: "\u{00bb}",  // »
+    block_full: "\u{2588}",   // █
+    block_top: "\u{2580}",    // ▀
+    block_bot: "\u{2584}",    // ▄
     spin: &["\u{25d0}", "\u{25d3}", "\u{25d1}", "\u{25d2}"], // ◐ ◓ ◑ ◒
-    bar_fill: "\u{2593}",       // ▓
-    bar_empty: "\u{2591}",      // ░
+    bar_fill: "\u{2593}",     // ▓
+    bar_empty: "\u{2591}",    // ░
 };
 
 /// 7-bit ASCII fallbacks for terminals/fonts that can't render [`UNICODE`].
@@ -646,6 +672,39 @@ mod tests {
         let mut e = env("xterm-256color");
         e.wt_session = Some("abc-123".into());
         assert_eq!(detect_color(&e), ColorDepth::Truecolor);
+    }
+
+    #[test]
+    fn windows_terminal_gets_full_unicode_without_posix_locale() {
+        // WT sets no LANG/LC_*: the locale check must not demote it to ASCII.
+        let e = TermEnv {
+            wt_session: Some("abc-123".into()),
+            ..Default::default()
+        };
+        let caps = detect(&e);
+        assert_eq!(caps.unicode, UnicodeLevel::Full);
+        assert!(caps.undercurl, "WT ≥1.18 renders undercurl");
+        assert!(caps.sync_output, "WT ≥1.18 supports DECSET 2026");
+    }
+
+    #[test]
+    fn modern_terminal_evidence_gates_conhost() {
+        // Bare conhost: no WT_SESSION, no TERM/COLORTERM — refused.
+        assert!(!modern_terminal_evidence(&TermEnv::default()));
+        // Windows Terminal.
+        let wt = TermEnv {
+            wt_session: Some("s".into()),
+            ..Default::default()
+        };
+        assert!(modern_terminal_evidence(&wt));
+        // Known-modern emulator name, truecolor advert, or a 256-color TERM.
+        assert!(modern_terminal_evidence(&env("wezterm")));
+        let ct = TermEnv {
+            colorterm: Some("truecolor".into()),
+            ..Default::default()
+        };
+        assert!(modern_terminal_evidence(&ct));
+        assert!(modern_terminal_evidence(&env("xterm-256color")));
     }
 
     #[test]

@@ -132,6 +132,15 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 # gated to `cfg(windows)` in the `thegn-media` leaf (cross-checked, never
 # linked on Linux).
 windows = "0.58"
+# Raw Win32 bindings for the host's platform seam (src/platform/windows.rs):
+# stderr handle redirect, process liveness/termination, and (Phase 3) Job
+# Objects. Target-gated to `cfg(windows)` — never linked on unix.
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_Console",
+  "Win32_System_Threading",
+  "Win32_System_JobObjects",
+] }
 # --- LLM proxy (group U/V): the one new HTTP-server dependency. tokio/reqwest
 # are widened with extra features inside the thegn-proxy crate's own manifest
 # (cargo merges them with the workspace base). ---
@@ -184,6 +193,18 @@ thegn-media = { path = "crates/thegn-media" }
 # --- dev/bench tooling ---
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+
+[profile.dev]
+# Build-speed tuning for the inner loop. `line-tables-only` keeps backtraces
+# (file:line) meaningful while skipping full DWARF variable/type info — the bulk
+# of debuginfo codegen + link cost. `unpacked` split-debuginfo keeps debug data
+# out of the object files the linker stitches, cutting incremental link time.
+# Deliberately NOT bumping `opt-level` on deps ([profile.dev.package."*"]): that
+# trades build time for dep runtime, the opposite of what we want here. For an
+# interactive lldb/gdb session that needs full locals, override with a scratch
+# profile (`debug = true`).
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
 
 [profile.release]
 strip = true

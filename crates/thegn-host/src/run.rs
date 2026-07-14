@@ -463,6 +463,21 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // `THEGN_LOG` selects the `thegn::perf` target. Off by default, so every
     // instrumentation hook is a single relaxed atomic load.
     crate::perf::init();
+
+    // Lift the open-fd ceiling before any PTY/git work: as its own multiplexer,
+    // thegn holds one PTY master fd per live pane across every resident
+    // workspace, and fd exhaustion makes every git read fail at once (the panel
+    // header collapses to "—"). Best-effort; logged in the startup waterfall.
+    if let Some((soft, hard)) = crate::fd_limit::raise_fd_limit() {
+        tracing::info!(
+            target: "thegn::startup",
+            since_start_ms = start.elapsed().as_millis() as u64,
+            fd_soft = soft,
+            fd_hard = hard,
+            "raised RLIMIT_NOFILE"
+        );
+    }
+
     // Arm the in-process sampling profiler (no-op unless built `--features
     // profiling`): SIGUSR2 toggles a flamegraph capture from the live process.
     crate::profile::install();
@@ -476,7 +491,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // scrolls the alt screen and corrupts the damage-tracked frame — ghost
     // tabbars / doubled panel headers. Redirect fd 2 to a file for the whole
     // session; the guard restores it on exit so post-exit errors still print.
-    let _stderr_guard = redirect_stderr_to_logfile();
+    let _stderr_guard = crate::platform::redirect_stderr_to_logfile();
 
     let caps = Capabilities::new_from_env().context("term capabilities")?;
     let mut term = new_terminal(caps).context("open terminal")?;
@@ -829,7 +844,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
     let (ai_metrics_tx, ai_metrics_rx) =
         tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
-    spawn_ai_sidecar(waker.clone(), ai_metrics_tx);
+    crate::ai_sidecar::spawn_ai_sidecar(waker.clone(), ai_metrics_tx);
     crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
     // The stats cadence is user-cyclable at runtime (click the top-right
     // stats block); the ticker thread reads it per tick.
@@ -878,31 +893,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         thegn_core::event_bus::NotificationUrgency::parse(&cfg.notifications.desktop_min_urgency),
     );
 
-    // Graceful shutdown on SIGTERM / SIGHUP: set a flag and pulse the waker so
-    // the blocking poll_input returns and the loop exits at the top of its next
-    // iteration, persisting session state before returning.
+    // Graceful shutdown on SIGTERM/SIGHUP (unix) or console-close (Windows):
+    // set a flag and pulse the waker so the blocking poll_input returns and the
+    // loop exits at the top of its next iteration, persisting session state
+    // before returning.
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let flag = shutdown.clone();
-        let sig_waker = waker.clone();
-        tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut term = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut hup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            tokio::select! {
-                _ = term.recv() => {}
-                _ = hup.recv() => {}
-            }
-            flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = sig_waker.wake();
-        });
-    }
+    crate::platform::install_shutdown_signal(shutdown.clone(), waker.clone());
 
     // Steady-state bench window (`THEGN_BENCH_RUN_MS`): run the full loop —
     // ticker, hydration, tokio pool and all — for a fixed window then exit, so
@@ -962,37 +958,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Frame is torn down; branded `msg::*` may print to stderr again.
     thegn_core::msg::set_tui_active(false);
     result
-}
-
-/// Redirect process stderr to `$XDG_STATE_HOME/thegn/logs/thegn-stderr.log`
-/// for the compositor's lifetime. Returns a guard whose `Drop` restores the
-/// original fd. `None` (no redirect) if any step fails — never blocks startup.
-fn redirect_stderr_to_logfile() -> Option<StderrGuard> {
-    use std::os::unix::io::AsRawFd;
-    let dir = thegn_core::util::xdg_state_home().join("thegn/logs");
-    std::fs::create_dir_all(&dir).ok()?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("thegn-stderr.log"))
-        .ok()?;
-    let saved = nix::unistd::dup(2).ok()?;
-    if nix::unistd::dup2(file.as_raw_fd(), 2).is_err() {
-        nix::unistd::close(saved).ok();
-        return None;
-    }
-    Some(StderrGuard { saved })
-}
-
-struct StderrGuard {
-    saved: std::os::unix::io::RawFd,
-}
-
-impl Drop for StderrGuard {
-    fn drop(&mut self) {
-        nix::unistd::dup2(self.saved, 2).ok();
-        nix::unistd::close(self.saved).ok();
-    }
 }
 
 /// Persist the supervisor's live pin set to `session_state.pin_state` (best
@@ -2007,76 +1972,12 @@ fn prune_vanished_group(session: &mut crate::session::Session, gi: usize) -> Vec
     ids
 }
 
-/// A workspace parked in the [`WorkspacePool`]: just the center pane trees and
-/// the active group index. Its `PtyPane`s stay live in `Panes` (we never reap on
-/// a switch), so restoring it reattaches the still-running processes by id. The
-/// drawer rides the shared (dir-keyed) `DrawerPool`, so it isn't parked here.
-pub(crate) struct ResidentWorkspace {
-    pub(crate) worktrees: Vec<crate::session::WorktreeGroup>,
-    pub(crate) active: usize,
-}
-
-/// Keeps every visited workspace's panes alive in memory, keyed by `repo_path`
-/// (`Session::id`). Switching parks the outgoing workspace and restores the
-/// target's live panes instead of killing and respawning them.
-#[derive(Default)]
-pub(crate) struct WorkspacePool {
-    map: std::collections::HashMap<String, ResidentWorkspace>,
-}
-
-impl WorkspacePool {
-    fn contains(&self, repo: &str) -> bool {
-        self.map.contains_key(repo)
-    }
-    fn take(&mut self, repo: &str) -> Option<ResidentWorkspace> {
-        self.map.remove(repo)
-    }
-    pub(crate) fn stash(&mut self, repo: String, rw: ResidentWorkspace) {
-        self.map.insert(repo, rw);
-    }
-}
-
-/// Move a freshly cold-resurrected workspace's pane ids onto a disjoint range
-/// reserved past every live pane, so its persisted tree can't alias a live pane
-/// of another resident workspace (the bleed the old reap-on-switch prevented).
-/// `materialize_with_specs` then spawns real panes over these placeholders.
-pub(crate) fn remap_cold_workspace_ids(session: &mut crate::session::Session, panes: &mut Panes) {
-    for g in &mut session.worktrees {
-        for tab in &mut g.tabs {
-            let mut uniq = tab.center.pane_ids();
-            uniq.sort_unstable();
-            uniq.dedup();
-            if uniq.is_empty() {
-                continue;
-            }
-            let base = panes.reserve_ids(uniq.len() as u32);
-            let map: std::collections::HashMap<u32, u32> = uniq
-                .iter()
-                .enumerate()
-                .map(|(i, &old)| (old, base + i as u32))
-                .collect();
-
-            tab.center
-                .remap(&mut |id| map.get(&id).copied().unwrap_or(id));
-            tab.focused_pane = map
-                .get(&tab.focused_pane)
-                .copied()
-                .unwrap_or(tab.focused_pane);
-            tab.pane_cwds = std::mem::take(&mut tab.pane_cwds)
-                .into_iter()
-                .map(|(id, cwd)| (map.get(&id).copied().unwrap_or(id), cwd))
-                .collect();
-            tab.pane_cmds = std::mem::take(&mut tab.pane_cmds)
-                .into_iter()
-                .map(|(id, cmd)| (map.get(&id).copied().unwrap_or(id), cmd))
-                .collect();
-            tab.pane_sessions = std::mem::take(&mut tab.pane_sessions)
-                .into_iter()
-                .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
-                .collect();
-        }
-    }
-}
+/// The resident-workspace pool, the parked-workspace type, and the cold-
+/// resurrect id remap live in the [`crate::workspace_pool`] sibling module
+/// (bounded LRU eviction, pane reaping).
+pub(crate) use crate::workspace_pool::{
+    ResidentWorkspace, WorkspacePool, remap_cold_workspace_ids,
+};
 
 /// Switch the active workspace to `target` (optionally landing on the named
 /// group), keeping the outgoing workspace's panes alive in `pool`. Returns
@@ -2130,7 +2031,7 @@ pub(crate) fn switch_workspace(
         session.id = target.to_string();
         session.worktrees = rw.worktrees;
         session.active = rw.active;
-        pool.stash(prev_id, parked);
+        pool.stash(prev_id, parked, panes);
         land_on(session, group);
         let _ = db.set_active_workspace(target);
         return true;
@@ -2151,7 +2052,7 @@ pub(crate) fn switch_workspace(
     if !landed && session.switch_to_workspace(target, db).is_err() {
         return false;
     }
-    pool.stash(prev_id, snapshot);
+    pool.stash(prev_id, snapshot, panes);
     remap_cold_workspace_ids(session, panes);
     true
 }
@@ -5262,7 +5163,7 @@ fn build_search_sources<'a>(
         SearchScope::Workspace => {
             // All worktrees in the active session.
             for g in &session.worktrees {
-                let wt_name = g.path.rsplit('/').next().unwrap_or(&g.name).to_string();
+                let wt_name = thegn_core::util::basename(&g.path).to_string();
                 for (ti, tab) in g.tabs.iter().enumerate() {
                     let label = format!("tab {} · {}", ti + 1, wt_name);
                     for pid in tab.center.pane_ids() {
@@ -5277,7 +5178,7 @@ fn build_search_sources<'a>(
             // Same as Workspace for now (profile == session in the current model;
             // when profiles land this will walk across sessions).
             for g in &session.worktrees {
-                let wt_name = g.path.rsplit('/').next().unwrap_or(&g.name).to_string();
+                let wt_name = thegn_core::util::basename(&g.path).to_string();
                 for (ti, tab) in g.tabs.iter().enumerate() {
                     let label = format!("tab {} · {}", ti + 1, wt_name);
                     for pid in tab.center.pane_ids() {
@@ -5861,11 +5762,7 @@ fn dispatch_acp_inbound(
 /// Build the approval overlay for a pending bouncer request: a 2-item allow/deny
 /// menu titled with the worktree + action, bodied with the command/path summary.
 fn approval_overlay<R>(req: &crate::bouncer::ApprovalRequest<R>) -> MenuOverlay {
-    let wt_name = req
-        .worktree
-        .rsplit('/')
-        .next()
-        .unwrap_or(req.worktree.as_str());
+    let wt_name = thegn_core::util::basename(&req.worktree);
     let title = format!(
         "{} {wt_name} · agent wants to {}",
         req.kind.glyph(),
@@ -6851,9 +6748,12 @@ async fn event_loop<T: Terminal>(
     let mut corner_relay = crate::kitty_relay::KittyRelay::new();
     let mut corner_gfx: Vec<Vec<u8>> = Vec::new();
     let mut corner_occluded = false;
-    // Keeps every visited workspace's panes alive in memory across switches, so
-    // a program left running in one repo is still there on return (no cap).
+    // Keeps recently-visited workspaces' panes alive in memory across switches,
+    // so a program left running in one repo is still there on return. Bounded by
+    // `[session] resident_pool_limit` (refreshed on config reload) so PTY
+    // fds/threads can't accumulate without limit over a long session.
     let mut workspace_pool = WorkspacePool::default();
+    workspace_pool.set_limit(keymap.config().session.resident_pool_limit);
 
     // Diff fs-watcher: bound to the active worktree, re-targeted on tab switch.
     // On a (debounced) change it pushes `RefreshKind::Model` into the shared
@@ -6909,23 +6809,12 @@ async fn event_loop<T: Terminal>(
     // (panes surviving UI exit) for panes spawned from here on.
     crate::handlers::startup::install_pane_services(&mut panes, &current_config);
 
-    // First-launch keymap picker (item 621). Skip entirely when the user has set
-    // `keymap_preset` in config (an explicit choice). Otherwise apply a preset
-    // remembered in `ui_state` from a previous run, or — on the very first launch
-    // — arm the one-time picker overlay (its pick/cancel persists to ui_state, so
-    // it shows exactly once).
-    if current_config.keymap_preset.is_empty() || current_config.keymap_preset == "default" {
-        match thegn_core::db::Db::open()
-            .ok()
-            .and_then(|db| db.get_ui_state("", "keymap_preset").ok().flatten())
-        {
-            Some(remembered) if remembered != "default" => {
-                current_config.keymap_preset = remembered;
-                keymap = rebuild_keymap(&current_config, &session);
-            }
-            Some(_) => {} // remembered "default" — no overlay, no picker
-            None => active_menu = Some(crate::menu::keymap_preset_menu()),
-        }
+    // First-run onboarding wizard (item 489) + the first-launch keymap picker
+    // (item 621); the wizard wins when both would arm (it has a keymap step).
+    let (mut onboarding, rebuild) =
+        crate::handlers::onboarding::startup(&mut current_config, &mut active_menu);
+    if rebuild {
+        keymap = rebuild_keymap(&current_config, &session);
     }
 
     let initial_app = app_host.active;
@@ -8119,6 +8008,14 @@ async fn event_loop<T: Terminal>(
         if drain_summary.preempted {
             loop_perf.input_preempt();
         }
+        // The onboarding wizard's login/agent tab closed: resume + re-probe.
+        dirty |= crate::handlers::onboarding::on_pane_exit(
+            &drain_summary.exited,
+            &mut onboarding,
+            &mut model,
+            &refresh_tx,
+            &waker,
+        );
         if drain_summary.disconnected {
             // Teardown, not an explicit close: keep daemon panes running.
             crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
@@ -9626,6 +9523,8 @@ async fn event_loop<T: Terminal>(
                     panel_ui.set_order(crate::panel::resolve_order(&new_cfg));
                     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(&new_cfg);
                     current_config = new_cfg;
+                    // Live resident-pool cap reload: applies on the next park.
+                    workspace_pool.set_limit(current_config.session.resident_pool_limit);
                     // Live notification-routing reload: swap in the reloaded
                     // rules/DND/sound/modes (preserving the runtime mode/toggle).
                     notify_state.update_cfg(current_config.effective_notifications(None));
@@ -9702,6 +9601,10 @@ async fn event_loop<T: Terminal>(
                 // Sizes land on the next hydrate; the scan doesn't force one.
                 RefreshKind::Disk => want_disk_refresh = true,
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
+                RefreshKind::Onboarding(r) => {
+                    dirty |=
+                        crate::handlers::onboarding::apply_probe(&mut onboarding, *r, &mut model)
+                }
                 RefreshKind::ProxyDash(p) => {
                     dirty |= crate::detail::apply_proxy_dash(&mut bar_detail, *p)
                 }
@@ -10409,11 +10312,7 @@ async fn event_loop<T: Terminal>(
             // app sets, else the program name derived from the spawn argv. Hoisted
             // above the if-chain so the partial paths (which repaint a pane's card
             // after recomposing its content) and the full path share one closure.
-            let title_leaf = model
-                .worktree
-                .rsplit_once('/')
-                .map(|(_, l)| l.to_string())
-                .unwrap_or_else(|| model.worktree.clone());
+            let title_leaf = thegn_core::util::basename(&model.worktree).to_string();
             let title_of = |id| {
                 panes
                     .table
@@ -10760,6 +10659,7 @@ async fn event_loop<T: Terminal>(
             if let Some(w) = &env_wizard_ui {
                 w.render(&mut scratch, screen);
             }
+            onboarding.render(&mut scratch, screen);
             if let Some(p) = &workspace_picker {
                 p.render(&mut scratch, screen);
             }
@@ -12034,6 +11934,33 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // Modal: the onboarding wizard (suspended while its login/agent
+                // tab runs). Writes ride handlers::onboarding (config_write +
+                // secret backend + ui_state flag).
+                if onboarding.active() {
+                    let applied = crate::handlers::onboarding::handle_key_event(
+                        &k.key,
+                        k.modifiers,
+                        &mut onboarding,
+                        &mut model,
+                        &mut current_config,
+                        &mut session,
+                        &mut panes,
+                        chrome.center,
+                        &refresh_tx,
+                        &waker,
+                    );
+                    if applied.keymap_changed {
+                        keymap = rebuild_keymap(&current_config, &session);
+                    }
+                    if applied.spawned {
+                        focus.zone = crate::focus::Zone::Center;
+                        refresh_tab_model(&mut model, &session, &mut sb);
+                        need_relayout = true;
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Modal: the "Add environment" wizard. Submit writes the env via
                 // the shared create_env path (config_write + secret backend).
                 if env_wizard_ui.is_some() {
@@ -12847,21 +12774,16 @@ async fn event_loop<T: Terminal>(
                                     forced_palette_action =
                                         Some(crate::keymap::Action::NewWorktree);
                                 }
-                                GitAfter::OpenEditor(path) => {
-                                    let cmd = editor_open_command(keymap.config(), &path, None);
-                                    let cwd = active_cwd(&session);
-                                    open_command_tab(
-                                        &mut session,
-                                        &mut panes,
-                                        &cmd,
-                                        cwd.as_deref(),
-                                        chrome.center,
-                                    );
-                                    focus.zone = crate::focus::Zone::Center;
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    need_relayout = true;
-                                }
-                                GitAfter::Terminal(cmd) => {
+                                // Both arms spawn a command tab: the editor arm
+                                // just derives its command from the path first.
+                                after @ (GitAfter::OpenEditor(_) | GitAfter::Terminal(_)) => {
+                                    let cmd = match after {
+                                        GitAfter::OpenEditor(path) => {
+                                            editor_open_command(keymap.config(), &path, None)
+                                        }
+                                        GitAfter::Terminal(cmd) => cmd,
+                                        _ => unreachable!(),
+                                    };
                                     let cwd = active_cwd(&session);
                                     open_command_tab(
                                         &mut session,
@@ -13746,6 +13668,10 @@ async fn event_loop<T: Terminal>(
                                     // variant — keymap.rs is a pinned god-file).
                                     env_wizard_ui =
                                         Some(crate::env_wizard::EnvWizard::new(keymap.config()));
+                                } else if key == "setup-wizard" {
+                                    onboarding.ui = Some(crate::onboarding::OnboardingWizard::new(
+                                        keymap.config(),
+                                    ));
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
                                     forced_palette_action = Some(action);
                                 } else if let Some(idx) = keymap
@@ -15136,7 +15062,13 @@ async fn event_loop<T: Terminal>(
                                     &abs_path.to_string_lossy(),
                                     None,
                                 );
-                                let _ = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
+                                let argv = thegn_core::shellinv::run_argv(
+                                    &thegn_core::util::shell(),
+                                    &cmd,
+                                );
+                                let _ = std::process::Command::new(&argv[0])
+                                    .args(&argv[1..])
+                                    .spawn();
                             }
                             true
                         }
@@ -15950,10 +15882,13 @@ async fn event_loop<T: Terminal>(
                                     Some(crate::keymap::HostCustomAction::Shell {
                                         run, ..
                                     }) => {
-                                        let mut cmd = std::process::Command::new(
-                                            thegn_core::util::shell(),
+                                        let argv = thegn_core::shellinv::run_argv(
+                                            &thegn_core::util::shell(),
+                                            &run,
                                         );
-                                        cmd.arg("-c").arg(&run);
+                                        let mut cmd =
+                                            std::process::Command::new(&argv[0]);
+                                        cmd.args(&argv[1..]);
                                         if let Some(dir) = active_cwd(&session) {
                                             cmd.current_dir(dir);
                                         }
@@ -16059,11 +15994,10 @@ async fn event_loop<T: Terminal>(
                                             };
                                             let spawned = match &run {
                                                 Some(cmdline) => {
-                                                    let argv = vec![
-                                                        thegn_core::util::shell(),
-                                                        "-c".to_string(),
-                                                        cmdline.clone(),
-                                                    ];
+                                                    let argv = thegn_core::shellinv::run_argv(
+                                                        &thegn_core::util::shell(),
+                                                        cmdline,
+                                                    );
                                                     panes.spawn_argv(
                                                         &argv,
                                                         pane_cwd.as_deref(),
@@ -17487,10 +17421,10 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
-                            Action::NewWorktree if (focus.sidebar()
-                                && sb.cursor_in_terminals(&model))
-                                || session.active_group().map(|g| g.kind)
-                                    == Some(crate::session::GroupKind::Terminal) =>
+                            Action::NewWorktree
+                                if (focus.sidebar() && sb.cursor_in_terminals(&model))
+                                    || session.active_group().map(|g| g.kind)
+                                        == Some(crate::session::GroupKind::Terminal) =>
                             {
                                 // Alt+w is context-dependent, mirroring the
                                 // sidebar `n` key: in the TERMINALS region it
@@ -18226,6 +18160,10 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                if onboarding.paste(&s) {
+                    dirty = true;
+                    continue;
+                }
                 // A chrome text-input is collecting keystrokes (commit message /
                 // rename / new-branch overlay, the search palette, or the git
                 // filter line): a paste belongs to it, not the terminal. We
@@ -18321,39 +18259,6 @@ fn remap_warmed_tab_ids(tab: &mut crate::session::Tab, focus: u32, pairs: &[(u32
         tab.focused_pane = *map.values().next().unwrap_or(&0);
     }
     true
-}
-
-pub fn spawn_ai_sidecar(
-    waker: termwiz::terminal::TerminalWaker,
-    tx: tokio::sync::mpsc::UnboundedSender<crate::chrome::AiMetrics>,
-) {
-    tokio::spawn(async move {
-        use std::process::Stdio;
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        use tokio::process::Command;
-
-        let mut child = match Command::new("python3")
-            .arg("src/sidecar.py")
-            .stdout(Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("failed to spawn AI metrics sidecar: {e}");
-                return;
-            }
-        };
-
-        if let Some(stdout) = child.stdout.take() {
-            let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if let Ok(metrics) = serde_json::from_str::<crate::chrome::AiMetrics>(&line) {
-                    let _ = tx.send(metrics);
-                    let _ = waker.wake();
-                }
-            }
-        }
-    });
 }
 
 #[cfg(test)]

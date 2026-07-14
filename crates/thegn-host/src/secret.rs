@@ -106,7 +106,8 @@ fn secrets_file(name: &str) -> Result<PathBuf> {
         .map(|p| p.join("secrets"))
         .context("config path has no parent")?;
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
-    set_mode(&dir, 0o700);
+    // best-effort: owner-only secrets dir (0700 / owner DACL).
+    let _ = thegn_core::fsperm::restrict_dir_to_owner(&dir);
     // Sanitize so a name never escapes the dir.
     let safe: String = name
         .chars()
@@ -124,18 +125,11 @@ fn secrets_file(name: &str) -> Result<PathBuf> {
 fn write_private(path: &std::path::Path, token: &str) -> Result<()> {
     std::fs::write(path, token.trim().as_bytes())
         .with_context(|| format!("write {}", path.display()))?;
-    set_mode(path, 0o600);
+    // best-effort: the keyring is the primary store; the file fallback is
+    // tightened to owner-only (0600 / owner DACL) where the platform allows.
+    let _ = thegn_core::fsperm::restrict_to_owner(path);
     Ok(())
 }
-
-#[cfg(unix)]
-fn set_mode(path: &std::path::Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
-}
-
-#[cfg(not(unix))]
-fn set_mode(_path: &std::path::Path, _mode: u32) {}
 
 #[cfg(test)]
 mod tests {

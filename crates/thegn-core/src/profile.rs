@@ -210,13 +210,10 @@ pub enum Singleton {
     AlreadyRunning,
 }
 
-/// Try to take the exclusive, non-blocking `flock` at `path`. `Ok(Some(file))`
-/// = acquired (keep the file to hold it); `Ok(None)` = already held elsewhere.
-// The `fcntl::Flock` replacement takes ownership of the file (RAII guard),
-// which doesn't fit this seam handing the bare File to SingletonGuard —
-// migrate both together (see `util::lock_git_mutations`).
-#[allow(deprecated)]
-#[cfg(not(windows))]
+/// Try to take the exclusive, non-blocking file lock at `path` (`flock` on
+/// unix, `LockFileEx` on Windows — std's cross-platform `File::try_lock`).
+/// `Ok(Some(file))` = acquired (keep the file to hold it); `Ok(None)` =
+/// already held elsewhere. Released on drop AND on process death — never stale.
 fn try_lock_nb(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -246,7 +243,6 @@ fn singleton_lock_path() -> std::path::PathBuf {
 /// **default** profile still returns `Acquired` silently (no warn, no refusal)
 /// — the lock was always advisory-only there and nested thegn launches must
 /// keep working exactly as before.
-#[cfg(not(windows))]
 pub fn acquire_singleton() -> Singleton {
     match try_lock_nb(&singleton_lock_path()) {
         Ok(Some(file)) => {
@@ -264,23 +260,10 @@ pub fn acquire_singleton() -> Singleton {
 }
 
 /// Best-effort: is another thegn process holding this profile's singleton
-/// lock (i.e. a live interactive compositor)? Probes the flock without keeping
+/// lock (i.e. a live interactive compositor)? Probes the lock without keeping
 /// it. `false` on any error — callers degrade to "no instance" (launch).
-#[cfg(not(windows))]
 pub fn instance_running() -> bool {
     matches!(try_lock_nb(&singleton_lock_path()), Ok(None))
-}
-
-/// Windows singleton detection is a follow-up; report no instance (launch).
-#[cfg(windows)]
-pub fn instance_running() -> bool {
-    false
-}
-
-#[cfg(windows)]
-pub fn acquire_singleton() -> Singleton {
-    // Windows singleton is a follow-up; default to running (no hard guard).
-    Singleton::Acquired(SingletonGuard(None))
 }
 
 /// Argv to launch a fresh window for `profile` in a new terminal: the

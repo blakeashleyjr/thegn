@@ -304,7 +304,10 @@ mod tests {
         let accent = col(S::Text);
         let g = crate::caps::active_glyphs();
         let (spun, c) = visual_glyph_live(StepState::Active, accent, true);
-        assert!(g.spin.contains(&spun), "active+animate uses a spinner frame");
+        assert!(
+            g.spin.contains(&spun),
+            "active+animate uses a spinner frame"
+        );
         assert_eq!(c, accent);
         assert_eq!(
             visual_glyph_live(StepState::Active, accent, false),
