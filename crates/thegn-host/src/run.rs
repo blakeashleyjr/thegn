@@ -17393,10 +17393,10 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
-                            Action::NewWorktree if (focus.sidebar()
-                                && sb.cursor_in_terminals(&model))
-                                || session.active_group().map(|g| g.kind)
-                                    == Some(crate::session::GroupKind::Terminal) =>
+                            Action::NewWorktree
+                                if (focus.sidebar() && sb.cursor_in_terminals(&model))
+                                    || session.active_group().map(|g| g.kind)
+                                        == Some(crate::session::GroupKind::Terminal) =>
                             {
                                 // Alt+w is context-dependent, mirroring the
                                 // sidebar `n` key: in the TERMINALS region it

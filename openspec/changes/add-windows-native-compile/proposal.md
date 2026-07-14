@@ -20,7 +20,7 @@ through them:
 
 - **`thegn_core::shellinv`** (pure, coverage-gated): shell-invocation argv
   building — POSIX `-c`/`-lc` vs pwsh `-NoProfile -Command` vs cmd `/C` — used
-  by every *local* pane/pin/custom-action spawn. Call sites that target a
+  by every _local_ pane/pin/custom-action spawn. Call sites that target a
   remote or sandboxed **Linux** substrate keep their literal `sh -lc` and are
   annotated as such.
 - **`thegn-host::platform`** (`unix.rs` / `windows.rs`): stderr redirect
