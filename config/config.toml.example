@@ -2592,8 +2592,15 @@ bouncer = false
 [merge_queue]
 enabled = true
 target_branch = "auto"        # branch to advance; "auto" = repo HEAD/default
-gate_command = ""             # e.g. "just ci" / "cargo test --workspace"; "" disables the gate
+gate_command = ""             # e.g. "just test" / "cargo nextest run --workspace"; "" disables the gate.
+                              # Prefer a LEAN gate: the pre-push hook already ran clippy + full
+                              # test + smoke before enqueue, so "just lint && just test" mostly
+                              # repeats that compile work. "just test" alone is ~3x cheaper.
 gate_on = true                # run gate_command before advancing main
+gate_reuse_worktree = true    # reuse a stable per-repo gate worktree + target dir between folds
+                              # (warm incremental rebuild instead of a cold from-scratch compile).
+                              # false = throwaway /tmp worktree each fold (cold; use for concurrent gates)
+gate_target_dir = ""          # CARGO_TARGET_DIR for the gate; "" = $XDG_STATE_HOME/thegn/gate/<repo>/target
 bisect_on_red = true          # on a red gate, defer just the offending branch
 snapshot_dirty = false        # auto-commit uncommitted worktree work before folding
 regenerate_paths = ["Cargo.lock"]  # conflicts confined to these are "regenerable", not handed off
