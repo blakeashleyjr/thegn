@@ -43,6 +43,8 @@ pub enum PanelTab {
     /// System & monitoring: Notifications, Logs, Sandbox, Telemetry, Keys.
     #[allow(dead_code)]
     System,
+    /// Built-in documentation: the Help section (docked twin of the F1 overlay).
+    Help,
 }
 
 impl PanelTab {
@@ -51,6 +53,7 @@ impl PanelTab {
             PanelTab::Git => "git",
             PanelTab::Work => "work",
             PanelTab::System => "system",
+            PanelTab::Help => "help",
         }
     }
 
@@ -63,6 +66,7 @@ impl PanelTab {
             "git" => Some(PanelTab::Git),
             "work" => Some(PanelTab::Work),
             "system" => Some(PanelTab::System),
+            "help" => Some(PanelTab::Help),
             _ => None,
         }
     }
@@ -71,15 +75,17 @@ impl PanelTab {
         match self {
             PanelTab::Git => PanelTab::Work,
             PanelTab::Work => PanelTab::System,
-            PanelTab::System => PanelTab::Git,
+            PanelTab::System => PanelTab::Help,
+            PanelTab::Help => PanelTab::Git,
         }
     }
 
     pub fn prev(self) -> PanelTab {
         match self {
-            PanelTab::Git => PanelTab::System,
+            PanelTab::Git => PanelTab::Help,
             PanelTab::Work => PanelTab::Git,
             PanelTab::System => PanelTab::Work,
+            PanelTab::Help => PanelTab::System,
         }
     }
 }
@@ -150,6 +156,9 @@ pub enum Section {
     /// `[media] enabled`.
     Media,
     Keys,
+    /// Built-in documentation, rendered from the embedded help registry —
+    /// the docked twin of the F1 overlay (`o` there opens the page here).
+    Help,
     // Placeholder sections — kept as dead variants for future use.
     #[allow(dead_code)]
     Debug,
@@ -162,10 +171,11 @@ pub enum Section {
 /// - Git (5): Changes, Commits, Branches, Stash, Files
 /// - Work (10): Mine, Across, Pr, Ci, MergeQueue, Issues, Problems, Jobs, Tests, Symbols
 /// - System (10): Notifications, Logs, Sandbox, Hosts, Environments, Share, Forward, Telemetry, Media, Keys
+/// - Help (1): Help
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 25] = [
+pub const SECTION_ORDER: [Section; 26] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -194,6 +204,8 @@ pub const SECTION_ORDER: [Section; 25] = [
     Section::Telemetry,
     Section::Media,
     Section::Keys,
+    // Help tab
+    Section::Help,
 ];
 
 impl Section {
@@ -221,6 +233,7 @@ impl Section {
             Section::Db => "db",
             Section::Telemetry => "telemetry",
             Section::Keys => "keys",
+            Section::Help => "help",
             Section::Issues => "issues",
             Section::Notifications => "notifications",
             Section::Logs => "logs",
@@ -260,6 +273,7 @@ impl Section {
             | Section::Keys
             | Section::Debug
             | Section::Db => PanelTab::System,
+            Section::Help => PanelTab::Help,
         }
     }
 
@@ -297,6 +311,14 @@ impl Section {
         };
         SECTION_ORDER.iter().copied().find(|s| s.as_key() == key)
     }
+}
+
+/// The Help section's state: the docked page id (empty = `index`) and the
+/// registry it renders from.
+#[derive(Debug, Clone, Default)]
+pub struct HelpPanelState {
+    pub page: String,
+    pub reg: Option<std::sync::Arc<thegn_core::help::HelpRegistry>>,
 }
 
 /// Resolve `[panel] sections` into the live accordion order: config keys map
@@ -777,6 +799,9 @@ pub struct PanelUi {
     /// The full test-explorer state (detected task, per-test status map,
     /// display tree, cursor/scroll/filter) backing the tests section's runs.
     pub tests: TestPanelState,
+    /// The Help section's state: which page is docked, and the registry it
+    /// renders from (installed at startup, refreshed on config reload).
+    pub help: HelpPanelState,
     /// The live accordion order (config-resolved, possibly trimmed) across ALL
     /// tabs. Sections are filtered to the active tab before display.
     /// The numbered jump keys index the ACTIVE TAB's slice. Never empty.
@@ -860,6 +885,7 @@ impl Default for PanelUi {
     fn default() -> Self {
         PanelUi {
             tests: TestPanelState::default(),
+            help: HelpPanelState::default(),
             order: SECTION_ORDER.to_vec(),
             tab: PanelTab::default(),
             open: Section::default(),
@@ -1172,7 +1198,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 25);
+        assert_eq!(SECTION_ORDER.len(), 26);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab

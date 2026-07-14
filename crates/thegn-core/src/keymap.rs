@@ -301,6 +301,19 @@ pub const BUILTINS: &[Action] = &[
         menu: true,
     },
     Action {
+        // The built-in help overlay: opens at the page for whatever has
+        // focus. `?` also opens it from non-typing zones (e.g. the sidebar).
+        id: "help",
+        chords: &["F1"],
+        menu_label: "Help — built-in docs",
+        hint: "help",
+        invocation: Invocation::Native { body: "Help;" },
+        scope: Scope::Shared,
+        contexts: &[Context::Global],
+        priority: 90,
+        menu: true,
+    },
+    Action {
         // Smart "close this": pane if the tab is split, else the tab. Shift
         // escalates to close-worktree (`Alt X`). This is the default `Alt x`
         // binding; the explicit `close-tab` action below has no default chord.
