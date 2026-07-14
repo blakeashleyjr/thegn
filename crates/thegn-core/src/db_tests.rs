@@ -671,6 +671,106 @@ fn swap_workspace_positions_reorders() {
 }
 
 #[test]
+fn swap_workspace_positions_heals_null_and_duplicate_positions() {
+    // Regression: some insert paths (migrate_brand, db_zones) create workspace
+    // rows without a `position` (NULL), and ties in the backfill can leave
+    // duplicates. `swap_workspace_positions` used to silently no-op when either
+    // side was NULL or the two positions were equal, so a sidebar reorder never
+    // reached the DB — and the nav ring, rebuilt from `db.workspaces()` order on
+    // the next hydration, kept walking the original order. It must instead
+    // normalize to contiguous distinct positions and actually swap.
+    let db = db();
+    // Insert bypassing `put_workspace`, mirroring migrate_brand.rs — no position.
+    for p in ["/a", "/b", "/c"] {
+        db.conn()
+            .execute("INSERT INTO workspaces (repo_path) VALUES (?1)", params![p])
+            .unwrap();
+    }
+    let order = |db: &Db| -> Vec<String> {
+        db.workspaces()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.repo_path)
+            .collect()
+    };
+    let before = order(&db);
+
+    // Swapping two NULL-position rows must reorder them, not no-op.
+    db.swap_workspace_positions(&before[0], &before[1]).unwrap();
+    let after = order(&db);
+    assert_eq!(
+        after,
+        vec![before[1].clone(), before[0].clone(), before[2].clone()],
+        "NULL-position workspaces must still swap"
+    );
+
+    // And the persisted positions are now contiguous + distinct, so subsequent
+    // swaps keep working.
+    db.swap_workspace_positions(&after[1], &after[2]).unwrap();
+    assert_eq!(
+        order(&db),
+        vec![after[0].clone(), after[2].clone(), after[1].clone()],
+        "second swap on healed positions reorders too"
+    );
+
+    // Duplicate (equal, non-NULL) positions are the same hazard — a value-swap
+    // is a no-op — and must heal + reorder just the same.
+    let db = Db::open_memory().unwrap();
+    for p in ["/x", "/y", "/z"] {
+        db.conn()
+            .execute(
+                "INSERT INTO workspaces (repo_path, position) VALUES (?1, 0)",
+                params![p],
+            )
+            .unwrap();
+    }
+    let dup_before = order(&db);
+    db.swap_workspace_positions(&dup_before[0], &dup_before[1])
+        .unwrap();
+    assert_eq!(
+        order(&db),
+        vec![
+            dup_before[1].clone(),
+            dup_before[0].clone(),
+            dup_before[2].clone()
+        ],
+        "duplicate-position workspaces must still swap"
+    );
+}
+
+#[test]
+fn swap_worktree_positions_heals_null_and_duplicate_positions() {
+    // Worktree parity with the workspace swap: the same NULL/duplicate hazard
+    // (v8-added column, inserts that miss it) must not make a manual reorder
+    // silently no-op.
+    let db = db();
+    db.put_workspace("/repo", "repo", "repo").unwrap();
+    for wt in ["/wt/a", "/wt/b", "/wt/c"] {
+        db.put_worktree("repo/x", "/repo", wt, "x", None, None)
+            .unwrap();
+    }
+    // Blank the positions to the legacy NULL state a manual reorder used to
+    // fail to persist against.
+    db.conn()
+        .execute("UPDATE worktrees SET position = NULL", [])
+        .unwrap();
+    let order = |db: &Db| -> Vec<String> {
+        db.worktrees()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.worktree)
+            .collect()
+    };
+    let before = order(&db);
+    db.swap_worktree_positions(&before[0], &before[1]).unwrap();
+    assert_eq!(
+        order(&db),
+        vec![before[1].clone(), before[0].clone(), before[2].clone()],
+        "NULL-position worktrees must still swap"
+    );
+}
+
+#[test]
 fn migrates_workspaces_position_from_recency() {
     // A pre-v16 `workspaces` table (no `position` column): the migration
     // ALTERs the column in and backfills it so the most-recently-active

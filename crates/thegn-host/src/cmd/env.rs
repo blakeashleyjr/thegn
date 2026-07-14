@@ -208,9 +208,12 @@ pub(crate) fn create_env(a: CreateArgs) -> Result<()> {
     let placement = match kind.as_str() {
         "local" => "local",
         "ssh" => "ssh",
-        "fly" | "digitalocean" | "hetzner" | "vultr" | "daytona" | "sprites" => "provider",
+        "fly" | "digitalocean" | "hetzner" | "vultr" | "daytona" | "sprites" | "machine0" => {
+            "provider"
+        }
         other => anyhow::bail!(
-            "unknown --provider {other:?} (local|ssh|fly|digitalocean|hetzner|daytona|sprites)"
+            "unknown --provider {other:?} \
+             (local|ssh|fly|digitalocean|hetzner|daytona|sprites|machine0)"
         ),
     };
 
@@ -360,8 +363,26 @@ fn api_provider(cfg: &Config, worktree: Option<String>) -> Result<thegn_svc::pro
                 anyhow::anyhow!("the Fly API token env var {key:?} is not set")
             })
         }
+        "machine0" => {
+            // Same resolved-id contract as the VPS/Fly arms: create/destroy must
+            // name the VM the panes attach to.
+            let id = match &env.placement {
+                thegn_core::placement::Placement::Provider(p) => p.id.clone(),
+                _ => String::new(),
+            };
+            crate::provider_factory::machine0_provider_for(pc, &id)
+                .map(Provider::Machine0)
+                .ok_or_else(|| {
+                    let key = if pc.api_key_env.trim().is_empty() {
+                        "MACHINE0_API_KEY"
+                    } else {
+                        pc.api_key_env.trim()
+                    };
+                    anyhow::anyhow!("the machine0 API key env var {key:?} is not set")
+                })
+        }
         other => anyhow::bail!(
-            "API provisioning supports 'daytona', 'sprites', 'fly', and VPS kinds \
+            "API provisioning supports 'daytona', 'sprites', 'fly', 'machine0', and VPS kinds \
              (hetzner, digitalocean); env {} uses {:?}",
             env.name,
             other
