@@ -1,0 +1,4 @@
+# help-ratchet — ACTION_SPECS ids not yet documented by any docs/help/ page.
+# This list may only SHRINK: document an action, delete its line
+# (or run `just help-ratchet-update`). New actions must be documented
+# immediately — the ratchet test refuses additions.

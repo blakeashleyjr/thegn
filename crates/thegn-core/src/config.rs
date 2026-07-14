@@ -1878,8 +1878,7 @@ pub struct EnvConfig {
     /// global default allows failover. Resolved by [`Config::env_failover`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failover: Option<bool>,
-    /// Requested placement class for the engine (`None` ⇒ inherit
-    /// `[placement] mode`). Clamped by the resolved mode floor.
+    /// Requested placement class (`None` ⇒ inherit `[placement] mode`); clamped by the resolved mode floor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placement_mode: Option<PlacementModePref>,
     /// `[env.<name>.resources]` — the declared resource ask the placement
@@ -1890,7 +1889,8 @@ pub struct EnvConfig {
 
 pub use crate::config_env_tables::{
     EnvK8sConfig, EnvProviderConfig, EnvSshConfig, MetricsConfig, MetricsTarget, NixInstaller,
-    ProviderConnect, ProviderExecMode, provider_scale_to_zero, vps_provider_kind,
+    ProviderConnect, ProviderExecMode, provider_scale_to_zero, provider_self_suspends,
+    vps_provider_kind,
 };
 
 /// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by

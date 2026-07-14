@@ -168,25 +168,42 @@ impl WorkspaceStore for Db {
     /// workspace analogue of `swap_worktree_positions`: the sidebar's manual
     /// workspace reorder (Ctrl+Alt+↑/↓) picks two adjacent workspaces and this
     /// exchanges their `position` so the new order survives restart.
+    ///
+    /// `position` is not always distinct + non-NULL: insert paths that bypass
+    /// `put_workspace` (`migrate_brand`, `db_zones`) never set it, and backfill
+    /// ties can duplicate it. A naive value-swap then no-ops (NULL, or equal
+    /// values), so the reorder never reached the DB and the nav ring — rebuilt
+    /// from `workspaces()` order on the next hydration — kept walking the old
+    /// order. So when either side is NULL or the two are equal, first normalize
+    /// the whole table to contiguous distinct positions (preserving the current
+    /// display order), then swap. Wrapped in one transaction so a normalize +
+    /// swap is atomic.
     fn swap_workspace_positions(&self, a: &str, b: &str) -> Result<()> {
-        // Read both before writing — a self-referential CASE-UPDATE could
-        // observe its own intermediate write and clobber the swap.
-        let pos = |p: &str| -> Result<Option<i64>> {
-            Ok(self
-                .conn()
-                .query_row(
-                    "SELECT position FROM workspaces WHERE repo_path=?1",
-                    params![p],
-                    |r| r.get::<_, Option<i64>>(0),
-                )
-                .optional()?
-                .flatten())
-        };
-        if let (Some(pa), Some(pb)) = (pos(a)?, pos(b)?) {
-            self.set_workspace_position(a, pb)?;
-            self.set_workspace_position(b, pa)?;
-        }
-        Ok(())
+        self.transaction(|db| {
+            // Read both before writing — a self-referential CASE-UPDATE could
+            // observe its own intermediate write and clobber the swap.
+            let pos = |p: &str| -> Result<Option<i64>> {
+                Ok(db
+                    .conn()
+                    .query_row(
+                        "SELECT position FROM workspaces WHERE repo_path=?1",
+                        params![p],
+                        |r| r.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?
+                    .flatten())
+            };
+            let (mut pa, mut pb) = (pos(a)?, pos(b)?);
+            if pa.is_none() || pb.is_none() || pa == pb {
+                db.normalize_workspace_positions()?;
+                (pa, pb) = (pos(a)?, pos(b)?);
+            }
+            if let (Some(pa), Some(pb)) = (pa, pb) {
+                db.set_workspace_position(a, pb)?;
+                db.set_workspace_position(b, pa)?;
+            }
+            Ok(())
+        })
     }
 
     /// Set one workspace's persisted sort position (repo_path key).
@@ -399,28 +416,36 @@ impl WorkspaceStore for Db {
     /// Swap the persisted sort positions of two worktrees (by path). Used by
     /// the sidebar's manual reorder (Shift+Alt+↑/↓): the caller picks the two
     /// adjacent siblings, this exchanges their `position` so the new order
-    /// survives restart. Positions are globally unique (migration + MAX+1
-    /// inserts), so a swap can never create a collision.
+    /// survives restart. Same NULL/duplicate hazard as the workspace swap
+    /// (v8-added column, inserts that miss it) — heal to contiguous distinct
+    /// positions before swapping so a reorder never silently no-ops.
     fn swap_worktree_positions(&self, a: &str, b: &str) -> Result<()> {
-        // Read both first, then write — a single CASE-UPDATE that reads the
-        // table it mutates can observe its own intermediate write and clobber
-        // the swap.
-        let pos = |wt: &str| -> Result<Option<i64>> {
-            Ok(self
-                .conn()
-                .query_row(
-                    "SELECT position FROM worktrees WHERE worktree=?1",
-                    params![wt],
-                    |r| r.get::<_, Option<i64>>(0),
-                )
-                .optional()?
-                .flatten())
-        };
-        if let (Some(pa), Some(pb)) = (pos(a)?, pos(b)?) {
-            self.set_worktree_position(a, pb)?;
-            self.set_worktree_position(b, pa)?;
-        }
-        Ok(())
+        self.transaction(|db| {
+            // Read both first, then write — a single CASE-UPDATE that reads the
+            // table it mutates can observe its own intermediate write and clobber
+            // the swap.
+            let pos = |wt: &str| -> Result<Option<i64>> {
+                Ok(db
+                    .conn()
+                    .query_row(
+                        "SELECT position FROM worktrees WHERE worktree=?1",
+                        params![wt],
+                        |r| r.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?
+                    .flatten())
+            };
+            let (mut pa, mut pb) = (pos(a)?, pos(b)?);
+            if pa.is_none() || pb.is_none() || pa == pb {
+                db.normalize_worktree_positions()?;
+                (pa, pb) = (pos(a)?, pos(b)?);
+            }
+            if let (Some(pa), Some(pb)) = (pa, pb) {
+                db.set_worktree_position(a, pb)?;
+                db.set_worktree_position(b, pa)?;
+            }
+            Ok(())
+        })
     }
 
     /// Set one worktree's persisted sort position (path key). The session-layout
@@ -963,6 +988,54 @@ impl WorkspaceStore for Db {
             "UPDATE terminals SET name = ?1 WHERE id = ?2",
             params![new_name, id],
         )?;
+        Ok(())
+    }
+}
+
+/// Position-healing helpers for the manual-reorder swaps. Kept as inherent
+/// `Db` methods (not on the `WorkspaceStore` seam) — they're an implementation
+/// detail of `swap_*_positions`, not part of the store contract.
+impl Db {
+    /// Renumber every workspace to a contiguous, distinct `position` (0..n) in
+    /// its current display order, healing NULL/duplicate positions (from insert
+    /// paths that bypass `put_workspace`, or backfill ties). Uses the same
+    /// `ORDER BY` as [`WorkspaceStore::workspaces`] so the visible order is
+    /// preserved; `repo_path` is the final deterministic tie-break. Idempotent.
+    pub(crate) fn normalize_workspace_positions(&self) -> Result<()> {
+        let paths: Vec<String> = {
+            let mut stmt = self.conn().prepare(
+                "SELECT repo_path FROM workspaces
+                 ORDER BY position, last_active DESC, repo_path",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for (i, p) in paths.iter().enumerate() {
+            self.conn().execute(
+                "UPDATE workspaces SET position=?2 WHERE repo_path=?1",
+                params![p, i as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Worktree analogue of [`Db::normalize_workspace_positions`]. Uses the same
+    /// `ORDER BY` as [`WorkspaceStore::worktrees`] so filed/loose worktree order
+    /// is preserved while positions become contiguous + distinct.
+    pub(crate) fn normalize_worktree_positions(&self) -> Result<()> {
+        let paths: Vec<String> = {
+            let mut stmt = self.conn().prepare(
+                "SELECT worktree FROM worktrees ORDER BY position, created_at, worktree",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for (i, p) in paths.iter().enumerate() {
+            self.conn().execute(
+                "UPDATE worktrees SET position=?2 WHERE worktree=?1",
+                params![p, i as i64],
+            )?;
+        }
         Ok(())
     }
 }

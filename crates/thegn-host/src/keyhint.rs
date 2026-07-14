@@ -86,6 +86,67 @@ pub fn cheatsheet_groups(cfg: &thegn_core::config::Config) -> Vec<HintGroup> {
     .collect()
 }
 
+/// The bottom bar's contextual keybind hints — (chord, label) pairs the
+/// statusbar renders as key chips + dim labels: what works right now, given
+/// the focused zone (and the panel's view when it owns the keyboard).
+/// (Extracted from `run.rs`, pinned by the file-size ratchet.)
+pub(crate) fn context_hints(
+    focus: &crate::focus::FocusState,
+    panel_ui: &crate::panel::PanelUi,
+    cfg: &thegn_core::config::Config,
+) -> Vec<(String, String)> {
+    let mut resolved = thegn_core::keymap::effective(cfg);
+    resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
+
+    let focus_context = match focus.zone {
+        // The corner overlay is a PTY zone like the center (keys forward to it).
+        crate::focus::Zone::Center | crate::focus::Zone::Corner => {
+            thegn_core::keymap::Context::Center
+        }
+        crate::focus::Zone::Sidebar => thegn_core::keymap::Context::Left,
+        crate::focus::Zone::Panel => thegn_core::keymap::Context::Right,
+        crate::focus::Zone::Drawer | crate::focus::Zone::Statusbar => {
+            thegn_core::keymap::Context::Bottom
+        }
+        crate::focus::Zone::Masthead => thegn_core::keymap::Context::Top,
+    };
+
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    if focus.zone == crate::focus::Zone::Panel {
+        out = crate::panel::hints::panel_help_pairs(panel_ui);
+    }
+    // Sidebar zone: the curated essentials first (the real keys live in
+    // `handlers/sidebar_keys.rs`, invisible to the keymap registry).
+    if focus.zone == crate::focus::Zone::Sidebar {
+        out = crate::sidebar_help::statusbar_pairs();
+    }
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, hint) in &out {
+        seen.insert(hint.clone());
+    }
+
+    for action in resolved {
+        if (action
+            .contexts
+            .contains(&thegn_core::keymap::Context::Global)
+            || action.contexts.contains(&focus_context))
+            && seen.insert(action.hint.clone())
+            && !action.hint.is_empty()
+            && let Some(chord) = action.chords.first()
+        {
+            out.push((chord.to_kdl().to_string(), action.hint.clone()));
+        }
+    }
+
+    if focus.locked {
+        return out.into_iter().filter(|(_, hint)| hint == "lock").collect();
+    }
+
+    out
+}
+
 /// Format a single `Key` for the which-key popup (e.g. `Ctrl-x`, `Space`, `↵`).
 pub fn key_hint(key: &Key) -> String {
     let mut parts = Vec::new();

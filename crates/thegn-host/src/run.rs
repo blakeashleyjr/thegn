@@ -269,66 +269,6 @@ fn toggle_recorder(
     }
 }
 
-/// The bottom bar's contextual keybind hints — (chord, label) pairs the
-/// statusbar renders as key chips + dim labels: what works right now, given
-/// the focused zone (and the panel's view when it owns the keyboard).
-fn context_hints(
-    focus: &crate::focus::FocusState,
-    panel_ui: &crate::panel::PanelUi,
-    cfg: &thegn_core::config::Config,
-) -> Vec<(String, String)> {
-    let mut resolved = thegn_core::keymap::effective(cfg);
-    resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
-
-    let focus_context = match focus.zone {
-        // The corner overlay is a PTY zone like the center (keys forward to it).
-        crate::focus::Zone::Center | crate::focus::Zone::Corner => {
-            thegn_core::keymap::Context::Center
-        }
-        crate::focus::Zone::Sidebar => thegn_core::keymap::Context::Left,
-        crate::focus::Zone::Panel => thegn_core::keymap::Context::Right,
-        crate::focus::Zone::Drawer | crate::focus::Zone::Statusbar => {
-            thegn_core::keymap::Context::Bottom
-        }
-        crate::focus::Zone::Masthead => thegn_core::keymap::Context::Top,
-    };
-
-    let mut out: Vec<(String, String)> = Vec::new();
-
-    if focus.zone == crate::focus::Zone::Panel {
-        out = crate::panel::hints::panel_help_pairs(panel_ui);
-    }
-    // Sidebar zone: the curated essentials first (the real keys live in
-    // `handlers/sidebar_keys.rs`, invisible to the keymap registry).
-    if focus.zone == crate::focus::Zone::Sidebar {
-        out = crate::sidebar_help::statusbar_pairs();
-    }
-
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (_, hint) in &out {
-        seen.insert(hint.clone());
-    }
-
-    for action in resolved {
-        if (action
-            .contexts
-            .contains(&thegn_core::keymap::Context::Global)
-            || action.contexts.contains(&focus_context))
-            && seen.insert(action.hint.clone())
-            && !action.hint.is_empty()
-            && let Some(chord) = action.chords.first()
-        {
-            out.push((chord.to_kdl().to_string(), action.hint.clone()));
-        }
-    }
-
-    if focus.locked {
-        return out.into_iter().filter(|(_, hint)| hint == "lock").collect();
-    }
-
-    out
-}
-
 /// Fetch the git section's heat/velocity/log payload off the loop (skipped
 /// while the per-worktree cache is warm). The result rides `tx` + a waker
 /// pulse; the body shows "loading…" until it lands.
@@ -6568,8 +6508,8 @@ async fn event_loop<T: Terminal>(
     // the active-worktree action opens the picker, so a cancelled sidebar pick
     // can't misdirect a later one.
     let mut pending_file_target: Option<(String, String)> = None;
-    // The sidebar's `?` help card; any key dismisses it.
-    let mut sidebar_help_open = false;
+    // The F1 help overlay (modal while open).
+    let mut help_overlay: Option<crate::help::HelpOverlay> = None;
     // The workspace (repo_path, slug, display) targeted by an open
     // delete-workspace menu, awaiting the user's keep-files/delete choice.
     let mut pending_delete_workspace: Option<(String, String, String)> = None;
@@ -6795,6 +6735,11 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
+    // The embedded help registry (authored pages + the generated keybindings
+    // and config-reference pages); rebuilt on config reload so rebinds show.
+    let mut help_registry =
+        std::sync::Arc::new(crate::help::pages::registry_logged(&current_config));
+    panel_ui.help.reg = Some(help_registry.clone());
     // Notification routing runtime (rules / DND / modes / sound). Threaded to
     // every dispatch site; the loop consumes the latched bell + reads DND/mode
     // for the status chip. Built from the effective (global + profile) config;
@@ -7183,7 +7128,7 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 SidebarOutcome::ShowHelp => {
-                    sidebar_help_open = true;
+                    help_overlay = crate::help::open_at(&help_registry, "zone:sidebar");
                     dirty = true;
                     continue;
                 }
@@ -7881,14 +7826,14 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        if need_relayout {
+        let tree = crate::handlers::pane_zoom::grown_tree(
+            zoom,
+            maximized,
+            focused_pane_id(&session),
+            session.active_tab().map(|t| t.center.clone()),
+        );
+        if need_relayout || crate::panes::size_drifted(&panes, &tree, chrome.center) {
             let _relayout_span = crate::perf::measure(crate::perf::Subsys::Relayout);
-            let tree = crate::handlers::pane_zoom::grown_tree(
-                zoom,
-                maximized,
-                focused_pane_id(&session),
-                session.active_tab().map(|t| t.center.clone()),
-            );
             relayout(&mut panes, &tree, chrome.center);
             if let Some(strip_rect) = chrome.strip {
                 relayout_strip(&mut panes, &supervisor, strip_rect);
@@ -9516,6 +9461,10 @@ async fn event_loop<T: Terminal>(
                     // the keys section's cheatsheet follows the new keymap.
                     panel_ui.set_order(crate::panel::resolve_order(&new_cfg));
                     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(&new_cfg);
+                    // The help registry embeds the effective keymap page.
+                    help_registry =
+                        std::sync::Arc::new(crate::help::pages::registry_logged(&new_cfg));
+                    panel_ui.help.reg = Some(help_registry.clone());
                     current_config = new_cfg;
                     // Live resident-pool cap reload: applies on the next park.
                     workspace_pool.set_limit(current_config.session.resident_pool_limit);
@@ -9884,7 +9833,7 @@ async fn event_loop<T: Terminal>(
         model.zoomed = zoom.is_some();
         model.maximized = maximized;
         model.sync_panes = sync_panes;
-        model.keyhints = context_hints(&focus, &panel_ui, keymap.config());
+        model.keyhints = crate::keyhint::context_hints(&focus, &panel_ui, keymap.config());
         // The ticker samples at live (500ms) cadence while the telemetry
         // section is on screen, so its graphs actually move.
         let telemetry_now =
@@ -10675,8 +10624,8 @@ async fn event_loop<T: Terminal>(
             if let Some(ov) = &media_overlay {
                 ov.render(&mut scratch, screen);
             }
-            if sidebar_help_open {
-                crate::sidebar_help::render(&mut scratch, screen);
+            if let Some(h) = help_overlay.as_mut() {
+                h.render(&mut scratch, screen);
             }
             if !which_key.is_empty() {
                 crate::keyhint::render_which_key(
@@ -11020,6 +10969,7 @@ async fn event_loop<T: Terminal>(
                 let (hit_pane, frames) = match crate::handlers::overlay::pre_dispatch(
                     current_config.ui.dismiss_overlay_on_click_outside,
                     &mut bar_detail,
+                    &mut help_overlay,
                     &m,
                     mx,
                     my,
@@ -11677,10 +11627,40 @@ async fn event_loop<T: Terminal>(
                 }
                 input_at = Some(std::time::Instant::now()); // input-latency stamp
                 let k = normalize_key(k);
-                // The sidebar `?` help card is a read-only overlay: any key
-                // dismisses it and is consumed.
-                if sidebar_help_open {
-                    sidebar_help_open = false;
+                // The help overlay is modal: it owns every key while open.
+                if let Some(h) = help_overlay.as_mut() {
+                    match h.handle_key(&k.key, k.modifiers) {
+                        crate::help::HelpOutcome::Close => help_overlay = None,
+                        // `o`: dock the current page into the panel's Help
+                        // section (same shape as OpenMergeQueueSection).
+                        crate::help::HelpOutcome::OpenInPanel => {
+                            panel_ui.help.page = h.page_id().to_string();
+                            help_overlay = None;
+                            panel_auto_revealed = None;
+                            if chrome.panel.is_none() {
+                                want_panel = true;
+                                panel_forced = cols < layout::PANEL_MIN_COLS;
+                                chrome = recompute_chrome!();
+                                need_relayout = true;
+                            }
+                            panel_ui.switch_tab(crate::panel::PanelTab::Help);
+                            open_panel_section(
+                                crate::panel::Section::Help,
+                                &mut panel_ui,
+                                &mut hydration_gen,
+                                &model_tx,
+                                &session,
+                                &waker,
+                                PanelDocsWiring {
+                                    model: &model,
+                                    generation: docs_gen,
+                                    tx: &docs_tx,
+                                },
+                            );
+                            focus.zone = crate::focus::Zone::Panel;
+                        }
+                        crate::help::HelpOutcome::Pending => {}
+                    }
                     dirty = true;
                     continue;
                 }
@@ -15903,6 +15883,9 @@ async fn event_loop<T: Terminal>(
                                     model.status = format!("Font list failed: {e}");
                                 }
                             },
+                            Action::Help => {
+                                help_overlay = crate::help::open(&help_registry, &focus, &panel_ui);
+                            }
                             Action::OpenPalette => {
                                 if let Ok(db) = thegn_core::db::Db::open() {
                                     palette = Some(crate::search_everywhere::PaletteSession::new(
