@@ -78,9 +78,16 @@ impl SshShim {
     /// per-instance host key, quiet. Pure over `self` (unit-tested).
     pub fn base_argv(&self) -> Vec<String> {
         let kh = registry::known_hosts_path(&self.name);
-        let control = registry::dir().join("cm-%C");
+        let control = control_socket_path();
         vec![
             "ssh".into(),
+            // Hermetic: a thegn-managed remote pins its own identity, known_hosts,
+            // and options below — never read the user's personal ~/.ssh/config
+            // (its Host rules don't apply to a direct-IP managed connection, and a
+            // home-manager/nix-store config file is root-owned, which OpenSSH
+            // rejects as "Bad owner or permissions", breaking every managed ssh).
+            "-F".into(),
+            "/dev/null".into(),
             "-o".into(),
             "BatchMode=yes".into(),
             "-o".into(),
@@ -105,55 +112,29 @@ impl SshShim {
         ]
     }
 
-    /// Run `script` remotely with `data` on stdin appended after the script is
-    /// consumed — the single primitive under exec and file ops. The remote
-    /// command is `/bin/sh -s` (nothing sensitive on either side's argv); the
-    /// script itself streams first, then sees `data` (if any) as the rest of
-    /// its own stdin via `cat`.
-    async fn run_raw(&self, full_script: &str, data: Option<&[u8]>) -> Result<(i32, Vec<u8>)> {
+    /// Run `full_script` remotely by streaming it to `/bin/sh -s` on **stdin**
+    /// — the single primitive under exec and file ops. The script rides stdin
+    /// (never argv): ssh space-joins any remote-command argv and the remote shell
+    /// re-splits it, so a multi-word `sh -c <script>` would mangle (e.g. `mkdir`
+    /// loses its operand). File writes embed their payload *inside* the script as
+    /// base64 (see [`write`](Self::write)), so there is never a second stdin
+    /// channel to multiplex.
+    async fn run_raw(&self, full_script: &str) -> Result<(i32, Vec<u8>)> {
         let mut argv = self.base_argv();
         argv.push("--".into());
-        // `sh -s` reads the whole script from stdin — but our file writes need
-        // stdin for DATA. Split the channel: script as the `-c` payload would
-        // put it on the remote argv (fine — scripts carry no secrets once env
-        // rides the exports preamble)… except the exports preamble IS the
-        // secret. So: base64 the script into the argv-safe command? No —
-        // simplest robust split: script over stdin, data over stdin after an
-        // explicit separator the script reads itself. Instead we take the
-        // pragmatic path: when there is no data, `/bin/sh -s` consumes stdin as
-        // the script; when there IS data, the script goes argv-side via `sh -c`
-        // but callers must not put secrets in file-op scripts (they don't: file
-        // paths only).
-        let mut child = if let Some(_d) = data {
-            argv.push("/bin/sh".into());
-            argv.push("-c".into());
-            argv.push(full_script.to_string());
-            tokio::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .context("spawn ssh (data)")?
-        } else {
-            argv.push("/bin/sh".into());
-            argv.push("-s".into());
-            tokio::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .context("spawn ssh")?
-        };
+        argv.push("/bin/sh".into());
+        argv.push("-s".into());
+        let mut child = tokio::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn ssh")?;
         let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("ssh stdin"))?;
-        let payload: Vec<u8> = match data {
-            Some(d) => d.to_vec(),
-            None => full_script.as_bytes().to_vec(),
-        };
-        // Feed stdin concurrently with output collection (a large write must
+        let payload = full_script.as_bytes().to_vec();
+        // Feed stdin concurrently with output collection (a large script must
         // not deadlock against a filling stdout pipe).
         let feeder = tokio::spawn(async move {
             let _ = stdin.write_all(&payload).await;
@@ -177,7 +158,7 @@ impl SshShim {
         env: &[(String, String)],
     ) -> Result<(i32, String)> {
         let script = stdin_script(&script_from_argv(argv), cwd, env);
-        let (code, out) = self.run_raw(&script, None).await?;
+        let (code, out) = self.run_raw(&script).await?;
         Ok((code, String::from_utf8_lossy(&out).into_owned()))
     }
 
@@ -185,7 +166,7 @@ impl SshShim {
     /// contract: a missing marker must be an error, not empty bytes).
     pub async fn read(&self, path: &str) -> Result<Vec<u8>> {
         let p = thegn_core::util::sh_quote(path);
-        let (code, out) = self.run_raw(&format!("cat {p}\n"), None).await?;
+        let (code, out) = self.run_raw(&format!("cat {p}\n")).await?;
         if code == 0 {
             Ok(out)
         } else {
@@ -193,8 +174,12 @@ impl SshShim {
         }
     }
 
-    /// Write `data` to a remote path (parents created), with `mode`.
+    /// Write `data` to a remote path (parents created), with `mode`. The payload
+    /// is base64-embedded *in the script* (decoded remotely with `base64 -d`), so
+    /// it rides the single stdin channel to `sh -s` — binary-safe, and never on
+    /// argv (which ssh would space-join + re-split).
     pub async fn write(&self, path: &str, data: &[u8], mode: &str) -> Result<()> {
+        use base64::Engine;
         let p = thegn_core::util::sh_quote(path);
         let dir = thegn_core::util::sh_quote(
             std::path::Path::new(path)
@@ -204,8 +189,10 @@ impl SshShim {
                 .unwrap_or_else(|| ".".into())
                 .as_str(),
         );
-        let script = format!("mkdir -p {dir} && cat > {p} && chmod {mode} {p}");
-        let (code, out) = self.run_raw(&script, Some(data)).await?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+        let script =
+            format!("mkdir -p {dir} && printf %s {b64} | base64 -d > {p} && chmod {mode} {p}");
+        let (code, out) = self.run_raw(&script).await?;
         if code == 0 {
             Ok(())
         } else {
@@ -220,7 +207,7 @@ impl SshShim {
     pub async fn list_dir(&self, path: &str) -> Result<Vec<crate::provider::FileEntry>> {
         let p = thegn_core::util::sh_quote(path);
         let script = format!("find {p} -maxdepth 1 -mindepth 1 -printf '%y\\t%s\\t%f\\n'");
-        let (code, out) = self.run_raw(&format!("{script}\n"), None).await?;
+        let (code, out) = self.run_raw(&format!("{script}\n")).await?;
         if code != 0 {
             return Err(anyhow!("list {path}: exit {code}"));
         }
@@ -230,7 +217,7 @@ impl SshShim {
     /// Delete a remote path recursively (idempotent).
     pub async fn delete(&self, path: &str) -> Result<()> {
         let p = thegn_core::util::sh_quote(path);
-        let (code, out) = self.run_raw(&format!("rm -rf {p}\n"), None).await?;
+        let (code, out) = self.run_raw(&format!("rm -rf {p}\n")).await?;
         if code == 0 {
             Ok(())
         } else {
@@ -240,6 +227,30 @@ impl SshShim {
             ))
         }
     }
+}
+
+/// The ControlMaster multiplex socket template (`…/cm-%C`, `%C` = OpenSSH's
+/// per-connection hash). A Unix-domain socket path is capped at ~104 bytes, so
+/// the base dir MUST be short — a deep `$XDG_STATE_HOME` (e.g. under a profile
+/// dir) blows the limit and every ssh fails with "path too long for Unix domain
+/// socket". Prefer the short, private `$XDG_RUNTIME_DIR` (`/run/user/<uid>`),
+/// falling back to a per-user temp dir; the socket is ephemeral (ControlPersist),
+/// so location is irrelevant beyond length + privacy. The `tg-ssh` dir is created
+/// 0700 best-effort.
+pub fn control_socket_path() -> PathBuf {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(std::env::temp_dir)
+        .join("tg-ssh");
+    // best-effort: if the mkdir fails, ssh reports the bind error as before.
+    let _ = std::fs::create_dir_all(&base);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
+    }
+    base.join("cm-%C")
 }
 
 /// Parse `find -printf '%y\t%s\t%f\n'` output into entries. Pure (unit-tested).

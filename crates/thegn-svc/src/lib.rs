@@ -20,6 +20,7 @@ pub mod iroh_reach;
 pub mod issue;
 pub mod log;
 pub mod lsp;
+pub mod machine0;
 pub mod mcp_git;
 pub mod projection;
 pub mod provider;

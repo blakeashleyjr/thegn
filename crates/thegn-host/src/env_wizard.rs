@@ -34,6 +34,7 @@ const KINDS: &[&str] = &[
     "hetzner",
     "daytona",
     "sprites",
+    "machine0",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
