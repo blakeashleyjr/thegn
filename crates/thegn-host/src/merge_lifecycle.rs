@@ -103,10 +103,18 @@ fn file_into(db: &Db, repo_root: &Path, worktree: &str, branch: &str, folder: &s
 /// cache rows. The branch name comes from the caller (the queue row), not live
 /// git — the fold may already have fast-forwarded the branch away.
 fn remove_landed(db: &Db, repo_root: &Path, worktree: &str, branch: &str, delete_branch: bool) {
-    thegn_core::worktree::remove(repo_root, Path::new(worktree), branch, delete_branch);
-    // best-effort cache cleanup: git is the source of truth.
+    let removed =
+        thegn_core::worktree::remove(repo_root, Path::new(worktree), branch, delete_branch);
+    // The branch landed, so it's no longer a queue entry regardless.
     let _ = db.remove_merge_entry(worktree);
-    let _ = db.del_worktree(worktree);
+    // Only drop the worktree's cache row (its folder assignment) when the dir
+    // actually went away. If removal failed (a read-only sandbox mount, or
+    // uncommitted changes), keep the row so the sidebar still files it under its
+    // folder instead of orphaning it ungrouped under the repo root ("home").
+    // git is the source of truth; the row self-corrects once the dir is gone.
+    if removed {
+        let _ = db.del_worktree(worktree);
+    }
 }
 
 /// After an in-app fold, tear down any live tab whose worktree dir was just
@@ -372,6 +380,49 @@ mod tests {
                 .all(|r| r.worktree != feat_s)
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Regression: when the worktree can't be removed (read-only sandbox mount,
+    // uncommitted changes) the cache row must be KEPT so the sidebar keeps it
+    // filed, instead of dropping the row and orphaning it under "home".
+    #[test]
+    fn landed_remove_keeps_row_when_removal_fails() {
+        let db = Db::open_memory().unwrap();
+        let (root, _feat) = repo_with_feat(&db, "rmfail");
+        let root_s = root.to_string_lossy().to_string();
+        // A path that is NOT a registered git worktree ⇒ `git worktree remove`
+        // fails (stands in for the read-only-mount removal failure).
+        let bogus = root.with_extension("bogus");
+        std::fs::create_dir_all(&bogus).unwrap();
+        let bogus_s = bogus.to_string_lossy().to_string();
+        let fid = db.ensure_folder(&root_s, "Merging").unwrap();
+        db.put_worktree("bogus", &root_s, &bogus_s, "bogus", None, Some(fid))
+            .unwrap();
+        db.enqueue_merge(&bogus_s, "bogus", "main").unwrap();
+        apply(
+            &cfg(OnLanded::Remove),
+            &db,
+            &root,
+            &bogus_s,
+            "bogus",
+            LifecycleEvent::Landed,
+        );
+        assert!(
+            db.worktrees()
+                .unwrap()
+                .iter()
+                .any(|w| w.worktree == bogus_s),
+            "worktree row kept when removal failed (not orphaned)"
+        );
+        assert!(
+            db.list_merge_queue()
+                .unwrap()
+                .iter()
+                .all(|r| r.worktree != bogus_s),
+            "queue entry still cleared"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bogus);
     }
 
     #[test]
