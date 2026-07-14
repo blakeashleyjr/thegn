@@ -11,9 +11,8 @@ impl StatRenderer {
         if !frame.fields.is_empty() {
             let y_field = frame.fields.iter().find(|f| f.ty == FieldType::Float64);
             if let Some(y) = y_field
-                && let Ok(y_vals) = y.series.f64()
-                // For MVP, just take the last non-null value
-                && let Some(val) = y_vals.into_iter().rev().flatten().next()
+                // For MVP, just take the last value.
+                && let Some(val) = y.floats().into_iter().next_back()
             {
                 text = format!("{:.2}", val);
             }

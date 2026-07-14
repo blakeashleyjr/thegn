@@ -591,7 +591,10 @@ mod tests {
             "repo/sz-feature",
             "/wt/authoritative",
         );
-        assert!(handled, "the placeholder for this gen is owned by reconcile");
+        assert!(
+            handled,
+            "the placeholder for this gen is owned by reconcile"
+        );
         assert_eq!(session.worktrees.len(), 1);
         assert_eq!(
             session.worktrees[0].path, "/wt/authoritative",
@@ -633,11 +636,23 @@ mod tests {
         let mut creating_tabs: HashSet<Key> = HashSet::new();
         let mut gen_tab: GenTab = HashMap::new();
         seed_placeholder(
-            &mut session, &mut sb, &mut loading, &mut creating_tabs, &mut gen_tab, 1, "repo/a",
+            &mut session,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut gen_tab,
+            1,
+            "repo/a",
             "/wt/a",
         );
         seed_placeholder(
-            &mut session, &mut sb, &mut loading, &mut creating_tabs, &mut gen_tab, 2, "repo/b",
+            &mut session,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut gen_tab,
+            2,
+            "repo/b",
             "/wt/b",
         );
 
@@ -699,11 +714,23 @@ mod tests {
         let mut creating_tabs: HashSet<Key> = HashSet::new();
         let mut gen_tab: GenTab = HashMap::new();
         seed_placeholder(
-            &mut session, &mut sb, &mut loading, &mut creating_tabs, &mut gen_tab, 1, "repo/a",
+            &mut session,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut gen_tab,
+            1,
+            "repo/a",
             "/wt/a",
         );
         seed_placeholder(
-            &mut session, &mut sb, &mut loading, &mut creating_tabs, &mut gen_tab, 2, "repo/b",
+            &mut session,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut gen_tab,
+            2,
+            "repo/b",
             "/wt/b",
         );
 

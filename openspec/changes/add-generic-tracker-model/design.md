@@ -155,7 +155,7 @@ default `team`/`project`.
   `split_once(':')` routing context-free. `backend_for_id` falls back from the
   exact instance to the first-of-kind for legacy ids.
 - **Workspace mapping**: `[workspace.<slug>] tracker = { provider, account,
-  team, project }` binds a workspace to an instance + scope. The per-repo
+team, project }` binds a workspace to an instance + scope. The per-repo
   `.thegn.toml` `[issues.linear]` overlay gains `account`/`team`/`project`
   (`team_id` kept as a deprecated alias). Precedence: repo overlay → workspace
   binding → account defaults → legacy `team_id`, resolved by the pure
@@ -210,7 +210,7 @@ SQLite (`crates/thegn-core/src/db.rs`): **bump `SCHEMA_VERSION` 43 → 44**. The
 migration adds two tables:
 
 - `tracker_meta (provider, scope, kind, json, fetched_at,
-  PRIMARY KEY(provider, scope, kind))` — team-scoped metadata (`teams`,
+PRIMARY KEY(provider, scope, kind))` — team-scoped metadata (`teams`,
   `states`, `cycles`, `projects` kinds), TTL ~900s (`[issues] meta_ttl_secs`).
 - `issue_detail_cache (issue_id PRIMARY KEY, json, fetched_at)` — single-item
   detail (comments + relations), 60s TTL.

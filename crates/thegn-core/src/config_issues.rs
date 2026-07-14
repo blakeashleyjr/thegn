@@ -137,7 +137,6 @@ impl Default for JiraConfig {
     }
 }
 
-
 /// Per-repo `[issues]` overlay from a repo-root `.thegn.*` file. Only the
 /// present keys override the global `[issues]`, letting a repo pin the Linear
 /// team / Jira project that scopes its "My Work" feed (GitHub is auto-scoped to

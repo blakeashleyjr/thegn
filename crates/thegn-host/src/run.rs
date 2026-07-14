@@ -843,7 +843,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
     let (ai_metrics_tx, ai_metrics_rx) =
         tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
-    spawn_ai_sidecar(waker.clone(), ai_metrics_tx);
+    crate::ai_sidecar::spawn_ai_sidecar(waker.clone(), ai_metrics_tx);
     crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
     // The stats cadence is user-cyclable at runtime (click the top-right
     // stats block); the ticker thread reads it per tick.
@@ -6808,23 +6808,12 @@ async fn event_loop<T: Terminal>(
     // (panes surviving UI exit) for panes spawned from here on.
     crate::handlers::startup::install_pane_services(&mut panes, &current_config);
 
-    // First-launch keymap picker (item 621). Skip entirely when the user has set
-    // `keymap_preset` in config (an explicit choice). Otherwise apply a preset
-    // remembered in `ui_state` from a previous run, or — on the very first launch
-    // — arm the one-time picker overlay (its pick/cancel persists to ui_state, so
-    // it shows exactly once).
-    if current_config.keymap_preset.is_empty() || current_config.keymap_preset == "default" {
-        match thegn_core::db::Db::open()
-            .ok()
-            .and_then(|db| db.get_ui_state("", "keymap_preset").ok().flatten())
-        {
-            Some(remembered) if remembered != "default" => {
-                current_config.keymap_preset = remembered;
-                keymap = rebuild_keymap(&current_config, &session);
-            }
-            Some(_) => {} // remembered "default" — no overlay, no picker
-            None => active_menu = Some(crate::menu::keymap_preset_menu()),
-        }
+    // First-run onboarding wizard (item 489) + the first-launch keymap picker
+    // (item 621); the wizard wins when both would arm (it has a keymap step).
+    let (mut onboarding, rebuild) =
+        crate::handlers::onboarding::startup(&mut current_config, &mut active_menu);
+    if rebuild {
+        keymap = rebuild_keymap(&current_config, &session);
     }
 
     let initial_app = app_host.active;
@@ -8018,6 +8007,14 @@ async fn event_loop<T: Terminal>(
         if drain_summary.preempted {
             loop_perf.input_preempt();
         }
+        // The onboarding wizard's login/agent tab closed: resume + re-probe.
+        dirty |= crate::handlers::onboarding::on_pane_exit(
+            &drain_summary.exited,
+            &mut onboarding,
+            &mut model,
+            &refresh_tx,
+            &waker,
+        );
         if drain_summary.disconnected {
             // Teardown, not an explicit close: keep daemon panes running.
             crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
@@ -9598,6 +9595,10 @@ async fn event_loop<T: Terminal>(
                 // Sizes land on the next hydrate; the scan doesn't force one.
                 RefreshKind::Disk => want_disk_refresh = true,
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
+                RefreshKind::Onboarding(r) => {
+                    dirty |=
+                        crate::handlers::onboarding::apply_probe(&mut onboarding, *r, &mut model)
+                }
                 RefreshKind::ProxyDash(p) => {
                     dirty |= crate::detail::apply_proxy_dash(&mut bar_detail, *p)
                 }
@@ -10652,6 +10653,7 @@ async fn event_loop<T: Terminal>(
             if let Some(w) = &env_wizard_ui {
                 w.render(&mut scratch, screen);
             }
+            onboarding.render(&mut scratch, screen);
             if let Some(p) = &workspace_picker {
                 p.render(&mut scratch, screen);
             }
@@ -11926,6 +11928,33 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // Modal: the onboarding wizard (suspended while its login/agent
+                // tab runs). Writes ride handlers::onboarding (config_write +
+                // secret backend + ui_state flag).
+                if onboarding.active() {
+                    let applied = crate::handlers::onboarding::handle_key_event(
+                        &k.key,
+                        k.modifiers,
+                        &mut onboarding,
+                        &mut model,
+                        &mut current_config,
+                        &mut session,
+                        &mut panes,
+                        chrome.center,
+                        &refresh_tx,
+                        &waker,
+                    );
+                    if applied.keymap_changed {
+                        keymap = rebuild_keymap(&current_config, &session);
+                    }
+                    if applied.spawned {
+                        focus.zone = crate::focus::Zone::Center;
+                        refresh_tab_model(&mut model, &session, &mut sb);
+                        need_relayout = true;
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Modal: the "Add environment" wizard. Submit writes the env via
                 // the shared create_env path (config_write + secret backend).
                 if env_wizard_ui.is_some() {
@@ -12739,21 +12768,16 @@ async fn event_loop<T: Terminal>(
                                     forced_palette_action =
                                         Some(crate::keymap::Action::NewWorktree);
                                 }
-                                GitAfter::OpenEditor(path) => {
-                                    let cmd = editor_open_command(keymap.config(), &path, None);
-                                    let cwd = active_cwd(&session);
-                                    open_command_tab(
-                                        &mut session,
-                                        &mut panes,
-                                        &cmd,
-                                        cwd.as_deref(),
-                                        chrome.center,
-                                    );
-                                    focus.zone = crate::focus::Zone::Center;
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    need_relayout = true;
-                                }
-                                GitAfter::Terminal(cmd) => {
+                                // Both arms spawn a command tab: the editor arm
+                                // just derives its command from the path first.
+                                after @ (GitAfter::OpenEditor(_) | GitAfter::Terminal(_)) => {
+                                    let cmd = match after {
+                                        GitAfter::OpenEditor(path) => {
+                                            editor_open_command(keymap.config(), &path, None)
+                                        }
+                                        GitAfter::Terminal(cmd) => cmd,
+                                        _ => unreachable!(),
+                                    };
                                     let cwd = active_cwd(&session);
                                     open_command_tab(
                                         &mut session,
@@ -13638,6 +13662,10 @@ async fn event_loop<T: Terminal>(
                                     // variant — keymap.rs is a pinned god-file).
                                     env_wizard_ui =
                                         Some(crate::env_wizard::EnvWizard::new(keymap.config()));
+                                } else if key == "setup-wizard" {
+                                    onboarding.ui = Some(crate::onboarding::OnboardingWizard::new(
+                                        keymap.config(),
+                                    ));
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
                                     forced_palette_action = Some(action);
                                 } else if let Some(idx) = keymap
@@ -17179,10 +17207,10 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
-                            Action::NewWorktree if (focus.sidebar()
-                                && sb.cursor_in_terminals(&model))
-                                || session.active_group().map(|g| g.kind)
-                                    == Some(crate::session::GroupKind::Terminal) =>
+                            Action::NewWorktree
+                                if (focus.sidebar() && sb.cursor_in_terminals(&model))
+                                    || session.active_group().map(|g| g.kind)
+                                        == Some(crate::session::GroupKind::Terminal) =>
                             {
                                 // Alt+w is context-dependent, mirroring the
                                 // sidebar `n` key: in the TERMINALS region it
@@ -17918,6 +17946,10 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                if onboarding.paste(&s) {
+                    dirty = true;
+                    continue;
+                }
                 // A chrome text-input is collecting keystrokes (commit message /
                 // rename / new-branch overlay, the search palette, or the git
                 // filter line): a paste belongs to it, not the terminal. We
@@ -18013,39 +18045,6 @@ fn remap_warmed_tab_ids(tab: &mut crate::session::Tab, focus: u32, pairs: &[(u32
         tab.focused_pane = *map.values().next().unwrap_or(&0);
     }
     true
-}
-
-pub fn spawn_ai_sidecar(
-    waker: termwiz::terminal::TerminalWaker,
-    tx: tokio::sync::mpsc::UnboundedSender<crate::chrome::AiMetrics>,
-) {
-    tokio::spawn(async move {
-        use std::process::Stdio;
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        use tokio::process::Command;
-
-        let mut child = match Command::new("python3")
-            .arg("src/sidecar.py")
-            .stdout(Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("failed to spawn AI metrics sidecar: {e}");
-                return;
-            }
-        };
-
-        if let Some(stdout) = child.stdout.take() {
-            let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if let Ok(metrics) = serde_json::from_str::<crate::chrome::AiMetrics>(&line) {
-                    let _ = tx.send(metrics);
-                    let _ = waker.wake();
-                }
-            }
-        }
-    });
 }
 
 #[cfg(test)]

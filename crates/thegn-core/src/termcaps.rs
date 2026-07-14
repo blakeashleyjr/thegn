@@ -332,45 +332,45 @@ pub const UNICODE: GlyphSet = GlyphSet {
     box_br: "╯",
     box_h: "─",
     box_v: "│",
-    dot_filled: "\u{25cf}",     // ●
-    dot_hollow: "\u{25cb}",     // ○
-    cross_heavy: "\u{2716}",    // ✖
-    arrow_up: "\u{2191}",       // ↑
-    arrow_down: "\u{2193}",     // ↓
-    diamond_filled: "\u{25c6}", // ◆
-    diamond_hollow: "\u{25c7}", // ◇
-    brand_sigil: "\u{00fe}",    // þ — Latin-1, width 1, safe at Full AND Basic
-    check: "\u{2713}",          // ✓
-    cross: "\u{2717}",          // ✗
-    ellipsis: "\u{2026}",       // …
-    middot: "\u{00b7}",         // ·
-    refresh: "\u{21bb}",        // ↻
-    emdash: "\u{2014}",         // —
-    warn: "\u{26a0}",           // ⚠
-    hex: "\u{2b21}",            // ⬡
-    mail: "\u{2709}",           // ✉
-    moon: "\u{23fe}",           // ⏾
-    attention: "\u{270b}",      // ✋ (one-line swap to `⚠` if emoji width misbehaves)
-    caret_closed: "\u{25b8}",   // ▸
-    caret_open: "\u{25be}",     // ▾
-    tree_tee: "\u{251c}",       // ├
-    tree_corner: "\u{2514}",    // └
-    half_block_r: "\u{2590}",   // ▐
-    chevron: "\u{203a}",        // ›
-    folder: "\u{25aa}",         // ▪
-    dir: "\u{2302}",            // ⌂
-    host_local: "\u{2261}",     // ≡
-    host_remote: "\u{21c5}",    // ⇅
-    flag: "\u{2691}",           // ⚑
-    half_dot: "\u{25d0}",       // ◐
-    quote_open: "\u{00ab}",     // «
-    quote_close: "\u{00bb}",    // »
-    block_full: "\u{2588}",     // █
-    block_top: "\u{2580}",      // ▀
-    block_bot: "\u{2584}",      // ▄
+    dot_filled: "\u{25cf}",                                  // ●
+    dot_hollow: "\u{25cb}",                                  // ○
+    cross_heavy: "\u{2716}",                                 // ✖
+    arrow_up: "\u{2191}",                                    // ↑
+    arrow_down: "\u{2193}",                                  // ↓
+    diamond_filled: "\u{25c6}",                              // ◆
+    diamond_hollow: "\u{25c7}",                              // ◇
+    brand_sigil: "\u{00fe}",  // þ — Latin-1, width 1, safe at Full AND Basic
+    check: "\u{2713}",        // ✓
+    cross: "\u{2717}",        // ✗
+    ellipsis: "\u{2026}",     // …
+    middot: "\u{00b7}",       // ·
+    refresh: "\u{21bb}",      // ↻
+    emdash: "\u{2014}",       // —
+    warn: "\u{26a0}",         // ⚠
+    hex: "\u{2b21}",          // ⬡
+    mail: "\u{2709}",         // ✉
+    moon: "\u{23fe}",         // ⏾
+    attention: "\u{270b}",    // ✋ (one-line swap to `⚠` if emoji width misbehaves)
+    caret_closed: "\u{25b8}", // ▸
+    caret_open: "\u{25be}",   // ▾
+    tree_tee: "\u{251c}",     // ├
+    tree_corner: "\u{2514}",  // └
+    half_block_r: "\u{2590}", // ▐
+    chevron: "\u{203a}",      // ›
+    folder: "\u{25aa}",       // ▪
+    dir: "\u{2302}",          // ⌂
+    host_local: "\u{2261}",   // ≡
+    host_remote: "\u{21c5}",  // ⇅
+    flag: "\u{2691}",         // ⚑
+    half_dot: "\u{25d0}",     // ◐
+    quote_open: "\u{00ab}",   // «
+    quote_close: "\u{00bb}",  // »
+    block_full: "\u{2588}",   // █
+    block_top: "\u{2580}",    // ▀
+    block_bot: "\u{2584}",    // ▄
     spin: &["\u{25d0}", "\u{25d3}", "\u{25d1}", "\u{25d2}"], // ◐ ◓ ◑ ◒
-    bar_fill: "\u{2593}",       // ▓
-    bar_empty: "\u{2591}",      // ░
+    bar_fill: "\u{2593}",     // ▓
+    bar_empty: "\u{2591}",    // ░
 };
 
 /// 7-bit ASCII fallbacks for terminals/fonts that can't render [`UNICODE`].

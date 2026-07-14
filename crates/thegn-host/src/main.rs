@@ -13,6 +13,7 @@ mod agent_output;
 mod agent_pi;
 mod agent_ssh;
 mod agent_teardown;
+mod ai_sidecar;
 mod apps;
 mod attention_status;
 mod autoscale;
@@ -102,6 +103,7 @@ mod naming;
 mod nav;
 mod nixcache;
 mod notify;
+mod onboarding;
 mod owl;
 mod palette;
 mod pane;
@@ -404,6 +406,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Launch the compositor straight into the onboarding wizard (forge auth,
+    /// issue trackers, hosts, sandbox, appearance). Re-runnable any time.
+    Setup,
     /// Generate shell completions (bash/zsh/fish/elvish/powershell) for the
     /// invoked binary name — `thegn completions zsh > …/_thegn`.
     Completions { shell: clap_complete::Shell },
@@ -621,7 +626,11 @@ fn main() -> anyhow::Result<()> {
     // interactive compositor (the default). `open` is special: with no live
     // instance it falls THROUGH to the interactive launch below.
     if let Some(command) = cli.command.take() {
-        let result = if let Command::Open { repo, no_launch } = command {
+        let result = if matches!(command, Command::Setup) {
+            // Fall through to the interactive launch with the wizard armed.
+            onboarding::request_setup_on_start();
+            Err(None)
+        } else if let Command::Open { repo, no_launch } = command {
             let mut cfg = thegn_core::config::Config::load_layered(
                 &thegn_core::config::ProcessEnv,
                 &cli.overrides,
@@ -764,6 +773,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Doctor { json } => cmd::doctor::run(&cfg, json),
+        // Dispatched before run_subcommand (it falls through to the TUI);
+        // unreachable here, kept for match exhaustiveness.
+        Command::Setup => Ok(()),
         Command::Completions { shell } => {
             // Generate against the same grouped command tree the parser uses,
             // named for the invoked alias (thegn / tg).
