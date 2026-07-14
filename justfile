@@ -108,6 +108,12 @@ build-musl: _apps
 host *args: build
     {{bin}} {{args}}
 
+# Regenerate test/help-ratchet.txt (the help-coverage allowlist) from the
+# current undocumented ACTION_SPECS set. The ratchet test only lets this file
+# shrink; run after documenting actions in docs/help/ to lock in the win.
+help-ratchet-update:
+    THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_ratchet_update -- --ignored
+
 # Startup benchmarks (hyperfine; needs the dev shell). Not part of `just ci` —
 # timings are machine-dependent. Three numbers: process/clap baseline; cold
 # launch → first diff-flushed frame (fresh state: pays schema creation + first

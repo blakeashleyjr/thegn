@@ -54,6 +54,7 @@ mod gitmut;
 mod glyph_refresh;
 mod graphics;
 mod handlers;
+mod help;
 mod hibernator;
 mod host_flow;
 mod host_provision;

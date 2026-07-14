@@ -72,6 +72,8 @@ rules:
   design:
     - Call out which render damage channel (Skip/Panes/Full) and event-loop wake path the change touches, if any.
     - Note any SQLite schema change and the required user_version bump.
+    - New interactive surfaces must state which help context key (`zone:*` / `panel:*`) maps to their docs/help/ page.
   tasks:
     - Core logic tasks must include unit tests (95% line gate on thegn-core).
+    - Any task adding or renaming a user-facing action, keybind, zone, panel section, or config table must include a task updating the matching docs/help/ page(s); the help ratchet test enforces action-to-page coverage and test/help-ratchet.txt may only shrink.
     - End with a task to run `just ci` (includes openspec-validate).

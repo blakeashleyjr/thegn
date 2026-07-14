@@ -428,6 +428,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         palette: true,
     },
     ActionSpec {
+        id: "help",
+        label: "Help — built-in docs",
+        hint: "help",
+        default_chords: &["F1"],
+        palette: true,
+    },
+    ActionSpec {
         id: "lazygit",
         label: "Open lazygit",
         hint: "lazygit",
