@@ -14,7 +14,7 @@
       and Mine sections (existing `b`/`D` keys unchanged), with key handling in
       `crates/thegn-host/src/handlers/tracker.rs` (not `run.rs` — god-file
       ratchet): generalize `pending_issue_link` to `pending_issue_start:
-      Option<(u64, IssueStartCtx { issue_id, title, body, url, launch_agent })>`
+Option<(u64, IssueStartCtx { issue_id, title, body, url, launch_agent })>`
       resolved at `CreateEvent::Done`; create the worktree off-loop via
       `begin_worktree_preset` with `NameSpec::Fixed`, add+focus the group
       (`session::add_group`), and record the `issue_links` binding — **render

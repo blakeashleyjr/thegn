@@ -1151,7 +1151,7 @@ brokered creds and no open ports. This is what lets AR 541–543 reach any harne
 
 ### AO. Onboarding / DX
 
-- [ ] 489. First-run setup wizard
+- [x] 489. First-run setup wizard — `thegn setup` / first-run overlay (forge auth, issues, hosts, sandbox, appearance, agent, tour)
 - [~] 490. Doctor/diagnostics command
 - [~] 491. Built-in help/docs
 - [ ] 492. Interactive tutorial

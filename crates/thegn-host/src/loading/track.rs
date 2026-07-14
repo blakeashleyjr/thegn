@@ -75,9 +75,7 @@ impl LoadingTracker {
                 // Left Active for a terminal state: freeze the start stamp and
                 // measure how long the step ran (the elapsed column's value
                 // for finished steps).
-                (Some(p), StepState::Done | StepState::Failed)
-                    if p.state == StepState::Active =>
-                {
+                (Some(p), StepState::Done | StepState::Failed) if p.state == StepState::Active => {
                     s.started_at = p.started_at;
                     s.took = p.started_at.map(|t| now.duration_since(t));
                 }
@@ -176,17 +174,16 @@ mod tests {
     #[test]
     fn stamps_on_pending_to_active_and_carries_across_replacement() {
         let mut t = LoadingTracker::default();
-        t.set(
-            key(),
-            vec![LoadStep::active("a"), LoadStep::pending("b")],
+        t.set(key(), vec![LoadStep::active("a"), LoadStep::pending("b")]);
+        let first = t.get(&key()).unwrap()[0]
+            .started_at
+            .expect("active stamped");
+        assert!(
+            t.get(&key()).unwrap()[1].started_at.is_none(),
+            "pending unstamped"
         );
-        let first = t.get(&key()).unwrap()[0].started_at.expect("active stamped");
-        assert!(t.get(&key()).unwrap()[1].started_at.is_none(), "pending unstamped");
         // Whole-Vec replacement, same states: the stamp carries.
-        t.set(
-            key(),
-            vec![LoadStep::active("a"), LoadStep::pending("b")],
-        );
+        t.set(key(), vec![LoadStep::active("a"), LoadStep::pending("b")]);
         assert_eq!(t.get(&key()).unwrap()[0].started_at, Some(first));
         // b goes active: stamped fresh; a goes done: stamp frozen.
         t.set(key(), vec![LoadStep::done("a"), LoadStep::active("b")]);
@@ -252,7 +249,14 @@ mod tests {
         assert!(t.get(&key()).unwrap()[1].took.is_some());
         // A step that jumps straight to Done without ever being Active has
         // nothing to measure.
-        t.set(key(), vec![LoadStep::done("a"), LoadStep::done("b"), LoadStep::done("c")]);
+        t.set(
+            key(),
+            vec![
+                LoadStep::done("a"),
+                LoadStep::done("b"),
+                LoadStep::done("c"),
+            ],
+        );
         assert!(t.get(&key()).unwrap()[2].took.is_none());
     }
 

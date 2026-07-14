@@ -154,6 +154,9 @@ pub(crate) struct DrainSummary {
     pub disconnected: bool,
     /// Input was discovered mid-drain and the drain aborted for it.
     pub preempted: bool,
+    /// Panes whose child exited this pass (the onboarding wizard watches for
+    /// its spawned `gh auth login` / agent-setup tab closing).
+    pub exited: Vec<u32>,
 }
 
 /// Everything the moved Output/Exit handlers touch, borrowed from the loop.
@@ -239,6 +242,7 @@ pub(crate) fn drain<T: Terminal>(
 
     // 2. Exits — flush the pane's stashed tail into its emulator first, so
     // its final output reaches scrollback before the pane leaves the table.
+    summary.exited = exits.iter().map(|(id, _)| *id).collect();
     for (id, code) in exits {
         let tail = backlog.drain_pane(id);
         if !tail.is_empty() {

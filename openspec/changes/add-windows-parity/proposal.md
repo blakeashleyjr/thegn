@@ -3,7 +3,7 @@
 ## Summary
 
 The compositor, daemon, and process substrate are Windows-native (phases 1–4);
-this change closes the remaining feature gaps so a Windows thegn *feels* like
+this change closes the remaining feature gaps so a Windows thegn _feels_ like
 a Linux thegn:
 
 - **Activity dots**: the `/proc` scanner gets a Windows twin — sysinfo
@@ -20,14 +20,14 @@ a Linux thegn:
   fallback files — keyring/Credential Manager is the primary store). Rewires
   the token file+dir (host `secret.rs`), share credentials, and VPN keys.
 - **Sandbox backend policy on Windows**: `pick_backend` declines OCI
-  runtimes on native Windows *even when Docker/Podman Desktop is installed* —
+  runtimes on native Windows _even when Docker/Podman Desktop is installed_ —
   their Linux containers live in a WSL2 VM that cannot bind-mount the
   worktree at its real absolute path (git worktree metadata carries host
   paths), which would silently break the sandbox contract. The warning names
   the reason and points at WSL2. The default `backend_chain` gains
   `"jobobject"` before `"host"` (probes Absent on unix), so Windows panes are
   scoped by kill-on-close Job Objects rather than silently uncontained.
-  Pane-child job *resource limits* stay deferred until on-machine validation
+  Pane-child job _resource limits_ stay deferred until on-machine validation
   shows orphans/need (ConPTY already scopes the pane tree).
 - **Desktop toasts**: a Windows arm for the notification dispatcher — WinRT
   toast via PowerShell (pwsh → powershell, never cmd), same best-effort

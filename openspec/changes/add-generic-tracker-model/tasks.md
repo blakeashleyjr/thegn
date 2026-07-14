@@ -16,7 +16,7 @@
       `move_on_merge` to local `thegn land` merges), the
       `[issues.linear.accounts.<name>]` tables (`api_key` secrets-ref,
       default `team`/`project`), `[workspace.<slug>] tracker = { provider,
-      account, team, project }` + `issues_agent_write`, and the `.thegn.toml`
+account, team, project }` + `issues_agent_write`, and the `.thegn.toml`
       `[issues.linear]` overlay `account`/`team`/`project` (`team_id` deprecated
       alias) in `crates/thegn-core/src/config.rs`; pure resolution via
       `Config::repo_issues_scoped(root, slug)` (repo overlay → workspace binding
@@ -25,8 +25,8 @@
       expansion (95% gate).
 - [ ] 1.3 Migration in `crates/thegn-core/src/db.rs`: bump `SCHEMA_VERSION`
       43 → 44, add `tracker_meta (provider, scope, kind, json, fetched_at,
-      PRIMARY KEY(provider,scope,kind))` (~900s TTL) and `issue_detail_cache
-      (issue_id PRIMARY KEY, json, fetched_at)` (60s TTL), activate the dormant
+PRIMARY KEY(provider,scope,kind))` (~900s TTL) and `issue_detail_cache
+(issue_id PRIMARY KEY, json, fetched_at)` (60s TTL), activate the dormant
       `issue_projects` table (no new `project_cache`), and clear
       `issue_cache`/`issue_projects` rows (pure caches); new
       `issue_relations.kind` values — **unit tests** for migration and cache

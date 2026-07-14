@@ -29,19 +29,32 @@ pub(crate) fn open_command_tab(
     cwd: Option<&std::path::Path>,
     center: Rect,
 ) {
+    let _ = open_command_tab_id(session, panes, command, cwd, center);
+}
+
+/// [`open_command_tab`], returning the spawned pane's id (the onboarding
+/// wizard watches its login/agent tab for exit).
+pub(crate) fn open_command_tab_id(
+    session: &mut Session,
+    panes: &mut Panes,
+    command: &str,
+    cwd: Option<&std::path::Path>,
+    center: Rect,
+) -> Option<u32> {
     let argv = tool_drawer_argv(command);
     let Ok(id) = panes.spawn_argv(&argv, cwd, center) else {
-        return;
+        return None;
     };
     if let Some(g) = session.active_group_mut() {
         g.add_tab();
         if let Some(tab) = g.active_tab_mut() {
             tab.center = crate::center::CenterTree::Leaf(id);
             tab.focused_pane = id;
-            return;
+            return Some(id);
         }
     }
     panes.table.remove(&id);
+    None
 }
 
 /// Spawn `command` into a new split beside the focused center pane.

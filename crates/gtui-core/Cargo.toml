@@ -7,7 +7,6 @@ publish = false
 license.workspace = true
 
 [dependencies]
-polars = { version = "0.45", features = ["dtype-datetime", "dtype-struct"] }
 chrono = { workspace = true }
 serde = { workspace = true }
 thiserror = "2.0.18"

@@ -96,7 +96,7 @@ call sites that rely on child-side cleanup are cancel-and-discard paths.
 
 - **WHEN** a newer test run supersedes an in-flight `cargo test` (or its
   watchdog deadline passes) on native Windows
-- **THEN** terminating the slot's `GroupHandle` kills the runner *and* every
+- **THEN** terminating the slot's `GroupHandle` kills the runner _and_ every
   test binary it spawned, immediately
 
 #### Scenario: Host death leaves no orphans

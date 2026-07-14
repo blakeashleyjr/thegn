@@ -141,11 +141,9 @@ pub(crate) fn maybe_materialize(
                 );
                 let _ = ptx.send((gname.clone(), ti, Vec::new()));
                 let _ = wk.wake();
-                observed(&|| {
-                    crate::direnv_warm::launch_spec_synced(&cfg, &wt, None, "shell")
-                })
-                .map(|spec| missing.iter().map(|id| (*id, spec.clone())).collect())
-                .map_err(spec_err)
+                observed(&|| crate::direnv_warm::launch_spec_synced(&cfg, &wt, None, "shell"))
+                    .map(|spec| missing.iter().map(|id| (*id, spec.clone())).collect())
+                    .map_err(spec_err)
             } else {
                 // Provision the env first (provider only; no-op otherwise):
                 // clone the repo + reproduce the declared toolchain + personal

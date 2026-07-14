@@ -361,6 +361,14 @@ pub(crate) fn build_command_palette_items(
         "＋ New environment…  (cloud / ssh / local)".to_string(),
     ));
 
+    // Onboarding wizard re-run (also `thegn setup`) — forge auth, issue
+    // trackers, hosts, sandbox, appearance. Dispatched via the "setup-wizard"
+    // key in the run-loop palette Enter arm.
+    items.push(crate::palette::PaletteItem::new(
+        "setup-wizard",
+        "⚙ Setup wizard…  (forge / hosts / sandbox / appearance)".to_string(),
+    ));
+
     items
 }
 
