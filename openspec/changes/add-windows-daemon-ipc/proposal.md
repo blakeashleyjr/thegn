@@ -13,7 +13,7 @@ Mechanics:
 
 - **`IpcEndpoint`**: classifies a stored/configured "socket path" — a
   `\\.\pipe\…` string is used as-is; any other path is a unix socket on unix
-  and is *derived into* a pipe name on Windows
+  and is _derived into_ a pipe name on Windows
   (`\\.\pipe\thegn-<hex(sha256(path))[..16]>`). Derivation + classification
   are pure and unit-tested on Linux, so per-state-dir daemon isolation (the
   "tests run inside a live thegn" gotcha) carries over unchanged.
