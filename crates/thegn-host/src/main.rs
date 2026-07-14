@@ -55,6 +55,7 @@ mod gitmut;
 mod glyph_refresh;
 mod graphics;
 mod handlers;
+mod help;
 mod hibernator;
 mod host_flow;
 mod host_provision;
@@ -81,6 +82,7 @@ mod loc_scan;
 mod logotype;
 mod loop_policy;
 mod lsp;
+mod machine0_bridge;
 mod managed_tool;
 mod mascot;
 mod masthead;
@@ -484,6 +486,18 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+    /// Hidden: the machine0 exec bridge (`machine0-ssh <name> -- cmd…`) — the CLI
+    /// prefix a machine0 provider env's panes and control-plane reads run through.
+    /// Resolves the VM IP + ssh user via the machine0 provider (`vm_get`; wakes a
+    /// suspended VM only for an interactive pane) and execs `ssh`/`mosh`.
+    #[command(hide = true)]
+    Machine0Ssh {
+        /// The machine0 VM name (the resolved sandbox id).
+        name: String,
+        /// Command to run (empty ⇒ a login shell).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
     /// Hidden: the sprites exec bridge (`sprite-exec <id> -- cmd…`) — the
     /// control-plane prefix a sprites (WSS-native) env's chrome git/gh/fs reads
     /// and persisted worktree location run through. Runs the command over the
@@ -835,6 +849,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             rt.block_on(sprite_proxy_relay(provider, id))
         }
         Command::VpsSsh { name, cmd } => vps_bridge::run(&cfg, &name, &cmd),
+        Command::Machine0Ssh { name, cmd } => machine0_bridge::run(&cfg, &name, &cmd),
         Command::SpriteExec { id, cmd } => sprite_bridge::run(&cfg, &id, &cmd),
         Command::SandboxArgv { worktree } => {
             let wt = worktree

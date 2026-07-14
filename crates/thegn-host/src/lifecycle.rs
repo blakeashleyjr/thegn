@@ -35,7 +35,11 @@ fn last_active() -> &'static Mutex<HashMap<String, Instant>> {
 /// worktrees so their sandboxes suspend and stop being live-scanned. No-op when
 /// the policy is disabled. Best-effort + cheap (a few map lookups + maybe a
 /// process kill); safe to call from the hydration thread.
-pub fn reconcile(session: &crate::session::Session, cfg: &LifecycleConfig) {
+pub fn reconcile(
+    session: &crate::session::Session,
+    app_cfg: &thegn_core::config::Config,
+    cfg: &LifecycleConfig,
+) {
     if !cfg.enabled {
         return;
     }
@@ -95,6 +99,11 @@ pub fn reconcile(session: &crate::session::Session, cfg: &LifecycleConfig) {
 
     for wt in &decision.suspend {
         let loc = GitLoc::for_worktree(Path::new(wt));
+        // Providers that don't self-suspend (machine0/fly) keep billing an idle VM
+        // unless thegn explicitly parks it — dropping the bridge alone (the
+        // sprites path, where Firecracker auto-idles) isn't enough. Do this BEFORE
+        // dropping the bridge so a live control read can't wake it back up.
+        explicit_park(app_cfg, wt);
         if let Some(key) = thegn_svc::bridge::bridge_key(&loc) {
             thegn_svc::bridge::drop_key(&key);
             tracing::debug!(
@@ -102,6 +111,61 @@ pub fn reconcile(session: &crate::session::Session, cfg: &LifecycleConfig) {
                 worktree = %wt,
                 "suspended idle sandbox (dropped resident bridge)"
             );
+        }
+    }
+}
+
+/// Explicitly `vm_suspend`/stop an idle worktree's sandbox when its provider is
+/// scale-to-zero but does NOT self-suspend (machine0, fly). Best-effort + bounded
+/// (a couple of provider API calls on the hydration thread, off the event loop);
+/// idempotent (a no-op if the provider self-idles, doesn't support it, or is
+/// already parked). Clears the machine0 bridge's endpoint cache so a control read
+/// can't attach to the just-parked VM.
+fn explicit_park(app_cfg: &thegn_core::config::Config, worktree: &str) {
+    use std::path::{Path, PathBuf};
+    use thegn_core::store::{PoolStore, WorkspaceStore};
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    if !loc.is_remote() {
+        return;
+    }
+    let repo_root: PathBuf = thegn_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| thegn_core::repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let selected = thegn_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let env = app_cfg.resolve_env(&repo_root, &loc, Path::new(worktree), selected.as_deref());
+    let Some(envc) = app_cfg.env.get(&env.name) else {
+        return;
+    };
+    let pc = &envc.provider;
+    let kind = pc.provider.trim();
+    if !thegn_core::config::provider_scale_to_zero(kind)
+        || thegn_core::config::provider_self_suspends(kind)
+    {
+        return; // self-suspends (sprites) or not scale-to-zero (VPS) ⇒ nothing to do
+    }
+    let thegn_core::placement::Placement::Provider(p) = &env.placement else {
+        return;
+    };
+    let id = thegn_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten())
+        .unwrap_or_else(|| p.id.clone());
+    let Some(provider) = crate::provider_factory::provider_for_named(pc, &id) else {
+        return;
+    };
+    match crate::agent::block_on_provider(|| async { provider.suspend(&id).await }) {
+        Ok(()) => {
+            crate::machine0_bridge::clear(&id);
+            tracing::debug!(target: "thegn::lifecycle", worktree = %worktree, sandbox = %id, "explicitly parked idle VM");
+        }
+        Err(e) => {
+            tracing::debug!(target: "thegn::lifecycle", worktree = %worktree, error = %e, "explicit park failed (best-effort)");
         }
     }
 }

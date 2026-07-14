@@ -18,6 +18,7 @@ mod ci;
 pub(crate) mod commits;
 mod environments;
 mod git;
+mod help;
 mod hosts;
 mod issues;
 mod keys;
@@ -466,6 +467,7 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Keys => vec![seg(g2(), "?")],
+        Section::Help => vec![seg(g2(), "F1")],
         Section::Mine => {
             let rows = &model.panel.my_work;
             if rows.is_empty() {
@@ -686,6 +688,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Db => misc::db(),
         Section::Telemetry => telemetry::content(ctx),
         Section::Keys => keys::content(ctx),
+        Section::Help => help::content(ctx),
         Section::Mine => my_work::content(ctx),
         Section::Across => across::content(ctx),
         Section::Issues => issues::content(ctx),
@@ -967,6 +970,14 @@ mod spec {
             open,
             width,
             docs: docs(),
+            // The loop installs the embedded help registry at startup; give
+            // the Help section the same so its views render real content.
+            help: crate::panel::HelpPanelState {
+                page: String::new(),
+                reg: Some(std::sync::Arc::new(crate::help::pages::registry_logged(
+                    &thegn_core::config::Config::default(),
+                ))),
+            },
             ..Default::default()
         }
     }
