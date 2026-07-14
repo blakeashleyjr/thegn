@@ -16,7 +16,7 @@
 - [x] 2.1 `task.rs`: registry stores `(generation, GroupHandle)`;
       cancel_slot/supersede/watchdog terminate through the handle; spawn via
       `spawn_grouped`. Existing cancel/timeout tests stay green.
-- [x] 2.2 `merge_driver.rs`: agent watchdog holds a *clone* (the spawner's
+- [x] 2.2 `merge_driver.rs`: agent watchdog holds a _clone_ (the spawner's
       handle must outlive the child — kill-on-close) and terminates the job
       on deadline.
 - [x] 2.3 Pane PTY children: not wired into jobs (portable-pty already scopes

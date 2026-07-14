@@ -943,11 +943,7 @@ pub(crate) fn relayout(panes: &mut Panes, tree: &crate::center::CenterTree, cent
 /// full-screen panel / zoomed zone, collapsed to ~1 col) is intentionally left
 /// at its real size, so it must not count as drift — otherwise it would pin
 /// `need_relayout` on every frame.
-pub(crate) fn size_drifted(
-    panes: &Panes,
-    tree: &crate::center::CenterTree,
-    center: Rect,
-) -> bool {
+pub(crate) fn size_drifted(panes: &Panes, tree: &crate::center::CenterTree, center: Rect) -> bool {
     tree.layout_framed(center)
         .into_iter()
         .any(|(id, _, content)| {
@@ -1064,14 +1060,24 @@ mod tests {
 
         // Center whose framed content rect is exactly the emulator size → the
         // compositor paints the whole grid, so no drift.
-        let matched = Rect { x: 0, y: 0, cols: 82, rows: 26 };
+        let matched = Rect {
+            x: 0,
+            y: 0,
+            cols: 82,
+            rows: 26,
+        };
         assert!(!size_drifted(&panes, &tree, matched));
 
         // The bug: a geometry change shrank the center (e.g. the drawer opened)
         // without a relayout. The emulator is still 24 rows but its rect is now
         // 20 — the compositor would clip the bottom 4 rows (the live tail) off,
         // unreachable. This must be flagged so the loop forces a relayout.
-        let shrunk = Rect { x: 0, y: 0, cols: 82, rows: 22 };
+        let shrunk = Rect {
+            x: 0,
+            y: 0,
+            cols: 82,
+            rows: 22,
+        };
         assert!(
             size_drifted(&panes, &tree, shrunk),
             "an emulator taller than its rect is the hidden-tail bug"
@@ -1080,7 +1086,12 @@ mod tests {
         // A collapsed/hidden pane (behind a full-screen panel / zoomed zone,
         // content ≤ 1) is intentionally left at its real size by relayout, so it
         // must not count as drift — else it would pin need_relayout every frame.
-        let hidden = Rect { x: 0, y: 0, cols: 82, rows: 3 }; // content rows == 1
+        let hidden = Rect {
+            x: 0,
+            y: 0,
+            cols: 82,
+            rows: 3,
+        }; // content rows == 1
         assert!(!size_drifted(&panes, &tree, hidden));
 
         // Once relayout snaps the pane to the shrunk rect, the drift clears.

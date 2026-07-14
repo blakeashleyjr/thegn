@@ -14,7 +14,7 @@
   connect-probe + unlink).
 - **Accept loop**: named pipes have no `accept()`; `IpcListener` holds a
   pre-created next instance, `connect().await`s it, hands it out, and
-  re-creates the successor *before* returning — a client arriving between
+  re-creates the successor _before_ returning — a client arriving between
   hand-off and the next accept never sees file-not-found. Hidden behind
   `accept_stream()` + an `axum::serve::Listener` impl, so the daemon loop is
   untouched.
@@ -22,7 +22,7 @@
   instances busy means the server is alive and mid-hand-off; unknown-name
   errors (daemon gone) surface immediately so `ensure_daemon`'s health-retry
   loop keeps its timing.
-- **Relay stays unix-only.** Its socket is bind-mounted into sealed *Linux*
+- **Relay stays unix-only.** Its socket is bind-mounted into sealed _Linux_
   containers; on a native Windows host that substrate doesn't exist, so the
   Phase-1 `Unsupported` stub is the correct permanent shape (revisit only if
   WSL-hosted sandboxes ever become a backend). Remote attach from/to Windows

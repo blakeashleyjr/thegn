@@ -160,8 +160,7 @@ pub(crate) fn request_group_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<usize
     // from the model, exactly like the sidebar `d` flow. Alt-X on a terminal
     // reaches here with the active group as the sole target.
     if let [gi] = raw_targets[..]
-        && cx.session.worktrees.get(gi).map(|g| g.kind)
-            == Some(crate::session::GroupKind::Terminal)
+        && cx.session.worktrees.get(gi).map(|g| g.kind) == Some(crate::session::GroupKind::Terminal)
     {
         let name = cx.session.worktrees[gi].name.clone();
         *cx.active_menu = Some(menu::confirm_menu(

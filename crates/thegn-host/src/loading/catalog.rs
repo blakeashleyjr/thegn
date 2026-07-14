@@ -201,12 +201,21 @@ pub(crate) fn plan_for(t: &ResolvedTarget) -> LoadPlan {
 /// no more specific `detail`.
 pub(crate) fn slow_hint(kind: StepKind, elapsed: Duration) -> Option<&'static str> {
     let (threshold_secs, hint) = match kind {
-        StepKind::Image => (15, "network-bound — a cold image pull can take a couple of minutes"),
+        StepKind::Image => (
+            15,
+            "network-bound — a cold image pull can take a couple of minutes",
+        ),
         StepKind::Build => (30, "first Dockerfile build can take several minutes"),
         StepKind::Create => (10, "container runtime is slow to answer — it may be wedged"),
-        StepKind::Connect => (10, "host is slow to answer — transient failures are retried"),
+        StepKind::Connect => (
+            10,
+            "host is slow to answer — transient failures are retried",
+        ),
         StepKind::Vpn => (15, "waiting for the VPN sidecar to come up"),
-        StepKind::Env => (20, "building the dev environment — a cold cache can take minutes"),
+        StepKind::Env => (
+            20,
+            "building the dev environment — a cold cache can take minutes",
+        ),
         StepKind::Provision => (30, "cold sandbox boot can take a couple of minutes"),
         StepKind::Shell => (5, "waiting for the login shell — rc files may be slow"),
         StepKind::Resolve | StepKind::Mount | StepKind::Other => return None,
@@ -249,7 +258,10 @@ mod tests {
             ..ResolvedTarget::host_local()
         };
         let steps = plan_for(&t).into_steps();
-        assert_eq!(labels(&steps), vec!["sandbox", "namespace (bwrap)", "shell"]);
+        assert_eq!(
+            labels(&steps),
+            vec!["sandbox", "namespace (bwrap)", "shell"]
+        );
         assert_plan_invariants(&steps);
         assert_eq!(steps[1].kind, StepKind::Create);
     }
@@ -325,10 +337,7 @@ mod tests {
             BackendClass::HostToolchain("bwrap".into()),
             BackendClass::Oci("docker".into()),
         ] {
-            for remote in [
-                RemoteClass::Local,
-                RemoteClass::Remote("ssh:h".into()),
-            ] {
+            for remote in [RemoteClass::Local, RemoteClass::Remote("ssh:h".into())] {
                 for (needs_build, vpn, mount, env_wrap) in [
                     (false, false, false, None),
                     (true, true, true, Some("devenv".to_string())),
@@ -376,7 +385,12 @@ mod tests {
             .collect();
         assert_eq!(
             labels,
-            vec!["sandbox", "image debian:stable", "container (podman-rootless)", "shell"]
+            vec![
+                "sandbox",
+                "image debian:stable",
+                "container (podman-rootless)",
+                "shell"
+            ]
         );
         // Bwrap classifies as a host-toolchain namespace.
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Bwrap;

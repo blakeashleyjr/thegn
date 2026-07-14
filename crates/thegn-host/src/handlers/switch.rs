@@ -82,11 +82,7 @@ pub(crate) fn refresh_tab_model_switch(
 /// [`refresh_tab_model_switch`], this re-derives the workspace list and rebuilds
 /// every row — used whenever more than the active pointer changed (workspace
 /// switch, worktree create/delete, hydration arrival, filter/sort).
-pub(crate) fn refresh_tab_model(
-    model: &mut FrameModel,
-    session: &Session,
-    sb: &mut SidebarState,
-) {
+pub(crate) fn refresh_tab_model(model: &mut FrameModel, session: &Session, sb: &mut SidebarState) {
     let _g = crate::perf::measure(crate::perf::Subsys::Switch);
     let (worktree, tabs, active_tab) = crate::hydrate::tab_strip(session);
     let active_path = crate::hydrate::active_tab_path(session);
@@ -101,10 +97,8 @@ pub(crate) fn refresh_tab_model(
     // drop stale fallbacks — replace semantics, never append-only (appending
     // duplicated workspaces whose live prefix didn't match their DB slug).
     let prev = std::mem::take(&mut model.sidebar_workspaces);
-    model.sidebar_workspaces = crate::hydrate::merge_workspace_lists(
-        prev,
-        crate::hydrate::workspace_list(session, None),
-    );
+    model.sidebar_workspaces =
+        crate::hydrate::merge_workspace_lists(prev, crate::hydrate::workspace_list(session, None));
     // Overlay the incoming workspace's last-known-good git glyphs from the
     // persistent cache so dirty-dots / ahead-behind arrows persist instantly
     // across a switch instead of blanking until the async hydration lands (the
