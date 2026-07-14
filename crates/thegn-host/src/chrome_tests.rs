@@ -1,6 +1,7 @@
 use super::*;
 use crate::emulator::AlacrittyEmulator;
 use crate::layout;
+use crate::panel::hints::panel_help_pairs;
 use crate::sidebar_view::{build_sidebar, clamp_sidebar_scroll, draw_sidebar, hit_rows, row_at};
 
 fn lines(s: &Surface) -> Vec<String> {

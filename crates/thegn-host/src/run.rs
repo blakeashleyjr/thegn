@@ -46,7 +46,6 @@ use crate::loading::{
     SpecOrigin, active_watchdog_deadline, is_shell_wait, provision_owns_tab, watchdog_deadline,
 };
 use crate::menu::{self, MenuChoice, MenuOverlay};
-use crate::naming::issue_branch_tail;
 use crate::palette::build_palette;
 use crate::pane::PaneEvent;
 use crate::panel::gitui::{self, GitFlow, GitMsg, GitView, StagePane};
@@ -2703,7 +2702,7 @@ use crate::handlers::wizard::begin_worktree_wizard;
 /// creation-progress overlay is revealed straight away for feedback; the
 /// `CreateEvent::Done` handler builds the tab + pane exactly as for the wizard.
 #[allow(clippy::too_many_arguments)]
-fn begin_worktree_preset(
+pub(crate) fn begin_worktree_preset(
     root: std::path::PathBuf,
     name: crate::keymap::NameSpec,
     sandbox: Option<String>,
@@ -7545,7 +7544,7 @@ async fn event_loop<T: Terminal>(
                 current_config.disk.clone(),
                 Some(waker.clone()),
             );
-            crate::hydrate::spawn_issue_cache_refresh(
+            crate::hydrate_tracker::spawn_issue_cache_refresh(
                 current_worktree.clone(),
                 current_config.issues.clone(),
                 Some(waker.clone()),
@@ -9160,16 +9159,11 @@ async fn event_loop<T: Terminal>(
                     );
                     // Branch-from-issue: link the freshly created worktree to the
                     // issue it was branched from, so its tab carries the issue badge.
-                    if let Some((g, issue_id)) = pending_issue_link.take() {
-                        if g == generation {
-                            if let Ok(db) = thegn_core::db::Db::open() {
-                                let _ = db.link_issue(&payload.path, &issue_id);
-                            }
-                        } else {
-                            // Not ours — put it back for the matching Done event.
-                            pending_issue_link = Some((g, issue_id));
-                        }
-                    }
+                    crate::handlers::tracker::on_worktree_created(
+                        &mut pending_issue_link,
+                        generation,
+                        &payload.path,
+                    );
                     refresh_tab_model(&mut model, &session, &mut sb);
                     need_relayout = true;
                     // Pane spawn (openpty+exec) is the only loop-side step;
@@ -9644,7 +9638,7 @@ async fn event_loop<T: Terminal>(
             );
         }
         if want_issue_refresh {
-            crate::hydrate::spawn_issue_cache_refresh(
+            crate::hydrate_tracker::spawn_issue_cache_refresh(
                 active_tab_path(&session),
                 current_config.issues.clone(),
                 Some(waker.clone()),
@@ -14339,39 +14333,23 @@ async fn event_loop<T: Terminal>(
                                         Section::Issues => {
                                             // Enter toggles the worktree↔issue link for
                                             // the cursor row.
-                                            let wt = active_tab_path(&session);
-                                            let wt_str = wt.to_string_lossy().to_string();
-                                            if let Some(issue) = model
-                                                .panel
-                                                .tracker_issues
-                                                .get(panel_ui.issues_cursor)
-                                            {
-                                                let id = issue.id.clone();
-                                                let already_linked =
-                                                    model.panel.tracker_links.contains(&id);
-                                                if let Ok(db) = thegn_core::db::Db::open() {
-                                                    if already_linked {
-                                                        let _ = db.unlink_issue(&wt_str, &id);
-                                                        model.status = format!("Unlinked {id}");
-                                                    } else {
-                                                        let _ = db.link_issue(&wt_str, &id);
-                                                        model.status = format!("Linked {id}");
-                                                    }
-                                                }
-                                                // Refresh model so the badge updates.
-                                                hydration_gen += 1;
-                                                crate::hydrate::spawn_model_hydration(
-                                                    model_tx.clone(),
-                                                    hydration_gen,
-                                                    session.clone(),
-                                                    Some(waker.clone()),
-                                                    crate::hydrate::HydrateHints {
-                                                        open: panel_ui.open,
-                                                        expanded: panel_ui.width.is_expanded(),
-                                                        ..Default::default()
-                                                    },
-                                                );
-                                            }
+                                            crate::handlers::tracker::toggle_link(
+                                                &mut crate::handlers::tracker::TrackerCtx {
+                                                    model: &mut model,
+                                                    panel_ui: &mut panel_ui,
+                                                    session: &session,
+                                                    cfg: keymap.config(),
+                                                    live_cfg: &current_config,
+                                                    waker: &waker,
+                                                    create_gen: &mut create_gen,
+                                                    create_tx: &create_tx,
+                                                    inflight: &mut inflight,
+                                                    wizard_ui: &mut wizard_ui,
+                                                    pending_issue_link: &mut pending_issue_link,
+                                                    model_tx: &model_tx,
+                                                    hydration_gen: &mut hydration_gen,
+                                                },
+                                            );
                                         }
                                         Section::Notifications => {
                                             // Enter widens the panel to half so
@@ -15146,237 +15124,45 @@ async fn event_loop<T: Terminal>(
                         // Issues section; reuses the headless worktree-create preset
                         // and links the new worktree to the issue on completion.
                         (Section::Mine | Section::Issues, KeyCode::Char('b')) => {
-                            let fields: Option<(String, String, String, Option<String>)> =
-                                if panel_ui.open == Section::Mine {
-                                    let rows =
-                                        crate::panel::sections::my_work::ordered_rows(&model.panel);
-                                    rows.get(panel_ui.cursor).and_then(|r| {
-                                        r.issue_id.clone().map(|id| {
-                                            (
-                                                id,
-                                                r.number.clone(),
-                                                r.title.clone(),
-                                                r.branch_hint.clone(),
-                                            )
-                                        })
-                                    })
-                                } else {
-                                    model.panel.tracker_issues.get(panel_ui.issues_cursor).map(
-                                        |i| {
-                                            (
-                                                i.id.clone(),
-                                                i.number.clone(),
-                                                i.title.clone(),
-                                                i.branch_hint.clone(),
-                                            )
-                                        },
-                                    )
-                                };
-                            if let Some((issue_id, number, title, hint)) = fields {
-                                let root = session
-                                    .active_group()
-                                    .map(|g| g.path.clone())
-                                    .filter(|p| !p.is_empty())
-                                    .and_then(|p| thegn_core::repo::main_worktree(Path::new(&p)))
-                                    .or_else(|| {
-                                        std::env::current_dir()
-                                            .ok()
-                                            .and_then(|c| thegn_core::repo::main_worktree(&c))
-                                    });
-                                if let Some(root) = root {
-                                    let tail = issue_branch_tail(&number, &title, hint.as_deref());
-                                    begin_worktree_preset(
-                                        root,
-                                        crate::keymap::NameSpec::Fixed(tail),
-                                        None,
-                                        None,
-                                        None,
-                                        keymap.config(),
-                                        &mut create_gen,
-                                        &create_tx,
-                                        &waker,
-                                        &mut inflight,
-                                        &mut wizard_ui,
-                                        &mut model,
-                                    );
-                                    pending_issue_link = Some((create_gen, issue_id));
-                                    model.status = format!("Branching worktree for {number}…");
-                                } else {
-                                    model.status =
-                                        "branch-from-issue: not inside a git repository".into();
-                                }
-                            }
-                            true
-                        }
-                        // -- issues: open URL, refresh, self-assign ----------
-                        (Section::Issues, KeyCode::Char('o')) => {
-                            if let Some(issue) =
-                                model.panel.tracker_issues.get(panel_ui.issues_cursor)
-                            {
-                                open_url_detached(&issue.url.clone());
-                                model.status = format!("Opened {} in browser", issue.number);
-                            }
-                            true
-                        }
-                        (Section::Issues, KeyCode::Char('r')) => {
-                            crate::hydrate::spawn_issue_cache_refresh(
-                                active_tab_path(&session),
-                                current_config.issues.clone(),
-                                Some(waker.clone()),
+                            crate::handlers::tracker::branch_from_issue(
+                                &mut crate::handlers::tracker::TrackerCtx {
+                                    model: &mut model,
+                                    panel_ui: &mut panel_ui,
+                                    session: &session,
+                                    cfg: keymap.config(),
+                                    live_cfg: &current_config,
+                                    waker: &waker,
+                                    create_gen: &mut create_gen,
+                                    create_tx: &create_tx,
+                                    inflight: &mut inflight,
+                                    wizard_ui: &mut wizard_ui,
+                                    pending_issue_link: &mut pending_issue_link,
+                                    model_tx: &model_tx,
+                                    hydration_gen: &mut hydration_gen,
+                                },
                             );
-                            model.status = "Refreshing issues…".into();
                             true
                         }
-                        (Section::Issues, KeyCode::Char('a')) => {
-                            // Self-assign the cursor issue.
-                            if let Some(issue) = model
-                                .panel
-                                .tracker_issues
-                                .get(panel_ui.issues_cursor)
-                                .cloned()
-                            {
-                                let cfg = current_config.issues.clone();
-                                let waker2 = waker.clone();
-                                let cwd2 = active_tab_path(&session);
-                                tokio::task::spawn_blocking(move || {
-                                    use thegn_core::issue::IssuePatch;
-                                    use thegn_svc::issue::IssueRouter;
-                                    let router = IssueRouter::from_config(&cfg);
-                                    if !router.is_configured() {
-                                        return;
-                                    }
-                                    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                                        .enable_all()
-                                        .build()
-                                    else {
-                                        return;
-                                    };
-                                    let patch = IssuePatch {
-                                        assignee_me: Some(true),
-                                        ..Default::default()
-                                    };
-                                    let _ = rt.block_on(router.update_issue(&issue.id, &patch));
-                                    crate::hydrate::spawn_issue_cache_refresh(
-                                        cwd2,
-                                        cfg,
-                                        Some(waker2),
-                                    );
-                                });
-                                model.status = format!("Assigning {} to you…", issue.number);
-                            }
-                            true
-                        }
-                        (Section::Issues, KeyCode::Char('D')) => {
-                            // Dispatch a Claude Code agent to a new worktree for
-                            // the selected issue.  Reuses the wizard's Done path.
-                            if let Some(issue) = model
-                                .panel
-                                .tracker_issues
-                                .get(panel_ui.issues_cursor)
-                                .cloned()
-                            {
-                                // Fresh generation for this headless dispatch: it
-                                // sends `Done` directly (no worker channel /
-                                // progress entry) and leaves concurrent creations
-                                // undisturbed.
-                                create_gen += 1;
-                                let dispatch_gen = create_gen;
-
-                                let cfg2 = keymap.config().clone();
-                                let tx2 = create_tx.clone();
-                                let wk2 = waker.clone();
-                                let src_path = session
-                                    .active_group()
-                                    .map(|g| g.path.clone())
-                                    .unwrap_or_default();
-                                let issue_id = issue.id.clone();
-                                let issue_number = issue.number.clone();
-                                let issue_title = issue.title.clone();
-                                let issue_body = issue.body.clone().unwrap_or_default();
-                                let issue_url = issue.url.clone();
-
-                                tokio::task::spawn_blocking(move || {
-                                    use thegn_core::{repo, worktree as wt};
-
-                                    // Find the repo root from the active worktree path.
-                                    let root_opt = (!src_path.is_empty())
-                                        .then(|| {
-                                            repo::main_worktree(std::path::Path::new(&src_path))
-                                        })
-                                        .flatten()
-                                        .or_else(|| {
-                                            std::env::current_dir()
-                                                .ok()
-                                                .and_then(|c| repo::main_worktree(&c))
-                                        });
-                                    let Some(root) = root_opt else {
-                                        return;
-                                    };
-
-                                    let base = wt::resolve_base(&root, &cfg2);
-                                    let taken = wt::BranchSet::load(&root);
-                                    let raw_branch = issue
-                                        .branch_hint
-                                        .as_deref()
-                                        .map(str::to_owned)
-                                        .unwrap_or_else(|| {
-                                            thegn_core::util::slugify(&issue_number)
-                                        });
-                                    let branch = wt::dedupe(&raw_branch, &taken);
-                                    let path = wt::worktree_path(&root, &branch, &cfg2);
-
-                                    if let Err(e) =
-                                        wt::add_checked(&root, &branch, &base, &path, &cfg2)
-                                    {
-                                        thegn_core::msg::warn(&format!("agent dispatch: {e}"));
-                                        return;
-                                    }
-
-                                    let wt_str = path.to_string_lossy().into_owned();
-                                    let Ok(mut spec) = crate::direnv_warm::launch_spec_synced(
-                                        &cfg2,
-                                        &wt_str,
-                                        Some(&branch),
-                                        "claude",
-                                    ) else {
-                                        return;
-                                    };
-
-                                    // Inject issue context for the agent.
-                                    spec.env.push(("THEGN_ISSUE_ID".into(), issue_id.clone()));
-                                    spec.env
-                                        .push(("THEGN_ISSUE_TITLE".into(), issue_title.clone()));
-                                    spec.env.push(("THEGN_ISSUE_BODY".into(), issue_body));
-                                    spec.env.push(("THEGN_ISSUE_URL".into(), issue_url));
-
-                                    let slug = repo::repo_slug(&root);
-                                    let tab = repo::branch_tab(&slug, &branch);
-
-                                    // Register the dispatch in the DB.
-                                    if let Ok(db) = thegn_core::db::Db::open() {
-                                        let root_s = root.to_string_lossy();
-                                        let _ = db.put_worktree(
-                                            &tab, &root_s, &wt_str, &branch, None, None,
-                                        );
-                                        let _ = db.put_agent_dispatch(&issue_id, &wt_str, "claude");
-                                        let _ = db.link_issue(&wt_str, &issue_id);
-                                    }
-                                    let payload = crate::wizard::CreatedWorktree {
-                                        tab: tab.clone(),
-                                        branch: branch.clone(),
-                                        path: wt_str,
-                                        agent: "claude".into(),
-                                        spec,
-                                    };
-                                    let _ = tx2.send(crate::wizard::CreateEvent::Done {
-                                        generation: dispatch_gen,
-                                        payload: Box::new(payload),
-                                    });
-                                    let _ = wk2.wake();
-                                });
-                                model.status = format!("Dispatching agent to {}…", issue.number);
-                            }
-                            true
+                        // -- issues: open URL, refresh, self-assign, dispatch --
+                        (Section::Issues, KeyCode::Char(c @ ('o' | 'r' | 'a' | 'D'))) => {
+                            crate::handlers::tracker::issues_key(
+                                c,
+                                &mut crate::handlers::tracker::TrackerCtx {
+                                    model: &mut model,
+                                    panel_ui: &mut panel_ui,
+                                    session: &session,
+                                    cfg: keymap.config(),
+                                    live_cfg: &current_config,
+                                    waker: &waker,
+                                    create_gen: &mut create_gen,
+                                    create_tx: &create_tx,
+                                    inflight: &mut inflight,
+                                    wizard_ui: &mut wizard_ui,
+                                    pending_issue_link: &mut pending_issue_link,
+                                    model_tx: &model_tx,
+                                    hydration_gen: &mut hydration_gen,
+                                },
+                            )
                         }
                         (Section::Notifications, KeyCode::Char('r')) => {
                             let notif_id = model

@@ -65,6 +65,7 @@ mod hydrate;
 mod hydrate_feed;
 mod hydrate_semantic;
 mod hydrate_terminal;
+mod hydrate_tracker;
 mod hydrate_tuning;
 mod input;
 mod integrate;

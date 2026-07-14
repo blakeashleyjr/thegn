@@ -1,6 +1,7 @@
 use super::*;
 use crate::center::CenterTree;
 use crate::hydrate::build_model;
+use crate::naming::issue_branch_tail;
 use crate::session::{GroupKind, Session, WorktreeGroup};
 
 #[test]
