@@ -2007,7 +2007,8 @@ pub struct EnvConfig {
 
 pub use crate::config_env_tables::{
     EnvK8sConfig, EnvProviderConfig, EnvSshConfig, MetricsConfig, MetricsTarget, NixInstaller,
-    ProviderConnect, ProviderExecMode, provider_scale_to_zero, vps_provider_kind,
+    ProviderConnect, ProviderExecMode, provider_scale_to_zero, provider_self_suspends,
+    vps_provider_kind,
 };
 
 /// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by

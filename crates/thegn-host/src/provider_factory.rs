@@ -51,8 +51,61 @@ pub(crate) fn provider_for_named(
             vps_provider_for(pc, name).map(Provider::Vps)
         }
         "fly" => fly_provider_for(pc, name).map(Provider::Fly),
+        "machine0" => machine0_provider_for(pc, name).map(Provider::Machine0),
         _ => None,
     }
+}
+
+/// Build the [`Machine0Provider`](thegn_svc::machine0::Machine0Provider) for a
+/// `provider = "machine0"` env config. `None` when the api key can't be resolved
+/// or the managed keypair can't be produced. Shared by the launch path and the
+/// (future) reaper. machine0 is driven over its MCP endpoint (no CLI binary); the
+/// pane/exec/file plane rides ssh with thegn's managed key.
+pub(crate) fn machine0_provider_for(
+    pc: &thegn_core::config::EnvProviderConfig,
+    name: &str,
+) -> Option<thegn_svc::machine0::Machine0Provider> {
+    let key = if pc.api_key_env.trim().is_empty() {
+        "MACHINE0_API_KEY"
+    } else {
+        pc.api_key_env.trim()
+    };
+    let api_key = crate::secret::resolve(key)?;
+    // The same managed keypair the VPS/Fly ssh transports use — one key for all
+    // thegn-managed remotes.
+    let (key_path, pubkey) = match crate::agent::sprite_ssh_keypair() {
+        Ok(k) => k,
+        Err(e) => {
+            thegn_core::msg::warn(&format!(
+                "machine0: managed ssh key generation failed ({e}); cannot drive machine0"
+            ));
+            return None;
+        }
+    };
+    Some(thegn_svc::machine0::Machine0Provider::new(
+        thegn_svc::machine0::Machine0Spec {
+            endpoint: pc.api_base.clone(),
+            api_key,
+            name: name.to_string(),
+            image: pc.template.clone(),
+            size: pc.size.clone(),
+            size_req: thegn_svc::machine0::SizeReq {
+                min_vcpu: pc.min_vcpu,
+                min_ram_gb: pc.min_ram_gb,
+                min_disk_gb: pc.min_disk_gb,
+                gpu: pc.gpu,
+                nvme: pc.nvme,
+            },
+            region: pc.region.clone(),
+            provision_flake: pc.provision_flake.clone(),
+            ssh_user: String::new(),
+            key_path,
+            pubkey,
+            max_instances: pc.max_instances,
+            max_lifetime_secs: pc.max_lifetime_secs,
+            skip_ready_wait: false,
+        },
+    ))
 }
 
 /// Build a [`FlyProvider`] for a `provider = "fly"` env config. `None` when the
@@ -199,6 +252,13 @@ mod tests {
         let pc = thegn_core::config::EnvProviderConfig {
             provider: "hetzner".into(),
             api_key_env: "TG_TEST_NO_SUCH_HCLOUD_TOKEN".into(),
+            ..Default::default()
+        };
+        assert!(provider_for_named(&pc, "x").is_none());
+        // machine0 without its api key env set is None (best-effort launch path).
+        let pc = thegn_core::config::EnvProviderConfig {
+            provider: "machine0".into(),
+            api_key_env: "TG_TEST_NO_SUCH_MACHINE0_KEY".into(),
             ..Default::default()
         };
         assert!(provider_for_named(&pc, "x").is_none());

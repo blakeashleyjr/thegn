@@ -167,8 +167,17 @@ pub struct EnvProviderConfig {
     /// a local `ssh` client tunneled over the provider's TCP-over-WebSocket proxy.
     /// See [`ProviderConnect`].
     pub connect: ProviderConnect,
+    /// Interactive-pane transport for a provider reached over ssh (VPS/machine0):
+    /// `mosh` (default — resilient roaming/latency, auto-falls-back to ssh when
+    /// the VM lacks `mosh-server`) or `ssh`. The control plane always uses ssh.
+    pub transport: RemoteTransport,
     /// Provider sandbox template/image to create from.
     pub template: String,
+    /// machine0 + NixOS only: a Nix flake ref applied to the VM after create via
+    /// `nixos-rebuild switch --flake <ref>` (over ssh — there is no provider
+    /// tool for it). A local `path#attr` is uploaded to the VM first; a flake URL
+    /// (`github:owner/repo#host`) is applied verbatim. Empty ⇒ no NixOS apply.
+    pub provision_flake: String,
     /// Working directory inside the sandbox that a `data = "sync"` projection
     /// pushes the local worktree into (and pulls back from). Empty ⇒ `/workspace`.
     pub workdir: String,
@@ -217,9 +226,23 @@ pub struct EnvProviderConfig {
     /// VPS providers only: vendor region/location (e.g. Hetzner `fsn1`).
     /// Empty ⇒ the provider's default.
     pub region: String,
-    /// VPS providers only: vendor size/plan/server-type (e.g. Hetzner `cx22`).
-    /// Empty ⇒ the provider's default.
+    /// Vendor size/plan/server-type (e.g. Hetzner `cx22`, machine0 `large`).
+    /// Empty or `"auto"` ⇒ the provider's default, or — for providers with a
+    /// priced size catalog (machine0) — the cheapest size meeting the
+    /// `min_vcpu`/`min_ram_gb`/`min_disk_gb`/`gpu`/`nvme` requirements below.
     pub size: String,
+    /// Dynamic-size requirement (providers with a size catalog, e.g. machine0):
+    /// minimum vCPUs. `0` ⇒ unconstrained. Only consulted when `size` is
+    /// unset/`auto`.
+    pub min_vcpu: u32,
+    /// Dynamic-size requirement: minimum RAM in GiB. `0` ⇒ unconstrained.
+    pub min_ram_gb: u32,
+    /// Dynamic-size requirement: minimum disk in GiB. `0` ⇒ unconstrained.
+    pub min_disk_gb: u32,
+    /// Dynamic-size requirement: require a GPU size.
+    pub gpu: bool,
+    /// Dynamic-size requirement: require an NVMe-backed local disk.
+    pub nvme: bool,
     /// VPS providers only: hard cap on concurrently-managed instances — the
     /// spend guardrail enforced at create. `0` ⇒ the built-in default (5).
     pub max_instances: u32,
@@ -248,7 +271,9 @@ impl EnvProviderConfig {
             && self.api_base.is_empty()
             && self.api_key_env.is_empty()
             && self.exec == ProviderExecMode::Auto
+            && self.transport == RemoteTransport::Mosh
             && self.template.is_empty()
+            && self.provision_flake.is_empty()
             && self.workdir.is_empty()
             && !self.auto_provision
             && !self.auto_checkpoint
@@ -262,6 +287,11 @@ impl EnvProviderConfig {
             && !self.host_cache
             && self.region.is_empty()
             && self.size.is_empty()
+            && self.min_vcpu == 0
+            && self.min_ram_gb == 0
+            && self.min_disk_gb == 0
+            && !self.gpu
+            && !self.nvme
             && self.max_instances == 0
             && self.max_lifetime_secs == 0
             && self.hibernate == HibernateMode::Auto
@@ -331,6 +361,17 @@ impl EnvProviderConfig {
                 .unwrap_or_else(|| "thegn".to_string());
             return vec![exe, "vps-ssh".into(), "{id}".into(), "--".into()];
         }
+        if self.provider.trim() == "machine0" {
+            // machine0 reaches its VM over ssh (MCP control plane, ssh data
+            // plane) — the same self-bridge role `vps-ssh` plays, but IP + ssh
+            // user are resolved via the machine0 provider (`vm_get`), not the VPS
+            // registry API. Panes AND chrome reads run through it.
+            let exe = std::env::current_exe()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "thegn".to_string());
+            return vec![exe, "machine0-ssh".into(), "{id}".into(), "--".into()];
+        }
         if wss_native_provider_kind(&self.provider) {
             // WSS-native providers (sprites) have no vendor CLI. The
             // control-plane READ path (chrome git/gh/fs reads + the persisted
@@ -373,13 +414,26 @@ pub fn wss_native_provider_kind(name: &str) -> bool {
 /// (`thegn_svc::provider::ProviderCaps::scale_to_zero` mirrors it by kind).
 ///
 /// `sprites` (Fly's scale-to-zero Firecracker microVMs: a ~30s idle timeout,
-/// zero idle compute charge) and `fly` (a stopped Fly machine bills only for its
-/// rootfs, and start/stop is fast) qualify. Everything else — VPS (a powered-off
-/// instance still bills), Daytona (no confirmed free idle), unknown kinds — is
-/// **false** on purpose: a wrong `false` merely keeps the safe age-out behavior,
-/// while a wrong `true` would park billed instances forever.
+/// zero idle compute charge), `fly` (a stopped Fly machine bills only for its
+/// rootfs, and start/stop is fast), and `machine0` (an idle VM `vm_suspend`s to a
+/// paused state billed only for storage; `vm_start` resumes) qualify. Everything
+/// else — VPS (a powered-off instance still bills), Daytona (no confirmed free
+/// idle), unknown kinds — is **false** on purpose: a wrong `false` merely keeps
+/// the safe age-out behavior, while a wrong `true` would park billed instances
+/// forever.
 pub fn provider_scale_to_zero(name: &str) -> bool {
-    matches!(name.trim(), "sprites" | "fly")
+    matches!(name.trim(), "sprites" | "fly" | "machine0")
+}
+
+/// Whether a scale-to-zero provider **self-suspends** an idle VM (so thegn only
+/// needs to drop the live exec session) versus needing an **explicit** suspend
+/// call. `sprites` self-idles (Firecracker auto-suspend on ~30s idle). `machine0`
+/// (`vm_suspend`) and `fly` (stop) do NOT — their DigitalOcean/Fly VMs keep
+/// billing until thegn explicitly parks them, so the warm/idle reconcile must
+/// call `Provider::suspend`. A wrong `true` here would leak a billing VM; a wrong
+/// `false` merely issues a harmless idempotent suspend, so default to `false`.
+pub fn provider_self_suspends(name: &str) -> bool {
+    matches!(name.trim(), "sprites")
 }
 
 /// `[metrics]` — Prometheus scrape targets for sidebar metrics display.
@@ -674,6 +728,43 @@ mod tests {
         assert!(!e.is_default());
         let e = EnvProviderConfig {
             hibernate_idle_secs: 5,
+            ..Default::default()
+        };
+        assert!(!e.is_default());
+    }
+
+    #[test]
+    fn machine0_classification_and_provision_flake() {
+        // machine0 is scale-to-zero (vm_suspend) but is NOT a commodity VPS kind
+        // (no ssh-key/ledger/reaper path) and NOT WSS-native (pane rides ssh).
+        assert!(provider_scale_to_zero("machine0"));
+        assert!(provider_scale_to_zero(" machine0 "));
+        assert!(!vps_provider_kind("machine0"));
+        assert!(!wss_native_provider_kind("machine0"));
+        // machine0 idles ~free ⇒ hibernate-on-idle stays OFF under auto.
+        assert!(!provider_env("machine0").hibernate_enabled());
+        // machine0 is scale-to-zero but does NOT self-suspend (needs explicit
+        // vm_suspend); only sprites self-idles.
+        assert!(!provider_self_suspends("machine0"));
+        assert!(!provider_self_suspends("fly"));
+        assert!(provider_self_suspends("sprites"));
+        // The pane/chrome reach the VM via the machine0-ssh self-bridge.
+        let tpl = EnvProviderConfig {
+            provider: "machine0".into(),
+            ..Default::default()
+        }
+        .control_command_template();
+        assert_eq!(tpl.get(1).map(String::as_str), Some("machine0-ssh"));
+        assert_eq!(tpl.last().map(String::as_str), Some("--"));
+        // The NixOS provision_flake + a non-mosh transport participate in is_default().
+        let e = EnvProviderConfig {
+            provision_flake: "github:me/nix#host".into(),
+            ..Default::default()
+        };
+        assert!(!e.is_default());
+        assert!(EnvProviderConfig::default().is_default(), "default transport is mosh");
+        let e = EnvProviderConfig {
+            transport: RemoteTransport::Ssh,
             ..Default::default()
         };
         assert!(!e.is_default());

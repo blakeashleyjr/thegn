@@ -767,7 +767,7 @@ fn collect_sidebar_status(
     // Reconcile the warm set now (after fresh activity): drop resident bridges for
     // idle, over-budget remote sandboxes so they suspend — BEFORE the glyph scan
     // below, so the just-suspended ones serve cache instead of being woken.
-    crate::lifecycle::reconcile(session, lifecycle);
+    crate::lifecycle::reconcile(session, app_cfg, lifecycle);
     let gate_remote_scans = lifecycle.enabled && lifecycle.serve_cached_glyphs;
 
     // Badge counts (item 28): unread + alert notifications grouped by worktree.

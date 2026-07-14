@@ -2258,6 +2258,68 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # max_lifetime_secs = 0
 # # Org defaults to "personal"; non-personal orgs are a follow-up config addition.
 #
+# ── machine0 VMs (MCP-native — NO `machine0` CLI binary) + NixOS ────────────
+# machine0 (https://machine0.io) is a cloud-VM platform driven entirely through
+# its remote MCP endpoint: thegn calls the MCP tools directly over HTTP
+# (`vm_create`/`vm_list`/`vm_destroy`/`vm_suspend`, `image_*` snapshots,
+# `ssh_key_*`, `sizes`) — no vendor CLI is installed. The interactive pane, exec,
+# and file sync ride plain ssh with thegn's managed key (machine0's MCP `ssh_exec`
+# is one-shot with no PTY, so a terminal must use real ssh — the VPS-shaped
+# model), so a machine0 VM needs a reachable public address. A stopped VM
+# `vm_suspend`s to a storage-only cost, so it is treated as SCALE-TO-ZERO (idle
+# spares park via suspend/start, like Fly).
+#
+# NixOS is a first-class image: create with `template = "nixos-25-11-loaded"`,
+# then thegn applies your flake with `nixos-rebuild switch --flake <ref>` over ssh
+# (there is no provider tool for it) — see `provision_flake` below. Snapshots use
+# `machine0 images` (checkpoint/restore recreates the VM from the saved image).
+#   1. Create an API key in the machine0 dashboard (or `machine0 keys` if you use
+#      the CLI elsewhere — thegn itself does not need it).
+#   2. export MACHINE0_API_KEY=...
+#
+# [env.machine0]
+# placement = "provider"
+# data = "in_env"
+# [env.machine0.provider]
+# provider = "machine0"
+# # api_key_env = "MACHINE0_API_KEY"      # x-api-key env var (this is the default)
+# # api_base = "https://app.machine0.io/mcp"  # the MCP endpoint (empty ⇒ this default).
+# #                                       #   USED (unlike the CLI providers) — thegn
+# #                                       #   POSTs JSON-RPC tools/call here.
+# # region = "us-east"                    # machine0 region (us-east/us-west/uk/eu/asia;
+# #                                       #   required — no default)
+# # template = ""                         # imageName at create. Empty ⇒ the default
+# #                                       #   "nixos-25-11-loaded" (NixOS 25.11 + modern
+# #                                       #   shell & dev tools). Or set any machine0 image
+# #                                       #   (e.g. "ubuntu-24-04") or a checkpoint image name.
+# # --- size: explicit OR dynamic multidimensional ---------------------------
+# # size = "large"                        # explicit machine0 size (see `machine0 sizes`).
+# #                                       #   Empty or "auto" ⇒ resolve the CHEAPEST size
+# #                                       #   meeting the requirements below (default: "large").
+# # min_vcpu = 0                          # dynamic-size floor: min vCPUs (0 ⇒ any)
+# # min_ram_gb = 0                        # min RAM GiB (0 ⇒ any)
+# # min_disk_gb = 0                       # min disk GiB (0 ⇒ any)
+# # gpu = false                           # require a GPU size
+# # nvme = false                          # require NVMe-backed local disk
+# #                                       #   e.g. size="auto", min_vcpu=4, min_ram_gb=8,
+# #                                       #   nvme=true ⇒ picks the cheapest xl-nvme-class box.
+# # provision_flake = "./flake.nix#host"  # NixOS ONLY: applied post-create via
+# #                                       #   `nixos-rebuild switch --flake <ref>` over
+# #                                       #   ssh. A local path#attr is uploaded to the
+# #                                       #   VM first; a flake URL (github:owner/repo#host)
+# #                                       #   is used verbatim. Empty ⇒ no NixOS apply.
+# # transport = "mosh"                    # interactive-pane transport: mosh (default —
+# #                                       #   roaming/latency-resilient; auto-falls-back to
+# #                                       #   ssh when the VM image lacks mosh-server) | ssh.
+# #                                       #   Control-plane reads always use ssh.
+# # auto_provision = false                # create the VM on first open if missing
+# # auto_checkpoint = false               # snapshot (machine0 images) on worktree close
+# # max_instances = 5                     # hard cap on concurrently-managed VMs
+# # max_lifetime_secs = 0                 # reaper ceiling (0 = off)
+# # Wired axes: FILE-SYNC (`data = "sync"` over ssh), SNAPSHOT (`thegn env snapshot`
+# # → machine0 images; restore recreates from the image), SCALE-TO-ZERO (idle
+# # suspend). NOT available: native WSS exec / egress translation (the pane is ssh).
+#
 # ── Sandbox lifecycle: warm/suspend + budget ───────────────────────────────
 # Budget-governed warm policy for managed-provider sandboxes (sprites/ssh/k8s).
 # A provider sandbox only stays *running* while a live exec session into it exists
