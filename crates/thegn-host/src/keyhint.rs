@@ -114,7 +114,7 @@ pub(crate) fn context_hints(
     let mut out: Vec<(String, String)> = Vec::new();
 
     if focus.zone == crate::focus::Zone::Panel {
-        out = crate::chrome::panel_help_pairs(panel_ui);
+        out = crate::panel::hints::panel_help_pairs(panel_ui);
     }
     // Sidebar zone: the curated essentials first (the real keys live in
     // `handlers/sidebar_keys.rs`, invisible to the keymap registry).

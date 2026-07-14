@@ -3,8 +3,10 @@
 ## Summary
 
 Close the loop from the existing unified-work surface to execution: from an issue
-in the work panel, one action **creates a worktree-tab for it** and — optionally —
-**launches an agent seeded with the issue's context**. Borrowed from
+in the work panel, one action — the **`s` ("start")** key, in both the Issues and
+Mine sections — **creates a worktree-tab for it** and — optionally —
+**launches an agent seeded with the issue's context**. The existing `b`
+(branch-from-issue) and `D` (agent dispatch) keys remain as today. Borrowed from
 [`emdash`](https://emdash.sh) and [`jmux`](https://github.com/jarredkenny/jmux),
 whose headline flow is "pick a Linear/GitHub issue, press a key, get a
 worktree + session + agent seeded with the issue." Config knobs
@@ -25,8 +27,9 @@ far the automation goes.
 
 thegn already aggregates issues across providers (`IssueRouter`, Linear/GitHub/
 Jira), renders them in the My Work panel with a linked-worktree marker, and has
-the primitives to create a worktree (`worktree::branch_name`/`add_checked`), add a
-tab (`session::add_group`), and launch an agent (`agent::launch_spec`). What's
+the primitives to create a worktree (the host's `naming.rs::issue_branch_tail` +
+`add_checked` via `begin_worktree_preset`), add a tab (`session::add_group`), and
+launch an agent (`agent::launch_spec`). What's
 missing is the one action that composes them and the seeding of issue context into
 the agent. emdash frames this as "the only parallel-agent app with issue-tracker
 integration, bridging task management and orchestration" — thegn's
