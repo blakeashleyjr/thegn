@@ -55,6 +55,15 @@ pub trait WorkspaceStore {
     /// Set one workspace's persisted sort position (repo_path key).
     fn set_workspace_position(&self, repo_path: &str, position: i64) -> Result<()>;
 
+    /// Persist the full sidebar workspace order: write `position = index` for
+    /// each `repo_path` in `order`, in one transaction. Unlike the swap +
+    /// normalize path, this encodes the *exact* on-screen order the caller
+    /// passes, so a hydration reload via [`Self::workspaces`] reproduces it
+    /// verbatim — no tiebreak drift between the persisted order and what the
+    /// user arranged. Paths not in `order` (none, in practice) keep their
+    /// current position.
+    fn set_workspace_order(&self, order: &[String]) -> Result<()>;
+
     /// Record a worktree. `location` is the remote descriptor (JSON) for a remote
     /// worktree, or `None`/empty for an ordinary on-host one.
     fn put_worktree(
