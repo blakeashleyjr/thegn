@@ -154,6 +154,13 @@ impl SidebarState {
     /// into `model.sidebar_workspaces` so it shows at once. Live-only workspaces
     /// (no DB row, hence no position) are skipped. Rebuilds; the caller places
     /// the cursor. Returns whether it moved.
+    ///
+    /// The neighbor is chosen from the **visible** workspace order
+    /// (`sidebar_rows`) — the order the user sees and the Shift+Alt nav ring
+    /// walks. Pins / `attention` workspace-sort float rows, so the visible order
+    /// can differ from the raw `sidebar_workspaces` order; picking the neighbor
+    /// here (not from the raw vec) keeps the persisted order following what's on
+    /// screen. With no pins the two orders coincide, so behaviour is unchanged.
     pub(crate) fn move_workspace_by_slug(
         &mut self,
         model: &mut FrameModel,
@@ -161,32 +168,44 @@ impl SidebarState {
         slug: &str,
         up: bool,
     ) -> bool {
-        // The reorderable (DB-backed) workspaces in display order, as
-        // (full-vec index, repo_path). Empty repo_path = live-only, no position.
-        let order: Vec<(usize, String)> = model
-            .sidebar_workspaces
+        // Reorderable (DB-backed) workspaces in visible order. A workspace
+        // header carries `worktree_path: Some(_)` only when it has a DB row;
+        // live-only fallbacks (no position) are skipped, as before.
+        let visible: Vec<String> = model
+            .sidebar_rows
             .iter()
-            .enumerate()
-            .filter(|(_, (_, _, _, repo))| !repo.is_empty())
-            .map(|(i, (_, _, _, repo))| (i, repo.clone()))
+            .filter(|r| {
+                r.visible
+                    && r.kind == crate::sidebar::RowKind::Workspace
+                    && r.worktree_path.is_some()
+            })
+            .map(|r| r.workspace_slug.clone())
             .collect();
-        // Locate the workspace within that order by slug.
-        let Some(p) = model
-            .sidebar_workspaces
-            .iter()
-            .position(|(s, _, _, _)| s == slug)
-            .and_then(|fi| order.iter().position(|(i, _)| *i == fi))
-        else {
+        let Some(p) = visible.iter().position(|s| s == slug) else {
             return false;
         };
         let neighbor = if up {
             p.checked_sub(1)
         } else {
-            (p + 1 < order.len()).then_some(p + 1)
+            (p + 1 < visible.len()).then_some(p + 1)
         };
         let Some(np) = neighbor else { return false };
-        let (ia, repo_a) = order[p].clone();
-        let (ib, repo_b) = order[np].clone();
+        let neighbor_slug = visible[np].clone();
+
+        // Map both slugs back to their `sidebar_workspaces` slot + repo path for
+        // the swap.
+        let slot = |model: &FrameModel, s: &str| -> Option<(usize, String)> {
+            model
+                .sidebar_workspaces
+                .iter()
+                .position(|(ws, _, _, _)| ws == s)
+                .map(|i| (i, model.sidebar_workspaces[i].3.clone()))
+        };
+        let (Some((ia, repo_a)), Some((ib, repo_b))) =
+            (slot(model, slug), slot(model, &neighbor_slug))
+        else {
+            return false;
+        };
 
         if let Ok(db) = thegn_core::db::Db::open() {
             // best-effort: same cache rule as the worktree swap above — the
@@ -617,6 +636,46 @@ mod tests {
             vec!["app/home", "app/a", "lib/home", "lib/x"],
             "nothing moved"
         );
+    }
+
+    #[test]
+    fn workspace_reorder_uses_visible_order_under_pins() {
+        // A pinned workspace floats to the top of the tree, so the visible
+        // order differs from the raw `sidebar_workspaces` order. Moving a
+        // workspace must swap it past its *visible* neighbor — the order the
+        // Shift+Alt nav ring walks — not the raw-order neighbor (which, before
+        // this, could pick the pinned row and produce no visible move).
+        let _db = DbGuard::new("ws-pins");
+        let session = app_session(&["home"]);
+        let mut model = build_initial_model(&session, None);
+        model.sidebar_workspaces = vec![
+            ("app".into(), "app".into(), "repo".into(), "/tmp/app".into()),
+            ("lib".into(), "lib".into(), "repo".into(), "/tmp/lib".into()),
+            ("zed".into(), "zed".into(), "repo".into(), "/tmp/zed".into()),
+        ];
+        let mut sb = SidebarState {
+            focused: true,
+            ..Default::default()
+        };
+        sb.view.pins = vec!["lib".into()];
+        sb.rebuild(&mut model, &session);
+
+        let visible = |model: &FrameModel| -> Vec<String> {
+            model
+                .sidebar_rows
+                .iter()
+                .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Workspace)
+                .map(|r| r.workspace_slug.clone())
+                .collect::<Vec<_>>()
+        };
+        // Pinned lib floats first: visible order is [lib, app, zed].
+        assert_eq!(visible(&model), vec!["lib", "app", "zed"]);
+
+        // Move zed up: its visible neighbor is app (lib is pinned above). It
+        // must swap past app, giving visible [lib, zed, app]. The raw-order
+        // neighbor would have been lib and left the tree unchanged.
+        assert!(sb.move_workspace_by_slug(&mut model, &session, "zed", true));
+        assert_eq!(visible(&model), vec!["lib", "zed", "app"]);
     }
 
     #[test]
