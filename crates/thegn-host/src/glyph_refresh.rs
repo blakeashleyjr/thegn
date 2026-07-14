@@ -60,10 +60,7 @@ mod tests {
     use super::*;
 
     fn row(dirty: bool, ahead: usize, behind: usize) -> (GlyphRow, Instant) {
-        (
-            (dirty, ahead, behind, None, String::new()),
-            Instant::now(),
-        )
+        ((dirty, ahead, behind, None, String::new()), Instant::now())
     }
 
     #[test]
@@ -86,8 +83,22 @@ mod tests {
         cache.insert("/b".to_string(), row(false, 0, 4));
         let mut git = BTreeMap::new();
         seed_glyphs_from_cache(&mut git, ["/a".to_string(), "/b".to_string()], &cache);
-        assert_eq!(git.get("/a"), Some(&GitGlyphs { dirty: true, ahead: 1, behind: 0 }));
-        assert_eq!(git.get("/b"), Some(&GitGlyphs { dirty: false, ahead: 0, behind: 4 }));
+        assert_eq!(
+            git.get("/a"),
+            Some(&GitGlyphs {
+                dirty: true,
+                ahead: 1,
+                behind: 0
+            })
+        );
+        assert_eq!(
+            git.get("/b"),
+            Some(&GitGlyphs {
+                dirty: false,
+                ahead: 0,
+                behind: 4
+            })
+        );
     }
 
     #[test]
@@ -95,7 +106,11 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert("/a".to_string(), row(false, 0, 0)); // stale cache
         let mut git = BTreeMap::new();
-        let fresh = GitGlyphs { dirty: true, ahead: 9, behind: 0 };
+        let fresh = GitGlyphs {
+            dirty: true,
+            ahead: 9,
+            behind: 0,
+        };
         git.insert("/a".to_string(), fresh); // fresh scan already present
         seed_glyphs_from_cache(&mut git, ["/a".to_string()], &cache);
         assert_eq!(git.get("/a"), Some(&fresh), "must not clobber a fresh scan");

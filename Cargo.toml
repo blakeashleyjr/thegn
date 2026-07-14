@@ -194,6 +194,18 @@ thegn-media = { path = "crates/thegn-media" }
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
 
+[profile.dev]
+# Build-speed tuning for the inner loop. `line-tables-only` keeps backtraces
+# (file:line) meaningful while skipping full DWARF variable/type info — the bulk
+# of debuginfo codegen + link cost. `unpacked` split-debuginfo keeps debug data
+# out of the object files the linker stitches, cutting incremental link time.
+# Deliberately NOT bumping `opt-level` on deps ([profile.dev.package."*"]): that
+# trades build time for dep runtime, the opposite of what we want here. For an
+# interactive lldb/gdb session that needs full locals, override with a scratch
+# profile (`debug = true`).
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
 [profile.release]
 strip = true
 lto = "thin"

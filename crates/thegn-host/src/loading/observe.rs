@@ -171,10 +171,16 @@ mod tests {
         let mut o = MaterializeObserver::new();
         let events = [
             SandboxPhase::Resolve,
-            SandboxPhase::Connect { host: "ssh:h".into() },
+            SandboxPhase::Connect {
+                host: "ssh:h".into(),
+            },
             SandboxPhase::PhaseDone,
-            SandboxPhase::ImageProbe { image: "img".into() },
-            SandboxPhase::ImagePull { image: "img".into() },
+            SandboxPhase::ImageProbe {
+                image: "img".into(),
+            },
+            SandboxPhase::ImagePull {
+                image: "img".into(),
+            },
             SandboxPhase::PhaseDone,
             SandboxPhase::ContainerCreate { backend: "podman" },
             SandboxPhase::PhaseDone,
@@ -192,7 +198,9 @@ mod tests {
     #[test]
     fn oci_local_happy_path_with_probe_hit() {
         let mut o = MaterializeObserver::new();
-        o.on_event(SandboxPhase::ImageProbe { image: "debian:stable".into() });
+        o.on_event(SandboxPhase::ImageProbe {
+            image: "debian:stable".into(),
+        });
         // Opening the image phase closes the seed resolve step.
         let out = o.render();
         assert_eq!(out[0].state, StepState::Done, "resolve closed");
@@ -204,15 +212,24 @@ mod tests {
         let out = o.on_event(SandboxPhase::ContainerCreate { backend: "podman" });
         assert_eq!(
             labels(&out),
-            vec!["sandbox", "image debian:stable", "container (podman)", "shell"]
+            vec![
+                "sandbox",
+                "image debian:stable",
+                "container (podman)",
+                "shell"
+            ]
         );
     }
 
     #[test]
     fn pull_relabels_and_carries_progress() {
         let mut o = MaterializeObserver::new();
-        o.on_event(SandboxPhase::ImageProbe { image: "dev:latest".into() });
-        let out = o.on_event(SandboxPhase::ImagePull { image: "dev:latest".into() });
+        o.on_event(SandboxPhase::ImageProbe {
+            image: "dev:latest".into(),
+        });
+        let out = o.on_event(SandboxPhase::ImagePull {
+            image: "dev:latest".into(),
+        });
         assert_eq!(out[1].label, "pull dev:latest", "probe step relabels");
         assert_eq!(out.len(), 3, "no stacked image step");
         let snap = PullSnapshot {
@@ -223,14 +240,19 @@ mod tests {
         };
         let out = o.on_event(SandboxPhase::PullProgress(snap));
         assert_eq!(out[1].progress, Some((10, Some(100))));
-        assert!(out[1].detail.as_deref().unwrap().contains("/"), "byte detail");
+        assert!(
+            out[1].detail.as_deref().unwrap().contains("/"),
+            "byte detail"
+        );
     }
 
     #[test]
     fn failure_marks_the_active_step_with_the_error() {
         let mut o = MaterializeObserver::new();
         o.on_event(SandboxPhase::ImagePull { image: "x".into() });
-        let out = o.on_event(SandboxPhase::PhaseFailed { err: "manifest unknown".into() });
+        let out = o.on_event(SandboxPhase::PhaseFailed {
+            err: "manifest unknown".into(),
+        });
         let failed = &out[1];
         assert_eq!(failed.state, StepState::Failed);
         assert_eq!(failed.detail.as_deref(), Some("manifest unknown"));
@@ -240,19 +262,26 @@ mod tests {
     #[test]
     fn connect_retry_annotates_and_reconnect_reactivates() {
         let mut o = MaterializeObserver::new();
-        o.on_event(SandboxPhase::Connect { host: "ssh:h".into() });
+        o.on_event(SandboxPhase::Connect {
+            host: "ssh:h".into(),
+        });
         let out = o.on_event(SandboxPhase::ConnectRetry { attempt: 2, max: 3 });
         let connect = out.iter().find(|s| s.kind == StepKind::Connect).unwrap();
         assert_eq!(connect.detail.as_deref(), Some("retrying 2/3"));
         // Chain probes reconnect: the SAME step reactivates, never a second one.
         o.on_event(SandboxPhase::PhaseDone);
-        let out = o.on_event(SandboxPhase::Connect { host: "ssh:h".into() });
+        let out = o.on_event(SandboxPhase::Connect {
+            host: "ssh:h".into(),
+        });
         assert_eq!(
             out.iter().filter(|s| s.kind == StepKind::Connect).count(),
             1
         );
         assert_eq!(
-            out.iter().find(|s| s.kind == StepKind::Connect).unwrap().state,
+            out.iter()
+                .find(|s| s.kind == StepKind::Connect)
+                .unwrap()
+                .state,
             StepState::Active
         );
     }
@@ -260,21 +289,26 @@ mod tests {
     #[test]
     fn refines_a_seeded_plan_in_place_and_in_order() {
         // The config-classified seed: sandbox → image → container → shell.
-        let seed = crate::loading::catalog::plan_for(
-            &crate::loading::catalog::ResolvedTarget {
-                backend: crate::loading::catalog::BackendClass::Oci("podman-rootless".into()),
-                image: Some("debian:stable".into()),
-                ..crate::loading::catalog::ResolvedTarget::host_local()
-            },
-        )
+        let seed = crate::loading::catalog::plan_for(&crate::loading::catalog::ResolvedTarget {
+            backend: crate::loading::catalog::BackendClass::Oci("podman-rootless".into()),
+            image: Some("debian:stable".into()),
+            ..crate::loading::catalog::ResolvedTarget::host_local()
+        })
         .into_steps();
         let mut o = MaterializeObserver::from_steps(&seed);
         // The probe event refines the SEEDED image row (no duplicate), closes
         // the resolve row, and the shell stays last.
-        let out = o.on_event(SandboxPhase::ImageProbe { image: "debian:stable".into() });
+        let out = o.on_event(SandboxPhase::ImageProbe {
+            image: "debian:stable".into(),
+        });
         assert_eq!(
             labels(&out),
-            vec!["sandbox", "image debian:stable", "container (podman-rootless)", "shell"],
+            vec![
+                "sandbox",
+                "image debian:stable",
+                "container (podman-rootless)",
+                "shell"
+            ],
             "same rows, refined in place"
         );
         assert_eq!(out[0].state, StepState::Done);
@@ -293,7 +327,9 @@ mod tests {
         // BEFORE the pending container row (chronological), not append.
         let seed = crate::loading::catalog::generic_seed();
         let mut o = MaterializeObserver::from_steps(&seed);
-        let out = o.on_event(SandboxPhase::ImagePull { image: "img".into() });
+        let out = o.on_event(SandboxPhase::ImagePull {
+            image: "img".into(),
+        });
         assert_eq!(
             labels(&out),
             vec!["sandbox", "pull img", "container", "shell"]

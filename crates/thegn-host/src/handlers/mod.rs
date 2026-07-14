@@ -13,6 +13,7 @@ pub(crate) mod host;
 pub(crate) mod host_heal;
 pub(crate) mod materialize;
 pub(crate) mod merge_queue;
+pub(crate) mod onboarding;
 pub(crate) mod overlay;
 pub(crate) mod pane_zoom;
 pub(crate) mod panel_changes;
