@@ -4,16 +4,19 @@
 
 ### Requirement: An issue can be turned into a worktree tab in one action
 
-thegn SHALL provide an action, from the unified work surface, that creates a
-worktree for a selected issue — deriving its branch from the issue via a
-configurable session-name template, creating the worktree off the event loop, and
-adding and focusing its tab — and records the issue↔worktree binding in the
-existing link store so the panel marks it linked and the binding survives a
-restart. This worktree-creation path MUST NOT depend on the AI layer.
+thegn SHALL provide a start action (the `s` key) on a selected issue, in both
+the Issues and Mine sections of the work surface, that creates a worktree for
+it — deriving its branch from the issue via a configurable session-name
+template (tokens `{identifier}`/`{slug}`/`{provider}`), creating the worktree
+off the event loop, and adding and focusing its tab — and records the
+issue↔worktree binding in the existing link store so the panel marks it linked
+and the binding survives a restart. The existing `b` (branch-from-issue) and
+`D` (agent dispatch) actions MUST remain unchanged. This worktree-creation path
+MUST NOT depend on the AI layer.
 
 #### Scenario: Starting an issue creates and opens its worktree tab
 
-- **WHEN** the user invokes the start action on a selected issue with
+- **WHEN** the user presses `s` on a selected issue with
   `auto_create_worktree` enabled
 - **THEN** a worktree is created off-loop with a branch derived from the issue and
   its tab is added and focused

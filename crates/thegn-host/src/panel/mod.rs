@@ -24,6 +24,7 @@ pub mod frame;
 pub mod gitfull;
 pub mod gitui;
 pub mod graph;
+pub mod hints;
 pub mod rollback;
 pub mod scope;
 pub mod sections;

@@ -30,6 +30,7 @@ pub(crate) mod startup;
 pub(crate) mod switch;
 pub(crate) mod switch_cache;
 pub(crate) mod terminal;
+pub(crate) mod tracker;
 pub(crate) mod wizard;
 pub(crate) mod worktree_delete;
 
