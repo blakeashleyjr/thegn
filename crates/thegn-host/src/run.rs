@@ -7827,14 +7827,14 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        if need_relayout {
+        let tree = crate::handlers::pane_zoom::grown_tree(
+            zoom,
+            maximized,
+            focused_pane_id(&session),
+            session.active_tab().map(|t| t.center.clone()),
+        );
+        if need_relayout || crate::panes::size_drifted(&panes, &tree, chrome.center) {
             let _relayout_span = crate::perf::measure(crate::perf::Subsys::Relayout);
-            let tree = crate::handlers::pane_zoom::grown_tree(
-                zoom,
-                maximized,
-                focused_pane_id(&session),
-                session.active_tab().map(|t| t.center.clone()),
-            );
             relayout(&mut panes, &tree, chrome.center);
             if let Some(strip_rect) = chrome.strip {
                 relayout_strip(&mut panes, &supervisor, strip_rect);
