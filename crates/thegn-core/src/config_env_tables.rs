@@ -762,7 +762,10 @@ mod tests {
             ..Default::default()
         };
         assert!(!e.is_default());
-        assert!(EnvProviderConfig::default().is_default(), "default transport is mosh");
+        assert!(
+            EnvProviderConfig::default().is_default(),
+            "default transport is mosh"
+        );
         let e = EnvProviderConfig {
             transport: RemoteTransport::Ssh,
             ..Default::default()

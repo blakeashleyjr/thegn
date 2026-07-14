@@ -320,7 +320,7 @@ pub(crate) fn complete_workspace_create(
         .and_then(|db| create_workspace_from_input_with_config(input, session, &db, cfg))
     {
         Ok(WorkspaceResolution::Repo(path)) => {
-            workspace_pool.stash(prev_id, snapshot);
+            workspace_pool.stash(prev_id, snapshot, panes);
             remap_cold_workspace_ids(session, panes);
             focus.zone = crate::focus::Zone::Center;
             refresh_tab_model(model, session, sb);

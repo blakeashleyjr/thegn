@@ -26,6 +26,9 @@ name: ci
 #  - sandbox-e2e-full (Tier-2 podman suites): not part of `just ci` either;
 #    the Tier-1 dns/db tests (no container runtime needed) DO run here.
 #  - macos: not part of `just ci`; OPT-IN via `[ci-macos]` (10x minute cost).
+#  - windows: routine (2x minute cost) — the msvc truth gate for the native
+#    Windows port (workspace check + real-pipe/Job-Object kernel tests +
+#    release thegn.exe artifact). Bare rustup, no nix.
 #
 # nix `access-tokens` comes from the NIX_GITHUB_TOKEN secret — it must read the
 # private flake inputs (muse, termite-chat) AND public ones, so it must be a
@@ -231,6 +234,38 @@ jobs:
           git config --global user.email ci@thegn.local
           git config --global user.name "thegn CI"
       - run: nix develop --command bash -lc "just build && just test"
+  windows:
+    # The msvc truth gate for the native Windows port, promoted to routine
+    # (phase 6) — the per-PR windows-gnu cross-*check* in `just check-cross`
+    # catches cfg regressions cheaply; this job proves msvc + real-kernel
+    # semantics and ships a usable binary artifact. windows-latest =
+    # GitHub-hosted x86_64 MSVC; no nix on Windows — bare rustup + cargo
+    # (the documented native dev loop, see CONTRIBUTING "Windows (native)").
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --locked
+      # Named-pipe IPC round-trip + bind-lock semantics (cfg(windows) tests) —
+      # the real-pipe truth gate for the daemon IPC seam. Scoped to the ipc
+      # module until the full suite is validated on Windows.
+      - run: cargo test -p thegn-svc --lib --locked ipc
+      # Job Object semantics on a real kernel: terminate() reaps the tree and
+      # dropping the last handle (KILL_ON_JOB_CLOSE) reaps it too.
+      - run: "cargo test -p thegn-host --locked platform::"
+      # Distribution: a release thegn.exe from every run — the download for
+      # native Windows installs until a tagged-release pipeline exists
+      # (documented install path: `cargo install --path crates/thegn-host`).
+      - run: cargo build --release --locked -p thegn-host
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thegn-x86_64-pc-windows-msvc
+          path: target/release/thegn.exe
+          retention-days: 30
   # One-shot baseline generator: muse visual baselines were never committed, so
   # `e2e` can't pass until they exist. Push a commit whose message contains
   # `[gen-baselines]` to (re)generate them in the CI env where `e2e` checks

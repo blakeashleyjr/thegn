@@ -151,14 +151,34 @@ enforce this automatically:
 
 - **pre-commit** (cheap, no compile): treefmt + shellcheck + yamllint + the
   god-file ratchet.
-- **pre-push**: clippy + `cargo test` + smoke.
+- **pre-push**: clippy + `cargo test` + smoke. **This is the single heavy gate**
+  that must be green before code leaves the machine — rely on it, don't re-run
+  full-workspace gates by hand while iterating.
 - **CI-only** (`just ci`): coverage (`cargo llvm-cov` — the heaviest gate,
   instrumented recompile), cross-check, docs, e2e, nix-build. Run `just coverage`
   locally on demand before a PR if you want the gate early.
 
+**Test precisely; keep full-workspace rebuilds to an absolute minimum.** A
+full-workspace compile is the most expensive thing you can do on this box, so
+while iterating:
+
+- Run **one crate's** checks — `just quick <crate>` (typecheck/clippy on lib/bin).
+- Run **the specific tests** you're touching, not the whole suite — e.g.
+  `cargo nextest run -p <crate> <substring>` or `cargo test -p <crate> <module>::`.
+  Reach for `cargo nextest run --workspace` / `just test` only right before push.
+- `just test`, `just coverage`, `just ci` are **pre-push / pre-PR gates, not
+  per-edit commands.** Let the pre-push hook be the thing that runs them.
+
 The dev shell also **caps `CARGO_BUILD_JOBS`** (leaves ~2 cores free) and wires
 **sccache** (`RUSTC_WRAPPER`, `CARGO_INCREMENTAL=0`) so cold worktrees / branch
 switches reuse compiled crates instead of rebuilding from scratch.
+
+**Merge-queue gate cost.** `thegn merge`'s fold gate runs `[merge_queue]
+gate_command` per fold. By default it now reuses a stable per-repo worktree +
+`CARGO_TARGET_DIR` under `$XDG_STATE_HOME/thegn/gate/` (`gate_reuse_worktree`), so
+folds warm-rebuild instead of cold-compiling from scratch. Keep `gate_command`
+**lean** (e.g. `just test`, not `just lint && just test`) — pre-push already
+covered clippy/test before the branch was enqueued.
 
 Nix: `nix profile install .#default`; `nix develop` for the dev shell.
 

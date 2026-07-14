@@ -13,6 +13,7 @@ mod agent_output;
 mod agent_pi;
 mod agent_ssh;
 mod agent_teardown;
+mod ai_sidecar;
 mod apps;
 mod attention_status;
 mod autoscale;
@@ -41,6 +42,7 @@ mod emulator;
 mod env_ui;
 mod env_wizard;
 mod escape;
+mod fd_limit;
 mod fff_backend;
 mod fly_reaper;
 mod focus;
@@ -79,6 +81,7 @@ mod loc_scan;
 mod logotype;
 mod loop_policy;
 mod lsp;
+mod machine0_bridge;
 mod managed_tool;
 mod mascot;
 mod masthead;
@@ -100,12 +103,14 @@ mod naming;
 mod nav;
 mod nixcache;
 mod notify;
+mod onboarding;
 mod owl;
 mod palette;
 mod pane;
 mod pane_pty;
 mod pane_source;
 mod panel;
+mod panel_header_cache;
 mod panel_util;
 mod panes;
 mod parity;
@@ -113,13 +118,13 @@ mod perf;
 mod pi_assets;
 mod pins;
 mod placement_flow;
+mod platform;
 mod pr_view;
 mod predict;
 mod preview_gfx;
 mod preview_pane;
 mod preview_render;
 mod probe;
-mod machine0_bridge;
 mod profile;
 mod provider_factory;
 mod provision_gate;
@@ -170,6 +175,7 @@ mod wire;
 mod wizard;
 mod workspace_create;
 mod workspace_picker;
+mod workspace_pool;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -400,6 +406,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Launch the compositor straight into the onboarding wizard (forge auth,
+    /// issue trackers, hosts, sandbox, appearance). Re-runnable any time.
+    Setup,
     /// Generate shell completions (bash/zsh/fish/elvish/powershell) for the
     /// invoked binary name — `thegn completions zsh > …/_thegn`.
     Completions { shell: clap_complete::Shell },
@@ -629,7 +638,11 @@ fn main() -> anyhow::Result<()> {
     // interactive compositor (the default). `open` is special: with no live
     // instance it falls THROUGH to the interactive launch below.
     if let Some(command) = cli.command.take() {
-        let result = if let Command::Open { repo, no_launch } = command {
+        let result = if matches!(command, Command::Setup) {
+            // Fall through to the interactive launch with the wizard armed.
+            onboarding::request_setup_on_start();
+            Err(None)
+        } else if let Command::Open { repo, no_launch } = command {
             let mut cfg = thegn_core::config::Config::load_layered(
                 &thegn_core::config::ProcessEnv,
                 &cli.overrides,
@@ -655,6 +668,17 @@ fn main() -> anyhow::Result<()> {
             Err(Some(e)) => return Err(e),
             Err(None) => {} // `open` with no live instance: launch the TUI
         }
+    }
+
+    // Native Windows targets Windows Terminal (or another modern VT emulator).
+    // Legacy conhost.exe renders the frame too poorly to degrade gracefully —
+    // refuse with a clear pointer instead of looking broken.
+    #[cfg(windows)]
+    if !thegn_core::termcaps::modern_terminal_evidence(&thegn_core::termcaps::TermEnv::from_env()) {
+        anyhow::bail!(
+            "thegn requires a modern terminal on Windows — run it inside Windows Terminal \
+             (https://aka.ms/terminal); legacy conhost.exe is not supported"
+        );
     }
 
     // Per-profile advisory singleton (H): one interactive window per named
@@ -761,6 +785,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Doctor { json } => cmd::doctor::run(&cfg, json),
+        // Dispatched before run_subcommand (it falls through to the TUI);
+        // unreachable here, kept for match exhaustiveness.
+        Command::Setup => Ok(()),
         Command::Completions { shell } => {
             // Generate against the same grouped command tree the parser uses,
             // named for the invoked alias (thegn / tg).

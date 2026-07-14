@@ -144,7 +144,11 @@ fn mosh_argv(shim: &ssh_shim::SshShim, cmd: &[String]) -> Vec<String> {
         .map(|a| thegn_core::util::sh_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
-    let mut argv = vec!["mosh".to_string(), format!("--ssh={ssh_opts}"), host.clone()];
+    let mut argv = vec![
+        "mosh".to_string(),
+        format!("--ssh={ssh_opts}"),
+        host.clone(),
+    ];
     if !cmd.is_empty() {
         argv.push("--".into());
         argv.extend(cmd.iter().cloned());
@@ -210,7 +214,10 @@ mod tests {
         assert_eq!(argv[0], "mosh");
         assert!(argv[1].starts_with("--ssh="));
         assert!(argv[1].contains("ssh"), "inner ssh opts present: {argv:?}");
-        assert!(!argv[1].contains("root@203.0.113.9"), "host is split off the --ssh opts");
+        assert!(
+            !argv[1].contains("root@203.0.113.9"),
+            "host is split off the --ssh opts"
+        );
         assert_eq!(argv[2], "root@203.0.113.9");
         // With a command, it is appended after `--`.
         let argv = mosh_argv(&shim, &["/bin/sh".into(), "-lc".into(), "echo hi".into()]);

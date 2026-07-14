@@ -128,7 +128,10 @@ impl Mcp0Client {
             .post(&self.endpoint)
             .header("x-api-key", &self.api_key)
             .header("MCP-Protocol-Version", PROTOCOL_VERSION)
-            .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
             .timeout(CONTROL_TIMEOUT)
             .json(&body)
             .send()
@@ -149,7 +152,10 @@ impl Mcp0Client {
                 .post(&self.endpoint)
                 .header("x-api-key", &self.api_key)
                 .header("MCP-Protocol-Version", PROTOCOL_VERSION)
-                .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/json, text/event-stream",
+                )
                 .timeout(CONTROL_TIMEOUT)
                 .json(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
             if let Some(s) = sid {
@@ -174,7 +180,10 @@ impl Mcp0Client {
                 .post(&self.endpoint)
                 .header("x-api-key", &self.api_key)
                 .header("MCP-Protocol-Version", PROTOCOL_VERSION)
-                .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/json, text/event-stream",
+                )
                 .timeout(CONTROL_TIMEOUT)
                 .json(&body);
             if let Some(s) = &session {

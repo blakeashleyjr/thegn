@@ -68,18 +68,20 @@ quick pkg="": _apps
     if [ -n "{{pkg}}" ]; then scope="-p {{pkg}}"; else scope="--workspace"; fi
     cargo clippy $scope -- -D warnings
 
-# Cross-platform regression gate: typecheck the C-dep-free leaf crates' per-OS
-# code for macOS + Windows on this (Linux) box. `thegn-metrics` covers the
-# sysinfo/battery substrate; `thegn-media` covers the per-OS player backends
-# (Linux MPRIS/mpv, Windows SMTC, macOS AppleScript). `cargo check --target`
-# needs no cross C toolchain (check never links). Targets are provided by the
-# flake's rust toolchain. Catches the #1 cross-platform breakage — won't-compile
-# — without macOS/Windows runners.
+# Cross-platform regression gate: typecheck per-OS code for macOS + Windows on
+# this (Linux) box. macOS coverage stays scoped to the C-dep-free leaf crates
+# (`thegn-metrics`: sysinfo/battery; `thegn-media`: per-OS player backends) —
+# no darwin cross C toolchain here. Windows now checks the WHOLE workspace
+# (the native-Windows port): windows-gnu shares `cfg(windows)` with -msvc, so
+# this catches any newly ungated unix API use; the C build scripts in the graph
+# (bundled sqlite, libgit2, stacker) use the mingw-w64 cc the dev shell wires
+# via CC_x86_64_pc_windows_gnu (devenv.nix). The msvc truth gate is the opt-in
+# `windows` CI job (`[ci-windows]`). Catches the #1 cross-platform breakage —
+# won't-compile — without macOS/Windows runners.
 check-cross:
     cargo check -p thegn-metrics --target aarch64-apple-darwin
-    cargo check -p thegn-metrics --target x86_64-pc-windows-gnu
     cargo check -p thegn-media --target aarch64-apple-darwin
-    cargo check -p thegn-media --target x86_64-pc-windows-gnu
+    cargo check --workspace --target x86_64-pc-windows-gnu
 
 # Debug build of the host with the in-process sampling profiler compiled in
 # (the `profiling` feature → SIGUSR2 flamegraph capture). Same artifact path as
@@ -219,8 +221,9 @@ openspec-setup:
 openspec-validate:
     OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1 openspec validate --all --strict
 
-# The full gate.
-ci: fmt-check lint deps-audit build check-cross test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
+# The full gate. `lint` now runs the treefmt fail-on-change check first, so the
+# formatting gate lives there (no separate `fmt-check` stage needed here).
+ci: lint deps-audit build check-cross test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
     @echo "ci: all green"
 
 # --- local CI (act) -------------------------------------------------------
@@ -354,7 +357,13 @@ coverage-html:
 
 # Comprehensive linting: rust (clippy), bash (shellcheck), yaml (yamllint), toml (taplo).
 lint: _apps
-    @for t in shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
+    @for t in treefmt shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
+    # Formatting gate (treefmt, fail-on-change) — FIRST so drift fails fast before
+    # the clippy compile. This is what makes `just lint` (and thus the merge-queue
+    # `gate_command`) reject unformatted code: the fold-actor lands via plumbing
+    # commits, so git's pre-commit/treefmt hook never fires on that path. `--ci`
+    # formats in place then exits nonzero on any change (mirrors `just fmt-check`).
+    treefmt --ci
     cargo clippy --workspace --all-targets -- -D warnings
     shellcheck -x install.sh test/smoke.sh test/brand-guard.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/file-size-ratchet.sh test/git-hooks/post-checkout.sh test/git-hooks/heal-worktree.sh
     yamllint .

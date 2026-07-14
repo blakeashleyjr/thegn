@@ -208,10 +208,7 @@ impl Machine0Provider {
     async fn call(&self, name: &str, args: Value) -> Result<Value> {
         let v = self.mcp.call_tool(name, args).await?;
         if let Some(err) = v.get("error").and_then(Value::as_str) {
-            let msg = v
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or(err);
+            let msg = v.get("message").and_then(Value::as_str).unwrap_or(err);
             return Err(anyhow!("machine0 {name}: {err}: {msg}"));
         }
         Ok(v)
@@ -220,7 +217,10 @@ impl Machine0Provider {
     /// Look up a VM by name; `Ok(None)` when it does not exist (idempotent
     /// destroy / existence checks). A genuine transport/API failure propagates.
     async fn vm_by_name(&self, name: &str) -> Result<Option<Machine0Vm>> {
-        match self.call(tool::VM_GET_BY_NAME, json!({ "name": name })).await {
+        match self
+            .call(tool::VM_GET_BY_NAME, json!({ "name": name }))
+            .await
+        {
             Ok(v) => Ok(parse_vm(&v)),
             Err(e) if is_not_found(&e.to_string()) => Ok(None),
             Err(e) => Err(e),
@@ -373,12 +373,7 @@ impl Machine0Provider {
 
     /// Poll `vm_get_by_name` until `pred(status)` holds (e.g. STOPPED before an
     /// image). Bounded; `label` names the target state for the timeout error.
-    async fn wait_status(
-        &self,
-        name: &str,
-        pred: fn(&str) -> bool,
-        label: &str,
-    ) -> Result<()> {
+    async fn wait_status(&self, name: &str, pred: fn(&str) -> bool, label: &str) -> Result<()> {
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
         let start = std::time::Instant::now();
         let mut last: String;
@@ -551,7 +546,12 @@ impl Machine0Provider {
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(1800);
         let (code, out) = tokio::time::timeout(BUDGET, shim.run_exec(&argv, None, &[]))
             .await
-            .map_err(|_| anyhow!("machine0: nixos-rebuild timed out after {}s", BUDGET.as_secs()))?
+            .map_err(|_| {
+                anyhow!(
+                    "machine0: nixos-rebuild timed out after {}s",
+                    BUDGET.as_secs()
+                )
+            })?
             .context("machine0: nixos-rebuild over ssh")?;
         if code != 0 {
             return Err(anyhow!(
@@ -830,7 +830,11 @@ pub fn parse_vm(v: &Value) -> Option<Machine0Vm> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let name = obj.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let name = obj
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let status = obj
         .get("status")
         .or_else(|| obj.get("state"))
@@ -899,7 +903,10 @@ pub fn parse_size_list(v: &Value) -> Vec<Machine0Size> {
     array_field(v, &["sizes", "items"])
         .iter()
         .filter_map(|e| {
-            let name = e.get("size").or_else(|| e.get("name")).and_then(Value::as_str)?;
+            let name = e
+                .get("size")
+                .or_else(|| e.get("name"))
+                .and_then(Value::as_str)?;
             Some(Machine0Size {
                 name: name.to_string(),
                 vcpu: e.get("vcpu").and_then(Value::as_u64).unwrap_or(0) as u32,
@@ -1068,26 +1075,64 @@ mod tests {
         let s = sample_sizes();
         // ≥2 cpu / ≥4 GB ⇒ cheapest is "large" (not the pricier nvme/xl).
         assert_eq!(
-            pick_size(&s, &SizeReq { min_vcpu: 2, min_ram_gb: 4, ..Default::default() }).as_deref(),
+            pick_size(
+                &s,
+                &SizeReq {
+                    min_vcpu: 2,
+                    min_ram_gb: 4,
+                    ..Default::default()
+                }
+            )
+            .as_deref(),
             Some("large")
         );
         // NVMe required ⇒ the nvme variant despite being pricier.
         assert_eq!(
-            pick_size(&s, &SizeReq { nvme: true, ..Default::default() }).as_deref(),
+            pick_size(
+                &s,
+                &SizeReq {
+                    nvme: true,
+                    ..Default::default()
+                }
+            )
+            .as_deref(),
             Some("large-nvme")
         );
         // GPU required ⇒ the gpu box (and non-gpu asks never get a gpu box).
         assert_eq!(
-            pick_size(&s, &SizeReq { gpu: true, ..Default::default() }).as_deref(),
+            pick_size(
+                &s,
+                &SizeReq {
+                    gpu: true,
+                    ..Default::default()
+                }
+            )
+            .as_deref(),
             Some("gpu-h100")
         );
         // Big disk ⇒ xl (160 GB) is the cheapest that fits ≥120.
         assert_eq!(
-            pick_size(&s, &SizeReq { min_disk_gb: 120, ..Default::default() }).as_deref(),
+            pick_size(
+                &s,
+                &SizeReq {
+                    min_disk_gb: 120,
+                    ..Default::default()
+                }
+            )
+            .as_deref(),
             Some("xl")
         );
         // Unsatisfiable ⇒ None.
-        assert_eq!(pick_size(&s, &SizeReq { min_vcpu: 99, ..Default::default() }), None);
+        assert_eq!(
+            pick_size(
+                &s,
+                &SizeReq {
+                    min_vcpu: 99,
+                    ..Default::default()
+                }
+            ),
+            None
+        );
         // No constraints, no gpu ⇒ cheapest non-gpu = "small".
         assert_eq!(pick_size(&s, &SizeReq::default()).as_deref(), Some("small"));
     }
@@ -1112,7 +1157,10 @@ mod tests {
         assert_eq!(vm.address.as_deref(), Some("198.51.100.9"));
         // networks array
         let arr = json!({ "id": "u3", "networks": [ { "ip": "192.0.2.5" } ] });
-        assert_eq!(parse_vm(&arr).unwrap().address.as_deref(), Some("192.0.2.5"));
+        assert_eq!(
+            parse_vm(&arr).unwrap().address.as_deref(),
+            Some("192.0.2.5")
+        );
         assert!(parse_vm(&json!({})).is_none());
     }
 
@@ -1148,7 +1196,10 @@ mod tests {
         assert_eq!(ks[0].0, "k1");
         assert!(same_pubkey(&ks[0].1, "ssh-ed25519 AAA other@comment"));
         assert!(!same_pubkey(&ks[0].1, "ssh-ed25519 BBB me@host"));
-        assert_eq!(parse_created_id(&json!({ "id": "new-key" })).as_deref(), Some("new-key"));
+        assert_eq!(
+            parse_created_id(&json!({ "id": "new-key" })).as_deref(),
+            Some("new-key")
+        );
         assert_eq!(
             parse_created_id(&json!({ "sshKey": { "sshKeyId": "sk-9" } })).as_deref(),
             Some("sk-9")
@@ -1157,7 +1208,9 @@ mod tests {
 
     #[test]
     fn not_found_detection() {
-        assert!(is_not_found("machine0 mcp vm_get_by_name: HTTP 404 Not Found"));
+        assert!(is_not_found(
+            "machine0 mcp vm_get_by_name: HTTP 404 Not Found"
+        ));
         assert!(is_not_found("machine not found"));
         assert!(!is_not_found("machine0 mcp vm_list: HTTP 500"));
     }

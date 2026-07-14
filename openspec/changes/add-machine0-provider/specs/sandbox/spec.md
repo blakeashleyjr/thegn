@@ -52,7 +52,7 @@ verbatim. A failed apply SHALL fail create loudly and leave the VM for debugging
 - **WHEN** a `provider = "machine0"` env with a NixOS `template` and a
   `provision_flake` is provisioned
 - **THEN** after the VM reaches RUNNING, thegn runs `nixos-rebuild switch
-  --flake <ref>` over ssh and only returns the sandbox handle once the apply
+--flake <ref>` over ssh and only returns the sandbox handle once the apply
   succeeds
 
 #### Scenario: A NixOS env without a provision flake skips the rebuild
@@ -75,7 +75,7 @@ WSS-native exec provider.
 #### Scenario: A checkpoint snapshots the VM and restore recreates it
 
 - **WHEN** `thegn env snapshot` runs against a machine0 sandbox and `env
-  restore <image>` is later invoked
+restore <image>` is later invoked
 - **THEN** an `image_create` captures the VM, and restore destroys the VM and
   recreates it from the saved image under the same sandbox name
 

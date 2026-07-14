@@ -6,6 +6,7 @@
 //! Drives the ACTUAL provider code path (MCP control plane + ssh data plane):
 //! import key → create VM → resolve dynamic size → ssh run_exec → file
 //! round-trip → destroy. If `MACHINE0_API_KEY` is unset the test no-ops.
+#![allow(clippy::disallowed_macros)] // diagnostics in an ignored live test (matches sibling *_live.rs)
 
 use std::path::PathBuf;
 
@@ -15,15 +16,7 @@ use thegn_svc::provider::{ProviderFiles, RemoteProvider};
 fn gen_keypair(dir: &std::path::Path) -> (PathBuf, String) {
     let key = dir.join("id_ed25519");
     let status = std::process::Command::new("ssh-keygen")
-        .args([
-            "-t",
-            "ed25519",
-            "-N",
-            "",
-            "-C",
-            "thegn-machine0-live",
-            "-f",
-        ])
+        .args(["-t", "ed25519", "-N", "", "-C", "thegn-machine0-live", "-f"])
         .arg(&key)
         .status()
         .expect("ssh-keygen");
@@ -57,7 +50,7 @@ async fn machine0_live_lifecycle() {
             min_vcpu: 1,
             ..Default::default()
         },
-        region: String::new(),   // ⇒ DEFAULT_REGION
+        region: String::new(), // ⇒ DEFAULT_REGION
         provision_flake: String::new(),
         ssh_user: String::new(), // ⇒ VM's defaultSSHUsername
         key_path,
@@ -104,12 +97,18 @@ async fn run_lifecycle(provider: &Machine0Provider, name: &str) -> anyhow::Resul
         .write(name, "/tmp/tg-live.txt", payload)
         .await
         .context("write")?;
-    let got = provider.read(name, "/tmp/tg-live.txt").await.context("read")?;
+    let got = provider
+        .read(name, "/tmp/tg-live.txt")
+        .await
+        .context("read")?;
     anyhow::ensure!(got == payload, "file round-trip mismatch: {got:?}");
 
     eprintln!("[live] list contains {name} …");
     let vms = provider.list().await.context("list")?;
-    anyhow::ensure!(vms.iter().any(|v| v == name), "list missing {name}: {vms:?}");
+    anyhow::ensure!(
+        vms.iter().any(|v| v == name),
+        "list missing {name}: {vms:?}"
+    );
 
     // Devenv substrate: the NixOS image must give us `nix` + a writable-enough
     // store to build a devShell. Hard-assert nix + /nix/store; then attempt a real
@@ -126,7 +125,10 @@ async fn run_lifecycle(provider: &Machine0Provider, name: &str) -> anyhow::Resul
         .await
         .context("nix probe")?;
     eprintln!("[live] nix: exit={code} out={out:?}");
-    anyhow::ensure!(code == 0 && out.contains("NIX_OK"), "no nix devenv substrate: {out}");
+    anyhow::ensure!(
+        code == 0 && out.contains("NIX_OK"),
+        "no nix devenv substrate: {out}"
+    );
 
     eprintln!("[live] devenv: nix develop a tiny flake (best-effort, ≤240s) …");
     let flake = r#"{ inputs.nixpkgs.url = "flake:nixpkgs"; outputs = { self, nixpkgs }: let p = nixpkgs.legacyPackages.x86_64-linux; in { devShells.x86_64-linux.default = p.mkShell { packages = [ p.hello ]; }; }; }"#;
@@ -153,7 +155,12 @@ async fn run_lifecycle(provider: &Machine0Provider, name: &str) -> anyhow::Resul
 
     // mosh-server presence (drives the bridge's mosh↔ssh choice — informational).
     let (_c, mout) = provider
-        .run_exec(name, &sh("command -v mosh-server || echo NO_MOSH_SERVER"), None, &[])
+        .run_exec(
+            name,
+            &sh("command -v mosh-server || echo NO_MOSH_SERVER"),
+            None,
+            &[],
+        )
         .await
         .context("mosh probe")?;
     eprintln!("[live] mosh-server: {}", mout.trim());
@@ -177,7 +184,10 @@ async fn run_lifecycle(provider: &Machine0Provider, name: &str) -> anyhow::Resul
         .run_exec(name, &sh("echo RESUMED=$(whoami)"), None, &[])
         .await
         .context("run_exec after resume")?;
-    anyhow::ensure!(code == 0 && out.contains("RESUMED="), "exec after resume failed: {out}");
+    anyhow::ensure!(
+        code == 0 && out.contains("RESUMED="),
+        "exec after resume failed: {out}"
+    );
 
     eprintln!("[live] OK");
     Ok(())

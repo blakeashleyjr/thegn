@@ -361,6 +361,14 @@ pub(crate) fn build_command_palette_items(
         "＋ New environment…  (cloud / ssh / local)".to_string(),
     ));
 
+    // Onboarding wizard re-run (also `thegn setup`) — forge auth, issue
+    // trackers, hosts, sandbox, appearance. Dispatched via the "setup-wizard"
+    // key in the run-loop palette Enter arm.
+    items.push(crate::palette::PaletteItem::new(
+        "setup-wizard",
+        "⚙ Setup wizard…  (forge / hosts / sandbox / appearance)".to_string(),
+    ));
+
     items
 }
 
@@ -650,8 +658,14 @@ pub(crate) fn build_env_palette(
 
 /// Provider kinds offered as "set up …" discovery rows in the host picker,
 /// in display order. Must stay within the kinds the env wizard can author.
-pub(crate) const ENV_SETUP_KINDS: &[&str] =
-    &["fly", "hetzner", "digitalocean", "sprites", "daytona", "machine0"];
+pub(crate) const ENV_SETUP_KINDS: &[&str] = &[
+    "fly",
+    "hetzner",
+    "digitalocean",
+    "sprites",
+    "daytona",
+    "machine0",
+];
 /// Build the agent-picker palette items for `cfg`: one row per agent/tool, plus
 /// a literal shell. The key is the bare choice name (the `PendingAgent` gate in
 /// the Enter handler routes it to a launch, not a command dispatch).
