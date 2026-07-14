@@ -7,8 +7,8 @@
 - `crates/thegn-core/src/shellinv.rs`: **pure, no I/O** shell-dialect argv
   building (`ShellFlavor {Posix, Pwsh, Cmd}`, `flavor_of`, `run_argv`,
   `exec_argv`). Core is substrate-agnostic and coverage-gated, so the Windows
-  arms are unit-tested on Linux CI. `util::shell()` resolves *which* shell;
-  `shellinv` resolves *how to invoke it*.
+  arms are unit-tested on Linux CI. `util::shell()` resolves _which_ shell;
+  `shellinv` resolves _how to invoke it_.
 - `crates/thegn-host/src/platform/{mod,unix,windows}.rs`: all OS-conditional
   syscalls. `mod.rs` holds the shared logic (e.g. opening the stderr log file)
   and re-exports the per-OS impl. Rule: nothing outside `platform/` writes a
@@ -58,7 +58,7 @@ exec-replace. Graceful no-ops are reserved for genuinely optional semantics
 ### D6 — CI gating
 
 - **Fast Linux gate (every PR)**: `cargo check --workspace --target
-  x86_64-pc-windows-gnu` in `just check-cross`, with the mingw-w64 cross-cc
+x86_64-pc-windows-gnu` in `just check-cross`, with the mingw-w64 cross-cc
   (`pkgsCross.mingwW64.stdenv.cc`) provided by the dev shell for the C build
   scripts in the graph (bundled sqlite, libgit2, stacker…). windows-gnu and
   windows-msvc share `cfg(windows)`, so this catches all gating regressions.
@@ -68,9 +68,9 @@ exec-replace. Graceful no-ops are reserved for genuinely optional semantics
 
 ## Alternatives considered
 
-- *Gate `libc` loosely and use CRT `_dup2` for stderr*: rejected — ownership
+- _Gate `libc` loosely and use CRT `_dup2` for stderr_: rejected — ownership
   hand-off through `open_osfhandle` is easy to double-free, and Rust-side
   writers (the actual risk: panics) go through the std handle anyway.
-- *One `#[cfg]` at every call site, no platform module*: rejected — that is how
+- _One `#[cfg]` at every call site, no platform module_: rejected — that is how
   the codebase got 30 scattered unix-isms; the seam keeps the diff reviewable
   and gives Phase 3 (Job Objects) a single landing point.

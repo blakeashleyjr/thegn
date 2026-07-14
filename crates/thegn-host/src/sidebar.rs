@@ -825,10 +825,10 @@ pub fn build_rows(
         // are emitted later under their folder header at depth 2. A worktree
         // whose `folder_id` has no matching header falls back to loose so it is
         // never invisible.
-        for gr in groups
-            .iter()
-            .filter(|g| g.folder_id.is_none_or(|fid| !rendered_folder_ids.contains(&fid)))
-        {
+        for gr in groups.iter().filter(|g| {
+            g.folder_id
+                .is_none_or(|fid| !rendered_folder_ids.contains(&fid))
+        }) {
             let pin_key = format!("{repo_slug}/{}", gr.label);
             rows.push(mk_row(gr, 1, pin_key));
         }
@@ -2070,7 +2070,10 @@ mod tests {
             .iter()
             .find(|r| r.kind == RowKind::Worktree && r.label == "feat")
             .expect("filed worktree must not vanish when its folder has no header");
-        assert_eq!(feat.depth, 1, "orphaned-folder worktree falls back to loose");
+        assert_eq!(
+            feat.depth, 1,
+            "orphaned-folder worktree falls back to loose"
+        );
     }
 
     #[test]

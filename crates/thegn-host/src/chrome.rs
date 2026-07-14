@@ -1655,8 +1655,7 @@ pub fn draw_panel(
     // only over rows `build_panel` didn't produce means it never overlaps panel
     // content and needs no change to `panel_hits`.
     if model.panel_focused {
-        let pairs: Vec<(String, String)> =
-            model.keyhints.iter().take(6).cloned().collect();
+        let pairs: Vec<(String, String)> = model.keyhints.iter().take(6).cloned().collect();
         let hint_h = pairs.len() + 1; // rule/title + one row per tip
         let avail = rect.rows.saturating_sub(frame.rows.len());
         // Require a one-row gap between the last panel row and the footer.
