@@ -94,10 +94,7 @@ mod tests {
     fn collector() -> (Arc<Mutex<Vec<SandboxPhase>>>, Sink) {
         let seen: Arc<Mutex<Vec<SandboxPhase>>> = Arc::default();
         let sink_seen = seen.clone();
-        (
-            seen,
-            Box::new(move |ev| sink_seen.lock().unwrap().push(ev)),
-        )
+        (seen, Box::new(move |ev| sink_seen.lock().unwrap().push(ev)))
     }
 
     #[test]
