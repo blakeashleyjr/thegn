@@ -265,8 +265,12 @@ pub fn purge_worktree_files(path: &Path) {
     let _ = std::fs::remove_dir_all(path);
 }
 
-/// Remove a worktree and optionally delete its branch.
-pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) {
+/// Remove a worktree and optionally delete its branch. Returns whether the
+/// worktree directory was actually removed. Callers that cache worktree state
+/// (e.g. the merge lifecycle) MUST NOT drop their rows when this returns `false`
+/// — a read-only mount or uncommitted changes can leave the worktree on disk,
+/// and dropping its row would orphan it out of its sidebar folder (under home).
+pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) -> bool {
     let _lock = util::lock_git_mutations(root);
     let removed = util::git_ok(root, &["worktree", "remove", &path.to_string_lossy()])
         || util::git_ok(
@@ -275,13 +279,14 @@ pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) {
         );
     if !removed {
         msg::warn(&format!(
-            "could not remove worktree at {} (uncommitted changes?)",
+            "could not remove worktree at {} (uncommitted changes or read-only mount?)",
             path.display()
         ));
     }
     if delete_branch && !branch.is_empty() && !util::git_ok(root, &["branch", "-D", branch]) {
         msg::warn(&format!("could not delete branch {branch}"));
     }
+    removed
 }
 
 /// Reclaim a worktree's build artifacts (`target/`) while keeping the checkout
