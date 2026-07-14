@@ -144,6 +144,8 @@ pub enum Action {
     /// dispatching the configured headless agent on conflicts/red gates.
     DrainMergeQueue,
     OpenPalette,
+    /// The built-in help overlay (F1), opened at the focused feature's page.
+    Help,
     Lazygit,
     Yazi,
     Editor,
@@ -408,6 +410,7 @@ impl Action {
             Action::Integrate => "integrate",
             Action::DrainMergeQueue => "merge-drain",
             Action::OpenPalette => "palette",
+            Action::Help => "help",
             Action::Lazygit => "lazygit",
             Action::Yazi => "yazi",
             Action::Editor => "editor",
@@ -522,6 +525,7 @@ impl Action {
             "integrate" => Action::Integrate,
             "merge-drain" => Action::DrainMergeQueue,
             "palette" | "menu" => Action::OpenPalette,
+            "help" => Action::Help,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
             "yazi" | "tool-yazi" => Action::Yazi,
             "editor" | "tool-editor" => Action::Editor,
@@ -968,7 +972,12 @@ fn parse_chord(s: &str) -> Result<Vec<Key>, String> {
                         "pagedown" | "pgdn" => KeyCode::PageDown,
                         "home" => KeyCode::Home,
                         "end" => KeyCode::End,
-                        _ => return Err(format!("unknown key name {other:?}")),
+                        // Function keys: "F1".."F12" (SS3/CSI-encoded, so they
+                        // work in every terminal and never type into a pane).
+                        _ => match other.strip_prefix('f').and_then(|d| d.parse::<u8>().ok()) {
+                            Some(n) if (1..=12).contains(&n) => KeyCode::Function(n),
+                            _ => return Err(format!("unknown key name {other:?}")),
+                        },
                     }
                 };
                 out.push(Key::modified(code, mods));
@@ -1009,6 +1018,9 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl q", Action::Quit).unwrap();
     // Palette lives on Ctrl+Space (Ctrl+k is a focus move; see below).
     map.insert_all("Ctrl Space", Action::OpenPalette).unwrap();
+    // Help works everywhere; F-keys encode unambiguously in every terminal
+    // (Ctrl+? does not — legacy encodings collapse it into Ctrl+/).
+    map.insert_all("F1", Action::Help).unwrap();
     // The keybind lock: Ctrl+g suspends every compositor chord (the loop
     // checks the lock before this map) so panes get Ctrl keys back.
     map.insert_all("Ctrl g", Action::ToggleKeyLock).unwrap();

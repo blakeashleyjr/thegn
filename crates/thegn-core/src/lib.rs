@@ -80,6 +80,7 @@ pub mod gitrefs;
 pub mod gitviz;
 pub mod grants;
 pub mod heal;
+pub mod help;
 pub mod history;
 pub mod host;
 pub mod host_config;
