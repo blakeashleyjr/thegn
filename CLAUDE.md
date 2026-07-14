@@ -224,6 +224,14 @@ part of the shipped `thegn` binary.
   a sibling module (e.g. `src/handlers/<area>.rs`) and call it from the loop.
   After shrinking a pinned file, run `test/file-size-ratchet.sh --update` to
   lock in the lower ceiling.
+- **Help ratchet (`crates/thegn-host/src/help/ratchet_tests.rs`, runs in
+  `just test`).** Every `ACTION_SPECS` action id must be claimed by a
+  `docs/help/` page's `actions:` frontmatter (F1 opens the in-app help;
+  pages are embedded via `include_str!` in `src/help/pages.rs`). New
+  actions/keybinds/zones/panel-sections need a help-page update in the same
+  change; `test/help-ratchet.txt` is the pinned-debt allowlist and may only
+  shrink (`just help-ratchet-update` regenerates it). The keybindings and
+  config-reference pages are generated at runtime — never hand-write them.
 - **Coverage gate: `thegn-core` only, 95% lines.** I/O / subprocess seams
   (the `cov_ignore` regex in the justfile) are excluded and exercised by
   `test/smoke.sh` instead. The host and svc crates carry their own unit tests

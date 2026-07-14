@@ -1466,6 +1466,12 @@ pub enum Provider {
     /// Container-native, so it's not a `VpsKind`; scale-to-zero via stop/start
     /// (see `crate::fly`). Exec/attach is the reachability spike boundary.
     Fly(crate::fly::FlyProvider),
+    /// machine0 (`machine0.io`) VMs — lifecycle/images/keys over machine0's
+    /// remote **MCP** endpoint (no `machine0` CLI), exec/files over plain ssh
+    /// with thegn's managed key (`ExecKind::Ssh`, VPS-shaped). Native image
+    /// snapshots (checkpoints) + `vm_suspend` scale-to-zero; NixOS via a
+    /// post-create `nixos-rebuild --flake` over ssh (see `crate::machine0`).
+    Machine0(crate::machine0::Machine0Provider),
     /// An **exec-only** transport to a sandbox reached over the iroh call-home
     /// reach (`crate::iroh_reach`): the sandbox dialed home and its interactive
     /// panes ride the iroh connection. The sandbox is created/destroyed through
@@ -1517,6 +1523,15 @@ impl Provider {
                 scale_to_zero,
                 ..ProviderCaps::default()
             },
+            // files over ssh; checkpoints via machine0 images; scale-to-zero via
+            // vm_suspend. No egress translation / no native WSS exec (pane rides
+            // ssh, same as VPS).
+            Provider::Machine0(_) => ProviderCaps {
+                files: true,
+                checkpoints: true,
+                scale_to_zero,
+                ..ProviderCaps::default()
+            },
             // Exec-only: no files/checkpoints/egress of its own (those go through
             // the underlying provider that created the sandbox).
             Provider::Iroh { .. } => ProviderCaps {
@@ -1533,6 +1548,7 @@ impl Provider {
             Provider::Sprites(p) => p.create().await,
             Provider::Vps(p) => p.create().await,
             Provider::Fly(p) => p.create().await,
+            Provider::Machine0(p) => p.create().await,
             Provider::Iroh { .. } => Err(iroh_exec_only("create")),
         }
     }
@@ -1543,6 +1559,7 @@ impl Provider {
             Provider::Sprites(p) => p.destroy(id).await,
             Provider::Vps(p) => p.destroy(id).await,
             Provider::Fly(p) => p.destroy(id).await,
+            Provider::Machine0(p) => p.destroy(id).await,
             Provider::Iroh { .. } => Err(iroh_exec_only("destroy")),
         }
     }
@@ -1553,6 +1570,7 @@ impl Provider {
             Provider::Sprites(p) => p.list().await,
             Provider::Vps(p) => p.list().await,
             Provider::Fly(p) => p.list().await,
+            Provider::Machine0(p) => p.list().await,
             // Exec-only: it manages no sandboxes of its own, so it lists none.
             Provider::Iroh { .. } => Ok(Vec::new()),
         }
@@ -1565,6 +1583,7 @@ impl Provider {
             Provider::Sprites(_) => "sprites",
             Provider::Vps(p) => p.spec().kind.as_str(),
             Provider::Fly(_) => "fly",
+            Provider::Machine0(_) => "machine0",
             Provider::Iroh { .. } => "iroh",
         }
     }
@@ -1578,6 +1597,29 @@ impl Provider {
         }
         self.create().await?;
         Ok(true)
+    }
+
+    /// Park a scale-to-zero sandbox to stop paying for idle compute (the
+    /// warm/idle policy calls this for providers that DON'T self-suspend —
+    /// `machine0` `vm_suspend`, `fly` stop). No-op for self-suspending providers
+    /// (sprites) or those without the notion. Idempotent.
+    pub async fn suspend(&self, id: &str) -> Result<()> {
+        match self {
+            Provider::Machine0(p) => p.suspend(id).await,
+            Provider::Fly(p) => p.stop(id).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Resume a parked sandbox (the claim/reopen path — `machine0` `vm_start`,
+    /// `fly` start), waiting until it is reachable. No-op for providers without
+    /// the notion. Idempotent (a running sandbox stays running).
+    pub async fn resume(&self, id: &str) -> Result<()> {
+        match self {
+            Provider::Machine0(p) => p.resume(id).await,
+            Provider::Fly(p) => p.start(id).await,
+            _ => Ok(()),
+        }
     }
 
     /// Wait (bounded by `budget`) until a freshly-created sandbox is booted enough
@@ -1612,6 +1654,7 @@ impl Provider {
     pub async fn checkpoint(&self, id: &str, label: Option<&str>) -> Result<String> {
         match self {
             Provider::Sprites(p) => p.checkpoint(id, label).await,
+            Provider::Machine0(p) => p.checkpoint(id, label).await,
             _ => Err(anyhow!(
                 "provider '{}' does not support checkpoints",
                 self.name()
@@ -1622,6 +1665,7 @@ impl Provider {
     pub async fn list_checkpoints(&self, id: &str) -> Result<Vec<CheckpointInfo>> {
         match self {
             Provider::Sprites(p) => p.list_checkpoints(id).await,
+            Provider::Machine0(p) => p.list_checkpoints(id).await,
             _ => Err(anyhow!(
                 "provider '{}' does not support checkpoints",
                 self.name()
@@ -1632,6 +1676,7 @@ impl Provider {
     pub async fn restore(&self, id: &str, checkpoint: &str) -> Result<()> {
         match self {
             Provider::Sprites(p) => p.restore(id, checkpoint).await,
+            Provider::Machine0(p) => p.restore(id, checkpoint).await,
             _ => Err(anyhow!(
                 "provider '{}' does not support checkpoints",
                 self.name()
@@ -1645,6 +1690,7 @@ impl Provider {
             Provider::Sprites(p) => p.read(id, path).await,
             Provider::Vps(p) => p.read(id, path).await,
             Provider::Fly(p) => p.read(id, path).await,
+            Provider::Machine0(p) => p.read(id, path).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
             Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
         }
@@ -1656,6 +1702,7 @@ impl Provider {
             Provider::Sprites(p) => p.write(id, path, data).await,
             Provider::Vps(p) => p.write(id, path, data).await,
             Provider::Fly(p) => p.write(id, path, data).await,
+            Provider::Machine0(p) => p.write(id, path, data).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
             Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
         }
@@ -1667,6 +1714,7 @@ impl Provider {
             Provider::Sprites(p) => p.write_exec(id, path, data).await,
             Provider::Vps(p) => p.write_exec(id, path, data).await,
             Provider::Fly(p) => p.write_exec(id, path, data).await,
+            Provider::Machine0(p) => p.write_exec(id, path, data).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
             Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
         }
@@ -1703,6 +1751,7 @@ impl Provider {
             Provider::Sprites(p) => p.upload_dir(id, local, remote).await,
             Provider::Vps(p) => p.upload_dir(id, local, remote).await,
             Provider::Fly(p) => p.upload_dir(id, local, remote).await,
+            Provider::Machine0(p) => p.upload_dir(id, local, remote).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
             Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
         }
@@ -1714,6 +1763,7 @@ impl Provider {
             Provider::Sprites(p) => p.download_dir(id, remote, local).await,
             Provider::Vps(p) => p.download_dir(id, remote, local).await,
             Provider::Fly(p) => p.download_dir(id, remote, local).await,
+            Provider::Machine0(p) => p.download_dir(id, remote, local).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
             Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
         }
@@ -1754,6 +1804,7 @@ impl Provider {
             Provider::Sprites(p) => p.run_exec(id, argv, cwd, env).await,
             Provider::Vps(p) => p.run_exec(id, argv, cwd, env).await,
             Provider::Fly(p) => p.run_exec(id, argv, cwd, env).await,
+            Provider::Machine0(p) => p.run_exec(id, argv, cwd, env).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
             // One-shot capture over iroh: open a non-tty exec and drain it.
             Provider::Iroh { home, .. } => {
