@@ -134,6 +134,10 @@ pub(crate) enum RefreshKind {
     /// The proxy dashboard's off-loop DB gather (stats/budgets/health),
     /// delivered into the live overlay by `crate::detail::apply_proxy_dash`.
     ProxyDash(Box<crate::detail::ProxyDashPayload>),
+    /// An onboarding-wizard probe answer (gh auth / sandbox backends / ssh
+    /// host), delivered into the live wizard by
+    /// [`crate::handlers::onboarding::apply_probe`].
+    Onboarding(Box<crate::onboarding::ProbeResult>),
     /// The repo's branch ref (e.g. `refs/heads/main`) moved out from under a
     /// checkout — an external `git update-ref` or a fold-actor CAS land in
     /// another process. Drives an off-loop, guarded fast-forward of the canonical
