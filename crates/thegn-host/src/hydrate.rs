@@ -821,7 +821,12 @@ fn collect_sidebar_status(
     // below use them to keep/serve other workspaces' glyphs across a switch.
     let all_wt_paths: Vec<String> = db
         .worktrees()
-        .map(|r| r.into_iter().map(|w| w.worktree).filter(|p| !p.is_empty()).collect())
+        .map(|r| {
+            r.into_iter()
+                .map(|w| w.worktree)
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
 
     // Partition into paths that must be rescanned now vs. served from cache.

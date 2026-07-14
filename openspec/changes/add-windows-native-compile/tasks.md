@@ -48,7 +48,7 @@
       `windows-sys` (Foundation, Console, Threading, JobObjects) added under
       `cfg(windows)`; workspace entry in root Cargo.toml.
 - [x] 4.2 `just check-cross` gains `cargo check --workspace --target
-      x86_64-pc-windows-gnu`; dev shell provides the mingw-w64 cross cc
+x86_64-pc-windows-gnu`; dev shell provides the mingw-w64 cross cc
       (`CC_x86_64_pc_windows_gnu` etc. in devenv.nix).
 - [x] 4.3 ci.yml: opt-in `windows` job (windows-latest, rustup + bare
       `cargo check --workspace --locked`, `[ci-windows]` marker/dispatch).

@@ -33,6 +33,7 @@ pub(crate) enum MousePre {
 pub(crate) fn pre_dispatch(
     dismiss_on_click_outside: bool,
     bar_detail: &mut Option<crate::detail::DetailOverlay>,
+    help: &mut Option<crate::help::HelpOverlay>,
     m: &MouseEvent,
     mx: usize,
     my: usize,
@@ -50,6 +51,34 @@ pub(crate) fn pre_dispatch(
     mouse_sel: &mut Option<(u32, crate::copymode::Selection)>,
     dirty: &mut bool,
 ) -> MousePre {
+    // 0. The help overlay is modal to the mouse like a detail popup: wheel
+    // scrolls the page, an outside left-press dismisses, everything else is
+    // swallowed (the overlay is keyboard-driven).
+    if let Some(h) = help.as_mut() {
+        if let Some(boxr) = h.box_rect(Rect {
+            x: 0,
+            y: 0,
+            cols,
+            rows,
+        }) {
+            if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
+                let delta = if m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) {
+                    -3
+                } else {
+                    3
+                };
+                h.scroll_by(delta);
+                *dirty = true;
+            } else if left && !*mouse_left_down && !contains(boxr, mx, my) {
+                *help = None;
+                *dirty = true;
+            }
+        }
+        *mouse_left_down = left;
+        *mouse_selecting = false;
+        *mouse_sel = None;
+        return MousePre::Consumed;
+    }
     // 1. A detail popup is modal to the mouse: outside left-press dismisses it
     // (like Esc); all mouse events are swallowed while it is up.
     if dismiss_on_click_outside

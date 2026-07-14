@@ -728,7 +728,7 @@ fn center_context_hints_include_close_tab_and_split_controls() {
     let cfg = thegn_core::config::Config::default();
     let focus = crate::focus::FocusState::default();
     let panel = crate::panel::PanelUi::default();
-    let hints = context_hints(&focus, &panel, &cfg);
+    let hints = crate::keyhint::context_hints(&focus, &panel, &cfg);
 
     let has = |c: &str, l: &str| hints.iter().any(|(hc, hl)| hc == c && hl == l);
     // Smart close on `Alt x`; worktree-removal escalates to `Alt X` (distinct
@@ -745,7 +745,7 @@ fn center_context_hints_follow_keybind_overrides() {
     cfg.keybinds.insert("close".into(), "Ctrl Alt x".into());
     let focus = crate::focus::FocusState::default();
     let panel = crate::panel::PanelUi::default();
-    let hints = context_hints(&focus, &panel, &cfg);
+    let hints = crate::keyhint::context_hints(&focus, &panel, &cfg);
 
     let has = |c: &str, l: &str| hints.iter().any(|(hc, hl)| hc == c && hl == l);
     assert!(has("Ctrl Alt x", "close"), "hints were {hints:?}");

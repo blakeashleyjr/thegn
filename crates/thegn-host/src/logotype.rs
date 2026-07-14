@@ -640,10 +640,16 @@ mod tests {
         assert!(l[5].contains(env!("CARGO_PKG_VERSION")));
         assert!(l[5].contains("git worktree IDE"));
         // Idle body: rule(8), hints(9..11), rule(12).
-        assert!(l[8].contains(crate::caps::active_glyphs().box_h), "top rule");
+        assert!(
+            l[8].contains(crate::caps::active_glyphs().box_h),
+            "top rule"
+        );
         assert!(l[9].contains("Ctrl-Space"));
         assert!(l[11].contains("Ctrl-g"));
-        assert!(l[12].contains(crate::caps::active_glyphs().box_h), "bottom rule");
+        assert!(
+            l[12].contains(crate::caps::active_glyphs().box_h),
+            "bottom rule"
+        );
         // Wordmark horizontally centered: 29 cols in 80 → starts near col 25.
         let start = l[1].find(['▀', '▄', '█']).unwrap();
         assert!((24..=26).contains(&start), "start {start}");

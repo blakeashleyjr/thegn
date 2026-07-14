@@ -1777,7 +1777,10 @@ fn focused_panel_reveals_navigation_footer_from_live_keyhints() {
     draw_panel(&mut s, rect, &model, &PanelUi::default());
     let text = s.screen_chars_to_string();
     assert!(text.contains("NAVIGATE"), "footer title missing: {text:?}");
-    assert!(text.contains("open"), "live keyhint label missing: {text:?}");
+    assert!(
+        text.contains("open"),
+        "live keyhint label missing: {text:?}"
+    );
     assert!(text.contains("j/k"), "live keyhint chord missing: {text:?}");
 }
 

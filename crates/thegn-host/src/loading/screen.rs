@@ -88,9 +88,7 @@ fn sublines(step: &LoadStep, accent: ColorAttribute, width: usize) -> Vec<SubLin
             None => format!("  {}", plan::fmt_bytes(done)),
         };
         let bar_w = BAR_W.min(width.saturating_sub(UnicodeWidthStr::width(bytes.as_str())));
-        let frac = total
-            .filter(|t| *t > 0)
-            .map(|t| done as f64 / t as f64);
+        let frac = total.filter(|t| *t > 0).map(|t| done as f64 / t as f64);
         let (fill, empty) = plan::bar(bar_w, frac);
         out.push(SubLine {
             segs: vec![(fill, accent), (empty, col(S::Ghost)), (bytes, col(S::Dim))],
@@ -208,7 +206,15 @@ pub(crate) fn draw_body(
         let (glyph, glyph_fg) = plan::visual_glyph_live(step.state, accent, true);
         chrome::draw_text(surface, bx, y, glyph, glyph_fg, bg, 1);
         let label = truncate(&step.label, label_budget);
-        chrome::draw_text(surface, bx + 2, y, &label, plan::label_color(step.state), bg, label_budget);
+        chrome::draw_text(
+            surface,
+            bx + 2,
+            y,
+            &label,
+            plan::label_color(step.state),
+            bg,
+            label_budget,
+        );
         if let Some(e) = elapsed_text(step) {
             let w = UnicodeWidthStr::width(e.as_str()).min(ELAPSED_W);
             let fg = if step.state == StepState::Active {
@@ -300,14 +306,20 @@ pub(crate) fn compact_line(
     ];
     let middot = crate::caps::active_glyphs().middot;
     if step.state == StepState::Failed {
-        parts.push((format!(" {middot} failed"), chrome::theme_color(thegn_core::theme::RED)));
+        parts.push((
+            format!(" {middot} failed"),
+            chrome::theme_color(thegn_core::theme::RED),
+        ));
         return parts;
     }
     if let Some((d, Some(t))) = step.progress
         && t > 0
     {
         parts.push((
-            format!(" {middot} {}%", (d as f64 / t as f64 * 100.0).round() as u64),
+            format!(
+                " {middot} {}%",
+                (d as f64 / t as f64 * 100.0).round() as u64
+            ),
             col(S::Dim),
         ));
     }
@@ -380,7 +392,12 @@ mod tests {
     }
 
     fn rect(cols: usize, rows: usize) -> Rect {
-        Rect { x: 0, y: 0, cols, rows }
+        Rect {
+            x: 0,
+            y: 0,
+            cols,
+            rows,
+        }
     }
 
     fn plan_steps(cursor: usize, failed: bool) -> Vec<LoadStep> {
@@ -498,8 +515,7 @@ mod tests {
     fn slow_hint_appears_past_threshold() {
         let mut steps = plan_steps(1, false);
         steps[1].kind = StepKind::Image;
-        steps[1].started_at =
-            Some(std::time::Instant::now() - std::time::Duration::from_secs(20));
+        steps[1].started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(20));
         let all = draw(&steps, &[]).join("\n");
         assert!(all.contains("network-bound"), "hint after 20s: {all}");
         // Elapsed column shows the running time.
@@ -510,8 +526,7 @@ mod tests {
     fn detail_wins_over_hint_and_elapsed_freezes_for_done() {
         let mut steps = plan_steps(1, false);
         steps[1].kind = StepKind::Image;
-        steps[1].started_at =
-            Some(std::time::Instant::now() - std::time::Duration::from_secs(20));
+        steps[1].started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(20));
         steps[1].detail = Some("layer 3/7".into());
         let all = draw(&steps, &[]).join("\n");
         assert!(all.contains("layer 3/7"));

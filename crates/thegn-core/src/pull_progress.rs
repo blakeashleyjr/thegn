@@ -197,8 +197,10 @@ fn split_layer_line(line: &str) -> Option<(&str, &str)> {
         return Some((id, rest));
     }
     let (head, rest) = line.split_once(": ")?;
-    let is_layer_id =
-        head.len() >= 6 && head.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase());
+    let is_layer_id = head.len() >= 6
+        && head
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase());
     is_layer_id.then_some((head, rest))
 }
 
@@ -301,7 +303,7 @@ mod tests {
             "error: something exploded",
             "WARN[0000] missing config",
             "  42  ",
-            "Pulling from library/debian", // no layer id
+            "Pulling from library/debian",    // no layer id
             "NOTALAYER: Downloading 1MB/2MB", // uppercase ⇒ not a hex id
         ] {
             assert!(p.feed_line(line).is_none(), "line {line:?} must not emit");
@@ -316,7 +318,10 @@ mod tests {
             "first progress emits"
         );
         // +0.5% — swallowed.
-        assert!(p.feed_line("Copying blob aaaa11 [>] 5MB / 1000MB").is_none());
+        assert!(
+            p.feed_line("Copying blob aaaa11 [>] 5MB / 1000MB")
+                .is_none()
+        );
         // Cumulative +1.0% since the last emit — emits.
         let s = p
             .feed_line("Copying blob aaaa11 [>] 10MB / 1000MB")
