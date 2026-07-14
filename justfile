@@ -227,8 +227,9 @@ openspec-setup:
 openspec-validate:
     OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1 openspec validate --all --strict
 
-# The full gate.
-ci: fmt-check lint deps-audit build check-cross test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
+# The full gate. `lint` now runs the treefmt fail-on-change check first, so the
+# formatting gate lives there (no separate `fmt-check` stage needed here).
+ci: lint deps-audit build check-cross test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
     @echo "ci: all green"
 
 # --- local CI (act) -------------------------------------------------------
@@ -362,7 +363,13 @@ coverage-html:
 
 # Comprehensive linting: rust (clippy), bash (shellcheck), yaml (yamllint), toml (taplo).
 lint: _apps
-    @for t in shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
+    @for t in treefmt shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
+    # Formatting gate (treefmt, fail-on-change) — FIRST so drift fails fast before
+    # the clippy compile. This is what makes `just lint` (and thus the merge-queue
+    # `gate_command`) reject unformatted code: the fold-actor lands via plumbing
+    # commits, so git's pre-commit/treefmt hook never fires on that path. `--ci`
+    # formats in place then exits nonzero on any change (mirrors `just fmt-check`).
+    treefmt --ci
     cargo clippy --workspace --all-targets -- -D warnings
     shellcheck -x install.sh test/smoke.sh test/brand-guard.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/file-size-ratchet.sh test/git-hooks/post-checkout.sh test/git-hooks/heal-worktree.sh
     yamllint .

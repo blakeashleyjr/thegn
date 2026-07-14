@@ -151,6 +151,6 @@ mod tests {
     async fn unknown_expr_yields_empty_value_series() {
         let source = HostSource::new();
         let res = source.query(vec![q("nope")]).await.unwrap();
-        assert_eq!(res[0].fields[1].series.len(), 0);
+        assert_eq!(res[0].fields[1].len(), 0);
     }
 }

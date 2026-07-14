@@ -27,25 +27,20 @@ impl TimeseriesRenderer {
                 // In a real implementation this would perform LTTB downsampling.
                 let y_field = frame.fields.iter().find(|f| f.ty == FieldType::Float64);
                 if let Some(y) = y_field {
-                    // Extract f64s from the Polars series.
-                    // This is a naive extraction for the MVP braille rendering.
-                    if let Ok(y_vals) = y.series.f64() {
-                        let mut prev: Option<(f64, f64)> = None;
-                        for (i, val) in y_vals.into_iter().enumerate() {
-                            if let Some(v) = val {
-                                let x = i as f64; // Fallback to index if no X series
-                                if let Some((px, py)) = prev {
-                                    ctx.draw(&Line {
-                                        x1: px,
-                                        y1: py,
-                                        x2: x,
-                                        y2: v,
-                                        color: Color::Green,
-                                    });
-                                }
-                                prev = Some((x, v));
-                            }
+                    // Naive extraction for the MVP braille rendering.
+                    let mut prev: Option<(f64, f64)> = None;
+                    for (i, v) in y.floats().into_iter().enumerate() {
+                        let x = i as f64; // Fallback to index if no X series
+                        if let Some((px, py)) = prev {
+                            ctx.draw(&Line {
+                                x1: px,
+                                y1: py,
+                                x2: x,
+                                y2: v,
+                                color: Color::Green,
+                            });
                         }
+                        prev = Some((x, v));
                     }
                 }
             })

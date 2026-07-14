@@ -337,29 +337,111 @@ pub fn persist(
     Ok(())
 }
 
-/// Build/test the folded tip in a throwaway detached worktree. Returns whether
-/// `gate_command` exited zero plus its captured combined output (tail-truncated),
-/// which the queue driver feeds to a fixing agent on a red gate. The worktree is
-/// always removed afterward.
+/// A stable per-repo directory for the reused gate build cache, keyed on the
+/// repo root's absolute path so each repo warms its own worktree + target under
+/// `$XDG_STATE_HOME/thegn/gate/` (the same state root as the DB/logs). The
+/// `DefaultHasher` seed is fixed, so the key is stable across runs.
+fn gate_base(repo_root: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    repo_root.hash(&mut h);
+    let key = h.finish();
+    let name = repo_root
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repo".to_string());
+    util::xdg_state_home()
+        .join("thegn/gate")
+        .join(format!("{name}-{key:016x}"))
+}
+
+/// Build/test the folded tip. By default (`gate_reuse_worktree`) this runs in a
+/// stable per-repo worktree kept between folds, with a persistent
+/// `CARGO_TARGET_DIR` — so cargo does a warm incremental rebuild instead of a
+/// cold from-scratch compile (the local-compute win). With reuse off it falls
+/// back to a fresh throwaway `/tmp` worktree removed afterward (concurrency-safe,
+/// but always cold). Returns whether `gate_command` exited zero plus its captured
+/// combined output (tail-truncated), which the queue driver feeds to a fixing
+/// agent on a red gate.
 // off-loop: the fold runs from the CLI (`thegn integrate`) or from
 // spawn_fold's spawn_blocking (see the module doc) — never on the loop.
 #[expect(clippy::disallowed_methods)]
-pub(crate) fn gate_tip(repo_root: &Path, oid: &str, gate_command: &str) -> Result<(bool, String)> {
-    let tmp = tmp_path("sz-foldgate");
-    let tmp_s = tmp.to_string_lossy().to_string();
-    if !util::git_ok(
-        repo_root,
-        &["worktree", "add", "--detach", "--force", &tmp_s, oid],
-    ) {
-        anyhow::bail!("merge queue: could not create gate worktree at {tmp_s}");
+pub(crate) fn gate_tip(
+    repo_root: &Path,
+    oid: &str,
+    cfg: &MergeQueueConfig,
+) -> Result<(bool, String)> {
+    // Callers only reach here with a non-empty command (`gate_on` already checks
+    // it), but guard anyway: an empty gate is a green no-op, not a worktree churn.
+    if cfg.gate_command.is_empty() {
+        return Ok((true, String::new()));
     }
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(gate_command)
-        .current_dir(&tmp)
-        .output();
-    // Best-effort teardown — never leak the gate worktree.
-    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &tmp_s]);
+
+    let reuse = cfg.gate_reuse_worktree;
+    // Where the gate builds, and where cargo writes artifacts. Reused: a stable
+    // per-repo worktree + target dir kept between folds. Throwaway: a unique /tmp
+    // worktree. An explicit `gate_target_dir` overrides the target location in
+    // either mode. Reuse depends on drains being serialized (queue design); the
+    // per-repo path also keeps concurrent drains of *different* repos apart.
+    let (wt, target_dir) = if reuse {
+        let base = gate_base(repo_root);
+        let td = if cfg.gate_target_dir.is_empty() {
+            base.join("target")
+        } else {
+            PathBuf::from(&cfg.gate_target_dir)
+        };
+        (base.join("wt"), Some(td))
+    } else if cfg.gate_target_dir.is_empty() {
+        (tmp_path("sz-foldgate"), None)
+    } else {
+        (
+            tmp_path("sz-foldgate"),
+            Some(PathBuf::from(&cfg.gate_target_dir)),
+        )
+    };
+    let wt_s = wt.to_string_lossy().to_string();
+
+    // (Re)create the gate worktree fresh at `wt`, pruning any stale registration
+    // for a path whose dir was removed out from under us.
+    let create = || {
+        if let Some(parent) = wt.parent() {
+            let _ = std::fs::create_dir_all(parent); // best-effort: create_dir_all is idempotent
+        }
+        let _ = util::git_ok(repo_root, &["worktree", "prune"]); // best-effort: drop stale registration
+        util::git_ok(
+            repo_root,
+            &["worktree", "add", "--detach", "--force", &wt_s, oid],
+        )
+    };
+    // Materialize the folded OID. Refresh a reused worktree in place — `checkout`
+    // only re-touches files that actually changed between folds, so cargo rebuilds
+    // just the affected crates. If that fails (stale/corrupt registration) self-heal
+    // by recreating it; the sibling `target/` dir survives. New paths create fresh.
+    let prepared = if reuse && wt.exists() {
+        util::git_ok(&wt, &["checkout", "--detach", "--force", oid]) || {
+            let _ = std::fs::remove_dir_all(&wt); // best-effort: self-heal a broken worktree
+            create()
+        }
+    } else {
+        create()
+    };
+    if !prepared {
+        anyhow::bail!("merge queue: could not prepare gate worktree at {wt_s}");
+    }
+
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(&cfg.gate_command).current_dir(&wt);
+    if let Some(td) = &target_dir {
+        let _ = std::fs::create_dir_all(td); // best-effort: create_dir_all is idempotent
+        cmd.env("CARGO_TARGET_DIR", td);
+    }
+    let out = cmd.output();
+
+    // A throwaway worktree is always removed; a reused one is kept — its warm
+    // target/ is the whole point.
+    if !reuse {
+        let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]);
+    }
     Ok(match out {
         Ok(o) => {
             let mut log = String::from_utf8_lossy(&o.stdout).into_owned();
@@ -404,7 +486,7 @@ fn bisect_offender(
             tip: branch_tip(repo_root, &l.branch)?,
         });
         let plan = fold::fold(adapter, base, prefix.clone(), &cfg.regenerate_paths)?;
-        if plan.advanced() && !gate_tip(repo_root, &plan.final_tip, &cfg.gate_command)?.0 {
+        if plan.advanced() && !gate_tip(repo_root, &plan.final_tip, cfg)?.0 {
             return Ok(Some(l.branch.clone()));
         }
     }
@@ -524,7 +606,7 @@ pub fn run_fold(
 
         // Test-gate the union before blessing it.
         let gate = if gate_on {
-            if gate_tip(repo_root, &plan.final_tip, &cfg.gate_command)?.0 {
+            if gate_tip(repo_root, &plan.final_tip, cfg)?.0 {
                 GateOutcome::Passed
             } else if cfg.bisect_on_red {
                 let landed: Vec<LandedReport> = plan
@@ -668,7 +750,7 @@ pub(crate) fn attempt_land(
         }
         let folded_tip = plan.final_tip.clone();
         if gate_on {
-            let (ok, log) = gate_tip(repo_root, &folded_tip, &cfg.gate_command)?;
+            let (ok, log) = gate_tip(repo_root, &folded_tip, cfg)?;
             if !ok {
                 return Ok(AttemptOutcome::GateFailed { log });
             }
