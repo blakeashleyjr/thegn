@@ -33,11 +33,7 @@ pub fn mq_ref(branch: &str) -> String {
 /// branch on another host, bundle-fetch its tip into `refs/thegn/mq/<branch>`
 /// and return that. Errors (host unreachable, fetch failed) bubble up so the
 /// drain can defer the row with a clear reason rather than silently dropping it.
-pub fn ensure_tip_in_target(
-    target: &GitLoc,
-    branch: &str,
-    branch_loc: &GitLoc,
-) -> Result<String> {
+pub fn ensure_tip_in_target(target: &GitLoc, branch: &str, branch_loc: &GitLoc) -> Result<String> {
     if !needs_ingest(target, branch_loc) {
         return Ok(format!("refs/heads/{branch}"));
     }
@@ -119,14 +115,18 @@ fn fetch_bundle(target: &GitLoc, branch: &str, bundle: &[u8]) -> Result<()> {
 fn tmp_bundle_path() -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("thegn-mq-{}-{}-{n}.bundle", std::process::id(), util::now()))
+    std::env::temp_dir().join(format!(
+        "thegn-mq-{}-{}-{n}.bundle",
+        std::process::id(),
+        util::now()
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::remote::{GitLoc, SshTarget};
     use std::path::PathBuf;
+    use thegn_core::remote::{GitLoc, SshTarget};
 
     fn remote(host: &str) -> GitLoc {
         GitLoc::Remote {
@@ -203,7 +203,10 @@ mod tests {
 
         // Store B (the "other host"): a clone of A with a feature branch whose
         // tip does NOT exist in A yet.
-        git(a.parent().unwrap(), &["clone", "-q", &a.to_string_lossy(), &b.to_string_lossy()]);
+        git(
+            a.parent().unwrap(),
+            &["clone", "-q", &a.to_string_lossy(), &b.to_string_lossy()],
+        );
         git(&b, &["config", "user.name", "t"]);
         git(&b, &["config", "user.email", "t@e"]);
         git(&b, &["config", "commit.gpgsign", "false"]);
