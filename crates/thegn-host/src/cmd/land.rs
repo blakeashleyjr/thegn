@@ -16,6 +16,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use thegn_core::config::Config;
+use thegn_core::db::Db;
 use thegn_core::{outln, util};
 
 use crate::integrate::{self, AttemptOutcome};
@@ -37,12 +38,22 @@ pub(crate) fn land_branch(
     let mut mq = cfg.merge_queue.clone();
     mq.auto_land = true;
     let target = integrate::resolve_target(&mq, &root);
-    let outcome = integrate::attempt_land(&mq, &root, &branch)?;
+    // `thegn land` lands the branch checked out in `worktree`; its loc tells
+    // attempt_land whether that worktree is on this host (no ingest) or remote.
+    let branch_loc = thegn_core::remote::GitLoc::for_worktree(worktree);
+    let outcome = integrate::attempt_land(&mq, &root, &branch, &branch_loc)?;
     Ok((branch, target, outcome))
 }
 
 pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let wt = super::resolve_worktree(worktree);
+    if let Ok(db) = Db::open()
+        && let Some(root) = integrate::main_checkout(&wt)
+        && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root)
+    {
+        outln!("{msg}");
+        return Ok(());
+    }
     let (branch, target, outcome) = land_branch(cfg, &wt)?;
     match outcome {
         AttemptOutcome::Landed { commit } => {
@@ -57,6 +68,9 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         }
         AttemptOutcome::GateFailed { .. } => {
             outln!("✗ {branch} breaks the build (gate red); not landed.");
+        }
+        AttemptOutcome::Unreachable { detail } => {
+            outln!("✗ {branch}: {detail}");
         }
         AttemptOutcome::Ready { .. } => {
             // Unreachable with auto_land forced on, but handle for completeness.
