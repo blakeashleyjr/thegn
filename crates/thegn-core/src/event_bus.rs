@@ -133,31 +133,55 @@ pub enum ProcessOutcome {
 }
 
 /// Decide whether (and how) a non-agent pane exit joins the attention model.
-/// `exit_code` is `None` when the child status couldn't be reaped (treated as a
-/// crash); `is_shell` marks routine interactive shells whose clean exits are
-/// noise. Returns `None` to suppress.
+///
+/// Two exits are deliberately treated as *non-failures* under every policy
+/// except the explicit opt-in `All`, because both are indistinguishable from
+/// routine teardown and would otherwise spam the sidebar with spurious "process
+/// failed" alerts:
+///
+/// - **Routine interactive shells** (`is_shell`): a shell exit carries no
+///   actionable failure context (the pane's `program` is the spawn argv, not
+///   the foreground job), and a shell torn down by SIGHUP on close/quit exits
+///   non-zero exactly like a crash. Genuine shell crashes are already surfaced
+///   interactively (the host's relaunch overlay + "keeps crashing" status,
+///   driven independently of this classifier).
+/// - **`None` exit codes**: the child status couldn't be reaped, or a remote
+///   Stream pane's relay lost its bridge. An *unconfirmed* exit must not mint a
+///   persistent red alert.
+///
+/// So a genuine failure surfaces only for a **task-like** pane (`is_shell ==
+/// false`, i.e. spawned as a concrete command) that exited with a real non-zero
+/// code. `All` still routes everything (its whole purpose). Returns `None` to
+/// suppress.
 pub fn classify_process_exit(
     exit_code: Option<i32>,
     is_shell: bool,
     policy: ProcessExitPolicy,
 ) -> Option<ProcessOutcome> {
-    let failed = exit_code != Some(0);
+    // A *confirmed* application failure: a real, reaped, non-zero code. An
+    // unreapable `None` is "unknown", not a confirmed failure (see above).
+    let failed = matches!(exit_code, Some(c) if c != 0);
+    // Routine shells and unconfirmed (`None`) exits never count as failures
+    // outside the explicit `All` policy.
+    let suppressed = is_shell || exit_code.is_none();
     match policy {
         ProcessExitPolicy::Off => None,
-        ProcessExitPolicy::FailuresOnly => failed.then_some(ProcessOutcome::Failed),
+        ProcessExitPolicy::FailuresOnly => {
+            (!suppressed && failed).then_some(ProcessOutcome::Failed)
+        }
         ProcessExitPolicy::FailuresAndTasks => {
-            if failed {
-                Some(ProcessOutcome::Failed)
-            } else if is_shell {
+            if suppressed {
                 None
+            } else if failed {
+                Some(ProcessOutcome::Failed)
             } else {
                 Some(ProcessOutcome::TaskDone)
             }
         }
-        ProcessExitPolicy::All => Some(if failed {
-            ProcessOutcome::Failed
-        } else {
+        ProcessExitPolicy::All => Some(if exit_code == Some(0) {
             ProcessOutcome::TaskDone
+        } else {
+            ProcessOutcome::Failed
         }),
     }
 }
@@ -851,26 +875,29 @@ mod tests {
             }
         }
 
-        // FailuresOnly: only non-zero / unknown, regardless of shell.
+        // FailuresOnly: only a CONFIRMED non-zero exit of a TASK-like pane. A
+        // routine shell (any code) and an unconfirmed `None` are suppressed —
+        // both are indistinguishable from routine teardown.
         assert_eq!(classify_process_exit(Some(0), false, FailuresOnly), None);
         assert_eq!(classify_process_exit(Some(0), true, FailuresOnly), None);
         assert_eq!(
             classify_process_exit(Some(2), false, FailuresOnly),
             Some(Failed)
         );
-        assert_eq!(
-            classify_process_exit(None, true, FailuresOnly),
-            Some(Failed)
-        );
+        // Was Some(Failed): a shell / unreapable exit no longer flags.
+        assert_eq!(classify_process_exit(None, true, FailuresOnly), None);
+        assert_eq!(classify_process_exit(Some(1), true, FailuresOnly), None);
+        assert_eq!(classify_process_exit(None, false, FailuresOnly), None);
 
-        // FailuresAndTasks (the default): failures always; clean non-shell =
-        // TaskDone; clean shell = suppressed.
+        // FailuresAndTasks (the default): a confirmed non-zero TASK exit fails;
+        // a clean task exit = TaskDone; shells and `None` are suppressed.
+        // Was Some(Failed): a failed shell no longer flags.
+        assert_eq!(classify_process_exit(Some(1), true, FailuresAndTasks), None);
+        // Was Some(Failed): an unreapable (relay-lost / unknown) exit no longer flags.
+        assert_eq!(classify_process_exit(None, false, FailuresAndTasks), None);
+        assert_eq!(classify_process_exit(None, true, FailuresAndTasks), None);
         assert_eq!(
-            classify_process_exit(Some(1), true, FailuresAndTasks),
-            Some(Failed)
-        );
-        assert_eq!(
-            classify_process_exit(None, false, FailuresAndTasks),
+            classify_process_exit(Some(2), false, FailuresAndTasks),
             Some(Failed)
         );
         assert_eq!(
@@ -879,7 +906,8 @@ mod tests {
         );
         assert_eq!(classify_process_exit(Some(0), true, FailuresAndTasks), None);
 
-        // All: every exit routes; clean → TaskDone, else Failed (even shells).
+        // All: every exit routes; clean → TaskDone, else Failed (even shells
+        // and unreapable `None`).
         assert_eq!(classify_process_exit(Some(0), true, All), Some(TaskDone));
         assert_eq!(classify_process_exit(Some(0), false, All), Some(TaskDone));
         assert_eq!(classify_process_exit(Some(5), true, All), Some(Failed));
