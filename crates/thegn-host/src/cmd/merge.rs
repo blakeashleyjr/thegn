@@ -164,6 +164,14 @@ fn clear(cfg: &Config) -> Result<()> {
 
 fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     let root = repo_root()?;
+    // The fold runs in the target repo's object store; a remote target can't be
+    // folded from here — guide the user to run the drain on that host.
+    if let Ok(db) = Db::open()
+        && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root)
+    {
+        outln!("{msg}");
+        return Ok(());
+    }
     let mq = &cfg.merge_queue;
     if all {
         add(cfg, Vec::new(), true)?;
@@ -174,6 +182,7 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         .map(|r| QueueItem {
             worktree: r.worktree,
             branch: r.branch,
+            location: r.location,
         })
         .collect();
     if items.is_empty() {
@@ -229,6 +238,13 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
 fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let wt = super::resolve_worktree(worktree);
     let wt_s = wt.to_string_lossy().to_string();
+    if let Ok(db) = Db::open()
+        && let Some(root) = integrate::main_checkout(&wt)
+        && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root)
+    {
+        outln!("{msg}");
+        return Ok(());
+    }
     // Share the fold/gate/CAS core with `thegn land`; this queue-aware path
     // additionally records the outcome on the worktree's merge-queue row.
     let (branch, _target, outcome) = super::land::land_branch(cfg, &wt)?;
@@ -257,6 +273,11 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
         AttemptOutcome::GateFailed { .. } => {
             lifecycle(LifecycleEvent::Failed);
             outln!("✗ {branch} breaks the build (gate red).");
+        }
+        AttemptOutcome::Unreachable { detail } => {
+            let _ = db.update_merge_status(&wt_s, "deferred", None, Some(&detail), None);
+            lifecycle(LifecycleEvent::Failed);
+            outln!("✗ {branch}: {detail}");
         }
         AttemptOutcome::Ready { .. } => {
             // Unreachable with auto_land forced on, but handle for completeness.

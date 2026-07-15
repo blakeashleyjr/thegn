@@ -7,11 +7,30 @@
 //! section-key arm to `handlers::merge_queue::section_key`, so the hint row
 //! below can never drift from the dispatch.
 
+use thegn_core::remote::GitLoc;
 use thegn_core::theme::Hue;
 
 use crate::seg::{Line, Seg, seg};
 
 use super::{PanelHit, PanelRow, Section, SectionCtx, d, g, g2, hint_row, hue};
+
+/// A short host label for a queue row whose branch lives off this host, or
+/// `None` for a local (same-store) branch. Derived from the row's `location`
+/// descriptor (mirrored from `worktrees.location`): the ssh host, or the
+/// provider's exec prefix head — so the reader can see, at a glance, which
+/// queued branches sit on another machine (they get their tip bundle-fetched
+/// into the target store at drain time; see `crate::merge_remote`).
+fn host_label(location: &str) -> Option<String> {
+    let loc = location.trim();
+    if loc.is_empty() || loc == "local" {
+        return None;
+    }
+    match GitLoc::from_db("", Some(loc)) {
+        GitLoc::Local(_) => None,
+        GitLoc::Remote { ssh, .. } => Some(ssh.host.clone()),
+        GitLoc::Provider { control_prefix, .. } => control_prefix.first().cloned(),
+    }
+}
 
 /// The hued glyph for a queue row's status string: the shared
 /// [`thegn_core::attention::MqStatus::glyph`] vocabulary (also the sidebar
@@ -40,6 +59,11 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     let mut out: Vec<PanelRow> = Vec::new();
     for (i, r) in rows.iter().enumerate() {
         let mut left = vec![status_glyph(&r.status), seg(d(), format!(" {}", r.branch))];
+        // Off-host branches get a host chip so the reader sees which rows live on
+        // another machine (their tips are bundle-fetched into the target store).
+        if let Some(host) = host_label(&r.location) {
+            left.push(seg(hue(Hue::Blue), format!(" @{host}")));
+        }
         // Blocked rows carry the reason: the conflicting paths, "breaks build"
         // for a gate failure, or the recorded detail when an agent gave up.
         if r.status == "deferred" || r.status == "gate_failed" || r.status == "needs_human" {

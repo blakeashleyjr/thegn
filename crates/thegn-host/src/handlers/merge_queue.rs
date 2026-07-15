@@ -139,12 +139,19 @@ pub(crate) fn spawn_drive(
                 return;
             }
         };
+        // The fold runs in the target repo's object store; a remote target must
+        // be drained on its own host (see the guidance).
+        if let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root) {
+            send(DriveMsg::Failed(msg));
+            return;
+        }
         let items: Vec<QueueItem> = merge_driver::rows_for_repo(&db, &root)
             .into_iter()
             .filter(|r| r.status != "landed" && r.status != "ready")
             .map(|r| QueueItem {
                 worktree: r.worktree,
                 branch: r.branch,
+                location: r.location,
             })
             .collect();
         if items.is_empty() {
@@ -405,6 +412,7 @@ pub(crate) fn apply_step(
                 result_oid: None,
                 conflict_paths: None,
                 error_detail: None,
+                location: String::new(),
             });
             panel.merge_queue.last_mut().expect("just pushed")
         }
@@ -902,6 +910,11 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
             lifecycle(LifecycleEvent::Failed, &branch);
             DriveMsg::Failed(format!("{branch} breaks the build (gate red)"))
         }
+        AttemptOutcome::Unreachable { detail } => {
+            record("deferred", None, Some(&detail));
+            lifecycle(LifecycleEvent::Failed, &branch);
+            DriveMsg::Failed(format!("{branch}: {detail}"))
+        }
         AttemptOutcome::Ready { tip } => {
             record("ready", Some(&tip), Some("gated green — awaiting land"));
             DriveMsg::Failed(format!("{branch} is ready but was not landed"))
@@ -924,6 +937,7 @@ mod tests {
             result_oid: None,
             conflict_paths: None,
             error_detail: None,
+            location: String::new(),
         }
     }
 

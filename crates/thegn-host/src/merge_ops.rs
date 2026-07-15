@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use thegn_core::config::MergeQueueConfig;
 use thegn_core::db::{Db, MergeQueueRow};
 use thegn_core::merge_lifecycle::LifecycleEvent;
-use thegn_core::store::WorktreeAuxStore;
+use thegn_core::remote::GitLoc;
+use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
 use thegn_core::util;
 
 use crate::{integrate, merge_driver};
@@ -27,6 +28,48 @@ pub fn branch_of(worktree: &Path) -> Option<String> {
 /// The repo root (main checkout) a worktree belongs to.
 pub fn repo_root_of(worktree: &Path) -> Option<PathBuf> {
     integrate::main_checkout(worktree)
+}
+
+/// The [`GitLoc`] of a repo root — the host where the target store (and so the
+/// fold/gate/CAS) lives. `Local` for an on-host repo, ssh/provider from the
+/// root's own `location`. The merge queue is anchored to this host: the drain
+/// must run co-located with it (a remote target can't be folded in-process —
+/// see [`is_remote_target`]).
+pub fn target_loc(db: &Db, repo_root: &Path) -> GitLoc {
+    let root_s = repo_root.to_string_lossy();
+    let loc_str = db.location_for(&root_s).ok().flatten();
+    GitLoc::from_db(&root_s, loc_str.as_deref())
+}
+
+/// A short human label for a target store's host (ssh host / provider prefix),
+/// or `None` when it's local. For the "run the drain on that host" guidance.
+pub fn target_host_label(loc: &GitLoc) -> Option<String> {
+    match loc {
+        GitLoc::Local(_) => None,
+        GitLoc::Remote { ssh, .. } => Some(ssh.host.clone()),
+        GitLoc::Provider { control_prefix, .. } => control_prefix.first().cloned(),
+    }
+}
+
+/// Guard for the in-process drain/land/integrate paths: when the target repo
+/// lives on another host, the fold/gate/CAS can't run here (the object store is
+/// remote). Returns a ready-to-print message telling the user to run the drain
+/// co-located with the target repo — where Milestone A bundle-fetches any
+/// off-host branch tips in. `None` when the target is local (proceed normally).
+///
+/// (The convenience path — the local UI auto-dispatching to a merge-drain daemon
+/// on the target host over ssh/iroh — needs remote-daemon reach that isn't wired
+/// yet; see tasks.md J128/129. Running the drain on the target host is the
+/// supported workflow until then.)
+pub fn remote_target_guard(db: &Db, repo_root: &Path) -> Option<String> {
+    let loc = target_loc(db, repo_root);
+    let host = target_host_label(&loc)?;
+    Some(format!(
+        "This repo's target branch lives on another host ({host}). \
+         The merge queue folds in the target's object store, so the drain must \
+         run there — open a shell on {host} and run `thegn merge drain` (branches \
+         queued from other hosts are fetched in automatically)."
+    ))
 }
 
 /// Queue rows belonging to a repo (membership rule shared with the in-app drain).

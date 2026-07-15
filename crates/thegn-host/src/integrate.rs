@@ -701,6 +701,11 @@ pub(crate) enum AttemptOutcome {
     GateFailed { log: String },
     /// The branch tip is already an ancestor of the target — nothing to do.
     UpToDate,
+    /// The branch lives on another host and its tip could not be fetched into
+    /// the target store (host unreachable / bundle or fetch failed). `detail`
+    /// is the reason. Held (deferred) rather than dropped, so a transient
+    /// network blip is retryable on the next drain.
+    Unreachable { detail: String },
 }
 
 /// Attempt to land a *single* branch onto the repo's current target tip, the way
@@ -713,10 +718,23 @@ pub(crate) fn attempt_land(
     cfg: &MergeQueueConfig,
     repo_root: &Path,
     branch_name: &str,
+    branch_loc: &GitLoc,
 ) -> Result<AttemptOutcome> {
     let loc = GitLoc::for_worktree(repo_root);
     let target_branch = resolve_target(cfg, repo_root);
     let target_ref = format!("refs/heads/{target_branch}");
+    // Cross-host: if the branch's worktree lives on another machine, fetch its
+    // tip into the target store first and fold that synthetic ref — a bare
+    // `refs/heads/<branch>` only exists in the branch host's own object store.
+    // A same-store branch just yields `refs/heads/<branch>` (no I/O).
+    let branch_ref = match crate::merge_remote::ensure_tip_in_target(&loc, branch_name, branch_loc) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(AttemptOutcome::Unreachable {
+                detail: format!("{e:#}"),
+            });
+        }
+    };
     let adapter = PlumbingAdapter {
         loc: loc.clone(),
         repo_root: repo_root.to_path_buf(),
@@ -727,7 +745,7 @@ pub(crate) fn attempt_land(
     let mut cas_attempts = 0u32;
     loop {
         let base = CliGit.rev_parse(&loc, &target_ref)?;
-        let branch_tip = CliGit.rev_parse(&loc, &format!("refs/heads/{branch_name}"))?;
+        let branch_tip = CliGit.rev_parse(&loc, &branch_ref)?;
         if util::git_ok(
             repo_root,
             &["merge-base", "--is-ancestor", &branch_tip, &base],
@@ -1035,7 +1053,7 @@ mod tests {
         repo.feature("b1", "a.txt", "a\n");
         let before = repo.out(&["rev-parse", "main"]);
 
-        match attempt_land(&cfg(""), &repo.dir, "b1").unwrap() {
+        match attempt_land(&cfg(""), &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap() {
             AttemptOutcome::Landed { commit } => assert!(!commit.is_empty()),
             o => panic!("expected Landed, got {o:?}"),
         }
@@ -1050,7 +1068,7 @@ mod tests {
         repo.commit("base.txt", "mainline\n", "main edits base");
         let before = repo.out(&["rev-parse", "main"]);
 
-        match attempt_land(&cfg(""), &repo.dir, "bad").unwrap() {
+        match attempt_land(&cfg(""), &repo.dir, "bad", &GitLoc::Local(repo.dir.clone())).unwrap() {
             AttemptOutcome::Conflict { paths } => assert!(paths.iter().any(|p| p == "base.txt")),
             o => panic!("expected Conflict, got {o:?}"),
         }
@@ -1067,7 +1085,7 @@ mod tests {
         repo.feature("b1", "a.txt", "a\n");
         let before = repo.out(&["rev-parse", "main"]);
 
-        match attempt_land(&cfg("false"), &repo.dir, "b1").unwrap() {
+        match attempt_land(&cfg("false"), &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap() {
             AttemptOutcome::GateFailed { .. } => {}
             o => panic!("expected GateFailed, got {o:?}"),
         }
@@ -1086,7 +1104,7 @@ mod tests {
         let mut c = cfg("true"); // green gate
         c.auto_land = false;
 
-        match attempt_land(&c, &repo.dir, "b1").unwrap() {
+        match attempt_land(&c, &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap() {
             AttemptOutcome::Ready { tip } => assert!(!tip.is_empty()),
             o => panic!("expected Ready, got {o:?}"),
         }
@@ -1101,10 +1119,10 @@ mod tests {
     fn attempt_land_is_uptodate_for_an_already_merged_branch() {
         let repo = Repo::new("al-uptodate");
         repo.feature("b1", "a.txt", "a\n");
-        attempt_land(&cfg(""), &repo.dir, "b1").unwrap(); // land it
+        attempt_land(&cfg(""), &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap(); // land it
         // A second attempt sees b1's tip already an ancestor of main.
         assert!(matches!(
-            attempt_land(&cfg(""), &repo.dir, "b1").unwrap(),
+            attempt_land(&cfg(""), &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap(),
             AttemptOutcome::UpToDate
         ));
     }
