@@ -798,6 +798,7 @@ fn activity_dot_glyph(state: crate::sidebar::ActivityState) -> &'static str {
         Active | Waiting => g.dot_filled, // ● / *
         Read => g.dot_hollow,             // ○ / o
         Loading => g.refresh,             // ↻ / @ — worktree building
+        Failed => g.cross,                // ✗ / x — env bring-up failed
         None => "",
     }
 }
@@ -806,12 +807,17 @@ fn activity_dot_glyph(state: crate::sidebar::ActivityState) -> &'static str {
 /// loading = accent). Both red states share the waiting slot (glyph-only diff).
 fn activity_dot_tok(state: crate::sidebar::ActivityState) -> crate::seg::Tok {
     use crate::sidebar::ActivityState::*;
-    crate::seg::Tok::Slot(match state {
-        Active => S::ActivityActive,
-        Waiting | Read => S::ActivityWaiting,
-        Loading => S::Accent,
-        None => S::Dim,
-    })
+    // Failed reads as an error, so it takes a red hue rather than an activity
+    // slot; every other state maps to its activity/accent slot.
+    match state {
+        Failed => crate::seg::Tok::Hue(theme::Hue::Red),
+        _ => crate::seg::Tok::Slot(match state {
+            Active => S::ActivityActive,
+            Waiting | Read => S::ActivityWaiting,
+            Loading => S::Accent,
+            _ => S::Dim,
+        }),
+    }
 }
 
 /// Compose the on-screen line(s) for one visible row. Headers (workspace / host
