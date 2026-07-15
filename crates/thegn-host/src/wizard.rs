@@ -765,6 +765,11 @@ pub enum CreateEvent {
         generation: u64,
         tab: String,
         path: String,
+        /// The host env the user chose in the wizard. Carried here (before the
+        /// DB row is written in the Register step) so the loading splash's
+        /// context block resolves the *actual* pick instead of the ambient
+        /// default — e.g. a local host against a provider `default_env`.
+        env: String,
     },
     Done {
         generation: u64,
@@ -1122,6 +1127,7 @@ pub fn run_worker(
         generation,
         tab: tab.clone(),
         path: path.to_string_lossy().into_owned(),
+        env: choices.env.clone(),
     });
 
     // Reuse the speculative prep only when it matches the submitted (env,
