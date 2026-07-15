@@ -1694,8 +1694,9 @@ impl Default for ArgoCiConfig {
     }
 }
 
+pub use crate::config_forge::{ForgeConfig, ForgeKind};
 pub use crate::config_issues::{
-    GitHubIssuesConfig, IssueProviderKind, IssuesConfig, JiraConfig, LinearConfig,
+    GitHubIssuesConfig, IssueAccount, IssueProviderKind, IssuesConfig, JiraConfig, LinearConfig,
 };
 
 /// `[apps]` — top-level sub-app tab ordering and startup focus.
@@ -3655,6 +3656,8 @@ pub struct Config {
     pub actions: Vec<CustomAction>,
     pub git_commands: Vec<GitCommand>,
     pub plugins: Vec<crate::plugin_api::PluginManifest>,
+    /// Named git forges (`[[forges]]`); see [`crate::config_forge`].
+    pub forges: Vec<ForgeConfig>,
     // --- sub-tables ---
     #[serde(default)]
     pub ui: UiConfig,
@@ -3796,6 +3799,7 @@ impl Default for Config {
             agents: Vec::new(),
             tools: Vec::new(),
             accounts: Vec::new(),
+            forges: Vec::new(),
             pins: Vec::new(),
             tasks: Vec::new(),
             worktree_templates: Vec::new(),

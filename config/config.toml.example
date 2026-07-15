@@ -298,6 +298,34 @@ move_on_merge = false        # when a worktree's PR merges, move its linked issu
 # api_token = "env:JIRA_API_TOKEN"
 # project_key = ""                # restrict to one project ("" = all)
 
+# Named accounts — MULTIPLE per provider (two Linear workspaces, a personal +
+# work GitHub, …), each with its own token + scope, all aggregating into one
+# feed. When any `[[issues.issue_accounts]]` exist they are the source of truth
+# and the single sub-tables above become a fallback only. The setup wizard
+# (`thegn setup`, issue-tracker step) writes these.
+#   [[issues.issue_accounts]]
+#   name = "work-linear"              # stable id (also the cache key)
+#   provider = "linear"              # linear | github | jira
+#   enabled = true                   # false keeps it in config but un-aggregated
+#   token = "env:LINEAR_API_KEY"     # SecretRef / env: — never a raw token
+#   team_id = "TEAM-123"             # Linear: restrict to one team ("" = all)
+#   workspace_slug = ""             # Linear: URL slug (inferred if empty)
+#   base_url = ""                   # Jira: instance URL
+#   email = ""                      # Jira: account email
+#   project_key = ""                # Jira: restrict to one project ("" = all)
+#   extra_flags = []                # GitHub: extra `gh issue list` flags
+#   forge = ""                      # optional `[[forges]]` name ("" = default)
+
+# Named git forges — github.com, GitHub Enterprise, self-hosted Forgejo/Gitea.
+# CONFIG SURFACE ONLY for now: issue/PR fetch drives the `gh` CLI (github/ghe);
+# forgejo/gitea entries are accepted but their fetch is not wired yet (they error
+# gracefully). Referenced by `[[issues.issue_accounts]].forge`.
+#   [[forges]]
+#   name = "corp"                    # stable id
+#   kind = "ghe"                     # github | ghe | forgejo | gitea
+#   host = "git.corp.example.com"    # API host ("" = the kind's default)
+#   token = "env:GHE_TOKEN"          # SecretRef / env: ("" = the CLI's own auth)
+
 # The "My Work" (Mine) panel is scoped to the ACTIVE worktree's repo by default:
 # GitHub issues/PRs are auto-filtered to the repo's `origin` remote, so no config
 # is needed. To scope Linear/Jira per repo, put an `[issues]` overlay in that
@@ -306,6 +334,8 @@ move_on_merge = false        # when a worktree's PR merges, move its linked issu
 #   team_id = "TEAM-123"          # this repo's Linear team
 #   [issues.jira]
 #   project_key = "ACME"          # this repo's Jira project
+# To restrict which named `[[issue_accounts]]` this repo aggregates, list their
+# names: `[issues]` with `accounts = ["work-linear"]`.
 # Press `a` in the Mine section to toggle between this-repo and all-repos views.
 
 # Cross-provider CI/CD inspection — run history, jobs/steps, logs (AV group).
