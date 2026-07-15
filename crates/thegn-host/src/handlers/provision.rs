@@ -78,6 +78,10 @@ pub(crate) struct SpecDrainCtx<'a> {
     pub prewarm_inflight: &'a mut std::collections::HashSet<(String, usize)>,
     pub materialize_failed: &'a mut std::collections::HashSet<(String, usize)>,
     pub prewarm_failed: &'a mut std::collections::HashSet<(String, usize)>,
+    /// Keys whose sandbox-halt modal was already dismissed: the modal is raised
+    /// at most once per key, so a re-materialize of a still-broken env doesn't
+    /// re-block the user (the row's error dot carries the state instead).
+    pub halt_dismissed: &'a mut std::collections::HashSet<(String, usize)>,
     pub last_pool_reconcile: &'a mut Option<std::time::Instant>,
     pub center_dormant: &'a mut bool,
     pub need_relayout: &'a mut bool,
@@ -292,7 +296,10 @@ pub(crate) fn drain_specs(
                     SpecError::Halt(halt) => {
                         ctx.model.status =
                             format!("{} unavailable: {}", halt.placement, halt.reason);
-                        if is_active {
+                        // Raise the blocking modal only the FIRST time for this
+                        // key; once dismissed the row's red error dot carries
+                        // the state and re-visiting no longer re-blocks.
+                        if is_active && !ctx.halt_dismissed.contains(&tab_key) {
                             *ctx.active_menu = Some(sandbox_halt_overlay(&halt));
                         }
                         halt.reason.clone()

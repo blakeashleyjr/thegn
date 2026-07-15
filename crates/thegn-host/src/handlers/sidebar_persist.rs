@@ -70,6 +70,10 @@ pub(crate) struct SidebarState {
     /// Group names of worktrees mid-creation; `rebuild` overlays a loading dot
     /// on their rows (a build in flight has no CPU-based activity yet).
     pub(crate) creating: std::collections::HashSet<String>,
+    /// Group names of worktrees whose env bring-up failed (mirrors the loop's
+    /// `materialize_failed`/`prewarm_failed`); `rebuild` overlays a red error
+    /// dot so the failure stays visible after the halt modal is dismissed.
+    pub(crate) env_failed: std::collections::HashSet<String>,
 }
 
 impl SidebarState {
