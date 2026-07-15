@@ -1422,6 +1422,20 @@ pub(crate) fn build_panel(
     let want_stashes = hints.open == crate::panel::Section::Stash || git_family_full;
     let want_lsfiles = hints.open == crate::panel::Section::Files;
 
+    // Branches are repo-global (all worktrees share the same ref store), so the
+    // heavy `branches_full` subprocess runs at most once per repo and is shared
+    // across every tab via `branch_cache`. Only compute the repo root / consult
+    // the cache when a section actually needs the list. The one per-worktree
+    // field, `is_head`, is recomputed below from this worktree's `branch`.
+    let repo_root = want_branches
+        .then(|| thegn_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf()));
+    let cached_branches = repo_root.as_deref().and_then(crate::branch_cache::get);
+    let need_branch_fetch = want_branches
+        && crate::branch_cache::should_refetch(
+            cached_branches.as_ref().map(|(_, age)| *age),
+            crate::branch_cache::BRANCH_CACHE_TTL,
+        );
+
     // Fan the independent, read-only git reads out across scoped threads: each
     // builds its own (trivial) `GixGit`, borrows `&loc` (read-only; `git -C` so
     // no chdir hazard) and applies the SAME error fallback inline, so a join
@@ -1439,7 +1453,7 @@ pub(crate) fn build_panel(
         merge_info,
         stash_count,
         log,
-        branches_raw,
+        fetched_branches,
         stashes_raw,
         ls_files,
         incoming,
@@ -1483,7 +1497,9 @@ pub(crate) fn build_panel(
         // stays on the main thread below; only the raw `branches_full` runs here.
         let h_log =
             want_log.then(|| s.spawn(|| GixGit::new().log_graph(&loc, log_n).unwrap_or_default()));
-        let h_branches = want_branches
+        // Only re-run the subprocess on a repo-cache miss/stale; a warm entry
+        // from another tab (or an earlier hydration) is reused verbatim below.
+        let h_branches = need_branch_fetch
             .then(|| s.spawn(|| GixGit::new().branches_full(&loc).unwrap_or_default()));
         let h_stashes =
             want_stashes.then(|| s.spawn(|| GixGit::new().stash_list(&loc).unwrap_or_default()));
@@ -1528,6 +1544,17 @@ pub(crate) fn build_panel(
         panel_git_ms = t_git.elapsed().as_millis() as u64,
         "panel git fan-out done"
     );
+
+    // Resolve the branch list: a fresh fetch refreshes the shared repo cache;
+    // otherwise reuse the warm entry populated by this (or a sibling) worktree.
+    let branches_raw = if need_branch_fetch {
+        if let Some(root) = repo_root.as_deref() {
+            crate::branch_cache::put(root, fetched_branches.clone());
+        }
+        fetched_branches
+    } else {
+        cached_branches.map(|(v, _)| v).unwrap_or_default()
+    };
 
     // Retain last-known-good header on transient git-read failure (never "—").
     let (branch, ahead_behind, merge_info) =
@@ -1623,6 +1650,7 @@ pub(crate) fn build_panel(
             .flatten()
             .map(|(json, _)| thegn_core::github::parse_pr_headers(&json))
             .unwrap_or_default();
+        let head_branch = panel.branch.clone();
         panel.branches =
             branches_raw
                 .into_iter()
@@ -1636,8 +1664,11 @@ pub(crate) fn build_panel(
                         }
                     });
                     crate::panel::BranchRow {
+                        // Recompute the HEAD marker for THIS worktree — the
+                        // cached list is repo-global and its `is_head` reflects
+                        // whichever worktree last fetched it.
+                        is_head: b.name == head_branch,
                         name: b.name,
-                        is_head: b.is_head,
                         upstream: b.upstream,
                         ahead: b.ahead,
                         behind: b.behind,

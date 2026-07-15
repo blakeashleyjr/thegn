@@ -9551,8 +9551,13 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::ProxyDash(p) => {
                     dirty |= crate::detail::apply_proxy_dash(&mut bar_detail, *p)
                 }
-                // Branch ref moved elsewhere; heal the canonical checkout off-loop.
-                RefreshKind::MainRefMoved => want_main_sync = true,
+                // Branch ref moved elsewhere; heal the canonical checkout
+                // off-loop and drop the shared branch cache so the list
+                // re-fetches (create/delete/commit/fetch under refs/heads/*).
+                RefreshKind::MainRefMoved => {
+                    want_main_sync = true;
+                    crate::branch_cache::invalidate_all();
+                }
                 RefreshKind::HostHeal => want_host_heal = true,
                 // Animate the visible splash (spinner frame / elapsed / hints):
                 // a repaint-only tick. Gated on a live active step so a
