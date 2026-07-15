@@ -735,9 +735,12 @@ impl GitBackend for CliGit {
                 let (mark, name) = l.split_once('\t')?;
                 // A detached worktree (e.g. the merge-queue's throwaway gate
                 // worktree, which runs the test suite) makes `git branch` emit a
-                // synthetic `(no branch)` row. It is not a real branch and gix's
-                // ref walk omits it, so drop it to keep the two backends in sync.
-                if name == "(no branch)" {
+                // synthetic HEAD row — `(no branch)` on older git, `(HEAD detached
+                // at <oid>)` / `(HEAD detached from <oid>)` on modern git. None is
+                // a real branch (a `refname:short` never starts with `(`), and
+                // gix's ref walk omits them, so drop any parenthesized pseudo-row
+                // to keep the two backends in sync.
+                if name.starts_with('(') {
                     return None;
                 }
                 Some(Branch {
