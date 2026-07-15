@@ -38,12 +38,27 @@ pub trait CacheStore {
         repo_root: &str,
     ) -> Result<std::collections::BTreeMap<String, usize>>;
 
-    /// Issue-tracker cache for `(repo, provider)`: `(json, fetched_at)`.
-    fn get_issue_cache(&self, repo_root: &str, provider: &str) -> Result<Option<(String, i64)>>;
-    /// All cached provider payloads for a repo, as `(provider, json)` pairs.
+    /// Issue-tracker cache for `(repo, provider, account)`: `(json,
+    /// fetched_at)`. `account` is the `[[issue_accounts]]` name (`""` for the
+    /// legacy single-account path).
+    fn get_issue_cache(
+        &self,
+        repo_root: &str,
+        provider: &str,
+        account: &str,
+    ) -> Result<Option<(String, i64)>>;
+    /// All cached provider payloads for a repo, as `(provider, json)` pairs
+    /// (one per `(provider, account)`; the account is not surfaced since callers
+    /// only concatenate for display).
     fn get_all_issue_cache(&self, repo_root: &str) -> Result<Vec<(String, String)>>;
-    /// Replace the issue-tracker cache for `(repo, provider)`.
-    fn put_issue_cache(&self, repo_root: &str, provider: &str, json: &str) -> Result<()>;
+    /// Replace the issue-tracker cache for `(repo, provider, account)`.
+    fn put_issue_cache(
+        &self,
+        repo_root: &str,
+        provider: &str,
+        account: &str,
+        json: &str,
+    ) -> Result<()>;
 
     /// The cached "My Work" payload for a `scope`: `(json, fetched_at)`.
     fn get_my_work_cache(&self, scope: &str) -> Result<Option<(String, i64)>>;

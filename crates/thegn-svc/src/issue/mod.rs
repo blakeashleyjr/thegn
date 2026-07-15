@@ -10,7 +10,7 @@ pub mod github;
 pub mod jira;
 pub mod linear;
 
-use thegn_core::config::{IssueProviderKind, IssuesConfig, expand_env_ref};
+use thegn_core::config::{IssueAccount, IssueProviderKind, IssuesConfig, expand_env_ref};
 use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch};
 
 /// Errors from any issue backend.
@@ -116,38 +116,40 @@ impl RouterInner {
 }
 
 impl RouterInner {
-    fn from_kind(kind: IssueProviderKind, cfg: &IssuesConfig) -> Option<Self> {
-        match kind {
+    /// Build a backend from one named account's token + scope. Returns `None`
+    /// for a `None`-provider account.
+    fn from_account(a: &IssueAccount) -> Option<Self> {
+        match a.provider {
             IssueProviderKind::Linear => {
-                let api_key = expand_env_ref(&cfg.linear.api_key).unwrap_or_default();
-                let team_id = if cfg.linear.team_id.is_empty() {
-                    None
-                } else {
-                    Some(cfg.linear.team_id.clone())
-                };
+                let api_key = expand_env_ref(&a.token).unwrap_or_default();
+                let team_id = (!a.team_id.is_empty()).then(|| a.team_id.clone());
                 Some(RouterInner::Linear(linear::LinearBackend::new(
                     api_key, team_id,
                 )))
             }
             IssueProviderKind::Github => Some(RouterInner::Github(
-                github::GitHubIssuesBackend::new(cfg.github_issues.extra_flags.clone()),
+                github::GitHubIssuesBackend::new(a.extra_flags.clone()),
             )),
             IssueProviderKind::Jira => {
-                let api_token = expand_env_ref(&cfg.jira.api_token).unwrap_or_default();
+                let api_token = expand_env_ref(&a.token).unwrap_or_default();
                 Some(RouterInner::Jira(jira::JiraBackend::new(
-                    cfg.jira.base_url.clone(),
-                    cfg.jira.email.clone(),
+                    a.base_url.clone(),
+                    a.email.clone(),
                     api_token,
-                    if cfg.jira.project_key.is_empty() {
-                        None
-                    } else {
-                        Some(cfg.jira.project_key.clone())
-                    },
+                    (!a.project_key.is_empty()).then(|| a.project_key.clone()),
                 )))
             }
             IssueProviderKind::None => None,
         }
     }
+}
+
+/// A configured backend tagged with the account name it was built from, so the
+/// cache and "My Work" feed can key each provider's issues by `(provider,
+/// account)` — supporting multiple accounts of the same provider.
+struct AccountBackend {
+    account: String,
+    inner: RouterInner,
 }
 
 /// Routes issue requests across every configured provider. `list`/`search` fan
@@ -156,15 +158,20 @@ impl RouterInner {
 /// renders gracefully regardless. A single provider failing never breaks the
 /// others: it logs and contributes nothing to the merged result.
 pub struct IssueRouter {
-    inner: Vec<RouterInner>,
+    inner: Vec<AccountBackend>,
 }
 
 impl IssueRouter {
     pub fn from_config(cfg: &IssuesConfig) -> Self {
         let inner = cfg
-            .active_providers()
+            .active_accounts()
             .into_iter()
-            .filter_map(|kind| RouterInner::from_kind(kind, cfg))
+            .filter_map(|acct| {
+                RouterInner::from_account(&acct).map(|inner| AccountBackend {
+                    account: acct.name,
+                    inner,
+                })
+            })
             .collect();
         IssueRouter { inner }
     }
@@ -174,49 +181,59 @@ impl IssueRouter {
     pub fn provider_id(&self) -> &'static str {
         self.inner
             .first()
-            .map(|b| b.provider_id())
+            .map(|b| b.inner.provider_id())
             .unwrap_or("none")
     }
 
-    /// Every configured provider id, in config order.
+    /// Every configured provider id, in config order (may repeat when several
+    /// accounts share a provider).
     pub fn provider_ids(&self) -> Vec<&'static str> {
-        self.inner.iter().map(|b| b.provider_id()).collect()
+        self.inner.iter().map(|b| b.inner.provider_id()).collect()
     }
 
     pub fn is_configured(&self) -> bool {
         !self.inner.is_empty()
     }
 
-    /// Locate the backend owning an id of the form `"<provider>:<key>"`.
+    /// Locate the backend owning an id of the form `"<provider>:<key>"`. When
+    /// multiple accounts share the provider this picks the first — get/update by
+    /// bare id can't disambiguate accounts (a known multi-account limitation).
     fn backend_for_id(&self, id: &str) -> Option<&RouterInner> {
         let prefix = id.split_once(':').map(|(p, _)| p).unwrap_or(id);
-        self.inner.iter().find(|b| b.provider_id() == prefix)
+        self.inner
+            .iter()
+            .find(|b| b.inner.provider_id() == prefix)
+            .map(|b| &b.inner)
     }
 
-    /// List issues across all providers, concatenated. A failing provider logs
+    /// List issues across all accounts, concatenated. A failing account logs
     /// and contributes nothing rather than failing the whole call.
     pub async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>, IssueError> {
         let mut all = Vec::new();
         for b in &self.inner {
-            match b.list_issues(filter).await {
+            match b.inner.list_issues(filter).await {
                 Ok(mut issues) => all.append(&mut issues),
                 Err(e) => {
-                    tracing::warn!(provider = b.provider_id(), error = %e, "issue list failed")
+                    tracing::warn!(account = %b.account, provider = b.inner.provider_id(), error = %e, "issue list failed")
                 }
             }
         }
         Ok(all)
     }
 
-    /// Per-provider results, so callers (the cache refresh) can store and diff
-    /// each provider under its own `(repo_root, provider)` key.
+    /// Per-account results, so callers (the cache refresh) can store and diff
+    /// each account under its own `(repo_root, provider, account)` key.
     pub async fn list_per_provider(
         &self,
         filter: &IssueFilter,
-    ) -> Vec<(&'static str, Result<Vec<Issue>, IssueError>)> {
+    ) -> Vec<(String, &'static str, Result<Vec<Issue>, IssueError>)> {
         let mut out = Vec::with_capacity(self.inner.len());
         for b in &self.inner {
-            out.push((b.provider_id(), b.list_issues(filter).await));
+            out.push((
+                b.account.clone(),
+                b.inner.provider_id(),
+                b.inner.list_issues(filter).await,
+            ));
         }
         out
     }
@@ -231,7 +248,7 @@ impl IssueRouter {
     /// Create an issue on the first configured provider.
     pub async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError> {
         match self.inner.first() {
-            Some(b) => b.create_issue(draft).await,
+            Some(b) => b.inner.create_issue(draft).await,
             None => Err(IssueError::NotConfigured),
         }
     }
@@ -243,14 +260,14 @@ impl IssueRouter {
         }
     }
 
-    /// Search across all providers, concatenated.
+    /// Search across all accounts, concatenated.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
         let mut all = Vec::new();
         for b in &self.inner {
-            match b.search(query, limit).await {
+            match b.inner.search(query, limit).await {
                 Ok(mut issues) => all.append(&mut issues),
                 Err(e) => {
-                    tracing::warn!(provider = b.provider_id(), error = %e, "issue search failed")
+                    tracing::warn!(account = %b.account, provider = b.inner.provider_id(), error = %e, "issue search failed")
                 }
             }
         }
@@ -299,6 +316,35 @@ mod spec {
         assert_eq!(r.provider_ids(), vec!["linear", "jira", "github"]);
         // The representative id is the first configured provider.
         assert_eq!(r.provider_id(), "linear");
+    }
+
+    #[test]
+    fn multiple_accounts_of_one_provider_each_build_a_backend() {
+        use thegn_core::config::IssueAccount;
+        let cfg = IssuesConfig {
+            issue_accounts: vec![
+                IssueAccount {
+                    name: "personal".into(),
+                    provider: IssueProviderKind::Linear,
+                    ..Default::default()
+                },
+                IssueAccount {
+                    name: "work".into(),
+                    provider: IssueProviderKind::Linear,
+                    ..Default::default()
+                },
+                // A disabled account is skipped.
+                IssueAccount {
+                    name: "old".into(),
+                    provider: IssueProviderKind::Jira,
+                    enabled: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let r = IssueRouter::from_config(&cfg);
+        assert_eq!(r.provider_ids(), vec!["linear", "linear"]);
     }
 
     #[test]
