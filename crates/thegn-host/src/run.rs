@@ -9087,6 +9087,7 @@ async fn event_loop<T: Terminal>(
                     generation,
                     tab,
                     path,
+                    env,
                 } => {
                     if crate::handlers::creating::on_tab_opened(
                         &mut session,
@@ -9098,6 +9099,7 @@ async fn event_loop<T: Terminal>(
                         generation,
                         tab,
                         path,
+                        env,
                         keymap.config().session.focus_on_create,
                     ) {
                         need_relayout = true;
@@ -9680,15 +9682,13 @@ async fn event_loop<T: Terminal>(
                 .unwrap_or_default();
             if model.load_steps != derived {
                 model.load_steps = derived;
-                // Refresh the context block (env / placement / sandbox / connect /
-                // workdir) only when the splash is up — a cheap DB+config resolve,
-                // gated to provisioning-state changes so it's not per-frame.
-                model.load_context = if model.load_steps.is_empty() {
-                    Vec::new()
-                } else {
-                    let wt = active_tab_path(&session);
-                    crate::agent::loading_context(&current_config, &wt.to_string_lossy())
-                };
+                // Refresh the splash context block (see `LoadingTracker::load_context`).
+                model.load_context = loading_state.load_context(
+                    &model.load_steps,
+                    &active_tab_path(&session).to_string_lossy(),
+                    &current_config,
+                    akey.as_ref(),
+                );
                 dirty = true;
             }
             // Keep the splash-scoped animation ticker alive exactly while a
