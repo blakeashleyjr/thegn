@@ -126,6 +126,27 @@ impl LoadingTracker {
         self.env.get(key).map(String::as_str)
     }
 
+    /// The splash context block (env / placement / sandbox / connect / workdir)
+    /// for the active tab: empty when there are no load steps, else resolved via
+    /// [`loading_context`], preferring this tracker's wizard-chosen env (`akey`)
+    /// over the DB `effective_env` — which isn't written until the create
+    /// worker's Register step, so a local pick against a provider ambient default
+    /// would otherwise briefly show the provider. Called from the event loop; the
+    /// resolution lives here (not inline in run.rs) to keep that god-file flat.
+    pub(crate) fn load_context(
+        &self,
+        steps: &[LoadStep],
+        worktree: &str,
+        cfg: &thegn_core::config::Config,
+        akey: Option<&Key>,
+    ) -> Vec<(String, String)> {
+        if steps.is_empty() {
+            return Vec::new();
+        }
+        let selected = akey.and_then(|k| self.env_for(k));
+        loading_context(cfg, worktree, selected)
+    }
+
     /// Provisioning finished; only the shell attach remains. Advance the
     /// existing plan — every non-shell step goes `Done`, the trailing shell
     /// step goes `Active` — rather than replacing it, so a rich backend-aware
@@ -186,6 +207,71 @@ impl LoadingTracker {
         };
         self.set(key, steps);
     }
+}
+
+/// `(key, value)` facts about where a worktree's pane is coming up, for the
+/// loading screen's context block: env, placement, provider/sandbox, connect
+/// mode, shell strategy, workdir. Loop-safe (a DB read + pure config resolution,
+/// no network/subprocess). Empty for a plain local env (nothing to show).
+/// (Relocated out of the `agent` god-file — it's loading-screen state.)
+pub(crate) fn loading_context(
+    cfg: &thegn_core::config::Config,
+    worktree: &str,
+    selected: Option<&str>,
+) -> Vec<(String, String)> {
+    use std::path::{Path, PathBuf};
+    use thegn_core::db::Db;
+    use thegn_core::placement::Placement;
+    use thegn_core::remote::GitLoc;
+    use thegn_core::repo;
+    use thegn_core::store::WorkspaceStore;
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    // Prefer an explicit override (the creation wizard's pick, captured before
+    // the DB env row is written) over the persisted `effective_env`.
+    let selected = selected.map(str::to_owned).or_else(|| {
+        Db::open()
+            .ok()
+            .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()))
+    });
+    let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), selected.as_deref());
+    if env.placement.is_local() {
+        return Vec::new();
+    }
+    let mut out = vec![
+        ("env".to_string(), env.name.clone()),
+        ("placement".to_string(), env.placement.label()),
+    ];
+    if let Placement::Provider(_) = &env.placement
+        && let Some(ec) = cfg.env.get(&env.name)
+    {
+        let pc = &ec.provider;
+        if !pc.provider.trim().is_empty() {
+            out.push(("provider".to_string(), pc.provider.clone()));
+        }
+        if let Some(id) = crate::provider_factory::provider_sandbox_name(cfg, worktree, &env.name)
+            .filter(|s| !s.is_empty())
+        {
+            out.push(("sandbox".to_string(), id));
+        }
+        out.push((
+            "connect".to_string(),
+            format!("{:?}", pc.connect).to_lowercase(),
+        ));
+        let wd = pc.sync_workdir();
+        if !wd.trim().is_empty() {
+            out.push(("workdir".to_string(), wd));
+        }
+    }
+    let strategy = format!("{:?}", env.sandbox.home.strategy).to_lowercase();
+    out.push(("shell".to_string(), strategy));
+    out
 }
 
 #[cfg(test)]

@@ -9682,20 +9682,13 @@ async fn event_loop<T: Terminal>(
                 .unwrap_or_default();
             if model.load_steps != derived {
                 model.load_steps = derived;
-                // Refresh the context block (env / placement / sandbox / connect /
-                // workdir) only when the splash is up — a cheap DB+config resolve,
-                // gated to provisioning-state changes so it's not per-frame.
-                model.load_context = if model.load_steps.is_empty() {
-                    Vec::new()
-                } else {
-                    let wt = active_tab_path(&session);
-                    // Prefer the wizard's chosen host (captured at `TabOpened`)
-                    // over the DB `effective_env`, which isn't written until the
-                    // create worker's Register step — so a local pick against a
-                    // provider ambient default doesn't briefly show the provider.
-                    let selected = akey.as_ref().and_then(|k| loading_state.env_for(k));
-                    crate::agent::loading_context(&current_config, &wt.to_string_lossy(), selected)
-                };
+                // Refresh the splash context block (see `LoadingTracker::load_context`).
+                model.load_context = loading_state.load_context(
+                    &model.load_steps,
+                    &active_tab_path(&session).to_string_lossy(),
+                    &current_config,
+                    akey.as_ref(),
+                );
                 dirty = true;
             }
             // Keep the splash-scoped animation ticker alive exactly while a

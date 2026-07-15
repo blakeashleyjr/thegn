@@ -2339,64 +2339,6 @@ fn tail_lines(out: &str, n: usize) -> String {
     lines[start..].join(" | ")
 }
 
-/// `(key, value)` facts about where a worktree's pane is coming up, for the
-/// loading screen's context block: env, placement, provider/sandbox, connect mode,
-/// shell strategy, workdir. Loop-safe (a DB read + pure config resolution, no
-/// network/subprocess). Empty for a plain local env (nothing interesting to show).
-pub fn loading_context(
-    cfg: &Config,
-    worktree: &str,
-    selected: Option<&str>,
-) -> Vec<(String, String)> {
-    use thegn_core::placement::Placement;
-    let loc = GitLoc::for_worktree(Path::new(worktree));
-    let repo_root: PathBuf = Db::open()
-        .ok()
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| repo::main_worktree(Path::new(worktree)))
-        .unwrap_or_else(|| PathBuf::from(worktree));
-    // Prefer an explicit override (the creation wizard's pick, captured before
-    // the DB env row is written) over the persisted `effective_env`.
-    let selected = selected.map(str::to_owned).or_else(|| {
-        Db::open()
-            .ok()
-            .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()))
-    });
-    let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), selected.as_deref());
-    if env.placement.is_local() {
-        return Vec::new();
-    }
-    let mut out = vec![
-        ("env".to_string(), env.name.clone()),
-        ("placement".to_string(), env.placement.label()),
-    ];
-    if let Placement::Provider(_) = &env.placement
-        && let Some(ec) = cfg.env.get(&env.name)
-    {
-        let pc = &ec.provider;
-        if !pc.provider.trim().is_empty() {
-            out.push(("provider".to_string(), pc.provider.clone()));
-        }
-        if let Some(id) = provider_sandbox_name(cfg, worktree, &env.name).filter(|s| !s.is_empty())
-        {
-            out.push(("sandbox".to_string(), id));
-        }
-        out.push((
-            "connect".to_string(),
-            format!("{:?}", pc.connect).to_lowercase(),
-        ));
-        let wd = pc.sync_workdir();
-        if !wd.trim().is_empty() {
-            out.push(("workdir".to_string(), wd));
-        }
-    }
-    let strategy = format!("{:?}", env.sandbox.home.strategy).to_lowercase();
-    out.push(("shell".to_string(), strategy));
-    out
-}
-
 /// Cheap, **loop-safe** (no network/subprocess) check made right before a
 /// worktree pane spawns: should this worktree HALT with a warning instead of
 /// opening a (host-degraded) pane? Returns `Some` only for a NON-LOCAL env with
