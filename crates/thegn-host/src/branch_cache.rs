@@ -58,6 +58,16 @@ pub(crate) fn invalidate_all() {
     cache().lock().unwrap().clear();
 }
 
+/// A branch ref under `refs/heads/*` moved (create/delete/commit/fetch, or the
+/// merge-queue advancing the target): request an off-loop heal of the canonical
+/// checkout and drop the shared branch cache so the list re-fetches. Kept here
+/// (not inline in the loop's `RefreshKind::MainRefMoved` arm) so the god-file
+/// `run.rs` stays flat.
+pub(crate) fn ref_moved(want_main_sync: &mut bool) {
+    *want_main_sync = true;
+    invalidate_all();
+}
+
 /// Whether the branch list must be re-fetched now, or can be served from cache.
 /// Pure, so it is unit-tested. A missing entry always fetches; a present entry
 /// fetches only once it is at least `ttl` old. There is deliberately no
