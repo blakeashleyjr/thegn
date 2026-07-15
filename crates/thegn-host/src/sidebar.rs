@@ -59,6 +59,11 @@ pub enum ActivityState {
     /// A worktree being created: the loop overlays this on rows whose tab is in
     /// `loading_state`, rendered as an accent "↻" while the splash builds.
     Loading,
+    /// A worktree whose (non-local) env failed to come up with `failover` off:
+    /// the loop overlays this on rows in `materialize_failed`/`prewarm_failed`,
+    /// rendered as a red "✗" so the failure stays visible after the halt modal
+    /// is dismissed.
+    Failed,
 }
 
 impl ActivityState {
