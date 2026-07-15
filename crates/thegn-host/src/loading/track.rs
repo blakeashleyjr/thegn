@@ -25,6 +25,12 @@ pub(crate) type Key = (String, usize);
 #[derive(Debug, Default)]
 pub(crate) struct LoadingTracker {
     map: HashMap<Key, Vec<LoadStep>>,
+    /// Per-tab env override for the splash's context block: the host the
+    /// creation wizard actually chose, captured at `TabOpened` before the DB
+    /// row is written. `loading_context` prefers this over the (not-yet-set)
+    /// `effective_env` lookup, so a local pick against a provider ambient
+    /// default doesn't briefly show the provider. Cleared with the steps.
+    env: HashMap<Key, String>,
 }
 
 impl std::ops::Deref for LoadingTracker {
@@ -90,15 +96,34 @@ impl LoadingTracker {
     }
 
     pub(crate) fn remove(&mut self, key: &Key) -> Option<Vec<LoadStep>> {
+        self.env.remove(key);
         self.map.remove(key)
     }
 
     /// Move an entry to a new key verbatim (worktree-creation settles its
     /// optimistic name); stamps ride along untouched.
     pub(crate) fn rename(&mut self, old: &Key, new: Key) {
+        if let Some(env) = self.env.remove(old) {
+            self.env.insert(new.clone(), env);
+        }
         if let Some(steps) = self.map.remove(old) {
             self.map.insert(new, steps);
         }
+    }
+
+    /// Record the host env the creation wizard chose for `key`, so the splash's
+    /// context block reflects the actual pick before the DB row exists. Empty
+    /// is a no-op (no override → fall back to the DB lookup).
+    pub(crate) fn set_env(&mut self, key: Key, env: &str) {
+        if env.trim().is_empty() {
+            return;
+        }
+        self.env.insert(key, env.to_string());
+    }
+
+    /// The wizard-chosen env override for `key`, if any.
+    pub(crate) fn env_for(&self, key: &Key) -> Option<&str> {
+        self.env.get(key).map(String::as_str)
     }
 
     /// Provisioning finished; only the shell attach remains. Advance the
@@ -335,6 +360,25 @@ mod tests {
         assert_eq!(steps[0].label, "sandbox");
         assert_eq!(steps[0].state, StepState::Failed);
         assert_eq!(steps[0].detail.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn env_override_is_set_read_moved_and_cleared() {
+        let mut t = LoadingTracker::default();
+        t.set(key(), vec![LoadStep::active("a")]);
+        // Empty is a no-op; a real pick is stored and readable.
+        t.set_env(key(), "");
+        assert_eq!(t.env_for(&key()), None);
+        t.set_env(key(), "default");
+        assert_eq!(t.env_for(&key()), Some("default"));
+        // Rename carries the override to the settled key.
+        let new = ("settled".to_string(), 0);
+        t.rename(&key(), new.clone());
+        assert_eq!(t.env_for(&key()), None);
+        assert_eq!(t.env_for(&new), Some("default"));
+        // Remove clears it alongside the steps.
+        t.remove(&new);
+        assert_eq!(t.env_for(&new), None);
     }
 
     #[test]
