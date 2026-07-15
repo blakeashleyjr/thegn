@@ -1033,6 +1033,15 @@ impl SidebarState {
                 .activity
                 .insert(name.clone(), crate::sidebar::ActivityState::Loading);
         }
+        // Overlay a red error dot on worktrees whose env bring-up failed. Runs
+        // after `creating` so a failure wins over a stale loading mark, and
+        // re-applied every rebuild so a hydration pass can't drop it.
+        for name in &self.env_failed {
+            model
+                .sidebar_status
+                .activity
+                .insert(name.clone(), crate::sidebar::ActivityState::Failed);
+        }
         let rows_span = crate::perf::measure(crate::perf::Subsys::Rows);
         model.sidebar_rows = crate::sidebar::build_rows(
             session,
@@ -6161,6 +6170,12 @@ async fn event_loop<T: Terminal>(
     // materialize path retries independently when the tab is actually focused.
     let mut prewarm_failed: std::collections::HashSet<(String, usize)> =
         std::collections::HashSet::new();
+    // Keys (group name, tab) whose sandbox-halt modal the user has dismissed:
+    // the halt modal is raised at most ONCE per key (the row keeps a red error
+    // dot instead), and a manual `[r]` retry re-attempts silently. Cleared on
+    // workspace switch and on env-heal so a fresh failure can surface again.
+    let mut halt_dismissed: std::collections::HashSet<(String, usize)> =
+        std::collections::HashSet::new();
     // Consecutive fast-crash count per (group, tab); the threshold + detection
     // live with the drain's exit handler (`pty_drain::CRASH_THRESHOLD`).
     let mut respawn_crash_count: std::collections::HashMap<(usize, usize), u32> =
@@ -7477,6 +7492,7 @@ async fn event_loop<T: Terminal>(
             // worktree is restored automatically — no reset.
             materialize_failed.clear();
             prewarm_failed.clear();
+            halt_dismissed.clear();
             respawn_crash_count.clear();
             // A crash-dormant screen from the previous worktree must not bleed
             // into the new one — clear it so the new worktree's shell can
@@ -8505,6 +8521,8 @@ async fn event_loop<T: Terminal>(
             // A host just turned Ready: let blocked tabs re-probe.
             materialize_failed.clear();
             prewarm_failed.clear();
+            // Env healed → allow a fresh halt modal on the next failure.
+            halt_dismissed.clear();
         }
         if let Some((menu_ov, host)) = hout.consent {
             active_menu = Some(menu_ov);
@@ -8528,6 +8546,7 @@ async fn event_loop<T: Terminal>(
                 prewarm_inflight: &mut prewarm_inflight,
                 materialize_failed: &mut materialize_failed,
                 prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
                 last_pool_reconcile: &mut last_pool_reconcile,
                 center_dormant: &mut center_dormant,
                 need_relayout: &mut need_relayout,
@@ -8535,6 +8554,14 @@ async fn event_loop<T: Terminal>(
                 loop_perf: &mut loop_perf,
             },
         );
+        // Mirror the failed keys into the sidebar so their rows keep a red error
+        // dot (group names only). Recomputed here after the drain may have added
+        // one, and at the clear/retry sites below.
+        sb.env_failed = materialize_failed
+            .iter()
+            .chain(prewarm_failed.iter())
+            .map(|(name, _)| name.clone())
+            .collect();
 
         // Resolved drawer launch specs (the async half of a cold drawer spawn).
         // Policy by CURRENT state, not the state at request time: show it when
@@ -12442,6 +12469,14 @@ async fn event_loop<T: Terminal>(
                                 {
                                     let _ = db.set_ui_state("", "keymap_preset", "default");
                                 }
+                                // Esc on the sandbox-halt modal is a dismissal:
+                                // suppress it for this key (the row's error dot
+                                // carries the state; revisiting won't re-block).
+                                if m.tag == menu::MenuKindTag::SandboxHalt
+                                    && let Some(g) = session.worktrees.get(session.active)
+                                {
+                                    halt_dismissed.insert((g.name.clone(), g.active_tab));
+                                }
                                 active_menu = None;
                                 pending_confirm_op = None;
                                 pending_undo = None;
@@ -12449,6 +12484,10 @@ async fn event_loop<T: Terminal>(
                             }
                         }
                         menu::MenuOutcome::Pick(choice) => {
+                            // Capture the tag before clearing: the `[n] dismiss`
+                            // choice is shared across menus, so recording a halt
+                            // dismissal below must be gated on this being one.
+                            let was_halt = m.tag == menu::MenuKindTag::SandboxHalt;
                             active_menu = None;
                             // Bouncer gate: send the user's allow/deny to the
                             // waiting tool-servicing task, then raise the next
@@ -12484,11 +12523,23 @@ async fn event_loop<T: Terminal>(
                                     let key = (g.name.clone(), g.active_tab);
                                     materialize_failed.remove(&key);
                                     prewarm_failed.remove(&key);
+                                    // Keep `halt_dismissed` set: a manual retry
+                                    // re-attempts silently — if it fails again
+                                    // the row's error dot suffices, no re-block.
                                 }
                                 center_dormant = false;
                                 model.status = "Retrying environment bring-up…".into();
                                 dirty = true;
                                 continue;
+                            }
+                            // Dismissing the sandbox-halt modal (`[n]`) suppresses
+                            // it for this key: the row keeps its red error dot and
+                            // revisiting the worktree no longer re-blocks.
+                            if let menu::MenuChoice::Dismiss = choice
+                                && was_halt
+                                && let Some(g) = session.worktrees.get(session.active)
+                            {
+                                halt_dismissed.insert((g.name.clone(), g.active_tab));
                             }
                             if let menu::MenuChoice::ConfirmCloseWorktrees = choice
                                 && let Some(targets) = pending_confirm_delete_worktrees.take()
