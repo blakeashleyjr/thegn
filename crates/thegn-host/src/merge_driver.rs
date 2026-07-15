@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use thegn_core::config::{ConflictHandoff, MergeQueueConfig};
 use thegn_core::db::Db;
-use thegn_core::store::WorktreeAuxStore;
+use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
 // Used only by the unix-gated `run_agent` chain (shell + sh_quote templating).
 #[cfg(any(unix, test))]
 use thegn_core::util;
@@ -37,6 +37,10 @@ use crate::integrate::{self, AttemptOutcome};
 pub(crate) struct QueueItem {
     pub worktree: String,
     pub branch: String,
+    /// The worktree's `location` descriptor (from the queue row): empty = local,
+    /// else an ssh/provider blob. Resolves the branch's [`GitLoc`] so the drain
+    /// knows whether to fetch its tip into the target store (cross-host).
+    pub location: String,
 }
 
 /// One status transition the driver made, handed to the caller's `progress`
@@ -67,12 +71,30 @@ enum Failure {
 /// Queue rows belonging to `root`'s repo (the queue is global; a drain is
 /// per-repo because the target ref is). Shared by the CLI (`merge` namespace)
 /// and the host's in-app drain so both see exactly one membership rule.
+///
+/// Membership is resolved from the DB (`worktrees.repo_path`) first — that's
+/// host-independent, so a queued worktree living on another machine (whose path
+/// can't be `git worktree list`ed on this box) is still attributed to its repo
+/// instead of being silently dropped. Only an *unregistered* worktree (an
+/// ad-hoc CLI enqueue with no DB row) falls back to the local `main_checkout`.
 pub(crate) fn rows_for_repo(db: &Db, root: &Path) -> Vec<thegn_core::db::MergeQueueRow> {
+    let root_s = root.to_string_lossy();
     db.list_merge_queue()
         .unwrap_or_default()
         .into_iter()
-        .filter(|r| integrate::main_checkout(Path::new(&r.worktree)).as_deref() == Some(root))
+        .filter(|r| row_belongs_to_repo(db, &r.worktree, &root_s, root))
         .collect()
+}
+
+/// One membership test (see [`rows_for_repo`]): DB repo_path when known, else a
+/// local `git worktree list` fallback for an unregistered worktree.
+fn row_belongs_to_repo(db: &Db, worktree: &str, root_s: &str, root: &Path) -> bool {
+    if let Ok(Some(rp)) = db.repo_root_for(worktree)
+        && !rp.is_empty()
+    {
+        return rp == root_s;
+    }
+    integrate::main_checkout(Path::new(worktree)).as_deref() == Some(root)
 }
 
 /// Drain `items` one at a time, landing clean branches and dispatching the agent
@@ -107,9 +129,16 @@ pub(crate) fn drive_queue(
             detail: "",
         });
 
+        // Where the branch's worktree lives — drives the cross-host tip ingest
+        // inside attempt_land (empty location = local = same store as target).
+        let branch_loc = thegn_core::remote::GitLoc::from_db(
+            &item.worktree,
+            (!item.location.is_empty()).then_some(item.location.as_str()),
+        );
+
         let mut agent_runs = 0u32;
         loop {
-            let attempt = match integrate::attempt_land(cfg, repo_root, &item.branch) {
+            let attempt = match integrate::attempt_land(cfg, repo_root, &item.branch, &branch_loc) {
                 Ok(a) => a,
                 Err(e) => {
                     let detail = format!("{e}");
@@ -160,6 +189,21 @@ pub(crate) fn drive_queue(
                         detail: "gated green — awaiting land",
                     });
                     out.ready.push(item.branch.clone());
+                    break;
+                }
+                AttemptOutcome::Unreachable { detail } => {
+                    // Branch host unreachable / tip couldn't be fetched in. Hold
+                    // (deferred) with the reason — a transient blip is retried on
+                    // the next drain; never silently drop the row.
+                    set(db, "deferred", None, Some(&detail));
+                    lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
+                    progress(&DriveStep {
+                        worktree: &item.worktree,
+                        branch: &item.branch,
+                        status: "deferred",
+                        detail: &detail,
+                    });
+                    out.deferred.push(item.branch.clone());
                     break;
                 }
                 AttemptOutcome::Conflict { paths } => Failure::Conflict(paths),
@@ -571,6 +615,7 @@ mod tests {
                 vec![QueueItem {
                     worktree: feat_wt.to_string_lossy().into(),
                     branch: "feat".into(),
+                    location: String::new(),
                 }],
                 |_| {},
             );
@@ -598,6 +643,7 @@ mod tests {
                 vec![QueueItem {
                     worktree: feat_wt.to_string_lossy().into(),
                     branch: "feat".into(),
+                    location: String::new(),
                 }],
                 |_| {},
             );

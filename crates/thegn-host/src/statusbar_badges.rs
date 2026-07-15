@@ -220,6 +220,7 @@ mod tests {
             result_oid: None,
             conflict_paths: None,
             error_detail: None,
+            location: String::new(),
         }
     }
 

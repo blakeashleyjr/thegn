@@ -69,7 +69,7 @@ use std::path::PathBuf;
 /// [`crate::store::HibernationStore`] — DDL in `db_migrate`).
 /// v40: adds `daemons`/`session_leases`/`pairings` (the control-plane registry;
 /// see [`crate::store::ControlStore`] — DDL in `db_control`).
-pub const SCHEMA_VERSION: i64 = 43;
+pub const SCHEMA_VERSION: i64 = 44;
 
 pub struct Db {
     conn: Connection,
@@ -99,6 +99,13 @@ pub struct MergeQueueRow {
     pub result_oid: Option<String>,
     pub conflict_paths: Option<String>,
     pub error_detail: Option<String>,
+    /// The worktree's `location` descriptor (mirrored from `worktrees.location`
+    /// at enqueue time): empty/`local` for an on-host worktree, or a small JSON
+    /// ssh/provider blob. Lets the queue attribute a row to a host without a
+    /// live git shell — the cross-host drain reads it to decide whether the
+    /// branch tip must be fetched into the target store. See [`crate::remote`].
+    #[serde(default)]
+    pub location: String,
 }
 
 // Share/forward resurrection rows live in `models` (size-capped file); the
@@ -643,7 +650,11 @@ impl Db {
               updated_at     INTEGER NOT NULL,
               result_oid     TEXT,
               conflict_paths TEXT,
-              error_detail   TEXT
+              error_detail   TEXT,
+              -- v44: the worktree's location (mirrored from worktrees.location at
+              -- enqueue) so a cross-host drain can attribute a row to a host and
+              -- decide whether to fetch its tip into the target store.
+              location       TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_merge_queue_status
               ON merge_queue (status, queued_at);
