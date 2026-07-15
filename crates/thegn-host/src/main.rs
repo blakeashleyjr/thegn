@@ -20,6 +20,7 @@ mod autoscale;
 mod bar_nav;
 mod blast_radius;
 mod borders;
+mod branch_cache;
 mod bouncer;
 mod bridge_sup;
 mod build_cache;
