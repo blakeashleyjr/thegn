@@ -1314,6 +1314,26 @@ pub(crate) fn build_model(
         String::new()
     };
 
+    // A TERMINAL tab has no worktree path, so the `resolve_env` above resolved the
+    // launch cwd's workspace/global `[sandbox] default_env` — which wrongly labeled
+    // a plain local shell with the workspace's default provider env (e.g.
+    // `machine0`). A terminal's env is its own connection + sandbox, so override
+    // the tab-bar chip triple from its DB row.
+    let (active_placement_kind, active_placement_label, active_sandbox_backend) = if session
+        .active_group()
+        .is_some_and(|g| g.kind == crate::session::GroupKind::Terminal)
+    {
+        let name = session.active_group().map(|g| g.name.as_str());
+        let row = name.and_then(|n| sidebar_db_terminals.iter().find(|t| t.name == n));
+        crate::hydrate_terminal::terminal_env(row)
+    } else {
+        (
+            active_placement_kind,
+            active_placement_label,
+            active_sandbox_backend,
+        )
+    };
+
     tracing::debug!(
         target: "thegn::hydrate",
         build_model_ms = t0.elapsed().as_millis() as u64,
