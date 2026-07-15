@@ -9694,11 +9694,7 @@ async fn event_loop<T: Terminal>(
                     // create worker's Register step — so a local pick against a
                     // provider ambient default doesn't briefly show the provider.
                     let selected = akey.as_ref().and_then(|k| loading_state.env_for(k));
-                    crate::agent::loading_context(
-                        &current_config,
-                        &wt.to_string_lossy(),
-                        selected,
-                    )
+                    crate::agent::loading_context(&current_config, &wt.to_string_lossy(), selected)
                 };
                 dirty = true;
             }
