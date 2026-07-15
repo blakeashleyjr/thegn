@@ -4,7 +4,7 @@
 
 The merge queue folds every queued branch into **one target repo's object
 store** — the host where the target branch (`main`) lives. Until now every part
-of that path assumed the target store and *every* queued worktree sat on the
+of that path assumed the target store and _every_ queued worktree sat on the
 local machine: queue rows carried no host, repo-membership was resolved by
 shelling `git worktree list` on the local FS (so a queued worktree on another
 machine resolved to nothing and was **silently dropped from the drain**), and a
@@ -52,7 +52,7 @@ queue lagged: it is the one write path, and its object-DB fold is intrinsically
 tied to a single store. Rather than teach the fold to reach across stores over
 ssh per-operation (slow, and the throwaway gate worktree + CAS don't port
 cleanly), the queue is **anchored to the target store's host** and only the
-*branch tips* cross the wire — the smallest thing that must move — via the same
+_branch tips_ cross the wire — the smallest thing that must move — via the same
 git-bundle mechanism the remote-worktree sync already uses.
 
 ## Non-goals

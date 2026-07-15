@@ -727,7 +727,8 @@ pub(crate) fn attempt_land(
     // tip into the target store first and fold that synthetic ref — a bare
     // `refs/heads/<branch>` only exists in the branch host's own object store.
     // A same-store branch just yields `refs/heads/<branch>` (no I/O).
-    let branch_ref = match crate::merge_remote::ensure_tip_in_target(&loc, branch_name, branch_loc) {
+    let branch_ref = match crate::merge_remote::ensure_tip_in_target(&loc, branch_name, branch_loc)
+    {
         Ok(r) => r,
         Err(e) => {
             return Ok(AttemptOutcome::Unreachable {
@@ -1085,7 +1086,14 @@ mod tests {
         repo.feature("b1", "a.txt", "a\n");
         let before = repo.out(&["rev-parse", "main"]);
 
-        match attempt_land(&cfg("false"), &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap() {
+        match attempt_land(
+            &cfg("false"),
+            &repo.dir,
+            "b1",
+            &GitLoc::Local(repo.dir.clone()),
+        )
+        .unwrap()
+        {
             AttemptOutcome::GateFailed { .. } => {}
             o => panic!("expected GateFailed, got {o:?}"),
         }
