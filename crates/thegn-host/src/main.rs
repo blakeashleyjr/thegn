@@ -21,6 +21,7 @@ mod bar_nav;
 mod blast_radius;
 mod borders;
 mod bouncer;
+mod branch_cache;
 mod bridge_sup;
 mod build_cache;
 mod caps;
