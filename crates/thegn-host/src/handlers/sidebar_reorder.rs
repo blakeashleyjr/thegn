@@ -149,11 +149,11 @@ impl SidebarState {
         }
     }
 
-    /// Move the workspace with this `slug` one slot, swapping its persisted
-    /// `position` with the adjacent DB-backed workspace and mirroring the swap
-    /// into `model.sidebar_workspaces` so it shows at once. Live-only workspaces
-    /// (no DB row, hence no position) are skipped. Rebuilds; the caller places
-    /// the cursor. Returns whether it moved.
+    /// Move the workspace with this `slug` one slot: swap it with its adjacent
+    /// neighbor in `model.sidebar_workspaces` so it shows at once, then persist
+    /// the **entire** new order via `set_workspace_order`. Live-only workspaces
+    /// (no DB row) are skipped. Rebuilds; the caller places the cursor. Returns
+    /// whether it moved.
     ///
     /// The neighbor is chosen from the **visible** workspace order
     /// (`sidebar_rows`) — the order the user sees and the Shift+Alt nav ring
@@ -161,6 +161,13 @@ impl SidebarState {
     /// can differ from the raw `sidebar_workspaces` order; picking the neighbor
     /// here (not from the raw vec) keeps the persisted order following what's on
     /// screen. With no pins the two orders coincide, so behaviour is unchanged.
+    ///
+    /// Persisting the whole order (not a two-position swap) is deliberate: the
+    /// nav ring is rebuilt from `db.workspaces()` on the next hydration, and a
+    /// swap that relies on `normalize_workspace_positions` can seed positions in
+    /// a different order than the tree shows when positions are NULL/tied — so
+    /// the ring would walk an order the user never arranged. Writing
+    /// `position = index` over the current order makes the reload verbatim.
     pub(crate) fn move_workspace_by_slug(
         &mut self,
         model: &mut FrameModel,
@@ -192,27 +199,36 @@ impl SidebarState {
         let Some(np) = neighbor else { return false };
         let neighbor_slug = visible[np].clone();
 
-        // Map both slugs back to their `sidebar_workspaces` slot + repo path for
-        // the swap.
-        let slot = |model: &FrameModel, s: &str| -> Option<(usize, String)> {
+        // Map both slugs back to their `sidebar_workspaces` slot for the swap.
+        let slot = |model: &FrameModel, s: &str| -> Option<usize> {
             model
                 .sidebar_workspaces
                 .iter()
                 .position(|(ws, _, _, _)| ws == s)
-                .map(|i| (i, model.sidebar_workspaces[i].3.clone()))
         };
-        let (Some((ia, repo_a)), Some((ib, repo_b))) =
-            (slot(model, slug), slot(model, &neighbor_slug))
-        else {
+        let (Some(ia), Some(ib)) = (slot(model, slug), slot(model, &neighbor_slug)) else {
             return false;
         };
 
-        if let Ok(db) = thegn_core::db::Db::open() {
-            // best-effort: same cache rule as the worktree swap above — the
-            // live model swap below is the user-visible move
-            let _ = db.swap_workspace_positions(&repo_a, &repo_b);
-        }
         model.sidebar_workspaces.swap(ia, ib);
+        // Persist the ENTIRE new on-screen order (not a two-position swap): the
+        // nav ring is rebuilt from `db.workspaces()` on the next hydration, and
+        // a swap that leans on `normalize_workspace_positions` can seed a
+        // different order than the tree shows when positions are NULL/tied
+        // (a different tiebreak) — so the ring would walk an order the user
+        // never arranged. Writing `position = index` over the current order
+        // makes the reload reproduce exactly what's on screen.
+        let order: Vec<String> = model
+            .sidebar_workspaces
+            .iter()
+            .filter(|(_, _, _, path)| !path.is_empty())
+            .map(|(_, _, _, path)| path.clone())
+            .collect();
+        if let Ok(db) = thegn_core::db::Db::open() {
+            // best-effort: the DB is a cache — the in-memory swap above is the
+            // user-visible move; a failed persist only loses order across restart
+            let _ = db.set_workspace_order(&order);
+        }
         self.rebuild(model, session);
         true
     }
@@ -706,6 +722,69 @@ mod tests {
             order,
             vec!["zed", "app", "lib"],
             "the app+lib block moved down"
+        );
+    }
+
+    #[test]
+    fn workspace_reorder_persisted_order_matches_tree_after_db_reload() {
+        // The Shift+Alt nav ring is rebuilt from `db.workspaces()` on the next
+        // hydration, so the persisted order MUST equal what the tree shows after
+        // a manual reorder. Regression: with NULL/tied positions (migrate_brand
+        // / db_zones inserts), the swap+`normalize_workspace_positions` path
+        // seeded positions by a `repo_path` tiebreak that differs from the
+        // on-screen order, so the ring walked an order the user never arranged.
+        // Persisting the whole visible order fixes it. Register real DB rows so
+        // the persist + reload actually round-trips (the other reorder tests use
+        // throwaway paths where the DB write no-ops).
+        let _db = DbGuard::new("ws-reload");
+        let db = thegn_core::db::Db::open().unwrap();
+        // Tie every position to reproduce the hazard; insertion order (wc, wb,
+        // wa) is deliberately the reverse of `repo_path` ASC so the old
+        // normalize tiebreak would diverge from the on-screen order.
+        for (path, name) in [("/tmp/wc", "wc"), ("/tmp/wb", "wb"), ("/tmp/wa", "wa")] {
+            db.put_workspace(path, name, "repo").unwrap();
+            db.set_workspace_position(path, 0).unwrap();
+        }
+        // Home group belongs to `wa` so its live-fallback slug is already in the
+        // DB list — no extra trailing workspace to skew the reload assertion.
+        let session = Session {
+            id: "/tmp/wa".into(),
+            worktrees: vec![WorktreeGroup::new("wa/home", GroupKind::Home, "/tmp/wa")],
+            active: 0,
+        };
+        let mut model = build_initial_model(&session, None);
+        // Explicit on-screen order [wc, wb, wa] (independent of any SQLite
+        // tie-order), matching the registered DB rows.
+        model.sidebar_workspaces = vec![
+            ("wc".into(), "wc".into(), "repo".into(), "/tmp/wc".into()),
+            ("wb".into(), "wb".into(), "repo".into(), "/tmp/wb".into()),
+            ("wa".into(), "wa".into(), "repo".into(), "/tmp/wa".into()),
+        ];
+        let mut sb = focused(&mut model, &session);
+
+        let visible = |model: &FrameModel| -> Vec<String> {
+            model
+                .sidebar_rows
+                .iter()
+                .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Workspace)
+                .map(|r| r.workspace_slug.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Move `wa` (bottom) up one → on-screen order [wc, wa, wb].
+        assert!(sb.move_workspace_by_slug(&mut model, &session, "wa", true));
+        assert_eq!(visible(&model), vec!["wc", "wa", "wb"]);
+
+        // The reload the nav ring rebuilds from must equal the on-screen order.
+        let reload: Vec<String> = crate::hydrate::workspace_list(&session, Some(&db))
+            .into_iter()
+            .map(|(slug, ..)| slug)
+            .collect();
+        assert_eq!(
+            reload,
+            vec!["wc", "wa", "wb"],
+            "db.workspaces() reload must match the reordered tree, not a \
+             normalize-tiebreak order"
         );
     }
 }
