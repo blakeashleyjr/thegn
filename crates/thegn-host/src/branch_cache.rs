@@ -82,7 +82,10 @@ mod tests {
 
     #[test]
     fn fresh_entry_serves_from_cache() {
-        assert!(!should_refetch(Some(Duration::from_millis(0)), BRANCH_CACHE_TTL));
+        assert!(!should_refetch(
+            Some(Duration::from_millis(0)),
+            BRANCH_CACHE_TTL
+        ));
         assert!(!should_refetch(
             Some(BRANCH_CACHE_TTL - Duration::from_millis(1)),
             BRANCH_CACHE_TTL
