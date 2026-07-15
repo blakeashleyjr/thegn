@@ -181,9 +181,9 @@ fn merge_queue_enqueue_update_list_and_remove() {
 fn get_all_issue_cache_returns_every_provider_for_a_repo() {
     let db = db();
     assert!(db.get_all_issue_cache("/repo").unwrap().is_empty());
-    db.put_issue_cache("/repo", "linear", "[1]").unwrap();
-    db.put_issue_cache("/repo", "jira", "[2]").unwrap();
-    db.put_issue_cache("/other", "github", "[3]").unwrap();
+    db.put_issue_cache("/repo", "linear", "", "[1]").unwrap();
+    db.put_issue_cache("/repo", "jira", "", "[2]").unwrap();
+    db.put_issue_cache("/other", "github", "", "[3]").unwrap();
     let mut got = db.get_all_issue_cache("/repo").unwrap();
     got.sort();
     assert_eq!(
@@ -195,6 +195,10 @@ fn get_all_issue_cache_returns_every_provider_for_a_repo() {
     );
     // A different repo's providers are not mixed in.
     assert_eq!(db.get_all_issue_cache("/other").unwrap().len(), 1);
+    // Two accounts of the same provider cache independently and both surface.
+    db.put_issue_cache("/repo", "linear", "work", "[9]")
+        .unwrap();
+    assert_eq!(db.get_all_issue_cache("/repo").unwrap().len(), 3);
 }
 
 #[test]
@@ -1390,19 +1394,34 @@ fn ui_state_roundtrip_upsert_and_scope_isolation() {
 fn issue_cache_roundtrips_and_updates() {
     let db = db();
     // Cold cache returns None.
-    assert!(db.get_issue_cache("/repo", "linear").unwrap().is_none());
+    assert!(db.get_issue_cache("/repo", "linear", "").unwrap().is_none());
     // Write and read back.
-    db.put_issue_cache("/repo", "linear", r#"[{"id":"linear:A-1"}]"#)
+    db.put_issue_cache("/repo", "linear", "", r#"[{"id":"linear:A-1"}]"#)
         .unwrap();
-    let (json, ts) = db.get_issue_cache("/repo", "linear").unwrap().unwrap();
+    let (json, ts) = db.get_issue_cache("/repo", "linear", "").unwrap().unwrap();
     assert_eq!(json, r#"[{"id":"linear:A-1"}]"#);
     assert!(ts > 0);
     // Different provider is independent.
-    assert!(db.get_issue_cache("/repo", "github").unwrap().is_none());
-    // Upsert overwrites.
-    db.put_issue_cache("/repo", "linear", r#"[{"id":"linear:A-2"}]"#)
+    assert!(db.get_issue_cache("/repo", "github", "").unwrap().is_none());
+    // A different account of the same provider is independent.
+    assert!(
+        db.get_issue_cache("/repo", "linear", "work")
+            .unwrap()
+            .is_none()
+    );
+    db.put_issue_cache("/repo", "linear", "work", r#"[{"id":"linear:W-1"}]"#)
         .unwrap();
-    let (json2, _) = db.get_issue_cache("/repo", "linear").unwrap().unwrap();
+    assert_eq!(
+        db.get_issue_cache("/repo", "linear", "work")
+            .unwrap()
+            .unwrap()
+            .0,
+        r#"[{"id":"linear:W-1"}]"#
+    );
+    // Upsert overwrites the same (provider, account).
+    db.put_issue_cache("/repo", "linear", "", r#"[{"id":"linear:A-2"}]"#)
+        .unwrap();
+    let (json2, _) = db.get_issue_cache("/repo", "linear", "").unwrap().unwrap();
     assert_eq!(json2, r#"[{"id":"linear:A-2"}]"#);
 }
 

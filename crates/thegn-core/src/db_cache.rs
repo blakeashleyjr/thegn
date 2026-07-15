@@ -111,12 +111,18 @@ impl CacheStore for Db {
         Ok(counts)
     }
 
-    fn get_issue_cache(&self, repo_root: &str, provider: &str) -> Result<Option<(String, i64)>> {
+    fn get_issue_cache(
+        &self,
+        repo_root: &str,
+        provider: &str,
+        account: &str,
+    ) -> Result<Option<(String, i64)>> {
         let r = self
             .conn()
             .query_row(
-                "SELECT json, fetched_at FROM issue_cache WHERE repo_root=?1 AND provider=?2",
-                params![repo_root, provider],
+                "SELECT json, fetched_at FROM issue_cache \
+                 WHERE repo_root=?1 AND provider=?2 AND account=?3",
+                params![repo_root, provider, account],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
             .ok();
@@ -133,12 +139,18 @@ impl CacheStore for Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    fn put_issue_cache(&self, repo_root: &str, provider: &str, json: &str) -> Result<()> {
+    fn put_issue_cache(
+        &self,
+        repo_root: &str,
+        provider: &str,
+        account: &str,
+        json: &str,
+    ) -> Result<()> {
         self.conn().execute(
-            r#"INSERT INTO issue_cache(repo_root,provider,json,fetched_at)
-               VALUES(?1,?2,?3,?4)
-               ON CONFLICT(repo_root,provider) DO UPDATE SET json=?3, fetched_at=?4"#,
-            params![repo_root, provider, json, util::now()],
+            r#"INSERT INTO issue_cache(repo_root,provider,account,json,fetched_at)
+               VALUES(?1,?2,?3,?4,?5)
+               ON CONFLICT(repo_root,provider,account) DO UPDATE SET json=?4, fetched_at=?5"#,
+            params![repo_root, provider, account, json, util::now()],
         )?;
         Ok(())
     }
