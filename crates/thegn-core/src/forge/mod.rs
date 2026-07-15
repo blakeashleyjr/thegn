@@ -248,6 +248,18 @@ pub fn detect_forge(_loc: &GitLoc) -> Box<dyn Forge> {
     Box::new(GitHubForge::new())
 }
 
+/// Pick a forge implementation for a configured `[[forges]]` entry's
+/// [`ForgeKind`](crate::config::ForgeKind). GitHub and GitHub Enterprise drive
+/// the `gh` CLI; Forgejo/Gitea return the stub whose methods error gracefully
+/// (config surface only — their API clients aren't wired yet).
+pub fn forge_for_kind(kind: crate::config::ForgeKind) -> Box<dyn Forge> {
+    use crate::config::ForgeKind;
+    match kind {
+        ForgeKind::Github | ForgeKind::Ghe => Box::new(GitHubForge::new()),
+        ForgeKind::Forgejo | ForgeKind::Gitea => Box::new(ForgejoForge::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +286,23 @@ mod tests {
             extract_issue_from_branch("123/fix-bug-and-stuff"),
             Some(123)
         );
+    }
+
+    #[test]
+    fn forge_for_kind_maps_kinds_to_impls() {
+        use crate::config::ForgeKind;
+        // github / ghe drive the gh CLI (constructing the box is the coverage;
+        // we don't call network methods here).
+        let _ = forge_for_kind(ForgeKind::Github);
+        let _ = forge_for_kind(ForgeKind::Ghe);
+        // forgejo / gitea map to the stub, whose methods error gracefully.
+        let loc = crate::remote::GitLoc::Local(std::path::PathBuf::from("/tmp/x"));
+        for kind in [ForgeKind::Forgejo, ForgeKind::Gitea] {
+            let f = forge_for_kind(kind);
+            assert!(matches!(
+                f.list_issues(&loc, "open"),
+                Err(ForgeError::Other(_))
+            ));
+        }
     }
 }

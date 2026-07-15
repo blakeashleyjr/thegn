@@ -160,6 +160,13 @@ pub(crate) fn handle_key_event(
                 &mut applied,
             );
             ob.ui = None;
+            // A dismissed wizard drops any live theme preview back to the saved
+            // theme. A completed wizard already persisted `theme.preset` (the
+            // live preview matches it, and the config watcher reconciles the
+            // in-memory `cfg`), so leave the previewed palette in place.
+            if !completed {
+                crate::chrome::set_palette(cfg.palette());
+            }
             persist_done();
             model.status = if completed {
                 "setup complete — re-run any time with `thegn setup`".into()
@@ -169,6 +176,21 @@ pub(crate) fn handle_key_event(
         }
     }
     applied
+}
+
+/// Resolve a token to the value written into config: an empty token stays
+/// empty, an already-`ref` token is passed through verbatim (legacy
+/// materialization), and a raw token is stored via the secret backend and
+/// replaced by its SecretRef (config never holds raw tokens).
+fn resolve_token(secret_name: &str, token: &str, is_ref: bool) -> anyhow::Result<String> {
+    let t = token.trim();
+    if t.is_empty() {
+        Ok(String::new())
+    } else if is_ref {
+        Ok(t.to_string())
+    } else {
+        crate::secret::store(secret_name, t)
+    }
 }
 
 /// Mark the wizard as seen so it stops auto-opening.
@@ -201,8 +223,6 @@ fn run_effects(
             WriteOp::SetArray { key, items } => {
                 thegn_core::config_write::set_string_array(&path, &key, &items)
             }
-            WriteOp::Secret { name, key, token } => crate::secret::store(&name, &token)
-                .and_then(|sref| thegn_core::config_write::set_key(&path, &key, &sref)),
             WriteOp::Host { name, ssh } => {
                 thegn_core::config_write::upsert_host(&path, &name, &ssh)
             }
@@ -211,6 +231,38 @@ fn run_effects(
                 applied.keymap_changed = true;
                 Ok(())
             }
+            WriteOp::UpsertIssueAccount {
+                name,
+                provider,
+                token,
+                token_is_ref,
+                team_id,
+                workspace_slug,
+                base_url,
+                email,
+                project_key,
+            } => resolve_token(&format!("issues-{name}"), &token, token_is_ref).and_then(|tref| {
+                thegn_core::config_write::upsert_issue_account(
+                    &path,
+                    &name,
+                    &provider,
+                    &tref,
+                    &team_id,
+                    &workspace_slug,
+                    &base_url,
+                    &email,
+                    &project_key,
+                )
+            }),
+            WriteOp::UpsertForge {
+                name,
+                kind,
+                host,
+                token,
+                token_is_ref,
+            } => resolve_token(&format!("forge-{name}"), &token, token_is_ref).and_then(|tref| {
+                thegn_core::config_write::upsert_forge(&path, &name, &kind, &host, &tref)
+            }),
         };
         match r {
             Ok(()) => wrote += 1,
@@ -226,6 +278,13 @@ fn run_effects(
             if wrote == 1 { "" } else { "s" },
             path.display()
         );
+    }
+    // Live theme preview: apply the previewed preset to the runtime palette
+    // (colors land on the next repaint; the caller sets `dirty`). Not persisted
+    // — the actual `theme.preset` write rides `leave_writes` on step advance,
+    // and a dismissed wizard reverts via `chrome::set_palette(cfg.palette())`.
+    if let Some(name) = effects.preview_theme {
+        crate::chrome::set_palette(cfg.palette_with_preset(&name));
     }
     if let Some(req) = effects.probe {
         spawn_probe(req, refresh_tx.clone(), waker.clone());

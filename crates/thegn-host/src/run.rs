@@ -10209,10 +10209,14 @@ async fn event_loop<T: Terminal>(
                 menu: active_menu.is_some(),
                 git_input: git_input.is_some(),
                 host_input: host_input.is_some(),
-                // The workspace picker is a centered modal like the wizard;
-                // fold it into the same overlay flag so pane-only damage can't
-                // erase it.
-                wizard: wizard_ui.is_some() || workspace_picker.is_some(),
+                // Every centered modal (picker + onboarding/terminal/env/new-
+                // worktree wizards) folds into one flag so pane-only damage
+                // can't erase it.
+                wizard: wizard_ui.is_some()
+                    || workspace_picker.is_some()
+                    || onboarding.active()
+                    || terminal_wizard_ui.is_some()
+                    || env_wizard_ui.is_some(),
                 hover: hover_popup.is_some(),
                 search: search.is_some(),
                 which_key: !which_key.is_empty(),
@@ -10713,13 +10717,21 @@ async fn event_loop<T: Terminal>(
             } else {
                 front.diff_screens(&scratch)
             };
+            // A fullscreen modal owns the screen + draws its own caret; park the
+            // hardware cursor so the focused pane's caret can't bleed through it.
+            let fullscreen_modal = palette.is_some()
+                || wizard_ui.is_some()
+                || onboarding.active()
+                || terminal_wizard_ui.is_some()
+                || env_wizard_ui.is_some()
+                || workspace_picker.is_some();
             if app_tile_active {
                 // The app tile owns the band; no host hardware cursor (the tile
                 // draws its own caret if it wants one).
                 pending.push(Change::CursorVisibility(
                     termwiz::surface::CursorVisibility::Hidden,
                 ));
-            } else if palette.is_none() && wizard_ui.is_none() {
+            } else if !fullscreen_modal {
                 // The creation toast is non-modal — the focused pane keeps its
                 // hardware cursor while a worktree builds in the background.
                 // The hardware cursor sits in the focused pane's CONTENT rect

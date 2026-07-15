@@ -74,13 +74,20 @@ enum Field {
     RepoRoots,
     // Forge
     ForgeAction,
+    ForgeName,
+    ForgeKind,
+    ForgeHost,
+    ForgeToken,
+    ForgeAccountAction,
     // Issues
     IssuesProvider,
+    IssuesName,
     IssuesToken,
     LinearTeam,
     JiraUrl,
     JiraEmail,
     JiraProject,
+    IssuesAction,
     // Hosts
     HostName,
     HostSsh,
@@ -141,16 +148,34 @@ pub enum WriteOp {
     Set { key: String, value: String },
     /// `config_write::set_string_array` on the global config.
     SetArray { key: String, items: Vec<String> },
-    /// Store `token` via the secret backend and point `key` at the ref.
-    Secret {
-        name: String,
-        key: String,
-        token: String,
-    },
     /// `config_write::upsert_host`: `[host.<name>]` + `[host.<name>.ssh]`.
     Host { name: String, ssh: String },
     /// The keymap preset (persisted to `ui_state`, not the config file).
     KeymapPreset(String),
+    /// `config_write::upsert_issue_account`: a `[[issue_accounts]]` entry.
+    /// `token` is a RAW token to be stored via the secret backend unless
+    /// `token_is_ref` (then it's an existing SecretRef, written verbatim —
+    /// used when materializing a legacy single-provider config into an account).
+    UpsertIssueAccount {
+        name: String,
+        provider: String,
+        token: String,
+        token_is_ref: bool,
+        team_id: String,
+        workspace_slug: String,
+        base_url: String,
+        email: String,
+        project_key: String,
+    },
+    /// `config_write::upsert_forge`: a `[[forges]]` entry. `token` raw unless
+    /// `token_is_ref`.
+    UpsertForge {
+        name: String,
+        kind: String,
+        host: String,
+        token: String,
+        token_is_ref: bool,
+    },
 }
 
 /// Side effects for the loop to perform. The wizard stays pure; the loop's
@@ -163,6 +188,9 @@ pub struct Effects {
     pub login: bool,
     /// Spawn `thegn agent setup` in an interactive pane.
     pub agent_setup: bool,
+    /// Live-apply this theme preset to the runtime palette (preview only, not
+    /// persisted): set while cycling the Appearance step's theme field.
+    pub preview_theme: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +208,13 @@ pub enum Outcome {
 
 const KEYMAP_PRESETS: &[&str] = &["default", "vscode", "jetbrains"];
 const ISSUE_PROVIDERS: &[&str] = &["none", "github", "linear", "jira"];
+const FORGE_KINDS: &[&str] = &["github", "ghe", "forgejo", "gitea"];
+
+/// Push a blank spacer line followed by `line` (a small body-lines helper).
+fn blank_then(lines: &mut Vec<Line>, line: Line) {
+    lines.push(Line::segs(vec![sp(0)]));
+    lines.push(line);
+}
 const SANDBOX_PROFILES: &[&str] = &["hardened", "open", "sealed", "sealed-tunnel"];
 
 pub struct OnboardingWizard {
@@ -192,20 +227,35 @@ pub struct OnboardingWizard {
     init_keymap: String,
     init_backend: String,
     init_profile: String,
-    init_issues_provider: String,
     // Paths
     worktrees_dir: String,
     repo_roots: String,
     // Forge
     forge: Probe<ForgeStatus>,
     forge_action: usize,
+    // Forge accounts (`[[forges]]`) — draft + running list of (name, kind).
+    forge_name: String,
+    forge_kind_sel: usize,
+    forge_host: String,
+    forge_token: String,
+    forge_account_action: usize,
+    forges: Vec<(String, String)>,
     // Issues
     issues_sel: usize,
+    issue_name: String,
     issues_token: String,
     linear_team: String,
     jira_url: String,
     jira_email: String,
     jira_project: String,
+    issues_action: usize,
+    // Issue accounts (`[[issue_accounts]]`) — running list of (name, provider).
+    issue_accounts: Vec<(String, String)>,
+    // Writes that materialize a legacy single-provider config into explicit
+    // `[[issue_accounts]]` on the first user add, so switching to explicit
+    // accounts never silently drops the legacy provider. Emitted once.
+    legacy_issue_seed: Vec<WriteOp>,
+    materialized_legacy: bool,
     // Hosts
     host_name: String,
     host_ssh: String,
@@ -240,12 +290,6 @@ impl OnboardingWizard {
         } else {
             cfg.keymap_preset.clone()
         };
-        let issues_provider = cfg
-            .issues
-            .active_providers()
-            .first()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_else(|| "none".to_string());
         // Cycle rows: "auto" + the effective chain (a concrete configured
         // backend collapses the chain to itself, mirroring doctor's view).
         let mut sandbox_rows = vec!["auto".to_string()];
@@ -262,6 +306,40 @@ impl OnboardingWizard {
             );
         }
         let pos = |list: &[&str], v: &str| list.iter().position(|x| *x == v).unwrap_or(0);
+        // Explicit issue accounts already in config → the display list.
+        let issue_accounts: Vec<(String, String)> = cfg
+            .issues
+            .issue_accounts
+            .iter()
+            .map(|a| (a.name.clone(), a.provider.as_str().to_string()))
+            .collect();
+        // A legacy single-provider config (no explicit accounts) synthesizes
+        // accounts; capture their writes so the first user add materializes them
+        // as explicit entries (tokens are already SecretRefs → written verbatim).
+        let legacy_issue_seed: Vec<WriteOp> = if cfg.issues.issue_accounts.is_empty() {
+            cfg.issues
+                .active_accounts()
+                .into_iter()
+                .map(|a| WriteOp::UpsertIssueAccount {
+                    name: a.name,
+                    provider: a.provider.as_str().to_string(),
+                    token: a.token,
+                    token_is_ref: true,
+                    team_id: a.team_id,
+                    workspace_slug: a.workspace_slug,
+                    base_url: a.base_url,
+                    email: a.email,
+                    project_key: a.project_key,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let forges: Vec<(String, String)> = cfg
+            .forges
+            .iter()
+            .map(|f| (f.name.clone(), f.kind.as_str().to_string()))
+            .collect();
         OnboardingWizard {
             step: Step::Welcome,
             focus: Field::ForgeAction, // unused until a fielded step; reset on entry
@@ -271,17 +349,29 @@ impl OnboardingWizard {
             init_keymap: keymap.clone(),
             init_backend: backend.clone(),
             init_profile: profile.clone(),
-            init_issues_provider: issues_provider.clone(),
             worktrees_dir: cfg.worktrees_dir.clone(),
             repo_roots,
             forge: Probe::Idle,
             forge_action: 0,
-            issues_sel: pos(ISSUE_PROVIDERS, &issues_provider),
+            forge_name: String::new(),
+            forge_kind_sel: 0,
+            forge_host: String::new(),
+            forge_token: String::new(),
+            forge_account_action: 0,
+            forges,
+            // The draft provider starts at "none" so a re-run doesn't re-add an
+            // existing account; the display list shows what's already configured.
+            issues_sel: pos(ISSUE_PROVIDERS, "none"),
+            issue_name: String::new(),
             issues_token: String::new(),
             linear_team: String::new(),
             jira_url: String::new(),
             jira_email: String::new(),
             jira_project: String::new(),
+            issues_action: 0,
+            issue_accounts,
+            legacy_issue_seed,
+            materialized_legacy: false,
             host_name: String::new(),
             host_ssh: String::new(),
             sandbox_sel: sandbox_rows.iter().position(|b| *b == backend).unwrap_or(0),
@@ -331,18 +421,37 @@ impl OnboardingWizard {
         match self.step {
             Step::Welcome | Step::Tour => vec![],
             Step::Paths => vec![Field::WorktreesDir, Field::RepoRoots],
-            Step::Forge => vec![Field::ForgeAction],
+            Step::Forge => {
+                let mut f = vec![Field::ForgeAction, Field::ForgeName, Field::ForgeKind];
+                // github.com needs no host/token (the `gh` CLI owns auth); the
+                // others take a host + optional token.
+                if self.forge_kind() != "github" {
+                    f.extend([Field::ForgeHost, Field::ForgeToken]);
+                }
+                f.push(Field::ForgeAccountAction);
+                f
+            }
             Step::Issues => {
                 let mut f = vec![Field::IssuesProvider];
                 match self.issues_provider() {
-                    "linear" => f.extend([Field::IssuesToken, Field::LinearTeam]),
+                    "linear" => {
+                        f.extend([Field::IssuesName, Field::IssuesToken, Field::LinearTeam])
+                    }
                     "jira" => f.extend([
+                        Field::IssuesName,
                         Field::IssuesToken,
                         Field::JiraUrl,
                         Field::JiraEmail,
                         Field::JiraProject,
                     ]),
+                    "github" => f.push(Field::IssuesName),
                     _ => {}
+                }
+                // The action row (add account / continue) is always the last row
+                // once a provider is chosen; with "none" the provider row is the
+                // only field and Enter advances.
+                if self.issues_provider() != "none" {
+                    f.push(Field::IssuesAction);
                 }
                 f
             }
@@ -405,55 +514,9 @@ impl OnboardingWizard {
                     });
                 }
             }
-            Step::Issues => {
-                let provider = self.issues_provider();
-                if changed(provider, &self.init_issues_provider) {
-                    w.push(WriteOp::Set {
-                        key: "issues.provider".into(),
-                        value: provider.to_string(),
-                    });
-                }
-                let token = self.issues_token.trim();
-                match provider {
-                    "linear" => {
-                        if !token.is_empty() {
-                            w.push(WriteOp::Secret {
-                                name: "issues-linear".into(),
-                                key: "issues.linear.api_key".into(),
-                                token: token.to_string(),
-                            });
-                        }
-                        if !self.linear_team.trim().is_empty() {
-                            w.push(WriteOp::Set {
-                                key: "issues.linear.team_id".into(),
-                                value: self.linear_team.trim().to_string(),
-                            });
-                        }
-                    }
-                    "jira" => {
-                        if !token.is_empty() {
-                            w.push(WriteOp::Secret {
-                                name: "issues-jira".into(),
-                                key: "issues.jira.api_token".into(),
-                                token: token.to_string(),
-                            });
-                        }
-                        for (key, val) in [
-                            ("issues.jira.base_url", &self.jira_url),
-                            ("issues.jira.email", &self.jira_email),
-                            ("issues.jira.project_key", &self.jira_project),
-                        ] {
-                            if !val.trim().is_empty() {
-                                w.push(WriteOp::Set {
-                                    key: key.into(),
-                                    value: val.trim().to_string(),
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            // Issues + Forge accounts are committed as `[[issue_accounts]]` /
+            // `[[forges]]` entries by `commit_issue_draft`/`commit_forge_draft`
+            // (via the action row or `advance`), not here.
             Step::Hosts => {
                 let (name, ssh) = (self.host_name.trim(), self.host_ssh.trim());
                 if !name.is_empty() && !ssh.is_empty() {
@@ -499,8 +562,17 @@ impl OnboardingWizard {
 
     /// Advance past the current step (writes + next step's probe), or finish.
     fn advance(&mut self) -> Outcome {
+        let mut writes = self.leave_writes();
+        // Commit any filled-but-not-explicitly-added issue/forge draft so a user
+        // who fills the form and just hits "continue" doesn't lose it.
+        if self.step == Step::Issues {
+            writes.extend(self.commit_issue_draft());
+        }
+        if self.step == Step::Forge {
+            writes.extend(self.commit_forge_draft());
+        }
         let mut effects = Effects {
-            writes: self.leave_writes(),
+            writes,
             ..Effects::default()
         };
         // A just-written host gets a reachability probe (result → status bar).
@@ -557,6 +629,124 @@ impl OnboardingWizard {
         ISSUE_PROVIDERS[self.issues_sel.min(ISSUE_PROVIDERS.len() - 1)]
     }
 
+    fn forge_kind(&self) -> &'static str {
+        FORGE_KINDS[self.forge_kind_sel.min(FORGE_KINDS.len() - 1)]
+    }
+
+    /// The issue action-row options: "add account" appears only when the draft
+    /// holds enough to save.
+    fn issues_actions(&self) -> Vec<&'static str> {
+        if self.issue_draft_has_content() {
+            vec!["add account", "continue"]
+        } else {
+            vec!["continue"]
+        }
+    }
+
+    /// The forge action-row options (the `[[forges]]` list, separate from the
+    /// `gh` auth action at the top of the step).
+    fn forge_account_actions(&self) -> Vec<&'static str> {
+        if self.forge_draft_has_content() {
+            vec!["add forge", "continue"]
+        } else {
+            vec!["continue"]
+        }
+    }
+
+    /// Does the issue draft hold enough to be worth saving as an account?
+    /// GitHub needs nothing but the provider choice; the rest need a token.
+    fn issue_draft_has_content(&self) -> bool {
+        match self.issues_provider() {
+            "none" => false,
+            "github" => true,
+            _ => !self.issues_token.trim().is_empty(),
+        }
+    }
+
+    /// A forge draft is saveable once it has a name.
+    fn forge_draft_has_content(&self) -> bool {
+        !self.forge_name.trim().is_empty()
+    }
+
+    /// Commit the current issue draft as a `[[issue_accounts]]` write (plus, on
+    /// the first add, the legacy-provider materialization), then clear the draft
+    /// (provider → none) so it isn't re-added. Returns the writes to apply.
+    fn commit_issue_draft(&mut self) -> Vec<WriteOp> {
+        if !self.issue_draft_has_content() {
+            return Vec::new();
+        }
+        let provider = self.issues_provider().to_string();
+        let name = if self.issue_name.trim().is_empty() {
+            let n = self
+                .issue_accounts
+                .iter()
+                .filter(|(_, p)| *p == provider)
+                .count()
+                + 1;
+            format!("{provider}-{n}")
+        } else {
+            self.issue_name.trim().to_string()
+        };
+        let mut writes = Vec::new();
+        // First explicit add while a legacy provider exists: materialize the
+        // legacy accounts so switching to explicit mode doesn't drop them.
+        if !self.materialized_legacy {
+            writes.append(&mut self.legacy_issue_seed);
+            self.materialized_legacy = true;
+        }
+        writes.push(WriteOp::UpsertIssueAccount {
+            name: name.clone(),
+            provider: provider.clone(),
+            token: self.issues_token.trim().to_string(),
+            token_is_ref: false,
+            team_id: self.linear_team.trim().to_string(),
+            workspace_slug: String::new(),
+            base_url: self.jira_url.trim().to_string(),
+            email: self.jira_email.trim().to_string(),
+            project_key: self.jira_project.trim().to_string(),
+        });
+        if !self.issue_accounts.iter().any(|(n, _)| *n == name) {
+            self.issue_accounts.push((name, provider));
+        }
+        self.issue_name.clear();
+        self.issues_token.clear();
+        self.linear_team.clear();
+        self.jira_url.clear();
+        self.jira_email.clear();
+        self.jira_project.clear();
+        self.issues_sel = 0; // reset to "none" so it isn't re-added on advance
+        self.issues_action = 0;
+        // Focus back to the provider row — the action row is gone now that the
+        // draft (provider) reset to "none".
+        self.focus = Field::IssuesProvider;
+        writes
+    }
+
+    /// Commit the current forge draft as a `[[forges]]` write, then clear it.
+    fn commit_forge_draft(&mut self) -> Vec<WriteOp> {
+        if !self.forge_draft_has_content() {
+            return Vec::new();
+        }
+        let name = self.forge_name.trim().to_string();
+        let kind = self.forge_kind().to_string();
+        let op = WriteOp::UpsertForge {
+            name: name.clone(),
+            kind: kind.clone(),
+            host: self.forge_host.trim().to_string(),
+            token: self.forge_token.trim().to_string(),
+            token_is_ref: false,
+        };
+        if !self.forges.iter().any(|(n, _)| *n == name) {
+            self.forges.push((name, kind));
+        }
+        self.forge_name.clear();
+        self.forge_host.clear();
+        self.forge_token.clear();
+        self.forge_account_action = 0;
+        self.focus = Field::ForgeName; // back to the top of the draft
+        vec![op]
+    }
+
     fn sandbox_backend(&self) -> &str {
         self.sandbox_rows
             .get(self.sandbox_sel)
@@ -587,6 +777,10 @@ impl OnboardingWizard {
             Field::JiraUrl => Some(&mut self.jira_url),
             Field::JiraEmail => Some(&mut self.jira_email),
             Field::JiraProject => Some(&mut self.jira_project),
+            Field::IssuesName => Some(&mut self.issue_name),
+            Field::ForgeName => Some(&mut self.forge_name),
+            Field::ForgeHost => Some(&mut self.forge_host),
+            Field::ForgeToken => Some(&mut self.forge_token),
             Field::HostName => Some(&mut self.host_name),
             Field::HostSsh => Some(&mut self.host_ssh),
             _ => None,
@@ -597,7 +791,10 @@ impl OnboardingWizard {
         matches!(
             f,
             Field::ForgeAction
+                | Field::ForgeKind
+                | Field::ForgeAccountAction
                 | Field::IssuesProvider
+                | Field::IssuesAction
                 | Field::SandboxBackend
                 | Field::SandboxProfile
                 | Field::ThemePreset
@@ -615,7 +812,17 @@ impl OnboardingWizard {
             Field::ForgeAction => {
                 self.forge_action = wrap(self.forge_action, self.forge_actions().len())
             }
+            Field::ForgeKind => self.forge_kind_sel = wrap(self.forge_kind_sel, FORGE_KINDS.len()),
+            Field::ForgeAccountAction => {
+                self.forge_account_action = wrap(
+                    self.forge_account_action,
+                    self.forge_account_actions().len(),
+                )
+            }
             Field::IssuesProvider => self.issues_sel = wrap(self.issues_sel, ISSUE_PROVIDERS.len()),
+            Field::IssuesAction => {
+                self.issues_action = wrap(self.issues_action, self.issues_actions().len())
+            }
             Field::SandboxBackend => {
                 self.sandbox_sel = wrap(self.sandbox_sel, self.sandbox_rows.len())
             }
@@ -671,11 +878,21 @@ impl OnboardingWizard {
         match key {
             KeyCode::UpArrow => self.move_focus(-1),
             KeyCode::DownArrow => self.move_focus(1),
-            KeyCode::LeftArrow if Self::is_cycle(self.focus) => self.cycle(-1),
-            KeyCode::RightArrow if Self::is_cycle(self.focus) => self.cycle(1),
+            KeyCode::LeftArrow if Self::is_cycle(self.focus) => {
+                self.cycle(-1);
+                if let Some(o) = self.theme_preview_outcome() {
+                    return o;
+                }
+            }
+            KeyCode::RightArrow if Self::is_cycle(self.focus) => {
+                self.cycle(1);
+                if let Some(o) = self.theme_preview_outcome() {
+                    return o;
+                }
+            }
             KeyCode::Enter => {
-                // Forge/Agent action rows dispatch on enter.
-                if self.step == Step::Forge {
+                // Forge gh-auth action row (login / re-check / continue).
+                if self.focus == Field::ForgeAction {
                     match self.forge_actions().get(self.forge_action).copied() {
                         Some("login now") => {
                             self.forge = Probe::Pending;
@@ -694,6 +911,29 @@ impl OnboardingWizard {
                         }
                         _ => return self.advance(),
                     }
+                }
+                // Issue / forge account action rows: add-and-stay, or continue.
+                if self.focus == Field::IssuesAction {
+                    return match self.issues_actions().get(self.issues_action).copied() {
+                        Some("add account") => Outcome::Do(Effects {
+                            writes: self.commit_issue_draft(),
+                            ..Effects::default()
+                        }),
+                        _ => self.advance(),
+                    };
+                }
+                if self.focus == Field::ForgeAccountAction {
+                    return match self
+                        .forge_account_actions()
+                        .get(self.forge_account_action)
+                        .copied()
+                    {
+                        Some("add forge") => Outcome::Do(Effects {
+                            writes: self.commit_forge_draft(),
+                            ..Effects::default()
+                        }),
+                        _ => self.advance(),
+                    };
                 }
                 if self.step == Step::Agent && self.focus == Field::AgentAction {
                     // enter on the action row runs setup AND advances; plain
@@ -732,6 +972,18 @@ impl OnboardingWizard {
 
     fn agent_run_selected(&self) -> bool {
         self.agent_run
+    }
+
+    /// When the Appearance theme field is focused, an effect that live-applies
+    /// the currently selected preset to the runtime palette. Preview only —
+    /// persistence still rides `leave_writes` on advance past the step.
+    fn theme_preview_outcome(&self) -> Option<Outcome> {
+        (self.focus == Field::ThemePreset).then(|| {
+            Outcome::Do(Effects {
+                preview_theme: Some(thegn_core::theme::PRESETS[self.theme_sel].to_string()),
+                ..Effects::default()
+            })
+        })
     }
 
     // ---- render ------------------------------------------------------------
@@ -861,17 +1113,63 @@ impl OnboardingWizard {
                     .get(self.forge_action)
                     .copied()
                     .unwrap_or("continue");
-                vec![
+                let mut lines = vec![
                     Line::segs(status),
                     blank(),
                     Line::segs(self.cycle_row(
-                        "action    ",
+                        "gh auth   ",
                         self.focus == Field::ForgeAction,
                         action,
                     )),
-                    blank(),
-                    note("PR panel, checks, and reviews ride the gh CLI's auth."),
-                ]
+                ];
+                lines.extend(self.configured_list("forges", &self.forges));
+                blank_then(
+                    &mut lines,
+                    note("add a forge (github.com, enterprise, forgejo/gitea):"),
+                );
+                lines.push(self.text_row(
+                    Field::ForgeName,
+                    "name      ",
+                    &self.forge_name,
+                    "· skip — no extra forge",
+                    false,
+                ));
+                lines.push(Line::segs(self.cycle_row(
+                    "kind      ",
+                    self.focus == Field::ForgeKind,
+                    self.forge_kind(),
+                )));
+                if self.forge_kind() != "github" {
+                    lines.push(self.text_row(
+                        Field::ForgeHost,
+                        "host      ",
+                        &self.forge_host,
+                        "git.example.com",
+                        false,
+                    ));
+                    lines.push(self.text_row(
+                        Field::ForgeToken,
+                        "token     ",
+                        &self.forge_token,
+                        "· optional (stored securely)",
+                        true,
+                    ));
+                }
+                let facction = self
+                    .forge_account_actions()
+                    .get(self.forge_account_action)
+                    .copied()
+                    .unwrap_or("continue");
+                lines.push(Line::segs(self.cycle_row(
+                    "          ",
+                    self.focus == Field::ForgeAccountAction,
+                    facction,
+                )));
+                blank_then(
+                    &mut lines,
+                    note("non-github forges are config-only for now (fetch: github)."),
+                );
+                lines
             }
             Step::Issues => {
                 let mut lines = vec![Line::segs(self.cycle_row(
@@ -881,6 +1179,13 @@ impl OnboardingWizard {
                 ))];
                 match self.issues_provider() {
                     "linear" => {
+                        lines.push(self.text_row(
+                            Field::IssuesName,
+                            "name      ",
+                            &self.issue_name,
+                            "· auto (linear-N)",
+                            false,
+                        ));
                         lines.push(self.text_row(
                             Field::IssuesToken,
                             "api key   ",
@@ -897,6 +1202,13 @@ impl OnboardingWizard {
                         ));
                     }
                     "jira" => {
+                        lines.push(self.text_row(
+                            Field::IssuesName,
+                            "name      ",
+                            &self.issue_name,
+                            "· auto (jira-N)",
+                            false,
+                        ));
                         lines.push(self.text_row(
                             Field::IssuesToken,
                             "api token ",
@@ -926,18 +1238,42 @@ impl OnboardingWizard {
                             false,
                         ));
                     }
-                    "github" => lines.push(note("github issues auto-scope to each repo's remote.")),
+                    "github" => {
+                        lines.push(self.text_row(
+                            Field::IssuesName,
+                            "name      ",
+                            &self.issue_name,
+                            "· auto (github-N)",
+                            false,
+                        ));
+                        lines.push(note("github issues auto-scope to each repo's remote."));
+                    }
                     _ => {}
                 }
-                lines.push(blank());
+                if self.issues_provider() != "none" {
+                    let action = self
+                        .issues_actions()
+                        .get(self.issues_action)
+                        .copied()
+                        .unwrap_or("continue");
+                    lines.push(Line::segs(self.cycle_row(
+                        "          ",
+                        self.focus == Field::IssuesAction,
+                        action,
+                    )));
+                }
+                lines.extend(self.configured_list("accounts", &self.issue_accounts));
                 let store = if self.keyring {
                     "OS keyring"
                 } else {
                     "0600 file"
                 };
-                lines.push(note(&format!(
-                    "issue feed is coming soon — config is saved now (tokens → {store})."
-                )));
+                blank_then(
+                    &mut lines,
+                    note(&format!(
+                        "add one or more accounts (tokens → {store}); all aggregate."
+                    )),
+                );
                 lines
             }
             Step::Hosts => vec![
@@ -1040,6 +1376,28 @@ impl OnboardingWizard {
                 self.hint_line("thegn setup", "re-run this wizard"),
             ],
         }
+    }
+
+    /// Render the running list of already-configured accounts/forges as a
+    /// header + one bullet per entry. Empty ⇒ no lines.
+    fn configured_list(&self, label: &str, items: &[(String, String)]) -> Vec<Line> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec![Line::segs(vec![sp(0)])];
+        out.push(Line::segs(vec![seg(
+            Tok::Slot(S::Faint),
+            format!("{label} ({}):", items.len()),
+        )]));
+        for (name, kind) in items {
+            out.push(Line::segs(vec![
+                sp(2),
+                seg(Tok::Hue(thegn_core::theme::Hue::Green), "● ".to_string()),
+                seg(Tok::Slot(S::Text), name.clone()),
+                seg(Tok::Slot(S::Faint), format!("  · {kind}")),
+            ]));
+        }
+        out
     }
 
     fn hint_line(&self, chord: &str, what: &str) -> Line {
@@ -1245,7 +1603,7 @@ mod tests {
     }
 
     #[test]
-    fn issues_provider_gates_fields_and_stores_token_as_secret() {
+    fn issues_provider_gates_fields_and_adds_account() {
         let mut w = wiz();
         goto(&mut w, Step::Issues);
         assert_eq!(w.fields(), vec![Field::IssuesProvider]);
@@ -1255,25 +1613,93 @@ mod tests {
         assert_eq!(w.issues_provider(), "linear");
         assert_eq!(
             w.fields(),
-            vec![Field::IssuesProvider, Field::IssuesToken, Field::LinearTeam]
+            vec![
+                Field::IssuesProvider,
+                Field::IssuesName,
+                Field::IssuesToken,
+                Field::LinearTeam,
+                Field::IssuesAction,
+            ]
         );
-        enter(&mut w);
+        enter(&mut w); // → name
+        enter(&mut w); // → token
         typ(&mut w, "lin_api_SECRET");
-        enter(&mut w); // → team id
+        enter(&mut w); // → team
+        enter(&mut w); // → action row
+        assert_eq!(w.focus, Field::IssuesAction);
+        // The draft has a token, so "add account" is offered and selected.
+        assert_eq!(w.issues_actions(), vec!["add account", "continue"]);
         match enter(&mut w) {
             Outcome::Do(e) => {
-                assert!(e.writes.contains(&WriteOp::Set {
-                    key: "issues.provider".into(),
-                    value: "linear".into()
-                }));
                 assert!(e.writes.iter().any(|op| matches!(
                     op,
-                    WriteOp::Secret { key, token, .. }
-                        if key == "issues.linear.api_key" && token == "lin_api_SECRET"
+                    WriteOp::UpsertIssueAccount { provider, token, token_is_ref, name, .. }
+                        if provider == "linear" && token == "lin_api_SECRET"
+                            && !token_is_ref && name == "linear-1"
                 )));
             }
             o => panic!("expected Do, got {o:?}"),
         }
+        // After adding, the draft resets to "none" and the account is listed —
+        // so a second account can be added without clobbering the first.
+        assert_eq!(w.issues_provider(), "none");
+        assert_eq!(w.issue_accounts.len(), 1);
+    }
+
+    #[test]
+    fn issues_can_add_two_accounts_of_one_provider() {
+        let mut w = wiz();
+        goto(&mut w, Step::Issues);
+        // Add first Linear account.
+        for _ in 0..2 {
+            w.handle_key(&KeyCode::RightArrow, NONE); // → linear
+        }
+        enter(&mut w); // name
+        enter(&mut w); // token
+        typ(&mut w, "tok1");
+        enter(&mut w); // team
+        enter(&mut w); // action
+        assert!(matches!(enter(&mut w), Outcome::Do(_))); // add
+        // Add a second Linear account.
+        for _ in 0..2 {
+            w.handle_key(&KeyCode::RightArrow, NONE); // none → github → linear
+        }
+        enter(&mut w); // name
+        enter(&mut w); // token
+        typ(&mut w, "tok2");
+        enter(&mut w); // team
+        enter(&mut w); // action
+        assert!(matches!(enter(&mut w), Outcome::Do(_))); // add
+        assert_eq!(w.issue_accounts.len(), 2);
+        assert_eq!(w.issue_accounts[0].0, "linear-1");
+        assert_eq!(w.issue_accounts[1].0, "linear-2");
+    }
+
+    #[test]
+    fn forge_step_adds_a_named_forge() {
+        let mut w = wiz();
+        goto(&mut w, Step::Forge);
+        // Focus starts on the gh-auth action; walk to the forge name field.
+        w.move_focus(1);
+        assert_eq!(w.focus, Field::ForgeName);
+        typ(&mut w, "corp");
+        w.move_focus(1); // → kind
+        w.handle_key(&KeyCode::RightArrow, NONE); // github → ghe
+        assert_eq!(w.forge_kind(), "ghe");
+        assert_eq!(w.fields().last(), Some(&Field::ForgeAccountAction));
+        // Navigate to the account action row and add.
+        while w.focus != Field::ForgeAccountAction {
+            w.move_focus(1);
+        }
+        assert_eq!(w.forge_account_actions(), vec!["add forge", "continue"]);
+        match enter(&mut w) {
+            Outcome::Do(e) => assert!(e.writes.iter().any(|op| matches!(
+                op,
+                WriteOp::UpsertForge { name, kind, .. } if name == "corp" && kind == "ghe"
+            ))),
+            o => panic!("expected Do, got {o:?}"),
+        }
+        assert_eq!(w.forges.len(), 1);
     }
 
     #[test]

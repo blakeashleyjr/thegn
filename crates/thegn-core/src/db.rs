@@ -69,7 +69,10 @@ use std::path::PathBuf;
 /// [`crate::store::HibernationStore`] — DDL in `db_migrate`).
 /// v40: adds `daemons`/`session_leases`/`pairings` (the control-plane registry;
 /// see [`crate::store::ControlStore`] — DDL in `db_control`).
-pub const SCHEMA_VERSION: i64 = 44;
+/// v45: `issue_cache`/`issue_projects` re-keyed `(repo_root, provider)` →
+/// `(repo_root, provider, account)` for multiple named accounts per provider.
+/// Pure caches → drop + recreate (the background refresh repopulates).
+pub const SCHEMA_VERSION: i64 = 45;
 
 pub struct Db {
     conn: Connection,
@@ -273,6 +276,17 @@ impl Db {
         if ver < 28 {
             let _ = conn.execute("DROP TABLE IF EXISTS my_work_cache", []);
         }
+        // v45: `issue_cache`/`issue_projects` gain an `account` PK column so
+        // multiple accounts per provider don't clobber each other. Pure caches
+        // (rebuilt by the background refresh), so drop the old-shape tables here;
+        // the CREATE below recreates them with the new PK and the next refresh
+        // repopulates. `account=''` is the legacy/synthesized-account sentinel.
+        if ver < 45 {
+            let _ = conn.execute_batch(
+                "DROP TABLE IF EXISTS issue_cache;
+                 DROP TABLE IF EXISTS issue_projects;",
+            );
+        }
         if ver < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -451,12 +465,16 @@ impl Db {
             -- a `Vec<Issue>` array; the host panel reads from this cache
             -- immediately on open (zero network latency) and a background worker
             -- refreshes it on a 60s interval.
+            -- v45: `account` (the `[[issue_accounts]]` name, `''` for the
+            -- legacy single-account path) joins the PK so multiple accounts of
+            -- one provider cache independently.
             CREATE TABLE IF NOT EXISTS issue_cache (
               repo_root  TEXT    NOT NULL,
               provider   TEXT    NOT NULL,
+              account    TEXT    NOT NULL DEFAULT '',
               json       TEXT    NOT NULL,
               fetched_at INTEGER NOT NULL,
-              PRIMARY KEY (repo_root, provider)
+              PRIMARY KEY (repo_root, provider, account)
             );
             -- v9: which issues the user has explicitly linked to a worktree,
             -- surfaced as tabbar badges and palette quick-links.
@@ -476,12 +494,14 @@ impl Db {
               PRIMARY KEY (issue_id, related_id, kind)
             );
             -- v10: project/sprint/milestone cache per repo+provider.
+            -- v45: `account` joins the PK (see `issue_cache`).
             CREATE TABLE IF NOT EXISTS issue_projects (
               repo_root  TEXT    NOT NULL,
               provider   TEXT    NOT NULL,
+              account    TEXT    NOT NULL DEFAULT '',
               json       TEXT    NOT NULL,
               fetched_at INTEGER NOT NULL,
-              PRIMARY KEY (repo_root, provider)
+              PRIMARY KEY (repo_root, provider, account)
             );
             -- v18 / v28: the unified "My Work" feed of `Vec<WorkRow>` JSON —
             -- assigned issues (all providers), review-requested / authored PRs,

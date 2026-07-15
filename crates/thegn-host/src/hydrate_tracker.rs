@@ -41,8 +41,9 @@ pub(crate) fn spawn_issue_cache_refresh(
             limit: cfg.max_issues,
             ..Default::default()
         };
-        // Fetch every configured provider; cache and diff each under its own
-        // `(repo_root, provider)` key so trackers aggregate without clobbering.
+        // Fetch every configured account; cache and diff each under its own
+        // `(repo_root, provider, account)` key so trackers (and multiple
+        // accounts of one provider) aggregate without clobbering.
         let per_provider = rt.block_on(router.list_per_provider(&filter));
         let Ok(db) = thegn_core::db::Db::open() else {
             return;
@@ -54,16 +55,16 @@ pub(crate) fn spawn_issue_cache_refresh(
             .into_iter()
             .collect();
         let mut changed = false;
-        for (provider, result) in per_provider {
+        for (account, provider, result) in per_provider {
             let Ok(issues) = result else {
-                continue; // a failing provider leaves its prior cache intact
+                continue; // a failing account leaves its prior cache intact
             };
             let Ok(json) = serde_json::to_string(&issues) else {
                 continue;
             };
-            // Diff old vs new for this provider to emit notifications first.
+            // Diff old vs new for this account to emit notifications first.
             let old_issues: Vec<thegn_core::issue::Issue> = db
-                .get_issue_cache(&repo_key, provider)
+                .get_issue_cache(&repo_key, provider, &account)
                 .ok()
                 .flatten()
                 .and_then(|(j, _)| serde_json::from_str(&j).ok())
@@ -86,7 +87,7 @@ pub(crate) fn spawn_issue_cache_refresh(
                     let _ = db.put_notification("status_changed", &issue.id, &msg, &repo_key);
                 }
             }
-            let _ = db.put_issue_cache(&repo_key, provider, &json);
+            let _ = db.put_issue_cache(&repo_key, provider, &account, &json);
             changed = true;
         }
         if changed && let Some(w) = &waker {
@@ -116,7 +117,8 @@ pub(crate) fn populate_tracker(
     if let Ok(links) = db.linked_issues(&cwd.to_string_lossy()) {
         panel.tracker_links = links;
     }
-    // Pure config check (no secrets, no network): does any `[issues]` provider
-    // exist? Lets the panel say "off" (unconfigured) vs "clear" (empty) honestly.
-    panel.issues_configured = !app_cfg.issues.active_providers().is_empty();
+    // Pure config check (no secrets, no network): is any issue account active
+    // (explicit `[[issue_accounts]]` or a synthesized legacy provider)? Lets the
+    // panel say "off" (unconfigured) vs "clear" (empty) honestly.
+    panel.issues_configured = !app_cfg.issues.active_accounts().is_empty();
 }

@@ -23,6 +23,7 @@ pub mod config;
 pub mod config_daemon;
 pub mod config_defaults;
 pub mod config_env_tables;
+pub mod config_forge;
 pub mod config_issues;
 pub mod config_llm;
 pub mod config_media;

@@ -176,6 +176,125 @@ pub fn upsert_host(config_path: &Path, name: &str, ssh: &str) -> Result<()> {
     write_doc(config_path, &doc)
 }
 
+/// Insert `key = "<v>"` only when `v` is non-blank (trimmed).
+fn put_str_ref(tbl: &mut Table, key: &str, v: &str) {
+    if !v.trim().is_empty() {
+        tbl.insert(key, value(v.trim()));
+    }
+}
+
+/// Upsert one entry into an array-of-tables at the dotted `array` path (e.g.
+/// `"forges"` → `[[forges]]`, or `"issues.issue_accounts"` →
+/// `[[issues.issue_accounts]]`), keyed by its `name` field — updates the
+/// matching entry in place or appends a new one, preserving comments and
+/// sibling entries. `fill` sets the entry's fields (`name` is written for you).
+fn upsert_named_array_entry(
+    config_path: &Path,
+    array: &str,
+    name: &str,
+    fill: impl FnOnce(&mut Table),
+) -> Result<()> {
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "{array} entry name is empty");
+    let parts: Vec<&str> = array.split('.').filter(|s| !s.is_empty()).collect();
+    anyhow::ensure!(!parts.is_empty(), "empty array path");
+    let mut doc = read_doc(config_path)?;
+    let mut parent = doc.as_table_mut();
+    for seg in &parts[..parts.len() - 1] {
+        parent.set_implicit(true);
+        parent = subtable(parent, seg);
+    }
+    let entry = parent
+        .entry(parts[parts.len() - 1])
+        .or_insert_with(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+    if !entry.is_array_of_tables() {
+        *entry = Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+    }
+    let aot = entry.as_array_of_tables_mut().expect("just ensured aot");
+    let idx = aot
+        .iter()
+        .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name));
+    let tbl = match idx {
+        Some(i) => aot.get_mut(i).expect("index in range"),
+        None => {
+            aot.push(Table::new());
+            aot.iter_mut().last().expect("just pushed")
+        }
+    };
+    tbl.insert("name", value(name));
+    fill(tbl);
+    write_doc(config_path, &doc)
+}
+
+/// Remove the entry named `name` from the array-of-tables at the dotted `array`
+/// path. Ok if absent.
+pub fn remove_array_entry(config_path: &Path, array: &str, name: &str) -> Result<()> {
+    let parts: Vec<&str> = array.split('.').filter(|s| !s.is_empty()).collect();
+    anyhow::ensure!(!parts.is_empty(), "empty array path");
+    let mut doc = read_doc(config_path)?;
+    let mut node: &mut Table = doc.as_table_mut();
+    for seg in &parts[..parts.len() - 1] {
+        match node.get_mut(seg).and_then(Item::as_table_mut) {
+            Some(t) => node = t,
+            None => return write_doc(config_path, &doc), // path absent → nothing to remove
+        }
+    }
+    if let Some(aot) = node
+        .get_mut(parts[parts.len() - 1])
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        let idx = aot
+            .iter()
+            .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name.trim()));
+        if let Some(i) = idx {
+            aot.remove(i);
+        }
+    }
+    write_doc(config_path, &doc)
+}
+
+/// Create or update a `[[issue_accounts]]` entry (keyed by `name`), preserving
+/// comments + sibling entries. `token_ref` must be a SecretRef / `env:` ref
+/// (never a raw token — see the module trust model); empty fields are omitted.
+#[allow(clippy::too_many_arguments)] // one call site; a struct would cost more than it saves
+pub fn upsert_issue_account(
+    config_path: &Path,
+    name: &str,
+    provider: &str,
+    token_ref: &str,
+    team_id: &str,
+    workspace_slug: &str,
+    base_url: &str,
+    email: &str,
+    project_key: &str,
+) -> Result<()> {
+    upsert_named_array_entry(config_path, "issues.issue_accounts", name, |t| {
+        t.insert("provider", value(provider));
+        put_str_ref(t, "token", token_ref);
+        put_str_ref(t, "team_id", team_id);
+        put_str_ref(t, "workspace_slug", workspace_slug);
+        put_str_ref(t, "base_url", base_url);
+        put_str_ref(t, "email", email);
+        put_str_ref(t, "project_key", project_key);
+    })
+}
+
+/// Create or update a `[[forges]]` entry (keyed by `name`). `token_ref` must be
+/// a SecretRef / `env:` ref; empty `host`/`token` are omitted.
+pub fn upsert_forge(
+    config_path: &Path,
+    name: &str,
+    kind: &str,
+    host: &str,
+    token_ref: &str,
+) -> Result<()> {
+    upsert_named_array_entry(config_path, "forges", name, |t| {
+        t.insert("kind", value(kind));
+        put_str_ref(t, "host", host);
+        put_str_ref(t, "token", token_ref);
+    })
+}
+
 /// In a **repo** `.thegn.toml`, select an env with a top-level `env = "<name>"`
 /// (repos select, never define — this refuses to write any `[env.*]` table).
 pub fn select_env_in_repo(repo_toml: &Path, name: &str) -> Result<()> {
@@ -334,6 +453,77 @@ mod tests {
         let p = tmp("host-empty.toml");
         assert!(upsert_host(&p, " ", "me@box").is_err());
         assert!(upsert_host(&p, "box", "  ").is_err());
+    }
+
+    #[test]
+    fn upsert_issue_account_appends_updates_and_removes() {
+        let p = tmp("issue-accts.toml");
+        std::fs::write(&p, "# keep\n[issues]\nprovider = \"none\"\n").unwrap();
+        upsert_issue_account(&p, "work", "linear", "keyring:work", "TEAM", "", "", "", "").unwrap();
+        upsert_issue_account(&p, "home", "linear", "env:LIN", "", "", "", "", "").unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(out.contains("# keep"), "comment preserved");
+        let doc = out.parse::<DocumentMut>().unwrap();
+        let aot = doc["issues"]["issue_accounts"]
+            .as_array_of_tables()
+            .unwrap();
+        assert_eq!(aot.len(), 2, "two distinct accounts of one provider");
+        assert_eq!(aot.get(0).unwrap()["name"].as_str(), Some("work"));
+        assert_eq!(aot.get(0).unwrap()["token"].as_str(), Some("keyring:work"));
+        assert_eq!(aot.get(0).unwrap()["team_id"].as_str(), Some("TEAM"));
+        // The pre-existing `[issues] provider` scalar is preserved.
+        assert_eq!(doc["issues"]["provider"].as_str(), Some("none"));
+        // Empty scope fields are omitted.
+        assert!(aot.get(1).unwrap().get("team_id").is_none());
+
+        // Upsert by name updates in place (no duplicate).
+        upsert_issue_account(&p, "work", "linear", "keyring:work2", "T2", "", "", "", "").unwrap();
+        let doc = std::fs::read_to_string(&p)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let aot = doc["issues"]["issue_accounts"]
+            .as_array_of_tables()
+            .unwrap();
+        assert_eq!(aot.len(), 2, "upsert did not duplicate");
+        assert_eq!(aot.get(0).unwrap()["token"].as_str(), Some("keyring:work2"));
+
+        // Remove by name.
+        remove_array_entry(&p, "issues.issue_accounts", "home").unwrap();
+        let doc = std::fs::read_to_string(&p)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            doc["issues"]["issue_accounts"]
+                .as_array_of_tables()
+                .unwrap()
+                .len(),
+            1
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn upsert_forge_writes_kind_and_host() {
+        let p = tmp("forges.toml");
+        let _ = std::fs::remove_file(&p);
+        upsert_forge(&p, "ghe", "ghe", "git.corp.example", "env:GHE").unwrap();
+        let doc = std::fs::read_to_string(&p)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let f = doc["forges"].as_array_of_tables().unwrap().get(0).unwrap();
+        assert_eq!(f["name"].as_str(), Some("ghe"));
+        assert_eq!(f["kind"].as_str(), Some("ghe"));
+        assert_eq!(f["host"].as_str(), Some("git.corp.example"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn upsert_issue_account_rejects_empty_name() {
+        let p = tmp("issue-empty.toml");
+        assert!(upsert_issue_account(&p, " ", "linear", "", "", "", "", "", "").is_err());
     }
 
     #[test]
