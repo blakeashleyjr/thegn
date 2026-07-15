@@ -9087,6 +9087,7 @@ async fn event_loop<T: Terminal>(
                     generation,
                     tab,
                     path,
+                    env,
                 } => {
                     if crate::handlers::creating::on_tab_opened(
                         &mut session,
@@ -9098,6 +9099,7 @@ async fn event_loop<T: Terminal>(
                         generation,
                         tab,
                         path,
+                        env,
                         keymap.config().session.focus_on_create,
                     ) {
                         need_relayout = true;
@@ -9687,7 +9689,16 @@ async fn event_loop<T: Terminal>(
                     Vec::new()
                 } else {
                     let wt = active_tab_path(&session);
-                    crate::agent::loading_context(&current_config, &wt.to_string_lossy())
+                    // Prefer the wizard's chosen host (captured at `TabOpened`)
+                    // over the DB `effective_env`, which isn't written until the
+                    // create worker's Register step — so a local pick against a
+                    // provider ambient default doesn't briefly show the provider.
+                    let selected = akey.as_ref().and_then(|k| loading_state.env_for(k));
+                    crate::agent::loading_context(
+                        &current_config,
+                        &wt.to_string_lossy(),
+                        selected,
+                    )
                 };
                 dirty = true;
             }

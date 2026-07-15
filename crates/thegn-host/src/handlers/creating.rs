@@ -201,8 +201,13 @@ pub(crate) fn open_or_reconcile(
     generation: u64,
     tab: String,
     path: String,
+    env: String,
     focus: bool,
 ) {
+    // The settled splash key is always `(tab, 0)` (both branches below), so
+    // record the wizard's host choice against it — the splash context resolves
+    // this pick instead of the (not-yet-written) DB env. See `set_env`.
+    let key = (tab.clone(), 0);
     if reconcile_name(
         session,
         sb,
@@ -229,6 +234,7 @@ pub(crate) fn open_or_reconcile(
             focus,
         );
     }
+    loading_state.set_env(key, &env);
 }
 
 /// Mirror the latest accumulated creation steps into the open tab's splash
@@ -411,6 +417,7 @@ pub(crate) fn on_tab_opened(
     generation: u64,
     tab: String,
     path: String,
+    env: String,
     focus: bool,
 ) -> bool {
     if !inflight.progress.contains_key(&generation) {
@@ -427,6 +434,7 @@ pub(crate) fn on_tab_opened(
         generation,
         tab,
         path,
+        env,
         focus,
     );
     true

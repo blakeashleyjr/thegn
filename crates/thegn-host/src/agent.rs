@@ -2343,7 +2343,11 @@ fn tail_lines(out: &str, n: usize) -> String {
 /// loading screen's context block: env, placement, provider/sandbox, connect mode,
 /// shell strategy, workdir. Loop-safe (a DB read + pure config resolution, no
 /// network/subprocess). Empty for a plain local env (nothing interesting to show).
-pub fn loading_context(cfg: &Config, worktree: &str) -> Vec<(String, String)> {
+pub fn loading_context(
+    cfg: &Config,
+    worktree: &str,
+    selected: Option<&str>,
+) -> Vec<(String, String)> {
     use thegn_core::placement::Placement;
     let loc = GitLoc::for_worktree(Path::new(worktree));
     let repo_root: PathBuf = Db::open()
@@ -2353,9 +2357,13 @@ pub fn loading_context(cfg: &Config, worktree: &str) -> Vec<(String, String)> {
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    // Prefer an explicit override (the creation wizard's pick, captured before
+    // the DB env row is written) over the persisted `effective_env`.
+    let selected = selected.map(str::to_owned).or_else(|| {
+        Db::open()
+            .ok()
+            .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()))
+    });
     let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), selected.as_deref());
     if env.placement.is_local() {
         return Vec::new();
