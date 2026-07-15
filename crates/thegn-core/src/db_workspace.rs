@@ -215,6 +215,21 @@ impl WorkspaceStore for Db {
         Ok(())
     }
 
+    /// Persist the full sidebar workspace order (see the trait docs). Writes
+    /// `position = index` for each path in `order` under one transaction, so
+    /// the persisted order is exactly the sequence the caller (the sidebar,
+    /// after a manual reorder) is showing — the reload via `workspaces()` can't
+    /// drift from it the way a swap + `normalize_workspace_positions` re-query
+    /// can when positions are NULL/tied.
+    fn set_workspace_order(&self, order: &[String]) -> Result<()> {
+        self.transaction(|db| {
+            for (i, p) in order.iter().enumerate() {
+                db.set_workspace_position(p, i as i64)?;
+            }
+            Ok(())
+        })
+    }
+
     // --- worktrees (one per tab; keyed by worktree path) -------------------
     /// Record a worktree. `location` is the remote descriptor (JSON) for a remote
     /// worktree, or `None`/empty for an ordinary on-host one.

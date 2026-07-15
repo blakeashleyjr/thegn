@@ -671,6 +671,42 @@ fn swap_workspace_positions_reorders() {
 }
 
 #[test]
+fn set_workspace_order_writes_exact_sequence_even_from_null_positions() {
+    // The sidebar reorder persists the whole on-screen order (not a two-position
+    // swap): `db.workspaces()` must then return that exact sequence, so the
+    // Shift+Alt nav ring — rebuilt from `workspaces()` on hydration — walks the
+    // order the user arranged. This must hold even when rows start with NULL /
+    // tied positions (migrate_brand / db_zones inserts), the case where a
+    // swap+normalize could seed a different tiebreak order than the tree shows.
+    let db = db();
+    for p in ["/a", "/b", "/c"] {
+        db.conn()
+            .execute("INSERT INTO workspaces (repo_path) VALUES (?1)", params![p])
+            .unwrap();
+    }
+    let order = |db: &Db| -> Vec<String> {
+        db.workspaces()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.repo_path)
+            .collect()
+    };
+
+    let arranged = vec!["/c".to_string(), "/a".to_string(), "/b".to_string()];
+    db.set_workspace_order(&arranged).unwrap();
+    assert_eq!(
+        order(&db),
+        arranged,
+        "reload matches the arranged order verbatim"
+    );
+
+    // A second arrangement over the now-contiguous positions round-trips too.
+    let arranged2 = vec!["/b".to_string(), "/c".to_string(), "/a".to_string()];
+    db.set_workspace_order(&arranged2).unwrap();
+    assert_eq!(order(&db), arranged2);
+}
+
+#[test]
 fn swap_workspace_positions_heals_null_and_duplicate_positions() {
     // Regression: some insert paths (migrate_brand, db_zones) create workspace
     // rows without a `position` (NULL), and ties in the backfill can leave
