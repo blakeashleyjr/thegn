@@ -144,15 +144,21 @@ impl WorktreeAuxStore for Db {
     /// a branch that was deferred and then rebased starts fresh.
     fn enqueue_merge(&self, worktree: &str, branch: &str, target_branch: &str) -> Result<()> {
         let now = util::now();
+        // `location` mirrors `worktrees.location` at enqueue time via a
+        // correlated subquery (NULL when the worktree isn't registered → treated
+        // as local), so the queue self-describes each row's host without a
+        // separate write path.
         self.conn().execute(
             r#"INSERT INTO merge_queue
                  (worktree,branch,target_branch,status,queued_at,updated_at,
-                  result_oid,conflict_paths,error_detail)
-               VALUES(?1,?2,?3,'queued',?4,?4,NULL,NULL,NULL)
+                  result_oid,conflict_paths,error_detail,location)
+               VALUES(?1,?2,?3,'queued',?4,?4,NULL,NULL,NULL,
+                  (SELECT location FROM worktrees WHERE worktree=?1))
                ON CONFLICT(worktree) DO UPDATE SET
                  branch=?2, target_branch=?3, status='queued',
                  queued_at=?4, updated_at=?4,
-                 result_oid=NULL, conflict_paths=NULL, error_detail=NULL"#,
+                 result_oid=NULL, conflict_paths=NULL, error_detail=NULL,
+                 location=(SELECT location FROM worktrees WHERE worktree=?1)"#,
             params![worktree, branch, target_branch, now],
         )?;
         Ok(())
@@ -202,7 +208,7 @@ impl WorktreeAuxStore for Db {
     fn list_merge_queue(&self) -> Result<Vec<MergeQueueRow>> {
         let mut stmt = self.conn().prepare(
             r#"SELECT worktree,branch,target_branch,status,queued_at,updated_at,
-                      result_oid,conflict_paths,error_detail
+                      result_oid,conflict_paths,error_detail,location
                FROM merge_queue ORDER BY queued_at"#,
         )?;
         let rows = stmt.query_map([], |r| {
@@ -216,6 +222,8 @@ impl WorktreeAuxStore for Db {
                 result_oid: r.get(6)?,
                 conflict_paths: r.get(7)?,
                 error_detail: r.get(8)?,
+                // NULL (pre-v44 / unregistered worktree) = local / same store.
+                location: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
             })
         })?;
         let mut v = Vec::new();

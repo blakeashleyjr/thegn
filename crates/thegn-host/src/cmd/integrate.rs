@@ -25,6 +25,14 @@ pub fn run(cfg: &Config) -> Result<()> {
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let repo_root = integrate::main_checkout(&cwd).context("not inside a git repository")?;
+    // The fold runs in the target repo's object store; a remote target must be
+    // folded on its own host (see the guidance).
+    if let Ok(db) = Db::open()
+        && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &repo_root)
+    {
+        outln!("{msg}");
+        return Ok(());
+    }
     let mq = &cfg.merge_queue;
     let target = integrate::resolve_target(mq, &repo_root);
 

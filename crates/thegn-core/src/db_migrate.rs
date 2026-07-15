@@ -423,6 +423,11 @@ pub(crate) fn additive_schema(conn: &Connection) {
         [],
     );
     let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN zone_id INTEGER", []);
+    // v44: the queued worktree's location (mirrored from `worktrees.location`)
+    // so a cross-host merge-queue drain can attribute a row to a host and decide
+    // whether the branch tip must be fetched into the target store. Additive;
+    // NULL on pre-v44 rows = treated as local (same store as the target).
+    let _ = conn.execute("ALTER TABLE merge_queue ADD COLUMN location TEXT", []);
 }
 
 #[cfg(test)]

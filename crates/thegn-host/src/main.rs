@@ -97,6 +97,7 @@ mod menu;
 mod merge_driver;
 mod merge_lifecycle;
 mod merge_ops;
+mod merge_remote;
 mod metrics;
 mod model_eq;
 mod mousefilter;
