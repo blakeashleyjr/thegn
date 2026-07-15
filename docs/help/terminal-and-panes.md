@@ -6,6 +6,7 @@ contexts: [zone:center]
 actions:
   [
     new-tab,
+    new-terminal,
     new-pane,
     split-down,
     split-right,
