@@ -694,7 +694,11 @@ fn set_workspace_order_writes_exact_sequence_even_from_null_positions() {
 
     let arranged = vec!["/c".to_string(), "/a".to_string(), "/b".to_string()];
     db.set_workspace_order(&arranged).unwrap();
-    assert_eq!(order(&db), arranged, "reload matches the arranged order verbatim");
+    assert_eq!(
+        order(&db),
+        arranged,
+        "reload matches the arranged order verbatim"
+    );
 
     // A second arrangement over the now-contiguous positions round-trips too.
     let arranged2 = vec!["/b".to_string(), "/c".to_string(), "/a".to_string()];
