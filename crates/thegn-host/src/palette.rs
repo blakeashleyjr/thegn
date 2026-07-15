@@ -342,10 +342,11 @@ pub(crate) fn build_command_palette_items(
         "⇓ Clone and open — paste a git URL",
     ));
 
-    // New-terminal wizard (name / connection / sandbox). `Action::NewTerminal`
-    // exists and is bound, but has no ActionSpec (keymap.rs is a pinned
-    // god-file), so surface it here — selecting it dispatches via
-    // `Action::from_key("new-terminal")` in the run-loop Enter arm.
+    // New-terminal wizard (name / connection / sandbox). The `new-terminal`
+    // ActionSpec is `palette: false` (so the spec loop above doesn't list it),
+    // letting us surface the wizard here with its `＋ …` styling and the resolved
+    // chord hint. Selecting it dispatches via `Action::from_key("new-terminal")`
+    // in the run-loop Enter arm.
     {
         let label = crate::keymap::chord_hint_for(cfg, "new-terminal")
             .map(|c| format!("＋ New terminal…  ({c})"))
