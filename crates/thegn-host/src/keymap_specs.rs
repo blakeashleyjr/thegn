@@ -71,6 +71,19 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         palette: true,
     },
     ActionSpec {
+        id: "new-terminal",
+        label: "New terminal",
+        hint: "terminal",
+        // `Alt T` — the capital T encodes Shift (see `sequence.rs`), so this is
+        // physically Alt+Shift+T; `Alt t` (above) is the new-tab sibling. Registered
+        // here so the chord surfaces in the keybindings help + the palette's chord
+        // hint. `palette: false`: the wizard entry point is pushed explicitly (with
+        // its `＋ …` styling) in `palette::build_command_palette_items`, so a
+        // `palette: true` here would double-list it.
+        default_chords: &["Alt T"],
+        palette: false,
+    },
+    ActionSpec {
         id: "new-pane",
         label: "New pane — smart split",
         hint: "smart split",
