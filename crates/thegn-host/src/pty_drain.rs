@@ -681,6 +681,21 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
                         (ProcessOutcome::Failed, None) => format!("{label} crashed"),
                         (ProcessOutcome::TaskDone, _) => format!("{label} finished"),
                     };
+                    // Diagnostic hook: with routine shells + unreapable `None`
+                    // exits suppressed in `classify_process_exit`, a
+                    // `process_failed` here is a genuine task-pane failure. If a
+                    // spurious pile ever recurs, `THEGN_LOG=thegn::attention=debug`
+                    // pins the worktree + exit_code + program that minted it
+                    // (e.g. to confirm a remote-bridge relay-lost trigger).
+                    if matches!(outcome, ProcessOutcome::Failed) {
+                        tracing::debug!(
+                            target: "thegn::attention",
+                            worktree = %wt,
+                            program = %program,
+                            ?exit_code,
+                            "recording process_failed notification"
+                        );
+                    }
                     // Routing gate: record (unless dropped), then desktop
                     // toast + sound only when the decision allows (rules /
                     // DND / modes).

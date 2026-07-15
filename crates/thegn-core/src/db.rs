@@ -72,7 +72,9 @@ use std::path::PathBuf;
 /// v45: `issue_cache`/`issue_projects` re-keyed `(repo_root, provider)` →
 /// `(repo_root, provider, account)` for multiple named accounts per provider.
 /// Pure caches → drop + recreate (the background refresh repopulates).
-pub const SCHEMA_VERSION: i64 = 45;
+/// v46: one-time read-flag cleanup of the spurious `process_failed` notification
+/// pile (no schema change) — see the post-batch migration in `open_at`.
+pub const SCHEMA_VERSION: i64 = 46;
 
 pub struct Db {
     conn: Connection,
@@ -735,6 +737,20 @@ impl Db {
         crate::db_compute::migrate_v36(&conn)?;
         crate::db_iroh::migrate_v38(&conn)?;
         crate::db_control::migrate_v40(&conn)?;
+        // v46: one-time cleanup of the spurious `process_failed` notification
+        // pile that accrued while routine shell teardown (and unreapable /
+        // relay-lost `None` exits) were mis-classified as failures — see
+        // `event_bus::classify_process_exit`. Mark those unread rows read so the
+        // sidebar's ⚠ badge + "process failed" attention hint clear immediately.
+        // Gated on the pre-bump on-disk version so it runs exactly once — genuine
+        // future task-failure alerts are never touched. Best-effort: the DB is a
+        // cache, and a fresh DB simply matches zero rows.
+        if ver < 46 {
+            let _ = conn.execute(
+                "UPDATE notifications SET read=1 WHERE kind='process_failed' AND read=0",
+                [],
+            );
+        }
         Ok(Db {
             conn,
             schema_mismatch,
