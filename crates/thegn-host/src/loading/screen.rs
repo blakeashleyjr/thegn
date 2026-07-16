@@ -32,8 +32,15 @@ use crate::chrome::{self, LoadStep, S, StepState, col};
 use crate::compositor::Rect;
 use crate::loading::{catalog, plan};
 
-/// Rows always reserved for the cursor step's floating sub-lines.
+/// Rows always reserved for the cursor step's floating sub-lines (an active
+/// step's progress bar + live detail).
 pub(crate) const SUBLINE_RESERVE: usize = 2;
+/// A FAILED step wraps its full error, which is often long (a provider HTTP
+/// error like `machine0 mcp vm_list: HTTP 429 Too Many Requests: {…}` used to
+/// clip mid-message at "HTTP"). Give it more lines so the actual cause is
+/// readable; `reserved_rows` reserves for this worst case so the anchor doesn't
+/// jump when a step fails.
+const ERROR_SUBLINE_RESERVE: usize = 6;
 /// Fixed width of the right-aligned elapsed column (fits `12m34s`).
 const ELAPSED_W: usize = 6;
 /// Content-height floor: absorbs the generic materialize seed (3 steps) being
@@ -52,7 +59,7 @@ const SUBLINE_MAX: usize = 60;
 /// (not of tick-by-tick state).
 pub(crate) fn reserved_rows(steps: &[LoadStep], ctx: &[(String, String)]) -> usize {
     let ctx_rows = if ctx.is_empty() { 0 } else { 1 + ctx.len() };
-    (1 + steps.len() + SUBLINE_RESERVE + ctx_rows).max(RESERVE_MIN)
+    (1 + steps.len() + SUBLINE_RESERVE.max(ERROR_SUBLINE_RESERVE) + ctx_rows).max(RESERVE_MIN)
 }
 
 /// The cursor step: the running one, else the failure, else none. Sub-lines
@@ -77,7 +84,7 @@ fn sublines(step: &LoadStep, accent: ColorAttribute, width: usize) -> Vec<SubLin
     if step.state == StepState::Failed {
         let err = step.detail.clone().unwrap_or_else(|| "failed".into());
         let red = chrome::theme_color(thegn_core::theme::RED);
-        for line in wrap(&err, width, SUBLINE_RESERVE) {
+        for line in wrap(&err, width, ERROR_SUBLINE_RESERVE) {
             out.push(SubLine {
                 segs: vec![(line, red)],
             });
