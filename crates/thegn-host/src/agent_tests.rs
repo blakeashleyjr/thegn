@@ -204,6 +204,121 @@ fn native_exec_health_reports_and_recovers() {
     assert!(native_exec_healthy(p), "a success clears it");
 }
 
+#[test]
+fn env_halt_reason_names_the_providers_own_token_var() {
+    // Bug #1: a machine0 env with no explicit api_key_env must report ITS OWN
+    // default token var (MACHINE0_API_KEY), not the old hardcoded SPRITES_TOKEN
+    // that produced a nonsensical "sprites key" halt modal for machine0 envs.
+    with_temp_state("halt-token-var", || {
+        let cfg: Config = toml::from_str(
+            "[env.m0]\nplacement = \"provider\"\n[env.m0.provider]\nprovider = \"machine0\"\n",
+        )
+        .unwrap();
+        let wt = std::env::temp_dir()
+            .join(format!("tg-halt-m0-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/m0", "/x/app", &wt, "sz/m0", None, None)
+            .unwrap();
+        db.set_worktree_env(&wt, "m0").unwrap();
+        // Both candidate vars unset so the check fails on the RIGHT one.
+        // SAFETY: guarded by ENV_LOCK inside with_temp_state.
+        unsafe {
+            std::env::remove_var("MACHINE0_API_KEY");
+            std::env::remove_var("SPRITES_TOKEN");
+        }
+        let halt = env_halt_reason(&cfg, &wt).expect("a tokenless provider env halts");
+        assert!(
+            halt.reason.contains("MACHINE0_API_KEY"),
+            "reason names the machine0 var: {}",
+            halt.reason
+        );
+        assert!(
+            !halt.reason.contains("SPRITES_TOKEN"),
+            "no nonsensical sprites var: {}",
+            halt.reason
+        );
+    });
+}
+
+#[test]
+fn env_halt_reason_resolves_a_file_secret_ref() {
+    // A `file:` (or keyring:) SecretRef must resolve like the provider does — NOT
+    // be treated as a literal env-var name. Regression: a machine0 env whose token
+    // lives at `file:~/.secrets/machine0/personal-key` falsely halted with
+    // "$file:… is not set" because the check used std::env::var, not secret::resolve.
+    with_temp_state("halt-file-secret", || {
+        let tok = std::env::temp_dir().join(format!("tg-m0-token-{}", std::process::id()));
+        std::fs::write(&tok, "secret-token-value\n").unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "[env.m0f]\nplacement = \"provider\"\n[env.m0f.provider]\nprovider = \"machine0\"\napi_key_env = \"file:{}\"\n",
+            tok.display()
+        ))
+        .unwrap();
+        let wt = std::env::temp_dir()
+            .join(format!("tg-halt-m0f-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/m0f", "/x/app", &wt, "sz/m0f", None, None)
+            .unwrap();
+        db.set_worktree_env(&wt, "m0f").unwrap();
+        // Provider healthy so only the token gate is under test.
+        native_exec_report("machine0", true);
+        assert!(
+            env_halt_reason(&cfg, &wt).is_none(),
+            "a resolvable file: token must not halt"
+        );
+        let _ = std::fs::remove_file(&tok);
+    });
+}
+
+#[test]
+fn env_halt_reason_halts_ssh_provider_on_connect_failure() {
+    // Bug #2: an ssh-reached provider (machine0) with its token SET but a recent
+    // connection failure in the health registry raises the halt; recovery drops it.
+    with_temp_state("halt-connect", || {
+        let cfg: Config = toml::from_str(
+            "[env.m0c]\nplacement = \"provider\"\n[env.m0c.provider]\nprovider = \"machine0\"\napi_key_env = \"TG_TEST_M0_TOKEN\"\n",
+        )
+        .unwrap();
+        let wt = std::env::temp_dir()
+            .join(format!("tg-halt-m0c-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/m0c", "/x/app", &wt, "sz/m0c", None, None)
+            .unwrap();
+        db.set_worktree_env(&wt, "m0c").unwrap();
+        // SAFETY: guarded by ENV_LOCK inside with_temp_state.
+        unsafe { std::env::set_var("TG_TEST_M0_TOKEN", "present") };
+
+        // Token present + provider healthy ⇒ no halt.
+        native_exec_report("machine0", true);
+        assert!(
+            env_halt_reason(&cfg, &wt).is_none(),
+            "healthy provider with a token does not halt"
+        );
+        // A recent connect failure ⇒ halt describing the connection failure.
+        native_exec_report("machine0", false);
+        let halt = env_halt_reason(&cfg, &wt).expect("an unhealthy ssh provider halts");
+        assert!(
+            halt.reason.contains("connection failure") || halt.reason.contains("unreachable"),
+            "reason describes the connect failure: {}",
+            halt.reason
+        );
+        // Recovery clears it.
+        native_exec_report("machine0", true);
+        assert!(
+            env_halt_reason(&cfg, &wt).is_none(),
+            "a recovered provider no longer halts"
+        );
+        // SAFETY: guarded by ENV_LOCK inside with_temp_state.
+        unsafe { std::env::remove_var("TG_TEST_M0_TOKEN") };
+    });
+}
+
 fn cfg_with(agents: &[(&str, &str)], tools: &[(&str, &str)]) -> Config {
     let mut cfg = Config::default();
     let mk = |(n, c): &(&str, &str)| thegn_core::config::NamedCommand {
@@ -521,6 +636,19 @@ fn shell_inner_oci_emits_runtime_probe_chain() {
     );
     // bash must always appear in the chain (present in every Debian image).
     assert!(oci.contains("bash"), "bash must be in the probe chain");
+    // Loads the flake devShell env explicitly (hook-independent) when the
+    // workspace has an `.envrc`, so a read-only-`~/.zshrc` image still enters
+    // the project toolchain. Gated on `.envrc`, applied before the login shell.
+    assert!(
+        oci.contains("[ -e .envrc ]") && oci.contains("direnv export bash"),
+        "OCI shell must eval the devShell env when an .envrc is present: {oci}"
+    );
+    let devshell_at = oci.find("direnv export bash").unwrap();
+    let shell_at = oci.find("exec /bin/sh -l").unwrap();
+    assert!(
+        devshell_at < shell_at,
+        "devShell env must load BEFORE the login shell execs"
+    );
     // Non-OCI: a simple "<shell> -l", not a chain.
     let host = shell_inner(false);
     assert!(

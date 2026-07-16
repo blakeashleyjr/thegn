@@ -7943,6 +7943,8 @@ async fn event_loop<T: Terminal>(
                 loading_remote: &mut loading_remote,
                 loading_retired: &mut loading_retired,
                 respawn_crash_count: &mut respawn_crash_count,
+                active_menu: &mut active_menu,
+                halt_dismissed: &mut halt_dismissed,
                 center_dormant: &mut center_dormant,
                 event_bus: &event_bus,
                 notify_state: &notify_state,

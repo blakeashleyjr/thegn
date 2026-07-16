@@ -49,6 +49,45 @@ use crate::run::{
 /// output-based detection would mis-classify them as normal exits.
 pub(crate) const CRASH_THRESHOLD: Duration = Duration::from_secs(2);
 
+/// On a fast failed exit of an ssh-reached provider's pane (`machine0`/`fly`/vps),
+/// mark that provider unhealthy in the connect-health registry so
+/// [`crate::agent::env_halt_reason`] raises the failover-off "cannot connect to the
+/// remote" halt on the immediate respawn. Cheap resolution mirroring
+/// `env_halt_reason` (DB effective-env; no network); a no-op for local/host panes
+/// and for the WSS-native providers (whose in-process relay reports its own health).
+fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str) {
+    use std::path::{Path, PathBuf};
+    use thegn_core::store::WorkspaceStore;
+    if wt.is_empty() {
+        return;
+    }
+    let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(wt));
+    let repo_root: PathBuf = thegn_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(wt).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| thegn_core::repo::main_worktree(Path::new(wt)))
+        .unwrap_or_else(|| PathBuf::from(wt));
+    let selected = thegn_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(wt, &repo_root.to_string_lossy()));
+    let env = cfg.resolve_env(&repo_root, &loc, Path::new(wt), selected.as_deref());
+    if env.placement.is_local() {
+        return;
+    }
+    let Some(provider) = cfg.env.get(&env.name).map(|e| e.provider.provider.trim()) else {
+        return;
+    };
+    if thegn_core::config::ssh_reached_provider_kind(provider) {
+        tracing::warn!(
+            target: "thegn::sandbox", %provider, worktree = %wt,
+            "remote pane connect failure; marking provider unhealthy"
+        );
+        crate::agent::native_exec_report(provider, false);
+    }
+}
+
 /// Raw, unparsed PTY chunks awaiting their parse slice, per pane, FIFO within
 /// a pane (cross-pane order is unspecified — same as the shared channel
 /// today). Loop-persistent: leftovers carry to the next iteration.
@@ -191,6 +230,12 @@ pub(crate) struct DrainCtx<'a> {
     pub loading_remote: &'a mut HashMap<(String, usize), bool>,
     pub loading_retired: &'a mut HashSet<(String, usize)>,
     pub respawn_crash_count: &'a mut HashMap<(usize, usize), u32>,
+    /// The loop's modal slot + the (group, tab) keys whose sandbox-halt modal the
+    /// user already dismissed. A fast-crashing remote env's "cannot connect" halt
+    /// raises the blocking modal exactly ONCE (then a row error dot), reusing the
+    /// same gate as the provision drain.
+    pub active_menu: &'a mut Option<crate::menu::MenuOverlay>,
+    pub halt_dismissed: &'a mut std::collections::HashSet<(String, usize)>,
     pub center_dormant: &'a mut bool,
     pub event_bus: &'a thegn_core::event_bus::EventBus,
     pub notify_state: &'a std::sync::Arc<crate::notify::NotifyState>,
@@ -610,6 +655,16 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
             Some(c) => c != 0,
             None => crashes > 0,
         };
+        // A remote env's interactive pane is a `*-ssh` self-bridge subprocess, so a
+        // fast failed exit is a connect/resolve failure the compositor can't observe
+        // any other way. Mark the provider unhealthy so the respawn's
+        // `env_halt_reason` halts (→ the "cannot connect" modal raised in the Err
+        // arm below) instead of silently husking pane after pane.
+        if failed && age < CRASH_THRESHOLD {
+            // Resolve with the SAME config the respawn's `env_halt_reason` uses
+            // (`keymap_config`), so the mark and the halt check agree.
+            report_pane_connect_failure(ctx.keymap_config, &ctx.session.worktrees[gi].path);
+        }
         // What this pane was last running (captured at persist time) —
         // offered for relaunch after a crash. Grabbed before the pane's tab
         // is mutated.
@@ -772,7 +827,24 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
                             ctx.loading_remote.remove(&k);
                             ctx.model.load_steps.clear();
                             *ctx.center_dormant = true;
-                            ctx.model.status = format!("Respawn failed: {err:#}");
+                            // A failover-off env that can't come up (token unset, or
+                            // — for a remote — a connect failure just marked above)
+                            // surfaces as a `SandboxHalt`: raise the blocking modal
+                            // exactly ONCE per (group, tab), matching the provision
+                            // drain. Once dismissed the row's error dot carries the
+                            // state; a `[r]` retry re-attempts. Anything else is a
+                            // plain status line.
+                            if let Some(halt) = crate::handlers::provision::sandbox_halt_in(&err) {
+                                ctx.model.status =
+                                    format!("{} unavailable: {}", halt.placement, halt.reason);
+                                if !ctx.halt_dismissed.contains(&k) {
+                                    *ctx.active_menu = Some(
+                                        crate::handlers::provision::sandbox_halt_overlay(halt),
+                                    );
+                                }
+                            } else {
+                                ctx.model.status = format!("Respawn failed: {err:#}");
+                            }
                         }
                     }
                 }
