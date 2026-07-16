@@ -1444,15 +1444,31 @@ fn agents_install_script(agents: &[String]) -> String {
 /// Configure git to authenticate HTTPS GitHub clone/push using a token from the
 /// environment, IF one is present (GH_TOKEN, else GITHUB_TOKEN). Runtime-
 /// conditional + idempotent; the helper reads the token at git-run time (so it's
-/// never baked into config or the checkpoint). No-op without a token (e.g. ssh
-/// remotes / public repos). Also marks the workdir a safe directory.
+/// never baked into config or the checkpoint). Also marks the workdir a safe
+/// directory and pins `core.sshCommand` to `StrictHostKeyChecking=accept-new` so
+/// a fresh sandbox with no `known_hosts` doesn't fail `Host key verification
+/// failed` on first contact.
+///
+/// When a token IS present it ALSO rewrites SSH GitHub origins to HTTPS
+/// (`url.https://github.com/.insteadOf git@github.com:` and the `ssh://` form):
+/// a sandbox has the token but NOT a GitHub-authorized SSH key, so an
+/// `git@github.com:…` origin (the common local remote) would otherwise clone-
+/// fail with `Permission denied (publickey)` even after the host key is
+/// trusted. The rewrite routes it through the token credential helper instead.
+/// Without a token the origin is left untouched (public HTTPS / agent-forwarded
+/// SSH still work). All persisted to `~/.gitconfig` so later pushes/pulls from
+/// the shell work too.
 fn git_auth_script() -> String {
     String::from(
         "tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; \
          git config --global --add safe.directory '*' 2>/dev/null || true; \
+         git config --global core.sshCommand 'ssh -o StrictHostKeyChecking=accept-new' 2>/dev/null || true; \
          if [ -n \"$tok\" ]; then \
            git config --global credential.helper \
              '!f() { test \"$1\" = get && printf \"username=x-access-token\\npassword=%s\\n\" \"${GH_TOKEN:-$GITHUB_TOKEN}\"; }; f'; \
+           git config --global --unset-all url.'https://github.com/'.insteadOf 2>/dev/null || true; \
+           git config --global --add url.'https://github.com/'.insteadOf 'git@github.com:' 2>/dev/null || true; \
+           git config --global --add url.'https://github.com/'.insteadOf 'ssh://git@github.com/' 2>/dev/null || true; \
          fi; true",
     )
 }
@@ -2689,6 +2705,27 @@ mod tests {
             "GitHub HTTPS token-as-password scheme"
         );
         assert!(s.contains("safe.directory"), "marks workdir safe");
+        assert!(
+            s.contains("core.sshCommand") && s.contains("StrictHostKeyChecking=accept-new"),
+            "trusts a fresh SSH host key so an ssh-origin clone doesn't fail host-key verification"
+        );
+        // With a token, rewrite ssh GitHub origins to https so the token helper
+        // authenticates the clone (the sandbox has no GitHub-authorized ssh key).
+        // insteadOf is a multivar: BOTH the scp-like (`git@github.com:`) and
+        // `ssh://` forms must be `--add`ed — a plain double `set` clobbers the
+        // first value, dropping the scp-like form the common origin actually uses.
+        assert!(
+            s.contains("--add url.'https://github.com/'.insteadOf 'git@github.com:'"),
+            "scp-like ssh origin rewrite is --added (not clobbered): {s}"
+        );
+        assert!(
+            s.contains("--add url.'https://github.com/'.insteadOf 'ssh://git@github.com/'"),
+            "ssh:// origin rewrite is --added too: {s}"
+        );
+        assert!(
+            s.contains("--unset-all url.'https://github.com/'.insteadOf"),
+            "clears prior insteadOf first so re-provision stays idempotent: {s}"
+        );
     }
 
     #[test]
