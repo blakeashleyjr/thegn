@@ -2662,10 +2662,17 @@ pub fn compose_spec(
     // If the resolved env's sandbox config has an explicit shell override, use
     // it for shell panes. Empty string = resolve from host $SHELL (the default).
     let sb_shell = sb.shell.trim().to_string();
-    // When running inside an OCI container the host's absolute $SHELL path
-    // (e.g. /run/current-system/sw/bin/zsh) does not exist in the container
-    // filesystem.  Pass in_oci=true so shell_inner() uses only the basename.
-    let in_oci = sb.spec.as_ref().is_some_and(|s| s.backend.is_oci());
+    // Use the probe-chain + devShell entry (`shell_inner(true)`) whenever the pane
+    // runs inside a sandbox that has its OWN environment — an OCI container OR any
+    // non-local placement (ssh host / k8s pod / provider sprite). The bare
+    // `${SHELL:-/bin/sh} -l` form is only safe locally: in a sprite the login
+    // user's `$SHELL` isn't the user's zsh, so it fell through to `/bin/sh`
+    // (`sh-5.3$`) and never entered the flake devShell. The probe chain finds zsh
+    // (added by the devShell) and the snippet loads the toolchain.
+    let in_oci = sb
+        .spec
+        .as_ref()
+        .is_some_and(|s| s.backend.is_oci() || !s.placement.is_local());
     let cmd = if choice == "clean-shell" {
         // Watchdog fallback: a plain rc-free shell. Ignores any `[sandbox] shell`
         // override on purpose — the override is part of what may be hanging.
