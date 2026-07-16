@@ -163,6 +163,7 @@ mod tests {
             name: "thegn-repo-feat".into(),
             vpn: None,
             oci_host: None,
+            oci_runtime: None,
         }
     }
 

@@ -807,6 +807,7 @@ mod tests {
             name: "thegn-test".into(),
             vpn: None,
             oci_host: None,
+            oci_runtime: None,
         }
     }
 
