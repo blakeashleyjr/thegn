@@ -249,7 +249,10 @@
       # (see the shellHook). Selected per-sandbox via `[sandbox] devshell =
       # "sandbox"` → `THEGN_DEVSHELL` → the repo `.envrc`'s `use flake` ref.
       devShells.sandbox = pkgs.mkShell {
-        packages = [rustToolchain pkgs.just];
+        # zsh so a sandbox/sprite pane (which enters THIS devShell via
+        # THEGN_DEVSHELL=sandbox) has a real login shell — the pane's shell probe
+        # finds it instead of dropping to a bare `/bin/sh`.
+        packages = [rustToolchain pkgs.just pkgs.zsh];
         shellHook = ''
           export PATH="$PWD/target/debug:$PATH"
           echo "thegn sandbox shell (lean: rust + just). Need a tool? Ephemeral:"
