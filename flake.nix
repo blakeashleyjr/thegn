@@ -289,6 +289,10 @@
             act
             # pty visual-regression harnesses (test/*.py reconstruct the screen)
             (python3.withPackages (ps: with ps; [pyte]))
+            # a login shell for sandbox panes: thegn injects this devShell's PATH
+            # into bwrap/OCI panes (which ship no zsh of their own), so the pane's
+            # shell probe finds zsh instead of dropping to a bare `/bin/sh`.
+            zsh
             # runtime tools thegn shells out to
             git
             fzf
