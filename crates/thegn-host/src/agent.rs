@@ -357,8 +357,11 @@ pub fn prepare_sandbox_env(
         }
         // failover on: don't strand the worktree on a provider that can't host it
         // (the doomed pane the user saw as a "crash"). Fall back to running LOCALLY
-        // on the host — the git worktree exists locally — with the local backend
-        // chain (Auto ⇒ bwrap/podman/host).
+        // on the host — the git worktree exists locally. Run it as a BARE host
+        // shell (`none`, not the bwrap chain): the fallback's whole job is a
+        // reliable working shell when the provider is down, and bare host is the
+        // user's real login shell (zsh + direnv + devShell), whereas a nested
+        // bwrap here just reintroduces the sandbox-toolchain fragility.
         thegn_core::msg::warn(&format!(
             "env '{env_name}' unavailable ({e}); falling back to the host"
         ));
@@ -366,7 +369,7 @@ pub fn prepare_sandbox_env(
         placement = thegn_core::placement::Placement::Local;
         exec_placement = thegn_core::placement::Placement::Local;
         env_is_remote = false;
-        sb.backend = thegn_core::config::SandboxBackend::Auto;
+        sb.backend = thegn_core::config::SandboxBackend::None;
     }
     if !placement.is_local()
         && let Err(e) = placement.ensure()
@@ -385,7 +388,7 @@ pub fn prepare_sandbox_env(
         placement = thegn_core::placement::Placement::Local;
         exec_placement = thegn_core::placement::Placement::Local;
         env_is_remote = false;
-        sb.backend = thegn_core::config::SandboxBackend::Auto;
+        sb.backend = thegn_core::config::SandboxBackend::None;
     }
     if let Some(pspec) = &projection {
         let backend = thegn_svc::projection::for_data_mode(pspec);
