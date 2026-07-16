@@ -353,7 +353,7 @@ fn hibernate_one(cfg: &Config, worktree: &str, env_name: &str) -> anyhow::Result
         updated_at: 0,
     })?;
 
-    let workdir = env.provider.sync_workdir();
+    let workdir = crate::provider_workdir::resolve(&env.provider, &name);
     let manifest = capture_to_store(
         &provider,
         &name,

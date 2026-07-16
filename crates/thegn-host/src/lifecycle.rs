@@ -464,7 +464,7 @@ fn recycle_spare(cfg: &Config, env_name: &str, spare: &PoolSpare, current_lock: 
             // provisioning outright, so at worst the eager path re-provisions
             // once, idempotently. A cold just-restored sprite may reject this
             // write; that is fine.
-            let workdir = env.provider.sync_workdir();
+            let workdir = crate::provider_workdir::resolve(&env.provider, name);
             let marker = thegn_core::envplan::EnvPlan::marker_path(&workdir);
             let _ = crate::agent::block_on_provider(|| async {
                 provider.write(name, &marker, b"ok\n").await

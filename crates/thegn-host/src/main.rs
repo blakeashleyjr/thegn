@@ -131,6 +131,7 @@ mod preview_render;
 mod probe;
 mod profile;
 mod provider_factory;
+mod provider_workdir;
 mod provision_gate;
 mod provision_recover;
 mod proxy_daemon;

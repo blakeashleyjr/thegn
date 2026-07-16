@@ -255,16 +255,21 @@ pub(crate) fn loading_context(
         if !pc.provider.trim().is_empty() {
             out.push(("provider".to_string(), pc.provider.clone()));
         }
-        if let Some(id) = crate::provider_factory::provider_sandbox_name(cfg, worktree, &env.name)
-            .filter(|s| !s.is_empty())
-        {
-            out.push(("sandbox".to_string(), id));
+        let sandbox_id = crate::provider_factory::provider_sandbox_name(cfg, worktree, &env.name)
+            .filter(|s| !s.is_empty());
+        if let Some(id) = &sandbox_id {
+            out.push(("sandbox".to_string(), id.clone()));
         }
         out.push((
             "connect".to_string(),
             format!("{:?}", pc.connect).to_lowercase(),
         ));
-        let wd = pc.sync_workdir();
+        // Show the resolved workdir (home-relative once the sandbox `$HOME` is
+        // cached), not the bare `/workspace` default.
+        let wd = match &sandbox_id {
+            Some(id) => crate::provider_workdir::resolve(pc, id),
+            None => pc.sync_workdir(),
+        };
         if !wd.trim().is_empty() {
             out.push(("workdir".to_string(), wd));
         }
