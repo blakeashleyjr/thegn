@@ -41,6 +41,11 @@ const ELAPSED_W: usize = 6;
 const RESERVE_MIN: usize = 12;
 /// Progress-bar cell budget.
 const BAR_W: usize = 20;
+/// Max content width for a floating sub-line (error / slow hint / progress
+/// detail). Sub-lines are NOT bound by the label-column `block_w` — an exit
+/// error or a slow hint gets the full centered content width (up to this cap)
+/// so it wraps instead of clipping to the short step-label column.
+const SUBLINE_MAX: usize = 60;
 
 /// Total body rows the loading layout will occupy for this plan — the value
 /// the splash reserves so its vertical anchor is a pure function of the plan
@@ -158,6 +163,13 @@ pub(crate) fn draw_body(
     let block_w = needed.min(cap);
     let bx = rect.x + rect.cols.saturating_sub(block_w) / 2;
     let label_budget = block_w.saturating_sub(2 + 2 + ELAPSED_W);
+    // Floating sub-lines hang under the cursor step's rail (`bx + 4`) and may
+    // run wider than the label column — out to a small right gutter, capped at
+    // SUBLINE_MAX — so a git error / slow hint wraps rather than clipping.
+    let sub_x = bx + 4;
+    let sub_w = (rect.x + rect.cols)
+        .saturating_sub(sub_x + 2)
+        .min(SUBLINE_MAX);
 
     // ── gauge ────────────────────────────────────────────────────────────
     let done = steps.iter().filter(|s| s.state == StepState::Done).count();
@@ -226,14 +238,14 @@ pub(crate) fn draw_body(
         }
         y += 1;
         if cur == Some(i) {
-            let lines = sublines(step, accent, block_w.saturating_sub(4));
+            let lines = sublines(step, accent, sub_w);
             for j in 0..SUBLINE_RESERVE {
                 if y >= bottom {
                     break;
                 }
                 if let Some(line) = lines.get(j) {
                     chrome::draw_text(surface, bx, y, g.box_v, col(S::Ghost), bg, 1);
-                    let mut x = bx + 4;
+                    let mut x = sub_x;
                     for (text, fg) in &line.segs {
                         chrome::draw_text(
                             surface,
@@ -242,7 +254,7 @@ pub(crate) fn draw_body(
                             text,
                             *fg,
                             bg,
-                            (bx + block_w).saturating_sub(x),
+                            (sub_x + sub_w).saturating_sub(x),
                         );
                         x += UnicodeWidthStr::width(text.as_str());
                     }
@@ -462,16 +474,21 @@ mod tests {
     #[test]
     fn failure_wraps_error_into_the_reserve() {
         let mut steps = plan_steps(1, true);
-        steps[1] = steps[1]
-            .clone()
-            .with_detail("manifest unknown: tag not found in registry (ghcr.io 404)");
+        // A long error wraps across the 2 reserve rows directly under the
+        // failed step (rows 3+4); overflow past the reserve is dropped, never a
+        // third row. The sub-line runs wider than the short label column, so a
+        // real git error isn't clipped mid-word.
+        steps[1] = steps[1].clone().with_detail(
+            "Clone repository (exit 128): Host key verification failed while reading from origin — retry",
+        );
         let l = draw(&steps, &[]);
-        // Wrapped into the 2 reserve rows directly under the failed step
-        // (rows 3+4); overflow past the reserve is dropped, never a third row.
-        assert!(l[3].contains("manifest"), "{:?}", l[3]);
-        assert!(!l[3].contains("registry"), "wraps, not one long line");
-        assert!(l[4].contains("not found"), "{:?}", l[4]);
-        assert!(!l[5].contains("ghcr"), "no third error row: {:?}", l[5]);
+        assert!(l[3].contains("Clone repository"), "{:?}", l[3]);
+        // The phrase survives across the two rows — it isn't clipped to the
+        // short label column (which was the reported truncation bug).
+        assert!(l[3].contains("Host key"), "row 1: {:?}", l[3]);
+        assert!(l[4].contains("verification failed"), "row 2: {:?}", l[4]);
+        // Exactly two rows: the tail beyond the reserve is dropped.
+        assert!(!l[5].contains("retry"), "no third error row: {:?}", l[5]);
     }
 
     #[test]
