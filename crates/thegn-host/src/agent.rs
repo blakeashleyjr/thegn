@@ -2663,16 +2663,15 @@ pub fn compose_spec(
     // it for shell panes. Empty string = resolve from host $SHELL (the default).
     let sb_shell = sb.shell.trim().to_string();
     // Use the probe-chain + devShell entry (`shell_inner(true)`) whenever the pane
-    // runs inside a sandbox that has its OWN environment — an OCI container OR any
-    // non-local placement (ssh host / k8s pod / provider sprite). The bare
-    // `${SHELL:-/bin/sh} -l` form is only safe locally: in a sprite the login
-    // user's `$SHELL` isn't the user's zsh, so it fell through to `/bin/sh`
-    // (`sh-5.3$`) and never entered the flake devShell. The probe chain finds zsh
-    // (added by the devShell) and the snippet loads the toolchain.
-    let in_oci = sb
-        .spec
-        .as_ref()
-        .is_some_and(|s| s.backend.is_oci() || !s.placement.is_local());
+    // runs inside ANY sandbox spec — OCI container, bwrap, or a remote/provider
+    // sprite. In all of these the host's absolute `$SHELL` path (or `$SHELL`
+    // itself, in a sprite) isn't the user's zsh, so the bare `${SHELL:-/bin/sh}
+    // -l` form fell through to `/bin/sh` (`sh-5.3$`) and never entered the flake
+    // devShell. The probe chain finds zsh (from the injected/loaded devShell) and
+    // the snippet loads the toolchain. Only a BARE-HOST pane (no sandbox spec,
+    // `backend = none` local) keeps `${SHELL} -l` — there `$SHELL` is the user's
+    // real zsh and the login files load the devShell via the rc-hook.
+    let in_oci = sb.spec.is_some();
     let cmd = if choice == "clean-shell" {
         // Watchdog fallback: a plain rc-free shell. Ignores any `[sandbox] shell`
         // override on purpose — the override is part of what may be hanging.
