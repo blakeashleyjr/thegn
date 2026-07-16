@@ -64,7 +64,16 @@ pub(crate) fn oci_login_snippet() -> String {
              devenv shell -- /bin/sh -lc '{inner}' && exit; \
          fi; "
     );
-    format!("{path_export}{devshell}{checks}exec /bin/sh -l")
+    // Robust fallback: if nothing above actually loaded a devShell (no `.envrc`,
+    // or direnv's `use flake` isn't supported in-sandbox because nix-direnv isn't
+    // installed — the "dropped into a bare shell" case), load the flake devShell
+    // DIRECTLY with `nix print-dev-env`. `IN_NIX_SHELL` is set once a devShell is
+    // active, so this no-ops when direnv already did the job. `THEGN_DEVSHELL`
+    // picks the attr (`sandbox` in-sandbox, else `default`).
+    let flake_fallback = "if [ -z \"$IN_NIX_SHELL\" ] && [ -e flake.nix ] && command -v nix >/dev/null 2>&1; then \
+             eval \"$(nix print-dev-env \".#${THEGN_DEVSHELL:-default}\" 2>/dev/null)\" 2>/dev/null || true; \
+         fi; ";
+    format!("{path_export}{devshell}{flake_fallback}{checks}exec /bin/sh -l")
 }
 
 #[cfg(test)]
@@ -86,6 +95,13 @@ mod tests {
                 && s.contains("devenv shell -- /bin/sh -lc")
                 && s.contains("&& exit"),
             "devenv fallback: {s}"
+        );
+        // Direct flake-devShell fallback when direnv didn't load one (no
+        // nix-direnv): guarded on IN_NIX_SHELL so it no-ops when already active.
+        assert!(
+            s.contains("[ -z \"$IN_NIX_SHELL\" ]")
+                && s.contains("nix print-dev-env \".#${THEGN_DEVSHELL:-default}\""),
+            "flake print-dev-env fallback: {s}"
         );
     }
 }
