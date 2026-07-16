@@ -174,25 +174,6 @@ fn store_root_of_truncates_to_top_level_store_path() {
 }
 
 #[test]
-fn sanitize_detail_strips_ansi_control_and_collapses_whitespace() {
-    // The real failing-step string: ANSI SGR codes + newlines (what tripped
-    // the renderer). Sanitized to a single clean line.
-    let raw = "Build dev shell (exit 2): \u{1b}[1m\u{1b}[32merror:\u{1b}[0m foo\n\n  bar\tbaz";
-    let s = sanitize_detail(raw);
-    assert!(!s.contains('\u{1b}'), "no escape bytes: {s:?}");
-    assert!(
-        !s.contains('\n') && !s.contains('\t'),
-        "no raw control: {s:?}"
-    );
-    assert_eq!(s, "Build dev shell (exit 2): error: foo bar baz");
-    // OSC sequence (ESC ] … BEL) is dropped whole.
-    assert_eq!(sanitize_detail("a\u{1b}]0;title\u{7}b"), "ab");
-    // Long input is clamped with an ellipsis.
-    let long = "x".repeat(500);
-    assert!(sanitize_detail(&long).chars().count() <= 201);
-}
-
-#[test]
 fn native_exec_health_reports_and_recovers() {
     // Unique provider name so the process-global registry doesn't collide
     // with other tests.

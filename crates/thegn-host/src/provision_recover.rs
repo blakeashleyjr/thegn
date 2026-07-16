@@ -38,6 +38,58 @@ pub(crate) fn exec_login_argv(script: &str) -> Vec<String> {
     ]
 }
 
+/// Sanitize a subprocess-derived message for display on the loading screen:
+/// strip ANSI/OSC escape sequences and other control bytes (provisioning output
+/// is full of them — they corrupt width math and have triggered renderer
+/// `capacity overflow`s), collapse runs of whitespace/newlines to single spaces,
+/// and clamp to a sane length. Pure + unit-tested.
+pub(crate) fn sanitize_detail(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(256));
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI (`ESC[ … final`) / OSC (`ESC] … BEL/ST`) / other ESC seq: skip
+            // the introducer and run to the terminating byte.
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for d in chars.by_ref() {
+                        if ('@'..='~').contains(&d) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    for d in chars.by_ref() {
+                        if d == '\u{7}' || d == '\u{1b}' {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        // Control chars (incl. newlines/tabs) + spaces → a single space; collapse
+        // runs so multi-line subprocess output reads as one tidy line.
+        if c.is_control() || c == ' ' {
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+        if out.chars().count() >= 200 {
+            out.push('…');
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
 /// Which provisioning steps are ESSENTIAL — a failure aborts creation — vs
 /// best-effort (warn + continue; the shell still opens and the step resolves
 /// lazily in the pane). Essentials: the worktree dir, git auth, the clone.
@@ -97,6 +149,20 @@ mod tests {
             argv[2].trim_end().ends_with("2>&1"),
             "folds stderr into stdout"
         );
+    }
+
+    #[test]
+    fn sanitize_detail_strips_ansi_control_and_collapses_whitespace() {
+        let raw = "Build dev shell (exit 2): \u{1b}[1m\u{1b}[32merror:\u{1b}[0m foo\n\n  bar\tbaz";
+        let s = sanitize_detail(raw);
+        assert!(!s.contains('\u{1b}'), "no escape bytes: {s:?}");
+        assert!(
+            !s.contains('\n') && !s.contains('\t'),
+            "no raw control: {s:?}"
+        );
+        assert_eq!(s, "Build dev shell (exit 2): error: foo bar baz");
+        assert_eq!(sanitize_detail("a\u{1b}]0;title\u{7}b"), "ab");
+        assert!(sanitize_detail(&"x".repeat(500)).chars().count() <= 201);
     }
 
     #[test]
