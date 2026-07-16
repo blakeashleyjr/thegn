@@ -53,16 +53,20 @@ done
 
 bindir="${bindir:-$HOME/.local/bin}"
 : "${XDG_CONFIG_HOME:=$HOME/.config}"
+: "${XDG_DATA_HOME:=$HOME/.local/share}"
 
 release_bin="$here/target/release/thegn"
 alacritty_config="$here/config/alacritty.toml"
 tg_tui="$bindir/tg-tui"
+apps_dir="$XDG_DATA_HOME/applications"
+desktop_file="$apps_dir/thegn.desktop"
 
 if ((dry_run)); then
   echo "dry-run: no files will be changed"
   echo "$bindir/thegn -> $release_bin"
   echo "$bindir/tg-tui wrapper -> $release_bin (current terminal)"
   echo "$bindir/tg wrapper -> alacritty --config-file $alacritty_config -e $tg_tui"
+  echo "$desktop_file -> app-launcher entry (Exec=$bindir/tg)"
   exit 0
 fi
 
@@ -86,7 +90,8 @@ tg_tui_q="$(shell_quote "$tg_tui")"
 # file or directory" as bash follows it to a non-existent target.
 # Also sweep the pre-rename superzej-era entry points.
 rm -f "$tg_tui" "$bindir/tg" \
-  "$bindir/sj" "$bindir/sj-tui" "$bindir/superzej" "$bindir/szhost"
+  "$bindir/sj" "$bindir/sj-tui" "$bindir/superzej" "$bindir/szhost" \
+  "$apps_dir/superzej.desktop" "$apps_dir/sj.desktop"
 
 cat >"$tg_tui" <<EOF
 #!/usr/bin/env bash
@@ -113,6 +118,34 @@ exec alacritty --config-file $alacritty_config_q -e $tg_tui_q
 EOF
 chmod 0755 "$bindir/tg"
 
+# App-launcher entry (GNOME/KDE/rofi/wofi/…): a `.desktop` file pointing at the
+# `tg` wrapper so thegn is searchable/pinnable in your launcher. `Terminal=false`
+# — `tg` opens its OWN alacritty window. The Icon uses the standard themed
+# terminal name (no bundled artwork); drop a `thegn.png` in your icon theme and
+# swap `Icon=` if you want custom artwork.
+tg_launcher="$bindir/tg"
+mkdir -p "$apps_dir"
+cat >"$desktop_file" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=thegn
+GenericName=Git Worktree IDE
+Comment=Terminal-native git-worktree IDE + multiplexer
+Exec=$tg_launcher
+TryExec=$tg_launcher
+Terminal=false
+Icon=utilities-terminal
+Categories=Development;IDE;RevisionControl;
+Keywords=git;worktree;terminal;ide;multiplexer;thegn;
+StartupNotify=true
+EOF
+chmod 0644 "$desktop_file"
+# Refresh the launcher's cache so the entry shows up without a re-login
+# (best-effort — not all environments ship the tool).
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$apps_dir" 2>/dev/null || true
+echo "wrote app-launcher entry: $desktop_file"
+
 if [[ ! -f "$XDG_CONFIG_HOME/thegn/config.toml" ]]; then
   mkdir -p "$XDG_CONFIG_HOME/thegn"
   cp "$here/config/config.toml.example" "$XDG_CONFIG_HOME/thegn/config.toml"
@@ -128,6 +161,7 @@ echo "installed:"
 echo "  $bindir/tg      -> dedicated alacritty window using $alacritty_config"
 echo "  $bindir/tg-tui  -> current-terminal native host ($release_bin)"
 echo "  $bindir/thegn   -> $release_bin"
+echo "  $desktop_file   -> app-launcher entry ('thegn')"
 echo
 echo "Ensure $bindir is on PATH, then run:  tg      # dedicated alacritty window"
 echo "                              or:  tg-tui  # current terminal"
