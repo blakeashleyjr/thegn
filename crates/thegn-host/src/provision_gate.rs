@@ -327,7 +327,7 @@ pub fn claim_spare(
         checkpoint = checkpoint.as_deref().unwrap_or("-"),
         "claimed spare checkpoint"
     );
-    let workdir = env.provider.sync_workdir();
+    let workdir = crate::provider_workdir::resolve(&env.provider, &name);
     // Per-worktree work: settle the branch in the spare's existing clone (the
     // sandbox auto-resumes when the exec opens). Best-effort — the bind already
     // succeeded, so the pane opens against the spare regardless.

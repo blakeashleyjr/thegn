@@ -120,8 +120,14 @@ pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, Stri
         }
     };
     // The sprite user owns the in-sandbox sshd + authorized_keys (non-root sshd
-    // can only authenticate as itself), so ssh logs in as that user.
-    Some((key, "sprite".to_string(), pc.sync_workdir()))
+    // can only authenticate as itself), so ssh logs in as that user. The workdir
+    // resolves against the sandbox's cached `$HOME` (workspace lives under the
+    // login user's home), falling back to the bare default when uncached.
+    let workdir = crate::provider_factory::provider_sandbox_name(cfg, worktree, &environment.name)
+        .filter(|s| !s.is_empty())
+        .map(|id| crate::provider_workdir::resolve(pc, &id))
+        .unwrap_or_else(|| pc.sync_workdir());
+    Some((key, "sprite".to_string(), workdir))
 }
 
 /// Build the local `ssh` argv for the SSH-over-WSS pane: a real ssh client whose
