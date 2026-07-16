@@ -55,6 +55,7 @@ fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {
         name: name.into(),
         vpn: None,
         oci_host: None,
+        oci_runtime: None,
     }
 }
 

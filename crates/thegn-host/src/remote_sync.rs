@@ -130,6 +130,48 @@ pub(crate) fn retarget_if_remote_oci(
     }
 }
 
+/// The final adjustments to a resolved spec just before `sandbox::ensure` creates
+/// the container: remote-OCI worktree materialization ([`retarget_if_remote_oci`])
+/// and degrading an unavailable strong OCI runtime to the daemon default
+/// ([`degrade_oci_runtime`]). Both are best-effort and only push human-visible
+/// warnings; neither fails the pane.
+pub(crate) fn finalize_spec_before_ensure(
+    spec: &mut thegn_core::sandbox::SandboxSpec,
+    worktree: &str,
+    warnings: &mut Vec<String>,
+) {
+    retarget_if_remote_oci(spec, worktree, warnings);
+    if let Some(w) = degrade_oci_runtime(spec) {
+        thegn_core::msg::warn(&format!("{w} for {worktree}"));
+        warnings.push(w);
+    }
+}
+
+/// If `spec` requests a strong OCI runtime (`runsc`/`krun`) that isn't usable on
+/// THIS host — the runtime binary is absent, or (for libkrun) `/dev/kvm` is
+/// missing — clear it so the container falls back to the daemon default runtime
+/// instead of failing `create --runtime …`. Returns the user-facing reason when
+/// it degraded, else `None`. The keep-or-degrade rule is the unit-tested pure
+/// [`thegn_core::sandbox_runtime::decide`]; here we only probe the host.
+pub(crate) fn degrade_oci_runtime(spec: &mut thegn_core::sandbox::SandboxSpec) -> Option<String> {
+    use thegn_core::sandbox_runtime::{RuntimeDecision, decide, runtime_req};
+    if !spec.backend.is_oci() {
+        return None;
+    }
+    let requested = spec.oci_runtime.clone();
+    let requested = requested.as_deref()?;
+    let req = runtime_req(requested.trim())?;
+    let binary_present = thegn_core::util::which_path(req.binary).is_some();
+    let kvm_present = std::path::Path::new("/dev/kvm").exists();
+    match decide(Some(requested), binary_present, kvm_present) {
+        RuntimeDecision::Keep => None,
+        RuntimeDecision::Degrade(reason) => {
+            spec.oci_runtime = None;
+            Some(reason)
+        }
+    }
+}
+
 /// Sync `worktree` to `runner`'s remote host under `~/thegn-worktrees/<slug>`
 /// and return the resolved absolute remote path. `slug` should be the sandbox
 /// container name (deterministic + unique per worktree), so the materialized

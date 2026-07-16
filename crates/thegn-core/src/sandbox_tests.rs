@@ -240,6 +240,7 @@ fn spec(backend: Backend) -> SandboxSpec {
         name: "thegn-repo-feat".into(),
         vpn: None,
         oci_host: None,
+        oci_runtime: None,
     }
 }
 
@@ -330,6 +331,30 @@ fn oci_create_opts_map_userns_and_mounts() {
     assert!(j.contains("-v /repo/.git:/repo/.git"));
     assert!(j.contains("-e GH_TOKEN=abc"));
     assert!(j.contains("-p 8080:8080"));
+}
+
+#[test]
+fn oci_runtime_injected_only_for_oci_backends_when_set() {
+    // Unset ⇒ no --runtime (daemon default).
+    assert!(
+        !oci_create_opts(&spec(Backend::Podman))
+            .join(" ")
+            .contains("--runtime")
+    );
+
+    // Set on an OCI backend ⇒ `--runtime <value>` at create.
+    let mut s = spec(Backend::Podman);
+    s.oci_runtime = Some("runsc".into());
+    assert!(oci_create_opts(&s).join(" ").contains("--runtime runsc"));
+
+    let mut k = spec(Backend::Docker);
+    k.oci_runtime = Some("krun".into());
+    assert!(oci_create_opts(&k).join(" ").contains("--runtime krun"));
+
+    // A blank/whitespace value is treated as unset.
+    let mut blank = spec(Backend::Podman);
+    blank.oci_runtime = Some("  ".into());
+    assert!(!oci_create_opts(&blank).join(" ").contains("--runtime"));
 }
 
 #[test]

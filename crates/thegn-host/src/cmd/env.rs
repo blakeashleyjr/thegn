@@ -755,14 +755,22 @@ fn env_isolation(
                 thegn_core::sandbox::Backend::None,
                 &env.placement,
                 false,
+                None,
             )
             .isolation,
         ),
         _ => {
             let backend = thegn_core::sandbox::Backend::from_config(env.sandbox.backend)?;
+            let runtime = (!env.sandbox.oci_runtime.trim().is_empty())
+                .then_some(env.sandbox.oci_runtime.as_str());
             Some(
-                thegn_core::capabilities::Capabilities::from_parts(backend, &env.placement, false)
-                    .isolation,
+                thegn_core::capabilities::Capabilities::from_parts(
+                    backend,
+                    &env.placement,
+                    false,
+                    runtime,
+                )
+                .isolation,
             )
         }
     }

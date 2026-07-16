@@ -36,10 +36,32 @@ fn yn(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 
-/// The honest boundary class a named backend resolves to at `Local` placement.
-fn isolation_of(backend_name: &str) -> Option<IsolationClass> {
+/// The honest boundary class a named backend resolves to at `Local` placement,
+/// under the configured OCI runtime (`runsc`/`krun` raise it for OCI backends).
+fn isolation_of(backend_name: &str, oci_runtime: Option<&str>) -> Option<IsolationClass> {
     let backend = Backend::parse(backend_name)?;
-    Some(Capabilities::from_parts(backend, &Placement::Local, false).isolation)
+    Some(Capabilities::from_parts(backend, &Placement::Local, false, oci_runtime).isolation)
+}
+
+/// The configured `[sandbox] oci_runtime`, or `None` when unset (daemon default).
+fn cfg_oci_runtime(cfg: &Config) -> Option<&str> {
+    (!cfg.sandbox.oci_runtime.trim().is_empty()).then_some(cfg.sandbox.oci_runtime.as_str())
+}
+
+/// A `" (…)"` availability suffix for the configured OCI runtime: whether its
+/// binary (and `/dev/kvm`, for libkrun) is present on THIS host, so the user
+/// learns a strong runtime would silently fall back before they rely on it.
+fn oci_runtime_status(rt: &str) -> String {
+    use thegn_core::sandbox_runtime::{RuntimeDecision, decide, runtime_req};
+    let Some(req) = runtime_req(rt.trim()) else {
+        return String::new(); // runc/crun/unknown: no extra requirement to report.
+    };
+    let binary_present = thegn_core::util::which_path(req.binary).is_some();
+    let kvm_present = std::path::Path::new("/dev/kvm").exists();
+    match decide(Some(rt), binary_present, kvm_present) {
+        RuntimeDecision::Keep => " (available)".to_string(),
+        RuntimeDecision::Degrade(reason) => format!(" (unavailable — {reason})"),
+    }
 }
 
 /// A one-line summary of the OS-isolation knobs a hardening preset imposes.
@@ -81,7 +103,7 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
         .map(|name| {
             serde_json::json!({
                 "backend": name,
-                "isolation": isolation_of(name).map(|c| c.as_str()),
+                "isolation": isolation_of(name, cfg_oci_runtime(cfg)).map(|c| c.as_str()),
             })
         })
         .collect();
@@ -532,10 +554,13 @@ fn sandbox_report(cfg: &Config) {
             cfg.sandbox.backend.as_str()
         );
     }
+    if let Some(rt) = cfg_oci_runtime(cfg) {
+        outln!("  oci_runtime   {rt}{}", oci_runtime_status(rt));
+    }
     let chain = shell_chain(cfg);
     let mut all_weak = true;
     for name in &chain {
-        match isolation_of(name) {
+        match isolation_of(name, cfg_oci_runtime(cfg)) {
             Some(class) => {
                 if !matches!(
                     class,
@@ -567,8 +592,10 @@ fn sandbox_report(cfg: &Config) {
     cpu_cap_report(cfg);
     if all_weak {
         outln!("  note          even the strongest preset here shares the host kernel; for a");
-        outln!("                stronger boundary on agent code use a guest-kernel backend");
-        outln!("                (gVisor/libkrun) in agent_backend_chain.");
+        outln!("                stronger boundary on agent code set [sandbox] oci_runtime to");
+        outln!(
+            "                \"runsc\" (gVisor userspace kernel) or \"krun\" (libkrun microVM)."
+        );
     }
 }
 
@@ -804,10 +831,37 @@ mod tests {
 
     #[test]
     fn isolation_of_resolves_known_backends() {
-        assert_eq!(isolation_of("bwrap"), Some(IsolationClass::SharedKernel));
-        assert_eq!(isolation_of("podman"), Some(IsolationClass::SharedKernel));
-        assert_eq!(isolation_of("host"), Some(IsolationClass::HostProcess));
-        assert_eq!(isolation_of("not-a-backend"), None);
+        assert_eq!(
+            isolation_of("bwrap", None),
+            Some(IsolationClass::SharedKernel)
+        );
+        assert_eq!(
+            isolation_of("podman", None),
+            Some(IsolationClass::SharedKernel)
+        );
+        assert_eq!(
+            isolation_of("host", None),
+            Some(IsolationClass::HostProcess)
+        );
+        assert_eq!(isolation_of("not-a-backend", None), None);
+        // A stronger OCI runtime raises the reported class for OCI backends…
+        assert_eq!(
+            isolation_of("podman", Some("runsc")),
+            Some(IsolationClass::UserspaceKernel)
+        );
+        assert_eq!(
+            isolation_of("podman", Some("krun")),
+            Some(IsolationClass::GuestKernel)
+        );
+        // …but a non-OCI backend ignores it, and runc/crun stay shared-kernel.
+        assert_eq!(
+            isolation_of("bwrap", Some("krun")),
+            Some(IsolationClass::SharedKernel)
+        );
+        assert_eq!(
+            isolation_of("podman", Some("crun")),
+            Some(IsolationClass::SharedKernel)
+        );
     }
 
     #[test]

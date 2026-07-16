@@ -2167,6 +2167,9 @@ pub struct SandboxConfig {
     /// subcommand. An alternative reach to `[env.<name>] placement = "ssh"`,
     /// useful when the daemon (not just the shell) lives on another box.
     pub oci_host: String,
+    /// OCI runtime for worktree containers (`--runtime`): `"runsc"` (gVisor) / `"krun"`
+    /// (libkrun microVM); empty ⇒ default. OCI backends only. See config.toml.example.
+    pub oci_runtime: String,
     pub remote: RemoteConfig,
     /// Allow-only these hostnames for outbound connections (empty = allow all).
     /// Enforced via a per-container DNS interceptor. Block-list is checked first
@@ -2242,6 +2245,7 @@ impl Default for SandboxConfig {
             on_missing: OnMissing::Warn,
             failover: FailoverMode::Halt,
             oci_host: String::new(),
+            oci_runtime: String::new(),
             remote: RemoteConfig::default(),
             network_allow: Vec::new(),
             network_block: Vec::new(),

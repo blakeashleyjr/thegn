@@ -142,6 +142,7 @@ pub mod sandbox_cpucap;
 pub mod sandbox_mounts;
 pub mod sandbox_prefetch;
 pub mod sandbox_preflight;
+pub mod sandbox_runtime;
 pub mod scheduler;
 pub mod search;
 pub mod semantic;
