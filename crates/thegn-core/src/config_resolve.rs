@@ -949,6 +949,26 @@ pub fn resolve_repo_sandbox(
 /// global `[sandbox] default_env` → implicit `"default"`. The named-env overlay
 /// is trusted (globally defined) and applies unclamped on top of the clamped
 /// repo base.
+/// Whether a resolved env should default its sandbox backend to `none` because
+/// the *placement itself* is the isolation boundary. A managed sandbox (provider
+/// microVM / k8s pod) brings its own isolation, so unless the env EXPLICITLY opts
+/// into a nested backend (`[env.<name>.sandbox] backend = …`, `env_set_backend`),
+/// it runs natively in the sandbox rather than inheriting the host's `[sandbox]
+/// backend` (e.g. `bwrap`) — whose local chain is meaningless remotely and just
+/// stalls the resolver probing it inside the sandbox. Local + ssh placements keep
+/// the configured chain (an ssh host may genuinely run a container). Pure so the
+/// rule is unit-tested without the full env-resolution world.
+fn managed_placement_defaults_none(
+    placement: &crate::placement::Placement,
+    env_set_backend: bool,
+) -> bool {
+    !env_set_backend
+        && matches!(
+            placement,
+            crate::placement::Placement::Provider(_) | crate::placement::Placement::K8s(_)
+        )
+}
+
 pub fn resolve_environment(
     cfg: &Config,
     repo_root: &Path,
@@ -987,9 +1007,13 @@ pub fn resolve_environment(
         }
         Some(envc) => {
             let mut sb = base;
+            let env_set_backend = envc.sandbox.backend.is_some();
             envc.sandbox.clone().apply(&mut sb);
             let mut placement =
                 crate::envbuild::build_env_placement(envc, &sb, loc, worktree, repo_root);
+            if managed_placement_defaults_none(&placement, env_set_backend) {
+                sb.backend = crate::config::SandboxBackend::None;
+            }
             // A host-pinned ssh env (`[env.*] host = "name"`) reaches the box
             // exactly as the control plane does — via the `[host.*.ssh]` config
             // (transport, ProxyCommand, identity, …). Without this the pane is
@@ -1133,6 +1157,32 @@ mod tests {
     }
 
     // ---- The security regression gate: hostile_repo_cannot_escape --------
+
+    #[test]
+    fn managed_placements_default_to_no_backend_unless_env_opts_in() {
+        use crate::placement::{Placement, ProviderPlacement};
+        let provider = Placement::Provider(ProviderPlacement {
+            provider: "machine0".into(),
+            id: "s".into(),
+            interactive_prefix: vec![],
+            control_prefix: vec![],
+            up_command: vec![],
+            down_command: vec![],
+        });
+        // Provider with no explicit env backend ⇒ default none (bring your own).
+        assert!(managed_placement_defaults_none(&provider, false));
+        // Explicit `[env.x.sandbox] backend` ⇒ honor the nesting opt-in.
+        assert!(!managed_placement_defaults_none(&provider, true));
+        // Local + ssh keep the configured chain regardless.
+        assert!(!managed_placement_defaults_none(&Placement::Local, false));
+        let ssh = Placement::Ssh(crate::placement::SshPlacement::plain(
+            "h".into(),
+            22,
+            false,
+            crate::placement::TransportKind::Ssh,
+        ));
+        assert!(!managed_placement_defaults_none(&ssh, false));
+    }
 
     #[test]
     fn hostile_repo_cannot_disable_sandbox() {

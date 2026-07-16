@@ -38,6 +38,13 @@ use std::time::{Duration, Instant};
 /// falls through to bwrap/host instead of freezing the caller — pane spawns
 /// run on the event loop's critical path.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Ceiling for a runtime probe that rides a REMOTE control transport (ssh /
+/// kubectl exec / provider exec): the local `PROBE_TIMEOUT` plus a budget for
+/// connection setup. Bounded so a hung/black-holed transport fails fast as
+/// `Unreachable` (then the retry/chain takes over) instead of blocking the whole
+/// sandbox resolution indefinitely — the raw `Command::output()` it replaced had
+/// no deadline, which is how one wedged exec turned into a multi-minute stall.
+pub(crate) const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Ceiling for container create (`run -d`): image is prefetched by then, so
 /// this is namespace/cgroup setup, not network.
 pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -194,7 +201,7 @@ impl Backend {
         )
     }
 
-    pub(crate) fn is_host_toolchain(self) -> bool {
+    pub fn is_host_toolchain(self) -> bool {
         matches!(
             self,
             Backend::Bwrap | Backend::Systemd | Backend::WinAppContainer | Backend::WinJobObject
@@ -972,7 +979,7 @@ pub fn placement_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Placement {
     }
 }
 
-pub use crate::sandbox_backend::placement_reachable;
+pub use crate::sandbox_backend::{ProbePass, placement_reachable, probe_pass_guard};
 use crate::sandbox_backend::{available, pick_backend};
 
 pub const DEFAULT_OCI_IMAGE: &str = "docker.io/library/debian:stable";

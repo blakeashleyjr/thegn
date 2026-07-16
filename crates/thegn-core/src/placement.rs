@@ -478,12 +478,20 @@ impl Placement {
             }
             _ => {
                 let argv = self.probe_argv(bin);
-                match std::process::Command::new(&argv[0])
-                    .args(&argv[1..])
-                    .output()
-                {
-                    Ok(o) => classify_probe(o.status.code(), &String::from_utf8_lossy(&o.stdout)),
-                    Err(_) => RuntimeProbe::Unreachable,
+                // Bounded: a wedged control transport (ssh/provider exec that
+                // connects then black-holes) must NOT block resolution forever.
+                // On timeout/spawn-failure we get `None` ⇒ `Unreachable`, which the
+                // caller's retry + backend chain already handle. A clean exit maps
+                // back through `classify_probe` (nonzero ⇒ transport failure ⇒
+                // Unreachable; exit 0 ⇒ the stdout sentinel decides present/absent).
+                match crate::sandbox::output_with_timeout(
+                    &argv,
+                    crate::sandbox::REMOTE_PROBE_TIMEOUT,
+                ) {
+                    Some((success, stdout)) => {
+                        classify_probe(Some(if success { 0 } else { 255 }), &stdout)
+                    }
+                    None => RuntimeProbe::Unreachable,
                 }
             }
         }

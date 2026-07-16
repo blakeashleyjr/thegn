@@ -1102,16 +1102,25 @@ fn direnv_install_script() -> String {
     // install` slow (~10s+); the native package is ~2s and direnv is just a PATH
     // shim (no Nix integration needed here). Nix is the fallback for base images
     // without apt.
+    // The rc-hook append is BEST-EFFORT: a read-only login rc (home-manager /
+    // nix-managed `~/.zshrc`, as on the sprite login user) makes `>> "$rc"` fail
+    // "Permission denied" — which used to exit the whole step 1 and paint a red X
+    // on the loading screen, even though direnv installed fine AND the hook is
+    // redundant there (the pane enters direnv via `eval "$(direnv export bash)"`,
+    // see `shell_snippet`). So: skip an unwritable rc (`[ -w ]`), swallow any write
+    // error, and end on `true` so the step only fails if direnv itself is unusable.
     format!(
         "{}command -v direnv >/dev/null 2>&1 \
            || (export DEBIAN_FRONTEND=noninteractive; apt-get update -y >/dev/null 2>&1 && apt-get install -y direnv >/dev/null 2>&1) \
            || nix profile install nixpkgs#direnv 2>/dev/null; \
          for sh in bash zsh; do \
            rc=\"$HOME/.${{sh}}rc\"; \
-           [ -f \"$rc\" ] || touch \"$rc\"; \
+           [ -e \"$rc\" ] || touch \"$rc\" 2>/dev/null || true; \
+           [ -w \"$rc\" ] || continue; \
            grep -q 'direnv hook' \"$rc\" 2>/dev/null || \
-             printf '\\neval \"$(direnv hook %s)\"\\n' \"$sh\" >> \"$rc\"; \
-         done",
+             printf '\\neval \"$(direnv hook %s)\"\\n' \"$sh\" >> \"$rc\" 2>/dev/null || true; \
+         done; \
+         true",
         nix_runtime_prelude(),
     )
 }
@@ -1133,8 +1142,10 @@ pub fn bake_scripts(
 }
 
 /// Warm the dev environment so the first interactive shell is instant. With
-/// direnv+flake we `direnv allow` + evaluate once; otherwise build the flake
-/// devShell / devenv directly.
+/// direnv+flake we `direnv allow` + evaluate once; a flake devShell (even
+/// alongside a `devenv.nix`) warms with `nix develop`; only a PURE-devenv repo
+/// (no flake devShell) installs the heavy `devenv` CLI; otherwise `nix-shell`
+/// (classic) or `nix develop`.
 fn devshell_warm_script(workdir: &str, req: &EnvRequirements) -> String {
     let wd = sh_quote(workdir);
     let tok = nix_runtime_prelude();
@@ -1154,7 +1165,14 @@ fn devshell_warm_script(workdir: &str, req: &EnvRequirements) -> String {
         format!(
             "{nixsh}; cd {wd} 2>/dev/null && direnv allow . 2>/dev/null; direnv exec . true 2>/dev/null || nix develop --command true 2>/dev/null || true; true"
         )
-    } else if req.devenv {
+    } else if req.devenv && !req.nix_flake_devshell {
+        // Pure-devenv (no flake devShell to fall back on): the `devenv` CLI is the
+        // only entry, so install it if absent. NOTE this `nix profile install` is
+        // heavy — a repo that ALSO ships a flake devShell skips it and warms via
+        // `nix develop` below (the flake gives the same toolchain without paying
+        // for devenv's closure, whose from-source realise can OOM-kill — exit 137,
+        // which restarts the VM — or time out a pooled provider microVM and paint
+        // a spurious "Build dev shell" failure on the loading screen).
         format!(
             "{nixsh}; cd {wd} 2>/dev/null && (command -v devenv >/dev/null 2>&1 || nix profile install nixpkgs#devenv 2>/dev/null) || true; devenv shell true 2>/dev/null || true; true"
         )
@@ -1704,6 +1722,29 @@ mod tests {
         assert_eq!(p.tier, Tier::Nix);
         let dev = p.steps.iter().find(|s| s.id == "devshell").unwrap();
         assert!(matches!(&dev.kind, StepKind::Exec(s) if s.contains("nix-shell --run true")));
+    }
+
+    #[test]
+    fn flake_devshell_warm_prefers_nix_develop_over_devenv_install() {
+        // A repo can ship BOTH a flake devShell and a devenv.nix (devenv's flake
+        // integration). The warm must use the flake (`nix develop`) and NEVER the
+        // heavy `nix profile install nixpkgs#devenv`, whose closure can OOM-kill /
+        // time out a pooled provider microVM and paint a spurious splash failure.
+        let req = EnvRequirements {
+            nix_flake_devshell: true,
+            devenv: true,
+            ..Default::default()
+        };
+        let s = devshell_warm_script("/workspace", &req);
+        assert!(s.contains("nix develop --command true"), "{s}");
+        assert!(!s.contains("nix profile install nixpkgs#devenv"), "{s}");
+        // Pure-devenv (no flake devShell) still installs the CLI — it's the only entry.
+        let pure = EnvRequirements {
+            devenv: true,
+            ..Default::default()
+        };
+        let p = devshell_warm_script("/workspace", &pure);
+        assert!(p.contains("nix profile install nixpkgs#devenv"), "{p}");
     }
 
     #[test]
@@ -2570,6 +2611,23 @@ mod tests {
         assert!(plain.contains("NIX_CONFIG") && plain.contains("/homeless-shelter"));
         // direnv install (also a nix build) carries the prelude too.
         assert!(direnv_install_script().contains("/homeless-shelter"));
+    }
+
+    #[test]
+    fn direnv_install_tolerates_a_readonly_login_rc() {
+        // Regression: a home-manager/nix read-only `~/.zshrc` (as on the sprite
+        // login user) must NOT fail the "Install direnv" step with a red X — skip
+        // the unwritable rc and end on `true` so only a broken direnv fails it.
+        let s = direnv_install_script();
+        assert!(
+            s.contains("[ -w \"$rc\" ] || continue"),
+            "skips an unwritable rc: {s}"
+        );
+        assert!(
+            s.contains(">> \"$rc\" 2>/dev/null || true"),
+            "swallows a failed hook append: {s}"
+        );
+        assert!(s.trim_end().ends_with("true"), "ends on true: {s}");
     }
 
     #[test]
