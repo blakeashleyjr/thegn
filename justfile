@@ -704,6 +704,10 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
     state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; logs="$state/thegn/logs"; mkdir -p "$state" "$run" "$logs"; \
       if [ -f "$PWD/.envrc.local" ]; then set -a; . "$PWD/.envrc.local"; set +a; fi; \
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
+      : "ROTATE the release daemon + detached pane shells before relaunch — otherwise the persisted daemon reattaches OLD-binary pane sessions and a rebuild is never reflected (the 'restarted but still bwrap/sh-5.3' trap)."; \
+      pkill -f "release/thegn[ ]daemon" 2>/dev/null || true; \
+      pkill -f "dtach[ ]-A[ ][^ ]*/tg-socket-" 2>/dev/null || true; \
+      sleep 0.3; \
       echo "profiler: 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/"; \
       echo "logs: $logs/thegn.log (full trace: startup/frame/hydrate/perf + every crate) + $logs/stderr.log (panic message + full backtrace)"; \
       echo "sprites token: $([ -n "${SPRITES_TOKEN:-}" ] && echo "loaded (len ${#SPRITES_TOKEN})" || echo "NOT set — sprites envs will halt; put SPRITES_TOKEN in .envrc.local")"; \
