@@ -442,6 +442,99 @@ pub(crate) fn upload_agent_configs(
     Ok(())
 }
 
+/// Deploy each declared coding-agent ACCOUNT's credential home into the sandbox
+/// under a stable per-account path (`$HOME/.thegn/accounts/<provider>/<slug>/`),
+/// so a provider pane can point the agent's home env var (`CLAUDE_CONFIG_DIR` /
+/// `CODEX_HOME`) at the selected one (see [`account_pane_env_exports`]). This is
+/// how client-side account switching (`[[accounts]]`) reaches a REMOTE provider:
+/// path-preserving bind-mounting the host dir (what the local path does) can't
+/// cross to a sprite, so we upload the dir's contents instead. Only *authed*
+/// accounts are shipped. Best-effort + budget-bounded; a missing/unreadable dir
+/// is skipped. No-op when no `[[accounts]]`/managed accounts exist — the default
+/// `~/.claude` upload in [`upload_agent_configs`] still covers the single-home case.
+pub(crate) fn upload_agent_accounts(
+    provider: &thegn_svc::provider::Provider,
+    id: &str,
+    sprite_home: &str,
+    cfg: &thegn_core::config::Config,
+) {
+    let Ok(db) = thegn_core::db::Db::open() else {
+        return;
+    };
+    let base = sprite_home.trim_end_matches('/');
+    let mut uploads: Vec<(String, Vec<u8>, bool)> = Vec::new();
+    for p in thegn_core::account::PROVIDERS {
+        for acct in thegn_core::account::list(cfg, &db, p.id) {
+            // Only ship accounts that are actually logged in (auth marker present)
+            // and whose dir exists — an un-authed managed dir would just 401 too.
+            if !acct.authed || !acct.dir.is_dir() {
+                continue;
+            }
+            let slug = thegn_core::util::slugify(&acct.name);
+            let dest_root = format!("{base}/.thegn/accounts/{}/{}", p.id, slug);
+            for (abs, rel, exec) in collect_agent_config_files(&acct.dir) {
+                if let Ok(data) = std::fs::read(&abs) {
+                    uploads.push((format!("{dest_root}/{rel}"), data, exec));
+                }
+            }
+        }
+    }
+    if uploads.is_empty() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + AGENT_CONFIG_STEP_BUDGET;
+    let _ = block_on_provider(|| async {
+        for (dest, data, exec) in &uploads {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let _ = tokio::time::timeout(
+                AGENT_CONFIG_UPLOAD_TIMEOUT,
+                write_preserving_mode(provider, id, dest, data, *exec),
+            )
+            .await;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+}
+
+/// The `export <HOME_ENV>="$HOME/.thegn/accounts/<provider>/<slug>"; …` prefix to
+/// splice ahead of a PROVIDER pane's inner command, pointing each agent CLI at the
+/// ACTIVE account deployed by [`upload_agent_accounts`]. `$HOME` is expanded
+/// in-sprite (the sandbox login `$HOME` isn't known host-side, so we can't bake an
+/// absolute path). Empty when no account is active for any provider — the pane
+/// then uses the agent's default `~/.<agent>` home (backwards-compatible).
+pub(crate) fn account_pane_env_exports(cfg: &thegn_core::config::Config, worktree: &str) -> String {
+    use thegn_core::store::WorkspaceStore;
+    let Ok(db) = thegn_core::db::Db::open() else {
+        return String::new();
+    };
+    let repo_root = db
+        .repo_root_for(worktree)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| thegn_core::repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| Path::new(worktree).to_path_buf());
+    let slug = crate::agent::repo_slug(&db, &repo_root);
+    let mut out = String::new();
+    for p in thegn_core::account::PROVIDERS {
+        let Some(name) =
+            thegn_core::account::active_name(cfg, &db, worktree, slug.as_deref(), p.id)
+        else {
+            continue;
+        };
+        out.push_str(&format!(
+            "export {}=\"$HOME/.thegn/accounts/{}/{}\"; ",
+            p.home_env,
+            p.id,
+            thegn_core::util::slugify(&name),
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

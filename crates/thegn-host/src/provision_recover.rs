@@ -38,6 +38,29 @@ pub(crate) fn exec_login_argv(script: &str) -> Vec<String> {
     ]
 }
 
+/// Which provisioning steps are ESSENTIAL — a failure aborts creation — vs
+/// best-effort (warn + continue; the shell still opens and the step resolves
+/// lazily in the pane). Essentials: the worktree dir, git auth, the clone.
+/// Everything else (nix install, devShell/direnv warm, personal tools, dotfiles,
+/// the home-parity closure, checkpoint) is best-effort, so one flaky `nix
+/// develop` / unreachable cache can't kill an otherwise-usable sandbox.
+pub(crate) fn step_is_fatal(step_id: &str) -> bool {
+    matches!(step_id, "workspace" | "git_auth" | "clone")
+}
+
+/// Which best-effort steps are pure PRE-WARMS whose only effect is to build the
+/// dev shell ahead of time — the pane rebuilds it lazily on entry, so a failure
+/// is invisible to the user. Their common failure on a pooled provider microVM is
+/// an OOM-kill (`exit 137`, which restarts the VM) or a timeout on a heavy Nix
+/// build; painting that as a red `Failed` splash row is alarming and misleading
+/// (nothing is actually broken). So these surface as a completed step with a "will
+/// finish in the shell" hint instead. Distinct from the other best-effort steps
+/// (dotfiles, tools, agent configs), whose failure the user DOES want to see —
+/// their effect isn't reproduced lazily in the pane.
+pub(crate) fn step_is_warm_only(step_id: &str) -> bool {
+    matches!(step_id, "devshell" | "cache_push" | "direnv_allow")
+}
+
 /// Whether a failed provisioning step likely **restarted the sandbox VM** — so
 /// the runner should `wait_ready` before the next step rather than let every
 /// remaining step independently exhaust its connect budget against a
@@ -74,6 +97,25 @@ mod tests {
             argv[2].trim_end().ends_with("2>&1"),
             "folds stderr into stdout"
         );
+    }
+
+    #[test]
+    fn warm_only_and_fatal_step_classifiers_partition_the_pipeline() {
+        // Essentials abort creation; pure pre-warms de-alarm to a hint; the rest
+        // keep the visible best-effort failure. The three sets must not overlap.
+        for id in ["workspace", "git_auth", "clone"] {
+            assert!(step_is_fatal(id), "{id} is fatal");
+            assert!(!step_is_warm_only(id), "{id} is not a warm-only");
+        }
+        for id in ["devshell", "cache_push", "direnv_allow"] {
+            assert!(step_is_warm_only(id), "{id} is a warm-only pre-warm");
+            assert!(!step_is_fatal(id), "{id} is not fatal");
+        }
+        // A best-effort-but-visible step (dotfiles/tools) is neither — its failure
+        // still surfaces because the pane doesn't reproduce it lazily.
+        for id in ["dotfiles", "tools", "agents"] {
+            assert!(!step_is_fatal(id) && !step_is_warm_only(id), "{id}");
+        }
     }
 
     #[test]

@@ -57,10 +57,16 @@ pub enum Action {
     /// create it also applies the env's network allow/block as the sandbox's
     /// egress policy when the provider supports it.
     Provision { worktree: Option<String> },
-    /// Destroy a managed-sandbox by id via the env's API provider.
+    /// Destroy managed-sandbox(es) via the env's API provider. Pass an `id`, or
+    /// `--all` to destroy every sandbox the provider can see. `--env <name>`
+    /// targets a named env's provider instead of the worktree's resolved one.
     Deprovision {
-        id: String,
+        id: Option<String>,
         worktree: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Create a checkpoint/snapshot of the env's sandbox (providers that support it).
     Snapshot {
@@ -140,8 +146,13 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Up { worktree } => lifecycle(cfg, worktree, Lifecycle::Up),
         Action::Down { worktree } => lifecycle(cfg, worktree, Lifecycle::Down),
         Action::Forward { spec, worktree } => forward(cfg, worktree, &spec),
-        Action::Provision { worktree } => provision(cfg, worktree, None),
-        Action::Deprovision { id, worktree } => provision(cfg, worktree, Some(id)),
+        Action::Provision { worktree } => provision(cfg, worktree),
+        Action::Deprovision {
+            id,
+            worktree,
+            all,
+            env,
+        } => deprovision(cfg, worktree, id, all, env),
         Action::Snapshot { worktree, label } => snapshot(cfg, worktree, label),
         Action::Snapshots { worktree } => snapshots(cfg, worktree),
         Action::Restore { id, worktree } => restore(cfg, worktree, &id),
@@ -259,6 +270,58 @@ fn remove(name: &str) -> Result<()> {
     thegn_core::config_write::remove_env(&path, name)?;
     crate::secret::forget(name);
     outln!("removed env '{name}'");
+    Ok(())
+}
+
+/// Destroy managed sandbox(es). With `--all`, list every sandbox the provider
+/// can see and destroy each (best-effort per id — a failed destroy warns and the
+/// rest continue). `--env <name>` targets that env's provider; otherwise the
+/// worktree's resolved env. Without `--all`, an explicit `id` is required.
+fn deprovision(
+    cfg: &Config,
+    worktree: Option<String>,
+    id: Option<String>,
+    all: bool,
+    env: Option<String>,
+) -> Result<()> {
+    let provider = match env.as_deref() {
+        Some(name) => {
+            let envc = cfg
+                .env
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("no [env.{name}] defined"))?;
+            crate::provider_factory::provider_for_named(&envc.provider, name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "env '{name}' has no API provider or its token could not be resolved"
+                )
+            })?
+        }
+        None => api_provider(cfg, worktree)?,
+    };
+    if all {
+        let ids = crate::agent::block_on_provider(|| async { provider.list().await })
+            .map_err(|e| anyhow::anyhow!("list sandboxes failed: {e}"))?;
+        if ids.is_empty() {
+            outln!("no managed sandboxes to destroy");
+            return Ok(());
+        }
+        let mut destroyed = 0usize;
+        for id in &ids {
+            match crate::agent::block_on_provider(|| async { provider.destroy(id).await }) {
+                Ok(()) => {
+                    destroyed += 1;
+                    outln!("destroyed sandbox: {id}");
+                }
+                Err(e) => msg::warn(&format!("destroy {id} failed: {e}")),
+            }
+        }
+        outln!("destroyed {destroyed}/{} sandbox(es)", ids.len());
+        return Ok(());
+    }
+    let id = id.ok_or_else(|| anyhow::anyhow!("provide a sandbox id, or pass --all"))?;
+    crate::agent::block_on_provider(|| async { provider.destroy(&id).await })
+        .map_err(|e| anyhow::anyhow!("destroy {id} failed: {e}"))?;
+    outln!("destroyed sandbox: {id}");
     Ok(())
 }
 
@@ -390,49 +453,41 @@ fn api_provider(cfg: &Config, worktree: Option<String>) -> Result<thegn_svc::pro
     }
 }
 
-/// Create (id=None) or destroy (id=Some) a managed sandbox via the API provider.
-/// On create, when the provider can translate egress and the env declares a
-/// network allow/block list, lower it to the provider's network policy so the
-/// new sandbox comes up already governed.
-fn provision(cfg: &Config, worktree: Option<String>, id: Option<String>) -> Result<()> {
+/// Create a managed sandbox via the API provider and print its id. When the
+/// provider can translate egress and the env declares a network allow/block
+/// list, lower it to the provider's network policy so the new sandbox comes up
+/// already governed. (Destroy lives in [`deprovision`].)
+fn provision(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let env = resolve_for(cfg, worktree.clone());
     let provider = api_provider(cfg, worktree)?;
     let rt = tokio::runtime::Runtime::new()?;
-    match id {
-        None => {
-            let handle = rt.block_on(provider.create())?;
-            outln!("created sandbox: {}", handle.id);
-            match handle.exec {
-                thegn_svc::provider::ExecKind::Command(argv) => {
-                    outln!("exec via: {}", argv.join(" "));
-                }
-                thegn_svc::provider::ExecKind::Ssh(t) => {
-                    outln!("exec via ssh: {}:{}", t.host, t.port);
-                }
-            }
-            // Egress translate: lower the env's allow/block lists onto the sandbox.
-            let allow = &env.sandbox.network_allow;
-            let block = &env.sandbox.network_block;
-            if provider.caps().egress && (!allow.is_empty() || !block.is_empty()) {
-                match rt.block_on(provider.set_network_policy(&handle.id, allow, block)) {
-                    Ok(()) => outln!(
-                        "applied network policy: {} allow, {} block",
-                        allow.len(),
-                        block.len()
-                    ),
-                    Err(e) => msg::warn(&format!("could not apply network policy: {e}")),
-                }
-            }
-            outln!(
-                "set `[env.<name>.provider] id = \"{}\"` to attach.",
-                handle.id
-            );
+    let handle = rt.block_on(provider.create())?;
+    outln!("created sandbox: {}", handle.id);
+    match handle.exec {
+        thegn_svc::provider::ExecKind::Command(argv) => {
+            outln!("exec via: {}", argv.join(" "));
         }
-        Some(id) => {
-            rt.block_on(provider.destroy(&id))?;
-            outln!("destroyed sandbox: {id}");
+        thegn_svc::provider::ExecKind::Ssh(t) => {
+            outln!("exec via ssh: {}:{}", t.host, t.port);
         }
     }
+    // Egress translate: lower the env's allow/block lists onto the sandbox.
+    let allow = &env.sandbox.network_allow;
+    let block = &env.sandbox.network_block;
+    if provider.caps().egress && (!allow.is_empty() || !block.is_empty()) {
+        match rt.block_on(provider.set_network_policy(&handle.id, allow, block)) {
+            Ok(()) => outln!(
+                "applied network policy: {} allow, {} block",
+                allow.len(),
+                block.len()
+            ),
+            Err(e) => msg::warn(&format!("could not apply network policy: {e}")),
+        }
+    }
+    outln!(
+        "set `[env.<name>.provider] id = \"{}\"` to attach.",
+        handle.id
+    );
     Ok(())
 }
 

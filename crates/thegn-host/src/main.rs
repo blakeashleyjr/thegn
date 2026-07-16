@@ -156,6 +156,7 @@ mod seg;
 mod sequence;
 mod session;
 mod share;
+mod shell_snippet;
 mod sidebar;
 mod sidebar_help;
 mod sidebar_legend;

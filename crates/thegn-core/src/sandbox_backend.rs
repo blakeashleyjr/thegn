@@ -21,26 +21,14 @@ use crate::sandbox::{Backend, backend_prefix, run_local_output};
 /// halt with an "unreachable" message rather than degrade to a host shell (which,
 /// for a remote placement, would ship a `cd <local-path>` to the wrong machine).
 pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option<Backend> {
-    let suitable = |b: Backend| -> bool {
-        // Native Windows declines OCI runtimes even when Docker/Podman Desktop
-        // is installed: their Linux containers live in a WSL2 VM that cannot
-        // bind-mount the worktree at its real absolute path (git worktree
-        // metadata carries host paths), breaking the sandbox contract. WSL as
-        // an explicit backend stays eligible; win-native scoping is suitable.
-        if cfg!(windows) && b.is_oci() && b != Backend::Wsl {
-            return false;
-        }
-        match b {
-            Backend::None => true,
-            _ if b.is_oci() => true,
-            _ if b.is_host_toolchain() => true,
-            _ => false,
-        }
-    };
+    let suitable = |b: Backend| backend_suitable(b, placement);
     let unsuitable_reason = |b: Backend| -> &'static str {
         if cfg!(windows) && b.is_oci() && b != Backend::Wsl {
             " on native Windows (Linux containers can't bind-mount the worktree \
              at its real path — use WSL2 for container sandboxes)"
+        } else if b.is_host_toolchain() && !placement.is_local() {
+            " on a non-local placement (a host-toolchain backend can't nest inside \
+             ssh/k8s/provider — the placement is already the isolation boundary)"
         } else {
             " for this image mode"
         }
@@ -120,6 +108,34 @@ pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option
     Some(Backend::None)
 }
 
+/// Whether `backend` can even be *considered* for `placement`, before probing
+/// whether its runtime is present. Pure so the placement/backend matrix is
+/// unit-tested without spawning a probe. Two rules:
+///
+///  - Native Windows declines OCI runtimes even when Docker/Podman Desktop is
+///    installed: their Linux containers live in a WSL2 VM that can't bind-mount
+///    the worktree at its real absolute path (git worktree metadata carries host
+///    paths), breaking the sandbox contract. WSL as an explicit backend stays
+///    eligible.
+///  - A host-toolchain backend (bwrap, systemd-nspawn, win-native) is a LOCAL
+///    isolation primitive — it wraps argv with host-namespace syscalls, so it
+///    only means anything on the box thegn runs on. On a non-local placement
+///    (ssh / k8s / provider) the placement ITSELF is the isolation boundary, so a
+///    nested bwrap is meaningless — and probing for it over the remote exec
+///    channel just answers `Unreachable` and stalls the resolver. Unsuitable, so
+///    the chain skips straight past it to an in-placement runtime or a bare shell.
+pub(crate) fn backend_suitable(b: Backend, placement: &Placement) -> bool {
+    if cfg!(windows) && b.is_oci() && b != Backend::Wsl {
+        return false;
+    }
+    match b {
+        Backend::None => true,
+        _ if b.is_oci() => true,
+        _ if b.is_host_toolchain() => placement.is_local(),
+        _ => false,
+    }
+}
+
 fn on_missing(cfg: &SandboxConfig, what: &str) {
     match cfg.on_missing {
         OnMissing::Fail => crate::msg::die(what),
@@ -143,7 +159,11 @@ pub fn placement_reachable(placement: &Placement, chain: &[String]) -> bool {
     for b in chain
         .iter()
         .filter_map(|n| Backend::parse(n))
-        .filter(|b| *b != Backend::None && (b.is_oci() || b.is_host_toolchain()))
+        // Same suitability gate as `pick_backend`: never probe a host-toolchain
+        // backend (bwrap, …) over a non-local transport — it can't run there, so
+        // its `Unreachable` answer is noise that would both mislabel reachability
+        // and re-incur the very remote probe the picker now skips.
+        .filter(|b| *b != Backend::None && backend_suitable(*b, placement))
     {
         probed_any = true;
         if available(placement, b) != RuntimeProbe::Unreachable {
@@ -153,6 +173,64 @@ pub fn placement_reachable(placement: &Placement, chain: &[String]) -> bool {
     !probed_any
 }
 
+thread_local! {
+    /// Per-resolution-pass probe memo (see [`probe_pass_guard`]). `Some` only
+    /// while a pass guard is live; keyed like the global cache.
+    static PASS_MEMO: std::cell::RefCell<Option<std::collections::HashMap<(String, Backend), RuntimeProbe>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Scope a **probe pass**: while the returned guard is alive, [`available`]
+/// memoizes *every* result — **including `Unreachable`** — on the current thread,
+/// so an already-unreachable placement is probed once per `(placement, backend)`
+/// rather than re-probed for every candidate the resolver walks. That storm is
+/// the multiplier behind a hung-transport stall: N candidates × M chain backends,
+/// each independently re-probing because the global cache (rightly) refuses to
+/// persist `Unreachable`. The memo lives only for the pass — thread-local,
+/// dropped with the guard — so the "never strand a host across sessions" rule is
+/// intact: the next open starts with an empty pass and re-probes. Nesting is
+/// safe; only the outermost guard installs and clears the memo.
+#[must_use]
+pub fn probe_pass_guard() -> ProbePass {
+    let outermost = PASS_MEMO.with(|m| {
+        let mut slot = m.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(std::collections::HashMap::new());
+            true
+        } else {
+            false
+        }
+    });
+    ProbePass { outermost }
+}
+
+/// RAII guard for a [`probe_pass_guard`] scope. Clears the pass memo on drop
+/// (only if it installed one), so an early return or a panic can't leak a stale
+/// `Unreachable` into a later pass.
+pub struct ProbePass {
+    outermost: bool,
+}
+
+impl Drop for ProbePass {
+    fn drop(&mut self) {
+        if self.outermost {
+            PASS_MEMO.with(|m| *m.borrow_mut() = None);
+        }
+    }
+}
+
+fn pass_memo_get(key: &(String, Backend)) -> Option<RuntimeProbe> {
+    PASS_MEMO.with(|m| m.borrow().as_ref().and_then(|map| map.get(key).copied()))
+}
+
+fn pass_memo_put(key: &(String, Backend), v: RuntimeProbe) {
+    PASS_MEMO.with(|m| {
+        if let Some(map) = m.borrow_mut().as_mut() {
+            map.insert(key.clone(), v);
+        }
+    });
+}
+
 /// Three-state availability of `backend`'s runtime in this placement (locally on
 /// PATH, or probed through the placement's control primitive: ssh / kubectl exec
 /// / provider). `Unreachable` (remote transport failed) is distinct from `Absent`
@@ -160,7 +238,10 @@ pub fn placement_reachable(placement: &Placement, chain: &[String]) -> bool {
 ///
 /// **Memoized** (D3): probe once per `(placement, backend)`; cache `Present`
 /// permanently, `Absent` only 30s (a permanent `false` stranded a remote host),
-/// and **never** cache `Unreachable` — a transient blip must not strand the host.
+/// and **never** cache `Unreachable` globally — a transient blip must not strand
+/// the host across sessions. Within a single [`probe_pass_guard`] scope, though,
+/// even `Unreachable` is memoized so one wedged transport isn't re-probed for
+/// every candidate in the pass.
 pub(crate) fn available(placement: &Placement, backend: Backend) -> RuntimeProbe {
     type AvailCache = std::sync::Mutex<
         std::collections::HashMap<(String, Backend), (RuntimeProbe, std::time::Instant)>,
@@ -168,9 +249,15 @@ pub(crate) fn available(placement: &Placement, backend: Backend) -> RuntimeProbe
     static CACHE: std::sync::OnceLock<AvailCache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let key = (format!("{placement:?}"), backend);
+    // Pass memo first: freshest within a resolve pass, and the only place an
+    // `Unreachable` is remembered (dedupes the per-candidate probe storm).
+    if let Some(v) = pass_memo_get(&key) {
+        return v;
+    }
     if let Some(&(v, at)) = cache.lock().unwrap().get(&key)
         && cache_is_fresh(v, at)
     {
+        pass_memo_put(&key, v);
         return v;
     }
     // A remote probe rides ssh: retry an `Unreachable` answer through a short
@@ -208,8 +295,11 @@ pub(crate) fn available(placement: &Placement, backend: Backend) -> RuntimeProbe
         cache
             .lock()
             .unwrap()
-            .insert(key, (v, std::time::Instant::now()));
+            .insert(key.clone(), (v, std::time::Instant::now()));
     }
+    // Always record in the pass memo (incl. `Unreachable`) so this pass doesn't
+    // re-probe the same (placement, backend). No-op when no pass is active.
+    pass_memo_put(&key, v);
     v
 }
 
@@ -284,6 +374,66 @@ fn available_probe(placement: &Placement, backend: Backend) -> RuntimeProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pass_memo_dedupes_within_scope_and_clears_after() {
+        let key = ("Provider(x)".to_string(), Backend::Podman);
+        // No pass active: get/put are no-ops (the global cache path is unaffected).
+        assert_eq!(pass_memo_get(&key), None);
+        pass_memo_put(&key, RuntimeProbe::Unreachable);
+        assert_eq!(pass_memo_get(&key), None, "no memo without a pass guard");
+
+        {
+            let _pass = probe_pass_guard();
+            assert_eq!(pass_memo_get(&key), None, "pass starts empty");
+            // Within the pass, even Unreachable is remembered (the whole point).
+            pass_memo_put(&key, RuntimeProbe::Unreachable);
+            assert_eq!(pass_memo_get(&key), Some(RuntimeProbe::Unreachable));
+            // Nested guard doesn't reset the outer memo.
+            {
+                let _inner = probe_pass_guard();
+                assert_eq!(
+                    pass_memo_get(&key),
+                    Some(RuntimeProbe::Unreachable),
+                    "nested guard shares the outer pass"
+                );
+            }
+            assert_eq!(
+                pass_memo_get(&key),
+                Some(RuntimeProbe::Unreachable),
+                "inner drop doesn't clear the outer pass"
+            );
+        }
+        // Outermost guard dropped ⇒ memo gone, so a later pass re-probes.
+        assert_eq!(pass_memo_get(&key), None, "pass memo cleared on scope exit");
+    }
+
+    #[test]
+    fn host_toolchain_backends_are_local_only() {
+        use crate::placement::{Placement, ProviderPlacement};
+        let provider = Placement::Provider(ProviderPlacement {
+            provider: "machine0".into(),
+            id: "thegn-thegn-ihetss".into(),
+            interactive_prefix: vec![],
+            control_prefix: vec![],
+            up_command: vec![],
+            down_command: vec![],
+        });
+        // bwrap: usable locally, meaningless on a provider (the placement is the
+        // isolation) — so the resolver never probes it there and never stalls.
+        assert!(backend_suitable(Backend::Bwrap, &Placement::Local));
+        assert!(!backend_suitable(Backend::Bwrap, &provider));
+        assert!(!backend_suitable(Backend::Systemd, &provider));
+        // OCI runtimes DO nest in a placement (a container in the sprite/pod), so
+        // they stay eligible remotely.
+        if !cfg!(windows) {
+            assert!(backend_suitable(Backend::Podman, &provider));
+            assert!(backend_suitable(Backend::Docker, &provider));
+        }
+        // `none` (run natively in the placement) is always eligible.
+        assert!(backend_suitable(Backend::None, &provider));
+        assert!(backend_suitable(Backend::None, &Placement::Local));
+    }
 
     #[test]
     fn unreachable_probe_is_never_cached_present_forever_absent_ttl() {

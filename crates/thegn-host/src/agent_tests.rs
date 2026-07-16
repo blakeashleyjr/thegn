@@ -649,6 +649,15 @@ fn shell_inner_oci_emits_runtime_probe_chain() {
         devshell_at < shell_at,
         "devShell env must load BEFORE the login shell execs"
     );
+    // Pure-devenv fallback: no `.envrc` but a `devenv.nix` + the `devenv` CLI ⇒
+    // enter `devenv shell` (re-running the probe chain inside it), guarded so any
+    // failure falls through to the bare chain rather than killing the pane.
+    assert!(
+        oci.contains("elif [ -e devenv.nix ] && command -v devenv")
+            && oci.contains("devenv shell -- /bin/sh -lc")
+            && oci.contains("&& exit"),
+        "OCI shell must fall back to `devenv shell` for a pure-devenv repo: {oci}"
+    );
     // Non-OCI: a simple "<shell> -l", not a chain.
     let host = shell_inner(false);
     assert!(

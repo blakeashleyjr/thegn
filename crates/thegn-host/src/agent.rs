@@ -68,50 +68,7 @@ pub fn resolve_command(cfg: &Config, choice: &str) -> String {
 /// exec site (remote-safe: baking the host's abs path → remote `exit 127`).
 pub(crate) fn shell_inner(in_oci: bool) -> String {
     if in_oci {
-        // Preference order: honour the host shell name if it's a known shell,
-        // then try zsh/bash/fish/sh in that order.  The outer /bin/sh -lc
-        // already provides a POSIX execution context, so this snippet is safe.
-        let host_shell = std::env::var("SHELL").unwrap_or_default();
-        let preferred = std::path::Path::new(&host_shell)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        // Build a chain that tries the host-preferred shell first (if it's a
-        // known name) then falls through to bash → sh.
-        let mut chain: Vec<&str> = Vec::new();
-        if matches!(preferred, "zsh" | "bash" | "fish" | "dash" | "ksh" | "mksh") {
-            chain.push(preferred);
-        }
-        for s in &["zsh", "bash", "sh"] {
-            if !chain.contains(s) {
-                chain.push(s);
-            }
-        }
-        // Emit: for s in zsh bash sh; do command -v "$s" >/dev/null 2>&1 && exec "$s" -l; done
-        let checks: String = chain
-            .iter()
-            .map(|s| format!("command -v {s} >/dev/null 2>&1 && exec {s} -l; "))
-            .collect();
-        // Load the flake devShell into THIS shell before exec'ing the login shell
-        // when the workspace has an `.envrc`, so the pane enters the toolchain even
-        // where the direnv rc-HOOK can't install (machine0's read-only home-manager
-        // `~/.zshrc`). stdout (`export`s) is eval'd; stderr (build progress) shows
-        // in the pane. Gated on `.envrc`; runs after `cd` (see `open_spec`).
-        let devshell = "if command -v direnv >/dev/null 2>&1 && [ -e .envrc ]; then \
-             direnv allow . 2>/dev/null; eval \"$(direnv export bash)\" || true; fi; ";
-        // Put the nix profile dirs on PATH FIRST so a `nix profile install`ed shell
-        // (zsh from nixpkgs) is actually found by `command -v` — covers the
-        // single-user (`~/.nix-profile`), daemon/system (Determinate `--init none`,
-        // `/nix/var/nix/profiles/default`), the Determinate per-user profile
-        // (`~/.local/state/nix/profile/bin`, where `nix profile install` lands on
-        // a Determinate install), and `~/.local/bin`. Without these the checks miss
-        // the installed zsh/starship and drop to `/bin/sh`. The trailing
-        // `/bin/sh -l` is the universal fallback.
-        format!(
-            "export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:\
-             $HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; \
-             {devshell}{checks}exec /bin/sh -l"
-        )
+        crate::shell_snippet::oci_login_snippet()
     } else {
         "${SHELL:-/bin/sh} -l".to_string() // deferred, remote-safe (see fn doc)
     }
@@ -312,8 +269,12 @@ pub fn prepare_sandbox_env(
     // A fresh/explicit choice always wins over config; a non-explicit DB value
     // only overrides when config is "auto" (an explicit `backend = "bwrap"` must
     // beat a stale entry). An explicit choice may be "host"/"none" — keep those.
+    // A saved backend is a LOCAL-session artifact (only the wizard writes it, for
+    // a local choice), so it must not resurrect a backend on a remote/provider
+    // placement — those default to `none` (the sandbox brings its own isolation).
     let config_is_auto = sb.backend == thegn_core::config::SandboxBackend::Auto;
-    if let Some(saved) = backend_choice.map(str::trim)
+    if placement.is_local()
+        && let Some(saved) = backend_choice.map(str::trim)
         && !saved.is_empty()
         && (choice_is_explicit || (config_is_auto && saved != "auto"))
         && let Ok(b) = thegn_core::config::SandboxBackend::from_str_validated(saved)
@@ -321,6 +282,31 @@ pub fn prepare_sandbox_env(
         explicit_backend =
             sandbox::Backend::from_config(b).filter(|b| *b != sandbox::Backend::None);
         sb.backend = b;
+    }
+    // A host-toolchain backend (bwrap, systemd-nspawn, win-native) only makes
+    // sense on the LOCAL box — it isolates via host-namespace syscalls. On a
+    // non-local placement (ssh / k8s / provider) the placement is already the
+    // isolation boundary, so a nested bwrap is meaningless: probing for it over
+    // the remote exec channel answers Unreachable and the resolver stalls, then
+    // hard-fails "sandbox backend 'bwrap' could not be resolved". This value is
+    // almost always inherited from the base `[sandbox]` (or a per-worktree choice
+    // saved from a prior LOCAL session), not a deliberate ask for THIS env — so
+    // drop it to Auto and let the chain pick an in-placement runtime or run
+    // natively in the placement, instead of treating it as an explicit demand.
+    if !placement.is_local() && explicit_backend.is_some_and(|b| b.is_host_toolchain()) {
+        // Expected, not a problem the user must fix: running natively in the
+        // placement IS correct here (the provider/pod/host is the sandbox). So
+        // trace it for `THEGN_LOG` / debugging rather than warning on every open —
+        // the noisy hard-failure this replaces is gone, and `config explain`
+        // still reports the configured value honestly.
+        tracing::debug!(
+            target: "thegn::sandbox",
+            backend = %sb.backend,
+            placement = %placement.label(),
+            "host-local backend can't nest in a non-local placement; running natively in the placement",
+        );
+        explicit_backend = None;
+        sb.backend = thegn_core::config::SandboxBackend::Auto;
     }
     let explicit_choice = explicit_backend.is_some();
     let auto_choice = sb.backend == thegn_core::config::SandboxBackend::Auto;
@@ -410,6 +396,11 @@ pub fn prepare_sandbox_env(
             }
         }
     }
+    // Scope one probe pass over the whole backend-resolution walk (every
+    // candidate's `resolve_placed` + the halt-path `placement_reachable` below).
+    // Within it an unreachable placement is probed once per backend, not
+    // re-probed for each of the N candidates — bounding a wedged-transport stall.
+    let _probe_pass = thegn_core::sandbox::probe_pass_guard();
     for candidate in sandbox_candidates(&sb) {
         if let Some(mut spec) =
             sandbox::resolve_placed(&candidate, loc, &cname, hardening, exec_placement.clone())
@@ -976,6 +967,11 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         None if sb_shell.is_empty() => shell_inner(true),
         None => shell_inner_override(&sb_shell),
     };
+    // Point each agent CLI at the ACTIVE account's uploaded credential home.
+    let inner = format!(
+        "{}{inner}",
+        crate::agent_configs::account_pane_env_exports(cfg, worktree)
+    );
     // Carry the host's passthrough secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) into
     // the provider exec so the in-sprite shell + any agent it spawns (pi, claude
     // code, hermes) work like local. Remote-safe filter drops host-local socket
@@ -1594,6 +1590,7 @@ pub fn provision_provider_env_named(
             }
             StepKind::Dotfiles(files) => upload_dotfiles(&provider, &id, &sprite_home, files),
             StepKind::AgentConfigs(agents) => {
+                crate::agent_configs::upload_agent_accounts(&provider, &id, &sprite_home, cfg);
                 crate::agent_configs::upload_agent_configs(&provider, &id, &sprite_home, agents)
             }
             StepKind::AtuinSync => upload_atuin_creds(&provider, &id, &sprite_home, &exec_env),
@@ -1686,15 +1683,28 @@ pub fn provision_provider_env_named(
         };
 
         if let Err(e) = result {
-            views[i].state = ProvisionState::Failed;
-            views[i].detail = Some(sanitize_detail(&e.to_string()));
+            // A pure pre-warm (devShell/cache/direnv-allow) that failed is invisible
+            // to the user — the pane rebuilds it lazily — so don't alarm with a red
+            // `Failed` row (its usual failure is an OOM/timeout on a heavy Nix build
+            // in a pooled microVM). Mark it done with a "finishes in the shell" hint.
+            let warm_only = crate::provision_recover::step_is_warm_only(&step.id);
+            views[i].state = if warm_only {
+                ProvisionState::Done
+            } else {
+                ProvisionState::Failed
+            };
+            views[i].detail = Some(if warm_only {
+                "deferred — the dev shell builds on first entry".to_string()
+            } else {
+                sanitize_detail(&e.to_string())
+            });
             progress(&views);
             // Only the essential steps (the worktree dir + clone + nix) abort
             // creation. The rest — warming the devShell/direnv, personal tools,
             // dotfiles, the home-parity closure — are BEST-EFFORT: the shell still
             // comes up and these resolve lazily in the pane. A best-effort failure
             // warns + continues so one flaky `nix develop` can't kill the sandbox.
-            if step_is_fatal(&step.id) {
+            if crate::provision_recover::step_is_fatal(&step.id) {
                 tracing::warn!(target: "thegn::startup", step = %step.id, ms = step_t0.elapsed().as_millis() as u64, error = %e, "provision step failed (fatal — aborting)");
                 return Err(e);
             }
@@ -2151,16 +2161,6 @@ exit 0"#;
     } else {
         Err(anyhow::anyhow!("exit {}", out.status.code().unwrap_or(-1)))
     }
-}
-
-/// Which provisioning steps are ESSENTIAL — a failure aborts creation — vs
-/// best-effort (warn + continue; the shell still opens and the step resolves
-/// lazily in the pane). Essentials: the worktree dir, git auth, the clone.
-/// Everything else (nix install, devShell/direnv warm, personal tools, dotfiles,
-/// the home-parity closure, checkpoint) is best-effort, so one flaky `nix
-/// develop` / unreachable cache can't kill an otherwise-usable sandbox.
-fn step_is_fatal(step_id: &str) -> bool {
-    matches!(step_id, "workspace" | "git_auth" | "clone")
 }
 
 /// Sanitize a subprocess-derived message for display on the loading screen:
@@ -3184,7 +3184,7 @@ fn inject_devshell_host(spec: &mut LaunchSpec, dev: &devenv::Devshell) {
 
 /// The persisted slug for a repo root (for per-workspace account defaults), or
 /// `None` if the DB has no slug yet.
-fn repo_slug(db: &Db, repo_root: &Path) -> Option<String> {
+pub(crate) fn repo_slug(db: &Db, repo_root: &Path) -> Option<String> {
     let base = repo_root.file_name()?.to_string_lossy().into_owned();
     db.slug_for_repo(&repo_root.to_string_lossy(), &base).ok()
 }
