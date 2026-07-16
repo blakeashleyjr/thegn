@@ -408,6 +408,17 @@ pub fn wss_native_provider_kind(name: &str) -> bool {
     matches!(name.trim(), "sprites")
 }
 
+/// Whether a provider reaches its sandbox over an **ssh subprocess self-bridge**
+/// (`machine0-ssh` / `vps-ssh`) rather than a WSS native-exec relay: machine0,
+/// fly, and the VPS kinds. Their interactive pane is a SEPARATE process that
+/// exec()s ssh, so a connect/resolve failure isn't visible to the in-process
+/// native-exec relay — it's observed at pane-exit and recorded in the host's
+/// connect-health registry, which drives the failover-off "cannot connect to the
+/// remote" halt modal (see `agent::env_halt_reason`).
+pub fn ssh_reached_provider_kind(name: &str) -> bool {
+    matches!(name.trim(), "machine0" | "fly") || vps_provider_kind(name)
+}
+
 /// Whether a provider *kind* is **scale-to-zero**: an idle sandbox self-suspends
 /// for effectively free (compute billed only while awake; the filesystem
 /// persists). This is the single source of truth the warm-pool policy consults
@@ -748,6 +759,15 @@ mod tests {
         assert!(!provider_self_suspends("machine0"));
         assert!(!provider_self_suspends("fly"));
         assert!(provider_self_suspends("sprites"));
+        // ssh-reached kinds (pane is a separate `*-ssh` subprocess): machine0, fly,
+        // and the VPS kinds — but NOT the WSS-native sprites or an unknown provider.
+        assert!(ssh_reached_provider_kind("machine0"));
+        assert!(ssh_reached_provider_kind(" fly "));
+        assert!(ssh_reached_provider_kind("hetzner"));
+        assert!(ssh_reached_provider_kind("digitalocean"));
+        assert!(!ssh_reached_provider_kind("sprites"));
+        assert!(!ssh_reached_provider_kind("daytona"));
+        assert!(!ssh_reached_provider_kind(""));
         // The pane/chrome reach the VM via the machine0-ssh self-bridge.
         let tpl = EnvProviderConfig {
             provider: "machine0".into(),

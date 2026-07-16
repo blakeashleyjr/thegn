@@ -61,8 +61,11 @@ pub fn env_snapshots(cfg: &Config) -> Vec<EnvSnapshot> {
 }
 
 /// The SecretRef (or bare env-var name) a provider env's token resolves from:
-/// the explicit `api_key_env`, else the provider's built-in default.
-fn effective_token_env(pc: &EnvProviderConfig) -> String {
+/// the explicit `api_key_env`, else the provider's built-in default. The single
+/// source of truth for the per-provider default token var (also consulted by
+/// `env_halt_reason` so its halt modal names the RIGHT var — a machine0 env must
+/// report `MACHINE0_API_KEY`, not the old hardcoded `SPRITES_TOKEN`).
+pub(crate) fn effective_token_env(pc: &EnvProviderConfig) -> String {
     let k = pc.api_key_env.trim();
     if !k.is_empty() {
         return k.to_string();

@@ -92,6 +92,13 @@ pub(crate) fn shell_inner(in_oci: bool) -> String {
             .iter()
             .map(|s| format!("command -v {s} >/dev/null 2>&1 && exec {s} -l; "))
             .collect();
+        // Load the flake devShell into THIS shell before exec'ing the login shell
+        // when the workspace has an `.envrc`, so the pane enters the toolchain even
+        // where the direnv rc-HOOK can't install (machine0's read-only home-manager
+        // `~/.zshrc`). stdout (`export`s) is eval'd; stderr (build progress) shows
+        // in the pane. Gated on `.envrc`; runs after `cd` (see `open_spec`).
+        let devshell = "if command -v direnv >/dev/null 2>&1 && [ -e .envrc ]; then \
+             direnv allow . 2>/dev/null; eval \"$(direnv export bash)\" || true; fi; ";
         // Put the nix profile dirs on PATH FIRST so a `nix profile install`ed shell
         // (zsh from nixpkgs) is actually found by `command -v` — covers the
         // single-user (`~/.nix-profile`), daemon/system (Determinate `--init none`,
@@ -103,7 +110,7 @@ pub(crate) fn shell_inner(in_oci: bool) -> String {
         format!(
             "export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:\
              $HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; \
-             {checks}exec /bin/sh -l"
+             {devshell}{checks}exec /bin/sh -l"
         )
     } else {
         "${SHELL:-/bin/sh} -l".to_string() // deferred, remote-safe (see fn doc)
@@ -268,10 +275,14 @@ pub fn prepare_sandbox_env(
     // worktree dir inside the env is the provider `workdir` (default /workspace).
     let location = match &placement {
         thegn_core::placement::Placement::Provider(p) => {
+            // Resolve against the sandbox's cached `$HOME` (workspace lives under the
+            // login user's home). Cold on the very first create (before provisioning
+            // has probed the home) ⇒ the `/workspace` fallback; recomputed + rewritten
+            // each open, so it self-heals to the real path once the home is cached.
             let workdir = cfg
                 .env
                 .get(&env_name)
-                .map(|e| e.provider.sync_workdir())
+                .map(|e| crate::provider_workdir::resolve(&e.provider, &p.id))
                 .unwrap_or_else(|| "/workspace".to_string());
             Some(thegn_core::remote::GitLoc::provider_db_string(
                 &p.control_prefix,
@@ -822,7 +833,8 @@ pub fn provider_proxy_target(
     };
     let pc = &cfg.env.get(&environment.name)?.provider;
     let provider = provider_for_named(pc, &p.id)?;
-    Some((provider, p.id.clone(), pc.sync_workdir()))
+    let workdir = crate::provider_workdir::resolve(pc, &p.id);
+    Some((provider, p.id.clone(), workdir))
 }
 
 pub(crate) use crate::agent_ssh::{
@@ -995,12 +1007,17 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
     let bound = Db::open()
         .ok()
         .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten());
+    let sandbox_id = bound.unwrap_or_else(|| p.id.clone());
+    // Resolve the pane cwd against the sandbox's cached `$HOME` (the workspace lives
+    // under the login user's home — see `provider_workdir`), so `cd {workdir}` lands
+    // in the repo and not a nonexistent `/workspace`.
+    let workdir = crate::provider_workdir::resolve(pc, &sandbox_id);
     Some(NativeShell {
         provider,
         provider_name: pc.provider.clone(),
-        sandbox_id: bound.unwrap_or_else(|| p.id.clone()),
+        sandbox_id,
         inner,
-        workdir: pc.sync_workdir(),
+        workdir,
         env,
     })
 }
@@ -1062,7 +1079,7 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
         // scope only the worktree we're opening anyway — so it doesn't wake idle
         // sandboxes wholesale.
         Ok(_) => {
-            let workdir = envc.provider.sync_workdir();
+            let workdir = crate::provider_workdir::resolve(&envc.provider, &id);
             let marker = thegn_core::envplan::EnvPlan::marker_path(&workdir);
             block_on_provider(|| async { provider.read(&id, &marker).await }).is_err()
         }
@@ -1248,8 +1265,6 @@ pub fn provision_provider_env_named(
     // marker short-circuit below makes its run a no-op. The marker alone only
     // guards SEQUENTIAL re-runs — it is written at the END of the pipeline.
     let _gate = crate::provision_gate::sandbox_lock(&id);
-    let workdir = pc.sync_workdir();
-    let marker = EnvPlan::marker_path(&workdir);
 
     // Recreate-if-missing: the sandbox may have been cleaned up out-of-band (TTL,
     // manual delete, provider GC). `ensure_exists` recreates it before we read the
@@ -1294,6 +1309,14 @@ pub fn provision_provider_env_named(
         boot[0].state = ProvisionState::Done;
         progress(&boot);
     }
+
+    // Site the workspace under the sandbox login's real `$HOME` (a property of the
+    // IMAGE: machine0's NixOS image logs in as `nix`/`/home/nix`, others as root) —
+    // a bare `/workspace` at the root fs is not writable by a non-root login and
+    // fails the "Prepare workspace" `mkdir`. Caches the home so the pane, chrome
+    // reads, and marker checks all resolve the SAME path (`provider_workdir`).
+    let (sprite_home, workdir) = crate::provider_workdir::probe_and_resolve(&provider, &id, pc);
+    let marker = EnvPlan::marker_path(&workdir);
 
     // Idempotent: already provisioned ⇒ nothing to do (no new checkpoint) — but
     // still refresh auth creds: the host's OAuth token rotates, so the
@@ -1494,26 +1517,8 @@ pub fn provision_provider_env_named(
         ));
     }
 
-    // The sandbox user's real `$HOME` — uploads must land there (sprites exec as
-    // user `sprite`, HOME=/home/sprite, NOT /root). Resolved once via the exec API.
-    let sprite_home = block_on_provider(|| async {
-        provider
-            .run_exec(
-                &id,
-                &[
-                    "/bin/sh".to_string(),
-                    "-lc".to_string(),
-                    "printf %s \"$HOME\"".to_string(),
-                ],
-                None,
-                &[],
-            )
-            .await
-    })
-    .ok()
-    .map(|(_, out)| out.trim().to_string())
-    .filter(|h| h.starts_with('/'))
-    .unwrap_or_else(|| "/root".to_string());
+    // `sprite_home` (the sandbox login's real `$HOME`) was resolved + cached above,
+    // right after the sandbox came Ready — reused here for the uploads.
 
     // The "thegn-provisioned" base checkpoint taken by this run's Checkpoint
     // step (if the plan has one) — persisted below + returned to the caller.
@@ -2403,14 +2408,12 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
     let placement = environment.placement.label();
     if let thegn_core::placement::Placement::Provider(_) = &environment.placement {
         let pc = &cfg.env.get(&environment.name)?.provider;
-        // Token check: the var the provider reads (defaults to SPRITES_TOKEN).
-        let var = {
-            let v = pc.api_key_env.trim();
-            if v.is_empty() { "SPRITES_TOKEN" } else { v }
-        };
-        let token_present = std::env::var(var)
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false);
+        // Token check: explicit `api_key_env`, else the provider's built-in default
+        // (machine0 ⇒ MACHINE0_API_KEY). Resolve it exactly as the provider does
+        // (`secret::resolve` — keyring:/file:/env:/bare env var), NOT a raw
+        // `std::env::var` (which would read a `file:` ref as a bogus env-var name).
+        let var = crate::env_ui::effective_token_env(pc);
+        let token_present = crate::secret::resolve(&var).is_some();
         let healthy = native_exec_healthy(&pc.provider);
         tracing::debug!(
             target: "thegn::sandbox",
@@ -2424,22 +2427,24 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
             return Some(SandboxHalt {
                 env_name: environment.name.clone(),
                 placement,
-                reason: format!("API token ${var} is not set"),
+                reason: format!("API token {var} could not be resolved"),
             });
         }
-        // Native-exec failure cooldown: a recent connect/auth failure (e.g. 401)
-        // marked the provider unhealthy. With failover off we won't drop to host,
-        // so surface the halt rather than spawn a doomed pane.
-        if pc.exec != ProviderExecMode::Cli
-            && thegn_svc::provider::exec_api_by_name(&pc.provider)
+        // Connect-failure cooldown: a recent connect/auth failure (401, or an ssh
+        // connect/resolve failure) marked the provider unhealthy. Failover off ⇒
+        // surface the halt. Covers WSS native-exec (sprites, tracked in-process) AND
+        // ssh-reached providers (machine0/fly/vps, tracked at pane-exit).
+        let native_exec_tracked =
+            pc.exec != ProviderExecMode::Cli && thegn_svc::provider::exec_api_by_name(&pc.provider);
+        if (native_exec_tracked || thegn_core::config::ssh_reached_provider_kind(&pc.provider))
             && !healthy
         {
-            tracing::warn!(target: "thegn::sandbox", env = %environment.name, provider = %pc.provider, "HALT: native exec unhealthy (recent failure)");
+            tracing::warn!(target: "thegn::sandbox", env = %environment.name, provider = %pc.provider, "HALT: provider unhealthy (recent connection failure)");
             return Some(SandboxHalt {
                 env_name: environment.name.clone(),
                 placement,
                 reason: format!(
-                    "provider '{}' is unreachable or rejected authentication (recent exec failure)",
+                    "provider '{}' is unreachable or rejected authentication (recent connection failure)",
                     pc.provider
                 ),
             });
@@ -2608,7 +2613,8 @@ fn provider_sync_target(
     if !provider.caps().files {
         return None;
     }
-    Some((provider, id, pc.sync_workdir()))
+    let workdir = crate::provider_workdir::resolve(pc, &id);
+    Some((provider, id, workdir))
 }
 
 /// Run an async provider call to completion on a fresh OS thread with its own
