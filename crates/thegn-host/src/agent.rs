@@ -210,7 +210,7 @@ pub fn prepare_sandbox_env(
 ) -> anyhow::Result<SandboxOutcome> {
     use crate::handlers::repo_trust::resolve_env_trusted;
     let environment = resolve_env_trusted(cfg, repo_root, loc, worktree, selected_env);
-    let placement = environment.placement.clone();
+    let mut placement = environment.placement.clone();
     let env_shell = environment.sandbox.shell.clone();
     // The worktree-projection plan (sshfs/sync) for this env's `data` mode, or
     // `None` for the default `in_env` (no projection). Captured before `sandbox`
@@ -257,12 +257,12 @@ pub fn prepare_sandbox_env(
     let cwd_override = projection
         .as_ref()
         .map(|p| std::path::PathBuf::from(&p.mountpoint));
-    let exec_placement = if cwd_override.is_some() {
+    let mut exec_placement = if cwd_override.is_some() {
         thegn_core::placement::Placement::Local
     } else {
         placement.clone()
     };
-    let env_is_remote = environment.is_remote() && cwd_override.is_none();
+    let mut env_is_remote = environment.is_remote() && cwd_override.is_none();
     let mut sb = environment.sandbox;
     let mut explicit_backend =
         sandbox::Backend::from_config(sb.backend).filter(|b| *b != sandbox::Backend::None);
@@ -355,13 +355,37 @@ pub fn prepare_sandbox_env(
             }
             .into());
         }
-        warnings.push(format!("sandbox auto-provision failed: {e}"));
-        thegn_core::msg::warn(&format!("sandbox auto-provision failed: {e}"));
+        // failover on: don't strand the worktree on a provider that can't host it
+        // (the doomed pane the user saw as a "crash"). Fall back to running LOCALLY
+        // on the host — the git worktree exists locally — with the local backend
+        // chain (Auto ⇒ bwrap/podman/host).
+        thegn_core::msg::warn(&format!(
+            "env '{env_name}' unavailable ({e}); falling back to the host"
+        ));
+        warnings.push(format!("{env_name} unavailable ({e}); running on the host"));
+        placement = thegn_core::placement::Placement::Local;
+        exec_placement = thegn_core::placement::Placement::Local;
+        env_is_remote = false;
+        sb.backend = thegn_core::config::SandboxBackend::Auto;
     }
     if !placement.is_local()
         && let Err(e) = placement.ensure()
     {
-        anyhow::bail!("env placement bring-up failed for {worktree}: {e}");
+        // Same failover-to-local rule for a placement (k8s pod / provider VM) that
+        // won't come up; halt only when failover is off.
+        if !failover {
+            anyhow::bail!("env placement bring-up failed for {worktree}: {e}");
+        }
+        thegn_core::msg::warn(&format!(
+            "env '{env_name}' placement bring-up failed ({e}); falling back to the host"
+        ));
+        warnings.push(format!(
+            "{env_name} placement bring-up failed; running on the host"
+        ));
+        placement = thegn_core::placement::Placement::Local;
+        exec_placement = thegn_core::placement::Placement::Local;
+        env_is_remote = false;
+        sb.backend = thegn_core::config::SandboxBackend::Auto;
     }
     if let Some(pspec) = &projection {
         let backend = thegn_svc::projection::for_data_mode(pspec);
@@ -1696,7 +1720,7 @@ pub fn provision_provider_env_named(
             views[i].detail = Some(if warm_only {
                 "deferred — the dev shell builds on first entry".to_string()
             } else {
-                sanitize_detail(&e.to_string())
+                crate::provision_recover::sanitize_detail(&e.to_string())
             });
             progress(&views);
             // Only the essential steps (the worktree dir + clone + nix) abort
@@ -2161,58 +2185,6 @@ exit 0"#;
     } else {
         Err(anyhow::anyhow!("exit {}", out.status.code().unwrap_or(-1)))
     }
-}
-
-/// Sanitize a subprocess-derived message for display on the loading screen:
-/// strip ANSI/OSC escape sequences and other control bytes (provisioning output
-/// is full of them — they corrupt width math and have triggered renderer
-/// `capacity overflow`s), collapse runs of whitespace/newlines to single spaces,
-/// and clamp to a sane length. Pure + unit-tested.
-fn sanitize_detail(s: &str) -> String {
-    let mut out = String::with_capacity(s.len().min(256));
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            // CSI (`ESC[ … final`) / OSC (`ESC] … BEL/ST`) / other ESC seq: skip
-            // the introducer and run to the terminating byte.
-            match chars.peek() {
-                Some('[') => {
-                    chars.next();
-                    for d in chars.by_ref() {
-                        if ('@'..='~').contains(&d) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    for d in chars.by_ref() {
-                        if d == '\u{7}' || d == '\u{1b}' {
-                            break;
-                        }
-                    }
-                }
-                _ => {
-                    chars.next();
-                }
-            }
-            continue;
-        }
-        // Control chars (incl. newlines/tabs) + spaces → a single space; collapse
-        // runs so multi-line subprocess output reads as one tidy line.
-        if c.is_control() || c == ' ' {
-            if !out.ends_with(' ') {
-                out.push(' ');
-            }
-        } else {
-            out.push(c);
-        }
-        if out.chars().count() >= 200 {
-            out.push('…');
-            break;
-        }
-    }
-    out.trim().to_string()
 }
 
 /// Host dotfiles to carry into a sandbox `$HOME` so the shell feels like home.
