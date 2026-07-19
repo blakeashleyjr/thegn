@@ -118,7 +118,12 @@ pub fn panel_key(
             model.status = match thegn_core::db::Db::open()
                 .and_then(|db| db.set_worktree_env(worktree, &env.name))
             {
-                Ok(()) => format!("bound env '{}' to this worktree", env.name),
+                Ok(()) => {
+                    // Rehydrate so the tab-bar placement/backend chips pick up
+                    // the new binding without waiting for another refresh.
+                    let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model);
+                    format!("bound env '{}' to this worktree", env.name)
+                }
                 Err(e) => format!("bind failed: {e}"),
             };
             true
