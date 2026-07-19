@@ -2538,8 +2538,9 @@ fn provision_provider_repo(repo_root: &Path, loc: &GitLoc, branch: Option<&str>)
             Ok(r) if r.exit == 0 => return,
             Ok(r) => {
                 thegn_core::msg::warn(&format!(
-                    "provider repo provision failed: {}",
-                    r.stderr.trim()
+                    "provider repo provision failed (exit {}): {}",
+                    r.exit,
+                    crate::provision_recover::stderr_gist(&r.stderr)
                 ));
                 return;
             }
@@ -2550,8 +2551,9 @@ fn provision_provider_repo(repo_root: &Path, loc: &GitLoc, branch: Option<&str>)
     match loc.sh_command(&script).output() {
         Ok(o) if o.status.success() => {}
         Ok(o) => thegn_core::msg::warn(&format!(
-            "provider repo provision failed: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
+            "provider repo provision failed ({}): {}",
+            o.status,
+            crate::provision_recover::stderr_gist(&String::from_utf8_lossy(&o.stderr))
         )),
         Err(e) => thegn_core::msg::warn(&format!("provider repo provision spawn failed: {e}")),
     }
@@ -2814,9 +2816,15 @@ pub fn launch_spec_with_key(
     // Provision the repo into a fresh provider env on open (8-A.3): clone origin
     // into the sandbox workdir so the chrome's git/files show real data. `outcome
     // .location` is set only for a `Placement::Provider` env; idempotent + a
-    // no-op for `data=sync` (whose upload already populated the tree).
-    if outcome.location.is_some() {
-        provision_provider_repo(&repo_root, &loc, branch);
+    // no-op for `data=sync` (whose upload already populated the tree). Route it
+    // through the RESOLVED location (rebound into the DB first, so chrome reads
+    // heal immediately) — the stale row `loc` may point at a dead provider the
+    // env no longer resolves to.
+    if let Some(blob) = outcome.location.as_deref() {
+        let fresh = crate::provision_gate::rebind_resolved_location(db.as_ref(), worktree, blob);
+        if fresh.is_remote() {
+            provision_provider_repo(&repo_root, &fresh, branch);
+        }
     }
 
     // Bouncer (opt-in): inject the agent's proxy + tool-override env into the

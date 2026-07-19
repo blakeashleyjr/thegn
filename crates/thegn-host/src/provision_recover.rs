@@ -90,6 +90,19 @@ pub(crate) fn sanitize_detail(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// The most informative line of a subprocess stderr blob: the first line whose
+/// trimmed form starts with `Error:`/`error:` (anyhow/CLI convention — the
+/// bridge's `Error: machine0-ssh: could not resolve VM …` otherwise drowns
+/// under `thegn migrate:` warnings and a RUST_BACKTRACE), else the last
+/// non-empty line, sanitized via [`sanitize_detail`]. Empty blob ⇒ `""`.
+pub(crate) fn stderr_gist(stderr: &str) -> String {
+    let lines = || stderr.lines().map(str::trim).filter(|l| !l.is_empty());
+    let pick = lines()
+        .find(|l| l.starts_with("Error:") || l.starts_with("error:"))
+        .or_else(|| lines().next_back());
+    pick.map(sanitize_detail).unwrap_or_default()
+}
+
 /// Which provisioning steps are ESSENTIAL — a failure aborts creation — vs
 /// best-effort (warn + continue; the shell still opens and the step resolves
 /// lazily in the pane). Essentials: the worktree dir, git auth, the clone.
@@ -149,6 +162,25 @@ mod tests {
             argv[2].trim_end().ends_with("2>&1"),
             "folds stderr into stdout"
         );
+    }
+
+    #[test]
+    fn stderr_gist_picks_the_error_line_over_noise() {
+        // The incident shape: migrate warning first, the real error buried,
+        // then a useless backtrace.
+        let blob = "thegn migrate: both ~/.superzej and ~/.thegn exist — preferring the new path\n\
+                    Error: machine0-ssh: could not resolve VM \"thegn-x\" (…); provision it first\n\
+                    Stack backtrace:\n   0: <unknown>\n";
+        assert!(stderr_gist(blob).starts_with("Error: machine0-ssh:"));
+        // No Error: line → last non-empty line.
+        assert_eq!(stderr_gist("warming up\nclone failed badly\n\n"), "clone failed badly");
+        // Empty → empty.
+        assert_eq!(stderr_gist("  \n\n"), "");
+        // ANSI stripped + long lines capped (sanitize_detail semantics).
+        let long = format!("error: {}", "x".repeat(500));
+        let s = stderr_gist(&long);
+        assert!(s.chars().count() <= 201);
+        assert!(!stderr_gist("error: \u{1b}[31mred\u{1b}[0m").contains('\u{1b}'));
     }
 
     #[test]
