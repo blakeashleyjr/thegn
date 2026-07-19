@@ -79,6 +79,14 @@ pub trait WorkspaceStore {
     /// The remote-location descriptor for a worktree (None/empty = local).
     fn location_for(&self, wt: &str) -> Result<Option<String>>;
 
+    /// Rebind a worktree's persisted remote-location blob to the freshly
+    /// RESOLVED placement — a stale create-time blob must not keep routing
+    /// chrome reads at a dead provider. Plain UPDATE: a missing row is a no-op
+    /// (a location without a registered worktree is meaningless), and callers
+    /// only pass a remote blob, so a provider location can never be wiped by a
+    /// local/failover resolution (mirrors [`Self::put_worktree`]'s COALESCE).
+    fn set_worktree_location(&self, wt: &str, location: &str) -> Result<()>;
+
     /// The (local) repo root recorded for a worktree — needed for the per-repo
     /// `.thegn` overlay when the worktree itself lives remote.
     fn repo_root_for(&self, wt: &str) -> Result<Option<String>>;

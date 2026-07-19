@@ -244,11 +244,22 @@ impl WorkspaceStore for Db {
     ) -> Result<()> {
         // Insert unconditionally falls to the end (`MAX+1`), while upsert leaves an
         // existing `position` untouched so a re-register never reshuffles order.
+        // `location` COALESCEs for the same reason: re-register callers pass None
+        // (they don't know the placement), which must not wipe a persisted
+        // provider/ssh location — removal deletes the whole row instead.
         self.conn().execute(
             r#"INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position,folder_id)
                VALUES(?1,?2,?3,?4,?5,'',?6,?7,(SELECT COALESCE(MAX(position),-1)+1 FROM worktrees),?8)
-               ON CONFLICT(worktree) DO UPDATE SET branch=?5, tab_name=?3, repo_path=?4, session_name=?2, location=?7, folder_id=COALESCE(?8, folder_id)"#,
+               ON CONFLICT(worktree) DO UPDATE SET branch=?5, tab_name=?3, repo_path=?4, session_name=?2, location=COALESCE(?7, location), folder_id=COALESCE(?8, folder_id)"#,
             params![wt, session(), tab, root, branch, util::now(), location, folder_id],
+        )?;
+        Ok(())
+    }
+
+    fn set_worktree_location(&self, wt: &str, location: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE worktrees SET location=?2 WHERE worktree=?1",
+            params![wt, location],
         )?;
         Ok(())
     }
@@ -554,8 +565,14 @@ impl WorkspaceStore for Db {
     /// `""` clears it (inherit the workspace/repo/global layer).
     fn set_worktree_env(&self, wt: &str, env: &str) -> Result<()> {
         let val = (!env.trim().is_empty()).then(|| env.trim().to_string());
+        // UPSERT, not UPDATE: a freshly `git worktree add`ed path isn't in the DB
+        // yet (put_worktree runs when it's first opened), so a plain UPDATE was a
+        // silent no-op and the pin never resolved — the "menu / `env set` selection
+        // is ignored on a new worktree" bug. Insert a minimal row (git stays the
+        // source of truth; the rest fills in on first open) so the pin sticks.
         self.conn().execute(
-            "UPDATE worktrees SET env_name=?2 WHERE worktree=?1",
+            "INSERT INTO worktrees(worktree, env_name) VALUES(?1, ?2) \
+             ON CONFLICT(worktree) DO UPDATE SET env_name=?2",
             params![wt, val],
         )?;
         Ok(())
@@ -1059,6 +1076,64 @@ impl Db {
 mod tests {
     use crate::db::Db;
     use crate::store::WorkspaceStore;
+
+    #[test]
+    fn env_pin_upserts_before_registration_and_survives_it() {
+        let db = Db::open_memory().unwrap();
+        // Pin an env on a worktree the DB has never seen (fresh `git worktree
+        // add`, not yet opened): must insert a row, not silently no-op.
+        db.set_worktree_env("/wt/new", "machine0").unwrap();
+        assert_eq!(
+            db.worktree_env("/wt/new").unwrap().as_deref(),
+            Some("machine0")
+        );
+        assert_eq!(
+            db.effective_env("/wt/new", "/repo").as_deref(),
+            Some("machine0")
+        );
+        // First open registers the full row; the pin must survive the upsert.
+        db.put_worktree("tab", "/repo", "/wt/new", "feat", None, None)
+            .unwrap();
+        assert_eq!(
+            db.worktree_env("/wt/new").unwrap().as_deref(),
+            Some("machine0")
+        );
+        // `""` clears back to inherit.
+        db.set_worktree_env("/wt/new", "").unwrap();
+        assert_eq!(db.worktree_env("/wt/new").unwrap(), None);
+    }
+
+    #[test]
+    fn set_worktree_location_rebinds_and_noops_on_unknown() {
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("tab", "/repo", "/wt/r", "feat", Some("old-blob"), None)
+            .unwrap();
+        db.set_worktree_location("/wt/r", "new-blob").unwrap();
+        assert_eq!(
+            db.location_for("/wt/r").unwrap().as_deref(),
+            Some("new-blob")
+        );
+        // Unknown path: Ok no-op — no row materializes.
+        db.set_worktree_location("/wt/ghost", "blob").unwrap();
+        assert_eq!(db.location_for("/wt/ghost").unwrap(), None);
+    }
+
+    #[test]
+    fn reregister_without_location_keeps_the_persisted_one() {
+        let db = Db::open_memory().unwrap();
+        let loc = r#"{"control_prefix":["sprite","exec"],"path":"/workspace"}"#;
+        db.put_worktree("tab", "/repo", "/wt/p", "feat", Some(loc), None)
+            .unwrap();
+        // Re-register callers (fold-into-folder, tracker) pass None for the
+        // location they don't know — the persisted provider blob must survive.
+        db.put_worktree("tab", "/repo", "/wt/p", "feat", None, None)
+            .unwrap();
+        assert_eq!(db.location_for("/wt/p").unwrap().as_deref(), Some(loc));
+        // An explicit new location still replaces it.
+        db.put_worktree("tab", "/repo", "/wt/p", "feat", Some("local"), None)
+            .unwrap();
+        assert_eq!(db.location_for("/wt/p").unwrap().as_deref(), Some("local"));
+    }
 
     #[test]
     fn del_worktree_cascades_to_disk_cache() {
