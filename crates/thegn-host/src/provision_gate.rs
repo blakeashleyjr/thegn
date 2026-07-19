@@ -386,19 +386,10 @@ pub fn claim_spare(
         .iter()
         .map(|s| s.replace("{id}", &name))
         .collect();
-    if !prefix.is_empty()
-        && let Ok(rows) = db.worktrees()
-        && let Some(row) = rows.into_iter().find(|r| r.worktree == worktree)
-    {
+    if !prefix.is_empty() {
         let loc = thegn_core::remote::GitLoc::provider_db_string(&prefix, &workdir);
-        let _ = db.put_worktree(
-            &row.tab_name,
-            &row.repo_root,
-            worktree,
-            &row.branch,
-            Some(&loc),
-            None,
-        );
+        // best-effort: a missed rebind heals on the worktree's next open.
+        let _ = db.set_worktree_location(worktree, &loc);
     }
     // Placement-engine accounting: if this spare holds a tenancy row (spares
     // minted onto engine-managed hosts), rebind it to the claiming worktree —
@@ -412,6 +403,28 @@ pub fn claim_spare(
     // the next ~8s maintainer tick to notice the gap (off-loop, its own thread).
     crate::lifecycle::refill_pool_after_claim(cfg, worktree);
     Some(name)
+}
+
+/// On-open location rebind: build the [`GitLoc`] for the freshly RESOLVED
+/// provider location blob and persist it when it differs from the stored row —
+/// a stale create-time location (e.g. a machine0 blob on a worktree whose env
+/// now resolves to sprites) must not keep routing chrome reads and repo
+/// provisioning at a dead provider. A blob that parses non-remote is returned
+/// but never persisted (malformed input must not clobber a possibly-good row).
+pub(crate) fn rebind_resolved_location(
+    db: Option<&thegn_core::db::Db>,
+    worktree: &str,
+    blob: &str,
+) -> thegn_core::remote::GitLoc {
+    let fresh = thegn_core::remote::GitLoc::from_db(worktree, Some(blob));
+    if fresh.is_remote()
+        && let Some(db) = db
+        && db.location_for(worktree).ok().flatten().as_deref() != Some(blob)
+    {
+        // best-effort: a missed rebind heals on the next open.
+        let _ = db.set_worktree_location(worktree, blob);
+    }
+    fresh
 }
 
 /// Destroy a spare sandbox + drop its DB row. Best-effort (idempotent).
@@ -446,6 +459,33 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn rebind_resolved_location_persists_only_remote_diffs() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let wt = "/wt/rebind";
+        let old = thegn_core::remote::GitLoc::provider_db_string(
+            &["machine0-ssh".into(), "vm".into()],
+            "/workspace",
+        );
+        db.put_worktree("tab", "/repo", wt, "feat", Some(&old), None)
+            .unwrap();
+        // A different resolved provider blob replaces the stale row.
+        let fresh = thegn_core::remote::GitLoc::provider_db_string(
+            &["sprite".into(), "exec".into()],
+            "/workspace",
+        );
+        let loc = rebind_resolved_location(Some(&db), wt, &fresh);
+        assert!(loc.is_remote());
+        assert_eq!(db.location_for(wt).unwrap().as_deref(), Some(fresh.as_str()));
+        // Same blob again: no-op (equality short-circuit).
+        let loc = rebind_resolved_location(Some(&db), wt, &fresh);
+        assert!(loc.is_remote());
+        // A malformed blob parses Local and must NOT clobber the stored row.
+        let loc = rebind_resolved_location(Some(&db), wt, "not-a-blob");
+        assert!(!loc.is_remote());
+        assert_eq!(db.location_for(wt).unwrap().as_deref(), Some(fresh.as_str()));
+    }
 
     #[test]
     fn sandbox_lock_serializes_same_name() {
