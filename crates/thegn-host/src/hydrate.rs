@@ -1269,7 +1269,12 @@ pub(crate) fn build_model(
 
     // Terse placement kind (ssh/mosh/k8s/<provider>) for the active worktree's
     // tab bar; pure config resolve, canonical repo_root from the sidebar list.
-    let active_path = loc.path();
+    // Key the DB lookups by the HOST worktree path (`cwd`), NOT `loc.path()`:
+    // for a provider worktree `loc.path()` is the in-sandbox path, so the
+    // host-path-keyed `worktrees` row (env pin, repo root) never matched and
+    // the chip fell through to the local default env — rendering a bogus
+    // `(bwrap)` backend chip on a machine0/sprite worktree.
+    let active_path = cwd.to_string_lossy().into_owned();
     let active_repo = sidebar_db_worktrees
         .iter()
         .find(|w| w.path == active_path)
@@ -1308,7 +1313,19 @@ pub(crate) fn build_model(
     // `bwrap`) is irrelevant — the sprite/provider IS the environment — and the
     // fallback that reads it produced a misleading `(bwrap)` chip next to the
     // sprite. The `[kind]` placement chip carries the environment instead.
-    let active_sandbox_backend = if active_env.placement.is_local() {
+    // Gate on the loc too: a worktree whose CONTENT lives remote (persisted
+    // provider/ssh location) must never show a local backend chip, even when
+    // env resolution degrades to Local (missing `[env.*]`, config drift).
+    let loc_is_local = matches!(loc, GitLoc::Local(_));
+    if active_env.placement.is_local() && !loc_is_local {
+        tracing::warn!(
+            worktree = %active_path,
+            env = %active_env.name,
+            "worktree has a remote/provider location but its env resolved to a \
+             local placement — check the worktree's env pin / [env.*] config"
+        );
+    }
+    let active_sandbox_backend = if active_env.placement.is_local() && loc_is_local {
         crate::hydrate_terminal::active_backend(db, &loc.path(), active_env.sandbox.backend)
     } else {
         String::new()
