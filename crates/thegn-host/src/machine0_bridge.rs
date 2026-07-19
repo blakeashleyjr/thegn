@@ -16,6 +16,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -54,9 +55,45 @@ fn write_cache(name: &str, ip: &str, user: &str) {
     }
 }
 
+/// Negative-cache TTL: after a failed resolve, CONTROL reads short-circuit for
+/// this long instead of re-hitting the provider API — a dead/unresolvable VM
+/// otherwise turns every chrome git/fs poll into a failing MCP call (subprocess
+/// churn, UI glitch, and self-inflicted API rate-limiting). Interactive
+/// attaches (`wake`) always retry so a pane open can still revive a parked VM.
+const DOWN_TTL: Duration = Duration::from_secs(30);
+
+fn down_path(name: &str) -> PathBuf {
+    cache_dir().join(format!("{name}.down"))
+}
+
+/// Whether a down-marker written at `mtime` is still fresh at `now`. Future
+/// mtimes (clock skew) count as fresh rather than erroring.
+fn down_fresh(mtime: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(mtime)
+        .map(|d| d < DOWN_TTL)
+        .unwrap_or(true)
+}
+
+/// The recorded failure reason iff the down-marker is fresh.
+fn read_down(name: &str) -> Option<String> {
+    let p = down_path(name);
+    let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
+    if !down_fresh(mtime, SystemTime::now()) {
+        return None;
+    }
+    Some(std::fs::read_to_string(&p).ok()?.trim().to_string())
+}
+
+fn note_down(name: &str, reason: &str) {
+    let _ = std::fs::create_dir_all(cache_dir());
+    // best-effort: the marker is an optimization; a miss just re-resolves.
+    let _ = std::fs::write(down_path(name), reason);
+}
+
 /// Drop a machine0 sandbox's cached endpoint (call on suspend/destroy so a parked
 /// or gone VM's stale IP is never served to a control read).
 pub fn clear(name: &str) {
+    let _ = std::fs::remove_file(down_path(name));
     let _ = std::fs::remove_file(cache_path(name));
 }
 
@@ -72,6 +109,13 @@ fn resolve(cfg: &Config, name: &str, wake: bool) -> Result<(String, String, Remo
     // never drives the pane, so its lack of a transport is fine.)
     if !wake && let Some((ip, user)) = read_cache(name) {
         return Ok((ip, user, transport));
+    }
+    // Control reads back off while a fresh down-marker stands — one `stat` +
+    // small read instead of a per-poll MCP call against a VM that just failed.
+    if !wake && let Some(reason) = read_down(name) {
+        return Err(anyhow!(
+            "machine0-ssh: {name} recently unreachable ({reason}); backing off"
+        ));
     }
     for envc in cfg.env.values() {
         let pc = &envc.provider;
@@ -90,9 +134,15 @@ fn resolve(cfg: &Config, name: &str, wake: bool) -> Result<(String, String, Remo
         } else {
             rt.block_on(provider.peek_endpoint(name))
         };
-        if let Ok((ip, user)) = res {
-            write_cache(name, &ip, &user);
-            return Ok((ip, user, transport));
+        match res {
+            Ok((ip, user)) => {
+                write_cache(name, &ip, &user);
+                let _ = std::fs::remove_file(down_path(name));
+                return Ok((ip, user, transport));
+            }
+            // Both wake and control failures prime the backoff (a failed
+            // interactive attach is the same dead VM the next poll would hit).
+            Err(e) => note_down(name, &e.to_string()),
         }
     }
     Err(anyhow!(
@@ -201,6 +251,16 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn down_marker_freshness_window() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(down_fresh(now, now));
+        assert!(down_fresh(now - Duration::from_secs(29), now));
+        assert!(!down_fresh(now - Duration::from_secs(31), now));
+        // Future mtime (clock skew) is fresh, not an error.
+        assert!(down_fresh(now + Duration::from_secs(5), now));
+    }
 
     #[test]
     fn mosh_argv_splits_host_and_carries_ssh_opts() {
