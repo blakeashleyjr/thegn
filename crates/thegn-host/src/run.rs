@@ -2733,7 +2733,7 @@ pub(crate) fn begin_worktree_preset(
     }
     *create_gen += 1;
     let candidate = thegn_core::worktree::candidate_name(cfg);
-    let env = wizard::default_env_name(cfg, &root);
+    let env = wizard::ambient_env_name_live(cfg, &root);
     let sandbox = sandbox.unwrap_or_else(|| cfg.sandbox.default_backend.as_str().to_string());
     let agent = agent.unwrap_or_else(|| "shell".to_string());
     let name_choice = match name {

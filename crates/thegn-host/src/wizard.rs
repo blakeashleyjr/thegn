@@ -91,10 +91,12 @@ pub enum NameChoice {
     Human(String),
 }
 
-/// The default execution-environment (host) name, matching the head of
-/// [`Config::resolve_env`]'s precedence (repo `.thegn.*` `env =` →
-/// `[sandbox] default_env` → `"default"`), so the wizard's Host row opens on
-/// the same env a pane would resolve to.
+/// The CONFIG-layer default execution-environment (host) name (repo `.thegn.*`
+/// `env =` → `[sandbox] default_env` → `"default"`). NOTE: a pane's runtime
+/// resolution consults the DB workspace env FIRST (`effective_env`), so use
+/// [`ambient_env_name`] wherever the answer must match what a worktree will
+/// actually resolve to — this config-only layer exists for DB-free callers
+/// (and the pure wizard unit tests).
 pub(crate) fn default_env_name(cfg: &Config, repo_root: &Path) -> String {
     let pick = |s: &str| {
         let t = s.trim();
@@ -103,6 +105,31 @@ pub(crate) fn default_env_name(cfg: &Config, repo_root: &Path) -> String {
     pick(&cfg.repo_env_name(repo_root))
         .or_else(|| pick(&cfg.repo_sandbox(repo_root).default_env))
         .unwrap_or_else(|| "default".to_string())
+}
+
+/// The env a worktree of `repo_root` will ACTUALLY inherit: DB workspace env →
+/// [`default_env_name`]'s config chain — the same precedence `effective_env` +
+/// `resolve_env` walk at launch. The register-time pin decision compares the
+/// wizard's choice against THIS (a choice equal to it stays NULL for a clean
+/// inherit); comparing against the config-only default silently un-pinned an
+/// explicit choice whenever a DB workspace env shadowed it (the "machine0
+/// worktree launched on sprites" bug).
+pub(crate) fn ambient_env_name(db: Option<&Db>, cfg: &Config, repo_root: &Path) -> String {
+    db.and_then(|db| {
+        db.workspace_env(&repo_root.to_string_lossy())
+            .ok()
+            .flatten()
+    })
+    .filter(|s| !s.trim().is_empty())
+    .unwrap_or_else(|| default_env_name(cfg, repo_root))
+}
+
+/// [`ambient_env_name`] for loop-side call sites with no `Db` in scope (wizard
+/// launch, headless preset): a one-shot best-effort open. Not for tests — the
+/// pure form/`default_env_name` paths stay DB-free.
+pub(crate) fn ambient_env_name_live(cfg: &Config, repo_root: &Path) -> String {
+    let db = Db::open().ok();
+    ambient_env_name(db.as_ref(), cfg, repo_root)
 }
 
 /// The Alt+w modal, a single-plane form: branch name (the configured prefix is
@@ -210,6 +237,16 @@ impl NewWorktreeWizard {
     /// [`crate::host_ui::wizard_host_badges`]); rendered after the host label.
     pub fn set_host_badges(&mut self, badges: std::collections::HashMap<String, String>) {
         self.host_badges = badges;
+    }
+
+    /// Re-point the Host row at `key` when it exists — the launch path passes
+    /// the DB-aware ambient ([`ambient_env_name_live`]) so the preselect shows
+    /// what the worktree will actually inherit; `new` itself stays DB-free
+    /// (pure prefill, unit-testable).
+    pub fn preselect_host(&mut self, key: &str) {
+        if let Some(i) = self.host_rows.iter().position(|(k, _, _)| k == key) {
+            self.host_sel = i;
+        }
     }
 
     /// True when the selected host runs on the local machine (so a sandbox
@@ -1220,15 +1257,15 @@ pub fn run_worker(
             }
             let _ = db.set_worktree_agent(&path_s, &choices.agent);
             // Persist the chosen host only when it DIFFERS from the ambient
-            // default this worktree would otherwise inherit (repo `.thegn.*`
-            // env → global `[sandbox] default_env` → "default"). A divergent
-            // choice — including an explicit "default" against a provider
-            // ambient default — is pinned so every later re-resolution
-            // (`effective_env` → `resolve_env(Some(..))`) reproduces the
-            // wizard's placement instead of falling through to the ambient
-            // sprite. A choice equal to the ambient default stays NULL (clean
-            // inherit).
-            let ambient = default_env_name(cfg, root);
+            // default this worktree would otherwise inherit (DB workspace env →
+            // repo `.thegn.*` env → global `[sandbox] default_env` →
+            // "default"). A divergent choice — including an explicit "default"
+            // against a provider ambient default — is pinned so every later
+            // re-resolution (`effective_env` → `resolve_env(Some(..))`)
+            // reproduces the wizard's placement instead of falling through to
+            // the ambient. A choice equal to the ambient default stays NULL
+            // (clean inherit).
+            let ambient = ambient_env_name(Some(&db), cfg, root);
             if choices.env != ambient {
                 let _ = db.set_worktree_env(&path_s, &choices.env);
             }
@@ -1298,6 +1335,26 @@ mod tests {
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
         cfg.worktree_mode = WorktreeMode::InRepo;
         cfg
+    }
+
+    #[test]
+    fn ambient_env_prefers_db_workspace_layer() {
+        let mut cfg = test_cfg();
+        cfg.sandbox.default_env = "cfgdefault".into();
+        // A path with no repo `.thegn.*` overlay, so the config chain ends at
+        // the global default.
+        let root = std::env::temp_dir().join("sz-wiz-ambient-none");
+        assert_eq!(ambient_env_name(None, &cfg, &root), "cfgdefault");
+        // The DB workspace env shadows the config default (the pin decision
+        // must compare against what `effective_env` will actually resolve).
+        let db = Db::open_memory().unwrap();
+        db.put_workspace(&root.to_string_lossy(), "t", "git").unwrap();
+        db.set_workspace_env(&root.to_string_lossy(), "sprites")
+            .unwrap();
+        assert_eq!(ambient_env_name(Some(&db), &cfg, &root), "sprites");
+        // A cleared workspace env falls back through the config chain.
+        db.set_workspace_env(&root.to_string_lossy(), "").unwrap();
+        assert_eq!(ambient_env_name(Some(&db), &cfg, &root), "cfgdefault");
     }
 
     // test code: fixture setup, never on the event loop.

@@ -182,7 +182,7 @@ fn new(
 
     // Register (git stays the source of truth; the DB row is what the sidebar
     // + session resurrection read). put_worktree is the primary path; the env
-    // pin is a bare UPDATE after it.
+    // pin upserts after it.
     let root_s = root.to_string_lossy().into_owned();
     let path_s = path.to_string_lossy().into_owned();
     let tab = thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug(&root), &branch);
@@ -195,7 +195,7 @@ fn new(
     // would inherit anyway (same rule as the wizard: a matching choice stays
     // NULL for a clean inherit).
     if let Some(e) = env.as_deref()
-        && e != crate::wizard::default_env_name(cfg, &root)
+        && e != crate::wizard::ambient_env_name(Some(&db), cfg, &root)
     {
         // best-effort: the worktree exists; a missed pin re-resolves ambient.
         let _ = db.set_worktree_env(&path_s, e);
