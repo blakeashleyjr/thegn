@@ -160,6 +160,56 @@ pub(crate) fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf,
 /// `$HOME` at `base`, preserving the executable bit. Returns `(ok, failed)`.
 /// Small (~5 tiny files per agent) + best-effort — the shared core of the
 /// initial login sync and the connect-time [`resync_agent_auth`] refresh.
+/// SOURCE path for an agent-config path `rel` (relative to `$HOME`): re-rooted
+/// at the provider's relocated credential home (`CLAUDE_CONFIG_DIR` /
+/// `CODEX_HOME`) when set. The host's LIVE login may be a relocated home (e.g.
+/// a claude-profiles dir) while the default `~/.claude` fossilizes — the login
+/// sync uploading the fossil gave every sprite a stale identity. The sandbox
+/// TARGET keeps the default rel path (in-sandbox agents run without the
+/// relocation env).
+fn agent_source_path(host_home: &str, rel: &str) -> std::path::PathBuf {
+    relocated_source(rel, &|k| std::env::var(k).ok())
+        .unwrap_or_else(|| Path::new(host_home).join(rel))
+}
+
+/// The relocation core, pure over an env lookup (unit-tested without touching
+/// process env). `None` ⇒ no provider relocates `rel` (use `$HOME/<rel>`).
+fn relocated_source(rel: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
+    for p in thegn_core::account::PROVIDERS {
+        let Some(root) = env(p.home_env)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .map(|v| std::path::PathBuf::from(thegn_core::util::expand_tilde(&v)))
+        else {
+            continue;
+        };
+        if rel == p.default_dir {
+            return Some(root);
+        }
+        if let Some(rest) = rel.strip_prefix(p.default_dir)
+            && let Some(rest) = rest.strip_prefix('/')
+        {
+            return Some(root.join(rest));
+        }
+        // claude's top-level `.claude.json` rides beside the config dir: with
+        // `CLAUDE_CONFIG_DIR` set claude keeps it INSIDE that dir; a
+        // claude-profiles home keeps it at the profile root (the dir's
+        // parent). First existing wins; neither ⇒ fall back to `$HOME`.
+        if p.id == "claude" && rel == ".claude.json" {
+            let inside = root.join(".claude.json");
+            if inside.is_file() {
+                return Some(inside);
+            }
+            if let Some(beside) = root.parent().map(|d| d.join(".claude.json"))
+                && beside.is_file()
+            {
+                return Some(beside);
+            }
+        }
+    }
+    None
+}
+
 fn sync_agent_auth_critical(
     provider: &thegn_svc::provider::Provider,
     id: &str,
@@ -171,7 +221,7 @@ fn sync_agent_auth_critical(
     let mut failed = 0usize;
     for agent in agents {
         for f in thegn_core::envplan::agent_auth_critical_files(agent) {
-            let src = Path::new(&host_home).join(&f);
+            let src = agent_source_path(&host_home, &f);
             let Ok(data) = std::fs::read(&src) else {
                 continue; // file absent on this host — skip silently
             };
@@ -325,7 +375,7 @@ pub(crate) fn upload_agent_configs(
             if already_uploaded.contains(&f) {
                 continue;
             }
-            let src = Path::new(&host_home).join(&f);
+            let src = agent_source_path(&host_home, &f);
             let Ok(data) = std::fs::read(&src) else {
                 continue;
             };
@@ -335,7 +385,7 @@ pub(crate) fn upload_agent_configs(
             all_uploads.push((format!("{base}/{f}"), data, exec));
         }
         for d in dirs {
-            let src = Path::new(&host_home).join(&d);
+            let src = agent_source_path(&host_home, &d);
             if !src.is_dir() {
                 continue;
             }
@@ -538,6 +588,38 @@ pub(crate) fn account_pane_env_exports(cfg: &thegn_core::config::Config, worktre
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_source_relocates_via_home_env() {
+        // test code: fixture setup, never on the event loop.
+        #[expect(clippy::disallowed_methods)]
+        let tmp = std::env::temp_dir().join(format!("sz-reloc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = tmp.join("profile/.claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Profile-home shape: `.claude.json` beside the config dir.
+        std::fs::write(tmp.join("profile/.claude.json"), b"{}").unwrap();
+        let dir_s = dir.to_string_lossy().into_owned();
+        let env = move |k: &str| (k == "CLAUDE_CONFIG_DIR").then(|| dir_s.clone());
+        // The dir + its children re-root at the relocated home.
+        assert_eq!(relocated_source(".claude", &env), Some(dir.clone()));
+        assert_eq!(
+            relocated_source(".claude/.credentials.json", &env),
+            Some(dir.join(".credentials.json"))
+        );
+        // Top-level `.claude.json` found beside the relocated dir.
+        assert_eq!(
+            relocated_source(".claude.json", &env),
+            Some(tmp.join("profile/.claude.json"))
+        );
+        // Unrelated paths / unset providers stay on `$HOME`.
+        assert_eq!(relocated_source(".config/claude/x", &env), None);
+        assert_eq!(relocated_source(".codex/auth.json", &env), None);
+        assert_eq!(relocated_source(".claude", &|_| None), None);
+        // Prefix must be a path component: `.claudeX` is not `.claude`.
+        assert_eq!(relocated_source(".claudeX/y", &env), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn agent_config_upload_skips_transcripts_and_bulk() {
