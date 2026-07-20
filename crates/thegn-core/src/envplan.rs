@@ -1106,8 +1106,8 @@ fn direnv_install_script() -> String {
     // nix-managed `~/.zshrc`, as on the sprite login user) makes `>> "$rc"` fail
     // "Permission denied" — which used to exit the whole step 1 and paint a red X
     // on the loading screen, even though direnv installed fine AND the hook is
-    // redundant there (the pane enters direnv via `eval "$(direnv export bash)"`,
-    // see `shell_snippet`). So: skip an unwritable rc (`[ -w ]`), swallow any write
+    // redundant there (the pane enters direnv via `direnv exec`, see
+    // `shell_snippet`). So: skip an unwritable rc (`[ -w ]`), swallow any write
     // error, and end on `true` so the step only fails if direnv itself is unusable.
     format!(
         "{}command -v direnv >/dev/null 2>&1 \
