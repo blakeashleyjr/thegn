@@ -27,11 +27,6 @@ pub(crate) fn oci_login_snippet() -> String {
             chain.push(s);
         }
     }
-    // Emit: for s in <chain>; do command -v "$s" && exec "$s" -l; done
-    let checks: String = chain
-        .iter()
-        .map(|s| format!("command -v {s} >/dev/null 2>&1 && exec {s} -l; "))
-        .collect();
     // Put the nix profile dirs on PATH FIRST so a `nix profile install`ed shell
     // (zsh from nixpkgs) is found by `command -v` — covers single-user
     // (`~/.nix-profile`), daemon/system (Determinate `--init none`,
@@ -40,40 +35,40 @@ pub(crate) fn oci_login_snippet() -> String {
     // checks miss the installed zsh/starship and drop to `/bin/sh`.
     let path_export = "export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:\
          $HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; ";
-    // The login-shell probe chain, PATH-primed. Reused both bare and, for a
-    // pure-devenv repo, RE-run inside `devenv shell` so the pane's real shell
-    // lands inside the devenv toolchain. No single quotes inside, so it embeds
-    // safely in the `sh -lc '…'` below.
-    let inner = format!("{path_export}{checks}exec /bin/sh -l");
-    // Load the project toolchain into THIS shell before exec'ing the login shell,
-    // so the pane enters it even where the direnv rc-HOOK can't install (machine0's
-    // read-only home-manager `~/.zshrc`). Three cases, most-specific first; each
-    // runs after `cd` (see `open_spec`):
-    //  - `.envrc` present ⇒ direnv (covers `use flake`, `use devenv`, …): eval its
-    //    exports (stdout) into this shell; build progress (stderr) shows.
-    //  - else a `devenv.nix` with the `devenv` CLI but NO direnv integration ⇒
-    //    enter `devenv shell` directly, re-running the probe chain inside it so the
-    //    user's shell keeps the devenv PATH. `&& exit` closes the pane on a clean
-    //    exit; ANY failure (missing/old devenv, build error) falls through to the
-    //    bare chain below — never worse than no devenv entry.
-    //  - else nothing: the bare chain runs.
-    let devshell = format!(
-        "if command -v direnv >/dev/null 2>&1 && [ -e .envrc ]; then \
-             direnv allow . 2>/dev/null; eval \"$(direnv export bash)\" || true; \
-         elif [ -e devenv.nix ] && command -v devenv >/dev/null 2>&1; then \
-             devenv shell -- /bin/sh -lc '{inner}' && exit; \
-         fi; "
-    );
-    // Robust fallback: if nothing above actually loaded a devShell (no `.envrc`,
-    // or direnv's `use flake` isn't supported in-sandbox because nix-direnv isn't
-    // installed — the "dropped into a bare shell" case), load the flake devShell
-    // DIRECTLY with `nix print-dev-env`. `IN_NIX_SHELL` is set once a devShell is
-    // active, so this no-ops when direnv already did the job. `THEGN_DEVSHELL`
-    // picks the attr (`sandbox` in-sandbox, else `default`).
-    let flake_fallback = "if [ -z \"$IN_NIX_SHELL\" ] && [ -e flake.nix ] && command -v nix >/dev/null 2>&1; then \
-             eval \"$(nix print-dev-env \".#${THEGN_DEVSHELL:-default}\" 2>/dev/null)\" 2>/dev/null || true; \
+    // Probe the login shell ONCE, first-match (host-preferred → zsh → bash →
+    // sh), into `$tgsh` — the toolchain entries below hand the ENTIRE entry to a
+    // tool (`direnv exec` / `devenv shell` / `nix develop --command`) instead of
+    // eval'ing shell-flavored export dumps in THIS wrapper. This wrapper is
+    // POSIX `/bin/sh` — dash on Debian sprites — and `eval "$(direnv export
+    // bash)"` there detonated the moment a provisioned sprite's flake devShell
+    // actually evaluated (bash-only quoting in nix stdenv vars ⇒ `export: …:
+    // bad variable name` ⇒ exit 2 ⇒ the pane crash-loop).
+    let probe: String = chain
+        .iter()
+        .map(|s| format!("[ -z \"$tgsh\" ] && command -v {s} >/dev/null 2>&1 && tgsh={s}; "))
+        .collect();
+    let probe = format!("tgsh=\"\"; {probe}: \"${{tgsh:=/bin/sh}}\"; ");
+    // Toolchain entries, most-specific first; each hands the pane to `$tgsh -l`
+    // WITH the project env loaded, and `&& exit` closes the pane on a clean
+    // shell exit. ANY failure (build error, missing/old tool) falls through to
+    // the next entry — never worse than a bare shell:
+    //  - `.envrc` ⇒ `direnv exec . $tgsh -l` (covers `use flake`, `use devenv`,
+    //    …): direnv applies the env itself — flavor-proof, no eval. Build
+    //    progress (stderr) still shows in the pane.
+    //  - else `devenv.nix` with the `devenv` CLI ⇒ enter `devenv shell` directly.
+    //  - else a flake ⇒ `nix develop .#$THEGN_DEVSHELL --command $tgsh -l`
+    //    (`sandbox` in-sandbox, else `default`), guarded on `IN_NIX_SHELL` so an
+    //    already-active devShell isn't re-entered.
+    let devshell = "if command -v direnv >/dev/null 2>&1 && [ -e .envrc ]; then \
+             direnv allow . 2>/dev/null; direnv exec . \"$tgsh\" -l && exit; \
+         fi; \
+         if [ -e devenv.nix ] && command -v devenv >/dev/null 2>&1; then \
+             devenv shell -- \"$tgsh\" -l && exit; \
+         fi; \
+         if [ -z \"$IN_NIX_SHELL\" ] && [ -e flake.nix ] && command -v nix >/dev/null 2>&1; then \
+             nix develop \".#${THEGN_DEVSHELL:-default}\" --command \"$tgsh\" -l && exit; \
          fi; ";
-    format!("{path_export}{devshell}{flake_fallback}{checks}exec /bin/sh -l")
+    format!("{path_export}{probe}{devshell}exec \"$tgsh\" -l")
 }
 
 #[cfg(test)]
@@ -83,25 +78,40 @@ mod tests {
     #[test]
     fn oci_snippet_probes_chain_devshell_and_devenv_fallback() {
         let s = oci_login_snippet();
-        assert!(s.contains("command -v"), "probes for shell availability");
-        assert!(s.ends_with("exec /bin/sh -l"), "ends with /bin/sh fallback");
+        // First-match probe into $tgsh, /bin/sh as the last resort.
+        assert!(
+            s.contains("[ -z \"$tgsh\" ] && command -v zsh") && s.contains("${tgsh:=/bin/sh}"),
+            "first-match shell probe: {s}"
+        );
         assert!(s.contains("bash"), "bash in the chain");
-        // direnv env loaded before the login shell execs.
-        assert!(s.contains("[ -e .envrc ]") && s.contains("direnv export bash"));
-        assert!(s.find("direnv export bash").unwrap() < s.find("exec /bin/sh -l").unwrap());
+        assert!(s.ends_with("exec \"$tgsh\" -l"), "ends with the probed shell");
+        // direnv hands the pane to the shell ITSELF (`direnv exec`) — never an
+        // `eval "$(direnv export bash)"` in this POSIX wrapper: dash (Debian
+        // sprites' /bin/sh) chokes on bash-flavored export dumps the moment the
+        // flake devShell evaluates (`export: …: bad variable name` → exit 2 →
+        // pane crash-loop).
+        assert!(
+            s.contains("[ -e .envrc ]") && s.contains("direnv exec . \"$tgsh\" -l && exit"),
+            "direnv entry via direnv exec: {s}"
+        );
+        assert!(!s.contains("eval \"$("), "no shell-flavored eval in the wrapper: {s}");
         // Pure-devenv fallback, guarded so any failure falls through.
         assert!(
-            s.contains("elif [ -e devenv.nix ] && command -v devenv")
-                && s.contains("devenv shell -- /bin/sh -lc")
-                && s.contains("&& exit"),
+            s.contains("[ -e devenv.nix ] && command -v devenv")
+                && s.contains("devenv shell -- \"$tgsh\" -l && exit"),
             "devenv fallback: {s}"
         );
-        // Direct flake-devShell fallback when direnv didn't load one (no
-        // nix-direnv): guarded on IN_NIX_SHELL so it no-ops when already active.
+        // Direct flake-devShell fallback when there's no .envrc: `nix develop
+        // --command`, guarded on IN_NIX_SHELL so it no-ops when already active.
         assert!(
             s.contains("[ -z \"$IN_NIX_SHELL\" ]")
-                && s.contains("nix print-dev-env \".#${THEGN_DEVSHELL:-default}\""),
-            "flake print-dev-env fallback: {s}"
+                && s.contains("nix develop \".#${THEGN_DEVSHELL:-default}\" --command \"$tgsh\" -l"),
+            "flake nix-develop fallback: {s}"
         );
+        // Entry order: direnv → devenv → flake → bare exec.
+        let pos = |needle: &str| s.find(needle).unwrap();
+        assert!(pos(".envrc") < pos("devenv.nix"));
+        assert!(pos("devenv.nix") < pos("flake.nix"));
+        assert!(pos("flake.nix") < pos("exec \"$tgsh\" -l"));
     }
 }

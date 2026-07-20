@@ -80,7 +80,7 @@ fn sprite_ssh_argv_wraps_proxycommand_and_remote_shell() {
     let remote = argv.last().unwrap();
     assert!(remote.contains("cd /workspace"), "{remote}");
     assert!(
-        remote.contains("command -v zsh") && remote.contains("exec zsh -l"),
+        remote.contains("command -v zsh") && remote.contains("exec \"$tgsh\" -l"),
         "remote should run the zsh-first login chain: {remote}"
     );
 }
@@ -610,32 +610,33 @@ fn shell_inner_oci_emits_runtime_probe_chain() {
         oci.contains("command -v"),
         "should probe for shell availability"
     );
-    // Must have an unconditional /bin/sh -l fallback at the end.
+    // Must end by exec'ing the probed shell (/bin/sh when nothing matched).
     assert!(
-        oci.ends_with("exec /bin/sh -l"),
-        "must end with /bin/sh fallback"
+        oci.ends_with("exec \"$tgsh\" -l") && oci.contains("${tgsh:=/bin/sh}"),
+        "must end with the probed shell (with a /bin/sh last resort)"
     );
     // bash must always appear in the chain (present in every Debian image).
     assert!(oci.contains("bash"), "bash must be in the probe chain");
-    // Loads the flake devShell env explicitly (hook-independent) when the
-    // workspace has an `.envrc`, so a read-only-`~/.zshrc` image still enters
-    // the project toolchain. Gated on `.envrc`, applied before the login shell.
+    // Enters the flake devShell hook-independently when the workspace has an
+    // `.envrc`, so a read-only-`~/.zshrc` image still enters the project
+    // toolchain — via `direnv exec` (flavor-proof), never by eval'ing
+    // bash-flavored export dumps in this POSIX (dash) wrapper.
     assert!(
-        oci.contains("[ -e .envrc ]") && oci.contains("direnv export bash"),
-        "OCI shell must eval the devShell env when an .envrc is present: {oci}"
+        oci.contains("[ -e .envrc ]") && oci.contains("direnv exec . \"$tgsh\" -l"),
+        "OCI shell must enter the devShell env when an .envrc is present: {oci}"
     );
-    let devshell_at = oci.find("direnv export bash").unwrap();
-    let shell_at = oci.find("exec /bin/sh -l").unwrap();
+    let devshell_at = oci.find("direnv exec").unwrap();
+    let shell_at = oci.find("exec \"$tgsh\" -l").unwrap();
     assert!(
         devshell_at < shell_at,
-        "devShell env must load BEFORE the login shell execs"
+        "devShell entry must come BEFORE the bare login-shell exec"
     );
     // Pure-devenv fallback: no `.envrc` but a `devenv.nix` + the `devenv` CLI ⇒
-    // enter `devenv shell` (re-running the probe chain inside it), guarded so any
-    // failure falls through to the bare chain rather than killing the pane.
+    // enter `devenv shell` with the probed login shell, guarded so any failure
+    // falls through to the bare chain rather than killing the pane.
     assert!(
-        oci.contains("elif [ -e devenv.nix ] && command -v devenv")
-            && oci.contains("devenv shell -- /bin/sh -lc")
+        oci.contains("[ -e devenv.nix ] && command -v devenv")
+            && oci.contains("devenv shell -- \"$tgsh\" -l")
             && oci.contains("&& exit"),
         "OCI shell must fall back to `devenv shell` for a pure-devenv repo: {oci}"
     );
@@ -672,8 +673,8 @@ fn native_open_spec_does_not_exec_prefix_the_probe_chain() {
         !script.contains("exec command"),
         "must not exec-prefix the probe chain (127 footgun): {script}"
     );
-    // The chain itself still self-execs into a shell, ending in /bin/sh.
-    assert!(script.contains("command -v zsh") && script.contains("exec /bin/sh -l"));
+    // The chain itself still self-execs into a shell (probed, /bin/sh last).
+    assert!(script.contains("command -v zsh") && script.contains("exec \"$tgsh\" -l"));
     // And it cd's into the workdir first.
     assert!(script.starts_with("cd /workspace"));
 }
