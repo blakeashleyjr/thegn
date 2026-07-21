@@ -171,7 +171,9 @@ pub(crate) fn maybe_materialize(
                     .map_err(spec_err),
                     Err(e) => Err(match crate::handlers::provision::sandbox_halt_in(&e) {
                         Some(h) => SpecError::Halt(h.clone()),
-                        None => SpecError::Other(format!("environment setup failed: {e}")),
+                        // `{e:#}` keeps the full cause chain (see `ensure sandbox`
+                        // in agent.rs) so the provider's real failure is shown.
+                        None => SpecError::Other(format!("environment setup failed: {e:#}")),
                     }),
                 }
             }

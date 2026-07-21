@@ -496,6 +496,22 @@ fn auto_backend_fallthrough_carries_visible_warning() {
 }
 
 #[test]
+fn heal_degraded_location_only_fires_for_provider_degrade() {
+    // A provider env that fell back to the host this open, with a stale remote
+    // blob in the DB row ⇒ heal it to local (else the chip lies "remote" while
+    // the pane runs on the host — the reported machine0 bug).
+    assert!(should_heal_degraded_location(true, Some("prov:machine0…")));
+    // Degraded but the row is already local (empty/None) ⇒ nothing to heal.
+    assert!(!should_heal_degraded_location(true, Some("")));
+    assert!(!should_heal_degraded_location(true, None));
+    // NOT a degrade: a genuine ssh/k8s worktree also carries `location = None`
+    // from `prepare_sandbox_env` yet legitimately keeps its remote location —
+    // it must never be clobbered here.
+    assert!(!should_heal_degraded_location(false, Some("ssh:host…")));
+    assert!(!should_heal_degraded_location(false, None));
+}
+
+#[test]
 fn compose_spec_host_fallback_is_login_shell() {
     let cfg = cfg_with(&[("claude", "claude --foo")], &[]);
     let loc = GitLoc::from_db("/wt/x", None);
@@ -507,6 +523,7 @@ fn compose_spec_host_fallback_is_login_shell() {
         is_remote: false,
         cwd_override: None,
         location: None,
+        degraded_from_provider: false,
     };
     let spec = compose_spec(&cfg, "/wt/x", Some("sz/x"), "claude", &loc, &host);
     assert_eq!(
@@ -543,6 +560,7 @@ fn host_outcome() -> SandboxOutcome {
         is_remote: false,
         cwd_override: None,
         location: None,
+        degraded_from_provider: false,
     }
 }
 
@@ -715,6 +733,7 @@ fn compose_spec_clean_shell_choice_uses_rc_free_shell() {
         is_remote: false,
         cwd_override: None,
         location: None,
+        degraded_from_provider: false,
     };
     let spec = compose_spec(&cfg, "/wt/x", None, "clean-shell", &loc, &sb);
     let joined = spec.argv.join(" ");
