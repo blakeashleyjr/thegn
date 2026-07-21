@@ -1081,6 +1081,17 @@ impl HydrateHints {
     fn visible_commit_limit(&self) -> usize {
         if self.expanded { 80 } else { 20 }
     }
+
+    /// The hints every switch-time hydration/prefetch builds identically: open
+    /// section, expanded width, active profile (`warm_commits` stays per-call).
+    pub(crate) fn for_switch(ui: &crate::panel::PanelUi, cfg: &thegn_core::config::Config) -> Self {
+        HydrateHints {
+            open: ui.open,
+            expanded: ui.width.is_expanded(),
+            profile: cfg.profile.clone(),
+            ..Default::default()
+        }
+    }
 }
 
 // Short TTL: the Commits list is only built while a commits / expanded-git
