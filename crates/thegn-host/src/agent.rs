@@ -169,6 +169,13 @@ pub struct SandboxOutcome {
     /// local). Set for a `Placement::Provider` env so the chrome's git/fs reads
     /// route into the sandbox via [`GitLoc::Provider`](thegn_core::remote::GitLoc).
     pub location: Option<String>,
+    /// True when a `Placement::Provider` env failed to come up and `failover`
+    /// degraded this open to a bare host shell. Distinct from a genuinely-local
+    /// (or ssh/k8s) env that also carries `location = None`: it tells the launch
+    /// site to actively HEAL a stale remote `worktrees.location` back to local,
+    /// so the chrome stops routing git/fs reads into the dead provider and the
+    /// tab chip stops claiming the pane is remote when it is running on the host.
+    pub degraded_from_provider: bool,
 }
 
 /// Resolve and `ensure` the sandbox for `worktree` — the BLOCKING half of a
@@ -230,7 +237,7 @@ pub fn prepare_sandbox_env(
     // chrome's git/fs reads route into the sandbox via the control-plane exec
     // prefix. `None` for local/ssh/k8s (their data plane is unchanged). The
     // worktree dir inside the env is the provider `workdir` (default /workspace).
-    let location = match &placement {
+    let mut location = match &placement {
         thegn_core::placement::Placement::Provider(p) => {
             // Resolve against the sandbox's cached `$HOME` (workspace lives under the
             // login user's home). Cold on the very first create (before provisioning
@@ -263,6 +270,9 @@ pub fn prepare_sandbox_env(
         placement.clone()
     };
     let mut env_is_remote = environment.is_remote() && cwd_override.is_none();
+    // Set when a provider bring-up failure degrades this open to the host (below),
+    // so the outcome can heal a stale remote `worktrees.location` back to local.
+    let mut degraded_from_provider = false;
     let mut sb = environment.sandbox;
     let mut explicit_backend =
         sandbox::Backend::from_config(sb.backend).filter(|b| *b != sandbox::Backend::None);
@@ -369,6 +379,11 @@ pub fn prepare_sandbox_env(
         placement = thegn_core::placement::Placement::Local;
         exec_placement = thegn_core::placement::Placement::Local;
         env_is_remote = false;
+        // The pane now runs on the host, so the worktree is NOT at the provider
+        // location computed above — drop it (and flag the degrade) so the DB row
+        // heals to local instead of routing chrome reads at the dead provider.
+        location = None;
+        degraded_from_provider = true;
         sb.backend = thegn_core::config::SandboxBackend::None;
     }
     if !placement.is_local()
@@ -388,6 +403,9 @@ pub fn prepare_sandbox_env(
         placement = thegn_core::placement::Placement::Local;
         exec_placement = thegn_core::placement::Placement::Local;
         env_is_remote = false;
+        // Same as the auto-provision degrade above: heal the location to local.
+        location = None;
+        degraded_from_provider = true;
         sb.backend = thegn_core::config::SandboxBackend::None;
     }
     if let Some(pspec) = &projection {
@@ -448,6 +466,7 @@ pub fn prepare_sandbox_env(
                     is_remote: env_is_remote,
                     cwd_override,
                     location,
+                    degraded_from_provider,
                 });
             }
             if let Some(expected) = explicit_backend
@@ -483,6 +502,7 @@ pub fn prepare_sandbox_env(
                         is_remote: env_is_remote,
                         cwd_override,
                         location,
+                        degraded_from_provider,
                     });
                 }
                 Err(e) => {
@@ -536,6 +556,7 @@ pub fn prepare_sandbox_env(
         is_remote: env_is_remote,
         cwd_override,
         location,
+        degraded_from_provider,
     })
 }
 
@@ -1305,7 +1326,11 @@ pub fn provision_provider_env_named(
     tracing::debug!(target: "thegn::startup", %id, "provider ensure_exists (create/list)");
     let created = match block_on_provider(|| async { provider.ensure_exists(&id).await }) {
         Ok(created) => created,
-        Err(e) => return Err(anyhow::anyhow!("ensure sandbox {id}: {e}")),
+        // `{e:#}` (alternate) flattens the whole anyhow cause chain into the
+        // message — without it, Display keeps only the outermost context and the
+        // real cause (e.g. machine0's `vm_create` `isError` text) is dropped
+        // before it can reach the loading screen / logs.
+        Err(e) => return Err(anyhow::anyhow!("ensure sandbox {id}: {e:#}")),
     };
     tracing::debug!(target: "thegn::startup", %id, created, "sandbox ensured");
 
@@ -1325,9 +1350,9 @@ pub fn provision_provider_env_named(
         if let Err(e) = block_on_provider(|| async { provider.wait_ready(&id, READY_BUDGET).await })
         {
             boot[0].state = ProvisionState::Failed;
-            boot[0].detail = Some(e.to_string());
+            boot[0].detail = Some(format!("{e:#}"));
             progress(&boot);
-            return Err(anyhow::anyhow!("sandbox {id} not ready: {e}"));
+            return Err(anyhow::anyhow!("sandbox {id} not ready: {e:#}"));
         }
         boot[0].state = ProvisionState::Done;
         progress(&boot);
@@ -2460,6 +2485,16 @@ pub fn ensure_remote_bridge(cfg: &Config, env_name: &str, binary: &Path, remote_
     }
 }
 
+/// Whether a worktree's persisted remote `location` should be healed back to
+/// local. True only when a provider env degraded to the host THIS open
+/// (`degraded`) AND the stored row still carries a non-empty (remote) location.
+/// Crucially gated on `degraded`: a genuine ssh/k8s worktree also resolves with
+/// `outcome.location == None` yet legitimately keeps its remote location, so it
+/// must never be clobbered here. Pure.
+pub(crate) fn should_heal_degraded_location(degraded: bool, current: Option<&str>) -> bool {
+    degraded && current.is_some_and(|l| !l.is_empty())
+}
+
 /// Warm-on-open (8-E): for a provider env with `auto_provision`, create the
 /// sandbox if it doesn't exist yet (API providers — CLI providers use
 /// `up_command`/`placement.ensure`). Runs off-loop. Returns `Err` if the provider
@@ -2825,6 +2860,22 @@ pub fn launch_spec_with_key(
         if fresh.is_remote() {
             provision_provider_repo(&repo_root, &fresh, branch);
         }
+    } else if let Some(db) = db.as_ref()
+        && should_heal_degraded_location(
+            outcome.degraded_from_provider,
+            db.location_for(worktree).ok().flatten().as_deref(),
+        )
+    {
+        // A provider env failed to come up and `failover` dropped this open to a
+        // bare host shell. A prior successful open left a remote provider blob in
+        // `worktrees.location`; leaving it would make the chrome route git/fs
+        // reads into the now-dead provider and the tab chip claim the pane is
+        // remote while it is really on the host. Heal the row to local (empty).
+        // best-effort: the DB is a cache; a missed heal self-corrects next open.
+        let _ = db.set_worktree_location(worktree, "");
+        thegn_core::msg::info(&format!(
+            "{worktree}: provider unavailable, worktree location healed to local"
+        ));
     }
 
     // Bouncer (opt-in): inject the agent's proxy + tool-override env into the

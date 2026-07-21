@@ -298,7 +298,12 @@ pub fn sse_last_data(body: &str) -> Option<String> {
 pub fn unwrap_tool_result(result: Value) -> Result<Value> {
     let text = first_text_content(&result);
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        return Err(anyhow!(text.unwrap_or_else(|| result.to_string())));
+        let raw = text.unwrap_or_else(|| result.to_string());
+        // machine0 delivers business errors as an `isError` text block whose body
+        // is `{"error":CODE,"message":MSG}` (e.g. MACHINE_LIMIT_REACHED). Render
+        // that as `CODE: MSG` so the user sees the reason, not a raw JSON blob;
+        // fall back to the raw text for any other error shape.
+        return Err(anyhow!(business_error_message(&raw)));
     }
     if let Some(sc) = result.get("structuredContent")
         && !sc.is_null()
@@ -310,6 +315,23 @@ pub fn unwrap_tool_result(result: Value) -> Result<Value> {
         // No content at all — hand back the raw result so callers can inspect it.
         None => Ok(result),
     }
+}
+
+/// Turn a machine0 error text block into a human message. When it is the
+/// documented `{"error":CODE,"message":MSG}` shape, return `CODE: MSG` (or just
+/// whichever field is present); otherwise hand back the text unchanged. Pure.
+pub fn business_error_message(raw: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(raw) {
+        let code = v.get("error").and_then(Value::as_str);
+        let msg = v.get("message").and_then(Value::as_str);
+        match (code, msg) {
+            (Some(c), Some(m)) if c != m => return format!("{c}: {m}"),
+            (Some(c), _) => return c.to_string(),
+            (None, Some(m)) => return m.to_string(),
+            _ => {}
+        }
+    }
+    raw.to_string()
 }
 
 /// The first `content[].text` block of a tool result, if any. Pure.
@@ -384,5 +406,33 @@ mod tests {
         let result = json!({ "isError": true, "content": [{"type":"text","text":"boom"}] });
         let e = unwrap_tool_result(result).unwrap_err();
         assert!(e.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn unwrap_is_error_renders_business_error_cleanly() {
+        // machine0's `{"error":CODE,"message":MSG}` body renders as `CODE: MSG`,
+        // not a raw JSON blob (e.g. the real MACHINE_LIMIT_REACHED rejection).
+        let result = json!({
+            "isError": true,
+            "content": [{"type":"text","text":"{\"error\":\"MACHINE_LIMIT_REACHED\",\"message\":\"machine limit reached\"}"}],
+        });
+        let e = unwrap_tool_result(result).unwrap_err();
+        assert_eq!(e.to_string(), "MACHINE_LIMIT_REACHED: machine limit reached");
+    }
+
+    #[test]
+    fn business_error_message_shapes() {
+        assert_eq!(
+            business_error_message(r#"{"error":"E_CODE","message":"human msg"}"#),
+            "E_CODE: human msg"
+        );
+        // only one field present
+        assert_eq!(business_error_message(r#"{"error":"E_CODE"}"#), "E_CODE");
+        assert_eq!(business_error_message(r#"{"message":"just a message"}"#), "just a message");
+        // identical code+message collapses to one
+        assert_eq!(business_error_message(r#"{"error":"x","message":"x"}"#), "x");
+        // non-JSON / unrelated shapes pass through untouched
+        assert_eq!(business_error_message("plain text"), "plain text");
+        assert_eq!(business_error_message(r#"{"other":1}"#), r#"{"other":1}"#);
     }
 }
