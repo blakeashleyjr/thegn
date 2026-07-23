@@ -1586,11 +1586,10 @@ pub fn provision_provider_env_named(
         snapshot_restore: (name_override.is_none())
             .then(|| crate::hibernator::begin_restore(worktree))
             .flatten(),
-        // When the host cache is on, bake its sandbox-side loopback substituter into
-        // nix.conf so the devShell build + in-pane `nix develop` substitute from the
-        // host store over the reverse tunnel (which the host stands up separately).
-        host_cache_url: pc
-            .host_cache
+        // Host-cache loopback substituter for nix.conf — but only when the resident
+        // musl bridge that carries the `:8484` tunnel is pushable; otherwise the port
+        // is dead and nix wastes minutes timing out before falling back to source.
+        host_cache_url: (pc.host_cache && crate::bridge_sup::bridge_binary_path().is_some())
             .then(|| format!("http://127.0.0.1:{}", crate::nixcache::SANDBOX_PORT)),
         // Provision the managed pi in the sandbox when a configured agent runs it
         // (its command references `~/.thegn/pi`), so the "Agent" entry's snippet

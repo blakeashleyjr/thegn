@@ -103,6 +103,25 @@ release: _apps
 build-musl: _apps
     cargo build --release -p thegn-host --bin thegn --target x86_64-unknown-linux-musl
 
+# Build the resident musl bridge (hermetically, via nix — no host musl toolchain
+# needed) and drop it next to BOTH the debug and release host binaries as
+# `thegn-musl`, where `bridge_sup::bridge_binary_path()` auto-discovers it. Without
+# it, `bridge_binary_path()` is None, the bridge is never pushed to provider envs,
+# and every reverse tunnel (nix cache :8484 / proxy :8383) execs a missing binary →
+# in-sandbox `:8484 could not connect` + slow from-source devShell builds. Run once
+# (nix caches it, so unchanged rebuilds are instant); re-run after source changes,
+# then restart the instance so the fresh bridge is pushed.
+bridge:
+    nix build .#thegn-musl -o result-bridge
+    mkdir -p target/debug target/release
+    install -m755 result-bridge/bin/thegn target/debug/thegn-musl
+    install -m755 result-bridge/bin/thegn target/release/thegn-musl
+    # Strip the installed copies — the bridge is pushed byte-for-byte over the exec
+    # stream into each fresh env, so shedding the (runtime-unneeded) symbol/debug
+    # tables cuts ~20% off every push. The nix store artifact stays intact.
+    strip target/debug/thegn-musl target/release/thegn-musl
+    @echo "bridge: installed → target/{debug,release}/thegn-musl ($(du -h target/release/thegn-musl | cut -f1), stripped)"
+
 # Run the native host compositor. Builds it first. Run from a real terminal —
 # it acquires raw mode and owns the screen.
 host *args: build
@@ -673,6 +692,7 @@ start-term name="dev" backend="": build-profiling (_apply-backend backend)
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
       echo "profiler: 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/"; \
       echo "logs: $state/thegn/logs/thegn.log (startup waterfall + frame/hydrate/perf)"; \
+      echo "bridge: $([ -x "$PWD/target/debug/thegn-musl" ] && echo "present (reverse tunnels :8484/:8383 live)" || echo "MISSING — run 'just bridge'; nix cache :8484 + proxy :8383 tunnels are disabled")"; \
       setsid -f ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
       'pidfile="$1"; shift; echo $$ > "$pidfile"; exec env "$@"' \
       sh "$pidfile" \
@@ -711,6 +731,7 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
       echo "profiler: 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/"; \
       echo "logs: $logs/thegn.log (full trace: startup/frame/hydrate/perf + every crate) + $logs/stderr.log (panic message + full backtrace)"; \
       echo "sprites token: $([ -n "${SPRITES_TOKEN:-}" ] && echo "loaded (len ${#SPRITES_TOKEN})" || echo "NOT set — sprites envs will halt; put SPRITES_TOKEN in .envrc.local")"; \
+      echo "bridge: $([ -x "$PWD/target/release/thegn-musl" ] && echo "present (reverse tunnels :8484/:8383 live)" || echo "MISSING — run 'just bridge'; nix cache :8484 + proxy :8383 tunnels are disabled")"; \
       setsid -f ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
       'pidfile="$1"; errlog="$2"; shift 2; echo $$ > "$pidfile"; exec env "$@" 2>"$errlog"' \
       sh "$pidfile" "$logs/stderr.log" \
