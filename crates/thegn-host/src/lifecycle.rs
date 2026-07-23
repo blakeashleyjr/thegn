@@ -149,6 +149,15 @@ fn explicit_park(app_cfg: &thegn_core::config::Config, worktree: &str) {
     {
         return; // self-suspends (sprites) or not scale-to-zero (VPS) ⇒ nothing to do
     }
+    // A mosh pane can't survive its VM being parked: mosh holds a UDP session with
+    // no TCP/ssh connection, and a suspend kills mosh-server / changes the IP on
+    // resume — the pane just hangs ("Nothing received from server"). Unlike ssh
+    // (which drops → the pane exits → refocus respawns + resumes the VM), mosh
+    // never recovers. So keep a mosh worktree's VM warm while its tab is open; it
+    // is still parked/destroyed on close via teardown.
+    if pc.transport == thegn_core::config::RemoteTransport::Mosh {
+        return;
+    }
     let thegn_core::placement::Placement::Provider(p) = &env.placement else {
         return;
     };
