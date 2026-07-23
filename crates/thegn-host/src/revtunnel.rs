@@ -142,6 +142,55 @@ impl ReverseTunnelSupervisor {
         tasks.insert(key, task);
     }
 
+    /// Arm every `(sandbox_port, host_target)` reverse tunnel for a provider
+    /// `worktree`, resolving the exec-API provider once.
+    ///
+    /// Unlike [`crate::agent::native_bridge_provider`], this deliberately ignores
+    /// the provider's *transient* native-exec health cooldown: that gate is right
+    /// for a one-shot control-plane call, but a reverse tunnel is a persistent
+    /// supervisor that already reconnects with bounded backoff. Gating it on the
+    /// instantaneous health at worktree-switch would leave the port unbound (e.g.
+    /// the nix-cache `:8484` "could not connect") until the next switch. Only the
+    /// durable gates apply: `exec != cli` and the provider has a native exec API.
+    pub fn start_all(
+        &self,
+        handle: &Handle,
+        cfg: &thegn_core::config::Config,
+        env: &thegn_core::env::Environment,
+        sandbox_id: &str,
+        worktree: &str,
+        tunnels: Vec<(u16, String)>,
+    ) {
+        if tunnels.is_empty() {
+            return;
+        }
+        // Only the durable gates apply (exec != cli, provider has a native exec
+        // API); `Provider` isn't `Clone`, so build a fresh one per tunnel.
+        let pc = match cfg.env.get(&env.name) {
+            Some(e)
+                if e.provider.exec != thegn_core::config::ProviderExecMode::Cli
+                    && thegn_svc::provider::exec_api_by_name(&e.provider.provider) =>
+            {
+                &e.provider
+            }
+            _ => return,
+        };
+        for (sandbox_port, host_target) in tunnels {
+            let Some(provider) = crate::provider_factory::provider_for(pc) else {
+                return;
+            };
+            self.start(
+                handle,
+                worktree,
+                provider,
+                sandbox_id.to_string(),
+                crate::bridge_sup::remote_thegn(),
+                sandbox_port,
+                host_target,
+            );
+        }
+    }
+
     /// Stop and forget all tunnels for `worktree` (called on worktree close).
     pub fn stop_worktree(&self, worktree: &str) {
         if let Ok(mut tasks) = self.tasks.lock() {
