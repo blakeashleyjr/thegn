@@ -42,13 +42,14 @@ static SYNCED: LazyLock<Mutex<HashMap<String, String>>> =
 pub(crate) fn ssh_none_guard(
     spec: &thegn_core::sandbox::SandboxSpec,
     configured: thegn_core::config::SandboxBackend,
-    failover: bool,
+    degrade_allowed: bool,
+    ask: bool,
     env_name: &str,
     placement_label: &str,
 ) -> anyhow::Result<()> {
     let ssh = matches!(spec.placement, thegn_core::placement::Placement::Ssh(_));
     let explicit_none = configured == thegn_core::config::SandboxBackend::None;
-    if ssh && !explicit_none && !failover {
+    if ssh && !explicit_none && !degrade_allowed {
         return Err(crate::agent::SandboxHalt {
             env_name: env_name.to_string(),
             placement: placement_label.to_string(),
@@ -56,6 +57,7 @@ pub(crate) fn ssh_none_guard(
                      detected over ssh); install a container runtime there, or \
                      set a reachable [sandbox] backend"
                 .to_string(),
+            ask,
         }
         .into());
     }

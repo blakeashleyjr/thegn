@@ -7,7 +7,7 @@ use crate::chrome::LoadStep;
 use crate::compositor::Rect;
 use crate::loading::{SpecOrigin, apply_spec_batch};
 use crate::menu::{self, MenuOverlay};
-use thegn_core::store::{PoolStore, WorkspaceStore};
+use thegn_core::store::{NotificationStore, PoolStore, WorkspaceStore};
 
 /// Resolved launch specs routed back to the requesting group by its unique
 /// NAME (a path can be shared by two groups); the batch also carries the path
@@ -52,11 +52,108 @@ pub(crate) fn sandbox_halt_in(e: &anyhow::Error) -> Option<&crate::agent::Sandbo
         .find_map(|src| src.downcast_ref::<crate::agent::SandboxHalt>())
 }
 
+/// The sandbox-halt/ask modal's `[r] retry` and `[h] run on host` choices:
+/// re-arm the active tab's lazy materialize (retry re-attempts the real env;
+/// run-on-host pins it to the host for the session). Returns `true` when it
+/// handled `choice` (the caller then flips `dirty` + `continue`s). `active_wt` /
+/// `active_key` are the active worktree's path + `(group, tab)` key.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_sandbox_retry_choice(
+    choice: &menu::MenuChoice,
+    cfg: &thegn_core::config::Config,
+    session: &crate::session::Session,
+    active_wt: Option<&std::path::Path>,
+    materialize_failed: &mut std::collections::HashSet<(String, usize)>,
+    prewarm_failed: &mut std::collections::HashSet<(String, usize)>,
+    halt_dismissed: &mut std::collections::HashSet<(String, usize)>,
+    center_dormant: &mut bool,
+    status: &mut String,
+) -> bool {
+    let active_key = session
+        .worktrees
+        .get(session.active)
+        .map(|g| (g.name.clone(), g.active_tab));
+    match choice {
+        // Retry: clear the provider failure cooldown + any run-on-host pin so it
+        // re-attempts the REAL env; if still down the blocked-launch handler
+        // re-raises the modal. Keep `halt_dismissed` — a manual retry is silent.
+        menu::MenuChoice::SandboxRetry => {
+            if let Some(wt) = active_wt {
+                let wt = wt.to_string_lossy();
+                crate::agent::clear_native_exec_cooldown(cfg, &wt);
+                crate::agent::clear_force_host(&wt);
+            }
+            if let Some(key) = active_key {
+                materialize_failed.remove(&key);
+                prewarm_failed.remove(&key);
+            }
+            *center_dormant = false;
+            *status = "Retrying environment bring-up…".into();
+            true
+        }
+        // Run on host: pin the worktree to the host so the respawn degrades
+        // instead of re-blocking; don't re-prompt (host was chosen explicitly).
+        menu::MenuChoice::SandboxRunOnHost => {
+            if let Some(wt) = active_wt {
+                crate::agent::request_force_host(&wt.to_string_lossy());
+            }
+            if let Some(key) = active_key {
+                materialize_failed.remove(&key);
+                prewarm_failed.remove(&key);
+                halt_dismissed.insert(key);
+            }
+            *center_dormant = false;
+            *status = "Running on the host (env unavailable) — retry from the env menu".into();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Record a `provider_degraded` notification (unread badge + routed desktop
+/// toast) when a launch degraded a managed provider to the host — the transient
+/// status line is easy to miss, and this matches the sidebar `«env ✗»` marker.
+/// No-op unless `spec.degraded`. Called from the materialize-done path.
+pub(crate) fn note_provider_degraded(
+    notify: &crate::notify::NotifyState,
+    branch: &str,
+    path: &str,
+    spec: &crate::agent::LaunchSpec,
+) {
+    if !spec.degraded {
+        return;
+    }
+    let msg = spec
+        .warning_summary()
+        .unwrap_or_else(|| format!("{branch} running on host"));
+    let dec = notify.decide("provider_degraded", path, &msg, path);
+    notify.emit_sound(&dec);
+    if dec.record {
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(db) = thegn_core::db::Db::open() {
+                let _ = db.put_notification("provider_degraded", &path, &msg, &path);
+            }
+        });
+    }
+}
+
 pub(crate) fn sandbox_halt_overlay(halt: &crate::agent::SandboxHalt) -> MenuOverlay {
     let title = format!("⚠ {} unavailable", halt.placement);
+    if halt.ask {
+        // `failover = "ask"`: surface the real cause and offer an explicit host
+        // escape hatch beside the retry — the pane is NOT silently degraded.
+        let body = format!(
+            "{} — [r] retry the bring-up, or [h] run this worktree on the host for \
+             now (you'll see it's degraded in the sidebar). Set `failover = \"auto\"` \
+             under [env.{}] / [sandbox] to skip this prompt.",
+            halt.reason, halt.env_name
+        );
+        return menu::sandbox_ask_menu(title, body);
+    }
     let body = format!(
         "{} — failover is off, so thegn won't drop to the host. Fix the env \
-         (e.g. set its token) then retry, or set `failover = true` under \
+         (e.g. set its token) then retry, or set `failover = \"ask\"`/`\"auto\"` under \
          [env.{}] / [sandbox] to allow a host fallback.",
         halt.reason, halt.env_name
     );

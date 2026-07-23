@@ -117,6 +117,11 @@ fn resolve(cfg: &Config, name: &str, wake: bool) -> Result<(String, String, Remo
             "machine0-ssh: {name} recently unreachable ({reason}); backing off"
         ));
     }
+    // Keep the last real provider error so the failure the user sees names the
+    // actual cause (quota/limit, not-RUNNING, ssh-auth) instead of a generic
+    // "could not resolve" — the true reason (e.g. MACHINE_LIMIT_REACHED) would
+    // otherwise be swallowed here after only priming the down-marker.
+    let mut last_err: Option<String> = None;
     for envc in cfg.env.values() {
         let pc = &envc.provider;
         if pc.provider.trim() != "machine0" {
@@ -142,13 +147,22 @@ fn resolve(cfg: &Config, name: &str, wake: bool) -> Result<(String, String, Remo
             }
             // Both wake and control failures prime the backoff (a failed
             // interactive attach is the same dead VM the next poll would hit).
-            Err(e) => note_down(name, &e.to_string()),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                note_down(name, &msg);
+                last_err = Some(msg);
+            }
         }
     }
-    Err(anyhow!(
-        "machine0-ssh: could not resolve VM {name:?} (no machine0 env with a set \
-         MACHINE0_API_KEY, or the VM is not running); provision it first"
-    ))
+    match last_err {
+        Some(cause) => Err(anyhow!(
+            "machine0-ssh: could not bring up VM {name:?}: {cause}"
+        )),
+        None => Err(anyhow!(
+            "machine0-ssh: could not resolve VM {name:?} (no machine0 env with a set \
+             MACHINE0_API_KEY); provision it first"
+        )),
+    }
 }
 
 /// Whether a local `mosh` client is installed (`mosh --version` succeeds).

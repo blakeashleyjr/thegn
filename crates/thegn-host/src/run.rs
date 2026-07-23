@@ -4145,9 +4145,9 @@ fn dispatch_menu_choice(
         // The bouncer approval gate is resolved directly in the loop (it owns the
         // approval queue + oneshots); it never routes through this git dispatcher.
         MenuChoice::ApproveTool { .. } => {}
-        // Sandbox-halt retry is resolved directly in the loop (re-arms the lazy
-        // materialize); it never routes through this git dispatcher.
-        MenuChoice::SandboxRetry => {}
+        // Sandbox-halt retry / run-on-host are resolved directly in the loop
+        // (re-arm the lazy materialize); they never route through this dispatcher.
+        MenuChoice::SandboxRetry | MenuChoice::SandboxRunOnHost => {}
     }
     GitAfter::None
 }
@@ -9236,6 +9236,13 @@ async fn event_loop<T: Terminal>(
                             ),
                             None => format!("worktree {} ready ({backend})", payload.branch),
                         };
+                        // Provider degraded to host: notify (badge) — no-op unless so.
+                        crate::handlers::provision::note_provider_degraded(
+                            &notify_state,
+                            &payload.branch,
+                            &payload.path,
+                            &payload.spec,
+                        );
                     } else {
                         model.status =
                             format!("worktree {} created (agent launch failed)", payload.branch);
@@ -12509,30 +12516,23 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
-                            // Sandbox-halt retry: clear the provider failure
-                            // cooldown and re-arm the active tab's lazy
-                            // materialize so it re-resolves specs (the env may
-                            // now be fixed). If it's still down, the blocked-
-                            // launch handler raises this modal again.
-                            if let menu::MenuChoice::SandboxRetry = choice {
-                                if let Some(wt) = active_cwd(&session) {
-                                    crate::agent::clear_native_exec_cooldown(
-                                        keymap.config(),
-                                        &wt.to_string_lossy(),
-                                    );
+                            // Sandbox-halt/ask modal `[r] retry` / `[h] run on host`.
+                            {
+                                let active_wt = active_cwd(&session);
+                                if crate::handlers::provision::handle_sandbox_retry_choice(
+                                    &choice,
+                                    keymap.config(),
+                                    &session,
+                                    active_wt.as_deref(),
+                                    &mut materialize_failed,
+                                    &mut prewarm_failed,
+                                    &mut halt_dismissed,
+                                    &mut center_dormant,
+                                    &mut model.status,
+                                ) {
+                                    dirty = true;
+                                    continue;
                                 }
-                                if let Some(g) = session.worktrees.get(session.active) {
-                                    let key = (g.name.clone(), g.active_tab);
-                                    materialize_failed.remove(&key);
-                                    prewarm_failed.remove(&key);
-                                    // Keep `halt_dismissed` set: a manual retry
-                                    // re-attempts silently — if it fails again
-                                    // the row's error dot suffices, no re-block.
-                                }
-                                center_dormant = false;
-                                model.status = "Retrying environment bring-up…".into();
-                                dirty = true;
-                                continue;
                             }
                             // Dismissing the sandbox-halt modal (`[n]`) suppresses
                             // it for this key: the row keeps its red error dot and

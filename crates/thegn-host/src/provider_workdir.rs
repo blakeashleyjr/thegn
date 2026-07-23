@@ -68,6 +68,42 @@ pub fn default_workdir(home: &str) -> String {
     format!("{}/workspace", home.trim_end_matches('/'))
 }
 
+// --- local "provisioned" marker -------------------------------------------
+//
+// A cheap, LOCAL record (a tiny file, no network) that a sandbox `id` completed
+// its full provisioning (repo clone + toolchain + the remote `.tg` marker). The
+// authoritative signal is the REMOTE marker, but reading it costs a network
+// round-trip — unsafe on the event loop (the 0%-idle invariant). This local
+// mirror lets the on-loop attach path (`spawn_worktree_shell_pane` → `launch_spec`)
+// cheaply refuse to drop a BARE shell onto an unprovisioned provider VM. It's
+// set at provision completion and cleared on teardown; a stale/missing marker is
+// self-correcting — a false "unprovisioned" just routes through the (idempotent)
+// materialize provision, which re-sets it.
+
+fn provisioned_dir() -> PathBuf {
+    thegn_core::util::thegn_dir().join("provisioned")
+}
+
+/// Record that sandbox `id` finished provisioning (local mirror of the remote
+/// `.tg` marker). Best-effort — a missed write costs one extra idempotent
+/// re-provision.
+pub fn mark_provisioned(id: &str) {
+    let _ = std::fs::create_dir_all(provisioned_dir());
+    let _ = std::fs::write(provisioned_dir().join(id), b"1");
+}
+
+/// Whether sandbox `id` has the LOCAL provisioned marker — a cheap file stat,
+/// safe to call on the event loop (unlike the network remote-marker read).
+pub fn is_provisioned_locally(id: &str) -> bool {
+    provisioned_dir().join(id).exists()
+}
+
+/// Drop the local provisioned marker (sandbox destroyed/recycled) so a recreated
+/// bare VM under the same id isn't treated as provisioned.
+pub fn clear_provisioned(id: &str) {
+    let _ = std::fs::remove_file(provisioned_dir().join(id));
+}
+
 /// The sandbox login's real `$HOME` (absolute), via one cheap exec. Falls back to
 /// `/root` when the probe fails or returns a non-absolute path (the historical
 /// default). Sites the workspace + personal-layer uploads under the actual login
@@ -206,6 +242,23 @@ mod tests {
         ));
         assert!(is_valid_home("/home/nix"));
         assert!(!is_valid_home("relative/home"));
+    }
+
+    #[test]
+    fn provisioned_marker_roundtrips() {
+        let tmp = std::env::temp_dir().join(format!("tg-prov-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // SAFETY: single-threaded test; `thegn_dir()` honors `THEGN_DIR`.
+        unsafe { std::env::set_var("THEGN_DIR", &tmp) };
+        let id = "thegn-tg-clever-falcon-rmuy88";
+        assert!(!is_provisioned_locally(id), "absent before mark");
+        mark_provisioned(id);
+        assert!(is_provisioned_locally(id), "present after mark");
+        clear_provisioned(id);
+        assert!(!is_provisioned_locally(id), "absent after clear");
+        // Clearing a never-marked id is a no-op (no panic).
+        clear_provisioned("never-marked");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

@@ -167,6 +167,9 @@ pub struct SidebarRow {
     /// Selected execution environment (`[env.<name>]`); `None`/`"default"` ⇒
     /// the implicit default (no badge shown).
     pub env_name: Option<String>,
+    /// The env is a managed provider but content resolved local (degraded to the
+    /// host) — renders the `«env»` badge as `«env ✗»`.
+    pub env_degraded: bool,
     pub activity: ActivityState,
     /// Render/navigation visibility: false when hidden by a collapsed parent or
     /// filtered out.
@@ -233,6 +236,7 @@ impl SidebarRow {
             git: None,
             sandbox_backend: None,
             env_name: None,
+            env_degraded: false,
             activity: ActivityState::None,
             visible: true,
             collapsed: false,
@@ -371,6 +375,10 @@ pub struct DbWorktree {
     /// Selected execution environment (`[env.<name>]`); `None`/`"default"` ⇒
     /// the implicit default (no badge shown).
     pub env_name: Option<String>,
+    /// The env is a managed PROVIDER but the worktree's content resolved local
+    /// (degraded to the host / never provisioned) — renders the `«env»` badge as
+    /// `«env ✗»`. Computed in [`crate::hydrate::db_worktree_list`].
+    pub env_degraded: bool,
 }
 
 /// Split a `{repo}/{branch}` group name into its parts.
@@ -462,6 +470,9 @@ struct Group {
     activity: ActivityState,
     sandbox_backend: Option<String>,
     env_name: Option<String>,
+    /// The env is a provider but content is local (degraded) — drives the `✗` on
+    /// the env badge. See [`DbWorktree::env_degraded`].
+    env_degraded: bool,
     folder_id: Option<i64>,
     /// What activating this group's row does: focus the live `(gi, tab)` for a
     /// loaded workspace, or switch to the workspace (landing on this group's
@@ -512,10 +523,20 @@ pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> 
         && env != "default"
     {
         let gl = crate::caps::active_glyphs();
-        segs.push(seg(
-            Tok::Slot(S::Faint),
-            format!("{}{env}{} ", gl.quote_open, gl.quote_close),
-        ));
+        // Degraded provider pin: mark the badge (`«env ✗»`, amber) so it doesn't
+        // imply the pane is on the provider when it's really on the host. ASCII
+        // fallback swaps `✗`→`x` and `«»`→`<>` via the caps glyph set.
+        if row.env_degraded {
+            segs.push(seg(
+                Tok::Hue(theme::Hue::Amber),
+                format!("{}{env} {}{} ", gl.quote_open, gl.cross, gl.quote_close),
+            ));
+        } else {
+            segs.push(seg(
+                Tok::Slot(S::Faint),
+                format!("{}{env}{} ", gl.quote_open, gl.quote_close),
+            ));
+        }
     }
     if let Some(backend) = &row.sandbox_backend
         && !backend.is_empty()
@@ -691,6 +712,7 @@ pub fn build_rows(
                 path: g.path.clone(),
                 sandbox_backend: dbw.and_then(|w| w.sandbox_backend.clone()),
                 env_name: dbw.and_then(|w| w.env_name.clone()),
+                env_degraded: dbw.is_some_and(|w| w.env_degraded),
                 activity: activity.get(&g.name).copied().unwrap_or_default(),
                 folder_id: dbw.and_then(|w| w.folder_id),
                 target: RowTarget::Tab(gi, g.active_tab),
@@ -717,6 +739,7 @@ pub fn build_rows(
                 path: repo_path.clone(),
                 sandbox_backend: db_home.and_then(|w| w.sandbox_backend.clone()),
                 env_name: db_home.and_then(|w| w.env_name.clone()),
+                env_degraded: db_home.is_some_and(|w| w.env_degraded),
                 // Keyed by tab name, same source the live rows use — so a
                 // workspace you switched away from keeps its activity dot.
                 activity: activity
@@ -737,6 +760,7 @@ pub fn build_rows(
                     path: w.path.clone(),
                     sandbox_backend: w.sandbox_backend.clone(),
                     env_name: w.env_name.clone(),
+                    env_degraded: w.env_degraded,
                     activity: activity
                         .get(w.tab_name.as_str())
                         .copied()
@@ -789,6 +813,7 @@ pub fn build_rows(
                 git,
                 sandbox_backend: gr.sandbox_backend.clone(),
                 env_name: gr.env_name.clone(),
+                env_degraded: gr.env_degraded,
                 activity: gr.activity,
                 visible: !collapsed,
                 pr_count,
@@ -1442,6 +1467,7 @@ mod tests {
             folder_id: None,
             sandbox_backend: None,
             env_name: Some("company-k8s".into()),
+            env_degraded: false,
         }];
         let rows = build_rows(
             &s,
@@ -1725,6 +1751,7 @@ mod tests {
                 folder_id: None,
                 sandbox_backend: None,
                 env_name: None,
+                env_degraded: false,
             },
             DbWorktree {
                 slug: "app".into(),
@@ -1735,6 +1762,7 @@ mod tests {
                 folder_id: None,
                 sandbox_backend: None,
                 env_name: None,
+                env_degraded: false,
             },
         ];
         let rows = build_rows(
@@ -1970,6 +1998,7 @@ mod tests {
             folder_id: Some(1),
             sandbox_backend: None,
             env_name: None,
+            env_degraded: false,
         }];
         let folders = vec![thegn_core::models::FolderRow {
             folder_id: 1,
@@ -2096,6 +2125,7 @@ mod tests {
             folder_id: None,
             sandbox_backend: None,
             env_name: None,
+            env_degraded: false,
         };
         let live = session(
             vec![
@@ -2210,6 +2240,7 @@ mod tests {
             folder_id: None,
             sandbox_backend: None,
             env_name: None,
+            env_degraded: false,
         };
         let dbw = vec![mk("zebra", "/wt/zebra"), mk("alpha", "/wt/alpha")];
         let view = ViewState {
@@ -2244,6 +2275,7 @@ mod tests {
             folder_id: Some(3),
             sandbox_backend: None,
             env_name: None,
+            env_degraded: false,
         }];
         // Filed worktree → both its workspace and its folder key.
         assert_eq!(

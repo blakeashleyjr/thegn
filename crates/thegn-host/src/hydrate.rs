@@ -657,7 +657,10 @@ pub(crate) fn merge_workspace_lists(
 
 /// Worktrees registered in the DB, ready for the sidebar's cross-workspace
 /// rows: one entry per registry row whose dir still exists (or is remote).
-pub(crate) fn db_worktree_list(db: &thegn_core::db::Db) -> Vec<crate::sidebar::DbWorktree> {
+pub(crate) fn db_worktree_list(
+    db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
+) -> Vec<crate::sidebar::DbWorktree> {
     let mut out = Vec::new();
     for w in db.worktrees().unwrap_or_default() {
         // git is the source of truth: a local registry row whose dir vanished
@@ -671,6 +674,19 @@ pub(crate) fn db_worktree_list(db: &thegn_core::db::Db) -> Vec<crate::sidebar::D
         let Some((slug, branch)) = crate::sidebar::split_tab(&w.tab_name) else {
             continue;
         };
+        // Degraded pin: the worktree is pinned to a managed-PROVIDER env but its
+        // content resolved local (empty `location` — never provisioned, or healed
+        // back after a failover). The `«env»` badge then reads `«env ✗»` so the
+        // sidebar doesn't imply the pane is on the provider. Gate on provider
+        // (not any non-local env): ssh/k8s with `data=sync` legitimately keep
+        // content local — same discriminator as the tab-bar chip.
+        let env_degraded = w.location.is_empty()
+            && w.env_name
+                .as_deref()
+                .and_then(|e| cfg.env.get(e))
+                .is_some_and(|e| {
+                    matches!(e.placement, thegn_core::config::PlacementMode::Provider)
+                });
         out.push(crate::sidebar::DbWorktree {
             slug,
             branch,
@@ -680,6 +696,7 @@ pub(crate) fn db_worktree_list(db: &thegn_core::db::Db) -> Vec<crate::sidebar::D
             folder_id: w.folder_id,
             sandbox_backend: w.sandbox_backend.clone(),
             env_name: w.env_name.clone(),
+            env_degraded,
         });
     }
     out
@@ -1237,7 +1254,7 @@ pub(crate) fn build_model(
         .filter(|(_, _, _, repo)| !repo.is_empty())
         .flat_map(|(_, _, _, repo)| db.folders_for_workspace(repo).unwrap_or_default())
         .collect();
-    let sidebar_db_worktrees = db_worktree_list(db);
+    let sidebar_db_worktrees = db_worktree_list(db, &app_cfg);
     let sidebar_db_terminals = crate::hydrate_terminal::sidebar_terminals(db);
     // One-shot at process start: collapse any stale running/active activity dot
     // (a session killed mid-run) to a settled state before the sidebar first
@@ -1275,10 +1292,23 @@ pub(crate) fn build_model(
     // the chip fell through to the local default env — rendering a bogus
     // `(bwrap)` backend chip on a machine0/sprite worktree.
     let active_path = cwd.to_string_lossy().into_owned();
+    // Resolve the repo root the SAME way the loading splash + launch path do
+    // (`db.repo_root_for` → `main_worktree`), not just the sidebar list: a
+    // worktree that isn't in `sidebar_db_worktrees` yet (freshly created, still
+    // provisioning) fell back to the worktree PATH as the repo root, so the
+    // `effective_env`/workspace lookup below missed → env resolved to the LOCAL
+    // default → a bogus `(bwrap)` backend chip on a provider (sprites/machine0)
+    // worktree, diverging from the splash. Match the splash's resolution.
     let active_repo = sidebar_db_worktrees
         .iter()
         .find(|w| w.path == active_path)
         .map(|w| w.repo_path.clone())
+        .or_else(|| db.repo_root_for(&active_path).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            thegn_core::repo::main_worktree(std::path::Path::new(&active_path))
+                .map(|p| p.to_string_lossy().into_owned())
+        })
         .unwrap_or_else(|| active_path.clone());
     // Use the EFFECTIVE env selection (per-worktree override, else the
     // workspace default) — the same source the loading splash's
@@ -1293,10 +1323,19 @@ pub(crate) fn build_model(
         std::path::Path::new(&active_path),
         db.effective_env(&active_path, &active_repo).as_deref(),
     );
-    let active_placement_kind =
-        (!active_env.placement.is_local()).then(|| active_env.placement.kind());
-    let active_placement_label =
-        (!active_env.placement.is_local()).then(|| active_env.placement.label());
+    // A provider env whose CONTENT resolved local has degraded to the host
+    // (provider unavailable + `failover`, or a stale remote location healed back
+    // to local — see the `should_heal_degraded_location` heal on open). A healthy
+    // provider always persists a `GitLoc::Provider`, so `loc == Local` for a
+    // provider env is the durable "runs on the host" signal. Suppress the
+    // placement chip entirely: don't claim the pane is on the provider when it is
+    // really on the host. (ssh/k8s with `data=sync`/sshfs also keep content local
+    // yet run remote, so gate on `is_provider()` — not "any non-local placement".)
+    let loc_is_local = matches!(loc, GitLoc::Local(_));
+    let degraded_to_host = active_env.placement.is_provider() && loc_is_local;
+    let show_placement = !active_env.placement.is_local() && !degraded_to_host;
+    let active_placement_kind = show_placement.then(|| active_env.placement.kind());
+    let active_placement_label = show_placement.then(|| active_env.placement.label());
 
     let panel = build_panel(&cwd, db, &hints, &app_cfg);
 
@@ -1316,7 +1355,7 @@ pub(crate) fn build_model(
     // Gate on the loc too: a worktree whose CONTENT lives remote (persisted
     // provider/ssh location) must never show a local backend chip, even when
     // env resolution degrades to Local (missing `[env.*]`, config drift).
-    let loc_is_local = matches!(loc, GitLoc::Local(_));
+    // (`loc_is_local` was bound above for the placement-chip degrade check.)
     if active_env.placement.is_local() && !loc_is_local {
         tracing::warn!(
             worktree = %active_path,

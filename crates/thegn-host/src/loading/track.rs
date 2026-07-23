@@ -274,8 +274,10 @@ pub(crate) fn loading_context(
             out.push(("workdir".to_string(), wd));
         }
     }
+    // This is the HOME (dotfiles) strategy, not the shell — label it accurately
+    // (it was mislabeled "shell", which read as "your login shell is portable").
     let strategy = format!("{:?}", env.sandbox.home.strategy).to_lowercase();
-    out.push(("shell".to_string(), strategy));
+    out.push(("home".to_string(), strategy));
     out
 }
 

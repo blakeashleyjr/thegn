@@ -383,6 +383,14 @@ impl Placement {
         matches!(self, Placement::Local)
     }
 
+    /// A managed-provider placement (sprite/machine0/…). Its content lives in
+    /// the sandbox, so a locally-resolved [`GitLoc`](crate::remote::GitLoc)
+    /// means the placement degraded to the host (provider unavailable +
+    /// failover). Unlike ssh/k8s, a provider never keeps content local.
+    pub fn is_provider(&self) -> bool {
+        matches!(self, Placement::Provider(_))
+    }
+
     /// The transport/provider *family* only — no host/id — for terse chrome
     /// (e.g. the center tab bar): `local`, `ssh`, `mosh`, `k8s`, or the provider
     /// id (`sprite`, `daytona`, …). See [`Placement::label`] for the full detail.
@@ -627,6 +635,29 @@ mod tests {
         assert_eq!(p.control_argv(&argv), argv);
         assert!(p.is_local());
         assert_eq!(p.label(), "local");
+    }
+
+    #[test]
+    fn is_provider_only_true_for_provider_placement() {
+        let prov = Placement::Provider(ProviderPlacement {
+            provider: "machine0".into(),
+            id: "i".into(),
+            interactive_prefix: vec!["a".into()],
+            control_prefix: vec!["b".into()],
+            up_command: Vec::new(),
+            down_command: Vec::new(),
+        });
+        assert!(prov.is_provider());
+        assert!(!Placement::Local.is_provider());
+        assert!(
+            !Placement::Ssh(SshPlacement::plain(
+                "dev@box".into(),
+                22,
+                true,
+                TransportKind::Ssh,
+            ))
+            .is_provider()
+        );
     }
 
     #[test]

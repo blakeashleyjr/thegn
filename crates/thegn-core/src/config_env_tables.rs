@@ -660,10 +660,11 @@ impl SnapshotStoreConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct PoolConfig {
-    /// Pre-provisioned spare sandboxes to keep ready per (repo, env). `0` = the
-    /// provider-aware auto default; a non-zero value overrides it (clamped to a
-    /// runaway ceiling). The `+`/`-` hotkey persists a per-repo+env override that
-    /// wins over both (including `0` to force the pool off).
+    /// Pre-provisioned spare sandboxes to keep ready per (repo, env). `0` (the
+    /// default) = **off**: the pool is strictly opt-in (idle spares consume
+    /// provider quota, fatal on a low-limit account). A non-zero value opts in
+    /// (clamped to a runaway ceiling). The `+`/`-` hotkey persists a per-repo+env
+    /// override that wins over this (including `0` to force the pool off).
     pub size: usize,
     /// AgeOut (billed-when-stopped, e.g. VPS) providers only: destroy an unclaimed
     /// pool member idle longer than this (seconds). Ignored for scale-to-zero

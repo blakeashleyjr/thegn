@@ -80,4 +80,7 @@ pub fn destroy_provider_sandbox(worktree: &str, env_name: &str) {
         Ok(()) => thegn_core::msg::info(&format!("destroyed sandbox {name} on worktree delete")),
         Err(e) => thegn_core::msg::warn(&format!("sandbox teardown on delete failed: {e}")),
     }
+    // Drop the local provisioned marker so a later sandbox reusing this id isn't
+    // treated as provisioned (the attach gate would skip re-provisioning).
+    crate::provider_workdir::clear_provisioned(&name);
 }
