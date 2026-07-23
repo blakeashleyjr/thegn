@@ -237,8 +237,7 @@ pub fn prepare_sandbox_env(
     // placement isn't handled by `for_environment`, which is ssh-only).
     let env_data = environment.data;
     let env_name = environment.name.clone();
-    // Failover policy: `halt`/`ask` block a bring-up failure with a `SandboxHalt`;
-    // `auto` (or a `force_host` run-on-host pin) allows the chain→host fallback.
+    // Failover: `halt`/`ask` block a bring-up failure; `auto`/`force_host` degrade.
     let failover_mode = cfg.env_failover_mode(repo_root, &env_name);
     let ask = matches!(failover_mode, thegn_core::config::FailoverMode::Ask);
     let degrade_allowed = matches!(failover_mode, thegn_core::config::FailoverMode::Auto)
@@ -373,13 +372,9 @@ pub fn prepare_sandbox_env(
             }
             .into());
         }
-        // Degrade: don't strand the worktree on a provider that can't host it
-        // (the doomed pane the user saw as a "crash"). Fall back to running LOCALLY
-        // on the host — the git worktree exists locally. Run it as a BARE host
-        // shell (`none`, not the bwrap chain): the fallback's whole job is a
-        // reliable working shell when the provider is down, and bare host is the
-        // user's real login shell (zsh + direnv + devShell), whereas a nested
-        // bwrap here just reintroduces the sandbox-toolchain fragility.
+        // Degrade to a BARE host shell (`none`, not the bwrap chain): the git
+        // worktree exists locally, and bare host is the user's real login shell —
+        // a reliable fallback when the provider is down.
         thegn_core::msg::warn(&format!(
             "env '{env_name}' unavailable ({e:#}); falling back to the host"
         ));
@@ -399,8 +394,7 @@ pub fn prepare_sandbox_env(
     if !placement.is_local()
         && let Err(e) = placement.ensure()
     {
-        // Same failover-to-local rule for a placement (k8s pod / provider VM) that
-        // won't come up; halt (with the ask/host choice) unless degrade is allowed.
+        // Same failover-to-local rule for a placement (k8s pod / provider VM).
         if !degrade_allowed {
             return Err(SandboxHalt {
                 env_name: env_name.clone(),
@@ -901,7 +895,7 @@ pub fn provider_proxy_target(
 }
 
 pub(crate) use crate::agent_ssh::{
-    SPRITE_SSHD_PORT, sprite_ssh_argv, sprite_ssh_connect, sprite_ssh_keypair,
+    SPRITE_SSHD_PORT, mosh_setup_script, sprite_ssh_argv, sprite_ssh_connect, sprite_ssh_keypair,
     sprite_sshd_setup_script, sprite_sshd_start_script,
 };
 
@@ -1492,6 +1486,12 @@ pub fn provision_provider_env_named(
         && let Ok((_key, pubkey)) = sprite_ssh_keypair()
     {
         setup.push(sprite_sshd_setup_script(&pubkey));
+    }
+    // mosh transport: install mosh-server (else the pane falls back to plain ssh).
+    if pc.transport == thegn_core::config::RemoteTransport::Mosh
+        && thegn_core::config::ssh_reached_provider_kind(&pc.provider)
+    {
+        setup.push(mosh_setup_script());
     }
     // Check out the worktree's branch in the sandbox clone (so it's not stuck on
     // origin's default). `git checkout <b> || git checkout -b <b>` — if the branch

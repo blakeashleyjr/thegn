@@ -66,6 +66,23 @@ pub fn sprite_sshd_setup_script(pubkey: &str) -> String {
     )
 }
 
+/// Idempotent in-sandbox setup for the mosh transport (`[env.<name>.provider]
+/// transport = "mosh"`): ensure `mosh-server` exists so the interactive pane rides
+/// mosh instead of silently falling back to plain ssh (the bridge probes for it
+/// and downgrades when absent). NixOS/Determinate images install it into the nix
+/// profile — on the login-shell PATH the mosh `--ssh` bootstrap runs the server
+/// through; apt is the non-Nix fallback. Best-effort — a mosh-less image just
+/// keeps the ssh pane. Pure (shell string).
+pub fn mosh_setup_script() -> String {
+    String::from(
+        "command -v mosh-server >/dev/null 2>&1 || \
+           nix profile install nixpkgs#mosh 2>/dev/null || \
+           (export DEBIAN_FRONTEND=noninteractive; \
+            sudo apt-get update -y && sudo apt-get install -y mosh) 2>/dev/null || true; \
+         true",
+    )
+}
+
 /// Idempotent: ensure the in-sandbox sshd is listening (start it if not). Run at
 /// connect time by the `sprite-proxy` ProxyCommand. Pure (shell string).
 pub fn sprite_sshd_start_script() -> String {
