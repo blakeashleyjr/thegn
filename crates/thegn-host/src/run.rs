@@ -1546,19 +1546,14 @@ fn connect_worktree_bridge(
                     tunnels.push(t);
                 }
             }
-            for (sandbox_port, host_target) in tunnels {
-                if let Some(provider) = crate::agent::native_bridge_provider(&cfg, &env) {
-                    rsup.start(
-                        &tokio::runtime::Handle::current(),
-                        &wt.to_string_lossy(),
-                        provider,
-                        p.id.clone(),
-                        crate::bridge_sup::remote_thegn(),
-                        sandbox_port,
-                        host_target,
-                    );
-                }
-            }
+            rsup.start_all(
+                &tokio::runtime::Handle::current(),
+                &cfg,
+                &env,
+                &p.id,
+                &wt.to_string_lossy(),
+                tunnels,
+            );
         }
         // CLI-free control plane: for an exec_api provider (and exec != cli),
         // start the bridge over the native exec API instead of the vendor CLI.
