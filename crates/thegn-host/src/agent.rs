@@ -360,9 +360,8 @@ pub fn prepare_sandbox_env(
     if matches!(placement, thegn_core::placement::Placement::Provider(_))
         && let Err(e) = auto_provision_sandbox(cfg, &env_name, worktree)
     {
-        // A provider that won't provision (bad token, quota/limit, API down) can't
-        // host the pane. `halt`/`ask` surface the REAL cause (`{e:#}`) as a
-        // `SandboxHalt`; `auto` (or a run-on-host pin) warn-and-continues to host.
+        // Provider won't provision (bad token, quota, API down): `halt`/`ask`
+        // surface the REAL cause (`{e:#}`); `auto`/run-on-host degrade to host.
         if !degrade_allowed {
             return Err(SandboxHalt {
                 env_name: env_name.clone(),
@@ -372,8 +371,7 @@ pub fn prepare_sandbox_env(
             }
             .into());
         }
-        // Degrade to a BARE host shell (`none`, not the bwrap chain): the git
-        // worktree exists locally, and bare host is the user's real login shell —
+        // Degrade to a BARE host shell (`none`): the git worktree exists locally,
         // a reliable fallback when the provider is down.
         thegn_core::msg::warn(&format!(
             "env '{env_name}' unavailable ({e:#}); falling back to the host"
@@ -2671,11 +2669,12 @@ pub fn compose_spec(
     } else {
         resolve_command(cfg, choice)
     };
-    // Local worktrees run in their own dir; a remote worktree (its `GitLoc`) or
-    // a remote placement (ssh/k8s/provider env) has no local dir — the placement
-    // cd's on the target — so the pane cwd stays unset.
+    // A provider pane lands at $HOME; prefix `cd <workdir>` so direnv/devShell load.
+    let placement = sb.spec.as_ref().map(|s| &s.placement);
+    let cmd = crate::provider_workdir::with_workdir_cd(choice, placement, cmd);
     // A projected data mode (sshfs/sync) pins the pane to its local mountpoint;
-    // otherwise a local worktree runs in its own dir and a remote one has none.
+    // otherwise a local worktree runs in its own dir and a remote/provider one
+    // has none — the placement cd's on the target — so the pane cwd stays unset.
     let cwd = sb
         .cwd_override
         .clone()
