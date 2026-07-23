@@ -68,6 +68,30 @@ pub fn default_workdir(home: &str) -> String {
     format!("{}/workspace", home.trim_end_matches('/'))
 }
 
+/// Prefix `cmd` with a `cd` into the provisioned workdir for a managed-PROVIDER
+/// pane. Its ssh/exec session lands at the login user's `$HOME` and no prefix cds
+/// to the workspace (only the sprite native-exec path does), so `shell_inner`'s
+/// `direnv exec .` would run at `$HOME` (no `.envrc`) and never enter the devShell
+/// — the machine0 bare `sh` at `/home/nix`. No-op for `clean-shell` (the bare
+/// escape hatch), a non-provider placement, or before the home is cached.
+pub fn with_workdir_cd(
+    choice: &str,
+    placement: Option<&thegn_core::placement::Placement>,
+    cmd: String,
+) -> String {
+    if choice == "clean-shell" {
+        return cmd;
+    }
+    let Some(thegn_core::placement::Placement::Provider(p)) = placement else {
+        return cmd;
+    };
+    let Some(home) = cached_home(&p.id) else {
+        return cmd;
+    };
+    let wd = thegn_core::util::sh_quote(&default_workdir(&home));
+    format!("cd {wd} 2>/dev/null; {cmd}")
+}
+
 // --- local "provisioned" marker -------------------------------------------
 //
 // A cheap, LOCAL record (a tiny file, no network) that a sandbox `id` completed
@@ -191,6 +215,10 @@ pub fn resolve(pc: &EnvProviderConfig, id: &str) -> String {
 mod tests {
     use super::*;
 
+    // Serialize the tests that mutate the process-global `THEGN_DIR` env var so
+    // `cargo test`'s in-process threads don't clobber each other's state dir.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn pc(provider: &str, workdir: &str) -> EnvProviderConfig {
         EnvProviderConfig {
             provider: provider.into(),
@@ -245,7 +273,45 @@ mod tests {
     }
 
     #[test]
+    fn with_workdir_cd_prefixes_provider_panes_only() {
+        use thegn_core::placement::{Placement, ProviderPlacement};
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("tg-cd-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // SAFETY: single-threaded test; `thegn_dir()` honors `THEGN_DIR`.
+        unsafe { std::env::set_var("THEGN_DIR", &tmp) };
+        let provider = Placement::Provider(ProviderPlacement {
+            provider: "machine0".into(),
+            id: "tg-x-abc".into(),
+            interactive_prefix: vec![],
+            control_prefix: vec![],
+            up_command: vec![],
+            down_command: vec![],
+        });
+        // No cached home yet ⇒ cmd unchanged.
+        assert_eq!(with_workdir_cd("shell", Some(&provider), "run".into()), "run");
+        // Cached home ⇒ cd into <home>/workspace first.
+        cache_home("tg-x-abc", "/home/nix");
+        assert_eq!(
+            with_workdir_cd("shell", Some(&provider), "run".into()),
+            "cd /home/nix/workspace 2>/dev/null; run"
+        );
+        // clean-shell escape hatch, a local placement, and no placement ⇒ unchanged.
+        assert_eq!(
+            with_workdir_cd("clean-shell", Some(&provider), "run".into()),
+            "run"
+        );
+        assert_eq!(
+            with_workdir_cd("shell", Some(&Placement::Local), "run".into()),
+            "run"
+        );
+        assert_eq!(with_workdir_cd("shell", None, "run".into()), "run");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn provisioned_marker_roundtrips() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("tg-prov-marker-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         // SAFETY: single-threaded test; `thegn_dir()` honors `THEGN_DIR`.
@@ -263,6 +329,7 @@ mod tests {
 
     #[test]
     fn cache_roundtrip_and_resolution() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Isolate the state dir so the test never touches a live cache.
         let tmp = std::env::temp_dir().join(format!("tg-workdir-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
