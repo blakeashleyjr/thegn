@@ -24,6 +24,11 @@ use tokio::task::JoinHandle;
 /// `(worktree, sandbox_port)` → its supervisor task (self-healing pump loop).
 type Tasks = Arc<Mutex<HashMap<(String, u16), JoinHandle<()>>>>;
 
+/// Latches the "no resident bridge → tunnels disabled" warning to one emission
+/// (`start_all` runs on every worktree switch; the operator only needs telling once).
+static BRIDGE_MISSING_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Reconnect backoff floor: the delay after the first failed/short-lived tunnel
 /// attempt before the supervisor dials again.
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
@@ -162,6 +167,22 @@ impl ReverseTunnelSupervisor {
         tunnels: Vec<(u16, String)>,
     ) {
         if tunnels.is_empty() {
+            return;
+        }
+        // Reverse tunnels ride the resident musl bridge pushed to `/workspace/.tg/thegn`
+        // (`agent::ensure_remote_bridge`). With no local bridge binary configured
+        // (`THEGN_BRIDGE_BINARY` / a `thegn-musl` next to the exe) that push is skipped,
+        // so `bridge-revtunnel` would exec a missing binary and the port never binds —
+        // surfacing in-sandbox as `:8484 could not connect`. Warn once and skip rather
+        // than spawn dead reconnect loops.
+        if crate::bridge_sup::bridge_binary_path().is_none() {
+            if !BRIDGE_MISSING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                thegn_core::msg::warn(
+                    "reverse tunnels (nix cache :8484 / proxy :8383) disabled: no resident \
+                     bridge binary — build it (`just bridge` / `nix build .#thegn-musl`) and set \
+                     THEGN_BRIDGE_BINARY",
+                );
+            }
             return;
         }
         // Only the durable gates apply (exec != cli, provider has a native exec
