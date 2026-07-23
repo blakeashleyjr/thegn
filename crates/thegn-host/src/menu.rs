@@ -111,6 +111,9 @@ pub enum MenuChoice {
     ShareReach(thegn_core::config::ShareReach),
     // sandbox bring-up failed (failover off): retry the active worktree's env.
     SandboxRetry,
+    // sandbox bring-up failed (failover = "ask"): run this worktree on the host
+    // for now instead of blocking on the unreachable env.
+    SandboxRunOnHost,
     Dismiss,
 }
 
@@ -712,6 +715,23 @@ pub fn sandbox_halt_menu(title: impl Into<String>, body: impl Into<String>) -> M
         title,
         vec![
             item(Some('r'), "retry bring-up", MenuChoice::SandboxRetry),
+            item(Some('n'), "dismiss", MenuChoice::Dismiss),
+        ],
+    )
+    .with_body(body)
+}
+
+/// The failover **`ask`** variant: same failed-bring-up modal, but with an
+/// explicit `[h] run on host` escape hatch beside the retry — the honest middle
+/// ground between a hard halt and a silent host drop. Resolves to
+/// `SandboxRetry`, `SandboxRunOnHost`, or `Dismiss`.
+pub fn sandbox_ask_menu(title: impl Into<String>, body: impl Into<String>) -> MenuOverlay {
+    MenuOverlay::new(
+        MenuKindTag::SandboxHalt,
+        title,
+        vec![
+            item(Some('r'), "retry bring-up", MenuChoice::SandboxRetry),
+            item(Some('h'), "run on host", MenuChoice::SandboxRunOnHost),
             item(Some('n'), "dismiss", MenuChoice::Dismiss),
         ],
     )

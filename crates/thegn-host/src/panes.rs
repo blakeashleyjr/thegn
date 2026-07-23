@@ -163,6 +163,7 @@ pub(crate) fn terminal_launch_spec(
             env: vec![],
             backend: backend.to_string(),
             warnings: vec![],
+            degraded: false,
         };
     }
     crate::agent::LaunchSpec {
@@ -171,6 +172,7 @@ pub(crate) fn terminal_launch_spec(
         env: vec![],
         backend: "host".to_string(),
         warnings: vec![],
+        degraded: false,
     }
 }
 

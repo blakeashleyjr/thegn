@@ -17,6 +17,71 @@ use crate::capacity::{HostSpec, ResourceReq, overcommit_pct, parse_cpu_milli, pa
 use crate::config::{Config, EnvConfig, config_enum, config_warn};
 
 config_enum! {
+    /// What thegn does when a *selected* non-local env (provider/ssh/k8s) can't be
+    /// brought up. `halt` blocks the pane with a retry modal (never a silent host
+    /// drop); `ask` blocks with a retry / run-on-host choice, surfacing the real
+    /// cause; `auto` silently walks `backend_chain` → host. Legacy booleans still
+    /// parse: `true` ⇒ `auto`, `false` ⇒ `halt` (see [`de_failover`]).
+    pub enum FailoverMode: "failover mode" {
+        Halt = "halt" | "off" | "false",
+        Ask = "ask" | "prompt",
+        Auto = "auto" | "host" | "on" | "true",
+    } default = Halt;
+}
+
+impl FailoverMode {
+    /// A bring-up failure blocks the pane (raising a modal) rather than silently
+    /// degrading to the host — true for `halt` and `ask`.
+    pub fn blocks(self) -> bool {
+        matches!(self, FailoverMode::Halt | FailoverMode::Ask)
+    }
+    /// Legacy bool mapping: `true` allowed a host fallback (`auto`), `false`
+    /// halted.
+    fn from_bool(b: bool) -> Self {
+        if b {
+            FailoverMode::Auto
+        } else {
+            FailoverMode::Halt
+        }
+    }
+}
+
+/// Deserialize `failover` accepting BOTH the modern string form (`halt`/`ask`/
+/// `auto`) and a legacy boolean (`true` ⇒ [`FailoverMode::Auto`], `false` ⇒
+/// [`FailoverMode::Halt`]), so existing `failover = true/false` configs still
+/// parse. Used via `#[serde(deserialize_with)]` on the two `failover` fields.
+pub(crate) fn de_failover<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<FailoverMode, D::Error> {
+    struct V;
+    impl serde::de::Visitor<'_> for V {
+        type Value = FailoverMode;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a failover mode (\"halt\"/\"ask\"/\"auto\") or a boolean")
+        }
+        fn visit_bool<E>(self, b: bool) -> Result<FailoverMode, E> {
+            Ok(FailoverMode::from_bool(b))
+        }
+        fn visit_str<E>(self, s: &str) -> Result<FailoverMode, E> {
+            Ok(FailoverMode::from_str_validated(s).unwrap_or_else(|e| {
+                config_warn(&e);
+                FailoverMode::default()
+            }))
+        }
+    }
+    d.deserialize_any(V)
+}
+
+/// The per-env `Option<FailoverMode>` variant: only invoked when the key is
+/// present (struct `#[serde(default)]` covers absence ⇒ `None`), so it always
+/// yields `Some`.
+pub(crate) fn de_failover_opt<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<FailoverMode>, D::Error> {
+    de_failover(d).map(Some)
+}
+
+config_enum! {
     /// `placement.mode` / `[env.<n>] placement_mode` — the *requested*
     /// placement class. `auto` lets the broker choose (packed when trust and
     /// capacity allow, dedicated otherwise); clamped by the resolved

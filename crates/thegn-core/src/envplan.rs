@@ -1481,6 +1481,8 @@ fn git_auth_script() -> String {
         "tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; \
          git config --global --add safe.directory '*' 2>/dev/null || true; \
          git config --global core.sshCommand 'ssh -o StrictHostKeyChecking=accept-new' 2>/dev/null || true; \
+         [ -n \"${THEGN_GIT_NAME:-}\" ] && git config --global user.name \"$THEGN_GIT_NAME\" 2>/dev/null || true; \
+         [ -n \"${THEGN_GIT_EMAIL:-}\" ] && git config --global user.email \"$THEGN_GIT_EMAIL\" 2>/dev/null || true; \
          if [ -n \"$tok\" ]; then \
            git config --global credential.helper \
              '!f() { test \"$1\" = get && printf \"username=x-access-token\\npassword=%s\\n\" \"${GH_TOKEN:-$GITHUB_TOKEN}\"; }; f'; \
@@ -2766,6 +2768,15 @@ mod tests {
         assert!(
             s.contains("core.sshCommand") && s.contains("StrictHostKeyChecking=accept-new"),
             "trusts a fresh SSH host key so an ssh-origin clone doesn't fail host-key verification"
+        );
+        // Carries the host git identity (via THEGN_GIT_NAME/EMAIL in the exec env)
+        // so sandbox commits aren't authored as the provider's default identity.
+        assert!(
+            s.contains("THEGN_GIT_NAME")
+                && s.contains("user.name")
+                && s.contains("THEGN_GIT_EMAIL")
+                && s.contains("user.email"),
+            "sets git user.name/email from the injected host identity: {s}"
         );
         // With a token, rewrite ssh GitHub origins to https so the token helper
         // authenticates the clone (the sandbox has no GitHub-authorized ssh key).

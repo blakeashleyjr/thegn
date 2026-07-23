@@ -883,6 +883,7 @@ fn inject_devshell_host_prepends_path_and_merges_vars() {
         env: vec![("KEEP_ME".to_string(), "user-set".to_string())],
         backend: "host".into(),
         warnings: vec![],
+        degraded: false,
     };
     // `inject_devshell_host` prepends to the *process* PATH, so set a known
     // base under the env guard. Without restoring it, `/usr/bin:/bin` would

@@ -217,17 +217,15 @@ pub fn pool_context(
 pub const POOL_TARGET_CEILING: usize = 8;
 
 /// The effective warm-pool target for `(repo, env)`, resolved in precedence order
-/// and clamped to [`POOL_TARGET_CEILING`]:
+/// and clamped to [`POOL_TARGET_CEILING`]. The pool is **off by default** — it is
+/// strictly opt-in:
 ///
 /// 1. An explicit runtime override in the DB (the `+`/`-` hotkey, per repo+env) —
 ///    including a deliberate `0` to turn the pool off.
 /// 2. An explicit `[lifecycle.pool] size`.
-/// 3. **Auto (scale-to-zero):** an env whose provider hibernates for free
-///    (`EnvProviderConfig::scale_to_zero`) AND that the user already opted to pay
-///    into (`auto_provision`) parks ONE idle spare, so the first open is instant.
-///    Gated on `auto_provision` so merely *configuring* a sprites env never spends;
-///    never applied to a billed-while-stopped VPS.
-/// 4. Otherwise off (`0`).
+/// 3. Otherwise off (`0`). (No provider-aware auto-default: idle spares consumed
+///    provider quota — fatal on a low-limit account like machine0's 3-VM cap — and
+///    the claim path never ran for a fresh worktree, so the spares were pure cost.)
 pub fn effective_pool_target(
     db: &thegn_core::db::Db,
     cfg: &Config,
@@ -236,16 +234,8 @@ pub fn effective_pool_target(
 ) -> usize {
     let target = if let Some(t) = db.pool_target(repo, env).ok().flatten() {
         t.max(0) as usize
-    } else if cfg.lifecycle.pool.size > 0 {
-        cfg.lifecycle.pool.size
-    } else if cfg
-        .env
-        .get(env)
-        .is_some_and(|e| e.provider.scale_to_zero() && e.provider.auto_provision)
-    {
-        1
     } else {
-        0
+        cfg.lifecycle.pool.size
     };
     target.min(POOL_TARGET_CEILING)
 }
@@ -585,11 +575,12 @@ mod tests {
         assert_eq!(again.0, "repo-pool-1");
     }
 
-    /// The pre-warm defaults: a scale-to-zero env the user pays into (auto_provision)
-    /// auto-parks one idle spare; a bare config, a non-auto env, or a VPS stays off;
-    /// explicit config/hotkey wins; the ceiling clamps a runaway value.
+    /// The pool is OFF by default (strictly opt-in): no provider-aware auto-default
+    /// — a scale-to-zero + auto_provision env stays off unless the user explicitly
+    /// sets `[lifecycle.pool] size` (or the `+`/`-` hotkey). The ceiling clamps a
+    /// runaway value.
     #[test]
-    fn pool_target_auto_defaults_for_scale_to_zero_and_clamps() {
+    fn pool_target_is_off_unless_explicit() {
         use thegn_core::config::{EnvConfig, EnvProviderConfig, PlacementMode};
         let db = Db::open_memory().unwrap();
         let mut cfg = Config::default();
@@ -605,27 +596,14 @@ mod tests {
 
         // No env table at all ⇒ off.
         assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 0);
-        // Scale-to-zero + auto_provision ⇒ auto-park one.
+        // Scale-to-zero + auto_provision ⇒ STILL off (no auto-default: idle spares
+        // consumed quota and were never claimed).
         cfg.env.insert("sprites".into(), sprites(true));
-        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 1);
-        // …but without auto_provision ⇒ off (no surprise spend from mere config).
+        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 0);
+        // Without auto_provision ⇒ off too.
         cfg.env.insert("sprites".into(), sprites(false));
         assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 0);
-        // VPS (not scale-to-zero) even with auto_provision ⇒ off (billed when stopped).
-        cfg.env.insert(
-            "vps".into(),
-            EnvConfig {
-                placement: PlacementMode::Provider,
-                provider: EnvProviderConfig {
-                    provider: "hetzner".into(),
-                    auto_provision: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "vps"), 0);
-        // Explicit config size wins over the auto default…
+        // Explicit config size opts in…
         cfg.env.insert("sprites".into(), sprites(true));
         cfg.lifecycle.pool.size = 3;
         assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 3);

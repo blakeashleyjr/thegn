@@ -110,6 +110,9 @@ pub struct LaunchSpec {
     pub backend: String,
     /// Human-visible notes when auto sandbox resolution fell through to another backend.
     pub warnings: Vec<String>,
+    /// A managed-PROVIDER env failed and `auto`/run-on-host dropped this launch to
+    /// the host — drives the `provider_degraded` notification.
+    pub degraded: bool,
 }
 
 impl LaunchSpec {
@@ -131,16 +134,23 @@ pub struct SandboxHalt {
     pub placement: String,
     /// Human-readable cause (token missing, auth rejected, no runnable backend…).
     pub reason: String,
+    /// `failover = "ask"`: the modal offers a "run on host" choice beside retry.
+    pub ask: bool,
 }
 
 impl std::fmt::Display for SandboxHalt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let allow = if self.ask {
+            "choose \"run on host\", or set `failover = \"auto\"`"
+        } else {
+            "set `failover = \"ask\"` or `\"auto\"`"
+        };
         write!(
             f,
-            "environment '{}' ({}) could not be brought up: {} — failover is off, \
-             so thegn will not silently fall back to the host. Fix the env, or \
-             set `failover = true` ([sandbox] or [env.{}]) to allow it.",
-            self.env_name, self.placement, self.reason, self.env_name
+            "environment '{}' ({}) could not be brought up: {} — thegn will not \
+             silently fall back to the host. Fix the env, retry, {} ([sandbox] or \
+             [env.{}]) to allow it.",
+            self.env_name, self.placement, self.reason, allow, self.env_name
         )
     }
 }
@@ -227,11 +237,12 @@ pub fn prepare_sandbox_env(
     // placement isn't handled by `for_environment`, which is ssh-only).
     let env_data = environment.data;
     let env_name = environment.name.clone();
-    // Failover policy for THIS env. When false (the default) and the env is
-    // non-local, a bring-up failure halts (a `SandboxHalt` error) rather than
-    // degrading to the host — a remote/managed env is often required, so a quiet
-    // host drop is refused. `true` restores the historical chain→host fallback.
-    let failover = cfg.env_failover(repo_root, &env_name);
+    // Failover policy: `halt`/`ask` block a bring-up failure with a `SandboxHalt`;
+    // `auto` (or a `force_host` run-on-host pin) allows the chain→host fallback.
+    let failover_mode = cfg.env_failover_mode(repo_root, &env_name);
+    let ask = matches!(failover_mode, thegn_core::config::FailoverMode::Ask);
+    let degrade_allowed = matches!(failover_mode, thegn_core::config::FailoverMode::Auto)
+        || force_host_requested(worktree);
     let placement_label = placement.label();
     // For a managed-provider env, persist a `GitLoc::Provider` location so the
     // chrome's git/fs reads route into the sandbox via the control-plane exec
@@ -343,29 +354,26 @@ pub fn prepare_sandbox_env(
     } else {
         base_cname
     };
-    // Bring the execution placement up (k8s pod / provider sandbox) and project
-    // the worktree into it BEFORE resolving the backend. Both are no-ops for the
-    // default local `in_env` env, so this changes nothing for the common case;
-    // for remote placements / `sshfs` it removes the previous need to run
-    // `thegn env up` by hand. This runs on the (already off-event-loop)
-    // sandbox-prepare path, mirroring the VPN sidecar bring-up below.
-    // Warm-on-open: create the API sandbox first if `auto_provision` is set, so
-    // the subsequent ensure/clone/connect find it live (8-E). No-op otherwise.
+    // Bring the execution placement up (k8s pod / provider sandbox) BEFORE
+    // resolving the backend — a no-op for the default local `in_env` env. Warm-on-
+    // open: create the API sandbox first if `auto_provision` is set so the
+    // subsequent ensure/clone/connect find it live (8-E).
     if matches!(placement, thegn_core::placement::Placement::Provider(_))
         && let Err(e) = auto_provision_sandbox(cfg, &env_name, worktree)
     {
-        // A provider that won't provision (bad token, quota, API down) can't host
-        // the pane. With failover off, halt instead of silently degrading; with
-        // failover on, keep the historical best-effort warn-and-continue.
-        if !failover {
+        // A provider that won't provision (bad token, quota/limit, API down) can't
+        // host the pane. `halt`/`ask` surface the REAL cause (`{e:#}`) as a
+        // `SandboxHalt`; `auto` (or a run-on-host pin) warn-and-continues to host.
+        if !degrade_allowed {
             return Err(SandboxHalt {
                 env_name: env_name.clone(),
                 placement: placement_label.clone(),
-                reason: format!("auto-provision failed: {e}"),
+                reason: format!("{e:#}"),
+                ask,
             }
             .into());
         }
-        // failover on: don't strand the worktree on a provider that can't host it
+        // Degrade: don't strand the worktree on a provider that can't host it
         // (the doomed pane the user saw as a "crash"). Fall back to running LOCALLY
         // on the host — the git worktree exists locally. Run it as a BARE host
         // shell (`none`, not the bwrap chain): the fallback's whole job is a
@@ -373,9 +381,11 @@ pub fn prepare_sandbox_env(
         // user's real login shell (zsh + direnv + devShell), whereas a nested
         // bwrap here just reintroduces the sandbox-toolchain fragility.
         thegn_core::msg::warn(&format!(
-            "env '{env_name}' unavailable ({e}); falling back to the host"
+            "env '{env_name}' unavailable ({e:#}); falling back to the host"
         ));
-        warnings.push(format!("{env_name} unavailable ({e}); running on the host"));
+        warnings.push(format!(
+            "{env_name} unavailable ({e:#}); running on the host"
+        ));
         placement = thegn_core::placement::Placement::Local;
         exec_placement = thegn_core::placement::Placement::Local;
         env_is_remote = false;
@@ -390,12 +400,18 @@ pub fn prepare_sandbox_env(
         && let Err(e) = placement.ensure()
     {
         // Same failover-to-local rule for a placement (k8s pod / provider VM) that
-        // won't come up; halt only when failover is off.
-        if !failover {
-            anyhow::bail!("env placement bring-up failed for {worktree}: {e}");
+        // won't come up; halt (with the ask/host choice) unless degrade is allowed.
+        if !degrade_allowed {
+            return Err(SandboxHalt {
+                env_name: env_name.clone(),
+                placement: placement_label.clone(),
+                reason: format!("{e:#}"),
+                ask,
+            }
+            .into());
         }
         thegn_core::msg::warn(&format!(
-            "env '{env_name}' placement bring-up failed ({e}); falling back to the host"
+            "env '{env_name}' placement bring-up failed ({e:#}); falling back to the host"
         ));
         warnings.push(format!(
             "{env_name} placement bring-up failed; running on the host"
@@ -457,7 +473,14 @@ pub fn prepare_sandbox_env(
                 if spec.placement.is_local() {
                     break;
                 }
-                ssh_none_guard(&spec, sb.backend, failover, &env_name, &placement_label)?;
+                ssh_none_guard(
+                    &spec,
+                    sb.backend,
+                    degrade_allowed,
+                    ask,
+                    &env_name,
+                    &placement_label,
+                )?;
                 return Ok(SandboxOutcome {
                     backend_label: spec.backend.label().to_string(),
                     spec: Some(spec),
@@ -534,12 +557,13 @@ pub fn prepare_sandbox_env(
     // Reaching here means no candidate produced a runnable sandbox and we'd fall
     // back to a bare host shell. For a NON-LOCAL env with failover off, that
     // silent drop is exactly what we refuse — halt with a warning instead.
-    if !placement.is_local() && !failover {
+    if !placement.is_local() && !degrade_allowed {
         let reachable = sandbox::placement_reachable(&exec_placement, &sb.backend_chain);
         return Err(SandboxHalt {
             env_name: env_name.clone(),
             placement: placement_label.clone(),
             reason: crate::remote_sync::no_backend_reason(reachable, &warnings),
+            ask,
         }
         .into());
     }
@@ -1131,6 +1155,37 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
     }
 }
 
+/// Worktrees the user pinned to the HOST via the failover `ask` modal's "run on
+/// host" choice — the launch path degrades instead of blocking until an explicit
+/// env retry ([`clear_force_host`]) un-pins it.
+fn force_host_registry() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Pin `worktree` to run on the host for this session (the ask modal's `[h]`).
+pub fn request_force_host(worktree: &str) {
+    if let Ok(mut s) = force_host_registry().lock() {
+        s.insert(worktree.to_string());
+    }
+}
+
+/// Whether `worktree` is pinned to the host (see [`request_force_host`]).
+pub(crate) fn force_host_requested(worktree: &str) -> bool {
+    force_host_registry()
+        .lock()
+        .map(|s| s.contains(worktree))
+        .unwrap_or(false)
+}
+
+/// Un-pin `worktree` from the host so an explicit retry re-attempts the real env.
+pub fn clear_force_host(worktree: &str) {
+    if let Ok(mut s) = force_host_registry().lock() {
+        s.remove(worktree);
+    }
+}
+
 /// Clear the failure cooldown for the worktree's provider native exec so a
 /// retry actually re-attempts the connection (otherwise [`env_halt_reason`]
 /// would re-halt immediately on the stale cooldown). No-op for non-provider
@@ -1370,6 +1425,7 @@ pub fn provision_provider_env_named(
     // still refresh auth creds: the host's OAuth token rotates, so the
     // provision-time snapshot goes stale and the in-sandbox agent 401s.
     if block_on_provider(|| async { provider.read(&id, &marker).await }).is_ok() {
+        crate::provider_workdir::mark_provisioned(&id);
         crate::agent_configs::resync_agent_auth(&provider, &id, cfg, worktree, env_name);
         return Ok((true, None));
     }
@@ -1387,7 +1443,8 @@ pub fn provision_provider_env_named(
     // Host secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) carried into every provisioning
     // command so the clone authenticates against private repos and setup steps can
     // reach the network/model. Remote-safe (no host-local socket vars).
-    let exec_env = cfg.repo_sandbox(&repo_root).passthrough_env_remote();
+    let mut exec_env = cfg.repo_sandbox(&repo_root).passthrough_env_remote();
+    crate::agent_configs::push_host_git_identity(&repo_root, &mut exec_env);
     // Which flake devShell the sandbox builds/enters ([sandbox] devshell, e.g.
     // "sandbox" for the lean build shell). Drives the seed build + realise so they
     // match the in-pane `.envrc` (which reads THEGN_DEVSHELL from exec_env).
@@ -1780,8 +1837,9 @@ pub fn provision_provider_env_named(
         progress(&views);
     }
 
-    // Drop the marker so a later open skips re-provisioning.
+    // Drop the marker (+ local mirror for the attach gate) so a later open skips it.
     let _ = block_on_provider(|| async { provider.write(&id, &marker, b"ok\n").await });
+    crate::provider_workdir::mark_provisioned(&id);
     // Record the provisioned-base checkpoint per (repo, env), keyed by the
     // flake.lock hash so a lockfile change invalidates it (see env_base_snapshots).
     if let Some(cp) = &base_checkpoint {
@@ -2344,115 +2402,8 @@ fn tail_lines(out: &str, n: usize) -> String {
     lines[start..].join(" | ")
 }
 
-/// Cheap, **loop-safe** (no network/subprocess) check made right before a
-/// worktree pane spawns: should this worktree HALT with a warning instead of
-/// opening a (host-degraded) pane? Returns `Some` only for a NON-LOCAL env with
-/// failover disabled whose bring-up is already known to be impossible — its API
-/// token is unset, or its native exec is in the post-failure cooldown (the live
-/// signal a recent connect/auth attempt failed, e.g. the sprites 401). `None`
-/// (proceed normally) for local envs, when failover is allowed, or when there's
-/// no cheap evidence of failure yet — in which case a later bring-up failure is
-/// caught in `prepare_sandbox_env` / the native relay, which flip the health flag
-/// so the next spawn halts here.
-pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
-    use thegn_core::config::ProviderExecMode;
-    let loc = GitLoc::for_worktree(Path::new(worktree));
-    let repo_root: PathBuf = Db::open()
-        .ok()
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| repo::main_worktree(Path::new(worktree)))
-        .unwrap_or_else(|| PathBuf::from(worktree));
-    // Refuse to silently ignore a malformed repo `.thegn.*` overlay that was
-    // SELECTING a non-local env: `load_repo_overlay` drops a file that fails to
-    // parse, so its `env = "sprites"` selection vanishes and resolution falls back
-    // to local (host) — exactly the silent degradation failover-off forbids. Catch
-    // it BEFORE resolve_env (which has already lost the selection) and surface the
-    // same warning modal. (No halt for a parse error that wasn't selecting a
-    // non-local env, or when that env opts into failover.)
-    if let Some(pe) = thegn_core::config::repo_overlay_parse_error(&repo_root)
-        && !pe.selected_env.is_empty()
-        && let Some(envc) = cfg.env.get(&pe.selected_env)
-        && !matches!(envc.placement, thegn_core::config::PlacementMode::Local)
-        && !cfg.env_failover(&repo_root, &pe.selected_env)
-    {
-        tracing::warn!(
-            target: "thegn::sandbox",
-            path = %pe.path.display(), env = %pe.selected_env,
-            "HALT: repo overlay failed to parse, dropping a non-local env selection"
-        );
-        return Some(SandboxHalt {
-            env_name: pe.selected_env.clone(),
-            placement: format!("{:?}", envc.placement).to_lowercase(),
-            reason: format!(
-                "{} failed to parse ({}); the env selection was dropped",
-                pe.path.display(),
-                pe.error.lines().next().unwrap_or("").trim(),
-            ),
-        });
-    }
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        selected_env.as_deref(),
-    );
-    // Local envs never halt; an env that opts into failover keeps the old behavior.
-    if environment.placement.is_local() || cfg.env_failover(&repo_root, &environment.name) {
-        return None;
-    }
-    let placement = environment.placement.label();
-    if let thegn_core::placement::Placement::Provider(_) = &environment.placement {
-        let pc = &cfg.env.get(&environment.name)?.provider;
-        // Token check: explicit `api_key_env`, else the provider's built-in default
-        // (machine0 ⇒ MACHINE0_API_KEY). Resolve it exactly as the provider does
-        // (`secret::resolve` — keyring:/file:/env:/bare env var), NOT a raw
-        // `std::env::var` (which would read a `file:` ref as a bogus env-var name).
-        let var = crate::env_ui::effective_token_env(pc);
-        let token_present = crate::secret::resolve(&var).is_some();
-        let healthy = native_exec_healthy(&pc.provider);
-        tracing::debug!(
-            target: "thegn::sandbox",
-            env = %environment.name, %placement, provider = %pc.provider,
-            token_var = %var, token_present, native_exec_healthy = healthy,
-            exec = ?pc.exec,
-            "env_halt_reason: evaluating provider env"
-        );
-        if !token_present {
-            tracing::warn!(target: "thegn::sandbox", env = %environment.name, token_var = %var, "HALT: API token not set");
-            return Some(SandboxHalt {
-                env_name: environment.name.clone(),
-                placement,
-                reason: format!("API token {var} could not be resolved"),
-            });
-        }
-        // Connect-failure cooldown: a recent connect/auth failure (401, or an ssh
-        // connect/resolve failure) marked the provider unhealthy. Failover off ⇒
-        // surface the halt. Covers WSS native-exec (sprites, tracked in-process) AND
-        // ssh-reached providers (machine0/fly/vps, tracked at pane-exit).
-        let native_exec_tracked =
-            pc.exec != ProviderExecMode::Cli && thegn_svc::provider::exec_api_by_name(&pc.provider);
-        if (native_exec_tracked || thegn_core::config::ssh_reached_provider_kind(&pc.provider))
-            && !healthy
-        {
-            tracing::warn!(target: "thegn::sandbox", env = %environment.name, provider = %pc.provider, "HALT: provider unhealthy (recent connection failure)");
-            return Some(SandboxHalt {
-                env_name: environment.name.clone(),
-                placement,
-                reason: format!(
-                    "provider '{}' is unreachable or rejected authentication (recent connection failure)",
-                    pc.provider
-                ),
-            });
-        }
-        tracing::debug!(target: "thegn::sandbox", env = %environment.name, "env_halt_reason: provider OK, no halt");
-    }
-    None
-}
+// `env_halt_reason` (cheap pre-spawn HALT check) lives in the `env_halt` sibling.
+pub use crate::env_halt::env_halt_reason;
 
 /// Idempotently install the resident bridge binary into a provider env so a
 /// `Placement::Provider` bridge connect finds it at `remote_path`. Content-
@@ -2755,6 +2706,7 @@ pub fn compose_spec(
         env,
         backend: sb.backend_label.clone(),
         warnings: sb.warnings.clone(),
+        degraded: sb.degraded_from_provider,
     }
 }
 
@@ -2877,6 +2829,14 @@ pub fn launch_spec_with_key(
             "{worktree}: provider unavailable, worktree location healed to local"
         ));
     }
+
+    // Never drop a bare shell onto an unprovisioned provider VM (resurrect/split/respawn).
+    crate::provision_gate::guard_unprovisioned_attach(
+        cfg,
+        worktree,
+        choice,
+        outcome.location.is_some(),
+    )?;
 
     // Bouncer (opt-in): inject the agent's proxy + tool-override env into the
     // sealed container's `env_overrides` (+ the control-socket mounts) before the

@@ -1500,16 +1500,20 @@ on_missing = "warn"
 # ── Failover when the SELECTED environment can't be brought up ─────────────────
 # Distinct from on_missing (which governs only the local Auto backend chain).
 # When a *named* [env.<name>] or an explicit non-local placement (provider/k8s/
-# ssh) fails to come up — e.g. a managed provider rejects the token, or a pod
-# won't schedule — should thegn quietly fall back to another backend / the
-# host, or stop?
-#   false — (default) HALT that worktree's pane and show a warning overlay. A
-#           remote/managed env is often required for correctness or safety, so a
-#           silent drop to the host is refused. You explicitly re-enable failover
-#           (here or per-env) or fix the env.
-#   true  — walk backend_chain down to the host on failure (historical behavior).
-# Override per environment with `[env.<name>] failover = true|false`.
-failover = false
+# ssh) fails to come up — e.g. a managed provider rejects the token / hits its
+# machine limit, or a pod won't schedule — what should thegn do?
+#   "halt" — (default) HALT that worktree's pane and show a warning modal with
+#            the real cause + a retry. A remote/managed env is often required for
+#            correctness or safety, so a silent drop to the host is refused.
+#   "ask"  — block and PROMPT: a modal shows the real failure cause and lets you
+#            [r] retry bring-up or [h] run on the host for now. The honest middle
+#            ground — you always know when you're NOT on the env you picked.
+#   "auto" — walk backend_chain down to the host on failure, silently (the
+#            worktree is still marked degraded in the sidebar). Historical
+#            `failover = true` behavior.
+# Legacy booleans still parse: true ⇒ "auto", false ⇒ "halt".
+# Override per environment with `[env.<name>] failover = "halt"|"ask"|"auto"`.
+failover = "halt"
 
 # Drive the OCI runtime against a REMOTE daemon instead of SSH-wrapping the whole
 # backend argv (an alternative reach to `[env.<name>] placement = "ssh"`, for when
@@ -1902,8 +1906,8 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # [env.gpu-box]
 # placement = "ssh"
 # data = "in_env"            # in_env (files on the remote) | sshfs | sync | local_exec
-# failover = false           # per-env override of [sandbox] failover: true = this env
-#                            #   may degrade to the local chain / host; false = halt+warn
+# failover = "halt"          # per-env override of [sandbox] failover:
+#                            #   "halt" | "ask" (prompt) | "auto" (silent host drop)
 # placement_mode = "auto"    # placement-engine class for this env (auto | packed |
 #                            #   dedicated); omit ⇒ inherit [placement] mode
 # [env.gpu-box.resources]    # declared ask the placement engine RESERVES (falls
@@ -2176,10 +2180,10 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # #    live session (replaying scrollback) across restarts. Set `exec = "cli"` to
 # #    fall back to the `interactive_command` bridge.
 # # FAILOVER — by default, if the sprite can't be brought up (bad/expired token,
-# #   API down, quota), the worktree's pane HALTS with a warning overlay rather
-# #   than silently dropping to a host shell (see [sandbox] failover). To let THIS
-# #   env fall back to the local backend chain / host instead, override per-env:
-# # failover = true            # this env may degrade to host; omit/false ⇒ halt+warn
+# #   API down, quota), the worktree's pane HALTS with a warning modal (the real
+# #   cause + a retry) rather than silently dropping to a host shell (see
+# #   [sandbox] failover). Override per-env to prompt or auto-degrade instead:
+# # failover = "ask"           # "halt" | "ask" (prompt: retry / run-on-host) | "auto"
 #
 # ── Example: a cheap commodity VPS (Hetzner Cloud) ─────────────────────────
 # The budget alternative to a managed sandbox provider: thegn provisions a
@@ -2401,16 +2405,15 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # [lifecycle.pool]            # WARM SPARE POOL: keep N pre-provisioned, unclaimed
 # size = 0                    #   sandboxes ready per (repo, env) so the NEXT worktree
 #                             #   CLAIMS one instantly (bind + branch checkout) instead
-#                             #   of provisioning from scratch. 0 ⇒ the AUTO default: one
-#                             #   parked spare for a SCALE-TO-ZERO provider (sprites — an
-#                             #   idle spare hibernates for free) that you already opted to
-#                             #   pay into via provider `auto_provision`; off otherwise. A
-#                             #   non-zero value overrides it (clamped to a runaway ceiling
-#                             #   of 8). Refills in the background right after a claim.
-#                             #   Adjust live with the warm-pool-increment / -decrement
-#                             #   hotkeys (Ctrl+Alt+= / Ctrl+Alt+-), which persist a per-
-#                             #   repo+env override (incl. 0 to force off); the sidebar
-#                             #   header shows `warm ready/target`.
+#                             #   of provisioning from scratch. 0 (the default) ⇒ OFF: the
+#                             #   pool is strictly opt-in — idle spares consume provider
+#                             #   quota (fatal on a low-limit account), so nothing is minted
+#                             #   unless you set a non-zero size (clamped to a ceiling of 8).
+#                             #   Refills in the background right after a claim. Adjust live
+#                             #   with the warm-pool-increment / -decrement hotkeys
+#                             #   (Ctrl+Alt+= / Ctrl+Alt+-), which persist a per-repo+env
+#                             #   override (incl. 0 to force off); the sidebar header shows
+#                             #   `warm ready/target`.
 # max_idle_secs = 600         # AgeOut providers (VPS) only: reap an unclaimed member idle
 #                             #   longer than this. Scale-to-zero spares are PARKED, not
 #                             #   aged out (they still rotate when flake.lock changes).

@@ -316,6 +316,9 @@ pub(crate) fn provision_worktree(
                 env_name,
                 placement: binding,
                 reason: failure_reason(&f),
+                // Host (hosts-as-resources) provisioning failure — a retry/dismiss
+                // halt; the "run on host" escape is provider-env-scoped.
+                ask: false,
             }))
         }
     }

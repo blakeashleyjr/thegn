@@ -1520,34 +1520,60 @@ fn passthrough_env_remote_normalizes_term() {
 
 #[test]
 fn env_failover_resolves_override_then_global() {
+    use crate::config::FailoverMode;
     let dir = tmpdir("failover");
     let mut cfg = Config::default();
-    // Global default is opt-out (halt+warn).
-    assert!(!cfg.env_failover(&dir, "default"));
+    // Global default is halt (a bring-up failure blocks, never a silent drop).
+    assert_eq!(cfg.env_failover_mode(&dir, "default"), FailoverMode::Halt);
     // An env with no override inherits the (repo-overlaid) global.
-    cfg.sandbox.failover = true;
+    cfg.sandbox.failover = FailoverMode::Auto;
     cfg.env.insert("inherit".into(), EnvConfig::default());
-    assert!(cfg.env_failover(&dir, "inherit"));
-    // Some(false) forces a halt even when the global allows failover.
+    assert_eq!(cfg.env_failover_mode(&dir, "inherit"), FailoverMode::Auto);
+    // A `halt` override forces a halt even when the global allows auto fallback.
     cfg.env.insert(
         "strict".into(),
         EnvConfig {
-            failover: Some(false),
+            failover: Some(FailoverMode::Halt),
             ..Default::default()
         },
     );
-    assert!(!cfg.env_failover(&dir, "strict"));
-    // Some(true) allows failover even when the global forbids it.
-    cfg.sandbox.failover = false;
+    assert_eq!(cfg.env_failover_mode(&dir, "strict"), FailoverMode::Halt);
+    // An `ask` override prompts even when the global halts.
+    cfg.sandbox.failover = FailoverMode::Halt;
     cfg.env.insert(
-        "loose".into(),
+        "prompt".into(),
         EnvConfig {
-            failover: Some(true),
+            failover: Some(FailoverMode::Ask),
             ..Default::default()
         },
     );
-    assert!(cfg.env_failover(&dir, "loose"));
+    assert_eq!(cfg.env_failover_mode(&dir, "prompt"), FailoverMode::Ask);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn failover_parses_legacy_bool_and_modern_string() {
+    use crate::config::FailoverMode;
+    // Legacy booleans still parse: true ⇒ auto, false ⇒ halt.
+    let c: Config = toml::from_str("[sandbox]\nfailover = true\n").unwrap();
+    assert_eq!(c.sandbox.failover, FailoverMode::Auto);
+    let c: Config = toml::from_str("[sandbox]\nfailover = false\n").unwrap();
+    assert_eq!(c.sandbox.failover, FailoverMode::Halt);
+    // Modern string form, global + per-env override.
+    let c: Config =
+        toml::from_str("[sandbox]\nfailover = \"ask\"\n[env.m0]\nfailover = \"auto\"\n").unwrap();
+    assert_eq!(c.sandbox.failover, FailoverMode::Ask);
+    assert_eq!(c.env["m0"].failover, Some(FailoverMode::Auto));
+    // Per-env legacy bool override too.
+    let c: Config = toml::from_str("[env.m0]\nfailover = false\n").unwrap();
+    assert_eq!(c.env["m0"].failover, Some(FailoverMode::Halt));
+    // `halt`/`ask` block (modal); `auto` degrades silently.
+    assert!(FailoverMode::Halt.blocks());
+    assert!(FailoverMode::Ask.blocks());
+    assert!(!FailoverMode::Auto.blocks());
+    // An unknown string warns and falls back to the default (halt), never panics.
+    let c: Config = toml::from_str("[sandbox]\nfailover = \"nonsense\"\n").unwrap();
+    assert_eq!(c.sandbox.failover, FailoverMode::Halt);
 }
 
 // ---- repo overlay parse-error and yaml/json error paths ----

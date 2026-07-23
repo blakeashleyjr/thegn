@@ -238,6 +238,62 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
     claim_spare(cfg, worktree, &repo_root, &env_name, branch.as_deref()).is_some()
 }
 
+/// The provisioning-gate halt for an attach: `Some` when `worktree` resolves to a
+/// provider env whose sandbox has NOT finished provisioning (no LOCAL marker — set
+/// at provision completion in `provision_provider_env_named`). Refusing the raw
+/// shell here keeps a bare shell off an unprovisioned VM on the direct-spawn paths
+/// (resurrect, pane splits, respawn-on-exit) that call `launch_spec` without a
+/// provision check — the materialize path passes, since it provisions first. The
+/// caller gates this on `outcome.location.is_some()` (a live provider placement).
+/// `None` for the clean-shell escape hatch or an already-provisioned sandbox. A
+/// cheap local file stat + config resolve — no network, loop-safe.
+/// `Err(SandboxHalt)` when `has_provider_location` (a live provider placement) and
+/// the sandbox has NOT finished provisioning (no LOCAL marker — set at provision
+/// completion). `Ok(())` otherwise. Cheap (local stat + config resolve, no
+/// network — loop-safe).
+pub(crate) fn guard_unprovisioned_attach(
+    cfg: &thegn_core::config::Config,
+    worktree: &str,
+    choice: &str,
+    has_provider_location: bool,
+) -> anyhow::Result<()> {
+    if !has_provider_location || choice == "clean-shell" {
+        return Ok(());
+    }
+    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(worktree));
+    let repo_root = thegn_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| thegn_core::repo::main_worktree(std::path::Path::new(worktree)))
+        .unwrap_or_else(|| std::path::PathBuf::from(worktree));
+    let selected_env = thegn_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let env_name = cfg
+        .resolve_env(
+            &repo_root,
+            &loc,
+            std::path::Path::new(worktree),
+            selected_env.as_deref(),
+        )
+        .name;
+    let Some(id) = crate::agent::provider_sandbox_name(cfg, worktree, &env_name) else {
+        return Ok(());
+    };
+    if crate::provider_workdir::is_provisioned_locally(&id) {
+        return Ok(());
+    }
+    Err(crate::agent::SandboxHalt {
+        env_name,
+        placement: "provider".into(),
+        reason: "sandbox is still provisioning — retry once setup finishes".into(),
+        ask: false,
+    }
+    .into())
+}
+
 // ---------------------------------------------------------------------------
 // Warm-pool spare lifecycle (mint / claim / destroy) — the flows the guards
 // above arbitrate. Extracted from the pinned `agent.rs`.
@@ -477,14 +533,20 @@ mod tests {
         );
         let loc = rebind_resolved_location(Some(&db), wt, &fresh);
         assert!(loc.is_remote());
-        assert_eq!(db.location_for(wt).unwrap().as_deref(), Some(fresh.as_str()));
+        assert_eq!(
+            db.location_for(wt).unwrap().as_deref(),
+            Some(fresh.as_str())
+        );
         // Same blob again: no-op (equality short-circuit).
         let loc = rebind_resolved_location(Some(&db), wt, &fresh);
         assert!(loc.is_remote());
         // A malformed blob parses Local and must NOT clobber the stored row.
         let loc = rebind_resolved_location(Some(&db), wt, "not-a-blob");
         assert!(!loc.is_remote());
-        assert_eq!(db.location_for(wt).unwrap().as_deref(), Some(fresh.as_str()));
+        assert_eq!(
+            db.location_for(wt).unwrap().as_deref(),
+            Some(fresh.as_str())
+        );
     }
 
     #[test]

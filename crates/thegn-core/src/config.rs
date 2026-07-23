@@ -136,6 +136,9 @@ config_enum! {
         Auto = "auto", Gum = "gum", Fzf = "fzf", Select = "select",
     } default = Auto;
 }
+// `FailoverMode` + its deserializers live in `config_placement` (re-exported).
+pub use crate::config_placement::FailoverMode;
+use crate::config_placement::{de_failover, de_failover_opt};
 // The terminal display/glyph config enums (UndercurlMode, ColorMode, GlyphMode,
 // AgentGlyphs) live in the `config_theme` sibling module to keep this god-file
 // flat; re-exported so `config::{ColorMode, …}` import paths keep working.
@@ -1873,12 +1876,13 @@ pub struct EnvConfig {
     /// `[env.<name>.provider]` — managed-sandbox provider (placement = provider).
     #[serde(skip_serializing_if = "EnvProviderConfig::is_default")]
     pub provider: EnvProviderConfig,
-    /// Per-env override of `[sandbox] failover`. `None` ⇒ inherit the global
-    /// policy; `Some(true)` lets *this* env fall back (chain → host) when it
-    /// can't be brought up; `Some(false)` forces a halt+warning even if the
-    /// global default allows failover. Resolved by [`Config::env_failover`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failover: Option<bool>,
+    /// Per-env override of `[sandbox] failover`; `None` ⇒ inherit.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_failover_opt"
+    )]
+    pub failover: Option<FailoverMode>,
     /// Requested placement class (`None` ⇒ inherit `[placement] mode`); clamped by the resolved mode floor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placement_mode: Option<PlacementModePref>,
@@ -2501,12 +2505,11 @@ pub struct SandboxConfig {
     /// at pane-spawn time; else an absolute path or name (e.g. `"zsh"`).
     pub shell: String,
     pub on_missing: OnMissing,
-    /// When a *selected* non-local env (named `[env.<name>]`, or provider/k8s/ssh)
-    /// can't be brought up, may thegn fall back to another backend/host?
-    /// Default `false`: halt + warn (a remote/managed env is often required, so a
-    /// quiet host drop is refused). `true` (here or per-env `[env.<name>]
-    /// failover`) walks `backend_chain` → host. Independent of `on_missing`.
-    pub failover: bool,
+    /// When a *selected* non-local env can't be brought up: `halt` (default,
+    /// blocks+warns), `ask` (prompt: retry/run-on-host), `auto` (silent host
+    /// fallback). Legacy bool: `true`⇒`auto`, `false`⇒`halt`. Per-env overridable.
+    #[serde(deserialize_with = "de_failover")]
+    pub failover: FailoverMode,
     /// Drive the OCI runtime against a **remote daemon** instead of SSH-wrapping
     /// the whole backend argv: a podman connection URL/name or a docker host
     /// (e.g. `ssh://user@host`). Empty ⇒ local daemon (the default). Injected as
@@ -2586,7 +2589,7 @@ impl Default for SandboxConfig {
             nix_daemon: false,
             shell: String::new(),
             on_missing: OnMissing::Warn,
-            failover: false,
+            failover: FailoverMode::Halt,
             oci_host: String::new(),
             remote: RemoteConfig::default(),
             network_allow: Vec::new(),
@@ -4602,12 +4605,9 @@ impl Config {
         )
     }
 
-    /// Effective failover policy for the environment named `env_name`: the env's
-    /// own `[env.<name>] failover` override if set, else the (repo-overlaid)
-    /// global `[sandbox] failover`. `true` ⇒ a bring-up failure may fall back
-    /// down the chain to the host; `false` (the default) ⇒ halt + warn. The
-    /// implicit/unknown "default" env has no override, so it inherits the global.
-    pub fn env_failover(&self, repo_root: &Path, env_name: &str) -> bool {
+    /// Effective failover mode for `env_name`: the env's `[env.<name>] failover`
+    /// override if set, else the (repo-overlaid) global `[sandbox] failover`.
+    pub fn env_failover_mode(&self, repo_root: &Path, env_name: &str) -> FailoverMode {
         if let Some(envc) = self.env.get(env_name)
             && let Some(f) = envc.failover
         {

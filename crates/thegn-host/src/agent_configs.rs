@@ -56,6 +56,37 @@ async fn write_preserving_mode(
     }
 }
 
+/// A Claude Code settings file that can carry a `hooks` block.
+fn is_claude_settings(rel: &str) -> bool {
+    rel.ends_with(".claude/settings.json") || rel.ends_with(".claude/settings.local.json")
+}
+
+/// Strip the host's `hooks` block from a Claude `settings.json`/`settings.local.json`
+/// before it lands in a sandbox. Host hooks shell out to host-only services (the
+/// agentmemory backend, the desktop `notify.sh`) whose scripts/paths don't function
+/// in the VM, so leaving them in only fires `…: not found` / hook errors on every
+/// Claude event inside the sprite (the reported SessionStart/PostToolUse/Stop
+/// failures). No-op for non-settings files, non-JSON-object content, or settings
+/// with no `hooks`. Pure — unit-tested.
+fn strip_sandbox_hooks(rel: &str, data: Vec<u8>) -> Vec<u8> {
+    if !is_claude_settings(rel) {
+        return data;
+    }
+    let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice(&data) else {
+        return data;
+    };
+    if obj.remove("hooks").is_none() {
+        return data;
+    }
+    match serde_json::to_vec_pretty(&serde_json::Value::Object(obj)) {
+        Ok(mut b) => {
+            b.push(b'\n');
+            b
+        }
+        Err(_) => data,
+    }
+}
+
 /// Directory names under an agent's config tree that hold bulky, ephemeral state
 /// (session transcripts, caches, snapshots) — NEVER needed to make the agent
 /// "logged in", and gigabytes in practice (`~/.claude/projects` alone is often
@@ -210,6 +241,32 @@ fn relocated_source(rel: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<s
     None
 }
 
+/// Push the host's git identity (`user.name`/`user.email`, effective repo→global
+/// values) into a provider sandbox's provisioning exec env as
+/// `THEGN_GIT_NAME`/`THEGN_GIT_EMAIL`, so `git_auth_script` can persist them to
+/// the sandbox `~/.gitconfig` — otherwise in-sandbox commits are authored as the
+/// provider default (`Sprite <noreply@sprites.dev>`). No-op for an unset key.
+// off-loop by contract: only called from the blocking provisioning path.
+#[expect(clippy::disallowed_methods)]
+pub(crate) fn push_host_git_identity(repo_root: &Path, exec_env: &mut Vec<(String, String)>) {
+    for (var, key) in [
+        ("THEGN_GIT_NAME", "user.name"),
+        ("THEGN_GIT_EMAIL", "user.email"),
+    ] {
+        let out = thegn_core::util::git_cmd(repo_root)
+            .args(["config", "--get", key])
+            .output();
+        if let Ok(o) = out
+            && o.status.success()
+        {
+            let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !v.is_empty() {
+                exec_env.push((var.to_string(), v));
+            }
+        }
+    }
+}
+
 fn sync_agent_auth_critical(
     provider: &thegn_svc::provider::Provider,
     id: &str,
@@ -225,6 +282,7 @@ fn sync_agent_auth_critical(
             let Ok(data) = std::fs::read(&src) else {
                 continue; // file absent on this host — skip silently
             };
+            let data = strip_sandbox_hooks(&f, data);
             let exec = std::fs::metadata(&src)
                 .map(|md| is_executable(&md))
                 .unwrap_or(false);
@@ -379,6 +437,7 @@ pub(crate) fn upload_agent_configs(
             let Ok(data) = std::fs::read(&src) else {
                 continue;
             };
+            let data = strip_sandbox_hooks(&f, data);
             let exec = std::fs::metadata(&src)
                 .map(|md| is_executable(&md))
                 .unwrap_or(false);
@@ -397,6 +456,7 @@ pub(crate) fn upload_agent_configs(
                 let Ok(data) = std::fs::read(&abs) else {
                     continue;
                 };
+                let data = strip_sandbox_hooks(&host_rel, data);
                 all_uploads.push((format!("{base}/{host_rel}"), data, exec));
             }
         }
@@ -588,6 +648,36 @@ pub(crate) fn account_pane_env_exports(cfg: &thegn_core::config::Config, worktre
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_sandbox_hooks_drops_hooks_from_claude_settings() {
+        let settings = br#"{"model":"opus","hooks":{"Stop":[{"hooks":[]}]}}"#.to_vec();
+        // Claude settings.json ⇒ hooks removed, other keys kept.
+        let out = strip_sandbox_hooks(".claude/settings.json", settings.clone());
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("hooks").is_none(), "hooks must be stripped");
+        assert_eq!(v.get("model").and_then(|m| m.as_str()), Some("opus"));
+        // settings.local.json too.
+        let out = strip_sandbox_hooks(".claude/settings.local.json", settings.clone());
+        assert!(!String::from_utf8_lossy(&out).contains("hooks"));
+        // Non-settings files pass through untouched (byte-identical).
+        assert_eq!(
+            strip_sandbox_hooks(".claude/.credentials.json", settings.clone()),
+            settings
+        );
+        // Settings with no hooks pass through unchanged.
+        let no_hooks = br#"{"model":"opus"}"#.to_vec();
+        assert_eq!(
+            strip_sandbox_hooks(".claude/settings.json", no_hooks.clone()),
+            no_hooks
+        );
+        // Non-JSON content is left as-is (never corrupts an odd file).
+        let junk = b"not json".to_vec();
+        assert_eq!(
+            strip_sandbox_hooks(".claude/settings.json", junk.clone()),
+            junk
+        );
+    }
 
     #[test]
     fn agent_source_relocates_via_home_env() {

@@ -40,6 +40,7 @@ mod direnv_warm;
 mod dragdrop;
 mod drawer_state;
 mod emulator;
+mod env_halt;
 mod env_ui;
 mod env_wizard;
 mod escape;
@@ -629,7 +630,26 @@ fn main() -> anyhow::Result<()> {
     // under the app home being moved) and before the first Db::open (the WAL
     // sidecars move while no connection is open). No-op cost once migrated:
     // three stats. THEGN_NO_MIGRATE=1 (dev/bench recipes) skips it entirely.
-    report_migration(&thegn_core::migrate_brand::run_startup_migration());
+    //
+    // SKIP for the internal stdio/PTY bridges (machine0-ssh, vps-ssh, sprite-exec,
+    // sprite-proxy, bridge, bridge-revtunnel): they stream straight into a pane or
+    // a framed protocol channel, so the migration's stderr chatter corrupts that
+    // stream (the `thegn migrate: …` line leaking into a machine0 pane). The host
+    // that spawned them already ran the migration.
+    let is_stdio_bridge = matches!(
+        cli.command,
+        Some(
+            Command::Bridge
+                | Command::BridgeRevtunnel { .. }
+                | Command::SpriteProxy { .. }
+                | Command::VpsSsh { .. }
+                | Command::Machine0Ssh { .. }
+                | Command::SpriteExec { .. }
+        )
+    );
+    if !is_stdio_bridge {
+        report_migration(&thegn_core::migrate_brand::run_startup_migration());
+    }
 
     // Reroot the process environment for the active profile (H) BEFORE the tokio
     // runtime or any thread starts — a whole-process firewall enforced via
