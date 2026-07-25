@@ -648,30 +648,44 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
     let stderr = child.stderr.take().context("child stderr")?;
     let stdin = child.stdin.take().context("child stdin")?;
     let chan = p.chan;
+    // Stream stdout + stderr as proc.out notifications. A relay thread that
+    // fails to start would leave a channel that silently drops output, so reap
+    // the child and fail the spawn instead of registering a dead channel.
+    let relays = spawn_stream_relay(stdout, chan, "stdout", writer.clone())
+        .and_then(|()| spawn_stream_relay(stderr, chan, "stderr", writer.clone()));
+    if let Err(e) = relays {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e).context("spawn bridge proc relay thread");
+    }
     procs.lock().unwrap().insert(
         chan,
         ProcState {
             stdin: Arc::new(Mutex::new(stdin)),
         },
     );
-    // Stream stdout + stderr as proc.out notifications.
-    spawn_stream_relay(stdout, chan, "stdout", writer.clone());
-    spawn_stream_relay(stderr, chan, "stderr", writer.clone());
     // Waiter: owns the Child, blocks on exit (no lock held), then reports exit and
     // drops the channel. The child exits when it finishes or when proc.kill /
     // connection-close drops its stdin (EOF).
-    std::thread::Builder::new()
+    let procs2 = procs.clone();
+    let waiter = std::thread::Builder::new()
         .name("bridge-proc-wait".into())
         .spawn(move || {
             let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
-            procs.lock().unwrap().remove(&chan);
+            procs2.lock().unwrap().remove(&chan);
             let note = serde_json::json!({
                 "method": "proc.exit",
                 "params": ProcExitNote { chan, code },
             });
             write_frame(&writer, &note);
-        })
-        .ok();
+        });
+    if let Err(e) = waiter {
+        // Without a waiter the client would never see proc.exit. The failed
+        // spawn dropped its closure (and the Child with it, un-reaped);
+        // deregistering drops stdin → EOF → the child exits on its own.
+        procs.lock().unwrap().remove(&chan);
+        return Err(e).context("spawn bridge-proc-wait thread");
+    }
     Ok(())
 }
 
@@ -681,7 +695,7 @@ fn spawn_stream_relay(
     chan: u64,
     stream: &'static str,
     writer: SharedWriter,
-) {
+) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name(format!("bridge-proc-{stream}"))
         .spawn(move || {
@@ -703,7 +717,7 @@ fn spawn_stream_relay(
                 }
             }
         })
-        .ok();
+        .map(|_| ())
 }
 
 fn proc_stdin_response(req: &Request, procs: &ProcRegistry) -> Response {
