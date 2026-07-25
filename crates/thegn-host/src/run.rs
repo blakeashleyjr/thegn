@@ -12623,27 +12623,27 @@ async fn event_loop<T: Terminal>(
                             if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files } = choice
                                 && let Some(targets) = pending_confirm_delete_worktrees.take()
                             {
-                                model.status = delete_groups(
-                                    &mut session,
-                                    &mut panes,
+                                // Delegate to the shared delete path (focus re-pin +
+                                // refresh) so a stale index can't strand focus.
+                                crate::handlers::worktree_delete::confirm_delete_worktrees(
+                                    &mut crate::handlers::worktree_delete::DeleteCtx {
+                                        session: &mut session,
+                                        panes: &mut panes,
+                                        model: &mut model,
+                                        sb: &mut sb,
+                                        drawer: &mut drawer,
+                                        drawer_pool: &mut drawer_pool,
+                                        drawer_home: &mut drawer_home,
+                                        active_menu: &mut active_menu,
+                                        pending: &mut pending_confirm_delete_worktrees,
+                                        need_relayout: &mut need_relayout,
+                                        waker: &waker,
+                                        cfg: keymap.config(),
+                                        center: chrome.center,
+                                        confirm_delete: current_config.confirm_delete,
+                                    },
                                     targets,
                                     keep_files,
-                                    Some(waker.clone()),
-                                );
-
-                                // Full sidebar refresh after deletion
-                                sb.marked.clear();
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                sb.focus_active_row(&mut model);
-                                need_relayout = true;
-                                sync_drawer_persistence(
-                                    &session,
-                                    &mut panes,
-                                    &mut drawer,
-                                    &mut drawer_pool,
-                                    &mut drawer_home,
-                                    keymap.config(),
-                                    chrome.center,
                                 );
                                 dirty = true;
                                 continue;
