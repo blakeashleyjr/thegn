@@ -224,8 +224,8 @@ fn rule_matches(
         return false;
     }
     if let Some(re) = &rule.message {
-        match regex::Regex::new(re) {
-            Ok(r) if r.is_match(message) => {}
+        match message_regex(re) {
+            Some(r) if r.is_match(message) => {}
             _ => return false, // no match, or an invalid pattern ⇒ rule inert
         }
     }
@@ -243,6 +243,32 @@ fn rule_matches(
         return false;
     }
     true
+}
+
+/// Compiled-`message`-regex memo, keyed by pattern text. Rules live in serde
+/// config structs (no compiled field possible) and `decide` runs per
+/// notification, so each distinct pattern compiles once here instead of per
+/// call. Config reload swaps `NotificationsConfig` wholesale, so pattern-keyed
+/// entries can never go stale; `None` memoizes an invalid pattern (rule inert).
+/// The size bound guards pathological config churn.
+fn message_regex(pattern: &str) -> Option<std::sync::Arc<regex::Regex>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cache = Mutex<HashMap<String, Option<Arc<regex::Regex>>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let mut g = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(hit) = g.get(pattern) {
+        return hit.clone();
+    }
+    if g.len() >= 64 {
+        g.clear();
+    }
+    let compiled = regex::Regex::new(pattern).ok().map(Arc::new);
+    g.insert(pattern.to_string(), compiled.clone());
+    compiled
 }
 
 /// Minimal glob: `*` matches any run (incl. empty), `?` any single char, other
@@ -683,6 +709,30 @@ mod tests {
             )
             .desktop
         );
+    }
+
+    // --- message_regex cache ---
+
+    #[test]
+    fn message_regex_cache_hits_and_clears() {
+        use std::sync::Arc;
+        // Repeat lookups return the same compiled regex (Arc identity)…
+        let a = message_regex("cache-hit-[0-9]+").unwrap();
+        let b = message_regex("cache-hit-[0-9]+").unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        // …distinct patterns coexist…
+        let c = message_regex("cache-other-[a-z]+").unwrap();
+        assert!(c.is_match("cache-other-xyz"));
+        assert!(a.is_match("cache-hit-42"));
+        // …an invalid pattern memoizes as inert…
+        assert!(message_regex("(cache-unclosed").is_none());
+        assert!(message_regex("(cache-unclosed").is_none());
+        // …and flooding past the bound clears without breaking matching.
+        for i in 0..70 {
+            let _ = message_regex(&format!("cache-flood-{i}"));
+        }
+        let d = message_regex("cache-hit-[0-9]+").unwrap();
+        assert!(d.is_match("cache-hit-7"));
     }
 
     // --- DND ---
