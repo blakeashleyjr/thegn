@@ -111,7 +111,19 @@ pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
             x: Position::Absolute(rect.x),
             y: Position::Absolute(rect.y + row),
         });
+        // A double-width glyph occupies TWO grid columns: the glyph cell plus a
+        // spacer cell the emulator fills with a blank. The glyph already advances
+        // the terminal cursor across both columns, so the spacer must emit nothing
+        // — otherwise every wide glyph pushes the rest of the row one cell right
+        // and overruns the pane rect. Skip the column immediately after a wide
+        // glyph (emulator-agnostic: keyed on the glyph's display width, not the
+        // emulator's spacer flag, which `conv_cell` doesn't carry through).
+        let mut skip_spacer = false;
         for col in 0..rect.cols.min(ecols as usize) {
+            if skip_spacer {
+                skip_spacer = false;
+                continue;
+            }
             // Snapshot first (one lock), then the borrowing accessor, then the
             // owning `cell()` — the fallbacks never run for the real emulator.
             let owned;
@@ -168,6 +180,9 @@ pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
                 // wider than a just-shrunk rect (e.g. opening the right panel).
                 run.push(' ');
             } else {
+                if text.width() > 1 {
+                    skip_spacer = true;
+                }
                 run.push_str(text);
             }
         }
@@ -327,6 +342,32 @@ mod tests {
                 (o, b) => panic!("cell/cell_ref presence differ at col {col}: {o:?} vs {b:?}"),
             }
         }
+    }
+
+    #[test]
+    fn wide_glyph_does_not_shift_following_content_right() {
+        // Regression: the spacer cell after a double-width glyph used to be
+        // emitted as a blank, pushing everything after it one column right and
+        // overrunning the pane. "世" (width 2) then "ok" must land at cols 0-1
+        // (the glyph) and 2-3 (o, k), not 0, 2, 3, 4.
+        let mut emu = AlacrittyEmulator::new(1, 6, 0);
+        emu.advance("世ok".as_bytes());
+        let mut surface = Surface::new(6, 1);
+        compose_pane(
+            &mut surface,
+            &emu,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 6,
+                rows: 1,
+            },
+        );
+        let cells = surface.screen_cells();
+        assert_eq!(cells[0][0].str(), "世", "wide glyph at col 0");
+        // col 1 is the spacer the wide glyph occupies; termwiz leaves it empty.
+        assert_eq!(cells[0][2].str(), "o", "content must not be shifted right");
+        assert_eq!(cells[0][3].str(), "k");
     }
 
     #[test]

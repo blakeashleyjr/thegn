@@ -278,18 +278,10 @@ fn is_escape(key: &KeyCode, mods: Modifiers) -> bool {
 }
 
 /// Truncate `s` to at most `max_cols` display columns, appending `…` if
-/// truncated. Simple byte-level truncation (assumes mostly ASCII content,
-/// which is the common case for terminal history).
+/// truncated. Width-aware and UTF-8-safe (byte-slicing panicked on non-ASCII
+/// scrollback, taking down the whole compositor).
 fn truncate_label(s: &str, max_cols: usize) -> String {
-    if max_cols == 0 {
-        return String::new();
-    }
-    if s.len() <= max_cols {
-        return s.to_string();
-    }
-    let mut t = s[..max_cols.saturating_sub(1)].to_string();
-    t.push('…');
-    t
+    crate::seg::clip_end(s, max_cols)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

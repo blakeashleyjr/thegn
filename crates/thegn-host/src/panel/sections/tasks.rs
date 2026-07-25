@@ -97,11 +97,9 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         let run = runs.get(&task.name);
         let glyph = kind_glyph(&task.kind);
         let name_w = ctx.cols.saturating_sub(glyph.len() + 1 + 8);
-        let name = if task.name.len() > name_w {
-            format!("{}…", &task.name[..name_w.saturating_sub(1)])
-        } else {
-            task.name.clone()
-        };
+        // Width-aware, UTF-8-safe clip: byte-slicing `task.name[..n]` panicked
+        // when a task name (or command, below) held a multibyte char.
+        let name = crate::seg::clip_end(&task.name, name_w);
 
         let mut segs = vec![
             seg(kind_hue(&task.kind), glyph),
@@ -154,7 +152,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             .cols
             .saturating_sub(glyph.len() + 1 + task.name.len() + 3 + dur.len() + 2);
         let cmd = if task.command.len() > cmd_w {
-            format!("{}…", &task.command[..cmd_w.saturating_sub(1)])
+            crate::seg::clip_end(&task.command, cmd_w)
         } else {
             task.command.clone()
         };
@@ -257,7 +255,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             let sel = if i == cursor { "▶ " } else { "  " };
             let name_w = list_w.saturating_sub(sel.len() + 2 + 8);
             let name = if task.name.len() > name_w {
-                format!("{}…", &task.name[..name_w.saturating_sub(1)])
+                crate::seg::clip_end(&task.name, name_w)
             } else {
                 task.name.clone()
             };
