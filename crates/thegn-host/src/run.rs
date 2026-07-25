@@ -5550,7 +5550,7 @@ fn dispatch_acp_inbound(
             if let Some(client) = client {
                 let wt = wt.to_string();
                 tokio::spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || read_scoped_file(&wt, &path))
+                    let result = tokio::task::spawn_blocking(move || crate::handlers::scoped_fs::read_scoped_file(&wt, &path))
                         .await
                         .unwrap_or_else(|_| Err("read task panicked".to_string()));
                     let reply = match result {
@@ -5636,7 +5636,7 @@ fn dispatch_acp_inbound(
                         return;
                     }
                     let result = tokio::task::spawn_blocking(move || {
-                        write_scoped_file(&wt, &path, &content)
+                        crate::handlers::scoped_fs::write_scoped_file(&wt, &path, &content)
                     })
                     .await
                     .unwrap_or_else(|_| Err("write task panicked".to_string()));
@@ -5668,7 +5668,7 @@ fn dispatch_acp_inbound(
                         return;
                     }
                     let result =
-                        tokio::task::spawn_blocking(move || apply_scoped_edits(&wt, &path, &edits))
+                        tokio::task::spawn_blocking(move || crate::handlers::scoped_fs::apply_scoped_edits(&wt, &path, &edits))
                             .await
                             .unwrap_or_else(|_| Err("edit task panicked".to_string()));
                     reply_edit_status(&client, id, result).await;
@@ -5825,114 +5825,6 @@ async fn reply_edit_status(
     if let Err(e) = reply {
         tracing::error!(target: "thegn::acp", "edit/write reply failed: {e}");
     }
-}
-
-/// Read a file requested by an agent over ACP `fs/read_text_file`, scoping the
-/// resolved path to the worktree so the agent cannot read outside its sandbox
-/// mount. Relative paths resolve against the worktree root.
-fn read_scoped_file(worktree: &str, path: &str) -> Result<String, String> {
-    let base = std::path::Path::new(worktree);
-    let req = std::path::Path::new(path);
-    let full = if req.is_absolute() {
-        req.to_path_buf()
-    } else {
-        base.join(req)
-    };
-    let canon = full.canonicalize().map_err(|e| format!("{path}: {e}"))?;
-    let base_canon = base
-        .canonicalize()
-        .map_err(|e| format!("{worktree}: {e}"))?;
-    if !canon.starts_with(&base_canon) {
-        return Err(format!("path escapes worktree: {path}"));
-    }
-    std::fs::read_to_string(&canon).map_err(|e| format!("{path}: {e}"))
-}
-
-/// Resolve a (possibly not-yet-existing) write target against the worktree,
-/// rejecting absolute escapes and any `..` traversal. Used by the agent's
-/// `write`/`edit` tools so they cannot touch files outside their sandbox mount.
-fn scoped_target(worktree: &str, path: &str) -> Result<std::path::PathBuf, String> {
-    use std::path::{Component, Path};
-    let base = Path::new(worktree)
-        .canonicalize()
-        .map_err(|e| format!("{worktree}: {e}"))?;
-    let raw = Path::new(path);
-    let joined = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        base.join(raw)
-    };
-    if joined
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
-        return Err(format!("path must not contain '..': {path}"));
-    }
-    // A lexical `starts_with` is symlink-traversable: a symlink *inside* the
-    // worktree pointing outside (e.g. `link -> /etc`) makes `link/passwd` pass
-    // the lexical check while resolving out of the sandbox mount. Canonicalize the
-    // deepest existing ancestor (which resolves any symlink in the path prefix)
-    // and require *that* to stay within the worktree; then reattach the
-    // not-yet-created tail (already `..`-free) to the symlink-free base.
-    let mut existing: &Path = joined.as_path();
-    let canon_existing = loop {
-        match existing.canonicalize() {
-            Ok(c) => break c,
-            Err(_) => match existing.parent() {
-                Some(p) => existing = p,
-                None => return Err(format!("path escapes worktree: {path}")),
-            },
-        }
-    };
-    if !canon_existing.starts_with(&base) {
-        return Err(format!("path escapes worktree: {path}"));
-    }
-    let tail = joined
-        .strip_prefix(existing)
-        .map_err(|_| format!("path escapes worktree: {path}"))?;
-    // When the target already exists, `tail` is empty; `join("")` would append a
-    // trailing separator and turn a file path into a "directory" path.
-    if tail.as_os_str().is_empty() {
-        Ok(canon_existing)
-    } else {
-        Ok(canon_existing.join(tail))
-    }
-}
-
-/// Write full file contents for an agent's `write` tool, scoped to the worktree.
-fn write_scoped_file(worktree: &str, path: &str, content: &str) -> Result<(), String> {
-    let target = scoped_target(worktree, path)?;
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{path}: {e}"))?;
-    }
-    std::fs::write(&target, content).map_err(|e| format!("{path}: {e}"))
-}
-
-/// Apply an agent `edit` tool's `[{oldText,newText}]` replacements to a file,
-/// scoped to the worktree. Each `oldText` must occur (first match is replaced);
-/// a missing match is an error so the agent can correct itself.
-fn apply_scoped_edits(worktree: &str, path: &str, edits: &serde_json::Value) -> Result<(), String> {
-    let target = scoped_target(worktree, path)?;
-    let mut text = std::fs::read_to_string(&target).map_err(|e| format!("{path}: {e}"))?;
-    let arr = edits.as_array().ok_or("edits must be an array")?;
-    for edit in arr {
-        let old = edit
-            .get("oldText")
-            .and_then(|v| v.as_str())
-            .ok_or("edit missing oldText")?;
-        let new = edit
-            .get("newText")
-            .and_then(|v| v.as_str())
-            .ok_or("edit missing newText")?;
-        match text.find(old) {
-            Some(idx) => text.replace_range(idx..idx + old.len(), new),
-            None => {
-                let preview: String = old.chars().take(40).collect();
-                return Err(format!("oldText not found in {path}: {preview:?}"));
-            }
-        }
-    }
-    std::fs::write(&target, text).map_err(|e| format!("{path}: {e}"))
 }
 
 async fn ensure_app_loaded(
