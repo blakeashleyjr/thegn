@@ -71,6 +71,35 @@ fn rebase_with_todo(
     todo: &[TodoEntry],
     opts: &RebaseOpts,
 ) -> Result<RebaseOutcome> {
+    // Guard the todo-build → rebase-apply window: `git rebase -i <base>` operates
+    // on the CURRENT `base..HEAD`, but the todo was built from an earlier snapshot
+    // (possibly under a separate lock). If a commit landed on the branch in
+    // between, it is in `base..HEAD` yet absent from the todo, and git rebase
+    // silently DROPS any in-range commit without a todo line — losing history.
+    // Every planned commit (including `drop`ped ones, which keep a `drop <sha>`
+    // line) is in the todo, so a range commit missing from it means HEAD advanced.
+    // Bail loudly rather than rewrite the branch to a lossy result.
+    {
+        let range = if base == "--root" {
+            "HEAD".to_string()
+        } else {
+            format!("{base}..HEAD")
+        };
+        if let Ok(revs) = run_w(loc, &[], &["rev-list", &range]) {
+            let todo_shas: Vec<&str> = todo.iter().map(|e| e.sha.as_str()).collect();
+            for rev in revs.split_whitespace() {
+                let covered = todo_shas
+                    .iter()
+                    .any(|s| rev.starts_with(*s) || s.starts_with(rev));
+                if !covered {
+                    bail!(
+                        "branch advanced during rebase (commit {} is not in the planned todo) — retry",
+                        &rev[..rev.len().min(8)]
+                    );
+                }
+            }
+        }
+    }
     loc.write_git_path(TODO_SCRATCH, serialize_todo(todo).as_bytes())
         .context("write prepared rebase todo")?;
     let scratch = loc
@@ -489,6 +518,32 @@ mod tests {
     /// File names touched by `sha`.
     fn touched(r: &TestRepo, sha: &str) -> String {
         r.out(&["show", "--name-only", "--format=", sha])
+    }
+
+    #[test]
+    fn rebase_bails_when_head_advances_after_the_todo_is_built() {
+        // Build the pick-everything todo for c2^..HEAD, then let a new commit land
+        // on the branch (as a concurrent agent would). Applying the stale todo must
+        // refuse — git rebase would otherwise silently drop c5 from history.
+        let r = linear("head-advance");
+        let c2 = r.sha_of("c2");
+        let base = base_for(&r.loc(), &c2).unwrap();
+        let todo = CliGit.rebase_todo_for(&r.loc(), &c2).unwrap();
+
+        // HEAD advances out from under the built todo.
+        r.commit_file("f5.txt", "5\n", "c5");
+        let head_before = r.out(&["rev-parse", "HEAD"]);
+
+        let err = CliGit
+            .rebase_interactive(&r.loc(), &base, &todo, &opts())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("branch advanced"),
+            "expected a branch-advanced bail, got: {err}"
+        );
+        // The branch is untouched — c5 is still there.
+        assert_eq!(r.out(&["rev-parse", "HEAD"]), head_before);
+        assert_eq!(r.subjects(), ["c5", "c4", "c3", "c2", "c1"]);
     }
 
     #[test]
