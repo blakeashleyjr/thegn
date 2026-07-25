@@ -87,3 +87,57 @@ pub(crate) fn persist_panel_state(panel_ui: &crate::panel::PanelUi) {
         let _ = db.set_ui_state("panel", "tab", panel_ui.tab.as_key());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_command_uses_default_and_strips_dot_suffix() {
+        let cfg = thegn_core::config::Config::default();
+        // Default editor is "${EDITOR:-vi} ."; the trailing " ." is dropped and
+        // the path is single-quoted.
+        assert_eq!(
+            editor_open_command(&cfg, "src/main.rs", None),
+            "${EDITOR:-vi} 'src/main.rs'"
+        );
+    }
+
+    #[test]
+    fn editor_command_adds_line_jump() {
+        let cfg = thegn_core::config::Config::default();
+        assert_eq!(
+            editor_open_command(&cfg, "src/main.rs", Some(42)),
+            "${EDITOR:-vi} +42 'src/main.rs'"
+        );
+    }
+
+    #[test]
+    fn editor_command_escapes_single_quotes_in_path() {
+        let cfg = thegn_core::config::Config::default();
+        // A single quote in the path is shell-escaped as '\'' so the command
+        // stays well-formed.
+        assert_eq!(
+            editor_open_command(&cfg, "a'b.rs", None),
+            r"${EDITOR:-vi} 'a'\''b.rs'"
+        );
+    }
+
+    #[test]
+    fn parse_file_line_splits_path_and_line() {
+        assert_eq!(
+            parse_file_line("src/main.rs:42"),
+            Some(("src/main.rs".to_string(), 42))
+        );
+        // rsplit means the last colon wins — a path containing colons is kept.
+        assert_eq!(parse_file_line("a:1:2"), Some(("a:1".to_string(), 2)));
+    }
+
+    #[test]
+    fn parse_file_line_rejects_bad_inputs() {
+        assert_eq!(parse_file_line("just a message"), None);
+        assert_eq!(parse_file_line("src/main.rs:notanumber"), None);
+        assert_eq!(parse_file_line(":42"), None, "empty path");
+        assert_eq!(parse_file_line(""), None);
+    }
+}
