@@ -96,7 +96,12 @@ pub fn highlight_diff(diff_text: &str, file_path: &str) -> String {
             continue;
         }
 
-        let (prefix, content) = line.split_at(1);
+        // Split off the diff prefix at the first *char* boundary, not byte 1: an
+        // external diff driver (`diff.external`) can emit a line whose first char
+        // is multibyte, and `split_at(1)` would land mid-UTF-8 and panic, taking
+        // down `thegn diff`. A multibyte prefix simply won't match "+"/"-"/" ".
+        let split = line.chars().next().map_or(0, char::len_utf8);
+        let (prefix, content) = line.split_at(split);
 
         // Treat `--- a/...` and `+++ b/...` as headers, not code lines.
         if (line.starts_with("--- ") || line.starts_with("+++ ")) && line.len() > 4 {
@@ -315,6 +320,16 @@ diff --git a/x.rs b/x.rs
         warm();
         // After warming, highlighting is immediate and well-formed.
         assert!(highlight_file("fn x() {}\n", "a.rs").contains("\x1b[38;2;"));
+    }
+
+    #[test]
+    fn highlight_diff_does_not_panic_on_multibyte_leading_char() {
+        // Regression: an external diff driver line starting with a multibyte char
+        // used to panic via split_at(1) landing mid-UTF-8.
+        let diff = "diff --git a/x b/x\n\u{2014}not a real diff prefix\n café line\n";
+        let out = highlight_diff(diff, "x.txt");
+        assert!(out.contains("not a real diff prefix"));
+        assert!(out.contains("café line"));
     }
 
     #[test]

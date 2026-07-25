@@ -250,7 +250,7 @@ impl WorkspaceStore for Db {
         self.conn().execute(
             r#"INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position,folder_id)
                VALUES(?1,?2,?3,?4,?5,'',?6,?7,(SELECT COALESCE(MAX(position),-1)+1 FROM worktrees),?8)
-               ON CONFLICT(worktree) DO UPDATE SET branch=?5, tab_name=?3, repo_path=?4, session_name=?2, location=COALESCE(?7, location), folder_id=COALESCE(?8, folder_id)"#,
+               ON CONFLICT(worktree) DO UPDATE SET branch=?5, tab_name=?3, repo_path=?4, session_name=?2, agent=COALESCE(agent,''), created_at=COALESCE(created_at,?6), location=COALESCE(?7, location), folder_id=COALESCE(?8, folder_id)"#,
             params![wt, session(), tab, root, branch, util::now(), location, folder_id],
         )?;
         Ok(())
@@ -414,8 +414,14 @@ impl WorkspaceStore for Db {
         // user-reorderable). Order by it so every consumer — the sidebar's
         // unloaded-workspace rows and the resurrect adopt loop — is stable;
         // created_at/path are deterministic tie-breakers for any unset row.
+        // COALESCE the NOT-NULL-in-Rust columns: `set_worktree_env` can insert a
+        // minimal row (only `worktree` + `env_name`) before the worktree is first
+        // opened, leaving branch/agent/created_at/repo_path/tab_name NULL. Without
+        // the COALESCE, `r.get::<_, String/i64>` errors on those NULLs and the row
+        // is silently dropped by `filter_map(|r| r.ok())` — losing the env pin and
+        // any row `put_worktree` hasn't fully healed yet.
         let mut stmt = self.conn().prepare(
-            "SELECT worktree, branch, agent, created_at, repo_path, tab_name, session_name, location, position, sandbox_backend, folder_id, env_name
+            "SELECT worktree, COALESCE(branch,''), COALESCE(agent,''), COALESCE(created_at,0), COALESCE(repo_path,''), COALESCE(tab_name,''), session_name, location, position, sandbox_backend, folder_id, env_name
              FROM worktrees ORDER BY position, created_at, worktree",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1101,6 +1107,35 @@ mod tests {
         // `""` clears back to inherit.
         db.set_worktree_env("/wt/new", "").unwrap();
         assert_eq!(db.worktree_env("/wt/new").unwrap(), None);
+    }
+
+    #[test]
+    fn repro_env_pin_then_register_row_visible_in_worktrees() {
+        let db = Db::open_memory().unwrap();
+        db.set_worktree_env("/wt/new", "machine0").unwrap();
+        db.put_worktree("tab", "/repo", "/wt/new", "feat", None, None)
+            .unwrap();
+        let rows = db.worktrees().unwrap();
+        assert_eq!(rows.len(), 1, "row dropped from worktrees(): {rows:?}");
+        // put_worktree must heal the NULL columns the env-pin insert left behind,
+        // and the pin itself must survive registration.
+        let row = &rows[0];
+        assert_eq!(row.branch, "feat");
+        assert_eq!(row.repo_root, "/repo");
+        assert!(row.created_at > 0, "created_at not healed: {row:?}");
+        assert_eq!(row.env_name.as_deref(), Some("machine0"));
+    }
+
+    #[test]
+    fn env_pin_only_row_survives_worktrees_scan() {
+        // A pin set on a worktree that has not been opened yet (no put_worktree)
+        // must still be enumerable, not silently dropped by NULL columns.
+        let db = Db::open_memory().unwrap();
+        db.set_worktree_env("/wt/pending", "vps").unwrap();
+        let rows = db.worktrees().unwrap();
+        assert_eq!(rows.len(), 1, "pin-only row dropped: {rows:?}");
+        assert_eq!(rows[0].env_name.as_deref(), Some("vps"));
+        assert_eq!(rows[0].branch, "");
     }
 
     #[test]

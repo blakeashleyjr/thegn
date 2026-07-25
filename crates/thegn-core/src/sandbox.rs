@@ -1006,9 +1006,22 @@ pub fn health_check(spec: &SandboxSpec) -> bool {
 /// bound) for both questions. The format emits an `OK` sentinel first line so
 /// we can distinguish "container missing / inspect failed" (no sentinel) from
 /// "running but mounts differ".
+/// Whether an OCI create (`oci_create_opts`) actually emits a `-v` bind for this
+/// mount. The DNS/hosts files are deliberately skipped for OCI backends (the
+/// runtime synthesizes its own — see `oci_create_opts`), so `container_status`
+/// must use the *same* predicate when it verifies the running container's binds,
+/// or it demands mounts that were never created and force-recreates forever.
+fn oci_emits_mount(m: &Mount) -> bool {
+    !matches!(m.dest.as_str(), "/etc/resolv.conf" | "/etc/hosts")
+}
+
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
-    let required: std::collections::HashSet<&str> =
-        spec.mounts.iter().map(|m| m.host.as_str()).collect();
+    let required: std::collections::HashSet<&str> = spec
+        .mounts
+        .iter()
+        .filter(|m| oci_emits_mount(m))
+        .map(|m| m.host.as_str())
+        .collect();
 
     // Emit "RUNNING" if actually running (not "created"/"exited"), then one
     // bind-mount source per line. A container in "created" state passes inspect
@@ -1635,7 +1648,7 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
         // container's own empty loopback → "Could not resolve host". bwrap/systemd
         // share the host netns and keep these mounts (loopback works there); this
         // also unshadows the `--dns` filter injection above.
-        if matches!(m.dest.as_str(), "/etc/resolv.conf" | "/etc/hosts") {
+        if !oci_emits_mount(m) {
             continue;
         }
         let suffix = if m.ro { ":ro" } else { "" };
@@ -1938,20 +1951,36 @@ fn parse_sandbox_stats(output: &str) -> Option<SandboxStats> {
 }
 
 pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> Vec<String> {
-    // Each active worktree owns both its container and (when `agent_profile`
-    // differs) the agent's `-szagent` container — neither is an orphan.
-    let active_names: Vec<String> = active_worktrees
+    // A live worktree owns EVERY container that reduces to its slug: the plain
+    // `thegn-{slug}`, the profile variant `thegn-{profile}-{slug}`
+    // (`container_name_with_profile`), and the `-szagent` / `-szvpn` companions of
+    // either. Reconcile by reverse-mapping each candidate back to a worktree slug
+    // rather than allow-listing exact names — the old allow-list only knew the
+    // plain + `-szagent` forms, so a session launched with a non-default profile
+    // or a VPN sidecar was misread as an orphan and force-removed while live.
+    // Reaping is fail-closed: any container that maps to an active worktree by any
+    // of these forms is kept.
+    let active_slugs: Vec<String> = active_worktrees
         .iter()
-        .flat_map(|w| {
-            let base = container_name(w);
-            [agent_container_name(&base), base]
-        })
+        .map(|w| util::slugify(w))
         .collect();
 
     containers
         .iter()
-        .filter(|c| c.starts_with("thegn-"))
-        .filter(|c| !active_names.contains(c))
+        .filter(|c| c.starts_with(CONTAINER_PREFIX))
+        .filter(|c| {
+            // Strip the companion suffixes to get the worktree/profile container
+            // base (`thegn-{slug}` or `thegn-{profile}-{slug}`).
+            let base = strip_vpn_suffix(strip_agent_suffix(c));
+            let Some(rest) = base.strip_prefix(CONTAINER_PREFIX) else {
+                return true;
+            };
+            // Orphan unless `rest` is an active slug (plain form) or ends with
+            // `-{slug}` (profile-prefixed form) for some active worktree.
+            !active_slugs
+                .iter()
+                .any(|s| rest == s || rest.ends_with(&format!("-{s}")))
+        })
         .cloned()
         .collect()
 }
@@ -2341,6 +2370,46 @@ mod tests {
         assert!(!j.contains(":/etc/hosts"), "/etc/hosts mounted: {j}");
         // Real worktree mounts are untouched.
         assert!(j.contains("-v /wt/feat:/wt/feat"));
+    }
+
+    #[test]
+    fn container_status_required_mounts_are_a_subset_of_created_mounts() {
+        // The force-recreate loop: container_status must only require mounts that
+        // oci_create_opts actually emits. With host DNS/hosts mounts in the spec,
+        // the runtime never binds them (oci_opts_never_bind_mount_host_dns_files),
+        // so requiring them made every ensure() see "stale mounts" and recreate the
+        // running container — killing live pane sessions on the default config.
+        let mut s = spec(Backend::Podman);
+        s.mounts.push(Mount {
+            host: "/etc/resolv.conf".into(),
+            dest: "/etc/resolv.conf".into(),
+            ro: true,
+            cache: false,
+        });
+        s.mounts.push(Mount {
+            host: "/etc/hosts".into(),
+            dest: "/etc/hosts".into(),
+            ro: true,
+            cache: false,
+        });
+        let emitted = oci_create_opts(&s).join(" ");
+        for m in s.mounts.iter().filter(|m| oci_emits_mount(m)) {
+            // Every required host path must appear as a created -v source.
+            assert!(
+                emitted.contains(&format!("-v {}:", m.host)),
+                "required mount {} not emitted by oci_create_opts: {emitted}",
+                m.host
+            );
+        }
+        // And the two DNS files must NOT be in the required set.
+        let required: std::collections::HashSet<&str> = s
+            .mounts
+            .iter()
+            .filter(|m| oci_emits_mount(m))
+            .map(|m| m.host.as_str())
+            .collect();
+        assert!(!required.contains("/etc/resolv.conf"));
+        assert!(!required.contains("/etc/hosts"));
     }
 
     #[test]
@@ -2951,5 +3020,39 @@ mod tests {
         assert!(!orphans.contains(&base));
         assert!(!orphans.contains(&agent));
         assert!(orphans.contains(&container_name("/wt/dead")));
+    }
+
+    #[test]
+    fn identify_orphans_spares_vpn_sidecar_and_profile_containers_of_live_worktrees() {
+        // Regression: a live worktree launched with a non-default profile
+        // (`thegn-{profile}-{slug}`) or a VPN sidecar (`-szvpn`) must never be
+        // reaped by run_gc. The old exact-name allow-list only knew the plain and
+        // `-szagent` forms and force-removed these live containers.
+        let active = vec!["/wt/feat".to_string()];
+        let base = container_name("/wt/feat");
+        let vpn = vpn_sidecar_name(&base);
+        let profile = container_name_with_profile("/wt/feat", Some("sealed"));
+        let profile_vpn = vpn_sidecar_name(&profile);
+        let profile_agent = agent_container_name(&profile);
+        let dead = container_name("/wt/dead");
+        let dead_vpn = vpn_sidecar_name(&dead);
+
+        let containers = vec![
+            base.clone(),
+            vpn.clone(),
+            profile.clone(),
+            profile_vpn.clone(),
+            profile_agent.clone(),
+            dead.clone(),
+            dead_vpn.clone(),
+        ];
+        let orphans = identify_orphans(&active, &containers);
+
+        for live in [&base, &vpn, &profile, &profile_vpn, &profile_agent] {
+            assert!(!orphans.contains(live), "reaped live container {live}");
+        }
+        // A dead worktree's container AND its sidecar are still orphans.
+        assert!(orphans.contains(&dead));
+        assert!(orphans.contains(&dead_vpn));
     }
 }

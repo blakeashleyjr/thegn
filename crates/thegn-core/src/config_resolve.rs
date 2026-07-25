@@ -560,9 +560,9 @@ pub fn classify_repo_overlay(
         }
         Some(list) => {
             let mut granted = Vec::new();
-            for entry in list {
-                if allow_entry_covered(&entry, &base.network_allow) {
-                    granted.push(entry);
+            for entry in &list {
+                if allow_entry_covered(entry, &base.network_allow) {
+                    granted.push(entry.clone());
                 } else {
                     events.push(ClampEvent::deny(
                         layer,
@@ -575,9 +575,30 @@ pub fn classify_repo_overlay(
                     ));
                 }
             }
-            // Setting the (narrowed) allow list replaces the base list, which is
-            // correct: the granted set is the intersection.
-            out.network_allow = Some(granted);
+            if granted.is_empty() {
+                // Every requested host was outside the trusted ceiling, so the
+                // intersection is empty. An empty `network_allow` means "allow
+                // everything" (DnsPolicy treats [] as universe and the filter is
+                // never even started), which would *widen* egress to the full
+                // internet — the opposite of the deny we just logged. Encode the
+                // empty intersection as deny-all, exactly like the empty-request
+                // branch above. Leaving `out.network_allow` = None here would
+                // instead inherit the trusted ceiling; deny-all is the stricter,
+                // safer reading of "you may narrow but asked only for the denied".
+                extra_block.push("*".to_string());
+                events.push(ClampEvent {
+                    layer,
+                    key: "sandbox.network_allow".to_string(),
+                    rule: RepoFieldRule::CeilingIntersect,
+                    requested: json!(&list),
+                    granted: json!("deny-all (no requested host within the trusted allow list)"),
+                    reason: "every requested egress host is outside the trusted allow list ⇒ deny all egress".to_string(),
+                });
+            } else {
+                // Setting the (narrowed) allow list replaces the base list, which
+                // is correct: the granted set is the intersection.
+                out.network_allow = Some(granted);
+            }
         }
     }
 
@@ -1347,6 +1368,36 @@ mod tests {
             r.events
                 .iter()
                 .any(|e| e.key == "sandbox.network_allow" && e.requested == json!("evil.com"))
+        );
+    }
+
+    #[test]
+    fn network_allow_all_denied_becomes_deny_all_not_allow_all() {
+        // Regression: a hostile repo requesting ONLY hosts outside the trusted
+        // ceiling used to resolve to an empty allow list (= allow-all / no filter),
+        // silently widening egress while logging a denial. It must resolve to
+        // deny-all instead.
+        let mut b = base();
+        b.network_allow = vec!["api.github.com".into()];
+        let mut o = overlay();
+        o.network_allow = Some(vec!["evil.com".into()]);
+        let r = classify_repo_overlay(o, &b, &Approvals::deny_all());
+        // Not an empty (universe) allow list.
+        assert_ne!(r.sanctioned.network_allow, Some(vec![]));
+        // Deny-all is encoded as a universal block.
+        assert!(
+            r.sanctioned
+                .network_block
+                .as_ref()
+                .is_some_and(|b| b.contains(&"*".to_string())),
+            "expected deny-all block, got {:?}",
+            r.sanctioned.network_block
+        );
+        // The original per-host denial is still reported.
+        assert!(
+            r.events
+                .iter()
+                .any(|e| e.key == "sandbox.network_allow")
         );
     }
 
