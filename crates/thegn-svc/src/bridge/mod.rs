@@ -486,12 +486,24 @@ fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs, procs: Procs
                         .get("params")
                         .cloned()
                         .and_then(|p| serde_json::from_value::<ProcOutNote>(p).ok())
-                        && let Some(tx) = procs.lock().unwrap().get(&note.chan)
                     {
-                        let _ = tx.send(ProcEvent::Out {
-                            stream: note.stream,
-                            data: B64.decode(&note.data).unwrap_or_default(),
-                        });
+                        // A malformed payload is a protocol violation; drop the
+                        // frame (never deliver a silently-empty chunk) but keep
+                        // the stream alive.
+                        match B64.decode(&note.data) {
+                            Ok(data) => {
+                                if let Some(tx) = procs.lock().unwrap().get(&note.chan) {
+                                    let _ = tx.send(ProcEvent::Out {
+                                        stream: note.stream,
+                                        data,
+                                    });
+                                }
+                            }
+                            Err(e) => tracing::warn!(
+                                chan = note.chan,
+                                "proc.out: dropping frame with invalid base64: {e}"
+                            ),
+                        }
                     }
                     continue;
                 }
@@ -633,7 +645,7 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
         .spawn()
         .with_context(|| format!("spawn {}", p.argv.join(" ")))?;
     let stdout = child.stdout.take().context("child stdout")?;
-    let stderr = child.stderr.take().context("child stdin")?;
+    let stderr = child.stderr.take().context("child stderr")?;
     let stdin = child.stdin.take().context("child stdin")?;
     let chan = p.chan;
     procs.lock().unwrap().insert(
@@ -703,7 +715,10 @@ fn proc_stdin_response(req: &Request, procs: &ProcRegistry) -> Response {
     let Some(stdin) = stdin else {
         return resp_err(req.id, format!("no such channel {}", p.chan));
     };
-    let data = B64.decode(&p.data).unwrap_or_default();
+    let data = match B64.decode(&p.data) {
+        Ok(d) => d,
+        Err(e) => return resp_err(req.id, format!("proc.stdin: invalid base64: {e}")),
+    };
     let mut g = stdin.lock().unwrap();
     match g.write_all(&data).and_then(|_| g.flush()) {
         Ok(()) => resp_ok(req.id, serde_json::json!({})),
@@ -1137,6 +1152,66 @@ mod tests {
             }
         }
         assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn proc_stdin_rejects_invalid_base64() {
+        let c = connect();
+        let (chan, rx) = c.spawn_proc(&["cat"], None, &[]).unwrap();
+        // A corrupt payload must be rejected, not silently written as empty.
+        let e = c
+            .call("proc.stdin", serde_json::json!({ "chan": chan, "data": "%%%" }))
+            .unwrap_err();
+        assert!(e.to_string().contains("invalid base64"), "err: {e}");
+        // The channel survives the rejected write: valid stdin still round-trips.
+        c.proc_stdin(chan, b"still-alive\n").unwrap();
+        match rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a proc event")
+        {
+            ProcEvent::Out { data, .. } => assert_eq!(&data, b"still-alive\n"),
+            ProcEvent::Exit { .. } => panic!("exited before echo"),
+        }
+        c.proc_kill(chan).unwrap();
+    }
+
+    #[test]
+    fn proc_out_with_invalid_base64_is_dropped_not_emptied() {
+        // Hand-roll the server side so a corrupt proc.out frame can be injected:
+        // the client must drop it (never deliver a silently-empty chunk) and keep
+        // the stream alive for the next valid frame.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (go_tx, go_rx) = channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Wait until the client has registered chan 1, so neither frame
+            // races the subscription.
+            go_rx.recv().unwrap();
+            for data in ["%%%not-base64%%%".to_string(), B64.encode(b"ok")] {
+                let note = serde_json::json!({
+                    "method": "proc.out",
+                    "params": { "chan": 1, "stream": "stdout", "data": data }
+                });
+                sock.write_all(&framing::encode(&note.to_string())).unwrap();
+            }
+            sock.flush().unwrap();
+            sock // keep the connection open until the client has read both frames
+        });
+        let sock = TcpStream::connect(addr).unwrap();
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let (tx, rx) = channel();
+        c.procs.lock().unwrap().insert(1, tx);
+        go_tx.send(()).unwrap();
+        // Only the valid frame arrives; the corrupt one was dropped.
+        match rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a proc event")
+        {
+            ProcEvent::Out { data, .. } => assert_eq!(&data, b"ok"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        drop(server.join());
     }
 
     #[test]
