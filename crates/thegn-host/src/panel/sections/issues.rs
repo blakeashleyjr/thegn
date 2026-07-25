@@ -510,9 +510,10 @@ mod tests {
     }
 
     fn panel_with(issues: Vec<Issue>) -> crate::panel::PanelData {
-        let mut p = crate::panel::PanelData::default();
-        p.tracker_issues = issues;
-        p
+        crate::panel::PanelData {
+            tracker_issues: issues,
+            ..Default::default()
+        }
     }
 
     #[test]
