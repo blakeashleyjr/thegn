@@ -43,6 +43,15 @@ fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String, String)> {
     ))
 }
 
+/// A git object id is 40 (SHA-1) or 64 (SHA-256) hex chars. Validate a parsed
+/// `merge-tree` tree oid before handing it to `commit-tree`: a truncated or
+/// garbled output (lossy SSH/bridge transport) would otherwise flow downstream
+/// as a bogus tree, failing deep inside `commit-tree` with an opaque "not a
+/// valid object" and potentially leaving the fold wedged. Reject it loudly here.
+fn is_object_id(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub trait PlumbingOps: GitBackend {
     /// Resolve a rev to a full object id (`git rev-parse <rev>`).
     fn rev_parse(&self, loc: &GitLoc, rev: &str) -> Result<String> {
@@ -73,12 +82,21 @@ pub trait PlumbingOps: GitBackend {
         let tree = parts.next().unwrap_or("").trim().to_string();
         match code {
             0 => {
-                if tree.is_empty() {
-                    anyhow::bail!("merge-tree: empty tree oid (stderr: {})", stderr.trim());
+                if !is_object_id(&tree) {
+                    anyhow::bail!(
+                        "merge-tree: invalid tree oid {tree:?} (stderr: {})",
+                        stderr.trim()
+                    );
                 }
                 Ok(MergeTreeOutcome::Clean { tree })
             }
             1 => {
+                if !is_object_id(&tree) {
+                    anyhow::bail!(
+                        "merge-tree: invalid tree oid {tree:?} on conflict (stderr: {})",
+                        stderr.trim()
+                    );
+                }
                 let mut paths = Vec::new();
                 for p in parts {
                     if p.is_empty() {
@@ -150,8 +168,19 @@ impl<T: GitBackend + ?Sized> PlumbingOps for T {}
 mod tests {
     use super::super::testutil::{TestRepo, git_in};
     use super::super::{CliGit, GitBackend};
-    use super::{MergeTreeOutcome, PlumbingOps};
+    use super::{MergeTreeOutcome, PlumbingOps, is_object_id};
     use std::path::Path;
+
+    #[test]
+    fn is_object_id_accepts_sha1_and_sha256_only() {
+        assert!(is_object_id(&"a".repeat(40))); // SHA-1
+        assert!(is_object_id(&"0".repeat(64))); // SHA-256
+        assert!(!is_object_id("")); // empty (truncated output)
+        assert!(!is_object_id(&"a".repeat(39))); // one short
+        assert!(!is_object_id(&"a".repeat(41))); // one long
+        assert!(!is_object_id(&"g".repeat(40))); // non-hex
+        assert!(!is_object_id("Already up to date.")); // stray informational line
+    }
 
     /// Ops run through `GitLoc` (the user's real git env), so the repo needs an
     /// identity for `commit-tree`/`commit` to succeed deterministically.

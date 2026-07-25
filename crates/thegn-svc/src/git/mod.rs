@@ -461,11 +461,19 @@ fn run_bridge(
     loc: &GitLoc,
     args: &[&str],
     env: &[(String, String)],
+    read_only: bool,
 ) -> Result<String> {
     let mut argv: Vec<String> = vec!["git".into(), "-C".into(), loc.path()];
     argv.extend(args.iter().map(|s| s.to_string()));
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let r = b.exec(&refs, None, env)?;
+    // Reads (status/diff/rev-*) take the shorter interactive deadline; writes
+    // (fetch/push/pull via `run_w`) keep the long default — a big fetch is slow
+    // but legitimate. See `BridgeClient::exec_read` / `exec`.
+    let r = if read_only {
+        b.exec_read(&refs, None, env)?
+    } else {
+        b.exec(&refs, None, env)?
+    };
     if r.exit != 0 {
         anyhow::bail!("git {} failed: {}", args.join(" "), r.stderr.trim());
     }
@@ -476,11 +484,9 @@ fn run(loc: &GitLoc, args: &[&str]) -> Result<String> {
     // Route through the resident bridge when one is connected for this worktree
     // (no-op/None for local locs — see `bridge::for_loc`'s fast path).
     if let Some(b) = crate::bridge::for_loc(loc) {
-        return run_bridge(&b, loc, args, &[]);
+        return run_bridge(&b, loc, args, &[], true);
     }
-    let out = loc
-        .git_command(args)
-        .output()
+    let out = output_bounded(loc.git_command(args), args)
         .with_context(|| format!("git {}", args.join(" ")))?;
     if !out.status.success() {
         anyhow::bail!(
@@ -503,12 +509,10 @@ fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String)> {
         let mut argv: Vec<String> = vec!["git".into(), "-C".into(), loc.path()];
         argv.extend(args.iter().map(|s| s.to_string()));
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let r = b.exec(&refs, None, &[])?;
+        let r = b.exec_read(&refs, None, &[])?; // read: no-upstream/absent-ref probes
         return Ok((r.exit, r.stdout));
     }
-    let out = loc
-        .git_command(args)
-        .output()
+    let out = output_bounded(loc.git_command(args), args)
         .with_context(|| format!("git {}", args.join(" ")))?;
     Ok((
         out.status.code().unwrap_or(-1),
@@ -516,8 +520,100 @@ fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String)> {
     ))
 }
 
-/// Parse `git status --porcelain=v1 -z` output into staged/unstaged/path rows.
-/// Shared by [`CliGit::status`] and the batched [`glyph_reads`].
+/// Upper bound (seconds) on a subprocess git *read* before the child is killed,
+/// so a wedged git — a lock held by a crashed process, a hung NFS/SSH mount, a
+/// stalled pack negotiation on a remote loc — can't pin a background hydration
+/// worker forever (the symptom is a silent, permanently-stale sidebar). Reads
+/// and fast local staging flow through [`run`]/[`run_status`]; the network-heavy
+/// writes (fetch/clone/push/pull) go through `run_w` and are deliberately *not*
+/// bounded here. Override with `THEGN_GIT_READ_TIMEOUT_SECS`; `0` disables it.
+fn git_read_timeout() -> Option<std::time::Duration> {
+    let secs = std::env::var("THEGN_GIT_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(60);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Run a prepared git `Command` capturing full output, but kill the child if it
+/// outruns [`git_read_timeout`]. Both pipes are drained on threads so a large
+/// output can't deadlock the wait; the exit is polled with a short adaptive
+/// backoff. This always runs on a background worker (hydration / diff watcher),
+/// never the compositor loop, so the poll costs nothing the UI can feel.
+fn output_bounded(cmd: std::process::Command, args: &[&str]) -> Result<std::process::Output> {
+    output_bounded_with(cmd, args, git_read_timeout())
+}
+
+/// [`output_bounded`] with the timeout injected — the seam the unit tests drive
+/// so they don't have to mutate the process-global `THEGN_GIT_READ_TIMEOUT_SECS`.
+fn output_bounded_with(
+    mut cmd: std::process::Command,
+    args: &[&str],
+    timeout: Option<std::time::Duration>,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let Some(timeout) = timeout else {
+        return Ok(cmd.output()?);
+    };
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut so = child.stdout.take().expect("piped stdout");
+    let mut se = child.stderr.take().expect("piped stderr");
+    let so_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = so.read_to_end(&mut b);
+        b
+    });
+    let se_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = se.read_to_end(&mut b);
+        b
+    });
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "git {} timed out after {}s (killed)",
+                args.join(" "),
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(backoff.min(remaining));
+        backoff = (backoff * 2).min(Duration::from_millis(25));
+    };
+    // Pipes are closed now the child has exited, so the readers finish promptly.
+    let stdout = so_h.join().unwrap_or_default();
+    let stderr = se_h.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Parse `git status --porcelain=v1 -z --no-renames` output into
+/// staged/unstaged/path rows. Shared by [`CliGit::status`] and the batched
+/// [`glyph_reads`].
+///
+/// `--no-renames` is load-bearing: with rename detection on, a rename emits two
+/// NUL-separated fields (`R  new\0old`), and splitting on `\0` would treat the
+/// `old` path as its own entry — parsing its first two bytes as garbage
+/// staged/unstaged flags and truncating the path. Disabling rename detection
+/// reports the change as a plain delete + add, each a well-formed XY row, which
+/// is exactly what a dirty-flag list wants.
 fn parse_status_porcelain(out: &str) -> Vec<FileStatus> {
     let mut v = Vec::new();
     for entry in out.split('\0').filter(|s| s.len() >= 3) {
@@ -553,7 +649,7 @@ fn parse_ahead_behind(out: &str) -> Option<(usize, usize)> {
 pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
     if let Some(b) = crate::bridge::for_loc(loc) {
         let cmds: Vec<Vec<String>> = [
-            &["status", "--porcelain=v1", "-z"][..],
+            &["status", "--porcelain=v1", "-z", "--no-renames"][..],
             &["rev-list", "--left-right", "--count", "@{u}...HEAD"][..],
             &["rev-parse", "--abbrev-ref", "HEAD"][..],
         ]
@@ -625,7 +721,7 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
     if let Some(b) = crate::bridge::for_loc(loc) {
         let mut env: Vec<(String, String)> = vec![("GIT_TERMINAL_PROMPT".into(), "0".into())];
         env.extend(envs.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-        return run_bridge(&b, loc, args, &env);
+        return run_bridge(&b, loc, args, &env, false);
     }
     // Serialize this mutation against other thegn/agent processes on the same
     // repo (held for the subprocess's lifetime). Remote locs lock on their own
@@ -706,7 +802,7 @@ impl GitBackend for CliGit {
     fn status(&self, loc: &GitLoc) -> Result<Vec<FileStatus>> {
         Ok(parse_status_porcelain(&run(
             loc,
-            &["status", "--porcelain=v1", "-z"],
+            &["status", "--porcelain=v1", "-z", "--no-renames"],
         )?))
     }
 
@@ -1076,6 +1172,110 @@ pub(crate) mod testutil {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_status_porcelain_plain_rows() {
+        // `-z` uses NUL terminators, XY flags in the first two columns, a space,
+        // then the path. Trailing NUL yields an empty final entry (filtered out).
+        let out = "M  src/a.rs\0?? new.txt\0 M lib.rs\0";
+        let v = parse_status_porcelain(out);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].staged, 'M');
+        assert_eq!(v[0].unstaged, ' ');
+        assert_eq!(v[0].path, "src/a.rs");
+        assert_eq!(
+            (v[1].staged, v[1].unstaged, v[1].path.as_str()),
+            ('?', '?', "new.txt")
+        );
+        assert_eq!(
+            (v[2].staged, v[2].unstaged, v[2].path.as_str()),
+            (' ', 'M', "lib.rs")
+        );
+    }
+
+    #[test]
+    fn parse_status_porcelain_empty_and_short_input() {
+        assert!(parse_status_porcelain("").is_empty());
+        // Entries shorter than "XY " (3 bytes) are not valid rows and are dropped.
+        assert!(parse_status_porcelain("A\0").is_empty());
+    }
+
+    #[test]
+    fn parse_status_porcelain_no_phantom_row_with_no_renames() {
+        // With `--no-renames` a rename is reported as delete(old) + add(new) —
+        // two well-formed XY rows, no split-`\0` phantom. This is the shape the
+        // status invocations now request; the parser must yield exactly two
+        // clean rows with valid status flags.
+        let out = "D  old.txt\0A  new.txt\0";
+        let v = parse_status_porcelain(out);
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].staged, v[0].path.as_str()), ('D', "old.txt"));
+        assert_eq!((v[1].staged, v[1].path.as_str()), ('A', "new.txt"));
+        // No row carries a lowercase-letter staged flag (the tell-tale of a
+        // path fragment misparsed as status bytes).
+        assert!(v.iter().all(|f| !f.staged.is_ascii_lowercase()));
+    }
+
+    #[test]
+    fn parse_ahead_behind_valid_and_order() {
+        // `rev-list --left-right --count @{u}...HEAD` prints "<behind>\t<ahead>";
+        // the parser returns (ahead, behind).
+        assert_eq!(parse_ahead_behind("2\t5"), Some((5, 2)));
+        assert_eq!(parse_ahead_behind("0\t0"), Some((0, 0)));
+    }
+
+    #[test]
+    fn output_bounded_fast_command_succeeds() {
+        let mut c = std::process::Command::new("printf");
+        c.arg("hello");
+        let out = output_bounded_with(
+            c,
+            &["printf", "hello"],
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+    }
+
+    #[test]
+    fn output_bounded_kills_a_hung_command() {
+        // A command that would run far longer than the bound must be killed and
+        // surface a timeout error — quickly, not after the sleep elapses.
+        let start = std::time::Instant::now();
+        let mut c = std::process::Command::new("sleep");
+        c.arg("30");
+        let r = output_bounded_with(
+            c,
+            &["sleep", "30"],
+            Some(std::time::Duration::from_millis(200)),
+        );
+        assert!(r.is_err(), "expected a timeout error");
+        assert!(
+            r.unwrap_err().to_string().contains("timed out"),
+            "error should mention the timeout"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "should return shortly after the bound, not after the sleep"
+        );
+    }
+
+    #[test]
+    fn output_bounded_disabled_timeout_runs_to_completion() {
+        let mut c = std::process::Command::new("printf");
+        c.arg("ok");
+        let out = output_bounded_with(c, &["printf", "ok"], None).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ok");
+    }
+
+    #[test]
+    fn parse_ahead_behind_malformed_is_none() {
+        assert_eq!(parse_ahead_behind(""), None);
+        assert_eq!(parse_ahead_behind("garbage"), None);
+        assert_eq!(parse_ahead_behind("3"), None); // single field
+        assert_eq!(parse_ahead_behind("a\tb"), None); // non-numeric
+    }
 
     fn repo_root() -> std::path::PathBuf {
         // The svc crate dir is <root>/crates/thegn-svc; the repo root is two up.

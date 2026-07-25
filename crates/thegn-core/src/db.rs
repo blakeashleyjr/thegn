@@ -783,7 +783,6 @@ impl Db {
     pub(crate) fn notifications_query(
         &self,
         sql: &str,
-        _params: &[&dyn rusqlite::ToSql],
         limit: usize,
     ) -> Result<Vec<crate::notification::Notification>> {
         let mut stmt = self.conn.prepare(sql)?;

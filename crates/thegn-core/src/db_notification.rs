@@ -32,7 +32,6 @@ impl NotificationStore for Db {
         self.notifications_query(
             "SELECT id,kind,issue_id,message,created_at_ms,read,worktree_path \
              FROM notifications WHERE read=0 ORDER BY created_at_ms DESC",
-            rusqlite::params![],
             usize::MAX,
         )
     }
@@ -45,7 +44,6 @@ impl NotificationStore for Db {
         self.notifications_query(
             "SELECT id,kind,issue_id,message,created_at_ms,read,worktree_path \
              FROM notifications ORDER BY created_at_ms DESC",
-            rusqlite::params![],
             limit,
         )
     }

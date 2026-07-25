@@ -168,7 +168,10 @@ pub struct BridgeClient {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     next_id: AtomicU64,
     pending: Pending,
+    /// RPC deadline for the default/write path (fetch/push/pull run long).
     timeout: Duration,
+    /// Shorter deadline for interactive read-only ops (glyph fan-out, status).
+    read_timeout: Duration,
     _reader: std::thread::JoinHandle<()>,
     subs: Subs,
     next_watch: AtomicU64,
@@ -177,6 +180,18 @@ pub struct BridgeClient {
     /// The spawned agent process, owned so it's killed when the client drops
     /// (subprocess transports). `None` for a caller-provided stream (tests).
     child: Mutex<Option<Child>>,
+}
+
+/// Resolve a bridge RPC deadline from `var` (seconds), falling back to
+/// `default_secs`. A missing/blank/unparseable value uses the default; `0` is
+/// treated as the default too (a bridge RPC with no deadline could hang forever).
+fn env_timeout(var: &str, default_secs: u64) -> Duration {
+    let secs = std::env::var(var)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(default_secs);
+    Duration::from_secs(secs)
 }
 
 impl BridgeClient {
@@ -220,7 +235,8 @@ impl BridgeClient {
             writer: Arc::new(Mutex::new(Box::new(writer))),
             next_id: AtomicU64::new(1),
             pending,
-            timeout: Duration::from_secs(120),
+            timeout: env_timeout("THEGN_BRIDGE_TIMEOUT_SECS", 120),
+            read_timeout: env_timeout("THEGN_BRIDGE_READ_TIMEOUT_SECS", 20),
             _reader: handle,
             subs,
             next_watch: AtomicU64::new(1),
@@ -231,6 +247,20 @@ impl BridgeClient {
     }
 
     fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        self.call_within(method, params, self.timeout)
+    }
+
+    /// [`call`](Self::call) with an explicit RPC deadline. Interactive read-only
+    /// ops (the sidebar glyph fan-out, `git status`/`rev-list` reads) pass the
+    /// shorter `read_timeout` so a stalled remote can't freeze a panel poll for
+    /// two minutes; network writes (fetch/push/pull via `run_w`) keep the long
+    /// default because a large fetch legitimately runs for a while.
+    fn call_within(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
         warn_if_on_loop_thread(method);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = channel();
@@ -247,7 +277,7 @@ impl BridgeClient {
                 bail!("bridge write failed: {e}");
             }
         }
-        match rx.recv_timeout(self.timeout) {
+        match rx.recv_timeout(timeout) {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(anyhow!("bridge: {e}")),
             Err(_) => {
@@ -257,19 +287,45 @@ impl BridgeClient {
         }
     }
 
-    /// Run a command in the env and return its captured output.
+    /// Run a command in the env and return its captured output. Uses the long
+    /// default RPC timeout — the write path (`run_w`: fetch/push/pull) rides this,
+    /// and those can legitimately run for a while.
     pub fn exec(
         &self,
         argv: &[&str],
         cwd: Option<&str>,
         env: &[(String, String)],
     ) -> Result<ExecResult> {
+        self.exec_within(argv, cwd, env, self.timeout)
+    }
+
+    /// [`exec`](Self::exec) bounded by the shorter interactive `read_timeout`, for
+    /// read-only git ops on the panel-poll path where a stalled remote must not
+    /// wedge the UI for the full write deadline.
+    pub fn exec_read(
+        &self,
+        argv: &[&str],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+    ) -> Result<ExecResult> {
+        self.exec_within(argv, cwd, env, self.read_timeout)
+    }
+
+    fn exec_within(
+        &self,
+        argv: &[&str],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<ExecResult> {
         let params = serde_json::to_value(ExecParams {
             argv: argv.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.map(str::to_string),
             env: env.to_vec(),
         })?;
-        Ok(serde_json::from_value(self.call("exec", params)?)?)
+        Ok(serde_json::from_value(
+            self.call_within("exec", params, timeout)?,
+        )?)
     }
 
     /// Run several commands in the env in **one** round-trip, returning each one's
@@ -286,7 +342,12 @@ impl BridgeClient {
             cmds: cmds.to_vec(),
             env: env.to_vec(),
         })?;
-        Ok(serde_json::from_value(self.call("exec.batch", params)?)?)
+        // Read-only glyph fan-out — bound by the shorter interactive deadline.
+        Ok(serde_json::from_value(self.call_within(
+            "exec.batch",
+            params,
+            self.read_timeout,
+        )?)?)
     }
 
     /// Sum of CPU jiffies per path for processes in the env whose cwd is under it
@@ -954,6 +1015,28 @@ fn do_exec(p: &ExecParams) -> Result<ExecResult> {
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn env_timeout_uses_default_when_unset_or_invalid() {
+        // A name no test sets — exercises the missing/blank fallback.
+        assert_eq!(
+            env_timeout("THEGN_NOPE_UNSET_TIMEOUT", 42),
+            Duration::from_secs(42)
+        );
+    }
+
+    #[test]
+    fn read_timeout_is_shorter_than_the_write_default() {
+        // The interactive read deadline must not exceed the write/default one, or
+        // a stalled read would still block for the full write timeout.
+        let c = connect();
+        assert!(
+            c.read_timeout <= c.timeout,
+            "read_timeout {:?} should be <= write timeout {:?}",
+            c.read_timeout,
+            c.timeout
+        );
+    }
 
     /// Connect a client to a freshly-served agent over a loopback socket (a real
     /// duplex byte stream — the same shape ssh/sprite-exec stdio provides).
