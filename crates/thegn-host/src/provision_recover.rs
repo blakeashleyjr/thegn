@@ -173,7 +173,10 @@ mod tests {
                     Stack backtrace:\n   0: <unknown>\n";
         assert!(stderr_gist(blob).starts_with("Error: machine0-ssh:"));
         // No Error: line → last non-empty line.
-        assert_eq!(stderr_gist("warming up\nclone failed badly\n\n"), "clone failed badly");
+        assert_eq!(
+            stderr_gist("warming up\nclone failed badly\n\n"),
+            "clone failed badly"
+        );
         // Empty → empty.
         assert_eq!(stderr_gist("  \n\n"), "");
         // ANSI stripped + long lines capped (sanitize_detail semantics).

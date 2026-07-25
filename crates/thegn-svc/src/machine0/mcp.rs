@@ -417,7 +417,10 @@ mod tests {
             "content": [{"type":"text","text":"{\"error\":\"MACHINE_LIMIT_REACHED\",\"message\":\"machine limit reached\"}"}],
         });
         let e = unwrap_tool_result(result).unwrap_err();
-        assert_eq!(e.to_string(), "MACHINE_LIMIT_REACHED: machine limit reached");
+        assert_eq!(
+            e.to_string(),
+            "MACHINE_LIMIT_REACHED: machine limit reached"
+        );
     }
 
     #[test]
@@ -428,9 +431,15 @@ mod tests {
         );
         // only one field present
         assert_eq!(business_error_message(r#"{"error":"E_CODE"}"#), "E_CODE");
-        assert_eq!(business_error_message(r#"{"message":"just a message"}"#), "just a message");
+        assert_eq!(
+            business_error_message(r#"{"message":"just a message"}"#),
+            "just a message"
+        );
         // identical code+message collapses to one
-        assert_eq!(business_error_message(r#"{"error":"x","message":"x"}"#), "x");
+        assert_eq!(
+            business_error_message(r#"{"error":"x","message":"x"}"#),
+            "x"
+        );
         // non-JSON / unrelated shapes pass through untouched
         assert_eq!(business_error_message("plain text"), "plain text");
         assert_eq!(business_error_message(r#"{"other":1}"#), r#"{"other":1}"#);

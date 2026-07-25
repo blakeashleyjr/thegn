@@ -289,7 +289,10 @@ mod tests {
             down_command: vec![],
         });
         // No cached home yet ⇒ cmd unchanged.
-        assert_eq!(with_workdir_cd("shell", Some(&provider), "run".into()), "run");
+        assert_eq!(
+            with_workdir_cd("shell", Some(&provider), "run".into()),
+            "run"
+        );
         // Cached home ⇒ cd into <home>/workspace first.
         cache_home("tg-x-abc", "/home/nix");
         assert_eq!(

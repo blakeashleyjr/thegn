@@ -1348,7 +1348,8 @@ mod tests {
         // The DB workspace env shadows the config default (the pin decision
         // must compare against what `effective_env` will actually resolve).
         let db = Db::open_memory().unwrap();
-        db.put_workspace(&root.to_string_lossy(), "t", "git").unwrap();
+        db.put_workspace(&root.to_string_lossy(), "t", "git")
+            .unwrap();
         db.set_workspace_env(&root.to_string_lossy(), "sprites")
             .unwrap();
         assert_eq!(ambient_env_name(Some(&db), &cfg, &root), "sprites");
