@@ -127,8 +127,38 @@ pub fn remove_env(config_path: &Path, name: &str) -> Result<()> {
     write_doc(config_path, &doc)
 }
 
-/// Set one dotted key (`a.b.c = "value"`) as a string, creating intermediate
-/// tables. The general `config set` counterpart to `config get`.
+/// Infer the TOML scalar type of a raw CLI string so `config set foo.enabled
+/// true` writes a real bool (not the string `"true"`). Booleans and plain
+/// integers/floats are typed; everything else stays a quoted string. This
+/// matters because most config fields are typed (`bool`/`u64`/…): writing a
+/// quoted string into one makes `toml::from_str::<Config>` hard-error, and
+/// `load_layered` then discards the *entire* file and reverts to defaults — so a
+/// single mistyped `config set` used to silently wipe the user's whole config.
+fn typed_value(val: &str) -> Item {
+    match val.trim() {
+        "true" => return value(true),
+        "false" => return value(false),
+        t => {
+            if let Ok(n) = t.parse::<i64>() {
+                return value(n);
+            }
+            // Require a decimal point / exponent before treating as float, so a
+            // long integer id isn't reinterpreted (and lossily rounded) as f64.
+            if (t.contains('.') || t.contains('e') || t.contains('E'))
+                && let Ok(f) = t.parse::<f64>()
+                && f.is_finite()
+            {
+                return value(f);
+            }
+        }
+    }
+    value(val)
+}
+
+/// Set one dotted key (`a.b.c = value`), creating intermediate tables. The
+/// value's type is inferred (see [`typed_value`]): `true`/`false` and bare
+/// integers/floats are written with their native TOML type, everything else as a
+/// string. The general `config set` counterpart to `config get`.
 pub fn set_key(config_path: &Path, dotted: &str, val: &str) -> Result<()> {
     let parts: Vec<&str> = dotted.split('.').filter(|s| !s.is_empty()).collect();
     anyhow::ensure!(!parts.is_empty(), "empty key");
@@ -137,7 +167,7 @@ pub fn set_key(config_path: &Path, dotted: &str, val: &str) -> Result<()> {
     for seg in &parts[..parts.len() - 1] {
         tbl = subtable(tbl, seg);
     }
-    tbl.insert(parts[parts.len() - 1], value(val));
+    tbl.insert(parts[parts.len() - 1], typed_value(val));
     write_doc(config_path, &doc)
 }
 
@@ -536,6 +566,26 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(doc["sandbox"]["backend"].as_str(), Some("docker"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn set_key_infers_scalar_types_and_config_stays_parseable() {
+        let p = tmp("set_typed.toml");
+        let _ = std::fs::remove_file(&p);
+        set_key(&p, "sandbox.enabled", "false").unwrap();
+        set_key(&p, "pr.ttl_secs", "120").unwrap();
+        set_key(&p, "sandbox.backend", "podman").unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        let doc = text.parse::<DocumentMut>().unwrap();
+        // Native types, not quoted strings.
+        assert_eq!(doc["sandbox"]["enabled"].as_bool(), Some(false));
+        assert_eq!(doc["pr"]["ttl_secs"].as_integer(), Some(120));
+        assert_eq!(doc["sandbox"]["backend"].as_str(), Some("podman"));
+        // The whole file must still deserialize as a Config — the failure the bug
+        // caused (typed field := quoted string ⇒ load_layered discards everything).
+        toml::from_str::<crate::config::Config>(&text)
+            .expect("config with a bool/int set must still parse");
         let _ = std::fs::remove_file(&p);
     }
 }
