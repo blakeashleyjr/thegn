@@ -64,28 +64,34 @@ pub(crate) fn changed_file_at(model: &FrameModel, cursor: usize) -> Option<Strin
 /// Toggle a directory's collapsed state in `panel_ui.files_collapsed` and
 /// persist to the DB.
 pub(crate) fn toggle_files_collapse(panel_ui: &mut crate::panel::PanelUi, dir: &str) {
-    if panel_ui.files_collapsed.contains(dir) {
-        panel_ui.files_collapsed.remove(dir);
-        if let Ok(db) = thegn_core::db::Db::open() {
-            let _ = db.del_ui_state("panel.files.col", dir);
-        }
+    let dir = dir.to_string();
+    if panel_ui.files_collapsed.contains(&dir) {
+        panel_ui.files_collapsed.remove(&dir);
+        crate::db_task::persist(move |db| {
+            let _ = db.del_ui_state("panel.files.col", &dir);
+        });
     } else {
-        panel_ui.files_collapsed.insert(dir.to_string());
-        if let Ok(db) = thegn_core::db::Db::open() {
-            let _ = db.set_ui_state("panel.files.col", dir, "1");
-        }
+        panel_ui.files_collapsed.insert(dir.clone());
+        crate::db_task::persist(move |db| {
+            let _ = db.set_ui_state("panel.files.col", &dir, "1");
+        });
     }
 }
 
 /// Persist the accordion's open section + wide mode + active tab (mirrors the
-/// sidebar's inline `ui_state` writes — single-row upserts on a WAL handle,
-/// sub-ms).
+/// sidebar's inline `ui_state` writes — single-row upserts on a WAL handle).
+/// Routed through the background writer so the loop never blocks on `Db::open`.
 pub(crate) fn persist_panel_state(panel_ui: &crate::panel::PanelUi) {
-    if let Ok(db) = thegn_core::db::Db::open() {
-        let _ = db.set_ui_state("panel", "open", panel_ui.open.as_key());
-        let _ = db.set_ui_state("panel", "width", panel_ui.width.as_key());
-        let _ = db.set_ui_state("panel", "tab", panel_ui.tab.as_key());
-    }
+    let (open, width, tab) = (
+        panel_ui.open.as_key(),
+        panel_ui.width.as_key(),
+        panel_ui.tab.as_key(),
+    );
+    crate::db_task::persist(move |db| {
+        let _ = db.set_ui_state("panel", "open", open);
+        let _ = db.set_ui_state("panel", "width", width);
+        let _ = db.set_ui_state("panel", "tab", tab);
+    });
 }
 
 #[cfg(test)]

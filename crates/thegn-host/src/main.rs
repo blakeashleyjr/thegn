@@ -34,6 +34,7 @@ mod cmd;
 mod compositor;
 mod copymode;
 mod daemon;
+mod db_task;
 mod desktop_notify;
 mod detail;
 mod direnv_warm;
@@ -743,6 +744,10 @@ fn main() -> anyhow::Result<()> {
         .thread_name("thegn-rt")
         .build()?;
     let result = rt.block_on(run::main(cli));
+    // Drain queued best-effort DB writes (yank registers, panel ui_state) before
+    // exit. The writer is its own std thread, so it outlives the runtime and this
+    // catches every quit path with one call.
+    db_task::flush(std::time::Duration::from_secs(2));
     rt.shutdown_background();
     report_kept_sessions(handlers::daemon_lifecycle::kept_sessions());
     // termwiz opens /dev/tty without O_CLOEXEC; child pane shells inherit that
