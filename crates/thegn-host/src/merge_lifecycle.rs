@@ -151,7 +151,20 @@ pub(crate) fn reconcile_removed_tabs(
     if gone.is_empty() {
         return false;
     }
+    // `delete_groups` moves `session.active` onto each group it removes
+    // (`switch_to` + `close_active_group`), so a background reap would silently
+    // steal focus onto whatever group shifts into the freed index — often an
+    // unmaterialized tab, which then paints the idle splash on the next full
+    // frame. Re-pin the group the user was on (by name; it survives unless it
+    // was itself reaped), mirroring the user-initiated delete
+    // (`handlers::worktree_delete`).
+    let prior = session.active_group().map(|g| g.name.clone());
     let _ = crate::run::delete_groups(session, panes, gone, false, Some(waker.clone()));
+    if let Some(name) = prior
+        && let Some(idx) = session.worktrees.iter().position(|g| g.name == name)
+    {
+        session.switch_to(idx);
+    }
     true
 }
 

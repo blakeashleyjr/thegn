@@ -211,6 +211,19 @@ pub(crate) fn request_group_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<usize
 /// only the last-resort fallback for edge cases where that neighbor can't be
 /// resolved (collapsed workspace, terminal-active, cross-workspace).
 fn perform_delete(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
+    confirm_delete_worktrees(cx, targets, false);
+}
+
+/// The `ConfirmDeleteWorktrees` menu-Pick path from `run.rs`: same body as
+/// `perform_delete` but honoring the chooser's `keep_files` (Close-keeps-files
+/// vs delete-from-disk). Exposed so the loop's confirm arm delegates here
+/// instead of re-inlining `delete_groups` + refresh with a weaker re-pin (which
+/// stranded focus on a surviving-but-wrong group → splash over a live pane).
+pub(crate) fn confirm_delete_worktrees(
+    cx: &mut DeleteCtx<'_>,
+    targets: Vec<usize>,
+    keep_files: bool,
+) {
     // Remember the active group's name AND workspace slug up front: `delete_groups`
     // removes groups and leaves `session.active` pointing at whatever slid into the
     // deleted slot — which may be a Terminal.
@@ -244,8 +257,13 @@ fn perform_delete(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
             .and_then(|gi| cx.session.worktrees.get(gi).map(|g| g.name.clone()))
     };
 
-    cx.model.status =
-        crate::run::delete_groups(cx.session, cx.panes, targets, false, Some(cx.waker.clone()));
+    cx.model.status = crate::run::delete_groups(
+        cx.session,
+        cx.panes,
+        targets,
+        keep_files,
+        Some(cx.waker.clone()),
+    );
 
     // Restore focus: (a) keep the still-living active group (it survived the
     // delete); (b) if it was deleted, land on the next/prev worktree in the same

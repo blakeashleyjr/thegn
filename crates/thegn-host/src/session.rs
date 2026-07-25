@@ -249,12 +249,24 @@ impl WorktreeGroup {
         }
     }
 
+    /// The active tab, clamped to a real tab. A group always holds ≥1 tab (its
+    /// constructors seed one; `close_active_tab` refuses to remove the last), so
+    /// this is total. Clamping matters because a stale `active_tab` index (left
+    /// out of range by a mid-loop mutation, e.g. a background merge-queue reap
+    /// shifting groups) would otherwise resolve to `None` → the render's phantom
+    /// `CenterTree::Leaf(0)` fallback → the idle splash painted over a live
+    /// shell. Returning the last tab keeps the frame valid and self-heals once
+    /// the stored index is re-clamped on the next loop turn.
     pub fn active_tab(&self) -> Option<&Tab> {
-        self.tabs.get(self.active_tab)
+        self.tabs.get(self.active_tab).or_else(|| self.tabs.last())
     }
 
     pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
-        self.tabs.get_mut(self.active_tab)
+        if self.active_tab >= self.tabs.len() {
+            self.tabs.last_mut()
+        } else {
+            self.tabs.get_mut(self.active_tab)
+        }
     }
 
     /// Append a tab titled with the next free ordinal and focus it.
@@ -462,12 +474,26 @@ impl Session {
         db.set_active_tab(session, tab, now)
     }
 
+    /// The active group, clamped to a real group. `None` only for a genuinely
+    /// empty session (the true "empty center / show splash" signal). Clamping
+    /// matters for the same reason as [`WorktreeGroup::active_tab`]: a stale
+    /// `self.active` index left out of range by a mid-loop mutation (e.g. a
+    /// background merge-queue reap shifting groups) would otherwise resolve to
+    /// `None` → the render's phantom `CenterTree::Leaf(0)` fallback → the idle
+    /// splash painted over a live shell. Returning the last group keeps the
+    /// frame valid; the stored index re-clamps on the next `switch_to`.
     pub fn active_group(&self) -> Option<&WorktreeGroup> {
-        self.worktrees.get(self.active)
+        self.worktrees
+            .get(self.active)
+            .or_else(|| self.worktrees.last())
     }
 
     pub fn active_group_mut(&mut self) -> Option<&mut WorktreeGroup> {
-        self.worktrees.get_mut(self.active)
+        if self.active >= self.worktrees.len() {
+            self.worktrees.last_mut()
+        } else {
+            self.worktrees.get_mut(self.active)
+        }
     }
 
     /// The active tab of the active group, if any.
@@ -954,6 +980,97 @@ mod tests {
         s.switch_to_tab(9, 9);
         assert_eq!(s.active, 0);
         assert_eq!(s.active_group().unwrap().active_tab, 0);
+    }
+
+    #[test]
+    fn active_tab_clamps_stale_index_to_a_real_tab() {
+        // A mid-loop mutation can leave `active_tab` out of range momentarily
+        // (e.g. a background reap shifting groups before the next re-clamp). The
+        // getter must still resolve to a real tab — never `None` → the render's
+        // phantom `Leaf(0)` splash over a live shell.
+        let mut s = Session::default();
+        let mut g = group("a");
+        // Give the last tab a real split tree so we can prove we resolve to it,
+        // not the placeholder `Leaf(0)`.
+        g.tabs[0].center = CenterTree::Split {
+            dir: Dir::Row,
+            children: vec![
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(3),
+                },
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(7),
+                },
+            ],
+        };
+        s.add_group(g);
+        s.active_group_mut().unwrap().active_tab = 9; // stale index
+
+        let tab = s.active_tab().expect("stale index still resolves to a tab");
+        assert!(
+            matches!(tab.center, CenterTree::Split { .. }),
+            "resolves to the real last tab, not a phantom Leaf(0)"
+        );
+        // The getter does not mutate the stored index (the loop re-clamps it).
+        assert_eq!(s.active_group().unwrap().active_tab, 9);
+    }
+
+    #[test]
+    fn active_tab_is_none_only_on_empty_session() {
+        let s = Session::default(); // no worktrees at all
+        assert!(
+            s.active_tab().is_none(),
+            "the empty-session signal is preserved after clamping"
+        );
+    }
+
+    #[test]
+    fn active_group_clamps_stale_index_to_a_real_group() {
+        // The GROUP index has the same hazard as `active_tab`: a background reap
+        // (delete_groups walks `session.active` onto removed slots) can leave
+        // `self.active` out of range. `active_group()` must then resolve to a
+        // real group so `active_tab()` reaches a real tab — never `None` → the
+        // render's phantom `Leaf(0)` splash painted over a live shell.
+        let mut s = Session::default();
+        s.add_group(group("a"));
+        let mut b = group("b");
+        b.tabs[0].center = CenterTree::Split {
+            dir: Dir::Row,
+            children: vec![
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(3),
+                },
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(7),
+                },
+            ],
+        };
+        s.add_group(b);
+        s.active = 9; // stale group index
+
+        let g = s
+            .active_group()
+            .expect("stale index still resolves to a group");
+        assert_eq!(g.name, "b", "resolves to the last group, not None");
+        assert!(
+            matches!(s.active_tab().unwrap().center, CenterTree::Split { .. }),
+            "and therefore to a real tab, not a phantom Leaf(0)"
+        );
+        // The getter does not mutate the stored index (the loop re-clamps it).
+        assert_eq!(s.active, 9);
+    }
+
+    #[test]
+    fn active_group_is_none_only_on_empty_session() {
+        let s = Session::default(); // no worktrees at all
+        assert!(
+            s.active_group().is_none(),
+            "the empty-session signal is preserved after clamping"
+        );
     }
 
     #[test]
