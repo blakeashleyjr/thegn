@@ -342,18 +342,33 @@ fn exec_argv(argv: &[String], timeout: Duration) -> Result<ExecOut, ExecFail> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| ExecFail::Spawn(format!("{}: {e}", argv[0])))?;
+    // Drain stdout and stderr on their own threads *while* waiting: reading only
+    // after the child exits deadlocks a child that writes more than a pipe buffer
+    // (~64KB), because it blocks on the full pipe forever and never exits, so the
+    // deadline kill is the only thing that ends it — losing all output.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let out_h = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut r) = stdout_pipe.take() {
+            let _ = r.read_to_string(&mut s);
+        }
+        s
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut r) = stderr_pipe.take() {
+            let _ = r.read_to_string(&mut s);
+        }
+        s
+    });
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut out = String::new();
-                let mut err = String::new();
-                if let Some(mut r) = child.stdout.take() {
-                    let _ = r.read_to_string(&mut out);
-                }
-                if let Some(mut r) = child.stderr.take() {
-                    let _ = r.read_to_string(&mut err);
-                }
+                // The pipes are closed now → the reader threads have hit EOF.
+                let out = out_h.join().unwrap_or_default();
+                let err = err_h.join().unwrap_or_default();
                 return Ok(ExecOut {
                     ok: status.success(),
                     code: status.code(),
@@ -364,6 +379,9 @@ fn exec_argv(argv: &[String], timeout: Duration) -> Result<ExecOut, ExecFail> {
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
+                // Killing the child closes the pipes, unblocking the readers.
+                let _ = out_h.join();
+                let _ = err_h.join();
                 return Err(ExecFail::Timeout {
                     secs: timeout.as_secs(),
                 });
@@ -1022,6 +1040,23 @@ impl HostRunner for OciRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_argv_drains_output_larger_than_a_pipe_buffer() {
+        // Regression: a child writing more than a pipe buffer (~64KB) used to
+        // deadlock — the old code only read the pipes after the child exited, but
+        // the child blocked on the full pipe and never exited until the deadline
+        // killed it. 512KB is comfortably past any platform's pipe buffer.
+        let n = 512 * 1024;
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("head -c {n} /dev/zero | tr '\\0' 'x'"),
+        ];
+        let out = exec_argv(&argv, Duration::from_secs(20)).expect("must complete, not time out");
+        assert!(out.ok, "exit status: {:?}", out.code);
+        assert_eq!(out.stdout.len(), n, "all output must be captured");
+    }
 
     #[test]
     fn local_runner_connects_trivially_and_ssh_urls_need_sockets() {
