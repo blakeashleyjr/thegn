@@ -84,7 +84,10 @@ mod tests {
             "first-match shell probe: {s}"
         );
         assert!(s.contains("bash"), "bash in the chain");
-        assert!(s.ends_with("exec \"$tgsh\" -l"), "ends with the probed shell");
+        assert!(
+            s.ends_with("exec \"$tgsh\" -l"),
+            "ends with the probed shell"
+        );
         // direnv hands the pane to the shell ITSELF (`direnv exec`) — never an
         // `eval "$(direnv export bash)"` in this POSIX wrapper: dash (Debian
         // sprites' /bin/sh) chokes on bash-flavored export dumps the moment the
@@ -94,7 +97,10 @@ mod tests {
             s.contains("[ -e .envrc ]") && s.contains("direnv exec . \"$tgsh\" -l && exit"),
             "direnv entry via direnv exec: {s}"
         );
-        assert!(!s.contains("eval \"$("), "no shell-flavored eval in the wrapper: {s}");
+        assert!(
+            !s.contains("eval \"$("),
+            "no shell-flavored eval in the wrapper: {s}"
+        );
         // Pure-devenv fallback, guarded so any failure falls through.
         assert!(
             s.contains("[ -e devenv.nix ] && command -v devenv")
@@ -105,7 +111,9 @@ mod tests {
         // --command`, guarded on IN_NIX_SHELL so it no-ops when already active.
         assert!(
             s.contains("[ -z \"$IN_NIX_SHELL\" ]")
-                && s.contains("nix develop \".#${THEGN_DEVSHELL:-default}\" --command \"$tgsh\" -l"),
+                && s.contains(
+                    "nix develop \".#${THEGN_DEVSHELL:-default}\" --command \"$tgsh\" -l"
+                ),
             "flake nix-develop fallback: {s}"
         );
         // Entry order: direnv → devenv → flake → bare exec.
