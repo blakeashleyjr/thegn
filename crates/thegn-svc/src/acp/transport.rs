@@ -79,3 +79,61 @@ impl AcpTransport {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thegn_core::acp::types::Notification;
+    use tokio::io::AsyncWriteExt;
+
+    fn note(method: &str) -> JsonRpcMessage {
+        JsonRpcMessage::Notification(Notification {
+            jsonrpc: "2.0".into(),
+            method: method.into(),
+            params: None,
+        })
+    }
+
+    /// A reader over `a` paired with a writer over `b`, where `(a, b)` are the two
+    /// ends of an in-memory duplex (a real AsyncRead/AsyncWrite pair).
+    fn connected() -> (AcpReader, AcpWriter) {
+        let (a, b) = tokio::io::duplex(4096);
+        let (reader, _) = AcpTransport::frame(Box::new(a), Box::new(tokio::io::sink()));
+        let (_, writer) = AcpTransport::frame(Box::new(tokio::io::empty()), Box::new(b));
+        (reader, writer)
+    }
+
+    #[tokio::test]
+    async fn valid_message_round_trips() {
+        let (mut reader, mut writer) = connected();
+        writer.send(&note("ping")).await.unwrap();
+        match reader.recv().await.unwrap().expect("a framed message") {
+            JsonRpcMessage::Notification(n) => assert_eq!(n.method, "ping"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_line_yields_none() {
+        let (a, mut b) = tokio::io::duplex(64);
+        let (mut reader, _) = AcpTransport::frame(Box::new(a), Box::new(tokio::io::sink()));
+        b.write_all(b"\n").await.unwrap();
+        assert!(reader.recv().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_an_error() {
+        let (a, mut b) = tokio::io::duplex(64);
+        let (mut reader, _) = AcpTransport::frame(Box::new(a), Box::new(tokio::io::sink()));
+        b.write_all(b"not json at all\n").await.unwrap();
+        assert!(reader.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn eof_yields_none() {
+        let (a, b) = tokio::io::duplex(64);
+        let (mut reader, _) = AcpTransport::frame(Box::new(a), Box::new(tokio::io::sink()));
+        drop(b); // peer hang-up ⇒ stream ends
+        assert!(reader.recv().await.unwrap().is_none());
+    }
+}

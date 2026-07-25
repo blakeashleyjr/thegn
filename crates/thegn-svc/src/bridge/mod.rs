@@ -1174,7 +1174,10 @@ mod tests {
         let (chan, rx) = c.spawn_proc(&["cat"], None, &[]).unwrap();
         // A corrupt payload must be rejected, not silently written as empty.
         let e = c
-            .call("proc.stdin", serde_json::json!({ "chan": chan, "data": "%%%" }))
+            .call(
+                "proc.stdin",
+                serde_json::json!({ "chan": chan, "data": "%%%" }),
+            )
             .unwrap_err();
         assert!(e.to_string().contains("invalid base64"), "err: {e}");
         // The channel survives the rejected write: valid stdin still round-trips.
@@ -1237,5 +1240,98 @@ mod tests {
         assert!(relevant_fs_path(Path::new("/w/.git/refs/heads/main")));
         assert!(relevant_fs_path(Path::new("/w/.git/logs/HEAD")));
         assert!(relevant_fs_path(Path::new("/w/src/main.rs")));
+    }
+
+    /// Drive the client's reader with a hand-rolled server: run `body(sock)` to
+    /// push frames once the client has registered chan 1, and return a
+    /// `ProcEvent` receiver for that channel.
+    fn scripted_server(
+        body: impl FnOnce(&mut TcpStream) + Send + 'static,
+    ) -> (BridgeClient, Receiver<ProcEvent>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (go_tx, go_rx) = channel::<()>();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            go_rx.recv().unwrap();
+            body(&mut sock);
+            sock.flush().unwrap();
+            // Hold the connection open until the client has consumed the frames.
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let sock = TcpStream::connect(addr).unwrap();
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let (tx, rx) = channel();
+        c.procs.lock().unwrap().insert(1, tx);
+        go_tx.send(()).unwrap();
+        (c, rx)
+    }
+
+    fn proc_out_frame(chan: u64, data: &[u8]) -> Vec<u8> {
+        let note = serde_json::json!({
+            "method": "proc.out",
+            "params": { "chan": chan, "stream": "stdout", "data": B64.encode(data) }
+        });
+        framing::encode(&note.to_string())
+    }
+
+    #[test]
+    fn malformed_frame_is_skipped_and_loop_survives() {
+        // A non-JSON frame must not kill the reader; a following valid frame is
+        // still delivered.
+        let (_c, rx) = scripted_server(|sock| {
+            sock.write_all(&framing::encode("this is not json {"))
+                .unwrap();
+            sock.write_all(&proc_out_frame(1, b"after-garbage"))
+                .unwrap();
+        });
+        match rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a proc event")
+        {
+            ProcEvent::Out { data, .. } => assert_eq!(&data, b"after-garbage"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_response_id_is_ignored() {
+        // A response correlating to no pending request is dropped silently; the
+        // reader keeps running and delivers the next notification.
+        let (_c, rx) = scripted_server(|sock| {
+            let resp = serde_json::json!({ "id": 99999, "ok": {} });
+            sock.write_all(&framing::encode(&resp.to_string())).unwrap();
+            sock.write_all(&proc_out_frame(1, b"still-here")).unwrap();
+        });
+        match rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a proc event")
+        {
+            ProcEvent::Out { data, .. } => assert_eq!(&data, b"still-here"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connection_close_fails_pending_calls_fast() {
+        // A server that accepts then hangs up must wake any in-flight call with an
+        // error immediately, not leave it blocked until the 120s RPC deadline.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            // Drop the connection without answering.
+            drop(sock);
+        });
+        let sock = TcpStream::connect(addr).unwrap();
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let start = Instant::now();
+        let r = c.exec(&["echo", "hi"], None, &[]);
+        assert!(r.is_err(), "closed transport ⇒ the call errors");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "call woke fast, not at the 120s deadline: {:?}",
+            start.elapsed()
+        );
     }
 }
