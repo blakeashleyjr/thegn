@@ -70,9 +70,23 @@ pub fn extract(emu: &dyn PaneEmulator, sel: &Selection) -> String {
             (0, cols)
         };
         let mut line = String::new();
+        // Skip the spacer cell that trails a double-width glyph: the emulator
+        // fills it with a blank, so copying it verbatim inserts a spurious space
+        // after every CJK/emoji glyph. Keyed on display width (same reasoning as
+        // compose_pane), which is emulator-agnostic.
+        let mut skip_spacer = false;
         for col in from..to.min(cols) {
+            if skip_spacer {
+                skip_spacer = false;
+                continue;
+            }
             match emu.cell_abs(r, col) {
-                Some(c) if !c.text.is_empty() => line.push_str(&c.text),
+                Some(c) if !c.text.is_empty() => {
+                    if unicode_width::UnicodeWidthStr::width(c.text.as_str()) > 1 {
+                        skip_spacer = true;
+                    }
+                    line.push_str(&c.text);
+                }
                 _ => line.push(' '),
             }
         }
@@ -143,6 +157,20 @@ mod tests {
             cursor: (0, 10),
         };
         assert_eq!(extract(&e, &sel), "world");
+    }
+
+    #[test]
+    fn extract_does_not_double_space_wide_glyphs() {
+        // Regression: the blank spacer trailing a double-width glyph used to be
+        // copied as a real space, so "世界x" came back as "世 界 x".
+        let mut e = AlacrittyEmulator::new(1, 20, 0);
+        e.advance("世界x".as_bytes());
+        // "世" spans cols 0-1, "界" spans 2-3, "x" is col 4.
+        let sel = Selection {
+            anchor: (0, 0),
+            cursor: (0, 4),
+        };
+        assert_eq!(extract(&e, &sel), "世界x");
     }
 
     #[test]
