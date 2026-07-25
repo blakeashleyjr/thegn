@@ -6551,7 +6551,9 @@ async fn event_loop<T: Terminal>(
     let mut mouse_sel: Option<(u32, crate::copymode::Selection)> = None;
     // A destructive delete awaiting its y/N confirmation: (question, targets).
     // A delete worktree action from menu awaiting the user choice
-    let mut pending_confirm_delete_worktrees: Option<Vec<usize>> = None;
+    // Stable group NAMES (not indices): a background reap can shift worktree
+    // indices while the confirm modal is open — see DeleteCtx::pending.
+    let mut pending_confirm_delete_worktrees: Option<Vec<String>> = None;
     // The sidebar's cursor-row `f`: `(worktree_path, repo_path)` the NEXT
     // move-to-folder pick applies to (else the active worktree). Cleared when
     // the active-worktree action opens the picker, so a cancelled sidebar pick
@@ -12582,8 +12584,14 @@ async fn event_loop<T: Terminal>(
                                 halt_dismissed.insert((g.name.clone(), g.active_tab));
                             }
                             if let menu::MenuChoice::ConfirmCloseWorktrees = choice
-                                && let Some(targets) = pending_confirm_delete_worktrees.take()
+                                && let Some(names) = pending_confirm_delete_worktrees.take()
                             {
+                                // Re-resolve the stashed names to current indices:
+                                // the session may have shifted while the modal was up.
+                                let targets =
+                                    crate::handlers::worktree_delete::resolve_group_indices(
+                                        &session, &names,
+                                    );
                                 crate::handlers::worktree_delete::perform_close(
                                     &mut crate::handlers::worktree_delete::DeleteCtx {
                                         session: &mut session,
@@ -12664,8 +12672,15 @@ async fn event_loop<T: Terminal>(
                                 continue;
                             }
                             if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files } = choice
-                                && let Some(targets) = pending_confirm_delete_worktrees.take()
+                                && let Some(names) = pending_confirm_delete_worktrees.take()
                             {
+                                // Re-resolve the stashed names to current indices so a
+                                // reap that shifted the session while the modal was
+                                // open can't make confirm delete the wrong worktree.
+                                let targets =
+                                    crate::handlers::worktree_delete::resolve_group_indices(
+                                        &session, &names,
+                                    );
                                 // Delegate to the shared delete path (focus re-pin +
                                 // refresh) so a stale index can't strand focus.
                                 crate::handlers::worktree_delete::confirm_delete_worktrees(

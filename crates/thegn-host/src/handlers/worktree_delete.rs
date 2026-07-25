@@ -11,6 +11,28 @@
 use crate::compositor::Rect;
 use crate::menu::{self, MenuOverlay};
 
+/// Map target indices to their groups' stable names (skipping any out of range),
+/// for stashing across a confirm modal.
+pub(crate) fn group_names_for(session: &crate::session::Session, targets: &[usize]) -> Vec<String> {
+    targets
+        .iter()
+        .filter_map(|&i| session.worktrees.get(i).map(|g| g.name.clone()))
+        .collect()
+}
+
+/// Re-resolve stashed group names to their *current* indices. Names that no
+/// longer exist (reaped while the modal was open) are dropped, so a confirm can
+/// only ever act on groups that still exist under the name the user saw.
+pub(crate) fn resolve_group_indices(
+    session: &crate::session::Session,
+    names: &[String],
+) -> Vec<usize> {
+    names
+        .iter()
+        .filter_map(|name| session.worktrees.iter().position(|g| &g.name == name))
+        .collect()
+}
+
 pub(crate) struct DeleteCtx<'a> {
     pub session: &'a mut crate::session::Session,
     pub panes: &'a mut crate::panes::Panes,
@@ -20,7 +42,12 @@ pub(crate) struct DeleteCtx<'a> {
     pub drawer_pool: &'a mut crate::run::DrawerPool,
     pub drawer_home: &'a mut Option<std::path::PathBuf>,
     pub active_menu: &'a mut Option<MenuOverlay>,
-    pub pending: &'a mut Option<Vec<usize>>,
+    /// Targets stashed across the confirm modal as **stable group names**, not
+    /// indices: a background reap/prune can shift `session.worktrees` indices
+    /// while the modal is open, so an index captured at open time would resolve
+    /// to a *different* worktree on confirm (and delete the wrong files).
+    /// Re-resolved to current indices via [`resolve_group_indices`] on confirm.
+    pub pending: &'a mut Option<Vec<String>>,
     pub need_relayout: &'a mut bool,
     pub waker: &'a termwiz::terminal::TerminalWaker,
     pub cfg: &'a thegn_core::config::Config,
@@ -50,7 +77,7 @@ pub(crate) fn request_close_or_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<us
     } else {
         menu::close_or_delete_menu_dirty(dirty_names.len(), &dirty_names.join(", "))
     });
-    *cx.pending = Some(targets);
+    *cx.pending = Some(group_names_for(cx.session, &targets));
 }
 
 /// Close (forget) the worktree groups at `targets` — the `[c]` arm of the
@@ -192,7 +219,7 @@ pub(crate) fn request_group_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<usize
         } else {
             menu::delete_worktree_menu(names.len(), &names.join(", "))
         });
-        *cx.pending = Some(targets);
+        *cx.pending = Some(group_names_for(cx.session, &targets));
         return;
     }
 
@@ -351,7 +378,7 @@ fn landing_for_slug(session: &crate::session::Session, slug: Option<&str>) -> Op
 
 #[cfg(test)]
 mod tests {
-    use super::{landing_for_slug, next_or_prev};
+    use super::{group_names_for, landing_for_slug, next_or_prev, resolve_group_indices};
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use std::collections::HashSet;
 
@@ -405,6 +432,31 @@ mod tests {
         }
         s.active = 0;
         s
+    }
+
+    #[test]
+    fn pending_targets_track_the_group_by_name_across_an_index_shift() {
+        // User selects "b" (index 1) for delete; the confirm modal stashes NAMES.
+        let s = session_with(vec![
+            group("a", GroupKind::Branch),
+            group("b", GroupKind::Branch),
+            group("c", GroupKind::Branch),
+        ]);
+        let names = group_names_for(&s, &[1]);
+        assert_eq!(names, vec!["b".to_string()]);
+
+        // While the modal is open a background reap removes "a" (index 0), so
+        // "b" is now at index 0. Re-resolving by name must yield the NEW index of
+        // "b", not the stale index 1 (which now points at "c").
+        let mut shifted = session_with(vec![
+            group("b", GroupKind::Branch),
+            group("c", GroupKind::Branch),
+        ]);
+        shifted.active = 0;
+        assert_eq!(resolve_group_indices(&shifted, &names), vec![0]);
+
+        // A name that vanished entirely resolves to nothing (never the wrong row).
+        assert!(resolve_group_indices(&shifted, &["gone".to_string()]).is_empty());
     }
 
     #[test]
