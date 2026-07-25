@@ -230,10 +230,22 @@ fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text
 
 /// Write `text` into a pane as input, wrapping it in the bracketed-paste
 /// markers when the app has requested them (so editors don't auto-indent).
+/// Strip bracketed-paste markers embedded in pasted content. Without this, a
+/// clipboard payload containing `ESC[201~` closes the paste bracket early and its
+/// tail is interpreted as keystrokes (bracketed-paste command injection); a stray
+/// start marker is dropped too so the payload can't re-open a nested bracket.
+fn neutralize_paste_markers(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains("\x1b[201~") || text.contains("\x1b[200~") {
+        std::borrow::Cow::Owned(text.replace("\x1b[201~", "").replace("\x1b[200~", ""))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 fn paste_text_into_pane(pane: &mut crate::pane::PtyPane, text: &str) -> anyhow::Result<()> {
     if pane.emulator().bracketed_paste() {
         pane.write_input(b"\x1b[200~")?;
-        pane.write_input(text.as_bytes())?;
+        pane.write_input(neutralize_paste_markers(text).as_bytes())?;
         pane.write_input(b"\x1b[201~")?;
     } else {
         pane.write_input(text.as_bytes())?;
@@ -5856,10 +5868,35 @@ fn scoped_target(worktree: &str, path: &str) -> Result<std::path::PathBuf, Strin
     {
         return Err(format!("path must not contain '..': {path}"));
     }
-    if !joined.starts_with(&base) {
+    // A lexical `starts_with` is symlink-traversable: a symlink *inside* the
+    // worktree pointing outside (e.g. `link -> /etc`) makes `link/passwd` pass
+    // the lexical check while resolving out of the sandbox mount. Canonicalize the
+    // deepest existing ancestor (which resolves any symlink in the path prefix)
+    // and require *that* to stay within the worktree; then reattach the
+    // not-yet-created tail (already `..`-free) to the symlink-free base.
+    let mut existing: &Path = joined.as_path();
+    let canon_existing = loop {
+        match existing.canonicalize() {
+            Ok(c) => break c,
+            Err(_) => match existing.parent() {
+                Some(p) => existing = p,
+                None => return Err(format!("path escapes worktree: {path}")),
+            },
+        }
+    };
+    if !canon_existing.starts_with(&base) {
         return Err(format!("path escapes worktree: {path}"));
     }
-    Ok(joined)
+    let tail = joined
+        .strip_prefix(existing)
+        .map_err(|_| format!("path escapes worktree: {path}"))?;
+    // When the target already exists, `tail` is empty; `join("")` would append a
+    // trailing separator and turn a file path into a "directory" path.
+    if tail.as_os_str().is_empty() {
+        Ok(canon_existing)
+    } else {
+        Ok(canon_existing.join(tail))
+    }
 }
 
 /// Write full file contents for an agent's `write` tool, scoped to the worktree.
@@ -11724,7 +11761,11 @@ async fn event_loop<T: Terminal>(
                         match text {
                             Some(t) if !t.is_empty() => {
                                 if let Some(p) = panes.table.get_mut(&focused) {
-                                    paste_text_into_pane(p, &t)?;
+                                    // best-effort: pasting into a just-closed pane
+                                    // must not take down the whole compositor.
+                                    if let Err(e) = paste_text_into_pane(p, &t) {
+                                        tracing::debug!(error = %e, "register paste failed (pane closing)");
+                                    }
                                 }
                             }
                             _ => toasts.info(
@@ -13146,9 +13187,13 @@ async fn event_loop<T: Terminal>(
                                             .unwrap_or_else(|_| "vi".into());
                                         let line_arg = format!("+{line_no}");
                                         if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                            // Shell-quote the path: it's written into
+                                            // the pane's live shell, and a filename
+                                            // with a space or metacharacter would
+                                            // otherwise break the command or inject.
                                             let cmd = format!(
                                                 "{editor} {line_arg} {}\n",
-                                                abs_path.display()
+                                                thegn_core::util::sh_quote(&abs_path.display().to_string())
                                             );
                                             let _ = focused_pane.write_input(cmd.as_bytes());
                                         }
@@ -13316,9 +13361,15 @@ async fn event_loop<T: Terminal>(
                                 } else if let Some(branch) = key.strip_prefix("git-branch:") {
                                     let wt_path = active_tab_path(&session);
                                     if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                        // Both the worktree path and the branch name
+                                        // are shell-quoted: they're written into the
+                                        // pane's live shell, and git allows branch
+                                        // names with characters a shell would treat
+                                        // as metacharacters (injection otherwise).
                                         let cmd = format!(
-                                            "git -C {} checkout {branch}\n",
-                                            wt_path.display()
+                                            "git -C {} checkout {}\n",
+                                            thegn_core::util::sh_quote(&wt_path.display().to_string()),
+                                            thegn_core::util::sh_quote(branch),
                                         );
                                         let _ = focused_pane.write_input(cmd.as_bytes());
                                     }
@@ -13336,7 +13387,7 @@ async fn event_loop<T: Terminal>(
                                     if let Some(focused_pane) = panes.table.get_mut(&focused) {
                                         let cmd = format!(
                                             "git -C {} stash pop --index {idx_str}\n",
-                                            wt_path.display()
+                                            thegn_core::util::sh_quote(&wt_path.display().to_string())
                                         );
                                         let _ = focused_pane.write_input(cmd.as_bytes());
                                     }

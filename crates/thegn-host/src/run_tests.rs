@@ -60,6 +60,40 @@ fn scoped_write_and_edit_stay_inside_worktree() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn scoped_write_rejects_symlink_traversal_out_of_worktree() {
+    use std::os::unix::fs::symlink;
+    let root = std::env::temp_dir().join(format!("sz-acp-symlink-{}", std::process::id()));
+    let wt = root.join("worktree");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&wt).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let wt_s = wt.to_str().unwrap();
+
+    // A symlink inside the worktree pointing outside it: writing "escape/pwned"
+    // must be rejected even though it contains no ".." and lexically starts with
+    // the worktree root.
+    symlink(&outside, wt.join("escape")).unwrap();
+    assert!(
+        write_scoped_file(wt_s, "escape/pwned", "x").is_err(),
+        "symlink traversal out of the worktree must be rejected"
+    );
+    assert!(
+        !outside.join("pwned").exists(),
+        "file must not have been written outside the worktree"
+    );
+
+    // A symlink that stays inside the worktree is still fine.
+    let inner = wt.join("real");
+    std::fs::create_dir_all(&inner).unwrap();
+    symlink(&inner, wt.join("innerlink")).unwrap();
+    write_scoped_file(wt_s, "innerlink/ok.txt", "hi").unwrap();
+    assert_eq!(std::fs::read_to_string(inner.join("ok.txt")).unwrap(), "hi");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn agent_session_update_tracks_tool_and_usage() {
     use crate::chrome::{AgentActivity, AgentConn};
@@ -2529,4 +2563,26 @@ fn crash_count_keys_are_independent() {
     );
     assert_eq!(counts[&key_a], 2);
     assert!(!counts.contains_key(&key_b));
+}
+
+#[test]
+fn neutralize_paste_markers_strips_embedded_brackets() {
+    // A clipboard payload that tries to close the paste bracket early and inject
+    // a command must have its markers removed before it is written into the pane.
+    let hostile = "ls\x1b[201~\nrm -rf ~\n";
+    let safe = neutralize_paste_markers(hostile);
+    assert!(!safe.contains("\x1b[201~"), "end marker survived: {safe:?}");
+    assert!(safe.contains("rm -rf ~"), "content preserved (just defused)");
+
+    // A stray start marker is dropped too.
+    let with_start = "a\x1b[200~b";
+    assert_eq!(neutralize_paste_markers(with_start), "ab");
+
+    // Clean text is passed through by reference (no allocation, no change).
+    let clean = "plain text\nline two";
+    assert!(matches!(
+        neutralize_paste_markers(clean),
+        std::borrow::Cow::Borrowed(_)
+    ));
+    assert_eq!(neutralize_paste_markers(clean), clean);
 }
