@@ -77,14 +77,20 @@ impl CenterTree {
                     Dir::Col => rect.rows,
                 };
                 // Integer apportionment that sums exactly to `extent` (last child
-                // absorbs the rounding remainder — no gaps, no overlap).
+                // absorbs the rounding remainder — no gaps, no overlap). Each
+                // non-last child is clamped to the space still remaining so the
+                // running offset can never exceed `extent`: with many tiny splits
+                // the per-child `round()` can each round up, and an unclamped sum
+                // would push later children past the rect boundary (and collapse
+                // the last child to 0). Clamping keeps every child inside `rect`.
                 let mut offset = 0usize;
                 for (i, b) in children.iter().enumerate() {
                     let w = if total <= 0.0 { 1.0 } else { b.weight.max(0.0) };
+                    let remaining = extent.saturating_sub(offset);
                     let size = if i + 1 == children.len() {
-                        extent.saturating_sub(offset)
+                        remaining
                     } else {
-                        ((w / total) * extent as f32).round() as usize
+                        (((w / total) * extent as f32).round() as usize).min(remaining)
                     };
                     let child_rect = match dir {
                         Dir::Row => Rect {
@@ -370,6 +376,50 @@ mod tests {
         assert_eq!(l[0].1.rows + l[1].1.rows, 40);
         assert!(l[0].1.rows > l[1].1.rows);
         assert_eq!(l[1].1.y, l[0].1.rows); // second starts where first ends
+    }
+
+    #[test]
+    fn many_tiny_splits_stay_within_the_rect() {
+        // Regression: with more children than the extent has cells, each
+        // non-last child's `round()` can push the running offset past `extent`,
+        // drawing children outside the parent rect (and collapsing the last to
+        // 0). Clamping each child to the remaining space must keep every rect
+        // inside the parent and the offsets monotonic and bounded.
+        let parent = Rect {
+            x: 0,
+            y: 0,
+            cols: 10,
+            rows: 3,
+        };
+        let children: Vec<Branch> = (0..6)
+            .map(|i| Branch {
+                weight: 1.0,
+                child: CenterTree::Leaf(i as PaneId),
+            })
+            .collect();
+        let t = CenterTree::Split {
+            dir: Dir::Col,
+            children,
+        };
+        let l = t.layout(parent);
+        for (_, r) in &l {
+            assert!(r.y >= parent.y, "child starts before the rect: {r:?}");
+            assert!(
+                r.y + r.rows <= parent.y + parent.rows,
+                "child extends past the rect boundary: {r:?}"
+            );
+            assert!(
+                r.x + r.cols <= parent.x + parent.cols,
+                "child extends past the rect width: {r:?}"
+            );
+        }
+        // Offsets never regress and the visible children exactly tile the extent.
+        let mut expected_y = parent.y;
+        for (_, r) in &l {
+            assert_eq!(r.y, expected_y, "gap or overlap between children: {r:?}");
+            expected_y += r.rows;
+        }
+        assert_eq!(expected_y, parent.y + parent.rows);
     }
 
     #[test]
