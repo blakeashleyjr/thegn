@@ -1122,3 +1122,96 @@ fn draw_row_menu(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sidebar::RowKind;
+
+    fn entry(id: &str) -> RowMenuEntry {
+        RowMenuEntry {
+            label: id.to_string(),
+            id: id.to_string(),
+            key: None,
+            danger: false,
+        }
+    }
+
+    #[test]
+    fn menu_step_skips_separators_both_directions() {
+        let entries = vec![
+            entry("a"),
+            RowMenuEntry::separator(),
+            entry("b"),
+            entry("c"),
+        ];
+        // Forward from 0 skips the separator at 1 and lands on 2.
+        assert_eq!(menu_step(&entries, 0, 1), 2);
+        // Backward from 2 skips the separator and lands on 0.
+        assert_eq!(menu_step(&entries, 2, -1), 0);
+        // Forward within a contiguous run.
+        assert_eq!(menu_step(&entries, 2, 1), 3);
+    }
+
+    #[test]
+    fn menu_step_clamps_at_edges() {
+        let entries = vec![entry("a"), entry("b")];
+        // No selectable entry past the end ⇒ unchanged.
+        assert_eq!(menu_step(&entries, 1, 1), 1);
+        // Nothing before the start ⇒ unchanged.
+        assert_eq!(menu_step(&entries, 0, -1), 0);
+        // A trailing separator with nothing beyond it ⇒ stay put.
+        let trailing = vec![entry("a"), RowMenuEntry::separator()];
+        assert_eq!(menu_step(&trailing, 0, 1), 0);
+    }
+
+    #[test]
+    fn clamp_scroll_keeps_cursor_visible() {
+        // Ten single-height rows, a 4-row window.
+        let heights = vec![1usize; 10];
+        // Cursor near the top with desired 0 ⇒ no scroll.
+        assert_eq!(clamp_sidebar_scroll(&heights, 1, 4, 0), 0);
+        // Cursor below the window ⇒ scroll so the cursor fits.
+        let scroll = clamp_sidebar_scroll(&heights, 7, 4, 0);
+        assert!(
+            (4..=7).contains(&scroll),
+            "cursor 7 fits in a 4-row window: {scroll}"
+        );
+        // Scroll never advances past the cursor.
+        assert!(clamp_sidebar_scroll(&heights, 3, 4, 9) <= 3);
+    }
+
+    #[test]
+    fn clamp_scroll_degenerate_inputs() {
+        assert_eq!(clamp_sidebar_scroll(&[], 0, 4, 0), 0);
+        assert_eq!(clamp_sidebar_scroll(&[1, 1], 0, 0, 0), 0);
+        // A cursor past the end is clamped to the last row.
+        assert_eq!(clamp_sidebar_scroll(&[1, 1, 1], 99, 3, 0), 0);
+    }
+
+    fn hit(y: usize, height: usize) -> RowHit {
+        RowHit {
+            visible_index: 0,
+            y,
+            height,
+            kind: RowKind::Worktree,
+            pin_key: String::new(),
+            caret_x: None,
+        }
+    }
+
+    #[test]
+    fn row_at_maps_screen_row_into_row_bounds() {
+        // Row 0 spans y=2 (height 2 ⇒ rows 2,3); row 1 spans y=4 (height 1).
+        let hits = vec![hit(2, 2), hit(4, 1)];
+        assert!(row_at(&hits, 1).is_none(), "above the first row");
+        assert_eq!(row_at(&hits, 2).map(|h| h.y), Some(2));
+        assert_eq!(
+            row_at(&hits, 3).map(|h| h.y),
+            Some(2),
+            "second line of a 2-high row"
+        );
+        assert_eq!(row_at(&hits, 4).map(|h| h.y), Some(4));
+        assert!(row_at(&hits, 5).is_none(), "below the last row");
+    }
+}

@@ -918,3 +918,44 @@ impl CiActionCtx<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thegn_cmd_joins_args_after_the_exe() {
+        let cmd = thegn_cmd(&["pr", "list", "--json"]);
+        // The exe path varies per environment, but the argv tail is fixed and
+        // space-joined with no trailing/leading padding.
+        assert!(cmd.ends_with(" pr list --json"), "cmd: {cmd}");
+        assert!(!cmd.starts_with(' '));
+        // No args ⇒ just the exe, no trailing space.
+        let bare = thegn_cmd(&[]);
+        assert!(!bare.ends_with(' '), "bare: {bare}");
+    }
+
+    #[test]
+    fn status_for_describes_ci_mutations_only() {
+        assert_eq!(
+            status_for(&DetailAction::CiRerun {
+                run_id: "1".into(),
+                failed: true
+            }),
+            "Re-running failed CI jobs…"
+        );
+        assert_eq!(
+            status_for(&DetailAction::CiRerun {
+                run_id: "1".into(),
+                failed: false
+            }),
+            "Re-running CI…"
+        );
+        assert_eq!(
+            status_for(&DetailAction::CiCancel { run_id: "1".into() }),
+            "Cancelling CI run…"
+        );
+        // A non-mutation action has no transient status.
+        assert_eq!(status_for(&DetailAction::CiRefresh), "");
+    }
+}
