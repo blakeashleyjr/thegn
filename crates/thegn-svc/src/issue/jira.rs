@@ -574,3 +574,134 @@ fn urlencoding_simple(s: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn status(cat: &str) -> Option<JiraStatus> {
+        serde_json::from_value(json!({
+            "name": "whatever",
+            "statusCategory": { "key": cat }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn map_status_by_category_and_fallback() {
+        assert_eq!(map_jira_status(&status("new")), IssueStatus::Todo);
+        assert_eq!(
+            map_jira_status(&status("indeterminate")),
+            IssueStatus::InProgress
+        );
+        assert_eq!(map_jira_status(&status("done")), IssueStatus::Done);
+        // Unknown category and a status with no category both fall back to Backlog.
+        assert_eq!(map_jira_status(&status("mystery")), IssueStatus::Backlog);
+        assert_eq!(map_jira_status(&None), IssueStatus::Backlog);
+    }
+
+    #[test]
+    fn map_priority_by_name_and_fallback() {
+        let p = |name: &str| -> Option<JiraPriority> {
+            serde_json::from_value(json!({ "name": name })).unwrap()
+        };
+        assert_eq!(map_jira_priority(&p("Highest")), IssuePriority::Urgent);
+        assert_eq!(map_jira_priority(&p("High")), IssuePriority::High);
+        assert_eq!(map_jira_priority(&p("Medium")), IssuePriority::Medium);
+        assert_eq!(map_jira_priority(&p("Low")), IssuePriority::Low);
+        assert_eq!(map_jira_priority(&p("Lowest")), IssuePriority::Low);
+        assert_eq!(map_jira_priority(&p("Trivial")), IssuePriority::None);
+        assert_eq!(map_jira_priority(&None), IssuePriority::None);
+    }
+
+    #[test]
+    fn parse_ms_valid_and_invalid() {
+        assert_eq!(
+            parse_ms(Some("1970-01-01T00:00:01Z")),
+            1000,
+            "one second past the epoch"
+        );
+        assert_eq!(parse_ms(Some("not-a-date")), 0);
+        assert_eq!(parse_ms(None), 0);
+    }
+
+    #[test]
+    fn extract_text_walks_adf_and_handles_edges() {
+        // A realistic ADF doc with nested paragraphs.
+        let doc = json!({
+            "type": "doc",
+            "content": [
+                { "type": "paragraph", "content": [{ "type": "text", "text": "Hello" }] },
+                { "type": "paragraph", "content": [
+                    { "type": "text", "text": "world" },
+                    { "type": "text", "text": "again" }
+                ]}
+            ]
+        });
+        assert_eq!(extract_text(&doc), "Hello world again");
+        // A bare string node round-trips.
+        assert_eq!(extract_text(&json!("plain")), "plain");
+        // An object that is neither content-bearing nor a text node is empty.
+        assert_eq!(extract_text(&json!({ "type": "hardBreak" })), "");
+        // Null / number nodes contribute nothing.
+        assert_eq!(extract_text(&json!(null)), "");
+        assert_eq!(extract_text(&json!(42)), "");
+    }
+
+    #[test]
+    fn issue_to_domain_maps_all_fields_and_derives_browse_url() {
+        let ji: JiraIssue = serde_json::from_value(json!({
+            "id": "10001",
+            "key": "PROJ-7",
+            "self": "https://myorg.atlassian.net/rest/api/3/issue/10001",
+            "fields": {
+                "summary": "Fix the thing",
+                "description": {
+                    "type": "doc",
+                    "content": [{ "type": "paragraph",
+                        "content": [{ "type": "text", "text": "details here" }] }]
+                },
+                "status": { "name": "In Progress",
+                    "statusCategory": { "key": "indeterminate" } },
+                "priority": { "name": "High" },
+                "assignee": { "displayName": "Dana Scully" },
+                "labels": ["bug", "p1"],
+                "updated": "1970-01-01T00:00:02Z"
+            }
+        }))
+        .unwrap();
+        let issue = jira_issue_to_domain(ji);
+        assert_eq!(issue.id, "jira:PROJ-7");
+        assert_eq!(issue.number, "PROJ-7");
+        assert_eq!(issue.provider, "jira");
+        assert_eq!(issue.title, "Fix the thing");
+        assert_eq!(issue.body.as_deref(), Some("details here"));
+        assert_eq!(issue.status, IssueStatus::InProgress);
+        assert_eq!(issue.priority, IssuePriority::High);
+        assert_eq!(issue.assignees, vec!["Dana Scully".to_string()]);
+        assert_eq!(issue.labels, vec!["bug".to_string(), "p1".to_string()]);
+        assert_eq!(issue.url, "https://myorg.atlassian.net/browse/PROJ-7");
+        assert_eq!(issue.updated_at_ms, 2000);
+    }
+
+    #[test]
+    fn issue_to_domain_tolerates_missing_optionals() {
+        // Only the required key/self plus an empty fields object.
+        let ji: JiraIssue = serde_json::from_value(json!({
+            "id": "1",
+            "key": "X-1",
+            "self": "https://h.example/rest/api/3/issue/1",
+            "fields": {}
+        }))
+        .unwrap();
+        let issue = jira_issue_to_domain(ji);
+        assert_eq!(issue.title, "");
+        assert_eq!(issue.body, None, "empty description filtered to None");
+        assert_eq!(issue.status, IssueStatus::Backlog);
+        assert_eq!(issue.priority, IssuePriority::None);
+        assert!(issue.assignees.is_empty());
+        assert_eq!(issue.updated_at_ms, 0);
+        assert_eq!(issue.url, "https://h.example/browse/X-1");
+    }
+}
