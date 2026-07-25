@@ -682,7 +682,6 @@ mod tests {
     #[test]
     fn agent_source_relocates_via_home_env() {
         // test code: fixture setup, never on the event loop.
-        #[expect(clippy::disallowed_methods)]
         let tmp = std::env::temp_dir().join(format!("sz-reloc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let dir = tmp.join("profile/.claude");
