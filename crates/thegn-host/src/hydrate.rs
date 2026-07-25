@@ -2049,6 +2049,19 @@ pub(crate) fn spawn_pr_cache_refresh(
     });
 }
 
+/// Policy decision for auto-cleaning a worktree whose PR left the open set,
+/// given the freshly-resolved PR `state`. Returns `(merged, should_clean)`.
+/// ONLY a definitive `MERGED`/`CLOSED` acts: `None` (a `gh`/network error) and
+/// `OPEN`/anything-else never clean, because deleting a worktree's build
+/// artifacts on a transient failure or a still-open PR is unrecoverable.
+fn pr_clean_decision(state: Option<&str>, cfg: &thegn_core::config::DiskConfig) -> (bool, bool) {
+    match state {
+        Some("MERGED") => (true, cfg.auto_clean_on_merge),
+        Some("CLOSED") => (false, cfg.clean_on_pr_closed),
+        _ => (false, false),
+    }
+}
+
 /// Auto-clean `target/` for worktrees whose open PR has just transitioned away
 /// (merged / closed-without-merge), gated by `[disk]` policy. Compares the
 /// previously-cached open branches against the current open set; for each
@@ -2102,12 +2115,14 @@ fn maybe_clean_merged_worktrees(
         if !path.is_dir() || row.worktree == active || crate::task::slot_active(&path) {
             continue;
         }
-        // Resolve the precise outcome (merged vs closed) against policy.
-        let merged = matches!(
-            thegn_core::github::pr_state_for_branch(loc, &row.branch).as_deref(),
-            Some("MERGED")
-        );
-        let should = (merged && cfg.auto_clean_on_merge) || (!merged && cfg.clean_on_pr_closed);
+        // Resolve the precise outcome against policy. Only a DEFINITIVE MERGED or
+        // CLOSED state may trigger cleaning: `pr_state_for_branch` returns None on
+        // any `gh`/network failure, and the PR may also have reopened since the
+        // cache diff. Treating None/OPEN/unknown as "closed" (the old `!merged`
+        // branch did) deletes the worktree's build artifacts on a transient error
+        // or a still-open PR — unrecoverable. When unsure, do nothing.
+        let state = thegn_core::github::pr_state_for_branch(loc, &row.branch);
+        let (merged, should) = pr_clean_decision(state.as_deref(), cfg);
         if !should {
             continue;
         }
@@ -2612,6 +2627,33 @@ mod tests {
     use super::*;
     use crate::hydrate_tuning::DEFAULT_MODEL_REFRESH_MS;
     use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    #[test]
+    fn pr_clean_decision_only_acts_on_definitive_states() {
+        // Both policies enabled: cleaning is still gated on a DEFINITIVE state.
+        let cfg = thegn_core::config::DiskConfig {
+            auto_clean_on_merge: true,
+            clean_on_pr_closed: true,
+            ..Default::default()
+        };
+        assert_eq!(pr_clean_decision(Some("MERGED"), &cfg), (true, true));
+        assert_eq!(pr_clean_decision(Some("CLOSED"), &cfg), (false, true));
+        // A still-open PR must never clean.
+        assert_eq!(pr_clean_decision(Some("OPEN"), &cfg), (false, false));
+        // An unresolvable state (gh/network error → None) must never clean — the
+        // regression: this used to be treated as "closed" and delete artifacts.
+        assert_eq!(pr_clean_decision(None, &cfg), (false, false));
+        assert_eq!(pr_clean_decision(Some("weird"), &cfg), (false, false));
+
+        // Policies are honored when disabled.
+        let off = thegn_core::config::DiskConfig {
+            auto_clean_on_merge: false,
+            clean_on_pr_closed: false,
+            ..Default::default()
+        };
+        assert_eq!(pr_clean_decision(Some("MERGED"), &off), (true, false));
+        assert_eq!(pr_clean_decision(Some("CLOSED"), &off), (false, false));
+    }
 
     fn one_tab_session() -> Session {
         Session {
