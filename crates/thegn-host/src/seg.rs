@@ -207,6 +207,36 @@ pub fn seg_width(segs: &[Seg]) -> usize {
     segs.iter().map(Seg::width).sum()
 }
 
+/// Clip a plain string to at most `max` display cells, appending a trailing `…`
+/// when it overflows. Cell math is display width (`unicode-width`): a wide glyph
+/// that would straddle the boundary is dropped whole, never split, so the result
+/// never exceeds `max` columns. Returns empty when `max` can't fit a char plus
+/// the ellipsis. The shared, width-correct replacement for the char-count clips
+/// that used to live in the panel/detail chrome.
+pub(crate) fn clip_end(s: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
+    }
+    if max < 2 {
+        return String::new();
+    }
+    // Reserve one cell for the ellipsis, then take whole chars until the next
+    // would exceed the budget.
+    let budget = max - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 /// Truncate a seg run to at most `max` cells, ending with a ghost ellipsis
 /// when anything was cut (the mockup's cutSegs). The ellipsis comes from the
 /// capability glyph table (`…`, or `...` under ASCII caps), so a truncated
@@ -543,6 +573,42 @@ mod tests {
     }
 
     const PAD: Tok = Tok::Slot(S::Bg1);
+
+    #[test]
+    fn clip_end_ascii_matches_char_count() {
+        // Fits ⇒ unchanged.
+        assert_eq!(clip_end("hello", 5), "hello");
+        assert_eq!(clip_end("hi", 10), "hi");
+        // Overflow ⇒ (max-1) chars + ellipsis, exactly `max` cells.
+        assert_eq!(clip_end("hello world", 8), "hello w…");
+        assert_eq!(clip_end("hello world", 8).chars().count(), 8);
+        // No room for a char + ellipsis.
+        assert_eq!(clip_end("hello", 1), "");
+        assert_eq!(clip_end("hello", 0), "");
+    }
+
+    #[test]
+    fn clip_end_never_splits_a_wide_glyph() {
+        // 你好世界 = 8 cells. Budget 5 ⇒ ellipsis reserves 1, budget 4: two wide
+        // glyphs (4 cells) fit, the third would overflow ⇒ dropped whole.
+        let s = "\u{4f60}\u{597d}\u{4e16}\u{754c}";
+        let clipped = clip_end(s, 5);
+        assert_eq!(clipped, "\u{4f60}\u{597d}…");
+        // The result never exceeds the budget in display cells.
+        assert!(UnicodeWidthStr::width(clipped.as_str()) <= 5);
+        // An odd budget that can't seat the next wide glyph underfills by one
+        // rather than splitting it.
+        let clipped2 = clip_end(s, 4); // budget 3 → one wide glyph (2) + ellipsis
+        assert_eq!(clipped2, "\u{4f60}…");
+        assert!(UnicodeWidthStr::width(clipped2.as_str()) <= 4);
+    }
+
+    #[test]
+    fn clip_end_wide_string_that_fits_is_unchanged() {
+        let s = "\u{4f60}\u{597d}"; // 4 cells
+        assert_eq!(clip_end(s, 4), s);
+        assert_eq!(clip_end(s, 10), s);
+    }
 
     #[test]
     fn take_cols_counts_display_width() {

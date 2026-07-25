@@ -1370,13 +1370,10 @@ fn kind_str(kind: thegn_metrics::DiskKind) -> &'static str {
     }
 }
 
-/// Truncate `s` to `max` display cells, ellipsizing when it overflows.
+/// Truncate `s` to `max` display cells, ellipsizing when it overflows. Delegates
+/// to the shared width-aware clip so wide glyphs are never split across the edge.
 fn trunc(s: String, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s;
-    }
-    let keep = max.saturating_sub(1);
-    format!("{}…", s.chars().take(keep).collect::<String>())
+    crate::seg::clip_end(&s, max)
 }
 
 /// Format a duration in seconds as `Nh Mm` (or `Mm` under an hour).

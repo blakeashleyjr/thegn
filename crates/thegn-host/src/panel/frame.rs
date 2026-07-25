@@ -7,7 +7,7 @@ use thegn_core::theme::Hue;
 use thegn_core::viz;
 
 use crate::chrome::{FrameModel, S};
-use crate::seg::{Line, Seg, Tok, seg, sp};
+use crate::seg::{Line, Seg, Tok, clip_end, seg, sp};
 
 use super::sections::{self, PanelRow, SectionCtx};
 use super::{PanelHit, PanelTab, PanelUi, budget};
@@ -35,20 +35,6 @@ pub struct RailSpan {
 
 fn hue(h: Hue) -> Tok {
     Tok::Hue(h)
-}
-
-/// Clip `s` to at most `budget` columns, appending a trailing `…` when it
-/// overflows. Returns empty when the budget can't fit even one char + ellipsis.
-fn clip_end(s: &str, budget: usize) -> String {
-    if s.chars().count() <= budget {
-        return s.to_string();
-    }
-    if budget < 2 {
-        return String::new();
-    }
-    let mut out: String = s.chars().take(budget - 1).collect();
-    out.push('…');
-    out
 }
 
 /// The header zone: branch + divergence, the merge banner when one is in
