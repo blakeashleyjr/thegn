@@ -216,14 +216,16 @@ fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text
     if !registers.yank(name, text.clone()) {
         return;
     }
-    if let Ok(db) = thegn_core::db::Db::open() {
+    // The in-memory register is already updated (same-session paste works now);
+    // persist off the event loop so the Db::open + write never blocks the loop.
+    crate::db_task::persist(move |db| {
         if is_persistent(name) {
             let _ = db.put_register(name, &text);
         }
         if name != DEFAULT {
             let _ = db.put_register(DEFAULT, &text);
         }
-    }
+    });
 }
 
 /// Write `text` into a pane as input, wrapping it in the bracketed-paste
