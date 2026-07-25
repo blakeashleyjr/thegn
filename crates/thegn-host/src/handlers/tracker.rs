@@ -40,17 +40,28 @@ pub(crate) struct TrackerCtx<'a> {
     pub hydration_gen: &'a mut u64,
 }
 
+/// The issue under the Issues-section cursor, selected from the SAME
+/// sorted+filtered view the panel renders. Returned owned so the (immutable)
+/// borrow of `ctx` is released before the caller mutates `ctx.model`. Indexing
+/// the raw, unsorted `tracker_issues` by `issues_cursor` targeted a *different*
+/// issue than the highlighted row (and ignored the active filter entirely).
+fn cursor_issue(ctx: &TrackerCtx) -> Option<thegn_core::issue::Issue> {
+    crate::panel::sections::issues::sorted_filtered_issues(
+        &ctx.model.panel,
+        &ctx.panel_ui.issues_filter,
+        ctx.panel_ui.issues_project_filter.as_deref(),
+    )
+    .into_iter()
+    .nth(ctx.panel_ui.issues_cursor)
+    .cloned()
+}
+
 /// Enter on the Issues section: toggle the worktree↔issue link for the
 /// cursor row, then re-hydrate so the badge updates.
 pub(crate) fn toggle_link(ctx: &mut TrackerCtx) {
     let wt = active_tab_path(ctx.session);
     let wt_str = wt.to_string_lossy().to_string();
-    if let Some(issue) = ctx
-        .model
-        .panel
-        .tracker_issues
-        .get(ctx.panel_ui.issues_cursor)
-    {
+    if let Some(issue) = cursor_issue(ctx) {
         let id = issue.id.clone();
         let already_linked = ctx.model.panel.tracker_links.contains(&id);
         if let Ok(db) = thegn_core::db::Db::open() {
@@ -92,18 +103,14 @@ pub(crate) fn branch_from_issue(ctx: &mut TrackerCtx) {
                     .map(|id| (id, r.number.clone(), r.title.clone(), r.branch_hint.clone()))
             })
         } else {
-            ctx.model
-                .panel
-                .tracker_issues
-                .get(ctx.panel_ui.issues_cursor)
-                .map(|i| {
-                    (
-                        i.id.clone(),
-                        i.number.clone(),
-                        i.title.clone(),
-                        i.branch_hint.clone(),
-                    )
-                })
+            cursor_issue(ctx).map(|i| {
+                (
+                    i.id.clone(),
+                    i.number.clone(),
+                    i.title.clone(),
+                    i.branch_hint.clone(),
+                )
+            })
         };
     if let Some((issue_id, number, title, hint)) = fields {
         let root = ctx
@@ -146,13 +153,8 @@ pub(crate) fn branch_from_issue(ctx: &mut TrackerCtx) {
 pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
     match key {
         'o' => {
-            if let Some(issue) = ctx
-                .model
-                .panel
-                .tracker_issues
-                .get(ctx.panel_ui.issues_cursor)
-            {
-                open_url_detached(&issue.url.clone());
+            if let Some(issue) = cursor_issue(ctx) {
+                open_url_detached(&issue.url);
                 ctx.model.status = format!("Opened {} in browser", issue.number);
             }
             true
@@ -168,13 +170,7 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
         }
         'a' => {
             // Self-assign the cursor issue.
-            if let Some(issue) = ctx
-                .model
-                .panel
-                .tracker_issues
-                .get(ctx.panel_ui.issues_cursor)
-                .cloned()
-            {
+            if let Some(issue) = cursor_issue(ctx) {
                 let cfg = ctx.live_cfg.issues.clone();
                 let waker2 = ctx.waker.clone();
                 let cwd2 = active_tab_path(ctx.session);
@@ -213,13 +209,7 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
 /// `D` on Issues: dispatch a Claude Code agent to a new worktree for the
 /// selected issue. Reuses the wizard's `Done` path.
 fn dispatch_agent(ctx: &mut TrackerCtx) {
-    if let Some(issue) = ctx
-        .model
-        .panel
-        .tracker_issues
-        .get(ctx.panel_ui.issues_cursor)
-        .cloned()
-    {
+    if let Some(issue) = cursor_issue(ctx) {
         // Fresh generation for this headless dispatch: it sends `Done`
         // directly (no worker channel / progress entry) and leaves concurrent
         // creations undisturbed.

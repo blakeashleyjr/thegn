@@ -56,12 +56,17 @@ fn truncate(s: &str, max: usize) -> String {
 // ---- sorted + filtered issue list ------------------------------------------
 
 /// Returns issues sorted by priority (Urgent first, Done/Cancelled last) and
-/// filtered by the active text query and project filter.
-fn sorted_issues<'a>(ctx: &'a SectionCtx) -> Vec<&'a Issue> {
-    let data = &ctx.model.panel;
-    let query = ctx.ui.issues_filter.to_lowercase();
-    let project = ctx.ui.issues_project_filter.as_deref();
-
+/// filtered by the active text query and project filter. Shared by the render
+/// path and the Issues action-key handlers (`handlers::tracker`) so a cursor
+/// index means the same row in both — indexing the raw, unsorted
+/// `tracker_issues` from the handlers used to act on a *different* issue than
+/// the one highlighted.
+pub(crate) fn sorted_filtered_issues<'a>(
+    data: &'a crate::panel::PanelData,
+    query: &str,
+    project: Option<&str>,
+) -> Vec<&'a Issue> {
+    let query = query.to_lowercase();
     let mut list: Vec<&Issue> = data
         .tracker_issues
         .iter()
@@ -87,6 +92,14 @@ fn sorted_issues<'a>(ctx: &'a SectionCtx) -> Vec<&'a Issue> {
         (terminal, i.priority) // (bool, IssuePriority) — IssuePriority derives Ord
     });
     list
+}
+
+fn sorted_issues<'a>(ctx: &'a SectionCtx) -> Vec<&'a Issue> {
+    sorted_filtered_issues(
+        &ctx.model.panel,
+        &ctx.ui.issues_filter,
+        ctx.ui.issues_project_filter.as_deref(),
+    )
 }
 
 // ---- main entry point -------------------------------------------------------
@@ -473,4 +486,66 @@ fn empty_rows(configured: bool) -> Vec<PanelRow> {
             seg(g3(), " to enable".to_string()),
         ])),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thegn_core::issue::{Issue, IssuePriority, IssueStatus};
+
+    fn issue(id: &str, prio: IssuePriority, status: IssueStatus, project: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            number: id.to_string(),
+            title: format!("title {id}"),
+            priority: prio,
+            status,
+            project_ids: if project.is_empty() {
+                vec![]
+            } else {
+                vec![project.to_string()]
+            },
+            ..Default::default()
+        }
+    }
+
+    fn panel_with(issues: Vec<Issue>) -> crate::panel::PanelData {
+        let mut p = crate::panel::PanelData::default();
+        p.tracker_issues = issues;
+        p
+    }
+
+    #[test]
+    fn sorted_filtered_issues_orders_by_priority_and_floats_terminal() {
+        // Insertion order deliberately scrambled vs. the intended display order.
+        let data = panel_with(vec![
+            issue("low", IssuePriority::Low, IssueStatus::Todo, ""),
+            issue("done", IssuePriority::Urgent, IssueStatus::Done, ""),
+            issue("urgent", IssuePriority::Urgent, IssueStatus::Todo, ""),
+            issue("high", IssuePriority::High, IssueStatus::InProgress, ""),
+        ]);
+        let ordered: Vec<&str> = sorted_filtered_issues(&data, "", None)
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        // Active by priority, then terminal (Done) last — regardless of its
+        // priority. Cursor N must map to THIS order, not insertion order.
+        assert_eq!(ordered, vec!["urgent", "high", "low", "done"]);
+    }
+
+    #[test]
+    fn sorted_filtered_issues_applies_query_and_project_filters() {
+        let data = panel_with(vec![
+            issue("APP-1", IssuePriority::High, IssueStatus::Todo, "proj-a"),
+            issue("APP-2", IssuePriority::High, IssueStatus::Todo, "proj-b"),
+        ]);
+        // Project filter narrows to a single issue.
+        let by_project = sorted_filtered_issues(&data, "", Some("proj-b"));
+        assert_eq!(by_project.len(), 1);
+        assert_eq!(by_project[0].id, "APP-2");
+        // Text query matches on number/title.
+        let by_query = sorted_filtered_issues(&data, "app-1", None);
+        assert_eq!(by_query.len(), 1);
+        assert_eq!(by_query[0].id, "APP-1");
+    }
 }

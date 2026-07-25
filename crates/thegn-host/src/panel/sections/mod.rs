@@ -20,7 +20,7 @@ mod environments;
 mod git;
 mod help;
 mod hosts;
-mod issues;
+pub(crate) mod issues;
 mod keys;
 mod logs;
 mod media;
