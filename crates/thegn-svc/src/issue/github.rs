@@ -240,3 +240,59 @@ impl IssueBackend for GitHubIssuesBackend {
         Ok(issues.into_iter().map(gh_issue_to_domain).collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_ms_valid_and_invalid() {
+        assert_eq!(parse_ms(Some("1970-01-01T00:00:05Z")), 5000);
+        assert_eq!(parse_ms(Some("nope")), 0);
+        assert_eq!(parse_ms(None), 0);
+    }
+
+    #[test]
+    fn issue_to_domain_open_maps_to_todo() {
+        let gi: GhIssue = serde_json::from_value(json!({
+            "number": 42,
+            "title": "Open bug",
+            "state": "OPEN",
+            "body": "steps to repro",
+            "assignees": [{ "login": "octocat" }],
+            "labels": [{ "name": "bug" }, { "name": "p2" }],
+            "url": "https://github.com/o/r/issues/42",
+            "updatedAt": "1970-01-01T00:00:06Z"
+        }))
+        .unwrap();
+        let issue = gh_issue_to_domain(gi);
+        assert_eq!(issue.id, "github:42");
+        assert_eq!(issue.number, "42");
+        assert_eq!(issue.provider, "github");
+        assert_eq!(issue.title, "Open bug");
+        assert_eq!(issue.body.as_deref(), Some("steps to repro"));
+        assert_eq!(issue.status, IssueStatus::Todo);
+        assert_eq!(issue.priority, IssuePriority::None);
+        assert_eq!(issue.assignees, vec!["octocat".to_string()]);
+        assert_eq!(issue.labels, vec!["bug".to_string(), "p2".to_string()]);
+        assert_eq!(issue.updated_at_ms, 6000);
+    }
+
+    #[test]
+    fn issue_to_domain_closed_maps_to_done() {
+        let gi: GhIssue = serde_json::from_value(json!({
+            "number": 7,
+            "title": "Closed",
+            "state": "CLOSED",
+            "url": "https://github.com/o/r/issues/7"
+        }))
+        .unwrap();
+        let issue = gh_issue_to_domain(gi);
+        assert_eq!(issue.status, IssueStatus::Done);
+        assert_eq!(issue.body, None);
+        assert!(issue.assignees.is_empty());
+        assert!(issue.labels.is_empty());
+        assert_eq!(issue.updated_at_ms, 0, "missing updatedAt ⇒ 0");
+    }
+}

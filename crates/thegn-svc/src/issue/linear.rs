@@ -477,3 +477,108 @@ impl IssueBackend for LinearBackend {
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn state(ty: &str) -> Option<LinearState> {
+        serde_json::from_value(json!({ "type": ty })).unwrap()
+    }
+
+    #[test]
+    fn map_state_covers_all_types_and_fallback() {
+        assert_eq!(map_state(state("triage").as_ref()), IssueStatus::Backlog);
+        assert_eq!(map_state(state("unstarted").as_ref()), IssueStatus::Todo);
+        assert_eq!(
+            map_state(state("started").as_ref()),
+            IssueStatus::InProgress
+        );
+        assert_eq!(map_state(state("completed").as_ref()), IssueStatus::Done);
+        assert_eq!(
+            map_state(state("cancelled").as_ref()),
+            IssueStatus::Cancelled
+        );
+        assert_eq!(map_state(state("weird").as_ref()), IssueStatus::Backlog);
+        assert_eq!(map_state(None), IssueStatus::Backlog);
+    }
+
+    #[test]
+    fn priority_maps_and_round_trips() {
+        // int → domain
+        assert_eq!(map_priority(1), IssuePriority::Urgent);
+        assert_eq!(map_priority(2), IssuePriority::High);
+        assert_eq!(map_priority(3), IssuePriority::Medium);
+        assert_eq!(map_priority(4), IssuePriority::Low);
+        assert_eq!(map_priority(0), IssuePriority::None);
+        assert_eq!(map_priority(99), IssuePriority::None);
+        // Every named priority survives a domain→int→domain round-trip.
+        for p in [
+            IssuePriority::Urgent,
+            IssuePriority::High,
+            IssuePriority::Medium,
+            IssuePriority::Low,
+            IssuePriority::None,
+        ] {
+            assert_eq!(map_priority(priority_to_int(p)), p, "round-trip {p:?}");
+        }
+    }
+
+    #[test]
+    fn parse_updated_at_valid_and_invalid() {
+        assert_eq!(parse_updated_at("1970-01-01T00:00:03Z"), 3000);
+        assert_eq!(parse_updated_at(""), 0);
+        assert_eq!(parse_updated_at("garbage"), 0);
+    }
+
+    #[test]
+    fn issue_to_domain_maps_all_fields() {
+        let li: LinearIssue = serde_json::from_value(json!({
+            "id": "uuid-1",
+            "identifier": "ABC-123",
+            "title": "Ship it",
+            "description": "the body",
+            "state": { "type": "started" },
+            "priority": 2,
+            "assignees": { "nodes": [{ "name": "Fox Mulder" }] },
+            "labels": { "nodes": [{ "name": "feature" }] },
+            "branchName": "abc-123-ship-it",
+            "url": "https://linear.app/x/issue/ABC-123",
+            "updatedAt": "1970-01-01T00:00:04Z"
+        }))
+        .unwrap();
+        let issue = linear_issue_to_domain(li);
+        assert_eq!(issue.id, "linear:ABC-123");
+        assert_eq!(issue.number, "ABC-123");
+        assert_eq!(issue.provider, "linear");
+        assert_eq!(issue.title, "Ship it");
+        assert_eq!(issue.body.as_deref(), Some("the body"));
+        assert_eq!(issue.status, IssueStatus::InProgress);
+        assert_eq!(issue.priority, IssuePriority::High);
+        assert_eq!(issue.assignees, vec!["Fox Mulder".to_string()]);
+        assert_eq!(issue.labels, vec!["feature".to_string()]);
+        assert_eq!(issue.branch_hint.as_deref(), Some("abc-123-ship-it"));
+        assert_eq!(issue.updated_at_ms, 4000);
+    }
+
+    #[test]
+    fn issue_to_domain_tolerates_missing_optionals() {
+        let li: LinearIssue = serde_json::from_value(json!({
+            "id": "uuid-2",
+            "identifier": "ABC-9",
+            "title": "Bare",
+            "url": "https://linear.app/x/issue/ABC-9",
+            "updatedAt": "not-a-date"
+        }))
+        .unwrap();
+        let issue = linear_issue_to_domain(li);
+        assert_eq!(issue.body, None);
+        assert_eq!(issue.status, IssueStatus::Backlog, "no state ⇒ backlog");
+        assert_eq!(issue.priority, IssuePriority::None, "default priority 0");
+        assert!(issue.assignees.is_empty());
+        assert!(issue.labels.is_empty());
+        assert_eq!(issue.branch_hint, None);
+        assert_eq!(issue.updated_at_ms, 0);
+    }
+}
