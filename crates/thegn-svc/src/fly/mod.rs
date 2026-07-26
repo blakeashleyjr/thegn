@@ -456,8 +456,24 @@ impl RemoteProvider for FlyProvider {
             created_at: thegn_core::util::now(),
         })?;
 
+        // `ensure_app` is the FIRST resource-creating call: until it succeeds no
+        // billable resource exists, so a 4xx there ⇒ "nothing created" and the
+        // intent record can be cleared (mirrors the VPS twin). Once the app
+        // exists, `ensure_ipv4` allocates a dedicated (billed) IPv4 and the
+        // machine POST creates a VM — a 4xx from any of *those* does NOT mean
+        // "nothing created", so we must NOT blindly drop the record (that would
+        // orphan a billing app/IP/machine invisible to `list()`). Instead we
+        // best-effort delete the app (cascading machine + IP) and only clear the
+        // record if that delete succeeds; otherwise the record stays so destroy/
+        // the reaper can reconcile the leak.
+        if let Err(e) = self.ensure_app(&app).await {
+            if e.to_string().contains("failed (4") {
+                registry::remove(&name);
+            }
+            return Err(e);
+        }
+
         let create = async {
-            self.ensure_app(&app).await?;
             let ip = self.ensure_ipv4(&app).await?;
             let base = self.spec.api_base();
             let body = machines::create_machine_body(
@@ -486,10 +502,16 @@ impl RemoteProvider for FlyProvider {
         let (machine_id, ip) = match create {
             Ok(v) => v,
             Err(e) => {
-                // A definite API rejection means nothing was created — clear the
-                // intent. Transport errors stay for the (future) reaper.
-                if e.to_string().contains("failed (4") {
-                    registry::remove(&name);
+                // The app already exists (billed IP possibly allocated, machine
+                // possibly created+running). Don't strand it: tear the app down
+                // best-effort and only clear the intent if the teardown landed.
+                // A failed teardown keeps the record so the leak stays visible.
+                if self.destroy(&name).await.is_err() {
+                    tracing::warn!(
+                        sandbox = %name,
+                        "fly: create failed after app existed and cleanup DELETE failed; \
+                         intent record kept for reconciliation"
+                    );
                 }
                 return Err(e);
             }
@@ -624,6 +646,113 @@ mod tests {
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
             "valid Fly app name: {a}"
         );
+    }
+
+    // A minimal in-process Fly-shaped HTTP/1.1 server: it 200s the app create
+    // + GraphQL IP allocation (so a billable app + dedicated IPv4 come into
+    // existence) but 422s the machine-create POST — the exact billing-leak
+    // trigger. It records every request line so the test can assert a cleanup
+    // DELETE actually fired.
+    async fn fake_fly_server(
+        hits: std::sync::Arc<Mutex<Vec<String>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let hits = hits.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let first = req.lines().next().unwrap_or_default().to_string();
+                    let method = first.split(' ').next().unwrap_or("");
+                    let path = first.split(' ').nth(1).unwrap_or("");
+                    hits.lock().unwrap().push(first.clone());
+                    let (code, body): (u16, String) = if path.contains("/machines")
+                        && method == "POST"
+                    {
+                        // Machine create is rejected — nothing to see, but the app
+                        // + IP already exist and must be reaped.
+                        (422, r#"{"error":"invalid region"}"#.into())
+                    } else if method == "DELETE" {
+                        // The best-effort teardown lands: app + IP + machine gone.
+                        (200, "{}".into())
+                    } else if method == "POST" && path == "/" {
+                        // GraphQL: app_ips (no v4 yet) then allocate (mints a v4).
+                        if req.contains("allocateIpAddress") {
+                            (200, r#"{"data":{"allocateIpAddress":{"ipAddress":{"id":"ip_x","address":"137.66.60.73","type":"v4"}}}}"#.into())
+                        } else {
+                            (200, r#"{"data":{"app":{"ipAddresses":{"nodes":[]}}}}"#.into())
+                        }
+                    } else if method == "GET" && path.contains("/apps/") {
+                        // App does not exist yet ⇒ create is taken.
+                        (404, r#"{"error":"not found"}"#.into())
+                    } else if method == "POST" && path.contains("/apps") {
+                        // App create succeeds — the FIRST billable resource.
+                        (200, r#"{"name":"sz-app"}"#.into())
+                    } else {
+                        (200, "{}".into())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (base, handle)
+    }
+
+    /// Regression: a 4xx on machine-create (after the app + dedicated IPv4 have
+    /// been created) must NOT orphan the billable resources. The old code just
+    /// dropped the ledger record on any "failed (4…" — leaving an invisible
+    /// billing app/IP. The fix best-effort-DELETEs the app (cascading IP +
+    /// machine) and only clears the record when that teardown succeeds.
+    #[tokio::test]
+    async fn create_4xx_after_app_exists_tears_down_not_orphans() {
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded env mutation scoped to this serial test.
+        unsafe {
+            std::env::set_var("THEGN_DIR", tmp.path());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (base, _srv) = fake_fly_server(hits.clone()).await;
+        let s = FlySpec {
+            api_base: base.clone(),
+            graphql_url: format!("{base}/"),
+            name: "sz-fly-leak".into(),
+            skip_ready_wait: true,
+            ..spec()
+        };
+        let provider = FlyProvider::new(s);
+        let res = provider.create().await;
+        assert!(res.is_err(), "machine 422 must surface as an error");
+
+        // The app + IP were created (app POST + GraphQL allocate both fired) and
+        // then a DELETE reaped them.
+        let seen = hits.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|h| h.starts_with("DELETE")),
+            "cleanup DELETE must fire to reap the leaked app/IP; saw {seen:?}"
+        );
+        // Teardown succeeded ⇒ the intent record is cleared (destroy removes it),
+        // so nothing is left orphaned AND invisible to list().
+        assert!(
+            registry::read("sz-fly-leak").is_none(),
+            "record must be gone after a successful teardown, not orphaned"
+        );
+
+        unsafe {
+            std::env::remove_var("THEGN_DIR");
+        }
     }
 
     #[test]

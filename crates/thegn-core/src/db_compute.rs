@@ -130,44 +130,56 @@ pub fn accrue_cost(rate_hourly: f64, last_ms: i64, now_ms: i64) -> f64 {
 
 impl Db {
     /// Accrue-or-stop shared body; `stop` also stamps `stopped_at_ms`.
+    ///
+    /// The watermark advance and the (triple) spend attribution run in ONE
+    /// transaction: this ledger is the primary spend-tracking path behind
+    /// [`check_compute_budget`]'s cap enforcement — nothing re-derives it — so a
+    /// failed attribution (SQLITE_BUSY past the 5s timeout under cross-process
+    /// contention, disk full) must NOT leave the watermark advanced with the
+    /// slice's cost silently dropped. On any error the whole transaction rolls
+    /// back, so the next tick re-accrues the same slice instead of losing it.
     fn meter_advance(&self, resource: &str, now_ms: i64, stop: bool) -> Result<f64> {
-        let m = self
-            .conn()
-            .query_row(
-                &format!("SELECT {METER_COLS} FROM compute_meters WHERE resource=?1"),
-                params![resource],
-                meter_from,
-            )
-            .optional()?;
-        let Some(m) = m else { return Ok(0.0) };
-        if m.stopped_at_ms.is_some() {
-            return Ok(0.0); // already final — idempotent
-        }
-        let cost = accrue_cost(m.rate_hourly, m.last_accrued_ms, now_ms);
-        let wm = now_ms.max(m.last_accrued_ms);
-        if stop {
-            self.conn().execute(
-                "UPDATE compute_meters SET last_accrued_ms=?2, stopped_at_ms=?2
-                  WHERE resource=?1",
-                params![resource, wm],
-            )?;
-        } else {
-            self.conn().execute(
-                "UPDATE compute_meters SET last_accrued_ms=?2 WHERE resource=?1",
-                params![resource, wm],
-            )?;
-        }
-        if cost > 0.0 {
-            // Triple attribution: scope, zone (when any), global.
-            let _ = self.add_compute_spend(&m.scope, cost, now_ms);
-            if !m.zone.is_empty() {
-                let _ = self.add_compute_spend(&format!("zone:{}", m.zone), cost, now_ms);
+        self.transaction(|db| {
+            let m = db
+                .conn()
+                .query_row(
+                    &format!("SELECT {METER_COLS} FROM compute_meters WHERE resource=?1"),
+                    params![resource],
+                    meter_from,
+                )
+                .optional()?;
+            let Some(m) = m else { return Ok(0.0) };
+            if m.stopped_at_ms.is_some() {
+                return Ok(0.0); // already final — idempotent
             }
-            if m.scope != "global" {
-                let _ = self.add_compute_spend("global", cost, now_ms);
+            let cost = accrue_cost(m.rate_hourly, m.last_accrued_ms, now_ms);
+            let wm = now_ms.max(m.last_accrued_ms);
+            if stop {
+                db.conn().execute(
+                    "UPDATE compute_meters SET last_accrued_ms=?2, stopped_at_ms=?2
+                      WHERE resource=?1",
+                    params![resource, wm],
+                )?;
+            } else {
+                db.conn().execute(
+                    "UPDATE compute_meters SET last_accrued_ms=?2 WHERE resource=?1",
+                    params![resource, wm],
+                )?;
             }
-        }
-        Ok(cost)
+            if cost > 0.0 {
+                // Triple attribution: scope, zone (when any), global. `?`, not
+                // `let _ =` — a failed charge rolls the watermark back so the
+                // slice is re-accrued next tick, never lost.
+                db.add_compute_spend(&m.scope, cost, now_ms)?;
+                if !m.zone.is_empty() {
+                    db.add_compute_spend(&format!("zone:{}", m.zone), cost, now_ms)?;
+                }
+                if m.scope != "global" {
+                    db.add_compute_spend("global", cost, now_ms)?;
+                }
+            }
+            Ok(cost)
+        })
     }
 }
 
@@ -398,6 +410,40 @@ mod tests {
             check_compute_budget(&db, None, true),
             ComputeVerdict::Refuse(_)
         ));
+    }
+
+    #[test]
+    fn failed_attribution_rolls_back_the_watermark() {
+        let db = db();
+        db.start_compute_meter(&meter("host-r", 1.0, "")).unwrap();
+        // Force the spend attribution to fail *after* the watermark would move:
+        // drop the budgets table so add_compute_spend's INSERT errors. The whole
+        // meter_advance transaction must roll back — watermark unchanged — so the
+        // accrued hour is re-accrued (not silently lost) on the next tick.
+        db.conn()
+            .execute("DROP TABLE compute_budgets", [])
+            .unwrap();
+        assert!(
+            db.accrue_compute_meter("host-r", 3_600_000).is_err(),
+            "attribution failure surfaces as an error, not a swallowed loss"
+        );
+        // Watermark did NOT advance (rolled back).
+        let wm: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_accrued_ms FROM compute_meters WHERE resource='host-r'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wm, 0, "watermark rolled back to its pre-tick value");
+
+        // Recreate the budgets table; the very next tick re-accrues the full hour
+        // — the slice was never lost.
+        migrate_v36(db.conn()).unwrap();
+        assert_eq!(db.accrue_compute_meter("host-r", 3_600_000).unwrap(), 1.0);
+        let g = db.compute_budget("global").unwrap().unwrap().spent_cost;
+        assert!((g - 1.0).abs() < 1e-9, "{g}");
     }
 
     #[test]

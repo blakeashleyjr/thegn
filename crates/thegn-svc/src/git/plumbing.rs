@@ -32,9 +32,12 @@ fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String, String)> {
         let r = b.exec(&refs, None, &[])?;
         return Ok((r.exit, r.stdout, r.stderr));
     }
-    let out = loc
-        .git_command(args)
-        .output()
+    // Bound the local path so a ref lock held by a crashed process or a hung
+    // NFS mount can't hang the merge-queue fold actor forever (merge-tree /
+    // update-ref are local object-DB/ref ops that should finish in ms). The
+    // exit-code-as-data semantics are unaffected: `output_bounded` only errors on
+    // spawn failure or timeout, never on a non-zero exit.
+    let out = super::output_bounded(loc.git_command(args), args)
         .with_context(|| format!("git {}", args.join(" ")))?;
     Ok((
         out.status.code().unwrap_or(-1),

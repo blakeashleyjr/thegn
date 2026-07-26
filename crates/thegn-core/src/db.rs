@@ -526,6 +526,16 @@ impl Db {
               read           INTEGER NOT NULL DEFAULT 0,
               worktree_path  TEXT    NOT NULL DEFAULT ''
             );
+            -- Supporting index for the two hot inbox queries: the per-hydration
+            -- unread-badge count (`WHERE read=0 AND kind IN(…) GROUP BY
+            -- worktree_path`, run twice per hydration) and the newest-first
+            -- inbox list. Without it every count/list is a full table scan +
+            -- sort, and the table grows monotonically (read rows are marked, not
+            -- deleted, and only pruned by `prune_notifications`).
+            CREATE INDEX IF NOT EXISTS idx_notifications_unread
+              ON notifications (read, kind, worktree_path);
+            CREATE INDEX IF NOT EXISTS idx_notifications_created
+              ON notifications (created_at_ms DESC);
             -- v41: per-worktree acknowledgement of a "Needs you" attention
             -- signal. Stores the exact (reason, since) that was showing when the
             -- user quieted it, so the nag stays silenced for *that episode* only
@@ -751,10 +761,17 @@ impl Db {
                 [],
             );
         }
-        Ok(Db {
+        let db = Db {
             conn,
             schema_mismatch,
-        })
+        };
+        // Startup prune: read notifications are only ever marked (never deleted)
+        // by the inbox, so without this the table grows monotonically on a
+        // long-lived install (see `prune_notifications`). Drop read rows older
+        // than 30 days; unread alerts are always kept. Best-effort — the DB is a
+        // cache and this must never gate open.
+        let _ = db.prune_notifications(30 * 24 * 3600);
+        Ok(db)
     }
 
     pub(crate) fn map_share_row(r: &rusqlite::Row) -> rusqlite::Result<ShareRow> {
@@ -780,11 +797,41 @@ impl Db {
 
     // --- notifications inbox -------------------------------------------------
 
+    /// Delete read (`read=1`) notifications older than `older_than_secs`.
+    /// Called on startup to keep the inbox table from growing unbounded — read
+    /// rows are otherwise never deleted (only marked), so a long-lived install
+    /// accumulates them forever (the v46 `process_failed` pile is the canonical
+    /// example: those rows were marked read, not removed). Unread rows are never
+    /// pruned regardless of age — an unacknowledged alert must survive. Returns
+    /// the number of rows removed. Best-effort: the DB is a cache.
+    pub fn prune_notifications(&self, older_than_secs: i64) -> Result<usize> {
+        // NB: `created_at_ms` holds unix *seconds* despite the legacy name
+        // (see `attention.rs`), and `put_notification` stamps it with
+        // `util::now()` (seconds) — so the cutoff is a plain seconds subtraction.
+        let cutoff = crate::util::now() - older_than_secs;
+        let n = self.conn.execute(
+            "DELETE FROM notifications WHERE read=1 AND created_at_ms < ?1",
+            rusqlite::params![cutoff],
+        )?;
+        Ok(n)
+    }
+
     pub(crate) fn notifications_query(
         &self,
         sql: &str,
         limit: usize,
     ) -> Result<Vec<crate::notification::Notification>> {
+        // Push the cap into SQL so a bounded inbox open never materializes +
+        // sorts the whole (monotonically-growing) table — the Rust-side
+        // `out.len() >= limit` break below stays as a belt-and-suspenders guard.
+        // `usize::MAX` (the unread feed) means "no cap": leave the SQL untouched.
+        let capped;
+        let sql = if limit == usize::MAX {
+            sql
+        } else {
+            capped = format!("{sql} LIMIT {limit}");
+            &capped
+        };
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([], |r| {
             Ok((

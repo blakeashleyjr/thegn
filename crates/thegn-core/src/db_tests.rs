@@ -1471,6 +1471,82 @@ fn notifications_put_and_read_and_mark_read() {
 }
 
 #[test]
+fn prune_notifications_drops_old_read_keeps_unread_and_recent() {
+    let db = db();
+    let now = crate::util::now();
+    let old = now - 60 * 24 * 3600; // 60 days ago (created_at_ms holds seconds)
+    // Four rows, inserted directly so we control created_at_ms:
+    //   read + old       → pruned
+    //   read + recent    → kept (too young)
+    //   unread + old     → kept (never prune an unacknowledged alert)
+    //   unread + recent  → kept
+    let insert = |kind: &str, read: i64, ts: i64| {
+        db.conn()
+            .execute(
+                "INSERT INTO notifications(kind,issue_id,message,created_at_ms,read,worktree_path)
+                 VALUES(?1,'x','m',?2,?3,'/wt')",
+                params![kind, ts, read],
+            )
+            .unwrap();
+    };
+    insert("read_old", 1, old);
+    insert("read_recent", 1, now);
+    insert("unread_old", 0, old);
+    insert("unread_recent", 0, now);
+
+    // Prune read rows older than 30 days: exactly one row removed.
+    let removed = db.prune_notifications(30 * 24 * 3600).unwrap();
+    assert_eq!(removed, 1, "only the old *read* row is pruned");
+
+    // The old read row is gone; every other row survives.
+    assert_eq!(
+        db.get_all_notifications(usize::MAX).unwrap().len(),
+        3,
+        "3 rows remain after pruning the single old read row"
+    );
+    // Both unread rows survive regardless of age.
+    assert_eq!(db.get_unread_notifications().unwrap().len(), 2);
+}
+
+#[test]
+fn notifications_query_pushes_limit_into_sql() {
+    let db = db();
+    // Insert five read+unread rows; a capped list must return exactly the cap.
+    for i in 0..5 {
+        db.put_notification("status_changed", &format!("id-{i}"), "m", "/wt")
+            .unwrap();
+    }
+    // get_all_notifications caps in SQL now — asking for 2 yields 2 (newest first).
+    let two = db.get_all_notifications(2).unwrap();
+    assert_eq!(two.len(), 2);
+    // A cap larger than the row count returns everything.
+    assert_eq!(db.get_all_notifications(100).unwrap().len(), 5);
+    // The unread feed (usize::MAX) is uncapped.
+    assert_eq!(db.get_unread_notifications().unwrap().len(), 5);
+}
+
+#[test]
+fn notifications_have_supporting_indexes() {
+    let db = db();
+    let idx: Vec<String> = db
+        .conn()
+        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='notifications'")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert!(
+        idx.iter().any(|n| n == "idx_notifications_unread"),
+        "unread-count index present: {idx:?}"
+    );
+    assert!(
+        idx.iter().any(|n| n == "idx_notifications_created"),
+        "created-at index present: {idx:?}"
+    );
+}
+
+#[test]
 fn agent_dispatch_roundtrip() {
     let db = db();
     // No dispatch for unknown path.

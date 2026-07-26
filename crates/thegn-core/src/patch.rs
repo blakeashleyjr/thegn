@@ -545,6 +545,13 @@ pub fn transform(file: &PatchFile, sel: &Selection, reverse: bool) -> Option<Str
     let mut body = String::new();
     let mut emitted = false;
     let mut delta: i64 = 0;
+    // Tracks whether the emitted body is a *partial* selection of a whole-file
+    // add/delete: a pure Deleted (forward) / Added (reverse) hunk has no context
+    // lines of its own, so any Context in the transformed output means some
+    // change lines were converted to context and the whole-file header
+    // (`deleted file mode`/`+++ /dev/null`, or `new file mode`/`--- /dev/null`)
+    // no longer matches — git would reject it.
+    let mut emitted_context = false;
     for (hi, hunk) in file.hunks.iter().enumerate() {
         let lines = transform_hunk_lines(hunk, hi, sel, reverse);
         let old_count = count_kinds(&lines, LineKind::Context, LineKind::Del);
@@ -553,6 +560,9 @@ pub fn transform(file: &PatchFile, sel: &Selection, reverse: bool) -> Option<Str
             .iter()
             .any(|l| matches!(l.kind, LineKind::Add | LineKind::Del));
         if has_changes {
+            if lines.iter().any(|l| l.kind == LineKind::Context) {
+                emitted_context = true;
+            }
             let adjust = if old_count == 0 {
                 1
             } else if new_count == 0 {
@@ -580,13 +590,114 @@ pub fn transform(file: &PatchFile, sel: &Selection, reverse: bool) -> Option<Str
     if !emitted {
         return None;
     }
+    // A partial selection of a whole-file delete (forward) or add (reverse)
+    // needs its header downgraded to a plain modify: drop the
+    // `deleted file mode`/`new file mode` line and put the real path back on the
+    // `/dev/null` side, or git apply rejects it (`deleted file … still has
+    // contents` / `new file … depends on old contents`).
+    let header = if emitted_context
+        && ((!reverse && file.kind == FileKind::Deleted)
+            || (reverse && file.kind == FileKind::Added))
+    {
+        rewrite_partial_whole_file_header(&file.header)
+    } else {
+        None
+    };
+
     let mut out = String::new();
-    for line in &file.header {
-        out.push_str(line);
-        out.push('\n');
+    match &header {
+        Some(rewritten) => out.push_str(rewritten),
+        None => {
+            for line in &file.header {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
     }
     out.push_str(&body);
     Some(out)
+}
+
+/// Downgrade a whole-file add/delete header to a modify header for a partial
+/// selection: drop the `deleted file mode`/`new file mode` line and replace the
+/// `/dev/null` side of `---`/`+++` with the real path (mirroring the surviving
+/// side's `a/`↔`b/` prefix, preserving quoting/trailing-tab). Returns the joined
+/// header text (each line newline-terminated), or `None` if the expected shape
+/// isn't present (leave the header untouched then).
+fn rewrite_partial_whole_file_header(header: &[String]) -> Option<String> {
+    // Find the surviving (non-/dev/null) `---`/`+++` path, keeping its verbatim
+    // suffix (quotes, trailing tab) so the transplanted side round-trips.
+    let mut minus_devnull = false;
+    let mut plus_devnull = false;
+    let mut minus_real: Option<&str> = None; // text after "--- "
+    let mut plus_real: Option<&str> = None; // text after "+++ "
+    for line in header {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            if rest.strip_suffix('\r').unwrap_or(rest) == "/dev/null" {
+                minus_devnull = true;
+            } else {
+                minus_real = Some(rest);
+            }
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            if rest.strip_suffix('\r').unwrap_or(rest) == "/dev/null" {
+                plus_devnull = true;
+            } else {
+                plus_real = Some(rest);
+            }
+        }
+    }
+
+    // Delete case: `+++ /dev/null`, real path on `---` (as `a/…`) → mirror to
+    // `b/…`. Add case: `--- /dev/null`, real path on `+++` (as `b/…`) → mirror
+    // to `a/…`.
+    let (fixed_minus, fixed_plus) = if plus_devnull {
+        let real = minus_real?;
+        (None, Some(mirror_side(real, "a/", "b/")))
+    } else if minus_devnull {
+        let real = plus_real?;
+        (Some(mirror_side(real, "b/", "a/")), None)
+    } else {
+        return None; // no /dev/null side — nothing to rewrite
+    };
+
+    let mut out = String::new();
+    for line in header {
+        if line.starts_with("deleted file mode") || line.starts_with("new file mode") {
+            continue; // drop: the file is no longer wholly deleted/added
+        }
+        if line.starts_with("--- ") && let Some(fixed) = &fixed_minus {
+            out.push_str(fixed);
+            out.push('\n');
+            continue;
+        }
+        if line.starts_with("+++ ") && let Some(fixed) = &fixed_plus {
+            out.push_str(fixed);
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Build a replacement `---`/`+++` line body from the surviving side's path
+/// text: swap its `from` prefix for `to` (e.g. `a/` ↔ `b/`), preserving the
+/// verbatim remainder (quotes, trailing tab, `\r`). Falls back to prefixing
+/// `to` when the surviving side lacks the expected prefix.
+fn mirror_side(surviving_body: &str, from: &str, to: &str) -> String {
+    let marker = if to == "a/" { "--- " } else { "+++ " };
+    // Handle a leading quote: `"a/…"` → `"b/…"`.
+    if let Some(inner) = surviving_body.strip_prefix('"') {
+        if let Some(rest) = inner.strip_prefix(from) {
+            return format!("{marker}\"{to}{rest}");
+        }
+        return format!("{marker}\"{to}{inner}");
+    }
+    if let Some(rest) = surviving_body.strip_prefix(from) {
+        return format!("{marker}{to}{rest}");
+    }
+    format!("{marker}{to}{surviving_body}")
 }
 
 /// Multi-file variant for custom-patch building: per-file selections keyed
@@ -1308,6 +1419,120 @@ mod tests {
         ]));
         let out = transform(&files[0], &sel(&[(0, 0), (0, 1)]), false).unwrap();
         assert!(out.contains("@@ -1,2 +0,0 @@\n-a\n-b\n"));
+    }
+
+    // ---- partial whole-file add/delete header rewrite ----------------------
+
+    fn deleted_fixture() -> String {
+        d(&[
+            "diff --git a/gone.txt b/gone.txt",
+            "deleted file mode 100644",
+            "index 2222222..0000000",
+            "--- a/gone.txt",
+            "+++ /dev/null",
+            "@@ -1,3 +0,0 @@",
+            "-a",
+            "-b",
+            "-c",
+        ])
+    }
+
+    fn added_fixture() -> String {
+        d(&[
+            "diff --git a/fresh.txt b/fresh.txt",
+            "new file mode 100644",
+            "index 0000000..2222222",
+            "--- /dev/null",
+            "+++ b/fresh.txt",
+            "@@ -0,0 +1,3 @@",
+            "+a",
+            "+b",
+            "+c",
+        ])
+    }
+
+    #[test]
+    fn partial_delete_forward_downgrades_header_to_modify() {
+        // Deleting a tracked file, then staging only a subset of the deletion:
+        // the emitted patch must NOT keep `deleted file mode` / `+++ /dev/null`
+        // (git apply rejects: "deleted file … still has contents"). The header
+        // is rewritten to a plain modify with the real path on the `+++` side.
+        let files = parse_patch(&deleted_fixture());
+        assert_eq!(files[0].kind, FileKind::Deleted);
+        let out = transform(&files[0], &sel(&[(0, 0)]), false).unwrap();
+        assert!(
+            !out.contains("deleted file mode"),
+            "mode line must be dropped:\n{out}"
+        );
+        assert!(!out.contains("+++ /dev/null"), "devnull must be replaced:\n{out}");
+        assert!(out.contains("--- a/gone.txt\n"), "{out}");
+        assert!(out.contains("+++ b/gone.txt\n"), "{out}");
+        // The kept deletion + converted-context body.
+        assert!(out.contains("@@ -1,3 +1,2 @@\n-a\n b\n c\n"), "{out}");
+    }
+
+    #[test]
+    fn full_delete_forward_keeps_whole_file_header() {
+        // Selecting the entire deletion still deletes the file → header must
+        // stay verbatim (byte-identical to the original patch).
+        let fixture = deleted_fixture();
+        let files = parse_patch(&fixture);
+        let out = transform(&files[0], &Selection::whole_file(&files[0]), false).unwrap();
+        assert_eq!(out, fixture);
+    }
+
+    #[test]
+    fn partial_add_reverse_downgrades_header_to_modify() {
+        // Staging a whole new file, then unstaging only a subset (reverse): the
+        // emitted patch must not keep `new file mode` / `--- /dev/null` (git
+        // apply --reverse rejects: "new file … depends on old contents").
+        let files = parse_patch(&added_fixture());
+        assert_eq!(files[0].kind, FileKind::Added);
+        let out = transform(&files[0], &sel(&[(0, 0)]), true).unwrap();
+        assert!(
+            !out.contains("new file mode"),
+            "mode line must be dropped:\n{out}"
+        );
+        assert!(!out.contains("--- /dev/null"), "devnull must be replaced:\n{out}");
+        assert!(out.contains("--- a/fresh.txt\n"), "{out}");
+        assert!(out.contains("+++ b/fresh.txt\n"), "{out}");
+    }
+
+    #[test]
+    fn full_add_reverse_keeps_whole_file_header() {
+        let fixture = added_fixture();
+        let files = parse_patch(&fixture);
+        let out = transform(&files[0], &Selection::whole_file(&files[0]), true).unwrap();
+        assert_eq!(out, fixture);
+    }
+
+    #[test]
+    fn partial_add_forward_keeps_new_file_header() {
+        // Forward-staging a subset of a NEW file keeps `new file mode` /
+        // `--- /dev/null` (git accepts a partial new-file add) — the rewrite is
+        // scoped to Deleted-forward / Added-reverse only.
+        let files = parse_patch(&added_fixture());
+        let out = transform(&files[0], &sel(&[(0, 0)]), false).unwrap();
+        assert!(out.contains("new file mode"), "{out}");
+        assert!(out.contains("--- /dev/null"), "{out}");
+    }
+
+    #[test]
+    fn partial_delete_rewrite_preserves_quoted_path() {
+        // A deleted file with a quoted (spaced/utf-8) path keeps its quoting
+        // when the surviving side is transplanted onto the +++ line.
+        let files = parse_patch(&d(&[
+            "diff --git \"a/go ne.txt\" \"b/go ne.txt\"",
+            "deleted file mode 100644",
+            "--- \"a/go ne.txt\"",
+            "+++ /dev/null",
+            "@@ -1,2 +0,0 @@",
+            "-a",
+            "-b",
+        ]));
+        let out = transform(&files[0], &sel(&[(0, 0)]), false).unwrap();
+        assert!(out.contains("+++ \"b/go ne.txt\"\n"), "{out}");
+        assert!(!out.contains("/dev/null"), "{out}");
     }
 
     // ---- transform: reverse mirrors ----------------------------------------

@@ -103,6 +103,10 @@ pub struct AcpClient {
     next_id: Arc<Mutex<i64>>,
     pending_requests: Arc<Mutex<HashMap<Id, oneshot::Sender<Result<Value>>>>>,
     tx_outbound: mpsc::Sender<JsonRpcMessage>,
+    // Set once the reader loop exits (EOF/error). A request registered *after*
+    // that point would miss the one-shot drain and could only bail on timeout, so
+    // `request()` checks this and fails fast instead.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AcpClient {
@@ -159,6 +163,9 @@ impl AcpClient {
         let pending_requests: Arc<Mutex<HashMap<Id, oneshot::Sender<Result<Value>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let pending_requests_clone = pending_requests.clone();
+
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed_clone = closed.clone();
 
         // Writer Loop
         tokio::spawn(async move {
@@ -227,9 +234,26 @@ impl AcpClient {
                             }
                         }
                     },
-                    Ok(None) => break, // EOF
-                    Err(_) => break,   // Read error
+                    Ok(None) => {
+                        tracing::debug!("ACP reader loop: EOF, agent connection closed");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("ACP reader loop: read error, connection closed: {e}");
+                        break;
+                    }
                 }
+            }
+            // The reader is the only path that completes a pending request. Once it
+            // exits (EOF/error), no reply will ever arrive, so drain the map and
+            // fail every waiter with "connection closed" — otherwise `request()`'s
+            // `rx.await` would hang forever (statusbar stuck 'Connecting', retry
+            // loop never advances, task + proxy key leak). Mark closed *before*
+            // draining so a request racing in after the drain also fails fast.
+            closed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut pending = pending_requests_clone.lock().await;
+            for (_, tx) in pending.drain() {
+                let _ = tx.send(Err(anyhow!("ACP connection closed")));
             }
         });
 
@@ -237,14 +261,23 @@ impl AcpClient {
             next_id: Arc::new(Mutex::new(1)),
             pending_requests,
             tx_outbound,
+            closed,
         };
 
         (client, rx_inbound)
     }
 
+    /// A request that never gets a reply must not wedge the caller forever. The
+    /// reader loop failing every pending request on disconnect covers the common
+    /// case, but a live-but-mute agent (accepts the connection, never answers)
+    /// would still hang `rx.await` — so bound every request with a wall-clock cap.
+    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Send a JSON-RPC request to the agent and await its result. Allocates a
     /// fresh id, registers a oneshot for the reply, and resolves when the reader
-    /// loop matches the response.
+    /// loop matches the response. Bounded by [`Self::REQUEST_TIMEOUT`]: if the
+    /// reader loop has exited it fails via the drained oneshot; if the agent is
+    /// alive but never replies the timeout fires and the stale entry is reaped.
     async fn request(&self, method: &str, params: Option<Value>) -> Result<Value> {
         let req_id = {
             let mut next = self.next_id.lock().await;
@@ -255,13 +288,31 @@ impl AcpClient {
         let req = Request::new(Id::Number(req_id), method, params);
 
         let (tx, rx) = oneshot::channel();
-        self.pending_requests
-            .lock()
-            .await
-            .insert(Id::Number(req_id), tx);
+        {
+            // Register under the pending lock, checking `closed` in the same
+            // critical section the drain uses. The reader sets `closed` *before*
+            // acquiring this lock to drain, so either: we insert first and the
+            // later drain fails our waiter, or the drain already ran and we observe
+            // `closed` here and bail — no request can slip past into a dead reader.
+            let mut pending = self.pending_requests.lock().await;
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(anyhow!("ACP connection closed"));
+            }
+            pending.insert(Id::Number(req_id), tx);
+        }
 
         self.tx_outbound.send(JsonRpcMessage::Request(req)).await?;
-        rx.await?
+        match tokio::time::timeout(Self::REQUEST_TIMEOUT, rx).await {
+            Ok(res) => res?,
+            Err(_elapsed) => {
+                // Reap the abandoned oneshot so the map doesn't leak the entry.
+                self.pending_requests.lock().await.remove(&Id::Number(req_id));
+                Err(anyhow!(
+                    "ACP request '{method}' timed out after {:?}",
+                    Self::REQUEST_TIMEOUT
+                ))
+            }
+        }
     }
 
     pub async fn initialize(&self) -> Result<AgentCapabilities> {
@@ -460,6 +511,34 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(2),
             "the retry budget is bounded"
         );
+    }
+
+    #[tokio::test]
+    async fn request_fails_fast_when_agent_hangs_up_before_replying() {
+        // The core hang fix: an agent that accepts the connection then closes it
+        // (crash / stray EOF) before answering `initialize` must not wedge the
+        // caller forever — the reader loop drains pending requests on exit and the
+        // awaiting request resolves with an error, well under the request timeout.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (sock, _) = l.accept().await.unwrap();
+            // Accept, then immediately hang up without ever replying.
+            drop(sock);
+        });
+
+        let (client, _rx) = AcpClient::connect(port).await.unwrap();
+        let start = std::time::Instant::now();
+        let res = client.initialize().await;
+        assert!(
+            res.is_err(),
+            "initialize must error when the agent hangs up, not hang forever"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the disconnect drain must resolve the request promptly, not wait out the timeout"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

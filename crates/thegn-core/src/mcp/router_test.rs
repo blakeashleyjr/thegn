@@ -211,6 +211,195 @@ fn merge_tools_absent_until_provider_attached() {
     }
 }
 
+/// A canned `HouseForge` — attaching it advertises the forge/git-write house
+/// tools and passes the provider gate. `create_branch`/`commit` echo their args
+/// so a test can prove exactly what the router forwarded (e.g. an empty name).
+struct FakeForge;
+impl crate::mcp::HouseForge for FakeForge {
+    fn pr_status(&self, _worktree: &str) -> Result<String, String> {
+        Ok("no PR".to_string())
+    }
+    fn pr_list(&self, _worktree: &str) -> Result<String, String> {
+        Ok("no open PRs".to_string())
+    }
+    fn ci_runs(&self, _worktree: &str) -> Result<String, String> {
+        Ok("no runs".to_string())
+    }
+    fn create_branch(&self, worktree: &str, name: &str, base: &str) -> Result<String, String> {
+        // Surface a git-level failure for an empty name, mirroring what the real
+        // backend does when it shells `git branch "" …`. This is the confusing
+        // -32603 the router should ideally not reach for empty args.
+        if name.is_empty() {
+            return Err("fatal: '' is not a valid branch name".to_string());
+        }
+        Ok(format!("created {name} off {base} in {worktree}"))
+    }
+    fn commit(&self, _worktree: &str, message: &str) -> Result<String, String> {
+        if message.is_empty() {
+            return Err("aborting commit due to empty commit message".to_string());
+        }
+        Ok(format!("committed: {message}"))
+    }
+}
+
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn forge_create_branch_forwards_base_default_and_name() {
+    // Happy path: base defaults to HEAD, name is forwarded verbatim.
+    let db = Arc::new(Db::open_memory().unwrap());
+    let bus = Arc::new(EventBus::new());
+    let router = McpRouter::new(db, bus).with_forge(Arc::new(FakeForge), "/wt".to_string());
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+        "params": { "name": "create_branch", "arguments": { "name": "feat/x" } }
+    });
+    let res = router.handle_request(&req);
+    assert!(res["error"].is_null(), "unexpected error: {res}");
+    let text = res["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("created feat/x off HEAD in /wt"), "got: {text}");
+}
+
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn forge_create_branch_missing_name_surfaces_git_error() {
+    // Adversarial input: a tools/call for create_branch with no `name` currently
+    // forwards an empty branch name to the provider, which fails at the git
+    // level and is mapped to -32603 (not a protocol-level -32602 invalid-params).
+    // This locks the CURRENT contract so a future refactor toward -32602 is a
+    // deliberate, visible change rather than a silent regression.
+    let db = Arc::new(Db::open_memory().unwrap());
+    let bus = Arc::new(EventBus::new());
+    let router = McpRouter::new(db, bus).with_forge(Arc::new(FakeForge), "/wt".to_string());
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+        "params": { "name": "create_branch", "arguments": {} }
+    });
+    let res = router.handle_request(&req);
+    assert_eq!(res["error"]["code"], -32603, "got: {res}");
+    assert!(
+        res["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a valid branch name"),
+        "got: {res}"
+    );
+}
+
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn forge_tool_without_provider_is_not_configured_error() {
+    // Calling a forge tool with no provider is a clean -32603, not a panic.
+    let router = McpRouter::new(
+        Arc::new(Db::open_memory().unwrap()),
+        Arc::new(EventBus::new()),
+    );
+    let req = json!({
+        "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+        "params": { "name": "create_branch", "arguments": { "name": "x" } }
+    });
+    let res = router.handle_request(&req);
+    assert_eq!(res["error"]["code"], -32603, "got: {res}");
+    assert!(
+        res["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not configured"),
+        "got: {res}"
+    );
+}
+
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn unknown_method_and_tool_and_malformed_request_error_codes() {
+    let db = Arc::new(Db::open_memory().unwrap());
+    let bus = Arc::new(EventBus::new());
+    let router = McpRouter::new(db, bus);
+
+    // Unknown method → -32601, id preserved.
+    let req = json!({ "jsonrpc": "2.0", "id": 5, "method": "no/such/method", "params": {} });
+    let res = router.handle_request(&req);
+    assert_eq!(res["error"]["code"], -32601, "got: {res}");
+    assert_eq!(res["id"], 5);
+
+    // Unknown tool via tools/call → -32601.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+        "params": { "name": "definitely_not_a_tool", "arguments": {} }
+    });
+    let res = router.handle_request(&req);
+    assert_eq!(res["error"]["code"], -32601, "got: {res}");
+
+    // Malformed request (missing required `method`) → -32700 parse error, id Null.
+    let req = json!({ "jsonrpc": "2.0", "id": 8, "params": {} });
+    let res = router.handle_request(&req);
+    assert_eq!(res["error"]["code"], -32700, "got: {res}");
+    assert!(res["id"].is_null(), "parse-error id must be Null: {res}");
+}
+
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn resources_read_status_and_malformed_uri() {
+    let db = Arc::new(Db::open_memory().unwrap());
+    let bus = Arc::new(EventBus::new());
+    let router = McpRouter::new(db, bus);
+
+    // fleet://status is always available.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 20, "method": "resources/read",
+        "params": { "uri": "fleet://status" }
+    });
+    let res = router.handle_request(&req);
+    assert!(res["error"].is_null(), "unexpected error: {res}");
+
+    // worktree://X/status with no cached diff → empty text (Ok(None) path), no error.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 21, "method": "resources/read",
+        "params": { "uri": "worktree:///wt/x/status" }
+    });
+    let res = router.handle_request(&req);
+    assert!(res["error"].is_null(), "unexpected error: {res}");
+    assert_eq!(res["result"]["contents"][0]["text"], "");
+
+    // A malformed URI (right scheme, wrong shape) → -32602 invalid-params.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 22, "method": "resources/read",
+        "params": { "uri": "worktree:///wt/x/nope" }
+    });
+    let res = router.handle_request(&req);
+    assert_eq!(res["error"]["code"], -32602, "got: {res}");
+
+    // A completely unknown scheme → -32602.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 23, "method": "resources/read",
+        "params": { "uri": "gopher://nope" }
+    });
+    let res = router.handle_request(&req);
+    assert_eq!(res["error"]["code"], -32602, "got: {res}");
+}
+
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn check_my_budget_defaults_scope_and_reports_no_limits() {
+    let db = Arc::new(Db::open_memory().unwrap());
+    let bus = Arc::new(EventBus::new());
+    let router = McpRouter::new(db, bus);
+
+    // Missing scope defaults to "global"; no budget row → Ok(None) reports it.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 30, "method": "tools/call",
+        "params": { "name": "check_my_budget", "arguments": {} }
+    });
+    let res = router.handle_request(&req);
+    assert!(res["error"].is_null(), "unexpected error: {res}");
+    let text = res["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("No budget limits set for scope global"),
+        "got: {text}"
+    );
+}
+
 #[test]
 #[allow(clippy::arc_with_non_send_sync)]
 fn merge_add_dispatches_to_provider() {

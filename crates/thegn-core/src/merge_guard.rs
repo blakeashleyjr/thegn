@@ -108,11 +108,25 @@ pub enum InstallAction {
 /// [`install`] should do. Never discards a foreign hook (it is chained, not
 /// dropped).
 pub fn decide(existing: Option<&str>) -> InstallAction {
+    decide_bytes(existing.map(str::as_bytes))
+}
+
+/// Byte-level pure decision — the form [`install`] actually uses. A hook that
+/// exists but is **not** valid UTF-8 (e.g. a compiled-binary foreign hook) is a
+/// foreign hook to be chained, never clobbered: only our own text script (which
+/// is ASCII, hence valid UTF-8) can ever be `AlreadyCurrent`/`Wrote`. Reading
+/// the file as bytes and deciding here is what distinguishes "absent" (`None`)
+/// from "unreadable as UTF-8" (`Some(non-utf8)`), which the old
+/// `read_to_string(...).ok()` path conflated.
+pub fn decide_bytes(existing: Option<&[u8]>) -> InstallAction {
     match existing {
         None => InstallAction::Wrote,
-        Some(body) if body == HOOK_SCRIPT => InstallAction::AlreadyCurrent,
-        Some(body) if body.contains(MARKER) => InstallAction::Wrote,
-        Some(_) => InstallAction::Chained,
+        Some(bytes) if bytes == HOOK_SCRIPT.as_bytes() => InstallAction::AlreadyCurrent,
+        // A non-UTF-8 body can't be ours (our script is ASCII) — it's foreign.
+        Some(bytes) => match std::str::from_utf8(bytes) {
+            Ok(body) if body.contains(MARKER) => InstallAction::Wrote,
+            _ => InstallAction::Chained,
+        },
     }
 }
 
@@ -122,8 +136,15 @@ pub fn decide(existing: Option<&str>) -> InstallAction {
 /// hooks dir, permissions) — callers should treat that as "skipped".
 pub fn install(hooks_dir: &Path) -> std::io::Result<InstallAction> {
     let path = hooks_dir.join(HOOK_NAME);
-    let existing = std::fs::read_to_string(&path).ok();
-    let action = decide(existing.as_deref());
+    // Read as bytes, not `read_to_string`: a non-UTF-8 (binary) foreign hook
+    // must NOT be mistaken for an absent file (`.ok()` → None) and clobbered.
+    // Only a genuine NotFound counts as absent; any other read error propagates.
+    let existing = match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let action = decide_bytes(existing.as_deref());
     match action {
         InstallAction::AlreadyCurrent => {}
         InstallAction::Wrote => {
@@ -186,6 +207,17 @@ mod tests {
     }
 
     #[test]
+    fn decide_chains_non_utf8_foreign_hook() {
+        // A compiled-binary (non-UTF-8) foreign hook must be chained, never
+        // clobbered: `read_to_string(...).ok()` used to map this to None and
+        // overwrite it. Bytes with an invalid UTF-8 sequence + our marker in
+        // the tail must still be treated as foreign (not "ours, refresh").
+        let binary = &[0x7f, b'E', b'L', b'F', 0xff, 0xfe, 0x00, 0x80][..];
+        assert!(std::str::from_utf8(binary).is_err());
+        assert_eq!(decide_bytes(Some(binary)), InstallAction::Chained);
+    }
+
+    #[test]
     fn script_is_scoped_and_self_describing() {
         // The guards that keep it from firing in the wrong place, the chain
         // delegation, and the redirect must all be present.
@@ -241,6 +273,27 @@ mod tests {
         // Re-running sees our own hook and refreshes without re-chaining.
         assert_eq!(install(&dir).unwrap(), InstallAction::AlreadyCurrent);
         assert_eq!(std::fs::read_to_string(&chained).unwrap(), foreign);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_chains_non_utf8_foreign_hook_instead_of_clobbering() {
+        // Regression: a non-UTF-8 (binary) foreign hook was silently overwritten
+        // (read_to_string → None → Wrote), deleting the user's hook with no
+        // backup. It must now be displaced to CHAINED_NAME and preserved verbatim.
+        let dir = scratch("binhook");
+        let path = dir.join(HOOK_NAME);
+        let binary: &[u8] = &[0x7f, b'E', b'L', b'F', 0xff, 0xfe, 0x00, 0x80];
+        std::fs::write(&path, binary).unwrap();
+
+        assert_eq!(install(&dir).unwrap(), InstallAction::Chained);
+        // Ours owns the slot…
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), HOOK_SCRIPT);
+        // …and the foreign binary hook is preserved byte-for-byte, executable.
+        let chained = dir.join(CHAINED_NAME);
+        assert_eq!(std::fs::read(&chained).unwrap(), binary);
+        #[cfg(unix)]
+        assert!(is_executable(&chained), "chained binary hook must stay executable");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

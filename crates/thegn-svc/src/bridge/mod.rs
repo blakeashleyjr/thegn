@@ -351,12 +351,16 @@ impl BridgeClient {
     }
 
     /// Sum of CPU jiffies per path for processes in the env whose cwd is under it
-    /// (feeds the activity FSM with the *env's* processes).
+    /// (feeds the activity FSM with the *env's* processes). Runs on the recurring
+    /// hydration/activity poll — a read-only interactive op — so it's bound by the
+    /// shorter `read_timeout`: a stalled remote must freeze the sidebar refresh for
+    /// the read deadline, not the full 120s write deadline.
     pub fn proc_list(&self, paths: &[String]) -> Result<BTreeMap<String, u64>> {
         let params = serde_json::to_value(ProcParams {
             paths: paths.to_vec(),
         })?;
-        let r: ProcResult = serde_json::from_value(self.call("proc.list", params)?)?;
+        let r: ProcResult =
+            serde_json::from_value(self.call_within("proc.list", params, self.read_timeout)?)?;
         Ok(r.jiffies)
     }
 
@@ -501,7 +505,12 @@ pub fn register(key: &str, client: Arc<BridgeClient>) {
     registry().lock().unwrap().insert(key.to_string(), client);
 }
 
-/// Drop a worktree's bridge (on close); the `BridgeClient` Drop kills the agent.
+/// Remove a worktree's bridge from the process-global registry. This drops **only
+/// the registry's** `Arc`; the agent is killed by `BridgeClient::drop` **only if
+/// this was the last `Arc`**. Callers that hold a second `Arc` (the host's
+/// `BridgeSupervisor` keeps one in its `conns` map) must drop that too — route
+/// teardown through the supervisor's disconnect path, not this alone — or the
+/// agent keeps running and `is_connected` still reports the stale client alive.
 pub fn drop_key(key: &str) {
     registry().lock().unwrap().remove(key);
 }
@@ -595,10 +604,18 @@ fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs, procs: Procs
             }
         }
     }
-    // Stream closed — unblock any waiters so they don't hang to the deadline.
+    // Stream closed — tear down every consumer so none hangs waiting for events
+    // that can never arrive (the connection can die without the client dropping).
+    // Pending RPC waiters get an error; proc subscribers get a final synthetic
+    // Exit; fs.watch subscribers observe the drop (Sender gone → recv errs).
     for (_, tx) in pending.lock().unwrap().drain() {
         let _ = tx.send(Err("bridge connection closed".into()));
     }
+    for (_, tx) in procs.lock().unwrap().drain() {
+        let _ = tx.send(ProcEvent::Exit { code: -1 });
+    }
+    // Dropping the Senders disconnects each fs.watch receiver's `recv()`.
+    subs.lock().unwrap().clear();
 }
 
 /// The agent side (`thegn --bridge`): read framed requests off `reader`, run
@@ -612,13 +629,22 @@ fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs, procs: Procs
 /// `fs.watch` background watcher threads (which push `fs.event` notifications).
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
-/// A live streaming child: only its stdin is retained (for `proc.stdin`). Dropping
-/// it closes stdin → the child sees EOF → exits → its waiter thread fires
-/// `proc.exit`. So `proc.kill` and connection-close are just a map removal — no
-/// shared `Child` mutex, no libc signal, no deadlock between reader/kill paths.
+/// A live streaming child. Its stdin is owned by a dedicated per-channel writer
+/// thread; `proc.stdin` just hands bytes to that thread over a **bounded** channel
+/// so the blocking pipe write never runs on the serve read loop (a child that
+/// stops draining stdin must not wedge the whole agent — every other request,
+/// including the `proc.kill` that would free the pipe, would sit unread otherwise).
+/// Dropping the `ProcState` drops the sender → the writer thread's `recv` errs →
+/// it drops stdin → the child sees EOF → exits → its waiter thread fires
+/// `proc.exit`. So `proc.kill` and connection-close remain just a map removal —
+/// no shared `Child` mutex, no libc signal, no deadlock between reader/kill paths.
 struct ProcState {
-    stdin: Arc<Mutex<std::process::ChildStdin>>,
+    /// Bounded so a wedged child's backlog can't grow without limit; a full queue
+    /// makes `proc.stdin` fail fast rather than block the read loop.
+    stdin_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
 }
+/// Backlog depth for a channel's stdin writer thread before `proc.stdin` errors.
+const STDIN_QUEUE_DEPTH: usize = 64;
 type ProcRegistry = Arc<Mutex<HashMap<u64, ProcState>>>;
 
 pub fn serve(mut reader: impl Read, writer: impl Write + Send + 'static) {
@@ -719,12 +745,28 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
         let _ = child.wait();
         return Err(e).context("spawn bridge proc relay thread");
     }
-    procs.lock().unwrap().insert(
-        chan,
-        ProcState {
-            stdin: Arc::new(Mutex::new(stdin)),
-        },
-    );
+    // A dedicated writer thread owns stdin: proc.stdin bytes arrive over a bounded
+    // channel, so the blocking pipe write happens here, never on the serve read
+    // loop. The thread ends when the sender drops (ProcState removed by proc.kill /
+    // connection-close) or the pipe errors — either way stdin drops → EOF.
+    let (stdin_tx, stdin_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(STDIN_QUEUE_DEPTH);
+    let writer_thread = std::thread::Builder::new()
+        .name("bridge-proc-stdin".into())
+        .spawn(move || {
+            let mut stdin = stdin;
+            while let Ok(chunk) = stdin_rx.recv() {
+                if stdin.write_all(&chunk).and_then(|()| stdin.flush()).is_err() {
+                    break;
+                }
+            }
+            // Drop stdin → child sees EOF.
+        });
+    if let Err(e) = writer_thread {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e).context("spawn bridge-proc-stdin thread");
+    }
+    procs.lock().unwrap().insert(chan, ProcState { stdin_tx });
     // Waiter: owns the Child, blocks on exit (no lock held), then reports exit and
     // drops the channel. The child exits when it finishes or when proc.kill /
     // connection-close drops its stdin (EOF).
@@ -786,18 +828,26 @@ fn proc_stdin_response(req: &Request, procs: &ProcRegistry) -> Response {
         Ok(p) => p,
         Err(e) => return resp_err(req.id, format!("bad proc.stdin params: {e}")),
     };
-    let stdin = procs.lock().unwrap().get(&p.chan).map(|s| s.stdin.clone());
-    let Some(stdin) = stdin else {
+    let stdin_tx = procs.lock().unwrap().get(&p.chan).map(|s| s.stdin_tx.clone());
+    let Some(stdin_tx) = stdin_tx else {
         return resp_err(req.id, format!("no such channel {}", p.chan));
     };
     let data = match B64.decode(&p.data) {
         Ok(d) => d,
         Err(e) => return resp_err(req.id, format!("proc.stdin: invalid base64: {e}")),
     };
-    let mut g = stdin.lock().unwrap();
-    match g.write_all(&data).and_then(|_| g.flush()) {
+    // Hand off to the channel's writer thread without blocking the read loop. A
+    // full queue means the child has stalled on reading its stdin — fail fast
+    // (the client sees the error and can back off / kill) rather than wedging the
+    // agent behind a blocked pipe write.
+    match stdin_tx.try_send(data) {
         Ok(()) => resp_ok(req.id, serde_json::json!({})),
-        Err(e) => resp_err(req.id, format!("proc.stdin write: {e}")),
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+            resp_err(req.id, "proc.stdin: channel stdin backlog full".into())
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+            resp_err(req.id, format!("proc.stdin: channel {} closed", p.chan))
+        }
     }
 }
 
@@ -1001,13 +1051,56 @@ fn do_exec(p: &ExecParams) -> Result<ExecResult> {
     for (k, v) in &p.env {
         c.env(k, v);
     }
-    let out = c
-        .output()
-        .with_context(|| format!("exec {}", p.argv.join(" ")))?;
+    // Bounded like the host's local `output_bounded`: a wedged git in the env (an
+    // index.lock held by a crashed process, a hung NFS/SSH mount) must not pin a
+    // `bridge-exec` thread + live process forever. The client abandons its RPC on
+    // timeout without cancelling us, so cap it here — deadline defaults above the
+    // client's read timeout so a legitimately-slow-but-live command still finishes.
+    let deadline = env_timeout("THEGN_BRIDGE_EXEC_DEADLINE_SECS", 90);
+    output_bounded(c, deadline).with_context(|| format!("exec {}", p.argv.join(" ")))
+}
+
+/// Run `c` to completion, draining stdout/stderr on threads (so a full pipe never
+/// deadlocks) and killing the child if it outlives `deadline`. Mirrors the host's
+/// `git::output_bounded`. A killed child yields `exit = -1`.
+fn output_bounded(mut c: Command, deadline: Duration) -> Result<ExecResult> {
+    c.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = c.spawn().context("spawn")?;
+    let mut stdout = child.stdout.take().context("child stdout")?;
+    let mut stderr = child.stderr.take().context("child stderr")?;
+    // Drain both pipes concurrently — a child that fills one while we block on the
+    // other would otherwise deadlock, and killing on deadline needs the readers to
+    // not be holding the process open.
+    let out_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = stdout.read_to_end(&mut b);
+        b
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = stderr.read_to_end(&mut b);
+        b
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait().context("wait")? {
+            Some(s) => break Some(s),
+            None if start.elapsed() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let stdout = out_h.join().unwrap_or_default();
+    let stderr = err_h.join().unwrap_or_default();
     Ok(ExecResult {
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        exit: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit: status.and_then(|s| s.code()).unwrap_or(-1),
     })
 }
 
@@ -1393,6 +1486,109 @@ mod tests {
             ProcEvent::Out { data, .. } => assert_eq!(&data, b"still-here"),
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn connection_close_delivers_exit_to_proc_subscribers() {
+        // A live proc.spawn subscriber must observe a terminal Exit when the
+        // connection dies (reader_loop close), not hang on recv forever — the
+        // production `bridge-fswatch`/proc forwarder threads rely on this.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            // Hold briefly so the client registers its sub, then hang up.
+            std::thread::sleep(Duration::from_millis(100));
+            drop(sock);
+        });
+        let sock = TcpStream::connect(addr).unwrap();
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        // Register a proc subscriber directly (no real proc.spawn round-trip; the
+        // server here never answers).
+        let (tx, rx) = channel();
+        c.procs.lock().unwrap().insert(7, tx);
+        let start = Instant::now();
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(ProcEvent::Exit { code }) => assert_eq!(code, -1),
+            other => panic!("expected a synthetic Exit on close, got {other:?}"),
+        }
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn connection_close_disconnects_fs_watch_subscribers() {
+        // An fs.watch receiver must disconnect (recv errs) when the connection
+        // dies, rather than blocking the forwarder thread for the process lifetime.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            drop(sock);
+        });
+        let sock = TcpStream::connect(addr).unwrap();
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let (tx, rx) = channel::<FsEvent>();
+        c.subs.lock().unwrap().insert(3, tx);
+        // recv must err (sender dropped by reader_loop close), not time out.
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            other => panic!("expected the fs.watch receiver to disconnect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proc_stdin_does_not_block_read_loop_when_child_ignores_stdin() {
+        // A child that never reads its stdin must not wedge the serve loop: once
+        // the OS pipe buffer fills, further proc.stdin either queue-fails fast or
+        // succeed, and crucially a subsequent proc.kill on the SAME connection is
+        // still processed (the read loop was never blocked in write_all).
+        let c = connect();
+        // `sleep` never reads stdin; feed it far more than a pipe buffer (~64KB).
+        let (chan, _rx) = c.spawn_proc(&["sh", "-c", "sleep 30"], None, &[]).unwrap();
+        let chunk = vec![b'x'; 16 * 1024];
+        // Push enough to overflow both the pipe and the bounded queue; some sends
+        // may error (backlog full) — that's the fast-fail, not a hang.
+        for _ in 0..256 {
+            let _ = c.proc_stdin(chan, &chunk);
+        }
+        // The read loop is still alive: proc.kill returns promptly instead of
+        // sitting behind a blocked pipe write.
+        let start = Instant::now();
+        c.proc_kill(chan).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "proc.kill was serviced (read loop not wedged): {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn output_bounded_kills_a_wedged_command_at_the_deadline() {
+        // A command that outlives the deadline is killed and reported as exit -1,
+        // rather than pinning the exec thread + process forever (a wedged git in
+        // the env). Uses a short local deadline — no process-global env needed.
+        let mut c = Command::new("sh");
+        c.args(["-c", "sleep 30"]);
+        let start = Instant::now();
+        let r = output_bounded(c, Duration::from_millis(300)).unwrap();
+        assert_eq!(r.exit, -1, "killed child reports -1");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "killed at the deadline, not after the full sleep: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn output_bounded_returns_output_for_a_fast_command() {
+        // The happy path still captures stdout/exit for a command that finishes
+        // well within the deadline.
+        let mut c = Command::new("sh");
+        c.args(["-c", "printf hi; exit 4"]);
+        let r = output_bounded(c, Duration::from_secs(10)).unwrap();
+        assert_eq!(r.stdout, "hi");
+        assert_eq!(r.exit, 4);
     }
 
     #[test]

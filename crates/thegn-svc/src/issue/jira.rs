@@ -30,7 +30,14 @@ impl JiraBackend {
         let creds = format!("{email}:{api_token}");
         let auth = format!("Basic {}", B64.encode(creds.as_bytes()));
         JiraBackend {
-            client: Client::new(),
+            // Bounded timeouts: a stalled tracker must not pin a background
+            // permit forever (mirrors gh.rs's OCTOCRAB_REQUEST_TIMEOUT). Falls
+            // back to the default client if the builder somehow fails.
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
             auth,
             project_key,
@@ -310,37 +317,14 @@ impl IssueBackend for JiraBackend {
         }
 
         if !filter.statuses.is_empty() {
-            let cats: Vec<&str> = filter
-                .statuses
-                .iter()
-                .map(|s| match s {
-                    IssueStatus::Backlog => "\"To Do\"",
-                    IssueStatus::Todo => "\"To Do\"",
-                    IssueStatus::InProgress => "\"In Progress\"",
-                    IssueStatus::Done => "\"Done\"",
-                    IssueStatus::Cancelled => "\"Done\"",
-                })
-                .collect();
-            let cats_deduped: Vec<&&str> = cats
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            jql_parts.push(format!(
-                "status in ({})",
-                cats_deduped
-                    .iter()
-                    .map(|s| **s)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            jql_parts.push(status_category_jql(&filter.statuses));
         } else {
             // Default: active issues only.
             jql_parts.push(r#"statusCategory in ("To Do", "In Progress")"#.to_string());
         }
 
         if let Some(q) = &filter.query {
-            jql_parts.push(format!("text ~ \"{q}\""));
+            jql_parts.push(format!("text ~ \"{}\"", escape_jql_str(q)));
         }
 
         let jql = if jql_parts.is_empty() {
@@ -539,10 +523,14 @@ impl IssueBackend for JiraBackend {
     }
 
     async fn search(&self, query_str: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
-        let q_escaped = urlencoding_simple(query_str);
+        // Escape JQL string-literal metachars first, then percent-encode the
+        // whole `text ~ "…"` clause so quotes/backslashes in the query neither
+        // break the JQL nor the query string.
+        let jql = format!("text ~ \"{}\" ORDER BY updated DESC", escape_jql_str(query_str));
         let limit = limit.min(100);
         let path = format!(
-            "search?jql=text+~+\"{q_escaped}\"+ORDER+BY+updated+DESC&fields={JIRA_FIELDS}&maxResults={limit}"
+            "search?jql={}&fields={JIRA_FIELDS}&maxResults={limit}",
+            urlencoding_simple(&jql)
         );
         let result: SearchResult = self.get(&path).await?;
         Ok(result
@@ -553,18 +541,52 @@ impl IssueBackend for JiraBackend {
     }
 }
 
+/// Build the `statusCategory in (...)` JQL clause for a set of domain statuses.
+/// Filters on statusCategory, not status display names: category names
+/// ("To Do"/"In Progress"/"Done") are fixed per Jira, whereas an instance may
+/// rename its workflow statuses (Open/Resolved/…) — a `status in ("To Do")`
+/// clause 400s the whole query on those.
+fn status_category_jql(statuses: &[IssueStatus]) -> String {
+    let cats_deduped: Vec<&str> = statuses
+        .iter()
+        .map(|s| match s {
+            IssueStatus::Backlog | IssueStatus::Todo => "\"To Do\"",
+            IssueStatus::InProgress => "\"In Progress\"",
+            IssueStatus::Done | IssueStatus::Cancelled => "\"Done\"",
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    format!("statusCategory in ({})", cats_deduped.join(", "))
+}
+
+/// Escape a user string for embedding inside a JQL double-quoted literal.
+/// JQL escapes with a backslash; a raw `"` or trailing `\` would otherwise
+/// terminate/break the literal, and newlines are illegal inside one.
+fn escape_jql_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Minimal percent-encoding for JQL query strings (no external dep needed).
+/// `+` and `=` are NOT in the pass-through set: since ' ' is emitted as '+', a
+/// literal '+' must be percent-encoded (%2B) so the server doesn't decode it
+/// back to a space; '=' (%3D) would otherwise be read as a query-param break.
 fn urlencoding_simple(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' | '+' | '=' | ' ' => {
-                if c == ' ' {
-                    out.push('+');
-                } else {
-                    out.push(c);
-                }
-            }
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(c),
+            ' ' => out.push('+'),
             _ => {
                 for byte in c.to_string().as_bytes() {
                     out.push_str(&format!("%{byte:02X}"));
@@ -683,6 +705,49 @@ mod tests {
         assert_eq!(issue.labels, vec!["bug".to_string(), "p1".to_string()]);
         assert_eq!(issue.url, "https://myorg.atlassian.net/browse/PROJ-7");
         assert_eq!(issue.updated_at_ms, 2000);
+    }
+
+    #[test]
+    fn status_filter_uses_statuscategory_not_display_names() {
+        // The clause must reference statusCategory (fixed names) — never a bare
+        // `status in (...)` on renamable display names.
+        let jql = status_category_jql(&[IssueStatus::Todo, IssueStatus::InProgress]);
+        assert!(
+            jql.starts_with("statusCategory in ("),
+            "must filter on statusCategory, got: {jql}"
+        );
+        assert!(!jql.contains("status in ("), "must not use bare status: {jql}");
+        assert!(jql.contains("\"To Do\""));
+        assert!(jql.contains("\"In Progress\""));
+        // Backlog+Todo collapse to a single "To Do", Done+Cancelled to "Done".
+        let all = status_category_jql(&[
+            IssueStatus::Backlog,
+            IssueStatus::Todo,
+            IssueStatus::InProgress,
+            IssueStatus::Done,
+            IssueStatus::Cancelled,
+        ]);
+        assert_eq!(all.matches("\"To Do\"").count(), 1, "deduped: {all}");
+        assert_eq!(all.matches("\"Done\"").count(), 1, "deduped: {all}");
+    }
+
+    #[test]
+    fn urlencoding_percent_encodes_plus_and_equals() {
+        // A literal '+' must become %2B (not pass through), else the server
+        // decodes it as a space; '=' must become %3D; ' ' stays '+'.
+        assert_eq!(urlencoding_simple("C++"), "C%2B%2B");
+        assert_eq!(urlencoding_simple("a b"), "a+b");
+        assert_eq!(urlencoding_simple("x=1"), "x%3D1");
+        // Unreserved chars pass through untouched.
+        assert_eq!(urlencoding_simple("A-z_0.~9"), "A-z_0.~9");
+    }
+
+    #[test]
+    fn escape_jql_str_neutralizes_quote_backslash_newline() {
+        assert_eq!(escape_jql_str(r#"say "hi""#), r#"say \"hi\""#);
+        assert_eq!(escape_jql_str(r"trailing\"), r"trailing\\");
+        assert_eq!(escape_jql_str("line1\nline2\rx"), "line1\\nline2\\rx");
+        assert_eq!(escape_jql_str("plain"), "plain");
     }
 
     #[test]

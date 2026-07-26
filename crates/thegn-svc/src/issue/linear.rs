@@ -23,7 +23,14 @@ pub struct LinearBackend {
 impl LinearBackend {
     pub fn new(api_key: String, team_id: Option<String>) -> Self {
         LinearBackend {
-            client: Client::new(),
+            // Bounded timeouts: a stalled tracker must not pin a background
+            // permit forever (mirrors gh.rs's OCTOCRAB_REQUEST_TIMEOUT). Falls
+            // back to the default client if the builder somehow fails.
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
             api_key,
             team_id,
         }
@@ -59,10 +66,15 @@ impl LinearBackend {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(IssueError::Auth(format!(
-                "HTTP {} from Linear API",
-                resp.status()
-            )));
+            let status = resp.status();
+            // Reserve Auth for actual credential failures; 429/5xx/400 are
+            // transient/API errors, not a reason to rotate a valid key.
+            let msg = format!("HTTP {status} from Linear API");
+            return Err(if status == 401 || status == 403 {
+                IssueError::Auth(msg)
+            } else {
+                IssueError::Api(msg)
+            });
         }
         let gql: GqlResponse<R> = resp.json().await?;
         if let Some(errs) = gql.errors
@@ -216,6 +228,25 @@ fn priority_to_int(p: IssuePriority) -> i64 {
     }
 }
 
+/// Escape a string for embedding inside a GraphQL double-quoted literal.
+/// A bare `"`, a trailing `\`, or a raw newline would terminate/break the
+/// literal (GraphQL string literals cannot contain raw line terminators);
+/// backslash must be escaped first so we don't double-escape our own output.
+fn escape_graphql_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn parse_updated_at(s: &str) -> i64 {
     // RFC3339 → unix ms; fall back to 0 on parse failure.
     chrono::DateTime::parse_from_rfc3339(s)
@@ -356,28 +387,36 @@ impl IssueBackend for LinearBackend {
     }
 
     async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError> {
-        let priority = priority_to_int(draft.priority);
-        let team_part = match (&self.team_id, &draft.project_id) {
-            (_, Some(pid)) => format!(r#"teamId: "{pid}""#),
-            (Some(tid), None) => format!(r#"teamId: "{tid}""#),
-            (None, None) => String::new(),
+        // Pass every user-controlled value as a GraphQL variable rather than
+        // string-splicing it into the mutation: interpolation breaks on
+        // multi-line/quoted/backslash bodies (GraphQL string literals can't hold
+        // raw line terminators) and would let a crafted body inject fields.
+        let team_id = match (&self.team_id, &draft.project_id) {
+            (_, Some(pid)) => Some(pid.clone()),
+            (Some(tid), None) => Some(tid.clone()),
+            (None, None) => None,
         };
-        let body_part = draft
-            .body
-            .as_deref()
-            .map(|b| format!(r#", description: "{b}""#))
-            .unwrap_or_default();
-        let query = format!(
-            r#"mutation {{
-                issueCreate(input: {{ title: "{}", priority: {priority}{body_part}, {team_part} }}) {{
-                    issue {{ {ISSUE_FIELDS} }}
-                }}
-            }}"#,
-            draft.title.replace('"', "\\\"")
-        );
         #[derive(Serialize)]
-        struct Vars {}
-        let data: IssueCreateData = self.gql(&query, Vars {}).await?;
+        struct Vars {
+            title: String,
+            priority: i64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            description: Option<String>,
+            #[serde(rename = "teamId", skip_serializing_if = "Option::is_none")]
+            team_id: Option<String>,
+        }
+        let query = r#"mutation($title: String!, $priority: Int, $description: String, $teamId: String) {
+            issueCreate(input: { title: $title, priority: $priority, description: $description, teamId: $teamId }) {
+                issue { id identifier title description state { type } priority assignees { nodes { name } } labels { nodes { name } } branchName url updatedAt }
+            }
+        }"#;
+        let vars = Vars {
+            title: draft.title.clone(),
+            priority: priority_to_int(draft.priority),
+            description: draft.body.clone(),
+            team_id,
+        };
+        let data: IssueCreateData = self.gql(query, vars).await?;
         data.issue_create
             .issue
             .map(linear_issue_to_domain)
@@ -391,7 +430,7 @@ impl IssueBackend for LinearBackend {
             fields.push(format!("priority: {}", priority_to_int(p)));
         }
         if let Some(t) = &patch.title {
-            fields.push(format!(r#"title: "{}""#, t.replace('"', "\\\"")));
+            fields.push(format!(r#"title: "{}""#, escape_graphql_str(t)));
         }
         // Status update requires knowing the stateId for the target state+team.
         // For simplicity we pass the status type as a string; callers that need
@@ -456,7 +495,7 @@ impl IssueBackend for LinearBackend {
     }
 
     async fn search(&self, query_str: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
-        let q_escaped = query_str.replace('"', "\\\"");
+        let q_escaped = escape_graphql_str(query_str);
         let limit = limit.min(250);
         let query = format!(
             r#"query {{
@@ -530,6 +569,22 @@ mod tests {
         assert_eq!(parse_updated_at("1970-01-01T00:00:03Z"), 3000);
         assert_eq!(parse_updated_at(""), 0);
         assert_eq!(parse_updated_at("garbage"), 0);
+    }
+
+    #[test]
+    fn escape_graphql_str_neutralizes_quote_backslash_newline_tab() {
+        // A bare quote must be escaped so it can't terminate the literal.
+        assert_eq!(escape_graphql_str(r#"a "b" c"#), r#"a \"b\" c"#);
+        // A trailing backslash must double, not escape our closing quote.
+        assert_eq!(escape_graphql_str(r"path\"), r"path\\");
+        // Raw line terminators (illegal in a GraphQL literal) become escapes.
+        assert_eq!(
+            escape_graphql_str("line1\nline2\r\tx"),
+            "line1\\nline2\\r\\tx"
+        );
+        // Backslash is handled before quote so we don't double-escape output.
+        assert_eq!(escape_graphql_str(r#"\""#), r#"\\\""#);
+        assert_eq!(escape_graphql_str("plain"), "plain");
     }
 
     #[test]

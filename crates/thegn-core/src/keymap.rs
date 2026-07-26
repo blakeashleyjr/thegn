@@ -199,8 +199,18 @@ impl Chord {
             if tok.chars().count() == 1 {
                 return true;
             }
+            let lower = tok.to_ascii_lowercase();
+            // Function keys (F1..F12) close a key-group like any other named key,
+            // so a leader sequence ending in an F-key (e.g. "Space F1") parses
+            // instead of bailing to strict single-chord parsing (which would
+            // mis-report the leader as an "unknown modifier").
+            if let Some(n) = lower.strip_prefix('f')
+                && let Ok(n) = n.parse::<u8>()
+            {
+                return (1..=12).contains(&n);
+            }
             matches!(
-                tok.to_ascii_lowercase().as_str(),
+                lower.as_str(),
                 "space"
                     | "leader"
                     | "enter"
@@ -220,6 +230,8 @@ impl Chord {
                     | "downarrow"
                     | "delete"
                     | "del"
+                    | "insert"
+                    | "ins"
                     | "pageup"
                     | "pgup"
                     | "pagedown"
@@ -1155,6 +1167,33 @@ mod tests {
         assert!(Chord::parse_loose("Space ctrl").is_err());
         assert!(Chord::parse_loose("Space boguskey").is_err());
         assert!(Chord::parse_loose("").is_err());
+    }
+
+    /// Regression: an F-key must close a key-group so a leader sequence ending in
+    /// one (e.g. "Space F1") parses instead of bailing to strict single-chord
+    /// parsing and mis-reporting "Space" as an "unknown modifier".
+    #[test]
+    fn parse_loose_accepts_function_keys_in_sequences() {
+        // The bug: "Space F1" used to fall back to Chord::parse("Space F1"),
+        // which read "Space" as a modifier and errored.
+        assert_eq!(Chord::parse_loose("Space F1").unwrap().to_kdl(), "Space F1");
+        assert_eq!(
+            Chord::parse_loose("ctrl x F12").unwrap().to_kdl(),
+            "Ctrl x F12"
+        );
+        // F-keys still work as a lone chord and with a modifier.
+        assert_eq!(Chord::parse_loose("F1").unwrap().to_kdl(), "F1");
+        assert_eq!(Chord::parse_loose("ctrl F5").unwrap().to_kdl(), "Ctrl F5");
+        // Insert/ins close a group too.
+        assert_eq!(
+            Chord::parse_loose("Space Insert").unwrap().to_kdl(),
+            "Space Insert"
+        );
+        // A non-existent F-key (F13) is not a key token, so it isn't a group
+        // boundary and the value falls back to strict parsing (which errors).
+        assert!(Chord::parse_loose("Space F13").is_err());
+        // "f" alone or a garbage "fx" is not treated as an F-key.
+        assert!(Chord::parse_loose("Space fx").is_err());
     }
 
     #[test]

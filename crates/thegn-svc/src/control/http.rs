@@ -192,6 +192,15 @@ fn default_scope() -> String {
     "read".into()
 }
 
+/// Resolve a caller-controlled `ttl_secs` into an absolute expiry (ms since
+/// epoch). ttl is clamped to `[1s, 1 year]` before scaling to ms, and the add
+/// saturates — an adversarial or buggy value can never overflow the multiply
+/// (a debug panic) or wrap `now + ttl` into a negative, already-expired stamp.
+fn expiry_ms(now: i64, ttl_secs: Option<i64>) -> i64 {
+    let ttl_ms = ttl_secs.unwrap_or(15 * 60).clamp(1, 60 * 60 * 24 * 365) * 1000;
+    now.saturating_add(ttl_ms)
+}
+
 async fn issue_pairing(
     State(state): State<ControlState>,
     headers: HeaderMap,
@@ -201,13 +210,12 @@ async fn issue_pairing(
         return r;
     }
     let now = now_ms();
-    let ttl_ms = body.ttl_secs.unwrap_or(15 * 60).max(1) * 1000;
     let minted = auth::mint(
         TokenKind::PairingCode,
         ScopeSet::parse(&body.scope),
         &body.label,
         None,
-        Some(now + ttl_ms),
+        Some(expiry_ms(now, body.ttl_secs)),
         now,
     );
     let put = {
@@ -890,4 +898,40 @@ async fn pump_attach(
         }
     }
     let _ = state.api.detach(&q.client_id, &session).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry_defaults_to_15_minutes() {
+        assert_eq!(expiry_ms(1_000, None), 1_000 + 15 * 60 * 1000);
+    }
+
+    #[test]
+    fn expiry_honours_a_sane_ttl() {
+        assert_eq!(expiry_ms(0, Some(30)), 30 * 1000);
+    }
+
+    #[test]
+    fn expiry_clamps_nonpositive_ttl_up_to_one_second() {
+        assert_eq!(expiry_ms(0, Some(0)), 1000);
+        assert_eq!(expiry_ms(0, Some(-5)), 1000);
+    }
+
+    #[test]
+    fn expiry_does_not_overflow_on_adversarial_ttl() {
+        // ttl_secs above i64::MAX/1000 would overflow the *1000 multiply
+        // (panic in debug, wrap to a negative already-expired stamp in
+        // release) without the clamp. Clamped to one year, the result stays a
+        // sane future stamp and the saturating add never wraps.
+        let one_year_ms = 60 * 60 * 24 * 365 * 1000;
+        assert_eq!(expiry_ms(0, Some(i64::MAX)), one_year_ms);
+        assert_eq!(expiry_ms(0, Some(10i64.pow(18))), one_year_ms);
+        // Even at the max `now`, the add saturates instead of overflowing.
+        assert_eq!(expiry_ms(i64::MAX, Some(i64::MAX)), i64::MAX);
+        // The stamp is always strictly in the future (never already-expired).
+        assert!(expiry_ms(1_000_000, Some(i64::MAX)) > 1_000_000);
+    }
 }

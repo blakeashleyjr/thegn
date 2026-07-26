@@ -817,6 +817,15 @@ fn clamp_limits(
     layer: TrustLevel,
 ) -> SandboxLimits {
     let mut out = base.clone();
+    // Destructure so a newly added SandboxLimits field fails to compile until it
+    // is clamped here — clamp_limits takes the struct whole (unlike
+    // classify_repo_overlay's SandboxOverlay destructure), so cpu_total was
+    // previously read by nobody and any request for it silently dropped.
+    let SandboxLimits {
+        cpu: _,
+        memory: _,
+        cpu_total,
+    } = req;
     if let Some(ref mem) = req.memory {
         match (
             parse_bytes(mem),
@@ -863,6 +872,34 @@ fn clamp_limits(
                 RepoFieldRule::CeilingIntersect,
                 json!(cpu),
                 "unparseable cpu limit",
+            )),
+        }
+    }
+    // Aggregate CPU cap: tightening (a smaller core count) is granted; weakening
+    // it — "off"/"" (disable) or a larger number — is denied and surfaced, never
+    // silently kept-at-base. `parse_cpu_millis` returns None for "off"/"" (the
+    // disable sentinels) and for genuinely unparseable input; both weaken/void
+    // the aggregate cap, so both are denials.
+    if let Some(total) = cpu_total {
+        match (
+            parse_cpu_millis(total),
+            base.cpu_total.as_deref().and_then(parse_cpu_millis),
+        ) {
+            (Some(r), Some(b)) if r <= b => out.cpu_total = Some(total.clone()),
+            (Some(_), None) => out.cpu_total = Some(total.clone()),
+            (Some(_), Some(_)) => events.push(ClampEvent::deny(
+                layer,
+                "sandbox.limits.cpu_total",
+                RepoFieldRule::CeilingIntersect,
+                json!(total),
+                "requested aggregate cpu limit exceeds the trusted ceiling",
+            )),
+            (None, _) => events.push(ClampEvent::deny(
+                layer,
+                "sandbox.limits.cpu_total",
+                RepoFieldRule::CeilingIntersect,
+                json!(total),
+                "a repo may not weaken the aggregate cpu ceiling (off/unparseable)",
             )),
         }
     }
@@ -1113,7 +1150,20 @@ pub fn explain(
     let defaults = Config::default();
     // L1: file (serde fills defaults, so this is defaults+file).
     let file = path.unwrap_or_else(Config::path);
-    let s = std::fs::read_to_string(&file).unwrap_or_default();
+    // Only a missing file is silently empty; an existing-but-unreadable file
+    // (EACCES/EIO/invalid-UTF-8) must warn rather than pretend every key is
+    // Builtin — matching Config::try_load_layered's read handling.
+    let s = match std::fs::read_to_string(&file) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            crate::config::config_warn(&format!(
+                "cannot read {}: {e}; explaining from defaults",
+                file.display()
+            ));
+            String::new()
+        }
+    };
     let file_cfg: Config = toml::from_str(&s).unwrap_or_default();
     // L2: + profile overlay.
     let mut profile_cfg = file_cfg.clone();
@@ -1446,6 +1496,61 @@ mod tests {
         assert_eq!(lim.memory, Some("512m".to_string()));
         assert_eq!(lim.cpu, Some("2".to_string()));
         assert!(r.events.iter().any(|e| e.key == "sandbox.limits.cpu"));
+    }
+
+    #[test]
+    fn hostile_repo_cannot_weaken_aggregate_cpu_ceiling() {
+        // Trusted aggregate cap of 4 cores.
+        let mut b = base();
+        b.limits = SandboxLimits {
+            cpu: None,
+            memory: None,
+            cpu_total: Some("4".into()),
+        };
+
+        // A repo requesting "off" (disable the aggregate cap) is denied +
+        // surfaced — previously cpu_total was never read, so this vanished.
+        let mut o = overlay();
+        o.limits = Some(SandboxLimits {
+            cpu_total: Some("off".into()),
+            ..Default::default()
+        });
+        let r = classify_repo_overlay(o, &b, &Approvals::deny_all());
+        assert_eq!(
+            r.sanctioned.limits.and_then(|l| l.cpu_total),
+            Some("4".to_string()),
+            "aggregate cap kept at the trusted value"
+        );
+        assert!(
+            r.events.iter().any(|e| e.key == "sandbox.limits.cpu_total"),
+            "the weakening attempt must surface a clamp event"
+        );
+
+        // Requesting a larger cap (8 > 4) is also a weakening → denied.
+        let mut o = overlay();
+        o.limits = Some(SandboxLimits {
+            cpu_total: Some("8".into()),
+            ..Default::default()
+        });
+        let r = classify_repo_overlay(o, &b, &Approvals::deny_all());
+        assert_eq!(
+            r.sanctioned.limits.and_then(|l| l.cpu_total),
+            Some("4".to_string())
+        );
+        assert!(r.events.iter().any(|e| e.key == "sandbox.limits.cpu_total"));
+
+        // A genuine tightening (2 ≤ 4) is honored.
+        let mut o = overlay();
+        o.limits = Some(SandboxLimits {
+            cpu_total: Some("2".into()),
+            ..Default::default()
+        });
+        let r = classify_repo_overlay(o, &b, &Approvals::deny_all());
+        assert_eq!(
+            r.sanctioned.limits.and_then(|l| l.cpu_total),
+            Some("2".to_string()),
+            "tightening the aggregate cap is granted"
+        );
     }
 
     // ---- Preferences pass through ---------------------------------------

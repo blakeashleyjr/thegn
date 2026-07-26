@@ -40,6 +40,13 @@ pub struct IssuesConfig {
     pub linear: LinearConfig,
     pub github_issues: GitHubIssuesConfig,
     pub jira: JiraConfig,
+    /// Set by a repo `[issues]` overlay that supplies an explicit `accounts`
+    /// restriction (including `accounts = []`): once a repo has restricted its
+    /// accounts, the legacy single-provider synthesis in [`active_accounts`] is
+    /// suppressed so an empty restriction means *none*, not "resurrect legacy".
+    /// Runtime-only; never read from / written to a config file.
+    #[serde(skip)]
+    pub accounts_restricted: bool,
 }
 
 impl Default for IssuesConfig {
@@ -55,6 +62,7 @@ impl Default for IssuesConfig {
             linear: LinearConfig::default(),
             github_issues: GitHubIssuesConfig::default(),
             jira: JiraConfig::default(),
+            accounts_restricted: false,
         }
     }
 }
@@ -94,6 +102,13 @@ impl IssuesConfig {
                 .filter(|a| a.enabled && a.provider != IssueProviderKind::None)
                 .cloned()
                 .collect();
+        }
+        // A repo that explicitly restricted its accounts (`accounts = [...]`,
+        // including `accounts = []`) opted out of the legacy synthesis fallback;
+        // an empty restriction must mean *no accounts*, not "resurrect the legacy
+        // single-provider account (with its token)".
+        if self.accounts_restricted {
+            return Vec::new();
         }
         self.active_providers()
             .into_iter()
@@ -290,10 +305,17 @@ impl IssuesOverlay {
     /// Field-merge present keys into a base [`IssuesConfig`] (absent inherit).
     pub(crate) fn apply(self, base: &mut IssuesConfig) {
         if let Some(p) = self.providers {
+            // An explicit restriction is authoritative: also clear the legacy
+            // single `provider` so `providers = []` resolves to *none* instead of
+            // falling back to the legacy provider in `active_providers`.
+            base.provider = IssueProviderKind::None;
             base.providers = p;
         }
         if let Some(names) = self.accounts {
             base.issue_accounts.retain(|a| names.contains(&a.name));
+            // Mark the accounts restricted so `active_accounts` skips the legacy
+            // synthesis fallback (an empty/typo'd restriction ⇒ zero accounts).
+            base.accounts_restricted = true;
         }
         if let Some(t) = self.linear.team_id {
             base.linear.team_id = t;
@@ -437,5 +459,91 @@ mod tests {
         overlay.apply(&mut base);
         assert_eq!(base.active_accounts().len(), 1);
         assert_eq!(base.active_accounts()[0].name, "b");
+    }
+
+    #[test]
+    fn overlay_empty_providers_means_none_not_legacy() {
+        // Global legacy config: a single provider with a token.
+        let mut base = IssuesConfig {
+            provider: IssueProviderKind::Linear,
+            linear: LinearConfig {
+                api_key: "work-token".into(),
+                team_id: "TEAM".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // A repo opts out with `providers = []` (documented "empty vec = none").
+        IssuesOverlay {
+            providers: Some(vec![]),
+            ..Default::default()
+        }
+        .apply(&mut base);
+        // The legacy provider must NOT be resurrected: zero providers, zero
+        // accounts (no Linear query with the work token for this repo).
+        assert!(
+            base.active_providers().is_empty(),
+            "providers = [] must resolve to none, not the legacy provider"
+        );
+        assert!(
+            base.active_accounts().is_empty(),
+            "no legacy account may be synthesized for an opted-out repo"
+        );
+    }
+
+    #[test]
+    fn overlay_empty_accounts_means_none_not_legacy_synthesis() {
+        // Legacy config (no explicit [[issue_accounts]]) with a Jira token.
+        let mut base = IssuesConfig {
+            provider: IssueProviderKind::Jira,
+            jira: JiraConfig {
+                base_url: "https://work".into(),
+                email: "me@work".into(),
+                api_token: "jira-token".into(),
+                project_key: "PROJ".into(),
+            },
+            ..Default::default()
+        };
+        // A repo restricts accounts to none (`accounts = []`).
+        IssuesOverlay {
+            accounts: Some(vec![]),
+            ..Default::default()
+        }
+        .apply(&mut base);
+        // Legacy synthesis must be suppressed: the work Jira account (with its
+        // token) must NOT be resurrected for the opted-out repo.
+        assert!(
+            base.active_accounts().is_empty(),
+            "accounts = [] must suppress legacy account synthesis"
+        );
+    }
+
+    #[test]
+    fn overlay_typod_account_name_restricts_to_none() {
+        // A restriction naming a non-existent account empties issue_accounts and
+        // must NOT fall back to legacy synthesis.
+        let mut base = IssuesConfig {
+            provider: IssueProviderKind::Linear,
+            linear: LinearConfig {
+                api_key: "tok".into(),
+                ..Default::default()
+            },
+            issue_accounts: vec![IssueAccount {
+                name: "real".into(),
+                provider: IssueProviderKind::Linear,
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        IssuesOverlay {
+            accounts: Some(vec!["typo".into()]),
+            ..Default::default()
+        }
+        .apply(&mut base);
+        assert!(
+            base.active_accounts().is_empty(),
+            "a typo'd account restriction must yield zero accounts, not legacy"
+        );
     }
 }

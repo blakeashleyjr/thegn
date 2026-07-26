@@ -503,10 +503,17 @@ pub fn start(
                 Streamable::Out(s) => Box::new(BufReader::new(s)),
                 Streamable::Err(s) => Box::new(BufReader::new(s)),
             };
+            // Drain to EOF for the child's whole lifetime — do NOT stop when the
+            // receiver is gone (it is: `rx` is dropped the moment `start`
+            // returns). Closing the child's stdout/stderr read ends here would
+            // make the next log write SIGPIPE the child — std::process resets
+            // SIGPIPE to SIG_DFL in children, and a Go tunnel client (frpc) dies
+            // on EPIPE to fd 1/2 on its next heartbeat/reconnect line, flipping a
+            // healthy share to Down for no visible reason. Keep reading and
+            // discarding until the pipe closes (the thread then exits naturally
+            // when the child dies).
             for line in reader.lines().map_while(std::result::Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
+                let _ = tx.send(line); // best-effort: receiver drops once URL is resolved
             }
         });
     }

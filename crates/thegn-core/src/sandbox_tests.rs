@@ -320,6 +320,9 @@
 
     #[test]
     fn oci_create_opts_map_userns_and_mounts() {
+        // GH_TOKEN=abc is synthetic here (its value doesn't match the ambient
+        // env) so it stays inline `-e`; unset it to keep that deterministic.
+        let _env = crate::testenv::EnvGuard::unset(&["GH_TOKEN"]);
         let opts = oci_create_opts(&spec(Backend::Podman));
         let j = opts.join(" ");
         assert!(j.contains("--userns keep-id"));
@@ -1036,4 +1039,176 @@
         // A dead worktree's container AND its sidecar are still orphans.
         assert!(orphans.contains(&dead));
         assert!(orphans.contains(&dead_vpn));
+    }
+
+    #[test]
+    fn wrap_script_skips_exec_for_or_and_pipe_fallbacks() {
+        // A `||` fallback (`claude --resume || claude`) must run directly, NOT
+        // as `exec …` — a failed `exec` (command not found) would exit the shell
+        // before the fallback branch could run. Same for a bare `|` pipeline.
+        let mut s = spec(Backend::Bwrap);
+        s.image = None;
+
+        let or_fallback = wrap_script(&s, "claude --resume || claude");
+        assert!(
+            or_fallback.ends_with("claude --resume || claude"),
+            "|| fallback must not be exec-prefixed: {or_fallback}"
+        );
+        assert!(
+            !or_fallback.contains("exec claude --resume"),
+            "|| fallback wrongly exec-prefixed: {or_fallback}"
+        );
+
+        let pipe = wrap_script(&s, "gen | tee log");
+        assert!(
+            pipe.ends_with("gen | tee log") && !pipe.contains("exec gen"),
+            "pipe must not be exec-prefixed: {pipe}"
+        );
+
+        // A simple single command is still exec'd so it owns the pane.
+        let simple = wrap_script(&s, "zsh -l");
+        assert!(
+            simple.ends_with("exec zsh -l"),
+            "simple command must be exec-prefixed: {simple}"
+        );
+    }
+
+    #[test]
+    fn ensure_stale_and_keepid_rm_go_through_oci_prefix() {
+        // Regression: the stale-mount rm and the keep-id-retry rm must target the
+        // SAME daemon as `run -d` (via oci_prefix), not a bare `binary()`. For
+        // rootful podman that means `sudo -n podman … rm`, and with oci_host it
+        // means the `--connection`/`--url`/`-H` flag — otherwise the rm no-ops on
+        // the wrong (local rootless) store and the recreate fails "name in use".
+        //
+        // We can't run the subprocess in a unit test, so we assert the argv the
+        // rm is built from: oci_prefix(spec) + ["rm","-f",name]. This mirrors the
+        // exact construction in `ensure`.
+        let mut r = spec(Backend::PodmanRootful);
+        r.oci_host = Some("workbox".into());
+        let mut rm = oci_prefix(&r);
+        rm.extend(["rm".into(), "-f".into(), r.name.clone()]);
+        assert_eq!(
+            rm,
+            vec![
+                "sudo",
+                "-n",
+                "podman",
+                "--connection",
+                "workbox",
+                "rm",
+                "-f",
+                "thegn-repo-feat",
+            ]
+        );
+        // A bare binary()-based rm would NOT carry sudo or the connection flag.
+        assert_ne!(rm[0], "podman", "rootful rm must start with sudo");
+    }
+
+    #[test]
+    fn teardown_targets_oci_host_daemon() {
+        // teardown must remove containers on the SAME daemon the create used:
+        // with `[sandbox] oci_host` set, the rm argv must carry the connection
+        // flag (via oci_prefix_for), or the remote container leaks forever.
+        let plain = oci_prefix_for(Backend::Podman, None);
+        assert_eq!(plain, vec!["podman"]);
+
+        let remote = oci_prefix_for(Backend::Podman, Some("workbox"));
+        assert_eq!(remote, vec!["podman", "--connection", "workbox"]);
+
+        // Docker uses -H; a URL uses --url; rootful keeps sudo -n.
+        assert_eq!(
+            oci_prefix_for(Backend::Docker, Some("ssh://user@box")),
+            vec!["docker", "-H", "ssh://user@box"]
+        );
+        assert_eq!(
+            oci_prefix_for(Backend::Podman, Some("ssh://u@h/sock")),
+            vec!["podman", "--url", "ssh://u@h/sock"]
+        );
+        assert_eq!(
+            oci_prefix_for(Backend::PodmanRootful, Some("workbox")),
+            vec!["sudo", "-n", "podman", "--connection", "workbox"]
+        );
+        // Empty/whitespace oci_host ⇒ local daemon (no flag).
+        assert_eq!(oci_prefix_for(Backend::Podman, Some("  ")), vec!["podman"]);
+    }
+
+    #[test]
+    fn oci_local_secrets_go_to_env_file_not_argv() {
+        // A host-sourced passthrough secret (value matching the launcher env)
+        // must NOT ride the world-readable `-e K=V` argv; it goes to a 0600
+        // `--env-file`. A synthetic pair (value absent from the host env) stays
+        // inline as `-e`.
+        let _env = crate::testenv::EnvGuard::set(&[("GH_TOKEN", "ghp_secret")]);
+        let mut s = spec(Backend::Podman);
+        s.name = "thegn-test-envfile-oci".into();
+        s.env = vec![
+            ("GH_TOKEN".into(), "ghp_secret".into()), // matches host ⇒ secret
+            ("THEGN_SANDBOX".into(), "1".into()),     // synthetic ⇒ inline
+        ];
+        let opts = oci_create_opts(&s);
+        let j = opts.join(" ");
+        // The token value never appears on the argv.
+        assert!(
+            !j.contains("ghp_secret"),
+            "secret leaked onto OCI argv: {j}"
+        );
+        assert!(!j.contains("-e GH_TOKEN"), "secret rode -e: {j}");
+        // It rode an --env-file instead, and that file is 0600.
+        let i = opts.iter().position(|a| a == "--env-file").expect("env-file");
+        let path = std::path::PathBuf::from(&opts[i + 1]);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "env-file must be 0600");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("GH_TOKEN=ghp_secret"), "env-file body: {body}");
+        // Synthetic pair still inline.
+        assert!(j.contains("-e THEGN_SANDBOX=1"), "synthetic pair inline: {j}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn systemd_local_secrets_go_to_environment_file_not_argv() {
+        let _env = crate::testenv::EnvGuard::set(&[("API_KEY", "sk_secret")]);
+        let mut s = spec(Backend::Systemd);
+        s.image = None;
+        s.name = "thegn-test-envfile-systemd".into();
+        s.env = vec![
+            ("API_KEY".into(), "sk_secret".into()), // secret
+            ("THEGN_SANDBOX".into(), "1".into()),   // synthetic
+        ];
+        let argv = backend_enter_argv(&s, "exec true");
+        let j = argv.join(" ");
+        assert!(!j.contains("sk_secret"), "secret leaked onto systemd argv: {j}");
+        assert!(!j.contains("--setenv API_KEY"), "secret rode --setenv: {j}");
+        // Carried via an EnvironmentFile= property instead.
+        let ef = argv
+            .iter()
+            .find(|a| a.starts_with("EnvironmentFile="))
+            .expect("EnvironmentFile property");
+        let path = std::path::PathBuf::from(ef.trim_start_matches("EnvironmentFile="));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("API_KEY=sk_secret"));
+        // Synthetic pair stays on --setenv.
+        assert!(j.contains("--setenv THEGN_SANDBOX=1"), "synthetic --setenv: {j}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remote_oci_keeps_all_env_inline_as_carrier() {
+        // Over ssh the argv is the ONLY env carrier — a remote spec must keep
+        // every pair inline (never divert a host-matching value to a local
+        // env-file the remote daemon can't read).
+        let _env = crate::testenv::EnvGuard::set(&[("GH_TOKEN", "ghp_secret")]);
+        let mut s = spec(Backend::Podman);
+        s.env = vec![("GH_TOKEN".into(), "ghp_secret".into())];
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "box".into(),
+            22,
+            false,
+            TransportKind::Ssh,
+        ));
+        let j = oci_create_opts(&s).join(" ");
+        assert!(j.contains("-e GH_TOKEN=ghp_secret"), "remote keeps env inline: {j}");
+        assert!(!j.contains("--env-file"), "remote must not use env-file: {j}");
     }

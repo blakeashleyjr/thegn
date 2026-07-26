@@ -278,9 +278,20 @@ pub trait GitBackend: Send + Sync {
         // dangling after a conflicted rebase is resolved and `--continue`d to
         // completion (only the state dir is removed), so probing the ref would
         // pin the "REBASING" banner on forever. The `onto` file exists for the
-        // duration of a paused rebase; `read_git_path` is remote-safe too.
-        let rebasing = loc.read_git_path("rebase-merge/onto").is_some()
-            || loc.read_git_path("rebase-apply/onto").is_some();
+        // duration of a paused rebase.
+        //
+        // On a bridged loc, probe the state dir over the live connection instead
+        // of `read_git_path`, which for a remote/provider loc spawns a fresh
+        // `rev-parse --git-path` + `cat` per file (up to 4 unbounded ssh/`sprite
+        // exec` spawns per refresh — the exact per-op cost the bridge routing
+        // exists to kill, and unbounded so a stalled connection pins hydration).
+        // On a local loc keep the cheap `std::fs` read.
+        let rebasing = if crate::bridge::for_loc(loc).is_some() {
+            bridged_rebase_in_progress(loc)
+        } else {
+            loc.read_git_path("rebase-merge/onto").is_some()
+                || loc.read_git_path("rebase-apply/onto").is_some()
+        };
         let kind = if exists("MERGE_HEAD") {
             Some((MergeKind::Merge, "MERGE_HEAD"))
         } else if rebasing {
@@ -375,15 +386,19 @@ pub trait GitBackend: Send + Sync {
         Ok(thegn_core::gitrefs::parse_branches(&out))
     }
 
-    /// The stash as structured entries (empty on a stash-less repo).
+    /// The stash as structured entries (empty on a stash-less repo). Routes
+    /// through [`run_status`] so it rides the persistent bridge (no per-op spawn)
+    /// and is bounded by the read timeout — a wedged git can't pin the hydration
+    /// batch forever (matches `stash_count` directly above).
     fn stash_list(&self, loc: &GitLoc) -> Result<Vec<StashEntry>> {
-        let out = match loc
-            .git_command(&["stash", "list", "--format=%gd\u{1f}%H\u{1f}%ct\u{1f}%gs"])
-            .output()
-        {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-            _ => return Ok(Vec::new()),
-        };
+        let (exit, out) =
+            match run_status(loc, &["stash", "list", "--format=%gd\u{1f}%H\u{1f}%ct\u{1f}%gs"]) {
+                Ok(v) => v,
+                Err(_) => return Ok(Vec::new()),
+            };
+        if exit != 0 {
+            return Ok(Vec::new());
+        }
         Ok(thegn_core::gitrefs::parse_stashes(&out))
     }
 
@@ -438,14 +453,18 @@ pub trait GitBackend: Send + Sync {
         run(loc, &args)
     }
 
-    /// Stage one path (`git add -- <path>`).
+    /// Stage one path (`git add -- <path>`). Routed through the write runner
+    /// (`run_w`), not the read runner: these are index mutations, so they take
+    /// the cross-process mutation lock and skip the 60s read-timeout SIGKILL that
+    /// would leave a stale `index.lock` — matching `StageOps::stage_all`.
     fn stage(&self, loc: &GitLoc, path: &str) -> Result<()> {
-        run(loc, &["add", "--", path]).map(|_| ())
+        run_w(loc, &[], &["add", "--", path]).map(|_| ())
     }
 
     /// Unstage one path (`git reset -q HEAD -- <path>` — works on every git).
+    /// Routed through the write runner for the same reason as [`stage`].
     fn unstage(&self, loc: &GitLoc, path: &str) -> Result<()> {
-        run(loc, &["reset", "-q", "HEAD", "--", path]).map(|_| ())
+        run_w(loc, &[], &["reset", "-q", "HEAD", "--", path]).map(|_| ())
     }
 }
 
@@ -518,6 +537,46 @@ fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String)> {
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
     ))
+}
+
+/// Probe whether a rebase is in progress over the persistent bridge, for the
+/// `merge_state` banner. `merge_state`'s other probes are single `rev-parse`s
+/// that ride `run_status`; this one keys off the on-disk `rebase-{merge,apply}/
+/// onto` state files, so replicating [`GitLoc::read_git_path`]'s two steps
+/// (`rev-parse --git-path` to resolve, then read) over the bridge — rather than
+/// letting `read_git_path` spawn a fresh `rev-parse`+`cat` per file on a
+/// remote/provider loc (up to 4 unbounded spawns per refresh). Resolves the
+/// gitdir once, then one bounded `test -e` over the live connection. Any bridge
+/// error degrades to `false` (no banner) — the same fail-quiet stance the local
+/// `read_git_path().is_some()` path has.
+///
+/// Caller guarantees a bridge is connected for `loc` (checked at the call site).
+fn bridged_rebase_in_progress(loc: &GitLoc) -> bool {
+    let Some(b) = crate::bridge::for_loc(loc) else {
+        return false;
+    };
+    // Resolve the private gitdir (a linked worktree's `.git` is a redirect file,
+    // so never assume `<path>/.git`).
+    let path = loc.path();
+    let gitdir = match b.exec_read(
+        &["git", "-C", &path, "rev-parse", "--absolute-git-dir"],
+        None,
+        &[],
+    ) {
+        Ok(r) if r.exit == 0 => r.stdout.trim().to_string(),
+        _ => return false,
+    };
+    if gitdir.is_empty() {
+        return false;
+    }
+    // One bounded existence probe for either rebase state file. `test` exits 0
+    // when the file exists, non-zero (data, not error) otherwise.
+    let merge = format!("{gitdir}/rebase-merge/onto");
+    let apply = format!("{gitdir}/rebase-apply/onto");
+    match b.exec_read(&["test", "-e", &merge, "-o", "-e", &apply], None, &[]) {
+        Ok(r) => r.exit == 0,
+        Err(_) => false,
+    }
 }
 
 /// Upper bound (seconds) on a subprocess git *read* before the child is killed,
@@ -898,11 +957,29 @@ impl GitBackend for CliGit {
     }
 
     fn remove_worktree(&self, root: &Path, path: &Path, delete_branch: bool) -> Result<()> {
+        // Resolve the branch name *before* removal — `git branch -D` needs the
+        // branch, not the worktree filesystem path (passing the path just fails,
+        // silently no-op'ing the delete). Match the worktree entry by canonical
+        // path so a symlinked/relative `path` still resolves.
+        let branch = delete_branch
+            .then(|| {
+                let want = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                self.worktrees(root).ok().and_then(|wts| {
+                    wts.into_iter()
+                        .find(|w| {
+                            std::fs::canonicalize(&w.path)
+                                .map(|c| c == want)
+                                .unwrap_or_else(|_| Path::new(&w.path) == path)
+                        })
+                        .and_then(|w| w.branch)
+                })
+            })
+            .flatten();
         let p = path.to_string_lossy();
         run_root(root, &["worktree", "remove", "--force", &p])?;
-        if delete_branch {
+        if let Some(branch) = branch {
             // Best-effort: the branch may still be checked out elsewhere.
-            let _ = run_root(root, &["branch", "-D", &p]);
+            let _ = run_root(root, &["branch", "-D", &branch]);
         }
         Ok(())
     }
@@ -1388,6 +1465,62 @@ mod tests {
         // Should not error on a normal repo (content is environment-dependent).
         let _ = CliGit.status(&loc).unwrap();
         let _ = CliGit.diff_files(&loc, "HEAD").unwrap();
+    }
+
+    #[test]
+    fn remove_worktree_deletes_the_branch_not_the_path() {
+        // Regression: remove_worktree(delete_branch=true) once passed the worktree
+        // filesystem PATH to `git branch -D`, which always fails (a path isn't a
+        // branch name), silently leaving the branch behind. It must resolve the
+        // branch from the worktree list and delete THAT.
+        let repo = testutil::TestRepo::new("rm-wt");
+        repo.commit_file("f.txt", "one\n", "c0");
+        let root = &repo.dir;
+        let wt = repo.dir.join("linked-wt");
+
+        // Add a worktree on a fresh branch, then remove it deleting the branch.
+        CliGit
+            .add_worktree(root, "feature-x", "main", &wt)
+            .unwrap();
+        assert!(
+            repo.out(&["branch", "--list", "feature-x"]).contains("feature-x"),
+            "branch should exist after add_worktree"
+        );
+
+        CliGit.remove_worktree(root, &wt, true).unwrap();
+
+        assert!(!wt.exists(), "worktree dir should be gone");
+        assert!(
+            repo.out(&["branch", "--list", "feature-x"]).is_empty(),
+            "branch feature-x must be deleted, not left behind"
+        );
+
+        // delete_branch=false leaves the branch alone.
+        let wt2 = repo.dir.join("linked-wt-2");
+        CliGit
+            .add_worktree(root, "feature-y", "main", &wt2)
+            .unwrap();
+        CliGit.remove_worktree(root, &wt2, false).unwrap();
+        assert!(
+            repo.out(&["branch", "--list", "feature-y"]).contains("feature-y"),
+            "branch feature-y must survive delete_branch=false"
+        );
+    }
+
+    #[test]
+    fn stash_list_returns_entries_and_is_empty_when_clean() {
+        // stash_list must survive the run_status routing (bounded + bridge) and
+        // still parse the same entries the raw command produced.
+        let repo = testutil::TestRepo::new("stash-list");
+        repo.commit_file("f.txt", "one\n", "c0");
+        let loc = repo.loc();
+
+        assert!(CliGit.stash_list(&loc).unwrap().is_empty());
+
+        std::fs::write(repo.dir.join("f.txt"), "two\n").unwrap();
+        testutil::git_in(&repo.dir, &["stash", "-q"]);
+        let entries = CliGit.stash_list(&loc).unwrap();
+        assert_eq!(entries.len(), 1, "one stash entry expected: {entries:?}");
     }
 
     /// Run `git` in `dir`, panicking on failure (test setup helper).

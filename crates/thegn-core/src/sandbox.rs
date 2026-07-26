@@ -1116,11 +1116,13 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
             "sandbox: container '{}' has stale mounts (config changed); recreating",
             spec.name
         ));
-        let _ = run_control_owned(
-            spec,
-            &[rt.to_string(), "rm".into(), "-f".into(), spec.name.clone()],
-            PROBE_TIMEOUT,
-        );
+        // Remove via oci_prefix (sudo -n for rootful, --url/--connection/-H for
+        // oci_host) so the rm targets the SAME daemon `run -d` will create on —
+        // a bare `rt` rm hits the local rootless store and no-ops on a rootful/
+        // remote container, so the recreate below then fails "name in use".
+        let mut rm = oci_prefix(spec);
+        rm.extend(["rm".into(), "-f".into(), spec.name.clone()]);
+        let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
     }
     // Build the image now (synchronous, correct ordering) when a Dockerfile
     // build was requested — the tag is `spec.image`, so the run below finds it.
@@ -1153,16 +1155,11 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     // containers work. Retry without keep-id so an explicit rootless Podman
     // selection still produces a real container instead of forcing host use.
     if spec.backend == Backend::Podman {
-        let _ = run_control_owned(
-            spec,
-            &[
-                spec.backend.binary().to_string(),
-                "rm".into(),
-                "-f".into(),
-                spec.name.clone(),
-            ],
-            PROBE_TIMEOUT,
-        );
+        // Same daemon-targeting fix as the stale-mount rm above: go through
+        // oci_prefix so the pre-retry rm hits the daemon the create used.
+        let mut rm = oci_prefix(spec);
+        rm.extend(["rm".into(), "-f".into(), spec.name.clone()]);
+        let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
         let mut retry: Vec<String> = oci_prefix(spec);
         retry.extend([
             "run".into(),
@@ -1235,6 +1232,10 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     // name is a harmless no-op.
     let agent = agent_container_name(name);
     let vpn = vpn_sidecar_name(name);
+    // Drive the same remote daemon the create used, or `None` for the local
+    // daemon; without this an `[sandbox] oci_host` container is never removed
+    // (rm hits the local daemon, which never held it) and leaks forever.
+    let oci_host = (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim());
     // Try whichever OCI runtimes are available; the container only exists under one.
     for b in [
         Backend::Podman,
@@ -1244,7 +1245,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
         Backend::Apple,
     ] {
         if available(&placement, b) == RuntimeProbe::Present {
-            let mut argv = backend_prefix(b);
+            let mut argv = oci_prefix_for(b, oci_host);
             argv.extend([
                 "rm".into(),
                 "-f".into(),
@@ -1338,12 +1339,20 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
         // their default PATH.
         let devenv = spec.devenv_path.as_deref().unwrap_or("devenv");
         s.push_str(&format!("exec {devenv} shell -- {inner}"));
-    } else if inner.contains("&&") || inner.contains(';') {
+    } else if inner.contains("&&")
+        || inner.contains("||")
+        || inner.contains('|')
+        || inner.contains(';')
+        || inner.contains('\n')
+    {
         // Compound expressions (e.g. a shell probe chain like
-        // `command -v zsh && exec zsh -l; exec bash -l`) must NOT be
-        // prefixed with `exec` — `exec` only accepts a single command.
-        // The individual `exec` calls inside the chain handle process
-        // replacement; running the expression directly is correct.
+        // `command -v zsh && exec zsh -l; exec bash -l`, or an `||` fallback
+        // like `claude --resume || claude`) must NOT be prefixed with `exec` —
+        // `exec` only accepts a single simple command, and a failed `exec`
+        // (command not found) exits the shell before any `||`/`;` fallback can
+        // run. Running the expression directly lets the individual `exec` calls
+        // inside it handle process replacement. (`||` is caught before the bare
+        // `|` check, but either substring is enough to skip the prefix.)
         s.push_str(inner);
     } else {
         s.push_str(&format!("exec {inner}"));
@@ -1544,7 +1553,23 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                     v.extend(["-p".into(), format!("ReadOnlyPaths={}", m.dest)]);
                 }
             }
-            for (k, val) in &spec.env {
+            // Host-sourced secrets go to a 0600 `EnvironmentFile=` property so
+            // they stay off systemd-run's argv, which persists for the pane's
+            // whole lifetime in `/proc/*/cmdline`; synthetic/non-secret pairs
+            // stay inline as `--setenv K=V`. (Remote specs keep everything
+            // inline — see `partition_secret_env`.)
+            let (inline_env, secret_env) = partition_secret_env(spec);
+            if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env) {
+                v.extend([
+                    "-p".into(),
+                    format!("EnvironmentFile={}", envfile.display()),
+                ]);
+            } else {
+                for (k, val) in &secret_env {
+                    v.extend(["--setenv".into(), format!("{k}={val}")]);
+                }
+            }
+            for (k, val) in &inline_env {
                 v.extend(["--setenv".into(), format!("{k}={val}")]);
             }
             v.extend(["/bin/sh".into(), "-lc".into(), script.to_string()]);
@@ -1569,6 +1594,55 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             vec!["/bin/sh".into(), "-lc".into(), body]
         }
     }
+}
+
+/// Split `spec.env` into (non-secret inline pairs, secret pairs) for a *local*
+/// Borrowed `(key, value)` env pairs from a spec's `env` map.
+type EnvPairs<'a> = Vec<(&'a String, &'a String)>;
+
+/// spec. A pair whose value matches the launcher's own process env is a
+/// host-sourced passthrough secret (GH_TOKEN, API keys — see `resolve`'s
+/// env_passthrough) and MUST NOT ride the world-readable argv (`-e K=V` /
+/// `--setenv K=V` are visible in `/proc/*/cmdline`); it goes to a 0600
+/// env-file instead. Synthetic pairs (THEGN_SANDBOX, NIX_REMOTE — values absent
+/// from the host env) are not secrets and stay inline. A REMOTE spec returns all
+/// pairs inline: the argv is the only env carrier through ssh (mirrors the bwrap
+/// branch), so nothing is diverted.
+fn partition_secret_env(spec: &SandboxSpec) -> (EnvPairs<'_>, EnvPairs<'_>) {
+    let mut inline: EnvPairs = Vec::new();
+    let mut secret: EnvPairs = Vec::new();
+    let local = spec.placement.is_local();
+    for (k, val) in &spec.env {
+        if local && std::env::var(k).ok().as_deref() == Some(val) {
+            secret.push((k, val));
+        } else {
+            inline.push((k, val));
+        }
+    }
+    (inline, secret)
+}
+
+/// Write host-sourced secret env pairs to a stable, 0600 per-sandbox env-file
+/// (`$XDG_STATE_HOME/thegn/sandbox-env/<name>.env`) and return its path, so the
+/// OCI `--env-file` / systemd `EnvironmentFile=` flags can carry tokens off the
+/// world-readable argv. Returns `None` when there are no secrets to write or the
+/// file can't be created (caller then keeps the pairs inline — availability over
+/// a hard failure). The 0600 mode is set BEFORE the secret bytes are written.
+fn write_secret_env_file(name: &str, secret: &[(&String, &String)]) -> Option<PathBuf> {
+    if secret.is_empty() {
+        return None;
+    }
+    let dir = util::xdg_state_home().join("thegn/sandbox-env");
+    std::fs::create_dir_all(&dir).ok()?;
+    let _ = crate::fsperm::restrict_dir_to_owner(&dir);
+    let path = dir.join(format!("{name}.env"));
+    // Create empty + lock down to 0600 before writing any secret bytes, so the
+    // token never lands in a world-readable file even momentarily.
+    std::fs::File::create(&path).ok()?;
+    crate::fsperm::restrict_to_owner(&path).ok()?;
+    let body: String = secret.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+    std::fs::write(&path, body).ok()?;
+    Some(path)
 }
 
 /// OCI `run` options shared by the keep-alive container: mounts, network, env,
@@ -1664,7 +1738,21 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     {
         v.extend(["-v".into(), "/nix:/nix:ro".into()]);
     }
-    for (k, val) in &spec.env {
+    // Host-sourced secrets (tokens, API keys) go to a 0600 `--env-file` so they
+    // never land on the world-readable process argv; only synthetic/non-secret
+    // pairs stay inline as `-e K=V`. (Remote specs keep everything inline — the
+    // argv is the only env carrier through ssh; see `partition_secret_env`.)
+    let (inline_env, secret_env) = partition_secret_env(spec);
+    if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env) {
+        v.extend(["--env-file".into(), envfile.to_string_lossy().into_owned()]);
+    } else {
+        // No env-file (no secrets, or write failed) — keep secrets inline rather
+        // than silently drop them; correctness over the leak in that rare case.
+        for (k, val) in &secret_env {
+            v.extend(["-e".into(), format!("{k}={val}")]);
+        }
+    }
+    for (k, val) in &inline_env {
         v.extend(["-e".into(), format!("{k}={val}")]);
     }
     for (vol_name, dest) in &spec.volumes {
@@ -1803,26 +1891,28 @@ pub(crate) fn backend_prefix(backend: Backend) -> Vec<String> {
 /// backend. Used by every container lifecycle/exec call so create, inspect, exec
 /// and teardown all target the same daemon.
 pub(crate) fn oci_prefix(spec: &SandboxSpec) -> Vec<String> {
-    let mut v = backend_prefix(spec.backend);
-    let Some(host) = spec
-        .oci_host
-        .as_deref()
-        .map(str::trim)
-        .filter(|h| !h.is_empty())
-    else {
+    oci_prefix_for(spec.backend, spec.oci_host.as_deref())
+}
+
+/// [`oci_prefix`] without a full spec: the backend + optional `oci_host` are all
+/// that determine the daemon-connection flag. Lets path-only teardowns
+/// (`teardown`/`teardown_by_path`) target the same remote daemon a create used.
+pub(crate) fn oci_prefix_for(backend: Backend, oci_host: Option<&str>) -> Vec<String> {
+    let mut v = backend_prefix(backend);
+    let Some(host) = oci_host.map(str::trim).filter(|h| !h.is_empty()) else {
         return v;
     };
-    if !spec.backend.is_oci() {
+    if !backend.is_oci() {
         return v;
     }
     // Insert the global connection flag right after the binary (before the
     // subcommand). For rootful podman the binary is at index 2 (`sudo -n podman`).
-    let bin_idx = if spec.backend == Backend::PodmanRootful {
+    let bin_idx = if backend == Backend::PodmanRootful {
         2
     } else {
         0
     };
-    let flags: Vec<String> = match spec.backend {
+    let flags: Vec<String> = match backend {
         Backend::Docker => vec!["-H".into(), host.to_string()],
         // podman: a URL (scheme://) is `--url`; a bare token is a named `--connection`.
         _ if host.contains("://") => vec!["--url".into(), host.to_string()],
@@ -1843,13 +1933,15 @@ pub fn oci_runtime_prefix(backend: Backend) -> Option<Vec<String>> {
 }
 
 pub(crate) fn run_local_output(prefix: &[String], args: &[&str]) -> Option<String> {
-    let (cmd, rest) = prefix.split_first()?;
-    let mut c = Command::new(cmd);
-    c.args(rest).args(args);
-    let out = c.output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+    // Bounded by PROBE_TIMEOUT: these are control-plane probes (`ps`, `stats`)
+    // on the recurring container-refresh cadence — a wedged runtime (stuck
+    // podman machine, broken overlay) must fail the probe fast, not hang the
+    // hydrate thread forever (the raw `Command::output()` this replaced had no
+    // deadline).
+    let mut argv: Vec<String> = prefix.to_vec();
+    argv.extend(args.iter().map(|a| a.to_string()));
+    let (ok, stdout) = output_with_timeout(&argv, PROBE_TIMEOUT)?;
+    ok.then_some(stdout)
 }
 
 /// Run a control-plane command (locally, or on the remote over ssh). Returns
@@ -1914,22 +2006,22 @@ pub fn stats(spec: &SandboxSpec) -> Option<SandboxStats> {
     if !spec.backend.is_oci() {
         return None;
     }
-    let rt = spec.backend.binary();
+    // Build the argv from oci_prefix (so rootful/`oci_host` specs hit the daemon
+    // that actually holds the container — a bare `binary()` queries the local
+    // rootless store, always empty for those) and wrap it through the
+    // placement's control primitive (ssh/kubectl/provider) for remote worktrees.
     // format: CPUPerc|MemUsage
-    let argv = [
-        rt,
-        "stats",
-        "--no-stream",
-        "--format",
-        "{{.CPUPerc}}|{{.MemUsage}}",
-        &spec.name,
-    ];
-
-    let out = std::process::Command::new(argv[0])
-        .args(&argv[1..])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut argv = oci_prefix(spec);
+    argv.extend([
+        "stats".into(),
+        "--no-stream".into(),
+        "--format".into(),
+        "{{.CPUPerc}}|{{.MemUsage}}".into(),
+        spec.name.clone(),
+    ]);
+    // Bounded like every other control-plane probe: a wedged runtime must not
+    // hang the caller.
+    let (_, stdout) = output_control_owned(spec, &argv, PROBE_TIMEOUT)?;
     parse_sandbox_stats(stdout.trim())
 }
 
@@ -1994,20 +2086,25 @@ pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
             continue;
         }
 
-        let Ok(out) = std::process::Command::new(backend.binary())
-            .args(["ps", "-a", "--format", "{{.Names}}"])
-            .output()
-        else {
+        // Bounded like every other control-plane call — this runs on the startup
+        // spawn_blocking task, so a wedged runtime must not pin it forever.
+        let mut ps = backend_prefix(backend);
+        ps.extend([
+            "ps".into(),
+            "-a".into(),
+            "--format".into(),
+            "{{.Names}}".into(),
+        ]);
+        let Some((_, stdout)) = output_with_timeout(&ps, PROBE_TIMEOUT) else {
             continue;
         };
 
-        let stdout = String::from_utf8_lossy(&out.stdout);
         let containers: Vec<String> = stdout.lines().map(|s| s.trim().to_string()).collect();
 
         for orphan in identify_orphans(db_worktrees, &containers) {
-            let _ = std::process::Command::new(backend.binary())
-                .args(["rm", "-f", &orphan])
-                .output();
+            let mut rm = backend_prefix(backend);
+            rm.extend(["rm".into(), "-f".into(), orphan.clone()]);
+            let _ = status_with_timeout(&rm, PROBE_TIMEOUT);
             removed.push(orphan);
         }
     }

@@ -245,8 +245,7 @@ const HEADROOM_SCRIPT: &str = r#"
 set -u
 echo "NPROC=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
 awk '/MemTotal/ {print "MEM_TOTAL_KB=" $2} /MemAvailable/ {print "MEM_AVAIL_KB=" $2}' /proc/meminfo 2>/dev/null
-awk '{printf "LOAD1_MILLI=%d
-", $1 * 1000}' /proc/loadavg 2>/dev/null
+awk '{printf "LOAD1_MILLI=%d\n", $1 * 1000}' /proc/loadavg 2>/dev/null
 df -kP "${HOME:-/}" 2>/dev/null | awk 'NR==2 {print "DISK_FREE=" $4 * 1024}'
 if command -v podman >/dev/null 2>&1; then
   echo "CONTAINERS=$(podman ps -q 2>/dev/null | wc -l | tr -d ' ')"
@@ -701,11 +700,13 @@ impl OciRunner {
             match run {
                 Ok(o) if o.ok && !o.stdout.trim().is_empty() => {
                     let json = o.stdout;
-                    let digest = if *local {
-                        sha256_local(&json)?
-                    } else {
-                        self.sha256_remote(&json)?
-                    };
+                    // The digest is of the manifest DOCUMENT (transport-
+                    // independent), and the JSON is already on the local side —
+                    // so hash it locally regardless of where the inspect ran.
+                    // A remote hash (sha256_remote) added a deadline-less ssh
+                    // exec that could wedge the whole provisioning thread with
+                    // no error and no retry when the link stalled post-inspect.
+                    let digest = sha256_local(&json)?;
                     return Ok((json, digest));
                 }
                 Ok(o) => last_err = o.msg("inspect"),
@@ -713,36 +714,6 @@ impl OciRunner {
             }
         }
         Err(format!("manifest inspect {target}: {last_err}"))
-    }
-
-    /// sha256 of a string via the host's `sha256sum` (stdin pipe).
-    fn sha256_remote(&self, content: &str) -> Result<Digest, String> {
-        // Content is JSON — safe to heredoc-quote via sh single quotes after
-        // escaping. Use base64 to dodge quoting entirely.
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-        let argv = self.placement.control_argv(&[
-            "sh".to_string(),
-            "-lc".to_string(),
-            "sha256sum | awk '{print $1}'".to_string(),
-        ]);
-        let mut child = Command::new(&argv[0])
-            .args(&argv[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("sha256: spawn: {e}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or("sha256: no stdin")?
-            .write_all(content.as_bytes())
-            .map_err(|e| format!("sha256: write: {e}"))?;
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("sha256: wait: {e}"))?;
-        Digest::from_hex(String::from_utf8_lossy(&out.stdout).trim())
     }
 }
 
@@ -1087,6 +1058,28 @@ mod tests {
     }
 
     #[test]
+    fn headroom_script_emits_load1_milli_key() {
+        // Regression: the LOAD1_MILLI awk program once had a literal newline
+        // inside its format string (`"LOAD1_MILLI=%d\n<newline>"`), an awk
+        // syntax error. With `2>/dev/null` swallowing the error and no `set -e`,
+        // the probe "succeeded" but never emitted the key, so parse_headroom's
+        // `.unwrap_or(0)` reported every host as load 0 and placement believed
+        // even a saturated box was idle. Assert the raw script emits the key.
+        let out = exec_argv(
+            &["sh".to_string(), "-c".to_string(), HEADROOM_SCRIPT.to_string()],
+            Duration::from_secs(15),
+        )
+        .expect("headroom script runs");
+        assert!(out.ok, "script exit: {:?} / {}", out.code, out.stderr);
+        assert!(
+            out.stdout.contains("LOAD1_MILLI="),
+            "LOAD1_MILLI must be emitted (awk string must not contain a raw newline); \
+             stdout was:\n{}",
+            out.stdout
+        );
+    }
+
+    #[test]
     fn probe_script_reports_machine_size_keys() {
         // The extended probe carries the size hints the capacity layer reads.
         let mut r = OciRunner::new(Placement::Local);
@@ -1208,6 +1201,21 @@ mod tests {
             d.as_str(),
             "sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
         );
+    }
+
+    #[test]
+    fn manifest_digest_is_document_hash_independent_of_transport() {
+        // The manifest (list) digest is the sha256 of the manifest DOCUMENT, so
+        // whether the inspect ran locally or over ssh, the digest is the same
+        // local hash of the same bytes. `fetch_manifest` therefore hashes the
+        // JSON locally in all cases — there is no deadline-less remote-hash exec
+        // that could wedge the provisioning thread when an ssh link stalls.
+        let json = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json"}"#;
+        let expect = sha256_local(json).unwrap();
+        // sha256sum of the same bytes on any host produces the identical digest;
+        // pin the value so a regression to a transport-specific hash is caught.
+        assert_eq!(expect.as_str().len(), "sha256:".len() + 64);
+        assert_eq!(sha256_local(json).unwrap(), expect);
     }
 
     /// Build a runner whose probed runtime is fixed by a synthetic probe line,

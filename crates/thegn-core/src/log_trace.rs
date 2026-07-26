@@ -143,9 +143,11 @@ pub fn init(role: Role, cfg: &LogConfig) {
             .event_format(Brand {
                 ansi: stderr_ansi,
                 timestamp: false,
+                json: false,
             })
     });
 
+    let file_json = matches!(cfg.format, LogFormat::Json);
     let file_layer = if cfg.file {
         match FileSink::open(cfg, &role.log_file()) {
             Ok(sink) => Some(
@@ -153,7 +155,10 @@ pub fn init(role: Role, cfg: &LogConfig) {
                     .with_writer(sink)
                     .event_format(Brand {
                         ansi: false,
-                        timestamp: matches!(cfg.format, LogFormat::Text),
+                        // JSON carries its own `ts` field; the text sink prefixes
+                        // a plain timestamp column.
+                        timestamp: !file_json,
+                        json: file_json,
                     }),
             ),
             Err(e) => {
@@ -184,6 +189,10 @@ pub fn init(role: Role, cfg: &LogConfig) {
 struct Brand {
     ansi: bool,
     timestamp: bool,
+    /// Emit a machine-readable JSON object per line (`[log] format = "json"`)
+    /// instead of the branded text column. Mutually exclusive with `timestamp`
+    /// (JSON carries its own `ts` field) and `ansi`.
+    json: bool,
 }
 
 impl Brand {
@@ -212,6 +221,10 @@ where
         let meta = event.metadata();
         let level = meta.level();
         let target = meta.target();
+
+        if self.json {
+            return self.format_json(ctx, writer, event, level, target);
+        }
 
         if self.timestamp {
             // Local wall-clock via the already-present `chrono` dep.
@@ -249,6 +262,64 @@ where
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
     }
+}
+
+impl Brand {
+    /// Emit one newline-terminated JSON object: `{"ts":…,"level":…,"target":…,
+    /// ["wt":…,]"msg":…}`. Keys mirror what `log::parser::parse_log` extracts
+    /// (`ts`/`level`/`wt`/`msg`), so the Logs panel and `thegn logs` read it
+    /// back losslessly. The message is the event's rendered fields (the default
+    /// text field formatter), JSON-string-escaped.
+    fn format_json<S, N>(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+        level: &Level,
+        target: &str,
+    ) -> std::fmt::Result
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+        N: for<'a> FormatFields<'a> + 'static,
+    {
+        // Render the event's fields (message + kv) into a scratch buffer, then
+        // escape as a JSON string value.
+        let mut fields = String::new();
+        ctx.field_format()
+            .format_fields(Writer::new(&mut fields), event)?;
+
+        let ts = chrono::Local::now().to_rfc3339();
+        write!(
+            writer,
+            "{{\"ts\":\"{}\",\"level\":\"{}\",\"target\":\"{}\"",
+            json_escape(&ts),
+            json_escape(level.as_str()),
+            json_escape(target),
+        )?;
+        if let Some(wt) = current_wt() {
+            write!(writer, ",\"wt\":\"{}\"", json_escape(&wt))?;
+        }
+        write!(writer, ",\"msg\":\"{}\"}}", json_escape(&fields))?;
+        writeln!(writer)
+    }
+}
+
+/// Minimal JSON string escaping for the file JSON sink (control chars, quotes,
+/// backslashes). Keeps the sink dependency-free; the reader uses `serde_json`.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// A size-capped log writer: one-step rotation (`.log` → `.log.1` → … →
@@ -369,6 +440,73 @@ mod tests {
         // Never keep more than max_files rotations.
         assert!(!dir.join("t.log.4").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn json_escape_handles_specials() {
+        assert_eq!(json_escape("plain"), "plain");
+        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(json_escape("l1\nl2\ttab"), "l1\\nl2\\ttab");
+        // Control char below 0x20 → \u escape.
+        assert_eq!(json_escape("\u{0007}"), "\\u0007");
+    }
+
+    #[test]
+    fn json_sink_emits_parseable_json_with_timestamp() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(BufWriter(buf.clone()))
+            .event_format(Brand {
+                ansi: false,
+                timestamp: false,
+                json: true,
+            });
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _g = enter_wt("app-feat");
+            tracing::error!(target: "thegn::db", "exploded");
+        });
+
+        let line = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let line = line.trim();
+        // A real JSON object (regression: the old code emitted plain text and
+        // dropped the timestamp for format = "json").
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("not JSON: {e}: {line:?}"));
+        assert_eq!(v["level"], "ERROR");
+        assert_eq!(v["target"], "thegn::db");
+        assert_eq!(v["wt"], "app-feat");
+        assert!(v["msg"].as_str().unwrap().contains("exploded"));
+        // Timestamp is present and RFC3339-parseable.
+        let ts = v["ts"].as_str().expect("ts field");
+        assert!(chrono::DateTime::parse_from_rfc3339(ts).is_ok(), "ts={ts}");
+
+        // And the parser round-trips it back into a ParsedLog.
+        let parsed = crate::log::parser::parse_log(line);
+        assert_eq!(parsed.level, crate::log::parser::LogLevel::Error);
+        assert_eq!(parsed.worktree.as_deref(), Some("app-feat"));
+        assert!(parsed.message.contains("exploded"));
     }
 
     #[test]

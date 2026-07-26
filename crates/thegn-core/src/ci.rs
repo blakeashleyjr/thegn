@@ -266,13 +266,27 @@ pub fn line_is_failure(line: &str) -> bool {
         || lower.starts_with("error ")
         || lower.starts_with("fatal:")
         || lower.starts_with("failed:")
-        || lower.contains("exit code 1")
-        || lower.contains("exited with code")
-        || lower.contains("process completed with exit code")
+        || nonzero_exit_after(&lower, "exit code")
+        || nonzero_exit_after(&lower, "exited with code")
+        || nonzero_exit_after(&lower, "process completed with exit code")
         || lower.contains("test failed")
         || lower.contains("build failed")
         || lower.contains("failures:")
         || lower.contains("panicked at")
+}
+
+/// True when `phrase` appears in `haystack` immediately followed by a **nonzero**
+/// integer code — so benign success lines (`exited with code 0`, `Process
+/// completed with exit code 0`, common in docker-compose / GitHub Actions logs)
+/// don't count as failures, and `exit code 1` no longer matches `exit code 10`
+/// only by accident. A phrase with no parseable trailing integer is not a match
+/// (conservative: avoids a false jump on ambiguous text).
+fn nonzero_exit_after(haystack: &str, phrase: &str) -> bool {
+    haystack.match_indices(phrase).any(|(i, _)| {
+        let rest = haystack[i + phrase.len()..].trim_start();
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u64>().is_ok_and(|code| code != 0)
+    })
 }
 
 // --- dispatchable workflows (trigger, Phase B) ----------------------------
@@ -716,6 +730,40 @@ mod tests {
         assert!(!line_is_failure("no errors here"));
         assert!(!line_is_failure("warning: deprecated"));
         assert!(!line_is_failure(""));
+    }
+
+    /// Success lines that echo an exit *phrase* with a zero code (routine in
+    /// docker-compose / GitHub-Actions logs) must NOT count as failures, and the
+    /// nonzero-code paths still do. Regression for the audit finding where
+    /// "exited with code 0" / "process completed with exit code 0" jumped
+    /// jump-to-failure to a benign line.
+    #[test]
+    fn exit_code_zero_is_not_a_failure() {
+        // Zero-code success lines: not failures.
+        assert!(!line_is_failure("web_1 exited with code 0"));
+        assert!(!line_is_failure("Process completed with exit code 0"));
+        assert!(!line_is_failure("container exited with code 0"));
+        assert!(!line_is_failure("job finished, exit code 0"));
+
+        // Nonzero codes still trip it, in every phrasing.
+        assert!(line_is_failure("db_1 exited with code 137"));
+        assert!(line_is_failure("Process completed with exit code 2"));
+        assert!(line_is_failure("step failed with exit code 1"));
+
+        // "exit code 1" no longer matches "exit code 10" only by accident: both
+        // are nonzero and both correctly count.
+        assert!(line_is_failure("exit code 10"));
+
+        // A phrase with no parseable trailing code is conservatively ignored.
+        assert!(!line_is_failure("see exit code documentation"));
+
+        // first_failure_line skips the benign code-0 line and lands on the real
+        // failure further down.
+        let log = CiLog {
+            text: "web_1 exited with code 0\nstill running\ndb_1 exited with code 1\ndone".into(),
+            truncated: false,
+        };
+        assert_eq!(log.first_failure_line(), Some(2));
     }
 
     #[test]

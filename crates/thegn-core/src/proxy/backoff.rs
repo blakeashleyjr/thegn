@@ -200,12 +200,18 @@ pub fn backoff_ramp(cfg: BackoffConfig, consecutive_failures: u32) -> Duration {
 
 /// Applies Go-style symmetric jitter to a backoff: jitter spans
 /// `[-jitterMax, +jitterMax)` nanoseconds where `jitterMax = backoff * factor`
-/// seconds, never dropping below 1s. A `factor` of 0 is a no-op.
+/// (so a 30s backoff at factor 0.2 spreads by up to ±6s), never dropping below
+/// 1s. A `factor` of 0 is a no-op.
 fn apply_jitter(backoff: Duration, factor: f64, jitter_ns: i64) -> Duration {
     if factor <= 0.0 {
         return backoff;
     }
-    let jitter_max = (backoff.as_secs_f64() * factor) as i64; // in seconds, as Go
+    // `jitter_max` is in NANOSECONDS — everything below (`j`, `backoff.as_nanos`,
+    // the 1s floor) is nanosecond-scale, so the magnitude must be too. Go's
+    // `time.Duration(backoff.Seconds()*factor) * time.Second` is likewise a
+    // nanosecond count. Computing it in seconds made jitter a ±few-nanosecond
+    // no-op on multi-second backoffs, defeating anti-stampede spreading.
+    let jitter_max = (backoff.as_secs_f64() * factor * 1e9) as i64;
     if jitter_max <= 0 {
         return backoff;
     }
@@ -317,6 +323,32 @@ mod tests {
     }
 
     #[test]
+    fn jitter_spread_is_seconds_scale_not_nanoseconds() {
+        // Regression: jitter_max was computed in seconds but added to a nanosecond
+        // count, so the spread was ~±6ns on a 30s backoff — a no-op that let every
+        // rate-limited lane re-probe in lockstep. Correct spread for RATE_LIMIT
+        // (30s * 0.2) is up to ±6s, so distinct jitter sources must produce
+        // results that differ by far more than a nanosecond.
+        let base = RATE_LIMIT_BACKOFF.initial;
+        // Two jitter sources landing at opposite ends of the [-max, +max) span.
+        // rem_euclid(2*max_ns) then subtract max_ns: pick 0 (→ -6s) and max_ns.
+        let max_ns = (base.as_secs_f64() * RATE_LIMIT_BACKOFF.jitter * 1e9) as i64;
+        let low = backoff_from_config_jittered(RATE_LIMIT_BACKOFF, 0, 0);
+        let high = backoff_from_config_jittered(RATE_LIMIT_BACKOFF, 0, max_ns);
+        // Low end is base - max = 24s; high end is base (offset 0) = 30s.
+        assert_eq!(low, base - Duration::from_nanos(max_ns as u64));
+        assert_eq!(high, base);
+        // The spread between the two extremes is seconds-scale (>100ms), not the
+        // ~nanosecond no-op the units bug produced.
+        assert!(
+            high.as_secs_f64() - low.as_secs_f64() > 0.1,
+            "spread {} → {} is not seconds-scale",
+            low.as_secs_f64(),
+            high.as_secs_f64()
+        );
+    }
+
+    #[test]
     fn every_config_arm_is_selected() {
         // Each kind maps to its profile (covers backoff_config_for arms),
         // checked on the jitter-free initial interval.
@@ -351,22 +383,26 @@ mod tests {
     }
 
     #[test]
-    fn jitter_noop_when_factor_zero_or_tiny() {
-        // client-error has jitter 0.0 → exact.
+    fn jitter_noop_only_when_factor_is_zero() {
+        // Only a jitter factor of exactly 0.0 is a true no-op.
         assert_eq!(
             backoff_from_config_jittered(CLIENT_ERROR_BACKOFF, 0, 999),
             CLIENT_ERROR_BACKOFF.initial
         );
-        // A sub-second backoff with a small factor yields jitter_max==0 → no-op.
+        // A multi-second backoff now spreads by a meaningful amount (the pre-fix
+        // ns-vs-seconds bug made jitter a ±few-ns no-op). 0.2 * 10s = 2s max
+        // spread, well above apply_jitter's 1s floor, so the result lands in
+        // [8s, 10s) — strictly below base, proving jitter actually applied.
         let cfg = BackoffConfig {
-            initial: Duration::from_millis(100),
+            initial: Duration::from_secs(10),
             multiplier: 1.0,
-            ceiling: Duration::from_secs(1),
-            jitter: 0.1,
+            ceiling: Duration::from_secs(30),
+            jitter: 0.2,
         };
-        assert_eq!(
-            backoff_from_config_jittered(cfg, 0, 12345),
-            Duration::from_millis(100)
+        let d = backoff_from_config_jittered(cfg, 0, 12345);
+        assert!(
+            d >= Duration::from_secs(8) && d < Duration::from_secs(10),
+            "multi-second jitter must apply, got {d:?}"
         );
     }
 

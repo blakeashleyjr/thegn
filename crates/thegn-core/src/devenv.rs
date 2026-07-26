@@ -218,25 +218,34 @@ fn resolve_and_cache(repo_root: &Path, key: &str) {
     }
 }
 
+/// Ceiling for a `nix print-dev-env` eval. A cold-cache eval that has to fetch
+/// flake inputs is legitimately slow, but a network drop mid-fetch would
+/// otherwise hang forever (nix has no default fetch deadline) — and because
+/// [`prewarm`] only clears the `in_flight` marker after this returns, one hung
+/// eval would permanently wedge devshell resolution for the repo. Bound it so
+/// the marker is always released and a negative cache always written.
+const PRINT_DEV_ENV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Invoke `nix print-dev-env --json` against the flake at `repo_root` and parse
-/// it. `None` on a non-zero exit or spawn failure (degrade silently). Subprocess
-/// seam.
+/// it. `None` on a non-zero exit, spawn failure, or timeout (degrade silently).
+/// Subprocess seam.
 fn run_print_dev_env(repo_root: &Path) -> Option<Devshell> {
     let installable = format!("{}#", repo_root.display());
-    let out = std::process::Command::new("nix")
-        .args([
-            "--extra-experimental-features",
-            "nix-command flakes",
-            "print-dev-env",
-            "--json",
-            &installable,
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let argv = [
+        "nix".to_string(),
+        "--extra-experimental-features".to_string(),
+        "nix-command flakes".to_string(),
+        "print-dev-env".to_string(),
+        "--json".to_string(),
+        installable,
+    ];
+    // Hard deadline: the child is killed + reaped on timeout, so the caller's
+    // `in_flight` entry is released even on a wedged eval.
+    let (ok, stdout) = crate::sandbox::output_with_timeout(&argv, PRINT_DEV_ENV_TIMEOUT)?;
+    if !ok {
         return None;
     }
-    let dev = parse_print_dev_env(&String::from_utf8_lossy(&out.stdout));
+    let dev = parse_print_dev_env(&stdout);
     (!dev.is_empty()).then_some(dev)
 }
 

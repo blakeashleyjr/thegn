@@ -939,6 +939,15 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
     EnvPlan { steps, tier }
 }
 
+/// Escape a value for embedding in the **single-quoted `printf` format string**
+/// that writes `nix.conf` (`printf '{conf}' > …`). Two hazards: a `%` is read by
+/// `printf` as a conversion directive (a presigned/S3 cache URL with `%2F`… would
+/// corrupt or error the output), and a `'` closes the shell single-quote (turning
+/// the generated script into a syntax error). `%` → `%%`; `'` → `'\''`.
+fn printf_fmt_escape(s: &str) -> String {
+    s.replace('%', "%%").replace('\'', "'\\''")
+}
+
 /// Single-user Nix install (no systemd/daemon — sprites are minimal microVMs),
 /// idempotent: a no-op if `nix` is already on `PATH`. Enables flakes.
 fn nix_install_script(
@@ -959,9 +968,15 @@ fn nix_install_script(
         ));
     }
     if let Some(c) = cache.filter(|c| !c.url.trim().is_empty()) {
-        conf.push_str(&format!("extra-substituters = {}\\n", c.url.trim()));
+        conf.push_str(&format!(
+            "extra-substituters = {}\\n",
+            printf_fmt_escape(c.url.trim())
+        ));
         if !c.key.trim().is_empty() {
-            conf.push_str(&format!("extra-trusted-public-keys = {}\\n", c.key.trim()));
+            conf.push_str(&format!(
+                "extra-trusted-public-keys = {}\\n",
+                printf_fmt_escape(c.key.trim())
+            ));
         }
     }
     // The host's embedded nix cache (served over the reverse tunnel). It's UNSIGNED
@@ -971,7 +986,10 @@ fn nix_install_script(
     // is single-user, and NarHash still content-checks each download). `nix`
     // accumulates `extra-substituters` lines, so this coexists with `cache` above.
     if let Some(url) = host_cache_url.map(str::trim).filter(|u| !u.is_empty()) {
-        conf.push_str(&format!("extra-substituters = {url}\\n"));
+        conf.push_str(&format!(
+            "extra-substituters = {}\\n",
+            printf_fmt_escape(url)
+        ));
         conf.push_str("require-sigs = false\\n");
         // Graceful degradation for a cache reachable ONLY over the per-sprite reverse
         // tunnel. Two failure modes made `host_cache` unusable: (1) the in-sprite
@@ -2747,6 +2765,33 @@ mod tests {
         };
         let p2 = plan(&req, &opts2);
         assert!(!p2.steps.iter().any(|s| s.id == "cache_push"));
+    }
+
+    #[test]
+    fn cache_url_special_chars_are_escaped_for_printf() {
+        use crate::config::NixInstaller;
+        // A presigned S3 URL (with `%`) and a `'` in the key must NOT corrupt the
+        // `printf '{conf}' > nix.conf` step: `%` → `%%` (else printf eats it as a
+        // conversion directive) and `'` → `'\''` (else it closes the shell quote).
+        let cache = BinaryCache {
+            url: "s3://b?X-Amz-Signature=ab%2Fcd".into(),
+            key: "it's-a-key".into(),
+            push: false,
+        };
+        let s = nix_install_script(NixInstaller::Official, None, Some(&cache), None);
+        // `%` doubled so printf emits a literal `%`.
+        assert!(s.contains("X-Amz-Signature=ab%%2Fcd"), "url % must be doubled: {s}");
+        assert!(!s.contains("ab%2Fcd"), "un-doubled % leaks into the format string");
+        // `'` escaped so the surrounding single-quote isn't terminated.
+        assert!(s.contains(r"it'\''s-a-key"), "key quote must be escaped: {s}");
+        // host_cache_url takes the same escaping.
+        let hc = nix_install_script(
+            NixInstaller::Official,
+            None,
+            None,
+            Some("http://h/%41"),
+        );
+        assert!(hc.contains("http://h/%%41"));
     }
 
     #[test]

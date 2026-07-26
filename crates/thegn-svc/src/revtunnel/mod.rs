@@ -26,7 +26,19 @@ use thegn_core::revtunnel::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Sender, channel};
+
+/// Bounded depth for the shared outbound frame sink and each per-connection
+/// inbound channel. This is the flow-control knob: with unbounded channels a
+/// fast local service (e.g. the host nix-cache serving a multi-GB NAR at
+/// loopback speed) outruns the WSS exec-stream drain and the difference piles
+/// up as queued frames, ballooning compositor RSS. A bounded channel makes the
+/// producing read `send(...).await` block once the queue is full, so
+/// backpressure propagates back to the local TCP read. Frames are at most
+/// `MAX_FRAME_PAYLOAD` (1 MiB) each, so peak in-flight is bounded by
+/// `CHANNEL_DEPTH * 1 MiB` per connection direction rather than the whole
+/// transfer size.
+const CHANNEL_DEPTH: usize = 32;
 
 /// Any bidirectional async stream usable as a tunneled connection (a real
 /// `TcpStream`, or an in-memory `DuplexStream` in tests).
@@ -111,9 +123,11 @@ fn decode_err(e: thegn_core::revtunnel::DecodeError) -> io::Error {
 }
 
 /// Spawn the writer task: serialize all outbound frames (from any connection
-/// task) onto the shared stream write half. Returns the frame sink.
-fn spawn_sink<W: AsyncWrite + Unpin + Send + 'static>(mut wr: W) -> UnboundedSender<Vec<u8>> {
-    let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+/// task) onto the shared stream write half. Returns the frame sink. The sink is
+/// **bounded** ([`CHANNEL_DEPTH`]) so a producer outracing the stream write
+/// blocks on `send().await` instead of queueing unboundedly (see the constant).
+fn spawn_sink<W: AsyncWrite + Unpin + Send + 'static>(mut wr: W) -> Sender<Vec<u8>> {
+    let (tx, mut rx) = channel::<Vec<u8>>(CHANNEL_DEPTH);
     tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
             if wr.write_all(&bytes).await.is_err() {
@@ -131,8 +145,8 @@ fn spawn_sink<W: AsyncWrite + Unpin + Send + 'static>(mut wr: W) -> UnboundedSen
 async fn pump_conn(
     id: u32,
     local: Box<dyn IoStream>,
-    mut inbound: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    sink: UnboundedSender<Vec<u8>>,
+    mut inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    sink: Sender<Vec<u8>>,
 ) {
     let (mut rd, mut wr) = tokio::io::split(local);
     // peer → local. Runs INDEPENDENTLY of the read direction: a half-close on the
@@ -149,22 +163,24 @@ async fn pump_conn(
     });
     // local → peer (Data frames), Close(id) at EOF/err (a half-close, not a full
     // teardown — the writer above keeps delivering the reverse direction).
+    // `send(...).await` blocks when the bounded sink is full, applying
+    // backpressure to this local read so a fast source can't balloon the queue.
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         match rd.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if sink.send(encode_data_chunked(id, &buf[..n])).is_err() {
+                if sink.send(encode_data_chunked(id, &buf[..n])).await.is_err() {
                     break;
                 }
             }
         }
     }
-    let _ = sink.send(encode(&Frame::Close(id)));
+    let _ = sink.send(encode(&Frame::Close(id))).await;
 }
 
 /// Shared per-connection routing table: id → inbound payload sender.
-type Conns = Arc<Mutex<HashMap<u32, UnboundedSender<Vec<u8>>>>>;
+type Conns = Arc<Mutex<HashMap<u32, Sender<Vec<u8>>>>>;
 
 /// Render a bounded byte preview for logs: printable ASCII verbatim, everything
 /// else as `.`. So a skipped preamble/garbage run shows up readably.
@@ -238,8 +254,14 @@ where
                 Ok(Some(frame)) => match frame {
                     Frame::Open(id) => on_open(id).await,
                     Frame::Data(id, d) => {
-                        if let Some(tx) = conns.lock().await.get(&id) {
-                            let _ = tx.send(d);
+                        // Clone the sender out and drop the guard before awaiting
+                        // the (now bounded) send — never hold the routing lock
+                        // across an await. A full inbound channel backpressures
+                        // this read loop, which stalls the shared stream read and
+                        // so throttles the peer's send rate for this connection.
+                        let tx = conns.lock().await.get(&id).cloned();
+                        if let Some(tx) = tx {
+                            let _ = tx.send(d).await;
                         }
                     }
                     Frame::Close(id) => {
@@ -285,13 +307,13 @@ where
             let sink = sink.clone();
             let conns = conns2.clone();
             async move {
-                let (in_tx, in_rx) = unbounded_channel::<Vec<u8>>();
+                let (in_tx, in_rx) = channel::<Vec<u8>>(CHANNEL_DEPTH);
                 conns.lock().await.insert(id, in_tx);
                 tokio::spawn(async move {
                     match dialer.dial().await {
                         Ok(local) => pump_conn(id, local, in_rx, sink).await,
                         Err(_) => {
-                            let _ = sink.send(encode(&Frame::Close(id)));
+                            let _ = sink.send(encode(&Frame::Close(id))).await;
                         }
                     }
                 });
@@ -314,7 +336,7 @@ where
     // Emit the sync marker as the FIRST bytes on stdout, before any frame, so the
     // host can skip whatever one-time preamble the exec transport prepended (a
     // runtime banner/MOTD/shell echo) and lock onto the framing. See `SYNC_MAGIC`.
-    let _ = sink.send(SYNC_MAGIC.to_vec());
+    let _ = sink.send(SYNC_MAGIC.to_vec()).await;
     let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
     let next_id = Arc::new(AtomicU32::new(1));
 
@@ -328,9 +350,9 @@ where
                 break;
             };
             let id = acc_ids.fetch_add(1, Ordering::Relaxed);
-            let (in_tx, in_rx) = unbounded_channel::<Vec<u8>>();
+            let (in_tx, in_rx) = channel::<Vec<u8>>(CHANNEL_DEPTH);
             acc_conns.lock().await.insert(id, in_tx);
-            if acc_sink.send(encode(&Frame::Open(id))).is_err() {
+            if acc_sink.send(encode(&Frame::Open(id))).await.is_err() {
                 break;
             }
             let sink = acc_sink.clone();
@@ -508,6 +530,78 @@ mod tests {
         assert_eq!(
             &buf, b"through-preamble",
             "tunnel works despite a startup banner on the sandbox stdout"
+        );
+    }
+
+    /// Regression: the outbound frame sink is BOUNDED, so a producer outracing a
+    /// stalled stream write can't queue frames without limit (the memory-balloon
+    /// this audit targets). We wire `spawn_sink` to a writer whose reader is
+    /// never drained; after `CHANNEL_DEPTH` frames the writer task is parked on
+    /// `write_all` holding one frame and the channel fills, so further
+    /// `try_send`s fail with `Full`. An unbounded sink would accept every one.
+    #[tokio::test]
+    async fn sink_is_bounded_under_a_stalled_writer() {
+        use tokio::sync::mpsc::error::TrySendError;
+
+        // A duplex whose far end we never read → writes block once its ~64 KiB
+        // buffer fills, stalling the sink's writer task.
+        let (near, _far) = tokio::io::duplex(64 * 1024);
+        let sink = spawn_sink(near);
+
+        // Frames large enough that a handful overflow the duplex write buffer,
+        // guaranteeing the writer task blocks rather than draining forever.
+        let frame = vec![0u8; 32 * 1024];
+        // Drain the initial slack (duplex buffer + channel depth + the one frame
+        // the writer pops before parking). Once saturated, try_send must reject.
+        let mut rejected = false;
+        for _ in 0..(CHANNEL_DEPTH + 16) {
+            match sink.try_send(frame.clone()) {
+                Ok(()) => {
+                    // Let the writer task run so it can pop/park deterministically.
+                    tokio::task::yield_now().await;
+                }
+                Err(TrySendError::Full(_)) => {
+                    rejected = true;
+                    break;
+                }
+                Err(TrySendError::Closed(_)) => panic!("sink closed unexpectedly"),
+            }
+        }
+        assert!(
+            rejected,
+            "bounded sink must reject sends once full under a stalled writer \
+             (an unbounded sink would accept every frame and balloon memory)"
+        );
+    }
+
+    /// A large multi-frame payload still round-trips end-to-end now that every
+    /// hop uses bounded `send().await` — proving backpressure throttles rather
+    /// than deadlocks the tunnel (the sink and per-conn inbound channels drain
+    /// on independent tasks, so there is no cycle).
+    #[tokio::test]
+    async fn bounded_tunnel_round_trips_backpressured_payload() {
+        let (host_side, sandbox_side) = tokio::io::duplex(16 * 1024);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(run_host(host_side, EchoDialer));
+        tokio::spawn(run_sandbox(sandbox_side, listener));
+
+        // Much larger than any single channel/buffer, forcing sustained
+        // backpressure through the bounded sink + inbound channels.
+        let payload = vec![0x5Au8; 4 * 1024 * 1024];
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut rd, mut wr) = client.into_split();
+        let p2 = payload.clone();
+        let writer = tokio::spawn(async move {
+            wr.write_all(&p2).await.unwrap();
+            wr.shutdown().await.unwrap();
+        });
+        let mut got = Vec::new();
+        rd.read_to_end(&mut got).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(
+            got, payload,
+            "backpressured payload round-trips intact over bounded channels"
         );
     }
 }

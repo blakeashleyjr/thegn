@@ -6,8 +6,17 @@
 
 use crate::git::{BranchOps, CliGit, CommitOps, GitBackend};
 use std::path::Path;
+use std::time::Duration;
 use thegn_core::remote::GitLoc;
 use thegn_core::{patch, semantic};
+
+/// Wall-clock cap for a `gh` network read (pr/ci status). `gh` can hang for
+/// minutes on a stalled HTTPS call — bounded here so a blackholed network can't
+/// wedge the agent's MCP tool turn indefinitely.
+const GH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cap for the raw `git diff` in `semantic_diff` (local, but a network-mounted
+/// or wedged worktree could still stall it).
+const GIT_DIFF_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct HouseGitImpl;
 
@@ -17,18 +26,76 @@ impl HouseGitImpl {
     }
 
     /// Run the `gh` CLI in the worktree, returning stdout (text) or stderr (err).
+    /// Bounded by [`GH_TIMEOUT`] so a hung network call maps to an `Err` the
+    /// agent can see rather than an indefinitely-stalled tool turn.
     fn gh(worktree: &str, args: &[&str]) -> Result<String, String> {
-        let out = std::process::Command::new("gh")
-            .args(args)
-            .current_dir(worktree)
-            .output()
-            .map_err(|e| format!("gh: {e}"))?;
+        let mut cmd = std::process::Command::new("gh");
+        cmd.args(args).current_dir(worktree);
+        let out = output_deadline(cmd, GH_TIMEOUT).map_err(|e| format!("gh: {e}"))?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         } else {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
     }
+}
+
+/// Run `cmd` to completion capturing full output, killing the child if it
+/// outruns `timeout`. Both pipes drain on threads so a large output can't
+/// deadlock the wait; the exit is polled with a short adaptive backoff. These
+/// are on-demand MCP tool calls off the compositor loop, so the poll costs
+/// nothing the UI can feel. (Local mirror of `git::output_bounded_with`, which
+/// is private to that module.)
+fn output_deadline(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut so = child.stdout.take().expect("piped stdout");
+    let mut se = child.stderr.take().expect("piped stderr");
+    let so_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = so.read_to_end(&mut b);
+        b
+    });
+    let se_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = se.read_to_end(&mut b);
+        b
+    });
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("timed out after {}s (killed)", timeout.as_secs()),
+            ));
+        }
+        std::thread::sleep(backoff.min(remaining));
+        backoff = (backoff * 2).min(Duration::from_millis(25));
+    };
+    let stdout = so_h.join().unwrap_or_default();
+    let stderr = se_h.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 impl thegn_core::mcp::HouseGit for HouseGitImpl {
@@ -79,10 +146,9 @@ impl thegn_core::mcp::HouseGit for HouseGitImpl {
     fn semantic_diff(&self, worktree: &str) -> Result<String, String> {
         // Raw unified diff vs HEAD → core::patch parse → per-file entity changes
         // → impact summary + suggested commit message (core::semantic).
-        let out = thegn_core::util::git_cmd(Path::new(worktree))
-            .args(["diff", "--no-color", "HEAD"])
-            .output()
-            .map_err(|e| e.to_string())?;
+        let mut cmd = thegn_core::util::git_cmd(Path::new(worktree));
+        cmd.args(["diff", "--no-color", "HEAD"]);
+        let out = output_deadline(cmd, GIT_DIFF_TIMEOUT).map_err(|e| e.to_string())?;
         if !out.status.success() {
             return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
         }
@@ -159,6 +225,33 @@ impl thegn_core::mcp::HouseForge for HouseGitImpl {
 mod tests {
     use super::*;
     use thegn_core::mcp::{HouseForge, HouseGit};
+
+    #[test]
+    fn output_deadline_kills_a_hung_child() {
+        // `sleep 30` would block the tool call indefinitely without the
+        // deadline; the helper must SIGKILL it and return a TimedOut error long
+        // before the sleep elapses.
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let start = std::time::Instant::now();
+        let r = output_deadline(cmd, Duration::from_millis(200));
+        let err = r.expect_err("expected a timeout error");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "helper waited far longer than the deadline: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn output_deadline_returns_output_when_the_child_finishes() {
+        let mut cmd = std::process::Command::new("printf");
+        cmd.arg("hello");
+        let out = output_deadline(cmd, Duration::from_secs(10)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+    }
 
     // Route test git through the scrubbing helper rather than a raw git command,
     // matching the repo invariant the lint guardrail enforces.
