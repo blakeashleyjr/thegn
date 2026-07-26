@@ -260,12 +260,11 @@ async fn accept_loop(
                     let watch_conn = conn.clone();
                     tokio::spawn(async move {
                         watch_conn.closed().await;
-                        if let Ok(mut m) = watch_conns.lock() {
-                            if m.get(&sandbox)
+                        if let Ok(mut m) = watch_conns.lock()
+                            && m.get(&sandbox)
                                 .is_some_and(|cur| cur.stable_id() == watch_conn.stable_id())
-                            {
-                                m.remove(&sandbox);
-                            }
+                        {
+                            m.remove(&sandbox);
                         }
                     });
                 }
@@ -424,9 +423,11 @@ mod tests {
         assert_eq!(sandbox, "wt-dead");
         assert!(home.is_connected("wt-dead"), "should be registered");
 
-        // Kill the connection from the sandbox side (agent crash / machine stop).
+        // Gracefully close the connection from the sandbox side. Keep the dialer
+        // endpoint alive so the CONNECTION_CLOSE frame actually transmits (dropping
+        // it immediately would abort the in-flight close, leaving the home to learn
+        // only via the much-longer idle timeout).
         conn.close(0u32.into(), b"agent gone");
-        drop(dialer);
 
         // The watcher must evict the dead entry so is_connected flips to false.
         let evicted = wait_until(|| !home.is_connected("wt-dead"), Duration::from_secs(5)).await;
