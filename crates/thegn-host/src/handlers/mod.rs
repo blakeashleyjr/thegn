@@ -34,6 +34,7 @@ pub(crate) mod switch_cache;
 pub(crate) mod terminal;
 pub(crate) mod tracker;
 pub(crate) mod wizard;
+pub(crate) mod workspace_remove;
 pub(crate) mod worktree_delete;
 
 /// Persist a first-launch keymap-preset choice (item 621) to `ui_state` and

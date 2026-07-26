@@ -336,7 +336,13 @@ pub trait GitBackend: Send + Sync {
         path: &str,
         max_lines: usize,
     ) -> Result<Vec<Hunk>> {
-        let out = run(loc, &["diff", "--no-color", "-U3", base, "--", path])?;
+        // `--no-ext-diff`: a configured external diff driver emits non-unified
+        // output that `parse_unified_hunks` can't read (empty inline hunk
+        // preview). See audit run.rs:346 / the SANITIZED_DIFF rationale above.
+        let out = run(
+            loc,
+            &["diff", "--no-ext-diff", "--no-color", "-U3", base, "--", path],
+        )?;
         Ok(parse_unified_hunks(&out, max_lines))
     }
 

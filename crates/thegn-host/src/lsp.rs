@@ -156,6 +156,7 @@ impl LspDiagnostics {
         dst.sort_by_key(|d| d.severity as u8);
     }
 
+    #[allow(dead_code)] // exercised by tests; the loop-side caller was removed
     pub fn is_empty(&self) -> bool {
         self.by_file.is_empty()
     }
