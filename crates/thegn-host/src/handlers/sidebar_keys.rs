@@ -161,14 +161,20 @@ impl SidebarState {
         let row = self.selected_row(model)?;
         match row.kind {
             crate::sidebar::RowKind::Workspace => row.worktree_path.clone(),
-            crate::sidebar::RowKind::Worktree => row
-                .worktree_path
-                .as_deref()
-                .and_then(|p| {
-                    thegn_core::repo::main_worktree(std::path::Path::new(p))
-                        .map(|p| p.to_string_lossy().into_owned())
-                })
-                .or_else(|| Self::workspace_repo_path(model, &row.workspace_slug)),
+            // A worktree row's repo root is its workspace's already-hydrated
+            // repo path (the main checkout). Prefer that over spawning
+            // `git rev-parse` here: this runs on the compositor loop, and a
+            // no-timeout git subprocess against a stalled mount / wedged .git
+            // lock would freeze the whole UI (event-loop-blocking invariant).
+            // Fall back to `main_worktree` only when the model has no workspace
+            // row for this slug (a live worktree with no persisted workspace).
+            crate::sidebar::RowKind::Worktree => Self::workspace_repo_path(model, &row.workspace_slug)
+                .or_else(|| {
+                    row.worktree_path.as_deref().and_then(|p| {
+                        thegn_core::repo::main_worktree(std::path::Path::new(p))
+                            .map(|p| p.to_string_lossy().into_owned())
+                    })
+                }),
             crate::sidebar::RowKind::Folder => {
                 Self::workspace_repo_path(model, &row.workspace_slug)
             }
@@ -610,8 +616,15 @@ impl SidebarState {
         let row = self.selected_row(model)?;
         let branch = row.branch.clone().filter(|b| !b.is_empty())?;
         let path = row.worktree_path.clone()?;
-        let repo_root = thegn_core::repo::main_worktree(std::path::Path::new(&path))
-            .map(|p| p.to_string_lossy().into_owned())
+        // Prefer the workspace's already-hydrated repo path over a loop-side
+        // `git rev-parse` (see `cursor_repo_root`: a no-timeout subprocess on
+        // the compositor loop can freeze the UI on a stalled mount). Fall back
+        // to `main_worktree`, then the row's own path.
+        let repo_root = Self::workspace_repo_path(model, &row.workspace_slug)
+            .or_else(|| {
+                thegn_core::repo::main_worktree(std::path::Path::new(&path))
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
             .unwrap_or(path);
         Some(SidebarOutcome::Fork {
             base_branch: branch,
@@ -886,8 +899,98 @@ impl SidebarState {
 
 #[cfg(test)]
 mod tests {
-    use super::worktree_mq_entries;
+    use super::*;
     use thegn_core::attention::MqStatus;
+
+    /// Create a real git repo dir so `main_worktree` (the OLD code path) would
+    /// resolve it to a concrete, DIFFERENT value than the hydrated workspace
+    /// path — letting the test distinguish new (workspace-first) from old
+    /// (git-subprocess-first) behavior.
+    fn temp_git_repo(tag: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        let uniq = format!(
+            "thegn-sbkeys-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        dir.push(uniq);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = thegn_core::util::git_ok(&dir, &["init", "-q"]);
+        dir
+    }
+
+    /// A Worktree row's repo root resolves from the already-hydrated workspace
+    /// list — NOT a loop-side `git rev-parse`. Regression for the event-loop-
+    /// blocking subprocess: `worktree_path` points at a REAL git repo, so the
+    /// OLD code (git-first) would resolve it to that repo's main-worktree path;
+    /// the fixed code must instead return the hydrated workspace path without
+    /// consulting git at all.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn cursor_repo_root_uses_hydrated_workspace_path() {
+        use crate::sidebar::{RowKind, SidebarRow};
+        let repo = temp_git_repo("cursor");
+        let mut model = FrameModel::default();
+        model.sidebar_workspaces = vec![(
+            "myrepo".to_string(),
+            "myrepo".to_string(),
+            "git".to_string(),
+            "/hydrated/root".to_string(),
+        )];
+        let mut row = SidebarRow::base(RowKind::Worktree, 1, "feature", "myrepo");
+        row.worktree_path = Some(repo.to_string_lossy().into_owned());
+        model.sidebar_rows = vec![row];
+
+        let sb = SidebarState::default();
+        assert_eq!(
+            sb.cursor_repo_root(&model),
+            Some("/hydrated/root".to_string()),
+            "repo root must come from the hydrated workspace, not a git subprocess \
+             on the loop (old code would return the git-resolved main worktree)",
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The fork outcome resolves its repo root from the hydrated workspace list
+    /// too (same no-git-on-loop rule), keeping the base branch. `worktree_path`
+    /// is a REAL repo so the old git-first path would have returned its
+    /// main-worktree instead of the hydrated value.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn fork_outcome_uses_hydrated_workspace_path() {
+        use crate::sidebar::{RowKind, SidebarRow};
+        let repo = temp_git_repo("fork");
+        let mut model = FrameModel::default();
+        model.sidebar_workspaces = vec![(
+            "myrepo".to_string(),
+            "myrepo".to_string(),
+            "git".to_string(),
+            "/hydrated/root".to_string(),
+        )];
+        let mut row = SidebarRow::base(RowKind::Worktree, 1, "feature", "myrepo");
+        row.worktree_path = Some(repo.to_string_lossy().into_owned());
+        row.branch = Some("feature".to_string());
+        model.sidebar_rows = vec![row];
+
+        let sb = SidebarState::default();
+        match sb.fork_outcome(&model) {
+            Some(SidebarOutcome::Fork {
+                base_branch,
+                repo_root,
+            }) => {
+                assert_eq!(base_branch, "feature");
+                assert_eq!(
+                    repo_root, "/hydrated/root",
+                    "fork repo root must come from the hydrated workspace, not git",
+                );
+            }
+            _ => panic!("expected Fork outcome"),
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 
     fn ids(status: Option<MqStatus>) -> Vec<&'static str> {
         worktree_mq_entries(status)

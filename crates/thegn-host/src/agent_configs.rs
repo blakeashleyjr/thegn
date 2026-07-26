@@ -21,7 +21,7 @@
 //! Chromium developer whose `~/.pi/agent/` contains 40k tool files will still
 //! get a working, logged-in agent; Phase 2 just won't finish all 40k files.
 
-use crate::agent::block_on_provider;
+use crate::agent::{block_on_provider, provision_step_timeout};
 use std::path::Path;
 
 /// Whether a resolved file is executable for anyone (unix mode `& 0o111`). The
@@ -117,6 +117,33 @@ const AGENT_CONFIG_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 /// sprite fs endpoint), not slow progress — time it out and move on best-effort
 /// instead of letting it strand "Sync agent logins" on the loading screen.
 const AGENT_CONFIG_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Per-write ceiling for the small non-`Exec` provisioning transfers (dotfiles,
+/// atuin creds): a KB-sized write that hasn't returned this quickly is a wedged
+/// endpoint, not slow progress. Mirrors `AGENT_CONFIG_UPLOAD_TIMEOUT`.
+const PROVISION_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run a provider await under a hard `to` ceiling (`label` names it in the error):
+/// a stalled/half-open fs or exec endpoint can leave a non-`Exec` provisioning
+/// step (dotfiles/atuin/checkpoint/devshell push) blocked forever — those don't
+/// get the per-step `tokio::time::timeout` the caller wraps around `Exec` steps,
+/// so wrap them here so the loading screen can't freeze. `Err` on expiry.
+pub(crate) fn with_provision_timeout<T, Fut>(
+    label: &str,
+    to: std::time::Duration,
+    f: impl FnOnce() -> Fut + Send,
+) -> anyhow::Result<T>
+where
+    T: Send,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    block_on_provider(|| async move {
+        match tokio::time::timeout(to, f()).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!("{label} timed out after {}s", to.as_secs())),
+        }
+    })
+}
 
 /// Whole-step wall-clock budget for Phase 2 (the full tree walk). Phase 1
 /// (auth-critical files) runs unconditionally outside this budget so the agent
@@ -582,8 +609,19 @@ pub(crate) fn upload_agent_accounts(
             }
             let slug = thegn_core::util::slugify(&acct.name);
             let dest_root = format!("{base}/.thegn/accounts/{}/{}", p.id, slug);
+            let is_claude = p.id == "claude";
             for (abs, rel, exec) in collect_agent_config_files(&acct.dir) {
                 if let Ok(data) = std::fs::read(&abs) {
+                    // An account dir IS the claude config dir, so its settings.json
+                    // has a BARE rel (not `.claude/settings.json`) — normalize before
+                    // the strip so the host `hooks` block (which shells out to host-
+                    // only services and errors on every Claude event in-sprite) is
+                    // dropped here too, not just on the default-home upload paths.
+                    let data = if is_claude {
+                        strip_sandbox_hooks(&format!(".claude/{rel}"), data)
+                    } else {
+                        data
+                    };
                     uploads.push((format!("{dest_root}/{rel}"), data, exec));
                 }
             }
@@ -645,6 +683,121 @@ pub(crate) fn account_pane_env_exports(cfg: &thegn_core::config::Config, worktre
     out
 }
 
+/// Upload the present host dotfiles/dotdirs into the sandbox's `$HOME` (`/root`).
+/// A basename that's a FILE is uploaded via the fs `write`; a DIRECTORY (e.g.
+/// `.config/gcloud`, `.aws`) is uploaded recursively via `upload_dir` — so cloud
+/// creds and multi-file config carry over too. Missing host paths are skipped; a
+/// genuine upload failure aborts the step. Each transfer is bounded: a stalled/
+/// half-open fs endpoint would otherwise hang the loading screen forever (only
+/// `Exec` steps get a per-step ceiling from the caller).
+pub(crate) fn upload_dotfiles(
+    provider: &thegn_svc::provider::Provider,
+    id: &str,
+    sandbox_home: &str,
+    files: &[String],
+) -> anyhow::Result<()> {
+    let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let base = sandbox_home.trim_end_matches('/');
+    for name in files {
+        let src = Path::new(&host_home).join(name);
+        let dest = format!("{base}/{name}");
+        if src.is_dir() {
+            with_provision_timeout("dotfiles upload", PROVISION_WRITE_TIMEOUT, || {
+                provider.upload_dir(id, &src, &dest)
+            })?;
+        } else if let Ok(data) = std::fs::read(&src) {
+            with_provision_timeout("dotfile write", PROVISION_WRITE_TIMEOUT, || {
+                provider.write(id, &dest, &data)
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Carry the host's atuin credentials + config into the sandbox so its shell
+/// history joins atuin's own sync (host ↔ sprites). Opt-in (`[sandbox.home]
+/// atuin = true`). Uploads the dereferenced `~/.config/atuin/config.toml` (the
+/// home-manager `/nix/store` symlink is read THROUGH, so the real bytes land, not
+/// a dangling link) + the auth/encryption files `~/.local/share/atuin/{key,
+/// session}`. The history DBs are deliberately NOT copied — atuin's sync server
+/// reconciles those. Best-effort: a missing source is skipped (only `key` and no
+/// `session` is a normal state); a genuine upload error aborts (surfaced as a
+/// best-effort step failure). Warns when there's nothing to carry.
+pub(crate) fn upload_atuin_creds(
+    provider: &thegn_svc::provider::Provider,
+    id: &str,
+    sandbox_home: &str,
+    exec_env: &[(String, String)],
+) -> anyhow::Result<()> {
+    let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let base = sandbox_home.trim_end_matches('/');
+    // Config first, then the auth/encryption state. `provider.write` creates parent
+    // dirs (mkdirParents), so the nested `.config/atuin` / `.local/share/atuin`
+    // paths land without an explicit mkdir.
+    //
+    // `meta.db` is the SERVER-AUTH carrier: atuin >=18 keeps the sync session token
+    // (the `hub_session` bearer for the sync server) in `meta.db`, NOT in a flat
+    // `session` file (which modern atuin no longer writes). Without it the sandbox
+    // has the encryption `key` but is logged OUT, so `auto_sync` can't authenticate
+    // and Ctrl-R stays empty. We still carry `session` too (older atuin / other
+    // hosts may have it) and deliberately skip the heavy history/records DBs — the
+    // server reconciles those once authenticated. `meta.db` is small (~28K).
+    let rels = [
+        ".config/atuin/config.toml",
+        ".local/share/atuin/key",
+        ".local/share/atuin/session",
+        ".local/share/atuin/meta.db",
+    ];
+    let mut carried = 0usize;
+    let mut token_carried = false;
+    for rel in rels {
+        let src = Path::new(&host_home).join(rel);
+        // `read` dereferences the symlink → the real bytes (the HM config.toml is a
+        // `/nix/store` symlink that would dangle in the sandbox).
+        if let Ok(data) = std::fs::read(&src) {
+            let dest = format!("{base}/{rel}");
+            with_provision_timeout("atuin cred write", PROVISION_WRITE_TIMEOUT, || {
+                provider.write(id, &dest, &data)
+            })?;
+            carried += 1;
+            if rel.ends_with("meta.db") || rel.ends_with("session") {
+                token_carried = true;
+            }
+        }
+    }
+    if carried == 0 {
+        thegn_core::msg::warn(
+            "atuin sync: no host atuin config/credentials found (~/.config/atuin, \
+             ~/.local/share/atuin) — nothing to carry.",
+        );
+        return Ok(());
+    }
+    // Prime history at provision time so it's baked into the checkpoint and Ctrl-R
+    // is populated the instant the pane opens (instead of waiting for the first
+    // `auto_sync` tick). `sync -f` forces a full reconcile regardless of the carried
+    // last-sync throttle, pulling the server's records into the sandbox's empty
+    // store. Best-effort: a sync failure (offline, server hiccup) just means history
+    // fills in on the next auto_sync. Skipped when no auth token was carried. The
+    // exec is bounded so a lost exit frame can't wedge the loading screen.
+    if token_carried {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "export PATH=\"$HOME/.local/bin:$HOME/.nix-profile/bin:$PATH\"; \
+             command -v atuin >/dev/null 2>&1 && atuin sync -f 2>&1 || true"
+                .to_string(),
+        ];
+        if let Err(e) = with_provision_timeout("atuin sync", provision_step_timeout("atuin"), || {
+            provider.run_exec(id, &argv, None, exec_env)
+        }) {
+            thegn_core::msg::warn(&format!(
+                "atuin sync: priming history failed ({e}); it will fill in on auto_sync."
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,6 +830,50 @@ mod tests {
             strip_sandbox_hooks(".claude/settings.json", junk.clone()),
             junk
         );
+    }
+
+    #[test]
+    fn account_dir_settings_normalizes_before_strip() {
+        // An account dir IS the claude config dir, so `collect_agent_config_files`
+        // yields a BARE `settings.json` rel — which the raw matcher does NOT
+        // recognize, so an unnormalized strip would ship the host `hooks` intact
+        // (the account-switch regression). `upload_agent_accounts` prefixes
+        // `.claude/` for claude accounts; assert both halves of that contract.
+        let settings = br#"{"model":"opus","hooks":{"Stop":[{"hooks":[]}]}}"#.to_vec();
+        // Bare rel is not matched — proves the normalization is load-bearing.
+        assert!(!is_claude_settings("settings.json"));
+        assert_eq!(
+            strip_sandbox_hooks("settings.json", settings.clone()),
+            settings
+        );
+        // Normalized rel (what upload_agent_accounts passes) DOES strip.
+        let out = strip_sandbox_hooks(&format!(".claude/{}", "settings.json"), settings.clone());
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("hooks").is_none(), "hooks must be stripped");
+        assert_eq!(v.get("model").and_then(|m| m.as_str()), Some("opus"));
+        // A NESTED account file (`hooks/foo.sh` → `.claude/hooks/foo.sh`) is not a
+        // settings file, so it rides through untouched — only top-level settings
+        // carry the hooks block.
+        assert!(!is_claude_settings(".claude/hooks/foo.sh"));
+    }
+
+    #[test]
+    fn with_provision_timeout_bounds_a_hung_await() {
+        use std::time::Duration;
+        // A provider await that never completes (the wedged fs/exec endpoint) must
+        // be abandoned at the ceiling with a "timed out" error, not hang forever —
+        // the whole point of wrapping the non-Exec provisioning steps.
+        let r: anyhow::Result<()> =
+            with_provision_timeout("stall", Duration::from_millis(50), || async {
+                futures::future::pending::<anyhow::Result<()>>().await
+            });
+        let e = r.expect_err("a pending future must time out");
+        assert!(e.to_string().contains("timed out"), "got: {e}");
+        assert!(e.to_string().contains("stall"), "label surfaced: {e}");
+        // A prompt await passes its result through unchanged.
+        let ok: anyhow::Result<u32> =
+            with_provision_timeout("quick", Duration::from_secs(5), || async { Ok(7) });
+        assert_eq!(ok.unwrap(), 7);
     }
 
     #[test]

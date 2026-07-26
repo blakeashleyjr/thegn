@@ -10,6 +10,7 @@ use termwiz::surface::{Change, Position, Surface};
 use crate::compositor::{Rect, compose_pane};
 use crate::emulator::PaneEmulator;
 use thegn_core::theme;
+use unicode_width::UnicodeWidthStr;
 
 use serde::Deserialize;
 
@@ -621,7 +622,7 @@ fn pin_chips_start(model: &FrameModel, strip: Rect) -> usize {
     let total: usize = model
         .pins
         .iter()
-        .map(|c| format!(" {} {} ", c.glyph, c.label).chars().count())
+        .map(|c| UnicodeWidthStr::width(format!(" {} {} ", c.glyph, c.label).as_str()))
         .sum();
     end.saturating_sub(total).max(strip.x)
 }
@@ -640,12 +641,12 @@ fn strip_chip_spans(model: &FrameModel, strip: Rect) -> Vec<(usize, usize, usize
     let mut x = strip.x + 1;
     if let Some((ws, leaf)) = worktree_parts(model) {
         if !ws.is_empty() {
-            x += ws.chars().count() + 3; // "WS ▸ "
+            x += UnicodeWidthStr::width(ws.as_str()) + 3; // "WS ▸ "
         }
-        x += leaf.chars().count() + 2; // "leaf" + gap
+        x += UnicodeWidthStr::width(leaf.as_str()) + 2; // "leaf" + gap
     }
     for (i, title) in model.tabs.iter().enumerate() {
-        let w = title.chars().count() + 2; // " {title} "
+        let w = UnicodeWidthStr::width(title.as_str()) + 2; // " {title} "
         if x + w > end {
             break;
         }
@@ -795,7 +796,7 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
                 bg,
                 chips_end.saturating_sub(x),
             );
-            x += ws.chars().count();
+            x += UnicodeWidthStr::width(ws.as_str());
             draw_text(
                 surface,
                 x,
@@ -816,7 +817,7 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
             bg,
             chips_end.saturating_sub(x),
         );
-        x += leaf.chars().count();
+        x += UnicodeWidthStr::width(leaf.as_str());
         // Issue badge: show the first linked issue's status + number next to
         // the active worktree name when at least one issue is linked.
         if let Some(issue_id) = model.panel.tracker_links.first()
@@ -828,7 +829,7 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
         {
             let badge = format!(" ◈{}", issue.number);
             let avail = chips_end.saturating_sub(x);
-            if avail >= badge.chars().count() {
+            if avail >= UnicodeWidthStr::width(badge.as_str()) {
                 draw_text(surface, x, strip.y, &badge, col(S::Accent), bg, avail);
             }
         }
@@ -869,7 +870,7 @@ fn draw_pin_chips(
         .iter()
         .map(|c| format!(" {} {} ", c.glyph, c.label))
         .collect();
-    let total: usize = chips.iter().map(|s| s.chars().count()).sum();
+    let total: usize = chips.iter().map(|s| UnicodeWidthStr::width(s.as_str())).sum();
     let mut x = content_end.saturating_sub(total).max(content.x);
     let chips_start = x;
     let bg = col(S::Panel);
@@ -885,7 +886,7 @@ fn draw_pin_chips(
         };
         let max = content_end.saturating_sub(x);
         draw_text(surface, x, content.y, chip, fg, bg, max);
-        x += chip.chars().count();
+        x += UnicodeWidthStr::width(chip.as_str());
     }
     chips_start
 }
@@ -1352,12 +1353,17 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
         ));
     }
     if let Some(ref metrics) = model.ai_metrics {
+        // BMP-only chrome policy (termcaps.rs): no astral-plane / emoji glyphs —
+        // the agent marker rides the BMP `diamond_filled` slot so it degrades to
+        // ASCII cleanly and its cell width matches unicode-width's measurement.
+        let g = crate::caps::active_glyphs();
         items.push((
             BarItemId::Badge(BarBadge::AiCost),
             vec![Seg::chip(
                 Tok::Hue(thegn_core::theme::Hue::Teal),
                 format!(
-                    " 🤖 {}: ${:.2} ({}t) ",
+                    " {} {}: ${:.2} ({}t) ",
+                    g.diamond_filled,
                     metrics.agent,
                     metrics.cost,
                     metrics.tokens.input + metrics.tokens.output
@@ -1367,21 +1373,27 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
     }
     if let Some(ref a) = model.agent_activity {
         use thegn_core::theme::Hue;
+        // BMP-only chrome policy: route the alert/agent/tool markers through the
+        // glyph table (warn + diamond + refresh) instead of astral emoji.
+        let g = crate::caps::active_glyphs();
         // The chip is the only native signal, so it must show failure states too.
         let (hue, label) = match a.conn {
-            AgentConn::Error => (Hue::Red, " ⚠ agent error ".to_string()),
-            AgentConn::Exited => (Hue::Orange, " ⚠ agent offline ".to_string()),
-            AgentConn::Connecting => (Hue::Blue, " 🤖 agent connecting… ".to_string()),
+            AgentConn::Error => (Hue::Red, format!(" {} agent error ", g.warn)),
+            AgentConn::Exited => (Hue::Orange, format!(" {} agent offline ", g.warn)),
+            AgentConn::Connecting => (
+                Hue::Blue,
+                format!(" {} agent connecting{} ", g.diamond_filled, g.ellipsis),
+            ),
             AgentConn::Online => {
                 let tool = match (&a.last_tool, a.running) {
-                    (Some(t), true) => format!("🛠 {t}…"),
-                    (Some(t), false) => format!("🛠 {t}"),
-                    (None, _) => "🤖 agent".to_string(),
+                    (Some(t), true) => format!("{} {t}{}", g.refresh, g.ellipsis),
+                    (Some(t), false) => format!("{} {t}", g.refresh),
+                    (None, _) => format!("{} agent", g.diamond_filled),
                 };
                 // Append context-window usage as a percentage when reported.
                 let label = if a.context_size > 0 {
                     let pct = (a.context_used * 100 / a.context_size).clamp(0, 100);
-                    format!(" {tool} · {pct}% ctx ")
+                    format!(" {tool} {} {pct}% ctx ", g.middot)
                 } else {
                     format!(" {tool} ")
                 };

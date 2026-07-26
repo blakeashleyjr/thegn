@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 
-use thegn_core::capacity::{HostCapacity, HostOwnership, MeasuredLoad};
+use thegn_core::capacity::{HostCapacity, HostOwnership, HostSpec, MeasuredLoad};
 use thegn_core::config::{Config, EnvConfig, PlacementMode};
 use thegn_core::config_placement::{OnExhaustion, ResolvedPlacement, resolve_placement};
 use thegn_core::db::Db;
@@ -127,6 +127,72 @@ pub(crate) fn note_pin(
 /// independent hosts), RESERVED floors (tenancy ledger), the latest MEASURED
 /// sample (refreshed lazily under `headroom_ttl_secs`), and the EFFECTIVE
 /// trust class (one notch down for unattested independent hosts).
+/// Zero-means-inherit precedence for an overcommit percent: an explicit
+/// per-host `overcommit_*_pct` of 0 means "no host override" and falls back to
+/// the resolved-placement default; any non-zero value wins.
+fn inherit_pct(over: u32, fallback: u32) -> u32 {
+    if over == 0 { fallback } else { over }
+}
+
+/// Map a host's persisted lifecycle state to the broker's `(ready, failed,
+/// draining)` eligibility triple. A retryable failure is NOT terminal (the
+/// driver may recover it), so only a non-retryable `Failed` sets `failed`.
+fn state_triple(state: Option<&HostState>) -> (bool, bool, bool) {
+    match state {
+        Some(HostState::Ready) => (true, false, false),
+        Some(HostState::Draining) => (false, false, true),
+        Some(HostState::Failed(f)) => (false, !f.retryable, false),
+        _ => (false, false, false),
+    }
+}
+
+/// Fold every capacity claim into the broker's `(spec, eff_oc_cpu, eff_oc_mem)`
+/// for one host. This is the load-bearing arithmetic the broker never sees (it
+/// receives already-folded [`HostSnapshot`]s), extracted pure so it can be
+/// unit-tested independent of the DB:
+///
+/// - **Managed** hosts trust their create-time declared spec at face value;
+///   overcommit stays as-is (the broker applies it).
+/// - **Independent** hosts compound the claims conservatively —
+///   `min(declared, probed) × overcommit × safety` — and then the live
+///   MemAvailable gate (`reserved + available×safety`) dominates the static
+///   arithmetic. Overcommit is FOLDED into the synthetic spec, so the returned
+///   overcommit is 100% (the broker must not double-apply it).
+/// - A **failed probe** on an independent host fails CLOSED: `spec = None` ⇒
+///   the broker reports `UnknownSpec` ⇒ no packing this round. Dedicated
+///   placements (which don't need a spec) are unaffected.
+#[allow(clippy::too_many_arguments)]
+fn fold_capacity(
+    ownership: HostOwnership,
+    probe_failed: bool,
+    declared: Option<HostSpec>,
+    headroom: Option<&thegn_core::host_probe::Headroom>,
+    reserved: &thegn_core::capacity::ReservedTotals,
+    oc_cpu: u32,
+    oc_mem: u32,
+    safety_pct: u32,
+) -> (Option<HostSpec>, u32, u32) {
+    match ownership {
+        HostOwnership::Managed => (declared, oc_cpu, oc_mem),
+        HostOwnership::Independent if probe_failed => (None, 100, 100),
+        HostOwnership::Independent => {
+            let ceiling = thegn_core::host_probe::independent_effective_ceiling(
+                declared, headroom, oc_cpu, oc_mem, safety_pct,
+            )
+            .map(|mut c| {
+                if let Some(h) = headroom {
+                    // Live gate: ceiling' = reserved + available×safety.
+                    let allowance =
+                        (h.mem_available_kb / 1024) * u64::from(safety_pct.clamp(1, 100)) / 100;
+                    c.mem_mb = c.mem_mb.min(reserved.mem_mb + allowance);
+                }
+                c
+            });
+            (ceiling, 100, 100)
+        }
+    }
+}
+
 fn snapshot_host(
     db: &Db,
     hc: &HostConfig,
@@ -180,52 +246,28 @@ fn snapshot_host(
         }
     }
 
-    let (ready, failed, draining) = match row.as_ref().map(|r| &r.state) {
-        Some(HostState::Ready) => (true, false, false),
-        Some(HostState::Draining) => (false, false, true),
-        Some(HostState::Failed(f)) => (false, !f.retryable, false),
-        _ => (false, false, false),
-    };
+    let (ready, failed, draining) = state_triple(row.as_ref().map(|r| &r.state));
     let caps = row.as_ref().and_then(|r| r.caps.clone());
     let declared = cap.as_ref().and_then(|c| c.spec).or(binding.declared_spec);
     let headroom = row.as_ref().and_then(|r| r.headroom);
-    let pct = |over: u32, fallback: u32| if over == 0 { fallback } else { over };
-    let oc_cpu = pct(
+    let oc_cpu = inherit_pct(
         cap.as_ref().map(|c| c.overcommit_cpu_pct).unwrap_or(0),
         resolved.overcommit_cpu_pct,
     );
-    let oc_mem = pct(
+    let oc_mem = inherit_pct(
         cap.as_ref().map(|c| c.overcommit_mem_pct).unwrap_or(0),
         resolved.overcommit_mem_pct,
     );
-    // Independent hosts: the ceiling compounds the claims conservatively
-    // (min(declared, probed) × overcommit × safety) and the live MemAvailable
-    // gate dominates the static arithmetic; overcommit is FOLDED into the
-    // synthetic spec, so the capacity math runs at 100%. A failed probe means
-    // no packing this round (spec None ⇒ UnknownSpec), dedicated unaffected.
-    let (spec, eff_oc_cpu, eff_oc_mem) = match ownership {
-        HostOwnership::Managed => (declared, oc_cpu, oc_mem),
-        HostOwnership::Independent if probe_failed => (None, 100, 100),
-        HostOwnership::Independent => {
-            let ceiling = thegn_core::host_probe::independent_effective_ceiling(
-                declared,
-                headroom.as_ref(),
-                oc_cpu,
-                oc_mem,
-                safety_pct,
-            )
-            .map(|mut c| {
-                if let Some(h) = headroom.as_ref() {
-                    // Live gate: ceiling' = reserved + available×safety.
-                    let allowance =
-                        (h.mem_available_kb / 1024) * u64::from(safety_pct.clamp(1, 100)) / 100;
-                    c.mem_mb = c.mem_mb.min(reserved.mem_mb + allowance);
-                }
-                c
-            });
-            (ceiling, 100, 100)
-        }
-    };
+    let (spec, eff_oc_cpu, eff_oc_mem) = fold_capacity(
+        ownership,
+        probe_failed,
+        declared,
+        headroom.as_ref(),
+        &reserved,
+        oc_cpu,
+        oc_mem,
+        safety_pct,
+    );
     let trust = match caps.as_ref() {
         Some(c) => effective_class(c, ownership, hc.trust_egress_enforced),
         None => TrustClass::T0HostShell, // unprobed: no known boundary yet
@@ -837,4 +879,220 @@ pub(crate) fn maintain_tick(cfg: &Config) {
             ));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thegn_core::capacity::ReservedTotals;
+    use thegn_core::host::HostStep;
+    use thegn_core::host_machine::HostState;
+    use thegn_core::host_probe::Headroom;
+
+    fn spec(cpu_milli: u32, mem_mb: u64) -> HostSpec {
+        HostSpec { cpu_milli, mem_mb }
+    }
+
+    /// A headroom sample: `mem_total_kb`/`mem_available_kb` in KiB.
+    fn headroom(cpus: u32, mem_total_kb: u64, mem_available_kb: u64) -> Headroom {
+        Headroom {
+            cpus,
+            mem_total_kb,
+            mem_available_kb,
+            load1_milli: 0,
+            disk_free_bytes: 0,
+            containers_running: 0,
+        }
+    }
+
+    fn reserved(cpu_milli: u64, mem_mb: u64) -> ReservedTotals {
+        ReservedTotals {
+            cpu_milli,
+            mem_mb,
+            tenants: 0,
+        }
+    }
+
+    #[test]
+    fn inherit_pct_zero_falls_back() {
+        // An explicit 0 (no host override) inherits the resolved default...
+        assert_eq!(inherit_pct(0, 150), 150);
+        // ...but any non-zero host value wins over the default.
+        assert_eq!(inherit_pct(200, 150), 200);
+        assert_eq!(inherit_pct(100, 0), 100);
+        // Zero on both is still zero (the callee normalizes 0→100 downstream).
+        assert_eq!(inherit_pct(0, 0), 0);
+    }
+
+    #[test]
+    fn state_triple_maps_every_case() {
+        assert_eq!(state_triple(Some(&HostState::Ready)), (true, false, false));
+        assert_eq!(
+            state_triple(Some(&HostState::Draining)),
+            (false, false, true)
+        );
+        // Non-retryable failure is terminal ⇒ failed.
+        let fatal = HostState::Failed(HostFailure {
+            step: HostStep::Connect,
+            error: "boom".into(),
+            retryable: false,
+        });
+        assert_eq!(state_triple(Some(&fatal)), (false, true, false));
+        // Retryable failure is NOT terminal — the driver may recover it.
+        let transient = HostState::Failed(HostFailure {
+            step: HostStep::Connect,
+            error: "temporary".into(),
+            retryable: true,
+        });
+        assert_eq!(state_triple(Some(&transient)), (false, false, false));
+        // Transient / unknown / absent ⇒ neither ready nor failed nor draining.
+        assert_eq!(state_triple(Some(&HostState::Probing)), (false, false, false));
+        assert_eq!(state_triple(None), (false, false, false));
+    }
+
+    #[test]
+    fn managed_trusts_declared_spec_and_overcommit() {
+        // Managed: the create-time spec is authoritative; overcommit passes
+        // through untouched (the broker applies it) and the probe is ignored.
+        let (s, cpu, mem) = fold_capacity(
+            HostOwnership::Managed,
+            false,
+            Some(spec(4000, 8192)),
+            None,
+            &reserved(0, 0),
+            150,
+            120,
+            85,
+        );
+        assert_eq!(s, Some(spec(4000, 8192)));
+        assert_eq!((cpu, mem), (150, 120));
+    }
+
+    #[test]
+    fn managed_probe_failure_is_ignored() {
+        // A failed probe never fails-closed a Managed host: its spec stands.
+        let (s, cpu, mem) = fold_capacity(
+            HostOwnership::Managed,
+            true,
+            Some(spec(2000, 4096)),
+            None,
+            &reserved(0, 0),
+            100,
+            100,
+            85,
+        );
+        assert_eq!(s, Some(spec(2000, 4096)));
+        assert_eq!((cpu, mem), (100, 100));
+    }
+
+    #[test]
+    fn independent_probe_failure_fails_closed() {
+        // Independent + probe_failed ⇒ spec None (⇒ broker UnknownSpec ⇒ no
+        // packing) and overcommit collapses to 100 (folded, not double-applied).
+        let (s, cpu, mem) = fold_capacity(
+            HostOwnership::Independent,
+            true,
+            Some(spec(9999, 99999)), // even a fat declared spec is dropped
+            Some(&headroom(8, 32_768_000, 16_384_000)),
+            &reserved(0, 0),
+            100,
+            100,
+            85,
+        );
+        assert_eq!(s, None);
+        assert_eq!((cpu, mem), (100, 100));
+    }
+
+    #[test]
+    fn independent_folds_overcommit_into_spec() {
+        // No probe, only a declared spec: independent_effective_ceiling applies
+        // overcommit×safety, and the returned overcommit is 100 (folded in).
+        let (s, cpu, mem) = fold_capacity(
+            HostOwnership::Independent,
+            false,
+            Some(spec(4000, 8192)),
+            None,
+            &reserved(0, 0),
+            100,
+            100,
+            100, // safety 100 ⇒ no haircut, overcommit 100 ⇒ no burst
+        );
+        assert_eq!(s, Some(spec(4000, 8192)));
+        assert_eq!((cpu, mem), (100, 100));
+    }
+
+    #[test]
+    fn independent_no_declared_no_probe_is_dedicated_only() {
+        // Neither a declared spec nor a probe ⇒ spec None ⇒ dedicated-only.
+        let (s, cpu, mem) = fold_capacity(
+            HostOwnership::Independent,
+            false,
+            None,
+            None,
+            &reserved(0, 0),
+            100,
+            100,
+            85,
+        );
+        assert_eq!(s, None);
+        assert_eq!((cpu, mem), (100, 100));
+    }
+
+    #[test]
+    fn independent_live_mem_gate_clamps_below_static_ceiling() {
+        // Declared 16 GiB, but only 2 GiB is live-available. At safety 100 the
+        // static ceiling would be 16384 MiB; the live gate clamps mem to
+        // reserved(0) + available(2048)×100% = 2048 MiB.
+        let (s, _cpu, _mem) = fold_capacity(
+            HostOwnership::Independent,
+            false,
+            Some(spec(8000, 16384)),
+            // probed spec matches declared on cpu/mem-total so only the
+            // available-mem gate bites: total 16 GiB, available 2 GiB.
+            Some(&headroom(8, 16_384 * 1024, 2048 * 1024)),
+            &reserved(0, 0),
+            100,
+            100,
+            100,
+        );
+        let s = s.expect("spec present with a declared+probed host");
+        assert_eq!(s.mem_mb, 2048, "live MemAvailable gate must dominate");
+    }
+
+    #[test]
+    fn independent_live_gate_adds_reserved_floor() {
+        // The live gate floor is reserved + available×safety — reserved tenants
+        // still hold their claim, so the ceiling rises with them (the min()
+        // must not drop the reserved term).
+        let with_reserved = fold_capacity(
+            HostOwnership::Independent,
+            false,
+            Some(spec(8000, 16384)),
+            Some(&headroom(8, 16_384 * 1024, 2048 * 1024)),
+            &reserved(0, 4096), // 4 GiB already reserved
+            100,
+            100,
+            100,
+        )
+        .0
+        .expect("spec present");
+        // ceiling' = min(static 16384, reserved 4096 + available 2048) = 6144.
+        assert_eq!(with_reserved.mem_mb, 6144);
+    }
+
+    #[test]
+    fn independent_safety_haircut_shrinks_live_allowance() {
+        // safety_pct halves the live allowance: available 4 GiB × 50% = 2 GiB.
+        let (s, _cpu, _mem) = fold_capacity(
+            HostOwnership::Independent,
+            false,
+            Some(spec(8000, 16384)),
+            Some(&headroom(8, 16_384 * 1024, 4096 * 1024)),
+            &reserved(0, 0),
+            100,
+            100,
+            50,
+        );
+        assert_eq!(s.expect("spec").mem_mb, 2048);
+    }
 }

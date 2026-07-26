@@ -401,3 +401,156 @@
             let _ = std::fs::remove_dir_all(d);
         }
     }
+
+    // --- audit fixes -------------------------------------------------------
+
+    #[test]
+    fn glyph_persist_entry_serializes_only_the_row() {
+        // The DB write moved out of the glyph_cache mutex; this helper is what the
+        // loop-off write path serializes. It must round-trip the row verbatim.
+        let row: GlyphRow = (true, 3, 1, Some("feature".into()), "/repo".into());
+        let (path, json) = glyph_persist_entry("/repo/wt", &row);
+        assert_eq!(path, "/repo/wt");
+        let back: GlyphRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, row);
+    }
+
+    #[test]
+    fn needs_fallback_send_only_on_non_normal_exit() {
+        // Normal exit (body ran + sent a model) must NOT re-send a fallback...
+        let normal: std::thread::Result<Option<()>> = Ok(Some(()));
+        assert!(!needs_fallback_send(&normal));
+        // ...but a handled early return (Db::open failed → Ok(None)) MUST, or the
+        // loop's inflight_hydration_gen gate strands forever.
+        let db_fail: std::thread::Result<Option<()>> = Ok(None);
+        assert!(needs_fallback_send(&db_fail));
+        // ...and a caught panic (Err) MUST likewise release the gate.
+        let panicked: std::thread::Result<Option<()>> =
+            Err(Box::new("boom") as Box<dyn std::any::Any + Send>);
+        assert!(needs_fallback_send(&panicked));
+    }
+
+    #[test]
+    fn pr_state_definitive_gates_cache_writes() {
+        use thegn_core::github::PanelState;
+        // Definitive answers are cacheable.
+        assert!(pr_state_is_definitive(&PanelState::NoPr));
+        assert!(pr_state_is_definitive(&PanelState::NoGh));
+        assert!(pr_state_is_definitive(&PanelState::NotAuthenticated));
+        // Transient failures must NOT overwrite a good cached PrPanel.
+        assert!(!pr_state_is_definitive(&PanelState::Offline));
+        assert!(!pr_state_is_definitive(&PanelState::RateLimited));
+        assert!(!pr_state_is_definitive(&PanelState::Error {
+            message: "dns failure".into()
+        }));
+    }
+
+    #[test]
+    fn plan_log_scan_covers_rotation_append_and_idle() {
+        // First scan of the process (prev_len == 0): read everything.
+        assert_eq!(plan_log_scan(0, 500), LogScanPlan::FromStart);
+        // Unchanged length: nothing new — reuse the running total (no re-read).
+        assert_eq!(plan_log_scan(500, 500), LogScanPlan::Unchanged);
+        // Grew: scan ONLY the appended suffix, not the whole file (the fix).
+        assert_eq!(
+            plan_log_scan(500, 900),
+            LogScanPlan::Append { offset: 500 }
+        );
+        // Shrank (log rotated/truncated): reset and re-scan from the start.
+        assert_eq!(plan_log_scan(900, 100), LogScanPlan::FromStart);
+    }
+
+    #[test]
+    fn count_error_lines_counts_only_errors() {
+        let chunk = "2026-06-05T12:00:00  INFO  thegn::db  ok\n\
+             2026-06-05T12:00:01  ERROR thegn::host  boom\n\
+             2026-06-05T12:00:02  WARN  thegn::x  slow\n\
+             2026-06-05T12:00:03  ERROR thegn::y  bang\n";
+        assert_eq!(count_error_lines(chunk.as_bytes()), 2);
+        assert_eq!(count_error_lines(b""), 0);
+    }
+
+    #[test]
+    fn update_log_error_total_is_incremental_and_resets_on_rotation() {
+        // A real file exercised through the incremental scanner: the running total
+        // must fold in only the appended errors, and reset when the file shrinks.
+        // The global state is process-wide, so this test drives it end to end.
+        let dir = std::env::temp_dir().join(format!(
+            "thegn-logscan-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.log");
+
+        // Baseline: reset global state to a known point by pointing at an empty
+        // file first (FromStart with 0 bytes → total 0).
+        std::fs::write(&path, b"").unwrap();
+        let len0 = std::fs::metadata(&path).unwrap().len();
+        let base = update_log_error_total(&path, len0);
+
+        // Append two ERRORs.
+        let a = "2026-06-05T12:00:01  ERROR thegn::a  one\n\
+                 2026-06-05T12:00:02  INFO  thegn::a  fine\n\
+                 2026-06-05T12:00:03  ERROR thegn::a  two\n";
+        std::fs::write(&path, a.as_bytes()).unwrap();
+        let len1 = std::fs::metadata(&path).unwrap().len();
+        let t1 = update_log_error_total(&path, len1);
+        assert_eq!(t1, base + 2, "both appended errors counted");
+
+        // Idle pass (no growth): total unchanged, and no re-scan of old bytes.
+        let t_idle = update_log_error_total(&path, len1);
+        assert_eq!(t_idle, t1);
+
+        // Append one more ERROR — only the suffix should be scanned, adding 1.
+        let mut full = a.to_string();
+        full.push_str("2026-06-05T12:00:04  ERROR thegn::a  three\n");
+        std::fs::write(&path, full.as_bytes()).unwrap();
+        let len2 = std::fs::metadata(&path).unwrap().len();
+        let t2 = update_log_error_total(&path, len2);
+        assert_eq!(t2, t1 + 1, "only the appended error is added");
+
+        // Rotation: file shrinks to a single ERROR → total resets to that count.
+        let rotated = "2026-06-05T13:00:00  ERROR thegn::a  fresh\n";
+        std::fs::write(&path, rotated.as_bytes()).unwrap();
+        let len3 = std::fs::metadata(&path).unwrap().len();
+        let t3 = update_log_error_total(&path, len3);
+        assert_eq!(t3, 1, "rotation resets the running total");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_log_tail_lines_is_bounded_and_snaps_to_line() {
+        let dir = std::env::temp_dir().join(format!(
+            "thegn-logtail-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.log");
+
+        // Build a file larger than the tail window so the read must be bounded.
+        let mut content = String::new();
+        for i in 0..2000 {
+            content.push_str(&format!("2026-06-05T12:00:00  INFO  thegn::x  line {i}\n"));
+        }
+        std::fs::write(&path, content.as_bytes()).unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+
+        // A small tail window: we must get the LAST lines, and the very first
+        // (partial) line of the window must be dropped so no corrupt row leaks.
+        let lines = read_log_tail_lines(&path, len, 4 * 1024);
+        assert!(!lines.is_empty());
+        assert!(
+            lines.len() < 2000,
+            "tail is bounded, not the whole file: got {}",
+            lines.len()
+        );
+        // The last parsed line is the last log line.
+        assert_eq!(lines.last().unwrap().message, "line 1999");
+        // Every parsed row is well-formed (no partial first line).
+        assert!(lines.iter().all(|l| l.message.starts_with("line ")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }

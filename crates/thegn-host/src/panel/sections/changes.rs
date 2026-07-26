@@ -4,6 +4,7 @@
 
 use thegn_core::diff_sbs::{CellKind, SbsCell, SbsFile};
 use thegn_core::theme::Hue;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::panel::docs::{diff_hunk_at, diff_hunk_starts};
 use crate::seg::{Line, Seg, Tok, seg, sp};
@@ -302,7 +303,7 @@ fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool, cols: usize) -> Pan
     // indent() adds sp(2) to l and sp(1) to r; draw_line adds 1-cell gap between l and r.
     // Net path budget = cols - 4(prefix) - r_w - 5(indent+gap overhead).
     let path_budget = cols.saturating_sub(4 + seg_width(&r) + 5);
-    let dir_display = clip_dir_left(&c.dir, c.name.chars().count(), path_budget);
+    let dir_display = clip_dir_left(&c.dir, UnicodeWidthStr::width(c.name.as_str()), path_budget);
     let l = vec![
         seg(glyph_tok, glyph),
         sp(1),
@@ -363,7 +364,9 @@ fn clip_dir_left(dir: &str, name_w: usize, budget: usize) -> String {
         return String::new();
     }
     let dir_chars: Vec<char> = dir.chars().collect();
-    let dir_w = dir_chars.len();
+    // Budget in display cells, not char count (unicode-width layout invariant):
+    // a CJK/emoji dir component occupies 2 cells per glyph.
+    let dir_w = UnicodeWidthStr::width(dir);
     if dir_w + name_w <= budget {
         return dir.to_string();
     }
@@ -371,16 +374,27 @@ fn clip_dir_left(dir: &str, name_w: usize, budget: usize) -> String {
     if dir_budget <= 1 {
         return "…/".to_string();
     }
-    // Reserve 1 char for the leading "…", the rest goes to the dir suffix.
-    let take = dir_budget.saturating_sub(1);
-    let from = dir_w.saturating_sub(take);
+    // Reserve 1 cell for the leading "…", the rest is the dir-suffix width budget.
+    // Walk from the tail accumulating display width until the next glyph would
+    // overflow, so we keep the widest right-anchored suffix that fits.
+    let take_w = dir_budget.saturating_sub(1);
+    let mut used = 0usize;
+    let mut from = dir_chars.len();
+    while from > 0 {
+        let w = UnicodeWidthChar::width(dir_chars[from - 1]).unwrap_or(0);
+        if used + w > take_w {
+            break;
+        }
+        used += w;
+        from -= 1;
+    }
     // Advance to the next '/' so we start cleanly on a component boundary.
     let snap = dir_chars[from..]
         .iter()
         .position(|&c| c == '/')
         .map(|p| from + p + 1)
         .unwrap_or(from);
-    if snap >= dir_w {
+    if snap >= dir_chars.len() {
         return "…/".to_string();
     }
     format!("…{}", dir_chars[snap..].iter().collect::<String>())
@@ -452,25 +466,36 @@ fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool, cols: usize) -> Vec<Pan
 /// indent; continuations align under the text at a 4-cell indent.
 fn wrap_preview(tok: crate::seg::Tok, mark: &str, text: &str, cols: usize) -> Vec<PanelRow> {
     let text_w = cols.saturating_sub(4).max(1);
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
+    if text.is_empty() {
         return vec![PanelRow::plain(Line::segs(vec![
             sp(2),
             seg(tok, mark.to_string()),
         ]))];
     }
+    // Chunk by *display* width, never splitting a wide glyph (unicode-width
+    // layout invariant): `take_cols` returns the widest prefix that fits.
     let mut rows = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let end = (i + text_w).min(chars.len());
-        let chunk: String = chars[i..end].iter().collect();
-        let segs = if i == 0 {
+    let mut rest = text;
+    let mut first = true;
+    while !rest.is_empty() {
+        let chunk = crate::seg::take_cols(rest, text_w);
+        // A single glyph wider than the whole band can't fit; take it anyway to
+        // guarantee forward progress rather than loop forever.
+        let chunk = if chunk.is_empty() {
+            let mut it = rest.char_indices();
+            it.next();
+            &rest[..it.next().map(|(i, _)| i).unwrap_or(rest.len())]
+        } else {
+            chunk
+        };
+        let segs = if first {
             vec![sp(2), seg(tok, format!("{mark}{chunk}"))]
         } else {
-            vec![sp(4), seg(tok, chunk)]
+            vec![sp(4), seg(tok, chunk.to_string())]
         };
         rows.push(PanelRow::plain(Line::segs(segs)));
-        i = end;
+        rest = &rest[chunk.len()..];
+        first = false;
     }
     rows
 }
@@ -503,8 +528,25 @@ fn diff_cell(cell: Option<&SbsCell>, w: usize, mask: Option<&[bool]>) -> Vec<Vec
     let mut i = 0;
     let mut first = true;
     loop {
-        let end = (i + text_w).min(chars.len());
-        let pad = text_w - (end - i);
+        // Advance by *display* width, not char count: accumulate whole chars
+        // until the next would overflow the band (unicode-width invariant), so a
+        // wrapped chunk occupies exactly `text_w - pad` cells, never up to 2×.
+        let mut used = 0usize;
+        let mut end = i;
+        while end < chars.len() {
+            let cw = UnicodeWidthChar::width(chars[end]).unwrap_or(0);
+            if used + cw > text_w {
+                break;
+            }
+            used += cw;
+            end += 1;
+        }
+        // Guarantee progress if a single glyph is wider than the whole band.
+        if end == i && i < chars.len() {
+            used = UnicodeWidthChar::width(chars[i]).unwrap_or(0).min(text_w);
+            end = i + 1;
+        }
+        let pad = text_w.saturating_sub(used);
         let no_text = if first {
             format!("{:>4} ", cell.line_no)
         } else {
@@ -569,6 +611,45 @@ fn changed_mask(segs: &[thegn_core::diff_highlight::WordSeg]) -> Vec<bool> {
     m
 }
 
+/// Per-char changed masks for a removed/added text pair, memoized across frames.
+///
+/// The word-level diff is a pure function of the two texts, but the side-by-side
+/// render path recomputes it on every Full frame (each scroll/keypress). This
+/// thread-local cache (the render loop is single-threaded) keys on the text pair
+/// so identical rows redrawn frame-to-frame hit the cache instead of re-running
+/// `similar`'s word diff. Bounded: cleared wholesale once it grows past a cap so
+/// a long editing session can't leak — the cache is a frame-cost optimization,
+/// not a correctness dependency.
+fn word_masks(old: &str, new: &str) -> (Vec<bool>, Vec<bool>) {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    // Cap chosen well above a viewport's worth of paired rows so scrolling never
+    // thrashes it; a wholesale clear on overflow keeps memory bounded without an
+    // LRU's per-entry bookkeeping.
+    const CAP: usize = 512;
+    // (old-side mask, new-side mask) for one paired diff row.
+    type WordMasks = (Vec<bool>, Vec<bool>);
+    thread_local! {
+        static MEMO: RefCell<HashMap<(String, String), WordMasks>> =
+            RefCell::new(HashMap::new());
+    }
+    MEMO.with(|memo| {
+        let key = (old.to_string(), new.to_string());
+        if let Some(hit) = memo.borrow().get(&key) {
+            return hit.clone();
+        }
+        let (os, ns) = thegn_core::diff_highlight::word_diff(old, new);
+        let masks = (changed_mask(&os), changed_mask(&ns));
+        let mut m = memo.borrow_mut();
+        if m.len() >= CAP {
+            m.clear();
+        }
+        m.insert(key, masks.clone());
+        masks
+    })
+}
+
 /// The flattened line at index `at`: a hunk header (one visual row) or an
 /// aligned old/new row pair. Long cells wrap, so a row pair can span several
 /// visual rows; the old and new sides wrap independently and stay column-locked
@@ -595,10 +676,16 @@ fn diff_flat_line(file: &SbsFile, starts: &[usize], at: usize, side: usize) -> V
     // Word-level emphasis (item 601): only when a removed line is paired with
     // an added line do we diff the two texts and emphasize just the changed
     // runs. Pure add/del rows have nothing to diff against → no mask.
+    //
+    // The word-diff depends only on the two texts, but this runs on every Full
+    // frame while the side-by-side view is open (each keypress/scroll step is a
+    // legitimate Full frame the render_plan Skip/Panes gates can't elide), so we
+    // memoize the per-char masks by (old_text, new_text) to avoid recomputing
+    // byte-identical `similar` diffs each frame while scrolling a large diff.
     let (old_mask, new_mask) = match (row.old.as_ref(), row.new.as_ref()) {
         (Some(o), Some(n)) if o.kind == CellKind::Removed && n.kind == CellKind::Added => {
-            let (os, ns) = thegn_core::diff_highlight::word_diff(&o.text, &n.text);
-            (Some(changed_mask(&os)), Some(changed_mask(&ns)))
+            let (om, nm) = word_masks(&o.text, &n.text);
+            (Some(om), Some(nm))
         }
         _ => (None, None),
     };
@@ -724,6 +811,79 @@ mod tests {
         let blank = diff_cell(None, 15, None);
         assert_eq!(blank.len(), 1);
         assert_eq!(seg_width(&blank[0]), 15);
+    }
+
+    #[test]
+    fn diff_cell_wraps_wide_glyphs_by_display_width() {
+        // side = 15 → text_w = 10 cells. "你好" is 4 cells; five of them = 20
+        // cells → must wrap into 2 rows (5 glyphs per 10-cell band), and every
+        // visual row must be exactly `side` cells — NOT split mid-glyph or
+        // overflow (the char-count bug packed 10 wide chars = 20 cells per row).
+        let wide = "你好世界你好世界你好世界"; // 12 wide glyphs = 24 cells
+        let c = cell(2, wide, CellKind::Added);
+        let rows = diff_cell(Some(&c), 15, None);
+        // 24 cells / 10 per row = 3 rows (5 + 5 + 2 glyphs).
+        assert_eq!(rows.len(), 3, "wrapped by display width");
+        for r in &rows {
+            assert_eq!(seg_width(r), 15, "each visual row is exactly side cells");
+        }
+    }
+
+    #[test]
+    fn wrap_preview_wraps_wide_glyphs_by_display_width() {
+        // cols = 14 → text_w = 10 cells. Seven "你" (2 cells each) = 14 cells →
+        // 5 per row → 2 rows. The char-count bug would put all 7 on one row
+        // (14 cells) and silently clip; here the wrap respects display width.
+        let rows = wrap_preview(t(), "+ ", "你你你你你你你", 14);
+        assert_eq!(rows.len(), 2);
+        if let Line::Segs(segs) = &rows[0].line {
+            // sp(2) + "+ " + 5 wide glyphs (10 cells) = 14 cells of content.
+            assert_eq!(segs_text(segs), "  + 你你你你你");
+        } else {
+            panic!("expected Segs");
+        }
+        if let Line::Segs(segs) = &rows[1].line {
+            assert_eq!(segs_text(segs), "    你你");
+        } else {
+            panic!("expected Segs");
+        }
+    }
+
+    #[test]
+    fn clip_dir_left_budgets_by_display_width() {
+        use unicode_width::UnicodeWidthStr;
+        // A wide dir: "世界/" is 5 display cells (2 glyphs × 2 + "/"). With a
+        // name of width 4 and budget 8, dir_w(5) + name(4) = 9 > 8, so it must
+        // clip — and the returned prefix's display width must fit the budget,
+        // never over-counting glyphs as 1 cell each (the char-count bug thought
+        // "世界/" was 3 wide and passed it through unclipped).
+        let out = clip_dir_left("aaa/世界/", 4, 8);
+        // dir display width budget = 8 - 4 = 4; suffix width must be ≤ 4.
+        assert!(out.starts_with('…'), "clipped: {out:?}");
+        assert!(
+            UnicodeWidthStr::width(out.as_str()) <= 4 + 1, // + the '…'
+            "clipped dir fits the display-width budget: {out:?} (w={})",
+            UnicodeWidthStr::width(out.as_str())
+        );
+        // A wide dir that *does* fit by display width passes through unchanged.
+        assert_eq!(clip_dir_left("世/", 4, 10), "世/");
+    }
+
+    #[test]
+    fn word_masks_are_memoized_across_calls() {
+        // Same text pair twice returns identical masks (cache hit path), and the
+        // masks match the direct `changed_mask(word_diff(..))` computation.
+        let (o, n) = ("let a = 1;", "let a = 2;");
+        let (om1, nm1) = word_masks(o, n);
+        let (om2, nm2) = word_masks(o, n);
+        assert_eq!(om1, om2);
+        assert_eq!(nm1, nm2);
+        let (os, ns) = thegn_core::diff_highlight::word_diff(o, n);
+        assert_eq!(om1, changed_mask(&os));
+        assert_eq!(nm1, changed_mask(&ns));
+        // Mask length equals the side's char count.
+        assert_eq!(om1.len(), o.chars().count());
+        assert_eq!(nm1.len(), n.chars().count());
     }
 
     #[test]

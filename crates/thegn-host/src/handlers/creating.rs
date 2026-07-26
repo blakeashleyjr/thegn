@@ -64,10 +64,18 @@ pub(crate) fn open_tab(
     focus: bool,
 ) {
     if session.worktrees.iter().any(|g| g.name == tab) {
-        // Idempotent (or a same-name collision with another in-flight
-        // creation): still tie this generation to the existing tab so its
-        // later Step/abort events route there.
-        gen_tab.insert(generation, (tab, 0));
+        // The name is already taken. Only adopt it for this generation when the
+        // existing group is ITSELF mid-creation (idempotent re-open, or a
+        // same-name collision with another in-flight creation) — then later
+        // Step/abort events route to it safely. If it is a settled LIVE tab,
+        // adopting it would let reconcile_name hijack (rename/repoint) it or
+        // abort_gen delete it — corrupting the user's open tab. In that case do
+        // NOT map the generation: leave the placeholder unopened and let the
+        // worker's authoritative TabOpened open a fresh tab under its deduped,
+        // non-colliding name.
+        if creating_tabs.contains(&(tab.clone(), 0)) {
+            gen_tab.insert(generation, (tab, 0));
+        }
         return;
     }
     let prev = session.active;
@@ -158,6 +166,15 @@ pub(crate) fn reconcile_name(
     let Some((old_name, _)) = gen_tab.get(&generation).cloned() else {
         return false;
     };
+    // Guard: only reconcile a placeholder this creation OWNS. If the mapped name
+    // is not in `creating_tabs`, `gen_tab` points at a settled LIVE tab (never
+    // opened as a placeholder) — renaming/repointing it would hijack the user's
+    // open tab. Drop the stale mapping and defer to a fresh `open_tab` (which
+    // will use the worker's deduped, non-colliding name).
+    if !creating_tabs.contains(&(old_name.clone(), 0)) {
+        gen_tab.remove(&generation);
+        return false;
+    }
     if old_name == tab {
         // Placeholder already carries the authoritative name; just settle the
         // (authoritative) path over the optimistically-derived one.
@@ -314,9 +331,17 @@ pub(crate) fn abort_gen(
         return;
     };
     let key = (name.clone(), idx);
-    creating_tabs.remove(&key);
+    // Only tear down a group this creation actually OWNS. If the name is not in
+    // `creating_tabs`, `gen_tab` was pointed at a settled live tab (or the
+    // placeholder was already adopted/renamed away) — removing it would delete
+    // the user's open tab. Retire only this generation's markers in that case.
+    let owns = creating_tabs.remove(&key);
     loading_state.remove(&key);
     sb.creating.remove(&name);
+    if !owns {
+        refresh_tab_model(model, session, sb);
+        return;
+    }
     if let Some(i) = session.worktrees.iter().position(|g| g.name == name) {
         session.worktrees.remove(i);
         // Keep `active` pointing at the same group it did before the removal
@@ -709,6 +734,170 @@ mod tests {
 
         // No tab yet for a generation → nothing mirrored.
         assert!(!sync_steps(&progress, &mut loading, 99, &gen_tab));
+    }
+
+    /// An optimistic open whose derived name COLLIDES with a settled LIVE tab
+    /// (not mid-creation) must not adopt it: `gen_tab` stays unmapped and the
+    /// live group is left untouched, so the worker's deduped `TabOpened` opens a
+    /// fresh tab instead of hijacking the user's open one.
+    #[test]
+    fn open_tab_does_not_adopt_a_live_colliding_tab() {
+        let mut session = Session::default();
+        let mut model = FrameModel::default();
+        let mut sb = SidebarState::default();
+        let mut loading = LoadingState::default();
+        let mut creating_tabs: HashSet<Key> = HashSet::new();
+        let mut gen_tab: GenTab = HashMap::new();
+        // A LIVE tab already owns the name (NOT in creating_tabs).
+        session.add_group(WorktreeGroup::new(
+            "repo/tg-fix-login".to_string(),
+            GroupKind::Branch,
+            "/wt/live".to_string(),
+        ));
+
+        open_tab(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut gen_tab,
+            None,
+            5,
+            "repo/tg-fix-login".to_string(),
+            "/wt/optimistic".to_string(),
+            true,
+        );
+
+        assert!(
+            !gen_tab.contains_key(&5),
+            "the generation must not be mapped onto the live tab",
+        );
+        assert!(!creating_tabs.contains(&("repo/tg-fix-login".to_string(), 0)));
+        assert_eq!(session.worktrees.len(), 1, "no duplicate group");
+        assert_eq!(
+            session.worktrees[0].path, "/wt/live",
+            "the live tab's path is untouched",
+        );
+    }
+
+    /// After the collision above, a `Failed`/abort for that generation must NOT
+    /// delete the live tab (gen_tab has no entry → no-op).
+    #[test]
+    fn abort_gen_spares_a_live_colliding_tab() {
+        let mut session = Session::default();
+        let mut model = FrameModel::default();
+        let mut sb = SidebarState::default();
+        let mut loading = LoadingState::default();
+        let mut creating_tabs: HashSet<Key> = HashSet::new();
+        let mut gen_tab: GenTab = HashMap::new();
+        session.add_group(WorktreeGroup::new(
+            "repo/tg-fix-login".to_string(),
+            GroupKind::Branch,
+            "/wt/live".to_string(),
+        ));
+        // Collision path left gen_tab unmapped.
+        open_tab(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut gen_tab,
+            None,
+            5,
+            "repo/tg-fix-login".to_string(),
+            "/wt/optimistic".to_string(),
+            true,
+        );
+
+        abort_gen(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut gen_tab,
+            5,
+        );
+
+        assert!(
+            session.worktrees.iter().any(|g| g.name == "repo/tg-fix-login"),
+            "the user's live tab survives a colliding creation's failure",
+        );
+    }
+
+    /// Defense-in-depth: if `gen_tab` somehow points at a name NOT in
+    /// `creating_tabs` (a settled live tab), `abort_gen` retires its own markers
+    /// but must NOT remove the group from the session.
+    #[test]
+    fn abort_gen_does_not_remove_a_non_creating_group() {
+        let mut session = Session::default();
+        let mut model = FrameModel::default();
+        let mut sb = SidebarState::default();
+        let mut loading = LoadingState::default();
+        let mut creating_tabs: HashSet<Key> = HashSet::new();
+        let mut gen_tab: GenTab = HashMap::new();
+        session.add_group(WorktreeGroup::new(
+            "repo/live".to_string(),
+            GroupKind::Branch,
+            "/wt/live".to_string(),
+        ));
+        // Stale mapping onto the live tab, with NO creating_tabs entry.
+        gen_tab.insert(9, ("repo/live".to_string(), 0));
+
+        abort_gen(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut gen_tab,
+            9,
+        );
+
+        assert!(
+            session.worktrees.iter().any(|g| g.name == "repo/live"),
+            "a non-creating group must never be torn down by abort_gen",
+        );
+        assert!(!gen_tab.contains_key(&9), "the stale mapping is cleared");
+    }
+
+    /// Defense-in-depth: `reconcile_name` refuses to rename a group whose name
+    /// isn't in `creating_tabs` (a settled live tab), returning false so the
+    /// caller opens a fresh tab instead of hijacking the live one.
+    #[test]
+    fn reconcile_refuses_a_non_creating_group() {
+        let mut session = Session::default();
+        let mut sb = SidebarState::default();
+        let mut loading = LoadingState::default();
+        let mut creating_tabs: HashSet<Key> = HashSet::new();
+        let mut gen_tab: GenTab = HashMap::new();
+        session.add_group(WorktreeGroup::new(
+            "repo/live".to_string(),
+            GroupKind::Branch,
+            "/wt/live".to_string(),
+        ));
+        gen_tab.insert(4, ("repo/live".to_string(), 0));
+
+        let handled = reconcile_name(
+            &mut session,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut gen_tab,
+            4,
+            "repo/tg-fix-login-1",
+            "/wt/new",
+        );
+
+        assert!(!handled, "must not adopt a non-creating group");
+        assert_eq!(
+            session.worktrees[0].name, "repo/live",
+            "the live tab is not renamed",
+        );
+        assert_eq!(session.worktrees[0].path, "/wt/live");
+        assert!(!gen_tab.contains_key(&4), "the stale mapping is cleared");
     }
 
     /// `abort_gen` removes only the failed generation's tab, leaving a

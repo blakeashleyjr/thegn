@@ -60,8 +60,22 @@ pub fn tick(cfg: &Config) {
 fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
     let ours = vps::host_label();
     let mut seen_accounts: Vec<String> = Vec::new();
+    // Names of every instance seen live across ALL accounts this pass. The
+    // ledger `ready`-drop must run against this UNION, not one account's list:
+    // a `VpsRecord` carries no api_base, so a `ready` record minted by a SECOND
+    // account of the same provider kind is absent from any OTHER account's list
+    // and would otherwise be dropped while its VPS is still live/billing.
+    let mut live_anywhere: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Provider kinds for which EVERY account listed cleanly this pass. Only
+    // these are eligible for `ready`-record cleanup: if any account of a kind
+    // failed to list (token gone / API error), we can't tell a genuinely-gone
+    // record from one whose live instance we simply couldn't see, so we leave
+    // that kind's records alone until a clean pass.
+    let mut listed_kinds: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut failed_kinds: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (env_name, pc) in envs {
-        let account = format!("{}|{}", pc.provider.trim(), pc.api_base.trim());
+        let kind = pc.provider.trim().to_string();
+        let account = format!("{}|{}", kind, pc.api_base.trim());
         if seen_accounts.contains(&account) {
             continue;
         }
@@ -69,6 +83,7 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
         // Token unset ⇒ nothing reachable to reap (and nothing could have been
         // created); skip quietly, same as the launch path.
         let Some(probe) = crate::provider_factory::vps_provider_for(pc, "reaper-probe") else {
+            failed_kinds.insert(kind.clone());
             continue;
         };
         let instances = match crate::agent::block_on_provider(|| async {
@@ -77,9 +92,11 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
             Ok(list) => list,
             Err(e) => {
                 tracing::debug!(target: "thegn::lifecycle", error = %e, "vps reap: list failed");
+                failed_kinds.insert(kind.clone());
                 continue;
             }
         };
+        listed_kinds.insert(kind.clone());
         let records = registry::list();
         let now = thegn_core::util::now();
 
@@ -87,6 +104,7 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
             .iter()
             .filter(|i| i.labels.get("tg-host").map(String::as_str) == Some(ours.as_str()))
         {
+            live_anywhere.insert(inst.name.clone());
             let record = records.iter().find(|r| r.name == inst.name);
             let age = inst.created.map(|c| now - c).unwrap_or(0);
             let over_lifetime = pc.max_lifetime_secs > 0 && age >= pc.max_lifetime_secs as i64;
@@ -111,6 +129,7 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
                     // pool row so the warm pool refills. best-effort: the DB is
                     // a cache and the next reconcile re-observes.
                     Ok(()) => {
+                        live_anywhere.remove(&inst.name);
                         if let Ok(db) = thegn_core::db::Db::open() {
                             let _ = db.delete_pool_spare(&inst.name);
                         }
@@ -122,29 +141,105 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
                 }
             }
         }
-
-        // Ledger-only cleanup for this provider's records.
-        for rec in records.iter().filter(|r| r.provider == pc.provider.trim()) {
-            let live = instances.iter().any(|i| i.name == rec.name);
-            if live {
-                continue;
-            }
-            let stale_creating =
-                rec.state == "creating" && now - rec.created_at >= CREATING_STALE_SECS;
-            let gone_ready = rec.state == "ready";
-            if stale_creating || gone_ready {
-                tracing::debug!(
-                    target: "thegn::lifecycle",
-                    name = %rec.name, state = %rec.state,
-                    "vps reap: dropping ledger record with no live instance"
-                );
-                registry::remove(&rec.name);
-                if let Ok(db) = thegn_core::db::Db::open() {
-                    // best-effort: phantom pool rows must not linger either.
-                    let _ = db.delete_pool_spare(&rec.name);
-                }
-            }
-        }
         let _ = env_name; // env identity only matters for per-env lifetime caps above
+    }
+
+    // Ledger cleanup runs ONCE, after every account is listed, against the
+    // union of live names — so a record whose live instance lives under a
+    // sibling account (same kind, different api_base) is never dropped. Only
+    // kinds where every account listed cleanly are eligible.
+    for k in &failed_kinds {
+        listed_kinds.remove(k);
+    }
+    let records: Vec<registry::VpsRecord> = registry::list()
+        .into_iter()
+        .filter(|r| listed_kinds.contains(&r.provider))
+        .collect();
+    cleanup_ledger(&records, &live_anywhere);
+}
+
+/// Pure decision: should this ledger record be dropped, given the union of
+/// names seen live across ALL accounts we reconciled this pass? A record with a
+/// live instance anywhere is kept (its VPS may belong to a sibling account of
+/// the same kind); otherwise stale `creating` or any `ready` record is dropped.
+fn should_drop_record(
+    rec: &registry::VpsRecord,
+    live: &std::collections::HashSet<String>,
+    now: i64,
+) -> bool {
+    if live.contains(&rec.name) {
+        return false;
+    }
+    let stale_creating = rec.state == "creating" && now - rec.created_at >= CREATING_STALE_SECS;
+    let gone_ready = rec.state == "ready";
+    stale_creating || gone_ready
+}
+
+/// Drop ledger records with no live instance ANYWHERE (across all accounts of
+/// the same kind): stale `creating` (the POST never landed) or a `ready` record
+/// whose instance is gone out-of-band.
+fn cleanup_ledger(records: &[registry::VpsRecord], live: &std::collections::HashSet<String>) {
+    let now = thegn_core::util::now();
+    for rec in records {
+        if !should_drop_record(rec, live, now) {
+            continue;
+        }
+        tracing::debug!(
+            target: "thegn::lifecycle",
+            name = %rec.name, state = %rec.state,
+            "vps reap: dropping ledger record with no live instance"
+        );
+        registry::remove(&rec.name);
+        if let Ok(db) = thegn_core::db::Db::open() {
+            // best-effort: phantom pool rows must not linger either.
+            let _ = db.delete_pool_spare(&rec.name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(name: &str, state: &str, created_at: i64) -> registry::VpsRecord {
+        registry::VpsRecord {
+            name: name.into(),
+            provider: "hetzner".into(),
+            state: state.into(),
+            instance_id: String::new(),
+            ip: String::new(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn ready_record_of_a_sibling_account_is_kept() {
+        // Two hetzner accounts (personal + work). Account 1's list has none of
+        // account 2's instances, but `live` is the UNION across both accounts,
+        // so account 2's still-live `ready` VPS is NOT dropped from the ledger.
+        let now = 2_000_000_000;
+        let mut live = std::collections::HashSet::new();
+        live.insert("sz-work-live".to_string()); // seen live under account 2
+        let r = rec("sz-work-live", "ready", now - 10_000);
+        assert!(
+            !should_drop_record(&r, &live, now),
+            "a live sibling-account VPS must never be reaped from the ledger"
+        );
+    }
+
+    #[test]
+    fn gone_ready_and_stale_creating_are_dropped() {
+        let now = 2_000_000_000;
+        let live = std::collections::HashSet::new(); // nothing live anywhere
+        // ready but gone out-of-band ⇒ drop.
+        assert!(should_drop_record(&rec("gone", "ready", now - 10_000), &live, now));
+        // creating older than the stale threshold ⇒ drop.
+        assert!(should_drop_record(
+            &rec("stuck", "creating", now - CREATING_STALE_SECS - 1),
+            &live,
+            now
+        ));
+        // creating but still fresh ⇒ keep (create may be in flight).
+        assert!(!should_drop_record(&rec("fresh", "creating", now - 1), &live, now));
     }
 }

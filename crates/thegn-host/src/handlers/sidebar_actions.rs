@@ -168,11 +168,17 @@ pub(crate) fn delete_folder(
             // regrouped the tree
             let _ = db.del_folder(folder_id);
             if let Some(key) = &key {
-                let _ = db.del_ui_state_prefix(
+                // Exact-key deletes — NOT a LIKE prefix. The key is
+                // `{slug}/folder:{id}` with no trailing delimiter, so
+                // `folder:1` is a strict prefix of `folder:10`/`:12`/…; a
+                // prefix delete would wipe those sibling folders' persisted
+                // collapse/pin state. toggle_collapse/toggle_pin unpersist
+                // these same keys exactly, so match that.
+                let _ = db.del_ui_state(
                     crate::handlers::sidebar_persist::SIDEBAR_SCOPE,
                     &format!("collapse:{key}"),
                 );
-                let _ = db.del_ui_state_prefix(
+                let _ = db.del_ui_state(
                     crate::handlers::sidebar_persist::SIDEBAR_SCOPE,
                     &format!("pin:{key}"),
                 );

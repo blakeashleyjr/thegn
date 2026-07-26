@@ -511,6 +511,11 @@ pub(crate) fn pool_target_adjust(
         .flatten()
         .unwrap_or(cfg.lifecycle.pool.size as i64);
     let new = (cur + delta).max(0);
-    db.set_pool_target(&repo_root, &env_name, new).ok()?;
+    // Surface a persist failure — this is a user-invoked hotkey on the primary
+    // path; a swallowed `.ok()?` would leave the user seeing nothing while the
+    // target silently didn't change (locked DB / disk full).
+    if let Err(e) = db.set_pool_target(&repo_root, &env_name, new) {
+        return Some(format!("warm pool: persist failed: {e}"));
+    }
     Some(format!("warm pool target: {new} spare(s)"))
 }

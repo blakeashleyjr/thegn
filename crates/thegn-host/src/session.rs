@@ -373,7 +373,7 @@ impl Session {
         // layout persist makes it stick. Skip a rename that would collide with
         // an existing group (mixed-version leftovers keep their legacy name).
         if let Some(slug) = &canonical {
-            let names: std::collections::HashSet<String> =
+            let mut names: std::collections::HashSet<String> =
                 worktrees.iter().map(|g| g.name.clone()).collect();
             for g in &mut worktrees {
                 if g.kind == GroupKind::Home
@@ -381,7 +381,13 @@ impl Session {
                     && prefix != *slug
                 {
                     let target = format!("{slug}/{branch}");
-                    if !names.contains(&target) {
+                    // Claim the target in `names` as we assign it: two legacy
+                    // home groups whose raw prefixes differ but canonicalize to
+                    // the same slug (e.g. "WASHU/home" and "Washu/home") must
+                    // not both become "washu/home" — group names are unique per
+                    // session and duplicates collapse on persist. The second one
+                    // keeps its legacy name, same as an already-existing target.
+                    if names.insert(target.clone()) {
                         g.name = target;
                     }
                 }
@@ -1263,5 +1269,35 @@ mod tests {
             vec!["washu/home", "WASHU/home"],
             "a rename that would duplicate an existing group name is skipped"
         );
+    }
+
+    #[test]
+    fn resurrect_two_legacy_home_groups_dont_rename_to_same_name() {
+        let db = temp_db();
+        let repo = "/r/WASHU";
+        // Two legacy home groups whose raw prefixes differ ("WASHU" vs "Washu")
+        // but both canonicalize to the same slug. Only the first may take the
+        // canonical name; the second keeps its legacy name so the two rows stay
+        // distinct (unique per session; duplicates collapse on persist).
+        let legacy = Session {
+            id: repo.into(),
+            worktrees: vec![
+                WorktreeGroup::new("WASHU/home", GroupKind::Home, repo),
+                WorktreeGroup::new("Washu/home", GroupKind::Home, "/r/other-checkout"),
+            ],
+            active: 0,
+        };
+        legacy.persist(&db, repo, 1).unwrap();
+
+        let s = Session::resurrect(&db, repo).unwrap();
+        let names: Vec<_> = s.worktrees.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|n| **n == "washu/home").count(),
+            1,
+            "at most one group takes the canonical name"
+        );
+        // Distinctness preserved: two rows, no collision.
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "group names stay unique");
     }
 }

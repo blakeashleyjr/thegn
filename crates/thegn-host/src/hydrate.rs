@@ -941,12 +941,21 @@ fn collect_sidebar_status(
     // are no longer present (bounds growth across the process lifetime). A
     // degraded row (a transient read error that reused its prior value) is left
     // out so the existing cache entry is preserved rather than poisoned.
-    {
+    //
+    // Only the in-memory insert/retain runs inside the mutex; the per-worktree
+    // SQLite upserts are collected here and flushed AFTER the lock is dropped.
+    // The mutex is taken loop-side (`glyph_refresh::seed_from_global_cache`, on
+    // every tab/worktree/pane switch), and `put_glyph_cache` is a real
+    // INSERT..ON CONFLICT that can stall up to the 5s `busy_timeout` under WAL
+    // write contention — holding those writes under the lock would freeze the
+    // event loop for the duration. Serialize outside the critical section too.
+    let to_persist: Vec<(String, String)> = {
         let mut cache = glyph_cache().lock().unwrap();
+        let mut persist = Vec::new();
         for (p, row, clean) in &scanned {
             if *clean {
                 cache.insert(p.clone(), (row.clone(), now));
-                let _ = db.put_glyph_cache(p, &serde_json::to_string(row).unwrap_or_default());
+                persist.push(glyph_persist_entry(p, row));
             }
         }
         // Keep every registered worktree's glyph resident, not just the active
@@ -954,6 +963,13 @@ fn collect_sidebar_status(
         // retain would evict (and blank on switch) other workspaces. Dead rows
         // still get pruned.
         cache.retain(|k, _| paths.iter().any(|p| p == k) || all_wt_paths.iter().any(|p| p == k));
+        persist
+    };
+    // best-effort: the glyph cache is a warm-start convenience; git is the source
+    // of truth. These writes are now outside the mutex so a stalled WAL write
+    // can never block a loop-side `seed_from_global_cache`.
+    for (p, json) in &to_persist {
+        let _ = db.put_glyph_cache(p, json);
     }
 
     let scanned_n = scanned.len();
@@ -1006,6 +1022,15 @@ fn collect_sidebar_status(
         "sidebar status collected"
     );
     status
+}
+
+/// Serialize one clean glyph row into the `(worktree, json)` pair persisted to
+/// the `glyph_cache` table. Split out of `collect_sidebar_status` so the DB
+/// upserts can be batched and flushed *after* the process-global glyph mutex is
+/// released — the mutex is also taken loop-side, so a stalled WAL write inside
+/// it would freeze the event loop. Pure, so it's unit-tested.
+fn glyph_persist_entry(path: &str, row: &GlyphRow) -> (String, String) {
+    (path.to_string(), serde_json::to_string(row).unwrap_or_default())
 }
 
 /// tokei line count for `path`, cached in `loc_cache` (hydration thread —
@@ -1143,6 +1168,19 @@ fn refresh_commit_cache(db: &thegn_core::db::Db, session: &crate::session::Sessi
         .ok()
         .and_then(|json| db.put_commit_cache(&loc.path(), &json).ok())
         .is_some()
+}
+
+/// Whether a freshly-fetched PR panel state is DEFINITIVE — i.e. an authoritative
+/// answer worth persisting to the `pr_cache`, as opposed to a transient failure
+/// (`Error`/`Offline`/`RateLimited`) that must never overwrite a good cached row.
+/// `Pr`/`NoPr`/`NotAuthenticated`/`NoGh` are all real answers about the PR/auth
+/// state; the transient trio are network/quota blips. Pure, so it's unit-tested.
+fn pr_state_is_definitive(state: &thegn_core::github::PanelState) -> bool {
+    use thegn_core::github::PanelState;
+    !matches!(
+        state,
+        PanelState::Error { .. } | PanelState::Offline | PanelState::RateLimited
+    )
 }
 
 /// Map the typed PR cache into the panel's pr/checks/threads/issues fields.
@@ -1793,27 +1831,23 @@ pub(crate) fn build_panel(
     }
 
     // Logs section: tail the thegn log file.
-    // Always scan for new ERRORs to surface as notifications; full tail only
-    // when the section is open (to avoid reading 5 MB on every tick).
+    // Historically this `read`+parsed the WHOLE file every pass (up to the 5 MB
+    // rotation cap) just to (a) count ERRORs and (b) build a bounded tail — on
+    // every 5s tick + every fs-watch/prefetch pass, self-amplifying since
+    // hydration itself logs. Now: the running ERROR total is tracked
+    // incrementally (only the appended suffix is scanned each pass, resetting on
+    // rotation), and the tails are built from a fixed-size END read, so cost is
+    // bounded by the *appended* bytes, not the file size. See `plan_log_scan`.
     let log_path = thegn_core::util::xdg_state_home().join("thegn/logs/thegn.log");
-    if log_path.exists()
-        && let Ok(bytes) = std::fs::read(&log_path)
+    if let Ok(meta) = std::fs::metadata(&log_path)
+        && meta.is_file()
     {
-        let content = String::from_utf8_lossy(bytes.as_ref());
-        let all_lines: Vec<_> = content
-            .lines()
-            .filter_map(thegn_core::log_view::parse_log_line)
-            .collect();
-
-        // Surface ERROR lines as a notification, but only when genuinely *new*
-        // errors have appeared since we last notified (the count grew). The log
-        // is append-only and never cleared, so a time-window dedup re-fired a
-        // fresh `read=0` row every few minutes for the same old errors, undoing
-        // the user's "mark read". See `hydrate_feed::maybe_emit_log_error`.
-        let error_count = all_lines
-            .iter()
-            .filter(|l| l.level == thegn_core::log_view::LogLevel::Error)
-            .count();
+        let cur_len = meta.len();
+        // Incremental ERROR count: scan only the newly-appended suffix and fold
+        // its error count into the process-global running total (reset on a
+        // shrink = log rotation). Kept correct for `maybe_emit_log_error`, which
+        // fires only when the *total* grows.
+        let error_count = update_log_error_total(&log_path, cur_len);
         crate::hydrate_feed::maybe_emit_log_error(
             db,
             &panel.notifications,
@@ -1821,19 +1855,149 @@ pub(crate) fn build_panel(
             app_cfg.notifications.surface_self_log_errors,
         );
 
+        // Bounded END read (~256 KB) for the tails — never the whole 5 MB file.
+        // Snap to the first full line so a mid-line start doesn't yield a
+        // corrupt row; parse just this window.
+        let tail_lines = read_log_tail_lines(&log_path, cur_len, LOG_TAIL_BYTES);
+
         if hints.open == crate::panel::Section::Logs {
-            let start = all_lines.len().saturating_sub(500);
-            panel.log_lines = all_lines[start..].to_vec();
+            let start = tail_lines.len().saturating_sub(500);
+            panel.log_lines = tail_lines[start..].to_vec();
         }
 
         // Always keep a bounded tail (unlike section-gated `log_lines`) so the
         // notification → log drilldown modal has data without new blocking I/O.
         // The drilldown opens error-gated, and errors are sparse, so a plain last-N
         // slice usually held none of them ("no matching log lines"). Fold the recent
-        // ERRORs back in — see `error_inclusive_tail`.
-        panel.log_tail = thegn_core::log_view::error_inclusive_tail(&all_lines, 400, 200);
+        // ERRORs back in — see `error_inclusive_tail`. Built from the same bounded
+        // tail window (errors older than ~256 KB back have long scrolled out).
+        panel.log_tail = thegn_core::log_view::error_inclusive_tail(&tail_lines, 400, 200);
     }
     panel
+}
+
+/// Size of the fixed END-of-file read used to build the Logs section tail +
+/// drilldown payload. 256 KB is thousands of log lines — far more than the
+/// 500-line `log_lines` / 400-line `log_tail` windows ever show — while bounding
+/// the per-pass read regardless of the file's (up to 5 MB) size.
+const LOG_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Process-global incremental log-scan state: `(last_scanned_len, error_total)`.
+/// `error_total` is the running count of ERROR lines seen across the whole file;
+/// each pass folds in only the ERRORs from the bytes appended since
+/// `last_scanned_len`, so the O(file) full re-parse is gone. Reset when the file
+/// shrinks (rotation). Mirrors the `glyph_cache` global-state pattern so it needs
+/// no threading through `build_panel`'s many call sites.
+fn log_scan_state() -> &'static std::sync::Mutex<(u64, usize)> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<(u64, usize)>> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new((0, 0)))
+}
+
+/// What to (re)scan given the previously-scanned length and the current file
+/// length. Pure, so it's unit-tested — it encodes the rotation/append logic
+/// without touching the filesystem.
+#[derive(Debug, PartialEq, Eq)]
+enum LogScanPlan {
+    /// File unchanged since last pass — no new bytes, reuse the running total.
+    Unchanged,
+    /// File grew — scan only the bytes in `[offset, cur_len)`.
+    Append { offset: u64 },
+    /// File shrank/rotated (or first ever scan) — reset the total and scan all.
+    FromStart,
+}
+
+fn plan_log_scan(prev_len: u64, cur_len: u64) -> LogScanPlan {
+    if cur_len < prev_len {
+        LogScanPlan::FromStart // rotation/truncation
+    } else if cur_len == prev_len {
+        LogScanPlan::Unchanged
+    } else if prev_len == 0 {
+        LogScanPlan::FromStart // first scan of this process
+    } else {
+        LogScanPlan::Append { offset: prev_len }
+    }
+}
+
+/// Count ERROR lines in a byte slice of (possibly partial-line-bounded) log text.
+/// The `offset` reads always start at a stored line boundary, so full lines
+/// parse cleanly; `parse_log_line` already drops any blank/partial trailing line.
+fn count_error_lines(bytes: &[u8]) -> usize {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(thegn_core::log_view::parse_log_line)
+        .filter(|l| l.level == thegn_core::log_view::LogLevel::Error)
+        .count()
+}
+
+/// Fold the ERROR lines appended since the last pass into the running total and
+/// return it. Reads only `[offset, cur_len)` on a plain append (or the whole
+/// file on first scan / after rotation), so cost tracks appended bytes, not file
+/// size. Best-effort: a read error leaves the total unchanged.
+fn update_log_error_total(log_path: &std::path::Path, cur_len: u64) -> usize {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut st = log_scan_state().lock().unwrap();
+    let (prev_len, total) = *st;
+    match plan_log_scan(prev_len, cur_len) {
+        LogScanPlan::Unchanged => total,
+        plan => {
+            let (offset, base) = match plan {
+                LogScanPlan::Append { offset } => (offset, total),
+                _ => (0, 0), // FromStart: reset the running total
+            };
+            let scanned = std::fs::File::open(log_path)
+                .and_then(|mut f| {
+                    f.seek(SeekFrom::Start(offset))?;
+                    let mut buf = Vec::new();
+                    f.take(cur_len.saturating_sub(offset)).read_to_end(&mut buf)?;
+                    Ok(buf)
+                })
+                .map(|buf| count_error_lines(&buf))
+                .unwrap_or(0);
+            let new_total = base + scanned;
+            *st = (cur_len, new_total);
+            new_total
+        }
+    }
+}
+
+/// Read the last `max_bytes` of the log and parse them into lines, snapping to
+/// the first full line so a mid-line start never yields a corrupt row. Bounded
+/// regardless of the file's size — the whole point of the change.
+fn read_log_tail_lines(
+    log_path: &std::path::Path,
+    cur_len: u64,
+    max_bytes: u64,
+) -> Vec<thegn_core::log_view::LogLine> {
+    use std::io::{Read, Seek, SeekFrom};
+    let start = cur_len.saturating_sub(max_bytes);
+    let buf = std::fs::File::open(log_path)
+        .and_then(|mut f| {
+            f.seek(SeekFrom::Start(start))?;
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf)?;
+            Ok(buf)
+        })
+        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&buf);
+    // When we started mid-file, drop the (likely partial) first line.
+    let body = if start > 0 {
+        text.find('\n').map(|i| &text[i + 1..]).unwrap_or("")
+    } else {
+        text.as_ref()
+    };
+    body.lines()
+        .filter_map(thegn_core::log_view::parse_log_line)
+        .collect()
+}
+
+/// Whether `spawn_model_hydration` must emit a fallback model to release the
+/// loop's `inflight_hydration_gen` gate. `Ok(Some(()))` = the body ran and sent
+/// a model normally; `Ok(None)` = a handled early return (e.g. `Db::open`
+/// failure) that sent nothing; `Err(_)` = a caught panic that sent nothing. Only
+/// the first case has already signalled the loop. Pure, so it's unit-tested — it
+/// locks the invariant that any non-normal exit still releases the gate.
+fn needs_fallback_send<T>(outcome: &std::thread::Result<Option<T>>) -> bool {
+    !matches!(outcome, Ok(Some(_)))
 }
 
 /// `gen` tags the result so the event loop can drop models that were spawned
@@ -1847,36 +2011,72 @@ pub(crate) fn spawn_model_hydration(
     hints: HydrateHints,
 ) {
     task::spawn_blocking(move || {
-        let Ok(db) = thegn_core::db::Db::open() else {
-            return;
-        };
-        let first = {
-            let _g = crate::perf::measure(crate::perf::Subsys::Hydrate);
-            build_model(&session, &db, hints.clone())
-        };
-        // `commits_loading` = the open Commits section needs a fresh list;
-        // `warm_commits` (set on a switch) also pre-warms a *closed* section.
-        let show_commits = first.panel.commits_loading;
-        let warm = hints.warm_commits;
-        if tx.send((generation, first)).is_ok()
-            && let Some(w) = &waker
-        {
-            let _ = w.wake();
-        }
+        // The loop gates every subsequent ticker/watcher hydration on THIS task
+        // sending a model tagged with `generation` (run.rs: `inflight_hydration_gen`
+        // is cleared only by an arriving model with that exact generation). If the
+        // task ever exits WITHOUT sending — a transient `Db::open` failure, or a
+        // panic inside `build_model`'s git/DB fan-outs — the gate strands `Some(gen)`
+        // forever and periodic model/PR/CI refresh dies for the rest of the session
+        // with nothing surfaced. So guarantee a completion signal on every exit path:
+        // catch panics, and on any failure fall back to the cheap first-frame model
+        // (still tagged `generation`) so the gate clears and the UI degrades to
+        // last-known/cached data instead of freezing.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(db) = thegn_core::db::Db::open() else {
+                tracing::warn!(
+                    target: "thegn::hydrate",
+                    "Db::open failed during model hydration — falling back to cheap model"
+                );
+                return None;
+            };
+            let first = {
+                let _g = crate::perf::measure(crate::perf::Subsys::Hydrate);
+                build_model(&session, &db, hints.clone())
+            };
+            // `commits_loading` = the open Commits section needs a fresh list;
+            // `warm_commits` (set on a switch) also pre-warms a *closed* section.
+            let show_commits = first.panel.commits_loading;
+            let warm = hints.warm_commits;
+            if tx.send((generation, first)).is_ok()
+                && let Some(w) = &waker
+            {
+                let _ = w.wake();
+            }
 
-        // `git log` can be expensive; run it only after the cache-backed model
-        // landed. Resend a refreshed model only when the list is on screen; a
-        // closed-section warm just leaves the DB cache fresh for the next open.
-        // Generation tagging drops the resend if the user switched meanwhile.
-        if (show_commits || warm)
-            && refresh_commit_cache(&db, &session)
-            && show_commits
-            && tx
-                .send((generation, build_model(&session, &db, hints)))
-                .is_ok()
-            && let Some(w) = &waker
-        {
-            let _ = w.wake();
+            // `git log` can be expensive; run it only after the cache-backed model
+            // landed. Resend a refreshed model only when the list is on screen; a
+            // closed-section warm just leaves the DB cache fresh for the next open.
+            // Generation tagging drops the resend if the user switched meanwhile.
+            if (show_commits || warm)
+                && refresh_commit_cache(&db, &session)
+                && show_commits
+                && tx
+                    .send((generation, build_model(&session, &db, hints)))
+                    .is_ok()
+                && let Some(w) = &waker
+            {
+                let _ = w.wake();
+            }
+            Some(())
+        }));
+
+        // Every non-`Some(())` outcome (Db::open failure OR a caught panic) means
+        // no model was sent for `generation`. Emit a fallback so the loop's gate
+        // clears — the cheap model needs no DB and carries the session's sidebar,
+        // so the UI keeps its last-known/cached data rather than freezing.
+        if outcome.is_err() {
+            tracing::warn!(
+                target: "thegn::hydrate",
+                "model hydration panicked — sending fallback model to release the loop gate"
+            );
+        }
+        if needs_fallback_send(&outcome) {
+            let fallback = build_initial_model(&session, None);
+            if tx.send((generation, fallback)).is_ok()
+                && let Some(w) = &waker
+            {
+                let _ = w.wake();
+            }
         }
     });
 }
@@ -1954,7 +2154,18 @@ pub(crate) fn spawn_pr_cache_refresh(
         let Ok(json) = serde_json::to_string(&panel) else {
             return;
         };
-        let _ = db.put_pr_cache(&loc.path(), &panel.branch, &json);
+        // Only overwrite the cache for DEFINITIVE states. A transient
+        // Error/Offline/RateLimited (a network blip) must NOT clobber a good
+        // cached PrPanel: doing so drops the cached PR/checks/threads (the panel
+        // then renders only the error note) AND resets `old_pr_state` to `None`,
+        // so a later OPEN→MERGED transition through the blip would miss its
+        // notification + `move_on_merge` automation. Keeping the last-known row
+        // preserves both the displayed data and the transition diff. See
+        // `pr_state_is_definitive` and `github.rs`'s Offline doc ("Stale cached
+        // data may still be shown").
+        if pr_state_is_definitive(&panel.state) {
+            let _ = db.put_pr_cache(&loc.path(), &panel.branch, &json);
+        }
 
         // Emit a notification when the PR transitions between states
         // (e.g. OPEN → MERGED). Only fires when there was a prior known state
@@ -2571,30 +2782,60 @@ pub(crate) fn retarget_diff_watcher(
                 last_send = Instant::now();
             }
         });
-        if let Ok(mut nw) = new_watcher
-            && nw.watch(&cwd, RecursiveMode::Recursive).is_ok()
+        let Ok(mut nw) = new_watcher else {
+            tracing::warn!(
+                target: "thegn::hydrate",
+                worktree = %cwd.display(),
+                "failed to construct diff fs-watcher — diff panel falls back to the 2s ticker"
+            );
+            return;
+        };
+        // Register the recursive root watch. On a machine whose
+        // `fs.inotify.max_user_watches` is exhausted (large monorepos, many
+        // instances) this fails with ENOSPC — previously the thread just exited
+        // silently, and `retarget`'s guard suppressed every retry, so the active
+        // worktree lost sub-second diff/ref-move/push detection for the rest of
+        // the session with no diagnostic. Fall back to a NON-recursive watch on
+        // the worktree root (one watch, not thousands): coarser (top-level edits
+        // + git-state paths under it still fire) but keeps the ref-move / push
+        // kicks working, and — crucially — still sends a watcher back so the loop
+        // adopts it (a later retarget away-and-back re-attempts the recursive one).
+        let recursive_ok = nw.watch(&cwd, RecursiveMode::Recursive).is_ok();
+        if !recursive_ok {
+            let fallback_ok = nw.watch(&cwd, RecursiveMode::NonRecursive).is_ok();
+            tracing::warn!(
+                target: "thegn::hydrate",
+                worktree = %cwd.display(),
+                fallback_ok,
+                "recursive diff fs-watch registration failed (inotify watches exhausted?) — \
+                 fell back to a non-recursive root watch"
+            );
+            if !fallback_ok {
+                // Nothing attached at all — don't ship a dead watcher; the 2s
+                // safety-net ticker covers diff refresh until the next retarget.
+                return;
+            }
+        }
+        // Linked worktree: add targeted watches on the external gitdir's
+        // state-bearing subtrees. Non-recursive on the gitdir roots (so we
+        // never descend into `objects/`, which floods on every commit/gc);
+        // `logs/` (reflog) and `refs/` are small and never written by
+        // hydration's read-only git, so a recursive watch there is storm-
+        // safe. Any root already under `cwd` is skipped — the recursive
+        // root watch above covers the main checkout.
+        for root in [git_dir.as_ref(), common_dir.as_ref()]
+            .into_iter()
+            .flatten()
         {
-            // Linked worktree: add targeted watches on the external gitdir's
-            // state-bearing subtrees. Non-recursive on the gitdir roots (so we
-            // never descend into `objects/`, which floods on every commit/gc);
-            // `logs/` (reflog) and `refs/` are small and never written by
-            // hydration's read-only git, so a recursive watch there is storm-
-            // safe. Any root already under `cwd` is skipped — the recursive
-            // root watch above covers the main checkout.
-            for root in [git_dir.as_ref(), common_dir.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                if root.starts_with(&cwd) {
-                    continue;
-                }
-                let _ = nw.watch(root, RecursiveMode::NonRecursive);
-                let _ = nw.watch(&root.join("logs"), RecursiveMode::Recursive);
-                let _ = nw.watch(&root.join("refs"), RecursiveMode::Recursive);
+            if root.starts_with(&cwd) {
+                continue;
             }
-            if wtx.send((cwd, nw)).is_ok() {
-                let _ = w.wake();
-            }
+            let _ = nw.watch(root, RecursiveMode::NonRecursive);
+            let _ = nw.watch(&root.join("logs"), RecursiveMode::Recursive);
+            let _ = nw.watch(&root.join("refs"), RecursiveMode::Recursive);
+        }
+        if wtx.send((cwd, nw)).is_ok() {
+            let _ = w.wake();
         }
     });
 }

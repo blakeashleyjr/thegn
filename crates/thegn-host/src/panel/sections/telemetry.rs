@@ -5,6 +5,7 @@
 
 use thegn_core::theme::Hue;
 use thegn_core::viz;
+use unicode_width::UnicodeWidthChar;
 
 use crate::seg::{Line, Tok, seg, sp};
 
@@ -428,7 +429,7 @@ fn disk_rows(ctx: &SectionCtx, meter_w: usize) -> Vec<PanelRow> {
         };
         let mut l = vec![
             sp(1),
-            seg(d(), format!("{:<10} ", trunc(&disk.mount, 10))),
+            seg(d(), format!("{} ", trunc_pad(&disk.mount, 10))),
             seg(t(), format!("{:>3}% ", disk.free_pct)),
         ];
         l.extend(bar_segs(disk.free_pct as f32 / 100.0, meter_w, tone));
@@ -491,13 +492,77 @@ fn fmt_uptime_secs(secs: u64) -> String {
     }
 }
 
-/// Truncate a string to `n` chars (no ellipsis — width is precious here).
-fn trunc(s: &str, n: usize) -> String {
-    s.chars()
-        .rev()
-        .take(n)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
+/// Left-truncate a string to the right-anchored suffix whose *display* width is
+/// `<= n` cells, then right-pad with spaces to exactly `n` columns. No ellipsis
+/// — width is precious in the DISK column. Uses unicode-width (the chrome layout
+/// invariant): a mount with wide glyphs (e.g. `/run/media/user/ボリューム`) keeps
+/// the DISK row's downstream clusters column-aligned instead of overflowing.
+fn trunc_pad(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    // Walk from the tail, accumulating display width until the next glyph would
+    // exceed the budget — the widest right-anchored suffix that fits in `n` cells.
+    let mut used = 0usize;
+    let mut from = chars.len();
+    while from > 0 {
+        let w = UnicodeWidthChar::width(chars[from - 1]).unwrap_or(0);
+        if used + w > n {
+            break;
+        }
+        used += w;
+        from -= 1;
+    }
+    let mut out: String = chars[from..].iter().collect();
+    // Pad by display width, not char count, to land on exactly `n` columns.
+    for _ in used..n {
+        out.push(' ');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn trunc_pad_ascii_fits_and_pads_to_width() {
+        // Shorter than budget → right-padded to exactly n columns.
+        let out = trunc_pad("/", 10);
+        assert_eq!(out, "/         ");
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 10);
+        // Exactly n chars → unchanged, no padding.
+        assert_eq!(trunc_pad("0123456789", 10), "0123456789");
+    }
+
+    #[test]
+    fn trunc_pad_ascii_keeps_the_right_anchored_tail() {
+        // Longer than budget → keeps the tail (the mount leaf), like the old
+        // char-count trunc did for ASCII.
+        let out = trunc_pad("/run/media/user/backup", 10);
+        assert_eq!(out, "ser/backup");
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 10);
+    }
+
+    #[test]
+    fn trunc_pad_wide_glyphs_land_on_exact_display_width() {
+        // A CJK mount leaf: 4 wide glyphs = 8 columns. Budget 10 → the whole
+        // "ボリューム" (5 glyphs = 10 cols) is exactly the budget; the render must
+        // be exactly 10 display cells, not 10 *chars* (which would be ~20 cols).
+        let mount = "/run/media/user/ボリューム";
+        let out = trunc_pad(mount, 10);
+        // Display width is exactly 10 (not char count) — this is the regression:
+        // the old `{:<10}` + char-count trunc produced up to ~20 columns.
+        assert_eq!(
+            UnicodeWidthStr::width(out.as_str()),
+            10,
+            "DISK mount must render at its display width, got {out:?}"
+        );
+        // The kept suffix is the wide leaf, right-anchored.
+        assert!(out.contains('ム'), "keeps the tail: {out:?}");
+
+        // And the full seg (mount + trailing space) is 11 columns, matching the
+        // format!("{} ", ...) call site — proving downstream clusters stay aligned.
+        let full = format!("{out} ");
+        assert_eq!(UnicodeWidthStr::width(full.as_str()), 11);
+    }
 }
