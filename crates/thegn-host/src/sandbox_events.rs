@@ -61,6 +61,9 @@ pub fn spawn(network_audit: bool, tx: tokio_mpsc::UnboundedSender<SandboxEventBa
 // Exec events
 // ---------------------------------------------------------------------------
 
+// off-loop: runs on the events-stream thread; the blocking reap on EOF is
+// exactly the point (audit run.rs:825).
+#[expect(clippy::disallowed_methods)]
 fn subscribe_exec(tx: Arc<tokio_mpsc::UnboundedSender<SandboxEventBatch>>) {
     let Ok(mut child) = Command::new("podman")
         .args([
@@ -89,6 +92,11 @@ fn subscribe_exec(tx: Arc<tokio_mpsc::UnboundedSender<SandboxEventBatch>>) {
             let _ = tx.send(batch);
         }
     }
+    // Reap the `podman events` child when the stream ends (EOF on daemon
+    // restart / no socket): a dropped `Child` is never waited on, leaving a
+    // zombie for the life of the long-running host. best-effort. See audit
+    // run.rs:825.
+    let _ = child.wait();
 }
 
 /// Parse a single JSON event line from `podman events` and write to DB.
@@ -117,6 +125,9 @@ fn process_exec_event(json: &str) -> Option<SandboxEventBatch> {
 // Network events
 // ---------------------------------------------------------------------------
 
+// off-loop: runs on the events-stream thread; the blocking reap on EOF is
+// exactly the point (audit run.rs:825).
+#[expect(clippy::disallowed_methods)]
 fn subscribe_network(tx: Arc<tokio_mpsc::UnboundedSender<SandboxEventBatch>>) {
     let Ok(mut child) = Command::new("podman")
         .args([
@@ -143,6 +154,9 @@ fn subscribe_network(tx: Arc<tokio_mpsc::UnboundedSender<SandboxEventBatch>>) {
             let _ = tx.send(batch);
         }
     }
+    // Reap the child on stream EOF so it doesn't linger as a zombie (audit
+    // run.rs:825). best-effort.
+    let _ = child.wait();
 }
 
 fn process_network_event(json: &str) -> Option<SandboxEventBatch> {

@@ -355,7 +355,10 @@ fn kick_diff_doc_fetch(
         // off-loop: inside spawn_blocking
         #[expect(clippy::disallowed_methods)]
         let text = loc
-            .git_command(&["diff", "--no-color", "HEAD", "--", &path])
+            // `--no-ext-diff`: a configured `[diff] external` / GIT_EXTERNAL_DIFF
+            // driver emits non-unified output that `diff_sbs::parse_unified`
+            // can't parse (silent empty side-by-side view). See audit run.rs:346.
+            .git_command(&["diff", "--no-ext-diff", "--no-color", "HEAD", "--", &path])
             .output()
             .ok()
             .filter(|o| o.status.success())
@@ -742,9 +745,15 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let config_waker = waker.clone();
     std::thread::spawn(move || {
         if let Some(parent) = config_path.parent() {
-            let mut last_send = std::time::Instant::now();
             let overrides_clone = cli.overrides.clone();
             let config_clone = cli.config.clone();
+            // TRAILING-edge debounce (audit run.rs:744): the notify callback only
+            // *signals* an event arrived; a coalescing recv loop below waits for
+            // the burst to stop before loading, so a truncate+write save (VS Code,
+            // `>` redirect) loads the COMPLETE file, not the empty truncate. A
+            // leading-edge load would read the empty intermediate and drop the
+            // trailing complete-content event.
+            let (ev_tx, ev_rx) = std::sync::mpsc::channel::<()>();
             if let Ok(mut watcher) = recommended_watcher(move |res: notify::Result<Event>| {
                 if let Ok(ev) = res
                     && matches!(
@@ -753,8 +762,22 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                             | notify::EventKind::Create(_)
                             | notify::EventKind::Remove(_)
                     )
-                    && last_send.elapsed() > std::time::Duration::from_millis(500)
                 {
+                    // best-effort: the recv loop owns the coalescing/load; a full
+                    // channel already has a pending wake-up, so a drop is fine.
+                    let _ = ev_tx.send(());
+                }
+            }) {
+                let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
+                let debounce = std::time::Duration::from_millis(200);
+                loop {
+                    // Block until the first event of a burst…
+                    if ev_rx.recv().is_err() {
+                        break; // watcher dropped
+                    }
+                    // …then drain everything that lands within the debounce window,
+                    // re-arming on each event so we only load once events stop.
+                    while ev_rx.recv_timeout(debounce).is_ok() {}
                     let new_cfg_res = thegn_core::config::Config::try_load_layered(
                         &thegn_core::config::ProcessEnv,
                         &overrides_clone,
@@ -767,12 +790,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                     if config_tx.send(new_cfg_res).is_ok() {
                         let _ = config_waker.wake();
                     }
-                    last_send = std::time::Instant::now();
-                }
-            }) {
-                let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
-                loop {
-                    std::thread::sleep(std::time::Duration::MAX);
                 }
             }
         }
@@ -832,9 +849,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (sandbox_event_tx, sandbox_event_rx) =
         tokio_mpsc::unbounded_channel::<crate::sandbox_events::SandboxEventBatch>();
     crate::sandbox_events::spawn(cfg.sandbox.network_audit, sandbox_event_tx);
-    // Drain sandbox_event_rx in the event loop below: model goes dirty so the
-    // panel audit log re-renders.
-    let _ = sandbox_event_rx; // placeholder until wired into event_loop
+    // Drained in the event loop below (audit run.rs:825): a container event was
+    // written to the DB, so mark the audit panel dirty. Draining also stops the
+    // unbounded channel from growing for the process lifetime when the sidecar
+    // produces but nothing consumes.
 
     // Notification event bus (items 420/421/430): aggregates git/agent/test/log
     // events and feeds desktop notifications + the in-app inbox + sidebar badges.
@@ -889,6 +907,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         container_rx,
         metrics_rx,
         ai_metrics_rx,
+        sandbox_event_rx,
         stats_interval_ms,
         stats_live,
         waker,
@@ -1466,7 +1485,16 @@ pub(crate) fn forget_worktree_group(
     // The registry row is gone, so its sidebar pin keys (`pin:{slug}/{branch}`
     // and the filed variant `pin:{slug}/{branch}/folder:{id}`) would orphan in
     // ui_state. best-effort: cache-only keys. (The group name IS `slug/branch`.)
-    let _ = db.del_ui_state_prefix(SIDEBAR_SCOPE, &format!("pin:{}", group.name));
+    //
+    // Segment-anchored (audit run.rs:1457): delete the exact `pin:{name}` key +
+    // everything under `pin:{name}/`, NOT the bare `pin:{name}` prefix — a raw
+    // `LIKE 'pin:myrepo/fix%'` also wipes an unrelated sibling `myrepo/fixup`.
+    crate::handlers::workspace_remove::del_ui_state_segment(
+        db,
+        SIDEBAR_SCOPE,
+        "pin",
+        &group.name,
+    );
     // Tear down any sandbox container for this worktree in the background
     // (best-effort: we fire-and-forget on a dedicated thread so the event loop
     // is never blocked by a slow container runtime).
@@ -1727,181 +1755,6 @@ pub(crate) fn delete_groups(
         status.push_str(" (home checkout skipped)");
     }
     status
-}
-
-/// Remove a workspace — the single path behind both Alt+Shift+X and the sidebar
-/// "Remove workspace" action. Always closes every live worktree group the
-/// workspace owns and prunes its DB rows (`workspaces`, the `worktrees`
-/// registry, its slug, and the active-workspace pointer). When `keep_files` is
-/// false it *also* deletes the workspace's worktree directories from disk (the
-/// home checkout at `repo_path` is always preserved); when true the files stay
-/// on disk and the workspace re-appears if reopened. If the removed workspace is
-/// the active one, the session switches to the next available workspace (or
-/// empties when none remain).
-/// Worktree directories to delete from disk when removing the workspace at
-/// `repo_path`: every registered worktree whose `repo_root` matches, EXCEPT the
-/// home checkout (its path == `repo_path`, which must never be deleted) and any
-/// empty-path legacy rows. Split out so the safety-critical home-skip guard is
-/// unit-testable without real I/O.
-fn workspace_worktree_dirs(db: &thegn_core::db::Db, repo_path: &str) -> Vec<String> {
-    db.worktrees()
-        .map(|rows| {
-            rows.into_iter()
-                .filter(|w| {
-                    w.repo_root == repo_path && w.worktree != repo_path && !w.worktree.is_empty()
-                })
-                .map(|w| w.worktree)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn remove_workspace(
-    session: &mut crate::session::Session,
-    panes: &mut Panes,
-    repo_path: &str,
-    slug: &str,
-    display: &str,
-    keep_files: bool,
-) -> String {
-    let db = thegn_core::db::Db::open().ok();
-    let was_active = session.id == repo_path;
-
-    // Read the workspace's branch-worktree dirs from the registry BEFORE
-    // `remove_workspace_with_db` prunes it. The home checkout (its path ==
-    // `repo_path`) is never included — only branch worktrees. Used either to
-    // delete them (destructive) or to report how many survive (keep-files).
-    let worktree_dirs = db
-        .as_ref()
-        .map(|db| workspace_worktree_dirs(db, repo_path))
-        .unwrap_or_default();
-
-    // Destructive: delete the workspace's worktree dirs from disk.
-    if !keep_files {
-        let root = Path::new(repo_path);
-        for path in &worktree_dirs {
-            thegn_core::worktree::remove(root, Path::new(path), "", false);
-            thegn_core::worktree::purge_worktree_files(Path::new(path));
-        }
-    }
-
-    remove_workspace_with_db(session, panes, db.as_ref(), repo_path, slug);
-
-    // Removing the active workspace leaves the session pointing at nothing;
-    // land on the next available workspace, else empty out.
-    if was_active {
-        land_after_workspace_removed(session, db.as_ref());
-    }
-
-    workspace_removed_status(display, keep_files, worktree_dirs.len())
-}
-
-/// After removing the *active* workspace, land on the first remaining workspace,
-/// or empty the session (no dangling context) when none remain. Split out so it
-/// can be unit-tested with an injected DB (the parent opens the process DB).
-fn land_after_workspace_removed(
-    session: &mut crate::session::Session,
-    db: Option<&thegn_core::db::Db>,
-) {
-    let mut switched = false;
-    if let Some(db) = db
-        && let Ok(workspaces) = db.workspaces()
-        && let Some(next) = workspaces.first()
-    {
-        switched = session.switch_to_workspace(&next.repo_path, db).is_ok();
-    }
-    if !switched {
-        session.id.clear();
-        session.worktrees.clear();
-        session.active = 0;
-    }
-}
-
-/// The status line after a workspace removal. Non-destructive (`keep_files`)
-/// removals report the orphaned-worktree count so the user knows what survived.
-fn workspace_removed_status(display: &str, keep_files: bool, orphan_count: usize) -> String {
-    if keep_files {
-        match orphan_count {
-            0 => format!("Removed workspace '{display}' (files kept on disk)"),
-            1 => format!("Removed workspace '{display}' (1 worktree remains on disk)"),
-            n => format!("Removed workspace '{display}' ({n} worktrees remain on disk)"),
-        }
-    } else {
-        format!("Deleted workspace '{display}' (worktrees removed from disk)")
-    }
-}
-
-/// Engine for [`remove_workspace`], split from the process-global `Db::open()`
-/// so tests can inject an isolated DB. Closes the workspace's live groups
-/// (always, reaping their panes) and — when a `db` is present — prunes every DB
-/// trace and persists the trimmed layout. Non-destructive: never touches the
-/// worktree files on disk.
-fn remove_workspace_with_db(
-    session: &mut crate::session::Session,
-    panes: &mut Panes,
-    db: Option<&thegn_core::db::Db>,
-    repo_path: &str,
-    slug: &str,
-) {
-    // Close (forget, never delete from disk) the workspace's live groups,
-    // highest index first so earlier indices stay valid as groups are removed.
-    let mut targets: Vec<usize> = session
-        .worktrees
-        .iter()
-        .enumerate()
-        .filter_map(|(gi, g)| {
-            crate::sidebar::split_tab(&g.name)
-                .filter(|(repo, _)| repo == slug)
-                .map(|_| gi)
-        })
-        .collect();
-    targets.sort_unstable_by(|a, b| b.cmp(a));
-    for gi in targets {
-        if gi >= session.worktrees.len() {
-            continue;
-        }
-        if let Some(db) = db {
-            forget_worktree_group(db, &session.id, &session.worktrees[gi]);
-        }
-        for tab in &session.worktrees[gi].tabs {
-            for id in tab.center.pane_ids() {
-                panes.table.remove(&id);
-            }
-        }
-        session.switch_to(gi);
-        session.close_active_group();
-    }
-
-    if let Some(db) = db {
-        // Prune every DB trace so the workspace doesn't re-render or resurrect.
-        let _ = db.del_worktrees_for_repo(repo_path);
-        let _ = db.del_workspace(repo_path);
-        let _ = db.del_repo_slug(repo_path);
-        if db.active_workspace().ok().flatten().as_deref() == Some(repo_path) {
-            let _ = db.del_ui_state("", "active_workspace");
-        }
-        // …including its sidebar view state: `collapse:{slug}`, `pin:{slug}`,
-        // `pin:{slug}/{branch}`, `collapse:{slug}/folder:{id}` would otherwise
-        // orphan in ui_state forever. best-effort: cache-only keys.
-        let _ = db.del_ui_state_prefix(SIDEBAR_SCOPE, &format!("collapse:{slug}"));
-        let _ = db.del_ui_state_prefix(SIDEBAR_SCOPE, &format!("pin:{slug}"));
-        // Persist the trimmed layout: otherwise `tab_groups`/`group_tabs`
-        // resurrect the closed groups on the next launch (see `delete_groups`).
-        let _ = session.persist(db, &session.id, now_secs());
-    }
-}
-
-/// Drop a just-removed workspace (and the registered-worktree rows its
-/// empty-live-groups branch would re-render) from the cached sidebar lists that
-/// [`refresh_tab_model`] rebuilds from. Without this the row lingers until the
-/// next full hydration re-reads the DB, so [`remove_workspace`] appears to do
-/// nothing. Kept as a free fn so the prune is exercised by the same code the
-/// event loop runs, not a copy.
-fn forget_workspace_in_model(model: &mut FrameModel, slug: &str, repo_path: &str) {
-    model
-        .sidebar_workspaces
-        .retain(|(s, _, _, p)| !(s == slug && p == repo_path));
-    model.sidebar_db_worktrees.retain(|w| w.slug != slug);
 }
 
 /// Remove group `gi` from the session (its dir vanished from disk — deleted
@@ -4922,6 +4775,32 @@ fn spawn_clean_shell_pane(
     panes.spawn(cfg, dir, center)
 }
 
+/// Kick a background pre-warm of the sandbox chain for `dir` OFF the event loop
+/// (audit run.rs:4951). `apply_layout_to_active_tab` spawns N leaves back-to-back
+/// on the loop, each calling `agent::launch_spec` → `prepare_sandbox_env`; on a
+/// cold/wedged container runtime the FIRST resolution can block for seconds to
+/// minutes (podman `ensure` pulls an image / a hung `inspect`). Kicking a
+/// `spawn_blocking(launch_spec)` when the layout action is *initiated* (menu
+/// open / prompt submit) runs that expensive `ensure` off the loop and warms its
+/// cache, so the subsequent on-loop resolutions hit the warm runtime. Fire-and-
+/// forget: the on-loop path still re-resolves (and surfaces its own
+/// error/degradation) — this only shrinks the window in which it can block.
+/// No-op for a local/down env or a missing dir.
+fn prewarm_sandbox_chain(cfg: &thegn_core::config::Config, dir: Option<std::path::PathBuf>) {
+    let Some(dir) = dir.filter(|d| d.is_dir()) else {
+        return;
+    };
+    let cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || {
+        let wt = dir.to_string_lossy().into_owned();
+        // A down/halted env has nothing warmable; a local env's chain is cheap.
+        if crate::agent::env_halt_reason(&cfg, &wt).is_some() {
+            return;
+        }
+        let _ = crate::agent::launch_spec(&cfg, &wt, None, "shell");
+    });
+}
+
 /// Capture the active tab's pane layout as an abstract `LayoutSpec` (items
 /// 99/115). Each leaf records its program (a plain shell → `None`).
 fn active_tab_layout_spec(
@@ -5430,8 +5309,14 @@ fn attach_agent_pane(
                     loop {
                         match connect_agent_channel(&acp_channel).await {
                             Ok((client, mut rx)) => {
-                                failures = 0;
-                                backoff = std::time::Duration::from_millis(500);
+                                // NOTE: do NOT reset failures/backoff here (audit
+                                // run.rs:5421). An endpoint that accepts TCP but
+                                // fails `initialize()` (wrong port, stale protocol)
+                                // would otherwise reset the counter every cycle —
+                                // the >=5 give-up would be unreachable and the loop
+                                // would spin at 2Hz forever, spamming the log. Reset
+                                // only on a *fully successful* connect (after
+                                // initialize succeeds, below).
                                 let client = std::sync::Arc::new(client);
                                 if let Err(e) = client.initialize().await {
                                     failures += 1;
@@ -5447,6 +5332,14 @@ fn attach_agent_pane(
                                     tracing::warn!(target: "thegn::acp", attempt = failures, "ACP initialize failed (retrying): {e}");
                                     emit(crate::chrome::AgentConn::Connecting);
                                 } else {
+                                    // A fully-successful connect serves the message
+                                    // stream and then `return`s — it never loops
+                                    // back, so no failures/backoff reset is needed
+                                    // (audit run.rs:5421). The counter must NOT be
+                                    // reset before `initialize()`: a listener that
+                                    // accepts TCP but fails initialize would reset
+                                    // every cycle, making the >=5 give-up
+                                    // unreachable and spinning at 2Hz forever.
                                     if let Err(e) = client.connect_mcp("thegn-house").await {
                                         tracing::warn!(target: "thegn::acp", "mcp/connect failed: {e}");
                                     }
@@ -5875,6 +5768,7 @@ async fn event_loop<T: Terminal>(
     mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<thegn_core::sandbox::ContainerInfo>>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
     mut ai_metrics_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::AiMetrics>,
+    mut sandbox_event_rx: tokio_mpsc::UnboundedReceiver<crate::sandbox_events::SandboxEventBatch>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     waker: TerminalWaker,
@@ -6750,23 +6644,19 @@ async fn event_loop<T: Terminal>(
     // new workspace's git glyphs render blank until something repopulates them.
     // Without this they only return when the ~1s refresh ticker fires. Mirrors
     // the inline spawns used by the panel refresh/notification handlers.
+    // Request a fresh model hydration for the active worktree. This does NOT
+    // spawn directly (audit run.rs:7482): every kick site accompanies an active-
+    // path change (workspace switch, clone-done, `thegn open`, picker), and the
+    // loop-top switch-detection block bumps `hydration_gen` before any drain,
+    // which would drop a directly-kicked spawn's result on arrival — a full,
+    // doomed `build_model` (git status/branch/DB reads across the workspace)
+    // computed and thrown away at the most latency-sensitive moment. Instead we
+    // set the coalescing flags; the gate below spawns exactly ONE correctly-
+    // tagged hydration this iteration (and pre-warms the commit cache).
     macro_rules! kick_model_hydration {
         () => {{
-            hydration_gen += 1;
-            crate::hydrate::spawn_model_hydration(
-                model_tx.clone(),
-                hydration_gen,
-                session.clone(),
-                Some(waker.clone()),
-                crate::hydrate::HydrateHints {
-                    open: panel_ui.open,
-                    expanded: panel_ui.width.is_expanded(),
-                    // Discrete switch/activation event: pre-warm the active
-                    // worktree's commit cache so opening Commits is instant.
-                    warm_commits: true,
-                    ..Default::default()
-                },
-            );
+            model_refresh_pending = true;
+            warm_commits_next = true;
         }};
     }
 
@@ -6910,15 +6800,18 @@ async fn event_loop<T: Terminal>(
                         // Confirm skipped: take the SAFE arm (keep
                         // files) — an unprompted action must never
                         // delete worktree dirs from disk.
-                        model.status = remove_workspace(
+                        model.status = crate::handlers::workspace_remove::remove_workspace(
                             &mut session,
                             &mut panes,
                             &repo_path,
                             &slug,
                             &display,
                             true,
+                            Some(waker.clone()),
                         );
-                        forget_workspace_in_model(&mut model, &slug, &repo_path);
+                        crate::handlers::workspace_remove::forget_workspace_in_model(
+                            &mut model, &slug, &repo_path,
+                        );
                         sb.marked.clear();
                         refresh_tab_model(&mut model, &session, &mut sb);
                         sb.focus_active_row(&mut model);
@@ -8009,8 +7902,17 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
         // Named task (Tasks section) run outcomes.
+        let active_task_wt = active_tab_path(&session).to_string_lossy().into_owned();
         while let Ok(outcome) = named_task_run_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
+            // Gate on the outcome's worktree (audit run.rs:8081): a task that
+            // finishes AFTER the user switched worktrees must not inject its
+            // (worktree-A-relative) diagnostics + run record into worktree B's
+            // panel. The sibling test-runner drain gates the same way. Drop the
+            // mismatch — its state is per-worktree and re-derived on return.
+            if !active_task_wt.is_empty() && outcome.worktree != active_task_wt {
+                continue;
+            }
             let elapsed_s = outcome.duration_ms as f64 / 1000.0;
             let exit = outcome.exit_code.unwrap_or(-1);
             let rec = crate::panel::TaskRunRecord {
@@ -8505,7 +8407,17 @@ async fn event_loop<T: Terminal>(
                 Err(e) => {
                     tracing::debug!(target: "thegn::drawer", dir = %ddir.display(), %e,
                         "drawer spec resolution failed");
-                    drawer_show_pending = None;
+                    // Only clear the user's pending show/focus intent if THIS
+                    // failure is for the dir they toggled (audit run.rs:8577):
+                    // an unrelated background prewarm's Err must not cancel a
+                    // pending show for a different worktree. Mirrors the Ok
+                    // path's dir-key filter below.
+                    if drawer_show_pending
+                        .as_ref()
+                        .is_some_and(|(d, _)| d == &ddir)
+                    {
+                        drawer_show_pending = None;
+                    }
                     continue;
                 }
             };
@@ -8553,7 +8465,14 @@ async fn event_loop<T: Terminal>(
         // FileIndexReady is special: it propagates back to `file_index` for
         // future searches rather than updating displayed results.
         if let Some(ps) = palette.as_mut() {
-            // Drain the channel; FileIndexReady is peeled out first.
+            // Drain the WHOLE channel in one pass (audit run.rs:8664): install
+            // every FileIndexReady (the loop owns `file_index`) and BUFFER every
+            // other result, then push the buffered results back for
+            // `drain_results` to apply. Breaking on the first non-ready result
+            // and re-queuing it (the old shape) could ping-pong a match batch
+            // and a FileIndexReady forever when the batch sat ahead of the ready
+            // event in the channel — neither was ever consumed.
+            let mut deferred: Vec<crate::search_everywhere::AsyncSearchResult> = Vec::new();
             loop {
                 match ps.result_rx.try_recv() {
                     Ok(crate::search_everywhere::AsyncSearchResult::FileIndexReady {
@@ -8590,13 +8509,14 @@ async fn event_loop<T: Terminal>(
                         }
                         dirty = true;
                     }
-                    Ok(result) => {
-                        // Re-queue for drain_results which handles gen filtering.
-                        let _ = ps.result_tx.send(result);
-                        break;
-                    }
+                    Ok(result) => deferred.push(result),
                     Err(_) => break,
                 }
+            }
+            // Hand the non-ready results back to drain_results (it owns the
+            // per-generation filtering + application).
+            for result in deferred {
+                let _ = ps.result_tx.send(result);
             }
             if ps.drain_results() {
                 dirty = true;
@@ -8683,12 +8603,26 @@ async fn event_loop<T: Terminal>(
             // full path.
             let prev_rows = (!model_changed && sb.creating.is_empty())
                 .then(|| std::mem::take(&mut model.sidebar_rows));
+            // These three panel fields are LOOP-owned and NOT populated by
+            // hydration (`build_model` never touches them — verified), so the
+            // fresh model carries empty defaults and the swap would wipe them
+            // every ~2s tick (audit run.rs:8755): the named-task last-run record
+            // + its `running` spinner (Tasks section), the task-extracted Problems
+            // entries, and the streamed structured Logs ring. Carry them over.
+            // (LSP diags are re-merged from `lsp_diags` below; `merge_into`
+            // retains the non-`lsp:` task entries we preserve here.)
+            let task_last_runs = std::mem::take(&mut model.panel.task_last_runs);
+            let log_lines_structured = std::mem::take(&mut model.panel.log_lines_structured);
+            let task_diagnostics = std::mem::take(&mut model.panel.diagnostics);
             model = next_model;
             model.stats = stats;
             model.metrics = metrics;
             model.load_steps = load_steps;
             model.load_context = load_context;
             model.pool = pool;
+            model.panel.task_last_runs = task_last_runs;
+            model.panel.log_lines_structured = log_lines_structured;
+            model.panel.diagnostics = task_diagnostics;
             if model.status.is_empty() {
                 model.status = prev_status;
             }
@@ -8699,10 +8633,12 @@ async fn event_loop<T: Terminal>(
                 active_tab_path(&session),
                 crate::handlers::switch_cache::WorktreeSlice::seed_from(&model),
             );
-            // A fresh model carries only git/db diagnostics; re-apply LSP ones.
-            if !lsp_diags.is_empty() {
-                lsp_diags.merge_into(&mut model.panel.diagnostics);
-            }
+            // We preserved the loop-owned diagnostics (task-sourced) across the
+            // swap; re-apply the LSP ones from their store. `merge_into` first
+            // drops every `lsp:`-sourced entry, so calling it unconditionally
+            // (even when empty) correctly clears stale LSP diags without touching
+            // the preserved task entries.
+            lsp_diags.merge_into(&mut model.panel.diagnostics);
             // Shares live on the supervisor (loop-local), not in hydration; a
             // fresh model wouldn't carry them — re-apply for the active worktree.
             model.shares = current_share_views(&share_supervisor, &session);
@@ -8974,14 +8910,28 @@ async fn event_loop<T: Terminal>(
                 model.metrics = state;
                 dirty = true;
             }
-            while let Ok(ai_state) = ai_metrics_rx.try_recv() {
-                loop_perf.tick(crate::perf::WakeSource::Metrics);
-                if model.ai_metrics.as_ref() != Some(&ai_state) {
-                    model.ai_metrics = Some(ai_state);
-                    // AI metrics render in the statusbar → bars path, not full.
-                    bars_dirty = true;
-                }
+        }
+
+        // AI sidecar metrics — a SIBLING drain (audit run.rs:9046), not nested
+        // inside the metrics drain: the two producers are independent, and with
+        // `[metrics]` targets empty (the default) the metrics loop body never
+        // runs, so a nested drain would never consume ai_metrics — the unbounded
+        // channel would grow forever and every sidecar wake would be wasted.
+        while let Ok(ai_state) = ai_metrics_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Metrics);
+            if model.ai_metrics.as_ref() != Some(&ai_state) {
+                model.ai_metrics = Some(ai_state);
+                // AI metrics render in the statusbar → bars path, not full.
+                bars_dirty = true;
             }
+        }
+
+        // Sandbox container audit events (podman exec/network) landed in the DB
+        // off-thread; drain so the audit panel re-renders and the channel can't
+        // grow unbounded (audit run.rs:825).
+        while sandbox_event_rx.try_recv().is_ok() {
+            loop_perf.tick(crate::perf::WakeSource::Container);
+            dirty = true;
         }
 
         // Panel document payloads from the on-entry fetches; stale
@@ -12672,15 +12622,18 @@ async fn event_loop<T: Terminal>(
                                 && let Some((repo_path, slug, display)) =
                                     pending_delete_workspace.take()
                             {
-                                model.status = remove_workspace(
+                                model.status = crate::handlers::workspace_remove::remove_workspace(
                                     &mut session,
                                     &mut panes,
                                     &repo_path,
                                     &slug,
                                     &display,
                                     keep_files,
+                                    Some(waker.clone()),
                                 );
-                                forget_workspace_in_model(&mut model, &slug, &repo_path);
+                                crate::handlers::workspace_remove::forget_workspace_in_model(
+                                    &mut model, &slug, &repo_path,
+                                );
                                 sb.marked.clear();
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 sb.focus_active_row(&mut model);
@@ -16827,6 +16780,12 @@ async fn event_loop<T: Terminal>(
                                         "No saved layouts yet — use \"Save layout as…\" first"
                                             .into();
                                 } else {
+                                    // Kick the sandbox pre-warm now (audit
+                                    // run.rs:4951): by the time the user types a
+                                    // name and hits Enter, `launch_spec`'s podman
+                                    // `ensure` is already warm off-loop, so the
+                                    // on-loop apply won't block on a cold runtime.
+                                    prewarm_sandbox_chain(keymap.config(), active_cwd(&session));
                                     host_input = Some((
                                         menu::InputOverlay::new("apply layout (name)", ""),
                                         HostInputKind::ApplyLayout,
@@ -16844,6 +16803,9 @@ async fn event_loop<T: Terminal>(
                                     "Export layout: enter a file path (Esc cancels)".into();
                             }
                             Action::ImportLayout => {
+                                // Pre-warm the sandbox off-loop while the user
+                                // types the path (audit run.rs:4951).
+                                prewarm_sandbox_chain(keymap.config(), active_cwd(&session));
                                 host_input = Some((
                                     menu::InputOverlay::new("import layout from file", ""),
                                     HostInputKind::ImportLayout,
@@ -17152,15 +17114,19 @@ async fn event_loop<T: Terminal>(
                                     pending_delete_workspace = Some((repo_path, slug, display));
                                 } else {
                                     // Confirmation disabled: delete from disk now.
-                                    model.status = remove_workspace(
-                                        &mut session,
-                                        &mut panes,
-                                        &repo_path,
-                                        &slug,
-                                        &display,
-                                        false,
+                                    model.status =
+                                        crate::handlers::workspace_remove::remove_workspace(
+                                            &mut session,
+                                            &mut panes,
+                                            &repo_path,
+                                            &slug,
+                                            &display,
+                                            false,
+                                            Some(waker.clone()),
+                                        );
+                                    crate::handlers::workspace_remove::forget_workspace_in_model(
+                                        &mut model, &slug, &repo_path,
                                     );
-                                    forget_workspace_in_model(&mut model, &slug, &repo_path);
                                     sb.marked.clear();
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     sb.focus_active_row(&mut model);
