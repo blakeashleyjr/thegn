@@ -31,11 +31,13 @@ pub(crate) mod sidebar_reorder;
 pub(crate) mod startup;
 pub(crate) mod switch;
 pub(crate) mod switch_cache;
+pub(crate) mod task_output;
 pub(crate) mod terminal;
 pub(crate) mod tracker;
 pub(crate) mod wizard;
 pub(crate) mod workspace_remove;
 pub(crate) mod worktree_delete;
+pub(crate) mod worktree_rename;
 
 /// Persist a first-launch keymap-preset choice (item 621) to `ui_state` and
 /// record it on `cfg`, returning the status line to show. The caller rebuilds

@@ -278,6 +278,22 @@ impl ShareSupervisor {
     }
 }
 
+/// Kill every tunnel child when the supervisor is dropped (audit run.rs:15915):
+/// the only explicit teardown (`shutdown_all`) was reached solely on the
+/// signal-shutdown path, so `q`/palette-quit/QuitKill leaked the tunnel
+/// children as orphans (the local port stayed publicly exposed, and the next
+/// launch's resurrection spawned a *second* tunnel for the same port). Dropping
+/// `event_loop`'s supervisor now reaps them on every exit path, including
+/// panics. `ShareInstance::kill` is idempotent, so an explicit `shutdown_all`
+/// before drop is harmless.
+impl Drop for ShareSupervisor {
+    fn drop(&mut self) {
+        for i in &self.instances {
+            i.kill();
+        }
+    }
+}
+
 /// The per-share supervisor thread: build the plan, bring the tunnel up, report
 /// its URL, then block on the child and report when it goes down.
 // off-loop: runs on the per-share supervisor std::thread (see the spawn above).
