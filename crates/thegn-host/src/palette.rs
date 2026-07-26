@@ -445,6 +445,31 @@ fn workspace_palette_label(name: &str, repo_path: &str, workspace_order: &[Strin
     }
 }
 
+/// A workspace-only palette: one `repo:<path>` row per OTHER workspace, keyed
+/// exactly like the switch rows in [`build_palette`] (so the existing `repo:`
+/// dispatch arm performs the switch). Backs `Action::SwitchWorkspace` — the
+/// dedicated Alt+o / "Switch workspace" entry point (audit run.rs:17226), which
+/// was previously a dead no-op because it read `palette.selected_key()` at
+/// dispatch time, when the palette had already been closed.
+pub(crate) fn build_workspace_switch_palette(
+    session: &crate::session::Session,
+    db: &thegn_core::db::Db,
+    workspace_order: &[String],
+) -> Vec<crate::palette::PaletteItem> {
+    use crate::palette::PaletteItem;
+    let mut items = Vec::new();
+    if let Ok(workspaces) = db.workspaces() {
+        for w in workspaces {
+            if w.repo_path != session.id {
+                let label = workspace_palette_label(&w.name, &w.repo_path, workspace_order);
+                items.push(PaletteItem::new(format!("repo:{}", w.repo_path), label));
+            }
+        }
+    }
+    let usage = db.palette_usage().unwrap_or_default();
+    crate::palette::order_by_frecency(items, &usage)
+}
+
 /// Build the palette's item list: the command actions + a nav row per open tab
 /// (`tab:<name>`), ordered by frecency for the empty-query view (the host port
 /// of the old engine's command + nav + frecency sources).

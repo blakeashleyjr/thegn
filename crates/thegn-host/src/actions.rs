@@ -126,14 +126,39 @@ pub(crate) fn dispatch_drawer_command(
     }
 }
 
+/// Spawn `cmd` fully detached and hand its `Child` to a reaper thread that
+/// `wait()`s on it (audit run.rs:13296). thegn is long-lived; without the wait,
+/// every short-lived helper (xdg-open, external editor, profile window) that
+/// exits would leave a `<defunct>` zombie for the rest of the session, since
+/// Rust drops `Child` without reaping and the host installs no global SIGCHLD
+/// handler. Returns whether the spawn itself succeeded.
+pub(crate) fn spawn_detached_reaped(mut cmd: std::process::Command) -> bool {
+    match cmd.spawn() {
+        Ok(mut child) => {
+            // best-effort reap: the thread lives only until the child exits.
+            std::thread::spawn(move || {
+                // off-loop: this runs on a dedicated reaper thread, never the
+                // event loop — the whole point is to reap the zombie async.
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "reaper thread, off the event loop"
+                )]
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Open a URL in the system browser, fully detached (no `gh`/toolchain needed).
 pub(crate) fn open_url_detached(url: &str) {
-    let _ = std::process::Command::new("xdg-open")
-        .arg(url)
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    spawn_detached_reaped(cmd);
 }
 
 /// Build a `thegn <args>` command line rooted at this process's own binary

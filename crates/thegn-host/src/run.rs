@@ -6037,6 +6037,12 @@ async fn event_loop<T: Terminal>(
     // Named task (Tasks section) run outcomes — separate from the test runner.
     let (named_task_run_tx, mut named_task_run_rx) =
         tokio_mpsc::unbounded_channel::<crate::task::TaskOutcome>();
+    // Off-loop worktree-rename completions (audit run.rs:12131/12147): the git
+    // subprocesses + dir move run on spawn_blocking and land here to re-key the
+    // session group by identity.
+    let (rename_tx, mut rename_rx) = tokio_mpsc::unbounded_channel::<
+        crate::handlers::worktree_rename::RenameDone,
+    >();
     // Test-explorer results from the background runner/discoverer (capped,
     // single-flight). Two channels: run outcomes and discovery outcomes.
     let (test_run_tx, mut test_run_rx) =
@@ -6051,6 +6057,12 @@ async fn event_loop<T: Terminal>(
     let (workspace_clone_tx, mut workspace_clone_rx) =
         tokio_mpsc::unbounded_channel::<crate::workspace_create::CloneEvent>();
     let mut test_generation: u64 = 0;
+    // Monotonic generation for named-task (Jobs section) runs (audit
+    // run.rs:14462): a superseded run's cleanup only deregisters the slot when
+    // it still owns the generation, so each new run MUST bump this — otherwise a
+    // killed run's `wait()` wakeup deregisters the LIVE run's process group and
+    // Stop ('s') silently no-ops.
+    let mut named_task_generation: u64 = 0;
     let mut loaded_tests_worktree = String::new();
     // Bounds concurrent test/discovery jobs across worktrees so explicit runs
     // can't collectively pin the machine. thegn never auto-runs tests.
@@ -7979,6 +7991,15 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         }
+        // Off-loop worktree-rename completions (audit run.rs:12131/12147).
+        while let Ok(done) = rename_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            model.status = crate::handlers::worktree_rename::apply(&mut session, done);
+            persist_session_layout(&mut session, &panes);
+            refresh_tab_model(&mut model, &session, &mut sb);
+            sb.focus_active_row(&mut model);
+            dirty = true;
+        }
         // Run results: the latest run upserts each reported test's status while
         // leaving other tests' most-recent status intact.
         while let Ok(outcome) = test_run_rx.try_recv() {
@@ -9166,6 +9187,13 @@ async fn event_loop<T: Terminal>(
                     // template's pins. The layout replaces the default agent pane;
                     // pins are orthogonal strip/float daemons.
                     if let Some(tmpl) = pending_template.remove(&generation) {
+                        // The template layout is applied to the active tab, so we
+                        // must make the new worktree active for the duration — but
+                        // only *restore* the user's tab afterward when they've
+                        // navigated away (audit run.rs:9288): switching
+                        // unconditionally yanks the visible center mid-typing,
+                        // defeating the `is_active_new` guard computed above.
+                        let prev_active = session.active;
                         if let Some(gi) =
                             session.worktrees.iter().position(|g| g.name == payload.tab)
                         {
@@ -9245,6 +9273,12 @@ async fn event_loop<T: Terminal>(
                                     chrome.center,
                                 );
                             }
+                        }
+                        // Restore the user's tab unless the new worktree is still
+                        // the one they're looking at (audit run.rs:9288). We only
+                        // switched to apply the layout to the correct tab.
+                        if !is_active_new && prev_active < session.worktrees.len() {
+                            session.switch_to(prev_active);
                         }
                         refresh_tab_model(&mut model, &session, &mut sb);
                         persist_session_layout(&mut session, &panes);
@@ -12005,59 +12039,28 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
                                     HostInputKind::RenameWorktree {
-                                        gi,
+                                        gi: _,
                                         repo_root,
                                         old_path,
                                         old_branch,
                                     } => {
-                                        let root = Path::new(&repo_root);
-                                        // Dedupe the typed name against existing
-                                        // branches (excluding the one being renamed).
-                                        let mut taken = thegn_core::worktree::BranchSet::load(root);
-                                        taken.remove(&old_branch);
-                                        let want =
-                                            thegn_core::worktree::dedupe(text.trim(), &taken);
-                                        match thegn_core::worktree::rename(
-                                            root,
-                                            Path::new(&old_path),
-                                            &old_branch,
-                                            &want,
-                                            &current_config,
-                                        ) {
-                                            Ok(new_path) => {
-                                                let new_path_s =
-                                                    new_path.to_string_lossy().into_owned();
-                                                // Re-key the live session group: name
-                                                // (slug/branch) + path follow the rename.
-                                                if let Some(g) = session.worktrees.get_mut(gi) {
-                                                    let slug = crate::sidebar::split_tab(&g.name)
-                                                        .map(|(s, _)| s)
-                                                        .unwrap_or_default();
-                                                    g.name = format!("{slug}/{want}");
-                                                    g.path = new_path_s.clone();
-                                                }
-                                                if let Ok(db) = thegn_core::db::Db::open() {
-                                                    let tab = session
-                                                        .worktrees
-                                                        .get(gi)
-                                                        .map(|g| g.name.clone())
-                                                        .unwrap_or_default();
-                                                    let _ = db.rename_worktree(
-                                                        &old_path,
-                                                        &new_path_s,
-                                                        &tab,
-                                                        &want,
-                                                    );
-                                                }
-                                                persist_session_layout(&mut session, &panes);
-                                                refresh_tab_model(&mut model, &session, &mut sb);
-                                                sb.focus_active_row(&mut model);
-                                                model.status = format!("Renamed to {want}");
-                                            }
-                                            Err(why) => {
-                                                model.status = format!("rename failed: {why}");
-                                            }
-                                        }
+                                        // Run the git branch-rename + worktree-move
+                                        // off the loop (audit run.rs:12131): several
+                                        // subprocesses + a dir move must not block
+                                        // the compositor. The completion re-keys the
+                                        // session group by identity (old_path), not
+                                        // by the now-possibly-stale captured index
+                                        // (audit run.rs:12147).
+                                        crate::handlers::worktree_rename::request(
+                                            repo_root,
+                                            old_path,
+                                            old_branch,
+                                            text.to_string(),
+                                            current_config.clone(),
+                                            &rename_tx,
+                                            &waker,
+                                        );
+                                        model.status = "Renaming worktree…".into();
                                     }
                                     HostInputKind::ShareWorktreePort { reach } => {
                                         match text.trim().parse::<u16>() {
@@ -13198,10 +13201,11 @@ async fn event_loop<T: Terminal>(
                                             None, &exe, name,
                                         ) {
                                             Some(argv) => {
-                                                let spawned = std::process::Command::new(&argv[0])
-                                                    .args(&argv[1..])
-                                                    .spawn()
-                                                    .is_ok();
+                                                let mut c =
+                                                    std::process::Command::new(&argv[0]);
+                                                c.args(&argv[1..]);
+                                                let spawned =
+                                                    crate::actions::spawn_detached_reaped(c);
                                                 model.status = if spawned {
                                                     format!("Launching profile {name}…")
                                                 } else {
@@ -13420,6 +13424,11 @@ async fn event_loop<T: Terminal>(
                                             .into();
                                 } else if key == "quit" {
                                     // Palette quit is a detach — see Action::Quit.
+                                    // Persist the layout first, exactly like the
+                                    // Action::Quit keybind (audit run.rs:13511):
+                                    // otherwise pane/split/focus changes made since
+                                    // the last periodic persist are lost on relaunch.
+                                    persist_session_layout(&mut session, &panes);
                                     crate::handlers::daemon_lifecycle::mark_session_panes_detached(
                                         &session, &panes,
                                     );
@@ -14364,13 +14373,15 @@ async fn event_loop<T: Terminal>(
                                                 let tx2 = named_task_run_tx.clone();
                                                 let wk2 = waker.clone();
                                                 let limits2 = keymap.config().limits.clone();
+                                                named_task_generation += 1;
+                                                let run_gen = named_task_generation;
                                                 tokio::task::spawn_blocking(move || {
                                                     let loc =
                                                         thegn_core::remote::GitLoc::for_worktree(
                                                             &wt,
                                                         );
                                                     let outcome = crate::task::run_task(
-                                                        wt, &loc, 0, test_task, &limits2,
+                                                        wt, &loc, run_gen, test_task, &limits2,
                                                     );
                                                     let _ = tx2.send(outcome);
                                                     let _ = wk2.wake();
@@ -14780,10 +14791,12 @@ async fn event_loop<T: Terminal>(
                                 let tx2 = named_task_run_tx.clone();
                                 let wk2 = waker.clone();
                                 let limits2 = keymap.config().limits.clone();
+                                named_task_generation += 1;
+                                let run_gen = named_task_generation;
                                 tokio::task::spawn_blocking(move || {
                                     let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
                                     let outcome =
-                                        crate::task::run_task(wt, &loc, 0, test_task, &limits2);
+                                        crate::task::run_task(wt, &loc, run_gen, test_task, &limits2);
                                     let _ = tx2.send(outcome);
                                     let _ = wk2.wake();
                                 });
@@ -14811,15 +14824,34 @@ async fn event_loop<T: Terminal>(
                                     model.panel.task_last_runs.get(&task.name).cloned()
                                 && !rec.output_tail.is_empty()
                             {
-                                let tmp =
-                                    std::env::temp_dir().join(format!("sz-task-{}.txt", task.name));
-                                let _ = std::fs::write(&tmp, &rec.output_tail);
+                                // Private, sanitized path under XDG state — not
+                                // a predictable /tmp name built from the repo-
+                                // controlled task name (audit run.rs:14904).
+                                let tmp = crate::handlers::task_output::task_output_dir().join(
+                                    format!(
+                                        "{}.txt",
+                                        crate::handlers::task_output::safe_task_filename(
+                                            &task.name
+                                        )
+                                    ),
+                                );
+                                // Write off the loop (no blocking fs on the loop).
+                                {
+                                    let tmp = tmp.clone();
+                                    let out = rec.output_tail.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let _ = std::fs::write(&tmp, out);
+                                    });
+                                }
                                 let bat = keymap
                                     .config()
                                     .tool_command("bat")
                                     .unwrap_or("bat --paging=always")
                                     .to_string();
-                                let cmd = format!("{bat} {}", tmp.display());
+                                let cmd = format!(
+                                    "{bat} {}",
+                                    test_shell_quote(&tmp.to_string_lossy())
+                                );
                                 let cwd_o = active_cwd(&session);
                                 open_command_pane(
                                     &mut session,
@@ -14997,9 +15029,9 @@ async fn event_loop<T: Terminal>(
                                     &thegn_core::util::shell(),
                                     &cmd,
                                 );
-                                let _ = std::process::Command::new(&argv[0])
-                                    .args(&argv[1..])
-                                    .spawn();
+                                let mut c = std::process::Command::new(&argv[0]);
+                                c.args(&argv[1..]);
+                                crate::actions::spawn_detached_reaped(c);
                             }
                             true
                         }
@@ -15050,12 +15082,12 @@ async fn event_loop<T: Terminal>(
                                 if cmd.is_empty() {
                                     open_url_detached(&f.url);
                                 } else {
-                                    let _ = std::process::Command::new(cmd)
-                                        .arg(&f.url)
+                                    let mut c = std::process::Command::new(cmd);
+                                    c.arg(&f.url)
                                         .stdin(std::process::Stdio::null())
                                         .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null())
-                                        .spawn();
+                                        .stderr(std::process::Stdio::null());
+                                    crate::actions::spawn_detached_reaped(c);
                                 }
                                 model.status = format!("Opened {} in browser", f.url);
                             }
@@ -15631,7 +15663,7 @@ async fn event_loop<T: Terminal>(
                                         if let Some(dir) = active_cwd(&session) {
                                             cmd.current_dir(dir);
                                         }
-                                        let _ = cmd.spawn();
+                                        crate::actions::spawn_detached_reaped(cmd);
                                     }
                                     Some(crate::keymap::HostCustomAction::Composite {
                                         action: composite,
@@ -17145,35 +17177,22 @@ async fn event_loop<T: Terminal>(
                                 continue;
                             }
                             Action::SwitchWorkspace => {
-                                if let Ok(db) = thegn_core::db::Db::open()
-                                    && let Some(target) =
-                                        palette.as_ref().and_then(|p| p.selected_key())
-                                {
-                                    let repo_path =
-                                        target.strip_prefix("repo:").unwrap_or(&target).to_string();
-                                    if switch_workspace(
-                                        &repo_path,
-                                        None,
-                                        &mut session,
-                                        &mut panes,
-                                        &mut workspace_pool,
-                                        &db,
-                                        &mut need_relayout,
-                                        &mut clear_on_next_frame,
-                                    ) {
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        kick_model_hydration!();
-                                        need_relayout = true;
-                                        sync_drawer_persistence(
+                                // Open a workspace-filtered palette (audit
+                                // run.rs:17226): the old body read
+                                // `palette.selected_key()` at dispatch time, but
+                                // the palette is always closed by then (Enter nulls
+                                // it before dispatch; Alt+o with the palette open
+                                // just types 'o'), so it was unreachable-dead. The
+                                // actual switch happens via the `repo:` palette-key
+                                // arm once the user picks a row here.
+                                if let Ok(db) = thegn_core::db::Db::open() {
+                                    palette = Some(crate::search_everywhere::PaletteSession::new(
+                                        crate::palette::build_workspace_switch_palette(
                                             &session,
-                                            &mut panes,
-                                            &mut drawer,
-                                            &mut drawer_pool,
-                                            &mut drawer_home,
-                                            keymap.config(),
-                                            chrome.center,
-                                        );
-                                    }
+                                            &db,
+                                            &sidebar_workspace_order(&model.sidebar_rows),
+                                        ),
+                                    ));
                                 }
                             }
                             Action::NewWorktree
