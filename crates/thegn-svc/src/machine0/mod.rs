@@ -341,7 +341,6 @@ impl Machine0Provider {
     async fn ensure_running_vm(&self, name: &str) -> Result<Machine0Vm> {
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(360);
         let start = std::time::Instant::now();
-        let mut started = false;
         let mut last: String;
         loop {
             // A transient control-plane blip (or brief post-create not-found from
@@ -353,9 +352,18 @@ impl Machine0Provider {
                         return Ok(vm);
                     }
                     last = vm.status.clone();
-                    if !started && !vm.id.is_empty() && status_startable(&vm.status) {
-                        self.call(tool::VM_START, json!({ "id": vm.id })).await?;
-                        started = true;
+                    // (Re-)issue vm_start whenever the VM is settled-startable:
+                    // there is no `started` latch, so a VM that settled back to a
+                    // startable state (an earlier start that did not take) is
+                    // retried instead of idling out the budget. Fold a start
+                    // error into `last` and keep polling — a single 409/5xx (e.g.
+                    // mid-SUSPENDING) must not abort the wait; the next poll
+                    // retries. Transitional states aren't startable, so this does
+                    // not spam vm_start while the VM is booting.
+                    if should_attempt_start(vm.id.is_empty(), &vm.status)
+                        && let Err(e) = self.call(tool::VM_START, json!({ "id": vm.id })).await
+                    {
+                        last = format!("start-transient: {e}");
                     }
                 }
                 Ok(None) => last = "not-found".into(),
@@ -507,6 +515,43 @@ impl Machine0Provider {
         Ok((ip, self.ssh_user_for(&vm)))
     }
 
+    /// Idempotent NixOS provisioning: (re-)apply the flake unless the VM already
+    /// carries the success marker for *this* flake ref. This is the re-checkable
+    /// entry point (create AND the resume/claim path both call it): if a prior
+    /// `nixos-rebuild` failed — transient network blip, flake-fetch error, or the
+    /// 1800s timeout — `create()` returned Err but the VM already exists and
+    /// billed, and nothing ever re-provisioned it (the ensure-exists retry path
+    /// finds the VM name in `vm_list` and never re-runs create). The marker closes
+    /// that hole: a VM missing the marker is re-provisioned on the next wake.
+    async fn ensure_provisioned(&self, name: &str) -> Result<()> {
+        let flake = self.spec.provision_flake.trim();
+        if flake.is_empty() {
+            return Ok(());
+        }
+        let marker = provision_marker_path(flake);
+        // A cheap `test -e <marker>` over ssh; exit 0 ⇒ already provisioned.
+        let shim = self.shim(name).await?;
+        let probe = vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            format!("test -e {}", thegn_core::util::sh_quote(&marker)),
+        ];
+        if let Ok((0, _)) = shim.run_exec(&probe, None, &[]).await {
+            return Ok(());
+        }
+        self.provision_nixos(name).await?;
+        // Best-effort marker write: if this fails the only cost is a redundant
+        // re-provision on the next wake (nixos-rebuild is itself idempotent), so
+        // never fail an otherwise-successful provision on the marker write.
+        let mark = vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            format!("touch {}", thegn_core::util::sh_quote(&marker)),
+        ];
+        let _ = shim.run_exec(&mark, None, &[]).await; // best-effort: marker is a cache
+        Ok(())
+    }
+
     /// NixOS flake apply over ssh (there is no `provision` MCP tool). A local
     /// `path#attr` ref is uploaded first and rebuilt from the uploaded dir; a
     /// flake URL is applied verbatim. Bounded — a rebuild takes minutes.
@@ -589,10 +634,15 @@ impl Machine0Provider {
     }
 
     /// Resume a suspended VM and wait until it is reachable again (claim path).
+    /// Re-applies the provisioning flake if the VM never carried the success
+    /// marker (a create-time provision that failed after the VM was already
+    /// billing), so a stock image whose declared environment never applied is
+    /// healed on the next claim rather than persisting forever.
     pub async fn resume(&self, name: &str) -> Result<()> {
         *self.endpoint.lock().unwrap() = None;
         let (ip, user) = self.awake_endpoint(name).await?;
-        self.wait_reachable(name, &ip, &user).await
+        self.wait_reachable(name, &ip, &user).await?;
+        self.ensure_provisioned(name).await
     }
 }
 
@@ -612,8 +662,10 @@ impl RemoteProvider for Machine0Provider {
             ));
         }
         let vm = self.spawn(&name, &self.spec.image).await?;
-        // NixOS flake apply (no-op unless `provision_flake` is set).
-        self.provision_nixos(&name).await?;
+        // NixOS flake apply (no-op unless `provision_flake` is set). Marker-gated
+        // so a failed apply here is re-attempted on the next wake rather than
+        // leaving a permanently half-provisioned VM.
+        self.ensure_provisioned(&name).await?;
         let host = vm.address.unwrap_or_default();
         Ok(SandboxHandle {
             id: name,
@@ -674,7 +726,7 @@ impl ProviderCheckpoints for Machine0Provider {
             .vm_by_name(id)
             .await?
             .ok_or_else(|| anyhow!("machine0: vm {id} not found"))?;
-        // machine0 images a **stopped** machine: stop, wait for STOPPED, then
+        // machine0 images a **stopped** machine: drive it to STOPPED, then
         // `image_create` by instance name. The VM is left stopped — the next exec
         // resumes it via `ensure_running_vm` (STOPPED is startable).
         let image_name = label
@@ -682,10 +734,13 @@ impl ProviderCheckpoints for Machine0Provider {
             .filter(|l| !l.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| format!("{id}-{}", thegn_core::util::now()));
-        if status_running(&vm.status) && !vm.id.is_empty() {
+        // machine0 can only image a fully-STOPPED disk. Drive the VM to STOPPED
+        // from whatever state it's in — not just RUNNING. A SUSPENDED spare (the
+        // normal warm-pool parked state) or a mid-transition VM would otherwise
+        // be imaged in an inconsistent state (or the image_create is rejected).
+        if !vm.id.is_empty() && !status_stopped(&vm.status) {
             *self.endpoint.lock().unwrap() = None;
-            self.call(tool::VM_STOP, json!({ "id": vm.id })).await?;
-            self.wait_status(id, status_stopped, "STOPPED").await?;
+            self.stop_to_imageable(id, &vm).await?;
         }
         let created = self
             .call(
@@ -704,11 +759,44 @@ impl ProviderCheckpoints for Machine0Provider {
     async fn restore(&self, id: &str, checkpoint: &str) -> Result<()> {
         // machine0 images have no in-place restore: destroy + recreate from the
         // saved image (recreate semantics — the VM's underlying id changes; the
-        // sandbox name/id is stable).
+        // sandbox name/id is stable). Validate the checkpoint image EXISTS before
+        // the destructive destroy: machine0's create silently accepts an unknown
+        // imageName (and even if it errored, the live VM would already be gone),
+        // so a typo'd/GC'd checkpoint would otherwise turn a restore into an
+        // irrecoverable destroy of the VM and all state since the last image.
+        if !restore_checkpoint_present(&self.list_checkpoints(id).await?, checkpoint) {
+            return Err(anyhow!(
+                "machine0: checkpoint {checkpoint:?} not found — refusing to destroy vm {id} for a \
+                 restore that cannot succeed (run `thegn env checkpoints` to list valid images)"
+            ));
+        }
         self.destroy(id).await?;
         *self.endpoint.lock().unwrap() = None;
         self.spawn(id, checkpoint).await?;
         Ok(())
+    }
+}
+
+impl Machine0Provider {
+    /// Drive a non-STOPPED VM to STOPPED so it can be imaged. A RUNNING VM stops
+    /// directly; a SUSPENDED or mid-transition VM is first brought back to a
+    /// settled RUNNING state (`ensure_running_vm` starts it and waits) before the
+    /// stop, since machine0 only transitions cleanly to STOPPED from RUNNING. In
+    /// all cases we wait for STOPPED before returning.
+    async fn stop_to_imageable(&self, id: &str, vm: &Machine0Vm) -> Result<()> {
+        // Resolve the VM id to stop: for a RUNNING VM use the one we already have;
+        // otherwise settle it to RUNNING first and use that (its id is stable).
+        let vm_id = if status_running(&vm.status) {
+            vm.id.clone()
+        } else {
+            let running = self.ensure_running_vm(id).await?;
+            running.id
+        };
+        if vm_id.is_empty() {
+            return Ok(());
+        }
+        self.call(tool::VM_STOP, json!({ "id": vm_id })).await?;
+        self.wait_status(id, status_stopped, "STOPPED").await
     }
 }
 
@@ -765,6 +853,34 @@ pub fn status_startable(status: &str) -> bool {
 /// Whether a VM is fully stopped (the pre-image state). Pure.
 pub fn status_stopped(status: &str) -> bool {
     status.trim().eq_ignore_ascii_case("stopped")
+}
+
+/// Whether `ensure_running_vm` should (re-)issue a `vm_start` for a VM observed
+/// in `status`. `true` iff the VM has an id and is in a settled startable state
+/// (STOPPED/SUSPENDED/ERRORED). This is intentionally **not** latched on a prior
+/// start: a VM seen back in a startable state means the earlier start did not
+/// take (raced/rejected server-side) and must be retried, and re-issuing
+/// `vm_start` on an already-starting VM is idempotent. Keeping this pure lets the
+/// resume state-machine be unit-tested without a live control plane. Pure.
+fn should_attempt_start(id_empty: bool, status: &str) -> bool {
+    !id_empty && status_startable(status)
+}
+
+/// The on-VM marker path proving *this* flake ref was applied successfully.
+/// Keyed on a short hash of the (trimmed) flake ref so changing the declared
+/// environment invalidates the marker and forces a re-provision. Pure.
+fn provision_marker_path(flake: &str) -> String {
+    let fp = thegn_core::util::short_hash(flake.trim(), 12);
+    format!("/root/.thegn-provisioned-{fp}")
+}
+
+/// Whether `checkpoint` names an existing image in `available` (matched on the
+/// checkpoint id — machine0's image **name**, what `vm_create.imageName` /
+/// restore consumes). Trimmed exact match. Guards the destructive destroy in
+/// `restore` against a typo'd/GC'd checkpoint. Pure.
+fn restore_checkpoint_present(available: &[CheckpointInfo], checkpoint: &str) -> bool {
+    let want = checkpoint.trim();
+    !want.is_empty() && available.iter().any(|c| c.id.trim() == want)
 }
 
 /// Whether an error string names a "does not exist" condition (idempotent
@@ -1046,6 +1162,48 @@ mod tests {
         assert!(!status_startable("RUNNING"));
         assert!(status_stopped("STOPPED"));
         assert!(!status_stopped("SUSPENDED"));
+    }
+
+    #[test]
+    fn should_attempt_start_retries_a_start_that_did_not_take() {
+        // Settled off-states get a start — including when a prior start "took"
+        // but the VM settled back to startable (no latch pins it): the audit's
+        // "started == true prevents any further start" bug is gone.
+        assert!(should_attempt_start(false, "STOPPED"));
+        assert!(should_attempt_start(false, "SUSPENDED"));
+        assert!(should_attempt_start(false, "ERRORED"));
+        // No id ⇒ nothing to start.
+        assert!(!should_attempt_start(true, "STOPPED"));
+        // Transitional / already-running states are not (re-)started, so a
+        // booting VM is never spammed with vm_start.
+        assert!(!should_attempt_start(false, "CREATING"));
+        assert!(!should_attempt_start(false, "SUSPENDING"));
+        assert!(!should_attempt_start(false, "STOPPING"));
+        assert!(!should_attempt_start(false, "RUNNING"));
+    }
+
+    #[test]
+    fn restore_checkpoint_present_guards_against_missing_image() {
+        let images = parse_image_list(&json!({ "images": [
+            { "name": "gm-1" }, { "name": "dev-1700" }
+        ]}));
+        // Present ⇒ restore may proceed (destroy is safe).
+        assert!(restore_checkpoint_present(&images, "gm-1"));
+        assert!(restore_checkpoint_present(&images, "  dev-1700  ")); // trimmed
+        // Absent (typo / GC'd) ⇒ refuse BEFORE the destructive destroy.
+        assert!(!restore_checkpoint_present(&images, "gm-2"));
+        assert!(!restore_checkpoint_present(&images, ""));
+        assert!(!restore_checkpoint_present(&[], "gm-1"));
+    }
+
+    #[test]
+    fn provision_marker_path_is_flake_scoped_and_stable() {
+        let a = provision_marker_path("github:me/env#host");
+        // Deterministic + trim-insensitive for the same ref.
+        assert_eq!(a, provision_marker_path("  github:me/env#host  "));
+        // A different flake ref ⇒ a different marker (forces re-provision).
+        assert_ne!(a, provision_marker_path("github:me/env#other"));
+        assert!(a.starts_with("/root/.thegn-provisioned-"));
     }
 
     fn sample_sizes() -> Vec<Machine0Size> {

@@ -310,9 +310,11 @@ pub fn substitute(input: &str, ctx: &SubstCtx) -> String {
             i = i + 2 + end + 1;
             continue;
         }
-        // Not a well-formed `${...}` — copy the byte through.
-        out.push(bytes[i] as char);
-        i += 1;
+        // Not a well-formed `${...}` — copy the char through on a UTF-8
+        // boundary (never re-encode a multibyte code point as Latin-1).
+        let ch = input[i..].chars().next().expect("valid utf-8 boundary");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -588,15 +590,25 @@ pub fn strip_jsonc(input: &str) -> String {
     while i < bytes.len() {
         let c = bytes[i];
         if in_str {
-            out.push(c as char);
-            if escaped {
+            if c < 0x80 {
+                // ASCII: the only bytes that affect string state (`\`, `"`).
+                out.push(c as char);
+                if escaped {
+                    escaped = false;
+                } else if c == b'\\' {
+                    escaped = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+                i += 1;
+            } else {
+                // Multibyte UTF-8: copy the whole code point on its boundary so
+                // non-ASCII string content isn't mangled into Latin-1 mojibake.
+                let ch = input[i..].chars().next().expect("valid utf-8 boundary");
+                out.push(ch);
                 escaped = false;
-            } else if c == b'\\' {
-                escaped = true;
-            } else if c == b'"' {
-                in_str = false;
+                i += ch.len_utf8();
             }
-            i += 1;
             continue;
         }
         match c {
@@ -633,8 +645,11 @@ pub fn strip_jsonc(input: &str) -> String {
                 i += 1;
             }
             _ => {
-                out.push(c as char);
-                i += 1;
+                // Copy on a char boundary — a multibyte code point outside a
+                // string (rare, but legal in JSON) must not be re-encoded.
+                let ch = input[i..].chars().next().expect("valid utf-8 boundary");
+                out.push(ch);
+                i += ch.len_utf8();
             }
         }
     }
@@ -868,6 +883,36 @@ mod tests {
         assert_eq!(substitute("m=${localEnv:MISSING}", &ctx), "m=");
         // Unknown variables are preserved literally.
         assert_eq!(substitute("${weird}", &ctx), "${weird}");
+    }
+
+    #[test]
+    fn non_ascii_strings_round_trip_without_mojibake() {
+        // Non-ASCII path/env values must survive strip_jsonc + parse intact —
+        // no Latin-1 doubling ("José" must not become "JosÃ©").
+        let text = r#"{
+            "image": "x",
+            // café ☕ — comment with unicode is dropped
+            "workspaceFolder": "/home/josé/proj",
+            "containerEnv": { "GREETING": "héllo wörld ☕" }
+        }"#;
+        let d = dc(text);
+        assert_eq!(d.workspace_folder.as_deref(), Some("/home/josé/proj"));
+        assert_eq!(
+            d.container_env.get("GREETING").map(String::as_str),
+            Some("héllo wörld ☕")
+        );
+    }
+
+    #[test]
+    fn substitute_preserves_non_ascii() {
+        let ctx = SubstCtx {
+            local_workspace_folder: "/home/josé".into(),
+            container_workspace_folder: String::new(),
+            local_env: &|_| None,
+            container_env: &|_| None,
+        };
+        // Multibyte content on the literal (non-`${}`) path is copied verbatim.
+        assert_eq!(substitute("café ☕ ${localWorkspaceFolder}", &ctx), "café ☕ /home/josé");
     }
 
     #[test]

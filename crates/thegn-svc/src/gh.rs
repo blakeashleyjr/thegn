@@ -398,7 +398,14 @@ impl GhBackend for GhNative {
         let (Some(token), Some((owner, repo))) = (resolve_token(), self.owner_repo(loc)) else {
             return self.fallback.pr_status(loc).await;
         };
-        let branch = github::pr_status(loc).branch; // cheap rev-parse via core
+        // Just the branch — a local `git rev-parse`. `github::pr_status` would
+        // ALSO run a full `gh pr view` network fetch (whole result discarded but
+        // `.branch`), double-fetching every refresh and defeating the octocrab
+        // timeout with an untimed subprocess. The native path exists to drop
+        // `gh` from the hot path, so resolve the branch locally.
+        let branch = loc
+            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap_or_default();
         let client = match octocrab::OctocrabBuilder::new()
             .personal_token(token)
             .build()
@@ -631,6 +638,41 @@ mod tests {
         let panel = parse_graphql_pr(&resp, "/wt", "feat", 1);
         assert!(matches!(panel.state, PanelState::NoPr));
         assert_eq!(panel.branch, "feat");
+    }
+
+    /// Regression: the native `pr_status` resolves the branch with a local
+    /// `git rev-parse`, NOT `github::pr_status` (which also runs a full,
+    /// network `gh pr view` whose result it discards — a double-fetch). This
+    /// pins the cheap resolution the fix now uses: it returns the checked-out
+    /// branch from a real repo with no `gh` in the loop.
+    #[test]
+    fn native_branch_resolution_is_local_rev_parse() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "root"]);
+        git(&["checkout", "-q", "-b", "feat/native"]);
+
+        let loc = GitLoc::Local(dir.to_path_buf());
+        // This is exactly the resolution the native pr_status now performs.
+        let branch = loc
+            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap_or_default();
+        assert_eq!(branch, "feat/native");
     }
 
     #[test]

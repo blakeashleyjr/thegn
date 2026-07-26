@@ -64,14 +64,19 @@ pub fn parse_log(line: &str) -> ParsedLog {
         };
     }
 
-    // Fallback: Plain text logfmt heuristic (time level msg)
-    // Very rudimentary fallback
+    // Fallback: the `Brand` text sink shape — `{ts}  {level:<5} {target}  {msg}`
+    // (log_trace::Brand). `parts[0]` IS the emission timestamp; preserve it so
+    // historical/tailed lines keep their real time rather than being restamped
+    // with parse-time `now`.
     let parts: Vec<&str> = line.split_whitespace().collect();
 
     let (timestamp, level, message) = if parts.len() >= 3 {
-        // Try to parse parts[1] as level
+        // Use parts[0] as the timestamp when it parses as an ISO instant (the
+        // Brand file format), else fall back to wall-clock now. parts[1] is the
+        // level; parts[2..] (target + message) becomes the message body.
+        let ts = normalize_text_timestamp(parts[0]).unwrap_or_else(|| Local::now().to_rfc3339());
         let lvl = LogLevel::parse(parts[1]);
-        (Local::now().to_rfc3339(), lvl, parts[2..].join(" "))
+        (ts, lvl, parts[2..].join(" "))
     } else {
         (Local::now().to_rfc3339(), LogLevel::Info, original.clone())
     };
@@ -87,6 +92,27 @@ pub fn parse_log(line: &str) -> ParsedLog {
         original,
         worktree,
     }
+}
+
+/// Normalize a text-sink timestamp token into an RFC3339 string, or `None` if
+/// it does not look like a timestamp. Accepts the `Brand` file format
+/// (`%Y-%m-%dT%H:%M:%S`, no offset — assumed local) as well as a full RFC3339
+/// instant (which some producers emit), so tailed/historical lines keep their
+/// real emission time instead of being restamped with parse-time `now`.
+fn normalize_text_timestamp(tok: &str) -> Option<String> {
+    use chrono::NaiveDateTime;
+    // Full RFC3339 (with offset / fractional seconds).
+    if let Ok(dt) = DateTime::parse_from_rfc3339(tok) {
+        return Some(dt.with_timezone(&Local).to_rfc3339());
+    }
+    // Brand's naive local `%Y-%m-%dT%H:%M:%S`.
+    if let Ok(naive) = NaiveDateTime::parse_from_str(tok, "%Y-%m-%dT%H:%M:%S") {
+        return naive
+            .and_local_timezone(Local)
+            .single()
+            .map(|dt| dt.to_rfc3339());
+    }
+    None
 }
 
 /// Pull a `wt=<slug>` token out of a text-format message, returning the slug (if
@@ -185,6 +211,38 @@ mod spec {
         assert_eq!(p.level, LogLevel::Error);
         assert_eq!(p.worktree.as_deref(), Some("app-feat"));
         assert_eq!(p.message, "exploded");
+    }
+
+    #[test]
+    fn text_line_preserves_brand_timestamp() {
+        // The Brand file sink writes `%Y-%m-%dT%H:%M:%S`; parse_log must keep
+        // that instant, not restamp it with parse-time `now` (regression: the
+        // FileLogProvider tail re-feeds historical lines on startup).
+        let p = parse_log("2026-07-03T10:00:00  INFO  thegn::startup  first frame");
+        // Same wall-clock instant as the emitted line, normalized to RFC3339.
+        assert!(
+            p.timestamp.starts_with("2026-07-03T10:00:00"),
+            "timestamp not preserved: {}",
+            p.timestamp
+        );
+    }
+
+    #[test]
+    fn text_line_full_rfc3339_timestamp_is_preserved() {
+        let p = parse_log("2026-07-03T10:00:00+00:00  WARN  thegn::db  slow");
+        // Converted to local tz but the same instant (2026-07-03, hour 10 UTC).
+        assert!(p.timestamp.starts_with("2026-07-03T"), "{}", p.timestamp);
+        assert_eq!(p.level, LogLevel::Warn);
+    }
+
+    #[test]
+    fn text_line_non_timestamp_first_token_falls_back_to_now() {
+        // A line whose first token isn't a timestamp still parses (level from
+        // parts[1]) but gets a fresh `now` stamp rather than garbage.
+        let p = parse_log("nonts WARN some message here");
+        assert_eq!(p.level, LogLevel::Warn);
+        // now() in local tz — current year, not the token.
+        assert!(!p.timestamp.starts_with("nonts"), "{}", p.timestamp);
     }
 
     #[test]

@@ -42,7 +42,16 @@ pub struct EnvSpec {
 }
 
 fn read_doc(path: &Path) -> Result<DocumentMut> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    // Only a genuinely-absent file is an empty document. Any OTHER read error
+    // (EACCES, EIO, a symlink loop, a file that exists but can't be read) must
+    // NOT be swallowed as "empty": the caller mutates and writes the doc back, so
+    // treating an unreadable-but-present config as empty would clobber the user's
+    // entire config.toml with just the one key being set.
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
     text.parse::<DocumentMut>()
         .with_context(|| format!("parse {}", path.display()))
 }
@@ -51,7 +60,11 @@ fn write_doc(path: &Path, doc: &DocumentMut) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
-    std::fs::write(path, doc.to_string()).with_context(|| format!("write {}", path.display()))
+    // Write atomically (tmp + rename) so a crash/full-disk mid-write can't leave a
+    // truncated, unparseable config that load_layered then discards.
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string()).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))
 }
 
 /// Get-or-create a child table named `key` under `parent`, marking it implicit
@@ -339,6 +352,36 @@ mod tests {
 
     fn tmp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("sz-cfgwrite-{}-{name}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_doc_does_not_treat_an_unreadable_file_as_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = tmp("unreadable.toml");
+        std::fs::write(&p, "[sandbox]\nbackend = \"bwrap\"\n").unwrap();
+        // Make the existing file unreadable: a read error that is NOT NotFound.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // set_key must ERROR rather than clobber the (present) config with an empty
+        // doc holding only the new key.
+        let r = set_key(&p, "sandbox.enabled", "true");
+        // Restore perms so the content check + cleanup work regardless of outcome.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(r.is_err(), "unreadable config must not be silently clobbered");
+        // The original content is untouched (atomic write never ran).
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(after.contains("bwrap"), "original config was clobbered: {after:?}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn write_doc_is_atomic_and_leaves_no_tmp() {
+        let p = tmp("atomic.toml");
+        let _ = std::fs::remove_file(&p);
+        set_key(&p, "sandbox.backend", "podman").unwrap();
+        assert!(p.exists());
+        assert!(!p.with_extension("toml.tmp").exists(), "tmp file leaked");
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

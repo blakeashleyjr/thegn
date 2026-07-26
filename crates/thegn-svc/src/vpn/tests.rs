@@ -197,6 +197,44 @@ fn netbird_plan_passes_setup_key_and_mgmt_url() {
     );
 }
 
+/// Regression: NetBird userspace (proxy) mode must pin its netstack SOCKS5
+/// listener to the SAME port the worktree's ALL_PROXY targets — otherwise
+/// NetBird listens on its default 1080 and every proxied connection to 1055
+/// is refused while readiness still reports success.
+#[test]
+fn netbird_userspace_listener_port_matches_proxy() {
+    let mut c = VpnConfig {
+        provider: VpnProviderKind::Netbird,
+        ..VpnConfig::default()
+    };
+    c.netbird.setup_key = "nbkey-xyz".into();
+    c.mode = VpnMode::Proxy;
+    let plan = for_provider(&spec(c)).sidecar_plan("c-szvpn").unwrap();
+
+    // Netstack mode on, and the listener port explicitly set.
+    assert_eq!(env_val(&plan.env, "NB_USE_NETSTACK_MODE"), Some("true"));
+    let listener = env_val(&plan.env, "NB_SOCKS5_LISTENER_PORT")
+        .expect("userspace netbird must pin its SOCKS5 listener port");
+
+    // The injected proxy points at that exact port.
+    let proxy = plan.proxy.expect("userspace exposes a proxy");
+    assert_eq!(proxy.all_proxy, format!("socks5://127.0.0.1:{listener}"));
+    assert_eq!(listener, "1055");
+}
+
+/// TUN (sidecar) netbird must NOT set a userspace listener or a proxy.
+#[test]
+fn netbird_tun_mode_has_no_proxy_listener() {
+    let mut c = VpnConfig {
+        provider: VpnProviderKind::Netbird,
+        ..VpnConfig::default()
+    };
+    c.netbird.setup_key = "nbkey-xyz".into(); // default mode = sidecar => TUN
+    let plan = for_provider(&spec(c)).sidecar_plan("c-szvpn").unwrap();
+    assert!(env_val(&plan.env, "NB_SOCKS5_LISTENER_PORT").is_none());
+    assert!(plan.proxy.is_none());
+}
+
 #[test]
 fn zerotier_plan_requires_network_and_joins_it() {
     let mut c = VpnConfig {
@@ -281,6 +319,115 @@ fn oci_runtime_argv_prefixes_subcommand() {
         rt.argv(&["run", "-d"]),
         vec!["sudo", "-n", "podman", "run", "-d"]
     );
+}
+
+/// The secret file must be 0600 the instant it exists — created with the mode,
+/// not chmodded after a world-readable window.
+#[cfg(unix)]
+#[test]
+fn write_secret_0600_creates_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wg.conf");
+    write_secret_0600(&path, b"[Interface]\nPrivateKey=xxx\n").unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "secret file must be created 0600");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"[Interface]\nPrivateKey=xxx\n"
+    );
+    // Overwriting an existing (possibly wrong-mode) file re-establishes 0600.
+    write_secret_0600(&path, b"new").unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+}
+
+/// `stage_files` writes each secret 0600 in a 0700 dir, and `cleanup_staged`
+/// removes the whole directory so secrets don't outlive the tunnel.
+#[cfg(unix)]
+#[test]
+fn stage_files_are_0600_in_0700_dir_and_cleaned_up() {
+    use std::os::unix::fs::PermissionsExt;
+    // Isolate XDG_STATE_HOME so state_dir() lands in a scratch tree. This test
+    // owns the env var for its duration (marked serial by the unique container).
+    let home = tempfile::tempdir().unwrap();
+    // SAFETY: single-threaded test binary section; no other thread reads env here.
+    unsafe {
+        std::env::set_var("XDG_STATE_HOME", home.path());
+    }
+    let container = format!("thegn-stagetest-{}", std::process::id());
+    let plan = SidecarPlan {
+        container: container.clone(),
+        image: "img".into(),
+        run_flags: vec![],
+        env: vec![],
+        mounts: vec![],
+        files: vec![SidecarFile {
+            contents: "secret-body".into(),
+            dest: "/etc/wireguard/wg0.conf".into(),
+        }],
+        command: vec![],
+        ready: ReadyProbe {
+            argv: vec!["true".into()],
+            when: ReadyWhen::ExitZero,
+        },
+        proxy: None,
+    };
+    let staged = stage_files(&plan).unwrap();
+    assert_eq!(staged.len(), 1);
+    let (host, dest) = &staged[0];
+    assert_eq!(dest, "/etc/wireguard/wg0.conf");
+    let host_path = std::path::Path::new(host);
+    assert_eq!(std::fs::read(host_path).unwrap(), b"secret-body");
+    let fmode = std::fs::metadata(host_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(fmode, 0o600);
+    let dmode = std::fs::metadata(host_path.parent().unwrap())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(dmode, 0o700, "staged dir must be 0700");
+
+    // Cleanup removes the whole per-sidecar dir.
+    cleanup_staged(&container);
+    assert!(!host_path.exists());
+    assert!(!host_path.parent().unwrap().exists());
+
+    unsafe {
+        std::env::remove_var("XDG_STATE_HOME");
+    }
+}
+
+/// A wedged `exec` must be killed at the per-attempt bound, not block forever —
+/// so `poll_ready`'s readiness deadline is actually honored.
+#[cfg(unix)]
+#[test]
+fn run_output_timed_kills_hung_child() {
+    // `sleep 30` stands in for a wedged `podman exec`.
+    let argv = vec!["sleep".to_string(), "30".to_string()];
+    let start = std::time::Instant::now();
+    let res = run_output_timed(&argv, Duration::from_millis(200));
+    let elapsed = start.elapsed();
+    assert!(res.is_err(), "a hung child must surface as a timeout error");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "must return near the timeout, not wait for the child ({elapsed:?})"
+    );
+}
+
+/// A fast command still returns its output normally under the timeout.
+#[cfg(unix)]
+#[test]
+fn run_output_timed_returns_fast_command_output() {
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "printf hello".to_string(),
+    ];
+    let (ok, out) = run_output_timed(&argv, Duration::from_secs(5)).unwrap();
+    assert!(ok);
+    assert_eq!(out, "hello");
 }
 
 #[test]

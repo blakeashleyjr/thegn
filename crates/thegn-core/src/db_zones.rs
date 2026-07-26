@@ -31,11 +31,26 @@ fn row_to_zone(r: &rusqlite::Row) -> rusqlite::Result<ZoneRow> {
 
 impl ZoneStore for Db {
     fn create_zone(&self, name: &str, now: i64) -> Result<i64> {
-        self.conn().execute(
-            "INSERT INTO zones(name, created_at) VALUES(?1, ?2)",
-            params![name, now],
-        )?;
-        Ok(self.conn().last_insert_rowid())
+        // `zones.zone_id` is INTEGER PRIMARY KEY *without* AUTOINCREMENT, so
+        // SQLite may recycle a deleted zone's rowid. If a prior crash/race left a
+        // workspace pointing at that now-freed id (a dangling `zone_id`), the new
+        // zone would silently inherit it as a member — a zone-policy boundary the
+        // user never chose. Do the insert + orphan-sweep atomically so the fresh
+        // zone starts with exactly the members later assigned to it, never
+        // recycled ones. (The DDL lives in `db_migrate`, so we defend here rather
+        // than depend on an AUTOINCREMENT schema change.)
+        self.transaction(|db| {
+            db.conn().execute(
+                "INSERT INTO zones(name, created_at) VALUES(?1, ?2)",
+                params![name, now],
+            )?;
+            let id = db.conn().last_insert_rowid();
+            db.conn().execute(
+                "UPDATE workspaces SET zone_id=NULL WHERE zone_id=?1",
+                params![id],
+            )?;
+            Ok(id)
+        })
     }
 
     fn rename_zone(&self, zone_id: i64, new_name: &str) -> Result<()> {
@@ -47,23 +62,31 @@ impl ZoneStore for Db {
     }
 
     fn delete_zone(&self, zone_id: i64, force: bool) -> Result<ZoneDeleteOutcome> {
-        let members: i64 = self.conn().query_row(
-            "SELECT COUNT(*) FROM workspaces WHERE zone_id=?1",
-            params![zone_id],
-            |r| r.get(0),
-        )?;
-        if members > 0 && !force {
-            return Ok(ZoneDeleteOutcome::RefusedNonEmpty(members));
-        }
-        if members > 0 {
-            self.conn().execute(
+        // Count → unassign → delete must be atomic: a concurrent process (a CLI
+        // `thegn` subcommand shares this DB file with the live compositor by
+        // design) that runs `assign_workspace_zone` between the count and the
+        // DELETE would otherwise leave a workspace pointing at the deleted zone.
+        // With rowid reuse (no AUTOINCREMENT) the next `create_zone` could then
+        // recycle that id and silently absorb the orphan — a policy-boundary
+        // error. The transaction closes that window; the unconditional unassign
+        // (dropping the `members > 0` guard) also sweeps any orphan that raced in.
+        self.transaction(|db| {
+            let members: i64 = db.conn().query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE zone_id=?1",
+                params![zone_id],
+                |r| r.get(0),
+            )?;
+            if members > 0 && !force {
+                return Ok(ZoneDeleteOutcome::RefusedNonEmpty(members));
+            }
+            db.conn().execute(
                 "UPDATE workspaces SET zone_id=NULL WHERE zone_id=?1",
                 params![zone_id],
             )?;
-        }
-        self.conn()
-            .execute("DELETE FROM zones WHERE zone_id=?1", params![zone_id])?;
-        Ok(ZoneDeleteOutcome::Deleted)
+            db.conn()
+                .execute("DELETE FROM zones WHERE zone_id=?1", params![zone_id])?;
+            Ok(ZoneDeleteOutcome::Deleted)
+        })
     }
 
     fn list_zones(&self) -> Result<Vec<ZoneRow>> {
@@ -173,6 +196,71 @@ mod tests {
         // Unknown worktree falls back to repo-path interpretation.
         assert_eq!(db.zone_of_worktree("/repo").unwrap().unwrap().name, "z");
         assert!(db.zone_of_worktree("/other").unwrap().is_none());
+    }
+
+    #[test]
+    fn create_zone_sweeps_recycled_rowid_orphans() {
+        // Reproduce the rowid-reuse aliasing: a workspace left pointing at a
+        // zone_id that a later create_zone recycles must NOT silently become a
+        // member of the new zone.
+        let db = db();
+        let a = db.create_zone("client-a", 1).unwrap();
+        add_ws(&db, "/orphan");
+        db.assign_workspace_zone("/orphan", Some(a)).unwrap();
+        // Simulate the race: the zone row is deleted out from under the
+        // assignment (as if a concurrent assign landed after delete_zone's count),
+        // leaving `/orphan` dangling at the now-free id `a`.
+        db.conn()
+            .execute("DELETE FROM zones WHERE zone_id=?1", params![a])
+            .unwrap();
+        assert_eq!(
+            db.zone_of_workspace("/orphan").unwrap().map(|z| z.name),
+            None,
+            "dangling id renders as unzoned"
+        );
+        // A new zone recycles the freed rowid (no AUTOINCREMENT). It must start
+        // empty — the orphan is swept, not inherited.
+        let b = db.create_zone("client-b", 2).unwrap();
+        assert_eq!(b, a, "SQLite recycled the freed rowid (test precondition)");
+        assert_eq!(
+            db.list_zones()
+                .unwrap()
+                .into_iter()
+                .find(|z| z.zone_id == b)
+                .unwrap()
+                .member_count,
+            0,
+            "recycled-id zone did not absorb the orphaned workspace"
+        );
+        assert!(
+            db.zone_of_workspace("/orphan").unwrap().is_none(),
+            "orphan stays unzoned after the recycled create"
+        );
+    }
+
+    #[test]
+    fn delete_zone_is_atomic_across_count_and_delete() {
+        // Force-delete a non-empty zone: the members are unassigned AND the zone
+        // row is gone as one unit (no partial state where the zone is deleted but
+        // a member still points at it).
+        let db = db();
+        let z = db.create_zone("z", 1).unwrap();
+        add_ws(&db, "/a");
+        add_ws(&db, "/b");
+        db.assign_workspace_zone("/a", Some(z)).unwrap();
+        db.assign_workspace_zone("/b", Some(z)).unwrap();
+        assert_eq!(db.delete_zone(z, true).unwrap(), ZoneDeleteOutcome::Deleted);
+        assert!(db.list_zones().unwrap().is_empty());
+        // No workspace still references the deleted zone.
+        let dangling: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE zone_id=?1",
+                params![z],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0, "no dangling zone_id survives the delete");
     }
 
     #[test]

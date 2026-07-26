@@ -18,16 +18,22 @@ pub struct AcpReader {
 }
 
 impl AcpReader {
+    /// Read the next framed JSON-RPC message. `Ok(None)` means genuine EOF (the
+    /// peer hung up) — a *blank* line is not EOF: a peer that frames with a stray
+    /// `\n\n` (or emits a keep-alive newline) must not be mistaken for a hang-up,
+    /// so blank lines are skipped and we keep reading. Only a real end-of-stream
+    /// or an IO/parse error terminates.
     pub async fn recv(&mut self) -> Result<Option<JsonRpcMessage>> {
-        if let Some(line) = self.reader.next().await {
+        loop {
+            let Some(line) = self.reader.next().await else {
+                return Ok(None); // genuine EOF: stream ended
+            };
             let line = line?;
             if line.trim().is_empty() {
-                return Ok(None);
+                continue; // stray blank line — not EOF, keep reading
             }
             let msg: JsonRpcMessage = serde_json::from_str(&line)?;
-            Ok(Some(msg))
-        } else {
-            Ok(None)
+            return Ok(Some(msg));
         }
     }
 }
@@ -68,10 +74,16 @@ impl AcpTransport {
         anyhow::bail!("ACP unix-socket transport is not supported on Windows")
     }
 
+    /// Cap on a single JSON-RPC frame (16 MiB) — generous for any real ACP
+    /// message, but bounds read-buffer growth so a peer that dumps an endless
+    /// stream with no newline surfaces a codec error and closes the connection
+    /// instead of ballooning host memory to OOM.
+    const MAX_LINE_LEN: usize = 16 * 1024 * 1024;
+
     fn frame(r: BoxRead, w: BoxWrite) -> (AcpReader, AcpWriter) {
         (
             AcpReader {
-                reader: FramedRead::new(r, LinesCodec::new()),
+                reader: FramedRead::new(r, LinesCodec::new_with_max_length(Self::MAX_LINE_LEN)),
             },
             AcpWriter {
                 writer: FramedWrite::new(w, LinesCodec::new()),
@@ -114,11 +126,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blank_line_yields_none() {
+    async fn blank_line_is_skipped_not_treated_as_eof() {
+        // A stray blank line between frames (e.g. `\n\n` framing) must NOT be
+        // mistaken for a hang-up: recv skips it and reads the following message.
         let (a, mut b) = tokio::io::duplex(64);
         let (mut reader, _) = AcpTransport::frame(Box::new(a), Box::new(tokio::io::sink()));
         b.write_all(b"\n").await.unwrap();
-        assert!(reader.recv().await.unwrap().is_none());
+        b.write_all(serde_json::to_string(&note("ping")).unwrap().as_bytes())
+            .await
+            .unwrap();
+        b.write_all(b"\n").await.unwrap();
+        match reader.recv().await.unwrap().expect("blank line must be skipped") {
+            JsonRpcMessage::Notification(n) => assert_eq!(n.method, "ping"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_line_is_an_error_not_unbounded_growth() {
+        // A frame past the max length surfaces as a codec error (connection
+        // closes) rather than letting the read buffer grow without bound.
+        let (a, mut b) = tokio::io::duplex(64);
+        let (mut reader, _) = AcpTransport::frame(Box::new(a), Box::new(tokio::io::sink()));
+        let writer = tokio::spawn(async move {
+            // Never send a newline; just keep pushing bytes past the cap.
+            let chunk = vec![b'x'; 64 * 1024];
+            loop {
+                if b.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        assert!(
+            reader.recv().await.is_err(),
+            "an over-long unterminated line must error, not grow forever"
+        );
+        writer.abort();
     }
 
     #[tokio::test]

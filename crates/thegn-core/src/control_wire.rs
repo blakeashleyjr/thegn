@@ -166,13 +166,39 @@ impl std::fmt::Display for WireError {
 
 impl std::error::Error for WireError {}
 
+/// Prepended when a snapshot's bytes get truncated (below), so a cut that lands
+/// mid-escape doesn't leave the reattached terminal in a broken SGR/mode state:
+/// SGR reset + reset-to-ground for any half-consumed CSI/OSC. It also visibly
+/// clears anything stale. Small, so it never itself pushes over the cap.
+const TRUNCATE_PREFIX: &[u8] = b"\x1b[0m\x1b\\\x1b[2J\x1b[H";
+
 /// `[header-len:u16 BE][header JSON][raw bytes]` inside a pane frame's payload.
+/// The whole frame is `[tag:u8][len:u32][payload]`, and the decoder fatals on
+/// `len > MAX_WIRE_PAYLOAD` (tearing the stream down permanently on reconnect),
+/// so a snapshot whose bytes overflow the cap must be bounded *here* rather than
+/// trusting the producer — the producer path (daemon `snapshot_frame`) has no
+/// per-line or total size guard. We keep the **tail** (most recent output) and
+/// prepend a reset so a mid-sequence cut is harmless.
 fn encode_pane_payload(header: &PaneHeader, bytes: &[u8]) -> Vec<u8> {
     let h = serde_json::to_vec(header).expect("pane header json");
+    // Bytes budget so `[tag][len][hdr-len][hdr][bytes]` fits MAX_WIRE_PAYLOAD.
+    let overhead = 5 + 2 + h.len();
+    let budget = MAX_WIRE_PAYLOAD.saturating_sub(overhead);
+    let bytes: std::borrow::Cow<'_, [u8]> = if bytes.len() > budget {
+        // Keep the tail; reserve room for the reset prefix we prepend.
+        let keep = budget.saturating_sub(TRUNCATE_PREFIX.len());
+        let tail = &bytes[bytes.len() - keep..];
+        let mut trunc = Vec::with_capacity(TRUNCATE_PREFIX.len() + tail.len());
+        trunc.extend_from_slice(TRUNCATE_PREFIX);
+        trunc.extend_from_slice(tail);
+        std::borrow::Cow::Owned(trunc)
+    } else {
+        std::borrow::Cow::Borrowed(bytes)
+    };
     let mut out = Vec::with_capacity(2 + h.len() + bytes.len());
     out.extend_from_slice(&(h.len() as u16).to_be_bytes());
     out.extend_from_slice(&h);
-    out.extend_from_slice(bytes);
+    out.extend_from_slice(&bytes);
     out
 }
 
@@ -526,6 +552,61 @@ mod tests {
         let mut d = EventDecoder::new();
         d.push(&framed);
         assert_eq!(d.next_frame(), Err(WireError::BadPayload(T_ACTIVITY)));
+    }
+
+    #[test]
+    fn oversized_snapshot_is_bounded_and_still_decodes() {
+        // A snapshot whose repaint bytes exceed the 1 MiB cap must not produce a
+        // frame the decoder fatals on (which would break warm attach forever).
+        let big = vec![b'x'; MAX_WIRE_PAYLOAD + 64 * 1024];
+        let f = EventFrame::PaneSnapshot {
+            session: "sess-huge".into(),
+            seq: 9,
+            cols: 200,
+            rows: 50,
+            bytes: big,
+        };
+        let encoded = f.encode();
+        assert!(
+            encoded.len() <= MAX_WIRE_PAYLOAD + 5,
+            "encoded frame {} exceeds cap",
+            encoded.len()
+        );
+        let mut d = EventDecoder::new();
+        d.push(&encoded);
+        // Decodes cleanly — no PayloadTooLarge tear-down.
+        let got = d.next_frame().unwrap().expect("frame present");
+        match got {
+            EventFrame::PaneSnapshot {
+                session,
+                seq,
+                cols,
+                rows,
+                bytes,
+            } => {
+                assert_eq!(session, "sess-huge");
+                assert_eq!((seq, cols, rows), (9, 200, 50));
+                // Truncated to fit, with the reset prefix preserving the tail.
+                assert!(bytes.starts_with(TRUNCATE_PREFIX));
+                assert!(bytes.ends_with(b"xxxx"));
+                assert!(bytes.len() < MAX_WIRE_PAYLOAD);
+            }
+            other => panic!("expected PaneSnapshot, got {other:?}"),
+        }
+        assert_eq!(d.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn at_cap_snapshot_is_untouched() {
+        // A snapshot comfortably under the cap must pass through byte-for-byte.
+        let bytes = vec![b'y'; 4096];
+        roundtrip(EventFrame::PaneSnapshot {
+            session: "s".into(),
+            seq: 1,
+            cols: 80,
+            rows: 24,
+            bytes,
+        });
     }
 
     #[test]

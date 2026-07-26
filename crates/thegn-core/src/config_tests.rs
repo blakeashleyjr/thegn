@@ -2009,5 +2009,162 @@ fn surface_self_log_errors_defaults_off_and_overlay_applies() {
     assert!(!ov.is_empty());
 }
 
+// --- audit regression tests (core-config bundle) ---
+
+/// SandboxOverlay::is_empty must account for every field: it is the
+/// `skip_serializing_if` for env/profile `[…sandbox]` overlays, so a field it
+/// forgets is silently dropped through the apply_override_str/apply_toml_overlay
+/// serde round-trip. Regression: 8 fields (file_access, ports, gpu, limits,
+/// volumes, compose, inject_devshell, nix_daemon) were previously omitted.
+#[test]
+fn sandbox_overlay_is_empty_covers_every_field() {
+    // A truly empty overlay is empty.
+    assert!(SandboxOverlay::default().is_empty());
+
+    // Each of the previously-omitted fields alone makes it non-empty.
+    let ports = SandboxOverlay {
+        ports: Some(vec!["8080:8080".into()]),
+        ..Default::default()
+    };
+    assert!(!ports.is_empty(), "ports set must not be empty");
+
+    let gpu = SandboxOverlay {
+        gpu: Some("all".into()),
+        ..Default::default()
+    };
+    assert!(!gpu.is_empty(), "gpu set must not be empty");
+
+    let limits = SandboxOverlay {
+        limits: Some(SandboxLimits {
+            memory: Some("2g".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(!limits.is_empty(), "limits set must not be empty");
+
+    let volumes = SandboxOverlay {
+        volumes: Some(std::collections::HashMap::from([("a".into(), "b".into())])),
+        ..Default::default()
+    };
+    assert!(!volumes.is_empty(), "volumes set must not be empty");
+
+    let compose = SandboxOverlay {
+        compose: Some("docker-compose.yml".into()),
+        ..Default::default()
+    };
+    assert!(!compose.is_empty(), "compose set must not be empty");
+
+    let inject = SandboxOverlay {
+        inject_devshell: Some(false),
+        ..Default::default()
+    };
+    assert!(!inject.is_empty(), "inject_devshell set must not be empty");
+
+    let nixd = SandboxOverlay {
+        nix_daemon: Some(true),
+        ..Default::default()
+    };
+    assert!(!nixd.is_empty(), "nix_daemon set must not be empty");
+
+    let fa = SandboxOverlay {
+        file_access: Some(FileAccess::default()),
+        ..Default::default()
+    };
+    assert!(!fa.is_empty(), "file_access set must not be empty");
+}
+
+/// End-to-end: an env sandbox overlay setting only one of the formerly-omitted
+/// fields must survive the apply_override_str serde round-trip (previously it was
+/// skip-serialized and came back all-None, silently dropping the override).
+#[test]
+fn env_sandbox_overlay_survives_override_roundtrip() {
+    let mut cfg = Config::default();
+    cfg.env.insert(
+        "dev".into(),
+        EnvConfig {
+            sandbox: SandboxOverlay {
+                limits: Some(SandboxLimits {
+                    memory: Some("2g".into()),
+                    ..Default::default()
+                }),
+                nix_daemon: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    // Any unrelated --set triggers the whole-Config serde round-trip.
+    Config::apply_override_str(&mut cfg, "picker", "fzf").unwrap();
+
+    let sb = &cfg.env["dev"].sandbox;
+    assert_eq!(
+        sb.limits.as_ref().and_then(|l| l.memory.as_deref()),
+        Some("2g"),
+        "env sandbox limits must survive the round-trip"
+    );
+    assert_eq!(
+        sb.nix_daemon,
+        Some(true),
+        "env sandbox nix_daemon must survive the round-trip"
+    );
+}
+
+/// try_load_layered must not treat an *existing* but unreadable/invalid-UTF-8
+/// config file as absent: an invalid byte sequence should surface as a parse
+/// error (via load_layered's warn path) rather than silently loading defaults.
+#[test]
+fn unreadable_config_file_is_not_treated_as_absent() {
+    let dir = std::env::temp_dir().join(format!("thegn-cfg-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    // Write invalid UTF-8 so read_to_string returns an Err on an existing file.
+    std::fs::write(&path, [0x80, 0x81, 0x82]).unwrap();
+
+    let env = MapEnv::default();
+    let res = Config::try_load_layered(&env, &[], Some(path.clone()));
+    // An existing-but-unreadable file must NOT parse cleanly as empty defaults.
+    assert!(
+        res.is_err(),
+        "unreadable/invalid config must error, not masquerade as absent"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// apply_override_str must reject a typo'd LEAF key rather than silently
+/// inserting it and dropping it through Config's non-deny_unknown_fields deser.
+#[test]
+fn apply_override_str_rejects_typod_leaf_key() {
+    let mut cfg = Config::default();
+    // "enalbed" is a typo of "enabled" — the intermediate "sandbox" is valid.
+    let err = Config::apply_override_str(&mut cfg, "sandbox.enalbed", "true");
+    assert!(err.is_err(), "typo'd leaf must be rejected");
+    // A correct leaf still works.
+    Config::apply_override_str(&mut cfg, "sandbox.enabled", "true").unwrap();
+    assert!(cfg.sandbox.enabled);
+    // The special-cased key still works.
+    Config::apply_override_str(&mut cfg, "apps.tab_order", "a,b").unwrap();
+    assert_eq!(cfg.apps.tab_order, vec!["a".to_string(), "b".to_string()]);
+}
+
+/// `config validate` must reject a body that load_layered would discard
+/// wholesale — a plain type mismatch that never reaches the enum spot-checks.
+#[test]
+fn validate_str_catches_wholesale_type_error() {
+    // `enabled` under [sandbox] is a bool; a string makes Config deser fail, so
+    // load_layered would discard the whole file. validate must report it.
+    let body = "[sandbox]\nenabled = \"false\"\n";
+    let errs = validate_str(body);
+    assert!(
+        !errs.is_empty(),
+        "type mismatch that breaks load must be reported: {errs:?}"
+    );
+
+    // A clean config still validates.
+    assert!(validate_str("picker = \"fzf\"\n").is_empty());
+}
+
 #[path = "config_tests_coverage.rs"]
 mod coverage;

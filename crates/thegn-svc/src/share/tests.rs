@@ -272,6 +272,51 @@ fn iroh_listens_and_scrapes_ticket_into_connect_command() {
     );
 }
 
+// ── start(): the child must survive after start() returns ─────────────────────
+
+/// Regression: the per-stream reader threads must keep draining the child's
+/// stdout/stderr for the child's whole lifetime. They used to `break` the moment
+/// `tx.send` failed — which is the instant `start()` returns (the local `rx` is
+/// dropped) — closing the pipe read ends. A tunnel client that then logs a line
+/// (frpc's reconnect/heartbeat) takes SIGPIPE against the closed fd and dies,
+/// flipping a healthy share to Down. Here a `sh` child (SIGPIPE is SIG_DFL in a
+/// spawned child, as for a Go client) keeps writing well past the grace window;
+/// with the leak it dies on its next write, with the fix it stays alive.
+#[cfg(unix)]
+#[test]
+fn start_keeps_draining_so_child_survives_post_return() {
+    // Prints a couple of lines during the grace window, then keeps writing every
+    // 50ms for ~3s — long after start() returns and `rx` is dropped.
+    let script = "i=0; while [ $i -lt 60 ]; do echo line $i; i=$((i+1)); sleep 0.05; done";
+    let plan = SharePlan {
+        program: "sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: vec![],
+        files: vec![],
+        url_rule: UrlRule::Fixed("http://fixed.example".into()),
+    };
+    let tmp = std::env::temp_dir().join(format!("thegn-share-test-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    let mut running = start(&plan, &tmp, Duration::from_secs(5)).expect("start");
+    assert_eq!(running.public_url, "http://fixed.example");
+
+    // Give the child time to emit several post-return lines: under the old
+    // break-on-send-fail behavior it would SIGPIPE and exit here.
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        running
+            .child
+            .try_wait()
+            .expect("try_wait")
+            .is_none(),
+        "child must still be running — a closed stdout would have SIGPIPE-killed it"
+    );
+
+    running.stop();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn tailscale_funnel_custom_port() {
     use thegn_core::config::TailscaleShareConfig;

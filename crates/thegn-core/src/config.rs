@@ -2649,6 +2649,10 @@ impl SandboxOverlay {
     }
 
     fn is_empty(&self) -> bool {
+        // `skip_serializing_if` for env/profile `[…sandbox]` overlays: EVERY field
+        // must be checked or it is silently dropped through the serde round-trip
+        // in apply_toml_overlay / apply_override_str. Test:
+        // sandbox_overlay_is_empty_covers_every_field.
         self.enabled.is_none()
             && self.backend.is_none()
             && self.default_backend.is_none()
@@ -2658,6 +2662,12 @@ impl SandboxOverlay {
             && self.profile.is_none()
             && self.agent_profile.is_none()
             && self.network.is_none()
+            && self.file_access.is_none()
+            && self.ports.is_none()
+            && self.gpu.is_none()
+            && self.limits.is_none()
+            && self.volumes.is_none()
+            && self.compose.is_none()
             && self.env_passthrough.is_none()
             && self.auto_caches.is_none()
             && self.mounts.is_none()
@@ -2665,6 +2675,8 @@ impl SandboxOverlay {
             && self.prepare.is_none()
             && self.warm_direnv.is_none()
             && self.devenv.is_none()
+            && self.inject_devshell.is_none()
+            && self.nix_daemon.is_none()
             && self.shell.is_none()
             && self.on_missing.is_none()
             && self.remote.is_none()
@@ -3843,7 +3855,15 @@ impl Config {
     ) -> Result<Self, String> {
         let _span = tracing::info_span!("config_load_layered").entered();
         let file = path.unwrap_or_else(Self::path);
-        let s = std::fs::read_to_string(&file).unwrap_or_else(|_| "".into());
+        // Only a *missing* file falls back to empty. An existing but unreadable
+        // file (EACCES/EIO/invalid-UTF-8) must NOT masquerade as absent — return
+        // Err so load_layered's warn-and-default path fires instead of silently
+        // running on defaults with no signal to the user.
+        let s = match std::fs::read_to_string(&file) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
+        };
         let mut cfg: Config = toml::from_str(&s).map_err(|e| format!("{e}"))?;
 
         // Profile overlay (H): a named profile's own `config.toml` (a full
@@ -3962,6 +3982,19 @@ impl Config {
 
         let new_cfg: Config =
             serde_json::from_value(tree).map_err(|e| format!("Type error on {}: {}", key, e))?;
+        // Reject a typo'd LEAF key: serde silently drops an unknown struct field,
+        // so the override would vanish without a word. Re-serialize and confirm
+        // the path survived the round-trip. A valid map/HashMap key (e.g.
+        // `theme.colors.bg1`) survives; a struct-field typo does not. Intermediate
+        // segments were already validated against the pre-image above.
+        let check = serde_json::to_value(&new_cfg).map_err(|e| e.to_string())?;
+        let mut cur = &check;
+        for part in &parts {
+            match cur.get(part) {
+                Some(v) => cur = v,
+                None => return Err(format!("Invalid path: {}", key)),
+            }
+        }
         *cfg = new_cfg;
         Ok(())
     }
@@ -4420,6 +4453,12 @@ pub fn validate_str(body: &str) -> Vec<String> {
         Ok(v) => v,
         Err(e) => return vec![format!("TOML syntax error: {e}")],
     };
+    // The wholesale check load_layered enforces: if the body fails to
+    // deserialize into `Config`, the entire file is discarded for defaults. The
+    // enum spot-checks below only cover warn-and-default cases.
+    if let Err(e) = toml::from_str::<Config>(body) {
+        errs.push(format!("config would be rejected on load: {e}"));
+    }
     fn check(
         errs: &mut Vec<String>,
         path: &str,

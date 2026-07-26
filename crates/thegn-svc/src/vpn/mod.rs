@@ -240,6 +240,8 @@ impl VpnProvider for BuiltinProvider<'_> {
         if let Some(argv) = deregister_argv(self.spec) {
             let _ = exec_in(rt, container, &argv);
         }
+        // Secret material must not outlive the tunnel it was minted for.
+        cleanup_staged(container);
         Ok(())
     }
 }
@@ -347,7 +349,12 @@ fn proxy_for_port(port: u16) -> Proxy {
     }
 }
 
-const TS_SOCKS_PORT: u16 = 1055;
+/// The loopback port a userspace tunnel's SOCKS5 listener binds inside the
+/// sidecar netns, and that the worktree's `ALL_PROXY` targets. Provider-neutral:
+/// each userspace provider is explicitly pinned to it (Tailscale via
+/// `TS_SOCKS5_SERVER`, NetBird via `NB_SOCKS5_LISTENER_PORT`) so the injected
+/// proxy address always matches the daemon's actual listener.
+const USERSPACE_SOCKS_PORT: u16 = 1055;
 
 fn plan_tailscale(
     spec: &VpnSpec,
@@ -405,7 +412,7 @@ fn plan_tailscale(
         env.push(("TS_USERSPACE".into(), "true".into()));
         env.push((
             "TS_SOCKS5_SERVER".into(),
-            format!("0.0.0.0:{TS_SOCKS_PORT}"),
+            format!("0.0.0.0:{USERSPACE_SOCKS_PORT}"),
         ));
     } else {
         env.push(("TS_USERSPACE".into(), "false".into()));
@@ -423,7 +430,7 @@ fn plan_tailscale(
             argv: vec!["tailscale".into(), "status".into(), "--json".into()],
             when: ReadyWhen::StdoutContains("\"Running\"".into()),
         },
-        proxy: userspace.then(|| proxy_for_port(TS_SOCKS_PORT)),
+        proxy: userspace.then(|| proxy_for_port(USERSPACE_SOCKS_PORT)),
     })
 }
 
@@ -572,6 +579,13 @@ fn plan_netbird(
     }
     if userspace {
         env.push(("NB_USE_NETSTACK_MODE".into(), "true".into()));
+        // Pin NetBird's netstack SOCKS5 listener to the port the worktree's
+        // ALL_PROXY targets. Without this, NetBird defaults to 1080 and every
+        // proxied connection to 1055 is refused while readiness reports success.
+        env.push((
+            "NB_SOCKS5_LISTENER_PORT".into(),
+            USERSPACE_SOCKS_PORT.to_string(),
+        ));
     }
     Ok(SidecarPlan {
         container: container.into(),
@@ -585,7 +599,7 @@ fn plan_netbird(
             argv: vec!["netbird".into(), "status".into()],
             when: ReadyWhen::StdoutContains("Connected".into()),
         },
-        proxy: userspace.then(|| proxy_for_port(TS_SOCKS_PORT)),
+        proxy: userspace.then(|| proxy_for_port(USERSPACE_SOCKS_PORT)),
     })
 }
 
@@ -701,8 +715,12 @@ fn run_sidecar(rt: &OciRuntime, plan: &SidecarPlan) -> Result<()> {
     if sidecar_running(rt, &plan.container) {
         return Ok(());
     }
-    let mut materialized: Vec<String> = Vec::new();
-    let staged = stage_files(plan, &mut materialized)?;
+    // A container that EXISTS but isn't running (Exited/Created — crashed daemon,
+    // host reboot, thegn killed mid-teardown) also clashes on `--name`. Remove
+    // any stale carcass so bring-up self-heals rather than wedging forever.
+    remove_stale_sidecar(rt, &plan.container);
+
+    let staged = stage_files(plan)?;
 
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -728,6 +746,8 @@ fn run_sidecar(rt: &OciRuntime, plan: &SidecarPlan) -> Result<()> {
         .output()
         .with_context(|| format!("vpn: start sidecar {}", plan.container))?;
     if !out.status.success() {
+        // The sidecar never came up — don't leave minted secret material on disk.
+        cleanup_staged(&plan.container);
         bail!(
             "vpn: sidecar '{}' failed to start: {}",
             plan.container,
@@ -737,24 +757,90 @@ fn run_sidecar(rt: &OciRuntime, plan: &SidecarPlan) -> Result<()> {
     Ok(())
 }
 
-/// Materialize `plan.files` to a 0600 dir under the state home; return their
-/// `(host, dest)` mount pairs.
-fn stage_files(plan: &SidecarPlan, written: &mut Vec<String>) -> Result<Vec<(String, String)>> {
+/// If a container with this name exists but isn't running, `rm -f` it so the
+/// subsequent `run --name` doesn't clash. Best-effort: on any failure we let
+/// `run` surface the real error.
+fn remove_stale_sidecar(rt: &OciRuntime, container: &str) {
+    let exists = {
+        let argv = rt.argv(&["inspect", container]);
+        std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if exists {
+        let argv = rt.argv(&["rm", "-f", container]);
+        // best-effort: cleanup of a stale sidecar; `run` reports if it persists.
+        let _ = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// Materialize `plan.files` to a 0700 dir under the state home, each file
+/// created 0600 *atomically* (never a world-readable window on the secret);
+/// return their `(host, dest)` mount pairs.
+fn stage_files(plan: &SidecarPlan) -> Result<Vec<(String, String)>> {
     if plan.files.is_empty() {
         return Ok(Vec::new());
     }
-    let dir = state_dir().join(&plan.container);
+    let dir = staged_dir(&plan.container);
     std::fs::create_dir_all(&dir).with_context(|| format!("vpn: mkdir {}", dir.display()))?;
+    // best-effort: 0700 so the secret files aren't traversable by other users.
+    let _ = thegn_core::fsperm::restrict_dir_to_owner(&dir);
     let mut out = Vec::new();
     for (i, f) in plan.files.iter().enumerate() {
         let host = dir.join(format!("f{i}"));
-        std::fs::write(&host, &f.contents)
+        write_secret_0600(&host, f.contents.as_bytes())
             .with_context(|| format!("vpn: write {}", host.display()))?;
-        set_0600(&host);
-        written.push(host.to_string_lossy().into_owned());
         out.push((host.to_string_lossy().into_owned(), f.dest.clone()));
     }
     Ok(out)
+}
+
+/// The per-sidecar directory holding its materialized secret files.
+fn staged_dir(container: &str) -> std::path::PathBuf {
+    state_dir().join(container)
+}
+
+/// Remove a sidecar's materialized secret directory (secrets must not outlive
+/// the tunnel they were minted for). Best-effort — absence is fine.
+pub fn cleanup_staged(container: &str) {
+    let dir = staged_dir(container);
+    // best-effort: secret-file teardown; a leftover dir is a security issue but
+    // a failed remove must not take down teardown.
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Write `contents` to `path` with mode 0600 set at creation time (unix), so the
+/// secret is never briefly world-readable under the process umask. On non-unix
+/// falls back to write-then-restrict (the existing best-effort DACL path).
+fn write_secret_0600(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // Replace any stale file so create-with-mode governs the perms.
+        let _ = std::fs::remove_file(path);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents)?;
+        f.flush()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)?;
+        set_0600(path);
+        Ok(())
+    }
 }
 
 fn state_dir() -> std::path::PathBuf {
@@ -769,8 +855,9 @@ fn state_dir() -> std::path::PathBuf {
     base.join("thegn").join("vpn")
 }
 
+#[cfg(not(unix))]
 fn set_0600(path: &std::path::Path) {
-    // best-effort: 0600 on unix, owner-only DACL on Windows.
+    // best-effort: owner-only DACL on Windows (unix uses create-with-mode).
     let _ = thegn_core::fsperm::restrict_to_owner(path);
 }
 
@@ -784,20 +871,61 @@ fn sidecar_running(rt: &OciRuntime, container: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Hard per-attempt cap on a `podman/docker exec` probe. A wedged runtime
+/// (hung conmon, stale OCI lock) must not let `output()` block `poll_ready`
+/// past its readiness deadline forever — each attempt is killed at this bound
+/// and retried, so the outer `timeout` is actually honored.
+const EXEC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// `exec` a command inside the sidecar; returns `(success, stdout)`. Public so
 /// the share layer can drive `tailscale serve` inside an existing VPN sidecar.
+///
+/// Bounded by [`EXEC_ATTEMPT_TIMEOUT`]: a hung `exec` is killed rather than
+/// blocking the caller indefinitely (a timeout surfaces as an `Err`).
 pub fn exec_in(rt: &OciRuntime, container: &str, cmd: &[String]) -> Result<(bool, String)> {
     let mut args = vec!["exec".to_string(), container.to_string()];
     args.extend(cmd.iter().cloned());
     let argv = rt.argv(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-    let out = std::process::Command::new(&argv[0])
+    run_output_timed(&argv, EXEC_ATTEMPT_TIMEOUT)
+        .with_context(|| format!("vpn: exec in {container}"))
+}
+
+/// Run `argv` to completion or `timeout`, killing the child on expiry.
+/// Returns `(success, stdout)`; a timeout is an `Err`.
+fn run_output_timed(argv: &[String], timeout: Duration) -> Result<(bool, String)> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(&argv[0])
         .args(&argv[1..])
-        .output()
-        .with_context(|| format!("vpn: exec in {container}"))?;
-    Ok((
-        out.status.success(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-    ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            // best-effort: kill the wedged child; we already have the timeout err.
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "timed out after {}s (killed `{}`)",
+                timeout.as_secs(),
+                argv.first().map(String::as_str).unwrap_or("?")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    Ok((status.success(), stdout))
 }
 
 /// Poll the readiness probe until it succeeds or `timeout` elapses.

@@ -153,10 +153,16 @@ impl DaytonaProvider {
 
 impl RemoteProvider for DaytonaProvider {
     async fn create(&self) -> Result<SandboxHandle> {
+        // Bounded per-request deadline: the shared client only caps *connection*
+        // setup, so a control plane that accepts the connection then withholds
+        // the response would hang provisioning forever (the "hung on startup"
+        // failure CONTROL_TIMEOUT documents). Sprites already guards this; Daytona
+        // was skipped.
         let resp = self
             .client
             .post(self.sandbox_url())
             .bearer_auth(&self.token)
+            .timeout(CONTROL_TIMEOUT)
             .json(&self.create_body())
             .send()
             .await
@@ -180,6 +186,7 @@ impl RemoteProvider for DaytonaProvider {
             .client
             .delete(self.sandbox_id_url(id))
             .bearer_auth(&self.token)
+            .timeout(CONTROL_TIMEOUT)
             .send()
             .await
             .context("daytona: DELETE /sandbox/{id}")?;
@@ -196,6 +203,7 @@ impl RemoteProvider for DaytonaProvider {
             .client
             .get(self.sandbox_url())
             .bearer_auth(&self.token)
+            .timeout(CONTROL_TIMEOUT)
             .send()
             .await
             .context("daytona: GET /sandbox")?;

@@ -7,6 +7,13 @@
 //! reads and several messages arriving in one buffer). All of it is unit-tested;
 //! the actual stdio lives in [`super::LspClient`].
 
+/// Reject any `Content-Length` above this — a well-formed LSP body is a JSON-RPC
+/// message, never gigabytes. A larger value is corruption or a hostile stream
+/// (ssh transports interleave foreign bytes: shell rc/banner output on stdout is
+/// a known real-world occurrence), so we treat it as a malformed header and
+/// resync rather than buffer the stream unboundedly.
+const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
 /// Frame a JSON body with the LSP `Content-Length` header.
 pub fn encode(body: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 32);
@@ -50,14 +57,28 @@ impl FrameDecoder {
                 continue;
             };
 
-            if self.buf.len() < body_start + len {
-                return None; // body not fully arrived yet
+            // `len` is attacker/corruption-controlled: a near-`usize::MAX` value
+            // would wrap `body_start + len` (a debug panic; in release a wrapped
+            // slice end that panics on the range), and even a huge non-wrapping
+            // value would buffer the stream unboundedly. Treat an overflow or an
+            // over-cap length as a malformed header and resync past it.
+            let body_end = body_start.checked_add(len);
+            match body_end {
+                Some(end) if len <= MAX_FRAME_LEN => {
+                    if self.buf.len() < end {
+                        return None; // body not fully arrived yet
+                    }
+                    let body: Vec<u8> = self.buf[body_start..end].to_vec();
+                    self.buf.drain(..end);
+                    // Bodies are UTF-8 JSON; a non-UTF-8 body is protocol-broken.
+                    return Some(String::from_utf8_lossy(&body).into_owned());
+                }
+                _ => {
+                    // Overflowing or over-cap length — drop this header and resync.
+                    self.buf.drain(..body_start);
+                    continue;
+                }
             }
-
-            let body: Vec<u8> = self.buf[body_start..body_start + len].to_vec();
-            self.buf.drain(..body_start + len);
-            // Bodies are UTF-8 JSON; a non-UTF-8 body is protocol-broken — skip it.
-            return Some(String::from_utf8_lossy(&body).into_owned());
         }
     }
 }
@@ -146,5 +167,40 @@ mod tests {
         let mut d = FrameDecoder::new();
         d.push(&encode(body));
         assert_eq!(d.next_message().as_deref(), Some(body));
+    }
+
+    #[test]
+    fn overflowing_content_length_resyncs_instead_of_panicking() {
+        // A near-usize::MAX Content-Length would wrap `body_start + len`
+        // (debug panic; release: a wrapped slice range that panics). It must be
+        // treated as a malformed header: dropped, then the next real message
+        // decodes.
+        let mut d = FrameDecoder::new();
+        d.push(format!("Content-Length: {}\r\n\r\n", usize::MAX).as_bytes());
+        // No panic, and no body yet (the hostile header was dropped).
+        assert_eq!(d.next_message(), None);
+        d.push(&encode("{\"ok\":true}"));
+        assert_eq!(d.next_message().as_deref(), Some("{\"ok\":true}"));
+    }
+
+    #[test]
+    fn over_cap_content_length_is_rejected_not_buffered() {
+        // A huge-but-not-overflowing length must not make the decoder buffer the
+        // stream unboundedly; it's dropped and the stream resyncs.
+        let mut d = FrameDecoder::new();
+        d.push(format!("Content-Length: {}\r\n\r\n", MAX_FRAME_LEN + 1).as_bytes());
+        assert_eq!(d.next_message(), None);
+        d.push(&encode("{\"ok\":true}"));
+        assert_eq!(d.next_message().as_deref(), Some("{\"ok\":true}"));
+    }
+
+    #[test]
+    fn at_cap_content_length_still_decodes() {
+        // The cap itself is a valid (if large) length — a body exactly at the
+        // cap boundary must still be accepted once it arrives.
+        let body = "x".repeat(MAX_FRAME_LEN);
+        let mut d = FrameDecoder::new();
+        d.push(&encode(&body));
+        assert_eq!(d.next_message().as_deref(), Some(body.as_str()));
     }
 }

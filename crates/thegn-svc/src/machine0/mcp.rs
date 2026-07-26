@@ -46,6 +46,19 @@ fn mcp_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Whether a tool is safe to **retry after an ambiguous transport failure**
+/// (timeout / connection reset / 5xx) — i.e. re-issuing it cannot mint a second
+/// resource or otherwise double-apply. Reads (`*_list`, `*_get*`) and idempotent
+/// upserts are retryable; **create** verbs are NOT: a `vm_create` /
+/// `image_create` / `ssh_key_create*` whose request was accepted server-side but
+/// whose *response* was lost at the edge would, on retry, either mint a duplicate
+/// billing resource or fail the whole call with a spurious name-conflict while
+/// the first resource silently exists. We conservatively treat any `*_create*`
+/// as non-idempotent and everything else as retryable. Pure.
+fn is_idempotent_tool(name: &str) -> bool {
+    !name.to_ascii_lowercase().contains("create")
+}
+
 /// The protocol version we advertise in `initialize` (and echo on later calls
 /// via the `MCP-Protocol-Version` header). A recent spec revision; the server
 /// negotiates down if it wants an older one.
@@ -172,6 +185,11 @@ impl Mcp0Client {
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {
         self.ensure_initialized().await;
         let session = self.session.lock().await.clone();
+        // Non-idempotent tools (create verbs) must never be retried after an
+        // ambiguous transport failure: the request may have been accepted while
+        // only the response was lost, and a retry would duplicate a billing VM /
+        // image (or fail spuriously on a name conflict). Reads/upserts retry.
+        let retry_ok = is_idempotent_tool(name);
         let mut last = String::new();
         for attempt in 0..ATTEMPTS {
             let body = tools_call_body(self.id(), name, arguments.clone());
@@ -201,7 +219,7 @@ impl Mcp0Client {
                     let text = resp.text().await.unwrap_or_default();
                     if !status.is_success() {
                         last = format!("machine0 mcp {name}: HTTP {status}: {text}");
-                        if transient_status(status) && attempt + 1 < ATTEMPTS {
+                        if retry_ok && transient_status(status) && attempt + 1 < ATTEMPTS {
                             tokio::time::sleep(BACKOFF).await;
                             continue;
                         }
@@ -224,7 +242,7 @@ impl Mcp0Client {
                 }
                 Err(e) => {
                     last = format!("machine0 mcp {name}: {e}");
-                    if retryable_err(&e) && attempt + 1 < ATTEMPTS {
+                    if retry_ok && retryable_err(&e) && attempt + 1 < ATTEMPTS {
                         tokio::time::sleep(BACKOFF).await;
                         continue;
                     }
@@ -352,6 +370,22 @@ fn first_text_content(result: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_verbs_are_not_retried() {
+        // Reads / idempotent tools may be retried after a transport blip.
+        assert!(is_idempotent_tool("vm_list"));
+        assert!(is_idempotent_tool("vm_get_by_name"));
+        assert!(is_idempotent_tool("vm_start"));
+        assert!(is_idempotent_tool("vm_stop"));
+        assert!(is_idempotent_tool("size_list"));
+        // Create verbs must NOT be retried — a lost response after a server-side
+        // accept would duplicate a billing VM/image or fail spuriously.
+        assert!(!is_idempotent_tool("vm_create"));
+        assert!(!is_idempotent_tool("image_create"));
+        assert!(!is_idempotent_tool("ssh_key_create_public"));
+        assert!(!is_idempotent_tool("VM_CREATE")); // case-insensitive
+    }
 
     #[test]
     fn tools_call_body_shape() {

@@ -271,6 +271,7 @@ impl EnvProviderConfig {
             && self.api_base.is_empty()
             && self.api_key_env.is_empty()
             && self.exec == ProviderExecMode::Auto
+            && self.connect == ProviderConnect::Exec
             && self.transport == RemoteTransport::Mosh
             && self.template.is_empty()
             && self.provision_flake.is_empty()
@@ -743,6 +744,14 @@ mod tests {
             ..Default::default()
         };
         assert!(!e.is_default());
+        // Regression: `connect` was omitted from is_default(), so a connect-only
+        // provider table was skip-serialized and lost through the config
+        // round-trip. A non-default `connect` must make is_default() false.
+        let e = EnvProviderConfig {
+            connect: ProviderConnect::Ssh,
+            ..Default::default()
+        };
+        assert!(!e.is_default(), "connect = ssh must not be default");
     }
 
     #[test]

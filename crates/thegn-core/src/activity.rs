@@ -26,6 +26,21 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Serializes in-process load→mutate→save cycles against `activity.json`. The
+/// ack path (focusing a red tab) and the ~2s hydrate poll both read-modify-write
+/// the same file; without this lock a poll can load a pre-ack snapshot and then
+/// overwrite the ack with its stale `waiting` copy (reverting the dot to unread).
+/// Cross-process safety still rests on the tmp+rename in [`save`]; this only
+/// covers the two writers that live in the same host process.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Monotonic per-write counter so concurrent writers in the same process never
+/// collide on the tmp path (pid alone is not enough — the ack + poll threads
+/// share a pid). See [`save`].
+static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// CPU per wall-second that counts as "working": 3 jiffies/s = 30ms/s ≈ 3% of
 /// one core. Catches builds / model streaming / tool runs; ignores an idle
@@ -177,6 +192,9 @@ pub fn poll_and_save_at_with(
     output_hints: &BTreeMap<String, f64>,
     now: f64,
 ) {
+    // Serialize against the ack path so a poll can't load a pre-ack snapshot and
+    // then save its stale `waiting` copy over a just-written ack (see WRITE_LOCK).
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut snap = load(path);
     if now - snap.polled_at < MIN_SCAN_INTERVAL_SECS {
         return;
@@ -195,6 +213,9 @@ pub fn ack(tab: &str) {
 
 /// [`ack`] against an explicit path (testable).
 pub fn ack_at(path: &Path, tab: &str) {
+    // Serialize the whole load→mutate→save against the poll thread so an ack is
+    // never clobbered by a concurrent stale save (see WRITE_LOCK).
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut snap = load(path);
     let mut changed = false;
     for e in snap.worktrees.values_mut() {
@@ -237,6 +258,7 @@ pub fn coerce_stale(state: &str, age_ms: u64, grace_ms: u64) -> String {
 /// re-derives the true state from fresh CPU deltas. Best-effort: a missing or
 /// garbled snapshot is a no-op, and nothing is written unless a state changed.
 pub fn coerce_stale_states_at(path: &Path, grace_ms: u64, now: f64) {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut snap = load(path);
     if snap.worktrees.is_empty() {
         return;
@@ -416,8 +438,9 @@ fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
 }
 
 /// Windows: same contract via sysinfo (PEB-read cwd + accumulated CPU time).
-/// Units are milliseconds rather than jiffies — fine, the activity state
-/// machine only ever *diffs* successive samples of the same counter.
+/// sysinfo reports milliseconds; we divide by 10 to convert to jiffy-equivalents
+/// (CLK_TCK = 100) so the shared busy threshold — which is expressed in jiffies —
+/// means the same fraction of a core here as it does on Linux.
 #[cfg(windows)]
 fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
@@ -437,7 +460,12 @@ fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
         let Some((_, wt)) = targets.iter().find(|(p, _)| cwd.starts_with(p)) else {
             continue;
         };
-        *sums.entry(wt.clone()).or_insert(0) += proc.accumulated_cpu_time();
+        // sysinfo reports accumulated CPU time in **milliseconds**, but the FSM's
+        // busy threshold (ACTIVE_JIFFIES_PER_SEC) is in Linux jiffies (CLK_TCK =
+        // 100, i.e. 10ms each). Convert ms → jiffy-equivalents so the same
+        // threshold means the same fraction of a core on both platforms;
+        // otherwise Windows would flip 'busy' at 1/10th the intended CPU.
+        *sums.entry(wt.clone()).or_insert(0) += proc.accumulated_cpu_time() / 10;
     }
     sums
 }
@@ -475,9 +503,16 @@ fn save(path: &Path, snap: &Snapshot) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let tmp = path.with_extension(format!("json.{}", std::process::id()));
+    // Unique per write: pid + a monotonic counter, so two threads in the same
+    // process (ack + poll) never truncate+write the *same* tmp file and publish
+    // a torn rename.
+    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{seq}", std::process::id()));
     if std::fs::write(&tmp, json).is_ok() {
         let _ = std::fs::rename(&tmp, path);
+    } else {
+        // best-effort: drop a failed tmp so it doesn't accumulate.
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -1125,5 +1160,85 @@ mod tests {
         // Missing file: no write, no panic.
         coerce_stale_states_at(&path, 600_000, 2000.0);
         assert!(!path.exists());
+    }
+
+    /// Regression: concurrent in-process ack + poll must never (a) lose the ack
+    /// (revert `read`→`waiting`) nor (b) publish a torn JSON file. Before the
+    /// fix, the ack and poll threads shared a pid-keyed tmp path and did
+    /// unserialized load→mutate→save, so a poll could clobber a fresh ack with
+    /// its stale snapshot and two `fs::write`s could interleave into garbage.
+    #[test]
+    fn concurrent_ack_and_poll_never_lose_ack_or_tear() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let path = Arc::new(tmp("race"));
+        let _ = std::fs::remove_file(&*path);
+        let managed = vec![ManagedWorktree {
+            worktree: "/nonexistent/wt-race".into(),
+            tab: "app/race".into(),
+        }];
+        // Seed a `waiting` (unread red) entry: the poll under a bogus path sees
+        // no CPU, so absent a race it would keep the state as-is on every cycle.
+        poll_and_save_at(&path, &managed, 1000.0);
+        {
+            let mut snap = load(&path);
+            let e = snap.worktrees.get_mut("/nonexistent/wt-race").unwrap();
+            e.state = "waiting".into();
+            e.quiet_since = Some(1000.0);
+            save(&path, &snap);
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        // Poll thread: hammers load→mutate→save on the same file with an
+        // advancing clock so the MIN_SCAN_INTERVAL guard never short-circuits it.
+        let poller = {
+            let (path, stop, managed) = (path.clone(), stop.clone(), managed.clone());
+            std::thread::spawn(move || {
+                let mut t = 1001.0;
+                while !stop.load(Ordering::Relaxed) {
+                    poll_and_save_at(&path, &managed, t);
+                    t += 2.0;
+                }
+            })
+        };
+        // Ack the tab; with the FSM sticky, once it is `read` it must stay red
+        // (never revert to `waiting`), and every read of the file must parse.
+        let mut acked_seen = false;
+        for _ in 0..2000 {
+            ack_at(&path, "app/race");
+            let st = read_states_at(&path); // parses => file was never torn
+            match st.get("app/race").map(String::as_str) {
+                Some("read") => acked_seen = true,
+                // Legal transient states, but never a revert *after* we saw read.
+                Some("waiting") | Some("active") | Some("none") | None => {
+                    assert!(
+                        !acked_seen,
+                        "ack was lost: state reverted away from `read`"
+                    );
+                }
+                other => panic!("unexpected state {other:?}"),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        poller.join().unwrap();
+        assert!(acked_seen, "ack never took effect at all");
+        let _ = std::fs::remove_file(&*path);
+    }
+
+    /// The tmp path used by `save` is unique per write (pid + counter), so two
+    /// writes never target the same file. Guards the torn-rename half of the fix.
+    #[test]
+    fn save_tmp_path_is_unique_per_write() {
+        let seq0 = WRITE_SEQ.load(Ordering::Relaxed);
+        let _ = seq0; // counter is monotonic; two saves advance it.
+        let path = tmp("tmp-unique");
+        let _ = std::fs::remove_file(&path);
+        let snap = Snapshot::default();
+        save(&path, &snap);
+        save(&path, &snap);
+        let seq1 = WRITE_SEQ.load(Ordering::Relaxed);
+        assert!(seq1 >= seq0 + 2, "each save must consume a fresh counter");
+        let _ = std::fs::remove_file(&path);
     }
 }

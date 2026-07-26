@@ -61,10 +61,7 @@ impl ReviewState {
 /// Run `gh <args>` with `cwd = worktree` (local, or over ssh on the remote host);
 /// trimmed stdout on success, else a classified error.
 pub fn gh_out(loc: &GitLoc, args: &[&str]) -> Result<String, GhError> {
-    let out = loc
-        .gh_command(args)
-        .output()
-        .map_err(|e| GhError::Other(e.to_string()))?;
+    let out = loc.gh_command(args).output().map_err(spawn_err)?;
     if out.status.success() {
         return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
     }
@@ -75,10 +72,7 @@ pub fn gh_out(loc: &GitLoc, args: &[&str]) -> Result<String, GhError> {
 
 /// Run `gh <args>` for its exit code (output discarded). Errors classified.
 pub fn gh_run(loc: &GitLoc, args: &[&str]) -> Result<(), GhError> {
-    let out = loc
-        .gh_command(args)
-        .output()
-        .map_err(|e| GhError::Other(e.to_string()))?;
+    let out = loc.gh_command(args).output().map_err(spawn_err)?;
     if out.status.success() {
         Ok(())
     } else {
@@ -88,17 +82,37 @@ pub fn gh_run(loc: &GitLoc, args: &[&str]) -> Result<(), GhError> {
     }
 }
 
+/// Map a spawn failure (e.g. `gh` binary absent) onto the right `GhError`.
+/// On a local worktree `gh_command` spawns `gh` directly, so a missing binary
+/// surfaces here as `ErrorKind::NotFound` rather than through `classify`.
+fn spawn_err(e: std::io::Error) -> GhError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        GhError::NotInstalled
+    } else {
+        GhError::Other(e.to_string())
+    }
+}
+
 fn classify(stderr: &str) -> GhError {
+    // Shell-shaped "not found" only — a bare "not found" also matches gh's REST
+    // `Not Found (HTTP 404)`, so the NotInstalled patterns must be specific.
     if stderr.contains("command not found")
-        || stderr.contains("not found")
-        || stderr.contains("no such file")
+        || stderr.contains("no such file or directory")
+        // A shell's "gh: not found" means the binary is missing — but gh's own
+        // REST error "Not Found (HTTP 404)" also contains ": not found", so only
+        // treat the bare form (no HTTP status) as NotInstalled.
+        || (stderr.contains(": not found") && !stderr.contains("http"))
     {
         GhError::NotInstalled
     } else if stderr.contains("no pull requests found")
         || stderr.contains("no default remote repository")
         || stderr.contains("no open pull request")
         || stderr.contains("no pr ")
+        || stderr.contains("http 404")
+        || stderr.contains("not found (http")
     {
+        // A 404 against a PR/repo endpoint means the target is gone, not that
+        // gh is missing — fold it into the "no PR" state rather than Other.
         GhError::NoPr
     } else if stderr.contains("not logged")
         || stderr.contains("authentication")
@@ -108,6 +122,18 @@ fn classify(stderr: &str) -> GhError {
         GhError::NotAuthenticated
     } else if stderr.contains("rate limit") || stderr.contains("api rate") {
         GhError::RateLimited
+    } else if stderr.contains("error connecting to")
+        || stderr.contains("could not resolve host")
+        || stderr.contains("no such host")
+        || stderr.contains("connection refused")
+        || stderr.contains("network is unreachable")
+        || stderr.contains("i/o timeout")
+        || stderr.contains("check your internet connection")
+        || stderr.contains("tls handshake")
+    {
+        // Transient network failure — distinct from Other so the UI can show
+        // "GitHub unreachable" and callers can circuit-break.
+        GhError::Offline
     } else {
         GhError::Other(stderr.trim().to_string())
     }
@@ -826,12 +852,17 @@ pub fn parse_unified_diff(raw: &str) -> PrDiff {
 }
 
 /// `a/PATH b/PATH` → the new-side (`b/`) path; the `+++` header refines it later.
+/// Split on the ` b/` separator (from the right) rather than the first space, so
+/// paths containing spaces survive — binary/rename-only files emit no `+++`
+/// header to correct a mis-split, so this is the final path for them.
 fn git_header_path(rest: &str) -> String {
-    if let Some((_, b)) = rest.split_once(' ') {
-        strip_ab(b).unwrap_or_else(|| b.to_string())
-    } else {
-        rest.to_string()
+    if let Some((_, b)) = rest.rsplit_once(" b/") {
+        return b.to_string();
     }
+    // Fallback for odd input (no ` b/`): strip the `a/`|`b/` prefix off the first
+    // token (single-path input has no space either).
+    let first = rest.split_once(' ').map(|(a, _)| a).unwrap_or(rest);
+    strip_ab(first).unwrap_or_else(|| first.to_string())
 }
 
 /// Strip the `a/`/`b/` prefix from a `---`/`+++` operand; `None` for `/dev/null`.
@@ -1516,6 +1547,83 @@ mod tests {
         // A round-trip through serde preserves the structure.
         let json = serde_json::to_string(&diff).unwrap();
         assert_eq!(serde_json::from_str::<PrDiff>(&json).unwrap(), diff);
+    }
+
+    #[test]
+    fn git_header_path_keeps_spaces_in_binary_paths() {
+        // Binary / rename-only diffs emit no `+++` header, so `git_header_path`
+        // is the final path. A filename with spaces must not be split on the
+        // first space (regression: old code yielded "shot.png b/docs/...").
+        assert_eq!(
+            git_header_path("a/docs/screen shot.png b/docs/screen shot.png"),
+            "docs/screen shot.png"
+        );
+        assert_eq!(git_header_path("a/src/foo.rs b/src/foo.rs"), "src/foo.rs");
+        // Pure rename: old and new paths differ, both with spaces.
+        assert_eq!(
+            git_header_path("a/old name.txt b/new name.txt"),
+            "new name.txt"
+        );
+        // Odd input with no ` b/` falls back to the leading-token behavior.
+        assert_eq!(git_header_path("a/only.txt"), "only.txt");
+    }
+
+    #[test]
+    fn classify_distinguishes_not_installed_404_and_offline() {
+        // Shell "command not found" → NotInstalled.
+        assert!(matches!(
+            classify("gh: command not found"),
+            GhError::NotInstalled
+        ));
+        assert!(matches!(
+            classify("/bin/sh: gh: not found"),
+            GhError::NotInstalled
+        ));
+        assert!(matches!(
+            classify("no such file or directory"),
+            GhError::NotInstalled
+        ));
+        // A REST 404 must NOT be misread as NotInstalled — gh prints it as
+        // `Not Found (HTTP 404)`, whose lowercase contains "not found".
+        assert!(matches!(
+            classify("gh: not found (http 404)"),
+            GhError::NoPr
+        ));
+        // Offline: real gh network stderr classifies as Offline, not Other.
+        assert!(matches!(
+            classify("error connecting to api.github.com\ncheck your internet connection"),
+            GhError::Offline
+        ));
+        assert!(matches!(
+            classify("dial tcp: lookup api.github.com: no such host"),
+            GhError::Offline
+        ));
+        assert!(matches!(
+            classify("could not resolve host: api.github.com"),
+            GhError::Offline
+        ));
+        assert!(classify("error connecting to api.github.com").is_transient());
+        // Still-correct existing branches.
+        assert!(matches!(
+            classify("no pull requests found for branch"),
+            GhError::NoPr
+        ));
+        assert!(matches!(classify("http 401"), GhError::NotAuthenticated));
+        assert!(matches!(classify("api rate limit exceeded"), GhError::RateLimited));
+        assert!(matches!(classify("some other failure"), GhError::Other(_)));
+    }
+
+    #[test]
+    fn spawn_err_maps_enoent_to_not_installed() {
+        use std::io::{Error, ErrorKind};
+        assert!(matches!(
+            spawn_err(Error::from(ErrorKind::NotFound)),
+            GhError::NotInstalled
+        ));
+        assert!(matches!(
+            spawn_err(Error::from(ErrorKind::PermissionDenied)),
+            GhError::Other(_)
+        ));
     }
 
     #[test]

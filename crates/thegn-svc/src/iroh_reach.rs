@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -21,6 +22,13 @@ use thegn_core::iroh_wire::{ALPN, ExecReq, Hello, Wire, WireDecoder, encode};
 use tokio::sync::{mpsc, watch};
 
 use crate::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec};
+
+/// Bound on how long an accepted-but-unauthenticated connection may take to send
+/// its [`Hello`]. A peer that completes the QUIC handshake (any holder of the
+/// home EndpointId, which is injected into every sandbox env) but then goes
+/// silent would otherwise pin a task + Connection forever (pre-auth resource
+/// hold). On expiry we close the connection and drop the task.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Authorizes an incoming sandbox connection. Returns the sandbox id the caller
 /// is authorized to serve (the registry key), or `None` to reject the connection.
@@ -76,6 +84,17 @@ impl IrohHome {
         endpoint: iroh::Endpoint,
         verifier: Arc<dyn TokenVerifier>,
     ) -> (Self, mpsc::UnboundedReceiver<String>) {
+        Self::serve_with_handshake_timeout(endpoint, verifier, HANDSHAKE_TIMEOUT)
+    }
+
+    /// [`serve`](Self::serve) with an explicit pre-auth handshake timeout. Only
+    /// the default is used in production; tests inject a short timeout to prove
+    /// the timeout path without a multi-second wait.
+    fn serve_with_handshake_timeout(
+        endpoint: iroh::Endpoint,
+        verifier: Arc<dyn TokenVerifier>,
+        handshake_timeout: Duration,
+    ) -> (Self, mpsc::UnboundedReceiver<String>) {
         let conns: Registry = Arc::new(Mutex::new(HashMap::new()));
         let (registered_tx, registered_rx) = mpsc::unbounded_channel();
 
@@ -84,6 +103,7 @@ impl IrohHome {
             verifier,
             conns.clone(),
             registered_tx.clone(),
+            handshake_timeout,
         ));
 
         (
@@ -182,6 +202,7 @@ async fn accept_loop(
     verifier: Arc<dyn TokenVerifier>,
     conns: Registry,
     registered_tx: mpsc::UnboundedSender<String>,
+    handshake_timeout: Duration,
 ) {
     while let Some(incoming) = endpoint.accept().await {
         let verifier = verifier.clone();
@@ -195,16 +216,31 @@ async fn accept_loop(
                     return;
                 }
             };
-            // The agent's first bi-stream carries the Hello handshake.
-            let mut recv = match conn.accept_bi().await {
-                Ok((_send, recv)) => recv,
-                Err(_) => return,
-            };
-            let mut dec = WireDecoder::new();
-            let hello = match read_frame(&mut recv, &mut dec).await {
-                Ok(Some(Wire::Hello(h))) => h,
-                _ => {
+            // The agent's first bi-stream carries the Hello handshake. Bound the
+            // whole pre-auth exchange (accept_bi + Hello read) so a peer that
+            // completes the QUIC handshake and then stalls can't pin this task +
+            // connection indefinitely.
+            let hello = match tokio::time::timeout(handshake_timeout, async {
+                let mut recv = match conn.accept_bi().await {
+                    Ok((_send, recv)) => recv,
+                    Err(_) => return None,
+                };
+                let mut dec = WireDecoder::new();
+                match read_frame(&mut recv, &mut dec).await {
+                    Ok(Some(Wire::Hello(h))) => Some(h),
+                    _ => None,
+                }
+            })
+            .await
+            {
+                Ok(Some(h)) => h,
+                Ok(None) => {
                     conn.close(1u32.into(), b"no hello");
+                    return;
+                }
+                Err(_) => {
+                    tracing::debug!("home: handshake timed out; closing pre-auth connection");
+                    conn.close(1u32.into(), b"handshake timeout");
                     return;
                 }
             };
@@ -212,9 +248,26 @@ async fn accept_loop(
                 Some(sandbox) => {
                     tracing::info!("home: sandbox '{sandbox}' registered over iroh");
                     if let Ok(mut m) = conns.lock() {
-                        m.insert(sandbox.clone(), conn);
+                        m.insert(sandbox.clone(), conn.clone());
                     }
-                    let _ = registered_tx.send(sandbox);
+                    let _ = registered_tx.send(sandbox.clone());
+                    // Evict the registry entry when the connection dies (agent
+                    // crash, machine stopped, path lost) so `is_connected` stops
+                    // reporting a dead sandbox reachable and the pane path falls
+                    // back to ssh. Guard on connection identity so a replacement
+                    // from a later re-register isn't evicted by the old close.
+                    let watch_conns = conns.clone();
+                    let watch_conn = conn.clone();
+                    tokio::spawn(async move {
+                        watch_conn.closed().await;
+                        if let Ok(mut m) = watch_conns.lock() {
+                            if m.get(&sandbox)
+                                .is_some_and(|cur| cur.stable_id() == watch_conn.stable_id())
+                            {
+                                m.remove(&sandbox);
+                            }
+                        }
+                    });
                 }
                 None => {
                     conn.close(2u32.into(), b"unauthorized");
@@ -275,5 +328,111 @@ async fn read_frame(recv: &mut RecvStream, dec: &mut WireDecoder) -> Result<Opti
             Some(0) => continue,
             Some(n) => dec.push(&buf[..n]),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Bind a local, relay-free iroh endpoint for the test (offline loopback).
+    async fn local_endpoint() -> iroh::Endpoint {
+        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("bind local endpoint")
+    }
+
+    /// Poll `f` until it returns true or the deadline passes.
+    async fn wait_until(mut f: impl FnMut() -> bool, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        f()
+    }
+
+    /// Regression: a peer that completes the QUIC handshake but never sends its
+    /// `Hello` must NOT pin the accept task + connection forever. With a short
+    /// injected handshake timeout the home closes the pre-auth connection, which
+    /// the dialer observes via `closed()`. The sandbox never registers.
+    #[tokio::test]
+    async fn handshake_timeout_closes_stalled_pre_auth_connection() {
+        // Verifier would accept, but the dialer never gets far enough to be checked.
+        let verifier: Arc<dyn TokenVerifier> =
+            Arc::new(FnVerifier(|_h: &Hello| Some("wt-stall".to_string())));
+        let (home, mut registered) = IrohHome::serve_with_handshake_timeout(
+            local_endpoint().await,
+            verifier,
+            Duration::from_millis(300),
+        );
+        let home_addr = home.addr();
+
+        // Dial and complete the QUIC handshake, then open the handshake stream but
+        // deliberately never write a Hello.
+        let dialer = local_endpoint().await;
+        let conn = dialer
+            .connect(home_addr, ALPN)
+            .await
+            .expect("dial home");
+        let (_stalled_send, _stalled_recv) = conn.open_bi().await.expect("open bi");
+
+        // The home must close our connection once the handshake timeout elapses.
+        let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+        assert!(
+            closed.is_ok(),
+            "home did not close the stalled pre-auth connection within the timeout"
+        );
+
+        // And no registration ever fired.
+        let reg = tokio::time::timeout(Duration::from_millis(200), registered.recv()).await;
+        assert!(reg.is_err(), "a stalled dialer must never register");
+        assert!(!home.is_connected("wt-stall"));
+    }
+
+    /// Regression: when a registered sandbox's connection dies, the registry must
+    /// evict it so `is_connected` stops reporting a dead sandbox reachable (which
+    /// would keep the pane path on iroh instead of falling back to ssh).
+    #[tokio::test]
+    async fn dead_connection_is_evicted_from_registry() {
+        let verifier: Arc<dyn TokenVerifier> =
+            Arc::new(FnVerifier(|h: &Hello| Some(h.sandbox.clone())));
+        let (home, mut registered) = IrohHome::serve(local_endpoint().await, verifier);
+        let home_addr = home.addr();
+
+        // Dial + send a valid Hello so the home registers us.
+        let dialer = local_endpoint().await;
+        let conn = dialer.connect(home_addr, ALPN).await.expect("dial home");
+        let (mut send, _recv) = conn.open_bi().await.expect("open bi");
+        send.write_all(&encode(&Wire::Hello(Hello {
+            token: "tok".into(),
+            sandbox: "wt-dead".into(),
+        })))
+        .await
+        .expect("send hello");
+        send.finish().expect("finish hello");
+
+        let sandbox = tokio::time::timeout(Duration::from_secs(5), registered.recv())
+            .await
+            .expect("registration timed out")
+            .expect("registered channel closed");
+        assert_eq!(sandbox, "wt-dead");
+        assert!(home.is_connected("wt-dead"), "should be registered");
+
+        // Kill the connection from the sandbox side (agent crash / machine stop).
+        conn.close(0u32.into(), b"agent gone");
+        drop(dialer);
+
+        // The watcher must evict the dead entry so is_connected flips to false.
+        let evicted = wait_until(|| !home.is_connected("wt-dead"), Duration::from_secs(5)).await;
+        assert!(
+            evicted,
+            "dead connection was not evicted; is_connected still reports it reachable"
+        );
     }
 }
