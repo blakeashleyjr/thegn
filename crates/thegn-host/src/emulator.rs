@@ -17,7 +17,7 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// One styled cell, renderer-agnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -165,16 +165,49 @@ pub enum MouseMode {
     AnyMotion,
 }
 
+/// The Term's event sink. The only event we care about is the OSC-0/2 window
+/// title (`AlacrittyEvent::Title`); everything else the alacritty core emits
+/// (bell, clipboard, PTY writes, etc.) the compositor drives itself, so we drop
+/// it. The title lands in a shared `Mutex<Option<String>>` that
+/// [`AlacrittyEmulator::title`] reads back. The cell is owned by the single
+/// `EventProxy` stored inside the shared `Term`, so both the loop-side
+/// `advance` and the reader-thread [`AlacrittyFeeder`] update the same title.
 #[derive(Clone)]
-pub struct EventProxy;
+pub struct EventProxy {
+    title: Arc<Mutex<Option<String>>>,
+}
+
+impl EventProxy {
+    fn new() -> Self {
+        Self {
+            title: Arc::new(Mutex::new(None)),
+        }
+    }
+}
 
 impl EventListener for EventProxy {
-    fn send_event(&self, _event: AlacrittyEvent) {}
+    fn send_event(&self, event: AlacrittyEvent) {
+        match event {
+            AlacrittyEvent::Title(t) => {
+                if let Ok(mut g) = self.title.lock() {
+                    *g = Some(t);
+                }
+            }
+            AlacrittyEvent::ResetTitle => {
+                if let Ok(mut g) = self.title.lock() {
+                    *g = None;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub struct AlacrittyEmulator {
     term: Arc<FairMutex<Term<EventProxy>>>,
     parser: Processor,
+    /// Shared with the [`EventProxy`] inside `term`; holds the last OSC title.
+    title: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -206,10 +239,13 @@ impl AlacrittyEmulator {
             ..Default::default()
         };
 
-        let term = Term::new(config, &size, EventProxy);
+        let proxy = EventProxy::new();
+        let title = Arc::clone(&proxy.title);
+        let term = Term::new(config, &size, proxy);
         Self {
             term: Arc::new(FairMutex::new(term)),
             parser: Processor::new(),
+            title,
         }
     }
 }
@@ -336,9 +372,14 @@ impl PaneEmulator for AlacrittyEmulator {
     }
 
     fn title(&self) -> Option<String> {
-        // OSC titles come through EventListener (AlacrittyEvent::Title(t)).
-        // For now, we skip capturing it to get it compiling cleanly.
-        None
+        // OSC 0/2 titles arrive via the shared `EventProxy` (see its docs); read
+        // the last one back here. A blank title is treated as "none" so callers
+        // fall back to a derived pane name instead of showing an empty label.
+        self.title
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .filter(|t| !t.is_empty())
     }
 
     fn cursor(&self) -> (u16, u16) {
@@ -524,5 +565,32 @@ mod tests {
         emu.advance(b"\x1b[3;5fBTOP");
         assert_eq!(emu.cell(2, 4).unwrap().text, "B");
         assert_eq!(emu.cell(2, 7).unwrap().text, "P");
+    }
+
+    #[test]
+    fn osc_title_is_captured_and_reset() {
+        let mut e = AlacrittyEmulator::new(24, 80, 0);
+        // No title until the app sets one.
+        assert_eq!(e.title(), None);
+        // OSC 2 (window title). Regression: EventProxy used to drop this and
+        // title() was hardcoded None, so OSC-title features were dead.
+        e.advance(b"\x1b]2;my session\x07");
+        assert_eq!(e.title(), Some("my session".to_string()));
+        // OSC 0 sets both icon + window title.
+        e.advance(b"\x1b]0;another\x07");
+        assert_eq!(e.title(), Some("another".to_string()));
+        // A blank title reads as "none" so callers fall back to a derived name.
+        e.advance(b"\x1b]2;\x07");
+        assert_eq!(e.title(), None);
+    }
+
+    #[test]
+    fn osc_title_is_shared_with_the_feeder() {
+        // Both the loop-side `advance` and the reader-thread feeder drive the
+        // same Term, so a title set through the feeder is visible via title().
+        let e = AlacrittyEmulator::new(24, 80, 0);
+        let mut feeder = e.feeder().expect("alacritty exposes a feeder");
+        feeder.advance(b"\x1b]2;from feeder\x07");
+        assert_eq!(e.title(), Some("from feeder".to_string()));
     }
 }

@@ -9,6 +9,7 @@
 //! `launch_spec` are pure over `Config`/`Db`, so the wiring in `run.rs` stays a
 //! thin call.
 
+use crate::agent_configs::with_provision_timeout;
 use crate::remote_sync::ssh_none_guard;
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
@@ -328,7 +329,7 @@ pub fn prepare_sandbox_env(
         explicit_backend = None;
         sb.backend = thegn_core::config::SandboxBackend::Auto;
     }
-    let explicit_choice = explicit_backend.is_some();
+    let mut explicit_choice = explicit_backend.is_some();
     let auto_choice = sb.backend == thegn_core::config::SandboxBackend::Auto;
     let mut warnings = Vec::new();
     let profile_slug = cfg.profile.trim();
@@ -387,6 +388,12 @@ pub fn prepare_sandbox_env(
         // heals to local instead of routing chrome reads at the dead provider.
         location = None;
         degraded_from_provider = true;
+        // Degrading to the host retires the configured backend: an explicit OCI
+        // backend (podman/smol — kept past line 316) would otherwise strand the
+        // bare-host fallback with "explicit backend 'none' did not produce a
+        // runnable sandbox". Clear it so the None candidate opens a plain shell.
+        explicit_backend = None;
+        explicit_choice = false;
         sb.backend = thegn_core::config::SandboxBackend::None;
     }
     if !placement.is_local()
@@ -411,9 +418,12 @@ pub fn prepare_sandbox_env(
         placement = thegn_core::placement::Placement::Local;
         exec_placement = thegn_core::placement::Placement::Local;
         env_is_remote = false;
-        // Same as the auto-provision degrade above: heal the location to local.
+        // Same as the auto-provision degrade above: heal the location to local
+        // and drop any latched explicit backend so the host fallback runs.
         location = None;
         degraded_from_provider = true;
+        explicit_backend = None;
+        explicit_choice = false;
         sb.backend = thegn_core::config::SandboxBackend::None;
     }
     if let Some(pspec) = &projection {
@@ -887,9 +897,16 @@ pub fn provider_proxy_target(
         return None;
     };
     let pc = &cfg.env.get(&environment.name)?.provider;
-    let provider = provider_for_named(pc, &p.id)?;
-    let workdir = crate::provider_workdir::resolve(pc, &p.id);
-    Some((provider, p.id.clone(), workdir))
+    // Bound-aware id (like `native_exec_for`/`provider_sandbox_name`): a claimed
+    // warm-pool spare targets that spare, not the derived husk the pool flow
+    // destroyed — else the ssh proxy + p2p push relay into the wrong sandbox.
+    let id = Db::open()
+        .ok()
+        .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten())
+        .unwrap_or_else(|| p.id.clone());
+    let provider = provider_for_named(pc, &id)?;
+    let workdir = crate::provider_workdir::resolve(pc, &id);
+    Some((provider, id, workdir))
 }
 
 pub(crate) use crate::agent_ssh::{
@@ -1754,9 +1771,11 @@ pub fn provision_provider_env_named(
                 }
                 Ok(())
             }
-            StepKind::Checkpoint => block_on_provider(|| async {
-                provider.checkpoint(&id, Some("thegn-provisioned")).await
-            })
+            StepKind::Checkpoint => with_provision_timeout(
+                "checkpoint",
+                std::time::Duration::from_secs(600),
+                || provider.checkpoint(&id, Some("thegn-provisioned")),
+            )
             .map(|cp| base_checkpoint = Some(cp)),
             StepKind::HomeClosurePush(roots) => {
                 // Host-executed: push the host store → sandbox store over the WSS
@@ -2118,7 +2137,6 @@ fn run_host_nix_timeout(secs: u32, argv: &[String]) -> anyhow::Result<std::proce
 /// `nix` steps are timeout-bounded. Requires the sandbox store to be writable (the
 /// `nix` step's `claim_store` ran first) + `nix` on the sandbox PATH.
 // off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
-#[expect(clippy::disallowed_methods)]
 fn push_devshell_closure(
     provider: &thegn_svc::provider::Provider,
     id: &str,
@@ -2143,11 +2161,12 @@ fn push_devshell_closure(
         DEVSHELL_PUSH_NIX_TIMEOUT_SECS,
         &nix_develop_profile_argv(&repo, &gcroot_str, devshell_attr),
     )?;
-    // 2. Resolve the devShell store path (what the sandbox must import).
-    let pi = std::process::Command::new("nix")
-        .args(["path-info", &gcroot_str])
-        .output()
-        .map_err(|e| anyhow::anyhow!("nix path-info: {e}"))?;
+    // 2. Resolve the devShell store path (what the sandbox must import). Bounded
+    //    like the sibling nix calls: a wedged daemon would hang path-info forever.
+    let pi = run_host_nix_timeout(
+        DEVSHELL_PUSH_NIX_TIMEOUT_SECS,
+        &["path-info".to_string(), gcroot_str.clone()],
+    )?;
     let store_path = String::from_utf8_lossy(&pi.stdout)
         .lines()
         .next()
@@ -2176,7 +2195,11 @@ fn push_devshell_closure(
             ));
         }
         let dest = "/tmp/sz-devshell-cache";
-        block_on_provider(|| async { provider.upload_dir(id, &cache, dest).await })?;
+        with_provision_timeout(
+            "devshell cache upload",
+            provision_step_timeout("devshell"),
+            || provider.upload_dir(id, &cache, dest),
+        )?;
         // `nix` is on PATH after `claim_store`. Realise the devShell via an
         // EVAL-based `nix develop` in the worktree, with the uploaded cache as an
         // extra substituter. This resolves the full closure from three sources at
@@ -2201,8 +2224,11 @@ fn push_devshell_closure(
              rm -rf {dest}; exit $rc"
         );
         let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), import];
-        let (code, out) =
-            block_on_provider(|| async { provider.run_exec(id, &argv, None, &[]).await })?;
+        let (code, out) = with_provision_timeout(
+            "devshell realise",
+            provision_step_timeout("devshell"),
+            || provider.run_exec(id, &argv, None, &[]),
+        )?;
         if code != 0 {
             return Err(anyhow::anyhow!(
                 "sandbox realise (exit {code}): {}",
@@ -2286,111 +2312,9 @@ pub(crate) fn default_dotfiles() -> Vec<String> {
     .collect()
 }
 
-/// Upload the present host dotfiles/dotdirs into the sandbox's `$HOME` (`/root`).
-/// A basename that's a FILE is uploaded via the fs `write`; a DIRECTORY (e.g.
-/// `.config/gcloud`, `.aws`) is uploaded recursively via `upload_dir` — so cloud
-/// creds and multi-file config carry over too. Missing host paths are skipped; a
-/// genuine upload failure aborts the step.
-fn upload_dotfiles(
-    provider: &thegn_svc::provider::Provider,
-    id: &str,
-    sandbox_home: &str,
-    files: &[String],
-) -> anyhow::Result<()> {
-    let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let base = sandbox_home.trim_end_matches('/');
-    for name in files {
-        let src = Path::new(&host_home).join(name);
-        let dest = format!("{base}/{name}");
-        if src.is_dir() {
-            block_on_provider(|| async { provider.upload_dir(id, &src, &dest).await })?;
-        } else if let Ok(data) = std::fs::read(&src) {
-            block_on_provider(|| async { provider.write(id, &dest, &data).await })?;
-        }
-    }
-    Ok(())
-}
-
-/// Carry the host's atuin credentials + config into the sandbox so its shell
-/// history joins atuin's own sync (host ↔ sprites). Opt-in (`[sandbox.home]
-/// atuin = true`). Uploads the dereferenced `~/.config/atuin/config.toml` (the
-/// home-manager `/nix/store` symlink is read THROUGH, so the real bytes land, not
-/// a dangling link) + the auth/encryption files `~/.local/share/atuin/{key,
-/// session}`. The history DBs are deliberately NOT copied — atuin's sync server
-/// reconciles those. Best-effort: a missing source is skipped (only `key` and no
-/// `session` is a normal state); a genuine upload error aborts (surfaced as a
-/// best-effort step failure). Warns when there's nothing to carry.
-fn upload_atuin_creds(
-    provider: &thegn_svc::provider::Provider,
-    id: &str,
-    sandbox_home: &str,
-    exec_env: &[(String, String)],
-) -> anyhow::Result<()> {
-    let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let base = sandbox_home.trim_end_matches('/');
-    // Config first, then the auth/encryption state. `provider.write` creates parent
-    // dirs (mkdirParents), so the nested `.config/atuin` / `.local/share/atuin`
-    // paths land without an explicit mkdir.
-    //
-    // `meta.db` is the SERVER-AUTH carrier: atuin >=18 keeps the sync session token
-    // (the `hub_session` bearer for the sync server) in `meta.db`, NOT in a flat
-    // `session` file (which modern atuin no longer writes). Without it the sandbox
-    // has the encryption `key` but is logged OUT, so `auto_sync` can't authenticate
-    // and Ctrl-R stays empty. We still carry `session` too (older atuin / other
-    // hosts may have it) and deliberately skip the heavy history/records DBs — the
-    // server reconciles those once authenticated. `meta.db` is small (~28K).
-    let rels = [
-        ".config/atuin/config.toml",
-        ".local/share/atuin/key",
-        ".local/share/atuin/session",
-        ".local/share/atuin/meta.db",
-    ];
-    let mut carried = 0usize;
-    let mut token_carried = false;
-    for rel in rels {
-        let src = Path::new(&host_home).join(rel);
-        // `read` dereferences the symlink → the real bytes (the HM config.toml is a
-        // `/nix/store` symlink that would dangle in the sandbox).
-        if let Ok(data) = std::fs::read(&src) {
-            let dest = format!("{base}/{rel}");
-            block_on_provider(|| async { provider.write(id, &dest, &data).await })?;
-            carried += 1;
-            if rel.ends_with("meta.db") || rel.ends_with("session") {
-                token_carried = true;
-            }
-        }
-    }
-    if carried == 0 {
-        thegn_core::msg::warn(
-            "atuin sync: no host atuin config/credentials found (~/.config/atuin, \
-             ~/.local/share/atuin) — nothing to carry.",
-        );
-        return Ok(());
-    }
-    // Prime history at provision time so it's baked into the checkpoint and Ctrl-R
-    // is populated the instant the pane opens (instead of waiting for the first
-    // `auto_sync` tick). `sync -f` forces a full reconcile regardless of the carried
-    // last-sync throttle, pulling the server's records into the sandbox's empty
-    // store. Best-effort: a sync failure (offline, server hiccup) just means history
-    // fills in on the next auto_sync. Skipped when no auth token was carried.
-    if token_carried {
-        let argv = vec![
-            "/bin/sh".to_string(),
-            "-lc".to_string(),
-            "export PATH=\"$HOME/.local/bin:$HOME/.nix-profile/bin:$PATH\"; \
-             command -v atuin >/dev/null 2>&1 && atuin sync -f 2>&1 || true"
-                .to_string(),
-        ];
-        if let Err(e) =
-            block_on_provider(|| async { provider.run_exec(id, &argv, None, exec_env).await })
-        {
-            thegn_core::msg::warn(&format!(
-                "atuin sync: priming history failed ({e}); it will fill in on auto_sync."
-            ));
-        }
-    }
-    Ok(())
-}
+// `upload_dotfiles` + `upload_atuin_creds` live in the `agent_configs` sibling
+// (file-size ratchet); the provision loop calls them via these re-exports.
+pub(crate) use crate::agent_configs::{upload_atuin_creds, upload_dotfiles};
 
 /// Last `n` non-empty lines of command output, for a compact error message.
 fn tail_lines(out: &str, n: usize) -> String {

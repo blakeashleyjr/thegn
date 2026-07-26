@@ -485,3 +485,163 @@ impl ControlApi for DaemonService {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a service with an in-memory DB and no live sessions — enough to
+    /// exercise the lease bookkeeping glue (`on_session_idle` / `on_session_busy`)
+    /// in isolation from the PTY actors, which is exactly the untested seam.
+    fn service(grace_ms: i64) -> (DaemonService, broadcast::Receiver<Arc<EventFrame>>) {
+        let (events, rx) = broadcast::channel(64);
+        let (idle_tx, _idle_rx) = mpsc::unbounded_channel();
+        let svc = DaemonService {
+            daemon_id: "d0".into(),
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            events,
+            db: Arc::new(Mutex::new(Db::open_memory().expect("in-memory db"))),
+            grace_ms,
+            idle_tx,
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            merge_queue: thegn_core::config::MergeQueueConfig::default(),
+        };
+        (svc, rx)
+    }
+
+    fn leases(svc: &DaemonService) -> Vec<LeaseRow> {
+        svc.db.lock().unwrap().leases(&svc.daemon_id).unwrap()
+    }
+
+    /// Drain one Lease frame (skip any non-lease frames like `Sessions`).
+    fn next_lease(
+        rx: &mut broadcast::Receiver<Arc<EventFrame>>,
+    ) -> (String, LeaseEventKind, Option<i64>) {
+        loop {
+            let frame = rx.try_recv().expect("a lease frame was emitted");
+            if let EventFrame::Lease {
+                session,
+                kind,
+                expires_at,
+            } = &*frame
+            {
+                return (session.clone(), *kind, *expires_at);
+            }
+        }
+    }
+
+    /// grace_ms == 0 ⇒ the never-reap default: an UNTIMED relay lease
+    /// (`expires_at IS NULL`) and an `Opened` frame carrying `None`. The
+    /// reaper's `plan_leases` skips null-expiry leases, so the session lives
+    /// until it is explicitly killed or reattached.
+    #[tokio::test]
+    async fn idle_with_zero_grace_opens_untimed_lease() {
+        let (svc, mut rx) = service(0);
+        svc.on_session_idle("s1").await;
+
+        let rows = leases(&svc);
+        assert_eq!(rows.len(), 1, "exactly one relay lease");
+        assert_eq!(rows[0].session_id, "s1");
+        assert_eq!(rows[0].kind, "relay");
+        assert_eq!(rows[0].expires_at, None, "grace 0 ⇒ untimed lease");
+
+        let (session, kind, expires) = next_lease(&mut rx);
+        assert_eq!(session, "s1");
+        assert_eq!(kind, LeaseEventKind::Opened);
+        assert_eq!(expires, None);
+    }
+
+    /// grace_ms > 0 ⇒ a timed relay lease whose `expires_at` is `now + grace`,
+    /// and the `Opened` frame carries the same instant. A regression that
+    /// inverts the `grace_ms > 0` guard (untimed when it should be timed, or
+    /// vice versa) fails one of these two tests.
+    #[tokio::test]
+    async fn idle_with_positive_grace_opens_timed_lease() {
+        let grace = 60_000; // 60s
+        let before = now_ms();
+        let (svc, mut rx) = service(grace);
+        svc.on_session_idle("s1").await;
+        let after = now_ms();
+
+        let rows = leases(&svc);
+        assert_eq!(rows.len(), 1);
+        let exp = rows[0].expires_at.expect("grace > 0 ⇒ timed lease");
+        assert!(
+            exp >= before + grace && exp <= after + grace,
+            "expires_at must be now+grace: {exp} not in [{}, {}]",
+            before + grace,
+            after + grace,
+        );
+
+        let (_, kind, frame_exp) = next_lease(&mut rx);
+        assert_eq!(kind, LeaseEventKind::Opened);
+        assert_eq!(frame_exp, Some(exp), "frame expiry matches the DB lease");
+    }
+
+    /// Re-detach refreshes: a second idle transition RELEASES the prior lease
+    /// and PUTs a fresh one, so the session never accumulates duplicate leases
+    /// (a leak that would keep resurrecting a reaped PTY).
+    #[tokio::test]
+    async fn re_idle_replaces_the_prior_lease() {
+        let (svc, _rx) = service(60_000);
+        svc.on_session_idle("s1").await;
+        let first = leases(&svc);
+        assert_eq!(first.len(), 1);
+        svc.on_session_idle("s1").await;
+        let second = leases(&svc);
+        assert_eq!(second.len(), 1, "release-then-put keeps exactly one lease");
+        assert_ne!(
+            first[0].lease_id, second[0].lease_id,
+            "the lease was replaced, not left stale"
+        );
+    }
+
+    /// Attaching (or the session ending) makes it busy: the relay lease is
+    /// released and a `Released` frame is emitted. This is the path that must
+    /// cancel the grace period so a returning client's session is NOT reaped.
+    #[tokio::test]
+    async fn busy_releases_the_lease() {
+        let (svc, mut rx) = service(60_000);
+        svc.on_session_idle("s1").await;
+        assert_eq!(leases(&svc).len(), 1);
+        let _ = next_lease(&mut rx); // drain the Opened frame
+
+        svc.on_session_busy("s1").await;
+        assert!(leases(&svc).is_empty(), "busy releases the relay lease");
+
+        let (session, kind, expires) = next_lease(&mut rx);
+        assert_eq!(session, "s1");
+        assert_eq!(kind, LeaseEventKind::Released);
+        assert_eq!(expires, None);
+    }
+
+    /// The reap contract the `lease_loop` relies on, driven at the store level
+    /// (the loop's DB half): a timed lease already past its expiry is returned
+    /// by `reap_expired_leases` (⇒ the loop kills its PTY + emits `Reaped`),
+    /// while an UNTIMED lease (grace 0) is never reaped. Inverting the grace
+    /// guard would either reap sessions that should survive or leak abandoned
+    /// ones — this pins the boundary.
+    #[tokio::test]
+    async fn expired_lease_is_reaped_untimed_is_not() {
+        let (svc, _rx) = service(60_000);
+        // A timed lease already expired 1s ago.
+        {
+            let db = svc.db.lock().unwrap();
+            let past = now_ms() - 1000;
+            db.put_lease("expired", &svc.daemon_id, None, "relay", Some(past), past)
+                .unwrap();
+            // An untimed (never-reap) lease.
+            db.put_lease("forever", &svc.daemon_id, None, "relay", None, now_ms())
+                .unwrap();
+        }
+        let reaped = {
+            let db = svc.db.lock().unwrap();
+            db.reap_expired_leases(&svc.daemon_id, now_ms()).unwrap()
+        };
+        assert_eq!(reaped.len(), 1, "only the expired timed lease is reaped");
+        assert_eq!(reaped[0].session_id, "expired");
+        let remaining = leases(&svc);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session_id, "forever", "untimed lease survives");
+    }
+}

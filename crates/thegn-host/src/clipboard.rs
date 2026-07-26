@@ -39,8 +39,10 @@ fn detect() -> Vec<Vec<&'static str>> {
 }
 
 /// Fire-and-forget copy: on a detached thread, try each candidate tool and
-/// pipe `text` to the first that spawns. No-op when none are installed (the
-/// OSC52 path the caller also emits still covers that case).
+/// pipe `text` to the first that *succeeds*. A tool that spawns but exits
+/// non-zero (e.g. `xclip` in a session that's actually Wayland, so it can't
+/// reach X) doesn't stop the chain — the next candidate is tried. No-op when
+/// none are installed (the OSC52 path the caller also emits still covers that).
 pub fn copy(text: &str) {
     let text = text.to_string();
     std::thread::spawn(move || {
@@ -112,7 +114,9 @@ fn read_from(argv: &[&str]) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Spawn one tool and write `text` to its stdin. Returns `true` if it spawned.
+/// Spawn one tool and write `text` to its stdin. Returns `true` only if the
+/// tool *exited successfully* — a tool that spawns but fails (e.g. can't reach
+/// the display server) returns `false` so the fallback chain keeps trying.
 // off-loop: only called from copy()'s detached std::thread.
 #[expect(clippy::disallowed_methods)]
 fn pipe_to(argv: &[&str], text: &str) -> bool {
@@ -132,8 +136,7 @@ fn pipe_to(argv: &[&str], text: &str) -> bool {
         let _ = stdin.write_all(text.as_bytes());
         // Drop closes stdin so the tool sees EOF and stores the content.
     }
-    let _ = child.wait();
-    true
+    child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -164,6 +167,21 @@ mod tests {
         let c = candidates("linux", false);
         assert_eq!(c[0], vec!["xclip", "-selection", "clipboard"]);
         assert_eq!(c.last().unwrap(), &vec!["wl-copy"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pipe_to_returns_false_on_nonzero_exit() {
+        // A tool that spawns fine but exits non-zero (like `xclip` failing to
+        // reach the display server) must NOT count as success, or it would
+        // break the fallback chain. `/bin/false` models that; `/bin/true`
+        // models a tool that actually stored the selection.
+        assert!(!pipe_to(&["false"], "x"), "nonzero exit must be a failure");
+        assert!(pipe_to(&["true"], "x"), "zero exit is success");
+        assert!(
+            !pipe_to(&["definitely-not-a-real-binary-xyz"], "x"),
+            "unspawnable tool is a failure"
+        );
     }
 
     #[test]

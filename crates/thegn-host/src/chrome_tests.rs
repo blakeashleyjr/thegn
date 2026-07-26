@@ -200,6 +200,57 @@ fn statusbar_items_includes_badges_so_they_are_navigable() {
 }
 
 #[test]
+fn agent_and_ai_cost_chips_are_bmp_only() {
+    // Regression: the agent / AI-cost chips hardcoded astral-plane emoji
+    // (🤖 U+1F916, 🛠 U+1F6E0), violating the BMP-only chrome policy — they
+    // rendered as mojibake on degraded terminals and their emoji cell width
+    // diverged from unicode-width. Every glyph in these chips must now be BMP
+    // (routed through caps::active_glyphs) and degrade to ASCII.
+    let model = FrameModel {
+        ai_metrics: Some(AiMetrics {
+            agent: "pi".into(),
+            session_id: "s".into(),
+            tokens: TokenUsage {
+                input: 10,
+                output: 5,
+            },
+            cost: 0.42,
+        }),
+        agent_activity: Some(AgentActivity {
+            conn: AgentConn::Online,
+            last_tool: Some("bash".into()),
+            running: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let text = |m: &FrameModel| -> String {
+        statusbar_items(m)
+            .into_iter()
+            .flat_map(|(_, segs)| segs)
+            .map(|s| s.text)
+            .collect()
+    };
+    // Full/Basic glyphs: still BMP (no char outside the Basic Multilingual Plane).
+    let full = text(&model);
+    assert!(
+        full.chars().all(|c| (c as u32) <= 0xFFFF),
+        "no astral-plane glyphs in agent/cost chips: {full:?}"
+    );
+    // And on an ASCII terminal the chips degrade cleanly to 7-bit ASCII.
+    crate::caps::test_override::with_unicode(
+        thegn_core::termcaps::UnicodeLevel::Ascii,
+        || {
+            let ascii = text(&model);
+            assert!(
+                ascii.is_ascii(),
+                "agent/cost chips degrade to ASCII: {ascii:?}"
+            );
+        },
+    );
+}
+
+#[test]
 fn statusbar_notify_chip_reflects_dnd_and_mode() {
     // No DND, no mode ⇒ no notify chip.
     let plain = FrameModel::default();
@@ -1057,6 +1108,49 @@ fn center_tabs_show_worktree_label_and_chips() {
     // And the drawn cell at the first span really is the chip text.
     let chip0: String = row.chars().skip(spans[0].0).take(spans[0].1).collect();
     assert_eq!(chip0, " 1 ");
+}
+
+#[test]
+fn center_tab_spans_use_display_width_for_wide_leaf() {
+    // Regression: the tab-strip cluster used chars().count() to advance past
+    // the worktree label. A width-2 (CJK) leaf has char count 3 but display
+    // width 6, so the chips would start 3 columns INTO the still-painted leaf
+    // and overlap it. The spans must clear the leaf's real display width.
+    use unicode_width::UnicodeWidthStr;
+    let mut s = Surface::new(80, 1);
+    let model = FrameModel {
+        // ws="WS" (width 2), leaf="日本語" (chars 3, display width 6).
+        worktree: "ws/日本語".into(),
+        tabs: vec!["1".into()],
+        active_tab: 0,
+        ..Default::default()
+    };
+    let strip = Rect {
+        x: 0,
+        y: 0,
+        cols: 80,
+        rows: 1,
+    };
+    draw_center_tabs(&mut s, strip, &model);
+    let row = &lines(&s)[0];
+    // Layout: x0=1, "WS"(2)+" ▸ "(3) => 6, leaf width 6 + 2 gap => 14. First
+    // chip span starts at column 14. With the old char-count math it would have
+    // been 11 (3 short), landing on top of the leaf's last glyph.
+    let spans = strip_chip_spans(&model, strip);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].0, 14, "chip clears the wide leaf's display width");
+    // The painted chip does not overlap the leaf: the display column where the
+    // chip is drawn is past the end of "日本語" on screen.
+    let leaf_at = row.find("日本語").expect("leaf painted");
+    let leaf_end_col = UnicodeWidthStr::width(&row[..leaf_at]) + 6;
+    assert!(
+        spans[0].0 >= leaf_end_col,
+        "chip col {} must be at/after leaf end col {leaf_end_col}: {row:?}",
+        spans[0].0
+    );
+    // Hit-testing agrees with the (corrected) draw position.
+    assert_eq!(center_tab_hit(&model, strip, spans[0].0 + 1), Some(0));
+    assert_eq!(center_tab_hit(&model, strip, 11), None, "old (wrong) column");
 }
 
 #[test]

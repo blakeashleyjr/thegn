@@ -833,6 +833,31 @@ enum SessionEnd {
 /// Max consecutive reconnects that make no progress before giving up.
 const MAX_DEAD_RECONNECTS: u32 = 3;
 
+/// Only output that arrives at least this long after a (re)attach counts as
+/// real "progress" for the reconnect budget. Attach replays scrollback / a
+/// screen snapshot immediately (see `pane_source.rs`), so counting the replay
+/// burst as progress would reset `dead` to 0 forever and defeat
+/// `MAX_DEAD_RECONNECTS` for any session with history — a flapping socket would
+/// spin `attach → replay → drop → attach` with no give-up path. Requiring
+/// output *past the replay window* means a replay-then-drop session still
+/// increments `dead` and eventually exits via the bounded path.
+const PROGRESS_GRACE_MS: u64 = 500;
+
+/// Base backoff before a reconnect attempt; grows `2^dead`, capped at
+/// [`RECONNECT_BACKOFF_CAP`]. Spaces out reattaches so a half-broken socket
+/// (accepts-then-resets) can't spin the loop / re-flood the pane with replayed
+/// scrollback at full speed.
+const RECONNECT_BACKOFF_BASE_MS: u64 = 250;
+const RECONNECT_BACKOFF_CAP_MS: u64 = 5_000;
+
+/// Backoff for the `dead`-th consecutive no-progress reconnect: `base·2^dead`,
+/// capped. Pure so it's unit-testable.
+fn reconnect_backoff_ms(dead: u32) -> u64 {
+    RECONNECT_BACKOFF_BASE_MS
+        .saturating_mul(1u64 << dead.min(20))
+        .min(RECONNECT_BACKOFF_CAP_MS)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     target = "thegn::frame",
@@ -949,7 +974,17 @@ async fn relay_exec(
         {
             pid_cell.store(pid, std::sync::atomic::Ordering::Relaxed);
         }
-        match relay_session(id, session, &tx, &waker, &mut ctrl_rx, &session_cell).await {
+        match relay_session(
+            id,
+            session,
+            &tx,
+            &waker,
+            &mut ctrl_rx,
+            &session_cell,
+            std::time::Duration::from_millis(PROGRESS_GRACE_MS),
+        )
+        .await
+        {
             SessionEnd::Exited(code) => {
                 tracing::debug!(
                     target: "thegn::sandbox",
@@ -986,6 +1021,15 @@ async fn relay_exec(
                     "exec session dropped (socket closed, no exit); reconnecting"
                 );
                 if dead < MAX_DEAD_RECONNECTS {
+                    // Back off before reconnecting: a half-broken socket
+                    // (accepts-then-resets) must not spin the loop / re-flood
+                    // the pane with replayed scrollback at full speed. Grows
+                    // with `dead`, capped. `dead == 0` (a genuinely progressing
+                    // session that just blipped) waits the base interval.
+                    let backoff = reconnect_backoff_ms(dead);
+                    if backoff > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    }
                     let sid = session_cell.lock().ok().and_then(|c| c.clone());
                     // 1. Prefer reattaching the SAME session: a transient socket
                     //    drop replays scrollback with the shell state preserved.
@@ -1042,6 +1086,9 @@ async fn relay_session(
     waker: &Option<TerminalWaker>,
     ctrl_rx: &mut tokio_mpsc::Receiver<ExecControl>,
     session_cell: &Arc<Mutex<Option<String>>>,
+    // Output within this window of (re)attach is treated as the scrollback
+    // replay burst and does NOT count as progress — see `PROGRESS_GRACE_MS`.
+    progress_grace: std::time::Duration,
 ) -> SessionEnd {
     let wake = || {
         if let Some(w) = waker {
@@ -1067,6 +1114,7 @@ async fn relay_session(
         *cell = Some(sid);
         sid_done = true;
     }
+    let started = std::time::Instant::now();
     let mut progressed = false;
     loop {
         tokio::select! {
@@ -1075,7 +1123,12 @@ async fn relay_session(
                     if tx.send(PaneEvent::Output(id, b)).await.is_err() {
                         return SessionEnd::PaneGone;
                     }
-                    progressed = true;
+                    // Only output past the replay window counts as progress, so
+                    // a session that just replays scrollback and drops still
+                    // increments the reconnect budget instead of resetting it.
+                    if started.elapsed() >= progress_grace {
+                        progressed = true;
+                    }
                     wake();
                 }
                 Some(ExecFrame::Exit(code)) => return SessionEnd::Exited(code),
@@ -1115,22 +1168,23 @@ pub fn drain_until_exit(
     rx: &mut tokio_mpsc::Receiver<PaneEvent>,
     deadline_ms: u64,
 ) -> bool {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
+    use tokio_mpsc::error::TryRecvError;
     let start = Instant::now();
+    // Poll with `try_recv` + a short sleep rather than `blocking_recv()`: the
+    // latter parks with no timeout, so a wedged child that stops producing
+    // events without exiting would hang the caller forever (the deadline checks
+    // only ran BETWEEN messages). This bounds the wait to `deadline_ms`.
     loop {
-        let remaining = deadline_ms.saturating_sub(start.elapsed().as_millis() as u64);
-        if remaining == 0 {
-            return false;
-        }
-        // Use blocking recv in a loop with timeout
-        match rx.blocking_recv() {
-            Some(PaneEvent::Output(_, b)) => pane.feed(&b),
-            Some(PaneEvent::Exit(..)) => return true,
-            Some(PaneEvent::SessionFallback(_)) => {}
-            None => return false,
-        }
         if start.elapsed().as_millis() as u64 >= deadline_ms {
             return false;
+        }
+        match rx.try_recv() {
+            Ok(PaneEvent::Output(_, b)) => pane.feed(&b),
+            Ok(PaneEvent::Exit(..)) => return true,
+            Ok(PaneEvent::SessionFallback(_)) => {}
+            Err(TryRecvError::Disconnected) => return false,
+            Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(2)),
         }
     }
 }
@@ -1401,7 +1455,16 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<SessionEnd>();
         rt.spawn(async move {
             let mut pane_ctrl_rx = pane_ctrl_rx;
-            let end = relay_session(7, session, &tx, &None, &mut pane_ctrl_rx, &cell_task).await;
+            let end = relay_session(
+                7,
+                session,
+                &tx,
+                &None,
+                &mut pane_ctrl_rx,
+                &cell_task,
+                std::time::Duration::ZERO,
+            )
+            .await;
             let _ = done_tx.send(end);
         });
 
@@ -1680,6 +1743,154 @@ mod tests {
         assert!(
             seen,
             "expected the repeated token somewhere in the visible grid"
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_and_caps() {
+        // Exponential in `dead`, from the 250ms base, capped at 5s.
+        assert_eq!(reconnect_backoff_ms(0), 250);
+        assert_eq!(reconnect_backoff_ms(1), 500);
+        assert_eq!(reconnect_backoff_ms(2), 1_000);
+        assert_eq!(reconnect_backoff_ms(3), 2_000);
+        assert_eq!(reconnect_backoff_ms(4), 4_000);
+        // 8s would exceed the cap; clamps to 5s and stays there (no overflow at
+        // absurd counts either).
+        assert_eq!(reconnect_backoff_ms(5), 5_000);
+        assert_eq!(reconnect_backoff_ms(64), 5_000);
+    }
+
+    /// Regression: scrollback replayed right after (re)attach must NOT count as
+    /// progress, or a flapping session resets the reconnect budget forever. A
+    /// session that emits output *inside* the grace window and then drops must
+    /// report `progressed: false`.
+    #[test]
+    fn replayed_scrollback_is_not_progress() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let (frames_tx, frames_rx) = tokio_mpsc::channel::<ExecFrame>(64);
+        let (prov_ctrl_tx, _prov_ctrl_rx) = tokio_mpsc::channel::<ExecControl>(64);
+        let (_sid_tx, sid_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+        let cell = Arc::new(Mutex::new(None));
+        let session = ExecSession {
+            frames: frames_rx,
+            control: prov_ctrl_tx,
+            session_id: sid_rx,
+        };
+        let cell_task = cell.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<SessionEnd>();
+        rt.spawn(async move {
+            let (_ctrl_keepalive, mut ctrl_rx) = tokio_mpsc::channel::<ExecControl>(8);
+            // A long grace so the replay burst below is unambiguously "inside" it.
+            let end = relay_session(
+                7,
+                session,
+                &tx,
+                &None,
+                &mut ctrl_rx,
+                &cell_task,
+                std::time::Duration::from_secs(3600),
+            )
+            .await;
+            let _ = done_tx.send(end);
+        });
+
+        // Replay burst arrives immediately (well within the grace window).
+        frames_tx
+            .blocking_send(ExecFrame::Stdout(b"replayed-scrollback".to_vec()))
+            .unwrap();
+        assert!(matches!(
+            rx.blocking_recv(),
+            Some(PaneEvent::Output(7, _))
+        ));
+        // Socket drops right after the replay: this is exactly the flapping
+        // case — it must report NO progress so `dead` can increment.
+        drop(frames_tx);
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(SessionEnd::Dropped { progressed: false }),
+            "replay-then-drop must not count as progress"
+        );
+    }
+
+    /// The complement: output that arrives AFTER the grace window is genuine
+    /// progress and resets the reconnect budget.
+    #[test]
+    fn post_grace_output_is_progress() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let (frames_tx, frames_rx) = tokio_mpsc::channel::<ExecFrame>(64);
+        let (prov_ctrl_tx, _prov_ctrl_rx) = tokio_mpsc::channel::<ExecControl>(64);
+        let (_sid_tx, sid_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+        let session = ExecSession {
+            frames: frames_rx,
+            control: prov_ctrl_tx,
+            session_id: sid_rx,
+        };
+        let cell = Arc::new(Mutex::new(None));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<SessionEnd>();
+        rt.spawn(async move {
+            let (_ctrl_keepalive, mut ctrl_rx) = tokio_mpsc::channel::<ExecControl>(8);
+            let end = relay_session(
+                7,
+                session,
+                &tx,
+                &None,
+                &mut ctrl_rx,
+                &cell,
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+            let _ = done_tx.send(end);
+        });
+        // Wait out the (short) grace, then emit — this is live output, not replay.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        frames_tx
+            .blocking_send(ExecFrame::Stdout(b"live".to_vec()))
+            .unwrap();
+        assert!(matches!(
+            rx.blocking_recv(),
+            Some(PaneEvent::Output(7, _))
+        ));
+        drop(frames_tx);
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(SessionEnd::Dropped { progressed: true }),
+            "output past the grace window must count as progress"
+        );
+    }
+
+    /// Regression: a wedged child that stops producing events without exiting
+    /// must NOT hang `drain_until_exit` forever — it must return `false` near
+    /// the deadline. (Old code parked in `blocking_recv()` with no timeout.)
+    #[test]
+    fn drain_until_exit_honors_deadline_when_wedged() {
+        // A stream pane with a live-but-silent channel: the sender is held so
+        // the receiver never disconnects, and nothing is ever sent — the
+        // "wedged child" case. `blocking_recv()` would park here forever.
+        let (ctrl_tx, _ctrl_rx) = tokio_mpsc::channel::<ExecControl>(8);
+        let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
+        let (_tx_keepalive, mut rx) = tokio_mpsc::channel::<PaneEvent>(8);
+
+        let start = std::time::Instant::now();
+        let exited = drain_until_exit(&mut pane, &mut rx, 200);
+        let elapsed = start.elapsed();
+        assert!(!exited, "a wedged child must report no exit at the deadline");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(180),
+            "must actually wait for the deadline, not return early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "must return promptly at the deadline, not hang: {elapsed:?}"
         );
     }
 }

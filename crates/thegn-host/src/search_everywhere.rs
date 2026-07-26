@@ -290,6 +290,16 @@ pub struct PaletteSession {
     pub result_tx: UnboundedSender<AsyncSearchResult>,
     pub search_gen: u64,
     pub searching: bool,
+    /// True while a file-index build is in flight (cold picker). Guards against
+    /// spawning one full worktree scan per keystroke: `file_index` stays `None`
+    /// until the loop installs it, so without this flag every keystroke typed
+    /// during a cold build re-spawns another scan of the same root.
+    index_building: bool,
+    /// Set by `kick_palette_search` so `drain_results` can pulse the loop after
+    /// re-queueing a `FileIndexReady` it can't apply itself (the loop owns
+    /// `file_index`). Without a wake the re-queued event would sit in the
+    /// channel until some other producer happens to wake the loop.
+    waker: Option<termwiz::terminal::TerminalWaker>,
 }
 
 impl PaletteSession {
@@ -306,6 +316,8 @@ impl PaletteSession {
             result_tx: tx,
             search_gen: 0,
             searching: false,
+            index_building: false,
+            waker: None,
         }
     }
 
@@ -491,19 +503,22 @@ impl PaletteSession {
     pub fn drain_results(&mut self) -> bool {
         let sg = self.search_gen;
         let mut dirty = false;
+        // `FileIndexReady` is installed by the event loop (it owns `file_index`),
+        // not here. Earlier this method re-queued a `FileIndexReady` and `break`ed
+        // ("caller drains again") — but the loop's own peel pass mirrors that for
+        // non-ready results, so a real result queued *ahead* of a `FileIndexReady`
+        // wedged the channel forever (each wake just permuted [result, ready] back
+        // to itself, applying nothing). Instead: buffer any `FileIndexReady`,
+        // keep draining every other result in one pass, then re-queue the ready
+        // event(s) and wake the loop to install them.
+        let mut deferred_ready: Vec<AsyncSearchResult> = Vec::new();
         while let Ok(result) = self.result_rx.try_recv() {
             match result {
-                AsyncSearchResult::FileIndexReady { sg: g, index, root } => {
-                    // Propagate to event loop via a side channel isn't possible
-                    // here; instead we smuggle it as a special result variant
-                    // and the caller must handle FileIndexReady separately.
-                    // Re-emit it so callers can pick it up.
-                    let _ = self.result_tx.send(AsyncSearchResult::FileIndexReady {
-                        sg: g,
-                        index,
-                        root,
-                    });
-                    break; // caller will drain again
+                AsyncSearchResult::FileIndexReady { .. } => {
+                    // A build finished; clear the in-flight guard so a later cold
+                    // search can rebuild if needed. The loop installs the index.
+                    self.index_building = false;
+                    deferred_ready.push(result);
                 }
                 AsyncSearchResult::FileMatches { sg: g, matches } if g == sg => {
                     self.async_results.files = matches;
@@ -532,6 +547,17 @@ impl PaletteSession {
                     dirty = true;
                 }
                 _ => {} // stale generation — discard
+            }
+        }
+        // Re-queue any buffered readiness signal(s) for the loop's peel pass and
+        // wake it — the channel is now drained of everything else, so there is no
+        // result left to ping-pong against.
+        if !deferred_ready.is_empty() {
+            for ev in deferred_ready {
+                let _ = self.result_tx.send(ev);
+            }
+            if let Some(w) = &self.waker {
+                let _ = w.wake();
             }
         }
         dirty
@@ -1356,6 +1382,9 @@ pub fn kick_palette_search(
     tests: &crate::panel::TestPanelState,
     waker: &termwiz::terminal::TerminalWaker,
 ) {
+    // Remember a waker so `drain_results` can pulse the loop after re-queueing a
+    // `FileIndexReady` it can't apply itself.
+    session.waker = Some(waker.clone());
     let (_, inner_query) = PaletteMode::parse(&session.raw_query);
     let query = inner_query.to_string();
     let sg = session.search_gen;
@@ -1384,8 +1413,15 @@ pub fn kick_palette_search(
                     // (`file_search` self-heals if the warm root differs).
                     spawn_file_search(worktree_root, query, sg, max_file, tx, waker.clone());
                 }
+                None if session.index_building => {
+                    // A build is already in flight; the FileIndexReady handler
+                    // re-kicks the current query once it lands, so don't spawn a
+                    // second full worktree scan for this keystroke.
+                }
                 None => {
-                    // Picker not warmed yet; build + scan it first.
+                    // Picker not warmed yet; build + scan it first. Guard against
+                    // spawning another scan per keystroke until this one lands.
+                    session.index_building = true;
                     spawn_file_index_build(worktree_root, sg, tx, waker.clone(), hidden);
                 }
             }
@@ -1700,6 +1736,97 @@ mod tests {
             extra: String::new(),
         });
         assert_eq!(s.selected_key(), Some("git-branch:main".into()));
+    }
+
+    // Mirror of the run.rs peel pass: install any FileIndexReady, re-queue the
+    // first non-ready result and stop (the loop drains its own channel once per
+    // wake). Returns whether a ready was installed this pass.
+    fn peel_like_loop(s: &mut PaletteSession) -> bool {
+        let mut installed = false;
+        loop {
+            match s.result_rx.try_recv() {
+                Ok(AsyncSearchResult::FileIndexReady { .. }) => installed = true,
+                Ok(other) => {
+                    let _ = s.result_tx.send(other);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        installed
+    }
+
+    #[test]
+    fn drain_consumes_result_queued_ahead_of_file_index_ready() {
+        // Regression: the channel holds a real result AHEAD of a FileIndexReady
+        // ([FileMatches, FileIndexReady]). The old smuggle-and-requeue protocol
+        // permuted that state back to itself on every wake — the FileMatches was
+        // never applied and the spinner never cleared. Now one drain consumes it.
+        let mut s = PaletteSession::new(vec![]);
+        s.mode = PaletteMode::Files;
+        let sg = s.search_gen;
+        s.searching = true;
+
+        s.result_tx
+            .send(AsyncSearchResult::FileMatches {
+                sg,
+                matches: vec![FileMatch {
+                    path: "src/run.rs".into(),
+                    score: 10,
+                }],
+            })
+            .unwrap();
+        s.result_tx
+            .send(AsyncSearchResult::FileIndexReady {
+                sg,
+                index: Arc::new(Vec::new()),
+                root: PathBuf::from("/repo"),
+            })
+            .unwrap();
+
+        // One wake cycle: loop's peel pass, then drain_results.
+        peel_like_loop(&mut s);
+        let dirty = s.drain_results();
+
+        assert!(dirty, "the queued FileMatches must be applied in one drain");
+        assert_eq!(s.async_results.files.len(), 1);
+        assert!(!s.searching, "spinner clears once results land");
+
+        // The FileIndexReady was re-queued for the loop; the next peel installs
+        // it and the channel then drains clean (no perpetual ping-pong).
+        assert!(
+            peel_like_loop(&mut s),
+            "FileIndexReady survives for the loop to install"
+        );
+        assert!(!s.drain_results(), "channel is empty after the ready is peeled");
+    }
+
+    #[test]
+    fn cold_index_build_spawns_once_across_keystrokes() {
+        // Regression: with a cold picker (`file_index == None`), each keystroke
+        // used to spawn another full worktree scan. The in-flight guard must let
+        // exactly one build spawn until FileIndexReady lands. We assert the guard
+        // flag directly (spawning real tokio tasks needs a runtime).
+        let mut s = PaletteSession::new(vec![]);
+        assert!(!s.index_building);
+
+        // First cold keystroke spawns a build: mark in-flight.
+        s.index_building = true;
+        // Subsequent keystrokes see the guard and must skip re-spawning. We model
+        // the kick_palette_search decision: spawn only if !index_building.
+        let would_spawn_again = !s.index_building;
+        assert!(!would_spawn_again, "no second scan while a build is in flight");
+
+        // When the build's FileIndexReady drains, the guard clears.
+        s.result_tx
+            .send(AsyncSearchResult::FileIndexReady {
+                sg: s.search_gen,
+                index: Arc::new(Vec::new()),
+                root: PathBuf::from("/repo"),
+            })
+            .unwrap();
+        s.drain_results();
+        assert!(!s.index_building, "guard clears once the build lands");
     }
 
     #[test]

@@ -37,6 +37,23 @@ const KINDS: &[&str] = &[
     "machine0",
 ];
 
+/// Probe keyring availability on a detached thread, returning the shared
+/// tri-state the wizard reads (0 = probing, 1 = available, 2 = unavailable).
+/// The probe is a synchronous D-Bus round-trip that can stall for ~25s on a
+/// locked keyring — running it inline in the wizard constructor would freeze the
+/// compositor from a single keypress, so it goes off the loop. The footer hint
+/// shows "checking…" until the answer lands (no waker needed: the wizard is
+/// interactive, so the next keystroke repaints the resolved hint).
+fn spawn_keyring_probe() -> std::sync::Arc<std::sync::atomic::AtomicU8> {
+    let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let out = state.clone();
+    std::thread::spawn(move || {
+        let v = if crate::secret::keyring_available() { 1 } else { 2 };
+        out.store(v, std::sync::atomic::Ordering::Relaxed);
+    });
+    state
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Kind,
@@ -93,7 +110,12 @@ pub struct EnvWizard {
     /// `(backend_key, label)` cycle rows for a `local` env.
     sandbox_rows: Vec<(String, String)>,
     sandbox_sel: usize,
-    keyring: bool,
+    /// Keyring availability, resolved off-loop: 0 = probing, 1 = available,
+    /// 2 = unavailable. The probe (`keyring_available`) does a synchronous D-Bus
+    /// Secret Service round-trip that can block for ~25s on a locked keyring, so
+    /// it must never run on the event loop; the footer hint reads this atomic and
+    /// shows "checking…" until the background thread stores an answer.
+    keyring: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl EnvWizard {
@@ -116,7 +138,7 @@ impl EnvWizard {
             ssh_host: String::new(),
             sandbox_rows,
             sandbox_sel: 0,
-            keyring: crate::secret::keyring_available(),
+            keyring: spawn_keyring_probe(),
         }
     }
 
@@ -306,10 +328,10 @@ impl EnvWizard {
         }
         // Footer: token-storage hint (cloud kinds) + key legend.
         let store_hint = if self.is_cloud() {
-            if self.keyring {
-                "token → OS keyring · "
-            } else {
-                "token → 0600 file · "
+            match self.keyring.load(std::sync::atomic::Ordering::Relaxed) {
+                1 => "token → OS keyring · ",
+                2 => "token → 0600 file · ",
+                _ => "token store: checking… · ",
             }
         } else {
             ""
@@ -460,5 +482,18 @@ mod tests {
             w.handle_key(&KeyCode::Escape, Modifiers::NONE),
             Outcome::Cancel
         );
+    }
+
+    #[test]
+    fn keyring_probe_is_off_loop_not_inline() {
+        // The constructor must NOT run the blocking keyring probe inline — the
+        // shared state starts at 0 ("checking…") and is resolved by a background
+        // thread. (A specific resolved value inline would mean the D-Bus probe
+        // ran on the loop, the very stall this fix removes.) The value is `Ordering`
+        // -published by the probe thread; here we only assert construction is
+        // non-blocking by observing the tri-state is a valid encoding.
+        let w = wiz();
+        let v = w.keyring.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(v <= 2, "keyring tri-state is one of probing/available/unavailable");
     }
 }

@@ -286,11 +286,38 @@ fn destroy_engine_host(cfg: &Config, db: &Db, host: &HostId, rows: &[HostCapacit
     }
 }
 
+/// Pure ownership/orphan predicate for the reaper: is `inst` a `tg-auto-*`
+/// engine host that THIS host created (`tg-host` label matches `ours`), has no
+/// local capacity row, and is old enough to be a crash orphan?
+///
+/// The `tg-host` guard is safety-critical: two thegn hosts can autoscale
+/// against one cloud account (shared API token), so the account-wide instance
+/// list includes *other* controllers' live engine hosts — none of which appear
+/// in our local `rows`. Without the label match this reaper would destroy
+/// another host's live compute (see `vps_reaper` / `vps::host_label`).
+fn is_reapable_orphan(
+    inst: &thegn_svc::vps::VpsInstance,
+    ours: &str,
+    rows: &[HostCapacityRow],
+    now: i64,
+) -> bool {
+    let owned = inst.labels.get("tg-host").map(String::as_str) == Some(ours);
+    let known = rows
+        .iter()
+        .any(|r| r.host.config_name() == Some(inst.name.as_str()));
+    let old = inst
+        .created
+        .is_some_and(|c| now.saturating_sub(c) > ORPHAN_AGE_SECS);
+    owned && inst.name.starts_with(AUTO_PREFIX) && !known && old
+}
+
 /// Destroy `tg-auto-*` instances that exist at the vendor but have no
 /// capacity row and are older than the orphan threshold (a crash between
-/// create and register).
+/// create and register). Scoped to instances labelled for THIS host so a
+/// shared cloud account never leaks a reap onto another controller's boxes.
 fn reap_unregistered(cfg: &Config, _db: &Db, rows: &[HostCapacityRow]) {
     let now = unix_now();
+    let ours = thegn_svc::vps::host_label();
     for t in &cfg.placement.autoscale.managed {
         if !thegn_core::config::vps_provider_kind(&t.provider) {
             continue;
@@ -305,22 +332,17 @@ fn reap_unregistered(cfg: &Config, _db: &Db, rows: &[HostCapacityRow]) {
             continue;
         };
         for inst in instances {
-            let known = rows
-                .iter()
-                .any(|r| r.host.config_name() == Some(inst.name.as_str()));
-            let old = inst
-                .created
-                .is_some_and(|c| now.saturating_sub(c) > ORPHAN_AGE_SECS);
-            if inst.name.starts_with(AUTO_PREFIX) && !known && old {
-                let name = inst.name.clone();
-                let _ = crate::agent::block_on_provider(|| async {
-                    use thegn_svc::provider::RemoteProvider;
-                    provider.destroy(&name).await
-                });
-                thegn_core::msg::warn(&format!(
-                    "placement: reaped unregistered engine host {name} (crashed create?)"
-                ));
+            if !is_reapable_orphan(&inst, &ours, rows, now) {
+                continue;
             }
+            let name = inst.name.clone();
+            let _ = crate::agent::block_on_provider(|| async {
+                use thegn_svc::provider::RemoteProvider;
+                provider.destroy(&name).await
+            });
+            thegn_core::msg::warn(&format!(
+                "placement: reaped unregistered engine host {name} (crashed create?)"
+            ));
         }
     }
 }
@@ -423,6 +445,68 @@ mod tests {
                 .join(" ")
                 .contains("StrictHostKeyChecking=accept-new")
         );
+    }
+
+    fn auto_inst(name: &str, host_label: Option<&str>, created: i64) -> thegn_svc::vps::VpsInstance {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("sz-managed".to_string(), "1".to_string());
+        if let Some(h) = host_label {
+            labels.insert("tg-host".to_string(), h.to_string());
+        }
+        thegn_svc::vps::VpsInstance {
+            id: "1".into(),
+            name: name.into(),
+            ip: None,
+            running: true,
+            created: Some(created),
+            labels,
+        }
+    }
+
+    #[test]
+    fn reaper_skips_another_hosts_engine_vm() {
+        let now = 1_000_000 + ORPHAN_AGE_SECS + 60; // old enough
+        let rows: Vec<HostCapacityRow> = Vec::new(); // not known locally
+        // A `tg-auto-*` engine host old + unknown, but labelled for ANOTHER host:
+        // must NEVER be reaped (that's another controller's live compute).
+        let theirs = auto_inst("tg-auto-cx32-abc123", Some("other-host-xyz"), 1_000_000);
+        assert!(
+            !is_reapable_orphan(&theirs, "our-host-abc", &rows, now),
+            "must not reap an instance labelled for a different tg-host"
+        );
+        // Same shape but labelled for us ⇒ reapable orphan.
+        let ours = auto_inst("tg-auto-cx32-abc123", Some("our-host-abc"), 1_000_000);
+        assert!(is_reapable_orphan(&ours, "our-host-abc", &rows, now));
+    }
+
+    #[test]
+    fn reaper_respects_prefix_age_and_registration() {
+        let now = 1_000_000 + ORPHAN_AGE_SECS + 60;
+        let rows: Vec<HostCapacityRow> = Vec::new();
+        // Unlabelled instance (legacy / foreign) ⇒ not ours, skip.
+        let unlabelled = auto_inst("tg-auto-cx32-abc123", None, 1_000_000);
+        assert!(!is_reapable_orphan(&unlabelled, "our-host-abc", &rows, now));
+        // Not a tg-auto-* name ⇒ skip even if labelled for us.
+        let non_engine = auto_inst("sz-dev-x1", Some("our-host-abc"), 1_000_000);
+        assert!(!is_reapable_orphan(&non_engine, "our-host-abc", &rows, now));
+        // Too young ⇒ skip (create/register may still be in flight).
+        let young = auto_inst("tg-auto-cx32-abc123", Some("our-host-abc"), now);
+        assert!(!is_reapable_orphan(&young, "our-host-abc", &rows, now));
+        // Known locally (has a capacity row) ⇒ skip (it's registered).
+        let known_rows = vec![HostCapacityRow {
+            host: HostId::named("tg-auto-cx32-abc123"),
+            ownership: HostOwnership::Managed,
+            spec: None,
+            overcommit_cpu_pct: 0,
+            overcommit_mem_pct: 0,
+            provider: "hetzner".into(),
+            template: "cx32".into(),
+            created_at: Some(1_000_000),
+            measured: None,
+            updated_at: 1_000_000,
+        }];
+        let ours = auto_inst("tg-auto-cx32-abc123", Some("our-host-abc"), 1_000_000);
+        assert!(!is_reapable_orphan(&ours, "our-host-abc", &known_rows, now));
     }
 
     #[test]

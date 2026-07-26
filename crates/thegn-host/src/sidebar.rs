@@ -907,17 +907,22 @@ pub fn build_rows(
                 ..SidebarRow::base(RowKind::Folder, 1, folder.name.clone(), repo_slug.clone())
             });
 
-            if !folder_collapsed {
-                // Filed children in the workspace's sort order: iterate the
-                // already-sorted `groups` filtered to this folder, so the same
-                // `view.sort` that ordered the loose rows orders these too.
-                for gr in groups
-                    .iter()
-                    .filter(|g| g.folder_id == Some(folder.folder_id))
-                {
-                    let pin_key = format!("{repo_slug}/{}/folder:{}", gr.label, folder.folder_id);
-                    rows.push(mk_row(gr, 2, pin_key));
-                }
+            // Filed children in the workspace's sort order: iterate the
+            // already-sorted `groups` filtered to this folder, so the same
+            // `view.sort` that ordered the loose rows orders these too. Always
+            // emit the rows (mirroring how a collapsed *workspace* still emits
+            // children with `visible:false`), only toggling visibility on the
+            // folder-collapsed state — so the sidebar filter can find and reveal
+            // a worktree filed into a collapsed folder, just as it can one under
+            // a collapsed workspace.
+            for gr in groups
+                .iter()
+                .filter(|g| g.folder_id == Some(folder.folder_id))
+            {
+                let pin_key = format!("{repo_slug}/{}/folder:{}", gr.label, folder.folder_id);
+                let mut row = mk_row(gr, 2, pin_key);
+                row.visible = !collapsed && !folder_collapsed;
+                rows.push(row);
             }
         }
     }
@@ -1180,12 +1185,25 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
     // surfaces both its host group and the TERMINALS banner; a header that
     // itself matched reveals its whole subtree.
     let mut last_workspace: Option<usize> = None;
+    let mut last_folder: Option<usize> = None;
     let mut last_section: Option<usize> = None;
     let mut last_host: Option<usize> = None;
     for i in 0..n {
         match rows[i].kind {
-            RowKind::Workspace => last_workspace = Some(i),
-            RowKind::Folder => {}
+            RowKind::Workspace => {
+                last_workspace = Some(i);
+                last_folder = None; // folders don't span workspaces
+            }
+            RowKind::Folder => {
+                last_folder = Some(i);
+                // A folder that matches on its own label surfaces its parent
+                // workspace header, so it never floats orphaned at depth 1.
+                if keep[i]
+                    && let Some(w) = last_workspace
+                {
+                    keep[w] = true;
+                }
+            }
             RowKind::SectionHeading => last_section = Some(i),
             RowKind::TerminalHost => {
                 last_host = Some(i);
@@ -1206,10 +1224,18 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 }
             }
             RowKind::Worktree => {
-                if keep[i]
-                    && let Some(w) = last_workspace
-                {
-                    keep[w] = true; // surface the parent repo header
+                if keep[i] {
+                    if let Some(w) = last_workspace {
+                        keep[w] = true; // surface the parent repo header
+                    }
+                    // A filed worktree (depth 2) also surfaces its folder
+                    // header so it isn't shown parentless; a loose worktree
+                    // (depth 1) has no folder to surface.
+                    if rows[i].depth >= 2
+                        && let Some(f) = last_folder
+                    {
+                        keep[f] = true;
+                    }
                 }
             }
             RowKind::EmptyHint => {}
@@ -1217,12 +1243,23 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
     }
     // Reveal children only for headers/groups that matched on their own label.
     let mut reveal_ws = false; // inside a self-matched workspace
+    let mut reveal_folder = false; // inside a self-matched folder
     let mut reveal_section = false; // inside a self-matched TERMINALS banner
     let mut reveal_host = false; // inside a self-matched host group
     for i in 0..n {
         match rows[i].kind {
-            RowKind::Workspace => reveal_ws = self_match[i],
-            RowKind::Folder => {}
+            RowKind::Workspace => {
+                reveal_ws = self_match[i];
+                reveal_folder = false; // folders don't span workspaces
+            }
+            RowKind::Folder => {
+                // A folder that matched on its own label reveals its children,
+                // and (like any surfaced folder) is itself surfaced above.
+                reveal_folder = self_match[i] || reveal_ws;
+                if reveal_ws {
+                    keep[i] = true;
+                }
+            }
             RowKind::SectionHeading => reveal_section = self_match[i],
             RowKind::TerminalHost => {
                 reveal_host = self_match[i] || reveal_section;
@@ -1236,7 +1273,9 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 }
             }
             RowKind::Worktree => {
-                if reveal_ws {
+                // Loose worktrees (depth 1) follow the workspace's reveal;
+                // filed worktrees (depth 2) also reveal when their folder did.
+                if reveal_ws || (rows[i].depth >= 2 && reveal_folder) {
                     keep[i] = true;
                 }
             }
@@ -2054,15 +2093,61 @@ mod tests {
             .find(|r| r.kind == RowKind::Folder)
             .expect("folder row still present");
         assert!(folder.collapsed);
+        // The filed child row is still emitted (so the filter can find/reveal
+        // it), but hidden while the folder is collapsed.
         assert!(
-            !rows
-                .iter()
-                .any(|r| r.kind == RowKind::Worktree && r.label == "feat")
+            rows.iter()
+                .any(|r| r.kind == RowKind::Worktree && r.label == "feat" && !r.visible),
+            "collapsed folder's child is emitted but not visible"
         );
         assert!(
             rows.iter()
                 .any(|r| r.kind == RowKind::Worktree && r.label == "home" && r.visible)
         );
+    }
+
+    #[test]
+    fn filter_finds_worktree_in_collapsed_folder() {
+        // Regression: a worktree filed into a *collapsed* folder used to be
+        // unfindable — its row wasn't even emitted. Now the filter surfaces it
+        // (and its folder + workspace headers), matching the collapsed-workspace
+        // contract.
+        let (s, ws, dbw, folders) = folder_fixture();
+        let view = ViewState {
+            collapsed: ["app/folder:1".to_string()].into_iter().collect(),
+            filter: "feat".into(),
+            ..Default::default()
+        };
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &folders, &[]);
+        let visible: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.visible)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert!(visible.contains(&"feat"), "filtered filed worktree surfaces");
+        assert!(visible.contains(&"Backend"), "its folder header surfaces");
+        assert!(visible.contains(&"app"), "its workspace header surfaces");
+        assert!(!visible.contains(&"home"), "non-matching sibling stays hidden");
+    }
+
+    #[test]
+    fn filter_on_folder_name_surfaces_workspace_and_children() {
+        // Filtering by a folder's own label surfaces its parent workspace (so it
+        // isn't orphaned at depth 1) and reveals its children.
+        let (s, ws, dbw, folders) = folder_fixture();
+        let view = ViewState {
+            filter: "backend".into(),
+            ..Default::default()
+        };
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &folders, &[]);
+        let visible: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.visible)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert!(visible.contains(&"Backend"), "matched folder shows");
+        assert!(visible.contains(&"app"), "parent workspace surfaces");
+        assert!(visible.contains(&"feat"), "folder's children revealed");
     }
 
     #[test]

@@ -71,13 +71,20 @@ pub(crate) fn maybe_materialize(
     ctx.materialize_inflight.insert(key.clone());
     // A fresh materialize is a genuine (re)bring-up: un-retire.
     ctx.loading_retired.remove(&key);
-    let remote = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(path)).is_remote();
-    ctx.loading_remote.insert(key.clone(), remote);
-    // The seed plan: backend-aware when the config names a concrete backend
-    // (a podman user sees image/container rows from frame one), the generic
-    // kinded three-step shape otherwise. Either way it ends in "shell" and the
-    // worker's observer refines the SAME rows as core phases stream in.
-    let seed = match crate::loading::catalog::seed_target(cfg, remote) {
+    // NOTE: remoteness is NOT resolved here. `GitLoc::for_worktree` opens+reads
+    // SQLite, and this runs on the compositor loop — a busy DB writer (gate run
+    // / bulk hydration) could stall the frame. The seed below is chosen as if
+    // LOCAL (the common case, and where the rich backend-aware rows matter):
+    // for a remote worktree the provider provisioner streams its own richer
+    // step views over this same key almost immediately, correcting the shape.
+    // `loading_remote` is seeded to the safe long (remote) window rather than
+    // resolved from the DB here — `drain_provision`/`drain_specs` overwrite it
+    // with the authoritative per-tab value the moment the first event lands
+    // (which is when the startup-shell watchdog, gated on the shell-wait step
+    // shape, actually starts caring). This matches `active_watchdog_deadline`'s
+    // own missing-entry default, so no local tab is under-guarded.
+    ctx.loading_remote.entry(key.clone()).or_insert(true);
+    let seed = match crate::loading::catalog::seed_target(cfg, false) {
         Some(t) => crate::loading::catalog::plan_for(&t).into_steps(),
         None => crate::loading::catalog::generic_seed(),
     };

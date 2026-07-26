@@ -6,9 +6,16 @@
 //! - a record past the env's `max_lifetime_secs` ⇒ destroy the app (the hard
 //!   spend ceiling — a running machine bills);
 //! - a `creating` record older than [`CREATING_STALE_SECS`] ⇒ the create crashed
-//!   between the intent write and finalize: best-effort destroy + drop it;
-//! - a `ready` record whose app/machine is gone (destroyed out-of-band) ⇒ drop
-//!   the record (heals the attach path's assumptions).
+//!   between the intent write and finalize: best-effort destroy + drop it.
+//!
+//! A `ready` record under the lifetime ceiling is deliberately left alone. If
+//! its Fly app was destroyed out-of-band the record is a harmless, non-billing
+//! stale IP-cache entry that the next attach re-resolves; reconciling it would
+//! cost a per-record Fly API probe (Fly exposes no cheap label-scoped app list
+//! the way the VPS providers do), which isn't worth it on the reaper's hot
+//! path. Unlike [`crate::vps_reaper`], this reaper never lists the Fly
+//! inventory — so it can only reconcile records it already has a reason to
+//! touch (lifetime / stale-creating).
 //!
 //! Runs from the hydration thread ([`tick`] self-throttles to [`TICK_INTERVAL`]);
 //! network work runs on its own spawned thread.
