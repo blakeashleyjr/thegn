@@ -493,6 +493,7 @@ pub fn sidebar_sort_menu(current: crate::sidebar::SortMode) -> MenuOverlay {
             "attention — what needs you floats up",
             SortMode::Attention,
         ),
+        ('l', "live — most-recently-active first", SortMode::Live),
     ];
     let default = modes
         .iter()

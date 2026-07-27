@@ -84,6 +84,19 @@ pub(crate) fn collect_attention(
     // Activity FSM snapshot, path-keyed with real state timestamps.
     let activity = thegn_core::activity::read_entries();
 
+    // Recency for the sidebar's `Live` sort: the last time each worktree was
+    // busy (CPU or fresh output). Bucketed to 2s so sub-second poll jitter
+    // between two co-active worktrees doesn't reorder them every hydration —
+    // equal buckets fall through to the stable session-slot tie-break. Built
+    // from the snapshot already in hand; no extra I/O, off the loop thread.
+    status.activity_recency = activity
+        .iter()
+        .filter_map(|(path, e)| {
+            e.last_active_at
+                .map(|t| (path.clone(), (t / 2.0).floor() * 2.0))
+        })
+        .collect();
+
     // Unread notifications grouped by worktree (host-global rows have an empty
     // path and never mark a worktree).
     let mut unread: BTreeMap<String, Vec<UnreadNote>> = BTreeMap::new();

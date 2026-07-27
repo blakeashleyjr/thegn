@@ -959,6 +959,11 @@ fn compose_row_lines(
             } else {
                 Tok::Slot(S::Dim)
             };
+            // Flat cross-workspace layout tags each row with its repo, dim, so
+            // a cross-repo list still shows which workspace a worktree is in.
+            if let Some(prefix) = &row.repo_prefix {
+                left.push(seg(Tok::Slot(S::Faint), format!("{prefix}/")));
+            }
             let label = crate::sidebar::compose_row_label(row.pr_number, window_title, &row.label);
             left.push(seg(name_fg, label));
 
