@@ -469,6 +469,7 @@ fn config_enum_every_variant_roundtrips_canon_and_aliases() {
         ("linear", IssueProviderKind::Linear),
         ("github", IssueProviderKind::Github),
         ("jira", IssueProviderKind::Jira),
+        ("kaneo", IssueProviderKind::Kaneo),
     ] {
         assert_eq!(IssueProviderKind::from_str_validated(s).unwrap(), v);
         assert_eq!(v.as_str(), s);
