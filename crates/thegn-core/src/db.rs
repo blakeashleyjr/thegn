@@ -74,7 +74,7 @@ use std::path::PathBuf;
 /// Pure caches → drop + recreate (the background refresh repopulates).
 /// v46: one-time read-flag cleanup of the spurious `process_failed` notification
 /// pile (no schema change) — see the post-batch migration in `open_at`.
-pub const SCHEMA_VERSION: i64 = 46;
+pub const SCHEMA_VERSION: i64 = 47;
 
 pub struct Db {
     conn: Connection,
@@ -735,6 +735,15 @@ impl Db {
               PRIMARY KEY (src_id, dst_id, kind)
             );
             CREATE INDEX IF NOT EXISTS idx_sem_edge_dst ON sem_edge (dst_id);
+            -- v47: device-flow access token per Kaneo instance (`base_url`).
+            -- Written by `thegn kaneo login`; the Kaneo issue backend falls back
+            -- to it when no `api_key` is configured. A cache/credential store,
+            -- not a source of truth — safe to drop (re-login re-populates).
+            CREATE TABLE IF NOT EXISTS kaneo_auth (
+              base_url   TEXT PRIMARY KEY,
+              token      TEXT NOT NULL,
+              fetched_at INTEGER NOT NULL
+            );
             COMMIT;
             "#,
         )?;

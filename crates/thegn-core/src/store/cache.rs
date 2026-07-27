@@ -65,6 +65,14 @@ pub trait CacheStore {
     /// Replace the cached "My Work" payload for a `scope`.
     fn put_my_work_cache(&self, scope: &str, json: &str) -> Result<()>;
 
+    /// The device-flow access token stored for a Kaneo instance (`base_url`):
+    /// `(token, fetched_at)`. `None` when no login exists for that instance.
+    fn get_kaneo_token(&self, base_url: &str) -> Result<Option<(String, i64)>>;
+    /// Store (or replace) the device-flow token for a Kaneo `base_url`.
+    fn put_kaneo_token(&self, base_url: &str, token: &str) -> Result<()>;
+    /// Forget the stored token for a Kaneo `base_url` (`thegn kaneo logout`).
+    fn delete_kaneo_token(&self, base_url: &str) -> Result<()>;
+
     /// Per-worktree diff cache: `(files, fetched_at)`.
     fn get_diff_cache(&self, worktree: &str) -> Result<Option<(String, i64)>>;
     /// Replace the per-worktree diff cache.
