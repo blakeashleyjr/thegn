@@ -39,7 +39,8 @@ terminals. `Alt-s` (or `Ctrl-←` from the leftmost pane) focuses it;
 - `f` — move to a folder (or create one)
 - `r` / `F2` — rename
 - `p` — pin to top
-- `s` — sort menu: manual / name / recent / attention
+- `s` — sort menu: manual / name / recent / attention / live (live orders
+  worktrees by most-recent process/agent activity, newest first)
 - `Space` — mark rows for bulk actions; `Shift-↑↓` — reorder manually
 
 ## Act
@@ -52,6 +53,10 @@ terminals. `Alt-s` (or `Ctrl-←` from the leftmost pane) focuses it;
 ## View
 
 - `< >` — resize the sidebar; `e` — wide mode
+- `g` — flat / grouped: toggle between one recency-ordered list of every
+  worktree across all repos (each tagged with its repo) and the
+  per-workspace grouping. Pair with the `s` → live sort to always see the
+  latest-changed worktree at the top, regardless of workspace
 
 Workspace ordering is configurable: `sidebar_workspace_sort = "attention"`
 bubbles the workspace that most needs you to the top. See

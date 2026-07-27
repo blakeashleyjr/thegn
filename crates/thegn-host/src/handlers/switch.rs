@@ -293,6 +293,7 @@ mod tests {
             crate::sidebar::SortMode::Name,
             crate::sidebar::SortMode::Recent,
             crate::sidebar::SortMode::Attention,
+            crate::sidebar::SortMode::Live,
         ] {
             let ranks = [
                 ("/tmp/app-fix", 0u32),

@@ -13,6 +13,7 @@
 //! | `sidebar_cols`       | width in columns     | adjust_width (`<`/`>`)            |
 //! | `sidebar_expanded`   | `"1"`/`"0"`          | `e` wide toggle                   |
 //! | `sidebar_mode`       | `SidebarMode::as_key()` | ToggleSidebar cycle            |
+//! | `sidebar_flat`       | `"1"` (absent=grouped) | toggle_flat (`g`)               |
 //!
 //! `<key>` is the row's stable identity: a workspace slug, `{slug}/{branch}`
 //! for worktrees, `{slug}/folder:{id}` for folders, `terminals/host:{key}` for
@@ -110,6 +111,8 @@ impl SidebarState {
                 self.width = value.parse().ok();
             } else if key == "sidebar_expanded" {
                 self.expanded = value == "1";
+            } else if key == "sidebar_flat" {
+                self.view.flat = value == "1";
             } else if key == "sidebar_mode" {
                 self.mode = crate::layout::SidebarMode::from_key(&value);
             }
@@ -150,5 +153,26 @@ impl SidebarState {
     /// Number of currently-visible rows.
     pub(crate) fn visible_len(model: &FrameModel) -> usize {
         model.sidebar_rows.iter().filter(|r| r.visible).count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_reads_sidebar_flat() {
+        // The `sidebar_flat` ui_state key restores the flat layout on startup.
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.set_ui_state(SIDEBAR_SCOPE, "sidebar_flat", "1").unwrap();
+        let mut sb = SidebarState::default();
+        sb.load(&db, SIDEBAR_SCOPE);
+        assert!(sb.view.flat);
+
+        // Absent key → grouped (the default).
+        let db2 = thegn_core::db::Db::open_memory().unwrap();
+        let mut sb2 = SidebarState::default();
+        sb2.load(&db2, SIDEBAR_SCOPE);
+        assert!(!sb2.view.flat);
     }
 }
