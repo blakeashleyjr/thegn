@@ -129,6 +129,12 @@ pub struct ActivityEntry {
     pub quiet_since: Option<f64>,
     /// When the current busy streak began — set while busy.
     pub busy_since: Option<f64>,
+    /// Unix seconds of the last poll at which this worktree was busy (CPU or
+    /// fresh output). Monotonic while the worktree lives; frozen once it goes
+    /// idle; `None` if it has never been active. The recency key for the
+    /// sidebar's `Live` sort (most-recently-active first). Distinct from
+    /// `busy_since` (start of the *current* streak, cleared on idle).
+    pub last_active_at: Option<f64>,
 }
 
 /// Read the latest activity entries as `worktree_path -> entry`. Empty on any
@@ -150,6 +156,7 @@ pub fn read_entries_at(path: &Path) -> BTreeMap<String, ActivityEntry> {
                     state: e.state,
                     quiet_since: e.quiet_since,
                     busy_since: e.busy_since,
+                    last_active_at: e.last_active_at,
                 },
             )
         })
@@ -555,15 +562,19 @@ mod tests {
         let path = tmp("entries");
         let json = r#"{"worktrees":{
             "/wt/a":{"tab":"app/home","state":"waiting","cpu_jiffies":0,"quiet_since":1234.0},
-            "/wt/b":{"tab":"app/feat","state":"active","cpu_jiffies":0,"busy_since":2000.0}}}"#;
+            "/wt/b":{"tab":"app/feat","state":"active","cpu_jiffies":0,"busy_since":2000.0,"last_active_at":2100.0}}}"#;
         std::fs::write(&path, json).unwrap();
         let m = read_entries_at(&path);
         let a = &m["/wt/a"];
         assert_eq!((a.tab.as_str(), a.state.as_str()), ("app/home", "waiting"));
         assert_eq!(a.quiet_since, Some(1234.0));
         assert_eq!(a.busy_since, None);
+        // No `last_active_at` in the JSON → `None` (serde default).
+        assert_eq!(a.last_active_at, None);
         let b = &m["/wt/b"];
         assert_eq!(b.busy_since, Some(2000.0));
+        // `last_active_at` round-trips from disk — the `Live` recency key.
+        assert_eq!(b.last_active_at, Some(2100.0));
         // Missing file → empty map; default-path wrapper never panics.
         let _ = std::fs::remove_file(&path);
         assert!(read_entries_at(&path).is_empty());

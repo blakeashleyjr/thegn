@@ -316,6 +316,7 @@ impl SidebarState {
                     entries.push(e("pin", "Pin / unpin", Some("p")));
                 }
                 entries.push(e("sort", "Sort worktrees by…", Some("s")));
+                entries.push(e("toggle-flat", "Flat / grouped view", Some("g")));
                 // Workspace-wide merge-queue controls (panel `A` / clear / `D`).
                 entries.push(sep());
                 entries.push(e("mq-add-all", "Queue all worktrees", None));
@@ -501,6 +502,7 @@ impl SidebarState {
                 self.sync(model);
             }
             KeyCode::Char('s') => return SidebarOutcome::SortMenu,
+            KeyCode::Char('g') => return self.toggle_flat(model, session),
             KeyCode::Char('p') => return self.toggle_pin(model, session),
             KeyCode::Char(' ') => {
                 // Multi-select toggle (item 26): mark/unmark the cursor row if it
@@ -767,6 +769,34 @@ impl SidebarState {
         SidebarOutcome::Redraw
     }
 
+    /// Toggle the flat cross-workspace layout (`g` / context menu): one
+    /// recency-ordered list of every worktree across all repos, vs the
+    /// per-workspace grouping. Persisted as `sidebar_flat` (grouped is the
+    /// default, so the key is deleted rather than tombstoned when off).
+    pub(crate) fn toggle_flat(
+        &mut self,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+    ) -> SidebarOutcome {
+        self.view.flat = !self.view.flat;
+        if self.view.flat {
+            self.persist("sidebar_flat", "1");
+        } else {
+            self.unpersist("sidebar_flat");
+        }
+        // The row set changes shape (banner + interleaved rows); land at the
+        // top so the cursor and scroll window don't dangle past the new list.
+        self.cursor = 0;
+        self.scroll = 0;
+        self.rebuild(model, session);
+        model.status = if self.view.flat {
+            "Sidebar: flat — all worktrees by recency".into()
+        } else {
+            "Sidebar: grouped by workspace".into()
+        };
+        SidebarOutcome::Redraw
+    }
+
     /// Drop out of the Wide expand back to the resting width (mirrors the
     /// panel's Esc collapse). Returns whether anything changed so the caller can
     /// gate a relayout. Persists "0" so an unfocused bar doesn't re-expand on
@@ -809,6 +839,7 @@ impl SidebarState {
                 }
             }
             "toggle" => return self.toggle_collapse(model, session),
+            "toggle-flat" => return self.toggle_flat(model, session),
             "pin" => return self.toggle_pin(model, session),
             "close" => {
                 let targets = self.action_targets(model);
