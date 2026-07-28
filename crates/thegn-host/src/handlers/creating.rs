@@ -114,12 +114,20 @@ pub(crate) fn open_optimistic(
     generation: u64,
     wizard: &crate::wizard::NewWorktreeWizard,
     cfg: &thegn_core::config::Config,
+    env: &str,
 ) {
     let tab = thegn_core::repo::branch_tab(&wizard.repo_slug, &progress.branch);
     let path = thegn_core::worktree::worktree_path(wizard.root(), &progress.branch, cfg)
         .to_string_lossy()
         .into_owned();
     let jump = cfg.session.focus_on_create;
+    // Record the wizard's host pick against the optimistic key BEFORE the worker's
+    // `TabOpened` (which re-asserts it in `open_or_reconcile`) — otherwise the
+    // splash context resolves `effective_env == None` (the DB row isn't written
+    // until the worker's Register step) and falls through the config chain to a
+    // provider `[sandbox] default_env`, briefly showing e.g. `machine0` for a
+    // local pick. `rename` carries this entry across any name-dedupe reconcile.
+    let key = (tab.clone(), 0);
     open_tab(
         session,
         model,
@@ -133,6 +141,7 @@ pub(crate) fn open_optimistic(
         path,
         jump,
     );
+    loading_state.set_env(key, env);
 }
 
 /// Reconcile an optimistically-opened placeholder group (opened on the loop at
@@ -401,6 +410,9 @@ pub(crate) fn on_submit(
     {
         cp.branch = format!("{}{}", cfg.branch_prefix, tail);
     }
+    // Capture the host pick before `choices` is moved into the Submit command, so
+    // the optimistic splash below can reflect it immediately (see `open_optimistic`).
+    let env = choices.env.clone();
     if let Some(tx) = wizard_cmd_tx.take() {
         let _ = tx.send(crate::wizard::WizardCmd::Submit(choices));
     }
@@ -419,6 +431,7 @@ pub(crate) fn on_submit(
             g,
             w,
             cfg,
+            &env,
         );
         relayout = true;
     }
@@ -962,5 +975,53 @@ mod tests {
             42,
         );
         assert!(session.worktrees.iter().any(|g| g.name == "repo/b"));
+    }
+
+    /// The optimistic placeholder opened at Submit records the wizard's host pick
+    /// against its `(tab, 0)` key, so the splash context resolves that env instead
+    /// of falling through to `[sandbox] default_env` (a provider) while the DB
+    /// `worktrees` row doesn't yet exist — the "splash briefly shows machine0 for a
+    /// local pick" regression.
+    #[test]
+    fn open_optimistic_records_the_chosen_env() {
+        let mut session = Session::default();
+        let mut model = FrameModel::default();
+        let mut sb = SidebarState::default();
+        let mut loading = LoadingState::default();
+        let mut creating_tabs: HashSet<Key> = HashSet::new();
+        let mut gen_tab: GenTab = HashMap::new();
+
+        // A config whose default env is a provider: without the recorded pick, the
+        // splash would resolve THIS key to that provider.
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.sandbox.default_env = "machine0".into();
+        let root = std::env::temp_dir();
+        let w = crate::wizard::NewWorktreeWizard::new(root.clone(), &cfg);
+        let progress = CreationProgress::new("tg-lively-orbit".to_string());
+        let key = (
+            thegn_core::repo::branch_tab(&w.repo_slug, &progress.branch),
+            0,
+        );
+
+        open_optimistic(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut gen_tab,
+            &progress,
+            5,
+            &w,
+            &cfg,
+            "host",
+        );
+
+        assert_eq!(
+            loading.env_for(&key),
+            Some("host"),
+            "the wizard's local host pick is recorded on the optimistic splash key, \
+             so the context never falls through to the provider default_env",
+        );
     }
 }
