@@ -353,6 +353,8 @@ impl Session {
         // persistent `position` so we can sort the final group list by it.
         let mut positions: std::collections::HashMap<String, i64> =
             std::collections::HashMap::new();
+        let mut ambient_cache: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         if let Ok(wts) = db.worktrees() {
             for wt in &wts {
                 positions.insert(wt.worktree.clone(), wt.position);
@@ -361,9 +363,16 @@ impl Session {
                 // git is the source of truth: a LOCAL registry row whose dir
                 // vanished (worktree deleted outside thegn) is stale — never
                 // resurrect it. Remote rows (a set `location` OR a non-local env
-                // placement) are kept: their tree isn't on the host.
-                if !crate::hydrate::row_is_remote(&wt.location, wt.env_name.as_deref(), cfg)
-                    && !std::path::Path::new(&wt.worktree).is_dir()
+                // placement, including one INHERITED from the repo's ambient
+                // default) are kept: their tree isn't on the host.
+                if !crate::hydrate::row_is_remote_effective(
+                    db,
+                    cfg,
+                    &wt.location,
+                    wt.env_name.as_deref(),
+                    &wt.repo_root,
+                    &mut ambient_cache,
+                ) && !std::path::Path::new(&wt.worktree).is_dir()
                 {
                     continue;
                 }
