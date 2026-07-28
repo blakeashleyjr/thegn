@@ -42,9 +42,7 @@ use crate::hydrate::{
 };
 use crate::input::key_bytes;
 use crate::layout;
-use crate::loading::{
-    SpecOrigin, active_watchdog_deadline, is_shell_wait, provision_owns_tab, watchdog_deadline,
-};
+use crate::loading::{SpecOrigin, provision_owns_tab};
 use crate::menu::{self, MenuChoice, MenuOverlay};
 use crate::palette::build_palette;
 use crate::pane::PaneEvent;
@@ -534,8 +532,18 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         "terminal ready (raw mode + alt screen + buffer)"
     );
 
+    // Load config BEFORE the session so `load_or_seed_session`'s reconcile knows
+    // each worktree's env PLACEMENT: a remote (ssh/k8s/provider) worktree has no
+    // host dir, so it must not be reaped as "deleted" just because its local path
+    // is absent. `merge_db_hosts`/i18n below augment this same `cfg`; env
+    // placement comes from the config file directly, so it's already correct here.
+    let mut cfg = thegn_core::config::Config::load_layered(
+        &thegn_core::config::ProcessEnv,
+        &cli.overrides,
+        cli.config.clone(),
+    );
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let (session, seeded) = load_or_seed_session(&cwd);
+    let (session, seeded) = load_or_seed_session(&cwd, &cfg);
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
     // main checkout's shared `.git/config` (which silently retargets every git
     // read — diff panel included — at another worktree). No-ops on linked
@@ -570,11 +578,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         "session loaded"
     );
 
-    let mut cfg = thegn_core::config::Config::load_layered(
-        &thegn_core::config::ProcessEnv,
-        &cli.overrides,
-        cli.config.clone(),
-    );
+    // `cfg` was loaded above (before the session reconcile); augment it with
+    // DB-stored hosts now that we're past session load.
     thegn_core::host_config::merge_db_hosts(&mut cfg);
     thegn_core::i18n::init(&cfg.ui.language);
 
@@ -4741,7 +4746,7 @@ pub(crate) fn spawn_worktree_shell_pane(
 /// native-provider path opens the exec with `open_spec_clean`, and the
 /// local/sandbox path resolves the `clean-shell` choice (no rc, not persisted as
 /// the worktree's agent). Never edits the user's config.
-fn spawn_clean_shell_pane(
+pub(crate) fn spawn_clean_shell_pane(
     panes: &mut Panes,
     cfg: &thegn_core::config::Config,
     dir: Option<&std::path::Path>,
@@ -6004,6 +6009,11 @@ async fn event_loop<T: Terminal>(
     // unit-tested). It fires ONCE per tab (tracked here) to swap a hung login
     // shell for a clean rc-free one.
     let mut shell_watchdog_fired: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
+    // A REMOTE tab gets ONE watchdog extension before the fallback (the machine0
+    // readiness gate can spend a full silent window bringing a cold VM up, which
+    // counts against `pane_age`). Tracked per tab; see `startup_watchdog::tick`.
+    let mut shell_watchdog_extended: std::collections::HashSet<(usize, usize)> =
         std::collections::HashSet::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
     // speculatively creates the worktree while the wizard is open; `wizard_cmd_tx`
@@ -9645,95 +9655,25 @@ async fn event_loop<T: Terminal>(
             splash_ticker.set_visible(!model.load_steps.is_empty());
         }
 
-        // Startup-shell watchdog: while the loading splash is up (clears on first
-        // PTY output), a shell alive past SHELL_OUTPUT_WATCHDOG with nothing on
-        // screen is hung — usually a login shell whose rc files hang/error in a
-        // provisioned env (e.g. host `.zshrc` sourcing absent `/nix/store/...`).
-        // Warn and fall back ONCE per tab to a clean rc-free shell (dotfiles left
-        // untouched). Re-checked cheaply on each wake (500ms ticker) — no new timer.
-        // Arm ONLY in the shell-attach wait — the loading phase's final "shell"
-        // step, after provisioning finished and we're waiting on the login shell
-        // to produce output. Never during clone/nix/devShell/cold-resume, where
-        // silence is expected (not a hung shell) — otherwise a slow provider
-        // provision trips the fallback and destroys the real shell.
-        if !center_dormant && is_shell_wait(&model.load_steps) {
-            let gi = session.active;
-            let ti = session.worktrees.get(gi).map(|g| g.active_tab).unwrap_or(0);
-            // A provider/remote worktree gets the long deadline (a silent devShell
-            // build / cold-sprite resume is not a hang); local keeps the snappy 8s.
-            // Remoteness comes from the PER-TAB `loading_remote` bool captured when
-            // this tab's splash was seeded (a provider stream, or `is_remote()` on
-            // the worktree path) — NOT `model.load_context`, which only refreshes
-            // when the derived step Vec CHANGES and so went stale when switching
-            // between two shell-wait tabs with byte-identical `[sandbox, container,
-            // shell]` steps (⇒ a sprite judged at the local 8s ⇒ premature
-            // rc-free-bash fallback). Missing ⇒ the safe 300s (never premature-drop
-            // a sprite). See `active_watchdog_deadline` / `loading_remote`.
-            let watchdog = session
-                .worktrees
-                .get(gi)
-                .map(|g| active_watchdog_deadline(&loading_remote, &(g.name.clone(), ti)))
-                .unwrap_or_else(|| watchdog_deadline(true));
-            let leaf = (!shell_watchdog_fired.contains(&(gi, ti)))
-                .then(|| session.worktrees.get(gi).and_then(|g| g.tabs.get(ti)))
-                .flatten()
-                .map(|t| t.center.pane_ids())
-                .filter(|ids| ids.len() == 1)
-                .and_then(|ids| ids.first().copied())
-                .filter(|pid| {
-                    panes.table.contains_key(pid)
-                        && panes.pane_age(*pid).is_some_and(|age| age > watchdog)
-                });
-            if let Some(pid) = leaf {
-                shell_watchdog_fired.insert((gi, ti));
-                tracing::warn!(
-                    target: "thegn::startup",
-                    pane = pid,
-                    secs = watchdog.as_secs(),
-                    "startup-shell watchdog fired: no PTY output within deadline — \
-                     falling back to a clean rc-free shell"
-                );
-                let cwd = group_cwd(&session.worktrees[gi])
-                    .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from));
-                match spawn_clean_shell_pane(
-                    &mut panes,
-                    keymap.config(),
-                    cwd.as_deref(),
-                    chrome.center,
-                ) {
-                    Ok(fresh) => {
-                        // Drop the hung pane and swap the clean shell into its leaf.
-                        panes.table.remove(&pid);
-                        panes.forget_spawn_time(pid);
-                        if let Some(tab) = session.tab_mut(gi, ti) {
-                            crate::panes::replace_single_dead_center_pane(tab, pid, fresh);
-                        }
-                        let k = (session.worktrees[gi].name.clone(), ti);
-                        loading_state.remove(&k);
-                        loading_remote.remove(&k);
-                        model.load_steps.clear();
-                        model.status = "Shell produced no output — fell back to a plain \
-                            shell. Your login shell's startup files likely hang or error \
-                            in this environment (e.g. dotfiles referencing host-only \
-                            paths); your config was left untouched."
-                            .into();
-                        need_relayout = true;
-                    }
-                    Err(e) => {
-                        let k = (session.worktrees[gi].name.clone(), ti);
-                        loading_state.remove(&k);
-                        loading_remote.remove(&k);
-                        model.load_steps.clear();
-                        center_dormant = true;
-                        model.status = format!(
-                            "Shell produced no output and the plain-shell fallback \
-                             failed: {e}"
-                        );
-                    }
-                }
-                dirty = true;
-            }
-        }
+        // Startup-shell watchdog (extracted to keep run.rs capped): a shell alive
+        // past its deadline with a blank screen is a hung login shell; swap it once
+        // for a clean rc-free shell. Remote tabs earn one deadline extension first.
+        crate::handlers::startup_watchdog::tick(
+            &mut crate::handlers::startup_watchdog::StartupWatchdogCtx {
+                panes: &mut panes,
+                session: &mut session,
+                model: &mut model,
+                cfg: keymap.config(),
+                center: chrome.center,
+                loading_state: &mut loading_state,
+                loading_remote: &mut loading_remote,
+                shell_watchdog_fired: &mut shell_watchdog_fired,
+                shell_watchdog_extended: &mut shell_watchdog_extended,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+            },
+        );
 
         // Mark the focused worktree's "stuck" dot as read: a filled-red
         // `Waiting` dot turns hollow-red `Read` once the user is on the tab —

@@ -300,12 +300,13 @@ pub(crate) fn prune_stale_worktree_groups(
     session: &mut crate::session::Session,
     db: &thegn_core::db::Db,
     session_name: &str,
+    cfg: &thegn_core::config::Config,
 ) -> usize {
     let remote: std::collections::HashSet<String> = db
         .worktrees()
         .map(|rows| {
             rows.into_iter()
-                .filter(|w| !w.location.is_empty())
+                .filter(|w| row_is_remote(&w.location, w.env_name.as_deref(), cfg))
                 .map(|w| w.worktree)
                 .collect()
         })
@@ -347,7 +348,10 @@ pub(crate) fn prune_stale_worktree_groups(
 ///
 /// The `bool` is true when the session was freshly SEEDED (first launch / new
 /// workspace) rather than resurrected — the launch splash shows only then.
-pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> (crate::session::Session, bool) {
+pub(crate) fn load_or_seed_session(
+    cwd: &std::path::Path,
+    cfg: &thegn_core::config::Config,
+) -> (crate::session::Session, bool) {
     let _span = tracing::info_span!("load_or_seed_session").entered();
     use crate::session::{GroupKind, Session, WorktreeGroup};
 
@@ -428,11 +432,12 @@ pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> (crate::session::Se
         );
     };
 
-    let mut session = Session::resurrect(&db, &session_name).unwrap_or_default();
+    let mut session = Session::resurrect_with_cfg(&db, &session_name, cfg).unwrap_or_default();
 
     // git is the source of truth for worktrees on disk: drop resurrected
-    // groups whose local dir vanished (deleted/moved outside thegn).
-    let _ = prune_stale_worktree_groups(&mut session, &db, &session_name);
+    // groups whose local dir vanished (deleted/moved outside thegn). Remote
+    // worktrees (non-local placement) are exempt — their tree isn't on the host.
+    let _ = prune_stale_worktree_groups(&mut session, &db, &session_name, cfg);
 
     let mut seeded = false;
     if session.worktrees.is_empty() {
@@ -462,7 +467,14 @@ pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> (crate::session::Se
     // workspace becomes active. Unconditional — it also self-heals installs
     // whose bootstrap workspace predates this registration. Safe upsert:
     // `put_workspace` assigns `position` (sidebar order) only on first insert.
-    if Path::new(&session.id).is_dir() {
+    // A workspace the user explicitly removed is tombstoned (see
+    // `WorkspaceStore::tombstone_workspace`): its home checkout stays on disk
+    // (git is truth), so this cold start can still resolve to its directory via
+    // the cwd fallback. Honour the removal — run it only as a transient live
+    // fallback, never re-registering it in `workspaces` or re-pinning it active
+    // — so "remove workspace" sticks instead of resurrecting on the next launch.
+    let tombstoned = db.workspace_tombstoned(&session.id).unwrap_or(false);
+    if !tombstoned && Path::new(&session.id).is_dir() {
         let name = Path::new(&session.id)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -480,7 +492,10 @@ pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> (crate::session::Se
     }
     // Record the resolved workspace as the active pointer so the next cold
     // start reopens it even on a first run (where no switch has happened yet).
-    let _ = db.set_active_workspace(&session.id);
+    // Skipped for a tombstoned workspace so it doesn't re-pin itself active.
+    if !tombstoned {
+        let _ = db.set_active_workspace(&session.id);
+    }
     (session, seeded)
 }
 
@@ -655,6 +670,28 @@ pub(crate) fn merge_workspace_lists(
     out
 }
 
+/// Whether a registry row is a REMOTE worktree — one whose tree legitimately
+/// lives off the host, so a missing local dir is NOT proof it was deleted. True
+/// when the row carries a `location` (a provisioned provider), OR its env's
+/// configured placement is non-local (provider/ssh/k8s). Keys off the STABLE
+/// config placement, not the transient `location` string: an ssh/k8s worktree
+/// never persists a `location`, and a provider worktree whose bring-up failed
+/// before writing one has an empty `location` too — both would otherwise be
+/// silently reaped by the local-dir reconcile the instant their host dir is
+/// absent (torn down on a failed remote bring-up).
+pub(crate) fn row_is_remote(
+    location: &str,
+    env_name: Option<&str>,
+    cfg: &thegn_core::config::Config,
+) -> bool {
+    if !location.is_empty() {
+        return true;
+    }
+    env_name
+        .and_then(|e| cfg.env.get(e))
+        .is_some_and(|e| !matches!(e.placement, thegn_core::config::PlacementMode::Local))
+}
+
 /// Worktrees registered in the DB, ready for the sidebar's cross-workspace
 /// rows: one entry per registry row whose dir still exists (or is remote).
 pub(crate) fn db_worktree_list(
@@ -663,11 +700,15 @@ pub(crate) fn db_worktree_list(
 ) -> Vec<crate::sidebar::DbWorktree> {
     let mut out = Vec::new();
     for w in db.worktrees().unwrap_or_default() {
-        // git is the source of truth: a local registry row whose dir vanished
+        // git is the source of truth: a LOCAL registry row whose dir vanished
         // (deleted outside thegn) is dead — delete it here (we're on the
         // hydration thread) instead of merely hiding it, so deceased
-        // worktrees stop resurfacing in the tree. Remote rows are exempt.
-        if w.location.is_empty() && !std::path::Path::new(&w.worktree).is_dir() {
+        // worktrees stop resurfacing in the tree. Remote rows (a set `location`
+        // OR a non-local env placement) are exempt: their tree lives off the
+        // host, so a missing local dir is not proof of deletion.
+        if !row_is_remote(&w.location, w.env_name.as_deref(), cfg)
+            && !std::path::Path::new(&w.worktree).is_dir()
+        {
             let _ = db.del_worktree(&w.worktree);
             continue;
         }

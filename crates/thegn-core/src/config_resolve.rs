@@ -344,6 +344,7 @@ pub fn classify_repo_overlay(
         backend,
         default_backend,
         default_env,
+        main_env,
         backend_chain,
         image,
         profile,
@@ -407,6 +408,11 @@ pub fn classify_repo_overlay(
         default_env,
         "sandbox.default_env",
         "a repo selects an env via the top-level `env = \"…\"` key, not [sandbox] default_env"
+    );
+    forbid!(
+        main_env,
+        "sandbox.main_env",
+        "a repo selects an env via the top-level `env = \"…\"` key, not [sandbox] main_env"
     );
     forbid!(
         compose,
@@ -1003,10 +1009,11 @@ pub fn resolve_repo_sandbox(
 }
 
 /// Resolve the full execution [`Environment`], honouring `approvals`. Env-name
-/// precedence (most specific wins): `selected` → repo `.thegn.*` `env =` →
-/// global `[sandbox] default_env` → implicit `"default"`. The named-env overlay
-/// is trusted (globally defined) and applies unclamped on top of the clamped
-/// repo base.
+/// precedence (most specific wins): `selected` → repo `.thegn.*` `env =` → the
+/// branch-aware global default (`[sandbox] main_env` on the repo's primary
+/// branch, else `default_env`) → implicit `"default"`. The named-env overlay is
+/// trusted (globally defined) and applies unclamped on top of the clamped repo
+/// base.
 /// Whether a resolved env should default its sandbox backend to `none` because
 /// the *placement itself* is the isolation boundary. A managed sandbox (provider
 /// microVM / k8s pod) brings its own isolation, so unless the env EXPLICITLY opts
@@ -1027,6 +1034,49 @@ fn managed_placement_defaults_none(
         )
 }
 
+/// Pure: the default env NAME given the two configured `[sandbox]` keys and
+/// whether the worktree sits on the repo's primary branch. `main_env` (trimmed)
+/// wins only on the primary branch and only when non-empty; otherwise
+/// `default_env` applies. Pure so the branch policy is unit-tested without a git
+/// tree.
+fn pick_default_env(main_env: &str, default_env: &str, on_primary_branch: bool) -> String {
+    let m = main_env.trim();
+    if on_primary_branch && !m.is_empty() {
+        m.to_string()
+    } else {
+        default_env.to_string()
+    }
+}
+
+/// Whether a worktree takes `[sandbox] main_env` rather than `default_env`. True
+/// (when `main_env` is set) for the workspace-ROOT/home checkout — the canonical
+/// host checkout `main_env` targets, which can't be provisioned to a remote, so a
+/// feature branch checked out THERE still runs locally — and for any checkout on
+/// the repo's primary branch. Linked feature worktrees off the primary branch use
+/// `default_env`. Pure so the policy is unit-tested without a git tree.
+fn worktree_uses_main_env(main_env: &str, is_root_checkout: bool, on_primary_branch: bool) -> bool {
+    !main_env.trim().is_empty() && (is_root_checkout || on_primary_branch)
+}
+
+/// Whether `worktree` is checked out on the repo's PRIMARY branch (origin/HEAD,
+/// e.g. `main`/`master`). Best-effort and gated to a LOCAL checkout: a remote /
+/// provider worktree is never the primary (the main checkout lives on the host)
+/// and probing its branch over the control plane would be expensive, so it reads
+/// as non-primary — exactly the "feature branches → `default_env`" outcome. Only
+/// invoked when `[sandbox] main_env` is set (see caller), so these two git reads
+/// never run for repos that haven't opted in.
+fn worktree_on_primary_branch(repo_root: &Path, worktree: &Path, loc: &GitLoc) -> bool {
+    if !matches!(loc, GitLoc::Local(_)) {
+        return false;
+    }
+    let Some(branch) =
+        crate::util::git_out(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+    else {
+        return false; // detached HEAD / not a checkout ⇒ not primary
+    };
+    branch.trim() == crate::worktree::default_branch(repo_root).trim()
+}
+
 pub fn resolve_environment(
     cfg: &Config,
     repo_root: &Path,
@@ -1041,10 +1091,25 @@ pub fn resolve_environment(
         let t = s.trim();
         (!t.is_empty()).then(|| t.to_string())
     };
+    // The global default env is branch-aware: a worktree on the repo's PRIMARY
+    // branch defaults to `[sandbox] main_env` (when set), every other branch to
+    // `default_env`. The workspace-ROOT/home checkout (`worktree == repo_root`)
+    // always takes `main_env` regardless of its branch — it's the canonical host
+    // checkout `main_env` targets and can't be provisioned to a remote (a feature
+    // branch checked out there still runs locally); only linked feature WORKTREES
+    // follow the branch rule. The git read is skipped for the root checkout and
+    // when `main_env` is empty, so non-opted-in repos keep the plain `default_env`
+    // path.
+    let is_root_checkout = matches!(loc, GitLoc::Local(_)) && worktree == repo_root;
+    let on_primary_branch = !is_root_checkout
+        && !base.main_env.trim().is_empty()
+        && worktree_on_primary_branch(repo_root, worktree, loc);
+    let on_primary = worktree_uses_main_env(&base.main_env, is_root_checkout, on_primary_branch);
+    let default_env = pick_default_env(&base.main_env, &base.default_env, on_primary);
     let name = selected
         .and_then(pick)
         .or_else(|| pick(&cfg.repo_env_name(repo_root)))
-        .or_else(|| pick(&base.default_env))
+        .or_else(|| pick(&default_env))
         .unwrap_or_else(|| "default".to_string());
 
     let env = match cfg.env.get(&name) {
@@ -1225,6 +1290,35 @@ mod tests {
 
     fn overlay() -> SandboxOverlay {
         SandboxOverlay::default()
+    }
+
+    #[test]
+    fn pick_default_env_honors_branch_and_main_env() {
+        // Feature off (main_env empty): every branch gets default_env, even the
+        // primary one.
+        assert_eq!(pick_default_env("", "machine0", true), "machine0");
+        assert_eq!(pick_default_env("", "machine0", false), "machine0");
+        // Feature on: primary branch → main_env, others → default_env.
+        assert_eq!(pick_default_env("host", "machine0", true), "host");
+        assert_eq!(pick_default_env("host", "machine0", false), "machine0");
+        // main_env is trimmed; a whitespace-only value counts as unset.
+        assert_eq!(pick_default_env("  ", "machine0", true), "machine0");
+        assert_eq!(pick_default_env(" host ", "machine0", true), "host");
+        // Both empty ⇒ empty (the caller then falls through to "default").
+        assert_eq!(pick_default_env("", "", true), "");
+    }
+
+    #[test]
+    fn root_checkout_takes_main_env_regardless_of_branch() {
+        // Feature off (main_env empty): never main_env, even for the root checkout.
+        assert!(!worktree_uses_main_env("", true, false));
+        assert!(!worktree_uses_main_env("  ", true, true));
+        // The workspace-root/home checkout always takes main_env when set — even on
+        // a feature branch (the regression: it was routed to default_env=machine0).
+        assert!(worktree_uses_main_env("host", true, false));
+        // A linked feature worktree takes main_env only on the primary branch.
+        assert!(worktree_uses_main_env("host", false, true));
+        assert!(!worktree_uses_main_env("host", false, false));
     }
 
     // ---- The security regression gate: hostile_repo_cannot_escape --------

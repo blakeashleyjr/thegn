@@ -7,6 +7,10 @@
 use crate::models::{WorkspaceRow, WorktreeRow};
 use anyhow::Result;
 
+/// `ui_state` scope holding workspace removal tombstones (keyed by `repo_path`).
+/// See [`WorkspaceStore::tombstone_workspace`].
+pub const WORKSPACE_TOMBSTONE_SCOPE: &str = "workspace_tombstone";
+
 /// Object-safe (`&self` + concrete args), so `&dyn WorkspaceStore` works for
 /// backend-agnostic consumers. [`crate::db::Db`] is the embedded-SQLite impl.
 pub trait WorkspaceStore {
@@ -39,6 +43,37 @@ pub trait WorkspaceStore {
     /// `workspaces` row so the sidebar stops listing it. The worktree files on
     /// disk are intentionally left untouched.
     fn del_workspace(&self, repo_path: &str) -> Result<()>;
+
+    /// Mark a workspace as *explicitly removed by the user* so the resurrection
+    /// paths never silently re-add it. thegn keeps the home checkout on disk
+    /// when a workspace is removed (git is the source of truth), so without a
+    /// tombstone a cold start whose cwd — or a stale active-workspace pointer —
+    /// resolves to that directory would `put_workspace` it straight back into
+    /// the sidebar. Recorded in `ui_state` (no schema bump), keyed by
+    /// `repo_path`; cleared by [`Self::clear_workspace_tombstone`] on an
+    /// explicit reopen. Default impl over the `ui_state` primitives.
+    fn tombstone_workspace(&self, repo_path: &str) -> Result<()> {
+        self.set_ui_state(
+            WORKSPACE_TOMBSTONE_SCOPE,
+            repo_path,
+            &crate::util::now().to_string(),
+        )
+    }
+
+    /// Whether [`Self::tombstone_workspace`] marked this workspace removed —
+    /// the guard the resurrection paths consult before re-registering a
+    /// workspace resolved from disk.
+    fn workspace_tombstoned(&self, repo_path: &str) -> Result<bool> {
+        Ok(self
+            .get_ui_state(WORKSPACE_TOMBSTONE_SCOPE, repo_path)?
+            .is_some())
+    }
+
+    /// Clear a workspace tombstone — called when the user explicitly reopens a
+    /// workspace (create / switch-to), which is unambiguous intent to keep it.
+    fn clear_workspace_tombstone(&self, repo_path: &str) -> Result<()> {
+        self.del_ui_state(WORKSPACE_TOMBSTONE_SCOPE, repo_path)
+    }
 
     /// All registered repos (for the sidebar / `list`), in manual `position`
     /// order (seeded from recency at the v16 migration; reorderable via

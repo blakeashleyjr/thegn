@@ -298,6 +298,22 @@ impl Session {
     /// Rebuild the session from the DB (cold-start resurrect). Groups come back
     /// in persisted order; the active group is restored from `session_state`.
     pub fn resurrect(db: &Db, session: &str) -> Result<Session> {
+        // Back-compat shim: callers without a loaded config (tests, workspace
+        // switch) fall back to a default config — no envs ⇒ the legacy
+        // location-only remote check. The real startup path calls
+        // `resurrect_with_cfg` so non-local placements (ssh/k8s/provider) are
+        // recognized and their worktrees aren't dropped for a missing host dir.
+        Self::resurrect_with_cfg(db, session, &thegn_core::config::Config::default())
+    }
+
+    /// Placement-aware [`resurrect`](Self::resurrect): `cfg` lets the adoption
+    /// filter recognize remote worktrees (their tree isn't on the host) so they
+    /// survive even when their local dir is absent.
+    pub fn resurrect_with_cfg(
+        db: &Db,
+        session: &str,
+        cfg: &thegn_core::config::Config,
+    ) -> Result<Session> {
         let tab_rows = db.group_tabs_for_session(session)?;
         let mut worktrees: Vec<WorktreeGroup> = db
             .groups_for_session(session)?
@@ -342,10 +358,13 @@ impl Session {
                 positions.insert(wt.worktree.clone(), wt.position);
             }
             for wt in wts {
-                // git is the source of truth: a local registry row whose dir
-                // vanished (worktree deleted outside thegn) is stale —
-                // never resurrect it. Remote rows (location set) are kept.
-                if wt.location.is_empty() && !std::path::Path::new(&wt.worktree).is_dir() {
+                // git is the source of truth: a LOCAL registry row whose dir
+                // vanished (worktree deleted outside thegn) is stale — never
+                // resurrect it. Remote rows (a set `location` OR a non-local env
+                // placement) are kept: their tree isn't on the host.
+                if !crate::hydrate::row_is_remote(&wt.location, wt.env_name.as_deref(), cfg)
+                    && !std::path::Path::new(&wt.worktree).is_dir()
+                {
                     continue;
                 }
                 let known = |ws: &[WorktreeGroup]| ws.iter().any(|g| g.name == wt.tab_name);
@@ -585,6 +604,10 @@ impl Session {
 
     pub fn switch_to_workspace(&mut self, repo_path: &str, db: &thegn_core::db::Db) -> Result<()> {
         let now = crate::run::now_secs();
+        // Switching *to* a workspace is unambiguous intent to keep it, so lift
+        // any prior removal tombstone (see `WorkspaceStore::tombstone_workspace`)
+        // — an explicit reopen must resurrect it into the sidebar again.
+        let _ = db.clear_workspace_tombstone(repo_path);
         self.persist(db, &self.id, now)?;
 
         let new_session = Session::resurrect(db, repo_path)?;

@@ -40,6 +40,33 @@ pub(crate) fn active_watchdog_deadline(
     watchdog_deadline(remote.get(key).copied().unwrap_or(true))
 }
 
+/// Effective watchdog deadline for a tab, applying the remote one-time
+/// extension. The machine0 readiness gate now spends bounded silent time
+/// bringing a parked/cold VM back before the shell prompts, and that wait counts
+/// against `pane_age` — so a remote tab that already spent its one extension must
+/// clear a DOUBLED window before the fallback strips the user's shell for a
+/// rc-free one. A local tab (or a remote tab pre-extension) uses `base`. Pure so
+/// the extend-once policy is unit-tested alongside `active_watchdog_deadline`.
+pub(crate) fn effective_watchdog_deadline(
+    base: std::time::Duration,
+    remote: bool,
+    already_extended: bool,
+) -> std::time::Duration {
+    if remote && already_extended {
+        base.saturating_mul(2)
+    } else {
+        base
+    }
+}
+
+/// On a watchdog expiry, whether to EXTEND the deadline once more (`true`)
+/// instead of falling back to a clean shell. Only a remote tab that has not yet
+/// extended earns the extension; a local tab, or a remote tab that already
+/// extended, falls back. Pairs with [`effective_watchdog_deadline`].
+pub(crate) fn watchdog_should_extend(remote: bool, already_extended: bool) -> bool {
+    remote && !already_extended
+}
+
 /// Whether a loading-step list is in the terminal "waiting on the shell" shape —
 /// sandbox + container done, the final `shell` step pending/active — as opposed to
 /// a still-live provisioning sequence (`workspace`/`clone`/`nix`/`direnv`/
@@ -220,6 +247,25 @@ mod tests {
             active_watchdog_deadline(&remote, &unknown),
             std::time::Duration::from_secs(300),
             "a missing entry defaults to the safe 300s window"
+        );
+    }
+
+    #[test]
+    fn remote_watchdog_extends_once_before_falling_back() {
+        let base = std::time::Duration::from_secs(300);
+        // Local: no extension — expiry falls back immediately.
+        assert!(!watchdog_should_extend(false, false));
+        assert_eq!(effective_watchdog_deadline(base, false, false), base);
+        // Remote, pre-extension: earns exactly one extension, still on the base
+        // window until it fires.
+        assert!(watchdog_should_extend(true, false));
+        assert_eq!(effective_watchdog_deadline(base, true, false), base);
+        // Remote, post-extension: no further extension, and the window doubles so
+        // the tab isn't re-judged 500ms later.
+        assert!(!watchdog_should_extend(true, true));
+        assert_eq!(
+            effective_watchdog_deadline(base, true, true),
+            base.saturating_mul(2)
         );
     }
 

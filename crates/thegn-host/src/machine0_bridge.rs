@@ -90,10 +90,43 @@ fn note_down(name: &str, reason: &str) {
     let _ = std::fs::write(down_path(name), reason);
 }
 
+/// Path of the "mosh doesn't work on this VM's network" marker (sibling of the
+/// down-marker). Written when a mosh attach fails to establish, cleared on a
+/// successful mosh session or on [`clear`] (suspend/destroy).
+fn nomosh_path(name: &str) -> PathBuf {
+    cache_dir().join(format!("{name}.nomosh"))
+}
+
+/// Whether to skip mosh for this VM. **Sticky** — no TTL, unlike the down-marker:
+/// UDP-routability (whether the VM's network delivers mosh's ~60000-61000 UDP back
+/// to the client) is a *structural* property of the path, not a transient blip, so
+/// once a mosh attach times out we go straight to ssh until the VM is recreated
+/// (`clear` wipes the marker). Pure over the marker's existence so the `run` branch
+/// stays unit-testable without execing.
+fn should_skip_mosh(marker_present: bool) -> bool {
+    marker_present
+}
+
+fn nomosh_present(name: &str) -> bool {
+    nomosh_path(name).exists()
+}
+
+fn note_nomosh(name: &str) {
+    let _ = std::fs::create_dir_all(cache_dir());
+    // best-effort: a miss just re-probes mosh next open (pays the ~18s timeout again).
+    let _ = std::fs::write(nomosh_path(name), "mosh session failed to establish");
+}
+
+fn clear_nomosh(name: &str) {
+    let _ = std::fs::remove_file(nomosh_path(name));
+}
+
 /// Drop a machine0 sandbox's cached endpoint (call on suspend/destroy so a parked
-/// or gone VM's stale IP is never served to a control read).
+/// or gone VM's stale IP is never served to a control read). Also wipes the
+/// `nomosh` marker so a recreated VM at the same name re-probes mosh.
 pub fn clear(name: &str) {
     let _ = std::fs::remove_file(down_path(name));
+    let _ = std::fs::remove_file(nomosh_path(name));
     let _ = std::fs::remove_file(cache_path(name));
 }
 
@@ -220,8 +253,40 @@ fn mosh_argv(shim: &ssh_shim::SshShim, cmd: &[String]) -> Vec<String> {
     argv
 }
 
+/// Build the plain-ssh interactive/exec argv (the non-mosh branch): `ssh [-tt]
+/// <opts…> user@ip [-- cmd]`. Interactive panes force PTY allocation (`-tt`);
+/// captured control reads stay non-tty. Pure over the shim's argv.
+fn ssh_argv(shim: &ssh_shim::SshShim, cmd: &[String], interactive: bool) -> Vec<String> {
+    let mut argv = shim.base_argv();
+    if interactive {
+        // We own a PTY ⇒ force allocation; captured control reads stay non-tty.
+        argv.insert(1, "-tt".into());
+    }
+    if !cmd.is_empty() {
+        argv.push("--".into());
+        argv.extend(cmd.iter().cloned());
+    }
+    argv
+}
+
+/// Undo terminal state a failed mosh client may have left before we exec ssh into
+/// the same pane: show cursor, leave the alternate screen, soft-reset (DECSTR),
+/// clear SGR attributes, re-enable autowrap. Best-effort direct writes — no
+/// `tput`/`reset` subprocess, and deliberately not a hard `\x1bc` RIS (which
+/// clobbers scrollback on many terminals).
+fn reset_terminal() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[?25h\x1b[?1049l\x1b[!p\x1b[0m\x1b[?7h");
+    let _ = out.flush();
+}
+
 /// Exec ssh (or mosh) to the named machine0 VM, running `cmd` (empty ⇒ a login
-/// shell). Replaces this process on success (the pane/exec owns the PTY directly).
+/// shell). Replaces this process on the ssh path (the pane/exec owns the PTY
+/// directly). The mosh path is *spawned* rather than exec'd so a failed attach
+/// (e.g. the VM's network blocks mosh UDP) falls back to plain ssh in this same
+/// live pane instead of leaving a dead pane; a sticky `nomosh` marker then makes
+/// the next open skip mosh outright.
 pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
@@ -236,28 +301,48 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
     };
 
     // Interactive pane over mosh (default) when the local client + the VM's
-    // mosh-server are both present; otherwise fall back to plain ssh so a
-    // mosh-less image never breaks the pane. Control/non-tty reads always use ssh.
-    let argv = if interactive
+    // mosh-server are both present AND mosh isn't already known-bad for this VM.
+    let try_mosh = interactive
         && transport == RemoteTransport::Mosh
+        && !should_skip_mosh(nomosh_present(name))
         && local_mosh_ok()
-        && mosh_server_present(&shim)
-    {
-        mosh_argv(&shim, cmd)
-    } else {
-        let mut argv = shim.base_argv();
-        if interactive {
-            // We own a PTY ⇒ force allocation; captured control reads stay non-tty.
-            argv.insert(1, "-tt".into());
-        }
-        if !cmd.is_empty() {
-            argv.push("--".into());
-            argv.extend(cmd.iter().cloned());
-        }
-        argv
-    };
+        && mosh_server_present(&shim);
 
-    // CLI bridge process: exec replaces us, ssh/mosh owns the PTY/stdio from here.
+    if try_mosh {
+        let margv = mosh_argv(&shim, cmd);
+        // SPAWN (not exec) so we survive a mosh failure and can fall back to ssh
+        // in this same live pane. mosh owns our stdio/TTY while it runs; this
+        // bridge is an off-loop CLI process, so a blocking child wait is fine.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "off-loop CLI bridge: block on the mosh child so a UDP-blocked \
+                      timeout falls back to ssh instead of killing the pane"
+        )]
+        let status = std::process::Command::new(&margv[0])
+            .args(&margv[1..])
+            .status();
+        match status {
+            // Clean mosh session (incl. a normal logout) → mosh works here; drop
+            // any stale marker and close the pane as usual.
+            Ok(s) if s.success() => {
+                clear_nomosh(name);
+                return Ok(());
+            }
+            // Non-zero exit (the UDP-blocked "Timed out waiting for server" case
+            // exits non-zero after ~18s) or a spawn error → remember mosh is bad
+            // for this VM, reset the terminal mosh may have dirtied, and fall
+            // through to the plain-ssh exec below.
+            _ => {
+                note_nomosh(name);
+                reset_terminal();
+            }
+        }
+    }
+
+    // Plain ssh: chosen up front (non-mosh transport, mosh-less image, or a
+    // non-tty control read), or reached by falling back from a failed mosh attach.
+    let argv = ssh_argv(&shim, cmd, interactive);
+    // CLI bridge process: exec replaces us, ssh owns the PTY/stdio from here.
     let err = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
     Err(err).with_context(|| format!("machine0-ssh: exec {}", argv.join(" ")))
 }
@@ -274,6 +359,36 @@ mod tests {
         assert!(!down_fresh(now - Duration::from_secs(31), now));
         // Future mtime (clock skew) is fresh, not an error.
         assert!(down_fresh(now + Duration::from_secs(5), now));
+    }
+
+    #[test]
+    fn nomosh_marker_is_sticky_selection() {
+        // Sticky: presence ⇒ skip mosh, absence ⇒ attempt it. No time input,
+        // unlike the down-marker's freshness window.
+        assert!(should_skip_mosh(true), "marker present ⇒ skip mosh");
+        assert!(!should_skip_mosh(false), "no marker ⇒ attempt mosh");
+    }
+
+    #[test]
+    fn ssh_argv_forces_tty_and_appends_cmd() {
+        let shim = ssh_shim::SshShim {
+            name: "m0-dev".into(),
+            ip: "203.0.113.9".into(),
+            user: "root".into(),
+            key_path: "/state/ssh/id".into(),
+        };
+        // Interactive: -tt injected right after "ssh"; host trails.
+        let argv = ssh_argv(&shim, &[], true);
+        assert_eq!(argv[0], "ssh");
+        assert_eq!(argv[1], "-tt");
+        assert_eq!(argv.last().map(String::as_str), Some("root@203.0.113.9"));
+        // Non-interactive control read: no forced PTY.
+        let argv = ssh_argv(&shim, &[], false);
+        assert!(!argv.iter().any(|a| a == "-tt"), "no -tt when non-tty: {argv:?}");
+        // A command is appended after `--`.
+        let argv = ssh_argv(&shim, &["/bin/sh".into(), "-lc".into(), "echo hi".into()], true);
+        let dd = argv.iter().position(|a| a == "--").expect("-- present");
+        assert_eq!(&argv[dd + 1..], &["/bin/sh", "-lc", "echo hi"]);
     }
 
     #[test]
