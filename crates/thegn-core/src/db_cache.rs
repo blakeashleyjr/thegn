@@ -51,6 +51,36 @@ impl CacheStore for Db {
         Ok(())
     }
 
+    fn get_kaneo_token(&self, base_url: &str) -> Result<Option<(String, i64)>> {
+        let r = self
+            .conn()
+            .query_row(
+                "SELECT token, fetched_at FROM kaneo_auth WHERE base_url=?1",
+                params![base_url],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    fn put_kaneo_token(&self, base_url: &str, token: &str) -> Result<()> {
+        self.conn().execute(
+            r#"INSERT INTO kaneo_auth(base_url,token,fetched_at)
+               VALUES(?1,?2,?3)
+               ON CONFLICT(base_url) DO UPDATE SET token=?2, fetched_at=?3"#,
+            params![base_url, token, util::now()],
+        )?;
+        Ok(())
+    }
+
+    fn delete_kaneo_token(&self, base_url: &str) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM kaneo_auth WHERE base_url=?1",
+            params![base_url],
+        )?;
+        Ok(())
+    }
+
     fn get_ci_cache(&self, worktree: &str) -> Result<Option<(String, i64)>> {
         let r = self
             .conn()
