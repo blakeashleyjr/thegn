@@ -2094,6 +2094,13 @@ pub struct SandboxConfig {
     /// `"default"` env (this `[sandbox]` block + `[sandbox.remote]`, today's
     /// behavior). See [`Config::resolve_env`].
     pub default_env: String,
+    /// Name of the `[env.<name>]` env to default to for a worktree on the repo's
+    /// PRIMARY branch (origin/HEAD, e.g. `main`/`master`), when it hasn't selected
+    /// one explicitly. Empty ⇒ the branch is never consulted and `default_env`
+    /// applies to every branch (today's behavior). Set both (e.g. `main_env =
+    /// "host"`, `default_env = "machine0"`) to run the main checkout locally and
+    /// feature branches on a remote provider. See [`Config::resolve_env`].
+    pub main_env: String,
     pub backend_chain: Vec<String>, // auto detection order; "host" = host fallback
     pub image: String,              // "" => host-toolchain mode
     /// Hardening preset for the worktree's interactive container (shell panes).
@@ -2185,6 +2192,7 @@ impl Default for SandboxConfig {
             backend: SandboxBackend::Auto,
             default_backend: SandboxBackend::Auto,
             default_env: String::new(),
+            main_env: String::new(),
             backend_chain: crate::config_defaults::default_backend_chain(),
             image: String::new(),
             profile: SandboxProfile::Hardened,
@@ -2503,6 +2511,7 @@ pub struct SandboxOverlay {
     pub backend: Option<SandboxBackend>,
     pub default_backend: Option<SandboxBackend>,
     pub default_env: Option<String>,
+    pub main_env: Option<String>,
     pub backend_chain: Option<Vec<String>>,
     pub image: Option<String>,
     pub profile: Option<SandboxProfile>,
@@ -2561,6 +2570,9 @@ impl SandboxOverlay {
         }
         if let Some(v) = self.default_env {
             base.default_env = v;
+        }
+        if let Some(v) = self.main_env {
+            base.main_env = v;
         }
         if let Some(v) = self.backend_chain {
             base.backend_chain = v;
@@ -2657,6 +2669,7 @@ impl SandboxOverlay {
             && self.backend.is_none()
             && self.default_backend.is_none()
             && self.default_env.is_none()
+            && self.main_env.is_none()
             && self.backend_chain.is_none()
             && self.image.is_none()
             && self.profile.is_none()

@@ -339,7 +339,7 @@
             ("XDG_STATE_HOME", state_home.to_str().unwrap()),
             ("THEGN_SESSION", &ws_str),
         ]);
-        let (session, seeded) = load_or_seed_session(&ws_dir);
+        let (session, seeded) = load_or_seed_session(&ws_dir, &Default::default());
 
         assert!(seeded);
         assert_eq!(session.id, ws_str);
@@ -350,6 +350,59 @@
             .find(|w| w.repo_path == ws_str)
             .expect("bootstrap workspace registered in the workspaces table");
         assert_eq!(row.kind, "dir", "a plain dir bootstraps as a dir workspace");
+
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&state_home);
+        let _ = std::fs::remove_dir_all(&ws_dir);
+    }
+
+    #[test]
+    fn load_or_seed_session_does_not_resurrect_tombstoned_workspace() {
+        // Regression: removing a workspace keeps its home checkout on disk (git
+        // is truth), so a cold start that resolves to that directory must NOT
+        // re-register it — the removal tombstone makes "remove workspace" stick.
+        let state_home = std::env::temp_dir()
+            .join(format!("tg-hydrate-tombstone-{}-state", std::process::id()));
+        let ws_dir =
+            std::env::temp_dir().join(format!("tg-hydrate-tombstone-{}-ws", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_home);
+        let _ = std::fs::remove_dir_all(&ws_dir);
+        std::fs::create_dir_all(state_home.join("thegn")).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let ws_str = ws_dir.to_string_lossy().into_owned();
+
+        // Pre-tombstone the directory in the very DB load_or_seed_session opens
+        // (selected by XDG_STATE_HOME), simulating a prior "remove workspace".
+        {
+            let db =
+                thegn_core::db::Db::open_at(&state_home.join("thegn/thegn.db")).unwrap();
+            db.tombstone_workspace(&ws_str).unwrap();
+        }
+
+        // Pin THEGN_SESSION to the tombstoned dir so resolution is deterministic
+        // (and exercises the guard) regardless of the test runner's cwd.
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("XDG_STATE_HOME", state_home.to_str().unwrap()),
+            ("THEGN_SESSION", &ws_str),
+        ]);
+        let (session, _seeded) = load_or_seed_session(&ws_dir, &Default::default());
+        // It still runs transiently in the directory (a live fallback)…
+        assert_eq!(session.id, ws_str);
+
+        let db = thegn_core::db::Db::open_at(&state_home.join("thegn/thegn.db")).unwrap();
+        // …but must not be re-registered in the sidebar or re-pinned active.
+        assert!(
+            !db.workspaces()
+                .unwrap()
+                .iter()
+                .any(|w| w.repo_path == ws_str),
+            "tombstoned workspace must not be re-registered"
+        );
+        assert_eq!(
+            db.active_workspace().unwrap(),
+            None,
+            "tombstoned workspace must not re-pin itself active"
+        );
 
         drop(_env);
         let _ = std::fs::remove_dir_all(&state_home);
@@ -381,7 +434,7 @@
             ("XDG_STATE_HOME", state_home.to_str().unwrap()),
             ("THEGN_SESSION", &a_str),
         ]);
-        let (mut session, _) = load_or_seed_session(&ws_a);
+        let (mut session, _) = load_or_seed_session(&ws_a, &Default::default());
         let db = thegn_core::db::Db::open_at(&state_home.join("thegn/thegn.db")).unwrap();
         session.switch_to_workspace(&b_str, &db).unwrap();
 
@@ -553,4 +606,38 @@
         assert!(lines.iter().all(|l| l.message.starts_with("line ")));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_placement_worktrees_survive_missing_local_dir() {
+        use thegn_core::config::{Config, EnvConfig, PlacementMode};
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "ageless".into(),
+            EnvConfig { placement: PlacementMode::Ssh, ..Default::default() },
+        );
+        cfg.env.insert(
+            "machine0".into(),
+            EnvConfig { placement: PlacementMode::Provider, ..Default::default() },
+        );
+        cfg.env.insert(
+            "host".into(),
+            EnvConfig { placement: PlacementMode::Local, ..Default::default() },
+        );
+
+        // Non-local placements are remote even with an EMPTY location (ssh/k8s
+        // never persist one; a provider whose bring-up failed hasn't yet), so the
+        // local-dir reconcile must NOT reap them. This is the regression: ssh
+        // (`ageless`) + provider (`machine0`) worktrees vanished on create.
+        assert!(row_is_remote("", Some("ageless"), &cfg));
+        assert!(row_is_remote("", Some("machine0"), &cfg));
+
+        // A local env whose dir is gone IS reapable; so is an unknown/absent env.
+        assert!(!row_is_remote("", Some("host"), &cfg));
+        assert!(!row_is_remote("", Some("gone-env"), &cfg));
+        assert!(!row_is_remote("", None, &cfg));
+
+        // A persisted location always wins, regardless of placement.
+        assert!(row_is_remote("{\"path\":\"/x\"}", Some("host"), &cfg));
+        assert!(row_is_remote("{\"path\":\"/x\"}", None, &cfg));
     }

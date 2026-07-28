@@ -208,6 +208,11 @@ pub(crate) fn remove_workspace_with_db(
         let _ = db.del_worktrees_for_repo(repo_path);
         let _ = db.del_workspace(repo_path);
         let _ = db.del_repo_slug(repo_path);
+        // Tombstone the removal: pruning the rows isn't enough because the home
+        // checkout stays on disk (git is truth), so a later cold start standing
+        // in this directory would `put_workspace` it back (hydrate / switch).
+        // The tombstone makes "remove workspace" stick until an explicit reopen.
+        let _ = db.tombstone_workspace(repo_path);
         if db.active_workspace().ok().flatten().as_deref() == Some(repo_path) {
             let _ = db.del_ui_state("", "active_workspace");
         }
@@ -372,6 +377,16 @@ mod tests {
         assert!(
             !ws.contains(&"/tmp/repo-lib".to_string()),
             "removed workspace row pruned: {ws:?}"
+        );
+        // The removal is tombstoned so a cwd/active-workspace cold start can't
+        // resurrect it, while the surviving sibling is left untombstoned.
+        assert!(
+            db.workspace_tombstoned("/tmp/repo-lib").unwrap(),
+            "removed workspace must be tombstoned"
+        );
+        assert!(
+            !db.workspace_tombstoned("/tmp/repo-app").unwrap(),
+            "sibling workspace must not be tombstoned"
         );
         let wt_roots: Vec<String> = db
             .worktrees()

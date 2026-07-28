@@ -169,7 +169,8 @@ pub struct EnvProviderConfig {
     pub connect: ProviderConnect,
     /// Interactive-pane transport for a provider reached over ssh (VPS/machine0):
     /// `mosh` (default — resilient roaming/latency, auto-falls-back to ssh when
-    /// the VM lacks `mosh-server`) or `ssh`. The control plane always uses ssh.
+    /// the VM lacks `mosh-server` or its network blocks mosh UDP) or `ssh`. The
+    /// control plane always uses ssh.
     pub transport: RemoteTransport,
     /// Provider sandbox template/image to create from.
     pub template: String,

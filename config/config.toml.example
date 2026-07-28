@@ -1317,6 +1317,17 @@ default_backend = "auto"
 # = the implicit "default" env (this `[sandbox]` block + `[sandbox.remote]`).
 default_env = ""
 
+# Branch-aware override of `default_env` for a worktree on the repo's PRIMARY
+# branch (origin/HEAD — e.g. main/master). Empty (default) = branch is never
+# consulted and `default_env` applies to every branch. Set both to run the main
+# checkout locally while feature branches go to a remote provider, e.g.:
+#   main_env    = "host"        # `[env.host]`     placement = "local"
+#   default_env = "machine0"    # `[env.machine0]` placement = "provider"
+# Applies below explicit worktree/workspace/repo selections. A repo `.thegn.toml`
+# may NOT set this (like `default_env`) — a repo picks its env via the top-level
+# `env = "…"` key instead.
+main_env = ""
+
 # Probe order for "auto". First backend that is installed and usable wins.
 # "none"/"host" anywhere in the list = uncontained fallback from that point on.
 # NixOS users: move "bwrap" first if podman isn't installed.
@@ -2352,8 +2363,8 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # #                                       #   is used verbatim. Empty ⇒ no NixOS apply.
 # # transport = "mosh"                    # interactive-pane transport: mosh (default —
 # #                                       #   roaming/latency-resilient; auto-falls-back to
-# #                                       #   ssh when the VM image lacks mosh-server) | ssh.
-# #                                       #   Control-plane reads always use ssh.
+# #                                       #   ssh when the VM lacks mosh-server or its network
+# #                                       #   blocks mosh UDP) | ssh. Control reads always ssh.
 # # auto_provision = false                # create the VM on first open if missing
 # # auto_checkpoint = false               # snapshot (machine0 images) on worktree close
 # # max_instances = 5                     # hard cap on concurrently-managed VMs

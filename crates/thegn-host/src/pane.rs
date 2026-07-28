@@ -830,8 +830,14 @@ enum SessionEnd {
     PaneGone,
 }
 
-/// Max consecutive reconnects that make no progress before giving up.
-const MAX_DEAD_RECONNECTS: u32 = 3;
+/// Max consecutive reconnects that make no progress before giving up. Sized for
+/// the remote resume-on-return path: a suspend-idle sandbox (e.g. a parked
+/// machine0 VM) can need several reattach/reopen rounds — each gated on the VM
+/// actually coming back — before a working shell is restored, so too small a
+/// budget kills a merely-parked pane. The exponential, capped backoff
+/// (`reconnect_backoff_ms`) keeps the total bounded (~13s across 6 tries) so a
+/// permanently-dead session still exits rather than spinning forever.
+const MAX_DEAD_RECONNECTS: u32 = 6;
 
 /// Only output that arrives at least this long after a (re)attach counts as
 /// real "progress" for the reconnect budget. Attach replays scrollback / a

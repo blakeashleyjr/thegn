@@ -1139,6 +1139,22 @@ mod tests {
     }
 
     #[test]
+    fn workspace_tombstone_round_trips_and_defaults_absent() {
+        let db = Db::open_memory().unwrap();
+        // Absent by default — a never-removed workspace isn't tombstoned.
+        assert!(!db.workspace_tombstoned("/repo/app").unwrap());
+        // Removing sets the tombstone; unrelated paths stay untombstoned.
+        db.tombstone_workspace("/repo/app").unwrap();
+        assert!(db.workspace_tombstoned("/repo/app").unwrap());
+        assert!(!db.workspace_tombstoned("/repo/svc").unwrap());
+        // An explicit reopen clears exactly that path's tombstone.
+        db.clear_workspace_tombstone("/repo/app").unwrap();
+        assert!(!db.workspace_tombstoned("/repo/app").unwrap());
+        // Clearing an absent tombstone is a no-op, not an error.
+        db.clear_workspace_tombstone("/repo/none").unwrap();
+    }
+
+    #[test]
     fn set_worktree_location_rebinds_and_noops_on_unknown() {
         let db = Db::open_memory().unwrap();
         db.put_worktree("tab", "/repo", "/wt/r", "feat", Some("old-blob"), None)

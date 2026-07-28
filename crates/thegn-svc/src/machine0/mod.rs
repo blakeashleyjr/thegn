@@ -471,7 +471,18 @@ impl Machine0Provider {
             .address
             .clone()
             .ok_or_else(|| anyhow!("machine0: vm {name} has no address"))?;
-        let ep = (ip, self.ssh_user_for(&vm));
+        let user = self.ssh_user_for(&vm);
+        // RUNNING != auth-ready: a NixOS/cloud-init image opens the sshd socket
+        // before it has injected the authorized key, so gate on a real ssh exec
+        // (not merely a TCP :22 connect) before handing the endpoint to the pane
+        // bridge or a control-plane exec — otherwise the first attach races key
+        // provisioning and fails with ssh's 255, flapping the pane back to the
+        // loading splash. This is the single wake choke point (resolve_endpoint
+        // for the interactive pane, shim() for control execs); it only fires on
+        // the first fresh resolve, since a cached endpoint short-circuits above.
+        // Off-loop; bounded (see wait_reachable). Mirrors resume()/spawn().
+        self.wait_reachable(name, &ip, &user).await?;
+        let ep = (ip, user);
         *self.endpoint.lock().unwrap() = Some(ep.clone());
         Ok(ep)
     }
@@ -640,8 +651,9 @@ impl Machine0Provider {
     /// healed on the next claim rather than persisting forever.
     pub async fn resume(&self, name: &str) -> Result<()> {
         *self.endpoint.lock().unwrap() = None;
-        let (ip, user) = self.awake_endpoint(name).await?;
-        self.wait_reachable(name, &ip, &user).await?;
+        // awake_endpoint now gates on wait_reachable itself (a fresh resolve after
+        // clearing the cache), so this no longer needs an explicit second probe.
+        self.awake_endpoint(name).await?;
         self.ensure_provisioned(name).await
     }
 }
