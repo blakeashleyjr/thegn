@@ -462,6 +462,49 @@ pub struct PrSummary {
     pub review_decision: Option<String>,
 }
 
+/// Reconcile a worktree's own PR resolution with the repo's open-PR list.
+///
+/// The per-branch panel resolves its PR via `gh pr view` on the current branch,
+/// which can miss a PR when the local branch has no upstream tracking (or the
+/// tab simply isn't on the PR's branch). Given the repo's cached open-PR headers
+/// this returns:
+///
+/// - **(A) robustness** — when the branch has no PR of its own (`has_pr` false)
+///   but an open header's head branch matches, a minimal [`PrSummary`] to surface
+///   it (title left empty — the header carries no title; the panel renders
+///   `PR #N  [OPEN]`).
+/// - **(B) visibility** — the repo's remaining open PRs (head branch ≠ the
+///   current branch), so the git section can list them when the current branch
+///   has no PR. An already-surfaced/own PR is never listed twice.
+///
+/// Pure, so it's unit-tested.
+pub(crate) fn repo_pr_surface(
+    branch: &str,
+    headers: Vec<thegn_core::github::PrHeader>,
+    has_pr: bool,
+) -> (Option<PrSummary>, Vec<thegn_core::github::PrHeader>) {
+    let open: Vec<thegn_core::github::PrHeader> = headers
+        .into_iter()
+        .filter(|h| h.state.eq_ignore_ascii_case("OPEN"))
+        .collect();
+    let surfaced = if has_pr {
+        None
+    } else {
+        open.iter()
+            .find(|h| h.head_ref == branch)
+            .map(|h| PrSummary {
+                number: h.number,
+                title: String::new(),
+                state: h.state.clone(),
+                url: h.url.clone(),
+                is_draft: h.is_draft,
+                review_decision: None,
+            })
+    };
+    let others = open.into_iter().filter(|h| h.head_ref != branch).collect();
+    (surfaced, others)
+}
+
 /// A branch row's PR badge, joined from the per-repo `pr_branch_cache`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrBadge {
@@ -633,6 +676,13 @@ pub struct PanelData {
     /// off-loop from the config by hydration (placement kind, region/size, token
     /// presence). Empty without any `[env.*]`.
     pub environments: Vec<crate::env_ui::EnvSnapshot>,
+    /// The repo's OTHER open PRs (head branch ≠ the current worktree's branch),
+    /// from the per-repo `pr_branch_cache`. Rendered by the git section only when
+    /// the current branch has no PR of its own, so an open PR is never invisible
+    /// just because you aren't on its branch (a PR created off a branch that
+    /// isn't an open tab would otherwise show nothing anywhere). See
+    /// [`repo_pr_surface`].
+    pub repo_prs: Vec<thegn_core::github::PrHeader>,
 }
 
 /// One row of the Symbols outline (or, in references mode, a reference site): a
@@ -1196,6 +1246,54 @@ pub fn accordion_key(key: &KeyCode, mods: Modifiers, ui: &PanelUi) -> Option<Pan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hdr(number: u64, branch: &str, state: &str) -> thegn_core::github::PrHeader {
+        thegn_core::github::PrHeader {
+            number,
+            head_ref: branch.into(),
+            state: state.into(),
+            url: format!("https://example/pr/{number}"),
+            is_draft: false,
+        }
+    }
+
+    #[test]
+    fn repo_pr_surface_finds_missed_pr_for_current_branch() {
+        // Branch has no PR of its own (gh pr view missed it — e.g. no upstream),
+        // but the repo's open-PR list has one whose head is this branch: surface
+        // it, and never list it among the "others".
+        let headers = vec![hdr(11, "feature/x", "OPEN"), hdr(12, "other", "OPEN")];
+        let (surfaced, others) = repo_pr_surface("feature/x", headers, false);
+        let pr = surfaced.expect("should surface the current branch's PR");
+        assert_eq!(pr.number, 11);
+        assert_eq!(pr.state, "OPEN");
+        assert!(pr.title.is_empty(), "header carries no title");
+        assert_eq!(others.len(), 1);
+        assert_eq!(others[0].number, 12);
+    }
+
+    #[test]
+    fn repo_pr_surface_lists_others_but_never_surfaces_when_branch_has_pr() {
+        // When the branch already resolved its own PR, don't surface a second
+        // one; still expose the repo's other open PRs for the empty-state list.
+        let headers = vec![hdr(11, "feature/x", "OPEN"), hdr(12, "other", "OPEN")];
+        let (surfaced, others) = repo_pr_surface("feature/x", headers, true);
+        assert!(surfaced.is_none());
+        // The current branch's own header is still excluded from "others".
+        assert_eq!(
+            others.iter().map(|h| h.number).collect::<Vec<_>>(),
+            vec![12]
+        );
+    }
+
+    #[test]
+    fn repo_pr_surface_ignores_non_open_headers() {
+        // Merged/closed headers must never surface or list.
+        let headers = vec![hdr(11, "feature/x", "MERGED"), hdr(12, "other", "CLOSED")];
+        let (surfaced, others) = repo_pr_surface("feature/x", headers, false);
+        assert!(surfaced.is_none(), "a merged PR must not be surfaced");
+        assert!(others.is_empty(), "closed/merged PRs must not be listed");
+    }
 
     #[test]
     fn section_order_jump_and_cycle() {

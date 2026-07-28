@@ -1030,7 +1030,10 @@ fn collect_sidebar_status(
 /// released — the mutex is also taken loop-side, so a stalled WAL write inside
 /// it would freeze the event loop. Pure, so it's unit-tested.
 fn glyph_persist_entry(path: &str, row: &GlyphRow) -> (String, String) {
-    (path.to_string(), serde_json::to_string(row).unwrap_or_default())
+    (
+        path.to_string(),
+        serde_json::to_string(row).unwrap_or_default(),
+    )
 }
 
 /// tokei line count for `path`, cached in `loc_cache` (hydration thread —
@@ -1665,6 +1668,26 @@ pub(crate) fn build_panel(
         apply_pr_cache(&mut panel, cached);
     }
 
+    // Reconcile against the repo-wide open-PR list (`pr_branch_cache`): surface a
+    // PR for the current branch that `gh pr view` missed (e.g. no upstream
+    // tracking), and expose the repo's *other* open PRs so the git section can
+    // list them when this branch has none — a PR opened off a branch that isn't
+    // an open tab is otherwise invisible everywhere. See `panel::repo_pr_surface`.
+    if let Some(root) = repo_root.as_deref()
+        && let Ok(Some((json, _))) = db.get_pr_branch_cache(&root.to_string_lossy())
+    {
+        let (surfaced, others) = crate::panel::repo_pr_surface(
+            &panel.branch,
+            thegn_core::github::parse_pr_headers(&json),
+            panel.pr.is_some(),
+        );
+        if let Some(pr) = surfaced {
+            panel.pr = Some(pr);
+            panel.pr_note = None;
+        }
+        panel.repo_prs = others;
+    }
+
     // The CI run-history cache feeds the `Ci` section rollup (AV group), with
     // its fetch age (the summary's "Ns ago" stamp) and any fetch-health note.
     if let Ok(Some((json, fetched_at))) = db.get_ci_cache(&loc.path())
@@ -1948,7 +1971,8 @@ fn update_log_error_total(log_path: &std::path::Path, cur_len: u64) -> usize {
                 .and_then(|mut f| {
                     f.seek(SeekFrom::Start(offset))?;
                     let mut buf = Vec::new();
-                    f.take(cur_len.saturating_sub(offset)).read_to_end(&mut buf)?;
+                    f.take(cur_len.saturating_sub(offset))
+                        .read_to_end(&mut buf)?;
                     Ok(buf)
                 })
                 .map(|buf| count_error_lines(&buf))
