@@ -8,6 +8,8 @@
 
 pub mod github;
 pub mod jira;
+pub mod kaneo;
+pub mod kaneo_auth;
 pub mod linear;
 
 use thegn_core::config::{IssueAccount, IssueProviderKind, IssuesConfig, expand_env_ref};
@@ -55,6 +57,29 @@ pub trait IssueBackend: Send + Sync {
     async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError>;
     async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError>;
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<Issue>, IssueError>;
+
+    // ---- optional project-management extras (default: unsupported) ----------
+    // Providers that can write comments / manage labels override these; the rest
+    // inherit the default and the panel/CLI reports the capability as absent.
+
+    /// Post a comment on an issue.
+    async fn add_comment(&self, _id: &str, _body: &str) -> Result<(), IssueError> {
+        Err(IssueError::Api(
+            "comments not supported by this provider".into(),
+        ))
+    }
+    /// Attach a label (by name) to an issue, creating it if the provider allows.
+    async fn attach_label(&self, _id: &str, _label: &str) -> Result<(), IssueError> {
+        Err(IssueError::Api(
+            "labels not supported by this provider".into(),
+        ))
+    }
+    /// Remove a label (by name) from an issue.
+    async fn detach_label(&self, _id: &str, _label: &str) -> Result<(), IssueError> {
+        Err(IssueError::Api(
+            "labels not supported by this provider".into(),
+        ))
+    }
 }
 
 /// Concrete backend variants (enum dispatch avoids dyn-incompatibility of
@@ -63,6 +88,7 @@ enum RouterInner {
     Linear(linear::LinearBackend),
     Github(github::GitHubIssuesBackend),
     Jira(jira::JiraBackend),
+    Kaneo(kaneo::KaneoBackend),
 }
 
 impl RouterInner {
@@ -71,6 +97,7 @@ impl RouterInner {
             RouterInner::Linear(_) => "linear",
             RouterInner::Github(_) => "github",
             RouterInner::Jira(_) => "jira",
+            RouterInner::Kaneo(_) => "kaneo",
         }
     }
 
@@ -79,6 +106,7 @@ impl RouterInner {
             RouterInner::Linear(b) => b.list_issues(filter).await,
             RouterInner::Github(b) => b.list_issues(filter).await,
             RouterInner::Jira(b) => b.list_issues(filter).await,
+            RouterInner::Kaneo(b) => b.list_issues(filter).await,
         }
     }
 
@@ -87,6 +115,7 @@ impl RouterInner {
             RouterInner::Linear(b) => b.get_issue(id).await,
             RouterInner::Github(b) => b.get_issue(id).await,
             RouterInner::Jira(b) => b.get_issue(id).await,
+            RouterInner::Kaneo(b) => b.get_issue(id).await,
         }
     }
 
@@ -95,6 +124,7 @@ impl RouterInner {
             RouterInner::Linear(b) => b.create_issue(draft).await,
             RouterInner::Github(b) => b.create_issue(draft).await,
             RouterInner::Jira(b) => b.create_issue(draft).await,
+            RouterInner::Kaneo(b) => b.create_issue(draft).await,
         }
     }
 
@@ -103,6 +133,7 @@ impl RouterInner {
             RouterInner::Linear(b) => b.update_issue(id, patch).await,
             RouterInner::Github(b) => b.update_issue(id, patch).await,
             RouterInner::Jira(b) => b.update_issue(id, patch).await,
+            RouterInner::Kaneo(b) => b.update_issue(id, patch).await,
         }
     }
 
@@ -111,6 +142,43 @@ impl RouterInner {
             RouterInner::Linear(b) => b.search(query, limit).await,
             RouterInner::Github(b) => b.search(query, limit).await,
             RouterInner::Jira(b) => b.search(query, limit).await,
+            RouterInner::Kaneo(b) => b.search(query, limit).await,
+        }
+    }
+
+    async fn add_comment(&self, id: &str, body: &str) -> Result<(), IssueError> {
+        match self {
+            RouterInner::Linear(b) => b.add_comment(id, body).await,
+            RouterInner::Github(b) => b.add_comment(id, body).await,
+            RouterInner::Jira(b) => b.add_comment(id, body).await,
+            RouterInner::Kaneo(b) => b.add_comment(id, body).await,
+        }
+    }
+
+    async fn attach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
+        match self {
+            RouterInner::Linear(b) => b.attach_label(id, label).await,
+            RouterInner::Github(b) => b.attach_label(id, label).await,
+            RouterInner::Jira(b) => b.attach_label(id, label).await,
+            RouterInner::Kaneo(b) => b.attach_label(id, label).await,
+        }
+    }
+
+    async fn detach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
+        match self {
+            RouterInner::Linear(b) => b.detach_label(id, label).await,
+            RouterInner::Github(b) => b.detach_label(id, label).await,
+            RouterInner::Jira(b) => b.detach_label(id, label).await,
+            RouterInner::Kaneo(b) => b.detach_label(id, label).await,
+        }
+    }
+
+    /// Downcast to the concrete Kaneo backend for board/project browsing, which
+    /// is Kaneo-shaped (columns per project) rather than provider-agnostic.
+    fn as_kaneo(&self) -> Option<&kaneo::KaneoBackend> {
+        match self {
+            RouterInner::Kaneo(b) => Some(b),
+            _ => None,
         }
     }
 }
@@ -139,9 +207,37 @@ impl RouterInner {
                     (!a.project_key.is_empty()).then(|| a.project_key.clone()),
                 )))
             }
+            IssueProviderKind::Kaneo => {
+                let mut api_key = expand_env_ref(&a.token).unwrap_or_default();
+                // No configured key ⇒ fall back to a token stored by
+                // `thegn kaneo login` (device flow) for this instance.
+                if api_key.is_empty() {
+                    api_key = kaneo_stored_token(&a.base_url).unwrap_or_default();
+                }
+                Some(RouterInner::Kaneo(kaneo::KaneoBackend::new(
+                    a.base_url.clone(),
+                    api_key,
+                    (!a.workspace_id.is_empty()).then(|| a.workspace_id.clone()),
+                    (!a.project_id.is_empty()).then(|| a.project_id.clone()),
+                )))
+            }
             IssueProviderKind::None => None,
         }
     }
+}
+
+/// Read the device-flow access token stored by `thegn kaneo login` for a Kaneo
+/// instance. Best-effort: a missing DB / no login yields `None`, and the
+/// backend then runs unauthenticated (and the panel shows it empty).
+fn kaneo_stored_token(base_url: &str) -> Option<String> {
+    use thegn_core::store::CacheStore;
+    let base = base_url.trim_end_matches('/');
+    thegn_core::db::Db::open()
+        .ok()?
+        .get_kaneo_token(base)
+        .ok()
+        .flatten()
+        .map(|(token, _)| token)
 }
 
 /// A configured backend tagged with the account name it was built from, so the
@@ -260,6 +356,35 @@ impl IssueRouter {
         }
     }
 
+    /// Post a comment on the issue identified by a `"<provider>:<key>"` id.
+    pub async fn add_comment(&self, id: &str, body: &str) -> Result<(), IssueError> {
+        match self.backend_for_id(id) {
+            Some(b) => b.add_comment(id, body).await,
+            None => Err(IssueError::NotConfigured),
+        }
+    }
+
+    /// Attach a label (by name) to the issue identified by its id.
+    pub async fn attach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
+        match self.backend_for_id(id) {
+            Some(b) => b.attach_label(id, label).await,
+            None => Err(IssueError::NotConfigured),
+        }
+    }
+
+    /// Remove a label (by name) from the issue identified by its id.
+    pub async fn detach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
+        match self.backend_for_id(id) {
+            Some(b) => b.detach_label(id, label).await,
+            None => Err(IssueError::NotConfigured),
+        }
+    }
+
+    /// The first configured Kaneo backend, for board/project browsing.
+    pub fn kaneo(&self) -> Option<&kaneo::KaneoBackend> {
+        self.inner.iter().find_map(|b| b.inner.as_kaneo())
+    }
+
     /// Search across all accounts, concatenated.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
         let mut all = Vec::new();
@@ -312,8 +437,9 @@ mod spec {
             IssueProviderKind::Linear,
             IssueProviderKind::Jira,
             IssueProviderKind::Github,
+            IssueProviderKind::Kaneo,
         ]));
-        assert_eq!(r.provider_ids(), vec!["linear", "jira", "github"]);
+        assert_eq!(r.provider_ids(), vec!["linear", "jira", "github", "kaneo"]);
         // The representative id is the first configured provider.
         assert_eq!(r.provider_id(), "linear");
     }
@@ -352,6 +478,7 @@ mod spec {
         let r = IssueRouter::from_config(&cfg_with(vec![
             IssueProviderKind::Linear,
             IssueProviderKind::Jira,
+            IssueProviderKind::Kaneo,
         ]));
         assert_eq!(
             r.backend_for_id("jira:PROJ-1").map(|b| b.provider_id()),
@@ -360,6 +487,10 @@ mod spec {
         assert_eq!(
             r.backend_for_id("linear:ABC-9").map(|b| b.provider_id()),
             Some("linear")
+        );
+        assert_eq!(
+            r.backend_for_id("kaneo:abc123").map(|b| b.provider_id()),
+            Some("kaneo")
         );
         // An id for a provider that isn't configured routes nowhere.
         assert!(r.backend_for_id("github:42").is_none());

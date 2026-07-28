@@ -1,9 +1,9 @@
 //! The `[issues]` config family — issue-tracker integration (Linear, GitHub
-//! Issues, Jira): the global `[issues]` table, its per-provider sub-tables,
-//! and the per-repo `.thegn.*` overlay that scopes a repo's tracker view
-//! (Linear team / Jira project). Kept in a sibling module (rather than the
-//! god-file `config.rs`) per the file-size ratchet; `config.rs` re-exports
-//! everything here. See [`crate::config::Config::repo_issues`].
+//! Issues, Jira, Kaneo): the global `[issues]` table, its per-provider
+//! sub-tables, and the per-repo `.thegn.*` overlay that scopes a repo's tracker
+//! view (Linear team / Jira project / Kaneo project). Kept in a sibling module
+//! (rather than the god-file `config.rs`) per the file-size ratchet; `config.rs`
+//! re-exports everything here. See [`crate::config::Config::repo_issues`].
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,7 @@ pub struct IssuesConfig {
     pub linear: LinearConfig,
     pub github_issues: GitHubIssuesConfig,
     pub jira: JiraConfig,
+    pub kaneo: KaneoConfig,
     /// Set by a repo `[issues]` overlay that supplies an explicit `accounts`
     /// restriction (including `accounts = []`): once a repo has restricted its
     /// accounts, the legacy single-provider synthesis in [`active_accounts`] is
@@ -62,6 +63,7 @@ impl Default for IssuesConfig {
             linear: LinearConfig::default(),
             github_issues: GitHubIssuesConfig::default(),
             jira: JiraConfig::default(),
+            kaneo: KaneoConfig::default(),
             accounts_restricted: false,
         }
     }
@@ -140,6 +142,12 @@ impl IssuesConfig {
             IssueProviderKind::Github => {
                 a.extra_flags = self.github_issues.extra_flags.clone();
             }
+            IssueProviderKind::Kaneo => {
+                a.token = self.kaneo.api_key.clone();
+                a.base_url = self.kaneo.base_url.clone();
+                a.workspace_id = self.kaneo.workspace_id.clone();
+                a.project_id = self.kaneo.project_id.clone();
+            }
             IssueProviderKind::None => {}
         }
         a
@@ -162,18 +170,25 @@ pub struct IssueAccount {
     /// Aggregate this account? Disabled entries are kept in config but skipped.
     pub enabled: bool,
     /// Provider token. Use a secret ref or `"env:VAR"` (resolved at fetch time).
-    /// Linear: API key. Jira: API token. GitHub: unused (`gh` handles auth).
+    /// Linear: API key. Jira: API token. Kaneo: API key (or empty to use a
+    /// stored device-flow token). GitHub: unused (`gh` handles auth).
     pub token: String,
     /// Linear: restrict to a single team id (`""` = all teams).
     pub team_id: String,
     /// Linear: workspace slug (used for URLs; inferred if empty).
     pub workspace_slug: String,
-    /// Jira: instance base URL, e.g. `"https://myorg.atlassian.net"`.
+    /// Jira / Kaneo: instance base URL, e.g. `"https://myorg.atlassian.net"` or
+    /// `"https://kaneo.example.com"`.
     pub base_url: String,
     /// Jira: user email (Basic-auth identity).
     pub email: String,
     /// Jira: restrict to a single project key (`""` = all).
     pub project_key: String,
+    /// Kaneo: restrict to a single workspace id (`""` = the first workspace).
+    pub workspace_id: String,
+    /// Kaneo: restrict to a single project id (`""` = all projects in the
+    /// workspace). Also the default project for `create`.
+    pub project_id: String,
     /// GitHub Issues: extra `gh issue list` flags.
     pub extra_flags: Vec<String>,
     /// Optional named-forge ref (see `[[forges]]`) for GitHub accounts; `""`
@@ -196,6 +211,8 @@ impl Default for IssueAccount {
             base_url: String::new(),
             email: String::new(),
             project_key: String::new(),
+            workspace_id: String::new(),
+            project_id: String::new(),
             extra_flags: Vec::new(),
             forge: String::new(),
         }
@@ -209,6 +226,7 @@ config_enum! {
         Linear  = "linear",
         Github  = "github",
         Jira    = "jira",
+        Kaneo   = "kaneo",
     } default = None;
 }
 
@@ -267,6 +285,39 @@ impl Default for JiraConfig {
     }
 }
 
+/// `[issues.kaneo]` — Kaneo (self-hosted, open-source PM) configuration.
+///
+/// Kaneo's REST API is served under `{base_url}/api` and accepts a static API
+/// key (better-auth apiKey plugin) as an `Authorization: Bearer` token. When
+/// `api_key` is empty, the backend falls back to a token stored by
+/// `thegn kaneo login` (device-flow) for this `base_url`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct KaneoConfig {
+    /// Instance base URL, e.g. `"https://kaneo.example.com"` (no trailing
+    /// `/api`). Required; empty disables the Kaneo backend.
+    pub base_url: String,
+    /// API key. Use `"env:KANEO_API_KEY"` to read from the environment. Empty
+    /// means "use the device-flow token stored for `base_url`".
+    pub api_key: String,
+    /// Restrict to a single workspace id. `""` = the first workspace.
+    pub workspace_id: String,
+    /// Restrict to a single project id. `""` = all projects in the workspace.
+    /// Also the default project for issue creation.
+    pub project_id: String,
+}
+
+impl Default for KaneoConfig {
+    fn default() -> Self {
+        KaneoConfig {
+            base_url: String::new(),
+            api_key: "env:KANEO_API_KEY".into(),
+            workspace_id: String::new(),
+            project_id: String::new(),
+        }
+    }
+}
+
 /// Per-repo `[issues]` overlay from a repo-root `.thegn.*` file. Only the
 /// present keys override the global `[issues]`, letting a repo pin the Linear
 /// team / Jira project that scopes its "My Work" feed (GitHub is auto-scoped to
@@ -283,6 +334,7 @@ pub struct IssuesOverlay {
     pub accounts: Option<Vec<String>>,
     pub linear: LinearOverlay,
     pub jira: JiraOverlay,
+    pub kaneo: KaneoOverlay,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -299,6 +351,15 @@ pub struct LinearOverlay {
 pub struct JiraOverlay {
     /// Restrict to a single Jira project key for this repo (`""` = all).
     pub project_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct KaneoOverlay {
+    /// Restrict to a single Kaneo workspace id for this repo.
+    pub workspace_id: Option<String>,
+    /// Restrict to a single Kaneo project id for this repo (`""` = all).
+    pub project_id: Option<String>,
 }
 
 impl IssuesOverlay {
@@ -326,6 +387,12 @@ impl IssuesOverlay {
         if let Some(k) = self.jira.project_key {
             base.jira.project_key = k;
         }
+        if let Some(w) = self.kaneo.workspace_id {
+            base.kaneo.workspace_id = w;
+        }
+        if let Some(p) = self.kaneo.project_id {
+            base.kaneo.project_id = p;
+        }
     }
 
     /// Whether the overlay carries no overrides (skip applying it).
@@ -335,6 +402,8 @@ impl IssuesOverlay {
             && self.linear.team_id.is_none()
             && self.linear.workspace_slug.is_none()
             && self.jira.project_key.is_none()
+            && self.kaneo.workspace_id.is_none()
+            && self.kaneo.project_id.is_none()
     }
 }
 
@@ -516,6 +585,69 @@ mod tests {
             base.active_accounts().is_empty(),
             "accounts = [] must suppress legacy account synthesis"
         );
+    }
+
+    #[test]
+    fn active_accounts_synthesizes_kaneo_from_legacy_sub_table() {
+        // A legacy Kaneo config (no `[[issue_accounts]]`) synthesizes one account
+        // carrying the sub-table api_key + base_url + workspace/project scope.
+        let cfg = IssuesConfig {
+            provider: IssueProviderKind::Kaneo,
+            kaneo: KaneoConfig {
+                base_url: "https://kaneo.example.com".into(),
+                api_key: "k-secret".into(),
+                workspace_id: "ws-1".into(),
+                project_id: "proj-1".into(),
+            },
+            ..Default::default()
+        };
+        let accts = cfg.active_accounts();
+        assert_eq!(accts.len(), 1);
+        let a = &accts[0];
+        assert_eq!(a.name, "kaneo");
+        assert_eq!(a.provider, IssueProviderKind::Kaneo);
+        assert!(a.enabled);
+        assert_eq!(a.token, "k-secret");
+        assert_eq!(a.base_url, "https://kaneo.example.com");
+        assert_eq!(a.workspace_id, "ws-1");
+        assert_eq!(a.project_id, "proj-1");
+    }
+
+    #[test]
+    fn kaneo_provider_parses_and_round_trips() {
+        assert_eq!(
+            IssueProviderKind::from_str_validated("kaneo").unwrap(),
+            IssueProviderKind::Kaneo
+        );
+        assert_eq!(IssueProviderKind::Kaneo.as_str(), "kaneo");
+    }
+
+    #[test]
+    fn kaneo_overlay_pins_workspace_and_project() {
+        let mut base = IssuesConfig {
+            provider: IssueProviderKind::Kaneo,
+            kaneo: KaneoConfig {
+                base_url: "https://kaneo.example.com".into(),
+                api_key: "tok".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let overlay = IssuesOverlay {
+            kaneo: KaneoOverlay {
+                workspace_id: Some("ws-9".into()),
+                project_id: Some("proj-9".into()),
+            },
+            ..Default::default()
+        };
+        assert!(!overlay.is_empty());
+        overlay.apply(&mut base);
+        assert_eq!(base.kaneo.workspace_id, "ws-9");
+        assert_eq!(base.kaneo.project_id, "proj-9");
+        // The synthesized account carries the pinned scope.
+        let a = &base.active_accounts()[0];
+        assert_eq!(a.workspace_id, "ws-9");
+        assert_eq!(a.project_id, "proj-9");
     }
 
     #[test]
