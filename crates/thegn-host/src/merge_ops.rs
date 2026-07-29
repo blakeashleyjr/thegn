@@ -72,6 +72,24 @@ pub fn remote_target_guard(db: &Db, repo_root: &Path) -> Option<String> {
     ))
 }
 
+/// Push the advanced target branch to `origin` — the `push` `remote_mode`'s
+/// convergence step after a sprite drains its own clone. Surfaces git's stderr
+/// on failure so a rejected push is a visible error, never a false success.
+pub fn push_target(repo_root: &Path, target: &str) -> Result<()> {
+    #[expect(clippy::disallowed_methods)] // one-shot CLI push, not a loop read
+    let out = util::git_cmd(repo_root)
+        .args(["push", "origin", target])
+        .output()
+        .with_context(|| format!("spawning `git push origin {target}`"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`git push origin {target}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Queue rows belonging to a repo (membership rule shared with the in-app drain).
 pub fn rows_for_repo(db: &Db, root: &Path) -> Vec<MergeQueueRow> {
     merge_driver::rows_for_repo(db, root)

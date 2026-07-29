@@ -109,7 +109,66 @@ fn list(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The host control endpoint + merge-scoped token injected into a sprite at
+/// provision time (the `route_to_host` remote_mode). `None` on a normal on-host
+/// worktree, where enqueue stays local.
+fn control_endpoint_from_env() -> Option<(String, String)> {
+    let url = std::env::var("THEGN_CONTROL_URL")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let token = std::env::var("THEGN_CONTROL_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    Some((url, token))
+}
+
+/// Enqueue on the host's daemon over the control plane. Sends the **host-canonical**
+/// worktree path (`$THEGN_WORKTREE`) so the host resolves the branch in its own
+/// store; the host's queue then owns the row and its drain bundle-fetches the
+/// sprite's tip. A failed call surfaces the reason and does not fall back to a
+/// local row.
+fn add_via_host(url: &str, token: &str, worktrees: Vec<String>) -> Result<()> {
+    use thegn_svc::control::client::{ControlAddr, ControlClient};
+    let targets: Vec<String> = if worktrees.is_empty() {
+        vec![
+            std::env::var("THEGN_WORKTREE")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .context(
+                    "route_to_host: $THEGN_WORKTREE is unset, so this worktree can't be \
+                     identified to the host",
+                )?,
+        ]
+    } else {
+        worktrees
+    };
+    let client = ControlClient::new(ControlAddr::Tcp {
+        addr: url.to_string(),
+        token: token.to_string(),
+    });
+    let rt = tokio::runtime::Runtime::new().context("tokio runtime for route-to-host enqueue")?;
+    for wt in &targets {
+        match rt.block_on(client.merge_add(wt)) {
+            Ok(_) => outln!("  + queued {wt} on host"),
+            Err(e) => {
+                outln!("  ✗ route-to-host enqueue failed for {wt}: {e}");
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn add(cfg: &Config, worktrees: Vec<String>, all: bool) -> Result<()> {
+    // route_to_host: a provisioned sprite (host control endpoint + token in its
+    // env) sends the enqueue to the host's daemon so the host's queue owns the
+    // row. `--all` enumerates local branches, so it stays on the local path.
+    if !all
+        && cfg.merge_queue.remote_mode == thegn_core::config::MergeRemoteMode::RouteToHost
+        && let Some((url, token)) = control_endpoint_from_env()
+    {
+        return add_via_host(&url, &token, worktrees);
+    }
     let root = repo_root()?;
     let mq = &cfg.merge_queue;
     let target = integrate::resolve_target(mq, &root);
@@ -164,15 +223,17 @@ fn clear(cfg: &Config) -> Result<()> {
 
 fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     let root = repo_root()?;
-    // The fold runs in the target repo's object store; a remote target can't be
-    // folded from here — guide the user to run the drain on that host.
-    if let Ok(db) = Db::open()
+    let mq = &cfg.merge_queue;
+    // `push` mode drains this clone locally and pushes to origin, so it skips the
+    // remote-target guard; `route_to_host` keeps the fold on the target host.
+    let push_mode = mq.remote_mode == thegn_core::config::MergeRemoteMode::Push;
+    if !push_mode
+        && let Ok(db) = Db::open()
         && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root)
     {
         outln!("{msg}");
         return Ok(());
     }
-    let mq = &cfg.merge_queue;
     if all {
         add(cfg, Vec::new(), true)?;
     }
@@ -231,6 +292,16 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             out.deferred.len(),
             out.needs_human.len()
         );
+    }
+    // push mode: converge by pushing the advanced target to origin.
+    if push_mode && !out.landed.is_empty() {
+        match crate::merge_ops::push_target(&root, &target) {
+            Ok(()) => outln!("Pushed {target} to origin."),
+            Err(e) => {
+                outln!("Push failed — {target} advanced locally but NOT on origin: {e}");
+                return Err(e);
+            }
+        }
     }
     Ok(())
 }

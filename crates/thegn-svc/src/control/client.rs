@@ -186,6 +186,15 @@ impl ControlClient {
         self.request("GET", "/v1/leases", None).await
     }
 
+    /// Enqueue a worktree's branch on the (remote) host's merge queue — the
+    /// `route_to_host` remote_mode path. `worktree` is the **host-canonical**
+    /// path the host resolves (the sprite's `$THEGN_WORKTREE`), not the sprite's
+    /// local mount. Returns the server's `{ "queued": … }` envelope.
+    pub async fn merge_add(&self, worktree: &str) -> Result<Value> {
+        self.request("POST", "/v1/merge/add", Some(json!({ "worktree": worktree })))
+            .await
+    }
+
     pub async fn open_worktree(&self, repo: &str, branch: Option<&str>) -> Result<()> {
         self.request(
             "POST",
