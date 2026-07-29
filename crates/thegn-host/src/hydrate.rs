@@ -302,11 +302,21 @@ pub(crate) fn prune_stale_worktree_groups(
     session_name: &str,
     cfg: &thegn_core::config::Config,
 ) -> usize {
+    let mut ambient_cache = std::collections::HashMap::new();
     let remote: std::collections::HashSet<String> = db
         .worktrees()
         .map(|rows| {
             rows.into_iter()
-                .filter(|w| row_is_remote(&w.location, w.env_name.as_deref(), cfg))
+                .filter(|w| {
+                    row_is_remote_effective(
+                        db,
+                        cfg,
+                        &w.location,
+                        w.env_name.as_deref(),
+                        &w.repo_root,
+                        &mut ambient_cache,
+                    )
+                })
                 .map(|w| w.worktree)
                 .collect()
         })
@@ -692,6 +702,39 @@ pub(crate) fn row_is_remote(
         .is_some_and(|e| !matches!(e.placement, thegn_core::config::PlacementMode::Local))
 }
 
+/// [`row_is_remote`], but a row with no persisted `env_name` is treated as
+/// inheriting the repo's ambient env (the same precedence
+/// [`crate::wizard::ambient_env_name`] / `effective_env` walk at launch). A
+/// clean-inherit worktree persists a NULL `env_name` (the wizard only pins a
+/// choice that DIFFERS from the ambient default), so when the ambient default
+/// is itself a remote (ssh/k8s/provider) env the raw column is empty and the
+/// bare [`row_is_remote`] would wrongly classify it local — and the local-dir
+/// reconcile would silently reap the worktree the instant its (off-host) tree
+/// isn't on disk. Resolving the ambient env here closes that gap and heals
+/// already-registered NULL rows without a migration.
+pub(crate) fn row_is_remote_effective(
+    db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
+    location: &str,
+    env_name: Option<&str>,
+    repo_root: &str,
+    ambient_cache: &mut std::collections::HashMap<String, String>,
+) -> bool {
+    if !location.is_empty() {
+        return true;
+    }
+    let effective = match env_name.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => e.to_string(),
+        None => ambient_cache
+            .entry(repo_root.to_string())
+            .or_insert_with(|| {
+                crate::wizard::ambient_env_name(Some(db), cfg, std::path::Path::new(repo_root))
+            })
+            .clone(),
+    };
+    row_is_remote(location, Some(&effective), cfg)
+}
+
 /// Worktrees registered in the DB, ready for the sidebar's cross-workspace
 /// rows: one entry per registry row whose dir still exists (or is remote).
 pub(crate) fn db_worktree_list(
@@ -699,16 +742,24 @@ pub(crate) fn db_worktree_list(
     cfg: &thegn_core::config::Config,
 ) -> Vec<crate::sidebar::DbWorktree> {
     let mut out = Vec::new();
+    let mut ambient_cache = std::collections::HashMap::new();
     for w in db.worktrees().unwrap_or_default() {
         // git is the source of truth: a LOCAL registry row whose dir vanished
         // (deleted outside thegn) is dead — delete it here (we're on the
         // hydration thread) instead of merely hiding it, so deceased
         // worktrees stop resurfacing in the tree. Remote rows (a set `location`
-        // OR a non-local env placement) are exempt: their tree lives off the
-        // host, so a missing local dir is not proof of deletion.
-        if !row_is_remote(&w.location, w.env_name.as_deref(), cfg)
+        // OR a non-local env placement, including one INHERITED from the repo's
+        // ambient default) are exempt: their tree lives off the host, so a
+        // missing local dir is not proof of deletion.
+        if !row_is_remote_effective(db, cfg, &w.location, w.env_name.as_deref(), &w.repo_root, &mut ambient_cache)
             && !std::path::Path::new(&w.worktree).is_dir()
         {
+            tracing::warn!(
+                target: "thegn::hydrate",
+                worktree = %w.worktree,
+                tab = %w.tab_name,
+                "reaping registry row: local worktree dir is gone and env resolves local"
+            );
             let _ = db.del_worktree(&w.worktree);
             continue;
         }
