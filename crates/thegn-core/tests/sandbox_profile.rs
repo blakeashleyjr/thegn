@@ -134,6 +134,7 @@ fn h3_profile_switch_teardown() {
         name: name_work.clone(),
         vpn: None,
         oci_host: None,
+        oci_runtime: None,
     };
     thegn_core::sandbox::ensure(&spec_work).expect("ensure work failed");
     assert!(container_running(&name_work));

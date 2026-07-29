@@ -106,7 +106,12 @@ pub struct Capabilities {
 impl Capabilities {
     /// Derive the capabilities of a resolved spec.
     pub fn derive(spec: &SandboxSpec) -> Self {
-        Self::from_parts(spec.backend, &spec.placement, spec.vpn.is_some())
+        Self::from_parts(
+            spec.backend,
+            &spec.placement,
+            spec.vpn.is_some(),
+            spec.oci_runtime.as_deref(),
+        )
     }
 
     /// The pure derivation, factored out of [`SandboxSpec`] so it is trivially
@@ -116,12 +121,21 @@ impl Capabilities {
     /// heuristic. Once the resolved `DataMode` is threaded onto the spec (the
     /// projection phase) this should consult it directly — a remote placement may
     /// be `sshfs` *or* `in_env`, which the placement alone cannot distinguish.
-    pub fn from_parts(backend: Backend, placement: &Placement, has_vpn: bool) -> Self {
+    ///
+    /// `oci_runtime` is the resolved `[sandbox] oci_runtime` (e.g. `"runsc"`,
+    /// `"krun"`); it raises the honest isolation class for OCI backends that run
+    /// under a stronger runtime, and is ignored by non-OCI backends.
+    pub fn from_parts(
+        backend: Backend,
+        placement: &Placement,
+        has_vpn: bool,
+        oci_runtime: Option<&str>,
+    ) -> Self {
         let is_provider = matches!(placement, Placement::Provider(_));
         // podman can checkpoint/restore a container (CRIU) — a real snapshot.
         let podman_checkpoint = matches!(backend, Backend::Podman | Backend::PodmanRootful);
         Capabilities {
-            isolation: isolation_for(backend, placement),
+            isolation: isolation_for(backend, placement, oci_runtime),
             projection: projection_for(placement),
             egress: egress_for(backend, placement, has_vpn),
             observability: obs_for(backend, placement),
@@ -137,7 +151,11 @@ impl Capabilities {
     }
 }
 
-fn isolation_for(backend: Backend, placement: &Placement) -> IsolationClass {
+fn isolation_for(
+    backend: Backend,
+    placement: &Placement,
+    oci_runtime: Option<&str>,
+) -> IsolationClass {
     // Placement decides first when it owns the boundary: a managed provider runs
     // the workload in its own infra, and a k8s pod is a container on a node we
     // don't control — both honestly a kernel we cannot harden ourselves.
@@ -147,6 +165,17 @@ fn isolation_for(backend: Backend, placement: &Placement) -> IsolationClass {
         // RuntimeClass like Kata, which we can't detect — so under-promise).
         Placement::K8s(_) => return IsolationClass::SharedKernel,
         Placement::Local | Placement::Ssh(_) => {}
+    }
+    // A stronger OCI runtime raises the honest class: gVisor's `runsc` services
+    // syscalls in a userspace kernel; libkrun's `krun` boots the container inside
+    // a hardware-virtualized microVM. Only the OCI backends honor `--runtime`;
+    // `runc`/`crun`/unset fall through to the shared-kernel default below.
+    if backend.is_oci() {
+        match oci_runtime.map(str::trim) {
+            Some("runsc") => return IsolationClass::UserspaceKernel,
+            Some("krun") => return IsolationClass::GuestKernel,
+            _ => {}
+        }
     }
     match backend {
         Backend::None => IsolationClass::HostProcess,
@@ -318,7 +347,7 @@ mod tests {
 
     #[test]
     fn local_oci_binds_enforces_and_is_instrumented() {
-        let c = Capabilities::from_parts(Backend::Podman, &Placement::Local, false);
+        let c = Capabilities::from_parts(Backend::Podman, &Placement::Local, false, None);
         assert_eq!(c.projection, ProjectionMode::Bind);
         assert_eq!(c.egress, EgressKind::Enforce);
         assert_eq!(c.observability, ObsLevel::Instrumented);
@@ -330,16 +359,16 @@ mod tests {
 
     #[test]
     fn bwrap_cannot_snapshot_but_podman_can() {
-        let bwrap = Capabilities::from_parts(Backend::Bwrap, &Placement::Local, false);
+        let bwrap = Capabilities::from_parts(Backend::Bwrap, &Placement::Local, false, None);
         assert!(!bwrap.can_snapshot);
-        let podman = Capabilities::from_parts(Backend::Podman, &Placement::Local, false);
+        let podman = Capabilities::from_parts(Backend::Podman, &Placement::Local, false, None);
         assert!(podman.can_snapshot);
     }
 
     #[test]
     fn host_toolchain_local_is_stats_only_unmanaged() {
         // bwrap with no OCI container and no tunnel: no egress hooks, stats only.
-        let c = Capabilities::from_parts(Backend::Bwrap, &Placement::Local, false);
+        let c = Capabilities::from_parts(Backend::Bwrap, &Placement::Local, false, None);
         assert_eq!(c.projection, ProjectionMode::Bind);
         assert_eq!(c.egress, EgressKind::Unmanaged);
         assert_eq!(c.observability, ObsLevel::StatsOnly);
@@ -348,20 +377,20 @@ mod tests {
     #[test]
     fn host_toolchain_with_vpn_can_enforce() {
         // A tunnel gives a route to govern even without an OCI container.
-        let c = Capabilities::from_parts(Backend::Bwrap, &Placement::Local, true);
+        let c = Capabilities::from_parts(Backend::Bwrap, &Placement::Local, true, None);
         assert_eq!(c.egress, EgressKind::Enforce);
     }
 
     #[test]
     fn plain_none_backend_is_unmanaged_stats_only() {
-        let c = Capabilities::from_parts(Backend::None, &Placement::Local, false);
+        let c = Capabilities::from_parts(Backend::None, &Placement::Local, false, None);
         assert_eq!(c.egress, EgressKind::Unmanaged);
         assert_eq!(c.observability, ObsLevel::StatsOnly);
     }
 
     #[test]
     fn ssh_placement_projects_via_sshfs_and_enforces_for_oci() {
-        let c = Capabilities::from_parts(Backend::Podman, &ssh(), false);
+        let c = Capabilities::from_parts(Backend::Podman, &ssh(), false, None);
         assert_eq!(c.projection, ProjectionMode::Sshfs);
         assert_eq!(c.egress, EgressKind::Enforce);
         assert_eq!(c.observability, ObsLevel::Instrumented);
@@ -369,7 +398,7 @@ mod tests {
 
     #[test]
     fn k8s_placement_is_in_env() {
-        let c = Capabilities::from_parts(Backend::Podman, &k8s(), false);
+        let c = Capabilities::from_parts(Backend::Podman, &k8s(), false, None);
         assert_eq!(c.projection, ProjectionMode::InEnv);
         assert_eq!(c.egress, EgressKind::Enforce);
     }
@@ -378,13 +407,47 @@ mod tests {
     fn provider_translates_streams_and_snapshots() {
         // Provider overrides backend: translate egress, provider-stream obs,
         // sync projection, and native snapshot/suspend/metering.
-        let c = Capabilities::from_parts(Backend::Podman, &provider(), false);
+        let c = Capabilities::from_parts(Backend::Podman, &provider(), false, None);
         assert_eq!(c.projection, ProjectionMode::Sync);
         assert_eq!(c.egress, EgressKind::Translate);
         assert_eq!(c.observability, ObsLevel::ProviderStream);
         assert!(c.can_snapshot);
         assert!(c.can_suspend_resume);
         assert!(c.meters_cost);
+    }
+
+    #[test]
+    fn oci_runtime_raises_isolation_class_honestly() {
+        // gVisor: userspace kernel. libkrun: guest kernel. Both keep the local
+        // container's path-preserving bind + our own egress enforcement — the
+        // whole point of a runtime modifier vs a remote provider.
+        let runsc =
+            Capabilities::from_parts(Backend::Podman, &Placement::Local, false, Some("runsc"));
+        assert_eq!(runsc.isolation, IsolationClass::UserspaceKernel);
+        assert_eq!(runsc.projection, ProjectionMode::Bind);
+        assert_eq!(runsc.egress, EgressKind::Enforce);
+
+        let krun =
+            Capabilities::from_parts(Backend::Docker, &Placement::Local, false, Some("krun"));
+        assert_eq!(krun.isolation, IsolationClass::GuestKernel);
+        assert_eq!(krun.projection, ProjectionMode::Bind);
+
+        // runc/crun/unknown stay shared-kernel; non-OCI backends ignore it.
+        assert_eq!(
+            Capabilities::from_parts(Backend::Podman, &Placement::Local, false, Some("crun"))
+                .isolation,
+            IsolationClass::SharedKernel
+        );
+        assert_eq!(
+            Capabilities::from_parts(Backend::Bwrap, &Placement::Local, false, Some("krun"))
+                .isolation,
+            IsolationClass::SharedKernel
+        );
+        // A managed provider still owns the boundary regardless of runtime.
+        assert_eq!(
+            Capabilities::from_parts(Backend::Podman, &provider(), false, Some("krun")).isolation,
+            IsolationClass::ProviderManaged
+        );
     }
 
     #[test]
@@ -405,19 +468,19 @@ mod tests {
             Backend::Systemd,
         ] {
             assert_eq!(
-                Capabilities::from_parts(b, &Placement::Local, false).isolation,
+                Capabilities::from_parts(b, &Placement::Local, false, None).isolation,
                 IsolationClass::SharedKernel,
                 "{b:?} should report shared-kernel"
             );
         }
         // The plain host fallback has no kernel boundary at all.
         assert_eq!(
-            Capabilities::from_parts(Backend::None, &Placement::Local, false).isolation,
+            Capabilities::from_parts(Backend::None, &Placement::Local, false, None).isolation,
             IsolationClass::HostProcess
         );
         // Apple's `container` runs each container in its own lightweight VM.
         assert_eq!(
-            Capabilities::from_parts(Backend::Apple, &Placement::Local, false).isolation,
+            Capabilities::from_parts(Backend::Apple, &Placement::Local, false, None).isolation,
             IsolationClass::GuestKernel
         );
     }
@@ -426,17 +489,17 @@ mod tests {
     fn isolation_class_lets_placement_own_the_boundary() {
         // A provider runs the workload in its own infra — not a boundary we control.
         assert_eq!(
-            Capabilities::from_parts(Backend::Podman, &provider(), false).isolation,
+            Capabilities::from_parts(Backend::Podman, &provider(), false, None).isolation,
             IsolationClass::ProviderManaged
         );
         // A k8s pod shares its node's kernel regardless of the local backend value.
         assert_eq!(
-            Capabilities::from_parts(Backend::Podman, &k8s(), false).isolation,
+            Capabilities::from_parts(Backend::Podman, &k8s(), false, None).isolation,
             IsolationClass::SharedKernel
         );
         // SSH falls through to the backend running on the remote host.
         assert_eq!(
-            Capabilities::from_parts(Backend::Podman, &ssh(), false).isolation,
+            Capabilities::from_parts(Backend::Podman, &ssh(), false, None).isolation,
             IsolationClass::SharedKernel
         );
     }

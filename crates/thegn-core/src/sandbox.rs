@@ -291,6 +291,12 @@ pub struct SandboxSpec {
     /// URL/name or docker host. `None` ⇒ the local daemon. Injected before every
     /// container subcommand by `oci_prefix`.
     pub oci_host: Option<String>,
+    /// OCI runtime to run the worktree container under (`[sandbox] oci_runtime`):
+    /// e.g. `"runsc"` (gVisor userspace kernel) or `"krun"` (libkrun microVM).
+    /// `None` ⇒ the daemon default (`runc`/`crun`, shared-kernel). Injected as
+    /// `--runtime <value>` at container *create* by `oci_create_opts` for OCI
+    /// backends only; drives the honest isolation class in [`crate::capabilities`].
+    pub oci_runtime: Option<String>,
 }
 
 impl SandboxSpec {
@@ -707,6 +713,8 @@ pub fn resolve_placed(
             build_vpn_spec(&cfg.vpn, name, profile)
         },
         oci_host: (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim().to_string()),
+        oci_runtime: (!cfg.oci_runtime.trim().is_empty())
+            .then(|| cfg.oci_runtime.trim().to_string()),
     })
 }
 
@@ -1649,6 +1657,19 @@ fn write_secret_env_file(name: &str, secret: &[(&String, &String)]) -> Option<Pa
 /// and uid mapping so bind-mounted files stay host-owned.
 fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     let mut v = Vec::new();
+    // Run under a specific OCI runtime (gVisor's `runsc`, libkrun's `krun`, …)
+    // when requested. podman/docker persist the runtime in the container config,
+    // so only `create` needs the flag — `exec`/`inspect`/teardown via `oci_prefix`
+    // pick it up automatically.
+    if spec.backend.is_oci()
+        && let Some(rt) = spec
+            .oci_runtime
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+    {
+        v.extend(["--runtime".into(), rt.to_string()]);
+    }
     match spec.backend {
         Backend::Podman => v.extend(["--userns".into(), "keep-id".into()]),
         Backend::PodmanRootful => {
