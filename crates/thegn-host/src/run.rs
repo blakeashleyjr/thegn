@@ -9593,6 +9593,28 @@ async fn event_loop<T: Terminal>(
         );
         model_refresh_pending |= want_model_refresh; // one hydration in flight; coalesce
         if model_refresh_pending && inflight_hydration_gen.is_none() {
+            // Reap ghost tabs for worktrees removed OUT OF BAND (a separate
+            // `thegn merge` drainer, `git worktree remove`, a manual `rm`). The
+            // in-app fold path already calls this, but an external removal leaves
+            // a stale session group that lingers as a sidebar row and only
+            // vanishes when the user CLICKS it (that click's hydration reaps the
+            // DB row underneath, so the tab appears to disappear on click).
+            // Running it here — on the coalesced periodic model refresh — clears
+            // the ghost within a tick instead. Cheap and loop-safe: it early-
+            // returns unless a local group's dir is actually gone.
+            //
+            // Gate on no creation in flight: an optimistically-opened tab has a
+            // session group before its worktree dir is materialized (the rename/
+            // speculative-create window), and reaping on a missing dir would kill
+            // the pane mid-create. Creations are short-lived, so a ghost simply
+            // waits for the next tick after they settle.
+            if creating_tabs.is_empty()
+                && crate::merge_lifecycle::reconcile_removed_tabs(&mut session, &mut panes, &waker)
+            {
+                refresh_tab_model(&mut model, &session, &mut sb);
+                need_relayout = true;
+                dirty = true;
+            }
             crate::agent_output::publish(
                 &session,
                 &panes,
