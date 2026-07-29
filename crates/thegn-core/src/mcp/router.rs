@@ -448,18 +448,20 @@ impl McpRouter {
                     &msg,
                     wt,
                 );
+                let notification = crate::notification::Notification {
+                    id: 0,
+                    kind: crate::notification::NotificationKind::AgentAttention,
+                    source_ref: format!("subtask:{wt}"),
+                    message: msg,
+                    created_at_ms: crate::util::now(),
+                    read: false,
+                    worktree_path: wt.to_string(),
+                };
+                // Chime for the needs-you cue (core can't reach the host sound
+                // engine directly, so route it through the bus' sound channel).
+                self.bus.notify_sound(&notification);
                 self.bus.publish_with_notification(
-                    &crate::event_bus::Event::NotificationReceived {
-                        notification: crate::notification::Notification {
-                            id: 0,
-                            kind: crate::notification::NotificationKind::AgentAttention,
-                            source_ref: format!("subtask:{wt}"),
-                            message: msg,
-                            created_at_ms: crate::util::now(),
-                            read: false,
-                            worktree_path: wt.to_string(),
-                        },
-                    },
+                    &crate::event_bus::Event::NotificationReceived { notification },
                 );
 
                 Ok(json!({
@@ -482,18 +484,20 @@ impl McpRouter {
                 // desktop toast (Alert priority). Not a fake AgentDone.
                 let kind = crate::notification::NotificationKind::AgentAttention;
                 let _ = self.db.put_notification(kind.as_str(), wt, reason, wt);
+                let notification = crate::notification::Notification {
+                    id: 0,
+                    kind,
+                    source_ref: wt.to_string(),
+                    message: reason.to_string(),
+                    created_at_ms: crate::util::now(),
+                    read: false,
+                    worktree_path: wt.to_string(),
+                };
+                // Chime for the needs-you cue (routed through the bus' sound
+                // channel since core can't reach the host sound engine).
+                self.bus.notify_sound(&notification);
                 self.bus.publish_with_notification(
-                    &crate::event_bus::Event::NotificationReceived {
-                        notification: crate::notification::Notification {
-                            id: 0,
-                            kind,
-                            source_ref: wt.to_string(),
-                            message: reason.to_string(),
-                            created_at_ms: crate::util::now(),
-                            read: false,
-                            worktree_path: wt.to_string(),
-                        },
-                    },
+                    &crate::event_bus::Event::NotificationReceived { notification },
                 );
 
                 Ok(json!({

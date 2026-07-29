@@ -20,6 +20,9 @@ use crate::notification::{NotificationKind, Priority};
 /// The audible cue a decision resolves to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SoundEmit {
+    /// Play the bundled (or configured) chime through an auto-detected system
+    /// player; the host resolves this to real I/O and falls back to [`Bell`].
+    Chime,
     /// Write a terminal `BEL` (`\x07`) on the next render flush.
     Bell,
     /// Run this command line off-thread (best-effort).
@@ -54,6 +57,10 @@ pub struct RouteCtx {
     pub active_mode: String,
     /// The active profile name (`""` = none), matched by a rule's `profile`.
     pub active_profile: String,
+    /// The currently-focused/visible worktree path (`""` = none). When
+    /// `[notifications.sound] suppress_focused` is set, a notification for this
+    /// worktree is silenced (you can already see it) — record + desktop still fire.
+    pub focused_worktree: String,
 }
 
 /// Decide how to route one notification. `cfg` is the *effective* notification
@@ -125,13 +132,29 @@ pub fn decide(
         }
     }
 
-    let sound = if !sound_allowed {
+    // Kinds in `always_kinds` chime regardless of `min_priority` (the
+    // agent-done/needs-you set is on by default).
+    let forced = cfg
+        .sound
+        .always_kinds
+        .iter()
+        .any(|k| k == kind.as_str());
+    let mut sound = if !sound_allowed {
         None
     } else if let Some(over) = rule_sound {
         over
     } else {
-        sound_emit(&cfg.sound, effective)
+        sound_emit_gated(&cfg.sound, effective, forced)
     };
+
+    // Suppress the audible cue for the worktree the user is already looking at
+    // (record + desktop still fire).
+    if cfg.sound.suppress_focused
+        && !ctx.focused_worktree.is_empty()
+        && worktree == ctx.focused_worktree
+    {
+        sound = None;
+    }
 
     RouteDecision {
         record,
@@ -158,17 +181,27 @@ fn parse_sound_override(s: &str) -> Option<SoundEmit> {
 }
 
 /// The sound a [`SoundConfig`] produces for a given effective priority, before
-/// any rule override or DND/channel suppression.
+/// any rule override or DND/channel suppression. Honors the `min_priority` gate.
 pub fn sound_emit(cfg: &SoundConfig, priority: Priority) -> Option<SoundEmit> {
+    sound_emit_gated(cfg, priority, false)
+}
+
+/// Like [`sound_emit`], but when `forced` the `min_priority` floor is bypassed
+/// (used for `always_kinds`, so an agent-done/needs-you cue fires even below the
+/// configured threshold).
+pub fn sound_emit_gated(cfg: &SoundConfig, priority: Priority, forced: bool) -> Option<SoundEmit> {
     if cfg.mode == SoundMode::Off {
         return None;
     }
-    let min = Priority::parse(&cfg.min_priority).unwrap_or(Priority::Alert);
-    if priority.rank() < min.rank() {
-        return None;
+    if !forced {
+        let min = Priority::parse(&cfg.min_priority).unwrap_or(Priority::Alert);
+        if priority.rank() < min.rank() {
+            return None;
+        }
     }
     match cfg.mode {
         SoundMode::Off => None,
+        SoundMode::Chime => Some(SoundEmit::Chime),
         SoundMode::Bell => Some(SoundEmit::Bell),
         SoundMode::Command => {
             let cmd = cfg
@@ -451,11 +484,29 @@ mod tests {
         assert!(d.desktop);
         assert!(!d.toast); // toast opt-in
         assert_eq!(d.effective_priority, Priority::Alert);
-        assert_eq!(d.sound, Some(SoundEmit::Bell)); // alert >= default min_priority
+        assert_eq!(d.sound, Some(SoundEmit::Chime)); // alert >= default min_priority
     }
 
     #[test]
     fn notice_below_sound_threshold_is_silent() {
+        // A Notice-priority kind NOT in `always_kinds` stays below the default
+        // `alert` sound threshold.
+        let d = decide(
+            NotificationKind::PrStateChanged,
+            "wt",
+            "merged",
+            "/wt/app",
+            &base_cfg(),
+            &ctx(),
+        );
+        assert_eq!(d.effective_priority, Priority::Notice);
+        assert_eq!(d.sound, None);
+    }
+
+    #[test]
+    fn always_kinds_chime_below_threshold() {
+        // agent_done is Notice (below the default `alert` floor) but is in
+        // `always_kinds`, so it chimes out of the box.
         let d = decide(
             NotificationKind::AgentDone,
             "wt",
@@ -465,7 +516,35 @@ mod tests {
             &ctx(),
         );
         assert_eq!(d.effective_priority, Priority::Notice);
+        assert_eq!(d.sound, Some(SoundEmit::Chime));
+    }
+
+    #[test]
+    fn suppress_focused_silences_only_the_focused_worktree() {
+        let c = RouteCtx {
+            focused_worktree: "/wt/app".into(),
+            ..Default::default()
+        };
+        // Focused worktree: audible cue suppressed, but record + desktop stay.
+        let d = decide(NotificationKind::AgentDone, "wt", "done", "/wt/app", &base_cfg(), &c);
+        assert!(d.record);
+        assert!(d.desktop);
         assert_eq!(d.sound, None);
+        // A different (background) worktree still chimes.
+        let d2 = decide(NotificationKind::AgentDone, "wt", "done", "/wt/other", &base_cfg(), &c);
+        assert_eq!(d2.sound, Some(SoundEmit::Chime));
+    }
+
+    #[test]
+    fn suppress_focused_off_chimes_even_when_focused() {
+        let mut cfg = base_cfg();
+        cfg.sound.suppress_focused = false;
+        let c = RouteCtx {
+            focused_worktree: "/wt/app".into(),
+            ..Default::default()
+        };
+        let d = decide(NotificationKind::AgentDone, "wt", "done", "/wt/app", &cfg, &c);
+        assert_eq!(d.sound, Some(SoundEmit::Chime));
     }
 
     // --- rules ---
@@ -560,7 +639,7 @@ mod tests {
             &ctx(),
         );
         assert_eq!(d.effective_priority, Priority::Alert);
-        assert_eq!(d.sound, Some(SoundEmit::Bell));
+        assert_eq!(d.sound, Some(SoundEmit::Chime));
     }
 
     #[test]
@@ -752,7 +831,7 @@ mod tests {
         // Alert breaks through.
         let d2 = decide(NotificationKind::TestFailed, "wt", "x", "/wt/app", &cfg, &c);
         assert!(d2.desktop);
-        assert_eq!(d2.sound, Some(SoundEmit::Bell));
+        assert_eq!(d2.sound, Some(SoundEmit::Chime));
     }
 
     #[test]
