@@ -643,3 +643,80 @@ fn remote_placement_worktrees_survive_missing_local_dir() {
     assert!(row_is_remote("{\"path\":\"/x\"}", Some("host"), &cfg));
     assert!(row_is_remote("{\"path\":\"/x\"}", None, &cfg));
 }
+
+#[test]
+fn inherited_remote_ambient_env_survives_missing_local_dir() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use thegn_core::config::{Config, EnvConfig, PlacementMode};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let p = std::env::temp_dir().join(format!(
+        "tg-hydrate-ambient-{}-{}/db.sqlite",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    let db = thegn_core::db::Db::open_at(&p).unwrap();
+
+    let mut cfg = Config::default();
+    cfg.env.insert(
+        "ageless".into(),
+        EnvConfig {
+            placement: PlacementMode::Ssh,
+            ..Default::default()
+        },
+    );
+    cfg.env.insert(
+        "host".into(),
+        EnvConfig {
+            placement: PlacementMode::Local,
+            ..Default::default()
+        },
+    );
+    let repo = "/tmp/ambient-ssh-repo";
+    let mut cache = std::collections::HashMap::new();
+
+    // The regression: a worktree that CLEANLY INHERITS a remote ambient
+    // default (env_name NULL, location empty) must be treated as remote —
+    // the wizard only pins an env that differs from the ambient default, so
+    // an ssh default env leaves the row's `env_name` NULL. The bare
+    // `row_is_remote` sees None and would wrongly reap it.
+    cfg.sandbox.default_env = "ageless".into();
+    assert!(!row_is_remote("", None, &cfg));
+    assert!(row_is_remote_effective(
+        &db, &cfg, "", None, repo, &mut cache
+    ));
+
+    // A local ambient default leaves an inherited NULL-env row reapable.
+    let mut cfg_local = cfg.clone();
+    cfg_local.sandbox.default_env = "host".into();
+    let mut cache2 = std::collections::HashMap::new();
+    assert!(!row_is_remote_effective(
+        &db,
+        &cfg_local,
+        "",
+        None,
+        repo,
+        &mut cache2
+    ));
+
+    // An explicitly-pinned non-local env still wins over a local ambient.
+    assert!(row_is_remote_effective(
+        &db,
+        &cfg_local,
+        "",
+        Some("ageless"),
+        repo,
+        &mut cache2
+    ));
+    // A persisted location always wins.
+    assert!(row_is_remote_effective(
+        &db,
+        &cfg_local,
+        "{\"path\":\"/x\"}",
+        None,
+        repo,
+        &mut cache2
+    ));
+
+    let _ = std::fs::remove_dir_all(p.parent().unwrap());
+}
