@@ -2780,17 +2780,21 @@ mod tests {
         };
         let s = nix_install_script(NixInstaller::Official, None, Some(&cache), None);
         // `%` doubled so printf emits a literal `%`.
-        assert!(s.contains("X-Amz-Signature=ab%%2Fcd"), "url % must be doubled: {s}");
-        assert!(!s.contains("ab%2Fcd"), "un-doubled % leaks into the format string");
-        // `'` escaped so the surrounding single-quote isn't terminated.
-        assert!(s.contains(r"it'\''s-a-key"), "key quote must be escaped: {s}");
-        // host_cache_url takes the same escaping.
-        let hc = nix_install_script(
-            NixInstaller::Official,
-            None,
-            None,
-            Some("http://h/%41"),
+        assert!(
+            s.contains("X-Amz-Signature=ab%%2Fcd"),
+            "url % must be doubled: {s}"
         );
+        assert!(
+            !s.contains("ab%2Fcd"),
+            "un-doubled % leaks into the format string"
+        );
+        // `'` escaped so the surrounding single-quote isn't terminated.
+        assert!(
+            s.contains(r"it'\''s-a-key"),
+            "key quote must be escaped: {s}"
+        );
+        // host_cache_url takes the same escaping.
+        let hc = nix_install_script(NixInstaller::Official, None, None, Some("http://h/%41"));
         assert!(hc.contains("http://h/%%41"));
     }
 

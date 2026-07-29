@@ -18,7 +18,10 @@ pub fn spawn_ai_sidecar(
     waker: termwiz::terminal::TerminalWaker,
     tx: tokio::sync::mpsc::UnboundedSender<crate::chrome::AiMetrics>,
 ) {
-    let Some(script) = std::env::var(SIDECAR_ENV).ok().filter(|s| !s.trim().is_empty()) else {
+    let Some(script) = std::env::var(SIDECAR_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    else {
         // Feature off: no sidecar configured. This is the default.
         return;
     };

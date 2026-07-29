@@ -1809,10 +1809,7 @@ mod tests {
         frames_tx
             .blocking_send(ExecFrame::Stdout(b"replayed-scrollback".to_vec()))
             .unwrap();
-        assert!(matches!(
-            rx.blocking_recv(),
-            Some(PaneEvent::Output(7, _))
-        ));
+        assert!(matches!(rx.blocking_recv(), Some(PaneEvent::Output(7, _))));
         // Socket drops right after the replay: this is exactly the flapping
         // case — it must report NO progress so `dead` can increment.
         drop(frames_tx);
@@ -1862,10 +1859,7 @@ mod tests {
         frames_tx
             .blocking_send(ExecFrame::Stdout(b"live".to_vec()))
             .unwrap();
-        assert!(matches!(
-            rx.blocking_recv(),
-            Some(PaneEvent::Output(7, _))
-        ));
+        assert!(matches!(rx.blocking_recv(), Some(PaneEvent::Output(7, _))));
         drop(frames_tx);
         assert_eq!(
             done_rx.recv_timeout(std::time::Duration::from_secs(2)),
@@ -1889,7 +1883,10 @@ mod tests {
         let start = std::time::Instant::now();
         let exited = drain_until_exit(&mut pane, &mut rx, 200);
         let elapsed = start.elapsed();
-        assert!(!exited, "a wedged child must report no exit at the deadline");
+        assert!(
+            !exited,
+            "a wedged child must report no exit at the deadline"
+        );
         assert!(
             elapsed >= std::time::Duration::from_millis(180),
             "must actually wait for the deadline, not return early: {elapsed:?}"

@@ -168,13 +168,14 @@ impl SidebarState {
             // lock would freeze the whole UI (event-loop-blocking invariant).
             // Fall back to `main_worktree` only when the model has no workspace
             // row for this slug (a live worktree with no persisted workspace).
-            crate::sidebar::RowKind::Worktree => Self::workspace_repo_path(model, &row.workspace_slug)
-                .or_else(|| {
+            crate::sidebar::RowKind::Worktree => {
+                Self::workspace_repo_path(model, &row.workspace_slug).or_else(|| {
                     row.worktree_path.as_deref().and_then(|p| {
                         thegn_core::repo::main_worktree(std::path::Path::new(p))
                             .map(|p| p.to_string_lossy().into_owned())
                     })
-                }),
+                })
+            }
             crate::sidebar::RowKind::Folder => {
                 Self::workspace_repo_path(model, &row.workspace_slug)
             }

@@ -946,7 +946,10 @@ mod tests {
         });
         assert_eq!(state_triple(Some(&transient)), (false, false, false));
         // Transient / unknown / absent ⇒ neither ready nor failed nor draining.
-        assert_eq!(state_triple(Some(&HostState::Probing)), (false, false, false));
+        assert_eq!(
+            state_triple(Some(&HostState::Probing)),
+            (false, false, false)
+        );
         assert_eq!(state_triple(None), (false, false, false));
     }
 

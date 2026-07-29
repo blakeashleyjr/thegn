@@ -1196,7 +1196,8 @@ fn load_or_seed_session_recovers_tabs_from_db_when_present() {
     // SAFETY: test is single-threaded; sets/clears an XDG var around one call.
     unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
 
-    let (session, seeded) = load_or_seed_session(std::path::Path::new("/tmp/app"), &Default::default());
+    let (session, seeded) =
+        load_or_seed_session(std::path::Path::new("/tmp/app"), &Default::default());
 
     unsafe { std::env::remove_var("XDG_STATE_HOME") };
 
@@ -1236,7 +1237,10 @@ fn load_or_seed_session_ignores_launch_directory() {
     // SAFETY: test holds ENV_LOCK; sets/clears an XDG var around one call.
     unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
     // Launch from a directory unrelated to either workspace.
-    let (session, _) = load_or_seed_session(std::path::Path::new("/tmp/somewhere-unrelated"), &Default::default());
+    let (session, _) = load_or_seed_session(
+        std::path::Path::new("/tmp/somewhere-unrelated"),
+        &Default::default(),
+    );
     unsafe { std::env::remove_var("XDG_STATE_HOME") };
     let _ = std::fs::remove_dir_all(&state_home);
 
@@ -1260,7 +1264,8 @@ fn load_or_seed_session_reports_fresh_seed() {
 
     // SAFETY: test holds ENV_LOCK; sets/clears an XDG var around one call.
     unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
-    let (session, seeded) = load_or_seed_session(std::path::Path::new("/tmp/Fresh-Repo"), &Default::default());
+    let (session, seeded) =
+        load_or_seed_session(std::path::Path::new("/tmp/Fresh-Repo"), &Default::default());
     unsafe { std::env::remove_var("XDG_STATE_HOME") };
 
     assert!(seeded, "an empty DB seeds a fresh home group");
@@ -1288,7 +1293,8 @@ fn hydration_worker_loads_real_workspaces_into_sidebar() {
     // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
     unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
 
-    let (session, _) = load_or_seed_session(std::path::Path::new("/tmp/repo1"), &Default::default());
+    let (session, _) =
+        load_or_seed_session(std::path::Path::new("/tmp/repo1"), &Default::default());
     let model = build_model(&session, &db, crate::hydrate::HydrateHints::default());
 
     unsafe { std::env::remove_var("XDG_STATE_HOME") };
@@ -2269,7 +2275,10 @@ fn neutralize_paste_markers_strips_embedded_brackets() {
     let hostile = "ls\x1b[201~\nrm -rf ~\n";
     let safe = neutralize_paste_markers(hostile);
     assert!(!safe.contains("\x1b[201~"), "end marker survived: {safe:?}");
-    assert!(safe.contains("rm -rf ~"), "content preserved (just defused)");
+    assert!(
+        safe.contains("rm -rf ~"),
+        "content preserved (just defused)"
+    );
 
     // A stray start marker is dropped too.
     let with_start = "a\x1b[200~b";
