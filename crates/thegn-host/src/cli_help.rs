@@ -17,7 +17,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
         "Workspace",
         &["wt", "repo", "open", "land", "integrate", "merge"],
     ),
-    ("Forge", &["pr", "issue", "ci"]),
+    ("Forge", &["pr", "issue", "kaneo", "ci"]),
     (
         "Environments",
         &[
