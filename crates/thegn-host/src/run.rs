@@ -6605,6 +6605,28 @@ async fn event_loop<T: Terminal>(
         current_config.profile.clone(),
         waker.clone(),
     );
+    // Audible-cue subscriber: bus-published inbox notifications (the MCP
+    // router's agent needs-you / subtask requests) reach the sound engine here,
+    // off the event loop. Typed events (test/process/worktree) keep their inline
+    // emit-sound sites, so this never double-fires.
+    {
+        let sound_rx = event_bus.sound_receiver();
+        let ns = std::sync::Arc::clone(&notify_state);
+        std::thread::Builder::new()
+            .name("notify-sound".into())
+            .spawn(move || {
+                while let Ok(n) = sound_rx.recv() {
+                    let dec = ns.decide(
+                        n.kind.as_str(),
+                        &n.source_ref,
+                        &n.message,
+                        &n.worktree_path,
+                    );
+                    ns.emit_sound(&dec);
+                }
+            })
+            .ok();
+    }
     // Per-pane services: `[replay]` recording ring + the `[daemon]` route
     // (panes surviving UI exit) for panes spawned from here on.
     crate::handlers::startup::install_pane_services(&mut panes, &current_config);
@@ -8888,6 +8910,17 @@ async fn event_loop<T: Terminal>(
                             }
                         };
                         event_bus.publish(&ev);
+                        // Chime on agent-turn completion (on by default via
+                        // `[notifications.sound] always_kinds`; suppressed for the
+                        // focused worktree + gated by rules/DND like any cue).
+                        let kind = if *success { "agent_done" } else { "agent_failed" };
+                        let base = thegn_core::util::basename(&wt);
+                        let msg = format!(
+                            "agent {} in {base}",
+                            if *success { "finished" } else { "failed" }
+                        );
+                        let dec = notify_state.decide(kind, &wt, &msg, &wt);
+                        notify_state.emit_sound(&dec);
                     }
                     apply_agent_session_update(acp_activity.entry(wt).or_default(), update);
                     dirty = true;
@@ -9670,6 +9703,16 @@ async fn event_loop<T: Terminal>(
                 need_relayout: &mut need_relayout,
                 dirty: &mut dirty,
             },
+        );
+
+        // Keep the sound engine's notion of the focused worktree current so
+        // `[notifications.sound] suppress_focused` silences a chime for the
+        // worktree the user is already looking at (record + desktop still fire).
+        notify_state.set_focused_worktree(
+            session
+                .active_group()
+                .map(|g| g.path.clone())
+                .unwrap_or_default(),
         );
 
         // Mark the focused worktree's "stuck" dot as read: a filled-red

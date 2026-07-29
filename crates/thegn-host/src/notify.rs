@@ -36,6 +36,13 @@ pub struct NotifyState {
     active_profile: String,
     /// Set when a terminal `BEL` should be written on the next render flush.
     pending_bell: AtomicBool,
+    /// Currently-focused/visible worktree path (`""` = none). Fed into the
+    /// routing context so `[notifications.sound] suppress_focused` can silence a
+    /// cue for the worktree the user is already looking at.
+    focused_worktree: Mutex<String>,
+    /// The configured chime file (`[notifications.sound] chime_file`), empty ⇒
+    /// the bundled chime. Read on every `Chime` emit.
+    chime_file: Mutex<String>,
     /// Wakes the event loop so a latched bell (or DND/mode chip change) paints.
     waker: TerminalWaker,
 }
@@ -49,6 +56,7 @@ impl NotifyState {
         waker: TerminalWaker,
     ) -> std::sync::Arc<Self> {
         let active_mode = cfg.active_mode.clone();
+        let chime_file = cfg.sound.chime_file.clone();
         std::sync::Arc::new(NotifyState {
             cfg: Mutex::new(cfg),
             debounce: Mutex::new(thegn_core::notify_debounce::NotifyDebounce::default()),
@@ -56,12 +64,20 @@ impl NotifyState {
             active_mode: Mutex::new(active_mode),
             active_profile,
             pending_bell: AtomicBool::new(false),
+            focused_worktree: Mutex::new(String::new()),
+            chime_file: Mutex::new(chime_file),
             waker,
         })
     }
 
+    /// Update the focused/visible worktree path (drives `suppress_focused`).
+    pub fn set_focused_worktree(&self, worktree: String) {
+        *self.focused_worktree.lock().unwrap() = worktree;
+    }
+
     /// Replace the effective config after a live reload.
     pub fn update_cfg(&self, cfg: NotificationsConfig) {
+        *self.chime_file.lock().unwrap() = cfg.sound.chime_file.clone();
         // Keep the runtime mode if it is still a valid mode (or empty); else
         // reset to the new config's default.
         {
@@ -79,6 +95,7 @@ impl NotifyState {
             dnd_forced: *self.dnd_forced.lock().unwrap(),
             active_mode: self.active_mode.lock().unwrap().clone(),
             active_profile: self.active_profile.clone(),
+            focused_worktree: self.focused_worktree.lock().unwrap().clone(),
         }
     }
 
@@ -109,6 +126,14 @@ impl NotifyState {
     /// loop) or spawn the configured command off-thread. Best-effort.
     pub fn emit_sound(&self, decision: &RouteDecision) {
         match &decision.sound {
+            Some(SoundEmit::Chime) => {
+                let file = self.chime_file.lock().unwrap().clone();
+                // No system player/file ⇒ fall back to the terminal bell so a
+                // chime is never a silent no-op.
+                if !crate::chime::play(&file) {
+                    self.ring_bell();
+                }
+            }
             Some(SoundEmit::Bell) => self.ring_bell(),
             Some(SoundEmit::Command(cmd)) => spawn_sound_command(cmd),
             None => {}
@@ -217,7 +242,7 @@ fn parse_kind(s: &str) -> Option<NotificationKind> {
 /// disrupt the session.
 // off-loop: the wait happens on the detached "notify-sound" std::thread below.
 #[expect(clippy::disallowed_methods)]
-fn spawn_sound_command(cmd: &str) {
+pub(crate) fn spawn_sound_command(cmd: &str) {
     let cmd = cmd.to_string();
     std::thread::Builder::new()
         .name("notify-sound".into())
