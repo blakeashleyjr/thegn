@@ -293,7 +293,10 @@ mod tests {
         let chained = dir.join(CHAINED_NAME);
         assert_eq!(std::fs::read(&chained).unwrap(), binary);
         #[cfg(unix)]
-        assert!(is_executable(&chained), "chained binary hook must stay executable");
+        assert!(
+            is_executable(&chained),
+            "chained binary hook must stay executable"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -341,7 +341,15 @@ pub trait GitBackend: Send + Sync {
         // preview). See audit run.rs:346 / the SANITIZED_DIFF rationale above.
         let out = run(
             loc,
-            &["diff", "--no-ext-diff", "--no-color", "-U3", base, "--", path],
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "-U3",
+                base,
+                "--",
+                path,
+            ],
         )?;
         Ok(parse_unified_hunks(&out, max_lines))
     }
@@ -397,11 +405,13 @@ pub trait GitBackend: Send + Sync {
     /// and is bounded by the read timeout — a wedged git can't pin the hydration
     /// batch forever (matches `stash_count` directly above).
     fn stash_list(&self, loc: &GitLoc) -> Result<Vec<StashEntry>> {
-        let (exit, out) =
-            match run_status(loc, &["stash", "list", "--format=%gd\u{1f}%H\u{1f}%ct\u{1f}%gs"]) {
-                Ok(v) => v,
-                Err(_) => return Ok(Vec::new()),
-            };
+        let (exit, out) = match run_status(
+            loc,
+            &["stash", "list", "--format=%gd\u{1f}%H\u{1f}%ct\u{1f}%gs"],
+        ) {
+            Ok(v) => v,
+            Err(_) => return Ok(Vec::new()),
+        };
         if exit != 0 {
             return Ok(Vec::new());
         }
@@ -1485,11 +1495,10 @@ mod tests {
         let wt = repo.dir.join("linked-wt");
 
         // Add a worktree on a fresh branch, then remove it deleting the branch.
-        CliGit
-            .add_worktree(root, "feature-x", "main", &wt)
-            .unwrap();
+        CliGit.add_worktree(root, "feature-x", "main", &wt).unwrap();
         assert!(
-            repo.out(&["branch", "--list", "feature-x"]).contains("feature-x"),
+            repo.out(&["branch", "--list", "feature-x"])
+                .contains("feature-x"),
             "branch should exist after add_worktree"
         );
 
@@ -1508,7 +1517,8 @@ mod tests {
             .unwrap();
         CliGit.remove_worktree(root, &wt2, false).unwrap();
         assert!(
-            repo.out(&["branch", "--list", "feature-y"]).contains("feature-y"),
+            repo.out(&["branch", "--list", "feature-y"])
+                .contains("feature-y"),
             "branch feature-y must survive delete_branch=false"
         );
     }

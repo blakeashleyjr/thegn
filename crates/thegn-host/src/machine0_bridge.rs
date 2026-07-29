@@ -384,9 +384,16 @@ mod tests {
         assert_eq!(argv.last().map(String::as_str), Some("root@203.0.113.9"));
         // Non-interactive control read: no forced PTY.
         let argv = ssh_argv(&shim, &[], false);
-        assert!(!argv.iter().any(|a| a == "-tt"), "no -tt when non-tty: {argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "-tt"),
+            "no -tt when non-tty: {argv:?}"
+        );
         // A command is appended after `--`.
-        let argv = ssh_argv(&shim, &["/bin/sh".into(), "-lc".into(), "echo hi".into()], true);
+        let argv = ssh_argv(
+            &shim,
+            &["/bin/sh".into(), "-lc".into(), "echo hi".into()],
+            true,
+        );
         let dd = argv.iter().position(|a| a == "--").expect("-- present");
         assert_eq!(&argv[dd + 1..], &["/bin/sh", "-lc", "echo hi"]);
     }

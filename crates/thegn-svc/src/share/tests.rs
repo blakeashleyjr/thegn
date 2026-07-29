@@ -305,11 +305,7 @@ fn start_keeps_draining_so_child_survives_post_return() {
     // break-on-send-fail behavior it would SIGPIPE and exit here.
     std::thread::sleep(Duration::from_millis(800));
     assert!(
-        running
-            .child
-            .try_wait()
-            .expect("try_wait")
-            .is_none(),
+        running.child.try_wait().expect("try_wait").is_none(),
         "child must still be running — a closed stdout would have SIGPIPE-killed it"
     );
 

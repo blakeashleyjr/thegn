@@ -42,7 +42,8 @@ pub(crate) fn sha256_hex(input: &str) -> String {
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
     ];
     let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
     // Pre-processing: append 0x80, pad with zeros to 56 mod 64, then the 64-bit
     // big-endian bit length.
@@ -261,6 +262,9 @@ mod tests {
             .ok();
         assert_eq!(by_plain, None);
         // But verify() (which hashes) still resolves it.
-        assert_eq!(db.verify_iroh_token(secret).unwrap().as_deref(), Some("wt-a"));
+        assert_eq!(
+            db.verify_iroh_token(secret).unwrap().as_deref(),
+            Some("wt-a")
+        );
     }
 }

@@ -912,7 +912,10 @@ mod tests {
             container_env: &|_| None,
         };
         // Multibyte content on the literal (non-`${}`) path is copied verbatim.
-        assert_eq!(substitute("café ☕ ${localWorkspaceFolder}", &ctx), "café ☕ /home/josé");
+        assert_eq!(
+            substitute("café ☕ ${localWorkspaceFolder}", &ctx),
+            "café ☕ /home/josé"
+        );
     }
 
     #[test]

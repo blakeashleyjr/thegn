@@ -492,8 +492,8 @@ mod tests {
         let line = line.trim();
         // A real JSON object (regression: the old code emitted plain text and
         // dropped the timestamp for format = "json").
-        let v: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("not JSON: {e}: {line:?}"));
+        let v: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("not JSON: {e}: {line:?}"));
         assert_eq!(v["level"], "ERROR");
         assert_eq!(v["target"], "thegn::db");
         assert_eq!(v["wt"], "app-feat");

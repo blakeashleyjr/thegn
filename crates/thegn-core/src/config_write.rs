@@ -367,10 +367,16 @@ mod tests {
         let r = set_key(&p, "sandbox.enabled", "true");
         // Restore perms so the content check + cleanup work regardless of outcome.
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(r.is_err(), "unreadable config must not be silently clobbered");
+        assert!(
+            r.is_err(),
+            "unreadable config must not be silently clobbered"
+        );
         // The original content is untouched (atomic write never ran).
         let after = std::fs::read_to_string(&p).unwrap();
-        assert!(after.contains("bwrap"), "original config was clobbered: {after:?}");
+        assert!(
+            after.contains("bwrap"),
+            "original config was clobbered: {after:?}"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

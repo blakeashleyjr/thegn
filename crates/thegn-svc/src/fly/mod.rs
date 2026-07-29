@@ -688,7 +688,10 @@ mod tests {
                         if req.contains("allocateIpAddress") {
                             (200, r#"{"data":{"allocateIpAddress":{"ipAddress":{"id":"ip_x","address":"137.66.60.73","type":"v4"}}}}"#.into())
                         } else {
-                            (200, r#"{"data":{"app":{"ipAddresses":{"nodes":[]}}}}"#.into())
+                            (
+                                200,
+                                r#"{"data":{"app":{"ipAddresses":{"nodes":[]}}}}"#.into(),
+                            )
                         }
                     } else if method == "GET" && path.contains("/apps/") {
                         // App does not exist yet ⇒ create is taken.

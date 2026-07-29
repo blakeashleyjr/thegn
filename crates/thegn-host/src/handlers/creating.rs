@@ -835,7 +835,10 @@ mod tests {
         );
 
         assert!(
-            session.worktrees.iter().any(|g| g.name == "repo/tg-fix-login"),
+            session
+                .worktrees
+                .iter()
+                .any(|g| g.name == "repo/tg-fix-login"),
             "the user's live tab survives a colliding creation's failure",
         );
     }

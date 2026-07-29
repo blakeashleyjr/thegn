@@ -447,7 +447,11 @@ mod tests {
         );
     }
 
-    fn auto_inst(name: &str, host_label: Option<&str>, created: i64) -> thegn_svc::vps::VpsInstance {
+    fn auto_inst(
+        name: &str,
+        host_label: Option<&str>,
+        created: i64,
+    ) -> thegn_svc::vps::VpsInstance {
         let mut labels = std::collections::BTreeMap::new();
         labels.insert("sz-managed".to_string(), "1".to_string());
         if let Some(h) = host_label {

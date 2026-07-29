@@ -870,7 +870,10 @@ fn draw_pin_chips(
         .iter()
         .map(|c| format!(" {} {} ", c.glyph, c.label))
         .collect();
-    let total: usize = chips.iter().map(|s| UnicodeWidthStr::width(s.as_str())).sum();
+    let total: usize = chips
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.as_str()))
+        .sum();
     let mut x = content_end.saturating_sub(total).max(content.x);
     let chips_start = x;
     let bg = col(S::Panel);

@@ -1066,7 +1066,11 @@ mod tests {
         // `.unwrap_or(0)` reported every host as load 0 and placement believed
         // even a saturated box was idle. Assert the raw script emits the key.
         let out = exec_argv(
-            &["sh".to_string(), "-c".to_string(), HEADROOM_SCRIPT.to_string()],
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                HEADROOM_SCRIPT.to_string(),
+            ],
             Duration::from_secs(15),
         )
         .expect("headroom script runs");

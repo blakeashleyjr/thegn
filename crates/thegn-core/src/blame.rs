@@ -27,7 +27,8 @@ pub fn parse_blame_porcelain(text: &str) -> Vec<BlameRow> {
     // just "<sha> <orig> <final>" + the TAB content line, with the metadata
     // omitted. Cache the per-commit metadata (keyed by full SHA) so those later
     // lines inherit the author/date instead of rendering blank/epoch.
-    let mut meta: std::collections::HashMap<String, (String, i64)> = std::collections::HashMap::new();
+    let mut meta: std::collections::HashMap<String, (String, i64)> =
+        std::collections::HashMap::new();
     let mut lines = text.lines().peekable();
     while let Some(header) = lines.next() {
         // Each group starts with "<40-sha> <orig> <final> [<num-lines>]".

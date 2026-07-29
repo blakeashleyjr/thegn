@@ -1494,12 +1494,7 @@ pub(crate) fn forget_worktree_group(
     // Segment-anchored (audit run.rs:1457): delete the exact `pin:{name}` key +
     // everything under `pin:{name}/`, NOT the bare `pin:{name}` prefix — a raw
     // `LIKE 'pin:myrepo/fix%'` also wipes an unrelated sibling `myrepo/fixup`.
-    crate::handlers::workspace_remove::del_ui_state_segment(
-        db,
-        SIDEBAR_SCOPE,
-        "pin",
-        &group.name,
-    );
+    crate::handlers::workspace_remove::del_ui_state_segment(db, SIDEBAR_SCOPE, "pin", &group.name);
     // Tear down any sandbox container for this worktree in the background
     // (best-effort: we fire-and-forget on a dedicated thread so the event loop
     // is never blocked by a slow container runtime).
@@ -5448,9 +5443,11 @@ fn dispatch_acp_inbound(
             if let Some(client) = client {
                 let wt = wt.to_string();
                 tokio::spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || crate::handlers::scoped_fs::read_scoped_file(&wt, &path))
-                        .await
-                        .unwrap_or_else(|_| Err("read task panicked".to_string()));
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::handlers::scoped_fs::read_scoped_file(&wt, &path)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("read task panicked".to_string()));
                     let reply = match result {
                         // The pi `read` tool reads `result.text`.
                         Ok(text) => {
@@ -5565,10 +5562,11 @@ fn dispatch_acp_inbound(
                             .await;
                         return;
                     }
-                    let result =
-                        tokio::task::spawn_blocking(move || crate::handlers::scoped_fs::apply_scoped_edits(&wt, &path, &edits))
-                            .await
-                            .unwrap_or_else(|_| Err("edit task panicked".to_string()));
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::handlers::scoped_fs::apply_scoped_edits(&wt, &path, &edits)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("edit task panicked".to_string()));
                     reply_edit_status(&client, id, result).await;
                 });
             }
@@ -6050,9 +6048,8 @@ async fn event_loop<T: Terminal>(
     // Off-loop worktree-rename completions (audit run.rs:12131/12147): the git
     // subprocesses + dir move run on spawn_blocking and land here to re-key the
     // session group by identity.
-    let (rename_tx, mut rename_rx) = tokio_mpsc::unbounded_channel::<
-        crate::handlers::worktree_rename::RenameDone,
-    >();
+    let (rename_tx, mut rename_rx) =
+        tokio_mpsc::unbounded_channel::<crate::handlers::worktree_rename::RenameDone>();
     // Test-explorer results from the background runner/discoverer (capped,
     // single-flight). Two channels: run outcomes and discovery outcomes.
     let (test_run_tx, mut test_run_rx) =
@@ -12996,7 +12993,9 @@ async fn event_loop<T: Terminal>(
                                             // otherwise break the command or inject.
                                             let cmd = format!(
                                                 "{editor} {line_arg} {}\n",
-                                                thegn_core::util::sh_quote(&abs_path.display().to_string())
+                                                thegn_core::util::sh_quote(
+                                                    &abs_path.display().to_string()
+                                                )
                                             );
                                             let _ = focused_pane.write_input(cmd.as_bytes());
                                         }
@@ -13141,8 +13140,7 @@ async fn event_loop<T: Terminal>(
                                             None, &exe, name,
                                         ) {
                                             Some(argv) => {
-                                                let mut c =
-                                                    std::process::Command::new(&argv[0]);
+                                                let mut c = std::process::Command::new(&argv[0]);
                                                 c.args(&argv[1..]);
                                                 let spawned =
                                                     crate::actions::spawn_detached_reaped(c);
@@ -13172,7 +13170,9 @@ async fn event_loop<T: Terminal>(
                                         // as metacharacters (injection otherwise).
                                         let cmd = format!(
                                             "git -C {} checkout {}\n",
-                                            thegn_core::util::sh_quote(&wt_path.display().to_string()),
+                                            thegn_core::util::sh_quote(
+                                                &wt_path.display().to_string()
+                                            ),
                                             thegn_core::util::sh_quote(branch),
                                         );
                                         let _ = focused_pane.write_input(cmd.as_bytes());
@@ -13191,7 +13191,9 @@ async fn event_loop<T: Terminal>(
                                     if let Some(focused_pane) = panes.table.get_mut(&focused) {
                                         let cmd = format!(
                                             "git -C {} stash pop --index {idx_str}\n",
-                                            thegn_core::util::sh_quote(&wt_path.display().to_string())
+                                            thegn_core::util::sh_quote(
+                                                &wt_path.display().to_string()
+                                            )
                                         );
                                         let _ = focused_pane.write_input(cmd.as_bytes());
                                     }
@@ -14735,8 +14737,9 @@ async fn event_loop<T: Terminal>(
                                 let run_gen = named_task_generation;
                                 tokio::task::spawn_blocking(move || {
                                     let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-                                    let outcome =
-                                        crate::task::run_task(wt, &loc, run_gen, test_task, &limits2);
+                                    let outcome = crate::task::run_task(
+                                        wt, &loc, run_gen, test_task, &limits2,
+                                    );
                                     let _ = tx2.send(outcome);
                                     let _ = wk2.wake();
                                 });
@@ -14767,14 +14770,13 @@ async fn event_loop<T: Terminal>(
                                 // Private, sanitized path under XDG state — not
                                 // a predictable /tmp name built from the repo-
                                 // controlled task name (audit run.rs:14904).
-                                let tmp = crate::handlers::task_output::task_output_dir().join(
-                                    format!(
+                                let tmp =
+                                    crate::handlers::task_output::task_output_dir().join(format!(
                                         "{}.txt",
                                         crate::handlers::task_output::safe_task_filename(
                                             &task.name
                                         )
-                                    ),
-                                );
+                                    ));
                                 // Write off the loop (no blocking fs on the loop).
                                 {
                                     let tmp = tmp.clone();
@@ -14788,10 +14790,8 @@ async fn event_loop<T: Terminal>(
                                     .tool_command("bat")
                                     .unwrap_or("bat --paging=always")
                                     .to_string();
-                                let cmd = format!(
-                                    "{bat} {}",
-                                    test_shell_quote(&tmp.to_string_lossy())
-                                );
+                                let cmd =
+                                    format!("{bat} {}", test_shell_quote(&tmp.to_string_lossy()));
                                 let cwd_o = active_cwd(&session);
                                 open_command_pane(
                                     &mut session,

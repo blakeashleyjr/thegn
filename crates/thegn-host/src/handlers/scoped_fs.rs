@@ -88,7 +88,11 @@ pub(crate) fn write_scoped_file(worktree: &str, path: &str, content: &str) -> Re
 /// Apply an agent `edit` tool's `[{oldText,newText}]` replacements to a file,
 /// scoped to the worktree. Each `oldText` must occur (first match is replaced);
 /// a missing match is an error so the agent can correct itself.
-pub(crate) fn apply_scoped_edits(worktree: &str, path: &str, edits: &serde_json::Value) -> Result<(), String> {
+pub(crate) fn apply_scoped_edits(
+    worktree: &str,
+    path: &str,
+    edits: &serde_json::Value,
+) -> Result<(), String> {
     let target = scoped_target(worktree, path)?;
     let mut text = std::fs::read_to_string(&target).map_err(|e| format!("{path}: {e}"))?;
     let arr = edits.as_array().ok_or("edits must be an array")?;
@@ -127,7 +131,10 @@ mod tests {
         assert_eq!(read_scoped_file(wt, "hello.txt").unwrap(), "hi there");
         // Absolute path inside the worktree is allowed.
         let abs = dir.join("hello.txt");
-        assert_eq!(read_scoped_file(wt, abs.to_str().unwrap()).unwrap(), "hi there");
+        assert_eq!(
+            read_scoped_file(wt, abs.to_str().unwrap()).unwrap(),
+            "hi there"
+        );
         // A path that escapes the worktree (via ..) is rejected, not read.
         assert!(
             read_scoped_file(wt, "../../../etc/passwd").is_err(),
