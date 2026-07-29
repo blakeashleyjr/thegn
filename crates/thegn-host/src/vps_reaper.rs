@@ -232,7 +232,11 @@ mod tests {
         let now = 2_000_000_000;
         let live = std::collections::HashSet::new(); // nothing live anywhere
         // ready but gone out-of-band ⇒ drop.
-        assert!(should_drop_record(&rec("gone", "ready", now - 10_000), &live, now));
+        assert!(should_drop_record(
+            &rec("gone", "ready", now - 10_000),
+            &live,
+            now
+        ));
         // creating older than the stale threshold ⇒ drop.
         assert!(should_drop_record(
             &rec("stuck", "creating", now - CREATING_STALE_SECS - 1),
@@ -240,6 +244,10 @@ mod tests {
             now
         ));
         // creating but still fresh ⇒ keep (create may be in flight).
-        assert!(!should_drop_record(&rec("fresh", "creating", now - 1), &live, now));
+        assert!(!should_drop_record(
+            &rec("fresh", "creating", now - 1),
+            &live,
+            now
+        ));
     }
 }

@@ -787,9 +787,11 @@ pub(crate) fn upload_atuin_creds(
              command -v atuin >/dev/null 2>&1 && atuin sync -f 2>&1 || true"
                 .to_string(),
         ];
-        if let Err(e) = with_provision_timeout("atuin sync", provision_step_timeout("atuin"), || {
-            provider.run_exec(id, &argv, None, exec_env)
-        }) {
+        if let Err(e) =
+            with_provision_timeout("atuin sync", provision_step_timeout("atuin"), || {
+                provider.run_exec(id, &argv, None, exec_env)
+            })
+        {
             thegn_core::msg::warn(&format!(
                 "atuin sync: priming history failed ({e}); it will fill in on auto_sync."
             ));

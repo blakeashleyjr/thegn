@@ -306,7 +306,10 @@ impl AcpClient {
             Ok(res) => res?,
             Err(_elapsed) => {
                 // Reap the abandoned oneshot so the map doesn't leak the entry.
-                self.pending_requests.lock().await.remove(&Id::Number(req_id));
+                self.pending_requests
+                    .lock()
+                    .await
+                    .remove(&Id::Number(req_id));
                 Err(anyhow!(
                     "ACP request '{method}' timed out after {:?}",
                     Self::REQUEST_TIMEOUT

@@ -136,7 +136,12 @@ mod tests {
             .await
             .unwrap();
         b.write_all(b"\n").await.unwrap();
-        match reader.recv().await.unwrap().expect("blank line must be skipped") {
+        match reader
+            .recv()
+            .await
+            .unwrap()
+            .expect("blank line must be skipped")
+        {
             JsonRpcMessage::Notification(n) => assert_eq!(n.method, "ping"),
             other => panic!("unexpected variant: {other:?}"),
         }

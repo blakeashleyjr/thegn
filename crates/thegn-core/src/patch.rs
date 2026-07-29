@@ -665,12 +665,16 @@ fn rewrite_partial_whole_file_header(header: &[String]) -> Option<String> {
         if line.starts_with("deleted file mode") || line.starts_with("new file mode") {
             continue; // drop: the file is no longer wholly deleted/added
         }
-        if line.starts_with("--- ") && let Some(fixed) = &fixed_minus {
+        if line.starts_with("--- ")
+            && let Some(fixed) = &fixed_minus
+        {
             out.push_str(fixed);
             out.push('\n');
             continue;
         }
-        if line.starts_with("+++ ") && let Some(fixed) = &fixed_plus {
+        if line.starts_with("+++ ")
+            && let Some(fixed) = &fixed_plus
+        {
             out.push_str(fixed);
             out.push('\n');
             continue;
@@ -1464,7 +1468,10 @@ mod tests {
             !out.contains("deleted file mode"),
             "mode line must be dropped:\n{out}"
         );
-        assert!(!out.contains("+++ /dev/null"), "devnull must be replaced:\n{out}");
+        assert!(
+            !out.contains("+++ /dev/null"),
+            "devnull must be replaced:\n{out}"
+        );
         assert!(out.contains("--- a/gone.txt\n"), "{out}");
         assert!(out.contains("+++ b/gone.txt\n"), "{out}");
         // The kept deletion + converted-context body.
@@ -1493,7 +1500,10 @@ mod tests {
             !out.contains("new file mode"),
             "mode line must be dropped:\n{out}"
         );
-        assert!(!out.contains("--- /dev/null"), "devnull must be replaced:\n{out}");
+        assert!(
+            !out.contains("--- /dev/null"),
+            "devnull must be replaced:\n{out}"
+        );
         assert!(out.contains("--- a/fresh.txt\n"), "{out}");
         assert!(out.contains("+++ b/fresh.txt\n"), "{out}");
     }

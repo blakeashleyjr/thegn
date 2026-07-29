@@ -1538,11 +1538,7 @@ mod tests {
             r.sanctioned.network_block
         );
         // The original per-host denial is still reported.
-        assert!(
-            r.events
-                .iter()
-                .any(|e| e.key == "sandbox.network_allow")
-        );
+        assert!(r.events.iter().any(|e| e.key == "sandbox.network_allow"));
     }
 
     #[test]

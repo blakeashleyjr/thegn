@@ -1609,7 +1609,10 @@ mod tests {
             GhError::NoPr
         ));
         assert!(matches!(classify("http 401"), GhError::NotAuthenticated));
-        assert!(matches!(classify("api rate limit exceeded"), GhError::RateLimited));
+        assert!(matches!(
+            classify("api rate limit exceeded"),
+            GhError::RateLimited
+        ));
         assert!(matches!(classify("some other failure"), GhError::Other(_)));
     }
 

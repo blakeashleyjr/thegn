@@ -2052,10 +2052,7 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
     // or a VPN sidecar was misread as an orphan and force-removed while live.
     // Reaping is fail-closed: any container that maps to an active worktree by any
     // of these forms is kept.
-    let active_slugs: Vec<String> = active_worktrees
-        .iter()
-        .map(|w| util::slugify(w))
-        .collect();
+    let active_slugs: Vec<String> = active_worktrees.iter().map(|w| util::slugify(w)).collect();
 
     containers
         .iter()

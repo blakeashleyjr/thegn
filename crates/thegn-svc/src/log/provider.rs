@@ -112,7 +112,10 @@ mod tests {
         // Give the tailer a moment to open + seek to end, then append.
         std::thread::sleep(Duration::from_millis(50));
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             writeln!(f, "new line").unwrap();
         }
 
@@ -137,7 +140,10 @@ mod tests {
         drop(rx);
         // Prod it out of any in-flight sleep with another append + wait.
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             writeln!(f, "trailing").unwrap();
         }
         let joined = {

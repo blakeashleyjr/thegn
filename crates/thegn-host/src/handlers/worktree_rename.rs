@@ -135,8 +135,12 @@ mod tests {
             .expect("renamed group present by new path");
         assert_eq!(g.name, "repo/renamed");
         // The unrelated group at the (formerly) captured index is untouched.
-        assert!(session.worktrees.iter().any(|g| g.name == "repo/feature"
-            && g.path == "/wt/feature"));
+        assert!(
+            session
+                .worktrees
+                .iter()
+                .any(|g| g.name == "repo/feature" && g.path == "/wt/feature")
+        );
     }
 
     #[test]

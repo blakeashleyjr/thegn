@@ -1223,10 +1223,7 @@ mod tests {
                 Some("read") => acked_seen = true,
                 // Legal transient states, but never a revert *after* we saw read.
                 Some("waiting") | Some("active") | Some("none") | None => {
-                    assert!(
-                        !acked_seen,
-                        "ack was lost: state reverted away from `read`"
-                    );
+                    assert!(!acked_seen, "ack was lost: state reverted away from `read`");
                 }
                 other => panic!("unexpected state {other:?}"),
             }

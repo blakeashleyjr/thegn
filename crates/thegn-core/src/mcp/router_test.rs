@@ -257,7 +257,10 @@ fn forge_create_branch_forwards_base_default_and_name() {
     let res = router.handle_request(&req);
     assert!(res["error"].is_null(), "unexpected error: {res}");
     let text = res["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("created feat/x off HEAD in /wt"), "got: {text}");
+    assert!(
+        text.contains("created feat/x off HEAD in /wt"),
+        "got: {text}"
+    );
 }
 
 #[test]
