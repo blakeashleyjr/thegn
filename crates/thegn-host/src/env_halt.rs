@@ -75,6 +75,32 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
         Path::new(worktree),
         selected_env.as_deref(),
     );
+    // A non-default env was SELECTED (per-worktree pin, repo `.thegn.*` overlay, or
+    // `default_env`) but didn't resolve to an `[env.<name>]` table, so resolution
+    // fell back to Local carrying the requested name (`unresolved_selection`). That
+    // silent drop is exactly what failover-off forbids — surface it like the repo
+    // overlay parse error above, BEFORE the `is_local()` early return below swallows
+    // it. `env_failover_mode` falls through to the global `[sandbox] failover` for a
+    // name that has no `[env.<name>]`.
+    if environment.unresolved_selection {
+        let mode = cfg.env_failover_mode(&repo_root, &environment.name);
+        if mode.blocks() && !force_host_requested(worktree) {
+            tracing::warn!(
+                target: "thegn::sandbox",
+                env = %environment.name,
+                "HALT: selected env is not defined under [env.<name>]; selection dropped"
+            );
+            return Some(SandboxHalt {
+                env_name: environment.name.clone(),
+                placement: format!("env {}", environment.name),
+                reason: format!(
+                    "env '{}' is not defined ([env.{}] missing); its selection was dropped",
+                    environment.name, environment.name
+                ),
+                ask: matches!(mode, thegn_core::config::FailoverMode::Ask),
+            });
+        }
+    }
     // Local envs never halt; `auto` degrades silently (no block); a worktree the
     // user pinned to the host ("run on host") must not re-block. Only `halt`/`ask`
     // surface a modal.

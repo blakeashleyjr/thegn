@@ -1267,7 +1267,14 @@ pub fn run_worker(
             // (clean inherit).
             let ambient = ambient_env_name(Some(&db), cfg, root);
             if choices.env != ambient {
-                let _ = db.set_worktree_env(&path_s, &choices.env);
+                // Fail the create rather than swallow it: a lost pin means the
+                // worktree silently inherits the ambient env instead of the one
+                // the user picked (e.g. machine0 → local) — the exact silent
+                // fallback this flow must never produce.
+                if let Err(e) = db.set_worktree_env(&path_s, &choices.env) {
+                    fail(CreateStep::Register, format!("pin env {}: {e}", choices.env));
+                    return;
+                }
             }
             step(CreateStep::Register, StepState::Done, None);
         }
@@ -1679,7 +1686,20 @@ mod tests {
     fn worker_persists_selected_host_env() {
         let repo = temp_repo("env");
         let db = repo.join("state/thegn.db");
-        let events = drive_worker(
+        // `myenv` must be a DEFINED local env: an undefined selection is now a
+        // dropped selection that halts the create (this change's whole point —
+        // no silent local fallback), so a bare `myenv` never reaches Done. Define
+        // it so the create succeeds and we can assert the pin is persisted.
+        let mut cfg = test_cfg();
+        cfg.env.insert(
+            "myenv".into(),
+            thegn_core::config::EnvConfig {
+                placement: thegn_core::config::PlacementMode::Local,
+                ..Default::default()
+            },
+        );
+        let events = drive_worker_cfg(
+            cfg,
             &repo,
             "sz/env-one",
             vec![

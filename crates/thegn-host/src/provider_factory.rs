@@ -70,7 +70,12 @@ pub(crate) fn machine0_provider_for(
     } else {
         pc.api_key_env.trim()
     };
-    let api_key = crate::secret::resolve(key)?;
+    let Some(api_key) = crate::secret::resolve(key) else {
+        thegn_core::msg::warn(&format!(
+            "machine0: API key {key} could not be resolved; cannot drive machine0"
+        ));
+        return None;
+    };
     // The same managed keypair the VPS/Fly ssh transports use — one key for all
     // thegn-managed remotes.
     let (key_path, pubkey) = match crate::agent::sprite_ssh_keypair() {
@@ -120,7 +125,12 @@ pub(crate) fn fly_provider_for(
     } else {
         pc.api_key_env.trim()
     };
-    let token = crate::secret::resolve(key)?;
+    let Some(token) = crate::secret::resolve(key) else {
+        thegn_core::msg::warn(&format!(
+            "fly: API token {key} could not be resolved; cannot drive fly"
+        ));
+        return None;
+    };
     // The same managed keypair the VPS ssh transport uses — Fly reaches its
     // machine over plain ssh (dedicated IPv4 + guest sshd).
     let (key_path, pubkey) = match crate::agent::sprite_ssh_keypair() {
@@ -171,7 +181,13 @@ pub(crate) fn vps_provider_for(
     } else {
         pc.api_key_env.trim()
     };
-    let token = crate::secret::resolve(key_env)?;
+    let Some(token) = crate::secret::resolve(key_env) else {
+        thegn_core::msg::warn(&format!(
+            "{}: API token {key_env} could not be resolved; cannot drive {}",
+            pc.provider, pc.provider
+        ));
+        return None;
+    };
     // The same managed keypair the sprite ssh transport uses — one key for all
     // thegn-managed remotes.
     let (key_path, pubkey) = match crate::agent::sprite_ssh_keypair() {

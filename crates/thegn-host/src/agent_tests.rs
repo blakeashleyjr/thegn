@@ -300,6 +300,34 @@ fn env_halt_reason_halts_ssh_provider_on_connect_failure() {
     });
 }
 
+#[test]
+fn env_halt_reason_halts_on_a_selected_env_with_no_table() {
+    // Regression ("machine0 silently fell back to local bwrap"): a worktree pinned
+    // to an env name that has NO `[env.<name>]` table resolves to a Local fallback,
+    // which the `is_local()` early return used to swallow. With the default
+    // failover ("halt"), the dropped selection must instead raise a halt that names
+    // the missing env — never a silent local shell.
+    with_temp_state("halt-phantom-env", || {
+        // Config with NO [env.ghost] table; global failover defaults to "halt".
+        let cfg = Config::default();
+        let wt = std::env::temp_dir()
+            .join(format!("tg-halt-ghost-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/ghost", "/x/app", &wt, "sz/ghost", None, None)
+            .unwrap();
+        db.set_worktree_env(&wt, "ghost").unwrap();
+        let halt = env_halt_reason(&cfg, &wt).expect("a phantom env selection halts");
+        assert_eq!(halt.env_name, "ghost");
+        assert!(
+            halt.reason.contains("ghost") && halt.reason.contains("not defined"),
+            "reason names the missing env: {}",
+            halt.reason
+        );
+    });
+}
+
 fn cfg_with(agents: &[(&str, &str)], tools: &[(&str, &str)]) -> Config {
     let mut cfg = Config::default();
     let mk = |(n, c): &(&str, &str)| thegn_core::config::NamedCommand {
@@ -818,6 +846,54 @@ fn explicit_host_pick_overrides_nonauto_config() {
             "non-explicit host must not beat bwrap config"
         );
     } // Err (bwrap unavailable) is acceptable — still not a host drop.
+}
+
+#[test]
+fn selected_env_with_no_table_halts_or_degrades_loudly() {
+    // Regression ("machine0 silently fell back to local bwrap"): selecting an env
+    // that has no `[env.<name>]` table must NOT open a silent local shell.
+    // failover = halt ⇒ Err(SandboxHalt); failover = auto ⇒ Ok but with
+    // `degraded_from_provider` set so the notification/status/sidebar marker fire.
+    with_temp_state("prep-phantom-env", || {
+        let loc = GitLoc::from_db("/wt/x", None);
+
+        // Default failover ("halt") ⇒ the dropped selection halts.
+        let cfg = Config::default();
+        let err = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            "/wt/x",
+            &loc,
+            None,
+            false,
+            SandboxScope::Shell,
+            Some("ghost"),
+        )
+        .expect_err("a phantom env selection halts when failover is off");
+        let halt = err
+            .downcast_ref::<crate::agent::SandboxHalt>()
+            .expect("the error is a SandboxHalt");
+        assert_eq!(halt.env_name, "ghost");
+
+        // failover = auto ⇒ degrade, but LOUDLY (degraded flag set).
+        let mut cfg = Config::default();
+        cfg.sandbox.failover = thegn_core::config::FailoverMode::Auto;
+        let out = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            "/wt/x",
+            &loc,
+            None,
+            false,
+            SandboxScope::Shell,
+            Some("ghost"),
+        )
+        .expect("auto failover degrades rather than halting");
+        assert!(
+            out.degraded_from_provider,
+            "the dropped selection is flagged degraded so the notification fires"
+        );
+    });
 }
 
 // H1: E2E launch_spec test — backend="none" → host fallback path.

@@ -721,13 +721,22 @@ pub(crate) fn db_worktree_list(
         // sidebar doesn't imply the pane is on the provider. Gate on provider
         // (not any non-local env): ssh/k8s with `data=sync` legitimately keep
         // content local — same discriminator as the tab-bar chip.
+        //
+        // A **phantom pin** — a non-default env name that isn't defined under
+        // `[env.<name>]` — is also degraded: the selection was silently dropped
+        // and the worktree opened local, which is exactly the failure we mark.
         let env_degraded = w.location.is_empty()
-            && w.env_name
-                .as_deref()
-                .and_then(|e| cfg.env.get(e))
-                .is_some_and(|e| {
-                    matches!(e.placement, thegn_core::config::PlacementMode::Provider)
-                });
+            && w.env_name.as_deref().is_some_and(|e| {
+                !e.is_empty()
+                    && e != "default"
+                    && match cfg.env.get(e) {
+                        Some(ec) => matches!(
+                            ec.placement,
+                            thegn_core::config::PlacementMode::Provider
+                        ),
+                        None => true,
+                    }
+            });
         out.push(crate::sidebar::DbWorktree {
             slug,
             branch,
