@@ -138,6 +138,10 @@ config_enum! {
 }
 // `FailoverMode` + its deserializers live in `config_placement` (re-exported).
 pub use crate::config_placement::FailoverMode;
+// The remote/data-placement enums + `MergeRemoteMode` live in `config_remote`
+// (re-exported), keeping `config.rs` under the god-file ratchet.
+pub use crate::config_remote::{DataMode, MergeRemoteMode, RemoteMode};
+pub(crate) use crate::config_remote::data_mode_from_remote;
 use crate::config_placement::{de_failover, de_failover_opt};
 // The terminal display/glyph config enums (UndercurlMode, ColorMode, GlyphMode,
 // AgentGlyphs) live in the `config_theme` sibling module to keep this god-file
@@ -341,12 +345,6 @@ config_enum! {
     } default = Mosh;
 }
 config_enum! {
-    /// Where a remote worktree lives.
-    pub enum RemoteMode: "remote mode" {
-        Remote = "remote", LocalExec = "local_exec", Sshfs = "sshfs",
-    } default = Remote;
-}
-config_enum! {
     /// Where a named environment's processes run (its [`crate::placement`]).
     /// `local` runs on the host; `ssh`/`mosh` over ssh; `k8s` inside a pod via
     /// `kubectl exec`; `provider` through a managed-sandbox provider (Daytona, …).
@@ -356,22 +354,6 @@ config_enum! {
         K8s = "k8s" | "kubernetes" | "kube",
         Provider = "provider",
     } default = Local;
-}
-config_enum! {
-    /// Where an environment's worktree files physically live. `in_env` (the
-    /// default) keeps files where the env runs — on the host for `local`, in the
-    /// pod/sandbox for remote placements (today's behavior). `local_exec` keeps
-    /// files on the host and only execs remotely. `sshfs` FUSE-mounts the remote
-    /// tree locally; `sync` keeps a local working copy kept coherent with the
-    /// remote via a changed-files (rsync) delta. Both `sshfs`/`sync` run the pane
-    /// *locally at the mountpoint* (the placement is used only to project the
-    /// tree); their mount/sync lifecycle is auto-run on pane spawn/close.
-    pub enum DataMode: "data mode" {
-        InEnv = "in_env" | "remote" | "native",
-        LocalExec = "local_exec" | "local",
-        Sshfs = "sshfs" | "mount",
-        Sync = "sync" | "rsync",
-    } default = InEnv;
 }
 config_enum! {
     /// Default log verbosity (the `THEGN_LOG` env filter can refine it
@@ -473,6 +455,8 @@ config_enum! {
 pub struct MergeQueueConfig {
     /// Master switch. When off, the `integrate`/`merge` commands are inert.
     pub enabled: bool,
+    /// How a remote-host (sprite) worktree lands onto the target. See [`MergeRemoteMode`].
+    pub remote_mode: MergeRemoteMode,
     /// Branch the fold advances. `"auto"` resolves it per repo (HEAD/default).
     pub target_branch: String,
     /// Shell command gating the CAS-advance. Empty disables it. Keep it lean
@@ -520,6 +504,7 @@ impl Default for MergeQueueConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            remote_mode: MergeRemoteMode::default(),
             target_branch: "auto".to_string(),
             gate_command: String::new(),
             gate_on: true,
@@ -4652,15 +4637,6 @@ fn lenient_env_selector(text: &str) -> String {
     String::new()
 }
 
-/// Map the legacy `[sandbox.remote] mode` onto the env [`DataMode`], so the
-/// default env honours an existing `mode = "sshfs"`/`"local_exec"` config.
-pub(crate) fn data_mode_from_remote(mode: RemoteMode) -> DataMode {
-    match mode {
-        RemoteMode::Remote => DataMode::InEnv,
-        RemoteMode::LocalExec => DataMode::LocalExec,
-        RemoteMode::Sshfs => DataMode::Sshfs,
-    }
-}
 
 /// "#rrggbb" / "#rgb" -> "R;G;B".
 fn parse_hex_rgb(hex: &str) -> Option<String> {

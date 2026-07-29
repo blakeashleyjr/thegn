@@ -2709,6 +2709,13 @@ bouncer = false
 # the command, panel section, and badge entirely.
 [merge_queue]
 enabled = true
+remote_mode = "route_to_host" # how a REMOTE-host (sprite) worktree lands onto the target;
+                              # inert for an on-host worktree. "route_to_host": send the
+                              # enqueue to the target host's daemon over the control plane so
+                              # the host's queue owns the row (needs a control endpoint +
+                              # merge-scoped token injected into the sprite). "push": the sprite
+                              # drains its OWN clone (fold+gate+advance), then `git push`es the
+                              # target to origin — no host reach; origin is the convergence point.
 target_branch = "auto"        # branch to advance; "auto" = repo HEAD/default
 gate_command = ""             # e.g. "just test" / "cargo nextest run --workspace"; "" disables the gate.
                               # Prefer a LEAN gate: the pre-push hook already ran clippy + full
