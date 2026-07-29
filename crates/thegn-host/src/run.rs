@@ -13381,11 +13381,13 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Some(crate::nav::ConnectTarget::OfferAdd(path)) => {
-                                            let seed = thegn_core::db::Db::open()
-                                                .map(|db| crate::workspace_picker::seed_repos(&db))
+                                            let (seed, excluded) = thegn_core::db::Db::open()
+                                                .map(|db| crate::workspace_picker::picker_seed(&db))
                                                 .unwrap_or_default();
                                             let mut p =
-                                                crate::workspace_picker::WorkspacePicker::new(seed);
+                                                crate::workspace_picker::WorkspacePicker::new(
+                                                    seed, excluded,
+                                                );
                                             p.start_manual(path.clone());
                                             workspace_picker = Some(p);
                                             model.status = format!(
@@ -13402,10 +13404,12 @@ async fn event_loop<T: Terminal>(
                                     // manual mode; a pasted URL clones OFF the loop
                                     // (spawn_workspace_clone → workspace_clone_rx
                                     // drain), then registers + opens the first tab.
-                                    let seed = thegn_core::db::Db::open()
-                                        .map(|db| crate::workspace_picker::seed_repos(&db))
+                                    let (seed, excluded) = thegn_core::db::Db::open()
+                                        .map(|db| crate::workspace_picker::picker_seed(&db))
                                         .unwrap_or_default();
-                                    let mut p = crate::workspace_picker::WorkspacePicker::new(seed);
+                                    let mut p = crate::workspace_picker::WorkspacePicker::new(
+                                        seed, excluded,
+                                    );
                                     p.start_manual("");
                                     workspace_picker = Some(p);
                                     model.status =
@@ -17094,10 +17098,11 @@ async fn event_loop<T: Terminal>(
                                 // the `repo_roots` scan (a filesystem walk that
                                 // can take a while on big trees) runs off-loop
                                 // and streams in via `drain_discovery`.
-                                let seed = thegn_core::db::Db::open()
-                                    .map(|db| crate::workspace_picker::seed_repos(&db))
+                                let (seed, excluded) = thegn_core::db::Db::open()
+                                    .map(|db| crate::workspace_picker::picker_seed(&db))
                                     .unwrap_or_default();
-                                let mut p = crate::workspace_picker::WorkspacePicker::new(seed);
+                                let mut p =
+                                    crate::workspace_picker::WorkspacePicker::new(seed, excluded);
                                 p.spawn_discovery(current_config.clone(), waker.clone());
                                 workspace_picker = Some(p);
                                 model.status =
