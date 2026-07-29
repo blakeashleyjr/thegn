@@ -139,6 +139,17 @@
           "x86_64-pc-windows-gnu"
         ];
       };
+      # Trimmed Linux-only toolchain for the `sprite-full` devShell. Same stable
+      # rustc/cargo/clippy/rustfmt/llvm-tools COMPONENTS as `rustToolchain` (so
+      # they share cache paths — a `sprite-full` fetch reuses `.#default`'s toolchain
+      # store paths) but from the `minimal` profile, so it drops `rust-docs` AND the
+      # darwin/windows cross-target `rust-std` sets — dead weight on a Linux sprite
+      # that bloat the closure (both cross `rust-std` sets + docs were in the
+      # from-scratch "wall of text"). `just check-cross` can't run on a sprite as a
+      # result — by design.
+      spriteRustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
+        extensions = ["clippy" "rustfmt" "llvm-tools-preview"];
+      };
       # The muse e2e harness, built from the pinned source with the same stable
       # toolchain. Pure-Rust (no system libs / git deps), so a vendored
       # `cargoLock.lockFile` build needs no cargoHash.
@@ -193,9 +204,91 @@
           runHook postInstall
         '';
       };
+
+      # `nix build .#default` / `nix profile install .#default` ships the host
+      # `thegn` AND — on x86_64-linux — the static-musl `thegn-musl` bridge beside
+      # it, so `bridge_sup::bridge_binary_path()` auto-discovers the bridge from ANY
+      # install location (not just a dev symlink that happens to resolve into the
+      # build tree, where `just bridge` drops it). Without an adjacent bridge,
+      # host_cache/revtunnel silently no-op and sprites build the devShell from
+      # source. Gated to x86_64-linux: the bridge is an x86_64-linux-musl artifact
+      # (sprites are x86_64-linux, driven from an x86_64-linux host); cross-building
+      # it from darwin/aarch64 isn't supported.
+      defaultPkg =
+        if system == "x86_64-linux"
+        then
+          thegn.overrideAttrs (old: {
+            postInstall =
+              (old.postInstall or "")
+              + ''
+                install -Dm755 ${thegnMusl}/bin/thegn $out/bin/thegn-musl
+              '';
+          })
+        else thegn;
+
+      # Shared dev-shell shellHook (mold linker, sccache on a per-mount-ns socket,
+      # CARGO_BUILD_JOBS headroom, pinned yazi, OpenSpec seeding). Used by BOTH the
+      # full `default` shell and the trimmed `sprite-full` shell so they never drift.
+      devShellHook = ''
+        export PATH="$PWD/target/debug:$PATH"
+        # Link with mold on the linux-gnu host triple — cuts incremental link
+        # time for every cargo invocation (build/clippy/test/coverage), so the
+        # pre-push gate and all `nix develop --command just …` CI jobs are
+        # cheaper. Scoped to this triple so `check-cross` (macOS/Windows/wasm)
+        # is unaffected; the packaged `nix build` never enters this shell.
+        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+        # Compilation cache. sccache reuses per-crate rustc output across cold
+        # worktrees / branch switches; it and Cargo incremental are mutually
+        # exclusive, so CARGO_INCREMENTAL=0 lets it work (the fast single-crate
+        # iterative path is `just quick <crate>`).
+        export RUSTC_WRAPPER=sccache
+        export CARGO_INCREMENTAL=0
+        # Bound the sccache cache so it can't creep unbounded on the dev box
+        # (the compile cache is disk; a full fs makes target/ writes fail with
+        # ENOSPC/EROFS mid-build). Honor an already-set value.
+        export SCCACHE_CACHE_SIZE="''${SCCACHE_CACHE_SIZE:-20G}"
+        # Pin the sccache server to a per-mount-namespace socket. thegn
+        # development happens inside sandboxes (bwrap; the AI agent's own
+        # bwrap) that bind-mount this worktree writable into a fresh mount
+        # namespace. sccache's default server is a long-lived daemon reached
+        # over the shared loopback endpoint — so a sandbox reuses a server
+        # left over from a *different* (often now-defunct) namespace whose
+        # view of this worktree's target/ is stale/read-only, and every
+        # compile dies with "Read-only file system (os error 30)". Keying the
+        # server socket to our mount-namespace inode gives each namespace its
+        # own server (lazily spawned here, where target/ is writable) and
+        # never contacts a foreign one. Guarded: only when sccache is present,
+        # neither endpoint var is already set (CI wires its own), and /proc is
+        # available (skips non-Linux). The short /tmp path stays under the
+        # AF_UNIX SUN_LEN (~108) limit.
+        if command -v sccache >/dev/null 2>&1 \
+          && [ -z "''${SCCACHE_SERVER_UDS:-}" ] && [ -z "''${SCCACHE_SERVER_PORT:-}" ]; then
+          _mnt_ns=$(readlink /proc/self/ns/mnt 2>/dev/null | tr -dc '0-9')
+          if [ -n "$_mnt_ns" ]; then
+            export SCCACHE_SERVER_UDS="/tmp/sccache-$(id -u)-$_mnt_ns.sock"
+          fi
+          unset _mnt_ns
+        fi
+        # Leave headroom so heavy builds don't peg the machine (parallel
+        # rustc/codegen jobs); computed here since Nix eval can't see nproc.
+        if [ -z "''${CARGO_BUILD_JOBS:-}" ]; then
+          _jobs=$(nproc 2>/dev/null || echo 4)
+          if [ "$_jobs" -gt 2 ]; then export CARGO_BUILD_JOBS=$((_jobs - 2)); else export CARGO_BUILD_JOBS=1; fi
+        fi
+        # Point dev thegn at the pinned yazi (the package wires this too).
+        export THEGN_YAZI_BIN="${yaziPinned}/bin/yazi"
+        # Spec-driven development (OpenSpec): telemetry off, no host writes.
+        export OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1
+        # Seed the Claude Code /opsx commands (gitignored, regenerable) if a
+        # fresh worktree lacks them. Cheap; idempotent.
+        if [ ! -d .claude/commands/opsx ] && [ -f openspec/config.yaml ]; then
+          openspec init --tools claude --profile core --force >/dev/null 2>&1 || true
+        fi
+        echo "thegn dev shell — 'cargo build', 'just host', 'just smoke', 'nix fmt', 'just openspec'"
+      '';
     in {
-      packages.default = thegn;
-      packages.thegn = thegn;
+      packages.default = defaultPkg;
+      packages.thegn = defaultPkg;
       # The pinned yazi thegn drives for the file-manager drawer.
       packages.yazi = yaziPinned;
       # The muse e2e harness (`nix run .#muse`, also on the dev-shell PATH).
@@ -316,63 +409,47 @@
           # below. Linux-only in nixpkgs — gate it so the shell evaluates on
           # macOS (where the default ld64 is used instead).
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.mold];
-        shellHook = ''
-          export PATH="$PWD/target/debug:$PATH"
-          # Link with mold on the linux-gnu host triple — cuts incremental link
-          # time for every cargo invocation (build/clippy/test/coverage), so the
-          # pre-push gate and all `nix develop --command just …` CI jobs are
-          # cheaper. Scoped to this triple so `check-cross` (macOS/Windows/wasm)
-          # is unaffected; the packaged `nix build` never enters this shell.
-          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
-          # Compilation cache. sccache reuses per-crate rustc output across cold
-          # worktrees / branch switches; it and Cargo incremental are mutually
-          # exclusive, so CARGO_INCREMENTAL=0 lets it work (the fast single-crate
-          # iterative path is `just quick <crate>`).
-          export RUSTC_WRAPPER=sccache
-          export CARGO_INCREMENTAL=0
-          # Bound the sccache cache so it can't creep unbounded on the dev box
-          # (the compile cache is disk; a full fs makes target/ writes fail with
-          # ENOSPC/EROFS mid-build). Honor an already-set value.
-          export SCCACHE_CACHE_SIZE="''${SCCACHE_CACHE_SIZE:-20G}"
-          # Pin the sccache server to a per-mount-namespace socket. thegn
-          # development happens inside sandboxes (bwrap; the AI agent's own
-          # bwrap) that bind-mount this worktree writable into a fresh mount
-          # namespace. sccache's default server is a long-lived daemon reached
-          # over the shared loopback endpoint — so a sandbox reuses a server
-          # left over from a *different* (often now-defunct) namespace whose
-          # view of this worktree's target/ is stale/read-only, and every
-          # compile dies with "Read-only file system (os error 30)". Keying the
-          # server socket to our mount-namespace inode gives each namespace its
-          # own server (lazily spawned here, where target/ is writable) and
-          # never contacts a foreign one. Guarded: only when sccache is present,
-          # neither endpoint var is already set (CI wires its own), and /proc is
-          # available (skips non-Linux). The short /tmp path stays under the
-          # AF_UNIX SUN_LEN (~108) limit.
-          if command -v sccache >/dev/null 2>&1 \
-            && [ -z "''${SCCACHE_SERVER_UDS:-}" ] && [ -z "''${SCCACHE_SERVER_PORT:-}" ]; then
-            _mnt_ns=$(readlink /proc/self/ns/mnt 2>/dev/null | tr -dc '0-9')
-            if [ -n "$_mnt_ns" ]; then
-              export SCCACHE_SERVER_UDS="/tmp/sccache-$(id -u)-$_mnt_ns.sock"
-            fi
-            unset _mnt_ns
-          fi
-          # Leave headroom so heavy builds don't peg the machine (parallel
-          # rustc/codegen jobs); computed here since Nix eval can't see nproc.
-          if [ -z "''${CARGO_BUILD_JOBS:-}" ]; then
-            _jobs=$(nproc 2>/dev/null || echo 4)
-            if [ "$_jobs" -gt 2 ]; then export CARGO_BUILD_JOBS=$((_jobs - 2)); else export CARGO_BUILD_JOBS=1; fi
-          fi
-          # Point dev thegn at the pinned yazi (the package wires this too).
-          export THEGN_YAZI_BIN="${yaziPinned}/bin/yazi"
-          # Spec-driven development (OpenSpec): telemetry off, no host writes.
-          export OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1
-          # Seed the Claude Code /opsx commands (gitignored, regenerable) if a
-          # fresh worktree lacks them. Cheap; idempotent.
-          if [ ! -d .claude/commands/opsx ] && [ -f openspec/config.yaml ]; then
-            openspec init --tools claude --profile core --force >/dev/null 2>&1 || true
-          fi
-          echo "thegn dev shell — 'cargo build', 'just host', 'just smoke', 'nix fmt', 'just openspec'"
-        '';
+        shellHook = devShellHook;
+      };
+
+      # Trimmed "full replica" shell for sprites / provider sandboxes: everything
+      # `just ci` needs MINUS the weight that dominates the closure on a fresh
+      # Firecracker microVM — rust-docs + darwin/windows cross-targets (via
+      # `spriteRustToolchain`), the `muse` e2e harness (a from-source Rust compile),
+      # `act`, `hyperfine`, and `python+pyte`. Keeps the full lint/format/coverage
+      # stack, openspec, yazi + preview deps, and the git tooling thegn shells out
+      # to. Selected via `[env.sprites.sandbox] devshell = "sprite-full"` →
+      # THEGN_DEVSHELL → the repo `.envrc`'s `use flake` ref. `just check-cross` /
+      # `just e2e` can't run here (no cross targets / no muse) — by design; a missing
+      # tool is one `nix shell nixpkgs#<tool>` away in-pane. Reuses `devShellHook`
+      # (sccache/mold/yazi/openspec) so it never drifts from `default`.
+      devShells.sprite-full = pkgs.mkShell {
+        packages = with pkgs;
+          [
+            spriteRustToolchain
+            just
+            treefmtWrapper
+            cargo-llvm-cov
+            cargo-nextest
+            sccache
+            shellcheck
+            yamllint
+            taplo
+            cargo-deny
+            cargo-machete
+            zsh
+            git
+            fzf
+            gum
+            lazygit
+            delta
+            gh
+            openspec
+          ]
+          ++ [yaziPinned]
+          ++ yaziDeps
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.mold];
+        shellHook = devShellHook;
       };
     })
     // {

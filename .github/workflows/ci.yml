@@ -195,7 +195,31 @@ jobs:
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      # Populate the persistent binary cache (if one is configured) so remote
+      # dev-envs — sprites especially — download the devShell closure over plain
+      # HTTPS instead of rebuilding it from source over the flaky host-cache
+      # reverse tunnel. cachix-action watches the store after setup, so every path
+      # realized below is pushed. No-op until CACHIX_AUTH_TOKEN is set (+ optionally
+      # the CACHIX_CACHE_NAME repo variable), so the gate is safe before standup.
+      - name: Set up binary cache (optional)
+        if: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}
+        uses: cachix/cachix-action@v15
+        with:
+          name: ${{ vars.CACHIX_CACHE_NAME || 'thegn' }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - run: nix build .#default --print-build-logs
+      # Realize the closures a provider dev-env needs so cachix pushes them: the
+      # static musl bridge and the FULL closure of each devShell (`inputDerivation`
+      # depends on every build input, so pushing it caches the whole shell). Only
+      # when a cache is configured — otherwise it's wasted work.
+      - name: Seed cache with provider dev-env closures
+        if: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}
+        run: |
+          nix build --print-build-logs \
+            .#thegn-musl \
+            .#devShells.x86_64-linux.sprite-full.inputDerivation \
+            .#devShells.x86_64-linux.sandbox.inputDerivation \
+            .#devShells.x86_64-linux.default.inputDerivation
   e2e:
     # OPT-IN (see header): muse visual baselines aren't committed yet and a few
     # specs have stale expectations, so this isn't in the routine gate. Run via
