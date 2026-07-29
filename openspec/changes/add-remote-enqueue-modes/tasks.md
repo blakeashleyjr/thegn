@@ -21,8 +21,9 @@
 - [x] 2.2 After a successful advance, `git push origin <target>`
       (`merge_ops::push_target`); push failure surfaces the reason and returns an
       error (no false success).
-- [ ] 2.3 End-to-end test: a two-repo (origin + clone) fold→advance→push lands on
-      origin. (Unit coverage in place; CLI e2e pending a binary build.)
+- [x] 2.3 End-to-end verified: a two-repo (origin + clone) fold→advance→push lands
+      on origin; a non-ff push is rejected, surfaced as an error (drain exits
+      non-zero), and leaves origin unchanged (no false success).
 
 ## 3. Route-to-host — provisioning (NEEDS A SERVING HOST; not verifiable on one sprite)
 
