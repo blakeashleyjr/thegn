@@ -415,6 +415,11 @@ impl EventSubscriber {
 struct EventBusState {
     subscribers: Vec<Sender<Event>>,
     desktop_receivers: Vec<Sender<DesktopNotification>>,
+    /// Receivers of the audible-cue channel: a published
+    /// [`Event::NotificationReceived`] is forwarded here so the host can route
+    /// it through `notify::emit_sound`. Typed events (test/process/worktree)
+    /// keep their inline emit-sound sites and are not forwarded here.
+    sound_receivers: Vec<Sender<crate::notification::Notification>>,
 }
 
 /// The event bus - a simple pub/sub for events with desktop notification support.
@@ -429,6 +434,7 @@ impl EventBus {
         let state = Arc::new(Mutex::new(EventBusState {
             subscribers: Vec::new(),
             desktop_receivers: Vec::new(),
+            sound_receivers: Vec::new(),
         }));
         Self { state }
     }
@@ -464,6 +470,21 @@ impl EventBus {
                 let _ = tx.send(notif.clone());
             }
         }
+
+    }
+
+    /// Forward a notification to the audible-cue channel so the host can route
+    /// it through `notify::emit_sound`, off the event loop. Used by emit sites
+    /// that live in core (the MCP router's agent needs-you / subtask requests)
+    /// and so cannot reach the host's sound engine directly. Host-side emit
+    /// sites already call `emit_sound` inline and must NOT call this (it would
+    /// double-fire).
+    pub fn notify_sound(&self, notification: &crate::notification::Notification) {
+        if let Ok(state) = self.state.lock() {
+            for tx in &state.sound_receivers {
+                let _ = tx.send(notification.clone());
+            }
+        }
     }
 
     /// Get a receiver for desktop notifications.
@@ -471,6 +492,18 @@ impl EventBus {
         let (tx, rx) = mpsc::channel();
         if let Ok(mut state) = self.state.lock() {
             state.desktop_receivers.push(tx);
+        }
+        rx
+    }
+
+    /// Get a receiver for the audible-cue channel (see [`notify_sound`]). The
+    /// host drives `emit_sound` from it.
+    ///
+    /// [`notify_sound`]: EventBus::notify_sound
+    pub fn sound_receiver(&self) -> Receiver<crate::notification::Notification> {
+        let (tx, rx) = mpsc::channel();
+        if let Ok(mut state) = self.state.lock() {
+            state.sound_receivers.push(tx);
         }
         rx
     }
