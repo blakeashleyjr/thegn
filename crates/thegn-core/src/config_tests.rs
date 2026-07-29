@@ -1829,13 +1829,18 @@ backend = \"podman\"
 }
 
 #[test]
-fn unknown_env_name_falls_back_to_default() {
+fn unknown_env_name_falls_back_to_local_but_is_flagged() {
+    // An unknown SELECTED env still falls back to a Local placement for graceful
+    // degradation, but now PRESERVES the requested name and sets
+    // `unresolved_selection` so callers surface the dropped selection instead of
+    // silently opening a local shell (the "machine0 → local bwrap" regression).
     let cfg = Config::default();
     let dir = tmpdir("env-unknown");
     let loc = GitLoc::Local(dir.clone());
     let env = cfg.resolve_env(&dir, &loc, &dir, Some("does-not-exist"));
-    assert_eq!(env.name, "default");
+    assert_eq!(env.name, "does-not-exist", "requested name is preserved");
     assert!(env.placement.is_local());
+    assert!(env.unresolved_selection, "the dropped selection is flagged");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

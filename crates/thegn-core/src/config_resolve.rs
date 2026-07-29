@@ -1114,18 +1114,30 @@ pub fn resolve_environment(
 
     let env = match cfg.env.get(&name) {
         None => {
-            // Implicit default env, or a typo'd selection: today's behavior.
-            if name != "default" {
+            // Two cases share the Local fallback but must NOT be conflated:
+            //   * `name == "default"` — nothing was selected. The implicit env;
+            //     today's behavior exactly (name coerced to "default").
+            //   * `name != "default"` — a real selection (per-worktree pin, repo
+            //     `.thegn.*` overlay, or `default_env`) that doesn't resolve to an
+            //     `[env.<name>]` table. Still fall back to Local for graceful
+            //     degradation, but PRESERVE the requested name and flag the
+            //     mismatch so the caller can surface it (halt/degrade + the
+            //     `provider_degraded` notification) instead of silently opening a
+            //     local shell. The old code coerced this to "default" too, which
+            //     is exactly why a selected provider env vanished without a trace.
+            let unresolved = name != "default";
+            if unresolved {
                 crate::config::config_warn(&format!(
                     "execution environment {name:?} is not defined under [env.{name}]; using the default"
                 ));
             }
             let data = crate::config::data_mode_from_remote(base.remote.mode);
             Environment {
-                name: "default".into(),
+                name: if unresolved { name } else { "default".into() },
                 placement: crate::sandbox::placement_from_loc(&base, loc),
                 sandbox: base,
                 data,
+                unresolved_selection: unresolved,
             }
         }
         Some(envc) => {
@@ -1155,6 +1167,7 @@ pub fn resolve_environment(
                 placement,
                 sandbox: sb,
                 data: envc.data,
+                unresolved_selection: false,
             }
         }
     };
@@ -1773,5 +1786,39 @@ mod tests {
             }
             other => panic!("expected ssh placement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn selected_env_without_a_table_is_flagged_not_silently_dropped() {
+        // A per-worktree selection of an env that has NO `[env.<name>]` table must
+        // fall back to Local for graceful degradation BUT preserve the requested
+        // name and flag `unresolved_selection` — the signal callers use to surface
+        // the dropped selection instead of silently opening a local shell. This is
+        // the regression behind "machine0 silently fell back to local bwrap".
+        let cfg = Config::default();
+        let loc = GitLoc::Local(std::path::PathBuf::from("/wt/x"));
+        let (env, _) = resolve_environment(
+            &cfg,
+            std::path::Path::new("/repo"),
+            &loc,
+            std::path::Path::new("/wt/x"),
+            Some("machine0"),
+            &Approvals::deny_all(),
+        );
+        assert_eq!(env.name, "machine0", "requested name is preserved");
+        assert!(env.placement.is_local(), "graceful Local fallback");
+        assert!(env.unresolved_selection, "the dropped selection is flagged");
+
+        // No selection ⇒ the implicit default; NOT flagged (no regression).
+        let (env, _) = resolve_environment(
+            &cfg,
+            std::path::Path::new("/repo"),
+            &loc,
+            std::path::Path::new("/wt/x"),
+            None,
+            &Approvals::deny_all(),
+        );
+        assert_eq!(env.name, "default");
+        assert!(!env.unresolved_selection);
     }
 }
