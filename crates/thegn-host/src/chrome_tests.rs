@@ -1518,6 +1518,65 @@ fn render_tab_shows_splash_when_no_live_panes() {
 }
 
 #[test]
+fn render_tab_no_fullscreen_splash_on_split_with_a_live_pane() {
+    use crate::center::{Branch, CenterTree, Dir};
+    // A split (>= 2 leaves) where leaf 1 is live and leaf 2 is a fresh
+    // placeholder whose materialize has seeded load_steps. The fullscreen splash
+    // must NOT black out the existing pane — it renders normally and leaf 2 is an
+    // empty card. (Regression: the loading splash flashed over the whole center.)
+    let cols = 160usize;
+    let rows = 40usize;
+    let chrome = layout::compute(cols, rows, false, false); // full-width center
+
+    let center = CenterTree::Split {
+        dir: Dir::Row,
+        children: vec![
+            Branch {
+                weight: 1.0,
+                child: CenterTree::Leaf(1),
+            },
+            Branch {
+                weight: 1.0,
+                child: CenterTree::Leaf(2),
+            },
+        ],
+    };
+    let half = (chrome.center.cols / 2) as u16;
+    let mut live = AlacrittyEmulator::new(chrome.center.rows as u16, half, 0);
+    live.advance(b"LIVEPANE");
+
+    let model = FrameModel {
+        tabs: vec!["repo/home".into()],
+        // The just-split leaf seeded a launch step — but with a sibling live pane
+        // this must not raise the fullscreen splash.
+        load_steps: vec![crate::chrome::LoadStep::active("shell")],
+        ..Default::default()
+    };
+    let mut s = Surface::new(cols, rows);
+    render_tab(
+        &mut s,
+        &chrome,
+        &center,
+        2,
+        &model,
+        &crate::panel::PanelUi::default(),
+        |id| (id == 1).then_some(&live as &dyn PaneEmulator),
+        &|id| format!("pane-{id}"),
+        &|_| None,
+    );
+    let text = s.screen_chars_to_string();
+    // The existing pane keeps rendering, and both cards have their ring/title.
+    assert!(text.contains("LIVEPANE"), "live pane still painted under a split");
+    assert!(text.contains('\u{256d}'), "pane card rings drawn, not a splash");
+    assert!(text.contains(" pane-2 "), "the new (empty) leaf shows its card");
+    // No splash wordmark took over the center.
+    assert!(
+        !text.chars().any(|c| "▀▄█".contains(c)),
+        "no fullscreen splash wordmark on a split: {text:?}"
+    );
+}
+
+#[test]
 fn full_frame_places_chrome_and_center_pane() {
     let cols = 160usize;
     let rows = 40usize;
