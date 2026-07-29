@@ -1548,6 +1548,18 @@ failover = "halt"
 # probes the local host; set this only when you know the remote daemon is up.)
 oci_host = ""
 
+# OCI runtime to run worktree containers under (`podman/docker --runtime <value>`).
+# Empty = the daemon default (runc/crun) — a shared-kernel container. Set a stronger
+# boundary when running untrusted code (only applies to OCI backends; non-OCI backends
+# ignore it, and an unavailable runtime warns + falls back to the default):
+#   "runsc" — gVisor: a userspace application kernel services the container's syscalls
+#             (no /dev/kvm needed). Reported as isolation class `userspace-kernel`.
+#   "krun"  — libkrun: the container runs inside a hardware-virtualized microVM
+#             (needs /dev/kvm). Reported as isolation class `guest-kernel`.
+# The worktree bind stays path-preserving either way, so host-side git keeps working.
+# `thegn doctor` reports the resolved isolation class.
+oci_runtime = ""
+
 # ── Personal environment layer ────────────────────────────────────────────────
 # [sandbox.home] makes a sandbox/remote feel like LOCAL by reproducing *your*
 # setup in it — independent of any repo. The PROJECT toolchain is derived
