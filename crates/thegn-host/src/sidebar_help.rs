@@ -12,6 +12,7 @@ pub(crate) fn statusbar_pairs() -> Vec<(String, String)> {
         ("n", "new"),
         ("d", "delete"),
         ("m", "menu"),
+        ("s", "sort"),
         ("?", "help"),
     ]
     .into_iter()
