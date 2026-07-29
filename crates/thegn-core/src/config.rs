@@ -2926,15 +2926,23 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// serde `skip_serializing_if` helper for `bool` fields (skips `true`).
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 config_enum! {
-    /// `[notifications.sound] mode` — how the audible cue is produced. `bell`
-    /// writes a terminal `BEL` on the next render flush; `command` runs a
-    /// configured command off-thread; `off` is silent.
+    /// `[notifications.sound] mode` — how the audible cue is produced. `chime`
+    /// (default) plays a bundled sound through an auto-detected system player
+    /// (falling back to the terminal `BEL`); `bell` writes a terminal `BEL` on
+    /// the next render flush; `command` runs a configured command off-thread;
+    /// `off` is silent.
     pub enum SoundMode: "notification sound mode" {
         Off = "off" | "none" | "silent",
+        Chime = "chime" | "sound",
         Bell = "bell" | "beep" | "terminal",
         Command = "command" | "cmd" | "exec",
-    } default = Bell;
+    } default = Chime;
 }
 
 /// One user routing rule (`[[notifications.rules]]`, item 420). All present
@@ -3027,11 +3035,25 @@ impl Default for DndConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SoundConfig {
-    /// How to produce the cue: `bell` (default), `command`, or `off`.
+    /// How to produce the cue: `chime` (default), `bell`, `command`, or `off`.
     pub mode: SoundMode,
     /// Minimum effective priority that makes a sound (`"info"`/`"notice"`/
-    /// `"alert"`, default `"alert"`).
+    /// `"alert"`, default `"alert"`). Kinds in `always_kinds` bypass this floor.
     pub min_priority: String,
+    /// Notification kinds that always chime regardless of `min_priority`
+    /// (snake_case, e.g. `"agent_done"`). Defaults to the agent
+    /// finished/needs-you set so a background worktree is audible out of the box.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub always_kinds: Vec<String>,
+    /// Suppress the audible cue for the currently-focused worktree (you can
+    /// already see it) — the inbox record + desktop toast still fire. Default
+    /// `true`.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub suppress_focused: bool,
+    /// Optional custom sound file for `mode = "chime"` (a `.wav` path). Empty ⇒
+    /// the bundled chime. The auto-detected player still applies.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub chime_file: String,
     /// Command for `mode = "command"` (run best-effort, off-thread). A literal
     /// command line, e.g. `"paplay /usr/share/sounds/alert.oga"`.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -3045,8 +3067,15 @@ pub struct SoundConfig {
 impl Default for SoundConfig {
     fn default() -> Self {
         SoundConfig {
-            mode: SoundMode::Bell,
+            mode: SoundMode::Chime,
             min_priority: "alert".into(),
+            always_kinds: vec![
+                "agent_done".into(),
+                "agent_attention".into(),
+                "agent_failed".into(),
+            ],
+            suppress_focused: true,
+            chime_file: String::new(),
             command: String::new(),
             per_priority: std::collections::BTreeMap::new(),
         }

@@ -1076,12 +1076,21 @@ active_mode = ""
 # windows = ["22:00-08:00", "sat,sun 00:00-24:00"]
 # allow_priority = "alert"
 
-# Sound / bell (item 429). `mode`: "bell" (terminal BEL, default), "command" (run
-# a command line off-thread), or "off". Only fires at/above `min_priority`.
+# Sound / chime (item 429). `mode`: "chime" (default — a bundled chime played
+# through an auto-detected system player: paplay/pw-play/afplay/PowerShell/…,
+# falling back to the terminal BEL), "bell" (terminal BEL), "command" (run a
+# command line off-thread), or "off". Fires at/above `min_priority` EXCEPT for
+# the `always_kinds` list, which chimes regardless (so a background agent that
+# finishes or needs you is audible out of the box). `suppress_focused` silences
+# the cue for the worktree you're currently viewing (the inbox record + desktop
+# toast still fire). `chime_file` points `mode = "chime"` at your own .wav.
 # [notifications.sound]
-# mode = "bell"
+# mode = "chime"
 # min_priority = "alert"
-# command = "paplay /usr/share/sounds/freedesktop/stereo/complete.oga"
+# always_kinds = ["agent_done", "agent_attention", "agent_failed"]
+# suppress_focused = true
+# chime_file = "~/sounds/ding.wav"     # optional custom chime (default: bundled)
+# command = "paplay /usr/share/sounds/freedesktop/stereo/complete.oga"  # mode = "command"
 # [notifications.sound.per_priority]   # optional per-priority command overrides
 # alert = "paplay /usr/share/sounds/freedesktop/stereo/dialog-warning.oga"
 

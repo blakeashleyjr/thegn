@@ -26,6 +26,7 @@ mod bridge_sup;
 mod build_cache;
 mod caps;
 mod center;
+mod chime;
 mod chrome;
 mod ci_refresh;
 mod cli_help;
