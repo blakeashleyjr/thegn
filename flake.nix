@@ -231,6 +231,19 @@
       # full `default` shell and the trimmed `sprite-full` shell so they never drift.
       devShellHook = ''
         export PATH="$PWD/target/debug:$PATH"
+        # Point pkg-config at the nix zlib/openssl .pc files. Without this,
+        # PKG_CONFIG_PATH is empty and pkg-config falls back to its host
+        # default search path (/usr/lib/.../pkgconfig). On hosts whose
+        # /usr/lib/pkgconfig advertises `includedir=/usr/include` (e.g. Sprite
+        # microVMs), libz-sys/openssl-sys then export that path and libgit2-sys
+        # compiles its vendored C with `-I /usr/include`, dragging in the host
+        # glibc headers ahead of nix's — which fails outright when the host
+        # /usr/include is a partial dev tree (missing bits/types/once_flag.h).
+        # Prepending the nix .pc dirs makes the nix libs win; LIBZ_SYS_STATIC
+        # vendors zlib as a belt-and-suspenders. Hermetic on every host.
+        # (nix ships zlib's .pc under share/pkgconfig, openssl's under lib/pkgconfig.)
+        export PKG_CONFIG_PATH="${pkgs.zlib.dev}/lib/pkgconfig:${pkgs.zlib.dev}/share/pkgconfig:${pkgs.openssl.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        export LIBZ_SYS_STATIC=1
         # Link with mold on the linux-gnu host triple — cuts incremental link
         # time for every cargo invocation (build/clippy/test/coverage), so the
         # pre-push gate and all `nix develop --command just …` CI jobs are
