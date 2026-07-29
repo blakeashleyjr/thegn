@@ -100,6 +100,16 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     // index will shift as groups below it are removed.
     let active_group_name = cx.session.active_group().map(|g| g.name.clone());
 
+    // Capture the worktree paths being closed BEFORE the loop shifts indices, so
+    // we can optimistically drop their merge-queue rows from the in-memory model
+    // (the authoritative DB delete happens in `forget_worktree_group`; this keeps
+    // the MQ badge correct on the same frame instead of next hydration tick).
+    let removed_paths: Vec<String> = targets
+        .iter()
+        .filter_map(|&gi| cx.session.worktrees.get(gi).map(|g| g.path.clone()))
+        .filter(|p| !p.is_empty())
+        .collect();
+
     // Close from the highest index down so earlier indices stay valid.
     let db = thegn_core::db::Db::open().ok();
     targets.sort_unstable_by(|a, b| b.cmp(a));
@@ -129,6 +139,11 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     {
         cx.session.switch_to(new_idx);
     }
+
+    cx.model
+        .panel
+        .merge_queue
+        .retain(|r| !removed_paths.contains(&r.worktree));
 
     if skipped_home > 0 {
         cx.model.status = "The home worktree can't be closed".into();
@@ -284,6 +299,16 @@ pub(crate) fn confirm_delete_worktrees(
             .and_then(|gi| cx.session.worktrees.get(gi).map(|g| g.name.clone()))
     };
 
+    // Capture the worktree paths being deleted BEFORE `delete_groups` shifts
+    // indices, so we can optimistically drop their merge-queue rows from the
+    // in-memory model (the authoritative DB delete happens in
+    // `forget_worktree_group`; this just updates the MQ badge on the same frame).
+    let removed_paths: Vec<String> = targets
+        .iter()
+        .filter_map(|&gi| cx.session.worktrees.get(gi).map(|g| g.path.clone()))
+        .filter(|p| !p.is_empty())
+        .collect();
+
     cx.model.status = crate::run::delete_groups(
         cx.session,
         cx.panes,
@@ -291,6 +316,10 @@ pub(crate) fn confirm_delete_worktrees(
         keep_files,
         Some(cx.waker.clone()),
     );
+    cx.model
+        .panel
+        .merge_queue
+        .retain(|r| !removed_paths.contains(&r.worktree));
 
     // Restore focus: (a) keep the still-living active group (it survived the
     // delete); (b) if it was deleted, land on the next/prev worktree in the same

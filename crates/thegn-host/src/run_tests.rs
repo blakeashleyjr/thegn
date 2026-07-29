@@ -584,9 +584,17 @@ fn forgetting_closed_worktree_registry_prevents_restart_readoption() {
     session.persist(&db, &repo_s, now_secs()).unwrap();
     db.put_worktree("app/feat", &repo_s, &feat_s, "feat", None, None)
         .unwrap();
+    // Queue the branch for merge: forgetting the worktree must also reap this row
+    // so the statusbar MQ badge stops counting a branch we just closed.
+    db.enqueue_merge(&feat_s, "feat", "main").unwrap();
+    assert_eq!(db.list_merge_queue().unwrap().len(), 1);
 
     let closing = session.worktrees[1].clone();
     forget_worktree_group(&db, &session.id, &closing);
+    assert!(
+        db.list_merge_queue().unwrap().is_empty(),
+        "closing a worktree should drop its merge-queue row"
+    );
     session.close_active_group();
     session.persist(&db, &repo_s, now_secs()).unwrap();
 
