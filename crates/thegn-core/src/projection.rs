@@ -90,6 +90,7 @@ mod tests {
             )),
             sandbox,
             data,
+            unresolved_selection: false,
         }
     }
 
