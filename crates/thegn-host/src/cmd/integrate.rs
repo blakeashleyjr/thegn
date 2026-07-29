@@ -25,9 +25,13 @@ pub fn run(cfg: &Config) -> Result<()> {
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let repo_root = integrate::main_checkout(&cwd).context("not inside a git repository")?;
-    // The fold runs in the target repo's object store; a remote target must be
-    // folded on its own host (see the guidance).
-    if let Ok(db) = Db::open()
+    // `push` mode lands the sprite's OWN clone and pushes to origin, so it skips
+    // the remote-target guard (which otherwise redirects an off-host target to
+    // its host). In `route_to_host` mode the fold still runs in the target repo's
+    // object store, so a remote target must be folded on its own host.
+    let push_mode = cfg.merge_queue.remote_mode == thegn_core::config::MergeRemoteMode::Push;
+    if !push_mode
+        && let Ok(db) = Db::open()
         && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &repo_root)
     {
         outln!("{msg}");
@@ -100,6 +104,16 @@ pub fn run(cfg: &Config) -> Result<()> {
         );
     } else {
         outln!("{target} unchanged ({}).", short(&report.original));
+    }
+    // push mode: converge by pushing the advanced target to origin.
+    if push_mode && report.advanced {
+        match crate::merge_ops::push_target(&repo_root, &target) {
+            Ok(()) => outln!("Pushed {target} to origin."),
+            Err(e) => {
+                outln!("Push failed — {target} advanced locally but NOT on origin: {e}");
+                return Err(e);
+            }
+        }
     }
     Ok(())
 }

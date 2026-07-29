@@ -186,4 +186,21 @@ mod tests {
         // Unspecified keys keep defaults.
         assert_eq!(rc.connect_timeout_secs, 10);
     }
+
+    #[test]
+    fn merge_remote_mode_parse_default_alias() {
+        assert_eq!(MergeRemoteMode::default(), MergeRemoteMode::RouteToHost);
+        assert_eq!(
+            MergeRemoteMode::from_str_validated("push").unwrap(),
+            MergeRemoteMode::Push
+        );
+        for s in ["route_to_host", "route-to-host", "host"] {
+            assert_eq!(
+                MergeRemoteMode::from_str_validated(s).unwrap(),
+                MergeRemoteMode::RouteToHost
+            );
+        }
+        assert_eq!(MergeRemoteMode::Push.as_str(), "push");
+        assert!(MergeRemoteMode::from_str_validated("bogus").is_err());
+    }
 }
