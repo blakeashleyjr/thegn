@@ -41,7 +41,7 @@ pub mod theme;
 pub mod wt;
 pub mod zone;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Exit-code contract for scripting. `anyhow` errors default to [`EXIT_ERROR`];
@@ -81,12 +81,61 @@ pub fn emit_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 
 /// Resolve the worktree a command targets: explicit arg, else `$THEGN_WORKTREE`,
 /// else the git toplevel of the cwd, else the cwd.
+///
+/// `$THEGN_WORKTREE` is the **host-canonical** path the parent thegn injects. In
+/// a local sandbox the worktree is bind-mounted at that same real path, so it
+/// exists and is used as-is. On a **remote sprite** the worktree is mounted at a
+/// *different* local path (e.g. `/home/sprite/workspace`), so the host path does
+/// not exist here — trusting it blindly breaks every worktree-scoped command
+/// (`merge add`, `land`, `wt`, `disk`, …). Guard on existence so a stale host
+/// path falls through to the git toplevel of the cwd; remote sprites then work
+/// out of the box.
 pub fn resolve_worktree(arg: Option<String>) -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let env_wt = std::env::var("THEGN_WORKTREE").ok();
+    resolve_worktree_from(arg, env_wt, &cwd)
+}
+
+/// Pure core of [`resolve_worktree`] (env/cwd read out) so the fallthrough is
+/// unit-testable. A `$THEGN_WORKTREE` that doesn't exist locally (a remote
+/// sprite's host path) is skipped in favor of the cwd's git toplevel.
+fn resolve_worktree_from(arg: Option<String>, env_wt: Option<String>, cwd: &Path) -> PathBuf {
     arg.map(PathBuf::from)
-        .or_else(|| std::env::var("THEGN_WORKTREE").ok().map(PathBuf::from))
-        .or_else(|| thegn_core::repo::toplevel(&cwd))
-        .unwrap_or(cwd)
+        .or_else(|| env_wt.map(PathBuf::from).filter(|p| p.exists()))
+        .or_else(|| thegn_core::repo::toplevel(cwd))
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
+#[cfg(test)]
+mod resolve_worktree_tests {
+    use super::resolve_worktree_from;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn explicit_arg_wins() {
+        let got = resolve_worktree_from(Some("/some/arg".into()), Some("/env".into()), Path::new("/cwd"));
+        assert_eq!(got, PathBuf::from("/some/arg"));
+    }
+
+    #[test]
+    fn existing_env_worktree_is_used() {
+        // A $THEGN_WORKTREE that exists (a local sandbox's bind-mounted path).
+        let dir = std::env::temp_dir();
+        let got = resolve_worktree_from(None, Some(dir.to_string_lossy().into()), Path::new("/nonexistent/cwd"));
+        assert_eq!(got, dir);
+    }
+
+    #[test]
+    fn nonexistent_env_worktree_falls_through() {
+        // The remote-sprite case: the host path isn't mounted here, so it must be
+        // ignored rather than trusted. The cwd (a temp dir, not a git repo) has no
+        // toplevel, so resolution lands on the cwd itself — never the dead path.
+        let cwd = std::env::temp_dir();
+        let dead = "/definitely/not/here/thegn-xyz";
+        let got = resolve_worktree_from(None, Some(dead.into()), &cwd);
+        assert_ne!(got, PathBuf::from(dead));
+        assert_eq!(got, cwd);
+    }
 }
 
 /// Yes/no confirmation (gum if present, else a y/N stdin prompt).
