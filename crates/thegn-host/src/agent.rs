@@ -1771,12 +1771,12 @@ pub fn provision_provider_env_named(
                 }
                 Ok(())
             }
-            StepKind::Checkpoint => with_provision_timeout(
-                "checkpoint",
-                std::time::Duration::from_secs(600),
-                || provider.checkpoint(&id, Some("thegn-provisioned")),
-            )
-            .map(|cp| base_checkpoint = Some(cp)),
+            StepKind::Checkpoint => {
+                with_provision_timeout("checkpoint", std::time::Duration::from_secs(600), || {
+                    provider.checkpoint(&id, Some("thegn-provisioned"))
+                })
+                .map(|cp| base_checkpoint = Some(cp))
+            }
             StepKind::HomeClosurePush(roots) => {
                 // Host-executed: push the host store → sandbox store over the WSS
                 // ssh tunnel (host's `nix copy --to ssh-ng://`). Best-effort — a

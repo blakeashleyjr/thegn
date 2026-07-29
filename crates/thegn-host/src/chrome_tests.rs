@@ -238,16 +238,13 @@ fn agent_and_ai_cost_chips_are_bmp_only() {
         "no astral-plane glyphs in agent/cost chips: {full:?}"
     );
     // And on an ASCII terminal the chips degrade cleanly to 7-bit ASCII.
-    crate::caps::test_override::with_unicode(
-        thegn_core::termcaps::UnicodeLevel::Ascii,
-        || {
-            let ascii = text(&model);
-            assert!(
-                ascii.is_ascii(),
-                "agent/cost chips degrade to ASCII: {ascii:?}"
-            );
-        },
-    );
+    crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
+        let ascii = text(&model);
+        assert!(
+            ascii.is_ascii(),
+            "agent/cost chips degrade to ASCII: {ascii:?}"
+        );
+    });
 }
 
 #[test]
@@ -1150,7 +1147,11 @@ fn center_tab_spans_use_display_width_for_wide_leaf() {
     );
     // Hit-testing agrees with the (corrected) draw position.
     assert_eq!(center_tab_hit(&model, strip, spans[0].0 + 1), Some(0));
-    assert_eq!(center_tab_hit(&model, strip, 11), None, "old (wrong) column");
+    assert_eq!(
+        center_tab_hit(&model, strip, 11),
+        None,
+        "old (wrong) column"
+    );
 }
 
 #[test]

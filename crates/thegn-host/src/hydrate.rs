@@ -1071,7 +1071,10 @@ fn collect_sidebar_status(
 /// released — the mutex is also taken loop-side, so a stalled WAL write inside
 /// it would freeze the event loop. Pure, so it's unit-tested.
 fn glyph_persist_entry(path: &str, row: &GlyphRow) -> (String, String) {
-    (path.to_string(), serde_json::to_string(row).unwrap_or_default())
+    (
+        path.to_string(),
+        serde_json::to_string(row).unwrap_or_default(),
+    )
 }
 
 /// tokei line count for `path`, cached in `loc_cache` (hydration thread —
@@ -1989,7 +1992,8 @@ fn update_log_error_total(log_path: &std::path::Path, cur_len: u64) -> usize {
                 .and_then(|mut f| {
                     f.seek(SeekFrom::Start(offset))?;
                     let mut buf = Vec::new();
-                    f.take(cur_len.saturating_sub(offset)).read_to_end(&mut buf)?;
+                    f.take(cur_len.saturating_sub(offset))
+                        .read_to_end(&mut buf)?;
                     Ok(buf)
                 })
                 .map(|buf| count_error_lines(&buf))

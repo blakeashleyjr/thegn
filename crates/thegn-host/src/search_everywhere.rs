@@ -1798,7 +1798,10 @@ mod tests {
             peel_like_loop(&mut s),
             "FileIndexReady survives for the loop to install"
         );
-        assert!(!s.drain_results(), "channel is empty after the ready is peeled");
+        assert!(
+            !s.drain_results(),
+            "channel is empty after the ready is peeled"
+        );
     }
 
     #[test]
@@ -1815,7 +1818,10 @@ mod tests {
         // Subsequent keystrokes see the guard and must skip re-spawning. We model
         // the kick_palette_search decision: spawn only if !index_building.
         let would_spawn_again = !s.index_building;
-        assert!(!would_spawn_again, "no second scan while a build is in flight");
+        assert!(
+            !would_spawn_again,
+            "no second scan while a build is in flight"
+        );
 
         // When the build's FileIndexReady drains, the guard clears.
         s.result_tx

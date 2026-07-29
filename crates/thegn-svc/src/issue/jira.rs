@@ -526,7 +526,10 @@ impl IssueBackend for JiraBackend {
         // Escape JQL string-literal metachars first, then percent-encode the
         // whole `text ~ "…"` clause so quotes/backslashes in the query neither
         // break the JQL nor the query string.
-        let jql = format!("text ~ \"{}\" ORDER BY updated DESC", escape_jql_str(query_str));
+        let jql = format!(
+            "text ~ \"{}\" ORDER BY updated DESC",
+            escape_jql_str(query_str)
+        );
         let limit = limit.min(100);
         let path = format!(
             "search?jql={}&fields={JIRA_FIELDS}&maxResults={limit}",
@@ -716,7 +719,10 @@ mod tests {
             jql.starts_with("statusCategory in ("),
             "must filter on statusCategory, got: {jql}"
         );
-        assert!(!jql.contains("status in ("), "must not use bare status: {jql}");
+        assert!(
+            !jql.contains("status in ("),
+            "must not use bare status: {jql}"
+        );
         assert!(jql.contains("\"To Do\""));
         assert!(jql.contains("\"In Progress\""));
         // Backlog+Todo collapse to a single "To Do", Done+Cancelled to "Done".

@@ -755,7 +755,11 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
         .spawn(move || {
             let mut stdin = stdin;
             while let Ok(chunk) = stdin_rx.recv() {
-                if stdin.write_all(&chunk).and_then(|()| stdin.flush()).is_err() {
+                if stdin
+                    .write_all(&chunk)
+                    .and_then(|()| stdin.flush())
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -828,7 +832,11 @@ fn proc_stdin_response(req: &Request, procs: &ProcRegistry) -> Response {
         Ok(p) => p,
         Err(e) => return resp_err(req.id, format!("bad proc.stdin params: {e}")),
     };
-    let stdin_tx = procs.lock().unwrap().get(&p.chan).map(|s| s.stdin_tx.clone());
+    let stdin_tx = procs
+        .lock()
+        .unwrap()
+        .get(&p.chan)
+        .map(|s| s.stdin_tx.clone());
     let Some(stdin_tx) = stdin_tx else {
         return resp_err(req.id, format!("no such channel {}", p.chan));
     };

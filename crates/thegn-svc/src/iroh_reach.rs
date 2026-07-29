@@ -375,10 +375,7 @@ mod tests {
         // Dial and complete the QUIC handshake, then open the handshake stream but
         // deliberately never write a Hello.
         let dialer = local_endpoint().await;
-        let conn = dialer
-            .connect(home_addr, ALPN)
-            .await
-            .expect("dial home");
+        let conn = dialer.connect(home_addr, ALPN).await.expect("dial home");
         let (_stalled_send, _stalled_recv) = conn.open_bi().await.expect("open bi");
 
         // The home must close our connection once the handshake timeout elapses.

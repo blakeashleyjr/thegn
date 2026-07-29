@@ -420,9 +420,7 @@ mod tests {
         // drop the budgets table so add_compute_spend's INSERT errors. The whole
         // meter_advance transaction must roll back — watermark unchanged — so the
         // accrued hour is re-accrued (not silently lost) on the next tick.
-        db.conn()
-            .execute("DROP TABLE compute_budgets", [])
-            .unwrap();
+        db.conn().execute("DROP TABLE compute_budgets", []).unwrap();
         assert!(
             db.accrue_compute_meter("host-r", 3_600_000).is_err(),
             "attribution failure surfaces as an error, not a swallowed loss"

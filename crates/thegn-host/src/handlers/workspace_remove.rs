@@ -236,12 +236,7 @@ pub(crate) fn remove_workspace_with_db(
 /// per-branch / per-folder children), but NOT sibling names that merely share a
 /// leading substring (e.g. `pin:api` must not touch `pin:api-v2/…`). See audit
 /// run.rs:1457. All best-effort: these are cache-only sidebar view keys.
-pub(crate) fn del_ui_state_segment(
-    db: &thegn_core::db::Db,
-    scope: &str,
-    prefix: &str,
-    name: &str,
-) {
+pub(crate) fn del_ui_state_segment(db: &thegn_core::db::Db, scope: &str, prefix: &str, name: &str) {
     let _ = db.del_ui_state(scope, &format!("{prefix}:{name}"));
     let _ = db.del_ui_state_prefix(scope, &format!("{prefix}:{name}/"));
 }
@@ -279,8 +274,15 @@ mod tests {
             now_secs()
         ));
         let db = thegn_core::db::Db::open_at(&db_path).unwrap();
-        db.put_worktree("lib/home", "/tmp/repo-lib", "/tmp/repo-lib", "home", None, None)
-            .unwrap();
+        db.put_worktree(
+            "lib/home",
+            "/tmp/repo-lib",
+            "/tmp/repo-lib",
+            "home",
+            None,
+            None,
+        )
+        .unwrap();
         db.put_worktree(
             "lib/feat",
             "/tmp/repo-lib",
@@ -335,8 +337,15 @@ mod tests {
         let db = thegn_core::db::Db::open_at(&db_path).unwrap();
         db.put_workspace("/tmp/repo-app", "app", "repo").unwrap();
         db.put_workspace("/tmp/repo-lib", "lib", "repo").unwrap();
-        db.put_worktree("lib/home", "/tmp/repo-lib", "/tmp/repo-lib", "home", None, None)
-            .unwrap();
+        db.put_worktree(
+            "lib/home",
+            "/tmp/repo-lib",
+            "/tmp/repo-lib",
+            "home",
+            None,
+            None,
+        )
+        .unwrap();
         db.put_worktree(
             "lib/feat",
             "/tmp/repo-lib",
@@ -346,8 +355,15 @@ mod tests {
             None,
         )
         .unwrap();
-        db.put_worktree("app/home", "/tmp/repo-app", "/tmp/repo-app", "home", None, None)
-            .unwrap();
+        db.put_worktree(
+            "app/home",
+            "/tmp/repo-app",
+            "/tmp/repo-app",
+            "home",
+            None,
+            None,
+        )
+        .unwrap();
         db.set_active_workspace("/tmp/repo-lib").unwrap();
 
         let mut session = Session {
@@ -373,7 +389,10 @@ mod tests {
             .into_iter()
             .map(|w| w.repo_path)
             .collect();
-        assert!(ws.contains(&"/tmp/repo-app".to_string()), "sibling kept: {ws:?}");
+        assert!(
+            ws.contains(&"/tmp/repo-app".to_string()),
+            "sibling kept: {ws:?}"
+        );
         assert!(
             !ws.contains(&"/tmp/repo-lib".to_string()),
             "removed workspace row pruned: {ws:?}"
@@ -443,7 +462,11 @@ mod tests {
         let db = thegn_core::db::Db::open_at(&db_path).unwrap();
         let mut session = Session {
             id: "/tmp/repo-lib".into(),
-            worktrees: vec![WorktreeGroup::new("lib/home", GroupKind::Home, "/tmp/repo-lib")],
+            worktrees: vec![WorktreeGroup::new(
+                "lib/home",
+                GroupKind::Home,
+                "/tmp/repo-lib",
+            )],
             active: 0,
         };
         land_after_workspace_removed(&mut session, Some(&db));
@@ -469,12 +492,16 @@ mod tests {
             .unwrap();
         // Sibling `api-v2`: must survive.
         db.set_ui_state(SIDEBAR_SCOPE, "pin:api-v2", "1").unwrap();
-        db.set_ui_state(SIDEBAR_SCOPE, "pin:api-v2/main", "1").unwrap();
+        db.set_ui_state(SIDEBAR_SCOPE, "pin:api-v2/main", "1")
+            .unwrap();
 
         del_ui_state_segment(&db, SIDEBAR_SCOPE, "pin", "api");
 
         assert_eq!(db.get_ui_state(SIDEBAR_SCOPE, "pin:api").unwrap(), None);
-        assert_eq!(db.get_ui_state(SIDEBAR_SCOPE, "pin:api/main").unwrap(), None);
+        assert_eq!(
+            db.get_ui_state(SIDEBAR_SCOPE, "pin:api/main").unwrap(),
+            None
+        );
         assert_eq!(
             db.get_ui_state(SIDEBAR_SCOPE, "pin:api/main/folder:3")
                 .unwrap(),

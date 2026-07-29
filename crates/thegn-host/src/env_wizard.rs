@@ -48,7 +48,11 @@ fn spawn_keyring_probe() -> std::sync::Arc<std::sync::atomic::AtomicU8> {
     let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
     let out = state.clone();
     std::thread::spawn(move || {
-        let v = if crate::secret::keyring_available() { 1 } else { 2 };
+        let v = if crate::secret::keyring_available() {
+            1
+        } else {
+            2
+        };
         out.store(v, std::sync::atomic::Ordering::Relaxed);
     });
     state
@@ -494,6 +498,9 @@ mod tests {
         // non-blocking by observing the tri-state is a valid encoding.
         let w = wiz();
         let v = w.keyring.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(v <= 2, "keyring tri-state is one of probing/available/unavailable");
+        assert!(
+            v <= 2,
+            "keyring tri-state is one of probing/available/unavailable"
+        );
     }
 }
