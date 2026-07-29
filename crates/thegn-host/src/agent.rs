@@ -238,6 +238,13 @@ pub fn prepare_sandbox_env(
     // placement isn't handled by `for_environment`, which is ssh-only).
     let env_data = environment.data;
     let env_name = environment.name.clone();
+    // A non-default env was SELECTED but did not resolve to an `[env.<name>]`
+    // table, so resolution fell back to Local carrying the requested `env_name`
+    // (captured before `environment` is partially moved below). The provider/ssh
+    // degrade paths further down never fire for it (placement is already Local),
+    // so it's routed through the same failover decision explicitly — see the guard
+    // after `warnings` is declared.
+    let unresolved_selection = environment.unresolved_selection;
     // Failover: `halt`/`ask` block a bring-up failure; `auto`/`force_host` degrade.
     let failover_mode = cfg.env_failover_mode(repo_root, &env_name);
     let ask = matches!(failover_mode, thegn_core::config::FailoverMode::Ask);
@@ -332,6 +339,33 @@ pub fn prepare_sandbox_env(
     let mut explicit_choice = explicit_backend.is_some();
     let auto_choice = sb.backend == thegn_core::config::SandboxBackend::Auto;
     let mut warnings = Vec::new();
+    // Selection dropped: the user asked for a non-default env that isn't defined
+    // under `[env.<name>]`, so `resolve_env` fell back to Local. The Provider/ssh
+    // bring-up degrade blocks below never fire (placement is already Local), so
+    // without this the dropped selection is silently honored as a local shell.
+    // Route it through the SAME failover decision (`env_name` already carries the
+    // requested name, so `failover_mode`/`degrade_allowed`/`ask` above were
+    // computed against it): halt/ask surface the modal; auto degrades but flags
+    // `degraded_from_provider` so the `provider_degraded` notification + status
+    // fire instead of vanishing.
+    if unresolved_selection {
+        if !degrade_allowed {
+            return Err(SandboxHalt {
+                env_name: env_name.clone(),
+                placement: format!("env {env_name}"),
+                reason: format!(
+                    "env '{env_name}' is not defined ([env.{env_name}] missing); its selection was dropped"
+                ),
+                ask,
+            }
+            .into());
+        }
+        thegn_core::msg::warn(&format!(
+            "env '{env_name}' is not configured; falling back to the host"
+        ));
+        warnings.push(format!("{env_name} not configured; running on the host"));
+        degraded_from_provider = true;
+    }
     let profile_slug = cfg.profile.trim();
     let base_cname = sandbox::container_name_with_profile(
         worktree,
@@ -2407,8 +2441,19 @@ fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyho
     }
     // Bake the RESOLVED name so `ensure_exists`→`create` names the new sandbox
     // correctly (the raw `pc.id` is a template + embeds a path-hash).
+    //
+    // Reaching here means the placement already resolved to `Provider` (gated by
+    // the caller), `auto_provision` is on (checked above), a real sandbox name
+    // resolved, and no pool spare is waiting — so a `None` provider genuinely
+    // means "the provider config is present but couldn't be built" (unresolved
+    // token/keypair), NOT a legitimate no-op. Surface it as an error so the
+    // caller's failover block (`prepare_sandbox_env`) halts or degrades-with-
+    // notification instead of silently opening a host/bwrap shell.
     let Some(provider) = provider_for_named(pc, &name) else {
-        return Ok(());
+        anyhow::bail!(
+            "env '{env_name}' provider '{}' could not be built (token or managed keypair unresolved)",
+            pc.provider
+        );
     };
     match block_on_provider(|| async { provider.ensure_exists(&name).await }) {
         Ok(true) => {

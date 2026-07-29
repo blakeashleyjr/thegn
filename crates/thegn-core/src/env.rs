@@ -29,6 +29,14 @@ pub struct Environment {
     pub sandbox: SandboxConfig,
     /// Where the worktree's files physically live.
     pub data: DataMode,
+    /// A non-default env name was **selected** (per-worktree pin, repo `.thegn.*`
+    /// overlay, or `default_env`) but did not resolve to an `[env.<name>]` table,
+    /// so this environment is the graceful **Local** fallback carrying the
+    /// requested `name`. Callers use this to surface the dropped selection
+    /// (halt/degrade + notification) instead of silently honoring the fallback —
+    /// see `env_halt_reason` / `prepare_sandbox_env`. `false` for a genuinely
+    /// resolved env (including the implicit `"default"`).
+    pub unresolved_selection: bool,
 }
 
 impl Environment {
@@ -55,6 +63,7 @@ mod tests {
             placement: Placement::Local,
             sandbox: SandboxConfig::default(),
             data: DataMode::InEnv,
+            unresolved_selection: false,
         };
         assert_eq!(local.label(), "default · local");
         assert!(!local.is_remote());
@@ -72,6 +81,7 @@ mod tests {
             }),
             sandbox: SandboxConfig::default(),
             data: DataMode::InEnv,
+            unresolved_selection: false,
         };
         assert_eq!(k8s.label(), "company-k8s · k8s:ns/p");
         assert!(k8s.is_remote());
