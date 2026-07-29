@@ -642,6 +642,17 @@ impl Panes {
             .collect()
     }
 
+    /// True when the tab already has ≥1 live pane — i.e. materializing its
+    /// missing leaves is a split/add, not a full (re)bring-up. Used to keep the
+    /// fullscreen loading splash off an instant split: the sandbox is already up,
+    /// so the new leaf just forks a shell and fills in without a takeover.
+    pub(crate) fn tab_has_live_pane(&self, tab: &crate::session::Tab) -> bool {
+        tab.center
+            .pane_ids()
+            .iter()
+            .any(|id| self.table.contains_key(id))
+    }
+
     /// Finish materialization with pre-resolved launch specs: spawn a pane per
     /// missing leaf and remap the tree's leaf ids + focused id onto them. Spec
     /// resolution (sandbox ensure, DB lookups — potentially SLOW: a wedged
@@ -1046,6 +1057,31 @@ mod tests {
         // The routing key (name, ti) is distinct from the active group's,
         // despite the shared path.
         assert_ne!(neighbor.0, "app/home");
+    }
+
+    #[test]
+    fn tab_has_live_pane_distinguishes_a_split_from_a_full_bringup() {
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+        let mut panes = Panes::new(tx);
+
+        // A single-leaf tab with nothing materialized yet: a full (re)bring-up,
+        // so the fullscreen launch splash is appropriate.
+        let mut tab = crate::session::Tab::new("t");
+        tab.center = crate::center::CenterTree::Leaf(1);
+        assert!(
+            !panes.tab_has_live_pane(&tab),
+            "no live pane yet → not a split"
+        );
+
+        // Split leaf 1 into a two-leaf tree, then bring leaf 1 live. Now the tab
+        // already has content to show, so materializing leaf 2 is a quiet split.
+        tab.center
+            .split(1, crate::center::Dir::Row, 2);
+        panes.insert_test_pane(1);
+        assert!(
+            panes.tab_has_live_pane(&tab),
+            "existing live leaf → a split, keep the splash off"
+        );
     }
 
     #[test]

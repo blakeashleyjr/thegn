@@ -58,6 +58,7 @@ pub(crate) fn maybe_materialize(
     path: &str,
     ti: usize,
     is_terminal: bool,
+    quiet: bool,
 ) {
     let key = (name.to_string(), ti);
     if missing.is_empty()
@@ -69,8 +70,15 @@ pub(crate) fn maybe_materialize(
         return;
     }
     ctx.materialize_inflight.insert(key.clone());
-    // A fresh materialize is a genuine (re)bring-up: un-retire.
-    ctx.loading_retired.remove(&key);
+    // A `quiet` materialize is a split/add into a tab that already has a live
+    // pane: the sandbox is already up, so raising the fullscreen provisioning
+    // splash would only flash over the existing pane(s). Skip every
+    // splash-raising side effect — the shell still forks off-thread below, so
+    // the new leaf opens as an ordinary empty card and fills in on first output.
+    // A fresh (re)bring-up (quiet == false) is un-retired so its splash shows.
+    if !quiet {
+        ctx.loading_retired.remove(&key);
+    }
     // NOTE: remoteness is NOT resolved here. `GitLoc::for_worktree` opens+reads
     // SQLite, and this runs on the compositor loop — a busy DB writer (gate run
     // / bulk hydration) could stall the frame. The seed below is chosen as if
@@ -90,11 +98,14 @@ pub(crate) fn maybe_materialize(
     };
     // Seed the splash — but never overwrite LIVE provisioning steps (an eager
     // stream may already own this key; the seed's shell-wait shape would
-    // briefly misclassify the tab).
-    if seed_materialize_steps(ctx.loading_state.get(&key).map(Vec::as_slice)) {
-        ctx.loading_state.set(key, seed.clone());
+    // briefly misclassify the tab). Skipped entirely for a quiet split: no seed,
+    // no ticker, no dirty churn — the existing pane keeps rendering.
+    if !quiet {
+        if seed_materialize_steps(ctx.loading_state.get(&key).map(Vec::as_slice)) {
+            ctx.loading_state.set(key, seed.clone());
+        }
+        *ctx.dirty = true;
     }
-    *ctx.dirty = true;
     let cfg = cfg.clone();
     let tx = tx.clone();
     let wt = path.to_string();
@@ -116,9 +127,14 @@ pub(crate) fn maybe_materialize(
             let ptx = ptx.clone();
             let wk = wk.clone();
             let gname = gname.clone();
+            // A quiet split never streams sandbox phases: the tab has no splash
+            // to update, and a stray step would re-raise the fullscreen takeover.
             let _sink = thegn_core::progress::scoped(Box::new(move |ev| {
-                let _ = ptx.send((gname.clone(), ti, observer.on_event(ev)));
-                let _ = wk.wake();
+                let steps = observer.on_event(ev);
+                if !quiet {
+                    let _ = ptx.send((gname.clone(), ti, steps));
+                    let _ = wk.wake();
+                }
             }));
             f()
         };
@@ -165,8 +181,12 @@ pub(crate) fn maybe_materialize(
                     &wt,
                     crate::host_flow::ConsentPolicy::Interactive,
                     |views| {
-                        let _ = ptx_p.send((gname_p.clone(), ti, provision_load_steps(views)));
-                        let _ = wk_p.wake();
+                        // Quiet split: swallow provider progress so it can't
+                        // re-raise the splash over the already-live tab.
+                        if !quiet {
+                            let _ = ptx_p.send((gname_p.clone(), ti, provision_load_steps(views)));
+                            let _ = wk_p.wake();
+                        }
                     },
                     hui.as_ref(),
                 );
