@@ -1484,6 +1484,10 @@ pub(crate) fn forget_worktree_group(
 ) {
     if !group.path.is_empty() {
         let _ = db.del_worktree(&group.path);
+        // best-effort: drop any merge-queue row keyed by this worktree so the
+        // statusbar MQ badge / section don't keep counting a branch we removed.
+        // (The DB is a cache; a failure here must never take down the loop.)
+        let _ = db.remove_merge_entry(&group.path);
     }
     let _ = db.del_worktree_for_tab(session_id, &group.name);
     let _ = db.delete_tab_group(session_id, &group.name);
