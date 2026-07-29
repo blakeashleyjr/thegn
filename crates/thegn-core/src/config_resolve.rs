@@ -364,6 +364,7 @@ pub fn classify_repo_overlay(
         warm_direnv,
         devenv,
         inject_devshell,
+        devshell,
         nix_daemon,
         shell,
         on_missing,
@@ -747,6 +748,10 @@ pub fn classify_repo_overlay(
     // --- Allow: in-sandbox preferences, inside the trust boundary. --------
     out.devenv = devenv;
     out.inject_devshell = inject_devshell;
+    // devshell: which flake devShell attr the sandbox enters — a repo names its
+    // own flake output, which runs INSIDE the sandbox (no escape/egress), so it's
+    // a benign in-sandbox preference like devenv/inject_devshell above.
+    out.devshell = devshell;
     out.shell = shell;
 
     ClassifiedRepoOverlay {
@@ -1538,11 +1543,7 @@ mod tests {
             r.sanctioned.network_block
         );
         // The original per-host denial is still reported.
-        assert!(
-            r.events
-                .iter()
-                .any(|e| e.key == "sandbox.network_allow")
-        );
+        assert!(r.events.iter().any(|e| e.key == "sandbox.network_allow"));
     }
 
     #[test]
