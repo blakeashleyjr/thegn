@@ -81,10 +81,24 @@ pub fn emit_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 
 /// Resolve the worktree a command targets: explicit arg, else `$THEGN_WORKTREE`,
 /// else the git toplevel of the cwd, else the cwd.
+///
+/// `$THEGN_WORKTREE` is the **host-canonical** path the parent thegn injects. In
+/// a local sandbox the worktree is bind-mounted at that same real path, so it
+/// exists and is used as-is. On a **remote sprite** the worktree is mounted at a
+/// *different* local path (e.g. `/home/sprite/workspace`), so the host path does
+/// not exist here — trusting it blindly breaks every worktree-scoped command
+/// (`merge add`, `land`, `wt`, `disk`, …). Guard on existence so a stale host
+/// path falls through to the git toplevel of the cwd; remote sprites then work
+/// out of the box.
 pub fn resolve_worktree(arg: Option<String>) -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     arg.map(PathBuf::from)
-        .or_else(|| std::env::var("THEGN_WORKTREE").ok().map(PathBuf::from))
+        .or_else(|| {
+            std::env::var("THEGN_WORKTREE")
+                .ok()
+                .map(PathBuf::from)
+                .filter(|p| p.exists())
+        })
         .or_else(|| thegn_core::repo::toplevel(&cwd))
         .unwrap_or(cwd)
 }
