@@ -7625,6 +7625,7 @@ async fn event_loop<T: Terminal>(
                 // `handlers::materialize` (which also streams the core's
                 // sandbox bring-up phases into the splash).
                 let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
+                let quiet = panes.tab_has_live_pane(&session.worktrees[session.active].tabs[ti]);
                 crate::handlers::materialize::maybe_materialize(
                     &mut crate::handlers::materialize::MaterializeCtx {
                         materialize_inflight: &mut materialize_inflight,
@@ -7647,6 +7648,7 @@ async fn event_loop<T: Terminal>(
                     &path,
                     ti,
                     is_terminal,
+                    quiet,
                 );
             }
         }
