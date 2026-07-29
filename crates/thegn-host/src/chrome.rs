@@ -2005,8 +2005,12 @@ pub fn render_panes<'a>(
     let any_live = frames.iter().any(|(id, _, _)| lookup(*id).is_some());
     // Show the loading splash whenever pane-launch steps are in progress,
     // even on a resurrected session (any_live may be false before the PTY
-    // forks, and we want the progress display visible immediately).
-    let show_splash = !any_live || !model.load_steps.is_empty();
+    // forks, and we want the progress display visible immediately). But only a
+    // single-leaf center may take the *fullscreen* splash: a split (>= 2 leaves)
+    // always has an existing pane to keep rendering, so load_steps must never
+    // black it out — the new leaf shows as an ordinary empty card until its
+    // shell speaks.
+    let show_splash = !any_live || (!model.load_steps.is_empty() && frames.len() == 1);
     if !show_splash {
         // The pane card owns the full center band. Paint the outside/ring
         // background before composing terminal content so no default black halo
