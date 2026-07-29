@@ -9,6 +9,8 @@
 //! shared `workspace_create` flows. The discovery channel is owned here (like
 //! `search_everywhere::PaletteSession`) so the loop only adds a one-line drain.
 
+use std::collections::HashSet;
+
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 use termwiz::terminal::TerminalWaker;
@@ -51,11 +53,22 @@ pub(crate) enum PickerOutcome {
 
 /// The picker's instant seed: most-recent first (frecency for the empty
 /// query), then every other repo the DB knows, deduped in order and
-/// stat-filtered to dirs that still exist.
-pub(crate) fn seed_repos(db: &thegn_core::db::Db) -> Vec<String> {
+/// stat-filtered to dirs that still exist — PLUS the set of already-registered
+/// workspace paths. Repos already added as workspaces (they live in the
+/// `workspaces` table and show in the sidebar) are excluded from the seed, and
+/// the returned set is carried into the picker so streamed-in discovery results
+/// are filtered the same way. Plain "recent" repos that were merely opened but
+/// never registered are kept.
+pub(crate) fn picker_seed(db: &thegn_core::db::Db) -> (Vec<String>, HashSet<String>) {
+    let added: HashSet<String> = db
+        .workspaces()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|w| w.repo_path)
+        .collect();
     let mut out: Vec<String> = Vec::new();
     let mut push = |p: String| {
-        if !out.contains(&p) && std::path::Path::new(&p).is_dir() {
+        if !added.contains(&p) && !out.contains(&p) && std::path::Path::new(&p).is_dir() {
             out.push(p);
         }
     };
@@ -65,7 +78,7 @@ pub(crate) fn seed_repos(db: &thegn_core::db::Db) -> Vec<String> {
     for p in db.known_repos().unwrap_or_default() {
         push(p);
     }
-    out
+    (out, added)
 }
 
 /// A tiny single-line editor: a text buffer plus a char-aware cursor. Enough
@@ -182,6 +195,9 @@ pub(crate) struct WorkspacePicker {
     /// Manual-entry field (kept across Tab toggles).
     manual: TextField,
     items: Vec<RepoEntry>,
+    /// Already-registered workspace paths, kept out of both the seed and any
+    /// discovery results streamed in later.
+    excluded: HashSet<String>,
     /// Indices into `items`, best match first (seed order when query empty).
     matches: Vec<usize>,
     selected: usize,
@@ -201,7 +217,7 @@ fn entry(path: String) -> RepoEntry {
 }
 
 impl WorkspacePicker {
-    pub(crate) fn new(seed: Vec<String>) -> Self {
+    pub(crate) fn new(seed: Vec<String>, excluded: HashSet<String>) -> Self {
         let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut p = Self {
             mode: PickerMode::Fuzzy,
@@ -209,6 +225,7 @@ impl WorkspacePicker {
             query: TextField::default(),
             manual: TextField::default(),
             items: seed.into_iter().map(entry).collect(),
+            excluded,
             matches: Vec::new(),
             selected: 0,
             scroll_offset: 0,
@@ -288,7 +305,7 @@ impl WorkspacePicker {
             self.scanning = false;
             changed = true;
             for p in found {
-                if !self.items.iter().any(|e| e.path == p) {
+                if !self.excluded.contains(&p) && !self.items.iter().any(|e| e.path == p) {
                     self.items.push(entry(p));
                 }
             }
@@ -802,7 +819,10 @@ mod tests {
     use super::*;
 
     fn picker(paths: &[&str]) -> WorkspacePicker {
-        WorkspacePicker::new(paths.iter().map(|s| s.to_string()).collect())
+        WorkspacePicker::new(
+            paths.iter().map(|s| s.to_string()).collect(),
+            HashSet::new(),
+        )
     }
 
     fn key(p: &mut WorkspacePicker, k: KeyCode) -> PickerOutcome {
@@ -891,7 +911,7 @@ mod tests {
     #[test]
     fn ctrl_j_k_navigate_and_scroll_clamps() {
         let paths: Vec<String> = (0..20).map(|i| format!("/code/r{i:02}")).collect();
-        let mut p = WorkspacePicker::new(paths);
+        let mut p = WorkspacePicker::new(paths, HashSet::new());
         for _ in 0..15 {
             p.handle_key(&KeyCode::Char('j'), Modifiers::CTRL);
         }
@@ -1018,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_repos_orders_recents_first_and_dedupes() {
+    fn picker_seed_orders_recents_first_and_dedupes() {
         let dir = std::env::temp_dir().join(format!("tg-picker-seed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let a = dir.join("a");
@@ -1030,14 +1050,54 @@ mod tests {
             a.to_string_lossy().into_owned(),
             b.to_string_lossy().into_owned(),
         );
-        // `b` is known via a workspace row; `a` is a (newer) recent repo.
-        db.put_workspace(&b_s, "b", "repo").unwrap();
+        // `b` is known via a worktree row (not a workspace, so not excluded);
+        // `a` is a (newer) recent repo, so it sorts first.
+        db.put_worktree(
+            "b/main",
+            &b_s,
+            &b.join("main").to_string_lossy(),
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
         db.touch_repo(&a_s, "a").unwrap();
-        let seed = seed_repos(&db);
+        let (seed, _excluded) = picker_seed(&db);
         assert_eq!(seed, vec![a_s.clone(), b_s.clone()]);
         // A vanished dir is filtered out.
         db.touch_repo("/no/such/dir", "gone").unwrap();
-        assert_eq!(seed_repos(&db), vec![a_s, b_s]);
+        assert_eq!(picker_seed(&db).0, vec![a_s, b_s]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picker_seed_excludes_already_added_workspaces() {
+        let dir = std::env::temp_dir().join(format!("tg-picker-excl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let added = dir.join("added");
+        let recent = dir.join("recent");
+        std::fs::create_dir_all(&added).unwrap();
+        std::fs::create_dir_all(&recent).unwrap();
+        let db = thegn_core::db::Db::open_at(&dir.join("db.sqlite")).unwrap();
+        let (added_s, recent_s) = (
+            added.to_string_lossy().into_owned(),
+            recent.to_string_lossy().into_owned(),
+        );
+        // `added` is a registered workspace (and also touched as a recent, to
+        // prove exclusion still wins); `recent` was only ever opened.
+        db.put_workspace(&added_s, "added", "repo").unwrap();
+        db.touch_repo(&added_s, "added").unwrap();
+        db.touch_repo(&recent_s, "recent").unwrap();
+        let (seed, excluded) = picker_seed(&db);
+        assert!(
+            !seed.contains(&added_s),
+            "added workspace excluded from the seed: {seed:?}"
+        );
+        assert!(
+            seed.contains(&recent_s),
+            "a plain recent (unregistered) repo is kept: {seed:?}"
+        );
+        assert!(excluded.contains(&added_s));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
