@@ -4,7 +4,62 @@
 //! the many `ssh_base()` call sites that carry no `Config` read them from the
 //! same holders the render caps use.
 
+use crate::config::{config_enum, config_warn};
 use serde::{Deserialize, Serialize};
+
+config_enum! {
+    /// `[merge_queue] remote_mode` — how a worktree on a **remote host** (sprite)
+    /// gets its branch onto the target's `main`. Inert for an on-host worktree,
+    /// whose branch folds in-process as usual.
+    ///
+    /// - `RouteToHost` — the enqueue is sent to the **target host's** daemon over
+    ///   the control plane, so the host's DB owns the row and its drain
+    ///   bundle-fetches the sprite's tip; the host queue stays authoritative (one
+    ///   gate, one ordering). Needs a control endpoint + merge-scoped token
+    ///   injected into the sprite at provision time.
+    /// - `Push` — the sprite drains its **own** clone (fold + gate + advance its
+    ///   local target), then `git push`es the advanced target to `origin`. No host
+    ///   reach or token; each sprite lands independently and `origin` converges.
+    pub enum MergeRemoteMode: "merge_queue remote mode" {
+        RouteToHost = "route_to_host" | "route-to-host" | "host",
+        Push = "push",
+    } default = RouteToHost;
+}
+
+config_enum! {
+    /// Where a remote worktree lives. (Re-exported from `config` — kept here with
+    /// the other remote/data-placement enums to keep `config.rs` off the ratchet.)
+    pub enum RemoteMode: "remote mode" {
+        Remote = "remote", LocalExec = "local_exec", Sshfs = "sshfs",
+    } default = Remote;
+}
+
+config_enum! {
+    /// Where an environment's worktree files physically live. `in_env` (the
+    /// default) keeps files where the env runs — on the host for `local`, in the
+    /// pod/sandbox for remote placements (today's behavior). `local_exec` keeps
+    /// files on the host and only execs remotely. `sshfs` FUSE-mounts the remote
+    /// tree locally; `sync` keeps a local working copy kept coherent with the
+    /// remote via a changed-files (rsync) delta. Both `sshfs`/`sync` run the pane
+    /// *locally at the mountpoint* (the placement is used only to project the
+    /// tree); their mount/sync lifecycle is auto-run on pane spawn/close.
+    pub enum DataMode: "data mode" {
+        InEnv = "in_env" | "remote" | "native",
+        LocalExec = "local_exec" | "local",
+        Sshfs = "sshfs" | "mount",
+        Sync = "sync" | "rsync",
+    } default = InEnv;
+}
+
+/// Map the legacy `[sandbox.remote] mode` onto the env [`DataMode`], so the
+/// default env honours an existing `mode = "sshfs"`/`"local_exec"` config.
+pub(crate) fn data_mode_from_remote(mode: RemoteMode) -> DataMode {
+    match mode {
+        RemoteMode::Remote => DataMode::InEnv,
+        RemoteMode::LocalExec => DataMode::LocalExec,
+        RemoteMode::Sshfs => DataMode::Sshfs,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
