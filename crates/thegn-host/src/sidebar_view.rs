@@ -436,13 +436,14 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
 /// stay legible in a narrow column; the chords mirror the real keymap
 /// (`Alt/Ctrl+N` jumps, tree motion, filter, the `?` card — see
 /// `handlers/sidebar_keys.rs`).
-fn sidebar_hint_rows() -> [(&'static str, &'static str); 6] {
+fn sidebar_hint_rows() -> [(&'static str, &'static str); 7] {
     [
         ("Alt+1-9", "jump worktree"),
         ("Ctrl+1-9", "jump workspace"),
         ("j / k", "move up/down"),
         ("Enter", "open / fold"),
         ("/", "filter"),
+        ("s", "sort"),
         ("?", "all keys"),
     ]
 }
