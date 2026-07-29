@@ -58,6 +58,20 @@ pub struct NixCacheHandle {
 pub async fn serve(addr: SocketAddr) -> anyhow::Result<NixCacheHandle> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let port = listener.local_addr()?.port();
+    // host_cache only reaches a sprite over the resident musl bridge's reverse
+    // tunnel. With no bridge binary resolvable, `agent` neither pushes the bridge
+    // nor injects the :8484 substituter — this server binds but is unreachable
+    // in-sprite, so the devShell silently builds FROM SOURCE. Warn loudly at the
+    // one place that proves host_cache is on. (Fix: `just bridge`, or install
+    // `.#default`, which now bundles `thegn-musl` beside the binary.)
+    if crate::bridge_sup::bridge_binary_path().is_none() {
+        tracing::warn!(
+            target: "thegn::startup",
+            "host_cache enabled but no `thegn-musl` bridge found (THEGN_BRIDGE_BINARY \
+             unset and none beside the thegn binary) — the in-sprite :8484 cache \
+             tunnel won't bind, so sprites build the devShell from source"
+        );
+    }
     let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router()).await {
             tracing::warn!(target: "thegn::nixcache", error = %e, "nix cache server exited");

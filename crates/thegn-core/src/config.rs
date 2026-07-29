@@ -2535,6 +2535,9 @@ pub struct SandboxOverlay {
     pub warm_direnv: Option<WarmDirenv>,
     pub devenv: Option<bool>,
     pub inject_devshell: Option<bool>,
+    /// Per-env override of `[sandbox] devshell` (the flake devShell attr a
+    /// sandbox/sprite enters, e.g. `"sprite-full"`), via `THEGN_DEVSHELL`.
+    pub devshell: Option<String>,
     pub nix_daemon: Option<bool>,
     pub shell: Option<String>,
     pub on_missing: Option<OnMissing>,
@@ -2561,152 +2564,8 @@ pub struct RemoteOverlay {
     pub forward_agent: Option<bool>,
 }
 
-impl SandboxOverlay {
-    pub(crate) fn apply(self, base: &mut SandboxConfig) {
-        if let Some(v) = self.enabled {
-            base.enabled = v;
-        }
-        if let Some(v) = self.backend {
-            base.backend = v;
-        }
-        if let Some(v) = self.default_backend {
-            base.default_backend = v;
-        }
-        if let Some(v) = self.default_env {
-            base.default_env = v;
-        }
-        if let Some(v) = self.main_env {
-            base.main_env = v;
-        }
-        if let Some(v) = self.backend_chain {
-            base.backend_chain = v;
-        }
-        if let Some(v) = self.image {
-            base.image = v;
-        }
-        if let Some(v) = self.profile {
-            base.profile = v;
-        }
-        if let Some(v) = self.agent_profile {
-            base.agent_profile = v;
-        }
-        if let Some(v) = self.network {
-            base.network = v;
-        }
-        if let Some(v) = self.file_access {
-            base.file_access = v;
-        }
-        if let Some(v) = self.ports {
-            base.ports = v;
-        }
-        if let Some(v) = self.gpu {
-            base.gpu = Some(v);
-        }
-        if let Some(v) = self.limits {
-            base.limits = v;
-        }
-        if let Some(v) = self.volumes {
-            base.volumes = v;
-        }
-        if let Some(v) = self.compose {
-            base.compose = Some(v);
-        }
-        if let Some(v) = self.env_passthrough {
-            base.env_passthrough = v;
-        }
-        if let Some(v) = self.auto_caches {
-            base.auto_caches = v;
-        }
-        if let Some(v) = self.mounts {
-            base.mounts = v;
-        }
-        if let Some(v) = self.init_script {
-            base.init_script = v;
-        }
-        if let Some(v) = self.prepare {
-            base.prepare = v;
-        }
-        if let Some(v) = self.warm_direnv {
-            base.warm_direnv = v;
-        }
-        if let Some(v) = self.devenv {
-            base.devenv = v;
-        }
-        if let Some(v) = self.inject_devshell {
-            base.inject_devshell = v;
-        }
-        if let Some(v) = self.nix_daemon {
-            base.nix_daemon = v;
-        }
-        if let Some(v) = self.shell {
-            base.shell = v;
-        }
-        if let Some(v) = self.on_missing {
-            base.on_missing = v;
-        }
-        if let Some(r) = self.remote {
-            r.apply(&mut base.remote);
-        }
-        if let Some(v) = self.network_allow {
-            base.network_allow = v;
-        }
-        if let Some(v) = self.network_block {
-            base.network_block = v;
-        }
-        if let Some(v) = self.network_audit {
-            base.network_audit = v;
-        }
-        if let Some(v) = self.vpn {
-            base.vpn = v;
-        }
-        if let Some(h) = self.home {
-            h.apply(&mut base.home);
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        // `skip_serializing_if` for env/profile `[…sandbox]` overlays: EVERY field
-        // must be checked or it is silently dropped through the serde round-trip
-        // in apply_toml_overlay / apply_override_str. Test:
-        // sandbox_overlay_is_empty_covers_every_field.
-        self.enabled.is_none()
-            && self.backend.is_none()
-            && self.default_backend.is_none()
-            && self.default_env.is_none()
-            && self.main_env.is_none()
-            && self.backend_chain.is_none()
-            && self.image.is_none()
-            && self.profile.is_none()
-            && self.agent_profile.is_none()
-            && self.network.is_none()
-            && self.file_access.is_none()
-            && self.ports.is_none()
-            && self.gpu.is_none()
-            && self.limits.is_none()
-            && self.volumes.is_none()
-            && self.compose.is_none()
-            && self.env_passthrough.is_none()
-            && self.auto_caches.is_none()
-            && self.mounts.is_none()
-            && self.init_script.is_none()
-            && self.prepare.is_none()
-            && self.warm_direnv.is_none()
-            && self.devenv.is_none()
-            && self.inject_devshell.is_none()
-            && self.nix_daemon.is_none()
-            && self.shell.is_none()
-            && self.on_missing.is_none()
-            && self.remote.is_none()
-            && self.network_allow.is_none()
-            && self.network_block.is_none()
-            && self.network_audit.is_none()
-            && self.vpn.is_none()
-            && self.home.as_ref().is_none_or(|h| h.is_empty())
-    }
-}
-
 impl RemoteOverlay {
-    fn apply(self, base: &mut RemoteConfig) {
+    pub(crate) fn apply(self, base: &mut RemoteConfig) {
         if let Some(v) = self.host {
             base.host = v;
         }

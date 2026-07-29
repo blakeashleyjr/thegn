@@ -2066,6 +2066,12 @@ fn sandbox_overlay_is_empty_covers_every_field() {
     };
     assert!(!inject.is_empty(), "inject_devshell set must not be empty");
 
+    let devshell = SandboxOverlay {
+        devshell: Some("sprite-full".into()),
+        ..Default::default()
+    };
+    assert!(!devshell.is_empty(), "devshell set must not be empty");
+
     let nixd = SandboxOverlay {
         nix_daemon: Some(true),
         ..Default::default()
