@@ -1505,12 +1505,16 @@ devenv = false
 # linters/formatters/tools out of the box. No-op for repos without a devShell.
 inject_devshell = true
 # Which flake devShell a sandbox/sprite enters. Empty = the flake default (same as
-# host dev). Set to a leaner attr (e.g. "sandbox" → `.#devShells.sandbox`) so a
-# remote sprite builds/seeds a much smaller closure — only what's needed to build
-# the project, not the full lint/test/preview toolset. Exported as
-# THEGN_DEVSHELL into the sandbox; the repo's `.envrc` must read it
+# host dev — the FULL closure). Set to a leaner attr so a remote sprite builds/seeds
+# a much smaller closure. thegn's own flake ships two lean attrs: "sandbox" (rust +
+# just only) and "sprite-full" (the full lint/test/coverage/openspec replica MINUS
+# rust-docs, the darwin/windows cross-targets, and the muse e2e harness — so
+# `just ci` works, but not `just check-cross`/`just e2e`). Exported as THEGN_DEVSHELL
+# into the sandbox; the repo's `.envrc` must read it
 # (`use flake ".#${THEGN_DEVSHELL:-default}"`). Missing tools are then a
-# `nix shell nixpkgs#<tool>` away in-pane.
+# `nix shell nixpkgs#<tool>` away in-pane. Override PER-ENV with
+# `[env.<name>.sandbox] devshell = "..."` (e.g. give sprites the lean "sprite-full"
+# while a bigger VPS env keeps the full default).
 # devshell = "sandbox"
 # Tier B: bind-mount the host Nix daemon socket into the sandbox so full
 # `nix develop`/`build`/`fmt` run INSIDE it. `true` forces it on for every

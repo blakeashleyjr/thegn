@@ -194,6 +194,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
             "resolved": caps_json(&resolved),
             "sandbox": sandbox_json(cfg),
             "remote_sandbox": remote_sandbox_json(cfg),
+            "provider_cache": provider_cache_json(cfg),
             "managed_tools": managed_tools_json(cfg),
             "mcp_servers": mcp_servers_json(cfg),
         });
@@ -239,6 +240,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     remote_sandbox_report(cfg);
+
+    outln!("");
+    provider_cache_report(cfg);
 
     outln!("");
     home_layer_report(cfg);
@@ -426,6 +430,95 @@ fn remote_sandbox_json(cfg: &Config) -> serde_json::Value {
             );
         }
         map.insert(name, serde_json::Value::Object(backends));
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Sorted names of every `[env.*]` that declares a provider.
+fn provider_env_names(cfg: &Config) -> Vec<&String> {
+    let mut names: Vec<&String> = cfg
+        .env
+        .iter()
+        .filter(|(_, e)| !e.provider.provider.trim().is_empty())
+        .map(|(n, _)| n)
+        .collect();
+    names.sort();
+    names
+}
+
+/// The flake devShell attr a sandbox for this env enters: the per-env
+/// `[env.*.sandbox] devshell` override, else the global `[sandbox] devshell`,
+/// else `default`.
+fn env_devshell(cfg: &Config, e: &thegn_core::config::EnvConfig) -> String {
+    e.sandbox
+        .devshell
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(cfg.sandbox.devshell.trim()).filter(|s| !s.is_empty()))
+        .unwrap_or("default")
+        .to_string()
+}
+
+/// Provider dev-env caching health: for each `[env.*]` with a provider, the
+/// devShell attr its sandbox enters, whether a persistent binary cache is
+/// configured, and — when `host_cache = true` — whether the resident musl bridge
+/// that carries the :8484 reverse-tunnel cache is actually resolvable. A
+/// host_cache with NO bridge silently no-ops: the sprite's nix.conf gets no
+/// working substituter and the devShell builds from source. Detection only.
+fn provider_cache_report(cfg: &Config) {
+    outln!("Provider dev-env cache ([env.*.provider])");
+    let names = provider_env_names(cfg);
+    if names.is_empty() {
+        outln!("  (no provider envs configured)");
+        return;
+    }
+    let bridge = crate::bridge_sup::bridge_binary_path();
+    for name in names {
+        let e = &cfg.env[name];
+        let p = &e.provider;
+        let cache = if p.binary_cache_url.trim().is_empty() {
+            "cache=(none — set binary_cache_url)".to_string()
+        } else {
+            format!("cache={}", p.binary_cache_url.trim())
+        };
+        outln!(
+            "  {name:<12} {} · devshell={} · {cache}",
+            p.provider.trim(),
+            env_devshell(cfg, e),
+        );
+        if p.host_cache {
+            match &bridge {
+                Some(pth) => outln!("               host_cache: on (bridge {})", pth.display()),
+                None => {
+                    outln!("               host_cache: ON but BRIDGE MISSING — sprites build the");
+                    outln!("               devShell FROM SOURCE. Fix: `just bridge` (or install");
+                    outln!(
+                        "               `.#default`, which bundles `thegn-musl`), then restart."
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn provider_cache_json(cfg: &Config) -> serde_json::Value {
+    let bridge_present = crate::bridge_sup::bridge_binary_path().is_some();
+    let mut map = serde_json::Map::new();
+    for name in provider_env_names(cfg) {
+        let e = &cfg.env[name];
+        let p = &e.provider;
+        map.insert(
+            name.clone(),
+            serde_json::json!({
+                "provider": p.provider.trim(),
+                "devshell": env_devshell(cfg, e),
+                "binary_cache_url": p.binary_cache_url.trim(),
+                "host_cache": p.host_cache,
+                "bridge_present": bridge_present,
+                "host_cache_effective": p.host_cache && bridge_present,
+            }),
+        );
     }
     serde_json::Value::Object(map)
 }
@@ -943,5 +1036,53 @@ args = ["--verbose"]
         remote_sandbox_report(&cfg);
         assert_eq!(probe_word(RuntimeProbe::Present), "present");
         assert!(probe_word(RuntimeProbe::Unreachable).starts_with("unreachable"));
+    }
+
+    #[test]
+    fn provider_cache_reports_env_devshell_and_bridge_relation() {
+        // No provider envs by default → the surface is an empty object.
+        let cfg = Config::default();
+        assert!(provider_env_names(&cfg).is_empty());
+        assert_eq!(provider_cache_json(&cfg), serde_json::json!({}));
+
+        // A provider env with host_cache + a per-env devshell override is reported;
+        // `host_cache_effective` is exactly `host_cache && bridge_present` (we don't
+        // assert the absolute bridge state — it depends on the test host).
+        use thegn_core::config::{EnvConfig, EnvProviderConfig, SandboxOverlay};
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "sprites".into(),
+            EnvConfig {
+                provider: EnvProviderConfig {
+                    provider: "sprites".into(),
+                    host_cache: true,
+                    ..Default::default()
+                },
+                sandbox: SandboxOverlay {
+                    devshell: Some("sprite-full".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let v = provider_cache_json(&cfg);
+        let s = &v["sprites"];
+        assert_eq!(s["provider"], "sprites");
+        assert_eq!(s["devshell"], "sprite-full");
+        assert_eq!(s["host_cache"], true);
+        let bridge = s["bridge_present"].as_bool().unwrap();
+        assert_eq!(s["host_cache_effective"], bridge);
+        // env_devshell falls back to the global default when no override is set.
+        let plain = EnvConfig {
+            provider: EnvProviderConfig {
+                provider: "fly".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(env_devshell(&cfg, &plain), "default");
+        // The human report runs without panicking.
+        provider_cache_report(&cfg);
     }
 }
