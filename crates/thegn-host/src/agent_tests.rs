@@ -656,33 +656,40 @@ fn shell_inner_oci_emits_runtime_probe_chain() {
         oci.contains("command -v"),
         "should probe for shell availability"
     );
-    // Must end by exec'ing the probed shell (/bin/sh when nothing matched).
+    // The `$sel` selector execs the probed shell (/bin/sh when nothing matched),
+    // and the snippet ends by running that selector in the base env.
     assert!(
-        oci.ends_with("exec \"$tgsh\" -l") && oci.contains("${tgsh:=/bin/sh}"),
-        "must end with the probed shell (with a /bin/sh last resort)"
+        oci.contains("exec \"$tgsh\" -l'") && oci.contains("${tgsh:=/bin/sh}"),
+        "the $sel selector must exec the probed shell (with a /bin/sh last resort)"
+    );
+    assert!(
+        oci.ends_with("exec sh -lc \"$sel\""),
+        "must end by running the selector in the base env"
     );
     // bash must always appear in the chain (present in every Debian image).
     assert!(oci.contains("bash"), "bash must be in the probe chain");
     // Enters the flake devShell hook-independently when the workspace has an
     // `.envrc`, so a read-only-`~/.zshrc` image still enters the project
     // toolchain — via `direnv exec` (flavor-proof), never by eval'ing
-    // bash-flavored export dumps in this POSIX (dash) wrapper.
+    // bash-flavored export dumps in this POSIX (dash) wrapper. The login shell
+    // is selected FROM INSIDE that env (the reproduced zsh lives in the devShell,
+    // not the bare base PATH), so the entry runs the `$sel` selector.
     assert!(
-        oci.contains("[ -e .envrc ]") && oci.contains("direnv exec . \"$tgsh\" -l"),
+        oci.contains("[ -e .envrc ]") && oci.contains("direnv exec . sh -lc \"$sel\""),
         "OCI shell must enter the devShell env when an .envrc is present: {oci}"
     );
     let devshell_at = oci.find("direnv exec").unwrap();
-    let shell_at = oci.find("exec \"$tgsh\" -l").unwrap();
+    let shell_at = oci.find("exec sh -lc \"$sel\"").unwrap();
     assert!(
         devshell_at < shell_at,
-        "devShell entry must come BEFORE the bare login-shell exec"
+        "devShell entry must come BEFORE the base-env selector"
     );
     // Pure-devenv fallback: no `.envrc` but a `devenv.nix` + the `devenv` CLI ⇒
     // enter `devenv shell` with the probed login shell, guarded so any failure
     // falls through to the bare chain rather than killing the pane.
     assert!(
         oci.contains("[ -e devenv.nix ] && command -v devenv")
-            && oci.contains("devenv shell -- \"$tgsh\" -l")
+            && oci.contains("devenv shell -- sh -lc \"$sel\"")
             && oci.contains("&& exit"),
         "OCI shell must fall back to `devenv shell` for a pure-devenv repo: {oci}"
     );
