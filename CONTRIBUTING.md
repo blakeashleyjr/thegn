@@ -123,5 +123,5 @@ experience differs from unix — nix/devenv and the justfile don't apply:
   panes, handlers.
 
 Read [`CLAUDE.md`](CLAUDE.md) before touching the event loop or render path —
-the 0%-idle and render-plan invariants are enforced by tests, and source
-files are size-capped by a ratchet (`test/file-size-ratchet.sh`).
+the 0%-idle and render-plan invariants are enforced by tests. Prefer sibling
+modules over growing the large legacy files (run.rs, config.rs, …).
