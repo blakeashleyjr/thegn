@@ -2058,3 +2058,42 @@ fn checks_render_inside_the_open_git_section() {
     assert!(text.contains("lint"), "{text:?}");
     assert!(text.contains("#42"), "{text:?}");
 }
+
+#[test]
+fn center_shows_splash_agrees_across_render_paths() {
+    use crate::center::{CenterTree, Dir};
+    let area = Rect {
+        x: 0,
+        y: 0,
+        cols: 40,
+        rows: 20,
+    };
+
+    // No live pane ⇒ splash (fresh launch before the PTY forks, or all dead).
+    let frames = CenterTree::single(1).layout_framed(area);
+    let empty = FrameModel::default();
+    assert!(center_shows_splash(&frames, &empty, |_| false));
+
+    // Single live leaf, launch steps in progress ⇒ splash (the local-devenv
+    // build case that used to flash through the incremental path).
+    let loading = FrameModel {
+        load_steps: vec![
+            LoadStep::done("sandbox"),
+            LoadStep::done("container (host)"),
+            LoadStep::active("shell"),
+        ],
+        ..FrameModel::default()
+    };
+    assert!(center_shows_splash(&frames, &loading, |_| true));
+
+    // Single live leaf, no steps ⇒ pane content, never the splash.
+    assert!(!center_shows_splash(&frames, &empty, |_| true));
+
+    // A ≥2-leaf split never takes the fullscreen splash even mid-launch — the
+    // existing pane keeps rendering while the new leaf fills in.
+    let mut tree = CenterTree::single(1);
+    assert!(tree.split(1, Dir::Row, 2));
+    let split_frames = tree.layout_framed(area);
+    assert_eq!(split_frames.len(), 2);
+    assert!(!center_shows_splash(&split_frames, &loading, |_| true));
+}
