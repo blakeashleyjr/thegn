@@ -44,7 +44,7 @@ to 95% first.
 | Stage          | What runs                                                                      | Where                  |
 | -------------- | ------------------------------------------------------------------------------ | ---------------------- |
 | **inner loop** | `just quick [crate]` — clippy on lib/bin only (no tests/coverage)              | on demand (fast)       |
-| **pre-commit** | treefmt, shellcheck, yamllint, god-file ratchet                                | devenv git-hook (fast) |
+| **pre-commit** | treefmt, shellcheck, yamllint                                                  | devenv git-hook (fast) |
 | **pre-push**   | clippy, `cargo test`, smoke                                                    | devenv git-hook        |
 | **CI**         | `just ci` (fmt + lint + build + test + **coverage** + smoke + e2e + nix-build) | authoritative          |
 

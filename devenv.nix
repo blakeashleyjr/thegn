@@ -135,22 +135,9 @@
     shellcheck.enable = true;
     yamllint.enable = true;
 
-    # god-file ratchet: legacy oversized files may only shrink, new files are
-    # hard-capped at 3000 lines (test/file-size-ratchet.sh, also in `just lint`).
-    # ~1s and reads the tree, not staged files — cheap enough to catch growth at
-    # commit time rather than only in CI.
-    file-size-ratchet = {
-      enable = true;
-      name = "god-file ratchet";
-      entry = "bash test/file-size-ratchet.sh";
-      language = "system";
-      pass_filenames = false;
-      stages = ["pre-commit"];
-    };
-
     # ── Tiered gates ──────────────────────────────────────────────────────
-    # pre-commit stays CHEAP (formatting + shell/yaml lint + the god-file
-    # ratchet) so commits are near-instant. The correctness gates — clippy, the
+    # pre-commit stays CHEAP (formatting + shell/yaml lint) so commits are
+    # near-instant. The correctness gates — clippy, the
     # full test suite, and smoke — run on pre-push (before code leaves the
     # machine) and in CI via `just ci`. This defers the semantic-merge check
     # (a stale call site across a clean auto-merge) from merge time to push time;

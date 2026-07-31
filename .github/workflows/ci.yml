@@ -63,8 +63,7 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just fmt-check
   lint:
-    # `just lint` also carries the git_cmd guard (no raw Command::new("git"))
-    # and the file-size ratchet (test/file-size-ratchet.sh).
+    # `just lint` also carries the git_cmd guard (no raw Command::new("git")).
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 30
     steps:

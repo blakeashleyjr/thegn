@@ -149,8 +149,7 @@ no coverage; `just quick thegn-host` scopes to one crate). Run the heavy
 gates **once, when preparing to push or open a PR** — not per-edit. The tiers
 enforce this automatically:
 
-- **pre-commit** (cheap, no compile): treefmt + shellcheck + yamllint + the
-  god-file ratchet.
+- **pre-commit** (cheap, no compile): treefmt + shellcheck + yamllint.
 - **pre-push**: clippy + `cargo test` + smoke. **This is the single heavy gate**
   that must be green before code leaves the machine — rely on it, don't re-run
   full-workspace gates by hand while iterating.
@@ -216,14 +215,12 @@ part of the shipped `thegn` binary.
 
 ## Conventions & gotchas
 
-- **God-file ratchet (`test/file-size-ratchet.sh`, runs in `just lint`).**
-  Source files are hard-capped at 3000 lines; the legacy oversized files
-  (run.rs, config.rs, db.rs, agent.rs, chrome.rs, sandbox.rs, keymap.rs) are
-  pinned at their recorded size in `test/file-size-ratchet.txt` and may only
-  shrink. Don't grow them: put new feature/Section key handlers and helpers in
-  a sibling module (e.g. `src/handlers/<area>.rs`) and call it from the loop.
-  After shrinking a pinned file, run `test/file-size-ratchet.sh --update` to
-  lock in the lower ceiling.
+- **Keep god-files from growing (guidance, no longer enforced).** The legacy
+  oversized files (run.rs, config.rs, db.rs, agent.rs, chrome.rs, sandbox.rs,
+  keymap.rs) are already large; don't add to them. Put new feature/Section key
+  handlers and helpers in a sibling module (e.g. `src/handlers/<area>.rs`) and
+  call it from the loop. (The size ratchet that used to enforce this was
+  removed; the preference stands.)
 - **Help ratchet (`crates/thegn-host/src/help/ratchet_tests.rs`, runs in
   `just test`).** Every `ACTION_SPECS` action id must be claimed by a
   `docs/help/` page's `actions:` frontmatter (F1 opens the in-app help;

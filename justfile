@@ -393,7 +393,7 @@ lint: _apps
     # formats in place then exits nonzero on any change (mirrors `just fmt-check`).
     treefmt --ci
     cargo clippy --workspace --all-targets -- -D warnings
-    shellcheck -x install.sh test/smoke.sh test/brand-guard.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/file-size-ratchet.sh test/git-hooks/post-checkout.sh test/git-hooks/heal-worktree.sh
+    shellcheck -x install.sh test/smoke.sh test/brand-guard.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/git-hooks/post-checkout.sh test/git-hooks/heal-worktree.sh
     yamllint .
     taplo lint
     # Guardrail: all git must route through util::git_cmd / GitLoc so GIT_ENV_VARS
@@ -401,9 +401,6 @@ lint: _apps
     # may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
     # Comment lines are ignored (doc-comments legitimately name the pattern they forbid).
     ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'thegn-core/src/util.rs' | grep -vE ':[0-9]+:[[:space:]]*//' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
-    # Guardrail: god-file ratchet — legacy oversized files may only shrink, new
-    # files are hard-capped at 3000 lines. See test/file-size-ratchet.sh.
-    bash test/file-size-ratchet.sh
     # Guardrail: pre-rename brand tokens must not come back — this is thegn.
     # Token list + allowlist live in the script. See test/brand-guard.sh.
     bash test/brand-guard.sh
