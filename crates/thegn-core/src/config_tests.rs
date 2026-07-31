@@ -2177,5 +2177,52 @@ fn validate_str_catches_wholesale_type_error() {
     assert!(validate_str("picker = \"fzf\"\n").is_empty());
 }
 
+#[test]
+fn clamp_to_channel_neutralises_experimental_in_stable() {
+    use crate::channel::{Channel, Feature};
+    use crate::config_issues::IssueProviderKind as K;
+
+    let mut cfg = Config::default();
+    // Turn on every experimental toggle the way a user's config might.
+    cfg.llm_proxy.enabled = true;
+    cfg.observe.enabled = true;
+    cfg.placement.enabled = true;
+    cfg.sandbox.remote.host = "box.example".into();
+    cfg.host.insert("gpu".into(), Default::default());
+    cfg.issues.provider = K::Linear;
+    cfg.issues.providers = vec![K::Linear, K::Github, K::Kaneo];
+
+    let clamped = cfg.clamp_to_channel(Channel::Stable);
+
+    // Every gated master toggle is forced off.
+    assert!(!cfg.llm_proxy.enabled);
+    assert!(!cfg.observe.enabled);
+    assert!(!cfg.placement.enabled);
+    assert!(cfg.sandbox.remote.host.is_empty());
+    assert!(cfg.host.is_empty());
+    // Trackers: GitHub survives, Linear/Kaneo are dropped.
+    assert_eq!(cfg.issues.provider, K::None);
+    assert_eq!(cfg.issues.providers, vec![K::Github]);
+    // All six gated features report as clamped.
+    assert_eq!(clamped.len(), Feature::ALL.len());
+}
+
+#[test]
+fn clamp_to_channel_is_a_noop_in_dev() {
+    use crate::channel::Channel;
+    let mut cfg = Config::default();
+    cfg.llm_proxy.enabled = true;
+    cfg.observe.enabled = true;
+    cfg.sandbox.remote.host = "box.example".into();
+    let before = cfg.clone();
+
+    let clamped = cfg.clamp_to_channel(Channel::Dev);
+
+    assert!(clamped.is_empty(), "dev honours every feature");
+    assert_eq!(cfg.llm_proxy.enabled, before.llm_proxy.enabled);
+    assert_eq!(cfg.observe.enabled, before.observe.enabled);
+    assert_eq!(cfg.sandbox.remote.host, before.sandbox.remote.host);
+}
+
 #[path = "config_tests_coverage.rs"]
 mod coverage;

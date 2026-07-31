@@ -19,6 +19,13 @@ path = "src/main.rs"
 # signal handler are only compiled in under this feature. Build with
 # `cargo build --features profiling` (see `just profile`).
 profiling = ["dep:pprof"]
+# The dev release channel. Empty by design — it does not pull in extra code,
+# it only flips the compiled-in *default* channel to `dev` so experimental
+# subsystems (remotes, AI/proxy, observe, placement, non-GitHub trackers) are
+# honoured instead of clamped off. `THEGN_CHANNEL` overrides it either way.
+# The regular build omits this (default = stable); Nix builds `.#dev` with it.
+# See `src/channel_state.rs` and `thegn_core::channel`.
+dev = []
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }

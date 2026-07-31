@@ -2,6 +2,20 @@
 # All keys are optional (sane defaults apply). Home-manager users get this
 # generated automatically from programs.thegn.
 
+# ── Release channel ───────────────────────────────────────────────────────────
+# thegn ships in two channels. The regular (stable) build runs the AI-free
+# workspace shell — git/worktrees/panes/sidebar/panel, the command palette,
+# sessions, sandboxing, and the CLI merge/land/integrate queue. Several
+# subsystems are still experimental and are DISABLED in the stable build even if
+# the keys below are set: remotes ([sandbox.remote]), the LLM proxy + agents
+# ([llm_proxy], [[agents]]), the Observe dashboards ([observe]), the placement
+# engine ([placement]), and the non-GitHub issue trackers ([issues]: Linear /
+# Jira / Kaneo). GitHub PR/issue viewing stays available in both channels.
+# To enable the experimental subsystems, run the dev build (`nix run .#dev`,
+# installed as `thegn-dev`) or set THEGN_CHANNEL=dev for one run. `thegn doctor`
+# prints the resolved channel and which features it allows. There is no config
+# key for the channel — it is a property of the binary/env, not the config file.
+
 # Where worktrees live (grouped per repo) and where remote URLs are cloned.
 worktrees_dir = "~/.thegn/worktrees"
 workspaces_dir = "~/code"

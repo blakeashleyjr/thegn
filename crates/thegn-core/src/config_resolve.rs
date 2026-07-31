@@ -943,6 +943,79 @@ use crate::env::Environment;
 use crate::remote::GitLoc;
 use std::path::Path;
 
+impl Config {
+    /// Neutralise experimental subsystems that are not allowed in `channel`.
+    ///
+    /// Called by the host immediately after config load, once the release
+    /// channel is resolved. In the stable channel this forces every dev-only
+    /// feature's master toggle off — mirroring the repo-overlay clamp above —
+    /// so an experimental key left in a user's config is inert rather than
+    /// silently half-active. AI is gated at the `[llm_proxy]` master switch
+    /// only; the `[[agents]]` launcher list (which also holds the plain-shell
+    /// entry) is left untouched. Trackers keep stable GitHub Issues and drop
+    /// only Linear/Jira/Kaneo. Returns the features actually changed, so the
+    /// caller can surface a one-line status note.
+    pub fn clamp_to_channel(
+        &mut self,
+        channel: crate::channel::Channel,
+    ) -> Vec<crate::channel::Feature> {
+        use crate::channel::Feature;
+        let mut clamped = Vec::new();
+        for feat in Feature::ALL {
+            if feat.allowed_in(channel) {
+                continue;
+            }
+            let changed = match feat {
+                Feature::Remote => {
+                    let was = !self.sandbox.remote.host.is_empty();
+                    self.sandbox.remote.host.clear();
+                    was
+                }
+                Feature::Providers => {
+                    let was = !self.host.is_empty();
+                    self.host.clear();
+                    was
+                }
+                Feature::Ai => {
+                    let was = self.llm_proxy.enabled;
+                    self.llm_proxy.enabled = false;
+                    was
+                }
+                Feature::Observe => {
+                    let was = self.observe.enabled;
+                    self.observe.enabled = false;
+                    was
+                }
+                Feature::Placement => {
+                    let was = self.placement.enabled;
+                    self.placement.enabled = false;
+                    was
+                }
+                Feature::Trackers => {
+                    // Keep stable GitHub Issues; drop the experimental trackers.
+                    use crate::config_issues::IssueProviderKind as K;
+                    let is_exp = |k: K| !matches!(k, K::None | K::Github);
+                    let mut was = is_exp(self.issues.provider);
+                    if is_exp(self.issues.provider) {
+                        self.issues.provider = K::None;
+                    }
+                    let before = self.issues.providers.len();
+                    self.issues.providers.retain(|k| !is_exp(*k));
+                    was |= self.issues.providers.len() != before;
+                    let before = self.issues.issue_accounts.len();
+                    self.issues.issue_accounts.retain(|a| !is_exp(a.provider));
+                    was |= self.issues.issue_accounts.len() != before;
+                    was
+                }
+            };
+            if changed {
+                clamped.push(feat);
+            }
+        }
+        clamped
+    }
+}
+
 /// A fully-resolved repo sandbox plus the clamp outcome for surfacing.
 pub struct ResolvedRepoSandbox {
     /// The effective sandbox config (global + profile [+ zone] + clamped repo +

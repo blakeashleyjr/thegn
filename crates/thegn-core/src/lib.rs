@@ -18,6 +18,7 @@ pub mod blame;
 pub mod bundle;
 pub mod capabilities;
 pub mod capacity;
+pub mod channel;
 pub mod ci;
 pub mod config;
 pub mod config_ci;

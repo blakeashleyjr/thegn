@@ -542,6 +542,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
+    let channel_note = crate::channel_state::apply_startup_channel(&mut cfg); // release-channel clamp
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
@@ -697,7 +698,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     }
     // Surface a newer-schema DB (a different-branch build wrote this shared DB):
     // we open it anyway, but some data may be invisible to this build.
-    if let Some(note) = crate::handlers::startup::schema_mismatch_status(startup_db.as_ref()) {
+    // Schema mismatch (data-loss risk) wins; else the stable-channel clamp note.
+    if let Some(note) =
+        crate::handlers::startup::schema_mismatch_status(startup_db.as_ref()).or(channel_note)
+    {
         model.status = note;
     }
     model.bars = cfg.bars.clone();
