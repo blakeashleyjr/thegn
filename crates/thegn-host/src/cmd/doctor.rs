@@ -166,6 +166,47 @@ fn home_json(cfg: &Config) -> serde_json::Value {
     })
 }
 
+/// The release channel + per-feature allow table for `--json`.
+fn channel_json() -> serde_json::Value {
+    let channel = crate::channel_state::current();
+    let features: serde_json::Map<String, serde_json::Value> = thegn_core::channel::Feature::ALL
+        .iter()
+        .map(|f| {
+            (
+                f.id().to_string(),
+                serde_json::Value::from(f.allowed_in(channel)),
+            )
+        })
+        .collect();
+    serde_json::json!({
+        "channel": channel.as_str(),
+        "features": features,
+    })
+}
+
+/// Report the resolved release channel and which gated features it allows —
+/// the authoritative answer to "why is remote/AI/observe disabled?".
+fn channel_report() {
+    let channel = crate::channel_state::current();
+    outln!("Release channel");
+    outln!("  channel       {}", channel.as_str());
+    for f in thegn_core::channel::Feature::ALL {
+        outln!(
+            "  {:<13} {}",
+            f.id(),
+            if f.allowed_in(channel) {
+                "enabled"
+            } else {
+                "disabled (dev-only)"
+            }
+        );
+    }
+    if matches!(channel, thegn_core::channel::Channel::Stable) {
+        outln!("  note          experimental features need the dev build (`nix run .#dev`)");
+        outln!("                or THEGN_CHANNEL=dev. GitHub PR/issue viewing stays available.");
+    }
+}
+
 pub fn run(cfg: &Config, json: bool) -> Result<()> {
     let env = TermEnv::from_env();
     let detected = thegn_core::termcaps::detect(&env);
@@ -173,6 +214,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     if json {
         let v = serde_json::json!({
+            "channel": channel_json(),
             "env": {
                 "TERM": env.term,
                 "COLORTERM": env.colorterm,
@@ -205,6 +247,8 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     let show = |k: &str, v: &Option<String>| {
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
+    channel_report();
+    outln!("");
     outln!("Terminal environment");
     show("TERM", &env.term);
     show("COLORTERM", &env.colorterm);

@@ -27,6 +27,10 @@ export HOME="$TMP" XDG_CONFIG_HOME="$TMP/.config" XDG_STATE_HOME="$TMP/.local/st
 export XDG_RUNTIME_DIR="$TMP/run"
 mkdir -p "$XDG_RUNTIME_DIR"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+# Exercise the full product surface: the experimental verbs (host/placement/
+# proxy/agent/kaneo) are dev-channel-only, so run smoke in the dev channel. A
+# dedicated section below verifies the stable channel refuses them + clamps.
+export THEGN_CHANNEL=dev
 
 mkdir -p "$XDG_CONFIG_HOME/thegn"
 cat >"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
@@ -623,6 +627,27 @@ check "migration wrote its forensics marker" \
 check "migration honors THEGN_NO_MIGRATE" \
   "mkdir -p '$MIG/.config/superzej' && env HOME='$MIG' XDG_CONFIG_HOME='$MIG/.config' XDG_STATE_HOME='$MIG/.local/state' THEGN_NO_MIGRATE=1 '$SZ' repos >/dev/null 2>&1 || true; [[ -d '$MIG/.config/superzej' ]]"
 rm -rf "$MIG"
+
+# --- release channels (stable vs dev) -------------------------------------
+# The smoke run above is dev-channel; here we assert the STABLE channel refuses
+# the experimental verbs and clamps the experimental config toggles.
+echo "release channels:"
+check "stable channel refuses an experimental verb (host)" \
+  "! env THEGN_CHANNEL=stable '$SZ' host list >/dev/null 2>&1"
+check "the refusal names the dev channel" \
+  "{ env THEGN_CHANNEL=stable '$SZ' host list 2>&1 || true; } | grep -q 'dev-channel feature'"
+check "dev channel allows the same verb" \
+  "env THEGN_CHANNEL=dev '$SZ' host list >/dev/null 2>&1"
+check "doctor reports the stable channel + disabled remote" \
+  "env THEGN_CHANNEL=stable '$SZ' doctor --json | grep -q '\"channel\": \"stable\"' && env THEGN_CHANNEL=stable '$SZ' doctor --json | grep -A8 '\"features\"' | grep -q '\"remote\": false'"
+check "doctor reports the dev channel + enabled remote" \
+  "env THEGN_CHANNEL=dev '$SZ' doctor --json | grep -A8 '\"features\"' | grep -q '\"remote\": true'"
+CHCFG="$TMP/channel.toml"
+printf '[observe]\nenabled = true\n\n[llm_proxy]\nenabled = true\n' >"$CHCFG"
+check "stable clamps experimental toggles off" \
+  "env THEGN_CHANNEL=stable '$SZ' --config '$CHCFG' config show | grep -A1 '^\[observe\]' | grep -q 'enabled = false'"
+check "dev honours the same toggles" \
+  "env THEGN_CHANNEL=dev '$SZ' --config '$CHCFG' config show | grep -A1 '^\[observe\]' | grep -q 'enabled = true'"
 
 echo
 if [[ $fail -eq 0 ]]; then

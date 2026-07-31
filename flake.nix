@@ -119,6 +119,18 @@
         inherit yaziDeps;
       };
 
+      # The dev release channel (`nix build .#dev`): same source, built with the
+      # host `dev` Cargo feature so experimental subsystems (remotes, AI/proxy,
+      # observe, placement, non-GitHub trackers) are enabled instead of clamped
+      # off. Installs as `thegn-dev`/`tg-dev`, so it coexists with a stable
+      # install. `THEGN_CHANNEL=stable` still forces either binary to stable.
+      thegnDev = pkgs.callPackage ./nix/package.nix {
+        src = thegnSrc;
+        yazi = yaziPinned;
+        inherit yaziDeps;
+        channel = "dev";
+      };
+
       # The OpenSpec CLI thegn uses for spec-driven development of itself.
       # A hermetic, pinned build (see nix/openspec.nix) — no global npm install,
       # telemetry off — shared by the dev shell and `just openspec*`.
@@ -302,6 +314,10 @@
     in {
       packages.default = defaultPkg;
       packages.thegn = defaultPkg;
+      # The dev release channel (`nix build .#dev` / `nix run .#dev`): the same
+      # host with experimental subsystems enabled, installed as `thegn-dev`.
+      packages.dev = thegnDev;
+      packages.thegn-dev = thegnDev;
       # The pinned yazi thegn drives for the file-manager drawer.
       packages.yazi = yaziPinned;
       # The muse e2e harness (`nix run .#muse`, also on the dev-shell PATH).

@@ -26,6 +26,7 @@ mod bridge_sup;
 mod build_cache;
 mod caps;
 mod center;
+mod channel_state;
 mod chime;
 mod chrome;
 mod ci_refresh;
@@ -682,6 +683,7 @@ fn main() -> anyhow::Result<()> {
                 cli.config.clone(),
             );
             thegn_core::host_config::merge_db_hosts(&mut cfg);
+            let _ = cfg.clamp_to_channel(crate::channel_state::resolve_and_install());
             match cmd::open::run(&cfg, &repo, no_launch) {
                 Ok(cmd::open::OpenOutcome::Delivered) => Ok(()),
                 Ok(cmd::open::OpenOutcome::LaunchTui) => Err(None), // fall through
@@ -767,15 +769,46 @@ fn main() -> anyhow::Result<()> {
     std::process::exit(code);
 }
 
+/// Map a subcommand to the experimental [`Feature`](thegn_core::channel::Feature)
+/// it belongs to, if any — the gate for refusing dev-only verbs in the stable
+/// build. Returns `(verb-name, feature)`; `None` for the always-available shell
+/// verbs (git/worktree/merge/land/integrate/config/doctor/…).
+fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::channel::Feature)> {
+    use thegn_core::channel::Feature;
+    Some(match command {
+        Command::Proxy { .. } => ("proxy", Feature::Ai),
+        Command::Agent { .. } => ("agent", Feature::Ai),
+        Command::Host { .. } => ("host", Feature::Providers),
+        Command::Placement { .. } => ("placement", Feature::Placement),
+        Command::Kaneo { .. } => ("kaneo", Feature::Trackers),
+        _ => return None,
+    })
+}
+
 /// Dispatch a non-interactive verb. Loads the layered config (the verbs that
 /// need it) and routes to the ported `cmd` module.
 fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
+    // Resolve + install the release channel so every verb (and `doctor`) sees a
+    // consistent view. Experimental verbs are refused in the stable build with
+    // a clear pointer to the dev channel rather than silently no-op'ing.
+    let channel = crate::channel_state::resolve_and_install();
+    if let Some((verb, feat)) = experimental_command(&command)
+        && !feat.allowed_in(channel)
+    {
+        anyhow::bail!(
+            "`thegn {verb}` is a dev-channel feature ({}); this is the stable build. \
+             Run the dev build (`nix run .#dev`) or set THEGN_CHANNEL=dev to enable it.",
+            feat.id(),
+        );
+    }
     let mut cfg = thegn_core::config::Config::load_layered(
         &thegn_core::config::ProcessEnv,
         &cli.overrides,
         cli.config.clone(),
     );
     thegn_core::host_config::merge_db_hosts(&mut cfg);
+    // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
+    let _ = cfg.clamp_to_channel(channel);
     let cfg = cfg;
     let config_path = cli
         .config
