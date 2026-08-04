@@ -15,6 +15,14 @@ pub struct ActionSpec {
     pub default_chords: &'static [&'static str],
     /// Whether this action should be surfaced in the command palette.
     pub palette: bool,
+    /// Extra, **non-visible** search terms folded into the command-palette fuzzy
+    /// haystack alongside `label` (synonyms, alternate names, related verbs) so an
+    /// action surfaces even when the user types a word that isn't in its label —
+    /// e.g. "fullscreen" / "maximize" / "full window" all reach `zoom`. Never
+    /// rendered; matched only. **Every action MUST supply at least one keyword**
+    /// (enforced by `tests::every_action_has_search_keywords`) — new actions are
+    /// required to fill this in.
+    pub keywords: &'static [&'static str],
 }
 
 /// Native-host action registry: one table drives palette rows, compact hints,
@@ -27,6 +35,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "worktree",
         default_chords: &["Alt w"],
         palette: true,
+        keywords: &[
+            "worktree",
+            "branch",
+            "new branch",
+            "add worktree",
+            "create worktree",
+            "checkout",
+        ],
     },
     ActionSpec {
         id: "new-workspace",
@@ -34,6 +50,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "workspace",
         default_chords: &["Alt W"],
         palette: true,
+        keywords: &[
+            "workspace",
+            "repo",
+            "repository",
+            "project",
+            "add repo",
+            "open repo",
+            "create workspace",
+        ],
     },
     ActionSpec {
         id: "delete-workspace",
@@ -44,6 +69,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         // sidebar row menu's "Remove workspace").
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "remove workspace",
+            "delete repo",
+            "close workspace",
+            "drop workspace",
+            "remove repo",
+        ],
     },
     ActionSpec {
         id: "integrate",
@@ -53,6 +85,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         // [merge_queue].enabled (see palette::build_command_palette_items).
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "merge queue",
+            "fold",
+            "land",
+            "merge",
+            "integrate queue",
+            "fold actor",
+        ],
     },
     ActionSpec {
         id: "merge-drain",
@@ -62,6 +102,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         // [merge_queue].enabled like the other fold-actor actions.
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "merge queue",
+            "drain",
+            "autopilot",
+            "agent",
+            "land all",
+            "process queue",
+        ],
     },
     ActionSpec {
         id: "new-tab",
@@ -69,6 +117,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "tab",
         default_chords: &["Alt t"],
         palette: true,
+        keywords: &["tab", "new tab", "same worktree", "add tab"],
     },
     ActionSpec {
         id: "new-terminal",
@@ -82,6 +131,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         // `palette: true` here would double-list it.
         default_chords: &["Alt T"],
         palette: false,
+        keywords: &[
+            "terminal",
+            "new terminal",
+            "shell",
+            "session",
+            "console",
+            "add terminal",
+        ],
     },
     ActionSpec {
         id: "new-pane",
@@ -89,6 +146,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "smart split",
         default_chords: &["Alt p"],
         palette: true,
+        keywords: &[
+            "pane",
+            "split",
+            "new pane",
+            "smart split",
+            "divide",
+            "window split",
+        ],
     },
     ActionSpec {
         id: "split-down",
@@ -96,6 +161,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "split↓",
         default_chords: &["Alt n"],
         palette: true,
+        keywords: &[
+            "split",
+            "split down",
+            "horizontal split",
+            "pane below",
+            "divide down",
+            "stack panes",
+        ],
     },
     ActionSpec {
         id: "split-right",
@@ -103,6 +176,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "split→",
         default_chords: &["Alt N"],
         palette: true,
+        keywords: &[
+            "split",
+            "split right",
+            "vertical split",
+            "pane beside",
+            "divide right",
+            "side by side",
+        ],
     },
     ActionSpec {
         id: "close-pane",
@@ -113,6 +194,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         // pane" semantics.
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "close pane",
+            "kill pane",
+            "remove pane",
+            "delete pane",
+            "exit pane",
+        ],
     },
     ActionSpec {
         id: "zoom",
@@ -120,6 +208,20 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "zoom",
         default_chords: &["Ctrl Alt z"],
         palette: true,
+        keywords: &[
+            "zoom",
+            "fullscreen",
+            "full screen",
+            "full window",
+            "maximize",
+            "maximise",
+            "expand pane",
+            "focus pane",
+            "toggle fullscreen",
+            "unzoom",
+            "solo pane",
+            "one pane",
+        ],
     },
     ActionSpec {
         id: "sync-panes",
@@ -127,6 +229,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "sync",
         default_chords: &["Ctrl Alt y"],
         palette: true,
+        keywords: &[
+            "sync panes",
+            "broadcast",
+            "broadcast input",
+            "type to all",
+            "mirror input",
+            "send to all panes",
+        ],
     },
     ActionSpec {
         id: "save-layout",
@@ -134,6 +244,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "save layout",
         default_chords: &[],
         palette: true,
+        keywords: &["save layout", "store layout", "layout", "snapshot layout"],
     },
     ActionSpec {
         id: "apply-layout",
@@ -141,6 +252,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "apply layout",
         default_chords: &[],
         palette: true,
+        keywords: &["apply layout", "load layout", "restore layout", "layout"],
     },
     ActionSpec {
         id: "export-layout",
@@ -148,6 +260,12 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "export layout",
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "export layout",
+            "save layout to file",
+            "layout file",
+            "write layout",
+        ],
     },
     ActionSpec {
         id: "import-layout",
@@ -155,6 +273,12 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "import layout",
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "import layout",
+            "load layout from file",
+            "layout file",
+            "read layout",
+        ],
     },
     ActionSpec {
         id: "new-worktree-from-template",
@@ -162,6 +286,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "template",
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "worktree",
+            "template",
+            "scaffold",
+            "new worktree template",
+            "from template",
+        ],
     },
     ActionSpec {
         id: "cycle-theme",
@@ -169,6 +300,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "theme",
         default_chords: &["Ctrl Alt t"],
         palette: true,
+        keywords: &[
+            "theme",
+            "color scheme",
+            "colours",
+            "cycle theme",
+            "appearance",
+            "dark mode",
+            "light mode",
+        ],
     },
     ActionSpec {
         id: "switch-font",
@@ -178,6 +318,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "font",
         default_chords: &["Alt f"],
         palette: true,
+        keywords: &["font", "typeface", "switch font", "change font"],
     },
     ActionSpec {
         id: "close",
@@ -185,6 +326,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "close",
         default_chords: &["Alt x"],
         palette: true,
+        keywords: &[
+            "close",
+            "close pane",
+            "close tab",
+            "smart close",
+            "exit",
+            "kill",
+        ],
     },
     ActionSpec {
         id: "close-tab",
@@ -194,6 +343,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         // rebindable for "close the tab specifically".
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "close tab",
+            "remove tab",
+            "kill tab",
+            "delete tab",
+            "exit tab",
+        ],
     },
     ActionSpec {
         id: "close-worktree",
@@ -201,6 +357,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "remove worktree (from disk)",
         default_chords: &["Alt X"],
         palette: true,
+        keywords: &[
+            "remove worktree",
+            "delete worktree",
+            "close worktree",
+            "prune worktree",
+            "drop worktree",
+            "from disk",
+        ],
     },
     ActionSpec {
         id: "switch-workspace",
@@ -208,6 +372,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "switch",
         default_chords: &["Alt o"],
         palette: true,
+        keywords: &[
+            "switch workspace",
+            "change repo",
+            "change workspace",
+            "jump workspace",
+            "select repo",
+        ],
     },
     ActionSpec {
         id: "switch-account",
@@ -215,6 +386,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "account",
         default_chords: &["Ctrl Alt a"],
         palette: true,
+        keywords: &[
+            "switch account",
+            "agent account",
+            "change account",
+            "login",
+            "identity",
+        ],
     },
     ActionSpec {
         id: "switch-bundle",
@@ -222,6 +400,12 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "bundle",
         default_chords: &["Ctrl Alt u"],
         palette: true,
+        keywords: &[
+            "switch bundle",
+            "env bundle",
+            "environment bundle",
+            "change bundle",
+        ],
     },
     ActionSpec {
         id: "switch-profile",
@@ -229,6 +413,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "profile",
         default_chords: &["Ctrl Alt g"],
         palette: true,
+        keywords: &["switch profile", "profile", "change profile", "select profile"],
     },
     ActionSpec {
         id: "prev-tab",
@@ -236,6 +421,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "prev tab",
         default_chords: &["Alt Left"],
         palette: true,
+        keywords: &[
+            "previous tab",
+            "prev tab",
+            "back tab",
+            "left tab",
+            "earlier tab",
+        ],
     },
     ActionSpec {
         id: "next-tab",
@@ -243,6 +435,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "next tab",
         default_chords: &["Alt Right"],
         palette: true,
+        keywords: &["next tab", "forward tab", "right tab", "later tab"],
     },
     ActionSpec {
         id: "prev-worktree",
@@ -250,6 +443,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "prev worktree",
         default_chords: &["Alt Up"],
         palette: true,
+        keywords: &[
+            "previous worktree",
+            "prev worktree",
+            "back worktree",
+            "up worktree",
+            "earlier worktree",
+        ],
     },
     ActionSpec {
         id: "next-worktree",
@@ -257,6 +457,12 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "next worktree",
         default_chords: &["Alt Down"],
         palette: true,
+        keywords: &[
+            "next worktree",
+            "forward worktree",
+            "down worktree",
+            "later worktree",
+        ],
     },
     ActionSpec {
         id: "prev-workspace",
@@ -264,6 +470,12 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "prev ws",
         default_chords: &["Shift Alt Up"],
         palette: true,
+        keywords: &[
+            "previous workspace",
+            "prev workspace",
+            "back workspace",
+            "earlier repo",
+        ],
     },
     ActionSpec {
         id: "next-workspace",
@@ -271,6 +483,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "next ws",
         default_chords: &["Shift Alt Down"],
         palette: true,
+        keywords: &["next workspace", "forward workspace", "later repo"],
     },
     ActionSpec {
         id: "toggle-region",
@@ -278,6 +491,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "ws↔term",
         default_chords: &["Alt `"],
         palette: true,
+        keywords: &[
+            "toggle region",
+            "workspaces",
+            "terminals",
+            "switch region",
+            "sidebar focus",
+            "workspaces vs terminals",
+        ],
     },
     ActionSpec {
         id: "move-item-up",
@@ -285,6 +506,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "move↑",
         default_chords: &["Ctrl Alt Up"],
         palette: true,
+        keywords: &[
+            "move up",
+            "reorder up",
+            "reorder workspace",
+            "reorder worktree",
+            "shift up",
+            "promote",
+        ],
     },
     ActionSpec {
         id: "move-item-down",
@@ -292,6 +521,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "move↓",
         default_chords: &["Ctrl Alt Down"],
         palette: true,
+        keywords: &[
+            "move down",
+            "reorder down",
+            "reorder workspace",
+            "reorder worktree",
+            "shift down",
+            "demote",
+        ],
     },
     ActionSpec {
         id: "move-worktree-to-folder",
@@ -299,6 +536,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "file worktree",
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "move worktree",
+            "folder",
+            "file worktree",
+            "organize worktree",
+            "group worktree",
+        ],
     },
     ActionSpec {
         id: "focus-left",
@@ -306,6 +550,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "focus←",
         default_chords: &["Ctrl Left", "Ctrl h"],
         palette: true,
+        keywords: &[
+            "focus left",
+            "move focus left",
+            "pane left",
+            "select left pane",
+            "go left",
+            "west pane",
+        ],
     },
     ActionSpec {
         id: "focus-right",
@@ -313,6 +565,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "focus→",
         default_chords: &["Ctrl Right", "Ctrl l"],
         palette: true,
+        keywords: &[
+            "focus right",
+            "move focus right",
+            "pane right",
+            "select right pane",
+            "go right",
+            "east pane",
+        ],
     },
     ActionSpec {
         id: "focus-up",
@@ -320,6 +580,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "focus↑",
         default_chords: &["Ctrl Up", "Ctrl k"],
         palette: true,
+        keywords: &[
+            "focus up",
+            "move focus up",
+            "pane above",
+            "select upper pane",
+            "go up",
+            "north pane",
+        ],
     },
     ActionSpec {
         id: "focus-down",
@@ -327,6 +595,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "focus↓",
         default_chords: &["Ctrl Down", "Ctrl j"],
         palette: true,
+        keywords: &[
+            "focus down",
+            "move focus down",
+            "pane below",
+            "select lower pane",
+            "go down",
+            "south pane",
+        ],
     },
     ActionSpec {
         id: "toggle-sidebar",
@@ -334,6 +610,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "sidebar",
         default_chords: &["Ctrl Alt s"],
         palette: true,
+        keywords: &[
+            "toggle sidebar",
+            "hide sidebar",
+            "show sidebar",
+            "sidebar",
+            "tree",
+            "workspace tree",
+        ],
     },
     ActionSpec {
         id: "warm-pool-increment",
@@ -341,6 +625,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "warm+",
         default_chords: &["Ctrl Alt ="],
         palette: true,
+        keywords: &[
+            "warm pool",
+            "add spare",
+            "prewarm",
+            "spare worktree",
+            "pool increment",
+            "more spares",
+        ],
     },
     ActionSpec {
         id: "warm-pool-decrement",
@@ -348,6 +640,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "warm-",
         default_chords: &["Ctrl Alt -"],
         palette: true,
+        keywords: &[
+            "warm pool",
+            "remove spare",
+            "pool decrement",
+            "fewer spares",
+            "shrink pool",
+        ],
     },
     ActionSpec {
         id: "toggle-panel",
@@ -355,6 +654,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "panel",
         default_chords: &["Ctrl Alt p"],
         palette: true,
+        keywords: &[
+            "toggle panel",
+            "diff panel",
+            "pr panel",
+            "show diff",
+            "hide panel",
+            "side panel",
+        ],
     },
     ActionSpec {
         id: "files-drawer",
@@ -362,6 +669,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "drawer",
         default_chords: &["Ctrl Alt f"],
         palette: true,
+        keywords: &[
+            "files drawer",
+            "toggle files",
+            "file list",
+            "changed files",
+            "drawer",
+        ],
     },
     ActionSpec {
         id: "toggle-corner",
@@ -369,6 +683,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "corner",
         default_chords: &["Ctrl Alt o"],
         palette: true,
+        keywords: &[
+            "corner overlay",
+            "video",
+            "picture in picture",
+            "pip",
+            "corner",
+            "webcam",
+        ],
     },
     ActionSpec {
         id: "focus-sidebar",
@@ -376,6 +698,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "sidebar",
         default_chords: &["Alt s"],
         palette: true,
+        keywords: &[
+            "focus sidebar",
+            "sidebar",
+            "jump to sidebar",
+            "workspace tree",
+            "select sidebar",
+        ],
     },
     ActionSpec {
         id: "focus-panel",
@@ -383,6 +712,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "panel",
         default_chords: &["Alt ."],
         palette: true,
+        keywords: &[
+            "focus panel",
+            "diff panel",
+            "pr panel",
+            "jump to panel",
+            "select panel",
+        ],
     },
     ActionSpec {
         id: "toggle-notifications",
@@ -390,6 +726,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "notifications",
         default_chords: &["Ctrl Alt i"],
         palette: true,
+        keywords: &[
+            "notifications",
+            "toggle notifications",
+            "notification panel",
+            "alerts",
+            "inbox",
+        ],
     },
     ActionSpec {
         id: "open-ci",
@@ -397,6 +740,17 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "ci",
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "ci",
+            "cicd",
+            "ci/cd",
+            "runs",
+            "pipelines",
+            "actions",
+            "checks",
+            "workflows",
+            "builds",
+        ],
     },
     ActionSpec {
         id: "open-proxy-dash",
@@ -404,6 +758,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "proxy",
         default_chords: &["Ctrl Alt l"],
         palette: true,
+        keywords: &[
+            "llm proxy",
+            "proxy dashboard",
+            "proxy",
+            "ai proxy",
+            "model proxy",
+            "tokens",
+            "usage dashboard",
+        ],
     },
     ActionSpec {
         id: "open-merge-queue",
@@ -411,6 +774,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "merge queue",
         default_chords: &["Ctrl Alt q"],
         palette: true,
+        keywords: &[
+            "merge queue",
+            "queue",
+            "folds",
+            "landing",
+            "merge",
+            "integrate",
+        ],
     },
     ActionSpec {
         id: "share-worktree-port",
@@ -418,6 +789,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "share",
         default_chords: &["Alt Shift S"],
         palette: true,
+        keywords: &[
+            "share port",
+            "expose port",
+            "tunnel",
+            "share worktree",
+            "publish port",
+            "forward port",
+        ],
     },
     ActionSpec {
         id: "stop-worktree-share",
@@ -425,6 +804,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "unshare",
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "stop share",
+            "unshare",
+            "close tunnel",
+            "stop port",
+            "revoke share",
+        ],
     },
     ActionSpec {
         id: "open-shares",
@@ -432,6 +818,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "shares",
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "shares panel",
+            "shared ports",
+            "tunnels",
+            "open shares",
+            "shares",
+        ],
     },
     ActionSpec {
         id: "palette",
@@ -439,6 +832,16 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "menu",
         default_chords: &["Ctrl Space"],
         palette: true,
+        keywords: &[
+            "command palette",
+            "menu",
+            "commands",
+            "cmdk",
+            "command k",
+            "actions",
+            "run command",
+            "search commands",
+        ],
     },
     ActionSpec {
         id: "help",
@@ -446,6 +849,16 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "help",
         default_chords: &["F1"],
         palette: true,
+        keywords: &[
+            "help",
+            "docs",
+            "documentation",
+            "manual",
+            "keybindings",
+            "shortcuts",
+            "guide",
+            "about",
+        ],
     },
     ActionSpec {
         id: "lazygit",
@@ -453,6 +866,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "lazygit",
         default_chords: &["Alt g"],
         palette: true,
+        keywords: &[
+            "lazygit",
+            "git ui",
+            "git tui",
+            "git",
+            "commit",
+            "stage",
+            "git client",
+        ],
     },
     ActionSpec {
         id: "yazi",
@@ -460,6 +882,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "yazi",
         default_chords: &["Alt y"],
         palette: true,
+        keywords: &[
+            "yazi",
+            "file manager",
+            "file browser",
+            "files",
+            "explorer",
+            "drawer",
+        ],
     },
     ActionSpec {
         id: "editor",
@@ -467,6 +897,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "editor",
         default_chords: &["Alt e"],
         palette: true,
+        keywords: &[
+            "editor",
+            "open editor",
+            "edit",
+            "vim",
+            "nvim",
+            "code",
+            "text editor",
+        ],
     },
     ActionSpec {
         id: "show-diff",
@@ -474,6 +913,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "diff",
         default_chords: &["Alt /"],
         palette: true,
+        keywords: &[
+            "diff",
+            "git diff",
+            "changes",
+            "show diff",
+            "unstaged",
+            "review changes",
+        ],
     },
     ActionSpec {
         id: "git-push",
@@ -481,6 +928,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "push",
         default_chords: &[],
         palette: true,
+        keywords: &["git push", "push", "upload", "publish branch", "push branch"],
     },
     ActionSpec {
         id: "git-pull",
@@ -488,6 +936,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "pull",
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "git pull",
+            "pull",
+            "sync",
+            "update branch",
+            "fetch and merge",
+        ],
     },
     ActionSpec {
         id: "git-fetch",
@@ -495,6 +950,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "fetch",
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "git fetch",
+            "fetch",
+            "prune",
+            "refresh remotes",
+            "update remotes",
+        ],
     },
     ActionSpec {
         id: "rollback",
@@ -502,6 +964,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "rollback",
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "rollback",
+            "discard",
+            "revert",
+            "undo changes",
+            "reset",
+            "restore",
+            "discard changes",
+        ],
     },
     ActionSpec {
         id: "scroll-up",
@@ -509,6 +980,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "scroll↑",
         default_chords: &["Shift PageUp", "PageUp"],
         palette: true,
+        keywords: &[
+            "scroll up",
+            "page up",
+            "scrollback up",
+            "history up",
+            "back scroll",
+        ],
     },
     ActionSpec {
         id: "scroll-down",
@@ -516,6 +994,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "scroll↓",
         default_chords: &["Shift PageDown", "PageDown"],
         palette: true,
+        keywords: &[
+            "scroll down",
+            "page down",
+            "scrollback down",
+            "history down",
+            "forward scroll",
+        ],
     },
     ActionSpec {
         id: "copy-pane",
@@ -523,6 +1008,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "copy",
         default_chords: &["Ctrl Alt c"],
         palette: true,
+        keywords: &[
+            "copy pane",
+            "copy",
+            "yank",
+            "copy contents",
+            "grab output",
+            "clipboard",
+        ],
     },
     ActionSpec {
         id: "search-pane",
@@ -530,6 +1023,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "search",
         default_chords: &["/"],
         palette: true,
+        keywords: &[
+            "search pane",
+            "find",
+            "search history",
+            "search scrollback",
+            "grep pane",
+            "find in pane",
+        ],
     },
     ActionSpec {
         id: "search-global",
@@ -537,6 +1038,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "search all",
         default_chords: &["Ctrl /"],
         palette: true,
+        keywords: &[
+            "search all panes",
+            "global search",
+            "find across panes",
+            "search worktree",
+            "grep all",
+        ],
     },
     ActionSpec {
         id: "toggle-key-lock",
@@ -544,6 +1052,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "lock",
         default_chords: &["Ctrl g"],
         palette: true,
+        keywords: &[
+            "key lock",
+            "lock keys",
+            "passthrough",
+            "pass through",
+            "unlock keybinds",
+            "disable keybinds",
+            "raw input",
+        ],
     },
     ActionSpec {
         id: "mode-normal",
@@ -551,6 +1068,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "normal",
         default_chords: &["Ctrl Alt n"],
         palette: true,
+        keywords: &["normal mode", "mode", "default mode", "switch mode"],
     },
     ActionSpec {
         id: "mode-vim-normal",
@@ -558,6 +1076,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "vim",
         default_chords: &["Ctrl Alt v"],
         palette: true,
+        keywords: &["vim normal", "vim mode", "vi mode", "modal", "vim"],
     },
     ActionSpec {
         id: "mode-vim-insert",
@@ -565,6 +1084,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "insert",
         default_chords: &[],
         palette: true,
+        keywords: &["vim insert", "insert mode", "vim", "vi insert"],
     },
     ActionSpec {
         id: "mode-emacs",
@@ -572,6 +1092,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "emacs",
         default_chords: &["Ctrl Alt e"],
         palette: true,
+        keywords: &["emacs mode", "emacs", "readline mode"],
     },
     ActionSpec {
         id: "toggle-strip",
@@ -579,6 +1100,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "pins",
         default_chords: &["Ctrl Alt b"],
         palette: true,
+        keywords: &[
+            "pin strip",
+            "pins",
+            "toggle pins",
+            "show pins",
+            "hide pins",
+            "strip",
+        ],
     },
     ActionSpec {
         id: "grow-strip",
@@ -586,6 +1115,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "pins+",
         default_chords: &["Ctrl Alt ]"],
         palette: true,
+        keywords: &[
+            "grow pins",
+            "bigger pin strip",
+            "expand strip",
+            "pin strip larger",
+            "wider pins",
+        ],
     },
     ActionSpec {
         id: "shrink-strip",
@@ -593,6 +1129,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "pins-",
         default_chords: &["Ctrl Alt ["],
         palette: true,
+        keywords: &[
+            "shrink pins",
+            "smaller pin strip",
+            "contract strip",
+            "pin strip smaller",
+            "narrower pins",
+        ],
     },
     ActionSpec {
         id: "promote-pin",
@@ -600,6 +1143,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "pin pane",
         default_chords: &["Ctrl Alt P"],
         palette: true,
+        keywords: &[
+            "pin pane",
+            "promote pin",
+            "add pin",
+            "pin this pane",
+            "move to pins",
+        ],
     },
     ActionSpec {
         id: "unpin",
@@ -607,6 +1157,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "unpin",
         default_chords: &["Ctrl Alt U"],
         palette: true,
+        keywords: &["unpin", "remove pin", "drop pin", "detach pin"],
     },
     ActionSpec {
         id: "quit",
@@ -614,6 +1165,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "quit",
         default_chords: &["Ctrl q"],
         palette: true,
+        keywords: &["quit", "exit", "close app", "leave", "shutdown"],
     },
     // The persistent-lifecycle pair (daemon-backed panes): quit is already a
     // detach; these make the two intents explicit and palette-discoverable.
@@ -623,6 +1175,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "detach",
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "detach",
+            "quit keep running",
+            "background",
+            "leave panes running",
+            "disconnect",
+        ],
     },
     ActionSpec {
         id: "quit-kill",
@@ -630,6 +1189,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "quit+kill",
         default_chords: &[],
         palette: true,
+        keywords: &[
+            "quit and kill",
+            "kill sessions",
+            "exit and kill",
+            "force quit",
+            "shutdown panes",
+        ],
     },
     // Media transport (optional [media] feature). Leader: `Alt m`. All inert when
     // media is disabled; surfaced in the palette so they're discoverable.
@@ -639,6 +1205,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "play/pause",
         default_chords: &["Alt m m"],
         palette: true,
+        keywords: &[
+            "media",
+            "play",
+            "pause",
+            "play pause",
+            "music",
+            "toggle playback",
+        ],
     },
     ActionSpec {
         id: "media-next",
@@ -646,6 +1220,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "next",
         default_chords: &["Alt m n"],
         palette: true,
+        keywords: &[
+            "media",
+            "next track",
+            "skip track",
+            "next song",
+            "forward track",
+        ],
     },
     ActionSpec {
         id: "media-previous",
@@ -653,6 +1234,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "prev",
         default_chords: &["Alt m p"],
         palette: true,
+        keywords: &[
+            "media",
+            "previous track",
+            "prev track",
+            "back track",
+            "previous song",
+        ],
     },
     ActionSpec {
         id: "media-shuffle-toggle",
@@ -660,6 +1248,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "shuffle",
         default_chords: &["Alt m s"],
         palette: true,
+        keywords: &["media", "shuffle", "random", "toggle shuffle"],
     },
     ActionSpec {
         id: "media-loop-cycle",
@@ -667,6 +1256,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "loop",
         default_chords: &["Alt m r"],
         palette: true,
+        keywords: &["media", "repeat", "loop", "cycle repeat", "repeat mode"],
     },
     ActionSpec {
         id: "media-volume-up",
@@ -674,6 +1264,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "vol+",
         default_chords: &["Alt m k"],
         palette: true,
+        keywords: &["media", "volume up", "louder", "raise volume", "vol up"],
     },
     ActionSpec {
         id: "media-volume-down",
@@ -681,6 +1272,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "vol−",
         default_chords: &["Alt m j"],
         palette: true,
+        keywords: &["media", "volume down", "quieter", "lower volume", "vol down"],
     },
     ActionSpec {
         id: "media-seek-forward",
@@ -688,6 +1280,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "seek+",
         default_chords: &["Alt m ."],
         palette: true,
+        keywords: &[
+            "media",
+            "seek forward",
+            "skip ahead",
+            "fast forward",
+            "scrub forward",
+        ],
     },
     ActionSpec {
         id: "media-seek-back",
@@ -695,6 +1294,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "seek−",
         default_chords: &["Alt m ,"],
         palette: true,
+        keywords: &["media", "seek back", "rewind", "skip back", "scrub back"],
     },
     ActionSpec {
         id: "media-open-panel",
@@ -702,6 +1302,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "now playing",
         default_chords: &["Alt m enter"],
         palette: true,
+        keywords: &[
+            "media",
+            "now playing",
+            "media panel",
+            "player panel",
+            "music panel",
+        ],
     },
     ActionSpec {
         id: "media-chapter-next",
@@ -709,6 +1316,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "chapter+",
         default_chords: &["Alt m ]"],
         palette: true,
+        keywords: &["media", "next chapter", "chapter forward", "video chapter"],
     },
     ActionSpec {
         id: "media-chapter-prev",
@@ -716,6 +1324,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "chapter−",
         default_chords: &["Alt m ["],
         palette: true,
+        keywords: &["media", "previous chapter", "chapter back", "video chapter"],
     },
     ActionSpec {
         id: "media-fullscreen",
@@ -723,6 +1332,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "fullscreen",
         default_chords: &["Alt m v"],
         palette: true,
+        keywords: &[
+            "media",
+            "fullscreen video",
+            "full screen",
+            "maximize video",
+            "video fullscreen",
+        ],
     },
     ActionSpec {
         id: "media-select-playlist",
@@ -730,6 +1346,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "playlist",
         default_chords: &["Alt m l"],
         palette: true,
+        keywords: &["media", "playlist", "select playlist", "choose playlist"],
     },
     ActionSpec {
         id: "media-select-player",
@@ -737,6 +1354,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "player",
         default_chords: &["Alt m o"],
         palette: true,
+        keywords: &[
+            "media",
+            "player",
+            "select player",
+            "choose player",
+            "output device",
+        ],
     },
     // Notification routing (items 426/427).
     ActionSpec {
@@ -745,6 +1369,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "dnd",
         default_chords: &["Ctrl Alt d"],
         palette: true,
+        keywords: &[
+            "do not disturb",
+            "dnd",
+            "silence",
+            "mute notifications",
+            "quiet",
+        ],
     },
     ActionSpec {
         id: "notify-mode-cycle",
@@ -752,6 +1383,12 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "notif mode",
         default_chords: &["Ctrl Alt m"],
         palette: true,
+        keywords: &[
+            "notification mode",
+            "routing mode",
+            "cycle notifications",
+            "notify mode",
+        ],
     },
     ActionSpec {
         id: "attention-next",
@@ -759,6 +1396,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "needs you",
         default_chords: &["Alt a"],
         palette: true,
+        keywords: &[
+            "attention",
+            "needs you",
+            "next attention",
+            "jump to alert",
+            "waiting",
+            "needs input",
+        ],
     },
     ActionSpec {
         id: "mark-all-read",
@@ -766,9 +1411,43 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "mark all read",
         default_chords: &["Alt Shift R"],
         palette: true,
+        keywords: &[
+            "mark all read",
+            "clear notifications",
+            "read all",
+            "dismiss all",
+            "clear inbox",
+        ],
     },
 ];
 
 pub fn action_specs() -> &'static [ActionSpec] {
     ACTION_SPECS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every action MUST carry at least one non-empty search keyword — this is
+    /// the "new ones are required" gate. The command palette folds `keywords`
+    /// into its fuzzy haystack (see `palette::build_command_palette_items`), so a
+    /// missing keyword set silently narrows discoverability. Adding an action
+    /// without keywords fails here.
+    #[test]
+    fn every_action_has_search_keywords() {
+        for spec in ACTION_SPECS {
+            assert!(
+                !spec.keywords.is_empty(),
+                "action `{}` has no search keywords — add synonyms/alternate \
+                 names so it surfaces in the command palette",
+                spec.id
+            );
+            assert!(
+                spec.keywords.iter().all(|k| !k.trim().is_empty()),
+                "action `{}` has an empty/whitespace keyword",
+                spec.id
+            );
+        }
+    }
 }

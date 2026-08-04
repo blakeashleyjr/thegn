@@ -14,11 +14,17 @@ use crate::seg::{self, Line, Tok, seg, sp};
 use thegn_core::store::WorkspaceStore;
 
 /// A selectable palette row. `key` is the stable dispatch/frecency key; `label`
-/// is what the user sees and what fuzzy matching runs against.
+/// is what the user sees. Fuzzy matching runs against `label` **plus** `search`
+/// — extra, non-visible terms (synonyms, alternate names, related verbs from an
+/// action's `ActionSpec::keywords`) that widen discoverability without cluttering
+/// the visible row. `search` is matched but never rendered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaletteItem {
     pub key: String,
     pub label: String,
+    /// Hidden search terms folded into the fuzzy haystack (see the struct doc).
+    /// Empty for rows that have no synonyms beyond their label.
+    pub search: String,
 }
 
 impl PaletteItem {
@@ -26,6 +32,22 @@ impl PaletteItem {
         Self {
             key: key.into(),
             label: label.into(),
+            search: String::new(),
+        }
+    }
+
+    /// Attach hidden search terms (folded into the fuzzy haystack, never shown).
+    pub fn with_search(mut self, search: impl Into<String>) -> Self {
+        self.search = search.into();
+        self
+    }
+
+    /// The fuzzy-match haystack: the visible label plus any hidden search terms.
+    fn haystack(&self) -> String {
+        if self.search.is_empty() {
+            self.label.clone()
+        } else {
+            format!("{} {}", self.label, self.search)
         }
     }
 }
@@ -182,9 +204,12 @@ impl Palette {
             self.matches = (0..self.items.len()).collect();
             return;
         }
-        let labels: Vec<&str> = self.items.iter().map(|it| it.label.as_str()).collect();
+        // Rank against label + hidden search terms (synonyms/alternate names), so
+        // e.g. "fullscreen" surfaces "Toggle zoom". Only the label is ever drawn.
+        let haystacks: Vec<String> = self.items.iter().map(|it| it.haystack()).collect();
+        let refs: Vec<&str> = haystacks.iter().map(|s| s.as_str()).collect();
         // neo_frizbee fuzzy rank (best-first); indices map straight back to items.
-        self.matches = crate::fff_backend::fuzzy_rank(&self.query, &labels)
+        self.matches = crate::fff_backend::fuzzy_rank(&self.query, &refs)
             .into_iter()
             .map(|(i, _)| i)
             .collect();
@@ -314,7 +339,10 @@ pub(crate) fn build_command_palette_items(
             let label = crate::keymap::chord_hint_for(cfg, spec.id)
                 .map(|chord| format!("{}  ({chord})", spec.label))
                 .unwrap_or_else(|| spec.label.to_string());
+            // Fold the action's hidden keywords into the fuzzy haystack so
+            // synonyms ("fullscreen", "maximize", …) surface it too.
             crate::palette::PaletteItem::new(spec.id, label)
+                .with_search(spec.keywords.join(" "))
         })
         .collect();
 
@@ -327,20 +355,28 @@ pub(crate) fn build_command_palette_items(
         } else {
             format!("{}  ({})", action.name, action.key.replace(' ', "-"))
         };
-        items.push(crate::palette::PaletteItem::new(action.name.clone(), label));
+        // Custom actions carry no keyword list; fold their `hint` into the
+        // haystack so a short synonym still helps them surface.
+        let search = action.hint.clone().unwrap_or_default();
+        items.push(
+            crate::palette::PaletteItem::new(action.name.clone(), label).with_search(search),
+        );
     }
 
     // Navigation verbs (frecency-navigation change): connect-to-root (the
     // sesh-`root` jump) and clone-and-open. Palette-dispatched (`run.rs`
     // Enter arm), not host Actions — no default chord.
-    items.push(crate::palette::PaletteItem::new(
-        "connect-root",
-        "⇱ Connect to root — jump to this pane's worktree",
-    ));
-    items.push(crate::palette::PaletteItem::new(
-        "clone-open",
-        "⇓ Clone and open — paste a git URL",
-    ));
+    items.push(
+        crate::palette::PaletteItem::new(
+            "connect-root",
+            "⇱ Connect to root — jump to this pane's worktree",
+        )
+        .with_search("connect root jump home base worktree return"),
+    );
+    items.push(
+        crate::palette::PaletteItem::new("clone-open", "⇓ Clone and open — paste a git URL")
+            .with_search("clone open git url checkout download repository"),
+    );
 
     // New-terminal wizard (name / connection / sandbox). The `new-terminal`
     // ActionSpec is `palette: false` (so the spec loop above doesn't list it),
@@ -351,24 +387,40 @@ pub(crate) fn build_command_palette_items(
         let label = crate::keymap::chord_hint_for(cfg, "new-terminal")
             .map(|c| format!("＋ New terminal…  ({c})"))
             .unwrap_or_else(|| "＋ New terminal…".to_string());
-        items.push(crate::palette::PaletteItem::new("new-terminal", label));
+        // Reuse the `new-terminal` ActionSpec's keyword list (it's `palette:
+        // false`, so the spec loop above skipped it) for the hidden haystack.
+        let search = crate::keymap::action_specs()
+            .iter()
+            .find(|s| s.id == "new-terminal")
+            .map(|s| s.keywords.join(" "))
+            .unwrap_or_default();
+        items.push(crate::palette::PaletteItem::new("new-terminal", label).with_search(search));
     }
 
     // "Add environment" wizard — author a `[env.<name>]` (local/ssh/cloud) with a
     // token, region/size/image. Dispatched via the "new-environment" key in the
     // run-loop palette Enter arm.
-    items.push(crate::palette::PaletteItem::new(
-        "new-environment",
-        "＋ New environment…  (cloud / ssh / local)".to_string(),
-    ));
+    items.push(
+        crate::palette::PaletteItem::new(
+            "new-environment",
+            "＋ New environment…  (cloud / ssh / local)".to_string(),
+        )
+        .with_search("new environment env cloud ssh local remote host add machine token region"),
+    );
 
     // Onboarding wizard re-run (also `thegn setup`) — forge auth, issue
     // trackers, hosts, sandbox, appearance. Dispatched via the "setup-wizard"
     // key in the run-loop palette Enter arm.
-    items.push(crate::palette::PaletteItem::new(
-        "setup-wizard",
-        "⚙ Setup wizard…  (forge / hosts / sandbox / appearance)".to_string(),
-    ));
+    items.push(
+        crate::palette::PaletteItem::new(
+            "setup-wizard",
+            "⚙ Setup wizard…  (forge / hosts / sandbox / appearance)".to_string(),
+        )
+        .with_search(
+            "setup wizard onboarding configure forge auth github issue tracker \
+             hosts sandbox appearance first run",
+        ),
+    );
 
     items
 }
