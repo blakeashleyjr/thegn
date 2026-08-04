@@ -606,6 +606,15 @@ pub fn resolve_placed(
     // panes carry no spec and so stay unmarked — correct, they aren't sandboxed.
     env.push(("THEGN_SANDBOX".to_string(), "1".to_string()));
 
+    // prek's `pre-commit` hook lives in the shared `.git/hooks` and so fires in
+    // every sandbox, but its `.pre-commit-config.yaml` is a gitignored,
+    // devenv-generated nix-store symlink that only exists in the checkout where
+    // `devenv shell` ran. When a sandbox shell has it (direnv/devenv active) the
+    // hooks run normally; when it doesn't, this makes prek skip rather than abort
+    // the commit — no dependency on store-mount timing or `post-checkout`
+    // symlink-chaining lining up. The real gate is pre-push (clippy/test/smoke).
+    env.push(("PREK_ALLOW_NO_CONFIG".to_string(), "1".to_string()));
+
     // Tier B: expose the host Nix daemon inside the sandbox so full
     // `nix develop`/`build`/`fmt` work there (Tier A only gives read-only tools
     // on PATH). Path-preserving bind of the daemon-socket dir + `NIX_REMOTE`;

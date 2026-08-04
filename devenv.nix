@@ -202,6 +202,15 @@
       unset _mnt_ns
     fi
 
+    # Backstop for the same missing-config failure below: if a worktree's
+    # gitignored .pre-commit-config.yaml symlink is absent or dangling (the
+    # post-checkout seed hasn't run, or a devenv re-lock left it pointing at a
+    # gone store path), let prek SKIP its hooks rather than abort the commit.
+    # Harmless where the config is present — prek runs the hooks as usual; the
+    # real gate is pre-push (clippy/test/smoke). Mirrors the PREK_ALLOW_NO_CONFIG
+    # injected into thegn sandboxes (crates/thegn-core/src/sandbox.rs).
+    export PREK_ALLOW_NO_CONFIG=1
+
     # Install the post-checkout hook into the effective (shared) hooks dir so the
     # prek hooks work in EVERY worktree. prek needs .pre-commit-config.yaml in
     # each worktree root, but devenv only materializes that gitignored store
