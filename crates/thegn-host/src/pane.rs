@@ -508,6 +508,14 @@ impl PtyPane {
         matches!(&self.io, PaneIo::Stream { provider, .. } if provider == "daemon")
     }
 
+    /// Test-only clone of the detach-on-drop flag, so a reaping path's test can
+    /// assert the pane was marked detached before it left the table. `None` for
+    /// PTY panes (no daemon session to keep alive).
+    #[cfg(test)]
+    pub(crate) fn detach_flag_handle(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        self.detach_on_drop.clone()
+    }
+
     /// Stash the restore payload for a possible reattach fallback (set at
     /// materialize time from the tab's persisted scrollback/command hints).
     pub fn set_fallback_restore(&mut self, scrollback: Option<String>, relaunch: Option<String>) {
