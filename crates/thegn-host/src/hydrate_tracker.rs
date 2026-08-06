@@ -56,8 +56,19 @@ pub(crate) fn spawn_issue_cache_refresh(
             .collect();
         let mut changed = false;
         for (account, provider, result) in per_provider {
-            let Ok(issues) = result else {
-                continue; // a failing account leaves its prior cache intact
+            let issues = match result {
+                Ok(issues) => {
+                    // Reached the tracker — online evidence for the app-wide holder.
+                    thegn_core::connectivity::report_success();
+                    issues
+                }
+                Err(e) => {
+                    // Only a dropped link is offline evidence (not a bad token).
+                    if e.is_transient() {
+                        thegn_core::connectivity::report_failure();
+                    }
+                    continue; // a failing account leaves its prior cache intact
+                }
             };
             let Ok(json) = serde_json::to_string(&issues) else {
                 continue;

@@ -239,6 +239,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
             "provider_cache": provider_cache_json(cfg),
             "managed_tools": managed_tools_json(cfg),
             "mcp_servers": mcp_servers_json(cfg),
+            "network": network_json(cfg),
         });
         outln!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -296,6 +297,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     mcp_servers_report(cfg);
+
+    outln!("");
+    network_report(cfg);
 
     outln!("");
     outln!("Summary");
@@ -831,6 +835,45 @@ fn managed_tools_json(cfg: &Config) -> serde_json::Value {
         })
         .collect();
     serde_json::Value::Array(tools)
+}
+
+/// Human-readable name for the resolved connectivity state.
+fn connectivity_str(c: thegn_core::connectivity::Connectivity) -> &'static str {
+    use thegn_core::connectivity::Connectivity;
+    match c {
+        Connectivity::Online => "online",
+        Connectivity::Offline => "offline",
+        Connectivity::Unknown => "unknown (no probe yet)",
+    }
+}
+
+fn network_report(cfg: &Config) {
+    // `cfg` is post-processed, so the forced mode is already installed into the
+    // holder; `current()` reflects `[network] mode` here.
+    outln!("Network / offline ([network])");
+    outln!("  mode          {}", cfg.network.mode.as_str());
+    outln!(
+        "  resolved      {}",
+        connectivity_str(thegn_core::connectivity::current())
+    );
+    outln!(
+        "  offline after {} consecutive failures",
+        cfg.network.offline_after_failures
+    );
+    outln!(
+        "  recovery probe every {}s while offline",
+        cfg.network.recovery_probe_secs
+    );
+    outln!("  when offline  pause PR/CI/issue refreshes + skip network MCPs (caches served stale)");
+}
+
+fn network_json(cfg: &Config) -> serde_json::Value {
+    serde_json::json!({
+        "mode": cfg.network.mode.as_str(),
+        "resolved": connectivity_str(thegn_core::connectivity::current()),
+        "offline_after_failures": cfg.network.offline_after_failures,
+        "recovery_probe_secs": cfg.network.recovery_probe_secs,
+    })
 }
 
 /// Report user-declared MCP servers and their capability grants (detection

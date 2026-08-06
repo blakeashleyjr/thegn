@@ -526,6 +526,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // `poll_input(None)` returns to drain its channel — the loop is fully
     // event-driven (zero idle wakeups) rather than polled on a 16ms tick.
     let waker = buf.terminal().waker();
+    // Repaint the offline chip promptly on a connectivity Offline↔Online edge.
+    crate::connectivity_gate::install_transition_waker(waker.clone());
     tracing::info!(
         target: "thegn::startup",
         since_start_ms = start.elapsed().as_millis() as u64,
@@ -9526,18 +9528,24 @@ async fn event_loop<T: Terminal>(
         }
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
+            // While offline, skip the network-backed refresh backstops (the
+            // local sidebar hydration still runs). Read once per drained kind.
+            let skip_net = crate::connectivity_gate::should_skip_refresh(
+                &kind,
+                thegn_core::connectivity::current(),
+            );
             match kind {
                 RefreshKind::Model => want_model_refresh = true,
                 RefreshKind::Pr => {
-                    want_pr_refresh = true;
+                    want_pr_refresh |= !skip_net;
                     want_model_refresh = true;
                 }
                 RefreshKind::Issues => {
-                    want_issue_refresh = true;
+                    want_issue_refresh |= !skip_net;
                     want_model_refresh = true;
                 }
                 RefreshKind::Ci { force } => {
-                    want_ci_refresh = true;
+                    want_ci_refresh |= !skip_net;
                     ci_refresh_force |= force;
                     want_model_refresh = true;
                 }
@@ -9554,6 +9562,12 @@ async fn event_loop<T: Terminal>(
                 // Branch ref moved: heal the checkout off-loop + drop the cache.
                 RefreshKind::MainRefMoved => crate::branch_cache::ref_moved(&mut want_main_sync),
                 RefreshKind::HostHeal => want_host_heal = true,
+                // Offline recovery re-probe (ticker emits only while offline).
+                RefreshKind::ConnRecover => crate::connectivity_gate::spawn_recovery_probe(
+                    active_tab_path(&session),
+                    &current_config,
+                    Some(waker.clone()),
+                ),
                 // Animate the visible splash (spinner frame / elapsed / hints):
                 // a repaint-only tick. Gated on a live active step so a
                 // straggler tick after the splash cleared stays damage-free

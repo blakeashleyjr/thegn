@@ -149,6 +149,10 @@ pub(crate) enum RefreshKind {
     /// Background host-heal tick ([`crate::handlers::host_heal`]): the handler
     /// no-ops from hydrated model state unless a Failed(retryable) host exists.
     HostHeal,
+    /// Offline recovery re-probe: emitted ONLY while offline (throttled by
+    /// `connectivity::should_probe`), so an online machine pays nothing. The
+    /// handler spawns one bounded PR fetch whose success flips the holder online.
+    ConnRecover,
     /// A splash-scoped animation tick ([`crate::loading::ticker::SplashTicker`]):
     /// repaint the visible loading splash (spinner frame / elapsed / hints).
     /// The ticker thread exists ONLY while a splash is visible — the 0%-idle
@@ -244,6 +248,14 @@ pub(crate) fn spawn_refresh_ticker(
             // Failed(retryable) host exists (0%-idle invariant preserved).
             if ticks.is_multiple_of(heal_every) {
                 if tx.send(RefreshKind::HostHeal).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            // Offline recovery: only while offline, throttled. `is_offline()` is
+            // a lock-free atomic — an online machine never sends.
+            if thegn_core::connectivity::is_offline() && thegn_core::connectivity::should_probe() {
+                if tx.send(RefreshKind::ConnRecover).is_err() {
                     break;
                 }
                 wake = true;
@@ -1590,6 +1602,7 @@ pub(crate) fn build_model(
             env!("THEGN_BUILD_TIME")
         ),
         accent: thegn_core::theme::TEAL.to_string(),
+        connectivity: thegn_core::connectivity::current(),
         ..Default::default()
     }
 }
@@ -2256,6 +2269,9 @@ pub(crate) fn spawn_pr_cache_refresh(
         // The full feed: PR + checks + review threads + issues (extras are
         // best-effort and never fail the panel).
         let panel = thegn_core::github::pr_status_full(&loc);
+        // Feed the app-wide connectivity holder (this CLI path is the 20s PR
+        // backstop + the offline recovery probe).
+        crate::connectivity_gate::report_pr_panel(&panel.state);
         let Ok(json) = serde_json::to_string(&panel) else {
             return;
         };

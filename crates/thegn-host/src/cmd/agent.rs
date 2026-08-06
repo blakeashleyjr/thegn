@@ -75,6 +75,20 @@ pub fn inject_mcp_servers(cfg: &thegn_core::config::Config) {
     if cfg.mcp_servers.is_empty() {
         return;
     }
+    // While offline, drop servers that need the network to acquire their binary
+    // (npm/cargo source, or a fetch-on-run `npx`/`uvx` launcher) — injecting them
+    // would have the agent hang trying to reach an unreachable registry. Servers
+    // already on PATH launch offline fine and are kept. Restored on the next
+    // `agent setup` once back online. AI is additive: the shell is unaffected.
+    let offline = thegn_core::connectivity::is_offline();
+    let servers: std::collections::BTreeMap<String, thegn_core::mcp::config::McpServerConfig> = cfg
+        .mcp_servers
+        .iter()
+        .filter(|(_, c)| !(offline && thegn_core::mcp::config::needs_network_acquire(c)))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let skipped = cfg.mcp_servers.len() - servers.len();
+
     let path = util::managed_pi_agent_dir().join("settings.json");
     let mut root = std::fs::read_to_string(&path)
         .ok()
@@ -83,16 +97,21 @@ pub fn inject_mcp_servers(cfg: &thegn_core::config::Config) {
     if let Some(obj) = root.as_object_mut() {
         obj.insert(
             "mcpServers".to_string(),
-            thegn_core::mcp::config::settings_block(&cfg.mcp_servers),
+            thegn_core::mcp::config::settings_block(&servers),
         );
         match serde_json::to_string_pretty(&root) {
             Ok(s) => {
                 if let Err(e) = std::fs::write(&path, s) {
                     tracing::debug!(target: "thegn::provision", error = %e, "best-effort: write pi settings.json (mcpServers)");
+                } else if skipped > 0 {
+                    msg::info(&format!(
+                        "injected {} MCP server(s) into pi settings ({skipped} network server(s) skipped — offline)",
+                        servers.len()
+                    ));
                 } else {
                     msg::info(&format!(
                         "injected {} MCP server(s) into pi settings",
-                        cfg.mcp_servers.len()
+                        servers.len()
                     ));
                 }
             }
