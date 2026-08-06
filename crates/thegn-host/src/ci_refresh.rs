@@ -217,6 +217,8 @@ fn refresh_ci_cache_for(
     match rt.block_on(client.runs(loc, branch.as_deref(), cfg.max_runs)) {
         Ok(runs) => {
             record_success(&key);
+            // A CI round trip got through — online evidence for the app-wide holder.
+            thegn_core::connectivity::report_success();
             if let Ok(json) = serde_json::to_string(&runs) {
                 let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json);
             }
@@ -224,6 +226,11 @@ fn refresh_ci_cache_for(
         Err(e) => {
             // The stale cache stays (better than blank), but the panel gets an
             // honest note instead of silently rendering old data as current.
+            // Only a transient (network) failure is offline evidence — an
+            // auth/rate-limit error means we reached the provider fine.
+            if e.is_transient() {
+                thegn_core::connectivity::report_failure();
+            }
             record_failure(&key, &e.message(), now, cfg.poll_interval_secs);
         }
     }

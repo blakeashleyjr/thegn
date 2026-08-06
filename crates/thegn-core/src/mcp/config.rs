@@ -67,6 +67,22 @@ pub struct McpServerConfig {
     pub grants: Vec<Grant>,
 }
 
+/// Whether launching this server requires network access to *acquire* its
+/// binary — either a declared [`McpSource`] (npm/cargo fetch) or a fetch-on-run
+/// launcher (`npx`/`uvx`/`bunx`/…, the common `npx -y @scope/server` form).
+/// Servers already on PATH (a plain command, no source) launch offline fine and
+/// return `false`. Pure — used to skip network MCPs while the app is offline.
+pub fn needs_network_acquire(cfg: &McpServerConfig) -> bool {
+    if cfg.source.is_some() {
+        return true;
+    }
+    let bin = cfg
+        .command
+        .first()
+        .map(|s| s.rsplit(['/', '\\']).next().unwrap_or(s));
+    matches!(bin, Some("npx" | "uvx" | "bunx" | "pnpx" | "dlx"))
+}
+
 /// The full launch argv (`command` then `args`).
 pub fn launch_argv(cfg: &McpServerConfig) -> Vec<String> {
     let mut argv = cfg.command.clone();
@@ -132,6 +148,32 @@ mod tests {
     fn empty_servers_empty_block() {
         let block = settings_block(&BTreeMap::new());
         assert_eq!(block, serde_json::json!({}));
+    }
+
+    #[test]
+    fn needs_network_acquire_classifies() {
+        // A declared npm/cargo source needs the network to acquire.
+        let mut with_source = server(&["server-git"]);
+        with_source.source = Some(McpSource::Npm {
+            package: "@scope/srv".into(),
+            version: "1.0.0".into(),
+        });
+        assert!(needs_network_acquire(&with_source));
+
+        // Fetch-on-run launchers (with or without a path prefix).
+        assert!(needs_network_acquire(&server(&["npx", "-y", "@scope/srv"])));
+        assert!(needs_network_acquire(&server(&["/usr/bin/uvx", "srv"])));
+        assert!(needs_network_acquire(&server(&["bunx", "srv"])));
+
+        // A plain on-PATH command launches offline fine.
+        assert!(!needs_network_acquire(&server(&[
+            "mcp-server-git",
+            "--repo",
+            "."
+        ])));
+        assert!(!needs_network_acquire(&server(&["/opt/tools/my-mcp"])));
+        // No command at all → nothing to launch, nothing to acquire.
+        assert!(!needs_network_acquire(&McpServerConfig::default()));
     }
 
     #[test]

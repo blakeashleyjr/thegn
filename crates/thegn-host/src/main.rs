@@ -33,6 +33,7 @@ mod cli_help;
 mod clipboard;
 mod cmd;
 mod compositor;
+mod connectivity_gate;
 mod copymode;
 mod daemon;
 mod db_task;

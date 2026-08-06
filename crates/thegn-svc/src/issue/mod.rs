@@ -41,6 +41,15 @@ impl std::fmt::Display for IssueError {
 
 impl std::error::Error for IssueError {}
 
+impl IssueError {
+    /// Whether this is a transient connectivity failure (connect/timeout) — as
+    /// opposed to auth/parse/not-configured. Feeds the connectivity holder so a
+    /// dropped link (not a bad token) is what flips the app offline.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, IssueError::Network(e) if e.is_connect() || e.is_timeout())
+    }
+}
+
 impl From<reqwest::Error> for IssueError {
     fn from(e: reqwest::Error) -> Self {
         IssueError::Network(e)

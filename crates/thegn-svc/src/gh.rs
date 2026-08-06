@@ -329,9 +329,14 @@ impl GhCircuit {
         if let Ok(mut g) = self.open_until.lock() {
             *g = None;
         }
+        // A GitHub round trip succeeded — the app is online.
+        thegn_core::connectivity::report_success();
     }
 
     fn record_failure(&self) {
+        // A transient GitHub network failure — offline evidence for the
+        // app-wide connectivity holder (flips after its own threshold).
+        thegn_core::connectivity::report_failure();
         let prev = self
             .failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

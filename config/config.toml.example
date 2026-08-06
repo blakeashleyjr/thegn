@@ -1697,6 +1697,21 @@ oci_runtime = ""
 # retry_max_delay_ms = 15000     # …capped here
 # heal_backoff_secs = [15, 30, 60, 300]  # failed-host re-probe cadence (last repeats)
 
+# ── Offline detection ─────────────────────────────────────────────────────────
+# thegn auto-detects when the network is unreachable and pauses remote features
+# (GitHub PR/CI/issue refreshes, network-acquired MCP servers) rather than
+# hammering unreachable endpoints. Local git/DB caches are served stale. It
+# restores automatically the moment a network call succeeds.
+[network]
+# mode:
+#   auto    — passive detection (default): flip offline after repeated failures,
+#             restore on the next success.
+#   online  — never auto-disable (opt out of detection).
+#   offline — force airplane mode: skip all remote refreshes + network MCPs.
+# mode = "auto"
+# offline_after_failures = 3   # consecutive failures before concluding offline
+# recovery_probe_secs = 30     # while offline, re-probe at most this often
+
 # ── Remote worktrees ──────────────────────────────────────────────────────────
 # Run worktrees on a remote machine over SSH. Leave host empty for local use.
 # Control-plane operations (git reads, container lifecycle) always use ssh;
