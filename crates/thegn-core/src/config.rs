@@ -3256,6 +3256,8 @@ pub struct Config {
     pub media: MediaConfig,
     /// `[remote]` — ssh keepalive/retry/heal tuning. See [`crate::config_remote`].
     pub remote: crate::config_remote::RemoteConfig,
+    /// `[network]` — offline-detection policy. See [`crate::config_network`].
+    pub network: crate::config_network::NetworkConfig,
     /// `[share]` — expose a worktree port at a public URL. Disabled by default.
     pub share: ShareConfig,
     /// `[forward]` — auto-forward sandbox-internal dev-server ports to the host's
@@ -3385,6 +3387,7 @@ impl Default for Config {
             replay: ReplayConfig::default(),
             media: MediaConfig::default(),
             remote: crate::config_remote::RemoteConfig::default(),
+            network: crate::config_network::NetworkConfig::default(),
             share: ShareConfig::default(),
             forward: ForwardConfig::default(),
             lifecycle: LifecycleConfig::default(),
@@ -3893,6 +3896,7 @@ impl Config {
         // Install the resolved [remote] tuning into the process-global holders
         // (ssh keepalives / control-plane retry / heal cadence); first set wins.
         self.remote.install();
+        self.network.install(); // [network] → connectivity holder (mode + thresholds)
         if self.agents.is_empty() {
             self.agents = vec![
                 NamedCommand {
