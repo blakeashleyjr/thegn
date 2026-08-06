@@ -366,6 +366,10 @@ pub enum CiError {
     NotFound,
     /// API rate limited.
     RateLimited,
+    /// Transient network failure (DNS/TLS/connect/timeout) — the provider is
+    /// unreachable, distinct from a config/auth issue. Feeds the connectivity
+    /// holder + lets the UI show "CI unreachable" rather than a hard error.
+    Offline,
     Other(String),
 }
 
@@ -377,8 +381,15 @@ impl CiError {
             CiError::NotConfigured => "no CI provider configured for this worktree".into(),
             CiError::NotFound => "no CI runs found".into(),
             CiError::RateLimited => "CI provider API rate limited".into(),
+            CiError::Offline => "CI provider unreachable".into(),
             CiError::Other(m) => m.clone(),
         }
+    }
+
+    /// Whether this is a transient network error (mirrors
+    /// [`crate::github::GhError::is_transient`]).
+    pub fn is_transient(&self) -> bool {
+        matches!(self, CiError::Offline)
     }
 }
 
@@ -403,6 +414,18 @@ pub fn classify_stderr(stderr: &str) -> CiError {
         CiError::NotAuthenticated
     } else if s.contains("rate limit") || s.contains("api rate") {
         CiError::RateLimited
+    } else if s.contains("error connecting to")
+        || s.contains("could not resolve host")
+        || s.contains("no such host")
+        || s.contains("connection refused")
+        || s.contains("network is unreachable")
+        || s.contains("i/o timeout")
+        || s.contains("check your internet connection")
+        || s.contains("tls handshake")
+    {
+        // Transient network failure — distinct from Other so the UI can show
+        // "CI unreachable" and the connectivity holder can flip offline.
+        CiError::Offline
     } else if s.contains("404") || s.contains("not found") {
         CiError::NotFound
     } else {
@@ -785,6 +808,19 @@ mod tests {
             CiError::RateLimited
         );
         assert_eq!(classify_stderr("404 project not found"), CiError::NotFound);
+        // Transient network failures classify as Offline (before the 404 branch).
+        for s in [
+            "error connecting to api.github.com",
+            "could not resolve host: gitlab.com",
+            "connection refused",
+            "network is unreachable",
+            "dial tcp: i/o timeout",
+            "tls handshake timeout",
+        ] {
+            assert_eq!(classify_stderr(s), CiError::Offline, "{s:?}");
+        }
+        assert!(CiError::Offline.is_transient());
+        assert!(!CiError::NotAuthenticated.is_transient());
         match classify_stderr("boom") {
             CiError::Other(m) => assert_eq!(m, "boom"),
             other => panic!("unexpected {other:?}"),
@@ -796,6 +832,7 @@ mod tests {
             CiError::NotConfigured,
             CiError::NotFound,
             CiError::RateLimited,
+            CiError::Offline,
             CiError::Other("x".into()),
         ] {
             assert!(!e.message().is_empty());

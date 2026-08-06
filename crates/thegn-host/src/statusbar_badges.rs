@@ -50,6 +50,22 @@ pub(crate) fn push_daemon_chip(model: &FrameModel, items: &mut Vec<(BarItemId, V
     ));
 }
 
+/// Offline chip: an amber `⚑ offline` while the app-wide connectivity holder
+/// reports offline (auto-detected or `[network] mode = offline`). Silent when
+/// online/unknown (clean is quiet). Signals that remote refreshes (PR/CI/issues)
+/// and network MCPs are paused; local git/DB caches are served stale.
+pub(crate) fn push_network_chip(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
+    use thegn_core::connectivity::Connectivity;
+    if model.connectivity != Connectivity::Offline {
+        return;
+    }
+    let flag = crate::caps::active_glyphs().warn;
+    items.push((
+        BarItemId::Badge(BarBadge::Network),
+        vec![Seg::chip(Tok::Hue(Hue::Amber), format!(" {flag} offline "))],
+    ));
+}
+
 /// CI rollup badge (AV group, item 158): a red ✗ chip when workflows are
 /// *currently* failing, an amber ● chip while runs are in flight; silent when
 /// all green (mirrors the "clean is quiet" notification posture). Only when CI

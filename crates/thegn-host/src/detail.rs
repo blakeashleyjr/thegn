@@ -2273,6 +2273,17 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
             44,
             near,
         )),
+        BarBadge::Network => Some(keyval(
+            "Offline",
+            vec![(
+                "state".into(),
+                "network unreachable — remote refreshes + network MCPs paused; caches served stale"
+                    .into(),
+                Tok::Hue(Hue::Amber),
+            )],
+            60,
+            near,
+        )),
         BarBadge::Sync => Some(keyval(
             "Sync panes",
             vec![(

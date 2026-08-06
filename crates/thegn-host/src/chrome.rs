@@ -294,6 +294,9 @@ pub struct FrameModel {
     /// The active worktree group's name ("app/feat") — the tabbar's left label.
     pub worktree: String,
     pub ai_metrics: Option<AiMetrics>,
+    /// App-wide network connectivity (from [`thegn_core::connectivity`]). Drives
+    /// the offline statusbar chip; refreshed each hydrate.
+    pub connectivity: thegn_core::connectivity::Connectivity,
     /// Live embedded-agent activity (ACP `session/update`), shown as a chip.
     pub agent_activity: Option<AgentActivity>,
     /// The active worktree's tab chip titles (tabs live WITHIN a worktree).
@@ -928,6 +931,8 @@ pub enum BarBadge {
     Ingress,
     Media,
     AiCost,
+    /// Network is offline — remote refreshes/MCPs paused.
+    Network,
     Agent,
     Zoom,
     Maximized,
@@ -1268,6 +1273,7 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
     // Needs-you / CI rollup / merge-queue chips live in `statusbar_badges.rs`
     // (extracted from this ratchet-pinned file).
     crate::statusbar_badges::push_attention_badge(model, &mut items);
+    crate::statusbar_badges::push_network_chip(model, &mut items);
     crate::statusbar_badges::push_daemon_chip(model, &mut items);
     crate::statusbar_badges::push_ci_badge(model, &mut items);
     crate::statusbar_badges::push_mq_badge(model, &mut items);
