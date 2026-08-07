@@ -1076,6 +1076,33 @@ impl Db {
         }
         Ok(())
     }
+
+    /// Persist the last OSC window title observed for a worktree. Keyed by
+    /// worktree path (the same key the sidebar's `sidebar_window_titles` map
+    /// uses), so the title survives workspace parking, cold resurrects, and
+    /// restarts. Written on change only (see the loop's live-title merge), not
+    /// per frame. Not on the `WorkspaceStore` seam — a compositor-side cache.
+    pub fn set_worktree_window_title(&self, worktree: &str, title: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO worktree_titles (worktree, last_title, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(worktree) DO UPDATE SET last_title=?2, updated_at=?3",
+            params![worktree, title, util::now()],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored worktree title as a `path -> title` map, for seeding the
+    /// sidebar on the first frame so persisted titles show before any pane
+    /// re-emits one. Skips empty/NULL titles.
+    pub fn all_worktree_titles(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT worktree, last_title FROM worktree_titles
+             WHERE last_title IS NOT NULL AND last_title <> ''",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
 }
 
 #[cfg(test)]
@@ -1256,5 +1283,29 @@ mod tests {
         // Unknown path is a no-op, not an error.
         db.delete_tab_groups_for_worktree(sess, "/wt/none").unwrap();
         assert_eq!(db.groups_for_session(sess).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn worktree_titles_roundtrip_and_upsert() {
+        let db = Db::open_memory().unwrap();
+        // Empty until something is stored.
+        assert!(db.all_worktree_titles().unwrap().is_empty());
+
+        db.set_worktree_window_title("/wt/a", "vim — main.rs")
+            .unwrap();
+        db.set_worktree_window_title("/wt/b", "cargo test").unwrap();
+        let map = db.all_worktree_titles().unwrap();
+        assert_eq!(map.get("/wt/a").map(String::as_str), Some("vim — main.rs"));
+        assert_eq!(map.get("/wt/b").map(String::as_str), Some("cargo test"));
+
+        // Upsert replaces the title in place (keyed by worktree path).
+        db.set_worktree_window_title("/wt/a", "less").unwrap();
+        let map = db.all_worktree_titles().unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("/wt/a").map(String::as_str), Some("less"));
+
+        // Empty titles are skipped by the bulk load (they'd add no sidebar value).
+        db.set_worktree_window_title("/wt/c", "").unwrap();
+        assert!(!db.all_worktree_titles().unwrap().contains_key("/wt/c"));
     }
 }

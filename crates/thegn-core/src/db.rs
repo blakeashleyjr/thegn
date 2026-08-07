@@ -74,7 +74,10 @@ use std::path::PathBuf;
 /// Pure caches → drop + recreate (the background refresh repopulates).
 /// v46: one-time read-flag cleanup of the spurious `process_failed` notification
 /// pile (no schema change) — see the post-batch migration in `open_at`.
-pub const SCHEMA_VERSION: i64 = 47;
+/// v48: adds `worktree_titles` (the last OSC window title per worktree, so the
+/// sidebar keeps a worktree's dynamic title across switches, parking, cold
+/// resurrects, and restarts — seeded at startup, refreshed live).
+pub const SCHEMA_VERSION: i64 = 48;
 
 pub struct Db {
     conn: Connection,
@@ -377,6 +380,16 @@ impl Db {
               size_bytes   INTEGER,
               target_bytes INTEGER,
               fetched_at   INTEGER
+            );
+            -- v48: last OSC window title per worktree. The sidebar renders each
+            -- worktree's dynamic (process-set) title; it lives only in the live
+            -- pane emulator, so without this it vanished when the worktree's
+            -- workspace was parked / cold-resurrected / on restart. Seeded into
+            -- the sidebar map at startup and refreshed on change.
+            CREATE TABLE IF NOT EXISTS worktree_titles (
+              worktree   TEXT PRIMARY KEY,
+              last_title TEXT,
+              updated_at INTEGER
             );
             -- Latest test-explorer state per worktree. This is a cache, not a
             -- history log: full timelines live in the later activity/audit layer.
