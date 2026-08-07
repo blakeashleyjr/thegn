@@ -140,9 +140,9 @@ config_enum! {
 pub use crate::config_placement::FailoverMode;
 // The remote/data-placement enums + `MergeRemoteMode` live in `config_remote`
 // (re-exported), keeping `config.rs` under the god-file ratchet.
-pub use crate::config_remote::{DataMode, MergeRemoteMode, RemoteMode};
-pub(crate) use crate::config_remote::data_mode_from_remote;
 use crate::config_placement::{de_failover, de_failover_opt};
+pub(crate) use crate::config_remote::data_mode_from_remote;
+pub use crate::config_remote::{DataMode, MergeRemoteMode, RemoteMode};
 // The terminal display/glyph config enums (UndercurlMode, ColorMode, GlyphMode,
 // AgentGlyphs) live in the `config_theme` sibling module to keep this god-file
 // flat; re-exported so `config::{ColorMode, …}` import paths keep working.
@@ -2129,8 +2129,9 @@ pub struct SandboxConfig {
     pub inject_devshell: bool,
     /// Which flake devShell attribute a sandbox/sprite enters, e.g. `"sandbox"`
     /// for a lean build-only shell (`.#devShells.sandbox`). Empty ⇒ `default`.
-    /// Exported as `THEGN_DEVSHELL` into the sandbox, which the repo `.envrc`'s
-    /// `use flake .#${…:-default}` reads — a smaller closure than full host dev.
+    /// Exported as `THEGN_DEVSHELL` into the sandbox, which the repo `.envrc`
+    /// reads to `use flake ".#$THEGN_DEVSHELL"` — a smaller closure than full
+    /// host dev (the host, with it unset, uses devenv instead).
     pub devshell: String,
     /// Bind-mount the host Nix daemon socket into the sandbox for full in-sandbox
     /// `nix develop`/`build`/`fmt`. `true` forces it on; `false` still auto-enables
@@ -2276,9 +2277,9 @@ impl SandboxConfig {
             })
             .collect();
         // Tell the sandbox which flake devShell to enter (`[sandbox] devshell`).
-        // The repo `.envrc` reads `THEGN_DEVSHELL` (`use flake .#${…:-default}`),
+        // The repo `.envrc` reads `THEGN_DEVSHELL` (`use flake ".#$THEGN_DEVSHELL"`),
         // so a fresh sprite enters the lean build shell instead of the full dev
-        // closure. Unset on the host → the default shell, unchanged.
+        // closure. Unset on the host → devenv (the host default), unchanged here.
         let attr = self.devshell.trim();
         if !attr.is_empty() {
             env.push(("THEGN_DEVSHELL".to_string(), attr.to_string()));
@@ -4532,7 +4533,6 @@ fn lenient_env_selector(text: &str) -> String {
     }
     String::new()
 }
-
 
 /// "#rrggbb" / "#rgb" -> "R;G;B".
 fn parse_hex_rgb(hex: &str) -> Option<String> {
