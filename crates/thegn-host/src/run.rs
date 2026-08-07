@@ -714,7 +714,13 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         0,
         session.clone(),
         Some(waker.clone()),
-        crate::hydrate::HydrateHints::default(),
+        // The panel is shown by default at launch, so warm the git-family
+        // summaries on the first hydration — they populate on first paint
+        // instead of reading `—` until the user opens each section.
+        crate::hydrate::HydrateHints {
+            warm_git_summaries: true,
+            ..Default::default()
+        },
     );
 
     // Startup orphan GC: remove any thegn containers whose worktrees no
@@ -2115,6 +2121,9 @@ fn open_panel_section(
         crate::hydrate::HydrateHints {
             open: panel_ui.open,
             expanded: panel_ui.width.is_expanded(),
+            // The panel is on screen when a section is opened/resized — keep the
+            // sibling git-family summaries warm too.
+            warm_git_summaries: true,
             ..Default::default()
         },
     );
@@ -2155,6 +2164,9 @@ fn toggle_panel_expand(
         crate::hydrate::HydrateHints {
             open: panel_ui.open,
             expanded: panel_ui.width.is_expanded(),
+            // The panel is on screen when a section is opened/resized — keep the
+            // sibling git-family summaries warm too.
+            warm_git_summaries: true,
             ..Default::default()
         },
     );
@@ -7160,6 +7172,9 @@ async fn event_loop<T: Terminal>(
             open: panel_ui.open,
             expanded: panel_ui.width.is_expanded(),
             profile: current_config.profile.clone(),
+            // Prefetch neighbors' git summaries too, so their panel reads
+            // populated the instant the user switches in.
+            warm_git_summaries: true,
             ..Default::default()
         };
         for path in neighbor_worktree_paths(&session, &sidebar_worktree_order(&model)) {
@@ -9650,6 +9665,10 @@ async fn event_loop<T: Terminal>(
                     // One-shot: a worktree switch pre-warms the commit cache; the
                     // periodic ticker (which shares this spawn) leaves it false.
                     warm_commits: std::mem::take(&mut warm_commits_next),
+                    // Fill the closed git-family summaries (branch/stash/commit)
+                    // from cache whenever the panel is visible — cost stays ~0
+                    // (cache reads + cold-miss-only fetch). Hidden panel: skip.
+                    warm_git_summaries: want_panel,
                 },
             );
             inflight_hydration_gen = Some(hydration_gen);

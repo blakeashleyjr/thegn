@@ -1229,9 +1229,20 @@ pub(crate) struct HydrateHints {
     /// Pre-warm the active worktree's `git log` commit cache on a switch even
     /// with the Commits section closed, so opening it is instant. Off the ticker.
     pub warm_commits: bool,
+    /// Populate the closed git-family summaries (branch count + PR badges,
+    /// first commit) from cache whenever the panel is visible, so they don't
+    /// read `—` until the section is opened. Reads caches always; triggers the
+    /// underlying `branches_full` subprocess only on a *cold* miss (not on TTL
+    /// staleness), so the periodic ticker cost stays ~0. (Stash needs no list —
+    /// its summary reads the always-fetched `stash_count`.)
+    pub warm_git_summaries: bool,
 }
 
 impl HydrateHints {
+    /// The Commits list is genuinely on screen (open section or the full git
+    /// frame) — drives the TTL refresh + loading spinner. A `warm_git_summaries`
+    /// pass reads the cache for the closed-row summary but does NOT count here,
+    /// so warming never forces a per-tick `git log` (see `build_panel`).
     fn wants_commits(&self) -> bool {
         self.open == crate::panel::Section::Commits || (self.expanded && self.open.is_git_family())
     }
@@ -1254,6 +1265,37 @@ fn commit_cache_needs_refresh(cache: Option<&(String, i64)>) -> bool {
     };
     serde_json::from_str::<Vec<crate::panel::CommitRow>>(json).is_err()
         || thegn_core::util::now().saturating_sub(*fetched_at) >= COMMIT_CACHE_TTL_SECS
+}
+
+/// Whether to (re)build the commit list this pass. An on-screen Commits section
+/// refreshes on the TTL; a `warm_git_summaries` pass (closed summary) reloads
+/// only on a *cold* miss, so the ticker never re-runs `git log` for a section
+/// nobody's looking at. Pure — unit-tested.
+fn commit_load_needed(commits_open: bool, cache: Option<&(String, i64)>) -> bool {
+    if commits_open {
+        commit_cache_needs_refresh(cache)
+    } else {
+        cache.is_none()
+    }
+}
+
+/// Whether to run the repo-global `branches_full` subprocess this pass. Same
+/// shape as `commit_load_needed`: TTL refresh when the Branches section is on
+/// screen, cold-miss-only when merely warming a closed summary. Pure.
+fn branch_fetch_needed(
+    want: bool,
+    branches_open: bool,
+    cached_age: Option<std::time::Duration>,
+    ttl: std::time::Duration,
+) -> bool {
+    if !want {
+        return false;
+    }
+    if branches_open {
+        crate::branch_cache::should_refetch(cached_age, ttl)
+    } else {
+        cached_age.is_none()
+    }
 }
 
 fn refresh_commit_cache(db: &thegn_core::db::Db, session: &crate::session::Session) -> bool {
@@ -1629,9 +1671,17 @@ pub(crate) fn build_panel(
     // The Full git frame shows every list, so any open git-family section at
     // Full hydrates branches + stashes too.
     let git_family_full = hints.expanded && hints.open.is_git_family();
-    let want_branches = hints.open == crate::panel::Section::Branches || git_family_full;
+    // The Branches summary (count + PR badges) needs the branch list, so warming
+    // pulls it in too — but only from cache (see `need_branch_fetch` below, which
+    // restricts the subprocess to a cold miss when merely warming).
+    let want_branches =
+        hints.open == crate::panel::Section::Branches || git_family_full || hints.warm_git_summaries;
     let want_stashes = hints.open == crate::panel::Section::Stash || git_family_full;
     let want_lsfiles = hints.open == crate::panel::Section::Files;
+    // When the Branches section is actually open (or the full git frame is up),
+    // keep the TTL refresh; when only warming a closed summary, fetch solely on a
+    // cold cache miss so the ticker never re-runs `branches_full` every 5s.
+    let branches_open = hints.open == crate::panel::Section::Branches || git_family_full;
 
     // Branches are repo-global (all worktrees share the same ref store), so the
     // heavy `branches_full` subprocess runs at most once per repo and is shared
@@ -1641,11 +1691,12 @@ pub(crate) fn build_panel(
     let repo_root = want_branches
         .then(|| thegn_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf()));
     let cached_branches = repo_root.as_deref().and_then(crate::branch_cache::get);
-    let need_branch_fetch = want_branches
-        && crate::branch_cache::should_refetch(
-            cached_branches.as_ref().map(|(_, age)| *age),
-            crate::branch_cache::BRANCH_CACHE_TTL,
-        );
+    let need_branch_fetch = branch_fetch_needed(
+        want_branches,
+        branches_open,
+        cached_branches.as_ref().map(|(_, age)| *age),
+        crate::branch_cache::BRANCH_CACHE_TTL,
+    );
 
     // Fan the independent, read-only git reads out across scoped threads: each
     // builds its own (trivial) `GixGit`, borrows `&loc` (read-only; `git -C` so
@@ -1843,7 +1894,8 @@ pub(crate) fn build_panel(
     panel.stash_count = stash_count;
     panel.log = log;
 
-    if hints.wants_commits() {
+    let commits_open = hints.wants_commits();
+    if commits_open || hints.warm_git_summaries {
         let cached = db.get_commit_cache(&loc.path()).ok().flatten();
         if let Some((json, _)) = cached.as_ref()
             && let Ok(mut rows) = serde_json::from_str::<Vec<crate::panel::CommitRow>>(json)
@@ -1851,7 +1903,10 @@ pub(crate) fn build_panel(
             rows.truncate(hints.visible_commit_limit());
             panel.commits = rows;
         }
-        panel.commits_loading = commit_cache_needs_refresh(cached.as_ref());
+        // Open section: refresh on the TTL. Warm-only (closed summary): refresh
+        // solely on a cold miss, so the ticker never re-runs `git log` for a
+        // section nobody's looking at — a slightly-stale first commit is fine.
+        panel.commits_loading = commit_load_needed(commits_open, cached.as_ref());
     }
     if want_branches {
         // The per-repo open-PR cache joins onto branch rows by head ref.

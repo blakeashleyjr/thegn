@@ -290,10 +290,12 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Stash => {
-            if data.stashes.is_empty() {
+            // `stash_count` is fetched unconditionally in the git fan-out, so the
+            // summary populates even while the (lazily-loaded) Stash list is empty.
+            if data.stash_count == 0 {
                 vec![seg(g2(), "—")]
             } else {
-                vec![seg(g(), data.stashes.len().to_string())]
+                vec![seg(g(), data.stash_count.to_string())]
             }
         }
         Section::Pr => match &data.pr {
@@ -1034,6 +1036,21 @@ mod spec {
         m.panel.alert_notifications = 1;
         let s = seg_text(&summary(Section::Notifications, &m));
         assert_eq!(s, "⚑ 1");
+    }
+
+    #[test]
+    fn stash_summary_reads_count_not_lazy_list() {
+        let seg_text = |segs: &[Seg]| segs.iter().map(|s| s.text.clone()).collect::<String>();
+        let mut m = FrameModel::default();
+
+        // No stashes: em dash.
+        assert_eq!(seg_text(&summary(Section::Stash, &m)), "—");
+
+        // The count is fetched unconditionally, while the list stays lazily
+        // empty for a closed section — the summary must still show the count.
+        m.panel.stash_count = 3;
+        assert!(m.panel.stashes.is_empty());
+        assert_eq!(seg_text(&summary(Section::Stash, &m)), "3");
     }
 
     #[test]
