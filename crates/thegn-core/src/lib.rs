@@ -94,6 +94,7 @@ pub mod host_db;
 pub mod host_machine;
 pub mod host_probe;
 pub mod i18n;
+pub mod identity;
 pub mod image;
 pub mod inventory;
 pub mod iroh_wire;

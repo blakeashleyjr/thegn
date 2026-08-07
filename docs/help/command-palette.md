@@ -9,6 +9,7 @@ actions:
     switch-account,
     switch-bundle,
     switch-profile,
+    switch-identity,
     cycle-theme,
   ]
 ---
@@ -36,7 +37,16 @@ chord). Type to filter, `↵` runs, `Esc` closes, `Tab` cycles modes.
   straight to the owning worktree's tab.
 - **Clone and open** — paste a git URL; it clones off-loop and opens as a
   workspace.
-- Account / bundle / profile / font / theme switchers.
+- Account / bundle / profile / **identity** / font / theme switchers.
+- **Switch identity** — pin a named per-tool identity (git config, git SSH
+  key, `gh` config, GnuPG home, agent accounts) at the focused scope; each
+  tool it sets overrides that credential for panes launched afterward, and
+  tools it leaves unset fall through. The reusable, mix-and-match form of a
+  profile's or bundle's `identity =`.
+- **Switch profile** — launch/focus a whole-process profile. While the
+  switcher is open, `Ctrl-Alt-↑/↓` **reorders** the highlighted profile; the
+  order is saved to `~/.config/thegn/profiles-order.json` (shared across
+  profiles) so it sticks.
 
 Rows are ordered by frecency: what you use often and recently floats up.
 Custom `[[actions]]` from your config appear here too — see
