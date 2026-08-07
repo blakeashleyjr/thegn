@@ -568,6 +568,29 @@ start name="dev": build
 # Alias for `start`.
 attach: start
 
+# Like `start`, but every invocation spins up a FRESH, randomly-named sandbox
+# ($HOME/.thegn-clean-<rand>/{state,run}) so it never touches the daily DB or
+# any other `just start`/install instance. Nothing is reattached (unique name),
+# so you always get a clean db + work area. Ephemeral by design — the dirs are
+# left on disk for post-mortem; sweep them with `just install-clean-sweep`.
+install-clean: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rand="$(od -An -N6 -tx1 /dev/urandom | tr -d ' ')"
+    root="$HOME/.thegn-clean-$rand"; state="$root/state"; run="$root/run"
+    mkdir -p "$state" "$run"
+    echo "install-clean: fresh sandbox at $root (XDG_STATE_HOME=$state)" >&2
+    exec env \
+      "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
+      "XDG_STATE_HOME=$state" \
+      "XDG_RUNTIME_DIR=$run" \
+      "THEGN_NO_MIGRATE=1" \
+      "{{bin}}"
+
+# Remove every ephemeral `just install-clean` sandbox ($HOME/.thegn-clean-*).
+install-clean-sweep:
+    rm -rf "$HOME"/.thegn-clean-*; echo "swept $HOME/.thegn-clean-*"
+
 # Like `start`, but in the dev release channel (experimental subsystems enabled)
 # via the runtime override — no separate binary needed. `just start-dev name=x`.
 start-dev name="dev": build

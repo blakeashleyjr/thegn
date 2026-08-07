@@ -2,9 +2,11 @@
 # install.sh — standalone (non-Nix) install of the native compositor host.
 #
 # Installs:
-#   tg      — opens thegn in a dedicated alacritty window with the bundled profile
-#   tg-tui  — opens thegn in the current terminal window
-#   thegn   — direct native host binary for CLI verbs/current-terminal use
+#   tg               — opens thegn in the CURRENT terminal (also forwards CLI verbs)
+#   tg -s|--standalone — opens thegn in a dedicated ghostty window (bundled profile)
+#   tg-tui           — always the current terminal (compat alias for `tg`)
+#   thegn            — direct native host binary for CLI verbs/current-terminal use
+# Plus a `.desktop` app-launcher entry (Exec=tg --standalone) with the owl icon.
 set -euo pipefail
 
 usage() {
@@ -57,16 +59,21 @@ bindir="${bindir:-$HOME/.local/bin}"
 
 release_bin="$here/target/release/thegn"
 alacritty_config="$here/config/alacritty.toml"
+ghostty_config="$here/config/ghostty.config"
 tg_tui="$bindir/tg-tui"
 apps_dir="$XDG_DATA_HOME/applications"
 desktop_file="$apps_dir/thegn.desktop"
+icon_src="$here/config/thegn.svg"
+icon_dir="$XDG_DATA_HOME/icons/hicolor/scalable/apps"
+icon_file="$icon_dir/thegn.svg"
 
 if ((dry_run)); then
   echo "dry-run: no files will be changed"
   echo "$bindir/thegn -> $release_bin"
   echo "$bindir/tg-tui wrapper -> $release_bin (current terminal)"
-  echo "$bindir/tg wrapper -> alacritty --config-file $alacritty_config -e $tg_tui"
-  echo "$desktop_file -> app-launcher entry (Exec=$bindir/tg)"
+  echo "$bindir/tg wrapper -> $tg_tui (current terminal); tg -s|--standalone -> ghostty --config-file $ghostty_config -e $tg_tui"
+  echo "$icon_file -> $icon_src (owl app icon)"
+  echo "$desktop_file -> app-launcher entry (Exec=$bindir/tg --standalone, Icon=thegn)"
   exit 0
 fi
 
@@ -83,6 +90,7 @@ ln -sfn "$release_bin" "$bindir/thegn"
 
 release_bin_q="$(shell_quote "$release_bin")"
 alacritty_config_q="$(shell_quote "$alacritty_config")"
+ghostty_config_q="$(shell_quote "$ghostty_config")"
 tg_tui_q="$(shell_quote "$tg_tui")"
 
 # Remove any existing wrappers first: a leftover dangling symlink (e.g. from a
@@ -93,6 +101,9 @@ rm -f "$tg_tui" "$bindir/tg" \
   "$bindir/sj" "$bindir/sj-tui" "$bindir/superzej" "$bindir/szhost" \
   "$apps_dir/superzej.desktop" "$apps_dir/sj.desktop"
 
+# tg-tui: always the current terminal. THEGN_ALACRITTY_CONFIG is unrelated to
+# the launch mechanism — it points the in-app font picker at the alacritty
+# profile it patches.
 cat >"$tg_tui" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -101,28 +112,40 @@ exec $release_bin_q "\$@"
 EOF
 chmod 0755 "$tg_tui"
 
+# tg: current terminal by default; `-s`/`--standalone` (must be the first arg)
+# opens a dedicated ghostty window running the bundled, hermetic profile. Any
+# other args (CLI verbs like `tg list`) run in the current terminal.
 cat >"$bindir/tg" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-if ((\$# > 0)); then
-  exec $tg_tui_q "\$@"
+if [[ \${1-} == -s || \${1-} == --standalone ]]; then
+  shift
+  if ! command -v ghostty >/dev/null 2>&1; then
+    echo "tg: ghostty not found; install ghostty or run 'tg' to open thegn in the current terminal." >&2
+    exit 127
+  fi
+  exec ghostty --config-default-files=false --config-file=$ghostty_config_q -e $tg_tui_q "\$@"
 fi
 
-if ! command -v alacritty >/dev/null 2>&1; then
-  echo "tg: alacritty not found; install alacritty or run 'tg-tui' to open thegn in the current terminal." >&2
-  exit 127
-fi
-
-exec alacritty --config-file $alacritty_config_q -e $tg_tui_q
+exec $tg_tui_q "\$@"
 EOF
 chmod 0755 "$bindir/tg"
 
-# App-launcher entry (GNOME/KDE/rofi/wofi/…): a `.desktop` file pointing at the
-# `tg` wrapper so thegn is searchable/pinnable in your launcher. `Terminal=false`
-# — `tg` opens its OWN alacritty window. The Icon uses the standard themed
-# terminal name (no bundled artwork); drop a `thegn.png` in your icon theme and
-# swap `Icon=` if you want custom artwork.
+# Owl app icon: the same perched-sentinel mascot the loading splash draws
+# (config/thegn.svg, generated from crates/thegn-host/src/owl.rs). Installed
+# into the user's hicolor icon theme so `Icon=thegn` resolves in any launcher.
+mkdir -p "$icon_dir"
+if [[ -f $icon_src ]]; then
+  cp "$icon_src" "$icon_file"
+  echo "wrote app icon: $icon_file"
+else
+  echo "warning: $icon_src missing — desktop entry will fall back to a generic icon" >&2
+fi
+
+# App-launcher entry (GNOME/KDE/rofi/wofi/…): a `.desktop` file so thegn is
+# searchable/pinnable in your launcher. A GUI launcher has no terminal, so it
+# runs `tg --standalone` to open thegn's OWN ghostty window (`Terminal=false`).
 tg_launcher="$bindir/tg"
 mkdir -p "$apps_dir"
 cat >"$desktop_file" <<EOF
@@ -132,18 +155,19 @@ Version=1.0
 Name=thegn
 GenericName=Git Worktree IDE
 Comment=Terminal-native git-worktree IDE + multiplexer
-Exec=$tg_launcher
+Exec=$tg_launcher --standalone
 TryExec=$tg_launcher
 Terminal=false
-Icon=utilities-terminal
+Icon=thegn
 Categories=Development;IDE;RevisionControl;
 Keywords=git;worktree;terminal;ide;multiplexer;thegn;
 StartupNotify=true
 EOF
 chmod 0644 "$desktop_file"
-# Refresh the launcher's cache so the entry shows up without a re-login
-# (best-effort — not all environments ship the tool).
+# Refresh the launcher + icon caches so the entry/icon show up without a
+# re-login (best-effort — not all environments ship the tools).
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$apps_dir" 2>/dev/null || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$XDG_DATA_HOME/icons/hicolor" 2>/dev/null || true
 echo "wrote app-launcher entry: $desktop_file"
 
 if [[ ! -f "$XDG_CONFIG_HOME/thegn/config.toml" ]]; then
@@ -152,19 +176,21 @@ if [[ ! -f "$XDG_CONFIG_HOME/thegn/config.toml" ]]; then
   echo "wrote default config: $XDG_CONFIG_HOME/thegn/config.toml"
 fi
 
-# Warn about missing runtime deps (delta is used for diff output; alacritty is
-# used by the `tg` dedicated-window launcher).
+# Warn about missing runtime deps (delta is used for diff output; ghostty backs
+# the `tg --standalone` dedicated-window launcher).
 command -v delta >/dev/null || echo "warning: 'delta' not found — diff output will lack syntax highlighting (install: https://github.com/dandavison/delta)" >&2
-command -v alacritty >/dev/null || echo "warning: 'alacritty' not found — 'tg' opens a dedicated alacritty window; use 'tg-tui' for the current terminal" >&2
+command -v ghostty >/dev/null || echo "warning: 'ghostty' not found — 'tg --standalone' opens a dedicated ghostty window; plain 'tg' opens thegn in the current terminal" >&2
 
 echo "installed:"
-echo "  $bindir/tg      -> dedicated alacritty window using $alacritty_config"
-echo "  $bindir/tg-tui  -> current-terminal native host ($release_bin)"
-echo "  $bindir/thegn   -> $release_bin"
-echo "  $desktop_file   -> app-launcher entry ('thegn')"
+echo "  $bindir/tg              -> current terminal ($release_bin)"
+echo "  $bindir/tg --standalone -> dedicated ghostty window using $ghostty_config"
+echo "  $bindir/tg-tui          -> current-terminal native host ($release_bin)"
+echo "  $bindir/thegn           -> $release_bin"
+echo "  $icon_file              -> owl app icon"
+echo "  $desktop_file           -> app-launcher entry ('thegn')"
 echo
-echo "Ensure $bindir is on PATH, then run:  tg      # dedicated alacritty window"
-echo "                              or:  tg-tui  # current terminal"
+echo "Ensure $bindir is on PATH, then run:  tg              # current terminal"
+echo "                              or:  tg --standalone  # dedicated ghostty window"
 echo "thegn shells out to:  git fzf (or gum) lazygit yazi delta gh"
 echo
 echo "Nix users: 'nix profile install $here#default' bundles the native host."

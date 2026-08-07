@@ -123,15 +123,19 @@ Or just the binary: `nix profile install .#default`.
 ### Standalone
 
 ```sh
-./install.sh    # builds thegn; installs tg (Alacritty), tg-tui (current terminal), thegn
-tg              # dedicated Alacritty window with the bundled profile
-tg-tui          # same TUI in the current terminal window
+./install.sh    # builds thegn; installs tg, tg-tui, thegn + an owl app-launcher entry
+tg              # thegn in the current terminal
+tg --standalone # dedicated Ghostty window with the bundled profile (also: tg -s)
+tg-tui          # same as plain `tg` — always the current terminal
 ```
 
-`./install.sh` needs Rust/Cargo. Alacritty is optional — it only backs the
-`tg` dedicated-window launcher; `tg-tui` and `thegn` run directly in
-the current terminal, whatever it is. thegn shells out to `git` (and
-`gh`/`ssh` as fallbacks where native support has gaps); `lazygit` is optional.
+`./install.sh` needs Rust/Cargo. `tg` and `tg-tui` run directly in the current
+terminal, whatever it is; `tg --standalone` (`-s`) opens thegn in its own
+Ghostty window using the bundled hermetic profile, so Ghostty is only needed for
+that path. The installer also drops a `thegn.desktop` app-launcher entry with the
+owl icon (Exec `tg --standalone`), searchable/pinnable in GNOME/KDE/rofi/wofi.
+thegn shells out to `git` (and `gh`/`ssh` as fallbacks where native support has
+gaps); `lazygit` is optional.
 
 **macOS:** `./setup-macos.sh` checks every prerequisite (Xcode CLT, Nix or
 rustup + Homebrew deps) and offers to install what's missing, then builds.
