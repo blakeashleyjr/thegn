@@ -132,6 +132,49 @@ pub(crate) fn ambient_env_name_live(cfg: &Config, repo_root: &Path) -> String {
     ambient_env_name(db.as_ref(), cfg, repo_root)
 }
 
+/// Persist a worktree's registry row plus its explicit sandbox/agent/env pins.
+///
+/// Called twice by the create worker: EARLY (before env bring-up, `location =
+/// None`) so a recoverable bring-up failure leaves the worktree persisted, and
+/// again on SUCCESS carrying the provider `location` blob. `put_worktree` upserts
+/// `location` via `COALESCE`, so the early `None` never clobbers the blob written
+/// on success. Only the primary row insert + the env pin are fatal (a lost pin
+/// silently downgrades the env, e.g. machine0 → local — the exact fallback this
+/// flow must never produce); sandbox/agent are best-effort UPDATEs.
+#[allow(clippy::too_many_arguments)]
+fn register_worktree_row(
+    db: &Db,
+    cfg: &Config,
+    repo_root: &Path,
+    tab: &str,
+    branch: &str,
+    path_s: &str,
+    choices: &WizardChoices,
+    location: Option<&str>,
+) -> anyhow::Result<()> {
+    let root_s = repo_root.to_string_lossy();
+    db.put_worktree(tab, &root_s, path_s, branch, location, None)
+        .map_err(|e| anyhow::anyhow!("db: {e}"))?;
+    // A *concrete* backend pick is a deliberate per-worktree override, pinned so
+    // it sticks across restarts even against a non-"auto" `[sandbox] backend`. An
+    // "auto" pick stays NULL so the worktree re-resolves against config each open.
+    if choices.sandbox != "auto" && !choices.sandbox.is_empty() {
+        let _ = db.set_worktree_sandbox(path_s, &choices.sandbox);
+    }
+    let _ = db.set_worktree_agent(path_s, &choices.agent);
+    // Pin the chosen host only when it DIFFERS from the ambient default this
+    // worktree would otherwise inherit; a choice equal to the ambient stays NULL
+    // (clean inherit). A divergent choice — including an explicit "default"
+    // against a provider ambient — is pinned so every later re-resolution
+    // reproduces the wizard's placement instead of falling through to the ambient.
+    let ambient = ambient_env_name(Some(db), cfg, repo_root);
+    if choices.env != ambient {
+        db.set_worktree_env(path_s, &choices.env)
+            .map_err(|e| anyhow::anyhow!("pin env {}: {e}", choices.env))?;
+    }
+    Ok(())
+}
+
 /// The Alt+w modal, a single-plane form: branch name (the configured prefix is
 /// fixed chrome, the tail is editable), host (execution env), sandbox backend,
 /// and program. All render at once; focus starts on the program list. Pure over
@@ -818,6 +861,16 @@ pub enum CreateEvent {
         step: CreateStep,
         error: String,
     },
+    /// The env bring-up failed RECOVERABLY (`failover = "ask"`/`"halt"`): unlike
+    /// [`CreateEvent::Failed`], the git worktree AND its registry row are KEPT.
+    /// The loop retires the creation markers but leaves the tab in place, then
+    /// raises the same ask/halt modal the launch path uses — so the user can
+    /// retry the bring-up or run the worktree on the host, instead of the create
+    /// path silently deleting a worktree over a down provider.
+    Halted {
+        generation: u64,
+        halt: crate::agent::SandboxHalt,
+    },
 }
 
 /// Everything the loop needs to adopt the finished worktree: the group/tab
@@ -968,6 +1021,16 @@ pub fn run_worker(
             step: s,
             error,
         });
+    };
+    // A RECOVERABLE env bring-up failure (failover ask/halt): unlike `fail`, the
+    // git worktree + its registry row are kept and the loop hands off to the
+    // launch-side ask/halt modal. See [`CreateEvent::Halted`].
+    let halted = |halt: crate::agent::SandboxHalt| {
+        send(CreateEvent::Halted { generation, halt });
+    };
+    let open_db = || match &ctx.db_path {
+        Some(p) => Db::open_at(p),
+        None => Db::open(),
     };
 
     // --- preflight: taken names + base, then the collision-free suggestion.
@@ -1167,6 +1230,26 @@ pub fn run_worker(
         env: choices.env.clone(),
     });
 
+    // Register the worktree the instant its git dir exists — BEFORE the env
+    // bring-up — so a RECOVERABLE provider failure (failover ask/halt) leaves a
+    // real, persisted worktree the user can retry / run-on-host, instead of the
+    // create path silently deleting it. `location` is filled in on success (the
+    // `COALESCE` upsert keeps the None here from clobbering it). A hard DB write
+    // failure is still fatal — there's nothing usable to keep.
+    let path_s = path.to_string_lossy().into_owned();
+    match open_db() {
+        Ok(db) => {
+            if let Err(e) = register_worktree_row(&db, cfg, root, &tab, &branch, &path_s, &choices, None) {
+                fail(CreateStep::Register, e.to_string());
+                return;
+            }
+        }
+        Err(e) => {
+            fail(CreateStep::Register, format!("db: {e}"));
+            return;
+        }
+    }
+
     // Reuse the speculative prep only when it matches the submitted (env,
     // backend); otherwise (no prep, or the user changed host/sandbox after the
     // last PrepChosen) prepare now with the submitted choice.
@@ -1193,7 +1276,18 @@ pub fn run_worker(
                 (choices.env.clone(), choices.sandbox.clone(), outcome)
             }
             Err(e) => {
+                // A recoverable bring-up failure (failover ask/halt) surfaces a
+                // typed `SandboxHalt` in the error chain: KEEP the (registered)
+                // worktree and hand off to the launch-side ask/halt modal instead
+                // of deleting the user's worktree. Any other error is fatal.
+                if let Some(halt) = crate::handlers::provision::sandbox_halt_in(&e).cloned() {
+                    halted(halt);
+                    return;
+                }
                 worktree::remove(root, &path, &branch, true);
+                if let Ok(db) = open_db() {
+                    let _ = db.del_worktree(&path_s);
+                }
                 fail(CreateStep::SandboxPrep, e.to_string());
                 return;
             }
@@ -1220,64 +1314,36 @@ pub fn run_worker(
                 sandbox = redo;
             }
             Err(e) => {
+                // A recoverable bring-up failure (failover ask/halt) surfaces a
+                // typed `SandboxHalt` in the error chain: KEEP the (registered)
+                // worktree and hand off to the launch-side ask/halt modal instead
+                // of deleting the user's worktree. Any other error is fatal.
+                if let Some(halt) = crate::handlers::provision::sandbox_halt_in(&e).cloned() {
+                    halted(halt);
+                    return;
+                }
                 worktree::remove(root, &path, &branch, true);
+                if let Ok(db) = open_db() {
+                    let _ = db.del_worktree(&path_s);
+                }
                 fail(CreateStep::SandboxPrep, e.to_string());
                 return;
             }
         }
     }
 
-    // --- register: one DB open for the whole pipeline. put_worktree must
-    // precede the sandbox/agent updates (they are bare UPDATEs).
+    // --- register: bring-up succeeded, so re-assert the row now carrying the
+    // provider `location` (if any) — the chrome's git/fs reads route into the
+    // sandbox via `GitLoc::Provider`. The row + env/sandbox/agent pins were
+    // already written before prep; this upsert just fills in `location`.
     step(CreateStep::Register, StepState::Running, None);
-    let path_s = path.to_string_lossy().into_owned();
-    let db = match &ctx.db_path {
-        Some(p) => Db::open_at(p),
-        None => Db::open(),
-    };
-    match db {
+    match open_db() {
         Ok(db) => {
-            let root_s = root.to_string_lossy();
-            // For a managed-provider env, persist the `GitLoc::Provider` location
-            // so the chrome's git/fs reads route into the sandbox.
-            let location = sandbox.location.as_deref();
-            if let Err(e) = db.put_worktree(&tab, &root_s, &path_s, &branch, location, None) {
-                fail(CreateStep::Register, format!("db: {e}"));
+            if let Err(e) =
+                register_worktree_row(&db, cfg, root, &tab, &branch, &path_s, &choices, sandbox.location.as_deref())
+            {
+                fail(CreateStep::Register, e.to_string());
                 return;
-            }
-            // Persist the sandbox backend the same way as the host below: only a
-            // *concrete* pick is a deliberate per-worktree override, pinned so it
-            // sticks across restarts even against a non-"auto" `[sandbox] backend`
-            // (relaunch reads it as explicit — see `agent::launch_spec_with_key`).
-            // An "auto" pick stays NULL so the worktree re-resolves against the
-            // current config each open. `sandbox_key()` already returns "auto" for
-            // a non-local host (which manages its own isolation).
-            if choices.sandbox != "auto" && !choices.sandbox.is_empty() {
-                let _ = db.set_worktree_sandbox(&path_s, &choices.sandbox);
-            }
-            let _ = db.set_worktree_agent(&path_s, &choices.agent);
-            // Persist the chosen host only when it DIFFERS from the ambient
-            // default this worktree would otherwise inherit (DB workspace env →
-            // repo `.thegn.*` env → global `[sandbox] default_env` →
-            // "default"). A divergent choice — including an explicit "default"
-            // against a provider ambient default — is pinned so every later
-            // re-resolution (`effective_env` → `resolve_env(Some(..))`)
-            // reproduces the wizard's placement instead of falling through to
-            // the ambient. A choice equal to the ambient default stays NULL
-            // (clean inherit).
-            let ambient = ambient_env_name(Some(&db), cfg, root);
-            if choices.env != ambient {
-                // Fail the create rather than swallow it: a lost pin means the
-                // worktree silently inherits the ambient env instead of the one
-                // the user picked (e.g. machine0 → local) — the exact silent
-                // fallback this flow must never produce.
-                if let Err(e) = db.set_worktree_env(&path_s, &choices.env) {
-                    fail(
-                        CreateStep::Register,
-                        format!("pin env {}: {e}", choices.env),
-                    );
-                    return;
-                }
             }
             step(CreateStep::Register, StepState::Done, None);
         }

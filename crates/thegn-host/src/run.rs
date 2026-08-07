@@ -9164,6 +9164,39 @@ async fn event_loop<T: Terminal>(
                         dirty = true;
                     }
                 }
+                wizard::CreateEvent::Halted { generation, halt } => {
+                    // Recoverable env bring-up failure: the worktree + registry row
+                    // are KEPT. Retire the creation markers, then leave the tab
+                    // looking exactly like an existing worktree whose provider is
+                    // down + un-materialized — mark it needs-bring-up and raise the
+                    // same ask/halt modal the launch path uses (retry / run-on-host
+                    // then reuse the launch-side handlers).
+                    if let Some(key) = crate::handlers::creating::on_halted(
+                        &mut session,
+                        &mut model,
+                        &mut sb,
+                        &mut loading_state,
+                        &mut creating_tabs,
+                        &mut inflight,
+                        &mut wizard_ui,
+                        &mut wizard_cmd_tx,
+                        generation,
+                    ) {
+                        let is_active = session
+                            .worktrees
+                            .get(session.active)
+                            .is_some_and(|g| (g.name.clone(), g.active_tab) == key);
+                        if is_active && !halt_dismissed.contains(&key) {
+                            active_menu = Some(sandbox_halt_overlay(&halt));
+                            center_dormant = true;
+                        }
+                        materialize_failed.insert(key);
+                        model.status =
+                            format!("{} unavailable: {}", halt.placement, halt.reason);
+                        need_relayout = true;
+                        dirty = true;
+                    }
+                }
                 wizard::CreateEvent::Done {
                     generation,
                     payload,
