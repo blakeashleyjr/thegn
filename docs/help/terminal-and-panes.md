@@ -12,6 +12,7 @@ actions:
     split-right,
     close-pane,
     zoom,
+    redraw,
     sync-panes,
     next-tab,
     prev-tab,
@@ -75,6 +76,14 @@ of PTY panes.
 
 `Ctrl-g` locks the keymap: every chord passes through to the pane until
 pressed again. Use it when a TUI inside the pane needs chords thegn owns.
+
+## Fixing a garbled screen
+
+`Ctrl-Shift-l` forces a full redraw — the classic Ctrl-L "fix my screen"
+escape hatch. Reach for it if the display drifts (repeated or leftover
+lines) after the outer terminal window regains focus: some terminals
+repaint their alt screen imperfectly and thegn gets no event to heal it
+automatically.
 
 ## Layouts
 
