@@ -10338,6 +10338,17 @@ async fn event_loop<T: Terminal>(
                 // Reuse the prior frame in `scratch`, recompose ONLY the damaged
                 // regions (never the full chrome); the bounded diff scans just those.
                 let frames = tree.layout_framed(chrome.center);
+                // When the fullscreen loading splash owns the center (single leaf
+                // + launch steps in progress, or no live pane), a full frame draws
+                // the splash *instead of* pane content. A pane-output frame must
+                // agree: skip composing center-frame panes so streaming build
+                // output can't flash through the splash a few times a second (the
+                // incremental path used to paint the pane unconditionally). The
+                // splash from the prior full frame stays; the derive block flips
+                // chrome dirty → a full frame the instant `load_steps` clears.
+                let splash = crate::chrome::center_shows_splash(&frames, &model, |id| {
+                    panes.table.get(&id).map(|p| p.emulator()).is_some()
+                });
                 for &id in ids {
                     // The corner overlay is an off-tree pane: compose its content +
                     // card and diff ONLY its outer rect (bounded, never a recompose).
@@ -10373,6 +10384,13 @@ async fn event_loop<T: Terminal>(
                     if let (Some((content, diff_rect, has_card)), Some(p)) =
                         (resolved, panes.table.get(&id))
                     {
+                        // A center-framed pane under the splash: don't paint its
+                        // content (the splash owns the band). The drawer
+                        // (`has_card == false`) and corner (handled above) are
+                        // outside the center band and keep rendering.
+                        if splash && has_card {
+                            continue;
+                        }
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
                         if has_card {
                             // Repaint the card so an edge wide-glyph can't nibble the

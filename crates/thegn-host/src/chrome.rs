@@ -1987,6 +1987,34 @@ fn draw_relaunch_overlay(surface: &mut Surface, content: Rect, cmd: &str) {
     );
 }
 
+/// Whether the center band shows the fullscreen loading splash instead of pane
+/// content, given the laid-out center leaves (`frames`, from
+/// [`crate::center::CenterTree::layout_framed`]) and the model.
+///
+/// The single source of truth shared by the full-frame path ([`render_panes`])
+/// and the incremental pane-output path (the `RenderPlan::Incremental` arm in
+/// `run.rs`), so the two agree on what the center shows for a given state.
+/// Before this was factored out, only the full path consulted it — so while a
+/// live pane streamed output under a still-up splash, incremental pane-output
+/// frames painted the pane while full frames painted the splash, flashing the
+/// loading screen in and out.
+///
+/// - `!any_live`: no visible leaf has a live emulator (fresh launch before the
+///   first pane materializes, or every pane died) — the splash replaces what
+///   would otherwise be a black hole, and disappears the frame a pane shows up.
+/// - `!load_steps.is_empty() && frames.len() == 1`: pane-launch steps are in
+///   progress. Only a single-leaf center may take the *fullscreen* splash — a
+///   split (>= 2 leaves) always has an existing pane to keep rendering, so
+///   `load_steps` must never black it out.
+pub fn center_shows_splash(
+    frames: &[(crate::center::PaneId, Rect, Rect)],
+    model: &FrameModel,
+    is_live: impl Fn(crate::center::PaneId) -> bool,
+) -> bool {
+    let any_live = frames.iter().any(|(id, _, _)| is_live(*id));
+    !any_live || (!model.load_steps.is_empty() && frames.len() == 1)
+}
+
 /// Compose the center band: every visible pane's terminal content + the card
 /// border ring (or the loading splash when no pane is live yet). This is the
 /// pane half of a frame; [`draw_chrome`] is the chrome half. They write
@@ -2004,19 +2032,7 @@ pub fn render_panes<'a>(
     relaunch_of: &dyn Fn(crate::center::PaneId) -> Option<String>,
 ) {
     let frames = center.layout_framed(chrome.center);
-    // "Empty center" = no visible leaf has a live emulator behind it (fresh
-    // launch before the first pane materializes, or every pane died). The
-    // splash replaces what used to render as a black hole, and disappears on
-    // the exact frame a pane shows up.
-    let any_live = frames.iter().any(|(id, _, _)| lookup(*id).is_some());
-    // Show the loading splash whenever pane-launch steps are in progress,
-    // even on a resurrected session (any_live may be false before the PTY
-    // forks, and we want the progress display visible immediately). But only a
-    // single-leaf center may take the *fullscreen* splash: a split (>= 2 leaves)
-    // always has an existing pane to keep rendering, so load_steps must never
-    // black it out — the new leaf shows as an ordinary empty card until its
-    // shell speaks.
-    let show_splash = !any_live || (!model.load_steps.is_empty() && frames.len() == 1);
+    let show_splash = center_shows_splash(&frames, model, |id| lookup(id).is_some());
     if !show_splash {
         // The pane card owns the full center band. Paint the outside/ring
         // background before composing terminal content so no default black halo
