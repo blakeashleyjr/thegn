@@ -1933,6 +1933,43 @@ fn workspace_pool_limit_zero_reaps_on_every_stash() {
     assert!(!panes.table.contains_key(&1), "pane reaped immediately");
 }
 
+/// The pool drops evicted/reaped panes as an INCIDENTAL drop: it marks each one
+/// detach-on-drop before removing it from the table, so a daemon-backed pane's
+/// server-side session keeps running (the daemon owns it; the next visit
+/// warm-reattaches) instead of being killed. Regression guard for the bug where
+/// leaving a workspace killed its still-running shell and the return spawned a
+/// fresh one.
+#[test]
+fn workspace_pool_detaches_reaped_panes_so_daemon_sessions_survive() {
+    use std::sync::atomic::Ordering;
+
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+    let mut pool = WorkspacePool::default();
+    pool.set_limit(0); // reap on every stash
+
+    let a = resident_with_live_pane(&mut panes, "/r/a", "a/home", 1);
+    // Capture the pane's detach-on-drop flag before it leaves the table — it's
+    // an Arc, so it stays observable after the pane is dropped.
+    let flag = panes
+        .table
+        .get(&1)
+        .and_then(|p| p.detach_flag_handle())
+        .expect("a stream pane carries a detach-on-drop flag");
+    assert!(
+        !flag.load(Ordering::Relaxed),
+        "flag starts false (kill-on-drop default)"
+    );
+
+    pool.stash("/r/a".into(), a, &mut panes);
+
+    assert!(!panes.table.contains_key(&1), "pane left the table on reap");
+    assert!(
+        flag.load(Ordering::Relaxed),
+        "an incidentally-reaped pane must be marked detached so the daemon keeps its session"
+    );
+}
+
 #[test]
 fn remap_cold_workspace_ids_moves_ids_past_the_live_range() {
     // A cold-resurrected workspace's persisted ids must be rewritten onto a

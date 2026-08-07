@@ -620,6 +620,31 @@ impl Panes {
         self.spawn_times.remove(&id);
     }
 
+    /// Remove a pane from the table as an **incidental drop** (resident-pool
+    /// park/evict), not an explicit user close: mark it detach-on-drop first so
+    /// a daemon-backed pane's server-side session KEEPS RUNNING (the daemon owns
+    /// it; the next visit warm-reattaches via `pane_sessions`) instead of being
+    /// killed on drop. `set_detach_on_drop` is a no-op for plain in-process PTY
+    /// panes (they have no daemon session), so those still die on drop as before
+    /// — exactly right: only daemon-backed shells are meant to survive.
+    ///
+    /// Contrast the explicit-close paths (close pane/tab, worktree/workspace
+    /// delete), which drop with the kill-on-drop default so a closed pane can't
+    /// leak a live session into a relay lease.
+    pub(crate) fn detach_pane(&mut self, id: u32) {
+        if let Some(p) = self.table.get(&id) {
+            p.set_detach_on_drop(true);
+            if p.is_daemon_backed() {
+                tracing::debug!(
+                    target: "thegn::daemon",
+                    pane = id,
+                    "detaching daemon pane on incidental drop (session kept alive for reattach)"
+                );
+            }
+        }
+        self.table.remove(&id);
+    }
+
     /// Reserve `n` fresh, never-reused pane ids and return the first. Used to
     /// remap a cold-resurrected workspace's persisted tree ids onto a disjoint
     /// range so they cannot collide with the live panes of other resident

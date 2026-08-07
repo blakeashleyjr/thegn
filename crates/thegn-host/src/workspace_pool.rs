@@ -11,9 +11,16 @@
 //! open-fd limit, at which point every git read fails at once and the panel
 //! header collapses to "—". So the pool is **bounded** by
 //! `[session].resident_pool_limit`, evicting the least-recently-used parked
-//! workspace (and reaping its panes) once the cap is exceeded — the same
-//! bounded-pool shape as [`crate::drawer_state::DrawerPool`]. An evicted
-//! workspace re-resurrects (respawning its processes) on the next visit.
+//! workspace once the cap is exceeded — the same bounded-pool shape as
+//! [`crate::drawer_state::DrawerPool`].
+//!
+//! Eviction (and the `limit = 0` reap-on-switch) drops each evicted pane
+//! through [`Panes::detach_pane`](crate::panes::Panes::detach_pane), **not** a
+//! bare `table.remove`: a daemon-backed pane is marked detach-on-drop so its
+//! server-side session keeps running in the pane daemon (the next visit
+//! warm-reattaches it) rather than being killed — only in-process PTY panes
+//! actually die on eviction. An evicted workspace re-resurrects on the next
+//! visit, reattaching live daemon sessions and respawning any in-process panes.
 
 use std::collections::VecDeque;
 
@@ -30,7 +37,7 @@ pub(crate) struct ResidentWorkspace {
 
 impl ResidentWorkspace {
     /// Every live pane id this workspace owns, across all its groups' tabs — the
-    /// panes to reap from the global table when this workspace is evicted.
+    /// panes to detach from the global table when this workspace is evicted.
     fn pane_ids(&self) -> Vec<u32> {
         self.worktrees
             .iter()
@@ -79,15 +86,16 @@ impl WorkspacePool {
     }
 
     /// Park `rw` under `repo`, enforcing the configured limit. A limit of 0
-    /// reaps the workspace's panes immediately (no pooling); an unset limit
+    /// detaches the workspace's panes immediately (no pooling); an unset limit
     /// (`None`) keeps every entry (unbounded); otherwise the least-recently
     /// parked entries beyond the limit are evicted and their panes dropped from
-    /// the table. Re-parking an already-present key replaces it in place (its
-    /// live panes are the same ids, so they are not reaped).
+    /// the table via [`Panes::detach_pane`] (daemon sessions survive; in-process
+    /// PTYs die). Re-parking an already-present key replaces it in place (its
+    /// live panes are the same ids, so they are not dropped).
     pub(crate) fn stash(&mut self, repo: String, rw: ResidentWorkspace, panes: &mut Panes) {
         if self.limit == Some(0) {
             for id in rw.pane_ids() {
-                panes.table.remove(&id);
+                panes.detach_pane(id);
             }
             return;
         }
@@ -101,7 +109,7 @@ impl WorkspacePool {
             while self.parked.len() > limit {
                 if let Some((_, evicted)) = self.parked.pop_front() {
                     for id in evicted.pane_ids() {
-                        panes.table.remove(&id);
+                        panes.detach_pane(id);
                     }
                 }
             }
