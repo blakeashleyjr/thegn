@@ -88,8 +88,11 @@ fn rows_for_repo(root: &Path) -> Result<Vec<thegn_core::db::MergeQueueRow>> {
 }
 
 fn list(json: bool) -> Result<()> {
-    let db = Db::open()?;
-    let rows = db.list_merge_queue()?;
+    // Scope to the current repo (same membership rule as `drain`) so a shared
+    // state DB holding several repos' queues doesn't leak other repos' rows into
+    // this repo's listing — `merge` is per-repo, and `list` must match `drain`.
+    let root = repo_root()?;
+    let rows = rows_for_repo(&root)?;
     if json {
         return super::emit_json(&rows);
     }
