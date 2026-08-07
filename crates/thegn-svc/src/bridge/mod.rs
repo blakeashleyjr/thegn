@@ -172,6 +172,14 @@ pub struct BridgeClient {
     timeout: Duration,
     /// Shorter deadline for interactive read-only ops (glyph fan-out, status).
     read_timeout: Duration,
+    /// Set once by the reader loop when the stream closes (see `reader_loop`
+    /// teardown). Read/written **only under the `pending` lock** so a `call`
+    /// registering a waiter and the reader draining-on-close are serialized: a
+    /// call either inserts before the drain (woken fast by it) or observes
+    /// `closed` afterwards and errors immediately — never orphaned until the
+    /// deadline. (Prior bug: a call that registered *after* the reader had
+    /// already torn down blocked the full RPC timeout.)
+    closed: Arc<AtomicBool>,
     _reader: std::thread::JoinHandle<()>,
     subs: Subs,
     next_watch: AtomicU64,
@@ -224,12 +232,16 @@ impl BridgeClient {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let subs: Subs = Arc::new(Mutex::new(HashMap::new()));
         let procs: Procs = Arc::new(Mutex::new(HashMap::new()));
+        let closed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let reader_pending = pending.clone();
         let reader_subs = subs.clone();
         let reader_procs = procs.clone();
+        let reader_closed = closed.clone();
         let handle = std::thread::Builder::new()
             .name("bridge-reader".into())
-            .spawn(move || reader_loop(reader, reader_pending, reader_subs, reader_procs))
+            .spawn(move || {
+                reader_loop(reader, reader_pending, reader_subs, reader_procs, reader_closed)
+            })
             .expect("spawn bridge reader");
         BridgeClient {
             writer: Arc::new(Mutex::new(Box::new(writer))),
@@ -237,6 +249,7 @@ impl BridgeClient {
             pending,
             timeout: env_timeout("THEGN_BRIDGE_TIMEOUT_SECS", 120),
             read_timeout: env_timeout("THEGN_BRIDGE_READ_TIMEOUT_SECS", 20),
+            closed,
             _reader: handle,
             subs,
             next_watch: AtomicU64::new(1),
@@ -264,7 +277,17 @@ impl BridgeClient {
         warn_if_on_loop_thread(method);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        {
+            // Register the waiter under the same lock the reader's close-teardown
+            // holds, and bail if the stream already closed — otherwise a call
+            // that lands after teardown would wait out the full RPC deadline for
+            // a response that can never come.
+            let mut p = self.pending.lock().unwrap();
+            if self.closed.load(Ordering::SeqCst) {
+                bail!("bridge connection closed");
+            }
+            p.insert(id, tx);
+        }
         let req = serde_json::to_string(&Request {
             id,
             method: method.to_string(),
@@ -522,7 +545,13 @@ pub fn for_loc(loc: &GitLoc) -> Option<Arc<BridgeClient>> {
     registry().lock().unwrap().get(&key).cloned()
 }
 
-fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs, procs: Procs) {
+fn reader_loop(
+    mut reader: impl Read,
+    pending: Pending,
+    subs: Subs,
+    procs: Procs,
+    closed: Arc<AtomicBool>,
+) {
     let mut dec = FrameDecoder::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -608,8 +637,16 @@ fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs, procs: Procs
     // that can never arrive (the connection can die without the client dropping).
     // Pending RPC waiters get an error; proc subscribers get a final synthetic
     // Exit; fs.watch subscribers observe the drop (Sender gone → recv errs).
-    for (_, tx) in pending.lock().unwrap().drain() {
-        let _ = tx.send(Err("bridge connection closed".into()));
+    // Mark `closed` *inside* the same critical section as the drain so a
+    // concurrent `call_within` is serialized: it either inserted before us (and
+    // is drained here) or observes `closed` after us and errors immediately —
+    // no waiter is left to time out.
+    {
+        let mut p = pending.lock().unwrap();
+        closed.store(true, Ordering::SeqCst);
+        for (_, tx) in p.drain() {
+            let _ = tx.send(Err("bridge connection closed".into()));
+        }
     }
     for (_, tx) in procs.lock().unwrap().drain() {
         let _ = tx.send(ProcEvent::Exit { code: -1 });
