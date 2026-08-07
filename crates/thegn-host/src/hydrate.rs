@@ -763,8 +763,14 @@ pub(crate) fn db_worktree_list(
         // OR a non-local env placement, including one INHERITED from the repo's
         // ambient default) are exempt: their tree lives off the host, so a
         // missing local dir is not proof of deletion.
-        if !row_is_remote_effective(db, cfg, &w.location, w.env_name.as_deref(), &w.repo_root, &mut ambient_cache)
-            && !std::path::Path::new(&w.worktree).is_dir()
+        if !row_is_remote_effective(
+            db,
+            cfg,
+            &w.location,
+            w.env_name.as_deref(),
+            &w.repo_root,
+            &mut ambient_cache,
+        ) && !std::path::Path::new(&w.worktree).is_dir()
         {
             tracing::warn!(
                 target: "thegn::hydrate",
@@ -793,10 +799,9 @@ pub(crate) fn db_worktree_list(
                 !e.is_empty()
                     && e != "default"
                     && match cfg.env.get(e) {
-                        Some(ec) => matches!(
-                            ec.placement,
-                            thegn_core::config::PlacementMode::Provider
-                        ),
+                        Some(ec) => {
+                            matches!(ec.placement, thegn_core::config::PlacementMode::Provider)
+                        }
                         None => true,
                     }
             });
@@ -1193,11 +1198,18 @@ pub(crate) fn build_initial_model(
     // so the sidebar shows all registered workspaces on the very first frame
     // instead of only the live session entries.
     let sidebar_workspaces = workspace_list(session, db);
+    // Seed the sidebar's dynamic (OSC) worktree titles from the DB so persisted
+    // titles show on the very first frame — before any pane re-emits one. The
+    // loop's live-title merge then refreshes them in place.
+    let sidebar_window_titles = db
+        .and_then(|d| d.all_worktree_titles().ok())
+        .unwrap_or_default();
     FrameModel {
         worktree,
         tabs,
         active_tab,
         sidebar_workspaces,
+        sidebar_window_titles,
         active_container_name: thegn_core::sandbox::container_name(&cwd.to_string_lossy()),
         panel: crate::panel::PanelData {
             branch: active_name,
