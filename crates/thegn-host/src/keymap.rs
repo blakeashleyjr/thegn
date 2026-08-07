@@ -39,6 +39,11 @@ pub enum Action {
     NewPane,
     /// Fullscreen the focused zone (pane / sidebar / panel); toggles off.
     ToggleZoom,
+    /// Force a full-screen redraw: rebuild the diff baseline, clear, and repaint
+    /// everything. The classic Ctrl-L "fix my screen" escape hatch — heals the
+    /// display after the outer terminal drifts from our baseline (e.g. an
+    /// imperfect alt-screen repaint when the window regains focus).
+    Redraw,
     /// Broadcast typed input to every pane in the focused tab (item 96); toggles off.
     ToggleSyncPanes,
     /// Save the focused tab's pane layout as a named snapshot (item 115).
@@ -357,6 +362,7 @@ impl Action {
             Action::NewTab => "new-tab",
             Action::NewPane => "new-pane",
             Action::ToggleZoom => "zoom",
+            Action::Redraw => "redraw",
             Action::ToggleSyncPanes => "sync-panes",
             Action::SaveLayout => "save-layout",
             Action::ApplyLayout => "apply-layout",
@@ -472,6 +478,7 @@ impl Action {
             "new-tab" => Action::NewTab,
             "new-pane" => Action::NewPane,
             "zoom" | "toggle-zoom" | "fullscreen" => Action::ToggleZoom,
+            "redraw" | "refresh" | "force-redraw" | "repaint" => Action::Redraw,
             "sync-panes" | "toggle-sync-panes" | "broadcast" => Action::ToggleSyncPanes,
             "save-layout" => Action::SaveLayout,
             "apply-layout" => Action::ApplyLayout,
@@ -1063,6 +1070,10 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt t", Action::NewTab).unwrap();
     map.insert_all("Alt p", Action::NewPane).unwrap();
     map.insert_all("Ctrl Alt z", Action::ToggleZoom).unwrap();
+    // Force full redraw — the Ctrl-L "fix my screen" escape hatch. Plain
+    // `Ctrl l` is FocusRight and `Ctrl Alt l` is the proxy dashboard, so this
+    // keeps the mnemonic L in the `Ctrl Shift` namespace.
+    map.insert_all("Ctrl Shift l", Action::Redraw).unwrap();
     map.insert_all("Ctrl Alt y", Action::ToggleSyncPanes)
         .unwrap();
     map.insert_all("Ctrl Alt t", Action::CycleTheme).unwrap();
@@ -1637,6 +1648,11 @@ mod tests {
             k('z', Modifiers::CTRL | Modifiers::ALT),
             Some(Action::ToggleZoom)
         );
+        // Redraw round-trips through its stable key; plain Ctrl-L stays
+        // FocusRight (the redraw chord is Ctrl-Shift-L, see keymap install).
+        assert_eq!(Action::Redraw.key(), "redraw");
+        assert_eq!(Action::from_key("redraw"), Some(Action::Redraw));
+        assert_eq!(k('l', Modifiers::CTRL), Some(Action::FocusRight));
         assert_eq!(Action::from_key("broadcast"), Some(Action::ToggleSyncPanes));
     }
 

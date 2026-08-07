@@ -6384,8 +6384,6 @@ async fn event_loop<T: Terminal>(
     // layout may survive. Tab/worktree switches reuse the same rects and must
     // NOT trigger this: a full repaint flashes the whole center.
     let mut full_repaint = true;
-    // Same-size resize: re-sync the diff baseline without a ClearScreen (below).
-    let mut resync_baseline = false;
     // Consecutive transient terminal-write failures (EIO); reset on a clean
     // flush, torn down only when it persists past `frame_write::RETRY_MAX`.
     let mut frame_write_errs: u32 = 0;
@@ -10675,10 +10673,11 @@ async fn event_loop<T: Terminal>(
             // diff has no such fallback and keeps damage-tracking exact.
             let mut wire: Vec<Change> = Vec::new();
             if full_repaint {
-                // Geometry changed since the last flush: reset the baseline
-                // so no cell from the previous layout survives (the
+                // Full heal: reset the baseline so no stale cell survives (the
                 // duplicate-tabbar / doubled-header class of corruption).
-                tracing::debug!(target: "thegn::frame", "geometry_changed → full_repaint");
+                // Triggered by geometry change, refocus SIGWINCH, or the manual
+                // `redraw` action when the terminal has drifted from our baseline.
+                tracing::debug!(target: "thegn::frame", "full_repaint");
                 front = Surface::new(cols, rows);
                 let clear = Change::ClearScreen(crate::chrome::col(crate::chrome::S::Bg0));
                 let seq = front.add_change(clear.clone());
@@ -10686,11 +10685,6 @@ async fn event_loop<T: Terminal>(
                 wire.push(clear);
                 wire_renderer.invalidate();
                 full_repaint = false;
-            } else if resync_baseline {
-                // Same-size resize: reset baseline so diff_screens re-emits over
-                // garbage; no ClearScreen (no orphaned cells; the escape flashes).
-                front = Surface::new(cols, rows);
-                resync_baseline = false;
             }
             // Bounded diff: the incremental path recomposed just a few rects
             // (changed panes and/or the bars) over the reused `scratch`, so diff
@@ -16836,6 +16830,16 @@ async fn event_loop<T: Terminal>(
                                 chrome = recompute_chrome!();
                                 need_relayout = true;
                             }
+                            Action::Redraw => {
+                                // Force a full-screen heal: `full_repaint` rebuilds
+                                // the diff baseline, clears, and re-emits everything
+                                // (the post-match `dirty` schedules the frame). The
+                                // Ctrl-L escape hatch for when the outer terminal
+                                // has drifted from our baseline (e.g. an imperfect
+                                // alt-screen repaint on window refocus).
+                                full_repaint = true;
+                                model.status = "Screen redrawn".into();
+                            }
                             Action::ToggleSyncPanes => {
                                 sync_panes = !sync_panes;
                                 model.status = if sync_panes {
@@ -17928,10 +17932,15 @@ async fn event_loop<T: Terminal>(
             Ok(Some(InputEvent::Resized { rows: r, cols: c })) => {
                 if r == rows && c == cols {
                     // Same-size SIGWINCH (niri re-`configure` on window refocus):
-                    // geometry unchanged, so don't relayout / SIGWINCH panes. Re-sync
-                    // the diff baseline (re-flush over any coalesced-drag garbage) but
-                    // with NO ClearScreen — no orphaned cells, and it flashes ghostty.
-                    resync_baseline = true;
+                    // geometry unchanged, so don't relayout / SIGWINCH panes. But the
+                    // outer terminal may have drifted from our baseline while we were
+                    // unfocused (imperfect alt-screen repaint → orphaned/duplicated
+                    // lines), so do a full heal: rebuild the baseline, ClearScreen,
+                    // and re-emit everything. A baseline-only resync can't erase the
+                    // orphans. The brief flash is the cost of a guaranteed-clean
+                    // screen on refocus. (Ghostty doesn't send this SIGWINCH, so it
+                    // sees no new flash; users there heal via the `redraw` action.)
+                    full_repaint = true;
                     dirty = true;
                 } else {
                     rows = r;
