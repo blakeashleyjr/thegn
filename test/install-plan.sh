@@ -16,8 +16,13 @@ out="$("$repo"/install.sh --dry-run "$tmp/bin")"
   echo "$out" >&2
   exit 1
 }
-[[ $out == *"$tmp/bin/tg wrapper -> alacritty --config-file $repo/config/alacritty.toml -e $tmp/bin/tg-tui"* ]] || {
-  echo "dry-run did not plan tg dedicated alacritty wrapper" >&2
+[[ $out == *"$tmp/bin/tg wrapper -> $tmp/bin/tg-tui (current terminal); tg -s|--standalone -> ghostty --config-file $repo/config/ghostty.config -e $tmp/bin/tg-tui"* ]] || {
+  echo "dry-run did not plan tg current-terminal + ghostty standalone wrapper" >&2
+  echo "$out" >&2
+  exit 1
+}
+[[ $out == *"app-launcher entry (Exec=$tmp/bin/tg --standalone, Icon=thegn)"* ]] || {
+  echo "dry-run did not plan the desktop entry with Exec=tg --standalone / Icon=thegn" >&2
   echo "$out" >&2
   exit 1
 }
@@ -40,13 +45,13 @@ cat >"$fakebin/delta" <<'EOF'
 exit 0
 EOF
 chmod 0755 "$fakebin/delta"
-cat >"$fakebin/alacritty" <<'EOF'
+cat >"$fakebin/ghostty" <<'EOF'
 #!/usr/bin/env sh
-printf '%s\n' "$@" >"${TG_ALACRITTY_LOG:?}"
+printf '%s\n' "$@" >"${TG_GHOSTTY_LOG:?}"
 EOF
-chmod 0755 "$fakebin/alacritty"
+chmod 0755 "$fakebin/ghostty"
 
-install_out="$(PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" "$repo/install.sh" "$tmp/bin")"
+install_out="$(PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" "$repo/install.sh" "$tmp/bin")"
 [[ -L $tmp/bin/thegn && $(readlink "$tmp/bin/thegn") == "$repo/target/release/thegn" ]] || {
   echo "install did not symlink thegn to the release binary" >&2
   echo "$install_out" >&2
@@ -62,16 +67,45 @@ install_out="$(PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/conf
   sed -n '1,120p' "$tmp/bin/tg-tui" >&2
   exit 1
 }
-[[ $(<"$tmp/bin/tg") == *"exec alacritty --config-file $repo/config/alacritty.toml -e $tmp/bin/tg-tui"* ]] || {
-  echo "tg should launch the dedicated alacritty profile" >&2
+# tg with no standalone flag execs tg-tui directly (current terminal), never ghostty.
+[[ $(<"$tmp/bin/tg") == *"exec $tmp/bin/tg-tui"* ]] || {
+  echo "tg should exec tg-tui directly in the current terminal by default" >&2
   sed -n '1,120p' "$tmp/bin/tg" >&2
   exit 1
 }
-TG_ALACRITTY_LOG="$tmp/alacritty.args" PATH="$fakebin:$PATH" "$tmp/bin/tg"
-alacritty_args="$(<"$tmp/alacritty.args")"
-[[ $alacritty_args == *$'--config-file\n'"$repo/config/alacritty.toml"*$'\n-e\n'"$tmp/bin/tg-tui"* ]] || {
-  echo "tg did not invoke alacritty with the bundled config and tg-tui" >&2
-  printf '%s\n' "$alacritty_args" >&2
+# tg -s / --standalone launches the dedicated ghostty profile.
+[[ $(<"$tmp/bin/tg") == *"exec ghostty --config-default-files=false --config-file=$repo/config/ghostty.config -e $tmp/bin/tg-tui"* ]] || {
+  echo "tg --standalone should launch the dedicated ghostty profile" >&2
+  sed -n '1,120p' "$tmp/bin/tg" >&2
+  exit 1
+}
+TG_GHOSTTY_LOG="$tmp/ghostty.args" PATH="$fakebin:$PATH" "$tmp/bin/tg" --standalone
+ghostty_args="$(<"$tmp/ghostty.args")"
+[[ $ghostty_args == *$'--config-file='"$repo/config/ghostty.config"*$'\n-e\n'"$tmp/bin/tg-tui"* ]] || {
+  echo "tg --standalone did not invoke ghostty with the bundled config and tg-tui" >&2
+  printf '%s\n' "$ghostty_args" >&2
+  exit 1
+}
+
+# The desktop entry + owl icon must be installed under XDG_DATA_HOME.
+desktop="$tmp/data/applications/thegn.desktop"
+icon="$tmp/data/icons/hicolor/scalable/apps/thegn.svg"
+[[ -f $desktop ]] || {
+  echo "install did not write the .desktop entry ($desktop)" >&2
+  exit 1
+}
+[[ $(<"$desktop") == *"Exec=$tmp/bin/tg --standalone"* ]] || {
+  echo ".desktop entry should Exec 'tg --standalone'" >&2
+  cat "$desktop" >&2
+  exit 1
+}
+[[ $(<"$desktop") == *$'\nIcon=thegn\n'* ]] || {
+  echo ".desktop entry should reference Icon=thegn" >&2
+  cat "$desktop" >&2
+  exit 1
+}
+[[ -f $icon && $(head -1 "$icon") == '<?xml'* ]] || {
+  echo "install did not write the owl SVG icon ($icon)" >&2
   exit 1
 }
 
