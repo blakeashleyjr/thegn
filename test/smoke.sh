@@ -302,12 +302,22 @@ if command -v sqlite3 >/dev/null 2>&1; then
     "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
        \"SELECT count(*) FROM merge_queue WHERE branch='$MB' AND status='queued'\") -eq 1 ]]"
 fi
+# `merge rm` removes a queued entry by path; re-add so drain has work. Done while
+# the worktree still exists — a clean land now auto-removes it (see below).
+check "merge rm deletes the entry by the same path" \
+  "'$SZ' merge rm '$MP' >/dev/null 2>&1"
+check "merge add re-queues the branch after rm" \
+  "'$SZ' merge add '$MP' | grep -q 'queued'"
 check "merge drain lands the clean branch" \
   "'$SZ' merge drain | grep -q 'landed'"
 check "drain advanced the target to include the branch's commit" \
   "git -C '$R' log --oneline | grep -q 'smoke merge change'"
-check "merge rm deletes the entry by the same path" \
-  "'$SZ' merge add '$MP' >/dev/null && '$SZ' merge rm '$MP' >/dev/null 2>&1"
+# organize_folders + on_landed = "remove" are on by default: a clean land removes
+# the merged worktree and deletes its now-redundant branch.
+check "clean land auto-removes the merged worktree" \
+  "[[ ! -d '$MP' ]]"
+check "clean land deletes the merged branch" \
+  "[[ -z \$(git -C '$R' branch --list '$MB') ]]"
 
 # ── placement engine ─────────────────────────────────────────────────────────
 # Engine OFF (the default): the dry-run reports passthrough and no state is
