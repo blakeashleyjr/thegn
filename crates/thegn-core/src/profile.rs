@@ -298,6 +298,160 @@ pub fn launch_window_argv(
     ])
 }
 
+/// Persistent, user-controlled ordering of profiles in the switcher.
+///
+/// Profiles have no DB rows (each profile is its own rerooted `thegn.db`), so a
+/// cross-profile order cannot live in the DB. It lives in **shared, never-rerooted
+/// config** at the real `XDG_CONFIG_HOME` — the one location [`reroot`] leaves
+/// untouched, so every profile's process observes one shared order. The switcher
+/// arranges the known profiles by this order and appends any not named in it in a
+/// stable (caller-sorted) order, so a freshly-created profile never reshuffles the
+/// existing ones. The sidecar JSON is a cache (config on disk is truth): writes
+/// are best-effort and a missing/malformed file falls back to alphabetical.
+pub mod order {
+    use crate::util;
+    use std::path::PathBuf;
+
+    /// `~/.config/thegn/profiles-order.json` (the real, un-rerooted config home).
+    fn order_path() -> PathBuf {
+        util::xdg_config_home()
+            .join("thegn")
+            .join("profiles-order.json")
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    struct OrderFile {
+        #[serde(default)]
+        order: Vec<String>,
+    }
+
+    /// Read a persisted order from `path`. Empty on missing/unreadable/malformed.
+    fn load_from(path: &std::path::Path) -> Vec<String> {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        serde_json::from_str::<OrderFile>(&raw)
+            .map(|f| f.order)
+            .unwrap_or_default()
+    }
+
+    /// Write `order` to `path`, creating the parent dir.
+    fn save_to(path: &std::path::Path, order: &[String]) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let doc = OrderFile {
+            order: order.to_vec(),
+        };
+        let json =
+            serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{\"order\":[]}".to_string());
+        std::fs::write(path, json)
+    }
+
+    /// The persisted profile order from the shared config sidecar (empty when
+    /// absent — the switcher then falls back to a config seed / alphabetical).
+    pub fn load_order() -> Vec<String> {
+        load_from(&order_path())
+    }
+
+    /// Persist the ENTIRE profile order (not a swap) to the shared config sidecar.
+    /// Best-effort — the sidecar is a cache; callers ignore the `Result`.
+    pub fn save_order(order: &[String]) -> std::io::Result<()> {
+        save_to(&order_path(), order)
+    }
+
+    /// Pure: arrange `known` by `order` — every `order` entry that exists in
+    /// `known` first (de-duped, in order), then any `known` not named in `order`
+    /// appended in their given (caller-sorted) sequence. Unknown/new profiles
+    /// never reshuffle the ones the user has arranged.
+    pub fn apply_order(known: &[String], order: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::with_capacity(known.len());
+        for name in order {
+            if known.iter().any(|k| k == name) && !out.iter().any(|o| o == name) {
+                out.push(name.clone());
+            }
+        }
+        for name in known {
+            if !out.iter().any(|o| o == name) {
+                out.push(name.clone());
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn v(xs: &[&str]) -> Vec<String> {
+            xs.iter().map(|s| s.to_string()).collect()
+        }
+
+        #[test]
+        fn apply_order_places_ordered_first_then_appends_rest() {
+            assert_eq!(
+                apply_order(&v(&["a", "b", "c", "d"]), &v(&["c", "a"])),
+                v(&["c", "a", "b", "d"])
+            );
+        }
+
+        #[test]
+        fn apply_order_empty_order_preserves_known() {
+            assert_eq!(apply_order(&v(&["a", "b", "c"]), &[]), v(&["a", "b", "c"]));
+        }
+
+        #[test]
+        fn apply_order_ignores_unknown_names_and_dedups() {
+            // "x" is not a known profile ⇒ ignored; "a" repeated ⇒ deduped.
+            assert_eq!(
+                apply_order(&v(&["a", "b"]), &v(&["x", "a", "a", "b"])),
+                v(&["a", "b"])
+            );
+        }
+
+        #[test]
+        fn apply_order_new_profile_appends_without_reshuffling() {
+            // "personal"/"washu" are ordered; a freshly-added "hubone" lands last.
+            assert_eq!(
+                apply_order(
+                    &v(&["default", "hubone", "personal", "washu"]),
+                    &v(&["personal", "washu", "default"])
+                ),
+                v(&["personal", "washu", "default", "hubone"])
+            );
+        }
+
+        #[test]
+        fn save_then_load_roundtrips() {
+            let dir = std::env::temp_dir().join(format!(
+                "tg-order-{}-{}",
+                std::process::id(),
+                crate::util::now()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("profiles-order.json");
+            assert!(load_from(&path).is_empty(), "missing file ⇒ empty");
+            save_to(&path, &v(&["washu", "default", "personal"])).unwrap();
+            assert_eq!(load_from(&path), v(&["washu", "default", "personal"]));
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn load_malformed_is_empty_not_a_panic() {
+            let dir = std::env::temp_dir().join(format!(
+                "tg-order-bad-{}-{}",
+                std::process::id(),
+                crate::util::now()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("profiles-order.json");
+            std::fs::write(&path, b"{ not json").unwrap();
+            assert!(load_from(&path).is_empty());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

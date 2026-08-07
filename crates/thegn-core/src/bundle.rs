@@ -365,6 +365,27 @@ fn compose_inner(
         .map(|z| z.name)
         .unwrap_or_default();
 
+    // Profile-base identity (lowest precedence): the active profile may resolve
+    // its credentials from a named identity (`[profiles.<p>] identity = "…"`).
+    // Fold it first so bound bundles layer on top per scope; any tool the identity
+    // leaves unset falls back to the profile-root default (pinned into the process
+    // env at reroot and carried into the pane via the host-env allowlist).
+    if let Some(id_name) = cfg
+        .profiles
+        .get(&crate::profile::name())
+        .map(|p| p.identity.clone())
+        .filter(|s| !s.is_empty())
+    {
+        fold_identity(
+            cfg,
+            db,
+            &id_name,
+            &mut overrides,
+            &mut mounts,
+            &mut ensure_dirs,
+        );
+    }
+
     for name in &order {
         let Some(b) = cfg.bundle.get(name) else {
             continue;
@@ -383,6 +404,21 @@ fn compose_inner(
             name,
             b,
             allow_secrets,
+            &mut overrides,
+            &mut mounts,
+            &mut ensure_dirs,
+        );
+    }
+
+    // Directly-bound identities (the identity switcher), highest-precedence per
+    // scope (global → workspace → worktree), folded after the bundle chain so an
+    // explicit identity switch wins over a bundle-referenced one. Each tool it
+    // leaves unset still falls through to the bundle/profile-base identity below.
+    for id_name in crate::identity::bound_in_order(db, worktree, slug) {
+        fold_identity(
+            cfg,
+            db,
+            &id_name,
             &mut overrides,
             &mut mounts,
             &mut ensure_dirs,
@@ -455,6 +491,11 @@ fn fold_bundle(
     mounts: &mut Vec<Mount>,
     ensure_dirs: &mut Vec<String>,
 ) {
+    // A bundle-referenced identity folds first, so the bundle's own explicit
+    // `env`/`config_dirs`/`accounts` below override the named identity per key.
+    if !b.identity.is_empty() {
+        fold_identity(cfg, db, &b.identity, overrides, mounts, ensure_dirs);
+    }
     for (k, v) in &b.env {
         if let Some(val) = resolve_value(v, cfg, allow_secrets) {
             overrides.insert(k.clone(), val);
@@ -487,6 +528,61 @@ fn fold_bundle(
             util::expand_tilde(&b.home)
         };
         fold_cred_dir("HOME", &home, overrides, mounts, ensure_dirs);
+    }
+}
+
+/// Fold a named [`crate::config::IdentityConfig`] into the accumulators. Each
+/// per-tool binding it sets overrides the matching credential env var and
+/// path-preservingly mounts the dir/file when it already exists; tools it leaves
+/// unset are untouched, so a less specific layer (or the profile-root fallback
+/// the pane inherits) fills them — the per-tool mix-and-match. Agent `accounts`
+/// fold exactly like a bundle's. An unknown identity name warns and is skipped.
+fn fold_identity(
+    cfg: &Config,
+    db: &Db,
+    name: &str,
+    overrides: &mut BTreeMap<String, String>,
+    mounts: &mut Vec<Mount>,
+    ensure_dirs: &mut Vec<String>,
+) {
+    let Some(id) = crate::identity::resolve(cfg, name) else {
+        crate::msg::warn(&format!("identity: unknown identity {name:?} (ignored)"));
+        return;
+    };
+    let r = crate::identity::resolved(id);
+    if let Some(p) = &r.git_config {
+        push_mount_if_exists(mounts, p);
+        overrides.insert("GIT_CONFIG_GLOBAL".to_string(), p.clone());
+    }
+    if let Some(cmd) = r.git_ssh_command() {
+        if let Some(key) = &r.git_ssh_key {
+            push_mount_if_exists(mounts, key);
+        }
+        overrides.insert("GIT_SSH_COMMAND".to_string(), cmd);
+    }
+    if let Some(p) = &r.gh_config {
+        push_mount_if_exists(mounts, p);
+        overrides.insert("GH_CONFIG_DIR".to_string(), p.clone());
+    }
+    if let Some(p) = &r.gpg_home {
+        push_mount_if_exists(mounts, p);
+        overrides.insert("GNUPGHOME".to_string(), p.clone());
+    }
+    // Per-provider agent accounts (`accounts = { claude = "washu" }`) resolve
+    // through `account.rs` to the provider home env var + path-preserving mount,
+    // identically to a bundle's `accounts`.
+    for (provider, acct) in &id.accounts {
+        if let Some(p) = account::provider(provider)
+            && let Some(dir) = account::account_dir(cfg, db, provider, acct)
+        {
+            fold_cred_dir(
+                p.home_env,
+                &dir.to_string_lossy(),
+                overrides,
+                mounts,
+                ensure_dirs,
+            );
+        }
     }
 }
 
@@ -1222,5 +1318,265 @@ mod tests {
             "foreign parent denied"
         );
         assert!(r.denied.iter().any(|(n, _)| n == "a-secrets"));
+    }
+
+    // --- decoupled identities: per-tool credential resolution ----------------
+
+    fn ident(
+        git_config: &str,
+        ssh_key: &str,
+        gh_config: &str,
+        gpg_home: &str,
+    ) -> crate::config::IdentityConfig {
+        use crate::config::{IdentityConfig, IdentityGh, IdentityGit, IdentityGpg};
+        IdentityConfig {
+            git: IdentityGit {
+                config: git_config.into(),
+                ssh_key: ssh_key.into(),
+            },
+            gh: IdentityGh {
+                config: gh_config.into(),
+            },
+            gpg: IdentityGpg {
+                home: gpg_home.into(),
+            },
+            accounts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn bundle_identity_folds_per_tool_credentials_and_leaks_no_token() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.identities.insert(
+            "washu".into(),
+            ident("/id/git", "/id/key", "/id/gh", "/id/gpg"),
+        );
+        cfg.bundle.insert(
+            "w".into(),
+            Bundle {
+                identity: "washu".into(),
+                ..Default::default()
+            },
+        );
+        set_active(&db, Bind::Global, "/wt", None, "w").unwrap();
+        let r = compose(&cfg, &db, "/wt", None, None);
+        assert_eq!(get(&r.overrides, "GIT_CONFIG_GLOBAL"), Some("/id/git"));
+        assert_eq!(get(&r.overrides, "GH_CONFIG_DIR"), Some("/id/gh"));
+        assert_eq!(get(&r.overrides, "GNUPGHOME"), Some("/id/gpg"));
+        assert_eq!(
+            get(&r.overrides, "GIT_SSH_COMMAND"),
+            Some("ssh -i /id/key -o IdentitiesOnly=yes")
+        );
+        // The firewall invariant: an identity never sets a forge token.
+        assert_eq!(get(&r.overrides, "GH_TOKEN"), None);
+        assert_eq!(get(&r.overrides, "GITHUB_TOKEN"), None);
+    }
+
+    #[test]
+    fn bundle_explicit_config_dir_overrides_referenced_identity() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.identities
+            .insert("washu".into(), ident("/id/git", "", "", ""));
+        let mut b = Bundle {
+            identity: "washu".into(),
+            ..Default::default()
+        };
+        b.config_dirs
+            .insert("GIT_CONFIG_GLOBAL".into(), "/explicit/git".into());
+        cfg.bundle.insert("w".into(), b);
+        set_active(&db, Bind::Global, "/wt", None, "w").unwrap();
+        let r = compose(&cfg, &db, "/wt", None, None);
+        assert_eq!(
+            get(&r.overrides, "GIT_CONFIG_GLOBAL"),
+            Some("/explicit/git"),
+            "the bundle's explicit config_dirs override its referenced identity"
+        );
+    }
+
+    #[test]
+    fn profile_base_identity_folds_with_bundle_mix_and_fallback() {
+        // The headline "mix and match": the active profile resolves git+ssh from
+        // its base identity, a worktree bundle supplies gh from a *different*
+        // identity, and gpg (set by neither) is left to fall back.
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        // profile::name() is "default" in tests (no THEGN_PROFILE).
+        cfg.profiles.insert(
+            "default".into(),
+            crate::config::ProfileConfig {
+                identity: "base".into(),
+                ..Default::default()
+            },
+        );
+        cfg.identities
+            .insert("base".into(), ident("/base/git", "/base/key", "", ""));
+        cfg.identities
+            .insert("gh-personal".into(), ident("", "", "/gh/personal", ""));
+        cfg.bundle.insert(
+            "b".into(),
+            Bundle {
+                identity: "gh-personal".into(),
+                ..Default::default()
+            },
+        );
+        set_active(&db, Bind::Worktree, "/wt", Some("repo"), "b").unwrap();
+        let r = compose(&cfg, &db, "/wt", Some("repo"), None);
+        assert_eq!(
+            get(&r.overrides, "GIT_CONFIG_GLOBAL"),
+            Some("/base/git"),
+            "git comes from the profile-base identity"
+        );
+        assert_eq!(
+            get(&r.overrides, "GIT_SSH_COMMAND"),
+            Some("ssh -i /base/key -o IdentitiesOnly=yes")
+        );
+        assert_eq!(
+            get(&r.overrides, "GH_CONFIG_DIR"),
+            Some("/gh/personal"),
+            "gh comes from the bundle-referenced identity"
+        );
+        assert_eq!(
+            get(&r.overrides, "GNUPGHOME"),
+            None,
+            "gpg set by neither ⇒ not overridden (falls back to profile-root)"
+        );
+    }
+
+    #[test]
+    fn bundle_identity_overrides_profile_base_per_tool() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.profiles.insert(
+            "default".into(),
+            crate::config::ProfileConfig {
+                identity: "base".into(),
+                ..Default::default()
+            },
+        );
+        cfg.identities
+            .insert("base".into(), ident("/base/git", "", "/base/gh", ""));
+        // The worktree bundle's identity overrides git only; gh falls through to
+        // the profile base.
+        cfg.identities
+            .insert("wt".into(), ident("/wt/git", "", "", ""));
+        cfg.bundle.insert(
+            "b".into(),
+            Bundle {
+                identity: "wt".into(),
+                ..Default::default()
+            },
+        );
+        set_active(&db, Bind::Worktree, "/wt", Some("repo"), "b").unwrap();
+        let r = compose(&cfg, &db, "/wt", Some("repo"), None);
+        assert_eq!(get(&r.overrides, "GIT_CONFIG_GLOBAL"), Some("/wt/git"));
+        assert_eq!(get(&r.overrides, "GH_CONFIG_DIR"), Some("/base/gh"));
+    }
+
+    #[test]
+    fn identity_accounts_fold_to_provider_home() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(Account {
+            name: "washu".into(),
+            provider: "claude".into(),
+            dir: Some("/creds/claude-washu".into()),
+        });
+        let mut idc = crate::config::IdentityConfig::default();
+        idc.accounts.insert("claude".into(), "washu".into());
+        cfg.identities.insert("washu".into(), idc);
+        cfg.bundle.insert(
+            "b".into(),
+            Bundle {
+                identity: "washu".into(),
+                ..Default::default()
+            },
+        );
+        set_active(&db, Bind::Global, "/wt", None, "b").unwrap();
+        let r = compose(&cfg, &db, "/wt", None, None);
+        assert_eq!(
+            get(&r.overrides, "CLAUDE_CONFIG_DIR"),
+            Some("/creds/claude-washu")
+        );
+    }
+
+    #[test]
+    fn identity_dir_that_exists_is_mounted_path_preserving() {
+        let db = Db::open_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!("tg-id-gh-{}", util::now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_string_lossy().into_owned();
+        let mut cfg = Config::default();
+        cfg.identities
+            .insert("washu".into(), ident("", "", &dir_s, ""));
+        cfg.bundle.insert(
+            "b".into(),
+            Bundle {
+                identity: "washu".into(),
+                ..Default::default()
+            },
+        );
+        set_active(&db, Bind::Global, "/wt", None, "b").unwrap();
+        let r = compose(&cfg, &db, "/wt", None, None);
+        assert_eq!(get(&r.overrides, "GH_CONFIG_DIR"), Some(dir_s.as_str()));
+        assert!(
+            r.mounts.iter().any(|m| m.dest == dir_s && !m.ro),
+            "an existing identity dir is mounted read-write path-preserving"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn directly_bound_identity_overrides_bundle_referenced_one() {
+        // The identity switcher pins "switched" at the worktree; a bound bundle
+        // references "bundle-id". The explicit switch wins.
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.identities
+            .insert("bundle-id".into(), ident("/b/git", "", "", ""));
+        cfg.identities
+            .insert("switched".into(), ident("/s/git", "", "", ""));
+        cfg.bundle.insert(
+            "b".into(),
+            Bundle {
+                identity: "bundle-id".into(),
+                ..Default::default()
+            },
+        );
+        set_active(&db, Bind::Global, "/wt", Some("repo"), "b").unwrap();
+        crate::identity::set_active(&db, Bind::Worktree, "/wt", Some("repo"), "switched").unwrap();
+        let r = compose(&cfg, &db, "/wt", Some("repo"), None);
+        assert_eq!(get(&r.overrides, "GIT_CONFIG_GLOBAL"), Some("/s/git"));
+    }
+
+    #[test]
+    fn bound_identity_worktree_beats_global() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.identities
+            .insert("g".into(), ident("/g/git", "", "", ""));
+        cfg.identities
+            .insert("w".into(), ident("/w/git", "", "", ""));
+        crate::identity::set_active(&db, Bind::Global, "/wt", Some("repo"), "g").unwrap();
+        crate::identity::set_active(&db, Bind::Worktree, "/wt", Some("repo"), "w").unwrap();
+        let r = compose(&cfg, &db, "/wt", Some("repo"), None);
+        assert_eq!(get(&r.overrides, "GIT_CONFIG_GLOBAL"), Some("/w/git"));
+    }
+
+    #[test]
+    fn unknown_identity_is_ignored_not_fatal() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.bundle.insert(
+            "b".into(),
+            Bundle {
+                identity: "ghost".into(),
+                ..Default::default()
+            },
+        );
+        set_active(&db, Bind::Global, "/wt", None, "b").unwrap();
+        let r = compose(&cfg, &db, "/wt", None, None);
+        assert!(get(&r.overrides, "GIT_CONFIG_GLOBAL").is_none());
     }
 }

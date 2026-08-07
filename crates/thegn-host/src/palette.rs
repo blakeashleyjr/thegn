@@ -341,8 +341,7 @@ pub(crate) fn build_command_palette_items(
                 .unwrap_or_else(|| spec.label.to_string());
             // Fold the action's hidden keywords into the fuzzy haystack so
             // synonyms ("fullscreen", "maximize", …) surface it too.
-            crate::palette::PaletteItem::new(spec.id, label)
-                .with_search(spec.keywords.join(" "))
+            crate::palette::PaletteItem::new(spec.id, label).with_search(spec.keywords.join(" "))
         })
         .collect();
 
@@ -358,9 +357,8 @@ pub(crate) fn build_command_palette_items(
         // Custom actions carry no keyword list; fold their `hint` into the
         // haystack so a short synonym still helps them surface.
         let search = action.hint.clone().unwrap_or_default();
-        items.push(
-            crate::palette::PaletteItem::new(action.name.clone(), label).with_search(search),
-        );
+        items
+            .push(crate::palette::PaletteItem::new(action.name.clone(), label).with_search(search));
     }
 
     // Navigation verbs (frecency-navigation change): connect-to-root (the
@@ -821,12 +819,42 @@ pub(crate) fn build_bundle_palette(
     items
 }
 
-/// Build the profile switcher palette: `default` plus every profile known from
-/// `[profiles.<name>]` config and every `profiles/<name>/config.toml` on disk.
-/// Selecting `profile:<name>` launches (or re-uses) that profile's window; the
-/// active profile is marked. See [`thegn_core::profile`].
-pub(crate) fn build_profile_palette(cfg: &thegn_core::config::Config) -> Vec<PaletteItem> {
-    let active = thegn_core::profile::name();
+/// Build the identity switcher palette: a "no identity" clear row plus every
+/// `[identities.<name>]`, marking the directly-bound one. Selecting
+/// `identity:<name>` pins it at the focused repo's scope (workspace when a repo
+/// is focused, else global); `identity-clear` removes the binding. Each tool the
+/// identity sets overrides that credential for subsequently-spawned panes; unset
+/// tools fall through. See [`thegn_core::identity`].
+pub(crate) fn build_identity_palette(
+    cfg: &thegn_core::config::Config,
+    db: &thegn_core::db::Db,
+    worktree: &str,
+    slug: Option<&str>,
+) -> Vec<PaletteItem> {
+    let active = thegn_core::identity::active_name(db, worktree, slug);
+    let mut items = Vec::new();
+    items.push(PaletteItem::new(
+        "identity-clear",
+        format!("○ No identity{}", if active.is_none() { " ✓" } else { "" }),
+    ));
+    for name in cfg.identities.keys() {
+        let mark = if active.as_deref() == Some(name.as_str()) {
+            " ✓"
+        } else {
+            ""
+        };
+        items.push(PaletteItem::new(
+            format!("identity:{name}"),
+            format!("◈ {name}{mark}"),
+        ));
+    }
+    items
+}
+
+/// The set of known profile names (`default` + `[profiles.<name>]` config +
+/// on-disk `profiles/<name>/config.toml`), sorted alphabetically. Split out so
+/// the switcher and the reorder handler share one source of truth.
+pub(crate) fn known_profile_names(cfg: &thegn_core::config::Config) -> Vec<String> {
     let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     names.insert("default".to_string());
     for k in cfg.profiles.keys() {
@@ -845,7 +873,39 @@ pub(crate) fn build_profile_palette(cfg: &thegn_core::config::Config) -> Vec<Pal
             }
         }
     }
-    names
+    names.into_iter().collect()
+}
+
+/// Effective switcher order for `known` profiles: the shared, never-rerooted
+/// sidecar order if present, else the config `profile_order` seed; any profile
+/// named in neither is appended in the given (alphabetical) order. Pure —
+/// [`thegn_core::profile::order::apply_order`] does the arranging.
+pub(crate) fn ordered_profiles(
+    known: &[String],
+    sidecar: &[String],
+    seed: &[String],
+) -> Vec<String> {
+    let order = if sidecar.is_empty() { seed } else { sidecar };
+    thegn_core::profile::order::apply_order(known, order)
+}
+
+/// The profiles in their persisted switcher order (sidecar → config seed →
+/// alphabetical). Reads the shared sidecar off `xdg_config_home` (never rerooted).
+pub(crate) fn profiles_in_order(cfg: &thegn_core::config::Config) -> Vec<String> {
+    let known = known_profile_names(cfg);
+    let sidecar = thegn_core::profile::order::load_order();
+    ordered_profiles(&known, &sidecar, &cfg.profile_order)
+}
+
+/// Build the profile switcher palette: `default` plus every profile known from
+/// `[profiles.<name>]` config and every `profiles/<name>/config.toml` on disk,
+/// arranged in the user's persisted order (reorder the highlighted row with the
+/// move-item chord while the switcher is open). Selecting `profile:<name>`
+/// launches (or re-uses) that profile's window; the active profile is marked.
+/// See [`thegn_core::profile`].
+pub(crate) fn build_profile_palette(cfg: &thegn_core::config::Config) -> Vec<PaletteItem> {
+    let active = thegn_core::profile::name();
+    profiles_in_order(cfg)
         .into_iter()
         .map(|n| {
             let mark = if n == active { " ✓" } else { "" };
@@ -898,6 +958,53 @@ mod tests {
         // No profile active in tests ⇒ default is marked.
         let def = items.iter().find(|i| i.key == "profile:default").unwrap();
         assert!(def.label.contains('✓'));
+    }
+
+    #[test]
+    fn build_identity_palette_lists_identities_clear_and_marks_active() {
+        use thegn_core::config::{Config, IdentityConfig};
+        use thegn_core::db::Db;
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.identities
+            .insert("washu".into(), IdentityConfig::default());
+        cfg.identities
+            .insert("personal".into(), IdentityConfig::default());
+        thegn_core::identity::set_active(
+            &db,
+            thegn_core::bundle::Bind::Global,
+            "/wt",
+            None,
+            "washu",
+        )
+        .unwrap();
+        let items = build_identity_palette(&cfg, &db, "/wt", None);
+        let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["identity-clear", "identity:personal", "identity:washu"]
+        );
+        let washu = items.iter().find(|i| i.key == "identity:washu").unwrap();
+        assert!(washu.label.contains('✓'));
+    }
+
+    #[test]
+    fn ordered_profiles_prefers_sidecar_then_seed_then_alpha() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // `known` arrives alphabetically (a BTreeSet), like the switcher builds it.
+        let known = s(&["default", "hubone", "personal", "washu"]);
+        // Sidecar present ⇒ it wins over the seed; unlisted names append alpha.
+        assert_eq!(
+            ordered_profiles(&known, &s(&["washu", "personal"]), &s(&["hubone"])),
+            s(&["washu", "personal", "default", "hubone"])
+        );
+        // No sidecar ⇒ the config `profile_order` seed drives order.
+        assert_eq!(
+            ordered_profiles(&known, &[], &s(&["hubone"])),
+            s(&["hubone", "default", "personal", "washu"])
+        );
+        // Neither ⇒ pure alphabetical (unchanged known order).
+        assert_eq!(ordered_profiles(&known, &[], &[]), known);
     }
 
     #[test]
