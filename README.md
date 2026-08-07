@@ -172,6 +172,11 @@ queue), `disk` / `clean` (per-worktree disk usage / reclaim `target/`),
 `share`, `forward`, `agent`, `notify`, `logs`, `doctor`. `--profile <name>`
 runs everything under a separate whole-process profile (own state/DB/config).
 
+`thegn mcp serve` runs thegn as a read-only **MCP server** so a coding agent can
+learn how thegn works — search/read the built-in help, the effective keymap, the
+config reference, and your current (secret-redacted) config. Register it with
+`claude mcp add thegn -- thegn mcp serve` (see [`docs/cli.md`](docs/cli.md)).
+
 ## Config
 
 Behavior is configured in `~/.config/thegn/config.toml` — see
