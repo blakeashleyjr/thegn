@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 publish = false
-license = "MIT"
+license = "MIT OR Apache-2.0"
 description = "thegn embedding contract: AppTile trait, backend-agnostic input, shared theme, and a standalone TUI harness"
 
 [dependencies]

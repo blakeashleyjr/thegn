@@ -1,0 +1,5 @@
+# Code owners for thegn. Requested for review automatically on matching PRs.
+# Docs: https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for everything in the repo.
+*       @blakeashleyjr

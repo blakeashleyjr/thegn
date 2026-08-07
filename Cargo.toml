@@ -23,7 +23,7 @@ exclude = ["apps", "vendor"]
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 # Resolves cargo-binstall's `{ repo }` template variable (thegn-host's
 # [package.metadata.binstall]) once the crates are published.
 repository = "https://github.com/blakeashleyjr/thegn"

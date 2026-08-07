@@ -222,8 +222,8 @@ part of the shipped `thegn` binary.
   (`nix/openspec.nix`, `nix run .#openspec`), on PATH in `nix develop`; telemetry
   is off by construction. `just openspec <args>` is a passthrough;
   `just openspec-validate` (`openspec validate --all --strict`) runs in `just ci`.
-- **`.hermes/plans/` is deprecated** in favor of `/opsx` — see
-  `.hermes/plans/DEPRECATED.md`. Existing files are kept for history only.
+- **The old `.hermes/plans/` narrative docs were removed** in favor of `/opsx`
+  (openspec). Historical design docs still live in `docs/superpowers/{plans,specs}/`.
 
 ## Conventions & gotchas
 
