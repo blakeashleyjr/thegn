@@ -6636,12 +6636,8 @@ async fn event_loop<T: Terminal>(
             .name("notify-sound".into())
             .spawn(move || {
                 while let Ok(n) = sound_rx.recv() {
-                    let dec = ns.decide(
-                        n.kind.as_str(),
-                        &n.source_ref,
-                        &n.message,
-                        &n.worktree_path,
-                    );
+                    let dec =
+                        ns.decide(n.kind.as_str(), &n.source_ref, &n.message, &n.worktree_path);
                     ns.emit_sound(&dec);
                 }
             })
@@ -8938,7 +8934,11 @@ async fn event_loop<T: Terminal>(
                         // Chime on agent-turn completion (on by default via
                         // `[notifications.sound] always_kinds`; suppressed for the
                         // focused worktree + gated by rules/DND like any cue).
-                        let kind = if *success { "agent_done" } else { "agent_failed" };
+                        let kind = if *success {
+                            "agent_done"
+                        } else {
+                            "agent_failed"
+                        };
                         let base = thegn_core::util::basename(&wt);
                         let msg = format!(
                             "agent {} in {base}",
@@ -13243,6 +13243,44 @@ async fn event_loop<T: Terminal>(
                                     palette = None;
                                     dirty = true;
                                     continue;
+                                } else if key == "identity-clear" || key.starts_with("identity:") {
+                                    // Identity switcher (H/AU): pin the chosen
+                                    // per-tool identity at the focused repo's scope
+                                    // (workspace when a repo is focused, else global);
+                                    // "identity-clear" removes it. Each tool it sets
+                                    // overrides that credential for panes launched
+                                    // *after* the switch; unset tools fall through.
+                                    let wt = active_tab_path(&session);
+                                    let wt_s = wt.to_string_lossy().into_owned();
+                                    if let Ok(db) = thegn_core::db::Db::open() {
+                                        let slug = bundle_scope_slug(&db, &wt_s);
+                                        let bind = if slug.is_some() {
+                                            thegn_core::bundle::Bind::Workspace
+                                        } else {
+                                            thegn_core::bundle::Bind::Global
+                                        };
+                                        if let Some(name) = key.strip_prefix("identity:") {
+                                            let _ = thegn_core::identity::set_active(
+                                                &db,
+                                                bind,
+                                                &wt_s,
+                                                slug.as_deref(),
+                                                name,
+                                            );
+                                            model.status = format!("Identity → {name}");
+                                        } else {
+                                            let _ = thegn_core::identity::clear_active(
+                                                &db,
+                                                bind,
+                                                &wt_s,
+                                                slug.as_deref(),
+                                            );
+                                            model.status = "Identity cleared".to_string();
+                                        }
+                                    }
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
                                 } else if let Some(name) = key.strip_prefix("profile:") {
                                     // Profile switcher (H): launch the chosen
                                     // profile in a NEW terminal window (thegn owns
@@ -13709,6 +13747,47 @@ async fn event_loop<T: Terminal>(
                                 // unified action table.
                             }
                             palette = None;
+                        }
+                        // Reorder the highlighted profile (profile switcher only)
+                        // with the move-item chord (Ctrl+Alt+↑/↓): swap it in the
+                        // shared, never-rerooted order sidecar and rebuild the
+                        // switcher in the new order, keeping it highlighted. The
+                        // sidecar is a cache, so the persist is best-effort.
+                        KeyCode::UpArrow | KeyCode::DownArrow
+                            if p.profile_reorder
+                                && k.modifiers.contains(Modifiers::CTRL)
+                                && k.modifiers.contains(Modifiers::ALT) =>
+                        {
+                            let up = k.key == KeyCode::UpArrow;
+                            let sel = p
+                                .selected_key()
+                                .and_then(|key| key.strip_prefix("profile:").map(str::to_string));
+                            if let Some(name) = sel {
+                                let mut order = crate::palette::profiles_in_order(&current_config);
+                                if let Some(i) = order.iter().position(|n| n == &name) {
+                                    let j = if up {
+                                        i.checked_sub(1)
+                                    } else {
+                                        (i + 1 < order.len()).then_some(i + 1)
+                                    };
+                                    if let Some(j) = j {
+                                        order.swap(i, j);
+                                        let _ = thegn_core::profile::order::save_order(&order);
+                                        let mut ps = crate::search_everywhere::PaletteSession::new(
+                                            crate::palette::build_profile_palette(&current_config),
+                                        );
+                                        ps.profile_reorder = true;
+                                        for _ in 0..j {
+                                            ps.move_down();
+                                        }
+                                        palette = Some(ps);
+                                        model.status = format!(
+                                            "Moved profile {name} {}",
+                                            if up { "up" } else { "down" }
+                                        );
+                                    }
+                                }
+                            }
                         }
                         KeyCode::UpArrow => p.move_up(),
                         KeyCode::DownArrow => p.move_down(),
@@ -15990,10 +16069,29 @@ async fn event_loop<T: Terminal>(
                                     ));
                                 }
                             }
+                            Action::SwitchIdentity => {
+                                if let Ok(db) = thegn_core::db::Db::open() {
+                                    let wt = active_tab_path(&session);
+                                    let wt_s = wt.to_string_lossy().into_owned();
+                                    let slug = bundle_scope_slug(&db, &wt_s);
+                                    palette = Some(crate::search_everywhere::PaletteSession::new(
+                                        crate::palette::build_identity_palette(
+                                            &current_config,
+                                            &db,
+                                            &wt_s,
+                                            slug.as_deref(),
+                                        ),
+                                    ));
+                                }
+                            }
                             Action::SwitchProfile => {
-                                palette = Some(crate::search_everywhere::PaletteSession::new(
+                                let mut ps = crate::search_everywhere::PaletteSession::new(
                                     crate::palette::build_profile_palette(&current_config),
-                                ));
+                                );
+                                // Enable reordering the highlighted profile with
+                                // the move-item chord while the switcher is open.
+                                ps.profile_reorder = true;
+                                palette = Some(ps);
                             }
                             // Both `Ctrl+Alt+f` and `Alt+y` are the same pooled
                             // toggle: hide-to-pool when open (position survives),

@@ -631,6 +631,41 @@ format = "text"           # text | json
 # CAVEAT: the firewall is only as strong as the loosest sandbox setting —
 # `[sandbox] file_access = "all"`, `network = "host"`, or SSH agent forwarding
 # defeat credential isolation.
+#
+# Switcher order: the profile switcher (Ctrl+Alt+g) lists profiles in a
+# user-controlled order. Reorder the highlighted profile with Ctrl+Alt+↑/↓ while
+# the switcher is open; the order is saved to the shared, never-rerooted
+# ~/.config/thegn/profiles-order.json (so every profile's window agrees on it).
+# The optional seed below is used only until that sidecar exists; names in
+# neither are appended alphabetically.
+# profile_order = ["personal", "washu", "hubone"]
+
+# ── Identities: decoupled, per-tool credentials (H/AU) ───────────────────────
+# A named identity is a REUSABLE set of per-tool credential locations that a
+# profile or a bundle references by name — each tool assignable INDEPENDENTLY
+# (mix-and-match: git from one identity, gh from another, gpg shared). Any field
+# is optional; a tool an identity leaves unset falls through to a less specific
+# layer and finally the profile-root default. Switch the active identity at the
+# focused scope from the palette ("switch identity"); it takes effect for panes
+# spawned afterward. Forge tokens are never set by an identity (they stay
+# firewalled), and an SSH key is pinned with IdentitiesOnly=yes.
+# [identities.washu]
+# accounts    = { claude = "washu" }     # per-provider agent account
+# [identities.washu.git]
+# config  = "~/.config/git/washu"        # → GIT_CONFIG_GLOBAL
+# ssh_key = "~/.ssh/id_washu"            # → GIT_SSH_COMMAND -i … -o IdentitiesOnly=yes
+# [identities.washu.gh]
+# config  = "~/.config/gh-washu"         # → GH_CONFIG_DIR
+# [identities.washu.gpg]
+# home    = "~/.gnupg"                   # → GNUPGHOME (shared)
+#
+# Reference an identity from a profile (its firewall base) or a bundle (soft,
+# per-scope; overrides the profile base, and the bundle's own env/config_dirs
+# override the referenced identity):
+# [profiles.washu]
+# identity = "washu"
+# [bundle.work]
+# identity = "washu"
 
 # Per-workspace overrides, keyed by repo slug (the workspace tab prefix). Applied
 # above [keybinds] but below a repo-root `.thegn.{toml,yaml,json}` overlay,

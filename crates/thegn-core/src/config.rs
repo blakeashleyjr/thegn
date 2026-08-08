@@ -140,9 +140,9 @@ config_enum! {
 pub use crate::config_placement::FailoverMode;
 // The remote/data-placement enums + `MergeRemoteMode` live in `config_remote`
 // (re-exported), keeping `config.rs` under the god-file ratchet.
-pub use crate::config_remote::{DataMode, MergeRemoteMode, RemoteMode};
-pub(crate) use crate::config_remote::data_mode_from_remote;
 use crate::config_placement::{de_failover, de_failover_opt};
+pub(crate) use crate::config_remote::data_mode_from_remote;
+pub use crate::config_remote::{DataMode, MergeRemoteMode, RemoteMode};
 // The terminal display/glyph config enums (UndercurlMode, ColorMode, GlyphMode,
 // AgentGlyphs) live in the `config_theme` sibling module to keep this god-file
 // flat; re-exported so `config::{ColorMode, …}` import paths keep working.
@@ -1058,6 +1058,14 @@ pub struct ProfileConfig {
     /// per-profile rules/DND/sound take effect without touching per-repo config.
     #[serde(skip_serializing_if = "NotificationsOverlay::is_empty")]
     pub notifications: NotificationsOverlay,
+    /// Named identity this profile resolves its credentials from
+    /// (`[profiles.<p>] identity = "washu"` → `[identities.washu]`). Each tool
+    /// (git config, git SSH key, `gh` config, GnuPG home, agent accounts) the
+    /// identity sets overrides the profile-root default independently; tools it
+    /// leaves unset fall back to `<profile_root>/…`. Empty ⇒ the profile-root
+    /// paths (today's behavior). See [`crate::identity`].
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub identity: String,
 }
 
 /// Per-workspace config (`[workspace.<slug>.keybinds]`), keyed by repo slug.
@@ -1137,6 +1145,89 @@ pub struct Bundle {
     /// worktrees in that zone may compose. Empty ⇒ global. See [`crate::zone`].
     #[serde(skip_serializing_if = "String::is_empty")]
     pub zone: String,
+    /// Named identity this bundle resolves credentials from (`[bundle.<n>]
+    /// identity = "work"` → `[identities.work]`), folded before the bundle's own
+    /// `env`/`config_dirs`/`accounts` (so the explicit fields override the
+    /// referenced identity) and honoring the usual scope precedence. The named,
+    /// reusable form of `config_dirs` + `accounts`. See [`crate::identity`].
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub identity: String,
+}
+
+/// A named, decoupled **identity** (`[identities.<name>]`) — a reusable set of
+/// per-tool credential locations plus per-provider agent accounts, referenced by
+/// name from a profile or a bundle. Every field is optional so an identity may
+/// set some tools and leave others to fall through (mix-and-match: `git` from one
+/// identity, `gh` from another, `gpg` shared). Resolution lives in
+/// [`crate::identity`]; folding into a pane's env lives in [`crate::bundle`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct IdentityConfig {
+    /// git bindings (`git.config` → `GIT_CONFIG_GLOBAL`, `git.ssh_key` →
+    /// `GIT_SSH_COMMAND` with `IdentitiesOnly=yes`).
+    #[serde(skip_serializing_if = "IdentityGit::is_empty")]
+    pub git: IdentityGit,
+    /// GitHub/forge binding (`gh.config` → `GH_CONFIG_DIR`).
+    #[serde(skip_serializing_if = "IdentityGh::is_empty")]
+    pub gh: IdentityGh,
+    /// GnuPG binding (`gpg.home` → `GNUPGHOME`).
+    #[serde(skip_serializing_if = "IdentityGpg::is_empty")]
+    pub gpg: IdentityGpg,
+    /// Per-provider agent account selection (`accounts = { claude = "washu" }`),
+    /// resolved through [`crate::account`] exactly like a bundle's `accounts`.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub accounts: std::collections::BTreeMap<String, String>,
+}
+
+/// git half of an [`IdentityConfig`] (`~` expanded at fold time).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct IdentityGit {
+    /// Path to a git config file → `GIT_CONFIG_GLOBAL`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub config: String,
+    /// Path to an SSH private key → `GIT_SSH_COMMAND -i <key> -o IdentitiesOnly=yes`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ssh_key: String,
+}
+
+impl IdentityGit {
+    /// True when neither git binding is set (so serialization skips the table).
+    pub fn is_empty(&self) -> bool {
+        self.config.is_empty() && self.ssh_key.is_empty()
+    }
+}
+
+/// GitHub/forge half of an [`IdentityConfig`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct IdentityGh {
+    /// Path to a `gh` config dir → `GH_CONFIG_DIR`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub config: String,
+}
+
+impl IdentityGh {
+    /// True when the `gh` binding is unset.
+    pub fn is_empty(&self) -> bool {
+        self.config.is_empty()
+    }
+}
+
+/// GnuPG half of an [`IdentityConfig`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct IdentityGpg {
+    /// Path to a GnuPG home dir → `GNUPGHOME`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub home: String,
+}
+
+impl IdentityGpg {
+    /// True when the GnuPG binding is unset.
+    pub fn is_empty(&self) -> bool {
+        self.home.is_empty()
+    }
 }
 
 /// Tier-2 dotfile materialization spec (`[bundle.<n>.dotfiles]`).
@@ -3277,6 +3368,21 @@ pub struct Config {
     /// Named keybind profiles (`[profiles.<name>]`), selected by `profile`.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub profiles: std::collections::BTreeMap<String, ProfileConfig>,
+    /// Optional seed for the profile-switcher order (`profile_order =
+    /// ["personal", "washu"]`). Consulted only when the shared, never-rerooted
+    /// `~/.config/thegn/profiles-order.json` sidecar is absent; once the user
+    /// reorders in the switcher the sidecar is authoritative. Names not listed
+    /// here (or in the sidecar) are appended alphabetically. See
+    /// [`crate::profile::order`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub profile_order: Vec<String>,
+    /// Named, decoupled per-tool identities (`[identities.<name>]`) — a reusable
+    /// set of git/gh/gpg/ssh credential locations + per-provider accounts,
+    /// referenced by name from a profile (`[profiles.<p>] identity = "…"`) or a
+    /// bundle (`[bundle.<n>] identity = "…"`), each tool assignable
+    /// independently (mix-and-match). See [`crate::identity`].
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub identities: std::collections::BTreeMap<String, IdentityConfig>,
     /// Per-workspace config keyed by repo slug (`[workspace.<slug>]`).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub workspace: std::collections::BTreeMap<String, WorkspaceConfig>,
@@ -3397,6 +3503,8 @@ impl Default for Config {
             profile: String::new(),
             keymap_preset: default_preset(),
             profiles: std::collections::BTreeMap::new(),
+            profile_order: Vec::new(),
+            identities: std::collections::BTreeMap::new(),
             workspace: std::collections::BTreeMap::new(),
             env: std::collections::BTreeMap::new(),
             host: std::collections::BTreeMap::new(),
@@ -4532,7 +4640,6 @@ fn lenient_env_selector(text: &str) -> String {
     }
     String::new()
 }
-
 
 /// "#rrggbb" / "#rgb" -> "R;G;B".
 fn parse_hex_rgb(hex: &str) -> Option<String> {

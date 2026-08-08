@@ -431,7 +431,29 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "profile",
         default_chords: &["Ctrl Alt g"],
         palette: true,
-        keywords: &["switch profile", "profile", "change profile", "select profile"],
+        keywords: &[
+            "switch profile",
+            "profile",
+            "change profile",
+            "select profile",
+        ],
+    },
+    ActionSpec {
+        id: "switch-identity",
+        label: "Switch identity",
+        hint: "identity",
+        // Palette-only by default (reach via Ctrl+Space → "switch identity");
+        // rebindable. Avoids clashing with the crowded Ctrl+Alt chord space.
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "switch identity",
+            "identity",
+            "git identity",
+            "change identity",
+            "credentials",
+            "mix and match",
+        ],
     },
     ActionSpec {
         id: "prev-tab",
@@ -946,7 +968,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "push",
         default_chords: &[],
         palette: true,
-        keywords: &["git push", "push", "upload", "publish branch", "push branch"],
+        keywords: &[
+            "git push",
+            "push",
+            "upload",
+            "publish branch",
+            "push branch",
+        ],
     },
     ActionSpec {
         id: "git-pull",
@@ -1290,7 +1318,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         hint: "vol−",
         default_chords: &["Alt m j"],
         palette: true,
-        keywords: &["media", "volume down", "quieter", "lower volume", "vol down"],
+        keywords: &[
+            "media",
+            "volume down",
+            "quieter",
+            "lower volume",
+            "vol down",
+        ],
     },
     ActionSpec {
         id: "media-seek-forward",

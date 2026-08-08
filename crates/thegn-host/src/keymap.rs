@@ -71,6 +71,9 @@ pub enum Action {
     SwitchBundle,
     /// Open the profile switcher — launch/focus a whole-process profile (H).
     SwitchProfile,
+    /// Open the identity switcher — pin a named per-tool identity (git/gh/gpg/ssh)
+    /// at the focused scope (H/AU). See [`thegn_core::identity`].
+    SwitchIdentity,
     NextTab,
     PrevTab,
     /// Switch to the next worktree (Alt+Down), wrapping WITHIN the active
@@ -377,6 +380,7 @@ impl Action {
             Action::SwitchAccount => "switch-account",
             Action::SwitchBundle => "switch-bundle",
             Action::SwitchProfile => "switch-profile",
+            Action::SwitchIdentity => "switch-identity",
             Action::NextTab => "next-tab",
             Action::PrevTab => "prev-tab",
             Action::NextWorktree => "next-worktree",
@@ -493,6 +497,7 @@ impl Action {
             "switch-account" => Action::SwitchAccount,
             "switch-bundle" => Action::SwitchBundle,
             "switch-profile" => Action::SwitchProfile,
+            "switch-identity" => Action::SwitchIdentity,
             "next-tab" => Action::NextTab,
             "prev-tab" => Action::PrevTab,
             "next-worktree" => Action::NextWorktree,
@@ -2159,6 +2164,7 @@ mod tests {
                 keybinds: Default::default(),
                 sandbox: Default::default(),
                 notifications: Default::default(),
+                identity: Default::default(),
             },
         );
         let cfg = thegn_core::config::Config {
