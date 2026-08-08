@@ -547,6 +547,31 @@ check "session list without a daemon exits 1 with a clear message" \
 check "session list --json emits the no_daemon error object" \
   "[[ $nodaemon_json_ok -eq 1 ]]"
 
+# `thegn attach` (the local thin client) shares the same connect path, so it
+# degrades identically when no daemon is running — never a crash.
+set +e
+attach_out="$("$SZ" attach 2>&1)"
+attach_rc=$?
+set -e
+attach_ok=1
+[[ $attach_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$attach_out" || attach_ok=0
+check "attach without a daemon exits 1 with a clear message" \
+  "[[ $attach_ok -eq 1 ]]"
+
+# The agent-driving verbs (`session wait`/`session split`) share the connect
+# path and must degrade cleanly too.
+set +e
+wait_out="$("$SZ" session wait --session bogus --until exited 2>&1)"
+wait_rc=$?
+split_out="$("$SZ" session split --session bogus 2>&1)"
+split_rc=$?
+set -e
+verbs_ok=1
+[[ $wait_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$wait_out" || verbs_ok=0
+[[ $split_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$split_out" || verbs_ok=0
+check "session wait/split without a daemon exit 1 with a clear message" \
+  "[[ $verbs_ok -eq 1 ]]"
+
 # Daemon lifecycle: spawn on an isolated socket, open a marker session over
 # the unix socket, see it in `session list` and its output in `snapshot`,
 # then stop it and verify the registry row + socket are gone.

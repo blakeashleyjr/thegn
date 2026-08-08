@@ -140,9 +140,9 @@ config_enum! {
 pub use crate::config_placement::FailoverMode;
 // The remote/data-placement enums + `MergeRemoteMode` live in `config_remote`
 // (re-exported), keeping `config.rs` under the god-file ratchet.
-pub use crate::config_remote::{DataMode, MergeRemoteMode, RemoteMode};
-pub(crate) use crate::config_remote::data_mode_from_remote;
 use crate::config_placement::{de_failover, de_failover_opt};
+pub(crate) use crate::config_remote::data_mode_from_remote;
+pub use crate::config_remote::{DataMode, MergeRemoteMode, RemoteMode};
 // The terminal display/glyph config enums (UndercurlMode, ColorMode, GlyphMode,
 // AgentGlyphs) live in the `config_theme` sibling module to keep this god-file
 // flat; re-exported so `config::{ColorMode, …}` import paths keep working.
@@ -3244,7 +3244,9 @@ pub struct Config {
     pub lsp: LspConfig,
     /// The LLM proxy daemon (`[llm_proxy]`). Disabled by default — AI is additive.
     pub llm_proxy: LlmProxyConfig,
-    /// `[daemon]` — the pane daemon (panes survive UI exit). Opt-in, off by default.
+    /// `[daemon]` — the pane daemon (center panes survive UI exit; tmux
+    /// semantics). On by default; set `[daemon] enabled = false` for plain
+    /// in-process PTYs.
     pub daemon: DaemonConfig,
     /// `[serve]` — remote thin-client serving + pairing policy (`thegn serve`).
     pub serve: ServeConfig,
@@ -4535,7 +4537,6 @@ fn lenient_env_selector(text: &str) -> String {
     }
     String::new()
 }
-
 
 /// "#rrggbb" / "#rgb" -> "R;G;B".
 fn parse_hex_rgb(hex: &str) -> Option<String> {

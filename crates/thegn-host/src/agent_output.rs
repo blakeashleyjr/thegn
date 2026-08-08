@@ -45,6 +45,16 @@ struct Registry {
     pane_wt: HashMap<u32, String>,
     /// worktree path → unix secs of the last unsolicited agent-pane output.
     hints: BTreeMap<String, f64>,
+    /// pane id → the agent CLI name running in it (the worktree's bound agent).
+    /// This is the per-pane attribution the CPU/output signals lack: a pane
+    /// qualifies when it is a non-shell/non-tool pane in an agent-bearing
+    /// worktree. Lets a client report per-pane state, not just per-worktree.
+    // Read by `snapshot_pane_agents`, which the per-pane `agent_states` control
+    // endpoint (B‑3 exposure) will call once the compositor→daemon state-push
+    // channel lands with the runtime split; staged here so the attribution is
+    // computed and tested now.
+    #[allow(dead_code)]
+    pane_agent: HashMap<u32, String>,
 }
 
 /// Process-global cell, mirroring the sibling `hydrate::glyph_cache` pattern:
@@ -56,6 +66,7 @@ fn cell() -> &'static Mutex<Registry> {
         Mutex::new(Registry {
             pane_wt: HashMap::new(),
             hints: BTreeMap::new(),
+            pane_agent: HashMap::new(),
         })
     })
 }
@@ -119,10 +130,11 @@ pub(crate) fn publish(
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
     let mut hints: BTreeMap<String, f64> = BTreeMap::new();
+    let mut pane_agent: HashMap<u32, String> = HashMap::new();
     for (id, wt) in &reg.pane_wt {
-        if !agent_by_wt.contains_key(wt) {
+        let Some(agent) = agent_by_wt.get(wt) else {
             continue;
-        }
+        };
         let Some(pane) = panes.table.get(id) else {
             continue;
         };
@@ -130,6 +142,8 @@ pub(crate) fn publish(
         if !counts_as_agent_pane(program, cfg.tool_command(program).is_some()) {
             continue;
         }
+        // Per-pane attribution: this pane is running the worktree's agent.
+        pane_agent.insert(*id, agent.clone());
         let (out_at, in_at) = pane.output_stamps();
         let Some(age) = unsolicited_age(
             out_at.map(|t| t.elapsed()),
@@ -144,6 +158,7 @@ pub(crate) fn publish(
         *e = e.max(stamp);
     }
     reg.hints = hints;
+    reg.pane_agent = pane_agent;
 }
 
 /// The last published stamps (`worktree path → unix secs`), for the hydration
@@ -152,6 +167,18 @@ pub(crate) fn snapshot() -> BTreeMap<String, f64> {
     cell()
         .lock()
         .map(|reg| reg.hints.clone())
+        .unwrap_or_default()
+}
+
+/// The current per-pane agent attribution (`pane id → agent CLI name`), for
+/// reporting per-pane semantic state. Empty until the next [`publish`].
+// Consumed by the forthcoming `agent_states` control endpoint (B‑3 exposure);
+// see the `pane_agent` field note.
+#[allow(dead_code)]
+pub(crate) fn snapshot_pane_agents() -> HashMap<u32, String> {
+    cell()
+        .lock()
+        .map(|reg| reg.pane_agent.clone())
         .unwrap_or_default()
 }
 
@@ -225,5 +252,19 @@ mod tests {
             reg.hints.clear();
         }
         assert!(snapshot().is_empty());
+    }
+
+    #[test]
+    fn pane_agent_attribution_roundtrips_via_registry() {
+        {
+            let mut reg = cell().lock().unwrap();
+            reg.pane_agent = HashMap::from([(7u32, "claude".to_string())]);
+        }
+        assert_eq!(snapshot_pane_agents().get(&7), Some(&"claude".to_string()));
+        {
+            let mut reg = cell().lock().unwrap();
+            reg.pane_agent.clear();
+        }
+        assert!(snapshot_pane_agents().is_empty());
     }
 }
