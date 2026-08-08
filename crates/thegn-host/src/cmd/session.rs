@@ -44,6 +44,31 @@ pub enum SessionAction {
         #[arg(long)]
         session: String,
     },
+    /// Block until a session reaches a state (agent-driving `wait`). Exit 0 on
+    /// match, 2 on timeout, 1 if no daemon.
+    Wait {
+        #[arg(long)]
+        session: String,
+        /// Condition: `exited` | `idle` | `blocked` | `done` | `match:<regex>`.
+        #[arg(long, default_value = "exited")]
+        until: String,
+        /// Milliseconds before giving up (exit 2). Omit to wait forever.
+        #[arg(long)]
+        timeout: Option<i64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Split a session: open a sibling pane (a shell, or the given program).
+    Split {
+        #[arg(long)]
+        session: String,
+        /// Placement relative to the target: `right` | `down`.
+        #[arg(long, default_value = "right")]
+        dir: String,
+        /// Program + args for the new pane (defaults to a login shell).
+        #[arg(trailing_var_arg = true)]
+        argv: Vec<String>,
+    },
     /// Command the preview browser (reserved contract slot).
     Browse {
         #[arg(long)]
@@ -57,6 +82,47 @@ pub enum SessionAction {
     },
 }
 
+/// Render one session as the human-table line shared by `session list` and
+/// `thegn attach` (no-arg listing).
+pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
+    let lease = s
+        .lease_expires_at
+        .map(|at| format!("  lease→{at}"))
+        .unwrap_or_default();
+    format!(
+        "{}  {}x{}  {} client(s)  {}{}{}",
+        s.id,
+        s.cols,
+        s.rows,
+        s.attached_clients,
+        s.program,
+        s.worktree
+            .as_deref()
+            .map(|w| format!("  [{w}]"))
+            .unwrap_or_default(),
+        lease
+    )
+}
+
+/// Parse a CLI `--until` string into a `WaitCondition` JSON value. `match:<rx>`
+/// waits on an output regex; the bare words map to the named conditions.
+fn parse_wait_condition(s: &str) -> Result<serde_json::Value> {
+    let v = match s {
+        "exited" => serde_json::json!({ "kind": "exited" }),
+        "idle" => serde_json::json!({ "kind": "idle" }),
+        "blocked" => serde_json::json!({ "kind": "blocked" }),
+        "done" => serde_json::json!({ "kind": "done" }),
+        other => match other.strip_prefix("match:") {
+            Some(rx) => serde_json::json!({ "kind": "output_matches", "regex": rx }),
+            None => anyhow::bail!(
+                "unknown wait condition '{other}' \
+                 (expected exited|idle|blocked|done|match:<regex>)"
+            ),
+        },
+    };
+    Ok(v)
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -66,7 +132,8 @@ fn now_ms() -> i64 {
 
 /// Discover the local daemon (registry first, configured socket as fallback)
 /// and verify it answers. `Err` carries the user-facing no-daemon message.
-async fn connect(cfg: &Config) -> Result<ControlClient> {
+/// Shared with `thegn attach` (`cmd::attach`), the local interactive client.
+pub(crate) async fn connect(cfg: &Config) -> Result<ControlClient> {
     let addr = Db::open()
         .ok()
         .and_then(|db| {
@@ -95,6 +162,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         &action,
         SessionAction::List { json: true }
             | SessionAction::Snapshot { json: true, .. }
+            | SessionAction::Wait { json: true, .. }
             | SessionAction::Leases { json: true }
     );
     let client = match connect(cfg).await {
@@ -114,21 +182,8 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             } else if sessions.is_empty() {
                 outln!("no live sessions");
             } else {
-                for s in sessions {
-                    let lease = s
-                        .lease_expires_at
-                        .map(|at| format!("  lease→{at}"))
-                        .unwrap_or_default();
-                    outln!(
-                        "{}  {}x{}  {} client(s)  {}{}{}",
-                        s.id,
-                        s.cols,
-                        s.rows,
-                        s.attached_clients,
-                        s.program,
-                        s.worktree.map(|w| format!("  [{w}]")).unwrap_or_default(),
-                        lease
-                    );
+                for s in &sessions {
+                    outln!("{}", session_line(s));
                 }
             }
         }
@@ -188,6 +243,42 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     _ => {}
                 }
             }
+        }
+        SessionAction::Wait {
+            session,
+            until,
+            timeout,
+            json,
+        } => {
+            let condition = parse_wait_condition(&until)?;
+            let outcome = client.wait(&session, condition, timeout).await?;
+            let matched = outcome
+                .get("matched")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else if matched {
+                let what = outcome
+                    .get("condition")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("condition");
+                let code = outcome
+                    .get("exit_code")
+                    .and_then(|c| c.as_i64())
+                    .map(|c| format!(" (exit {c})"))
+                    .unwrap_or_default();
+                outln!("{what} on {session}{code}");
+            } else {
+                outln!("timeout waiting on {session}");
+            }
+            if !matched {
+                std::process::exit(crate::cmd::EXIT_RETRYABLE);
+            }
+        }
+        SessionAction::Split { session, dir, argv } => {
+            let info = client.split(&session, &dir, &argv).await?;
+            outln!("opened {} ({}x{})", info.id, info.cols, info.rows);
         }
         SessionAction::Browse { session, url } => {
             // The reserved drive-browser slot: surface the server's verdict.

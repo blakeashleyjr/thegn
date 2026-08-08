@@ -30,7 +30,9 @@ use thegn_core::control_wire::{EventFrame, Hello, PROTO_VERSION};
 use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
-use super::{AttachKind, BrowserCommand, ControlApi, ControlError, OpenSpec};
+use super::{
+    AttachKind, BrowserCommand, ControlApi, ControlError, OpenSpec, SplitDir, WaitCondition,
+};
 
 /// Shared state for the control router. One instance per listener, so the
 /// unix-socket listener can carry `local_admin` while the TCP one never does.
@@ -63,6 +65,8 @@ pub fn router(state: ControlState) -> Router {
         .route("/v1/sessions/{s}/snapshot", get(snapshot))
         .route("/v1/sessions/{s}/input", post(send_input))
         .route("/v1/sessions/{s}/resize", post(resize))
+        .route("/v1/sessions/{s}/wait", post(wait))
+        .route("/v1/sessions/{s}/split", post(split))
         .route("/v1/sessions/{s}/detach", post(detach))
         .route("/v1/sessions/{s}/attach", get(attach_ws))
         .route("/v1/sessions/{s}", delete(kill))
@@ -453,6 +457,93 @@ async fn resize(
     }
     match state.api.resize(&s, body.rows, body.cols).await {
         Ok(()) => axum::Json(json!({ "resized": true })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Default program for a `split` with no argv: the daemon's login shell.
+fn default_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
+#[derive(Deserialize)]
+struct WaitBody {
+    condition: WaitCondition,
+    /// Milliseconds before giving up (`matched=false`). Omit to wait forever.
+    #[serde(default)]
+    timeout_ms: Option<i64>,
+}
+
+async fn wait(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(s): Path<String>,
+    body: axum::Json<WaitBody>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::Wait) {
+        return r;
+    }
+    match state
+        .api
+        .wait(&s, body.0.condition, body.0.timeout_ms)
+        .await
+    {
+        Ok(outcome) => axum::Json(outcome).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SplitBody {
+    #[serde(default)]
+    dir: SplitDir,
+    /// Program for the new pane; a login shell when empty.
+    #[serde(default)]
+    argv: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: Vec<(String, String)>,
+    #[serde(default)]
+    rows: u16,
+    #[serde(default)]
+    cols: u16,
+}
+
+async fn split(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(s): Path<String>,
+    body: axum::Json<SplitBody>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::Split) {
+        return r;
+    }
+    let b = body.0;
+    // Inherit the target session's worktree, cwd and geometry so the sibling
+    // lands in the same project at the same size.
+    let target = match state.api.list_sessions().await {
+        Ok(list) => list.into_iter().find(|si| si.id == s),
+        Err(e) => return e.into_response(),
+    };
+    let Some(target) = target else {
+        return ControlError::NotFound(format!("session {s}")).into_response();
+    };
+    let argv = if b.argv.is_empty() {
+        vec![default_shell()]
+    } else {
+        b.argv
+    };
+    let spec = OpenSpec {
+        argv,
+        cwd: b.cwd.or(target.cwd),
+        env: b.env,
+        rows: if b.rows == 0 { target.rows } else { b.rows },
+        cols: if b.cols == 0 { target.cols } else { b.cols },
+        worktree: target.worktree,
+    };
+    match state.api.split(&s, b.dir, spec).await {
+        Ok(info) => axum::Json(info).into_response(),
         Err(e) => e.into_response(),
     }
 }
