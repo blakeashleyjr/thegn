@@ -720,3 +720,45 @@ fn inherited_remote_ambient_env_survives_missing_local_dir() {
 
     let _ = std::fs::remove_dir_all(p.parent().unwrap());
 }
+
+#[test]
+fn commit_load_needed_open_follows_ttl_warm_only_cold_miss() {
+    let now = thegn_core::util::now();
+    let fresh = ("[]".to_string(), now);
+    let stale = ("[]".to_string(), now - (COMMIT_CACHE_TTL_SECS + 10));
+
+    // Open section: honour the TTL — refresh when cold or stale, skip when fresh.
+    assert!(commit_load_needed(true, None));
+    assert!(commit_load_needed(true, Some(&stale)));
+    assert!(!commit_load_needed(true, Some(&fresh)));
+
+    // Warm-only (closed summary): refresh on a cold miss ONLY. A present cache is
+    // reused even when stale, so the ticker never re-runs `git log` for a section
+    // nobody's looking at.
+    assert!(commit_load_needed(false, None));
+    assert!(!commit_load_needed(false, Some(&stale)));
+    assert!(!commit_load_needed(false, Some(&fresh)));
+}
+
+#[test]
+fn branch_fetch_needed_open_follows_ttl_warm_only_cold_miss() {
+    use std::time::Duration;
+    let ttl = crate::branch_cache::BRANCH_CACHE_TTL;
+    let fresh = Some(Duration::from_millis(0));
+    let stale = Some(ttl + Duration::from_secs(1));
+
+    // Nothing wanted → never fetch, regardless of cache state.
+    assert!(!branch_fetch_needed(false, true, None, ttl));
+    assert!(!branch_fetch_needed(false, false, None, ttl));
+
+    // Open section: TTL refresh — cold or stale fetches, fresh skips.
+    assert!(branch_fetch_needed(true, true, None, ttl));
+    assert!(branch_fetch_needed(true, true, stale, ttl));
+    assert!(!branch_fetch_needed(true, true, fresh, ttl));
+
+    // Warm-only: cold miss ONLY — a cached list is reused even when stale, so the
+    // repo-global `branches_full` subprocess never runs on the ticker.
+    assert!(branch_fetch_needed(true, false, None, ttl));
+    assert!(!branch_fetch_needed(true, false, stale, ttl));
+    assert!(!branch_fetch_needed(true, false, fresh, ttl));
+}
