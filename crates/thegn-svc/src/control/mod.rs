@@ -99,6 +99,50 @@ pub enum BrowserAction {
     Back,
 }
 
+/// A condition for the agent-driving `wait` verb: block until a session reaches
+/// a state instead of polling it. `Exited` is implemented today (it hooks the
+/// session-exit event); the activity-derived conditions (`Idle`/`Blocked`/
+/// `Done`) and `OutputMatches` require the per-pane state feed and answer
+/// [`ControlError::Unimplemented`] until it lands (the `drive_browser`
+/// precedent) — the verb, route and CLI ship now and light up in place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum WaitCondition {
+    /// The session's PTY child exited.
+    Exited,
+    /// The agent went idle after being active (finished a turn).
+    Idle,
+    /// The agent is blocked waiting on the user (asked for input).
+    Blocked,
+    /// The agent reported done.
+    Done,
+    /// The session's output matched this regex.
+    OutputMatches { regex: String },
+}
+
+/// The result of a `wait`: `matched=false` means the timeout elapsed first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitOutcome {
+    pub matched: bool,
+    /// Which condition fired (or the one waited on, if timed out).
+    pub condition: String,
+    /// The PTY exit code, when the condition was `Exited`.
+    pub exit_code: Option<i32>,
+}
+
+/// Where a `split` places the new pane relative to the target session. Mirrors
+/// the compositor's `center::Dir`; the wire type lives here so `thegn-svc` does
+/// not depend on `thegn-host`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitDir {
+    /// New pane to the right (vertical divider).
+    #[default]
+    Right,
+    /// New pane below (horizontal divider).
+    Down,
+}
+
 /// One changed file in a worktree (the mobile stage/commit contract).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitFileStatus {
@@ -203,6 +247,35 @@ pub trait ControlApi: Send + Sync + 'static {
 
     /// Command the preview browser. v1: always `Err(Unimplemented)`.
     fn drive_browser(&self, cmd: BrowserCommand) -> BoxFuture<'_, ControlResult<()>>;
+
+    /// Block until `session` reaches `cond` (or `timeout_ms` elapses). The
+    /// default answers `Unimplemented`; the daemon overrides it to implement the
+    /// `Exited` condition off its event feed (no polling). Activity-derived
+    /// conditions light up when the per-pane state feed lands.
+    fn wait<'a>(
+        &'a self,
+        session: &'a str,
+        cond: WaitCondition,
+        timeout_ms: Option<i64>,
+    ) -> BoxFuture<'a, ControlResult<WaitOutcome>> {
+        let _ = (session, cond, timeout_ms);
+        Box::pin(async { Err(ControlError::Unimplemented("wait")) })
+    }
+
+    /// Split `session`: create a sibling pane running `spec`. The default opens
+    /// a sibling *session* (the daemon registry is flat), which the compositor
+    /// places beside the target when it observes the new session; full in-layout
+    /// placement over the API lands with server-side layout. `dir` is recorded
+    /// for that future placement.
+    fn split<'a>(
+        &'a self,
+        session: &'a str,
+        dir: SplitDir,
+        spec: OpenSpec,
+    ) -> BoxFuture<'a, ControlResult<SessionInfo>> {
+        let _ = (session, dir);
+        self.open(spec)
+    }
 
     // Git verbs (the mobile stage/commit contract) — impls route through the
     // GitBackend seam on spawn_blocking; git stays the source of truth.

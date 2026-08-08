@@ -6269,6 +6269,11 @@ async fn event_loop<T: Terminal>(
     // single-flights those fetches (stale deliveries dropped).
     let mut pr_view: Option<crate::pr_view::PrView> = None;
     let mut pr_view_gen: u64 = 0;
+    // The full-screen in-app worktree diff viewer (the `Diff` action, when no
+    // external `diff` tool is configured). Its git diff arrives over
+    // `diff_view_tx`; `diff_view_gen` single-flights the fetch.
+    let mut diff_view: Option<crate::diff_view::DiffView> = None;
+    let mut diff_view_gen: u64 = 0;
     // Transient bottom-anchored notifications ("Text copied to clipboard", …).
     // Each push schedules a one-shot waker pulse so the toast clears on its own
     // even with no further input (the loop never polls on a timer).
@@ -6437,6 +6442,9 @@ async fn event_loop<T: Terminal>(
     // The full-screen PR view's async diff + conversation feed.
     let (pr_view_tx, mut pr_view_rx) =
         tokio_mpsc::unbounded_channel::<crate::pr_view::PrViewData>();
+    // The in-app diff viewer's async git-diff feed.
+    let (diff_view_tx, mut diff_view_rx) =
+        tokio_mpsc::unbounded_channel::<crate::diff_view::DiffViewData>();
     // Media (optional [media] feature): the watcher / control ops push now-playing
     // snapshots; the picker tasks push playlist/player lists. The watcher runs
     // only while `[media] enabled`; `restart_media_watch` (re)spawns it on config
@@ -9041,6 +9049,13 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // In-app diff viewer: async git diff (stale generations dropped).
+        while let Ok(data) = diff_view_rx.try_recv() {
+            if crate::actions::apply_diff_view_delivery(diff_view.as_mut(), data) {
+                dirty = true;
+            }
+        }
+
         // Worktree-creation progress from the wizard worker; stale
         // generations (a cancelled run's stragglers) are dropped.
         while let Ok(ev) = create_rx.try_recv() {
@@ -10633,6 +10648,10 @@ async fn event_loop<T: Terminal>(
             if let Some(v) = &pr_view {
                 v.render(&mut scratch, screen);
             }
+            // The in-app diff viewer shares that modal layer.
+            if let Some(v) = &diff_view {
+                v.render(&mut scratch, screen);
+            }
             // The Now-Playing media control overlay (centered modal).
             if let Some(ov) = &media_overlay {
                 ov.render(&mut scratch, screen);
@@ -11800,6 +11819,13 @@ async fn event_loop<T: Terminal>(
                         &waker,
                         &mut model,
                     );
+                    dirty = true;
+                    continue;
+                }
+                // The in-app diff viewer is a top-priority read-only modal: it
+                // owns every key while open (Esc/q dismiss).
+                if diff_view.is_some() {
+                    crate::actions::dispatch_diff_view_key(&mut diff_view, &k.key, k.modifiers);
                     dirty = true;
                     continue;
                 }
@@ -17593,14 +17619,13 @@ async fn event_loop<T: Terminal>(
                                     max,
                                 ));
                             }
-                            Action::Lazygit | Action::Editor | Action::Diff => {
+                            Action::Lazygit | Action::Editor => {
                                 // Tools open in a fresh center tab — a real
                                 // working surface, not the bottom drawer.
                                 let cwd = active_cwd(&session);
                                 let tool_name = match action {
                                     Action::Lazygit => "lazygit",
                                     Action::Editor => "editor",
-                                    Action::Diff => "diff",
                                     _ => unreachable!(),
                                 };
                                 if let Some(cmd_str) = keymap.config().tool_command(tool_name) {
@@ -17615,6 +17640,32 @@ async fn event_loop<T: Terminal>(
                                     focus.zone = crate::focus::Zone::Center;
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
+                                }
+                            }
+                            Action::Diff => {
+                                // A configured external `diff` tool still wins
+                                // (delta/difftastic in a tab); otherwise open the
+                                // native in-app diff viewer modal.
+                                if let Some(cmd_str) = keymap.config().tool_command("diff") {
+                                    let cmd = cmd_str.to_string();
+                                    let cwd = active_cwd(&session);
+                                    open_command_tab(
+                                        &mut session,
+                                        &mut panes,
+                                        &cmd,
+                                        cwd.as_deref(),
+                                        chrome.center,
+                                    );
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                } else {
+                                    diff_view = Some(crate::actions::open_diff_view(
+                                        &session,
+                                        &mut diff_view_gen,
+                                        &diff_view_tx,
+                                        &waker,
+                                    ));
                                 }
                             }
                             Action::Push | Action::Pull | Action::Fetch => {

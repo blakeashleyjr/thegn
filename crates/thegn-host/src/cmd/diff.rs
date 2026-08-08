@@ -57,8 +57,9 @@ pub fn run(
 }
 
 /// The repo's default branch (origin/HEAD, else main/master, else HEAD), probed
-/// through the location so it works for remote worktrees too.
-fn default_branch(loc: &GitLoc) -> String {
+/// through the location so it works for remote worktrees too. Shared with the
+/// in-app diff viewer (`diff_view`).
+pub(crate) fn default_branch(loc: &GitLoc) -> String {
     if let Some(r) = loc.git_out(&[
         "symbolic-ref",
         "--quiet",

@@ -302,12 +302,22 @@ if command -v sqlite3 >/dev/null 2>&1; then
     "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
        \"SELECT count(*) FROM merge_queue WHERE branch='$MB' AND status='queued'\") -eq 1 ]]"
 fi
+# `merge rm` removes a queued entry by path; re-add so drain has work. Done while
+# the worktree still exists — a clean land now auto-removes it (see below).
+check "merge rm deletes the entry by the same path" \
+  "'$SZ' merge rm '$MP' >/dev/null 2>&1"
+check "merge add re-queues the branch after rm" \
+  "'$SZ' merge add '$MP' | grep -q 'queued'"
 check "merge drain lands the clean branch" \
   "'$SZ' merge drain | grep -q 'landed'"
 check "drain advanced the target to include the branch's commit" \
   "git -C '$R' log --oneline | grep -q 'smoke merge change'"
-check "merge rm deletes the entry by the same path" \
-  "'$SZ' merge add '$MP' >/dev/null && '$SZ' merge rm '$MP' >/dev/null 2>&1"
+# organize_folders + on_landed = "remove" are on by default: a clean land removes
+# the merged worktree and deletes its now-redundant branch.
+check "clean land auto-removes the merged worktree" \
+  "[[ ! -d '$MP' ]]"
+check "clean land deletes the merged branch" \
+  "[[ -z \$(git -C '$R' branch --list '$MB') ]]"
 
 # ── placement engine ─────────────────────────────────────────────────────────
 # Engine OFF (the default): the dry-run reports passthrough and no state is
@@ -536,6 +546,31 @@ check "session list without a daemon exits 1 with a clear message" \
   "[[ $nodaemon_msg_ok -eq 1 ]]"
 check "session list --json emits the no_daemon error object" \
   "[[ $nodaemon_json_ok -eq 1 ]]"
+
+# `thegn attach` (the local thin client) shares the same connect path, so it
+# degrades identically when no daemon is running — never a crash.
+set +e
+attach_out="$("$SZ" attach 2>&1)"
+attach_rc=$?
+set -e
+attach_ok=1
+[[ $attach_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$attach_out" || attach_ok=0
+check "attach without a daemon exits 1 with a clear message" \
+  "[[ $attach_ok -eq 1 ]]"
+
+# The agent-driving verbs (`session wait`/`session split`) share the connect
+# path and must degrade cleanly too.
+set +e
+wait_out="$("$SZ" session wait --session bogus --until exited 2>&1)"
+wait_rc=$?
+split_out="$("$SZ" session split --session bogus 2>&1)"
+split_rc=$?
+set -e
+verbs_ok=1
+[[ $wait_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$wait_out" || verbs_ok=0
+[[ $split_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$split_out" || verbs_ok=0
+check "session wait/split without a daemon exit 1 with a clear message" \
+  "[[ $verbs_ok -eq 1 ]]"
 
 # Daemon lifecycle: spawn on an isolated socket, open a marker session over
 # the unix socket, see it in `session list` and its output in `snapshot`,

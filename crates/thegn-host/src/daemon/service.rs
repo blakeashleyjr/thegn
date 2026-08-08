@@ -18,7 +18,7 @@ use thegn_core::db::Db;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow};
 use thegn_svc::control::{
     AttachKind, AttachReply, BrowserCommand, ControlApi, ControlError, ControlResult,
-    GitFileStatus, OpenSpec, SessionInfo,
+    GitFileStatus, OpenSpec, SessionInfo, WaitCondition, WaitOutcome,
 };
 use thegn_svc::git::{CliGit, CommitOps, GitBackend};
 
@@ -342,6 +342,74 @@ impl ControlApi for DaemonService {
 
     fn drive_browser(&self, _cmd: BrowserCommand) -> BoxFuture<'_, ControlResult<()>> {
         Box::pin(async move { Err(ControlError::Unimplemented("drive-browser")) })
+    }
+
+    fn wait<'a>(
+        &'a self,
+        session: &'a str,
+        cond: WaitCondition,
+        timeout_ms: Option<i64>,
+    ) -> BoxFuture<'a, ControlResult<WaitOutcome>> {
+        Box::pin(async move {
+            match cond {
+                // Event-driven, never polled: subscribe BEFORE confirming the
+                // session is live so no exit event is missed in the gap, then
+                // block on the feed until the target session exits.
+                WaitCondition::Exited => {
+                    let mut rx = self.events.subscribe();
+                    let _ = self.entry_tx(session).await?; // 404 if already gone
+                    let feed = async {
+                        loop {
+                            match rx.recv().await {
+                                Ok(frame) => {
+                                    if let EventFrame::SessionExit { session: s, code } = &*frame
+                                        && s == session
+                                    {
+                                        return WaitOutcome {
+                                            matched: true,
+                                            condition: "exited".into(),
+                                            exit_code: *code,
+                                        };
+                                    }
+                                }
+                                // A lagging receiver skipped events; keep waiting
+                                // (an exit we missed would 404 on the next check,
+                                // but the feed is bounded generously).
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    return WaitOutcome {
+                                        matched: true,
+                                        condition: "exited".into(),
+                                        exit_code: None,
+                                    };
+                                }
+                            }
+                        }
+                    };
+                    match timeout_ms {
+                        Some(ms) if ms >= 0 => {
+                            let dur = std::time::Duration::from_millis(ms as u64);
+                            Ok(tokio::time::timeout(dur, feed)
+                                .await
+                                .unwrap_or(WaitOutcome {
+                                    matched: false,
+                                    condition: "exited".into(),
+                                    exit_code: None,
+                                }))
+                        }
+                        _ => Ok(feed.await),
+                    }
+                }
+                // Activity-derived + output-match conditions need the per-pane
+                // state feed (B‑3 exposure) / attach delta stream — staged.
+                WaitCondition::Idle
+                | WaitCondition::Blocked
+                | WaitCondition::Done
+                | WaitCondition::OutputMatches { .. } => Err(ControlError::Unimplemented(
+                    "wait on activity/output condition",
+                )),
+            }
+        })
     }
 
     fn git_status<'a>(

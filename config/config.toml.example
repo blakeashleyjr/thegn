@@ -2832,17 +2832,21 @@ auto_land = true              # queue driver: CAS-advance on green; false ⇒ st
 agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human"
 agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
 #
-# Sidebar organization (optional, OFF by default). As a branch moves through the
-# queue, file its worktree into sidebar folders so in-flight / merged / blocked
-# work is grouped at a glance. The folder names below are pre-filled for
-# convenience but do NOTHING until organize_folders = true. A worktree open as a
-# live tab is torn down cleanly (like closing it) when on_landed removes it; the
-# home worktree is never filed or removed. Failed branches (conflict/red gate/
-# agent-gave-up) move to failed_folder. Out-of-process `merge add` changes may
-# take up to ~2 s to appear in a running instance (git-watch / refresh ticker).
-organize_folders = false      # master switch for the folder automation below
+# Sidebar organization (ON by default). As a branch moves through the queue,
+# file its worktree into sidebar folders so in-flight / merged / blocked work is
+# grouped at a glance, and — once a branch lands cleanly — remove its now-dead
+# worktree so the workspace stays "live work only". By default: enqueued work is
+# filed into queued_folder, a clean land removes the worktree AND deletes the
+# merged branch (on_landed = "remove"), and failures move to failed_folder. Set
+# organize_folders = false to disable the whole lifecycle, or on_landed = "detach"
+# to keep merged branches ("move"/"off" keep the worktree). Only landings through
+# thegn's own merge queue trigger this (not GitHub / manual git merges). A worktree
+# open as a live tab is torn down cleanly (like closing it) when on_landed removes
+# it; the home worktree is never filed or removed. Out-of-process `merge add`
+# changes may take up to ~2 s to appear in a running instance (git-watch / ticker).
+organize_folders = true       # master switch for the folder automation below
 queued_folder = "Merging"     # file a worktree here when its branch is enqueued ("" ⇒ don't)
-on_landed = "off"             # off | move | detach | remove — what to do when a branch lands
+on_landed = "remove"          # off | move | detach | remove — what to do when a branch lands
                               #   move   = file the worktree into merged_folder
                               #   detach = remove the worktree, keep the branch
                               #   remove = remove the worktree AND delete the merged branch

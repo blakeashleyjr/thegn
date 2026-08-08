@@ -166,6 +166,36 @@ impl ControlClient {
         .map(|_| ())
     }
 
+    /// Block until `session` reaches `condition` (a JSON `WaitCondition`), or
+    /// `timeout_ms` elapses. Returns the `WaitOutcome` JSON (`matched`,
+    /// `condition`, `exit_code`).
+    pub async fn wait(
+        &self,
+        session: &str,
+        condition: Value,
+        timeout_ms: Option<i64>,
+    ) -> Result<Value> {
+        self.request(
+            "POST",
+            &format!("/v1/sessions/{session}/wait"),
+            Some(json!({ "condition": condition, "timeout_ms": timeout_ms })),
+        )
+        .await
+    }
+
+    /// Split `session`: open a sibling pane running `argv` (empty = a shell) in
+    /// direction `dir` (`right`/`down`). Returns the new [`SessionInfo`].
+    pub async fn split(&self, session: &str, dir: &str, argv: &[String]) -> Result<SessionInfo> {
+        let v = self
+            .request(
+                "POST",
+                &format!("/v1/sessions/{session}/split"),
+                Some(json!({ "dir": dir, "argv": argv })),
+            )
+            .await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     pub async fn detach(&self, session: &str, client_id: &str) -> Result<()> {
         self.request(
             "POST",
@@ -191,8 +221,12 @@ impl ControlClient {
     /// path the host resolves (the sprite's `$THEGN_WORKTREE`), not the sprite's
     /// local mount. Returns the server's `{ "queued": … }` envelope.
     pub async fn merge_add(&self, worktree: &str) -> Result<Value> {
-        self.request("POST", "/v1/merge/add", Some(json!({ "worktree": worktree })))
-            .await
+        self.request(
+            "POST",
+            "/v1/merge/add",
+            Some(json!({ "worktree": worktree })),
+        )
+        .await
     }
 
     pub async fn open_worktree(&self, repo: &str, branch: Option<&str>) -> Result<()> {

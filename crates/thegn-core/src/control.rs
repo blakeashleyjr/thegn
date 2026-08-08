@@ -142,6 +142,10 @@ pub enum Verb {
     KillSession,
     OpenWorktree,
     DriveBrowser,
+    /// Block until a session reaches a state — observes only.
+    Wait,
+    /// Create a sibling pane/session — a write-side effect like `OpenSession`.
+    Split,
     GitStatus,
     GitStage,
     GitCommit,
@@ -168,6 +172,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::LeaseStatus
         | Verb::GitStatus
         | Verb::MergeList
+        | Verb::Wait
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -178,7 +183,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::Resize
         | Verb::KillSession
         | Verb::OpenWorktree
-        | Verb::DriveBrowser => Scope::Write,
+        | Verb::DriveBrowser
+        | Verb::Split => Scope::Write,
         Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
         Verb::IssuePairing
         | Verb::ListPairings
@@ -429,6 +435,7 @@ mod tests {
             LeaseStatus,
             GitStatus,
             MergeList,
+            Wait,
             Me,
         ];
         let write = [
@@ -440,6 +447,7 @@ mod tests {
             KillSession,
             OpenWorktree,
             DriveBrowser,
+            Split,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear];
         let admin = [

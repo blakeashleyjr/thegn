@@ -40,6 +40,7 @@ mod daemon;
 mod db_task;
 mod desktop_notify;
 mod detail;
+mod diff_view;
 mod direnv_warm;
 mod dragdrop;
 mod drawer_state;
@@ -446,6 +447,15 @@ pub enum Command {
     Session {
         #[command(subcommand)]
         action: cmd::session::SessionAction,
+    },
+    /// Attach to a running local session over the pane daemon's unix socket —
+    /// the local thin client. With no argument, lists live sessions to pick
+    /// from; with a session id, grabs it interactively (raw keystrokes in, PTY
+    /// bytes out). Detach with Ctrl-\ — the work keeps running under the
+    /// daemon. Local-only: never dials the TCP `serve` listener.
+    Attach {
+        /// Session id to attach to (see `thegn attach` with no argument).
+        session: Option<String>,
     },
     /// Manage pairing credentials for thin clients (mint codes, list,
     /// approve, revoke). Works with or without a running daemon.
@@ -885,6 +895,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             daemon::serve_blocking(&cfg, daemon::ServeOpts { bind, no_pair_url })
         }
         Command::Session { action } => cmd::session::run(&cfg, action),
+        Command::Attach { session } => cmd::attach::run(&cfg, session),
         Command::Pair { action } => cmd::pair::run(&cfg, action),
         Command::Daemon { socket } => daemon::run_blocking(&cfg, socket),
         Command::Bridge => {
