@@ -1011,7 +1011,7 @@ impl PrView {
 
 // --- free helpers ----------------------------------------------------------
 
-fn sel_marker(selected: bool) -> &'static str {
+pub(crate) fn sel_marker(selected: bool) -> &'static str {
     if selected { "❯ " } else { "  " }
 }
 
@@ -1032,7 +1032,7 @@ fn review_tone(state: &str) -> Tok {
     }
 }
 
-fn file_stat(f: &DiffFile) -> (usize, usize) {
+pub(crate) fn file_stat(f: &DiffFile) -> (usize, usize) {
     let mut adds = 0;
     let mut dels = 0;
     for h in &f.hunks {
@@ -1047,7 +1047,7 @@ fn file_stat(f: &DiffFile) -> (usize, usize) {
     (adds, dels)
 }
 
-fn diff_line(dl: &DiffLine, selected: bool, cols: usize) -> Line {
+pub(crate) fn diff_line(dl: &DiffLine, selected: bool, cols: usize) -> Line {
     let (marker, tone) = match dl.kind {
         DiffLineKind::Add => ("+", Tok::Hue(thegn_core::theme::Hue::Green)),
         DiffLineKind::Del => ("-", Tok::Hue(thegn_core::theme::Hue::Red)),
@@ -1065,7 +1065,7 @@ fn diff_line(dl: &DiffLine, selected: bool, cols: usize) -> Line {
     ])
 }
 
-fn trunc(s: &str, max: usize) -> String {
+pub(crate) fn trunc(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {

@@ -174,6 +174,51 @@ pub enum ActivityKind {
     Read,
 }
 
+/// Per-pane agent state, herdr's `blocked · working · done · idle` vocabulary,
+/// derived from the signals thegn already tracks (the activity FSM + the
+/// attention tier). This is the *reporting* face of the same state machine —
+/// it does not introduce a new FSM. Exposed over the control API so a client
+/// (or another agent) can ask "what is this agent doing?" and wait on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PaneAgentState {
+    /// Stopped, waiting on the user (agent asked for input / needs a human).
+    Blocked,
+    /// Actively producing work (CPU advancing or mid-turn output).
+    Working,
+    /// Finished a turn and awaiting the user (went idle after being active).
+    Done,
+    /// Nothing pending — a non-agent pane, or an acknowledged idle agent.
+    #[default]
+    Idle,
+}
+
+/// Map thegn's activity + attention signals onto herdr's four-state agent
+/// vocabulary. `has_agent` is false for a plain shell pane in an agent-bearing
+/// worktree — those report `Idle`, never a work state. Pure and unit-tested.
+///
+/// Precedence: an explicit block (the agent asked for input, tier `Blocked`)
+/// wins over any activity reading; otherwise the activity FSM decides —
+/// `Active`/`Loading` ⇒ working, `Waiting` ⇒ done (idle after a turn), and
+/// `None`/`Read` ⇒ idle (never seen busy, or seen-and-acknowledged).
+pub fn pane_agent_state(
+    activity: ActivityKind,
+    tier: AttentionTier,
+    has_agent: bool,
+) -> PaneAgentState {
+    if !has_agent {
+        return PaneAgentState::Idle;
+    }
+    if tier == AttentionTier::Blocked {
+        return PaneAgentState::Blocked;
+    }
+    match activity {
+        ActivityKind::Active | ActivityKind::Loading => PaneAgentState::Working,
+        ActivityKind::Waiting => PaneAgentState::Done,
+        ActivityKind::None | ActivityKind::Read => PaneAgentState::Idle,
+    }
+}
+
 /// One unread notification relevant to the worktree: `(kind, created_at)` in
 /// unix seconds (the DB's `created_at_ms` misnomer — it holds seconds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,6 +501,24 @@ mod tests {
 
     fn note(kind: NotificationKind, at: i64) -> UnreadNote {
         UnreadNote { kind, at }
+    }
+
+    #[test]
+    fn pane_agent_state_maps_herdr_four_states() {
+        use ActivityKind as A;
+        use PaneAgentState as P;
+        // A non-agent pane is always idle, whatever the worktree is doing.
+        assert_eq!(pane_agent_state(A::Active, T::Working, false), P::Idle);
+        assert_eq!(pane_agent_state(A::Waiting, T::Blocked, false), P::Idle);
+        // Blocked (agent asked for input) overrides any activity reading.
+        assert_eq!(pane_agent_state(A::Active, T::Blocked, true), P::Blocked);
+        assert_eq!(pane_agent_state(A::None, T::Blocked, true), P::Blocked);
+        // Otherwise the activity FSM decides.
+        assert_eq!(pane_agent_state(A::Active, T::Working, true), P::Working);
+        assert_eq!(pane_agent_state(A::Loading, T::Working, true), P::Working);
+        assert_eq!(pane_agent_state(A::Waiting, T::Waiting, true), P::Done);
+        assert_eq!(pane_agent_state(A::None, T::Idle, true), P::Idle);
+        assert_eq!(pane_agent_state(A::Read, T::Waiting, true), P::Idle);
     }
 
     #[test]

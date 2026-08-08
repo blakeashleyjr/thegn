@@ -9,6 +9,7 @@ use termwiz::input::{KeyCode, Modifiers};
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::diff_view::{DiffView, DiffViewData, DiffViewOutcome};
 use crate::pr_view::{PrView, PrViewData, PrViewOutcome};
 
 use crate::chrome::FrameModel;
@@ -606,6 +607,77 @@ pub(crate) fn dispatch_pr_view_key(
 
 /// Apply an async delivery to the open view if its generation is current.
 pub(crate) fn apply_pr_view_delivery(view: Option<&mut PrView>, data: PrViewData) -> bool {
+    if let Some(v) = view
+        && data.generation == v.generation
+    {
+        v.apply_data(data);
+        return true;
+    }
+    false
+}
+
+/// Fetch the worktree's branch-point diff (the `thegn diff` range, incl.
+/// uncommitted work) off the loop and deliver it over `tx`. Single-flight via
+/// `generation`; a failed read delivers an empty diff (the view shows "no
+/// changes" rather than hanging on "loading").
+pub(crate) fn spawn_diff_view_fetch(
+    session: Session,
+    generation: u64,
+    tx: &UnboundedSender<DiffViewData>,
+    waker: &TerminalWaker,
+) {
+    let tx = tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let wt = active_tab_path(&session);
+        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let base = crate::cmd::diff::default_branch(&loc);
+        let target = loc
+            .git_out(&["merge-base", &base, "HEAD"])
+            .unwrap_or_else(|| "HEAD".to_string());
+        let raw = loc
+            .git_out(&["diff", "--no-color", &target])
+            .unwrap_or_default();
+        let diff = thegn_core::github::parse_unified_diff(&raw);
+        let data = DiffViewData {
+            generation,
+            diff: Some(diff),
+        };
+        if tx.send(data).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+}
+
+/// Open the in-app diff viewer for the active worktree, kicking its async load.
+pub(crate) fn open_diff_view(
+    session: &Session,
+    gen_ctr: &mut u64,
+    tx: &UnboundedSender<DiffViewData>,
+    waker: &TerminalWaker,
+) -> DiffView {
+    *gen_ctr += 1;
+    let wt = active_tab_path(session);
+    let title = wt
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| format!("{n} · diff"))
+        .unwrap_or_else(|| "diff".to_string());
+    spawn_diff_view_fetch(session.clone(), *gen_ctr, tx, waker);
+    DiffView::new(title, *gen_ctr)
+}
+
+/// Route a key to the open diff viewer: close it, or consume it (read-only).
+pub(crate) fn dispatch_diff_view_key(view: &mut Option<DiffView>, key: &KeyCode, mods: Modifiers) {
+    let Some(v) = view.as_mut() else { return };
+    match v.handle_key(key, mods) {
+        DiffViewOutcome::Close => *view = None,
+        DiffViewOutcome::Pending => {}
+    }
+}
+
+/// Apply an async delivery to the open viewer if its generation is current.
+pub(crate) fn apply_diff_view_delivery(view: Option<&mut DiffView>, data: DiffViewData) -> bool {
     if let Some(v) = view
         && data.generation == v.generation
     {

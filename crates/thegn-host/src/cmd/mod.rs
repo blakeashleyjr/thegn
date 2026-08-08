@@ -10,6 +10,7 @@
 //! the default when no subcommand is given.
 
 pub mod agent;
+pub mod attach;
 pub mod ci;
 pub mod config;
 pub mod debug;
@@ -113,7 +114,11 @@ mod resolve_worktree_tests {
 
     #[test]
     fn explicit_arg_wins() {
-        let got = resolve_worktree_from(Some("/some/arg".into()), Some("/env".into()), Path::new("/cwd"));
+        let got = resolve_worktree_from(
+            Some("/some/arg".into()),
+            Some("/env".into()),
+            Path::new("/cwd"),
+        );
         assert_eq!(got, PathBuf::from("/some/arg"));
     }
 
@@ -121,7 +126,11 @@ mod resolve_worktree_tests {
     fn existing_env_worktree_is_used() {
         // A $THEGN_WORKTREE that exists (a local sandbox's bind-mounted path).
         let dir = std::env::temp_dir();
-        let got = resolve_worktree_from(None, Some(dir.to_string_lossy().into()), Path::new("/nonexistent/cwd"));
+        let got = resolve_worktree_from(
+            None,
+            Some(dir.to_string_lossy().into()),
+            Path::new("/nonexistent/cwd"),
+        );
         assert_eq!(got, dir);
     }
 

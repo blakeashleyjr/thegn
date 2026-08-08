@@ -488,7 +488,10 @@ pub struct MergeQueueConfig {
     pub agent_max_attempts: u32,
     /// Watchdog (seconds) for one agent invocation. 0 disables it.
     pub agent_timeout_secs: u64,
-    /// Master switch for filing worktrees into sidebar folders as branches move through the queue. Off ⇒ fields below inert.
+    /// Master switch for the merge-queue sidebar lifecycle — filing worktrees
+    /// into folders as branches move through the queue, and removing a worktree
+    /// once its branch lands cleanly (see `on_landed`). On by default; `false` ⇒
+    /// fields below inert (today's manual behavior).
     pub organize_folders: bool,
     /// Folder for an enqueued (`queued`) worktree. Empty ⇒ don't file on enqueue.
     pub queued_folder: String,
@@ -519,9 +522,9 @@ impl Default for MergeQueueConfig {
             auto_land: true,
             agent_max_attempts: 2,
             agent_timeout_secs: 900,
-            organize_folders: false,
+            organize_folders: true,
             queued_folder: "Merging".to_string(),
-            on_landed: OnLanded::Off,
+            on_landed: OnLanded::Remove,
             merged_folder: "Merged".to_string(),
             failed_folder: "Needs attention".to_string(),
         }
@@ -3332,7 +3335,9 @@ pub struct Config {
     pub lsp: LspConfig,
     /// The LLM proxy daemon (`[llm_proxy]`). Disabled by default — AI is additive.
     pub llm_proxy: LlmProxyConfig,
-    /// `[daemon]` — the pane daemon (panes survive UI exit). Opt-in, off by default.
+    /// `[daemon]` — the pane daemon (center panes survive UI exit; tmux
+    /// semantics). On by default; set `[daemon] enabled = false` for plain
+    /// in-process PTYs.
     pub daemon: DaemonConfig,
     /// `[serve]` — remote thin-client serving + pairing policy (`thegn serve`).
     pub serve: ServeConfig,

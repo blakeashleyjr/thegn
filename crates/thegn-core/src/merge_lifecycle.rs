@@ -192,4 +192,28 @@ mod tests {
         assert_eq!(OnLanded::Detach.as_str(), "detach");
         assert_eq!(OnLanded::default(), OnLanded::Off);
     }
+
+    #[test]
+    fn default_config_enables_full_lifecycle() {
+        // The shipped default is "whole lifecycle on": file in-flight work into
+        // folders, and on a clean land remove the worktree AND delete the merged
+        // branch. Locks the default flip (organize_folders + on_landed) so a
+        // regression back to inert is caught here, not in the field.
+        let c = MergeQueueConfig::default();
+        assert!(c.organize_folders);
+        assert_eq!(
+            decide(&c, LifecycleEvent::Enqueued),
+            LifecycleAction::FileInto("Merging".into())
+        );
+        assert_eq!(
+            decide(&c, LifecycleEvent::Landed),
+            LifecycleAction::RemoveWorktree {
+                delete_branch: true
+            }
+        );
+        assert_eq!(
+            decide(&c, LifecycleEvent::Failed),
+            LifecycleAction::FileInto("Needs attention".into())
+        );
+    }
 }
