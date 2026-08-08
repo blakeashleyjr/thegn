@@ -650,11 +650,14 @@ format = "text"           # text | json
 # spawned afterward. Forge tokens are never set by an identity (they stay
 # firewalled), and an SSH key is pinned with IdentitiesOnly=yes.
 # [identities.school]
-# git.config  = "~/.config/git/school"   # → GIT_CONFIG_GLOBAL
-# git.ssh_key = "~/.ssh/id_school"        # → GIT_SSH_COMMAND -i … -o IdentitiesOnly=yes
-# gh.config   = "~/.config/gh-school"     # → GH_CONFIG_DIR
-# gpg.home    = "~/.gnupg"               # → GNUPGHOME (shared)
 # accounts    = { claude = "school" }     # per-provider agent account
+# [identities.school.git]
+# config  = "~/.config/git/school"        # → GIT_CONFIG_GLOBAL
+# ssh_key = "~/.ssh/id_school"            # → GIT_SSH_COMMAND -i … -o IdentitiesOnly=yes
+# [identities.school.gh]
+# config  = "~/.config/gh-school"         # → GH_CONFIG_DIR
+# [identities.school.gpg]
+# home    = "~/.gnupg"                   # → GNUPGHOME (shared)
 #
 # Reference an identity from a profile (its firewall base) or a bundle (soft,
 # per-scope; overrides the profile base, and the bundle's own env/config_dirs
