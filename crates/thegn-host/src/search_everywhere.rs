@@ -283,6 +283,10 @@ pub struct PaletteSession {
     pub palette: crate::palette::Palette,
     pub async_results: AsyncResults,
     pub selected: usize,
+    /// True when this session is the profile switcher, which supports reordering
+    /// the highlighted profile with the move-item chord (Ctrl+Alt+↑/↓). Off for
+    /// every other palette. See [`crate::palette::build_profile_palette`].
+    pub profile_reorder: bool,
     /// Scroll offset for async-mode result lists (All-mode uses the inner
     /// Palette's own scroll_offset).
     pub scroll_offset: usize,
@@ -311,6 +315,7 @@ impl PaletteSession {
             palette: crate::palette::Palette::new(items),
             async_results: AsyncResults::default(),
             selected: 0,
+            profile_reorder: false,
             scroll_offset: 0,
             result_rx: rx,
             result_tx: tx,
