@@ -23,8 +23,10 @@ workspace, worktree, and pane position.
 
 - `Ctrl-←/↓/↑/→` (or `Ctrl-h/j/k/l`) moves focus across one spatial map:
   [[sidebar]] ← center panes → [[panel]], masthead above, status bar below.
-- `Alt-←/→` cycles tabs within the worktree; `Alt-↑/↓` cycles worktrees
-  within the workspace; `Shift-Alt-↑/↓` cycles workspaces.
+- `Alt-←/↓/↑/→` moves focus the same way, but running off the outer edge
+  falls through to the next thing: `←/→` to the previous/next tab, `↑/↓` to
+  the previous/next worktree — one motion for the whole layout.
+- `Shift-Alt-↑/↓` cycles workspaces.
 - `Alt-1..9` jumps to a worktree, `Ctrl-1..9` to a workspace, by sidebar
   order.
 - `Ctrl-Space` opens the [[command-palette]] — every action, fuzzy-searched.

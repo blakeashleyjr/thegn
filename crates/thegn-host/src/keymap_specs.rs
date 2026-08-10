@@ -459,7 +459,10 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "prev-tab",
         label: "Previous tab",
         hint: "prev tab",
-        default_chords: &["Alt Left"],
+        // Alt+← reaches this via the seamless `nav-left` fall-through (at the
+        // left edge with nowhere further to focus); kept chord-free + palette /
+        // rebindable for a direct binding.
+        default_chords: &[],
         palette: true,
         keywords: &[
             "previous tab",
@@ -473,7 +476,8 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "next-tab",
         label: "Next tab",
         hint: "next tab",
-        default_chords: &["Alt Right"],
+        // Reached via `nav-right` at the right edge; chord-free + rebindable.
+        default_chords: &[],
         palette: true,
         keywords: &["next tab", "forward tab", "right tab", "later tab"],
     },
@@ -481,7 +485,8 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "prev-worktree",
         label: "Previous worktree",
         hint: "prev worktree",
-        default_chords: &["Alt Up"],
+        // Reached via `nav-up` at the top edge; chord-free + rebindable.
+        default_chords: &[],
         palette: true,
         keywords: &[
             "previous worktree",
@@ -495,7 +500,8 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "next-worktree",
         label: "Next worktree",
         hint: "next worktree",
-        default_chords: &["Alt Down"],
+        // Reached via `nav-down` at the bottom edge; chord-free + rebindable.
+        default_chords: &[],
         palette: true,
         keywords: &[
             "next worktree",
@@ -642,6 +648,65 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
             "select lower pane",
             "go down",
             "south pane",
+        ],
+    },
+    // Nav = the seamless Alt+arrow motion: focus the neighbour (pane, then
+    // sidebar / panel / bar / drawer); at the outer edge, fall through to the
+    // tab (←/→) or worktree (↑/↓) switch. Resolved in the run loop.
+    ActionSpec {
+        id: "nav-left",
+        label: "Navigate left",
+        hint: "nav←",
+        default_chords: &["Alt Left"],
+        palette: true,
+        keywords: &[
+            "navigate left",
+            "focus or previous tab",
+            "pane left",
+            "left edge previous tab",
+            "seamless left",
+        ],
+    },
+    ActionSpec {
+        id: "nav-right",
+        label: "Navigate right",
+        hint: "nav→",
+        default_chords: &["Alt Right"],
+        palette: true,
+        keywords: &[
+            "navigate right",
+            "focus or next tab",
+            "pane right",
+            "right edge next tab",
+            "seamless right",
+        ],
+    },
+    ActionSpec {
+        id: "nav-up",
+        label: "Navigate up",
+        hint: "nav↑",
+        default_chords: &["Alt Up"],
+        palette: true,
+        keywords: &[
+            "navigate up",
+            "focus or previous worktree",
+            "pane above",
+            "top edge previous worktree",
+            "seamless up",
+        ],
+    },
+    ActionSpec {
+        id: "nav-down",
+        label: "Navigate down",
+        hint: "nav↓",
+        default_chords: &["Alt Down"],
+        palette: true,
+        keywords: &[
+            "navigate down",
+            "focus or next worktree",
+            "pane below",
+            "bottom edge next worktree",
+            "seamless down",
         ],
     },
     ActionSpec {

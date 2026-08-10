@@ -129,7 +129,7 @@ sleep 0.3
 for _ in $(seq 1 "$FLOODS"); do
   keys 'seq 1 100000000\r'
   sleep 0.4
-  keys '\x1b[1;3B' # Alt+Down → NextWorktree
+  keys '\x1b[1;3B' # Alt+Down → nav-down (focus down; next worktree at the edge)
   sleep 0.4
 done
 
