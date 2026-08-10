@@ -59,6 +59,7 @@ pub(crate) fn maybe_materialize(
     ti: usize,
     is_terminal: bool,
     quiet: bool,
+    sandbox_override: Option<&str>,
 ) {
     let key = (name.to_string(), ti);
     if missing.is_empty()
@@ -92,7 +93,7 @@ pub(crate) fn maybe_materialize(
     // shape, actually starts caring). This matches `active_watchdog_deadline`'s
     // own missing-entry default, so no local tab is under-guarded.
     ctx.loading_remote.entry(key.clone()).or_insert(true);
-    let seed = match crate::loading::catalog::seed_target(cfg, false) {
+    let seed = match crate::loading::catalog::seed_target(cfg, false, sandbox_override) {
         Some(t) => crate::loading::catalog::plan_for(&t).into_steps(),
         None => crate::loading::catalog::generic_seed(),
     };

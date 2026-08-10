@@ -89,9 +89,17 @@ impl ResolvedTarget {
 /// flows stream their own plans; `backend = "auto"` resolves off-thread) —
 /// the caller then seeds the generic three-step shape and lets the observer
 /// refine it.
+///
+/// `override_backend` is the worktree's saved `sandbox_backend` (the DB column,
+/// carried on the loop via `model.active_sandbox_backend` — no read here). A
+/// valid, non-`auto` override wins over the global `[sandbox] backend`, so an
+/// uncontained worktree (`none`) seeds the host plan even under a sandboxed
+/// default, and a pinned worktree seeds its own backend. Empty/`auto`/unknown
+/// falls back to config.
 pub(crate) fn seed_target(
     cfg: &thegn_core::config::Config,
     remote: bool,
+    override_backend: Option<&str>,
 ) -> Option<ResolvedTarget> {
     if remote {
         return None;
@@ -109,8 +117,15 @@ pub(crate) fn seed_target(
         return Some(host);
     }
     use thegn_core::sandbox::Backend as B;
+    // Prefer a valid, non-`auto` per-worktree override over the global default;
+    // an empty/`auto`/unparseable value falls back to config.
+    let effective = override_backend
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "auto")
+        .and_then(|s| thegn_core::config::SandboxBackend::from_str_validated(s).ok())
+        .unwrap_or(cfg.sandbox.backend);
     // `auto` (None) means the chain resolves off-thread — unknowable here.
-    let b = B::from_config(cfg.sandbox.backend)?;
+    let b = B::from_config(effective)?;
     let backend = match b {
         B::None => BackendClass::Host,
         B::Bwrap | B::Systemd | B::WinAppContainer | B::WinJobObject => {
@@ -361,21 +376,21 @@ mod tests {
     fn seed_target_classifies_cheaply_or_declines() {
         let mut cfg = thegn_core::config::Config::default();
         // Remote flows stream their own plans: no seed classification.
-        assert_eq!(seed_target(&cfg, true), None);
+        assert_eq!(seed_target(&cfg, true, None), None);
         // Sandboxing off ⇒ host shell.
         cfg.sandbox.enabled = false;
         assert_eq!(
-            seed_target(&cfg, false).unwrap().backend,
+            seed_target(&cfg, false, None).unwrap().backend,
             BackendClass::Host
         );
         // `auto` can't be classified without probing ⇒ generic seed.
         cfg.sandbox.enabled = true;
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
-        assert_eq!(seed_target(&cfg, false), None);
+        assert_eq!(seed_target(&cfg, false, None), None);
         // An explicit OCI backend seeds the rich plan, with the image ref.
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Podman;
         cfg.sandbox.image = "debian:stable".into();
-        let t = seed_target(&cfg, false).unwrap();
+        let t = seed_target(&cfg, false, None).unwrap();
         assert_eq!(t.backend, BackendClass::Oci("podman-rootless".into()));
         assert_eq!(t.image.as_deref(), Some("debian:stable"));
         let labels: Vec<String> = plan_for(&t)
@@ -395,9 +410,39 @@ mod tests {
         // Bwrap classifies as a host-toolchain namespace.
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Bwrap;
         assert_eq!(
-            seed_target(&cfg, false).unwrap().backend,
+            seed_target(&cfg, false, None).unwrap().backend,
             BackendClass::HostToolchain("bwrap".into())
         );
+    }
+
+    #[test]
+    fn seed_target_honors_per_worktree_override() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.sandbox.enabled = true;
+        // Global default is a host-toolchain sandbox…
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Bwrap;
+        // …but an uncontained worktree (`none`) seeds the bare host plan —
+        // no namespace/container step. This is the regression under fix.
+        let t = seed_target(&cfg, false, Some("none")).unwrap();
+        assert_eq!(t.backend, BackendClass::Host);
+        assert_eq!(labels(&plan_for(&t).into_steps()), vec!["sandbox", "shell"]);
+        // `host` alias resolves the same way.
+        assert_eq!(
+            seed_target(&cfg, false, Some("host")).unwrap().backend,
+            BackendClass::Host
+        );
+        // A pinned backend wins even when the global config is `auto`
+        // (which alone would decline to the generic seed).
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        assert_eq!(
+            seed_target(&cfg, false, Some("podman")).unwrap().backend,
+            BackendClass::Oci("podman-rootless".into())
+        );
+        // Empty / `auto` / unparseable override ⇒ fall back to config (`auto`
+        // ⇒ generic seed).
+        assert_eq!(seed_target(&cfg, false, Some("")), None);
+        assert_eq!(seed_target(&cfg, false, Some("auto")), None);
+        assert_eq!(seed_target(&cfg, false, Some("nonsense")), None);
     }
 
     #[test]
