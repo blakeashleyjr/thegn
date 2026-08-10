@@ -243,7 +243,7 @@ pub(crate) fn del_ui_state_segment(db: &thegn_core::db::Db, scope: &str, prefix:
 
 /// Drop a just-removed workspace (and the registered-worktree rows its
 /// empty-live-groups branch would re-render) from the cached sidebar lists that
-/// [`refresh_tab_model`] rebuilds from. Without this the row lingers until the
+/// `refresh_tab_model` rebuilds from. Without this the row lingers until the
 /// next full hydration re-reads the DB, so [`remove_workspace`] appears to do
 /// nothing. Kept as a free fn so the prune is exercised by the same code the
 /// event loop runs, not a copy.

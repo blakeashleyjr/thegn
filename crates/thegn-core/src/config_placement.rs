@@ -21,7 +21,7 @@ config_enum! {
     /// brought up. `halt` blocks the pane with a retry modal (never a silent host
     /// drop); `ask` blocks with a retry / run-on-host choice, surfacing the real
     /// cause; `auto` silently walks `backend_chain` → host. Legacy booleans still
-    /// parse: `true` ⇒ `auto`, `false` ⇒ `halt` (see [`de_failover`]).
+    /// parse: `true` ⇒ `auto`, `false` ⇒ `halt` (see `de_failover`).
     pub enum FailoverMode: "failover mode" {
         Halt = "halt" | "off" | "false",
         Ask = "ask" | "prompt",

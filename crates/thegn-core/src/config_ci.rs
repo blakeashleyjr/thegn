@@ -25,7 +25,7 @@ config_enum! {
 
 /// `[ci]` — cross-provider CI/CD inspection (AV group). Provider-agnostic knobs
 /// here; per-provider endpoints/tokens in the sub-tables. Tokens accept the
-/// `"env:VAR"` form resolved by [`expand_env_ref`], so secrets stay out of the
+/// `"env:VAR"` form resolved by `expand_env_ref`, so secrets stay out of the
 /// file.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]

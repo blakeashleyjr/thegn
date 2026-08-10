@@ -169,7 +169,7 @@ fn typed_value(val: &str) -> Item {
 }
 
 /// Set one dotted key (`a.b.c = value`), creating intermediate tables. The
-/// value's type is inferred (see [`typed_value`]): `true`/`false` and bare
+/// value's type is inferred (see `typed_value`): `true`/`false` and bare
 /// integers/floats are written with their native TOML type, everything else as a
 /// string. The general `config set` counterpart to `config get`.
 pub fn set_key(config_path: &Path, dotted: &str, val: &str) -> Result<()> {

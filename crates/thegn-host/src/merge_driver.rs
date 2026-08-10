@@ -38,7 +38,7 @@ pub(crate) struct QueueItem {
     pub worktree: String,
     pub branch: String,
     /// The worktree's `location` descriptor (from the queue row): empty = local,
-    /// else an ssh/provider blob. Resolves the branch's [`GitLoc`] so the drain
+    /// else an ssh/provider blob. Resolves the branch's `GitLoc` so the drain
     /// knows whether to fetch its tip into the target store (cross-host).
     pub location: String,
 }

@@ -880,7 +880,7 @@ const EXEC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// `exec` a command inside the sidecar; returns `(success, stdout)`. Public so
 /// the share layer can drive `tailscale serve` inside an existing VPN sidecar.
 ///
-/// Bounded by [`EXEC_ATTEMPT_TIMEOUT`]: a hung `exec` is killed rather than
+/// Bounded by `EXEC_ATTEMPT_TIMEOUT`: a hung `exec` is killed rather than
 /// blocking the caller indefinitely (a timeout surfaces as an `Err`).
 pub fn exec_in(rt: &OciRuntime, container: &str, cmd: &[String]) -> Result<(bool, String)> {
     let mut args = vec!["exec".to_string(), container.to_string()];

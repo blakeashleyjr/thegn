@@ -21,7 +21,7 @@ use crate::notification::{NotificationKind, Priority};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SoundEmit {
     /// Play the bundled (or configured) chime through an auto-detected system
-    /// player; the host resolves this to real I/O and falls back to [`Bell`].
+    /// player; the host resolves this to real I/O and falls back to `Bell`.
     Chime,
     /// Write a terminal `BEL` (`\x07`) on the next render flush.
     Bell,

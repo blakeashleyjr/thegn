@@ -178,7 +178,7 @@ fn collect_chain(cfg: &Config, name: &str, seen: &mut HashSet<String>, out: &mut
 
 /// Resolve one raw bundle value.
 ///
-/// - `env:VAR` / `file:PATH` → [`expand_env_ref`].
+/// - `env:VAR` / `file:PATH` → `expand_env_ref`.
 /// - `<scheme>:<ref>` where `<scheme>` is a configured `[secrets.resolvers]`
 ///   entry → run the resolver command (only when `allow_secrets`; otherwise the
 ///   key is *skipped*, never injected as the raw `pass:…` reference). Resolvers

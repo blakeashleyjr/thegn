@@ -461,7 +461,7 @@ pub fn claim_spare(
     Some(name)
 }
 
-/// On-open location rebind: build the [`GitLoc`] for the freshly RESOLVED
+/// On-open location rebind: build the `GitLoc` for the freshly RESOLVED
 /// provider location blob and persist it when it differs from the stored row —
 /// a stale create-time location (e.g. a machine0 blob on a worktree whose env
 /// now resolves to sprites) must not keep routing chrome reads and repo
