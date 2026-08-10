@@ -168,7 +168,7 @@ mod tests {
     fn stderr_gist_picks_the_error_line_over_noise() {
         // The incident shape: migrate warning first, the real error buried,
         // then a useless backtrace.
-        let blob = "thegn migrate: both ~/.superzej and ~/.thegn exist — preferring the new path\n\
+        let blob = "thegn migrate: both the legacy dir and ~/.thegn exist — preferring the new path\n\
                     Error: machine0-ssh: could not resolve VM \"thegn-x\" (…); provision it first\n\
                     Stack backtrace:\n   0: <unknown>\n";
         assert!(stderr_gist(blob).starts_with("Error: machine0-ssh:"));
