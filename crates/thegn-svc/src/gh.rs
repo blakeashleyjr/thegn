@@ -652,13 +652,13 @@ mod tests {
     /// branch from a real repo with no `gh` in the loop.
     #[test]
     fn native_branch_resolution_is_local_rev_parse() {
-        use std::process::Command;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
+        // Route test git through the scrubbing helper rather than a raw git
+        // command, matching the repo invariant the lint guardrail enforces.
         let git = |args: &[&str]| {
-            let ok = Command::new("git")
+            let ok = thegn_core::util::git_cmd(dir)
                 .args(args)
-                .current_dir(dir)
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@e")
                 .env("GIT_COMMITTER_NAME", "t")
