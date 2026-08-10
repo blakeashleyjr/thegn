@@ -288,8 +288,6 @@ fn reset_terminal() {
 /// live pane instead of leaving a dead pane; a sticky `nomosh` marker then makes
 /// the next open skip mosh outright.
 pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-
     let interactive = std::io::stdin().is_terminal();
     let (ip, user, transport) = resolve(cfg, name, interactive)?;
     let (key, _pubkey) = crate::agent::sprite_ssh_keypair()?;
@@ -342,9 +340,28 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
     // Plain ssh: chosen up front (non-mosh transport, mosh-less image, or a
     // non-tty control read), or reached by falling back from a failed mosh attach.
     let argv = ssh_argv(&shim, cmd, interactive);
-    // CLI bridge process: exec replaces us, ssh owns the PTY/stdio from here.
+    // CLI bridge process: hand the PTY/stdio to ssh from here.
+    exec_ssh(&argv)
+}
+
+/// Replace this process with ssh (Unix: `exec` — ssh owns the PTY/stdio and we
+/// never return on success). The machine0 bridge is a Unix/sprite feature; the
+/// off-Unix arm below exists only so the Windows cross-check compiles.
+#[cfg(unix)]
+fn exec_ssh(argv: &[String]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
     Err(err).with_context(|| format!("machine0-ssh: exec {}", argv.join(" ")))
+}
+
+/// Off-Unix: no `exec`; spawn ssh, wait, and propagate its exit code.
+#[cfg(not(unix))]
+fn exec_ssh(argv: &[String]) -> Result<()> {
+    let status = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status()
+        .with_context(|| format!("machine0-ssh: spawn {}", argv.join(" ")))?;
+    std::process::exit(status.code().unwrap_or(1))
 }
 
 #[cfg(test)]
