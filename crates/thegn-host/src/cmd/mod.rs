@@ -107,6 +107,28 @@ fn resolve_worktree_from(arg: Option<String>, env_wt: Option<String>, cwd: &Path
         .unwrap_or_else(|| cwd.to_path_buf())
 }
 
+/// Yes/no confirmation (gum if present, else a y/N stdin prompt).
+#[allow(clippy::disallowed_macros)] // a raw interactive prompt, not a log line
+pub fn confirm(message: &str) -> bool {
+    if thegn_core::util::have("gum") {
+        // CLI path: interactive confirm prompt, no event loop.
+        #[expect(clippy::disallowed_methods)]
+        return Command::new("gum")
+            .args(["confirm", message])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    }
+    eprint!("{message} [y/N] ");
+    use std::io::{BufRead, Write};
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim(), "y" | "Y" | "yes" | "YES")
+}
+
 #[cfg(test)]
 mod resolve_worktree_tests {
     use super::resolve_worktree_from;
@@ -145,26 +167,4 @@ mod resolve_worktree_tests {
         assert_ne!(got, PathBuf::from(dead));
         assert_eq!(got, cwd);
     }
-}
-
-/// Yes/no confirmation (gum if present, else a y/N stdin prompt).
-#[allow(clippy::disallowed_macros)] // a raw interactive prompt, not a log line
-pub fn confirm(message: &str) -> bool {
-    if thegn_core::util::have("gum") {
-        // CLI path: interactive confirm prompt, no event loop.
-        #[expect(clippy::disallowed_methods)]
-        return Command::new("gum")
-            .args(["confirm", message])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-    }
-    eprint!("{message} [y/N] ");
-    use std::io::{BufRead, Write};
-    let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    if std::io::stdin().lock().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim(), "y" | "Y" | "yes" | "YES")
 }
