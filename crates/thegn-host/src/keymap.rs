@@ -110,6 +110,16 @@ pub enum Action {
     FocusRight,
     FocusUp,
     FocusDown,
+    /// Alt+arrow: the same spatial focus graph as `Focus*` (panes ← → sidebar /
+    /// panel, masthead / statusbar / drawer), but a move that dead-ends at the
+    /// outer edge falls through to the tab/worktree switch Alt+arrow historically
+    /// owned — left/right → prev/next tab, up/down → prev/next worktree. Resolved
+    /// in the run loop (rewritten to a `Focus*` or a tab/worktree action), so it
+    /// needs no handler arm of its own.
+    NavLeft,
+    NavRight,
+    NavUp,
+    NavDown,
     ToggleSidebar,
     /// Raise / lower the warm-spare-pool target for the active workspace's env.
     PoolIncrement,
@@ -399,6 +409,10 @@ impl Action {
             Action::FocusRight => "focus-right",
             Action::FocusUp => "focus-up",
             Action::FocusDown => "focus-down",
+            Action::NavLeft => "nav-left",
+            Action::NavRight => "nav-right",
+            Action::NavUp => "nav-up",
+            Action::NavDown => "nav-down",
             Action::ToggleSidebar => "toggle-sidebar",
             Action::PoolIncrement => "warm-pool-increment",
             Action::PoolDecrement => "warm-pool-decrement",
@@ -516,6 +530,10 @@ impl Action {
             "focus-right" => Action::FocusRight,
             "focus-up" => Action::FocusUp,
             "focus-down" => Action::FocusDown,
+            "nav-left" => Action::NavLeft,
+            "nav-right" => Action::NavRight,
+            "nav-up" => Action::NavUp,
+            "nav-down" => Action::NavDown,
             "toggle-sidebar" => Action::ToggleSidebar,
             "warm-pool-increment" => Action::PoolIncrement,
             "warm-pool-decrement" => Action::PoolDecrement,
@@ -1114,12 +1132,16 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl j", Action::FocusDown).unwrap();
     map.insert_all("Ctrl k", Action::FocusUp).unwrap();
     map.insert_all("Ctrl l", Action::FocusRight).unwrap();
-    // Alt owns tabs/worktrees: ←/→ cycles tabs WITHIN the active worktree,
-    // ↑/↓ navigates worktrees, wrapping WITHIN the current workspace only.
-    map.insert_all("Alt Left", Action::PrevTab).unwrap();
-    map.insert_all("Alt Right", Action::NextTab).unwrap();
-    map.insert_all("Alt Up", Action::PrevWorktree).unwrap();
-    map.insert_all("Alt Down", Action::NextWorktree).unwrap();
+    // Rule 1, Alt tier — one seamless motion: Alt+arrow walks the SAME spatial
+    // focus graph as Ctrl+arrow (panes ← → sidebar / panel, out to the bars /
+    // drawer), and only when a move dead-ends at the outer edge does it fall
+    // through to the tab/worktree switch Alt historically owned — ←/→ cycles
+    // tabs WITHIN the active worktree, ↑/↓ navigates worktrees (wrapping within
+    // the current workspace). The run loop resolves this per keypress.
+    map.insert_all("Alt Left", Action::NavLeft).unwrap();
+    map.insert_all("Alt Right", Action::NavRight).unwrap();
+    map.insert_all("Alt Up", Action::NavUp).unwrap();
+    map.insert_all("Alt Down", Action::NavDown).unwrap();
     // Shift+Alt+↑/↓ switches workspace (a real context switch).
     map.insert_all("Shift Alt Up", Action::PrevWorkspace)
         .unwrap();
@@ -1676,22 +1698,24 @@ mod tests {
             map_key(&KeyCode::UpArrow, Modifiers::CTRL),
             Some(Action::FocusUp)
         );
-        // Alt owns tabs (within the worktree) and worktrees (vertical).
+        // Alt+arrow drives the seamless focus graph, with a tab/worktree
+        // fall-through at the outer edge (resolved in the run loop). The chord
+        // itself binds to the Nav* actions.
         assert_eq!(
             map_key(&KeyCode::LeftArrow, Modifiers::ALT),
-            Some(Action::PrevTab)
+            Some(Action::NavLeft)
         );
         assert_eq!(
             map_key(&KeyCode::RightArrow, Modifiers::ALT),
-            Some(Action::NextTab)
+            Some(Action::NavRight)
         );
         assert_eq!(
             map_key(&KeyCode::UpArrow, Modifiers::ALT),
-            Some(Action::PrevWorktree)
+            Some(Action::NavUp)
         );
         assert_eq!(
             map_key(&KeyCode::DownArrow, Modifiers::ALT),
-            Some(Action::NextWorktree)
+            Some(Action::NavDown)
         );
         // Alt+hjkl no longer claims focus moves (forwards to the pane).
         assert_eq!(k('h', Modifiers::ALT), None);
