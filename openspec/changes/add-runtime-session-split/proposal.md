@@ -5,10 +5,10 @@
 thegn's pane **daemon** already owns the PTYs, so center panes survive a UI exit
 and warm-reattach at next launch (tmux semantics, on by default). But the
 **session model** — the pane-tree layout, focus, active group/tab — still lives
-as locals inside the compositor's event loop (`run.rs`). The loop *is* the
+as locals inside the compositor's event loop (`run.rs`). The loop _is_ the
 session owner; a second UI cannot attach to a running local session's layout,
 and the loop cannot run headless. Competitor "herdr" makes the runtime the owner
-and every UI (TUI, CLI, SSH) a client: work survives *every* client closing, and
+and every UI (TUI, CLI, SSH) a client: work survives _every_ client closing, and
 many clients can attach to one live session at once.
 
 This change moves session ownership behind a seam so the daemon can own it and
@@ -21,7 +21,7 @@ that each keep the render-decision invariants and the ~0%-idle contract green:
    `run.rs`'s ~30 structural-mutation sites route through the handle. No
    semantic change — pure seam.
 2. **Semantic session protocol.** New `EventFrame::SessionModel`/`LayoutDelta`/
-   `FocusChanged` frames (the daemon streams a *model*, not a framebuffer — each
+   `FocusChanged` frames (the daemon streams a _model_, not a framebuffer — each
    client composes chrome at its own geometry) and `ControlApi`
    `session_model`/`apply_layout`/`subscribe_layout`/`attach_session` verbs.
 3. **`RemoteSession`.** A socket-backed `SessionHandle` whose mutations are
@@ -52,11 +52,11 @@ that each keep the render-decision invariants and the ~0%-idle contract green:
 The seam is drawn at the per-pane vt100 emulator grid, not the loop: the client
 keeps emulation + the damage-region compositor local, so a daemon-backed pane
 tick stays a one-rect `Incremental` frame — the exact work-shape the CI render
-tests lock. Streaming a *semantic model* (not pixels) is what lets a phone, an
+tests lock. Streaming a _semantic model_ (not pixels) is what lets a phone, an
 80×24 SSH client and a 4K terminal each render their own chrome from one session,
 and keeps the 0%-idle contract client-local. The additive agent-driving verbs
 (`wait`/`split`, local `thegn attach`, per-pane agent state) already shipped; this
-change generalizes the daemon's existing PTY persistence to the *whole session*.
+change generalizes the daemon's existing PTY persistence to the _whole session_.
 
 ## Non-goals
 

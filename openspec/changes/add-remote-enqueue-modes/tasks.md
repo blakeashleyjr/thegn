@@ -9,7 +9,7 @@
 ## 1. Config
 
 - [x] 1.1 `RemoteMode` enum (`route_to_host` default, `push`) + `merge_queue.
-      remote_mode` field, default `RouteToHost`.
+remote_mode` field, default `RouteToHost`.
 - [ ] 1.2 Document `remote_mode` in `config/config.toml.example`; keybindings /
       config-reference pages regenerate automatically.
 

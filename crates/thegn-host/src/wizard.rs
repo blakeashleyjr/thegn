@@ -1272,7 +1272,10 @@ pub fn run_worker(
                 // the user picked (e.g. machine0 → local) — the exact silent
                 // fallback this flow must never produce.
                 if let Err(e) = db.set_worktree_env(&path_s, &choices.env) {
-                    fail(CreateStep::Register, format!("pin env {}: {e}", choices.env));
+                    fail(
+                        CreateStep::Register,
+                        format!("pin env {}: {e}", choices.env),
+                    );
                     return;
                 }
             }

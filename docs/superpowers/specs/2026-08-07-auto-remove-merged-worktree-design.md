@@ -20,7 +20,7 @@ rewrites the accompanying docs — no new mechanism.
 After a branch merges, its worktree is dead weight: it lingers as a sidebar tab
 and on disk, and the merged branch ref is redundant (it's already in `main`).
 Today, clearing the merge queue (`thegn merge clear`) only drops the queue
-*assignment*, not the worktree — so merged work stays visible until the user
+_assignment_, not the worktree — so merged work stays visible until the user
 manually closes each tab. Auto-removing on a clean land keeps the workspace to
 "live work only" without manual cleanup.
 

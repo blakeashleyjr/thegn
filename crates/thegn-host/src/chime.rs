@@ -106,13 +106,21 @@ fn detect_player() -> Option<Player> {
     #[cfg(target_os = "macos")]
     {
         if have("afplay") {
-            return Some(Player { prog: "afplay", args: &[], powershell: false });
+            return Some(Player {
+                prog: "afplay",
+                args: &[],
+                powershell: false,
+            });
         }
     }
     #[cfg(windows)]
     {
         // PowerShell ships with Windows; no PATH probe needed.
-        return Some(Player { prog: "powershell", args: &[], powershell: true });
+        return Some(Player {
+            prog: "powershell",
+            args: &[],
+            powershell: true,
+        });
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -121,11 +129,18 @@ fn detect_player() -> Option<Player> {
             ("pw-play", &[][..]),
             ("paplay", &[][..]),
             ("aplay", &["-q"][..]),
-            ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"][..]),
+            (
+                "ffplay",
+                &["-nodisp", "-autoexit", "-loglevel", "quiet"][..],
+            ),
             ("play", &["-q"][..]),
         ] {
             if have(prog) {
-                return Some(Player { prog, args, powershell: false });
+                return Some(Player {
+                    prog,
+                    args,
+                    powershell: false,
+                });
             }
         }
     }
@@ -228,10 +243,18 @@ mod tests {
 
     #[test]
     fn player_command_includes_quoted_file() {
-        let p = Player { prog: "paplay", args: &[], powershell: false };
+        let p = Player {
+            prog: "paplay",
+            args: &[],
+            powershell: false,
+        };
         let cmd = p.command(std::path::Path::new("/tmp/chime.wav"));
         assert_eq!(cmd, "paplay '/tmp/chime.wav'");
-        let p2 = Player { prog: "aplay", args: &["-q"], powershell: false };
+        let p2 = Player {
+            prog: "aplay",
+            args: &["-q"],
+            powershell: false,
+        };
         assert_eq!(
             p2.command(std::path::Path::new("/tmp/c.wav")),
             "aplay -q '/tmp/c.wav'"

@@ -470,7 +470,6 @@ impl EventBus {
                 let _ = tx.send(notif.clone());
             }
         }
-
     }
 
     /// Forward a notification to the audible-cue channel so the host can route

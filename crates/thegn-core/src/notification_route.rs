@@ -134,11 +134,7 @@ pub fn decide(
 
     // Kinds in `always_kinds` chime regardless of `min_priority` (the
     // agent-done/needs-you set is on by default).
-    let forced = cfg
-        .sound
-        .always_kinds
-        .iter()
-        .any(|k| k == kind.as_str());
+    let forced = cfg.sound.always_kinds.iter().any(|k| k == kind.as_str());
     let mut sound = if !sound_allowed {
         None
     } else if let Some(over) = rule_sound {
@@ -526,12 +522,26 @@ mod tests {
             ..Default::default()
         };
         // Focused worktree: audible cue suppressed, but record + desktop stay.
-        let d = decide(NotificationKind::AgentDone, "wt", "done", "/wt/app", &base_cfg(), &c);
+        let d = decide(
+            NotificationKind::AgentDone,
+            "wt",
+            "done",
+            "/wt/app",
+            &base_cfg(),
+            &c,
+        );
         assert!(d.record);
         assert!(d.desktop);
         assert_eq!(d.sound, None);
         // A different (background) worktree still chimes.
-        let d2 = decide(NotificationKind::AgentDone, "wt", "done", "/wt/other", &base_cfg(), &c);
+        let d2 = decide(
+            NotificationKind::AgentDone,
+            "wt",
+            "done",
+            "/wt/other",
+            &base_cfg(),
+            &c,
+        );
         assert_eq!(d2.sound, Some(SoundEmit::Chime));
     }
 
@@ -543,7 +553,14 @@ mod tests {
             focused_worktree: "/wt/app".into(),
             ..Default::default()
         };
-        let d = decide(NotificationKind::AgentDone, "wt", "done", "/wt/app", &cfg, &c);
+        let d = decide(
+            NotificationKind::AgentDone,
+            "wt",
+            "done",
+            "/wt/app",
+            &cfg,
+            &c,
+        );
         assert_eq!(d.sound, Some(SoundEmit::Chime));
     }
 

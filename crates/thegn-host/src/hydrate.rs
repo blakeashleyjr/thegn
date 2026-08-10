@@ -763,8 +763,14 @@ pub(crate) fn db_worktree_list(
         // OR a non-local env placement, including one INHERITED from the repo's
         // ambient default) are exempt: their tree lives off the host, so a
         // missing local dir is not proof of deletion.
-        if !row_is_remote_effective(db, cfg, &w.location, w.env_name.as_deref(), &w.repo_root, &mut ambient_cache)
-            && !std::path::Path::new(&w.worktree).is_dir()
+        if !row_is_remote_effective(
+            db,
+            cfg,
+            &w.location,
+            w.env_name.as_deref(),
+            &w.repo_root,
+            &mut ambient_cache,
+        ) && !std::path::Path::new(&w.worktree).is_dir()
         {
             tracing::warn!(
                 target: "thegn::hydrate",
@@ -793,10 +799,9 @@ pub(crate) fn db_worktree_list(
                 !e.is_empty()
                     && e != "default"
                     && match cfg.env.get(e) {
-                        Some(ec) => matches!(
-                            ec.placement,
-                            thegn_core::config::PlacementMode::Provider
-                        ),
+                        Some(ec) => {
+                            matches!(ec.placement, thegn_core::config::PlacementMode::Provider)
+                        }
                         None => true,
                     }
             });
@@ -1674,8 +1679,9 @@ pub(crate) fn build_panel(
     // The Branches summary (count + PR badges) needs the branch list, so warming
     // pulls it in too — but only from cache (see `need_branch_fetch` below, which
     // restricts the subprocess to a cold miss when merely warming).
-    let want_branches =
-        hints.open == crate::panel::Section::Branches || git_family_full || hints.warm_git_summaries;
+    let want_branches = hints.open == crate::panel::Section::Branches
+        || git_family_full
+        || hints.warm_git_summaries;
     let want_stashes = hints.open == crate::panel::Section::Stash || git_family_full;
     let want_lsfiles = hints.open == crate::panel::Section::Files;
     // When the Branches section is actually open (or the full git frame is up),
