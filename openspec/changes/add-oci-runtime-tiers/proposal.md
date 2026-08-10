@@ -14,7 +14,7 @@ it yields — reaching two isolation tiers above today's shared-kernel default
 - unset / `runc` / `crun` → today's shared-kernel container (unchanged).
 
 Both gVisor and libkrun register as **OCI runtimes**, so this is a `--runtime
-<value>` flag on the existing Podman/Docker backend at container *create*. Every
+<value>` flag on the existing Podman/Docker backend at container _create_. Every
 existing seam is reused: the worktree bind stays **path-preserving** (host-side
 git keeps working), egress stays **thegn-enforced** (our DNS filter runs on a
 container we own — unlike a remote provider), and detection/teardown/compose are
@@ -36,8 +36,8 @@ explicitly **out of scope** here and deferred to a later change.
 - tasks.md: **AB** (container management, AB 349–362) — the worktree-sandbox core
   this extends — and the isolation-class work in `capabilities`/`trust_class`.
   Complements, and is orthogonal to, the managed-provider lineage (**AE**,
-  machine0/VPS): those are *placements* we don't control; this is a stronger
-  boundary on a container we *do* control.
+  machine0/VPS): those are _placements_ we don't control; this is a stronger
+  boundary on a container we _do_ control.
 - Code: `[sandbox] oci_runtime` (config + example), `SandboxSpec.oci_runtime`,
   `--runtime` injection in `oci_create_opts`, the runtime→class map in
   `capabilities::isolation_for`, the pure availability rule in a new

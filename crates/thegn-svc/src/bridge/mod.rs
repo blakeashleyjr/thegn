@@ -240,7 +240,13 @@ impl BridgeClient {
         let handle = std::thread::Builder::new()
             .name("bridge-reader".into())
             .spawn(move || {
-                reader_loop(reader, reader_pending, reader_subs, reader_procs, reader_closed)
+                reader_loop(
+                    reader,
+                    reader_pending,
+                    reader_subs,
+                    reader_procs,
+                    reader_closed,
+                )
             })
             .expect("spawn bridge reader");
         BridgeClient {

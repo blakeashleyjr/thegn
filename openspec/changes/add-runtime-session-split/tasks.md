@@ -11,7 +11,7 @@ particular the `render_plan::plan` invariant tests and the ~0%-idle contract.
       `subscribe()`), plus a `LocalSession` impl wrapping today's `Session` +
       `center.rs` mutators, behavior-identical.
 - [ ] 1.2 Route `run.rs`'s ~30 structural-mutation `Action::*` sites through the
-      handle; pane *bytes* stay on the existing `PaneEvent → emulator → dirty_panes`
+      handle; pane _bytes_ stay on the existing `PaneEvent → emulator → dirty_panes`
       path (never through the handle).
 - [ ] 1.3 Verify `render_plan` invariant tests unchanged; add a test that a
       handle-routed split still yields a Full frame.

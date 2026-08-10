@@ -1566,9 +1566,18 @@ fn render_tab_no_fullscreen_splash_on_split_with_a_live_pane() {
     );
     let text = s.screen_chars_to_string();
     // The existing pane keeps rendering, and both cards have their ring/title.
-    assert!(text.contains("LIVEPANE"), "live pane still painted under a split");
-    assert!(text.contains('\u{256d}'), "pane card rings drawn, not a splash");
-    assert!(text.contains(" pane-2 "), "the new (empty) leaf shows its card");
+    assert!(
+        text.contains("LIVEPANE"),
+        "live pane still painted under a split"
+    );
+    assert!(
+        text.contains('\u{256d}'),
+        "pane card rings drawn, not a splash"
+    );
+    assert!(
+        text.contains(" pane-2 "),
+        "the new (empty) leaf shows its card"
+    );
     // No splash wordmark took over the center.
     assert!(
         !text.chars().any(|c| "▀▄█".contains(c)),

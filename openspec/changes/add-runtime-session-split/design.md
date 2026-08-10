@@ -16,7 +16,7 @@ lock.
 whole-session activity/lease state, and `Session::persist`/`resurrect`
 (single-writer; the DB stays a cache, git stays the source of truth).
 
-**Per-client even after the split:** chrome is *rendered* client-side from the
+**Per-client even after the split:** chrome is _rendered_ client-side from the
 streamed model + local view state, so different-sized clients render different
 chrome from one session. Cursor/selection/scroll are local.
 
@@ -34,16 +34,16 @@ layout authority.
 ## Carving `run.rs` without a rewrite
 
 The loop reads/writes `session`/`panes` as locals. A `SessionHandle` trait
-captures only the ~30 *structural* mutations; a `LocalSession` shim wraps the
+captures only the ~30 _structural_ mutations; a `LocalSession` shim wraps the
 existing `Session` + `center.rs` mutators (Phase 1 is behavior-identical, so
 `just ci` stays green with no semantic change). The socket-backed `RemoteSession`
 is a later drop-in the loop can't distinguish. The loop's thousands of lines that
-*read* `session.active_tab().center` are untouched; only the mutation call sites
+_read_ `session.active_tab().center` are untouched; only the mutation call sites
 are redirected.
 
 ## Risks and mitigations
 
-- **0%-idle across the socket:** the relay task pulses the client waker *only* on
+- **0%-idle across the socket:** the relay task pulses the client waker _only_ on
   real damage-producing frames (pane bytes, this client's `LayoutDelta`/
   `FocusChanged`); heartbeat/lease frames are dropped — the discipline
   `daemon/client.rs::adapt` already follows. CI test: attached-but-quiet remote
@@ -65,6 +65,6 @@ The additive agent-driving surface this generalizes is already in place: local
 `thegn attach`, the `wait`/`split` control verbs, per-pane semantic agent-state
 core, and the in-app diff viewer. The pane daemon is already the default
 (`[daemon] enabled = true`), so center panes already survive UI exit and
-warm-reattach at next launch. This change makes the *whole session* (layout +
+warm-reattach at next launch. This change makes the _whole session_ (layout +
 focus) daemon-owned so live multi-client attach and a headless owner become
 possible.

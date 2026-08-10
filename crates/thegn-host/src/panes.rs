@@ -1100,8 +1100,7 @@ mod tests {
 
         // Split leaf 1 into a two-leaf tree, then bring leaf 1 live. Now the tab
         // already has content to show, so materializing leaf 2 is a quiet split.
-        tab.center
-            .split(1, crate::center::Dir::Row, 2);
+        tab.center.split(1, crate::center::Dir::Row, 2);
         panes.insert_test_pane(1);
         assert!(
             panes.tab_has_live_pane(&tab),
