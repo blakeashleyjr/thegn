@@ -401,7 +401,7 @@ pub trait GitBackend: Send + Sync {
     }
 
     /// The stash as structured entries (empty on a stash-less repo). Routes
-    /// through [`run_status`] so it rides the persistent bridge (no per-op spawn)
+    /// through `run_status` so it rides the persistent bridge (no per-op spawn)
     /// and is bounded by the read timeout — a wedged git can't pin the hydration
     /// batch forever (matches `stash_count` directly above).
     fn stash_list(&self, loc: &GitLoc) -> Result<Vec<StashEntry>> {
@@ -478,7 +478,7 @@ pub trait GitBackend: Send + Sync {
     }
 
     /// Unstage one path (`git reset -q HEAD -- <path>` — works on every git).
-    /// Routed through the write runner for the same reason as [`stage`].
+    /// Routed through the write runner for the same reason as `stage`.
     fn unstage(&self, loc: &GitLoc, path: &str) -> Result<()> {
         run_w(loc, &[], &["reset", "-q", "HEAD", "--", path]).map(|_| ())
     }
@@ -599,7 +599,7 @@ fn bridged_rebase_in_progress(loc: &GitLoc) -> bool {
 /// so a wedged git — a lock held by a crashed process, a hung NFS/SSH mount, a
 /// stalled pack negotiation on a remote loc — can't pin a background hydration
 /// worker forever (the symptom is a silent, permanently-stale sidebar). Reads
-/// and fast local staging flow through [`run`]/[`run_status`]; the network-heavy
+/// and fast local staging flow through [`run`]/`run_status`; the network-heavy
 /// writes (fetch/clone/push/pull) go through `run_w` and are deliberately *not*
 /// bounded here. Override with `THEGN_GIT_READ_TIMEOUT_SECS`; `0` disables it.
 fn git_read_timeout() -> Option<std::time::Duration> {

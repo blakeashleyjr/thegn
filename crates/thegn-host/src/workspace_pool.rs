@@ -2,7 +2,7 @@
 //!
 //! thegn is its own multiplexer, so switching workspaces **parks** the outgoing
 //! one — its center pane trees are stashed here and its `PtyPane`s stay live in
-//! the global [`Panes`](crate::panes::Panes) table, so switching back reattaches
+//! the global `Panes` table, so switching back reattaches
 //! the still-running processes instantly (no DB resurrect, no respawn).
 //!
 //! Left unbounded that is a slow resource leak: every workspace ever visited

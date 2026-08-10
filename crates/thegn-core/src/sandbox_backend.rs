@@ -180,7 +180,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Scope a **probe pass**: while the returned guard is alive, [`available`]
+/// Scope a **probe pass**: while the returned guard is alive, `available`
 /// memoizes *every* result — **including `Unreachable`** — on the current thread,
 /// so an already-unreachable placement is probed once per `(placement, backend)`
 /// rather than re-probed for every candidate the resolver walks. That storm is
@@ -341,7 +341,7 @@ fn cache_is_fresh(v: RuntimeProbe, at: std::time::Instant) -> bool {
     }
 }
 
-/// The uncached availability probe (subprocess / PATH / remote). See [`available`].
+/// The uncached availability probe (subprocess / PATH / remote). See `available`.
 fn available_probe(placement: &Placement, backend: Backend) -> RuntimeProbe {
     let from_bool = |b: bool| {
         if b {

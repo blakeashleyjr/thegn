@@ -858,7 +858,7 @@ const MAX_DEAD_RECONNECTS: u32 = 6;
 const PROGRESS_GRACE_MS: u64 = 500;
 
 /// Base backoff before a reconnect attempt; grows `2^dead`, capped at
-/// [`RECONNECT_BACKOFF_CAP`]. Spaces out reattaches so a half-broken socket
+/// `RECONNECT_BACKOFF_CAP`. Spaces out reattaches so a half-broken socket
 /// (accepts-then-resets) can't spin the loop / re-flood the pane with replayed
 /// scrollback at full speed.
 const RECONNECT_BACKOFF_BASE_MS: u64 = 250;

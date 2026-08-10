@@ -30,11 +30,11 @@ pub fn repo_root_of(worktree: &Path) -> Option<PathBuf> {
     integrate::main_checkout(worktree)
 }
 
-/// The [`GitLoc`] of a repo root — the host where the target store (and so the
+/// The `GitLoc` of a repo root — the host where the target store (and so the
 /// fold/gate/CAS) lives. `Local` for an on-host repo, ssh/provider from the
 /// root's own `location`. The merge queue is anchored to this host: the drain
 /// must run co-located with it (a remote target can't be folded in-process —
-/// see [`is_remote_target`]).
+/// see `is_remote_target`).
 pub fn target_loc(db: &Db, repo_root: &Path) -> GitLoc {
     let root_s = repo_root.to_string_lossy();
     let loc_str = db.location_for(&root_s).ok().flatten();

@@ -5,7 +5,7 @@
 //! embedded page set ([`pages`]), AST→`Line` rendering ([`render`]), the F1
 //! overlay ([`overlay`]), focus→page resolution ([`context`]), and the
 //! generated keybindings page ([`gen_pages`]). The ratchet test in
-//! [`ratchet_tests`] keeps every action documented.
+//! `ratchet_tests` keeps every action documented.
 
 pub mod context;
 pub mod gen_pages;

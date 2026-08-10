@@ -179,7 +179,7 @@ pub enum WriteOp {
 }
 
 /// Side effects for the loop to perform. The wizard stays pure; the loop's
-/// [`crate::handlers::onboarding::apply_outcome`] executes these.
+/// `crate::handlers::onboarding::apply_outcome` executes these.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Effects {
     pub writes: Vec<WriteOp>,

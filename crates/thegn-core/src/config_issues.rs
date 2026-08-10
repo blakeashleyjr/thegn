@@ -43,7 +43,7 @@ pub struct IssuesConfig {
     pub kaneo: KaneoConfig,
     /// Set by a repo `[issues]` overlay that supplies an explicit `accounts`
     /// restriction (including `accounts = []`): once a repo has restricted its
-    /// accounts, the legacy single-provider synthesis in [`active_accounts`] is
+    /// accounts, the legacy single-provider synthesis in `active_accounts` is
     /// suppressed so an empty restriction means *none*, not "resurrect legacy".
     /// Runtime-only; never read from / written to a config file.
     #[serde(skip)]

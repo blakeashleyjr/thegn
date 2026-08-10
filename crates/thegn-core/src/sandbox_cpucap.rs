@@ -7,7 +7,7 @@
 //! shared [`CPU_SLICE`] so the *aggregate* of all panes is bounded too. When the
 //! host lacks cgroup `cpu` delegation it degrades to a soft `nice` (priority
 //! only). The OCI backends carry `--cpus`/`--memory` natively, and the Systemd
-//! backend caps inline via [`systemd_cap_args`], so neither is scope-wrapped.
+//! backend caps inline via `systemd_cap_args`, so neither is scope-wrapped.
 //!
 //! Extracted from the pinned-oversized `sandbox.rs` (file-size ratchet). The
 //! argv builders are pure over the probed mechanism ([`CpuCap`]) so they are
@@ -30,7 +30,7 @@ const CPU_NICE: i32 = 10;
 
 /// How an interactive worktree pane gets its CPU/mem ceiling on a host-toolchain
 /// backend (bwrap / none). Resolved once from PATH + cgroup delegation;
-/// [`cap_prefix`] is pure over it so it is unit-testable deterministically.
+/// `cap_prefix` is pure over it so it is unit-testable deterministically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuCap {
     /// `systemd-run --user --scope` with a real cgroup v2 `CPUQuota` ceiling.
