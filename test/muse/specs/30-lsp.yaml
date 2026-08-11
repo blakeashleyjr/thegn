@@ -28,10 +28,20 @@ spawn:
     export XDG_CONFIG_HOME="$XDG_STATE_HOME/cfg"
     repo="$XDG_STATE_HOME/wt"
     mkdir -p "$repo" "$XDG_CONFIG_HOME/thegn"
-    printf '[[lsp.servers]]\n' > "$XDG_CONFIG_HOME/thegn/config.toml"
-    printf 'lang = "rust"\n' >> "$XDG_CONFIG_HOME/thegn/config.toml"
-    printf 'command = "fake_lsp"\n' >> "$XDG_CONFIG_HOME/thegn/config.toml"
-    printf 'args = []\n' >> "$XDG_CONFIG_HOME/thegn/config.toml"
+    cfg="$XDG_CONFIG_HOME/thegn/config.toml"
+    # This spawn overrides XDG_CONFIG_HOME, so it must re-assert sandbox=none
+    # (the _e2e_env's config is bypassed): panes run on the host, else a
+    # sandboxed shell fails to reach the cut session bus and floods Problems.
+    printf '[sandbox]\nbackend = "none"\n' > "$cfg"
+    # Pin the Work-tab accordion so Symbols/Problems are digit-reachable:
+    # opening Symbols ('2') lazily starts the server; Problems ('3') shows the
+    # pushed diagnostic. (The built-in order buries Symbols at the 10th slot,
+    # past the '1'..'9' jump range.)
+    printf '[panel]\nsections = ["changes", "symbols", "problems"]\n' >> "$cfg"
+    printf '[[lsp.servers]]\n' >> "$cfg"
+    printf 'lang = "rust"\n' >> "$cfg"
+    printf 'command = "fake_lsp"\n' >> "$cfg"
+    printf 'args = []\n' >> "$cfg"
     cd "$repo"
     git init -q -b main
     git config user.email t@t.t
@@ -58,21 +68,27 @@ steps:
   - sleep_ms: 800
   - key: {key: right, mods: [ctrl]}
   - sleep_ms: 300
-  # Tab cycles the panel tab (Git → Work); '6' opens the Symbols section, whose
-  # outline fetch lazily starts the (fake) server. The first start spawns + does
-  # the initialize handshake, so allow generous time before asserting.
+  # On the Git tab, open Changes ('1') and select the dirty file so the outline
+  # has a target, then cross to the Work tab.
+  - key: {key: "1"}
+  - sleep_ms: 200
+  - key: {key: enter}
+  - sleep_ms: 300
+  # Tab cycles the panel tab (Git → Work). With the pinned order (changes,
+  # symbols, problems), the Work tab shows [symbols, problems] → Symbols is '1';
+  # its outline fetch lazily starts the (fake) server. The first start spawns +
+  # does the initialize handshake, so allow generous time before asserting.
   - key: {key: tab}
   - sleep_ms: 500
-  # Open the Symbols section (6th): its outline fetch lazily starts the server.
-  - key: {key: "6"}
+  - key: {key: "1"}
   - sleep_ms: 3000
-  # Starting the server makes it push diagnostics; the Problems section (3rd)
-  # shows the unique "fake error" — proving the full pipeline end-to-end (config
-  # → lazy server start → publishDiagnostics → Problems panel). The diagnostic is
+  # Starting the server makes it push diagnostics; Problems ('2') shows the
+  # unique "fake error" — proving the full pipeline end-to-end (config → lazy
+  # server start → publishDiagnostics → Problems panel). The diagnostic is
   # stored host-side and persists, so this is robust to render timing.
-  - key: {key: "3"}
+  - key: {key: "2"}
   - sleep_ms: 1000
   - expect_visible: {regex: "fake error", timeout_ms: 15000}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"
-      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

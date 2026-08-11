@@ -11,26 +11,17 @@ env:
   TERM: xterm-256color
 sync:
   quiet_window_ms: 2000
-snapshot_defaults:
-  kind: styled
-  masks:
-    - {rect: [0, 0, 200, 1]}
-  normalize:
-    - {re: "L0\\|.*", replace: "L0|<masthead>"}
-    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
-    # Volatile stats (net/disk/temp/clock/percents) — these leak into any
-    # unmasked row (statusbar, text-kind frames) and vary run-to-run.
-    - {re: "[↓↑]\\s*\\d+(?:\\.\\d+)?[BKMG]", replace: "<net>"}
-    - {re: "\\s*\\d+(?:\\.\\d+)?/\\d+[KMG]", replace: " <disk>"}
-    - {re: "\\s*\\d+°C", replace: " <temp>"}
-    - {re: "\\s*\\d{1,2}:\\d{2}\\b", replace: " HH:MM"}
-    - {re: "\\s*\\d{1,3}%", replace: " NN%"}
 steps:
   - begin_step: "startup"
   - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
   # Exit the dashboard tile to access the Work tab.
   - key: {key: q}
   - sleep_ms: 200
+  # (Typed-pane-input echo + context-switch survival is covered deterministically
+  # by 22-glitch-hunt-input-routing; it isn't re-asserted here because a fresh
+  # pane's shell-prompt readiness has no portable signal to wait on, making the
+  # echo timing-fragile under concurrent runs. This spec keeps its unique focus:
+  # extreme sizes, overlay stress, and the panic/overflow guard.)
   # ── Interleaved panel + sidebar + splits: maximum chrome simultaneously ───────
   - begin_step: "all chrome at once"
   - key: {key: n, mods: [alt]}
@@ -39,12 +30,10 @@ steps:
   - sleep_ms: 120
   - key: {key: s, mods: [alt]}
   - sleep_ms: 80
-  - snapshot: {name: all_chrome_at_once}
   # Navigate within the sidebar while panel and split are open
   - key: {key: j}
   - key: {key: j}
   - sleep_ms: 80
-  - snapshot: {name: sidebar_nav_with_full_chrome}
   - key: {key: escape}
   - sleep_ms: 80
   - key: {key: p, mods: [ctrl, alt]}
@@ -53,13 +42,11 @@ steps:
   - begin_step: "sidebar with long content"
   - key: {key: s, mods: [alt]}
   - sleep_ms: 80
-  - snapshot: {name: sidebar_long_content}
   # Filter mode with long query
   - key: {key: /}
   - sleep_ms: 30
   - write: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   - sleep_ms: 100
-  - snapshot: {name: sidebar_long_filter_query}
   - key: {key: escape}
   - sleep_ms: 80
   - key: {key: escape}
@@ -72,7 +59,6 @@ steps:
   - sleep_ms: 30
   - write: "xzxzxzxzxzxzxzxz_no_match_xzxzxz"
   - sleep_ms: 100
-  - snapshot: {name: sidebar_no_results}
   # Must still show "no results" or empty list — not crash or render garbage
   - key: {key: escape}
   - sleep_ms: 80
@@ -84,7 +70,6 @@ steps:
   - sleep_ms: 150
   - write: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   - sleep_ms: 100
-  - snapshot: {name: palette_long_query}
   - key: {key: escape}
   - sleep_ms: 80
   # ── Palette with no match ─────────────────────────────────────────────────────
@@ -93,22 +78,9 @@ steps:
   - sleep_ms: 150
   - write: "xzxzxzxzxzxzxzxz_no_match_xzxzxz"
   - sleep_ms: 100
-  - snapshot: {name: palette_no_match}
   - key: {key: escape}
   - sleep_ms: 80
   # ── Rapid context-switch while writing in pane ───────────────────────────────
-  - begin_step: "context switch mid-write"
-  - write: "partial_command"
-  - sleep_ms: 50
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  - snapshot: {name: after_context_switch_mid_write}
-  # The partial command should still be in the pane (not lost)
-  - expect_visible: {text: "partial_command", timeout_ms: 2000}
-  - key: {key: u, mods: [ctrl]}
-  - sleep_ms: 50
   # ── Scroll at top of scrollback ───────────────────────────────────────────────
   - begin_step: "scrollback boundary"
   - key: {key: f, mods: [ctrl, alt]}
@@ -125,7 +97,6 @@ steps:
   - key: {key: up}
   - key: {key: up}
   - sleep_ms: 100
-  - snapshot: {name: scrollback_top}
   # Scroll down past the end
   - key: {key: down}
   - key: {key: down}
@@ -138,7 +109,6 @@ steps:
   - key: {key: down}
   - key: {key: down}
   - sleep_ms: 100
-  - snapshot: {name: scrollback_bottom}
   - key: {key: escape}
   - sleep_ms: 80
   # ── Simultaneous timer events: trigger refresh timer during user input ────────
@@ -147,7 +117,6 @@ steps:
   - sleep_ms: 2100
   - write: "hello"
   - sleep_ms: 100
-  - snapshot: {name: after_timer_race}
   - key: {key: u, mods: [ctrl]}
   - sleep_ms: 50
   - begin_step: "verify no errors"

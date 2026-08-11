@@ -11,20 +11,6 @@ env:
   TERM: xterm-256color
 sync:
   quiet_window_ms: 2000
-snapshot_defaults:
-  kind: styled
-  masks:
-    - {rect: [0, 0, 200, 1]}
-  normalize:
-    - {re: "L0\\|.*", replace: "L0|<masthead>"}
-    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
-    # Volatile stats (net/disk/temp/clock/percents) — these leak into any
-    # unmasked row (statusbar, text-kind frames) and vary run-to-run.
-    - {re: "[↓↑]\\s*\\d+(?:\\.\\d+)?[BKMG]", replace: "<net>"}
-    - {re: "\\s*\\d+(?:\\.\\d+)?/\\d+[KMG]", replace: " <disk>"}
-    - {re: "\\s*\\d+°C", replace: " <temp>"}
-    - {re: "\\s*\\d{1,2}:\\d{2}\\b", replace: " HH:MM"}
-    - {re: "\\s*\\d{1,3}%", replace: " NN%"}
 steps:
   - begin_step: "startup"
   - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
@@ -46,17 +32,14 @@ steps:
   - sleep_ms: 100
   - key: {key: p, mods: [ctrl, alt]}
   - sleep_ms: 80
-  - snapshot: {name: pane_after_host_keys}
   # ── Mouse click routing ───────────────────────────────────────────────────────
   - begin_step: "mouse click in center pane"
   - mouse: {row: 15, col: 50}
   - sleep_ms: 80
-  - snapshot: {name: after_pane_click}
   # Click sidebar area
   - begin_step: "mouse click sidebar"
   - mouse: {row: 5, col: 2}
   - sleep_ms: 80
-  - snapshot: {name: after_sidebar_click}
   # Sidebar should now be focused
   - key: {key: escape}
   - sleep_ms: 80
@@ -64,12 +47,10 @@ steps:
   - begin_step: "mouse click statusbar"
   - mouse: {row: 29, col: 50}
   - sleep_ms: 100
-  - snapshot: {name: after_statusbar_click}
   # ── Paste does not corrupt chrome ─────────────────────────────────────────────
   - begin_step: "bracketed paste does not corrupt chrome"
   - paste: "this is a pasted string with special chars: <>[]{}()"
   - sleep_ms: 100
-  - snapshot: {name: after_paste}
   - key: {key: u, mods: [ctrl]}
   - sleep_ms: 50
   # ── Rapid write does not corrupt ─────────────────────────────────────────────
@@ -78,25 +59,25 @@ steps:
   - sleep_ms: 50
   - write: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   - sleep_ms: 50
-  - snapshot: {name: after_rapid_write}
   - key: {key: u, mods: [ctrl]}
   - sleep_ms: 50
   # ── Multi-pane input isolation ────────────────────────────────────────────────
   - begin_step: "multi-pane input isolation"
-  # Alt+N = SplitDown (top/bottom); new bottom pane is focused after split
+  # Alt+N = SplitDown (top/bottom); new bottom pane is focused after split.
+  # Give the fresh pane's shell time to print its prompt before writing, else
+  # the marker races the shell startup and is lost.
   - key: {key: n, mods: [alt]}
-  - sleep_ms: 200
+  - sleep_ms: 600
   # Bottom pane is focused — write the right-pane marker here
   - write_line: "rpmark"
-  - sleep_ms: 80
+  - sleep_ms: 150
   # Move up to the top pane
   - key: {key: up, mods: [ctrl]}
-  - sleep_ms: 80
+  - sleep_ms: 150
   - write_line: "lpmark"
-  - sleep_ms: 80
-  - snapshot: {name: two_pane_input_isolation}
-  - expect_visible: {text: "lpmark", timeout_ms: 2000}
-  - expect_visible: {text: "rpmark", timeout_ms: 2000}
+  - sleep_ms: 150
+  - expect_visible: {text: "lpmark", timeout_ms: 8000}
+  - expect_visible: {text: "rpmark", timeout_ms: 8000}
   - begin_step: "verify no errors"
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"

@@ -16,13 +16,9 @@ name: ci
 #
 # `just ci` locally = fmt-check lint deps-audit build check-cross test
 # doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db
-# e2e nix-build. Stages NOT in the routine server-side gate:
-#  - e2e (muse visual suite): OPT-IN via `[ci-e2e]` commit marker or dispatch.
-#    The muse specs spawn thegn in a PTY (which does work on ubuntu runners),
-#    but the visual baselines in test/muse/snapshots/ were never committed and
-#    a few specs carry stale `toBeVisible` expectations from main's UI drift,
-#    so routine runs would always be red. `[gen-baselines]` runs the one-shot
-#    generator job that commits baselines back.
+# e2e nix-build. The e2e job (muse) is routine: it's assertion-based (semantic
+# `expect_*` + a `check_file` panic/overflow guard), not visual snapshots, so
+# it's deterministic on ubuntu runners. Stages NOT in the routine gate:
 #  - sandbox-e2e-full (Tier-2 podman suites): not part of `just ci` either;
 #    the Tier-1 dns/db tests (no container runtime needed) DO run here.
 #  - macos: not part of `just ci`; OPT-IN via `[ci-macos]` (10x minute cost).
@@ -220,11 +216,11 @@ jobs:
             .#devShells.x86_64-linux.sandbox.inputDerivation \
             .#devShells.x86_64-linux.default.inputDerivation
   e2e:
-    # OPT-IN (see header): muse visual baselines aren't committed yet and a few
-    # specs have stale expectations, so this isn't in the routine gate. Run via
-    # dispatch or a `[ci-e2e]` commit-message marker (absent on PR events, so
-    # PRs never schedule it).
-    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-e2e]') }}
+    # Routine gate: the muse suite is assertion-based (semantic `expect_*` checks
+    # + a `check_file` panic/overflow guard), NOT visual snapshots, so it's
+    # deterministic and runs on every push/PR. It spawns thegn in a PTY (works on
+    # ubuntu runners) and proves "doesn't crash / the pipeline works" across
+    # resize/focus/input boundaries and end-to-end LSP/git flows.
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
     timeout-minutes: 30
     steps:
@@ -289,35 +285,3 @@ jobs:
           name: thegn-x86_64-pc-windows-msvc
           path: target/release/thegn.exe
           retention-days: 30
-  # One-shot baseline generator: muse visual baselines were never committed, so
-  # `e2e` can't pass until they exist. Push a commit whose message contains
-  # `[gen-baselines]` to (re)generate them in the CI env where `e2e` checks
-  # them, and commit them back. The generated commit has no marker, so it can't
-  # loop.
-  update-baselines:
-    if: contains(github.event.head_commit.message, '[gen-baselines]')
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
-    timeout-minutes: 40
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: ./.github/actions/ci-setup
-        with:
-          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
-      # Tolerate partial failures: a few specs have stale expectations from
-      # main's UI drift, but the rest still regenerate — commit what we got.
-      - run: nix develop --command just e2e-update || true
-      - name: commit regenerated baselines
-        run: |
-          git config user.name "thegn CI"
-          git config user.email ci@thegn.local
-          if [ -n "$(git status --porcelain test/muse/snapshots/)" ]; then
-            git add test/muse/snapshots/
-            git commit -m "test(e2e): generate muse visual baselines in CI"
-            git push origin "HEAD:${{ github.ref_name }}"
-          else
-            echo "no baseline changes to commit"
-          fi

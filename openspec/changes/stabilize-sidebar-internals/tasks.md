@@ -50,13 +50,16 @@
       machete ignore for generated-code prost), and the termwiz `?1003h`
       any-motion push (corrective DECSET write; mouse fully off on mouse-less
       terminals, button+drag only elsewhere).
-- [ ] 5.3 e2e determinism mode (follow-up): the muse suite now normalizes
-      volatile stats (net/disk/temp/clock/percents) suite-wide and runs at
-      workers 2 / 20s deadlines, but ~half the cases still flake run-to-run
-      on REAL app state — activity dots decaying ●→○ on quiet timers, the ✋
-      needs-you chip appearing when a fresh shell settles (shifting the whole
-      statusbar), and captures landing before the pane frame paints. Going
-      green needs an app-side e2e env that freezes activity/chip/stats
-      (regex normalization cannot mask semantic state).
+- [x] 5.3 e2e determinism — RESOLVED BY DECISION (no app-side freeze built).
+      The visual-snapshot half of the muse suite was the source of the
+      run-to-run flake (activity ●→○ decay, ✋ needs-you chip, stats-cluster
+      shift — real app state regex can't mask) AND had never actually gated
+      anything (its baselines in test/muse/snapshots/ were never committed).
+      Rather than build a `THEGN_E2E` freeze of activity/chip/stats, we
+      dropped the snapshots entirely and kept muse as a deterministic
+      SEMANTIC + crash gate (`expect_*` on stable UI text + a `check_file`
+      panic/overflow guard, panes forced to `sandbox=none`). The suite is now
+      green and promoted into the routine `just ci` gate. See branch
+      tg/muse-semantic-gate.
 - [ ] 5.2 Live TUI pass (`just start name=dev`): ASCII under `TERM=linux`,
       rail identity, terminals-section toggle, Manual default order.

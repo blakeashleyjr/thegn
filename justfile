@@ -14,17 +14,23 @@ _tmp="$(mktemp -d)"; trap 'rm -rf "$_tmp"' EXIT
 export HOME="$_tmp/home" XDG_CONFIG_HOME="$_tmp/config" XDG_STATE_HOME="$_tmp/state"
 export GIT_CONFIG_GLOBAL="$_tmp/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
 # Cut the session D-Bus: otherwise the developer's live media player leaks
-# into the statusbar/masthead media badge and every snapshot goes
-# nondeterministic as tracks change.
+# into the statusbar/masthead media badge, flapping the text the specs match.
 export DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null/e2e-no-dbus"
 # In-process panes: muse kills compositors without a quit path — daemon-backed
 # panes would detach into never-reaped sessions (a leaked daemon + shell per
-# case), and the async "persist" chip would flake the statusbar snapshots.
+# case), and the async "persist" chip would flake the statusbar.
 # The runtime dir is isolated for the same reason smoke isolates it: the
 # daemon socket path prefers $XDG_RUNTIME_DIR.
 export THEGN_NO_DAEMON=1 XDG_RUNTIME_DIR="$_tmp/run"
-mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
+# Start in the normal UI, not the first-run onboarding wizard / keymap picker —
+# those modals would swallow the specs' driven keystrokes (fresh per-case DB).
+export THEGN_SKIP_ONBOARDING=1
+mkdir -p "$HOME" "$XDG_CONFIG_HOME/thegn" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
 printf '[user]\nname = e2e\nemail = e2e@example.invalid\n' > "$_tmp/gitconfig"
+# Run panes on the host (no container): this suite exercises thegn's UI, not the
+# sandbox runtime (that is sandbox-e2e-*). A container backend would also fail
+# to reach the cut session bus and log a pane-crash ERROR the guard rejects.
+printf '[sandbox]\nbackend = "none"\n' > "$XDG_CONFIG_HOME/thegn/config.toml"
 '''
 
 # Show available recipes (default).
@@ -297,10 +303,15 @@ deps-audit:
     cargo deny check
     cargo machete
 
-# Visual regression suite: run all muse specs against a live thegn binary.
-# Baselines live in test/muse/snapshots/ and are committed to git.
-# Workers default to 4; glitch-hunt specs run serial (--workers 1) to avoid
-# UI-state races between concurrently running thegn processes.
+# Semantic + crash e2e gate: run every muse spec against a live thegn binary in
+# a real PTY. The specs are ASSERTION-BASED — `expect_visible` / `expect_count`
+# / `expect_not_visible` on stable UI text plus a `check_file` guard that fails
+# on any panic / overflow / corruption in the log. NO visual snapshots: they
+# require committed baselines + an app-side determinism freeze (activity dot,
+# needs-you chip, stats cluster) that regex normalization can't provide, so we
+# deliberately don't diff frames — this suite proves "doesn't crash / the
+# pipeline works" across resize storms, focus/input boundaries, and end-to-end
+# LSP/git flows, which the deterministic unit tests structurally cannot.
 # thegn is put on PATH so specs can use spawn: ["thegn"] portably.
 #
 # The suite is hermetic w.r.t. the developer's environment: `_e2e_env` isolates
@@ -311,34 +322,19 @@ e2e: build
     #!/usr/bin/env bash
     {{_e2e_env}}
     # muse takes spec FILES (a bare directory is "Is a directory" — os error 21).
-    # Workers 2 (was 4): concurrent thegn instances contend for CPU and push
-    # wide-size cases past their expect_visible windows, capturing blank/late
-    # frames. KNOWN RESIDUAL FLAKE (run-to-run, even serial): live app state —
-    # the activity dot decays ●→○ on output-quiet timers, the ✋ needs-you chip
-    # appears when a fresh shell's output settles mid-run (shifting the whole
-    # statusbar cluster), and muse's quiet-window can fire before the pane
-    # frame paints. Regex normalization cannot mask semantic state; going
-    # green needs an app-side determinism env for e2e (freeze activity/chip/
-    # stats) — tracked in openspec `stabilize-sidebar-internals` follow-ups.
+    # Workers 2: several specs type into a freshly-spawned pane shell, which
+    # needs a moment to print its prompt; higher concurrency starves that
+    # startup and races the write past the not-yet-ready shell.
     PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
         --reporter pretty --workers 2 --deadline-ms 20000
 
-# Run only the glitch-hunt specs (18–28) — slower, more thorough.
+# Run only the glitch-hunt specs (18–28) — the boundary/stress subset.
 e2e-glitch: build
     #!/usr/bin/env bash
     {{_e2e_env}}
     PATH="$(pwd)/target/debug:$PATH" muse run \
         test/muse/specs/1[89]-*.yaml test/muse/specs/2[0-9]-*.yaml \
         --reporter pretty --workers 2 --deadline-ms 12000
-
-# Update snapshot baselines (run after intentional rendering changes).
-e2e-update: build
-    #!/usr/bin/env bash
-    {{_e2e_env}}
-    # Same workers/deadline as `e2e`: baselines must be captured under the
-    # SAME contention profile they are verified under.
-    PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
-        --update-snapshots --workers 2 --deadline-ms 20000
 
 # (e2e/stress/perf harnesses drove the old zellij CLI's worktree-creation
 # commands headlessly; worktree/workspace/pin creation is now an interactive

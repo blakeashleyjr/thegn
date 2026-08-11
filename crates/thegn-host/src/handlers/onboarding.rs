@@ -75,6 +75,18 @@ pub(crate) fn startup(
     cfg: &mut Config,
     active_menu: &mut Option<crate::menu::MenuOverlay>,
 ) -> (OnboardingUi, bool) {
+    // Headless/e2e launches set THEGN_SKIP_ONBOARDING to start straight in the
+    // normal UI: a first-run wizard (or the keymap-preset picker below) is modal
+    // and would otherwise swallow driven keystrokes. Skips both.
+    if std::env::var_os("THEGN_SKIP_ONBOARDING").is_some() {
+        return (
+            OnboardingUi {
+                ui: None,
+                wait: None,
+            },
+            false,
+        );
+    }
     let requested = crate::onboarding::setup_requested();
     // Only a healthy DB with no marker counts as first run — a broken DB must
     // not re-open the wizard on every launch.

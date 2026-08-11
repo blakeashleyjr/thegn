@@ -11,20 +11,6 @@ env:
   TERM: xterm-256color
 sync:
   quiet_window_ms: 2000
-snapshot_defaults:
-  kind: styled
-  masks:
-    - {rect: [0, 0, 200, 1]}
-  normalize:
-    - {re: "L0\\|.*", replace: "L0|<masthead>"}
-    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
-    # Volatile stats (net/disk/temp/clock/percents) — these leak into any
-    # unmasked row (statusbar, text-kind frames) and vary run-to-run.
-    - {re: "[↓↑]\\s*\\d+(?:\\.\\d+)?[BKMG]", replace: "<net>"}
-    - {re: "\\s*\\d+(?:\\.\\d+)?/\\d+[KMG]", replace: " <disk>"}
-    - {re: "\\s*\\d+°C", replace: " <temp>"}
-    - {re: "\\s*\\d{1,2}:\\d{2}\\b", replace: " HH:MM"}
-    - {re: "\\s*\\d{1,3}%", replace: " NN%"}
 steps:
   - begin_step: "startup"
   - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
@@ -34,19 +20,15 @@ steps:
   # ── Key sequences that could alias across modes ───────────────────────────────
   # Test: Alt+arrows in different modes behave correctly
   - begin_step: "alt-arrows in normal mode"
-  - snapshot: {name: normal_mode_baseline}
   - key: {key: left, mods: [alt]}
   - sleep_ms: 80
-  - snapshot: {name: alt_left_normal}
   - key: {key: right, mods: [alt]}
   - sleep_ms: 80
   - begin_step: "alt-arrows should not reach shell when in key-lock"
   - key: {key: g, mods: [ctrl]}
   - sleep_ms: 50
-  - snapshot: {name: in_key_lock}
   - key: {key: left, mods: [alt]}
   - sleep_ms: 80
-  - snapshot: {name: alt_left_in_lock}
   - key: {key: g, mods: [ctrl]}
   - sleep_ms: 50
   # ── Escape key handling: must exit UI layers but not shell ────────────────────
@@ -56,26 +38,22 @@ steps:
   - sleep_ms: 150
   - key: {key: escape}
   - sleep_ms: 80
-  - snapshot: {name: after_palette_escape}
   # In sidebar focused
   - key: {key: s, mods: [alt]}
   - sleep_ms: 80
   - key: {key: escape}
   - sleep_ms: 80
-  - snapshot: {name: after_sidebar_escape}
   # In panel
   - key: {key: p, mods: [ctrl, alt]}
   - sleep_ms: 100
   - key: {key: escape}
   - sleep_ms: 80
-  - snapshot: {name: after_panel_escape_from_nav}
   - key: {key: p, mods: [ctrl, alt]}
   - sleep_ms: 80
   # ── Ctrl+C must not quit thegn (only the active process) ────────────────────
   - begin_step: "ctrl-c stays in thegn"
   - key: {key: c, mods: [ctrl]}
   - sleep_ms: 100
-  - snapshot: {name: after_ctrl_c}
   # thegn must still be running
   - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 2000}
   # ── Ctrl+Q must trigger quit confirm (not instant quit) ───────────────────────
@@ -86,7 +64,6 @@ steps:
   # Instead test that pressing Ctrl+\ (SIGQUIT) does not crash thegn.
   - key: {key: "\\", mods: [ctrl]}
   - sleep_ms: 100
-  - snapshot: {name: after_ctrl_backslash}
   - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 2000}
   # ── F-key passthrough: F1–F12 should reach the active pane ──────────────────
   - begin_step: "f-key passthrough"
@@ -96,14 +73,12 @@ steps:
   - sleep_ms: 80
   - key: {key: f12}
   - sleep_ms: 80
-  - snapshot: {name: after_f_keys}
   # ── Verify correct profile-specific behavior ──────────────────────────────────
   # vt220 profile: Alt+arrows may encode differently; the host should still
   # decode them and route correctly.
   - begin_step: "profile-specific key routing"
   - key: {key: s, mods: [ctrl, alt]}
   - sleep_ms: 80
-  - snapshot: {name: sidebar_toggled_profile}
   - key: {key: s, mods: [ctrl, alt]}
   - sleep_ms: 80
   - begin_step: "verify no errors"
