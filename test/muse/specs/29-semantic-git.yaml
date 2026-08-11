@@ -51,9 +51,9 @@ steps:
   - key: {key: enter}
   - sleep_ms: 500
   # The impact line summarizes the entity-level change (item 313)…
-  - expect_visible: {regex: "across 1 file", timeout_ms: 6000}
+  - expect_visible: {regex: "semantic.*1 file", timeout_ms: 6000}
   # …and the selected file shows its touched entity (item 311).
   - expect_visible: {regex: "fn greet", timeout_ms: 6000}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"
-      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

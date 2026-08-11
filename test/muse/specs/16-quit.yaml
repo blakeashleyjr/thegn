@@ -22,4 +22,4 @@ steps:
   - expect_exit: {code: 0, timeout_ms: 4000}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"
-      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

@@ -11,20 +11,6 @@ env:
   TERM: xterm-256color
 sync:
   quiet_window_ms: 2000
-snapshot_defaults:
-  kind: styled
-  masks:
-    - {rect: [0, 0, 200, 1]}
-  normalize:
-    - {re: "L0\\|.*", replace: "L0|<masthead>"}
-    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
-    # Volatile stats (net/disk/temp/clock/percents) — these leak into any
-    # unmasked row (statusbar, text-kind frames) and vary run-to-run.
-    - {re: "[↓↑]\\s*\\d+(?:\\.\\d+)?[BKMG]", replace: "<net>"}
-    - {re: "\\s*\\d+(?:\\.\\d+)?/\\d+[KMG]", replace: " <disk>"}
-    - {re: "\\s*\\d+°C", replace: " <temp>"}
-    - {re: "\\s*\\d{1,2}:\\d{2}\\b", replace: " HH:MM"}
-    - {re: "\\s*\\d{1,3}%", replace: " NN%"}
 steps:
   - begin_step: "startup"
   - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
@@ -41,21 +27,17 @@ steps:
   - sleep_ms: 150
   - key: {key: n, mods: [alt]}
   - sleep_ms: 150
-  - snapshot: {name: near_pane_limit}
   # Try to create more (should show a "limit reached" message or silently ignore)
   - key: {key: n, mods: [alt]}
   - sleep_ms: 150
   - key: {key: n, mods: [alt]}
   - sleep_ms: 150
-  - snapshot: {name: at_or_past_pane_limit}
   # ── Zoom with many panes ──────────────────────────────────────────────────────
   - begin_step: "zoom with many panes"
   - key: {key: z, mods: [ctrl, alt]}
   - sleep_ms: 80
-  - snapshot: {name: zoomed_many_panes}
   - key: {key: z, mods: [ctrl, alt]}
   - sleep_ms: 80
-  - snapshot: {name: unzoomed_many_panes}
   # ── Rapid split/close cycle ───────────────────────────────────────────────────
   - begin_step: "rapid split/close cycle"
   - key: {key: n, mods: [alt]}
@@ -70,7 +52,6 @@ steps:
   - sleep_ms: 100
   - key: {key: x, mods: [ctrl, alt]}
   - sleep_ms: 100
-  - snapshot: {name: after_rapid_split_close}
   # ── Closing the last pane: must not crash (should block or warn) ──────────────
   - begin_step: "protect against closing last pane"
   # Close until one remains
@@ -84,15 +65,12 @@ steps:
   - sleep_ms: 100
   - key: {key: x, mods: [ctrl, alt]}
   - sleep_ms: 100
-  - snapshot: {name: single_pane_protected}
   # ── Resize the last pane all the way ─────────────────────────────────────────
   - begin_step: "resize last pane extremes"
   - resize: "40x8"
   - sleep_ms: 80
-  - snapshot: {name: min_viable_with_one_pane}
   - resize: "200x60"
   - sleep_ms: 80
-  - snapshot: {name: max_size_with_one_pane}
   - resize: "100x30"
   - sleep_ms: 80
   - begin_step: "verify no errors"

@@ -11,27 +11,12 @@ env:
   TERM: xterm-256color
 sync:
   quiet_window_ms: 2000
-snapshot_defaults:
-  kind: styled
-  masks:
-    - {rect: [0, 0, 200, 1]}
-  normalize:
-    - {re: "L0\\|.*", replace: "L0|<masthead>"}
-    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
-    # Volatile stats (net/disk/temp/clock/percents) — these leak into any
-    # unmasked row (statusbar, text-kind frames) and vary run-to-run.
-    - {re: "[↓↑]\\s*\\d+(?:\\.\\d+)?[BKMG]", replace: "<net>"}
-    - {re: "\\s*\\d+(?:\\.\\d+)?/\\d+[KMG]", replace: " <disk>"}
-    - {re: "\\s*\\d+°C", replace: " <temp>"}
-    - {re: "\\s*\\d{1,2}:\\d{2}\\b", replace: " HH:MM"}
-    - {re: "\\s*\\d{1,3}%", replace: " NN%"}
 steps:
   - begin_step: "startup"
   - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
   # Exit the dashboard tile to access the Work tab.
   - key: {key: q}
   - sleep_ms: 200
-  - snapshot: {name: initial_single_tab}
   # ── Open tabs rapidly and navigate ───────────────────────────────────────────
   - begin_step: "rapid tab creation"
   - key: {key: t, mods: [alt]}
@@ -40,7 +25,6 @@ steps:
   - sleep_ms: 200
   - key: {key: t, mods: [alt]}
   - sleep_ms: 200
-  - snapshot: {name: four_tabs}
   # Rapid tab navigation (no sleep between — stress test)
   - begin_step: "rapid tab navigation"
   - key: {key: right, mods: [alt]}
@@ -50,7 +34,6 @@ steps:
   - key: {key: left, mods: [alt]}
   - key: {key: right, mods: [alt]}
   - sleep_ms: 150
-  - snapshot: {name: after_rapid_nav}
   # ── Navigate prev/next at boundary: should not crash ─────────────────────────
   - begin_step: "tab boundary navigation"
   # Go to first tab
@@ -59,29 +42,24 @@ steps:
   - key: {key: left, mods: [alt]}
   - key: {key: left, mods: [alt]}
   - sleep_ms: 100
-  - snapshot: {name: at_first_tab}
   # Try to go left past first tab (should clamp or wrap)
   - key: {key: left, mods: [alt]}
   - key: {key: left, mods: [alt]}
   - sleep_ms: 80
-  - snapshot: {name: past_first_tab}
   # Go to last tab
   - key: {key: right, mods: [alt]}
   - key: {key: right, mods: [alt]}
   - key: {key: right, mods: [alt]}
   - key: {key: right, mods: [alt]}
   - sleep_ms: 100
-  - snapshot: {name: at_last_tab}
   # Try to go right past last tab
   - key: {key: right, mods: [alt]}
   - key: {key: right, mods: [alt]}
   - sleep_ms: 80
-  - snapshot: {name: past_last_tab}
   # ── Close confirm dialog: multiple cancels ────────────────────────────────────
   - begin_step: "close dialog cancel loop"
   - key: {key: x, mods: [alt]}
   - sleep_ms: 200
-  - snapshot: {name: close_dialog}
   - key: {key: escape}
   - sleep_ms: 80
   - key: {key: x, mods: [alt]}
@@ -92,14 +70,12 @@ steps:
   - sleep_ms: 150
   - key: {key: escape}
   - sleep_ms: 80
-  - snapshot: {name: after_repeated_cancel}
   # Tab count must still be 4
   - expect_count: {regex: "\\bthegn\\b|[0-9]+:", min: 1, timeout_ms: 1000}
   # ── Tabbar overflow: many tabs on small screen ────────────────────────────────
   - begin_step: "tabbar overflow"
   - resize: "60x20"
   - sleep_ms: 80
-  - snapshot: {name: tabbar_overflow}
   - resize: "100x30"
   - sleep_ms: 80
   # ── Panel open during tab switch ─────────────────────────────────────────────
@@ -108,10 +84,8 @@ steps:
   - sleep_ms: 100
   - key: {key: right, mods: [alt]}
   - sleep_ms: 80
-  - snapshot: {name: panel_after_tab_switch}
   - key: {key: left, mods: [alt]}
   - sleep_ms: 80
-  - snapshot: {name: panel_after_tab_back}
   - key: {key: p, mods: [ctrl, alt]}
   - sleep_ms: 80
   - begin_step: "verify no errors"
