@@ -297,6 +297,16 @@ pub struct SandboxSpec {
     /// `--runtime <value>` at container *create* by `oci_create_opts` for OCI
     /// backends only; drives the honest isolation class in [`crate::capabilities`].
     pub oci_runtime: Option<String>,
+    /// This sandbox is owned by the **pane daemon** (a separate, long-lived
+    /// process that keeps the shell running across UI detach — "tmux
+    /// semantics"). The daemon reaps its sessions explicitly (kill-on-close,
+    /// lease expiry, boot sweep), so the bwrap `--die-with-parent` guard is
+    /// both redundant and actively harmful here: it tied the sandbox's life to
+    /// the transient thread that forked it, killing a *supposed-to-persist*
+    /// backgrounded shell. Set on daemon-routed center-tab panes only;
+    /// ephemeral in-process chrome panes (pins/drawer) leave it `false` so they
+    /// still die with the compositor. Only affects the bwrap backend.
+    pub daemon_persistent: bool,
 }
 
 impl SandboxSpec {
@@ -724,6 +734,10 @@ pub fn resolve_placed(
         oci_host: (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim().to_string()),
         oci_runtime: (!cfg.oci_runtime.trim().is_empty())
             .then(|| cfg.oci_runtime.trim().to_string()),
+        // Default off: the resolver has no idea whether this pane is a
+        // daemon-routed center tab or an ephemeral chrome pane. The pane owner
+        // (the host's launch-spec builder) flips it on for daemon-backed panes.
+        daemon_persistent: false,
     })
 }
 
@@ -1463,7 +1477,18 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 let flag = if m.ro { "--ro-bind" } else { "--bind" };
                 v.extend([flag.into(), m.host.clone(), m.dest.clone()]);
             }
-            v.extend(["--unshare-pid".into(), "--die-with-parent".into()]);
+            v.push("--unshare-pid".into());
+            // `--die-with-parent` kills the sandbox (bwrap is PID 1 of the
+            // unshared namespace) the instant its parent goes away — right for
+            // an in-process pane owned by the compositor, but fatal for a
+            // daemon-owned shell that is *supposed* to survive UI detach: the
+            // guard is keyed to the transient thread that forked bwrap, so it
+            // reaps a backgrounded session. The pane daemon reaps its own
+            // sessions explicitly (kill-on-close + lease expiry + boot sweep),
+            // so drop the flag for daemon-persistent panes.
+            if !spec.daemon_persistent {
+                v.push("--die-with-parent".into());
+            }
             if spec.network == Network::None {
                 v.push("--unshare-net".into());
             }
