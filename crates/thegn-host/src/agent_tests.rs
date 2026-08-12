@@ -940,6 +940,7 @@ fn launch_spec_with_key_injects_scoped_key() {
             "shell",
             Some("sk-test-scoped".into()),
             false,
+            false,
         )
         .unwrap();
         // On the host path there's no OCI spec to mutate, so scoped key

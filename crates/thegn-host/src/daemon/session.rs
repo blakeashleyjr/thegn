@@ -175,14 +175,18 @@ impl SessionActor {
         mut pane_rx: mpsc::Receiver<PaneEvent>,
         mut msg_rx: mpsc::Receiver<SessionMsg>,
     ) {
-        let exit_code: Option<i32> = loop {
+        // `child_exited` distinguishes a natural child exit (the reader thread
+        // already reaped it) from a teardown while the child may still be alive
+        // (Kill / mailbox closed) — the latter must actively terminate the PTY
+        // child (see below).
+        let (exit_code, child_exited): (Option<i32>, bool) = loop {
             tokio::select! {
                 ev = pane_rx.recv() => match ev {
                     Some(PaneEvent::Output(_, bytes)) => self.on_output(&bytes),
-                    Some(PaneEvent::Exit(_, code)) => break code,
+                    Some(PaneEvent::Exit(_, code)) => break (code, true),
                     // Compositor-relay-only event; a PTY reader never emits it.
                     Some(PaneEvent::SessionFallback(_)) => {}
-                    None => break None, // reader thread gone without an Exit
+                    None => break (None, true), // reader gone ⇒ child already EOF'd
                 },
                 msg = msg_rx.recv() => match msg {
                     Some(SessionMsg::Attach { client_id, kind, rows, cols, reply }) => {
@@ -201,10 +205,22 @@ impl SessionActor {
                     Some(SessionMsg::Snapshot { reply }) => {
                         let _ = reply.send(self.snapshot_frame());
                     }
-                    Some(SessionMsg::Kill) | None => break None,
+                    Some(SessionMsg::Kill) | None => break (None, false),
                 },
             }
         };
+
+        // Teardown while the child may still be alive (Kill / mailbox closed):
+        // actively terminate the PTY child. Dropping the master alone won't hang
+        // up the tty — the reader thread holds a cloned fd, so the pty stays
+        // open until the child exits — and a daemon-persistent bwrap pane no
+        // longer carries `--die-with-parent`, so nothing else reaps the
+        // sandbox. bwrap is PID 1 of its namespace, so terminating it collapses
+        // the whole namespace. Best-effort; skipped after a natural exit, whose
+        // pid the reader thread already reaped (avoids a pid-reuse hazard).
+        if !child_exited && let Some(pid) = self.pty.pid {
+            crate::platform::terminate_pid(pid);
+        }
 
         // Terminal: tell subscribers (then close their channels by dropping),
         // tell the feed, and remove this session from the daemon's table.

@@ -195,13 +195,17 @@ fn sandbox_wrap_shell(
     sb.backend = be;
     let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&home));
     let name = thegn_core::sandbox::container_name(&home);
-    let spec = thegn_core::sandbox::resolve_placed(
+    let mut spec = thegn_core::sandbox::resolve_placed(
         &sb,
         &loc,
         &name,
         sb.profile,
         thegn_core::placement::Placement::Local,
     )?;
+    // Terminal-connection tabs are center panes routed through the pane daemon,
+    // so a local bwrap terminal must drop `--die-with-parent` to survive UI
+    // detach (see the daemon-persistent gate in `sandbox::enter_argv`).
+    spec.daemon_persistent = crate::handlers::startup::daemon_active(cfg);
     // `enter_argv` execs `inner` as the pane's foreground program; the shell
     // argv (path + login flags) is the interactive shell that owns the pane.
     let inner = shell_words_join(shell_argv);
