@@ -112,6 +112,19 @@ impl Priority {
             _ => None,
         }
     }
+
+    /// The accent hue for this priority — the single source that colors the
+    /// transient toast projection of a routed notification. `None` is the
+    /// neutral (default text) color: an `Info` toast (a plain acknowledgement
+    /// like "copied") must not pull a hue. This mirrors the flag/count colors:
+    /// `Alert` is the red ⚑ urgency, `Notice` the neutral-blue unread accent.
+    pub fn hue(self) -> Option<crate::theme::Hue> {
+        match self {
+            Self::Info => None,
+            Self::Notice => Some(crate::theme::Hue::Blue),
+            Self::Alert => Some(crate::theme::Hue::Red),
+        }
+    }
 }
 
 impl NotificationKind {
@@ -216,6 +229,39 @@ impl NotificationKind {
         }
     }
 
+    /// The one caps-aware hued-glyph vocabulary for notifications — the single
+    /// source every surface renders through (the unified inbox overlay, the
+    /// panel inbox section, and the transient toast). Mirrors
+    /// [`crate::attention::MqStatus::glyph`]: glyphs come from the caller's
+    /// capability-resolved [`GlyphSet`](crate::termcaps::GlyphSet) where a slot
+    /// exists (so failure/queue markers degrade to ASCII with the rest of the
+    /// chrome), and the hue is per-kind so the popup and panel can never diverge.
+    /// Kinds without a dedicated `GlyphSet` slot keep their fixed BMP glyph
+    /// (identical to [`Self::glyph`]).
+    pub fn hued_glyph(self, gl: &crate::termcaps::GlyphSet) -> (&'static str, crate::theme::Hue) {
+        use crate::theme::Hue;
+        match self {
+            Self::Assigned => ("→", Hue::Blue),
+            Self::Mentioned => ("@", Hue::Blue),
+            Self::StatusChanged => ("⟳", Hue::Amber),
+            Self::BlockerResolved => (gl.check, Hue::Green),
+            Self::PrLinked => ("⎇", Hue::Amber),
+            Self::Overdue => ("!", Hue::Red),
+            Self::PrStateChanged => ("⑂", Hue::Amber),
+            Self::AgentDone => ("◉", Hue::Green),
+            Self::AgentFailed => (gl.cross, Hue::Red),
+            Self::AgentAttention => (gl.warn, Hue::Amber),
+            Self::TestFailed => (gl.cross, Hue::Red),
+            Self::WorktreeCreated => ("+", Hue::Green),
+            Self::LogError => (gl.cross, Hue::Red),
+            Self::ProcessExited => (gl.diamond_hollow, Hue::Green),
+            Self::ProcessFailed => (gl.cross, Hue::Red),
+            Self::QueueLanded => (gl.check, Hue::Green),
+            Self::QueueReady => (gl.diamond_filled, Hue::Green),
+            Self::QueueNeedsHuman => (gl.attention, Hue::Red),
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Assigned => "assigned",
@@ -306,6 +352,49 @@ mod tests {
             };
             assert_eq!(p, expected, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn hued_glyph_is_total_caps_aware_and_nonempty() {
+        use crate::termcaps::{ASCII, UNICODE};
+        for kind in NotificationKind::ALL {
+            let (gu, _) = kind.hued_glyph(&UNICODE);
+            let (ga, _) = kind.hued_glyph(&ASCII);
+            assert!(!gu.is_empty(), "{kind:?} unicode glyph empty");
+            assert!(!ga.is_empty(), "{kind:?} ascii glyph empty");
+        }
+        // Failure/queue kinds degrade with the chrome (they route through a
+        // GlyphSet slot), so the ASCII glyph differs from the Unicode one.
+        let (u, _) = NotificationKind::TestFailed.hued_glyph(&UNICODE);
+        let (a, _) = NotificationKind::TestFailed.hued_glyph(&ASCII);
+        assert_eq!(u, UNICODE.cross);
+        assert_eq!(a, ASCII.cross);
+    }
+
+    #[test]
+    fn hued_glyph_failures_are_red() {
+        use crate::termcaps::UNICODE;
+        use crate::theme::Hue;
+        // The hard-failure kinds all render the red cross; AgentAttention is a
+        // deliberate amber ⚠ (attention, not failure), so it is excluded.
+        for kind in [
+            NotificationKind::AgentFailed,
+            NotificationKind::TestFailed,
+            NotificationKind::ProcessFailed,
+            NotificationKind::LogError,
+        ] {
+            let (glyph, hue) = kind.hued_glyph(&UNICODE);
+            assert_eq!(glyph, UNICODE.cross, "{kind:?}");
+            assert_eq!(hue, Hue::Red, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn priority_hue_neutral_info_colored_rest() {
+        use crate::theme::Hue;
+        assert_eq!(Priority::Info.hue(), None);
+        assert_eq!(Priority::Notice.hue(), Some(Hue::Blue));
+        assert_eq!(Priority::Alert.hue(), Some(Hue::Red));
     }
 
     #[test]
