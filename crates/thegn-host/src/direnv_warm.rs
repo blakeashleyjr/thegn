@@ -73,5 +73,9 @@ pub(crate) fn launch_spec_synced(
     branch: Option<&str>,
     choice: &str,
 ) -> anyhow::Result<LaunchSpec> {
-    launch_spec_with_key(cfg, worktree, branch, choice, None, true)
+    // This is the off-loop resolver for daemon-routed center-tab panes
+    // (materialize / prewarm / agent tabs), so mark the spec daemon-persistent
+    // when the daemon is active — a local bwrap pane then survives UI detach.
+    let daemon_persistent = crate::handlers::startup::daemon_active(cfg);
+    launch_spec_with_key(cfg, worktree, branch, choice, None, true, daemon_persistent)
 }

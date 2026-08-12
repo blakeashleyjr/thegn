@@ -6,6 +6,23 @@
 use thegn_core::db::Db;
 use thegn_core::store::WorkspaceStore;
 
+/// Whether center-tab panes route through the pane daemon (surviving UI detach)
+/// for this process. The single source of truth for that decision, shared by
+/// [`install_pane_services`] (which transport the registry uses) and the
+/// launch-spec builders (which drop the bwrap `--die-with-parent` guard on
+/// daemon-persistent panes) so the two can't drift.
+///
+/// Harness kill-switch: the first-frame benchmark and the e2e snapshot suite
+/// kill the compositor without a quit path — their panes would detach into
+/// never-reaped daemon sessions (one leaked daemon + shell per iteration/case),
+/// and the racy "persist" chip would flake the snapshots. Those harnesses opt
+/// out via env, forcing plain in-process panes.
+pub(crate) fn daemon_active(cfg: &thegn_core::config::Config) -> bool {
+    cfg.daemon.enabled
+        && std::env::var_os("THEGN_BENCH_FIRST_FRAME_EXIT").is_none()
+        && std::env::var_os("THEGN_NO_DAEMON").is_none()
+}
+
 /// Install the per-pane service configs on the registry — `[replay]`
 /// recording and the `[daemon]` control-plane route — in one call so the
 /// startup and live-config-reload paths in `run.rs` can't drift apart.
@@ -14,17 +31,8 @@ pub(crate) fn install_pane_services(
     cfg: &thegn_core::config::Config,
 ) {
     panes.set_replay_config(cfg.replay.clone());
-    // Harness kill-switch: the first-frame benchmark and the e2e snapshot
-    // suite kill the compositor without a quit path — their panes would
-    // detach into never-reaped daemon sessions (one leaked daemon + shell
-    // per iteration/case), and the racy "persist" chip would flake the
-    // snapshots. Those harnesses run in-process panes instead.
     let mut daemon = cfg.daemon.clone();
-    if std::env::var_os("THEGN_BENCH_FIRST_FRAME_EXIT").is_some()
-        || std::env::var_os("THEGN_NO_DAEMON").is_some()
-    {
-        daemon.enabled = false;
-    }
+    daemon.enabled = daemon_active(cfg);
     panes.set_daemon_config(daemon);
     set_aggregate_cpu_cap(cfg);
 }

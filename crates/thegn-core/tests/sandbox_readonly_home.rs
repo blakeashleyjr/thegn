@@ -51,6 +51,7 @@ fn mk_spec(
         vpn: None,
         oci_host: None,
         oci_runtime: None,
+        daemon_persistent: false,
     }
 }
 

@@ -2695,7 +2695,11 @@ pub fn launch_spec(
     branch: Option<&str>,
     choice: &str,
 ) -> anyhow::Result<LaunchSpec> {
-    launch_spec_with_key(cfg, worktree, branch, choice, None, false)
+    // `daemon_persistent = false`: the convenience path serves the tool drawer,
+    // one-shot CLI shells, and tests — in-process panes that keep the bwrap
+    // `--die-with-parent` guard. Daemon-routed center tabs go through
+    // `launch_spec_synced` / `terminal_launch_spec`, which pass `true`.
+    launch_spec_with_key(cfg, worktree, branch, choice, None, false, false)
 }
 
 /// Like [`launch_spec`] but injects a scoped API key for the sandbox.
@@ -2704,6 +2708,11 @@ pub fn launch_spec(
 /// background warm (the first launch of a cold worktree falls back), `true`
 /// warms synchronously + bounded before composing the spec (off-loop callers
 /// only — see [`crate::direnv_warm::launch_spec_synced`]).
+///
+/// `daemon_persistent` marks the resolved sandbox spec as pane-daemon-owned so
+/// a local bwrap pane drops `--die-with-parent` and survives UI detach instead
+/// of being reaped with its forking thread. Set `true` for daemon-routed center
+/// tabs, `false` for ephemeral in-process panes (drawer/CLI).
 pub fn launch_spec_with_key(
     cfg: &Config,
     worktree: &str,
@@ -2711,6 +2720,7 @@ pub fn launch_spec_with_key(
     choice: &str,
     scoped_key: Option<String>,
     sync_warm: bool,
+    daemon_persistent: bool,
 ) -> anyhow::Result<LaunchSpec> {
     let loc = GitLoc::for_worktree(Path::new(worktree));
 
@@ -2917,6 +2927,14 @@ pub fn launch_spec_with_key(
     // remote worktree's `.envrc` isn't on this host's filesystem).
     if !loc.is_remote() && !outcome.is_remote {
         crate::direnv_warm::warm_for_launch(cfg, Path::new(worktree), sync_warm);
+    }
+
+    // Mark the resolved sandbox as pane-daemon-owned when this pane is
+    // daemon-routed, so `enter_argv` drops the bwrap `--die-with-parent` guard
+    // (harmless no-op for non-bwrap backends). The daemon reaps its own
+    // sessions, so the guard would only reap a shell that is meant to persist.
+    if let Some(spec) = outcome.spec.as_mut() {
+        spec.daemon_persistent = daemon_persistent;
     }
 
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome);
