@@ -2268,15 +2268,19 @@ pub(crate) fn spawn_model_hydration(
             // landed. Resend a refreshed model only when the list is on screen; a
             // closed-section warm just leaves the DB cache fresh for the next open.
             // Generation tagging drops the resend if the user switched meanwhile.
-            if (show_commits || warm)
-                && refresh_commit_cache(&db, &session)
-                && show_commits
-                && tx
-                    .send((generation, build_model(&session, &db, hints)))
-                    .is_ok()
-                && let Some(w) = &waker
-            {
-                let _ = w.wake();
+            if show_commits || warm {
+                // Refresh the DB cache for both the on-screen and warm cases;
+                // only *resend* a model when the list is actually visible.
+                let refreshed = refresh_commit_cache(&db, &session);
+                if refreshed
+                    && show_commits
+                    && tx
+                        .send((generation, build_model(&session, &db, hints)))
+                        .is_ok()
+                    && let Some(w) = &waker
+                {
+                    let _ = w.wake();
+                }
             }
             Some(())
         }));

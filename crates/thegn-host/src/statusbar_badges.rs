@@ -210,8 +210,10 @@ mod tests {
     fn daemon_chip_is_always_shown_and_hues_by_state() {
         use crate::chrome::{DaemonChipState, S};
         let tone_for = |state: DaemonChipState| {
-            let mut model = FrameModel::default();
-            model.daemon_state = state;
+            let model = FrameModel {
+                daemon_state: state,
+                ..Default::default()
+            };
             let mut items = Vec::new();
             push_daemon_chip(&model, &mut items);
             // Never silent — the daemon chip is a persistent affordance.
@@ -237,8 +239,10 @@ mod tests {
     fn daemon_chip_renders_far_right() {
         // Force another right-cluster badge (Sync) so we can prove the daemon
         // chip sorts AFTER the rest of the cluster, at the far right.
-        let mut model = FrameModel::default();
-        model.sync_panes = true;
+        let model = FrameModel {
+            sync_panes: true,
+            ..Default::default()
+        };
         let items = crate::chrome::statusbar_items(&model);
         let last = items.last().expect("at least the daemon chip");
         assert!(
