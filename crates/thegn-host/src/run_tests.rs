@@ -94,6 +94,9 @@ fn t_node(
 /// A group `mod` with one test child; `cursor` selects within `nodes` order.
 fn tests_state(matcher_path: Option<&str>, cursor: usize) -> crate::panel::TestPanelState {
     use crate::panel::{TestNodeKind, TestState};
+    // `TestPanelState` has private fields, so a struct literal isn't possible
+    // here — build via default + field assignment.
+    #[allow(clippy::field_reassign_with_default)]
     let mut st = crate::panel::TestPanelState::default();
     st.nodes = vec![
         t_node(

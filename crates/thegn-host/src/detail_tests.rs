@@ -908,8 +908,10 @@ fn sections_popup_renders_legibly() {
 #[test]
 fn daemon_chip_opens_expanded_status_modal() {
     use crate::chrome::{DaemonChipState, DaemonStatus};
-    let mut model = FrameModel::default();
-    model.daemon_state = DaemonChipState::Persist;
+    let model = FrameModel {
+        daemon_state: DaemonChipState::Persist,
+        ..Default::default()
+    };
     // A present daemon so the identity section renders pid/version/uptime.
     let daemon = DaemonStatus {
         present: true,

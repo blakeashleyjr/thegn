@@ -14629,21 +14629,20 @@ async fn event_loop<T: Terminal>(
                                                 },
                                             );
                                         }
-                                        Section::Notifications => {
-                                            // Enter widens the panel to half so
-                                            // the full notification is readable —
-                                            // the resting width truncates it. It
-                                            // deliberately does NOT mark the
-                                            // notification read (that's `r`) or
-                                            // navigate away: reading shouldn't
-                                            // dismiss it.
+                                        // Enter widens the panel to half so the
+                                        // full notification is readable — the
+                                        // resting width truncates it. It
+                                        // deliberately does NOT mark the
+                                        // notification read (that's `r`) or
+                                        // navigate away: reading shouldn't
+                                        // dismiss it.
+                                        Section::Notifications
                                             if !model.panel.notifications.is_empty()
                                                 && panel_ui.width
-                                                    == crate::layout::PanelWidth::Normal
-                                            {
-                                                panel_ui.width = crate::layout::PanelWidth::Half;
-                                                need_relayout = true;
-                                            }
+                                                    == crate::layout::PanelWidth::Normal =>
+                                        {
+                                            panel_ui.width = crate::layout::PanelWidth::Half;
+                                            need_relayout = true;
                                         }
                                         Section::Jobs => {
                                             // Enter on a task row runs the selected task.
