@@ -282,6 +282,8 @@ pub struct GlyphSet {
     pub arrow_down: &'static str,     // ↓ behind
     pub diamond_filled: &'static str, // ◆ generic emphasis marker
     pub diamond_hollow: &'static str, // ◇ pending step
+    pub role_server: &'static str,    // ▲ daemon serving remote thin clients
+    pub role_client: &'static str,    // ▽ attached to a remote daemon
     pub brand_sigil: &'static str,    // þ masthead brand mark (OE thorn, "þegn")
     pub check: &'static str,          // ✓ pass
     pub cross: &'static str,          // ✗ fail
@@ -339,6 +341,8 @@ pub const UNICODE: GlyphSet = GlyphSet {
     arrow_down: "\u{2193}",                                  // ↓
     diamond_filled: "\u{25c6}",                              // ◆
     diamond_hollow: "\u{25c7}",                              // ◇
+    role_server: "\u{25b2}",                                 // ▲
+    role_client: "\u{25bd}",                                 // ▽
     brand_sigil: "\u{00fe}",  // þ — Latin-1, width 1, safe at Full AND Basic
     check: "\u{2713}",        // ✓
     cross: "\u{2717}",        // ✗
@@ -389,6 +393,8 @@ pub const ASCII: GlyphSet = GlyphSet {
     arrow_down: "v",
     diamond_filled: "*",
     diamond_hollow: "o",
+    role_server: "^",
+    role_client: "v",
     brand_sigil: "*",
     check: "+",
     cross: "x",
@@ -824,6 +830,8 @@ mod tests {
             g.arrow_down,
             g.diamond_filled,
             g.diamond_hollow,
+            g.role_server,
+            g.role_client,
             g.brand_sigil,
             g.check,
             g.cross,
@@ -888,6 +896,8 @@ mod tests {
             g.arrow_down,
             g.diamond_filled,
             g.diamond_hollow,
+            g.role_server,
+            g.role_client,
             g.check,
             g.cross,
             g.ellipsis,

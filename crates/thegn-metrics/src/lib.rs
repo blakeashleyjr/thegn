@@ -73,6 +73,17 @@ pub struct StatsSnapshot {
     pub load_avg: Option<(f32, f32, f32)>,
     /// System uptime in seconds.
     pub uptime_secs: Option<u64>,
+    /// Resident-set size of the thegn (compositor) process itself, in bytes.
+    /// Feeds the daemon/status modal's "this process" history graph.
+    pub self_rss_bytes: Option<u64>,
+    /// CPU utilization of the thegn process (delta over the interval). May
+    /// exceed 100 on a multi-threaded burst — it is a per-core sum, not clamped.
+    pub self_cpu_pct: Option<f32>,
+    /// Resident-set size of the pane-daemon process, in bytes. Absent until the
+    /// daemon PID is known (see [`StatsSampler::set_daemon_pid`]).
+    pub daemon_rss_bytes: Option<u64>,
+    /// CPU utilization of the pane-daemon process (delta over the interval).
+    pub daemon_cpu_pct: Option<f32>,
 }
 
 /// A mounted disk's snapshot. `read_bps`/`write_bps` are bytes/sec over the
@@ -213,5 +224,26 @@ mod tests {
         for (label, c) in &snap.temps {
             assert!(c.is_finite(), "temp {label} = {c}");
         }
+        // The sampler always watches its own PID, so the second reading has a
+        // valid RSS and a primed (finite, non-negative) CPU delta.
+        assert!(snap.self_rss_bytes.unwrap_or(0) > 0, "self rss");
+        if let Some(c) = snap.self_cpu_pct {
+            assert!(c.is_finite() && c >= 0.0, "self cpu {c}");
+        }
+    }
+
+    #[test]
+    fn daemon_pid_reprimes_without_panicking() {
+        let mut s = StatsSampler::new(std::env::temp_dir());
+        // Point at our own PID as a stand-in daemon: it exists, so the field
+        // populates; toggling it re-primes the CPU delta cleanly.
+        s.set_daemon_pid(Some(std::process::id()));
+        let _ = s.sample();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        let snap = s.sample();
+        assert!(snap.daemon_rss_bytes.unwrap_or(0) > 0, "daemon rss");
+        s.set_daemon_pid(None);
+        let snap = s.sample();
+        assert!(snap.daemon_rss_bytes.is_none(), "cleared daemon pid");
     }
 }

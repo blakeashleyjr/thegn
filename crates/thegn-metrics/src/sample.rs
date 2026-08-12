@@ -7,7 +7,8 @@
 use std::time::Instant;
 
 use sysinfo::{
-    Components, CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System,
+    Components, CpuRefreshKind, Disks, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind,
+    ProcessesToUpdate, RefreshKind, System,
 };
 
 use crate::gpu::GpuProbe;
@@ -51,6 +52,13 @@ pub struct StatsSampler {
     tick: u64,
     /// CPU usage needs a delta; the first sample only primes it.
     cpu_primed: bool,
+    /// This process's PID — always watched for the daemon/status modal.
+    self_pid: Pid,
+    /// The pane-daemon's PID once the host resolves it (`None` = unknown).
+    daemon_pid: Option<Pid>,
+    /// Per-process CPU usage also needs a delta; primed on the first refresh of
+    /// the watched set (reset when the daemon PID changes).
+    proc_primed: bool,
     /// When the network counters were last read (for bytes/sec).
     prev_net: Instant,
     /// When disk IO counters were last read (for bytes/sec).
@@ -80,10 +88,24 @@ impl StatsSampler {
             disk_path,
             tick: 0,
             cpu_primed: false,
+            self_pid: Pid::from_u32(std::process::id()),
+            daemon_pid: None,
+            proc_primed: false,
             prev_net: now,
             prev_disk: now,
             last_disks: Vec::new(),
             last_temps: Vec::new(),
+        }
+    }
+
+    /// Point the per-process sampler at the pane-daemon PID (`None` = unknown /
+    /// no daemon). Changing it re-primes the CPU delta so the next reading is
+    /// clean. Cheap; the host calls it from the ticker when the daemon connects.
+    pub fn set_daemon_pid(&mut self, pid: Option<u32>) {
+        let next = pid.map(Pid::from_u32);
+        if next != self.daemon_pid {
+            self.daemon_pid = next;
+            self.proc_primed = false;
         }
     }
 
@@ -216,6 +238,37 @@ impl StatsSampler {
             snap.load_avg = Some((la.one as f32, la.five as f32, la.fifteen as f32));
         }
         snap.uptime_secs = Some(System::uptime());
+
+        // --- Per-process footprint (thegn + the pane daemon) ---
+        // Only the specific PIDs are refreshed — sysinfo's cheap targeted path,
+        // not a full process enumeration. CPU is a delta, so the first refresh
+        // of the set only primes it (mirrors `cpu_primed`).
+        {
+            let mut pids = vec![self.self_pid];
+            if let Some(d) = self.daemon_pid {
+                pids.push(d);
+            }
+            self.sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&pids),
+                false, // keep entries whose delta we still want next tick
+                ProcessRefreshKind::nothing().with_cpu().with_memory(),
+            );
+            if let Some(p) = self.sys.process(self.self_pid) {
+                snap.self_rss_bytes = Some(p.memory());
+                if self.proc_primed {
+                    snap.self_cpu_pct = Some(p.cpu_usage());
+                }
+            }
+            if let Some(d) = self.daemon_pid
+                && let Some(p) = self.sys.process(d)
+            {
+                snap.daemon_rss_bytes = Some(p.memory());
+                if self.proc_primed {
+                    snap.daemon_cpu_pct = Some(p.cpu_usage());
+                }
+            }
+            self.proc_primed = true;
+        }
 
         self.tick = self.tick.wrapping_add(1);
         snap

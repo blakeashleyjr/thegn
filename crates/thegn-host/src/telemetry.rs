@@ -64,6 +64,12 @@ pub struct TelemetryHistory {
     /// Battery charge 0..=1. Fixed scale so a slow drain reads as a gentle
     /// downward slope rather than a rescaled sawtooth.
     battery: VecDeque<f32>,
+    /// thegn's own resident-set size, raw bytes (for the daemon/status modal).
+    self_rss: VecDeque<f32>,
+    /// thegn's own CPU utilization, raw percent (per-core sum, may exceed 100).
+    self_cpu: VecDeque<f32>,
+    /// The pane-daemon's resident-set size, raw bytes.
+    daemon_rss: VecDeque<f32>,
 }
 
 impl TelemetryHistory {
@@ -103,6 +109,12 @@ impl TelemetryHistory {
         push_cap(
             &mut self.battery,
             snap.battery.map(|(p, _)| p as f32 / 100.0).unwrap_or(0.0),
+        );
+        push_cap(&mut self.self_rss, snap.self_rss_bytes.unwrap_or(0) as f32);
+        push_cap(&mut self.self_cpu, snap.self_cpu_pct.unwrap_or(0.0));
+        push_cap(
+            &mut self.daemon_rss,
+            snap.daemon_rss_bytes.unwrap_or(0) as f32,
         );
     }
 
@@ -170,6 +182,30 @@ impl TelemetryHistory {
     /// Battery charge series (0..=1, fixed scale), right-aligned to `n`.
     pub fn battery_series(&self, n: usize) -> Vec<f32> {
         series(&self.battery, n)
+    }
+
+    /// thegn's RSS series normalized by the window's rolling max, right-aligned.
+    pub fn self_rss_series(&self, n: usize) -> Vec<f32> {
+        norm(series(&self.self_rss, n))
+    }
+
+    /// thegn's CPU series normalized by the window's rolling max, right-aligned.
+    pub fn self_cpu_series(&self, n: usize) -> Vec<f32> {
+        norm(series(&self.self_cpu, n))
+    }
+
+    /// The pane-daemon's RSS series normalized by the window's rolling max.
+    pub fn daemon_rss_series(&self, n: usize) -> Vec<f32> {
+        norm(series(&self.daemon_rss, n))
+    }
+
+    /// Latest raw (thegn RSS bytes, thegn CPU %, daemon RSS bytes) for headlines.
+    pub fn last_proc(&self) -> (u64, f32, u64) {
+        (
+            self.self_rss.back().copied().unwrap_or(0.0) as u64,
+            self.self_cpu.back().copied().unwrap_or(0.0),
+            self.daemon_rss.back().copied().unwrap_or(0.0) as u64,
+        )
     }
 }
 

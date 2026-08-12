@@ -24,6 +24,50 @@ use thegn_core::log_view::{LogLevel, LogLine};
 use thegn_core::theme::Hue;
 use thegn_core::viz;
 
+/// Everything the daemon/status modal needs beyond the [`FrameModel`]: the
+/// rolling resource history, the loop self-profiler, the cached daemon record,
+/// and the two clocks (now, for daemon uptime; and this process's uptime).
+/// Bundled so [`open_detail_for`] takes one extra parameter, not four.
+pub struct StatusCtx<'a> {
+    pub hist: &'a TelemetryHistory,
+    pub loop_perf: &'a crate::telemetry::LoopPerfHistory,
+    pub daemon: &'a crate::chrome::DaemonStatus,
+    /// Unix milliseconds now — daemon uptime is `now_ms - daemon.started_at_ms`.
+    pub now_ms: i64,
+    /// This (compositor) process's uptime in whole seconds.
+    pub uptime_secs: u64,
+}
+
+impl<'a> StatusCtx<'a> {
+    /// Borrow the loop's cached docs into a status context. `uptime_secs` is the
+    /// compositor's own uptime (`start.elapsed().as_secs()`).
+    pub fn new(docs: &'a crate::panel::docs::PanelDocs, uptime_secs: u64) -> Self {
+        StatusCtx {
+            hist: &docs.telemetry,
+            loop_perf: &docs.loop_perf,
+            daemon: &docs.daemon,
+            // now() is seconds; widen to ms to match `started_at_ms`.
+            now_ms: thegn_core::util::now() * 1000,
+            uptime_secs,
+        }
+    }
+
+    /// Test-only context: real history, default (absent) loop-perf + daemon.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(hist: &'a TelemetryHistory) -> Self {
+        use std::sync::OnceLock;
+        static LP: OnceLock<crate::telemetry::LoopPerfHistory> = OnceLock::new();
+        static DM: OnceLock<crate::chrome::DaemonStatus> = OnceLock::new();
+        StatusCtx {
+            hist,
+            loop_perf: LP.get_or_init(Default::default),
+            daemon: DM.get_or_init(Default::default),
+            now_ms: 0,
+            uptime_secs: 0,
+        }
+    }
+}
+
 /// A time-series graph (one or two normalized 0..=1 series). `series2`, when
 /// present, splits the plot area in half (e.g. net rx over tx).
 pub struct GraphDetail {
@@ -1426,12 +1470,12 @@ pub fn open_detail_for(
     anchor: Rect,
     screen: Rect,
     model: &FrameModel,
-    hist: &TelemetryHistory,
+    ctx: &StatusCtx,
 ) -> Option<DetailOverlay> {
     let near = Placement::near(anchor, screen);
     match id {
-        BarItemId::Widget(w) => widget_detail(w, near, model, hist),
-        BarItemId::Badge(b) => badge_detail(*b, near, model),
+        BarItemId::Widget(w) => widget_detail(w, near, model, ctx.hist),
+        BarItemId::Badge(b) => badge_detail(*b, near, model, ctx),
     }
 }
 
@@ -1990,7 +2034,12 @@ fn widget_detail(
     }
 }
 
-fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<DetailOverlay> {
+fn badge_detail(
+    b: BarBadge,
+    near: Placement,
+    model: &FrameModel,
+    ctx: &StatusCtx,
+) -> Option<DetailOverlay> {
     match b {
         // Both the inbox chip (⚑ / N unread) and the needs-you chip (✋) open the
         // single unified surface: Needs you · Alerts · Notifications · Logs.
@@ -2294,17 +2343,166 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
             44,
             near,
         )),
-        BarBadge::Persist => Some(keyval(
-            "Persistent pane",
-            vec![(
-                "state".into(),
-                "daemon-backed: quit keeps it running; relaunch reattaches".into(),
-                Tok::Hue(Hue::Teal),
-            )],
-            52,
-            near,
-        )),
+        BarBadge::Persist => Some(status_detail(model, ctx, near)),
     }
+}
+
+/// Human-readable byte size (RSS): "180.0M", "1.4G", "42B".
+fn human_bytes(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{b}B")
+    } else {
+        format!("{v:.1}{}", UNITS[i])
+    }
+}
+
+/// Coarse duration, largest two units: "2d 3h", "4h 12m", "5m 9s", "8s".
+fn fmt_uptime(secs: u64) -> String {
+    let (d, h, m, s) = (
+        secs / 86400,
+        (secs % 86400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// One-word summary of the chip state for the modal's role line.
+fn role_word(state: crate::chrome::DaemonChipState) -> &'static str {
+    use crate::chrome::DaemonChipState::*;
+    match state {
+        NonPersist => "non-persistent (inline pane)",
+        Persist => "persistent (daemon-backed)",
+        Server => "server (serving remote clients)",
+        Client => "client (remote daemon)",
+    }
+}
+
+/// The expanded daemon/program status modal opened by the far-right chip: a
+/// stacked-sections popup (daemon identity + uptime + sessions, this process's
+/// resource history, and the event-loop rollup). Anchored upward from the bar
+/// like the other bottom-bar detail popups.
+fn status_detail(model: &FrameModel, ctx: &StatusCtx, near: Placement) -> DetailOverlay {
+    let d = ctx.daemon;
+    let mut secs: Vec<Section> = Vec::new();
+
+    // --- Daemon identity / uptime / sessions -------------------------------
+    let mut kv: Vec<(String, String, Tok)> = vec![(
+        "role".into(),
+        role_word(model.daemon_state).into(),
+        Tok::Slot(S::Text),
+    )];
+    if d.present {
+        kv.push((
+            "pid".into(),
+            d.pid.map_or("—".into(), |p| p.to_string()),
+            Tok::Slot(S::Dim),
+        ));
+        if !d.version.is_empty() {
+            kv.push(("version".into(), d.version.clone(), Tok::Slot(S::Dim)));
+        }
+        if !d.hostname.is_empty() {
+            kv.push(("host".into(), d.hostname.clone(), Tok::Slot(S::Dim)));
+        }
+        let uptime = (ctx.now_ms - d.started_at_ms).max(0) as u64 / 1000;
+        kv.push(("uptime".into(), fmt_uptime(uptime), Tok::Slot(S::Text)));
+        kv.push((
+            "sessions".into(),
+            format!("{} ({} attached)", d.sessions, d.attached),
+            Tok::Slot(S::Dim),
+        ));
+        if !d.tcp_addr.is_empty() {
+            kv.push(("serving".into(), d.tcp_addr.clone(), Tok::Hue(Hue::Blue)));
+        }
+        if !d.endpoint.is_empty() {
+            kv.push((
+                "endpoint".into(),
+                trunc(d.endpoint.clone(), 30),
+                Tok::Slot(S::Ghost),
+            ));
+        }
+    } else {
+        kv.push((
+            "daemon".into(),
+            "none (inline panes only)".into(),
+            Tok::Slot(S::Ghost),
+        ));
+    }
+    secs.push(Section::KeyVal(kv));
+
+    // --- This process's footprint + history --------------------------------
+    let (self_rss, self_cpu, daemon_rss) = ctx.hist.last_proc();
+    let n = plot_cols(44);
+    secs.push(Section::Heading {
+        label: "thegn process".into(),
+        note: Some(format!("up {}", fmt_uptime(ctx.uptime_secs))),
+    });
+    secs.push(Section::Graph(GraphSection {
+        label: "RSS".into(),
+        cur: human_bytes(self_rss),
+        footer: Some(format!("pid {}", std::process::id())),
+        series: ctx.hist.self_rss_series(n),
+        tone: Tok::Hue(Hue::Purple),
+        height: 4,
+        series2: None,
+    }));
+    secs.push(Section::Sparkrow {
+        label: "cpu".into(),
+        spark: ctx.hist.self_cpu_series(24),
+        cur: format!("{self_cpu:.0}%"),
+        tone: Tok::Hue(Hue::Teal),
+    });
+    if d.present && d.pid.is_some() {
+        secs.push(Section::Sparkrow {
+            label: "daemon rss".into(),
+            spark: ctx.hist.daemon_rss_series(24),
+            cur: human_bytes(daemon_rss),
+            tone: Tok::Hue(Hue::Blue),
+        });
+    }
+
+    // --- Event-loop rollup (the same data thegn::perf logs) ----------------
+    if ctx.loop_perf.has_data() {
+        let p = ctx.loop_perf.last();
+        secs.push(Section::Heading {
+            label: "loop".into(),
+            note: None,
+        });
+        secs.push(Section::KeyVal(vec![
+            (
+                "wakes/s".into(),
+                format!("{:.0}", p.wakes_per_s),
+                Tok::Slot(S::Text),
+            ),
+            (
+                "render".into(),
+                format!("p50 {}µs · p99 {}µs", p.render_p50_us, p.render_p99_us),
+                Tok::Slot(S::Dim),
+            ),
+            (
+                "idle".into(),
+                format!("{:.1}%", p.idle_ratio * 100.0),
+                Tok::Slot(S::Dim),
+            ),
+        ]));
+    }
+
+    sections("thegn status", 44, secs, near)
 }
 
 /// The one unified notification surface, opened by both statusbar chips (the

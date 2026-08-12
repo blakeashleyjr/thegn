@@ -828,6 +828,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<thegn_metrics::StatsSnapshot>();
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<Vec<thegn_core::sandbox::ContainerInfo>>();
+    let (daemon_status_tx, daemon_status_rx) =
+        tokio_mpsc::unbounded_channel::<crate::chrome::DaemonStatus>();
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
     let (ai_metrics_tx, ai_metrics_rx) =
         tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
@@ -853,6 +855,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         refresh_tx.clone(),
         stats_tx,
         container_tx,
+        daemon_status_tx,
         stats_interval_ms.clone(),
         stats_live.clone(),
         disk_fs_path,
@@ -922,6 +925,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         drive_rx,
         stats_rx,
         container_rx,
+        daemon_status_rx,
         metrics_rx,
         ai_metrics_rx,
         sandbox_event_rx,
@@ -5791,6 +5795,7 @@ async fn event_loop<T: Terminal>(
     mut drive_rx: crate::handlers::merge_queue::DriveRx,
     mut stats_rx: tokio_mpsc::UnboundedReceiver<thegn_metrics::StatsSnapshot>,
     mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<thegn_core::sandbox::ContainerInfo>>,
+    mut daemon_status_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::DaemonStatus>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
     mut ai_metrics_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::AiMetrics>,
     mut sandbox_event_rx: tokio_mpsc::UnboundedReceiver<crate::sandbox_events::SandboxEventBatch>,
@@ -8853,6 +8858,17 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Cached daemon/status from the ticker (far-right chip + its modal). A
+        // changed record re-renders the bars so the chip glyph tracks the daemon
+        // role/sessions; the per-frame model block recomputes `daemon_state`.
+        while let Ok(status) = daemon_status_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Stats);
+            if panel_ui.docs.daemon != status {
+                panel_ui.docs.daemon = status;
+                bars_dirty = true;
+            }
+        }
+
         // Container list from the 5s ticker — replaces the old inline call
         // inside model hydration so `podman ps` never blocks the hydrate path.
         while let Ok(containers) = container_rx.try_recv() {
@@ -10137,6 +10153,12 @@ async fn event_loop<T: Terminal>(
                 .table
                 .get(&focused)
                 .is_some_and(|p| p.is_daemon_backed());
+            // The always-on far-right daemon/status chip: resolve its glyph state
+            // from the cached daemon record + this pane's persistence.
+            model.daemon_state = crate::handlers::status::daemon_chip_state(
+                &panel_ui.docs.daemon,
+                model.persistent_pane,
+            );
             let tree = crate::handlers::pane_zoom::grown_tree(
                 zoom,
                 maximized,
@@ -11248,7 +11270,10 @@ async fn event_loop<T: Terminal>(
                                     rect,
                                     screen,
                                     &model,
-                                    &panel_ui.docs.telemetry,
+                                    &crate::detail::StatusCtx::new(
+                                        &panel_ui.docs,
+                                        start.elapsed().as_secs(),
+                                    ),
                                 );
                             }
                         } else if mx >= chrome.masthead.cols / 2 {
@@ -11292,7 +11317,10 @@ async fn event_loop<T: Terminal>(
                                     rect,
                                     Rect::full(cols, rows),
                                     &model,
-                                    &panel_ui.docs.telemetry,
+                                    &crate::detail::StatusCtx::new(
+                                        &panel_ui.docs,
+                                        start.elapsed().as_secs(),
+                                    ),
                                 );
                             }
                         }
@@ -13939,7 +13967,10 @@ async fn event_loop<T: Terminal>(
                                     rect,
                                     Rect::full(cols, rows),
                                     &model,
-                                    &panel_ui.docs.telemetry,
+                                    &crate::detail::StatusCtx::new(
+                                        &panel_ui.docs,
+                                        start.elapsed().as_secs(),
+                                    ),
                                 );
                             }
                         }
@@ -16434,7 +16465,10 @@ async fn event_loop<T: Terminal>(
                                         rect,
                                         screen,
                                         &model,
-                                        &panel_ui.docs.telemetry,
+                                        &crate::detail::StatusCtx::new(
+                                            &panel_ui.docs,
+                                            start.elapsed().as_secs(),
+                                        ),
                                     );
                                 }
                             }

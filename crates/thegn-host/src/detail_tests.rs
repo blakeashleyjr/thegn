@@ -37,7 +37,7 @@ fn cpu_maps_to_a_graph_near_the_item() {
         item_at(0),
         screen(),
         &model,
-        &hist,
+        &StatusCtx::new_for_test(&hist),
     )
     .expect("cpu has a detail view");
     assert!(matches!(ov.content, DetailContent::Graph(_)));
@@ -56,7 +56,7 @@ fn box_rect_encloses_the_drawn_box() {
         item,
         screen(),
         &model,
-        &hist,
+        &StatusCtx::new_for_test(&hist),
     )
     .expect("cpu has a detail view");
     let b = ov.box_rect(screen()).expect("box fits");
@@ -82,7 +82,7 @@ fn absent_data_yields_no_modal() {
                 item_at(0),
                 screen(),
                 &model,
-                &hist
+                &StatusCtx::new_for_test(&hist)
             )
             .is_none(),
             "{id} with no data should not open a modal"
@@ -100,7 +100,7 @@ fn notifications_badge_is_the_unified_surface_with_a_logs_entry() {
         item_at(39),
         screen(),
         &model,
-        &TelemetryHistory::default(),
+        &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
     .expect("notifications always opens");
     assert_eq!(ov.title(), "Notifications");
@@ -133,7 +133,7 @@ fn disk_badge_shows_free_used_total_and_worktree_rows() {
         item_at(39),
         screen(),
         &model,
-        &TelemetryHistory::default(),
+        &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
     .expect("disk badge opens a modal");
     assert_eq!(ov.title, "Disk space");
@@ -162,7 +162,7 @@ fn statusbar_item_opens_above_itself() {
         item_at(39),
         screen(),
         &model,
-        &TelemetryHistory::default(),
+        &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
     .unwrap();
     assert!(matches!(ov.placement, Placement::NearAbove(_)));
@@ -248,7 +248,7 @@ fn ci_badge_detail_is_actionable_with_a_hint() {
         item_at(39),
         screen(),
         &model,
-        &TelemetryHistory::default(),
+        &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
     .expect("ci badge opens a detail overlay");
     assert!(ov.actionable());
@@ -304,7 +304,7 @@ fn renders_without_panic_and_is_legible() {
         item_at(0),
         screen(),
         &model,
-        &hist,
+        &StatusCtx::new_for_test(&hist),
     )
     .unwrap();
     let mut s = Surface::new(120, 40);
@@ -338,7 +338,7 @@ fn loc_opens_a_scrollable_tokei_table() {
         item_at(39),
         screen(),
         &model,
-        &TelemetryHistory::default(),
+        &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
     .expect("loc opens a detail overlay");
     // A table (not a keyval), with the Total footer and the full header set.
@@ -373,7 +373,7 @@ fn loc_table_renders_legibly() {
         item_at(39),
         screen(),
         &model,
-        &TelemetryHistory::default(),
+        &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
     .unwrap();
     let mut s = Surface::new(120, 40);
@@ -434,7 +434,7 @@ fn open_notifications(model: &FrameModel) -> DetailOverlay {
         item_at(39),
         screen(),
         model,
-        &TelemetryHistory::default(),
+        &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
     .expect("notifications always opens")
 }
@@ -803,7 +803,7 @@ fn rich_widgets_map_to_sections() {
             item_at(0),
             screen(),
             &model,
-            &hist,
+            &StatusCtx::new_for_test(&hist),
         )
         .unwrap_or_else(|| panic!("{w} should open a detail"));
         assert!(
@@ -891,7 +891,7 @@ fn sections_popup_renders_legibly() {
             item_at(0),
             screen(),
             &model,
-            &hist,
+            &StatusCtx::new_for_test(&hist),
         )
         .unwrap();
         let mut s = Surface::new(120, 40);
@@ -901,6 +901,48 @@ fn sections_popup_renders_legibly() {
             "{w} popup has an unreadable cell"
         );
     }
+}
+
+#[test]
+fn daemon_chip_opens_expanded_status_modal() {
+    use crate::chrome::{DaemonChipState, DaemonStatus};
+    let mut model = FrameModel::default();
+    model.daemon_state = DaemonChipState::Persist;
+    // A present daemon so the identity section renders pid/version/uptime.
+    let daemon = DaemonStatus {
+        present: true,
+        pid: Some(4242),
+        version: "9.9.9".into(),
+        hostname: "box".into(),
+        started_at_ms: 0,
+        sessions: 2,
+        attached: 1,
+        ..Default::default()
+    };
+    let hist = TelemetryHistory::default();
+    let ctx = StatusCtx {
+        hist: &hist,
+        loop_perf: &crate::telemetry::LoopPerfHistory::default(),
+        daemon: &daemon,
+        now_ms: 60_000, // 60s of daemon uptime
+        uptime_secs: 125,
+    };
+    let ov = open_detail_for(
+        &BarItemId::Badge(BarBadge::Persist),
+        item_at(39), // bottom half → floats upward
+        screen(),
+        &model,
+        &ctx,
+    )
+    .expect("daemon chip has a detail view");
+    assert_eq!(ov.title(), "thegn status");
+    assert!(matches!(ov.content, DetailContent::Sections(_)));
+    // Anchored upward from a bottom-bar item.
+    assert!(matches!(ov.placement, Placement::NearAbove(_)));
+    // It renders without a contrast violation (readable on the theme).
+    let mut s = Surface::new(120, 40);
+    ov.render(&mut s, screen());
+    assert!(seg::text_contrast_violations(&mut s, 3.0).is_empty());
 }
 
 #[test]
