@@ -231,7 +231,7 @@ mod tests {
     use super::*;
     use crate::chrome::{BarBadge, BarItemId, FrameModel};
     use crate::compositor::Rect;
-    use crate::detail::{DetailAction, DetailContent, DetailOutcome, open_detail_for};
+    use crate::detail::{DetailAction, DetailContent, DetailOutcome, StatusCtx, open_detail_for};
     use crate::telemetry::TelemetryHistory;
     use termwiz::input::{KeyCode, Modifiers};
 
@@ -279,7 +279,7 @@ mod tests {
             item_at(39),
             screen(),
             &model,
-            &TelemetryHistory::default(),
+            &StatusCtx::new_for_test(&TelemetryHistory::default()),
         )
         .expect("ci badge opens");
         // The row text carries name + outcome + title; the note carries the
@@ -377,7 +377,7 @@ mod tests {
             item_at(39),
             screen(),
             &model,
-            &TelemetryHistory::default(),
+            &StatusCtx::new_for_test(&TelemetryHistory::default()),
         )
         .expect("ci badge opens");
         ov.enter_ci_view(&running);
