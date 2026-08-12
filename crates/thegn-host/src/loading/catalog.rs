@@ -196,31 +196,70 @@ pub(crate) fn plan_for(t: &ResolvedTarget) -> LoadPlan {
 
 /// The "this is taking a while, and that's (probably) fine" hint for an
 /// active step of `kind` that has been running for `elapsed`. `None` below
-/// the step-kind's threshold or for kinds with nothing useful to say. The
-/// splash renders this as the active step's sub-line when the producer gave
-/// no more specific `detail`.
+/// the step-kind's first threshold or for kinds with nothing useful to say.
+/// The splash renders this as the active step's sub-line when the producer
+/// gave no more specific `detail`.
+///
+/// Each kind maps to an ASCENDING list of `(threshold_secs, hint)` tiers: the
+/// highest tier whose threshold is met wins, so a stalled step ESCALATES its
+/// message the longer it hangs — a reassuring "this is expected" early, then a
+/// "this looks wedged; press Esc to cancel" once it crosses into
+/// unusual-latency territory (which is what the frozen 5-minute `sandbox`
+/// spinner needed). Sampled at draw time from the step's `started_at`; no state.
 pub(crate) fn slow_hint(kind: StepKind, elapsed: Duration) -> Option<&'static str> {
-    let (threshold_secs, hint) = match kind {
-        StepKind::Image => (
-            15,
-            "network-bound — a cold image pull can take a couple of minutes",
-        ),
-        StepKind::Build => (30, "first Dockerfile build can take several minutes"),
-        StepKind::Create => (10, "container runtime is slow to answer — it may be wedged"),
-        StepKind::Connect => (
-            10,
-            "host is slow to answer — transient failures are retried",
-        ),
-        StepKind::Vpn => (15, "waiting for the VPN sidecar to come up"),
-        StepKind::Env => (
-            20,
-            "building the dev environment — a cold cache can take minutes",
-        ),
-        StepKind::Provision => (30, "cold sandbox boot can take a couple of minutes"),
-        StepKind::Shell => (5, "waiting for the login shell — rc files may be slow"),
-        StepKind::Resolve | StepKind::Mount | StepKind::Other => return None,
+    let tiers: &[(u64, &'static str)] = match kind {
+        StepKind::Resolve => &[
+            (
+                8,
+                "resolving the sandbox backend — probing container runtimes",
+            ),
+            (45, "runtime slow to answer — press Esc to run on host"),
+        ],
+        StepKind::Image => &[
+            (
+                15,
+                "network-bound — a cold image pull can take a couple of minutes",
+            ),
+            (150, "pull unusually slow — press Esc to run on host"),
+        ],
+        StepKind::Build => &[
+            (30, "first Dockerfile build can take several minutes"),
+            (300, "build unusually slow — press Esc to run on host"),
+        ],
+        StepKind::Create => &[
+            (10, "container runtime is slow to answer — it may be wedged"),
+            (45, "runtime looks wedged — press Esc to run on host"),
+        ],
+        StepKind::Connect => &[
+            (
+                10,
+                "host is slow to answer — transient failures are retried",
+            ),
+            (60, "host not answering — press Esc to run on host"),
+        ],
+        StepKind::Vpn => &[(15, "waiting for the VPN sidecar to come up")],
+        StepKind::Env => &[
+            (
+                20,
+                "building the dev environment — a cold cache can take minutes",
+            ),
+            (240, "env build unusually slow — press Esc to run on host"),
+        ],
+        StepKind::Provision => &[
+            (30, "cold sandbox boot can take a couple of minutes"),
+            (300, "sandbox boot slow — press Esc to run on host"),
+        ],
+        StepKind::Shell => &[
+            (5, "waiting for the login shell — rc files may be slow"),
+            (30, "shell not answering — press Esc to run on host"),
+        ],
+        StepKind::Mount | StepKind::Other => return None,
     };
-    (elapsed >= Duration::from_secs(threshold_secs)).then_some(hint)
+    tiers
+        .iter()
+        .rev()
+        .find(|(threshold_secs, _)| elapsed >= Duration::from_secs(*threshold_secs))
+        .map(|(_, hint)| *hint)
 }
 
 #[cfg(test)]
@@ -414,9 +453,36 @@ mod tests {
         assert!(slow_hint(StepKind::Vpn, D::from_secs(15)).is_some());
         assert!(slow_hint(StepKind::Env, D::from_secs(20)).is_some());
         assert!(slow_hint(StepKind::Provision, D::from_secs(30)).is_some());
+        // The Resolve step (the frozen "sandbox" spinner) now explains itself.
+        assert_eq!(slow_hint(StepKind::Resolve, D::from_secs(7)), None);
+        assert!(slow_hint(StepKind::Resolve, D::from_secs(8)).is_some());
         // Kinds with nothing useful to say stay quiet forever.
-        assert_eq!(slow_hint(StepKind::Resolve, D::from_secs(600)), None);
         assert_eq!(slow_hint(StepKind::Other, D::from_secs(600)), None);
         assert_eq!(slow_hint(StepKind::Mount, D::from_secs(600)), None);
+    }
+
+    #[test]
+    fn slow_hint_escalates_and_offers_an_escape() {
+        use std::time::Duration as D;
+        // Early tier: reassuring. Late tier: names a likely wedge + the Esc
+        // affordance. The highest crossed threshold wins.
+        let early = slow_hint(StepKind::Resolve, D::from_secs(10)).unwrap();
+        let late = slow_hint(StepKind::Resolve, D::from_secs(60)).unwrap();
+        assert_ne!(early, late, "the message escalates past the second tier");
+        assert!(!early.contains("Esc"), "early hint is reassuring: {early}");
+        assert!(late.contains("Esc"), "late hint offers a way out: {late}");
+        // Every kind that can genuinely hang gets an Esc escape at its top tier.
+        for (kind, secs) in [
+            (StepKind::Resolve, 45),
+            (StepKind::Image, 150),
+            (StepKind::Create, 45),
+            (StepKind::Shell, 30),
+            (StepKind::Connect, 60),
+        ] {
+            assert!(
+                slow_hint(kind, D::from_secs(secs)).unwrap().contains("Esc"),
+                "{kind:?} top tier offers cancel"
+            );
+        }
     }
 }

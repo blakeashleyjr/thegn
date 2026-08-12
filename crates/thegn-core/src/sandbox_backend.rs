@@ -34,6 +34,12 @@ pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option
         }
     };
 
+    // Open the resolve phase so the splash's "sandbox" step names what the
+    // resolver is probing (a wedged runtime probe otherwise freezes an opaque
+    // spinner — see `output_with_timeout`'s detached reap). A no-op when no
+    // progress sink is installed on this thread (CLI, tests).
+    crate::progress::emit(crate::progress::SandboxPhase::Resolve);
+
     // A remote probe that returned `Unreachable` means we couldn't learn what
     // runtimes exist. If the chain then finds nothing, we must NOT silently pick
     // `Backend::None` for the remote — that ships a bare-shell `cd <local-path>`
@@ -47,6 +53,9 @@ pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option
             Backend::None => return Some(Backend::None),
             b => {
                 if suitable(b) {
+                    crate::progress::emit(crate::progress::SandboxPhase::ResolveProbe {
+                        backend: b.label().to_string(),
+                    });
                     match available(placement, b) {
                         RuntimeProbe::Present => return Some(b),
                         RuntimeProbe::Unreachable => saw_unreachable = true,
@@ -89,6 +98,9 @@ pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option
             return Some(Backend::None);
         }
         if suitable(b) {
+            crate::progress::emit(crate::progress::SandboxPhase::ResolveProbe {
+                backend: b.label().to_string(),
+            });
             match available(placement, b) {
                 RuntimeProbe::Present => return Some(b),
                 RuntimeProbe::Unreachable => saw_unreachable = true,

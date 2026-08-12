@@ -140,8 +140,24 @@ pub(crate) fn maybe_materialize(
         };
         let specs = if is_terminal {
             let (conn, sandbox) = crate::run::terminal_launch_for(&gname);
-            let spec = crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox);
-            Ok(missing.into_iter().map(|id| (id, spec.clone())).collect())
+            // Honor a host pin (the splash Esc-cancel, keyed by group name or
+            // worktree path): drop the sandbox wrap so the retry opens a plain
+            // host shell instead of re-entering the bring-up the user bailed on.
+            let sandbox = if crate::agent::force_host_requested(&gname)
+                || (!wt.is_empty() && crate::agent::force_host_requested(&wt))
+            {
+                String::new()
+            } else {
+                sandbox
+            };
+            // Resolve the sandbox-wrapping spec UNDER the progress sink: backend
+            // probing (`pick_backend` → `available` subprocess probes) runs
+            // synchronously in `terminal_launch_spec` on THIS thread and can
+            // stall for seconds on a wedged runtime, so its resolve phases must
+            // stream to the tab's splash instead of leaving the seed frozen.
+            observed(&|| Ok(crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox)))
+                .map(|spec| missing.iter().map(|id| (*id, spec.clone())).collect())
+                .map_err(spec_err)
         } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
             // Non-local env, failover off, known-down (token unset / exec
             // cooldown): halt rather than degrade to host.
