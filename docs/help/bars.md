@@ -65,3 +65,13 @@ bindable): toggle the notifications view, cycle notification modes, toggle
 do-not-disturb, mark everything read, and jump to the next item that needs
 you. The CI item opens the CI runs section; the proxy item opens the LLM
 proxy dashboard when configured.
+
+The inbox `⚑`/`✉` chip, the needs-you `✋` chip, and the merge-queue chip
+all open the **one unified surface** — a single grouped list of _Needs
+you · Alerts · Merge queue · Notifications · Logs_. One clear/dismiss
+convention holds throughout: `x` dismisses the row under the cursor, `a`
+clears all. Merge-queue rows act in place — `l` lands a gated-green
+branch, `r` retries a blocked one, `x` removes it, `m` jumps to the full
+Work ▸ Merge queue section. Ephemeral confirmations ("Landed", "Text
+copied") surface as transient toasts, the passing view of the same
+routed events that also land in this inbox.

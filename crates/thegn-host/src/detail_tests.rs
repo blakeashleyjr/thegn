@@ -477,8 +477,10 @@ fn notifications_are_actionable_with_dismiss_clear_keys() {
         ov.handle_key(&KeyCode::Char('x'), Modifiers::NONE),
         DetailOutcome::Act(DetailAction::DismissNotification { id: 1 })
     );
+    // The one clear-all key across every surface is `a` (the `X`/`R` aliases
+    // were retired).
     assert_eq!(
-        ov.handle_key(&KeyCode::Char('X'), Modifiers::NONE),
+        ov.handle_key(&KeyCode::Char('a'), Modifiers::NONE),
         DetailOutcome::Act(DetailAction::ClearNotifications)
     );
 }

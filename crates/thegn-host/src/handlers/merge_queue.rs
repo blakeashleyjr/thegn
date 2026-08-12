@@ -30,7 +30,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::hydrate::RefreshKind;
 use crate::integrate::{self, AttemptOutcome, FoldReport};
 use crate::merge_driver::{self, DriveOutcome, QueueItem};
-use crate::toast::{ToastKind, Toasts};
+use crate::toast::Toasts;
 
 pub(crate) type DriveTx = tokio_mpsc::UnboundedSender<DriveMsg>;
 pub(crate) type DriveRx = tokio_mpsc::UnboundedReceiver<DriveMsg>;
@@ -181,8 +181,7 @@ pub(crate) fn spawn_drive(
 fn arm_fold(enabled: bool, fold_inflight: &mut bool, toasts: &mut Toasts, verb: &str) -> bool {
     let now = std::time::Instant::now();
     if !enabled {
-        toasts.push(
-            ToastKind::Info,
+        toasts.info_ttl(
             "Merge queue disabled — set [merge_queue] enabled = true".to_string(),
             now,
             std::time::Duration::from_secs(6),
@@ -190,8 +189,7 @@ fn arm_fold(enabled: bool, fold_inflight: &mut bool, toasts: &mut Toasts, verb: 
         return false;
     }
     if *fold_inflight {
-        toasts.push(
-            ToastKind::Info,
+        toasts.info_ttl(
             "Already integrating…".to_string(),
             now,
             std::time::Duration::from_secs(3),
@@ -266,8 +264,7 @@ pub(crate) fn drain_fold_results(rx: &mut FoldRx, ctx: &mut DrainCtx) {
                 }
             }
             Err(e) => {
-                ctx.toasts.push(
-                    ToastKind::Info,
+                ctx.toasts.info_ttl(
                     format!("Integrate failed: {e}"),
                     now,
                     std::time::Duration::from_secs(6),
@@ -318,8 +315,7 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                         *ctx.want_model_refresh = true;
                     }
                     "needs_human" => {
-                        ctx.toasts.push(
-                            ToastKind::Info,
+                        ctx.toasts.info_ttl(
                             format!("{branch} needs a human — {detail}"),
                             now,
                             std::time::Duration::from_secs(6),
@@ -355,7 +351,7 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                     ctx.toasts.success(msg, now);
                 } else {
                     ctx.toasts
-                        .push(ToastKind::Info, msg, now, std::time::Duration::from_secs(6));
+                        .info_ttl(msg, now, std::time::Duration::from_secs(6));
                 }
                 *ctx.want_model_refresh = true;
                 // A land (`l`) records `landed` here without a Step; its `apply`
@@ -370,8 +366,7 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
             }
             DriveMsg::Failed(e) => {
                 *ctx.fold_inflight = false;
-                ctx.toasts.push(
-                    ToastKind::Info,
+                ctx.toasts.info_ttl(
                     format!("Merge queue: {e}"),
                     now,
                     std::time::Duration::from_secs(6),
@@ -666,7 +661,7 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
 /// Mirrors the panel's `a/A/x/l/r/c/D`, but keyed by an explicit path rather
 /// than the panel cursor so the two surfaces behave identically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SidebarMq {
+pub enum SidebarMq {
     /// Queue the target worktree's branch (panel `a`).
     Add,
     /// Remove the target worktree from the queue (panel `x`).
