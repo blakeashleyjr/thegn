@@ -25,6 +25,11 @@ use crate::pull_progress::PullSnapshot;
 pub enum SandboxPhase {
     /// Backend chain resolution / bring-up entry.
     Resolve,
+    /// A specific runtime backend is being probed for availability during
+    /// resolution (`probing podman`, `probing docker`, `bwrap`). Refines the
+    /// open resolve step's detail so a slow/wedged probe names what it is
+    /// waiting on instead of freezing an opaque "sandbox" spinner.
+    ResolveProbe { backend: String },
     /// Connecting a remote placement (ssh/mosh control channel).
     Connect { host: String },
     /// A transient connect failure is being retried.

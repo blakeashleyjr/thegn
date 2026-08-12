@@ -11884,6 +11884,60 @@ async fn event_loop<T: Terminal>(
                     need_relayout = true;
                     dirty = true;
                 }
+                // Escape hatch: while a worktree BRING-UP splash is up (not the
+                // idle launch splash — `center_dormant` is false here), Esc
+                // cancels a slow/wedged sandbox bring-up and pins the worktree to
+                // the host, so the next open is a plain shell instead of a hung
+                // sandbox. This is the "press Esc to run on host" the slow-step
+                // hints advertise. Safe against the still-running materialize
+                // worker: going dormant makes `drain_specs` DROP its late result
+                // (the `is_active && center_dormant` guard), and the next keypress
+                // re-materializes on the host (`force_host` skips backend probing).
+                //
+                // Gated on NO input-capturing modal being open: every modal below
+                // is dispatched AFTER this point and owns Esc when up (a
+                // sandbox-halt menu, say, can overlap a failed-step splash), so a
+                // splash-cancel here must never pre-empt a modal's own dismiss.
+                let no_modal_owns_esc = active_menu.is_none()
+                    && palette.is_none()
+                    && host_input.is_none()
+                    && git_input.is_none()
+                    && rollback.is_none()
+                    && wizard_ui.is_none()
+                    && env_wizard_ui.is_none()
+                    && terminal_wizard_ui.is_none()
+                    && workspace_picker.is_none()
+                    && which_key.is_empty();
+                if matches!(k.key, KeyCode::Escape)
+                    && no_modal_owns_esc
+                    && let Some((key, wt)) = session.worktrees.get(session.active).and_then(|g| {
+                        let key = (g.name.clone(), g.active_tab);
+                        loading_state
+                            .get(&key)
+                            .filter(|s| !s.is_empty())
+                            .map(|_| (key, g.path.clone()))
+                    })
+                {
+                    // Pin to host by BOTH worktree path (provision path honors
+                    // it via `agent::force_host_requested`) and group name (the
+                    // terminal path keys on the name, whose worktree path may be
+                    // empty) so the retry degrades to a plain shell either way.
+                    if !wt.is_empty() {
+                        crate::agent::request_force_host(&wt);
+                    }
+                    crate::agent::request_force_host(&key.0);
+                    materialize_inflight.remove(&key);
+                    loading_state.remove(&key);
+                    loading_remote.remove(&key);
+                    model.load_steps.clear();
+                    center_dormant = true;
+                    model.status =
+                        "Cancelled sandbox bring-up — press any key to open a shell on the host."
+                            .into();
+                    need_relayout = true;
+                    dirty = true;
+                    continue;
+                }
                 // Typing clears any lingering mouse selection highlight.
                 if mouse_sel.take().is_some() {
                     dirty = true;

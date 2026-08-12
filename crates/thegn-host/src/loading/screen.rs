@@ -117,16 +117,17 @@ fn sublines(step: &LoadStep, accent: ColorAttribute, width: usize) -> Vec<SubLin
             .and_then(|t| catalog::slow_hint(step.kind, t.elapsed()))
             .map(str::to_string),
     };
-    if let Some(t) = text
-        && out.len() < SUBLINE_RESERVE
-    {
-        let mut line = t;
-        if UnicodeWidthStr::width(line.as_str()) > width {
-            line = truncate(&line, width);
+    if let Some(t) = text {
+        // Wrap across the reserve rows still free under this step (the whole
+        // reserve when there's no progress bar) so a long escalation hint —
+        // "…it may be wedged; press Esc to cancel" — shows its actionable tail
+        // instead of clipping to one truncated line.
+        let remaining = SUBLINE_RESERVE.saturating_sub(out.len());
+        for line in wrap(&t, width, remaining) {
+            out.push(SubLine {
+                segs: vec![(line, col(S::Faint))],
+            });
         }
-        out.push(SubLine {
-            segs: vec![(line, col(S::Faint))],
-        });
     }
     out.truncate(SUBLINE_RESERVE);
     out
@@ -544,6 +545,19 @@ mod tests {
         assert!(all.contains("network-bound"), "hint after 20s: {all}");
         // Elapsed column shows the running time.
         assert!(all.contains("20s"), "{all}");
+    }
+
+    #[test]
+    fn slow_resolve_hint_wraps_and_offers_the_escape() {
+        // The frozen-"sandbox" case: a Resolve step aged into its escalation
+        // tier shows the hint AND its actionable "press Esc to run on host"
+        // tail — wrapped across the reserve rows, never clipped mid-message.
+        let mut steps = plan_steps(1, false);
+        steps[1].kind = StepKind::Resolve;
+        steps[1].started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        let all = draw(&steps, &[]).join("\n");
+        assert!(all.contains("Esc"), "escape affordance shown: {all}");
+        assert!(all.contains("host"), "actionable tail not clipped: {all}");
     }
 
     #[test]
