@@ -60,6 +60,17 @@ impl MaterializeObserver {
             SandboxPhase::Resolve => {
                 self.upsert(StepKind::Resolve, "sandbox".to_string());
             }
+            SandboxPhase::ResolveProbe { backend } => {
+                // Refine the open resolve step so a slow probe names its
+                // candidate. Open the resolve step first if a producer emitted
+                // a probe without a leading `Resolve` (defensive).
+                if self.find_mut(StepKind::Resolve).is_none() {
+                    self.upsert(StepKind::Resolve, "sandbox".to_string());
+                }
+                if let Some(s) = self.find_mut(StepKind::Resolve) {
+                    s.detail = Some(format!("probing {backend}"));
+                }
+            }
             SandboxPhase::Connect { host } => {
                 self.upsert(StepKind::Connect, format!("connect {host}"));
             }
@@ -193,6 +204,44 @@ mod tests {
                 labels(&out)
             );
         }
+    }
+
+    #[test]
+    fn resolve_probe_names_the_candidate_on_the_sandbox_step() {
+        // The frozen-spinner fix: a resolve probe refines the "sandbox" step's
+        // detail so a slow/wedged probe says what it's waiting on.
+        let mut o = MaterializeObserver::new();
+        let out = o.on_event(SandboxPhase::ResolveProbe {
+            backend: "podman".into(),
+        });
+        assert_eq!(out[0].label, "sandbox");
+        assert_eq!(out[0].state, StepState::Active);
+        assert_eq!(out[0].detail.as_deref(), Some("probing podman"));
+        // A later candidate re-labels the same detail (no stacked step).
+        let out = o.on_event(SandboxPhase::ResolveProbe {
+            backend: "bwrap".into(),
+        });
+        assert_eq!(out[0].detail.as_deref(), Some("probing bwrap"));
+        assert_eq!(
+            out.iter().filter(|s| s.kind == StepKind::Resolve).count(),
+            1
+        );
+        // Opening the next phase closes the resolve step and clears its detail.
+        let out = o.on_event(SandboxPhase::ContainerCreate { backend: "podman" });
+        assert_eq!(out[0].state, StepState::Done);
+        assert_eq!(out[0].detail, None, "detail clears when the phase closes");
+    }
+
+    #[test]
+    fn resolve_probe_without_a_leading_resolve_opens_the_step() {
+        // Defensive: a producer that emits a probe first still gets a sandbox row.
+        let mut o = MaterializeObserver { steps: Vec::new() };
+        let out = o.on_event(SandboxPhase::ResolveProbe {
+            backend: "docker".into(),
+        });
+        assert_eq!(out[0].label, "sandbox");
+        assert_eq!(out[0].detail.as_deref(), Some("probing docker"));
+        assert!(crate::loading::is_shell_wait(&out));
     }
 
     #[test]
