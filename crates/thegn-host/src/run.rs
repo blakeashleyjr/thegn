@@ -270,8 +270,7 @@ fn toggle_recorder(
                 *recorder = Some(r);
             }
             Err(e) => {
-                toasts.push(
-                    crate::toast::ToastKind::Info,
+                toasts.info_ttl(
                     format!("Failed to start recording: {e}"),
                     std::time::Instant::now(),
                     std::time::Duration::from_secs(5),
@@ -6638,6 +6637,9 @@ async fn event_loop<T: Terminal>(
         current_config.profile.clone(),
         waker.clone(),
     );
+    // Let routed notifications project a transient in-app toast via the loop's
+    // refresh channel (the single funnel; fires only when routing authorizes it).
+    notify_state.set_toast_tx(refresh_tx.clone());
     // Audible-cue subscriber: bus-published inbox notifications (the MCP
     // router's agent needs-you / subtask requests) reach the sound engine here,
     // off the event loop. Typed events (test/process/worktree) keep their inline
@@ -9625,6 +9627,20 @@ async fn event_loop<T: Terminal>(
                         dirty = true;
                     }
                 }
+                // The transient projection of a routed notification: push it onto
+                // the toast stack (colored by the same priority model the badges
+                // use) and schedule its one-shot expiry wake, so an off-loop
+                // alert pops a toast without the loop ever polling on a timer.
+                RefreshKind::Toast { message, priority } => {
+                    toasts.push(
+                        crate::toast::priority_color(priority),
+                        message,
+                        std::time::Instant::now(),
+                        crate::toast::DEFAULT_TTL,
+                    );
+                    schedule_toast_clear(&waker);
+                    dirty = true;
+                }
             }
         }
         // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s, off-loop).
@@ -11799,6 +11815,30 @@ async fn event_loop<T: Terminal>(
                                 },
                             );
                             focus.zone = crate::focus::Zone::Panel;
+                        }
+                        // A merge-queue row action (land/retry/remove) from the
+                        // unified surface: keyed by the row's explicit worktree
+                        // path, dispatched to the same fold/drive path the panel
+                        // section uses (which needs the drive/fold locals only the
+                        // loop owns, not `CiActionCtx`). The action closes the
+                        // overlay; its refresh rebuilds the queue.
+                        crate::detail::DetailOutcome::Act(
+                            crate::detail::DetailAction::MergeQueueAction { path, action },
+                        ) => {
+                            bar_detail = None;
+                            crate::handlers::merge_queue::sidebar_action(
+                                action,
+                                crate::handlers::merge_queue::MqKeyCtx {
+                                    model: &mut model,
+                                    cfg: &current_config,
+                                    active_wt: std::path::PathBuf::from(path),
+                                    refresh_tx: &refresh_tx,
+                                    waker: &waker,
+                                    drive_tx: &drive_tx,
+                                    fold_inflight: &mut fold_inflight,
+                                    toasts: &mut toasts,
+                                },
+                            );
                         }
                         // "Needs you" Enter: activate the row's resolved target
                         // (live tab OR dormant-workspace switch). Needs the
@@ -15369,7 +15409,9 @@ async fn event_loop<T: Terminal>(
                                 },
                             )
                         }
-                        (Section::Notifications, KeyCode::Char('r')) => {
+                        // `x` dismisses the cursor row (mark read) — the one
+                        // dismiss key shared with the unified overlay.
+                        (Section::Notifications, KeyCode::Char('x')) => {
                             let notif_id = model
                                 .panel
                                 .notifications
@@ -15408,7 +15450,9 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
-                        (Section::Notifications, KeyCode::Char('R')) => {
+                        // `a` clears all (mark all read) — the one clear-all key
+                        // shared with the unified overlay.
+                        (Section::Notifications, KeyCode::Char('a')) => {
                             tokio::task::spawn_blocking(|| {
                                 let Ok(db) = thegn_core::db::Db::open() else {
                                     return;

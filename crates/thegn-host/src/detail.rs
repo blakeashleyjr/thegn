@@ -138,6 +138,15 @@ pub enum DetailAction {
     /// Open the right panel to Work ▸ Merge queue (the MQ badge's `m` key —
     /// intercepted by the loop, which owns the panel state).
     OpenMergeQueueSection,
+    /// A merge-queue action fired on a row of the unified surface's Merge-queue
+    /// section, keyed by the row's explicit worktree `path` (not the panel
+    /// cursor). Intercepted by the loop's Act arm — the fold/drive locals live
+    /// there, not in `CiActionCtx` — and dispatched to
+    /// [`crate::handlers::merge_queue::sidebar_action`].
+    MergeQueueAction {
+        path: String,
+        action: crate::handlers::merge_queue::SidebarMq,
+    },
 }
 
 impl DetailAction {
@@ -2041,9 +2050,12 @@ fn badge_detail(
     ctx: &StatusCtx,
 ) -> Option<DetailOverlay> {
     match b {
-        // Both the inbox chip (⚑ / N unread) and the needs-you chip (✋) open the
-        // single unified surface: Needs you · Alerts · Notifications · Logs.
-        BarBadge::Notifications | BarBadge::Attention => unified_detail(model),
+        // The inbox chip (⚑ / N unread), the needs-you chip (✋), and the
+        // merge-queue chip all open the single unified surface: Needs you ·
+        // Alerts · Merge queue · Notifications · Logs.
+        BarBadge::Notifications | BarBadge::Attention | BarBadge::MergeQueue => {
+            unified_detail(model)
+        }
         BarBadge::Agent => {
             let a = model.agent_activity.as_ref()?;
             let conn = match a.conn {
@@ -2148,45 +2160,6 @@ fn badge_detail(
                 .collect();
             let mut ov = list("CI runs", rows, "no CI runs", 60, 14);
             ov.hint = Some("↵ view · o open · r/R rerun · c cancel · g refresh".into());
-            Some(ov)
-        }
-        BarBadge::MergeQueue => {
-            if model.panel.merge_queue.is_empty() {
-                return None;
-            }
-            let rows: Vec<DetailRow> = model
-                .panel
-                .merge_queue
-                .iter()
-                .map(|r| {
-                    let (glyph, marker) = match r.status.as_str() {
-                        "landed" => ("✓", Tok::Hue(Hue::Green)),
-                        "ready" => ("◆", Tok::Hue(Hue::Green)),
-                        "deferred" | "gate_failed" => ("⚑", Tok::Hue(Hue::Red)),
-                        "needs_human" => ("✋", Tok::Hue(Hue::Red)),
-                        "folding" | "verifying" => ("●", Tok::Hue(Hue::Amber)),
-                        "agent_running" => ("◐", Tok::Hue(Hue::Amber)),
-                        _ => ("○", Tok::Slot(S::Dim)),
-                    };
-                    let note = match r.status.as_str() {
-                        "deferred" | "gate_failed" | "needs_human" => r
-                            .error_detail
-                            .as_deref()
-                            .or(r.conflict_paths.as_deref())
-                            .map(|p| p.replace('\n', ", ")),
-                        _ => Some(r.status.clone()),
-                    };
-                    let mut row = DetailRow::new(marker, glyph, r.branch.clone())
-                        .on_enter(DetailAction::FocusWorktree(r.worktree.clone()))
-                        .action('m', DetailAction::OpenMergeQueueSection);
-                    if let Some(n) = note {
-                        row = row.note(n);
-                    }
-                    row
-                })
-                .collect();
-            let mut ov = list("Merge queue", rows, "merge queue empty", 56, 14);
-            ov.hint = Some("↵ focus worktree · m open section".into());
             Some(ov)
         }
         BarBadge::Ingress => {
@@ -2505,14 +2478,16 @@ fn status_detail(model: &FrameModel, ctx: &StatusCtx, near: Placement) -> Detail
     sections("thegn status", 44, secs, near)
 }
 
-/// The one unified notification surface, opened by both statusbar chips (the
-/// inbox `⚑`/unread chip and the needs-you `✋` chip). It folds what used to be
-/// two separate popups plus a logs section into a single grouped list:
+/// The one unified notification surface, opened by the inbox `⚑`/unread chip,
+/// the needs-you `✋` chip, and the merge-queue chip. It folds what used to be
+/// three separate popups plus a logs section into a single grouped list:
 ///
 /// - **Needs you** — the live, per-worktree attention rollup (what needs a
 ///   decision now).
 /// - **Alerts** — unread failure-priority notifications *not* already covered by
 ///   a Needs-you row (host-global / orphan alerts only — no double-show).
+/// - **Merge queue** — the active queue, dedup'd against Needs-you worktrees;
+///   per-row `l`/`r`/`x` run the same fold/drive path as the panel section.
 /// - **Notifications** — the rest of the inbox (Notice/Info history).
 /// - **Logs** — one quiet entry point into thegn.log (never a red alert;
 ///   self-diagnostics are gated off by default, see `surface_self_log_errors`).
@@ -2521,7 +2496,7 @@ fn unified_detail(model: &FrameModel) -> Option<DetailOverlay> {
     let mut rows: Vec<DetailRow> = Vec::new();
 
     // 1. Needs you — the actionable per-worktree rollup. Its paths drive the
-    //    de-dup: a worktree failure surfaced here is suppressed in Alerts.
+    //    de-dup: a worktree failure surfaced here is suppressed in Alerts + MQ.
     let (needs_rows, needs_paths) = needs_you_rows(model);
     if !needs_rows.is_empty() {
         rows.push(DetailRow::header("Needs you"));
@@ -2550,7 +2525,22 @@ fn unified_detail(model: &FrameModel) -> Option<DetailOverlay> {
         rows.extend(alerts);
     }
 
-    // 3. Notifications — the Notice/Info history (never log rows).
+    // 3. Merge queue — the active queue entries, dedup'd against Needs-you
+    //    worktrees (a queued branch already surfaced there is not repeated).
+    let gl = crate::caps::active_glyphs();
+    let mq: Vec<DetailRow> = model
+        .panel
+        .merge_queue
+        .iter()
+        .filter(|r| r.worktree.is_empty() || !needs_paths.contains(&r.worktree))
+        .map(|r| mq_row(r, gl))
+        .collect();
+    if !mq.is_empty() {
+        rows.push(DetailRow::header("Merge queue"));
+        rows.extend(mq);
+    }
+
+    // 4. Notifications — the Notice/Info history (never log rows).
     let inbox: Vec<DetailRow> = notes
         .iter()
         .filter(|n| n.source_ref != "log:thegn" && n.kind.default_priority() < Priority::Alert)
@@ -2561,13 +2551,72 @@ fn unified_detail(model: &FrameModel) -> Option<DetailOverlay> {
         rows.extend(inbox);
     }
 
-    // 4. Logs — always one dim entry point into thegn.log.
+    // 5. Logs — always one dim entry point into thegn.log.
     rows.push(DetailRow::header("Logs"));
     rows.push(logs_row(model, &notes));
 
     let mut ov = list("Notifications", rows, "all clear", 62, 18);
-    ov.hint = Some("↵ open · x dismiss · a mark all read · o log · Alt a next".into());
+    ov.hint = Some("↵ open · x dismiss · a clear all · l land · r retry · o log".into());
     Some(ov)
+}
+
+/// One Merge-queue row for the unified surface. Marker glyph + hue come from the
+/// single core vocabulary ([`thegn_core::attention::MqStatus::glyph`]); per-row
+/// actions are keyed by the row's explicit worktree path (not the list cursor)
+/// so they run the exact fold/drive path the panel section uses. `m` still jumps
+/// to the full accordion section.
+fn mq_row(r: &thegn_core::db::MergeQueueRow, gl: &thegn_core::termcaps::GlyphSet) -> DetailRow {
+    use crate::handlers::merge_queue::SidebarMq;
+    use thegn_core::attention::MqStatus;
+    let (glyph, hue) = MqStatus::parse(&r.status)
+        .map(|s| s.glyph(gl))
+        .unwrap_or((gl.dot_hollow, Hue::Blue));
+    // Blocked rows show their reason; the rest show the status word.
+    let note = match r.status.as_str() {
+        "deferred" | "gate_failed" | "needs_human" => r
+            .error_detail
+            .as_deref()
+            .or(r.conflict_paths.as_deref())
+            .map(|p| p.replace('\n', ", ")),
+        _ => Some(r.status.clone()),
+    };
+    let path = r.worktree.clone();
+    let mut row = DetailRow::new(Tok::Hue(hue), glyph, r.branch.clone())
+        .on_enter(DetailAction::FocusWorktree(path.clone()))
+        .action('m', DetailAction::OpenMergeQueueSection);
+    // Verb keys mirror the panel section, gated on the row's status.
+    match r.status.as_str() {
+        "ready" => {
+            row = row.action(
+                'l',
+                DetailAction::MergeQueueAction {
+                    path: path.clone(),
+                    action: SidebarMq::Land,
+                },
+            );
+        }
+        "deferred" | "gate_failed" | "needs_human" => {
+            row = row.action(
+                'r',
+                DetailAction::MergeQueueAction {
+                    path: path.clone(),
+                    action: SidebarMq::Retry,
+                },
+            );
+        }
+        _ => {}
+    }
+    row = row.action(
+        'x',
+        DetailAction::MergeQueueAction {
+            path,
+            action: SidebarMq::Remove,
+        },
+    );
+    if let Some(n) = note {
+        row = row.note(n);
+    }
+    row
 }
 
 /// The "Needs you" rows (live attention rollup) plus the set of worktree paths
@@ -2657,9 +2706,9 @@ fn notification_row(n: &thegn_core::notification::Notification) -> DetailRow {
             row = row.on_highlight(DetailAction::MarkNotificationRead { id: n.id });
         }
     }
-    row.action('X', DetailAction::ClearNotifications)
-        .action('R', DetailAction::ClearNotifications)
-        .action('a', DetailAction::ClearNotifications)
+    // One clear/dismiss convention across every surface: `x` dismisses this row,
+    // `a` clears all. (The old `X`/`R` aliases are retired.)
+    row.action('a', DetailAction::ClearNotifications)
 }
 
 /// The single dim Logs entry point. In dev mode (`surface_self_log_errors`) a
@@ -2687,14 +2736,12 @@ fn logs_row(model: &FrameModel, notes: &[thegn_core::notification::Notification]
     row
 }
 
+/// The notification marker glyph + color — a thin caps-aware adapter over the
+/// single core vocabulary ([`NotificationKind::hued_glyph`]) so the overlay and
+/// the panel inbox section can never diverge.
 fn notif_glyph(kind: thegn_core::notification::NotificationKind) -> (&'static str, Tok) {
-    use thegn_core::notification::NotificationKind as K;
-    match kind {
-        K::AgentFailed | K::TestFailed | K::ProcessFailed => ("✗", Tok::Hue(Hue::Red)),
-        K::AgentAttention | K::Overdue => ("⚑", Tok::Hue(Hue::Amber)),
-        K::AgentDone | K::ProcessExited | K::WorktreeCreated => ("✓", Tok::Hue(Hue::Green)),
-        _ => ("•", Tok::Hue(Hue::Blue)),
-    }
+    let (glyph, hue) = kind.hued_glyph(crate::caps::active_glyphs());
+    (glyph, Tok::Hue(hue))
 }
 
 #[cfg(test)]

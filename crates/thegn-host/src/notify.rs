@@ -43,6 +43,10 @@ pub struct NotifyState {
     /// The configured chime file (`[notifications.sound] chime_file`), empty ⇒
     /// the bundled chime. Read on every `Chime` emit.
     chime_file: Mutex<String>,
+    /// Sender for the transient in-app toast projection, installed once at loop
+    /// startup ([`set_toast_tx`]). `None` before wiring (or in headless tests),
+    /// so an emit is a silent no-op rather than a panic.
+    toast_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>>>,
     /// Wakes the event loop so a latched bell (or DND/mode chip change) paints.
     waker: TerminalWaker,
 }
@@ -66,8 +70,36 @@ impl NotifyState {
             pending_bell: AtomicBool::new(false),
             focused_worktree: Mutex::new(String::new()),
             chime_file: Mutex::new(chime_file),
+            toast_tx: Mutex::new(None),
             waker,
         })
+    }
+
+    /// Install the loop's refresh channel so routed notifications can project a
+    /// transient in-app toast. Called once at startup, after the loop owns
+    /// `refresh_tx`.
+    pub fn set_toast_tx(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    ) {
+        *self.toast_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Project a routed notification onto the in-app toast stack — the transient
+    /// twin of the persistent inbox entry. Best-effort (a gone loop / unwired
+    /// channel just drops it) and cheap (a channel send + waker pulse), so it is
+    /// safe on any dispatch thread.
+    pub fn emit_toast(&self, message: &str, priority: thegn_core::notification::Priority) {
+        if let Some(tx) = self.toast_tx.lock().unwrap().as_ref()
+            && tx
+                .send(crate::hydrate::RefreshKind::Toast {
+                    message: message.to_string(),
+                    priority,
+                })
+                .is_ok()
+        {
+            let _ = self.waker.wake();
+        }
     }
 
     /// Update the focused/visible worktree path (drives `suppress_focused`).
@@ -230,6 +262,13 @@ pub fn record(
     } else {
         None
     };
+    // The transient in-app toast is the one funnel for routed events: it fires
+    // iff the routing decision authorizes it (`toast`), governed by the same
+    // rules/DND as every other channel — never a hand-rolled toast that dodges
+    // routing.
+    if decision.toast {
+        state.emit_toast(message, decision.effective_priority);
+    }
     (decision, id)
 }
 
