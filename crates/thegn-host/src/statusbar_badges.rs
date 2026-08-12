@@ -36,17 +36,29 @@ pub(crate) fn push_attention_badge(model: &FrameModel, items: &mut Vec<(BarItemI
     ));
 }
 
-/// Persistent-pane chip: a quiet dim `◆ persist` while the focused pane is
-/// daemon-backed — quitting the UI detaches it (the process keeps running;
-/// the next launch warm-reattaches). ASCII terminals get `* persist`.
+/// The always-on daemon/status chip — one glyph, no word, pinned to the far
+/// right of the statusbar (pushed last by `statusbar_items`). Unlike the other
+/// badges it is *never* silent: it is a persistent affordance whose glyph
+/// reports the program's daemon relationship, and activating it opens the
+/// expanded status modal (`detail.rs`). States (ASCII fallbacks in parens):
+///
+/// - **NonPersist** — dim `○` (`o`): the focused pane runs inline; quit ends it.
+/// - **Persist** — teal `◆` (`*`): the focused pane is daemon-backed (quit
+///   detaches, relaunch reattaches).
+/// - **Server** — blue `▲` (`^`): this instance's daemon serves remote clients.
+/// - **Client** — purple `▽` (`v`): attached to a remote pane daemon.
 pub(crate) fn push_daemon_chip(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
-    if !model.persistent_pane {
-        return;
-    }
-    let mark = crate::caps::active_glyphs().diamond_filled;
+    use crate::chrome::{DaemonChipState, S};
+    let g = crate::caps::active_glyphs();
+    let (glyph, tone) = match model.daemon_state {
+        DaemonChipState::NonPersist => (g.dot_hollow, Tok::Slot(S::Dim)),
+        DaemonChipState::Persist => (g.diamond_filled, Tok::Hue(Hue::Teal)),
+        DaemonChipState::Server => (g.role_server, Tok::Hue(Hue::Blue)),
+        DaemonChipState::Client => (g.role_client, Tok::Hue(Hue::Purple)),
+    };
     items.push((
         BarItemId::Badge(BarBadge::Persist),
-        vec![Seg::chip(Tok::Hue(Hue::Teal), format!(" {mark} persist "))],
+        vec![Seg::chip(tone, format!(" {glyph} "))],
     ));
 }
 
@@ -192,6 +204,51 @@ mod tests {
             .insert(0, run("9", "lint", CiState::Fail));
         push_ci_badge(&model, &mut items);
         assert!(chip_text(&items).contains(" 1 CI"));
+    }
+
+    #[test]
+    fn daemon_chip_is_always_shown_and_hues_by_state() {
+        use crate::chrome::{DaemonChipState, S};
+        let tone_for = |state: DaemonChipState| {
+            let mut model = FrameModel::default();
+            model.daemon_state = state;
+            let mut items = Vec::new();
+            push_daemon_chip(&model, &mut items);
+            // Never silent — the daemon chip is a persistent affordance.
+            assert_eq!(items.len(), 1, "{state:?} must always emit a chip");
+            assert!(matches!(items[0].0, BarItemId::Badge(BarBadge::Persist)));
+            // A glyph-only chip: exactly one seg, no label word (just ` X `).
+            let text = chip_text(&items);
+            assert_eq!(
+                text.chars().filter(|c| !c.is_whitespace()).count(),
+                1,
+                "{text:?}"
+            );
+            items[0].1[0].bg.unwrap()
+        };
+        // The default (inline pane, no daemon) is a quiet dim chip.
+        assert_eq!(tone_for(DaemonChipState::NonPersist), Tok::Slot(S::Dim));
+        assert_eq!(tone_for(DaemonChipState::Persist), Tok::Hue(Hue::Teal));
+        assert_eq!(tone_for(DaemonChipState::Server), Tok::Hue(Hue::Blue));
+        assert_eq!(tone_for(DaemonChipState::Client), Tok::Hue(Hue::Purple));
+    }
+
+    #[test]
+    fn daemon_chip_renders_far_right() {
+        // Force another right-cluster badge (Sync) so we can prove the daemon
+        // chip sorts AFTER the rest of the cluster, at the far right.
+        let mut model = FrameModel::default();
+        model.sync_panes = true;
+        let items = crate::chrome::statusbar_items(&model);
+        let last = items.last().expect("at least the daemon chip");
+        assert!(
+            matches!(last.0, BarItemId::Badge(BarBadge::Persist)),
+            "daemon chip must be the last (far-right) item"
+        );
+        assert!(
+            matches!(items[items.len() - 2].0, BarItemId::Badge(BarBadge::Sync)),
+            "the daemon chip follows the rest of the cluster"
+        );
     }
 
     #[test]

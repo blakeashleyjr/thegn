@@ -34,9 +34,29 @@ or a click outside dismisses it.
   _right now_, for whatever owns focus. The hints follow you: sidebar
   keys while the sidebar is focused, section keys while the panel is.
 - **Right:** status widgets (activity, host, share/forward state).
+- **Far right:** the always-on **daemon/status indicator** — a single glyph,
+  no label. It is the one badge that is never silent, since it is a persistent
+  affordance rather than an alert.
 
 The hint strip is the quick reference; this help (`F1`) and the
 [[keybindings]] page are the complete one.
+
+## Daemon / status indicator
+
+Pinned to the far right of the status bar, one glyph reports how this
+instance relates to the pane daemon:
+
+- `○` **non-persistent** — the focused pane runs inline; quitting ends it.
+- `◆` **persistent** — the focused pane is daemon-backed: quitting detaches
+  it (the process keeps running) and the next launch reattaches.
+- `▲` **server** — this instance's daemon is serving remote thin clients.
+- `▽` **client** — attached to a pane daemon on another machine.
+
+(On ASCII terminals these degrade to `o`, `*`, `^`, `v`.) Activating it — a
+click, or `↵` with the bar focused — opens the **status modal**: daemon PID,
+version, uptime, live session/attached-client counts, this process's memory
+and CPU history, the pane daemon's memory, and the event-loop rollup
+(wakes/s, render latency, idle ratio).
 
 ## Notifications & attention
 
