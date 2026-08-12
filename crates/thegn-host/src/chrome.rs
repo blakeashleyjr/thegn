@@ -286,6 +286,52 @@ pub fn fill(surface: &mut Surface, rect: Rect, bg: ColorAttribute) {
     }
 }
 
+/// The state of the always-on daemon indicator (far-right statusbar chip). One
+/// glyph, no word — see `statusbar_badges::push_daemon_chip`. Computed each
+/// frame from the cached [`DaemonStatus`] + whether the focused pane is
+/// daemon-backed (`handlers::status::daemon_chip_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DaemonChipState {
+    /// The focused pane runs inline; quitting the UI ends it. Plain default.
+    #[default]
+    NonPersist,
+    /// The focused pane is daemon-backed — quit detaches, relaunch reattaches.
+    Persist,
+    /// This instance's daemon is serving remote thin clients (`thegn serve`).
+    Server,
+    /// This instance is attached to a *remote* pane daemon (remote backend).
+    Client,
+}
+
+/// A cached, render-side view of the pane daemon this instance talks to,
+/// refreshed off-loop (never a DB read on the loop) and delivered like any
+/// other hydration producer. Feeds the far-right status chip's state and the
+/// expanded status modal's key/value block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonStatus {
+    /// True once a daemon row has been resolved (else the modal shows a hint).
+    pub present: bool,
+    /// The daemon process PID.
+    pub pid: Option<u32>,
+    /// The daemon's reported `CARGO_PKG_VERSION`.
+    pub version: String,
+    /// Hostname the daemon runs on.
+    pub hostname: String,
+    /// Unix socket path / named-pipe endpoint the daemon binds.
+    pub endpoint: String,
+    /// `host:port` when the daemon is serving remote thin clients, else empty.
+    pub tcp_addr: String,
+    /// Daemon start time (Unix ms), for the uptime line.
+    pub started_at_ms: i64,
+    /// Live session count owned by the daemon.
+    pub sessions: usize,
+    /// Attached-client count across those sessions.
+    pub attached: usize,
+    /// True when this instance reaches the daemon over a *remote* transport
+    /// (drives the `Client` chip state).
+    pub remote: bool,
+}
+
 /// What the chrome needs to paint a frame. Populated from session state + DB +
 /// git by the host; kept renderer-agnostic so it's unit-testable.
 #[derive(Debug, Clone, Default)]
@@ -373,9 +419,13 @@ pub struct FrameModel {
     /// frame from the notification runtime.
     pub notify_dnd: bool,
     /// Focused pane is daemon-backed — quitting detaches it (the process keeps
-    /// running; the next launch reattaches). Drives the "persistent" chip.
+    /// running; the next launch reattaches). One input to `daemon_state`.
     /// Set each frame from the live panes table.
     pub persistent_pane: bool,
+    /// Resolved state of the always-on far-right daemon indicator. Computed each
+    /// frame from `persistent_pane` + the cached [`DaemonStatus`]. Drives the
+    /// glyph the chip shows (`handlers::status::daemon_chip_state`).
+    pub daemon_state: DaemonChipState,
     /// Active notification routing mode (item 427; `""` = default). Shown as a
     /// statusbar chip when non-empty.
     pub notify_mode: String,
@@ -1274,7 +1324,6 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
     // (extracted from this ratchet-pinned file).
     crate::statusbar_badges::push_attention_badge(model, &mut items);
     crate::statusbar_badges::push_network_chip(model, &mut items);
-    crate::statusbar_badges::push_daemon_chip(model, &mut items);
     crate::statusbar_badges::push_ci_badge(model, &mut items);
     crate::statusbar_badges::push_mq_badge(model, &mut items);
     // Low-free-space badge: trips when the worktrees' filesystem drops to/below
@@ -1453,6 +1502,9 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
             )],
         ));
     }
+    // The always-on daemon/status indicator is pushed LAST so it renders at the
+    // far right of the bottom bar (the right cluster is right-aligned in order).
+    crate::statusbar_badges::push_daemon_chip(model, &mut items);
     items
 }
 

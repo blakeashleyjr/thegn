@@ -187,6 +187,7 @@ pub(crate) fn spawn_refresh_ticker(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     stats_tx: tokio_mpsc::UnboundedSender<thegn_metrics::StatsSnapshot>,
     container_tx: tokio_mpsc::UnboundedSender<Vec<thegn_core::sandbox::ContainerInfo>>,
+    daemon_tx: tokio_mpsc::UnboundedSender<crate::chrome::DaemonStatus>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     disk_path: std::path::PathBuf,
@@ -209,6 +210,27 @@ pub(crate) fn spawn_refresh_ticker(
         let mut sampler = thegn_metrics::StatsSampler::new(disk_path);
         let _ = stats_tx.send(sampler.sample()); // prime counters for rate deltas
         let mut last_stats = Instant::now();
+        // Daemon/status: a read-only DB handle + this state dir's scope, read on
+        // the disk cadence to fill the far-right chip's modal and to point the
+        // per-process sampler at the daemon PID. Best-effort — a DB-open failure
+        // just leaves the status absent (the chip falls back to NonPersist).
+        let daemon_scope = crate::daemon::scope_key();
+        let daemon_db = thegn_core::db::Db::open().ok();
+        let refresh_daemon =
+            |sampler: &mut thegn_metrics::StatsSampler| -> Option<crate::chrome::DaemonStatus> {
+                let db = daemon_db.as_ref()?;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let status = crate::handlers::status::snapshot(db, &daemon_scope, now_ms);
+                sampler.set_daemon_pid(status.pid);
+                Some(status)
+            };
+        // Prime once so the sampler watches the daemon PID from the first sample.
+        if let Some(status) = refresh_daemon(&mut sampler) {
+            let _ = daemon_tx.send(status);
+        }
         loop {
             std::thread::sleep(tick);
             ticks += 1;
@@ -240,6 +262,16 @@ pub(crate) fn spawn_refresh_ticker(
             }
             if ticks.is_multiple_of(disk_every) {
                 if tx.send(RefreshKind::Disk).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            // Daemon/status refresh on the same slow cadence: re-resolves the
+            // daemon PID for the per-process sampler and updates the chip modal.
+            if ticks.is_multiple_of(disk_every)
+                && let Some(status) = refresh_daemon(&mut sampler)
+            {
+                if daemon_tx.send(status).is_err() {
                     break;
                 }
                 wake = true;
