@@ -7865,6 +7865,7 @@ async fn event_loop<T: Terminal>(
                 active_menu: &mut active_menu,
                 halt_dismissed: &mut halt_dismissed,
                 center_dormant: &mut center_dormant,
+                shutdown: &shutdown,
                 event_bus: &event_bus,
                 notify_state: &notify_state,
                 writer: &writer,
@@ -17194,14 +17195,19 @@ async fn event_loop<T: Terminal>(
                                 // group's content is unchanged, so only a redraw
                                 // is needed.
                                 let up = action == Action::MoveItemUp;
-                                let on_workspace = focus.sidebar()
-                                    && sb.selected_row(&model).is_some_and(|r| {
-                                        r.kind == crate::sidebar::RowKind::Workspace
-                                    });
-                                let moved = if on_workspace {
-                                    sb.move_selected_workspace(&mut model, &session, up)
-                                } else {
-                                    sb.move_active_worktree(&mut model, &mut session, up)
+                                let cursor_kind = focus
+                                    .sidebar()
+                                    .then(|| sb.selected_row(&model).map(|r| r.kind))
+                                    .flatten();
+                                let moved = match cursor_kind {
+                                    Some(crate::sidebar::RowKind::Workspace) => {
+                                        sb.move_selected_workspace(&mut model, &session, up)
+                                    }
+                                    // A terminal reorders within its host group.
+                                    Some(crate::sidebar::RowKind::Terminal) => {
+                                        sb.move_cursor_terminal(&mut model, &session, up)
+                                    }
+                                    _ => sb.move_active_worktree(&mut model, &mut session, up),
                                 };
                                 if moved {
                                     need_relayout = true;

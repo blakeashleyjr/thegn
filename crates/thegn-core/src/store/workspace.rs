@@ -321,4 +321,15 @@ pub trait WorkspaceStore {
     fn del_terminal(&self, id: i64) -> Result<()>;
 
     fn rename_terminal(&self, id: i64, new_name: &str) -> Result<()>;
+
+    /// Swap the persisted sort positions of two terminals (by name). Used by the
+    /// sidebar's manual reorder (Ctrl+Alt+↑/↓) within a host group, mirroring
+    /// [`Self::swap_worktree_positions`]. Heals NULL/tied positions (older rows
+    /// whose `position` was never re-assigned) before swapping so a reorder never
+    /// silently no-ops.
+    fn swap_terminal_positions(&self, a_name: &str, b_name: &str) -> Result<()>;
+
+    /// Set one terminal's persisted sort position (name key). Mirrors
+    /// [`Self::set_worktree_position`].
+    fn set_terminal_position(&self, name: &str, position: i64) -> Result<()>;
 }
