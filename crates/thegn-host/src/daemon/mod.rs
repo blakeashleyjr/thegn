@@ -148,6 +148,17 @@ async fn run(
 
     // Boot sweep: previous daemons for this scope whose pid is gone left
     // meaningless registry rows and leases (their PTYs died with them).
+    //
+    // No session-pid reaping is needed even though daemon-persistent bwrap
+    // panes drop `--die-with-parent`: when a daemon process dies (graceful OR
+    // SIGKILL), the kernel closes every fd it held — including each session's
+    // PTY master AND the reader thread's cloned fd — which hangs up the tty and
+    // delivers SIGHUP to the child. bwrap is PID 1 of its unshared namespace,
+    // so its death collapses the whole namespace. The guarantee `--die-with-
+    // parent` used to give (die with the forking process) is preserved by the
+    // tty hangup; what it wrongly added — dying with the forking *thread* — is
+    // what we shed. Per-session teardown while the daemon lives is handled by
+    // the actor's explicit child-terminate (see `SessionActor::run`).
     {
         let db = db.lock().expect("daemon db lock");
         for row in db.daemons().unwrap_or_default() {

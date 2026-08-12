@@ -808,6 +808,7 @@ mod tests {
             vpn: None,
             oci_host: None,
             oci_runtime: None,
+            daemon_persistent: false,
         }
     }
 

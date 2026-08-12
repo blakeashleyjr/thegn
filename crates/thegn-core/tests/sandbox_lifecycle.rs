@@ -65,6 +65,7 @@ fn alpine_spec(name: &str, worktree: &str) -> SandboxSpec {
         vpn: None,
         oci_host: None,
         oci_runtime: None,
+        daemon_persistent: false,
     }
 }
 

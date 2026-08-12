@@ -241,6 +241,7 @@ fn spec(backend: Backend) -> SandboxSpec {
         vpn: None,
         oci_host: None,
         oci_runtime: None,
+        daemon_persistent: false,
     }
 }
 
@@ -308,6 +309,35 @@ fn bwrap_binds_worktree_and_gitdir() {
     assert!(joined.contains("--bind /repo/.git /repo/.git"));
     assert!(joined.contains("--chdir /wt/feat"));
     assert_eq!(argv.last().unwrap(), "exec claude");
+}
+
+#[test]
+fn bwrap_die_with_parent_is_gated_by_daemon_persistent() {
+    // Default (in-process / chrome pane): the sandbox dies with the compositor.
+    let mut ephemeral = spec(Backend::Bwrap);
+    ephemeral.image = None;
+    let joined = enter_argv(&ephemeral, "claude").join(" ");
+    assert!(joined.contains("--unshare-pid"), "pid ns is unconditional");
+    assert!(
+        joined.contains("--die-with-parent"),
+        "an in-process bwrap pane keeps --die-with-parent: {joined}"
+    );
+
+    // Daemon-owned pane: the daemon reaps its own sessions, so the guard is
+    // dropped — otherwise a backgrounded shell is killed when the forking
+    // thread goes away (the "restarts on switch" bug).
+    let mut persistent = spec(Backend::Bwrap);
+    persistent.image = None;
+    persistent.daemon_persistent = true;
+    let joined = enter_argv(&persistent, "claude").join(" ");
+    assert!(
+        joined.contains("--unshare-pid"),
+        "pid ns stays even for daemon panes: {joined}"
+    );
+    assert!(
+        !joined.contains("--die-with-parent"),
+        "a daemon-persistent bwrap pane must NOT die with its forking parent: {joined}"
+    );
 }
 
 #[test]
