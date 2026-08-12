@@ -159,6 +159,16 @@ pub(crate) enum RefreshKind {
     /// contract — and a straggler tick after the splash cleared leaves damage
     /// empty, so `render_plan` still Skips.
     SplashTick,
+    /// The transient in-app projection of a routed notification — sent from an
+    /// off-loop dispatch site ([`crate::notify::record`]) when the routing
+    /// decision authorizes an in-app toast (`RouteDecision.toast`). The loop
+    /// pushes it onto the [`crate::toast::Toasts`] stack (colored by priority)
+    /// and schedules the one-shot expiry wake, so the transient toast and the
+    /// persistent inbox entry are two views of the one routed event.
+    Toast {
+        message: String,
+        priority: thegn_core::notification::Priority,
+    },
 }
 
 const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);

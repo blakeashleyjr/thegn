@@ -6,7 +6,6 @@
 //!   Full   (150 cols): left list + right detail panel side-by-side.
 
 use thegn_core::notification::{Notification, NotificationKind};
-use thegn_core::theme::Hue;
 
 use crate::seg::{Line, Seg, seg, sp};
 
@@ -16,26 +15,16 @@ use super::{
 
 // ---- helpers -----------------------------------------------------------------
 
+/// The kind's marker glyph + color from the single core vocabulary
+/// ([`NotificationKind::hued_glyph`]), so the panel inbox and the unified
+/// overlay never diverge and both degrade to ASCII with the chrome.
+fn kind_gh(k: NotificationKind) -> (&'static str, crate::seg::Tok) {
+    let (glyph, h) = k.hued_glyph(crate::caps::active_glyphs());
+    (glyph, hue(h))
+}
+
 fn kind_hue(k: NotificationKind) -> crate::seg::Tok {
-    match k {
-        NotificationKind::AgentDone
-        | NotificationKind::WorktreeCreated
-        | NotificationKind::BlockerResolved
-        | NotificationKind::QueueLanded
-        | NotificationKind::QueueReady => hue(Hue::Green),
-        NotificationKind::AgentFailed
-        | NotificationKind::TestFailed
-        | NotificationKind::Overdue
-        | NotificationKind::LogError
-        | NotificationKind::ProcessFailed
-        | NotificationKind::QueueNeedsHuman => hue(Hue::Red),
-        NotificationKind::AgentAttention
-        | NotificationKind::PrStateChanged
-        | NotificationKind::StatusChanged
-        | NotificationKind::PrLinked => hue(Hue::Amber),
-        NotificationKind::Assigned | NotificationKind::Mentioned => hue(Hue::Blue),
-        NotificationKind::ProcessExited => hue(Hue::Green),
-    }
+    kind_gh(k).1
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -118,7 +107,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         };
 
         let row = PanelRow::plain(Line::segs(vec![
-            seg(glyph_tok, n.kind.glyph()),
+            seg(glyph_tok, kind_gh(n.kind).0),
             seg(g3(), " "),
             seg(src_tok, src),
             seg(g3(), " "),
@@ -143,8 +132,8 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows.push(hint_row(&[
         ("↵", "read"),
         ("/ ", "search"),
-        ("r", "read"),
-        ("R", "all"),
+        ("x", "dismiss"),
+        ("a", "clear"),
         ("d", "del"),
         ("A", "show read"),
         (
@@ -181,7 +170,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         let src = truncate(&n.source_ref, 14);
         let msg_budget = ctx
             .cols
-            .saturating_sub(n.kind.glyph().len() + 1 + src.len() + 3 + ago.len() + 1);
+            .saturating_sub(kind_gh(n.kind).0.len() + 1 + src.len() + 3 + ago.len() + 1);
         let msg = truncate(&n.message, msg_budget.max(4));
         let wt_base = n
             .worktree_path
@@ -196,7 +185,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         };
 
         let line1 = Line::segs(vec![
-            seg(glyph_tok, n.kind.glyph()),
+            seg(glyph_tok, kind_gh(n.kind).0),
             seg(g3(), " "),
             seg(src_tok, src),
             seg(g(), " · "),
@@ -239,8 +228,8 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows.push(hint_row(&[
         ("↵", "read"),
         ("/ ", "search"),
-        ("r", "read"),
-        ("R", "all"),
+        ("x", "dismiss"),
+        ("a", "clear"),
         ("d", "del"),
         ("A", "show read"),
         (
@@ -319,7 +308,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             };
             vec![
                 seg(if i == cursor { t() } else { g() }, sel_mark),
-                seg(glyph_tok, n.kind.glyph()),
+                seg(glyph_tok, kind_gh(n.kind).0),
                 seg(g3(), " "),
                 seg(src_tok, src),
                 seg(g3(), " "),
@@ -345,9 +334,9 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows.push(hint_row(&[
         ("↵", "read"),
         ("/ ", "search"),
-        ("r", "mark read"),
-        ("R", "all read"),
-        ("d", "dismiss"),
+        ("x", "dismiss"),
+        ("a", "clear all"),
+        ("d", "del"),
         ("A", "show all"),
     ]));
     rows
@@ -358,7 +347,7 @@ fn notification_detail_segs(n: &Notification, w: usize) -> Vec<Vec<Seg>> {
 
     // Kind glyph + source reference (title row)
     out.push(vec![
-        seg(kind_hue(n.kind), n.kind.glyph()),
+        seg(kind_hue(n.kind), kind_gh(n.kind).0),
         seg(g(), "  "),
         seg(t(), truncate(&n.source_ref, w.saturating_sub(4))).bold(),
     ]);

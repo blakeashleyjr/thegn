@@ -16,30 +16,28 @@ use crate::chrome::S;
 use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::seg::{Line, Tok, seg};
+use thegn_core::notification::Priority;
 use thegn_core::theme::Hue;
 
-/// Severity of a toast — drives its text/border color.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToastKind {
-    Info,
-    Success,
-}
+/// The neutral (default text) toast color — a plain acknowledgement that must
+/// not pull a hue ("Text copied", "Recording saved").
+pub const INFO: Tok = Tok::Slot(S::Text);
+/// A positive-outcome toast color.
+pub const SUCCESS: Tok = Tok::Hue(Hue::Green);
 
-impl ToastKind {
-    /// The color token for this kind's message text + box border.
-    fn tok(self) -> Tok {
-        match self {
-            ToastKind::Info => Tok::Slot(S::Text),
-            ToastKind::Success => Tok::Hue(Hue::Green),
-        }
-    }
+/// The toast color for a routed notification of the given effective priority —
+/// the single source shared with the flag/count badges (via [`Priority::hue`]):
+/// `Info` stays neutral, `Notice`/`Alert` pick up their accent hue.
+pub fn priority_color(p: Priority) -> Tok {
+    p.hue().map_or(INFO, Tok::Hue)
 }
 
 /// One transient message and the instant it should disappear.
 #[derive(Debug, Clone)]
 pub struct Toast {
     pub message: String,
-    pub kind: ToastKind,
+    /// Message + border color (see [`INFO`] / [`SUCCESS`] / [`priority_color`]).
+    pub color: Tok,
     pub expires: Instant,
 }
 
@@ -56,18 +54,12 @@ pub struct Toasts {
 }
 
 impl Toasts {
-    /// Push a toast that expires `ttl` after `now`, capping the stack to the
-    /// most recent [`MAX_TOASTS`].
-    pub fn push(
-        &mut self,
-        kind: ToastKind,
-        message: impl Into<String>,
-        now: Instant,
-        ttl: Duration,
-    ) {
+    /// Push a `color`-styled toast that expires `ttl` after `now`, capping the
+    /// stack to the most recent [`MAX_TOASTS`].
+    pub fn push(&mut self, color: Tok, message: impl Into<String>, now: Instant, ttl: Duration) {
         self.stack.push(Toast {
             message: message.into(),
-            kind,
+            color,
             expires: now + ttl,
         });
         if self.stack.len() > MAX_TOASTS {
@@ -78,12 +70,17 @@ impl Toasts {
 
     /// Convenience: a success toast with the default TTL.
     pub fn success(&mut self, message: impl Into<String>, now: Instant) {
-        self.push(ToastKind::Success, message, now, DEFAULT_TTL);
+        self.push(SUCCESS, message, now, DEFAULT_TTL);
     }
 
-    /// Convenience: an info toast with the default TTL.
+    /// Convenience: a neutral info toast with the default TTL.
     pub fn info(&mut self, message: impl Into<String>, now: Instant) {
-        self.push(ToastKind::Info, message, now, DEFAULT_TTL);
+        self.push(INFO, message, now, DEFAULT_TTL);
+    }
+
+    /// A neutral info toast with a caller-chosen TTL (longer-lived notices).
+    pub fn info_ttl(&mut self, message: impl Into<String>, now: Instant, ttl: Duration) {
+        self.push(INFO, message, now, ttl);
     }
 
     /// Drop every toast whose deadline has passed. Returns `true` when the
@@ -103,7 +100,7 @@ impl Toasts {
     pub fn lines(&self) -> Vec<Line> {
         self.stack
             .iter()
-            .map(|t| Line::segs(vec![seg(t.kind.tok(), t.message.clone())]))
+            .map(|t| Line::segs(vec![seg(t.color, t.message.clone())]))
             .collect()
     }
 
@@ -124,7 +121,7 @@ impl Toasts {
         let border = self
             .stack
             .last()
-            .map(|t| t.kind.tok())
+            .map(|t| t.color)
             .unwrap_or(Tok::Slot(S::Accent));
         let spec = LayerSpec {
             cols,
@@ -183,8 +180,8 @@ mod tests {
     fn distinct_ttls_expire_independently() {
         let t0 = base();
         let mut toasts = Toasts::default();
-        toasts.push(ToastKind::Info, "a", t0, Duration::from_secs(5));
-        toasts.push(ToastKind::Info, "b", t0, Duration::from_secs(2));
+        toasts.push(INFO, "a", t0, Duration::from_secs(5));
+        toasts.push(INFO, "b", t0, Duration::from_secs(2));
         // At t0+3s the 2s toast is gone but the 5s one survives.
         assert!(toasts.prune(t0 + Duration::from_secs(3)));
         assert_eq!(toasts.lines().len(), 1);

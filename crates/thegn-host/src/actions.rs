@@ -832,6 +832,9 @@ impl CiActionCtx<'_> {
             // Intercepted by the loop's Act arm (it owns the panel locals);
             // unreachable here.
             DetailAction::OpenMergeQueueSection => {}
+            // Intercepted by the loop's Act arm (it owns the fold/drive locals
+            // that `CiActionCtx` lacks); unreachable here.
+            DetailAction::MergeQueueAction { .. } => {}
         }
         // Retain the overlay only for the in-place drills (CI, highlight-read);
         // every other action has done its side effect and the modal should close.
