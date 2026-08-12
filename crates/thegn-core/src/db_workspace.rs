@@ -1028,6 +1028,44 @@ impl WorkspaceStore for Db {
         )?;
         Ok(())
     }
+
+    /// Terminal analogue of [`WorkspaceStore::swap_worktree_positions`] (name
+    /// key). Read both first, then write — a CASE-UPDATE that reads the table it
+    /// mutates can observe its own intermediate write. Heal NULL/tied positions
+    /// (older `local` reseeds / pre-reorder rows) before swapping.
+    fn swap_terminal_positions(&self, a_name: &str, b_name: &str) -> Result<()> {
+        self.transaction(|db| {
+            let pos = |name: &str| -> Result<Option<i64>> {
+                Ok(db
+                    .conn()
+                    .query_row(
+                        "SELECT position FROM terminals WHERE name=?1",
+                        params![name],
+                        |r| r.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?
+                    .flatten())
+            };
+            let (mut pa, mut pb) = (pos(a_name)?, pos(b_name)?);
+            if pa.is_none() || pb.is_none() || pa == pb {
+                db.normalize_terminal_positions()?;
+                (pa, pb) = (pos(a_name)?, pos(b_name)?);
+            }
+            if let (Some(pa), Some(pb)) = (pa, pb) {
+                db.set_terminal_position(a_name, pb)?;
+                db.set_terminal_position(b_name, pa)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn set_terminal_position(&self, name: &str, position: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE terminals SET position=?2 WHERE name=?1",
+            params![name, position],
+        )?;
+        Ok(())
+    }
 }
 
 /// Position-healing helpers for the manual-reorder swaps. Kept as inherent
@@ -1102,6 +1140,27 @@ impl Db {
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Terminal analogue of [`Db::normalize_worktree_positions`]. Uses the same
+    /// `ORDER BY` as [`WorkspaceStore::terminals`] (`position, last_active DESC`)
+    /// so the visible order is preserved while positions become contiguous +
+    /// distinct; `name` is the final deterministic tie-break. Idempotent.
+    pub(crate) fn normalize_terminal_positions(&self) -> Result<()> {
+        let names: Vec<String> = {
+            let mut stmt = self
+                .conn()
+                .prepare("SELECT name FROM terminals ORDER BY position, last_active DESC, name")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for (i, n) in names.iter().enumerate() {
+            self.conn().execute(
+                "UPDATE terminals SET position=?2 WHERE name=?1",
+                params![n, i as i64],
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1307,5 +1366,51 @@ mod tests {
         // Empty titles are skipped by the bulk load (they'd add no sidebar value).
         db.set_worktree_window_title("/wt/c", "").unwrap();
         assert!(!db.all_worktree_titles().unwrap().contains_key("/wt/c"));
+    }
+
+    #[test]
+    fn terminal_position_swap_round_trips_and_survives_read() {
+        let db = Db::open_memory().unwrap();
+        // Insert order is the initial position order (MAX+1 each).
+        db.put_terminal("a", "local", "", None).unwrap();
+        db.put_terminal("b", "local", "", None).unwrap();
+        db.put_terminal("c", "local", "", None).unwrap();
+        let names = |db: &Db| -> Vec<String> {
+            db.terminals()
+                .unwrap()
+                .into_iter()
+                .map(|t| t.name)
+                .collect()
+        };
+        assert_eq!(names(&db), vec!["a", "b", "c"]);
+
+        // Swap the two adjacent siblings a<->b; the new order persists.
+        db.swap_terminal_positions("a", "b").unwrap();
+        assert_eq!(names(&db), vec!["b", "a", "c"]);
+
+        // set_terminal_position drives a single row directly.
+        db.set_terminal_position("c", -1).unwrap();
+        assert_eq!(names(&db), vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn terminal_position_swap_heals_tied_positions() {
+        let db = Db::open_memory().unwrap();
+        // Simulate legacy rows whose position was never re-assigned (all 0):
+        // put_terminal seeds MAX+1, so force a tie directly.
+        db.put_terminal("a", "local", "", None).unwrap();
+        db.put_terminal("b", "local", "", None).unwrap();
+        db.conn()
+            .execute("UPDATE terminals SET position=0", [])
+            .unwrap();
+        // A swap must heal the tie (normalize) then exchange, not no-op.
+        db.swap_terminal_positions("a", "b").unwrap();
+        let names: Vec<String> = db
+            .terminals()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["b", "a"]);
     }
 }

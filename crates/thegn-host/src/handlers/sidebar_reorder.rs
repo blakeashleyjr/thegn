@@ -127,6 +127,94 @@ impl SidebarState {
         true
     }
 
+    /// Move the terminal named `name` one slot within its **host group**,
+    /// swapping the durable `position` with its adjacent same-host sibling in
+    /// display order. Terminals live in the DB registry (not `session.worktrees`
+    /// as orderable groups), so this swaps `terminals.position` and re-reads the
+    /// registry snapshot before rebuilding. Never crosses a host boundary; the
+    /// local/remote host grouping itself is fixed (see `terminal_hosts_ordered`).
+    /// Returns whether it moved.
+    pub(crate) fn move_terminal_row(
+        &mut self,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+        name: &str,
+        up: bool,
+    ) -> bool {
+        use crate::sidebar::RowKind;
+        // The cursor terminal's host slug (`terminals/host:{key}`) confines the
+        // motion to same-host siblings.
+        let Some(host_slug) = model
+            .sidebar_rows
+            .iter()
+            .find(|r| r.kind == RowKind::Terminal && r.worktree_path.as_deref() == Some(name))
+            .map(|r| r.workspace_slug.clone())
+        else {
+            return false;
+        };
+        // In-host display order (terminal names), top to bottom as rendered.
+        let order = |model: &FrameModel| -> Vec<String> {
+            model
+                .sidebar_rows
+                .iter()
+                .filter(|r| {
+                    r.visible && r.kind == RowKind::Terminal && r.workspace_slug == host_slug
+                })
+                .filter_map(|r| r.worktree_path.clone())
+                .collect()
+        };
+        let cur = order(model);
+        let Some(p) = cur.iter().position(|n| n == name) else {
+            return false;
+        };
+        let neighbor = if up {
+            p.checked_sub(1)
+        } else {
+            (p + 1 < cur.len()).then_some(p + 1)
+        };
+        let Some(np) = neighbor else { return false };
+        let other = cur[np].clone();
+
+        if let Ok(db) = thegn_core::db::Db::open() {
+            // best-effort: the DB is the source of truth for the terminals
+            // registry; a failed persist only loses the order across restart.
+            let _ = db.swap_terminal_positions(name, &other);
+            // Re-read the registry snapshot the tree renders from so the new
+            // order shows immediately (build_rows reads `sidebar_db_terminals`,
+            // not a fresh query).
+            if let Ok(terms) = db.terminals() {
+                model.sidebar_db_terminals = terms;
+            }
+        }
+        self.rebuild(model, session);
+        true
+    }
+
+    /// Move the terminal under the sidebar cursor one slot within its host
+    /// (Ctrl+Alt+↑/↓), keeping the cursor on the moved terminal — the terminal
+    /// analogue of [`Self::move_active_worktree`] / [`Self::move_selected_workspace`].
+    pub(crate) fn move_cursor_terminal(
+        &mut self,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+        up: bool,
+    ) -> bool {
+        let Some(row) = self.selected_row(model) else {
+            return false;
+        };
+        let cursor_key = row.pin_key.clone();
+        let Some(name) = row.worktree_path.clone() else {
+            return false;
+        };
+        if self.move_terminal_row(model, session, &name, up) {
+            self.cursor = visible_index_of_pin_key(model, &cursor_key).unwrap_or(self.cursor);
+            self.sync(model);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Reorder the workspace under the sidebar cursor one slot (Ctrl+Alt+↑/↓),
     /// keeping the cursor on the moved workspace's header.
     pub(crate) fn move_selected_workspace(
@@ -385,6 +473,82 @@ impl SidebarState {
                         continue;
                     }
                     if self.move_workspace_by_slug(model, session, slug, up) {
+                        moved = true;
+                    }
+                }
+                if moved {
+                    self.cursor =
+                        visible_index_of_pin_key(model, &cursor_key).unwrap_or(self.cursor);
+                    self.sync(model);
+                }
+                moved
+            }
+            RowKind::Terminal => {
+                // Selected terminals (marked Terminal rows, else the cursor's),
+                // confined to the cursor's host group — terminals only reorder
+                // within their own host, mirroring worktrees-within-a-workspace.
+                let host_slug = cursor_row.workspace_slug.clone();
+                let mut sel_names: Vec<String> = model
+                    .sidebar_rows
+                    .iter()
+                    .filter(|r| {
+                        r.visible
+                            && r.kind == RowKind::Terminal
+                            && r.workspace_slug == host_slug
+                            && self.marked.contains(&r.pin_key)
+                    })
+                    .filter_map(|r| r.worktree_path.clone())
+                    .collect();
+                if sel_names.is_empty()
+                    && let Some(n) = self
+                        .selected_row(model)
+                        .and_then(|r| r.worktree_path.clone())
+                {
+                    sel_names.push(n);
+                }
+                if sel_names.is_empty() {
+                    return false;
+                }
+                let sel: HashSet<String> = sel_names.iter().cloned().collect();
+                // In-host display order of the selected terminals — top-first for
+                // up, bottom-first for down — so the block moves as a unit.
+                let in_host = |model: &FrameModel| -> Vec<String> {
+                    model
+                        .sidebar_rows
+                        .iter()
+                        .filter(|r| {
+                            r.visible
+                                && r.kind == RowKind::Terminal
+                                && r.workspace_slug == host_slug
+                        })
+                        .filter_map(|r| r.worktree_path.clone())
+                        .collect()
+                };
+                let mut ordered: Vec<String> = in_host(model)
+                    .into_iter()
+                    .filter(|n| sel.contains(n))
+                    .collect();
+                if !up {
+                    ordered.reverse();
+                }
+                let mut moved = false;
+                for name in &ordered {
+                    let disp = in_host(model);
+                    let Some(p) = disp.iter().position(|n| n == name) else {
+                        continue;
+                    };
+                    let neighbor = if up {
+                        p.checked_sub(1)
+                    } else {
+                        (p + 1 < disp.len()).then_some(p + 1)
+                    };
+                    // Don't swap two selected terminals past each other.
+                    if let Some(np) = neighbor
+                        && sel.contains(&disp[np])
+                    {
+                        continue;
+                    }
+                    if self.move_terminal_row(model, session, name, up) {
                         moved = true;
                     }
                 }
@@ -786,5 +950,72 @@ mod tests {
             "db.workspaces() reload must match the reordered tree, not a \
              normalize-tiebreak order"
         );
+    }
+
+    #[test]
+    fn reorder_terminal_within_host_swaps_and_persists() {
+        use thegn_core::store::WorkspaceStore;
+        let _g = DbGuard::new("terminal-reorder");
+        let db = thegn_core::db::Db::open().unwrap();
+        // Three local terminals; insert order is the initial position order.
+        db.put_terminal("a", "local", "", None).unwrap();
+        db.put_terminal("b", "local", "", None).unwrap();
+        db.put_terminal("c", "local", "", None).unwrap();
+
+        let mut session = app_session(&["home"]);
+        let mut model = one_ws_model(&session);
+        model.sidebar_db_terminals = db.terminals().unwrap();
+        let mut sb = focused(&mut model, &session);
+
+        let term_order = |model: &FrameModel| -> Vec<String> {
+            model
+                .sidebar_rows
+                .iter()
+                .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Terminal)
+                .map(|r| r.label.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(term_order(&model), vec!["a", "b", "c"]);
+
+        // Cursor on "b", move up → swaps with its same-host sibling "a".
+        sb.cursor = vidx(&model, "b");
+        sb.sync(&mut model);
+        assert!(sb.reorder_selection(&mut model, &mut session, true));
+        assert_eq!(term_order(&model), vec!["b", "a", "c"]);
+        // Persisted: a fresh registry read reflects the new order.
+        let persisted: Vec<String> = db
+            .terminals()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(persisted, vec!["b", "a", "c"]);
+
+        // The top terminal can't move up past the host boundary — no-op.
+        sb.cursor = vidx(&model, "b");
+        sb.sync(&mut model);
+        assert!(!sb.reorder_selection(&mut model, &mut session, true));
+        assert_eq!(term_order(&model), vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn reorder_terminals_do_not_cross_host_boundaries() {
+        use thegn_core::store::WorkspaceStore;
+        let _g = DbGuard::new("terminal-reorder-hosts");
+        let db = thegn_core::db::Db::open().unwrap();
+        // One local + one ssh terminal: distinct host groups (local sorts first).
+        db.put_terminal("loc", "local", "", None).unwrap();
+        db.put_terminal("rem", "ssh", "ssh dev@prod", None).unwrap();
+
+        let mut session = app_session(&["home"]);
+        let mut model = one_ws_model(&session);
+        model.sidebar_db_terminals = db.terminals().unwrap();
+        let mut sb = focused(&mut model, &session);
+
+        // Cursor on the sole local terminal; moving down must NOT pull the remote
+        // terminal into the local group — there's no same-host sibling below.
+        sb.cursor = vidx(&model, "loc");
+        sb.sync(&mut model);
+        assert!(!sb.reorder_selection(&mut model, &mut session, false));
     }
 }
