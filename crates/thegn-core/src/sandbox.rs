@@ -88,7 +88,19 @@ pub(crate) fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<
             }
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
-                let _ = child.wait();
+                // Reap on a DETACHED thread, never inline: a probe subprocess
+                // wedged in an uninterruptible syscall (dead daemon socket,
+                // stalled DNS, hung NFS) doesn't die the instant SIGKILL lands
+                // — the kernel delivers it only when the task leaves the
+                // syscall, so a synchronous `wait()` here blocks for as long as
+                // the wedge lasts. That is exactly how one hung `podman`/`docker`
+                // probe turned a 5s deadline into a multi-minute freeze on the
+                // sandbox-resolution path (which pane spawns sit behind). Hand
+                // the child off and return at the deadline; the zombie is
+                // reaped whenever it finally dies.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
                 return None;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
