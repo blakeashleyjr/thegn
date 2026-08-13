@@ -134,6 +134,9 @@ pub(crate) enum RefreshKind {
     /// The proxy dashboard's off-loop DB gather (stats/budgets/health),
     /// delivered into the live overlay by `crate::detail::apply_proxy_dash`.
     ProxyDash(Box<crate::detail::ProxyDashPayload>),
+    /// The usage overlay's off-loop gather (per-account rate-limit windows),
+    /// delivered into the live overlay by `crate::detail::apply_usage`.
+    Usage(Box<crate::detail::UsagePayload>),
     /// An onboarding-wizard probe answer (gh auth / sandbox backends / ssh
     /// host), delivered into the live wizard by
     /// [`crate::handlers::onboarding::apply_probe`].

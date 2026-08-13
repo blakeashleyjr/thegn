@@ -673,6 +673,43 @@ impl Default for MediaConfig {
     }
 }
 
+/// `[usage]` — the AI-account usage tracker (roadmap V 300). An opt-in detail
+/// overlay (`open-usage`) that shows per-account rate-limit windows (session /
+/// weekly / …) as usage bars, modeled on orca. Reads each harness's local state:
+/// Codex from its rollout files (offline), Claude + Antigravity by reading the
+/// locally-stored OAuth token and making a lightweight authenticated request —
+/// the latter gated behind `allow_network` so the shell stays offline by default.
+/// AI features are strictly additive; this never affects the AI-free shell.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct UsageConfig {
+    /// Master switch. `false` ⇒ the `open-usage` overlay reports the feature off
+    /// and gathers nothing.
+    pub enabled: bool,
+    /// Which harnesses to track (`"codex"`, `"claude"`, `"antigravity"`). Order is
+    /// the display order; an unknown id is ignored.
+    pub providers: Vec<String>,
+    /// Allow the outward-facing live fetches (Claude `/api/oauth/usage`,
+    /// Antigravity quota summary) using the on-disk OAuth token. `false` ⇒ only
+    /// offline sources are used (Codex rollup files); Claude/Antigravity show
+    /// "unavailable". Off by default — the live GET/POST is opt-in.
+    pub allow_network: bool,
+    /// Re-poll cadence (seconds) for a future live refresh while the overlay is
+    /// open. v1 gathers once on open, so this is currently advisory.
+    pub poll_interval_secs: u64,
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        UsageConfig {
+            enabled: true,
+            providers: vec!["codex".into(), "claude".into(), "antigravity".into()],
+            allow_network: false,
+            poll_interval_secs: 60,
+        }
+    }
+}
+
 // `MediaConfig`'s inherent impls (`resolve_opts`, `seek_step`) live in the
 // `config_media` sibling module to keep this ratcheted god-file from growing.
 
@@ -3350,6 +3387,9 @@ pub struct Config {
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
+    /// `[usage]` — the AI-account usage tracker overlay (`open-usage`). Opt-in,
+    /// additive; the shell never depends on it. See [`UsageConfig`].
+    pub usage: UsageConfig,
     /// `[remote]` — ssh keepalive/retry/heal tuning. See [`crate::config_remote`].
     pub remote: crate::config_remote::RemoteConfig,
     /// `[network]` — offline-detection policy. See [`crate::config_network`].
@@ -3497,6 +3537,7 @@ impl Default for Config {
             merge_queue: MergeQueueConfig::default(),
             replay: ReplayConfig::default(),
             media: MediaConfig::default(),
+            usage: UsageConfig::default(),
             remote: crate::config_remote::RemoteConfig::default(),
             network: crate::config_network::NetworkConfig::default(),
             share: ShareConfig::default(),
