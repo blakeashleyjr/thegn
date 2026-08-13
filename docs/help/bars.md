@@ -12,6 +12,7 @@ actions:
     mark-all-read,
     open-ci,
     open-proxy-dash,
+    open-usage,
   ]
 ---
 
@@ -75,3 +76,15 @@ branch, `r` retries a blocked one, `x` removes it, `m` jumps to the full
 Work ▸ Merge queue section. Ephemeral confirmations ("Landed", "Text
 copied") surface as transient toasts, the passing view of the same
 routed events that also land in this inbox.
+
+## AI account usage
+
+**AI account usage** (command palette, or bind the `open-usage` action) opens
+an overlay of per-account rate-limit windows — session / weekly / … — for your
+AI coding harnesses (Claude, Codex, Antigravity), drawn as usage bars with a
+`used %` and a "resets in …" countdown. It only reads credentials the harnesses
+already wrote locally; thegn never asks for or stores an API key. Codex usage is
+read offline from its rollup files; Claude and Antigravity don't persist their
+windows to disk, so they require `[usage] allow_network = true` (an opt-in,
+authenticated request using the on-disk OAuth token) and otherwise show
+"unavailable". Configure it under `[usage]`.

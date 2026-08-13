@@ -870,6 +870,25 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "open-usage",
+        label: "AI account usage",
+        hint: "usage",
+        // Palette-only (no default chord): a low-frequency, user-bindable action.
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "usage",
+            "account usage",
+            "rate limit",
+            "rate limits",
+            "quota",
+            "limits",
+            "orca",
+            "session weekly monthly",
+            "claude codex antigravity",
+        ],
+    },
+    ActionSpec {
         id: "open-merge-queue",
         label: "Merge queue",
         hint: "merge queue",

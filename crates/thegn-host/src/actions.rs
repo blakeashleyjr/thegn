@@ -374,6 +374,28 @@ pub(crate) fn spawn_proxy_dash(refresh_tx: &UnboundedSender<RefreshKind>, waker:
     });
 }
 
+/// Gather AI-account usage off the loop (each harness's local state: Codex rollup
+/// files offline, Claude/Antigravity via their on-disk OAuth token + a live fetch
+/// when `[usage] allow_network`) and deliver it into the live overlay via
+/// `RefreshKind::Usage` (applied by `crate::detail::apply_usage`). The loop
+/// already painted the loading shell, and `thegn_svc::usage::gather` never errors
+/// — unreadable providers come back `Unavailable`.
+pub(crate) fn spawn_usage(
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    cfg: thegn_core::config::UsageConfig,
+) {
+    let tx = refresh_tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let accounts = thegn_svc::usage::gather(&cfg);
+        let payload = crate::detail::UsagePayload { accounts };
+        if tx.send(RefreshKind::Usage(Box::new(payload))).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+}
+
 /// Run a full-screen PR-view action off the loop, posting an in-progress status
 /// and pulsing a `RefreshKind::Pr` on completion (which re-hydrates the panel
 /// cache and, if the view is open, re-fetches its diff + conversation). Mirrors
