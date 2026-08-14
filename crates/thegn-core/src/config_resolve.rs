@@ -348,7 +348,6 @@ pub fn classify_repo_overlay(
         backend_chain,
         image,
         profile,
-        agent_profile,
         network,
         file_access,
         ports,
@@ -462,15 +461,6 @@ pub fn classify_repo_overlay(
         profile,
         base.profile,
         "sandbox.profile",
-        profile_rank,
-        |p| p.as_str().to_string(),
-    );
-    floor_enum(
-        &mut out.agent_profile,
-        &mut events,
-        agent_profile,
-        base.agent_profile,
-        "sandbox.agent_profile",
         profile_rank,
         |p| p.as_str().to_string(),
     );

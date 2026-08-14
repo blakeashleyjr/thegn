@@ -46,10 +46,7 @@ pub enum MenuChoice {
     BisectSkip,
     BisectReset,
     // branch actions
-    BranchDelete {
-        name: String,
-        force: bool,
-    },
+    BranchDelete { name: String, force: bool },
     BranchForcePush,
     BranchPush,
     BranchPull,
@@ -75,38 +72,21 @@ pub enum MenuChoice {
     ConfirmUndo,
     ConfirmRedo,
     // generic yes/no confirm — the loop interprets `tag`
-    Confirm {
-        tag: &'static str,
-        arg: String,
-    },
+    Confirm { tag: &'static str, arg: String },
     // delete worktree confirm: variant to capture "leave files" intent
-    ConfirmDeleteWorktrees {
-        keep_files: bool,
-    },
+    ConfirmDeleteWorktrees { keep_files: bool },
     // the `[c]` arm of the close-or-delete chooser: close the pending worktree
     // groups (forget them in thegn) without touching branch or files.
     ConfirmCloseWorktrees,
     // delete workspace confirm: variant to capture "leave files" intent
-    ConfirmDeleteWorkspace {
-        keep_files: bool,
-    },
+    ConfirmDeleteWorkspace { keep_files: bool },
     // init git confirm
-    ConfirmInitGit {
-        path: String,
-    },
+    ConfirmInitGit { path: String },
     // new-project confirm: mkdir the leaf (parent exists) + git init + open.
-    ConfirmCreateProject {
-        path: String,
-    },
+    ConfirmCreateProject { path: String },
     // first-launch keymap picker (item 621): the chosen preset id
     // ("default" | "vscode" | "jetbrains").
     SetKeymapPreset(String),
-    // bouncer tool-approval gate: allow/deny the sealed agent's pending shell /
-    // edit / write tool call. The four ACP permission options — allow/reject,
-    // each once or "always" (session-remembered). Esc/cancel = reject once.
-    ApproveTool {
-        decision: crate::bouncer::ApprovalDecision,
-    },
     // share reach picker: the chosen reach (public/team/peer).
     ShareReach(thegn_core::config::ShareReach),
     // sandbox bring-up failed (failover off): retry the active worktree's env.
@@ -132,7 +112,6 @@ pub enum MenuKindTag {
     RedoConfirm,
     Confirm,
     KeymapPicker,
-    Approval,
     ShareReach,
     SandboxHalt,
 }
@@ -654,55 +633,6 @@ pub fn host_actions_menu(name: &str, id: &str, is_db_def: bool) -> MenuOverlay {
         );
     }
     MenuOverlay::new(MenuKindTag::Confirm, format!("host: {name}"), items)
-}
-
-/// The bouncer's tool-approval gate: a sealed agent wants to `run`/`edit`/`write`
-/// and the user picks one of ACP's four permission options. `[a]` allows once,
-/// `[s]` allows for the rest of the session (remembered for this worktree +
-/// action), `[d]` denies once, `[x]` denies for the session; `[d]`/Esc is the
-/// safe default. `title` names the worktree + action (e.g. `pi · run a shell
-/// command`); `body` is the command or path summary. Resolves to
-/// `ApproveTool { decision }`.
-pub fn approval_menu(title: impl Into<String>, body: impl Into<String>) -> MenuOverlay {
-    use crate::bouncer::ApprovalDecision as D;
-    MenuOverlay::new(
-        MenuKindTag::Approval,
-        title,
-        vec![
-            item(
-                Some('a'),
-                "allow once",
-                MenuChoice::ApproveTool {
-                    decision: D::AllowOnce,
-                },
-            ),
-            item(
-                Some('s'),
-                "allow this session",
-                MenuChoice::ApproveTool {
-                    decision: D::AllowAlways,
-                },
-            )
-            .note("remember for this action"),
-            item(
-                Some('d'),
-                "deny once",
-                MenuChoice::ApproveTool {
-                    decision: D::RejectOnce,
-                },
-            )
-            .danger(),
-            item(
-                Some('x'),
-                "deny this session",
-                MenuChoice::ApproveTool {
-                    decision: D::RejectAlways,
-                },
-            )
-            .danger(),
-        ],
-    )
-    .with_body(body)
 }
 
 /// A non-local environment (provider/k8s/ssh) could not be brought up and
@@ -1861,47 +1791,6 @@ mod tests {
                 arg: "host:laptop".into(),
             }
         );
-    }
-
-    #[test]
-    fn approval_menu_offers_four_acp_options() {
-        use crate::bouncer::ApprovalDecision as D;
-        let mut m = approval_menu("pi · run a shell command", "git status");
-        assert_eq!(m.tag, MenuKindTag::Approval);
-        // allow-once (0) and allow-session (1) are safe; the two deny rows are
-        // danger-tinted.
-        assert!(!m.items()[0].danger && !m.items()[1].danger);
-        assert!(
-            m.items()[2].danger && m.items()[3].danger,
-            "deny rows danger"
-        );
-        // [a] allow once, [s] allow this session, [d] deny once, [x] deny session.
-        assert_eq!(
-            m.handle_key(&KeyCode::Char('a'), NONE),
-            MenuOutcome::Pick(MenuChoice::ApproveTool {
-                decision: D::AllowOnce
-            })
-        );
-        assert_eq!(
-            m.handle_key(&KeyCode::Char('s'), NONE),
-            MenuOutcome::Pick(MenuChoice::ApproveTool {
-                decision: D::AllowAlways
-            })
-        );
-        assert_eq!(
-            m.handle_key(&KeyCode::Char('d'), NONE),
-            MenuOutcome::Pick(MenuChoice::ApproveTool {
-                decision: D::RejectOnce
-            })
-        );
-        assert_eq!(
-            m.handle_key(&KeyCode::Char('x'), NONE),
-            MenuOutcome::Pick(MenuChoice::ApproveTool {
-                decision: D::RejectAlways
-            })
-        );
-        // Esc is treated as deny-once by the loop (Cancel).
-        assert_eq!(m.handle_key(&KeyCode::Escape, NONE), MenuOutcome::Cancel);
     }
 
     #[test]

@@ -479,24 +479,17 @@ fn map_env(pairs: &[(&str, &str)]) -> MapEnv {
 
 #[test]
 fn sandbox_profile_defaults_and_env_overlay() {
-    // Safe-by-default: the worktree shell is hardened, the embedded agent
-    // gets its own sealed container.
+    // Safe-by-default: the worktree shell is hardened.
     let c = SandboxConfig::default();
     assert_eq!(c.profile, SandboxProfile::Hardened);
-    assert_eq!(c.agent_profile, SandboxProfile::Sealed);
 
-    let o = env_overlay(&map_env(&[
-        ("THEGN_SANDBOX_PROFILE", "open"),
-        ("THEGN_SANDBOX_AGENT_PROFILE", "hardened"),
-    ]));
+    let o = env_overlay(&map_env(&[("THEGN_SANDBOX_PROFILE", "open")]));
     assert_eq!(o.sandbox.profile, Some(SandboxProfile::Open));
-    assert_eq!(o.sandbox.agent_profile, Some(SandboxProfile::Hardened));
 
     // Overlay precedence: a present key overrides the global default.
     let mut base = SandboxConfig::default();
     o.sandbox.apply(&mut base);
     assert_eq!(base.profile, SandboxProfile::Open);
-    assert_eq!(base.agent_profile, SandboxProfile::Hardened);
 }
 
 // The same overlay expressed in each format must produce identical results,

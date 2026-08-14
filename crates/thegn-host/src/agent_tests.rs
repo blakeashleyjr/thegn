@@ -579,72 +579,6 @@ fn compose_spec_host_fallback_is_login_shell() {
     );
 }
 
-fn host_outcome() -> SandboxOutcome {
-    SandboxOutcome {
-        spec: None,
-        backend_label: "host".into(),
-        warnings: Vec::new(),
-        shell: String::new(),
-        is_remote: false,
-        cwd_override: None,
-        location: None,
-        degraded_from_provider: false,
-    }
-}
-
-#[test]
-fn route_agent_injects_proxy_env_into_host_agent_pane() {
-    // `route_agent` on, bouncer OFF: a configured agent on the host gets the
-    // proxy vars routed to the LOCAL loopback; a plain shell gets nothing.
-    let mut cfg = cfg_with(&[("shell", "__shell__"), ("Agent", "/a/pi")], &[]);
-    cfg.llm_proxy.route_agent = true;
-    cfg.llm_proxy.bouncer = false;
-
-    let mut outcome = host_outcome();
-    let agent = apply_bouncer_launch(&cfg, "/wt/x", "Agent", &mut outcome);
-    assert!(
-        agent
-            .host_env
-            .iter()
-            .any(|(k, v)| k == "THEGN_PROXY_BASE_URL" && v == "http://127.0.0.1:8383"),
-        "host agent pane routes through the local proxy without bouncer"
-    );
-    assert!(
-        !agent
-            .host_env
-            .iter()
-            .any(|(k, _)| k == "ANTHROPIC_BASE_URL"),
-        "claude is NOT routed by default (route_claude off) — talks to Anthropic directly"
-    );
-
-    // route_claude ON → claude/codex on host also get ANTHROPIC_BASE_URL.
-    cfg.llm_proxy.route_claude = true;
-    let mut outcome = host_outcome();
-    let claude = apply_bouncer_launch(&cfg, "/wt/x", "Agent", &mut outcome);
-    assert!(
-        claude
-            .host_env
-            .iter()
-            .any(|(k, _)| k == "ANTHROPIC_BASE_URL"),
-        "route_claude → claude/codex on host get ANTHROPIC_BASE_URL"
-    );
-    cfg.llm_proxy.route_claude = false;
-
-    // A shell never routes.
-    let mut outcome = host_outcome();
-    let shell = apply_bouncer_launch(&cfg, "/wt/x", "shell", &mut outcome);
-    assert!(shell.host_env.is_empty(), "shells are not routed");
-
-    // route_agent OFF → no injection even for an agent.
-    cfg.llm_proxy.route_agent = false;
-    let mut outcome = host_outcome();
-    let off = apply_bouncer_launch(&cfg, "/wt/x", "Agent", &mut outcome);
-    assert!(
-        off.host_env.is_empty(),
-        "no routing when route_agent is off"
-    );
-}
-
 /// OCI shell panes emit a runtime probe chain so containers that don't have
 /// the host shell (e.g. a bare Debian image has bash but not zsh) still get
 /// a working login shell instead of "exec: zsh: not found".
@@ -783,17 +717,8 @@ fn prepare_sandbox_none_backend_falls_to_host() {
     let mut cfg = Config::default();
     cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
     let loc = GitLoc::from_db("/wt/x", None);
-    let out = prepare_sandbox_env(
-        &cfg,
-        Path::new("/repo"),
-        "/wt/x",
-        &loc,
-        None,
-        false,
-        SandboxScope::Shell,
-        None,
-    )
-    .unwrap();
+    let out =
+        prepare_sandbox_env(&cfg, Path::new("/repo"), "/wt/x", &loc, None, false, None).unwrap();
     assert!(out.spec.is_none());
     assert_eq!(out.backend_label, "host");
     // An explicit "none" choice behaves the same as the configured backend.
@@ -804,7 +729,6 @@ fn prepare_sandbox_none_backend_falls_to_host() {
         &loc,
         Some("none"),
         false,
-        SandboxScope::Shell,
         None,
     )
     .unwrap();
@@ -828,7 +752,6 @@ fn explicit_host_pick_overrides_nonauto_config() {
         &loc,
         Some("host"),
         true,
-        SandboxScope::Shell,
         None,
     )
     .unwrap();
@@ -844,7 +767,6 @@ fn explicit_host_pick_overrides_nonauto_config() {
         &loc,
         Some("host"),
         false,
-        SandboxScope::Shell,
         None,
     );
     if let Ok(o) = out {
@@ -873,7 +795,6 @@ fn selected_env_with_no_table_halts_or_degrades_loudly() {
             &loc,
             None,
             false,
-            SandboxScope::Shell,
             Some("ghost"),
         )
         .expect_err("a phantom env selection halts when failover is off");
@@ -892,7 +813,6 @@ fn selected_env_with_no_table_halts_or_degrades_loudly() {
             &loc,
             None,
             false,
-            SandboxScope::Shell,
             Some("ghost"),
         )
         .expect("auto failover degrades rather than halting");
@@ -923,31 +843,6 @@ fn launch_spec_none_backend_produces_valid_spec() {
                     && v == &worktree.to_string_lossy().to_string()),
             "THEGN_WORKTREE missing from env"
         );
-    });
-}
-
-// H1 (C2 variant): launch_spec_with_key injects scoped API key.
-#[test]
-fn launch_spec_with_key_injects_scoped_key() {
-    with_temp_state("launch-spec-key", || {
-        let mut cfg = cfg_with(&[("claude", "claude --foo")], &[]);
-        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
-        let worktree = std::env::temp_dir().join(format!("sz-ls-key-{}", std::process::id()));
-        let spec = launch_spec_with_key(
-            &cfg,
-            &worktree.to_string_lossy(),
-            None,
-            "shell",
-            Some("sk-test-scoped".into()),
-            false,
-            false,
-        )
-        .unwrap();
-        // On the host path there's no OCI spec to mutate, so scoped key
-        // falls into the LaunchSpec env directly via compose_spec.
-        // At minimum the spec must succeed; the key injection path is
-        // exercised without a running container.
-        assert_eq!(spec.backend, "host");
     });
 }
 

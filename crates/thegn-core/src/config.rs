@@ -196,7 +196,6 @@ config_enum! {
     /// (read-only root, capability drops, no-new-privileges, a pids cap, and a
     /// network floor). Selectable per level: global `[sandbox] profile`, per
     /// workspace/repo via the `.thegn.toml` overlay, or `THEGN_SANDBOX_PROFILE`.
-    /// The embedded agent gets its own container hardened by `agent_profile`.
     ///
     /// - `open`     — no hardening; reproduces pre-preset behavior (back-compat).
     /// - `hardened` — read-only root + no-new-privileges + pids cap; networking
@@ -2221,10 +2220,6 @@ pub struct SandboxConfig {
     pub image: String,              // "" => host-toolchain mode
     /// Hardening preset for the worktree's interactive container (shell panes).
     pub profile: SandboxProfile,
-    /// Hardening preset for the embedded agent's tool container. When it differs
-    /// from `profile`, the agent runs in its own separate (more-locked-down)
-    /// container; when equal, it reuses the worktree container.
-    pub agent_profile: SandboxProfile,
     pub network: Network,
     pub file_access: FileAccess,
     pub ports: Vec<String>, // e.g. ["8080:8080"]
@@ -2316,7 +2311,6 @@ impl Default for SandboxConfig {
             backend_chain: crate::config_defaults::default_backend_chain(),
             image: String::new(),
             profile: SandboxProfile::Hardened,
-            agent_profile: SandboxProfile::Sealed,
             network: Network::Nat,
             file_access: FileAccess::default(),
             ports: Vec::new(),
@@ -2636,7 +2630,6 @@ pub struct SandboxOverlay {
     pub backend_chain: Option<Vec<String>>,
     pub image: Option<String>,
     pub profile: Option<SandboxProfile>,
-    pub agent_profile: Option<SandboxProfile>,
     pub network: Option<Network>,
     pub file_access: Option<FileAccess>,
     pub ports: Option<Vec<String>>,
@@ -3836,9 +3829,6 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_SANDBOX_PROFILE") {
         o.sandbox.profile = SandboxProfile::from_str_validated(v.trim()).ok();
     }
-    if let Some(v) = env.get("THEGN_SANDBOX_AGENT_PROFILE") {
-        o.sandbox.agent_profile = SandboxProfile::from_str_validated(v.trim()).ok();
-    }
     o.sandbox.image = env.get("THEGN_SANDBOX_IMAGE");
     if let Some(v) = env.get("THEGN_SANDBOX_ON_MISSING") {
         o.sandbox.on_missing = OnMissing::from_str_validated(v.trim()).ok();
@@ -4542,12 +4532,6 @@ pub fn validate_str(body: &str) -> Vec<String> {
         check(&mut errs, "sandbox.profile", sb.get("profile"), |s| {
             SandboxProfile::from_str_validated(s).map(|_| ())
         });
-        check(
-            &mut errs,
-            "sandbox.agent_profile",
-            sb.get("agent_profile"),
-            |s| SandboxProfile::from_str_validated(s).map(|_| ()),
-        );
         check(&mut errs, "sandbox.on_missing", sb.get("on_missing"), |s| {
             OnMissing::from_str_validated(s).map(|_| ())
         });

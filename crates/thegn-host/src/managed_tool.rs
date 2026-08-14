@@ -98,9 +98,9 @@ fn wait_with_deadline(child: &mut Child, deadline: Instant, ctx: &str) -> Result
 }
 
 /// The managed tools thegn knows about, for `doctor` reporting and (later)
-/// pre-provisioning. Today just the managed pi.
+/// pre-provisioning.
 pub fn known() -> Vec<ManagedTool> {
-    vec![crate::cmd::agent::pi_tool(), thegn_core::debug::bs_tool()]
+    vec![thegn_core::debug::bs_tool()]
 }
 
 /// Acquire a tool's binary into its managed dir — the raw fetch, without the

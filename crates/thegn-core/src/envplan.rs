@@ -457,13 +457,6 @@ pub struct PlanOpts {
     /// `require-sigs = false`, so `nix develop`/`direnv` substitute prebuilt store
     /// paths from the host instead of building. See `[env.<name>.provider] host_cache`.
     pub host_cache_url: Option<String>,
-    /// Provision thegn's MANAGED pi inside the sandbox (`<home>/.thegn/pi`):
-    /// carry the host's managed agent dir (the seeded `thegn-acp` package +
-    /// settings) and npm-install the pinned binary there, so the "Agent" picker
-    /// entry's `$HOME/.thegn/pi` snippet resolves in-sprite exactly as on the
-    /// host. `false` ⇒ skip (no managed-pi agent configured). Emits a
-    /// `managed_pi` step. Best-effort.
-    pub managed_pi: bool,
     /// `[toolchain]` — how the [`Tier::SynthNix`] tier resolves language
     /// manifests into a synthesized Nix devShell (mode + per-language package
     /// overrides). The default (`mode = "auto"`) keeps SynthNix; `mise`/`off`
@@ -509,7 +502,6 @@ impl Default for PlanOpts {
             local_parity: None,
             snapshot_restore: None,
             host_cache_url: None,
-            managed_pi: false,
             toolchain: crate::toolchain::ToolchainConfig::default(),
         }
     }
@@ -575,11 +567,6 @@ pub enum StepKind {
         workdir: String,
         snapshot_id: String,
     },
-    /// Host-executed: provision thegn's managed pi inside the sandbox — carry
-    /// the host's `~/.thegn/pi/agent` (the seeded thegn-acp package + config)
-    /// into `<home>/.thegn/pi/agent`, then npm-install the pinned pi binary
-    /// there. Best-effort. The pin + host dir are resolved in the applier.
-    ManagedPi,
 }
 
 /// The compiled, backend-agnostic provisioning plan.
@@ -831,17 +818,6 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
             id: "agents_config".into(),
             label: "Sync agent logins".into(),
             kind: StepKind::AgentConfigs(opts.agents.clone()),
-        });
-    }
-
-    // Managed pi: carry the host's ~/.thegn/pi/agent + install the pinned binary
-    // in the sandbox, so the "Agent" picker entry's `$HOME/.thegn/pi` snippet
-    // resolves in-sprite. After agent configs (it's the same family of work).
-    if opts.managed_pi {
-        steps.push(ProvisionStep {
-            id: "managed_pi".into(),
-            label: "Set up Agent".into(),
-            kind: StepKind::ManagedPi,
         });
     }
 
@@ -2327,28 +2303,6 @@ mod tests {
             },
         );
         assert!(!none.steps.iter().any(|s| s.id == "snapshot_restore"));
-    }
-
-    #[test]
-    fn plan_managed_pi_step_emitted_only_when_requested() {
-        let on = PlanOpts {
-            managed_pi: true,
-            ..Default::default()
-        };
-        assert!(
-            plan(&EnvRequirements::default(), &on)
-                .steps
-                .iter()
-                .any(|s| s.id == "managed_pi" && s.kind == StepKind::ManagedPi),
-            "managed_pi step present when requested"
-        );
-        assert!(
-            !plan(&EnvRequirements::default(), &PlanOpts::default())
-                .steps
-                .iter()
-                .any(|s| s.id == "managed_pi"),
-            "absent by default"
-        );
     }
 
     #[test]

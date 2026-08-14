@@ -12,60 +12,10 @@ use crate::emulator::PaneEmulator;
 use thegn_core::theme;
 use unicode_width::UnicodeWidthStr;
 
-use serde::Deserialize;
-
 // The masthead (top bar) layout + hit-test spans live in the `masthead` sibling
 // module (seg-layer, mirrors the statusbar); re-exported so callers that reach
 // for `chrome::masthead_item_spans` keep resolving.
 pub use crate::masthead::masthead_item_spans;
-
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-pub struct TokenUsage {
-    pub input: u32,
-    pub output: u32,
-}
-
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-pub struct AiMetrics {
-    pub agent: String,
-    pub session_id: String,
-    pub tokens: TokenUsage,
-    pub cost: f64,
-}
-
-/// The embedded agent's ACP connection state, surfaced in the statusbar chip so
-/// a connect/proxy failure is visible (the chip is the *only* native signal — pi
-/// owns the conversation in its terminal pane, by design).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum AgentConn {
-    /// ACP server spawned; client not connected/initialized yet.
-    Connecting,
-    /// Connected + initialized (+ provider routed when the proxy is enabled).
-    #[default]
-    Online,
-    /// The ACP socket dropped (agent likely went away).
-    Exited,
-    /// Connect / initialize / provider-routing failed.
-    Error,
-}
-
-/// Live activity of the embedded `pi` agent, streamed over ACP `session/update`
-/// (tool calls + context-window usage) plus its connection lifecycle. Distinct
-/// from [`AiMetrics`], which is proxy-side spend; this is the agent's own
-/// progress, rendered as a statusbar chip so the user sees what the agent is
-/// doing without leaving their pane.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct AgentActivity {
-    /// Connection lifecycle (drives the offline/error chip states).
-    pub conn: AgentConn,
-    /// The most recent tool the agent invoked (e.g. "bash", "edit").
-    pub last_tool: Option<String>,
-    /// Whether that tool is still running (vs. completed/failed).
-    pub running: bool,
-    /// Context-window tokens used / total, from `usage_update` (0 = unknown).
-    pub context_used: i64,
-    pub context_size: i64,
-}
 
 /// The resolved chrome palette. A process-global because every draw helper
 /// needs it and threading it through each call would touch every signature;
@@ -339,12 +289,9 @@ pub struct DaemonStatus {
 pub struct FrameModel {
     /// The active worktree group's name ("app/feat") — the tabbar's left label.
     pub worktree: String,
-    pub ai_metrics: Option<AiMetrics>,
     /// App-wide network connectivity (from [`thegn_core::connectivity`]). Drives
     /// the offline statusbar chip; refreshed each hydrate.
     pub connectivity: thegn_core::connectivity::Connectivity,
-    /// Live embedded-agent activity (ACP `session/update`), shown as a chip.
-    pub agent_activity: Option<AgentActivity>,
     /// The active worktree's tab chip titles (tabs live WITHIN a worktree).
     pub tabs: Vec<String>,
     /// Index of the active chip in `tabs`.
@@ -980,10 +927,8 @@ pub enum BarBadge {
     DiskWarn,
     Ingress,
     Media,
-    AiCost,
     /// Network is offline — remote refreshes/MCPs paused.
     Network,
-    Agent,
     Zoom,
     Maximized,
     Lock,
@@ -1408,60 +1353,6 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
         items.push((
             BarItemId::Badge(BarBadge::Media),
             vec![Seg::chip(Tok::Hue(hue), format!(" {clipped} "))],
-        ));
-    }
-    if let Some(ref metrics) = model.ai_metrics {
-        // BMP-only chrome policy (termcaps.rs): no astral-plane / emoji glyphs —
-        // the agent marker rides the BMP `diamond_filled` slot so it degrades to
-        // ASCII cleanly and its cell width matches unicode-width's measurement.
-        let g = crate::caps::active_glyphs();
-        items.push((
-            BarItemId::Badge(BarBadge::AiCost),
-            vec![Seg::chip(
-                Tok::Hue(thegn_core::theme::Hue::Teal),
-                format!(
-                    " {} {}: ${:.2} ({}t) ",
-                    g.diamond_filled,
-                    metrics.agent,
-                    metrics.cost,
-                    metrics.tokens.input + metrics.tokens.output
-                ),
-            )],
-        ));
-    }
-    if let Some(ref a) = model.agent_activity {
-        use thegn_core::theme::Hue;
-        // BMP-only chrome policy: route the alert/agent/tool markers through the
-        // glyph table (warn + diamond + refresh) instead of astral emoji.
-        let g = crate::caps::active_glyphs();
-        // The chip is the only native signal, so it must show failure states too.
-        let (hue, label) = match a.conn {
-            AgentConn::Error => (Hue::Red, format!(" {} agent error ", g.warn)),
-            AgentConn::Exited => (Hue::Orange, format!(" {} agent offline ", g.warn)),
-            AgentConn::Connecting => (
-                Hue::Blue,
-                format!(" {} agent connecting{} ", g.diamond_filled, g.ellipsis),
-            ),
-            AgentConn::Online => {
-                let tool = match (&a.last_tool, a.running) {
-                    (Some(t), true) => format!("{} {t}{}", g.refresh, g.ellipsis),
-                    (Some(t), false) => format!("{} {t}", g.refresh),
-                    (None, _) => format!("{} agent", g.diamond_filled),
-                };
-                // Append context-window usage as a percentage when reported.
-                let label = if a.context_size > 0 {
-                    let pct = (a.context_used * 100 / a.context_size).clamp(0, 100);
-                    format!(" {tool} {} {pct}% ctx ", g.middot)
-                } else {
-                    format!(" {tool} ")
-                };
-                let hue = if a.running { Hue::Amber } else { Hue::Teal };
-                (hue, label)
-            }
-        };
-        items.push((
-            BarItemId::Badge(BarBadge::Agent),
-            vec![Seg::chip(Tok::Hue(hue), label)],
         ));
     }
     if model.zoomed {
