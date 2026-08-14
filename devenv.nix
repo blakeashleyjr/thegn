@@ -229,6 +229,12 @@
     if [ ! -d .claude/commands/opsx ] && [ -f openspec/config.yaml ]; then
       openspec init --tools claude --profile core --force >/dev/null 2>&1 || true
     fi
+
+    # Quiet podman→docker compatibility (DOCKER_HOST + guarded ~/.docker
+    # self-heal). Read-only tolerant so the sandbox's read-only /home bind never
+    # turns it into "ln: … Read-only file system" noise. Shared with the flake
+    # devShellHook so the host (devenv) + sandbox (flake) shells never drift.
+    source ${./nix/dev-docker-shim.sh}
   '';
 
   # `devenv test` runs the hooks, then this.
