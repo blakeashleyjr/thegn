@@ -190,6 +190,76 @@ pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
     flush_run(surface, &mut run);
 }
 
+/// Emit a change list that repaints EVERY cell of `surface` (blanks written as
+/// spaces), against no baseline. Used by the flash-free periodic resync heal.
+///
+/// `Surface::diff_screens` against a fresh (blank) baseline only emits cells that
+/// DIFFER from the blank default — a scratch cell that is a default space equals
+/// that baseline and is skipped. So a diff-against-blank resync heals drifted
+/// non-blank cells but can never clear an orphaned physical ghost wherever the
+/// current frame is blank (the "doubled/ghosted rows" that stick until the app
+/// overwrites them). Writing every cell explicitly overwrites those ghosts too,
+/// and — because it emits no `ClearScreen` — stays flash-free (each cell is
+/// overwritten in place with its correct content, the screen is never blanked).
+///
+/// Applying the returned changes to a blank `Surface` reproduces `surface`
+/// cell-for-cell, so the caller can keep its `front` baseline in sync by replaying
+/// them. Mirrors `compose_pane`'s style-run coalescing + wide-glyph spacer skip.
+pub fn full_repaint_changes(surface: &mut Surface) -> Vec<Change> {
+    let (cols, rows) = surface.dimensions();
+    let cells = surface.screen_cells();
+    let mut out: Vec<Change> = Vec::new();
+    let mut run = String::new();
+    for (y, line) in cells.iter().enumerate().take(rows) {
+        flush_run_to(&mut out, &mut run);
+        out.push(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(y),
+        });
+        // Reset the attribute baseline at each row start: the first cell always
+        // emits its attributes, so a blank front reconstructs the row exactly.
+        let mut current: Option<CellAttributes> = None;
+        let mut skip_spacer = false;
+        let last_col = cols.saturating_sub(1);
+        for (x, cell) in line.iter().enumerate().take(cols) {
+            if skip_spacer {
+                // The blank placeholder termwiz keeps right of a wide glyph; the
+                // glyph already advanced the terminal cursor across it.
+                skip_spacer = false;
+                continue;
+            }
+            let attrs = cell.attrs();
+            if current.as_ref() != Some(attrs) {
+                flush_run_to(&mut out, &mut run);
+                out.push(Change::AllAttributes(attrs.clone()));
+                current = Some(attrs.clone());
+            }
+            let text = cell.str();
+            let width = unicode_width::UnicodeWidthStr::width(text);
+            if text.is_empty() || (x == last_col && width > 1) {
+                // Empty cell → a space; a wide glyph with no room at the last
+                // column can't be drawn there (would advance past the surface).
+                run.push(' ');
+            } else {
+                if width > 1 {
+                    skip_spacer = true;
+                }
+                run.push_str(text);
+            }
+        }
+    }
+    flush_run_to(&mut out, &mut run);
+    out
+}
+
+/// Push a coalesced text run onto a raw change list (the `flush_run` shape, but
+/// appending to a `Vec<Change>` rather than a `Surface`).
+fn flush_run_to(out: &mut Vec<Change>, run: &mut String) {
+    if !run.is_empty() {
+        out.push(Change::Text(std::mem::take(run)));
+    }
+}
+
 /// Paint the mouse-selection highlight over a pane's `content` rect: selected
 /// cells keep their glyph and foreground, on `bg`. Extract-style spans (first
 /// row from the anchor column, middle rows full, last row to the cursor) so
@@ -395,6 +465,63 @@ mod tests {
             cells[0][0].attrs().foreground(),
             ColorAttribute::PaletteIndex(1),
             "red SGR must survive compose",
+        );
+    }
+
+    #[test]
+    fn full_repaint_emits_every_cell_including_blanks() {
+        // A resync heal must re-emit blank cells (as spaces) too — that's the
+        // property `diff_screens` against a blank baseline lacks, and the reason
+        // orphaned ghosts in now-blank regions stuck on screen. Compose a styled
+        // row plus a wide glyph into a surface with trailing blank columns/rows,
+        // replay `full_repaint_changes` onto a fresh surface, and require an exact
+        // cell-for-cell reproduction (glyph + attributes), including the blanks.
+        let mut emu = AlacrittyEmulator::new(2, 8, 0);
+        emu.advance("\x1b[31mRED\x1b[0m 世x".as_bytes()); // red run, space, wide glyph, x
+        let (cols, rows) = (10, 3); // wider + taller than the emulator → trailing blanks
+        let mut src = Surface::new(cols, rows);
+        compose_pane(
+            &mut src,
+            &emu,
+            Rect {
+                x: 0,
+                y: 0,
+                cols,
+                rows,
+            },
+        );
+
+        let changes = full_repaint_changes(&mut src);
+        let mut rebuilt = Surface::new(cols, rows);
+        rebuilt.add_changes(changes);
+
+        let a = src.screen_cells();
+        let b = rebuilt.screen_cells();
+        for y in 0..rows {
+            for x in 0..cols {
+                assert_eq!(a[y][x].str(), b[y][x].str(), "glyph mismatch at ({x},{y})");
+                assert_eq!(
+                    a[y][x].attrs().foreground(),
+                    b[y][x].attrs().foreground(),
+                    "fg mismatch at ({x},{y})"
+                );
+                assert_eq!(
+                    a[y][x].attrs().background(),
+                    b[y][x].attrs().background(),
+                    "bg mismatch at ({x},{y})"
+                );
+            }
+        }
+        // The red run survived, and a trailing blank cell is a space (not skipped).
+        assert_eq!(b[0][0].str(), "R");
+        assert_eq!(
+            b[0][0].attrs().foreground(),
+            ColorAttribute::PaletteIndex(1),
+        );
+        assert_eq!(
+            b[2][9].str(),
+            " ",
+            "trailing blank must be re-emitted as space"
         );
     }
 
