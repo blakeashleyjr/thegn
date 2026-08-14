@@ -60,9 +60,11 @@ of PTY panes.
 - `Alt-n` / `Alt-N` — split down / split right
 - `Ctrl-←/↓/↑/→` (or `h/j/k/l`) — move focus between panes and out to the
   [[sidebar]] / [[panel]]
-- `Alt-←/↓/↑/→` — the same seamless motion, but a move that runs off the
-  outer edge falls through to a tab (`←/→`) or worktree (`↑/↓`) switch, so
-  one key walks the whole layout and keeps going
+- `Alt-←/→` — the same seamless horizontal motion, but a move that runs off
+  the outer edge falls through to a previous / next tab switch, so one key
+  walks the whole row and keeps going
+- `Alt-↑/↓` — cycle the previous / next worktree within the current workspace.
+  This never focuses the top / bottom bars — that is `Ctrl-↑/↓`.
 - `Ctrl-Alt-z` — zoom the focused pane; cycles tiled → maximized → full-window
 - `Ctrl-Alt-y` — sync panes: broadcast typed input to every pane in the tab
 
