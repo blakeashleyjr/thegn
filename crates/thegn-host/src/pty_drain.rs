@@ -237,6 +237,10 @@ pub(crate) struct DrainCtx<'a> {
     pub active_menu: &'a mut Option<crate::menu::MenuOverlay>,
     pub halt_dismissed: &'a mut std::collections::HashSet<(String, usize)>,
     pub center_dormant: &'a mut bool,
+    /// The loop's shutdown flag. A terminal shell exiting while this is set is
+    /// teardown, not a user close — its `terminals` registry row must be kept so
+    /// the terminal survives to the next launch (see [`close_exited_terminal`]).
+    pub shutdown: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub event_bus: &'a thegn_core::event_bus::EventBus,
     pub notify_state: &'a std::sync::Arc<crate::notify::NotifyState>,
     /// All stdout bytes route through the writer thread — a direct write here
@@ -635,7 +639,19 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
         // `path` skips anyway) so the `terminals` registry row + sidebar entry
         // are removed. The dead pane is already out of `panes.table` (top of fn).
         if sole && ctx.session.worktrees[gi].kind == crate::session::GroupKind::Terminal {
-            close_exited_terminal(ctx, gi, ti);
+            // Delete the `terminals` registry row ONLY on a genuine interactive
+            // close (Ctrl-D on a live terminal). Keep it — so the terminal
+            // survives to the next launch — when the exit is teardown or a
+            // non-interactive death:
+            //  - shutting down: the exit is the app quitting, not a user close;
+            //  - fast crash (age < CRASH_THRESHOLD): a resurrected terminal whose
+            //    sandbox/remote backend is gone at launch exits immediately, and
+            //    reaping its row would silently drop a persisted terminal.
+            let age = ctx.panes.pane_age(id).unwrap_or_default();
+            ctx.panes.forget_spawn_time(id);
+            let shutting_down = ctx.shutdown.load(std::sync::atomic::Ordering::Relaxed);
+            let interactive_close = !shutting_down && age >= CRASH_THRESHOLD;
+            close_exited_terminal(ctx, gi, ti, interactive_close);
             return;
         }
         let is_active_tab = gi == ctx.session.active && ti == ctx.session.worktrees[gi].active_tab;
@@ -865,15 +881,34 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
 /// A standalone terminal's last shell exited: tear the terminal down instead of
 /// respawning. Mirrors `handlers::sidebar_actions::close_terminal` for the drain
 /// context — a multi-tab terminal loses just the dead tab, and when its last tab
-/// goes the whole group is removed, its `terminals` registry row deleted, and the
-/// sidebar rebuilt so it stops rendering. Best-effort DB delete: the live session
-/// + model are the source of truth here; the DB is a cache.
-fn close_exited_terminal(ctx: &mut DrainCtx<'_>, gi: usize, ti: usize) {
-    if let Some((name, db_id)) =
-        detach_exited_terminal(ctx.session, &mut ctx.model.sidebar_db_terminals, gi, ti)
-    {
-        ctx.model.status = format!("Closed terminal \"{name}\"");
-        if let Some(id) = db_id {
+/// goes the whole group is removed and the sidebar rebuilt so it stops rendering.
+///
+/// `delete_registry` controls whether the durable `terminals` row is also
+/// removed: `true` for a genuine interactive close (Ctrl-D on a live terminal),
+/// `false` when the exit is teardown/shutdown or a non-interactive fast crash —
+/// there the terminal must persist to the next launch, so the row stays and the
+/// dead group is simply dropped from the live session (it re-materializes on
+/// activation). Best-effort DB delete: the live session + model are the source
+/// of truth here; the DB is a cache.
+fn close_exited_terminal(ctx: &mut DrainCtx<'_>, gi: usize, ti: usize, delete_registry: bool) {
+    if let Some((name, db_id)) = detach_exited_terminal(
+        ctx.session,
+        &mut ctx.model.sidebar_db_terminals,
+        gi,
+        ti,
+        delete_registry,
+    ) {
+        // Keep-case leaves the registry row in the snapshot (above), so the
+        // persisted terminal keeps rendering — now as an inactive, materializable
+        // entry — after its dead group is dropped from the live session.
+        ctx.model.status = if delete_registry {
+            format!("Closed terminal \"{name}\"")
+        } else {
+            format!("Terminal \"{name}\" exited")
+        };
+        if let Some(id) = db_id
+            && delete_registry
+        {
             tokio::task::spawn_blocking(move || {
                 use thegn_core::store::WorkspaceStore;
                 // best-effort: cache-only; the group is already gone from the
@@ -891,18 +926,22 @@ fn close_exited_terminal(ctx: &mut DrainCtx<'_>, gi: usize, ti: usize) {
     *ctx.dirty = true;
 }
 
-/// Detach an exited terminal's dead tab from the live `session` + the sidebar's
-/// `db_terminals` registry snapshot, restoring focus to the pre-exit active
-/// group when it survives. A multi-tab terminal loses only tab `ti` and returns
-/// `None`; the last tab removes the whole group and returns
-/// `Some((name, db_row_id))` so the caller can delete the DB registry row and
-/// set the status. Pure session/model bookkeeping so the last-tab vs multi-tab
-/// split is unit-tested without a `DrainCtx`.
+/// Detach an exited terminal's dead tab from the live `session` + (optionally)
+/// the sidebar's `db_terminals` registry snapshot, restoring focus to the
+/// pre-exit active group when it survives. A multi-tab terminal loses only tab
+/// `ti` and returns `None`; the last tab removes the whole group and returns
+/// `Some((name, db_row_id))`. `remove_from_snapshot` drops the row from the
+/// sidebar snapshot (the interactive-close path, which also deletes the DB row);
+/// when `false` the row is left in place so the persisted terminal keeps
+/// rendering after a non-interactive/teardown exit. Pure session/model
+/// bookkeeping so the last-tab vs multi-tab split is unit-tested without a
+/// `DrainCtx`.
 fn detach_exited_terminal(
     session: &mut crate::session::Session,
     db_terminals: &mut Vec<thegn_core::models::TerminalRow>,
     gi: usize,
     ti: usize,
+    remove_from_snapshot: bool,
 ) -> Option<(String, Option<i64>)> {
     // Keep focus on whatever group the user was on (the terminal may have been a
     // background one); restore it by name after the remove shifts indices.
@@ -917,13 +956,17 @@ fn detach_exited_terminal(
         }
         None
     } else {
-        // Last tab: drop the group and its DB registry row (optimistic model
-        // removal first, so the sidebar rebuild no longer lists it).
+        // Last tab: drop the group. On an interactive close also remove the
+        // registry row from the snapshot (optimistic, so the rebuild stops
+        // listing it); otherwise leave it so the persisted terminal keeps
+        // rendering as an inactive entry.
         let name = session.worktrees[gi].name.clone();
-        let db_id = db_terminals
-            .iter()
-            .position(|t| t.name == name)
-            .map(|i| db_terminals.remove(i).id);
+        let pos = db_terminals.iter().position(|t| t.name == name);
+        let db_id = if remove_from_snapshot {
+            pos.map(|i| db_terminals.remove(i).id)
+        } else {
+            pos.map(|i| db_terminals[i].id)
+        };
         session.switch_to(gi);
         session.close_active_group();
         Some((name, db_id))
@@ -971,12 +1014,36 @@ mod tests {
         session.switch_to(1);
         let mut db_terminals = vec![term_row(7, "local")];
 
-        let closed = detach_exited_terminal(&mut session, &mut db_terminals, 1, 0);
+        let closed = detach_exited_terminal(&mut session, &mut db_terminals, 1, 0, true);
 
         assert_eq!(closed, Some(("local".to_string(), Some(7))));
         assert!(session.worktrees.iter().all(|g| g.name != "local"));
         assert_eq!(session.worktrees.len(), 1, "only the home worktree remains");
         assert!(db_terminals.is_empty(), "registry snapshot row removed");
+    }
+
+    #[test]
+    fn detach_exited_terminal_keep_case_drops_group_but_retains_registry_row() {
+        // Non-interactive / teardown exit (`remove_from_snapshot = false`): the
+        // dead group leaves the live session, but the registry snapshot row stays
+        // so the persisted terminal keeps rendering (as an inactive, re-openable
+        // entry) and its DB row is NOT deleted on the next launch.
+        let mut session = Session::default();
+        session.add_group(WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app"));
+        session.add_group(WorktreeGroup::terminal("local")); // gi 1
+        session.switch_to(1);
+        let mut db_terminals = vec![term_row(7, "local")];
+
+        let closed = detach_exited_terminal(&mut session, &mut db_terminals, 1, 0, false);
+
+        // Still reports the closed terminal (for status), but keeps the snapshot.
+        assert_eq!(closed, Some(("local".to_string(), Some(7))));
+        assert!(
+            session.worktrees.iter().all(|g| g.name != "local"),
+            "dead group dropped from the live session"
+        );
+        assert_eq!(db_terminals.len(), 1, "registry snapshot row retained");
+        assert_eq!(db_terminals[0].id, 7);
     }
 
     #[test]
@@ -991,7 +1058,7 @@ mod tests {
         session.switch_to(1);
         let mut db_terminals = vec![term_row(7, "local")];
 
-        let closed = detach_exited_terminal(&mut session, &mut db_terminals, 1, 0);
+        let closed = detach_exited_terminal(&mut session, &mut db_terminals, 1, 0, true);
 
         assert_eq!(closed, None, "the terminal survives, so nothing to delete");
         let g = session
@@ -1014,7 +1081,7 @@ mod tests {
         session.switch_to(0);
         let mut db_terminals = vec![term_row(7, "local")];
 
-        detach_exited_terminal(&mut session, &mut db_terminals, 1, 0);
+        detach_exited_terminal(&mut session, &mut db_terminals, 1, 0, true);
 
         assert_eq!(
             session.active_group().map(|g| g.name.as_str()),
