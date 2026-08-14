@@ -397,34 +397,6 @@ config_enum! {
 }
 
 config_enum! {
-    /// How the LLM proxy chooses among a route's backends. Milestone 1 implements
-    /// `sequential` (ordered failover); the others are reserved for the AR
-    /// intelligent-routing work (cost-aware tiering, speculative cascade).
-    pub enum RoutingStrategy: "routing strategy" {
-        Sequential = "sequential" | "failover" | "ordered",
-        LoadBalanced = "load_balanced" | "balanced",
-        Speculative = "speculative" | "cascade",
-    } default = Sequential;
-}
-
-config_enum! {
-    /// Token-reduction aggressiveness for in-flight tool-output compression
-    /// (group W). `conservative` is lossless-ish (ANSI/progress/blank-line
-    /// cleanup); higher levels add repeated-line/JSON/whitespace folding and
-    /// head/tail truncation.
-    pub enum CompressionLevel: "compression level" {
-        Off = "off" | "none",
-        Conservative = "conservative",
-        Balanced = "balanced",
-        Aggressive = "aggressive",
-    } default = Conservative;
-}
-
-// `[llm_proxy]`'s `LlmProxyConfig` lives in the `config_llm` sibling module to
-// keep this ratcheted god-file from growing.
-pub use crate::config_llm::LlmProxyConfig;
-
-config_enum! {
     /// `[merge_queue] conflict_handoff` — fate of a branch the fold can't land:
     /// `"agent"` (default) dispatches the agent to fix it, `"notify"`/`"manual"` don't.
     pub enum ConflictHandoff: "conflict handoff" {
@@ -3364,8 +3336,6 @@ pub struct Config {
     pub search: SearchConfig,
     pub palette: PaletteConfig,
     pub lsp: LspConfig,
-    /// The LLM proxy daemon (`[llm_proxy]`). Disabled by default — AI is additive.
-    pub llm_proxy: LlmProxyConfig,
     /// `[daemon]` — the pane daemon (center panes survive UI exit; tmux
     /// semantics). On by default; set `[daemon] enabled = false` for plain
     /// in-process PTYs.
@@ -3525,7 +3495,6 @@ impl Default for Config {
             search: SearchConfig::default(),
             palette: PaletteConfig::default(),
             lsp: LspConfig::default(),
-            llm_proxy: LlmProxyConfig::default(),
             daemon: DaemonConfig::default(),
             serve: ServeConfig::default(),
             merge_queue: MergeQueueConfig::default(),
@@ -3903,6 +3872,15 @@ impl Config {
             Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
         };
         let mut cfg: Config = toml::from_str(&s).map_err(|e| format!("{e}"))?;
+
+        // The AI layer ([llm_proxy], the LLM proxy + agent control plane) was
+        // removed before the public alpha. A leftover section is harmless
+        // (tolerant deser drops unknown keys) but worth one line of signal.
+        if let Ok(raw) = toml::from_str::<toml::Value>(&s)
+            && raw.get("llm_proxy").is_some()
+        {
+            config_warn("[llm_proxy] is no longer supported and is ignored");
+        }
 
         // Profile overlay (H): a named profile's own `config.toml` (a full
         // Config-shaped overlay) merges over the shared base, from the REAL

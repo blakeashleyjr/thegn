@@ -1479,7 +1479,6 @@ pub(crate) fn build_model(
     hints: HydrateHints,
 ) -> FrameModel {
     use thegn_core::remote::GitLoc;
-    use thegn_core::store::ProxyStore;
 
     let t0 = std::time::Instant::now();
     let cwd = active_tab_path(session);
@@ -1681,11 +1680,10 @@ pub(crate) fn build_model(
         // on `podman ps` subprocess calls.
         containers: vec![],
         container_events: db.container_events(&loc.path(), 10).unwrap_or_default(),
-        // Unified timeline: sandbox audit + proxy spend, merged newest-first.
-        // Two small off-loop reads on the hydration thread (never the event loop).
+        // Unified timeline: sandbox audit events, newest-first. A small
+        // off-loop read on the hydration thread (never the event loop).
         timeline: thegn_core::models::merge_timeline(
             &db.container_events(&loc.path(), 20).unwrap_or_default(),
-            &db.proxy_requests(&loc.path(), 20).unwrap_or_default(),
             20,
         ),
         panel,

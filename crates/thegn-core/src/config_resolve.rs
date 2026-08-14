@@ -940,9 +940,7 @@ impl Config {
     /// channel is resolved. In the stable channel this forces every dev-only
     /// feature's master toggle off — mirroring the repo-overlay clamp above —
     /// so an experimental key left in a user's config is inert rather than
-    /// silently half-active. AI is gated at the `[llm_proxy]` master switch
-    /// only; the `[[agents]]` launcher list (which also holds the plain-shell
-    /// entry) is left untouched. Trackers keep stable GitHub Issues and drop
+    /// silently half-active. Trackers keep stable GitHub Issues and drop
     /// only Linear/Jira/Kaneo. Returns the features actually changed, so the
     /// caller can surface a one-line status note.
     pub fn clamp_to_channel(
@@ -964,11 +962,6 @@ impl Config {
                 Feature::Providers => {
                     let was = !self.host.is_empty();
                     self.host.clear();
-                    was
-                }
-                Feature::Ai => {
-                    let was = self.llm_proxy.enabled;
-                    self.llm_proxy.enabled = false;
                     was
                 }
                 Feature::Observe => {

@@ -572,7 +572,6 @@ fn timeline_section(events: &[thegn_core::models::TimelineEvent]) -> Vec<PanelRo
         };
         let src = match ev.source {
             TimelineSource::Sandbox => "sbx",
-            TimelineSource::Proxy => "llm",
         };
         let detail = if ev.detail.is_empty() {
             "—".to_string()
