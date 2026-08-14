@@ -15,13 +15,16 @@ use std::time::Instant;
 use crate::hydrate::GlyphRow;
 use crate::sidebar::GitGlyphs;
 
-/// Map a cached `GlyphRow` `(dirty, ahead, behind, branch, repo_root)` to the
-/// renderable `GitGlyphs`.
+/// Map a cached `GlyphRow` `(dirty, ahead, behind, branch, repo_root, add, del,
+/// branch_diff)` to the renderable `GitGlyphs`.
 pub(crate) fn glyphs_from_row(row: &GlyphRow) -> GitGlyphs {
     GitGlyphs {
         dirty: row.0,
         ahead: row.1,
         behind: row.2,
+        add: row.5,
+        del: row.6,
+        branch_diff: row.7,
     }
 }
 
@@ -60,7 +63,10 @@ mod tests {
     use super::*;
 
     fn row(dirty: bool, ahead: usize, behind: usize) -> (GlyphRow, Instant) {
-        ((dirty, ahead, behind, None, String::new()), Instant::now())
+        (
+            (dirty, ahead, behind, None, String::new(), 0, 0, None),
+            Instant::now(),
+        )
     }
 
     #[test]
@@ -72,6 +78,22 @@ mod tests {
                 dirty: true,
                 ahead: 3,
                 behind: 2,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn glyphs_from_row_maps_diff_stats() {
+        let r: GlyphRow = (true, 0, 0, None, String::new(), 42, 7, Some((310, 84)));
+        assert_eq!(
+            glyphs_from_row(&r),
+            GitGlyphs {
+                dirty: true,
+                add: 42,
+                del: 7,
+                branch_diff: Some((310, 84)),
+                ..Default::default()
             }
         );
     }
@@ -88,7 +110,8 @@ mod tests {
             Some(&GitGlyphs {
                 dirty: true,
                 ahead: 1,
-                behind: 0
+                behind: 0,
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -96,7 +119,8 @@ mod tests {
             Some(&GitGlyphs {
                 dirty: false,
                 ahead: 0,
-                behind: 4
+                behind: 4,
+                ..Default::default()
             })
         );
     }
@@ -110,6 +134,7 @@ mod tests {
             dirty: true,
             ahead: 9,
             behind: 0,
+            ..Default::default()
         };
         git.insert("/a".to_string(), fresh); // fresh scan already present
         seed_glyphs_from_cache(&mut git, ["/a".to_string()], &cache);
