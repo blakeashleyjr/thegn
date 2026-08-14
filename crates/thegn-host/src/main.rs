@@ -4,23 +4,19 @@
 //! portable-pty pane through a `PaneEmulator` grid, composited into a termwiz
 //! `Surface` that diff-flushes to the outer terminal (the "no-flash" mechanism).
 
-mod acp_gate;
 mod actions;
 mod agent;
 mod agent_configs;
 mod agent_home;
 mod agent_output;
-mod agent_pi;
 mod agent_ssh;
 mod agent_teardown;
-mod ai_sidecar;
 mod apps;
 mod attention_status;
 mod autoscale;
 mod bar_nav;
 mod blast_radius;
 mod borders;
-mod bouncer;
 mod branch_cache;
 mod bridge_sup;
 mod build_cache;
@@ -94,7 +90,6 @@ mod machine0_bridge;
 mod managed_tool;
 mod mascot;
 mod masthead;
-mod mcp_merge;
 mod media_art;
 mod media_ctl;
 mod media_overlay;
@@ -125,7 +120,6 @@ mod panel_util;
 mod panes;
 mod parity;
 mod perf;
-mod pi_assets;
 mod pins;
 mod placement_flow;
 mod platform;
@@ -141,12 +135,10 @@ mod provider_workdir;
 mod provision_gate;
 mod provision_recover;
 mod proxy_daemon;
-mod proxy_keys;
 mod pty_drain;
 mod queries;
 mod rasterize;
 mod recorder;
-mod relay;
 mod remote_sync;
 mod render_plan;
 mod replay;
@@ -381,12 +373,6 @@ pub enum Command {
     Host {
         #[command(subcommand)]
         action: cmd::host::Action,
-    },
-    /// Install + configure thegn's managed pi under `~/.thegn/pi` (the
-    /// "Agent" picker entry): a pinned binary + the thegn-acp extension.
-    Agent {
-        #[command(subcommand)]
-        action: cmd::agent::Action,
     },
     /// BugStalker debugger: install/pin `bs`, or start a session (`debug run
     /// <program>` / `debug attach <pid>`) — run inside a pane to debug within
@@ -788,7 +774,6 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
     use thegn_core::channel::Feature;
     Some(match command {
         Command::Proxy { .. } => ("proxy", Feature::Ai),
-        Command::Agent { .. } => ("agent", Feature::Ai),
         Command::Host { .. } => ("host", Feature::Providers),
         Command::Placement { .. } => ("placement", Feature::Placement),
         Command::Kaneo { .. } => ("kaneo", Feature::Trackers),
@@ -861,7 +846,6 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Zone { action } => cmd::zone::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),
-        Command::Agent { action } => cmd::agent::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
         Command::Notify { action } => cmd::notify::run(action),

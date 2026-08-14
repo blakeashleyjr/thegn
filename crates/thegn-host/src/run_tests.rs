@@ -5,49 +5,6 @@ use crate::naming::issue_branch_tail;
 use crate::session::{GroupKind, Session, WorktreeGroup};
 
 #[test]
-fn agent_session_update_tracks_tool_and_usage() {
-    use crate::chrome::{AgentActivity, AgentConn};
-    use thegn_core::acp::methods::SessionUpdateEvent as E;
-    let mut a = AgentActivity::default();
-
-    // A tool call sets the tool name and marks it running.
-    apply_agent_session_update(
-        &mut a,
-        E::ToolCall {
-            tool_call_id: "1".into(),
-            tool_name: "bash".into(),
-            args: serde_json::json!({}),
-        },
-    );
-    assert_eq!(a.last_tool.as_deref(), Some("bash"));
-    assert!(a.running);
-    // Folding a session update must not disturb the connection lifecycle.
-    assert_eq!(a.conn, AgentConn::Online);
-
-    // A completed update clears the running flag.
-    apply_agent_session_update(
-        &mut a,
-        E::ToolCallUpdate {
-            tool_call_id: "1".into(),
-            status: "completed".into(),
-            result: None,
-        },
-    );
-    assert!(!a.running);
-
-    // Usage updates feed the context-window percentage.
-    apply_agent_session_update(&mut a, E::UsageUpdate { used: 5, size: 20 });
-    assert_eq!((a.context_used, a.context_size), (5, 20));
-    assert_eq!(a.last_tool.as_deref(), Some("bash")); // unchanged
-    assert_eq!(a.conn, AgentConn::Online); // still untouched
-
-    // Agent-end clears running (and is what drives the AgentDone notification).
-    a.running = true;
-    apply_agent_session_update(&mut a, E::AgentEnd { success: true });
-    assert!(!a.running);
-}
-
-#[test]
 fn issue_branch_tail_prefers_hint_then_slugifies() {
     // A provider branch hint is used verbatim (trimmed).
     assert_eq!(

@@ -430,9 +430,8 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
     resolve_scoped(cfg, loc, name, cfg.profile)
 }
 
-/// Like [`resolve`] but with an explicit hardening [`SandboxProfile`]. Used for
-/// the embedded agent's separate `agent_profile` container, which is sealed
-/// independently of the worktree's interactive `profile`.
+/// Like [`resolve`] but with an explicit hardening [`SandboxProfile`], for
+/// callers that need a preset other than the config's `profile`.
 pub fn resolve_scoped(
     cfg: &SandboxConfig,
     loc: &GitLoc,
@@ -778,13 +777,14 @@ pub fn container_name_with_profile(worktree: &str, profile: Option<&str>) -> Str
     }
 }
 
-/// Suffix marking the embedded agent's own (separately-hardened) container, used
-/// when `agent_profile` differs from the worktree `profile` so the agent runs in
-/// a more-locked-down container than the interactive shell. Chosen to be
-/// collision-resistant against worktree slugs that happen to end in `-agent`.
+/// LEGACY suffix that marked the (since-removed) embedded agent's own
+/// separately-hardened container. Kept so teardown/reconciliation still cleans
+/// up containers created by older builds. Chosen to be collision-resistant
+/// against worktree slugs that happen to end in `-agent`.
 pub const AGENT_CONTAINER_SUFFIX: &str = "-szagent";
 
-/// The agent's container name, derived from the worktree container name `base`.
+/// The legacy agent container name, derived from the worktree container name
+/// `base` — only used to `rm -f` leftovers from older builds.
 pub fn agent_container_name(base: &str) -> String {
     format!("{base}{AGENT_CONTAINER_SUFFIX}")
 }
@@ -1233,9 +1233,9 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
 /// cleanup when a worktree is closed and only its path is known (no cfg/loc).
 pub fn teardown_by_path(worktree: &str) {
     let name = container_name(worktree);
-    // Also remove the agent's separate container (when `agent_profile` differs
-    // it runs in `thegn-{slug}-szagent`); `rm -f` of a non-existent name is a
-    // harmless no-op.
+    // Also remove any LEGACY separate agent container (`thegn-{slug}-szagent`,
+    // created by older builds); `rm -f` of a non-existent name is a harmless
+    // no-op.
     let agent = agent_container_name(&name);
     // Also remove the VPN sidecar (`thegn-{slug}-szvpn`) when one was started;
     // `rm -f` of a missing name is a harmless no-op. (Ephemeral node de-register
@@ -1270,9 +1270,9 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
         return;
     }
     let placement = placement_from_loc(cfg, loc);
-    // Remove both the worktree container and the agent's separate container (the
-    // latter only exists when `agent_profile` differs); `rm -f` of a missing
-    // name is a harmless no-op.
+    // Remove both the worktree container and any LEGACY separate agent
+    // container left behind by older builds; `rm -f` of a missing name is a
+    // harmless no-op.
     let agent = agent_container_name(name);
     let vpn = vpn_sidecar_name(name);
     // Drive the same remote daemon the create used, or `None` for the local

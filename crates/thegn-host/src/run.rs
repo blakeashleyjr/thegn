@@ -644,19 +644,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         None
     };
     let host_cache_port = _nix_cache.as_ref().map(|h| h.port);
-    // Self-heal the managed pi: if a configured agent runs the managed pi
-    // (`~/.thegn/pi`) but it's missing/stale, install+seed it off-thread (npm +
-    // extension seed — never blocks the loop). Explicit `thegn agent setup` does
-    // the same; this just means the "Agent" entry works without a manual step.
-    if !crate::cmd::agent::is_current()
-        && cfg.agents.iter().any(|a| a.command.contains(".thegn/pi"))
-    {
-        tokio::task::spawn_blocking(|| {
-            if let Err(e) = crate::cmd::agent::setup(false) {
-                tracing::warn!(target: "thegn::startup", error = %e, "managed pi setup failed; run `thegn agent setup`");
-            }
-        });
-    }
     let keymap = rebuild_keymap(&cfg, &session);
     let mode = crate::keymap::startup_mode(&cfg);
     // Validate that no keybinding scope has ambiguous duplicates. Cross-scope
@@ -830,9 +817,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (daemon_status_tx, daemon_status_rx) =
         tokio_mpsc::unbounded_channel::<crate::chrome::DaemonStatus>();
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
-    let (ai_metrics_tx, ai_metrics_rx) =
-        tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
-    crate::ai_sidecar::spawn_ai_sidecar(waker.clone(), ai_metrics_tx);
     crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
     // The stats cadence is user-cyclable at runtime (click the top-right
     // stats block); the ticker thread reads it per tick.
@@ -926,7 +910,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         container_rx,
         daemon_status_rx,
         metrics_rx,
-        ai_metrics_rx,
         sandbox_event_rx,
         stats_interval_ms,
         stats_live,
@@ -4029,9 +4012,6 @@ fn dispatch_menu_choice(
         // New-project creation is intercepted at the call site (it owns
         // session/panes/pool); never routes through this git dispatcher.
         MenuChoice::ConfirmCreateProject { .. } => {}
-        // The bouncer approval gate is resolved directly in the loop (it owns the
-        // approval queue + oneshots); it never routes through this git dispatcher.
-        MenuChoice::ApproveTool { .. } => {}
         // Sandbox-halt retry / run-on-host are resolved directly in the loop
         // (re-arm the lazy materialize); they never route through this dispatcher.
         MenuChoice::SandboxRetry | MenuChoice::SandboxRunOnHost => {}
@@ -5192,92 +5172,23 @@ pub(crate) fn persist_active_focus(session: &crate::session::Session) {
     });
 }
 
-use crate::acp_gate::AgentChannel;
-
-/// Connect to the agent's ACP server over the resolved channel. TCP connects
-/// after a fixed warm-up; the unix socket is created by the in-container pi
-/// extension only once it boots, so we retry until it appears (or time out).
-async fn connect_agent_channel(
-    channel: &AgentChannel,
-) -> anyhow::Result<(
-    thegn_svc::acp::client::AcpClient,
-    tokio::sync::mpsc::Receiver<thegn_svc::acp::client::AcpInbound>,
-)> {
-    use thegn_svc::acp::client::AcpClient;
-    match channel {
-        AgentChannel::Tcp(port) => {
-            // A freshly-spawned agent may not have bound its ACP port yet; retry on
-            // a fixed cadence (like the unix path's boot wait) rather than racing a
-            // single connect against the spawn — a lost race left the agent showing
-            // `Error` permanently despite coming up moments later (ECONNREFUSED).
-            // ~15s total (60 × 250ms); connects immediately once the port is up.
-            // Covers a cold managed pi that binds ACP_PORT ~12s after launch, so a
-            // healthy agent connects on attempt 1 (no transient error/backoff).
-            AcpClient::connect_retry(*port, 60, std::time::Duration::from_millis(250)).await
-        }
-        AgentChannel::Unix(path) => {
-            let path_s = path.to_string_lossy().into_owned();
-            // The sealed agent boots pi, then the extension `listen`s on the
-            // bind-mounted socket — which can take a few seconds on a cold image.
-            let mut last = None;
-            for _ in 0..40 {
-                if path.exists() {
-                    match AcpClient::connect_unix(&path_s).await {
-                        Ok(conn) => return Ok(conn),
-                        Err(e) => last = Some(e),
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-            Err(last.unwrap_or_else(|| anyhow::anyhow!("agent ACP socket {path_s} never appeared")))
-        }
-        AgentChannel::None => Err(anyhow::anyhow!("no ACP channel reserved")),
-    }
-}
-
 /// Attach a freshly-created worktree's agent pane: spawn the pre-resolved
 /// launch spec (openpty+exec — fast, the blocking sandbox/compose work already
 /// ran on the wizard worker) into the tab named `tab_name` and point that
 /// tab's center at the live pane so `materialize` won't also spawn a plain
 /// shell. No-op (returns false) if the tab is gone.
-///
-/// ACP is armed only when `agent_name` is the managed pi (see
-/// [`crate::acp_gate::resolve_agent_channel`]); a plain shell spawns the pane and
-/// nothing more (no phantom `⚠ agent error`).
-#[allow(clippy::too_many_arguments)]
 fn attach_agent_pane(
     session: &mut crate::session::Session,
     panes: &mut Panes,
     tab_name: &str,
     spec: &crate::agent::LaunchSpec,
-    agent_name: &str,
     center: Rect,
-    cfg: &thegn_core::config::Config,
-    acp_inbound_tx: &tokio_mpsc::UnboundedSender<(String, thegn_svc::acp::client::AcpInbound)>,
-    acp_reg_tx: &tokio_mpsc::UnboundedSender<(
-        String,
-        std::sync::Arc<thegn_svc::acp::client::AcpClient>,
-    )>,
-    acp_status_tx: &tokio_mpsc::UnboundedSender<(String, crate::chrome::AgentConn)>,
-    waker: &TerminalWaker,
 ) -> bool {
     let Some(gi) = session.worktrees.iter().position(|g| g.name == tab_name) else {
         return false;
     };
     let cwd = spec.cwd.clone();
-    let mut env = spec.env.clone();
-    let wt_path = session.worktrees[gi].path.clone();
-
-    // Resolve the ACP reach-back channel + proxy side effects, gated on whether
-    // this agent actually speaks ACP (the managed pi). For a shell / claude / etc.
-    // this returns `None` — no port, no env, no supervisor — so the pane spawns
-    // clean without a phantom `⚠ agent error`. See `crate::acp_gate`.
-    let crate::acp_gate::AcpArming {
-        channel: acp_channel,
-        revoke_key,
-        relay,
-    } = crate::acp_gate::resolve_agent_channel(cfg, agent_name, &wt_path, &spec.backend, &mut env);
-
+    let env = spec.env.clone();
     let argv = spec.argv.clone();
     match panes.spawn_argv_env(&argv, cwd.as_deref(), &env, center) {
         Ok(id) => {
@@ -5293,458 +5204,12 @@ fn attach_agent_pane(
             }
             tab.center = crate::center::CenterTree::Leaf(id);
             tab.focused_pane = id;
-
-            // Connect to ACP in the background over the resolved channel. The task
-            // registers its client with the loop (so the loop can reply) and then
-            // forwards every inbound message tagged with the worktree path; the
-            // loop owns servicing + replies (see `dispatch_acp_inbound`).
-            if !matches!(acp_channel, AgentChannel::None) {
-                let inbound_tx = acp_inbound_tx.clone();
-                let reg_tx = acp_reg_tx.clone();
-                let waker_clone = waker.clone();
-                let wt_name = g.path.clone();
-                // `revoke_key` (revoked on disconnect) and `relay` (the model
-                // relay, whose `Drop` tears down the socket) are captured by the
-                // `move` task below — they live exactly as long as the connection.
-
-                // Surface lifecycle in the statusbar chip (the only native signal).
-                let emit = {
-                    let status_tx = acp_status_tx.clone();
-                    let waker = waker_clone.clone();
-                    let wt = wt_name.clone();
-                    move |conn: crate::chrome::AgentConn| {
-                        let _ = status_tx.send((wt.clone(), conn));
-                        let _ = waker.wake();
-                    }
-                };
-                emit(crate::chrome::AgentConn::Connecting);
-
-                tokio::spawn(async move {
-                    let _relay = relay; // keep alive for the life of this task
-                    // Supervisor: retry with bounded backoff (500ms→30s) so a
-                    // slow-booting agent doesn't get a permanent red chip.
-                    let finish = |conn| {
-                        emit(conn);
-                        if let Some(key) = &revoke_key {
-                            crate::proxy_keys::revoke_agent_proxy_key(key);
-                        }
-                    };
-                    let mut backoff = std::time::Duration::from_millis(500);
-                    let mut failures: u32 = 0;
-                    loop {
-                        match connect_agent_channel(&acp_channel).await {
-                            Ok((client, mut rx)) => {
-                                // NOTE: do NOT reset failures/backoff here (audit
-                                // run.rs:5421). An endpoint that accepts TCP but
-                                // fails `initialize()` (wrong port, stale protocol)
-                                // would otherwise reset the counter every cycle —
-                                // the >=5 give-up would be unreachable and the loop
-                                // would spin at 2Hz forever, spamming the log. Reset
-                                // only on a *fully successful* connect (after
-                                // initialize succeeds, below).
-                                let client = std::sync::Arc::new(client);
-                                if let Err(e) = client.initialize().await {
-                                    failures += 1;
-                                    // Transient warmup failures stay at WARN so a
-                                    // slow-but-successful agent never trips the
-                                    // "error in thegn.log" badge; ERROR is reserved
-                                    // for the final give-up.
-                                    if failures >= 5 {
-                                        tracing::error!(target: "thegn::acp", attempt = failures, "ACP initialize failed, giving up: {e}");
-                                        finish(crate::chrome::AgentConn::Error);
-                                        return;
-                                    }
-                                    tracing::warn!(target: "thegn::acp", attempt = failures, "ACP initialize failed (retrying): {e}");
-                                    emit(crate::chrome::AgentConn::Connecting);
-                                } else {
-                                    // A fully-successful connect serves the message
-                                    // stream and then `return`s — it never loops
-                                    // back, so no failures/backoff reset is needed
-                                    // (audit run.rs:5421). The counter must NOT be
-                                    // reset before `initialize()`: a listener that
-                                    // accepts TCP but fails initialize would reset
-                                    // every cycle, making the >=5 give-up
-                                    // unreachable and spinning at 2Hz forever.
-                                    if let Err(e) = client.connect_mcp("thegn-house").await {
-                                        tracing::warn!(target: "thegn::acp", "mcp/connect failed: {e}");
-                                    }
-                                    if reg_tx.send((wt_name.clone(), client.clone())).is_err() {
-                                        finish(crate::chrome::AgentConn::Exited);
-                                        return;
-                                    }
-                                    emit(crate::chrome::AgentConn::Online);
-                                    while let Some(msg) = rx.recv().await {
-                                        if inbound_tx.send((wt_name.clone(), msg)).is_err() {
-                                            break;
-                                        }
-                                        let _ = waker_clone.wake();
-                                    }
-                                    finish(crate::chrome::AgentConn::Exited);
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                failures += 1;
-                                // Transient warmup failures stay at WARN; ERROR only
-                                // on the final give-up (see the initialize arm).
-                                if failures >= 5 {
-                                    tracing::error!(target: "thegn::acp", attempt = failures, "failed to connect to agent ACP channel, giving up: {e}");
-                                    finish(crate::chrome::AgentConn::Error);
-                                    return;
-                                }
-                                tracing::warn!(target: "thegn::acp", attempt = failures, "failed to connect to agent ACP channel (retrying): {e}");
-                                emit(crate::chrome::AgentConn::Connecting);
-                            }
-                        }
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
-                    }
-                });
-            }
-
             true
         }
         Err(e) => {
             thegn_core::msg::warn(&format!("agent launch failed: {e}"));
             false
         }
-    }
-}
-
-/// Service one inbound ACP message from an agent's `pi` subprocess. Requests are
-/// dispatched OFF the event loop (their replies are `async`; the loop must never
-/// block) via `tokio::spawn` + `spawn_blocking`, using the registered
-/// `AcpClient` to send the reply. Returns whether the frame should be repainted.
-///
-/// The reply shapes match the `thegn-acp.ts` pi extension exactly:
-/// `terminal/create → {output}`, `fs/read_text_file → {text}`,
-/// `thegn/edit`/`thegn/write → {status:"approved"|"rejected"}`. All file
-/// access is scoped to the worktree; shell commands run inside its sandbox.
-///
-/// NOTE: as of the "additive" integration, the extension no longer overrides
-/// pi's built-in bash/read/edit/write — pi runs those natively in-process — so
-/// the terminal/fs/edit arms below are currently UNEXERCISED. They are retained
-/// for the deferred "real bouncer" path (a sealed sandbox reachable via a
-/// unix-socket ACP transport + a review/approval gate), at which point the
-/// extension would re-route the core tools and these arms light up again.
-///
-/// Notifications (`session/update`) are handled by the caller against the
-/// rendered model; this services only requests that need a reply.
-/// Session-scoped bouncer remember-choice store: `(worktree, kind) -> allow`,
-/// shared between the loop (writer, on an "always" pick) and the off-loop gate
-/// tasks (readers, for the auto-resolve fast path).
-type AcpRemember = std::sync::Arc<
-    std::sync::Mutex<std::collections::HashMap<(String, crate::bouncer::ApprovalKind), bool>>,
->;
-
-#[allow(clippy::too_many_arguments)]
-fn dispatch_acp_inbound(
-    wt: &str,
-    inbound: thegn_svc::acp::client::AcpInbound,
-    acp_clients: &std::collections::HashMap<
-        String,
-        std::sync::Arc<thegn_svc::acp::client::AcpClient>,
-    >,
-    cfg: &thegn_core::config::Config,
-    event_bus: &thegn_core::event_bus::EventBus,
-    approval_tx: &tokio_mpsc::UnboundedSender<
-        crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>,
-    >,
-    remember: &AcpRemember,
-    waker: &TerminalWaker,
-) {
-    use thegn_svc::acp::client::AcpInbound;
-    let client = acp_clients.get(wt).cloned();
-    // In bouncer mode the consequential tools (shell/edit/write) are gated behind
-    // the user's approval; reads + MCP pass through. Off by default.
-    let bouncer = cfg.llm_proxy.bouncer;
-    match inbound {
-        AcpInbound::Initialized(caps) => {
-            tracing::debug!(target: "thegn::acp", worktree = %wt, ?caps, "agent initialized");
-        }
-        // Handled by the loop against the model; defensively ignored here.
-        AcpInbound::SessionUpdate(_) => {}
-        AcpInbound::FsReadRequest { id, path } => {
-            if let Some(client) = client {
-                let wt = wt.to_string();
-                tokio::spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::handlers::scoped_fs::read_scoped_file(&wt, &path)
-                    })
-                    .await
-                    .unwrap_or_else(|_| Err("read task panicked".to_string()));
-                    let reply = match result {
-                        // The pi `read` tool reads `result.text`.
-                        Ok(text) => {
-                            client
-                                .reply_result(id, serde_json::json!({ "text": text }))
-                                .await
-                        }
-                        Err(e) => client.reply_error(id, -32000, &e).await,
-                    };
-                    if let Err(e) = reply {
-                        tracing::error!(target: "thegn::acp", "fs/read reply failed: {e}");
-                    }
-                });
-            }
-        }
-        AcpInbound::TerminalCreateRequest { id, command, .. } => {
-            if let Some(client) = client {
-                let wt = wt.to_string();
-                let cfg = cfg.clone();
-                let approval_tx = approval_tx.clone();
-                let remember = remember.clone();
-                let waker = waker.clone();
-                tokio::spawn(async move {
-                    if !gate_approval(
-                        bouncer,
-                        &wt,
-                        crate::bouncer::ApprovalKind::Shell,
-                        command.clone(),
-                        &approval_tx,
-                        &remember,
-                        &waker,
-                    )
-                    .await
-                    {
-                        let _ = client
-                            .reply_error(id, -32001, "shell command denied by the thegn bouncer")
-                            .await;
-                        return;
-                    }
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::agent::run_in_sandbox(&cfg, &wt, &command)
-                    })
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("terminal task panicked")));
-                    let reply = match result {
-                        // The pi `bash` tool reads `result.output`.
-                        Ok(output) => {
-                            client
-                                .reply_result(id, serde_json::json!({ "output": output }))
-                                .await
-                        }
-                        Err(e) => client.reply_error(id, -32000, &e.to_string()).await,
-                    };
-                    if let Err(e) = reply {
-                        tracing::error!(target: "thegn::acp", "terminal/create reply failed: {e}");
-                    }
-                });
-            }
-        }
-        AcpInbound::ThegnWriteRequest { id, path, content } => {
-            if let Some(client) = client {
-                let wt = wt.to_string();
-                let approval_tx = approval_tx.clone();
-                let remember = remember.clone();
-                let waker = waker.clone();
-                tokio::spawn(async move {
-                    if !gate_approval(
-                        bouncer,
-                        &wt,
-                        crate::bouncer::ApprovalKind::Write,
-                        path.clone(),
-                        &approval_tx,
-                        &remember,
-                        &waker,
-                    )
-                    .await
-                    {
-                        let _ = client
-                            .reply_error(id, -32001, "write denied by the thegn bouncer")
-                            .await;
-                        return;
-                    }
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::handlers::scoped_fs::write_scoped_file(&wt, &path, &content)
-                    })
-                    .await
-                    .unwrap_or_else(|_| Err("write task panicked".to_string()));
-                    reply_edit_status(&client, id, result).await;
-                });
-            }
-        }
-        AcpInbound::ThegnEditRequest { id, path, edits } => {
-            if let Some(client) = client {
-                let wt = wt.to_string();
-                let approval_tx = approval_tx.clone();
-                let remember = remember.clone();
-                let waker = waker.clone();
-                tokio::spawn(async move {
-                    if !gate_approval(
-                        bouncer,
-                        &wt,
-                        crate::bouncer::ApprovalKind::Edit,
-                        path.clone(),
-                        &approval_tx,
-                        &remember,
-                        &waker,
-                    )
-                    .await
-                    {
-                        let _ = client
-                            .reply_error(id, -32001, "edit denied by the thegn bouncer")
-                            .await;
-                        return;
-                    }
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::handlers::scoped_fs::apply_scoped_edits(&wt, &path, &edits)
-                    })
-                    .await
-                    .unwrap_or_else(|_| Err("edit task panicked".to_string()));
-                    reply_edit_status(&client, id, result).await;
-                });
-            }
-        }
-        // MCP-over-ACP: route the agent's encapsulated MCP request through the
-        // host's McpRouter (budget/fleet/worktree-status/house tools) and reply
-        // with a `mcp/message` notification. Off-loop; the router opens the DB
-        // (`Connection` is !Send, so it's built + used inside spawn_blocking).
-        AcpInbound::McpMessage {
-            connection_id,
-            inner,
-        } => {
-            if let Some(client) = client {
-                let bus = event_bus.clone();
-                let wt_owned = wt.to_string();
-                // The merge house tools ride along only when the queue is enabled;
-                // the router build + DB open happen on the blocking thread (Db is
-                // !Send). Body lives in `mcp_merge` to keep this god-file lean.
-                let mq = cfg.merge_queue.enabled.then(|| cfg.merge_queue.clone());
-                tokio::spawn(async move {
-                    let resp = tokio::task::spawn_blocking(move || {
-                        crate::mcp_merge::handle_house_request(&inner, bus, &wt_owned, mq)
-                    })
-                    .await
-                    .unwrap_or_else(|_| {
-                        serde_json::json!({
-                            "jsonrpc": "2.0", "id": serde_json::Value::Null,
-                            "error": { "code": -32603, "message": "mcp task panicked" }
-                        })
-                    });
-                    if let Err(e) = client
-                        .send_notification(
-                            "mcp/message",
-                            serde_json::json!({ "connectionId": connection_id, "message": resp }),
-                        )
-                        .await
-                    {
-                        tracing::error!(target: "thegn::acp", "mcp/message reply failed: {e}");
-                    }
-                });
-            }
-        }
-    }
-}
-
-/// Build the approval overlay for a pending bouncer request: a 2-item allow/deny
-/// menu titled with the worktree + action, bodied with the command/path summary.
-fn approval_overlay<R>(req: &crate::bouncer::ApprovalRequest<R>) -> MenuOverlay {
-    let wt_name = thegn_core::util::basename(&req.worktree);
-    let title = format!(
-        "{} {wt_name} · agent wants to {}",
-        req.kind.glyph(),
-        req.kind.verb()
-    );
-    menu::approval_menu(title, crate::bouncer::summary(&req.detail))
-}
-
-/// Ask the bouncer gate for permission to run a consequential tool call (bouncer
-/// mode only). Sends an `ApprovalRequest` to the loop, pulses the waker so the
-/// overlay is raised, and awaits the user's decision. Returns `true` to proceed;
-/// a deny — or a gone loop — returns `false`. A no-op (`true`) when not gating.
-///
-/// A prior "always" pick for this `(worktree, kind)` short-circuits the overlay:
-/// the remembered decision is returned immediately without prompting.
-async fn gate_approval(
-    bouncer: bool,
-    wt: &str,
-    kind: crate::bouncer::ApprovalKind,
-    detail: String,
-    approval_tx: &tokio_mpsc::UnboundedSender<
-        crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>,
-    >,
-    remember: &AcpRemember,
-    waker: &TerminalWaker,
-) -> bool {
-    if !bouncer {
-        return true;
-    }
-    // Fast path: a remembered "always" decision auto-resolves without prompting.
-    // Copy out under the lock (never held across the await below).
-    if let Some(allow) = remember
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&(wt.to_string(), kind)).copied())
-    {
-        return allow;
-    }
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if approval_tx
-        .send(crate::bouncer::ApprovalRequest {
-            worktree: wt.to_string(),
-            kind,
-            detail,
-            reply: reply_tx,
-        })
-        .is_err()
-    {
-        return false; // loop gone
-    }
-    let _ = waker.wake();
-    reply_rx.await.unwrap_or(false)
-}
-
-/// Fold an ACP `session/update` into a worktree's agent-activity entry: track the
-/// latest tool call + its running state and the context-window usage. Message /
-/// thought / config chunks don't change the chip (a richer follow-along panel is
-/// a future addition), so they're ignored here. The connection lifecycle
-/// (`conn`) is owned by the status channel, not touched here.
-fn apply_agent_session_update(
-    a: &mut crate::chrome::AgentActivity,
-    update: thegn_core::acp::methods::SessionUpdateEvent,
-) {
-    use thegn_core::acp::methods::SessionUpdateEvent as E;
-    match update {
-        E::ToolCall { tool_name, .. } => {
-            a.last_tool = Some(tool_name);
-            a.running = true;
-        }
-        E::ToolCallUpdate { status, .. } => {
-            a.running = matches!(status.as_str(), "pending" | "in_progress");
-        }
-        E::UsageUpdate { used, size } => {
-            a.context_used = used;
-            a.context_size = size;
-        }
-        E::AgentEnd { .. } => {
-            // Turn finished: no tool is running. (Notification is published by
-            // the loop drain, which owns the EventBus.)
-            a.running = false;
-        }
-        E::AgentMessageChunk { .. }
-        | E::AgentThoughtChunk { .. }
-        | E::ConfigOptionUpdate { .. } => {}
-    }
-}
-
-/// Reply to a `thegn/edit` / `thegn/write` request with the
-/// `{status:"approved"}` shape the pi extension expects, or a JSON-RPC error.
-async fn reply_edit_status(
-    client: &thegn_svc::acp::client::AcpClient,
-    id: thegn_core::acp::types::Id,
-    result: Result<(), String>,
-) {
-    let reply = match result {
-        Ok(()) => {
-            client
-                .reply_result(id, serde_json::json!({ "status": "approved" }))
-                .await
-        }
-        Err(e) => client.reply_error(id, -32000, &e).await,
-    };
-    if let Err(e) = reply {
-        tracing::error!(target: "thegn::acp", "edit/write reply failed: {e}");
     }
 }
 
@@ -5796,7 +5261,6 @@ async fn event_loop<T: Terminal>(
     mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<thegn_core::sandbox::ContainerInfo>>,
     mut daemon_status_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::DaemonStatus>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
-    mut ai_metrics_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::AiMetrics>,
     mut sandbox_event_rx: tokio_mpsc::UnboundedReceiver<crate::sandbox_events::SandboxEventBatch>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -6489,50 +5953,6 @@ async fn event_loop<T: Terminal>(
     let mut pending_paste_register = false;
     let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(PANE_EVENT_CHANNEL_CAPACITY);
     let mut panes = Panes::with_waker(tx, waker.clone());
-
-    // ACP (upper control plane) request/reply plumbing. Each agent pane spawns a
-    // background `AcpClient` connect task; once connected it (1) registers its
-    // `Arc<AcpClient>` here so the loop can reply, and (2) forwards every inbound
-    // JSON-RPC message tagged with its worktree. The loop drains both channels on
-    // wake and services requests OFF-loop (replies are async; we never await on
-    // the loop — see `dispatch_acp_inbound`).
-    let (acp_inbound_tx, mut acp_inbound_rx) =
-        tokio_mpsc::unbounded_channel::<(String, thegn_svc::acp::client::AcpInbound)>();
-    let (acp_reg_tx, mut acp_reg_rx) = tokio_mpsc::unbounded_channel::<(
-        String,
-        std::sync::Arc<thegn_svc::acp::client::AcpClient>,
-    )>();
-    let mut acp_clients: std::collections::HashMap<
-        String,
-        std::sync::Arc<thegn_svc::acp::client::AcpClient>,
-    > = std::collections::HashMap::new();
-    // Per-worktree agent activity (the statusbar chip's source of truth) + a
-    // lifecycle-status channel the connect task feeds (connecting/online/exited/
-    // error). The chip is the *only* native agent signal, so it must reflect
-    // both progress (session updates) and connection failures. `model`'s single
-    // `agent_activity` is set from the FOCUSED worktree's entry each turn.
-    let (acp_status_tx, mut acp_status_rx) =
-        tokio_mpsc::unbounded_channel::<(String, crate::chrome::AgentConn)>();
-    let mut acp_activity: std::collections::HashMap<String, crate::chrome::AgentActivity> =
-        std::collections::HashMap::new();
-
-    // The bouncer's tool-approval gate (B1). When the agent runs sealed, its
-    // shell/edit/write tool calls are routed back over ACP and gated here: the
-    // off-loop servicing task sends an `ApprovalRequest` carrying a oneshot, and
-    // awaits the user's allow/deny. The loop drains the channel into a FIFO
-    // `ApprovalQueue`, shows one `approval_menu` overlay at a time, and resolves
-    // each request's oneshot on the pick. (No-op unless `[llm_proxy].bouncer`.)
-    type AcpApproval = crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>;
-    let (acp_approval_tx, mut acp_approval_rx) = tokio_mpsc::unbounded_channel::<AcpApproval>();
-    let mut acp_approvals: crate::bouncer::ApprovalQueue<tokio::sync::oneshot::Sender<bool>> =
-        crate::bouncer::ApprovalQueue::new();
-    // Session-scoped remember-choice store for the bouncer gate: an "always"
-    // pick records `(worktree, kind) -> allow` here, and the gate task consults
-    // it (off-loop) to auto-resolve matching calls without re-prompting. Shared
-    // with the gate tasks; the loop only ever writes it (on an "always" pick).
-    let acp_remember: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<(String, crate::bouncer::ApprovalKind), bool>>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     // The resurrected session restored each tab's tree with pane ids the
     // PREVIOUS process allocated (numbered from 1). This process's `next_id`
@@ -8935,128 +8355,12 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
-        // Register newly-connected agent ACP clients so the loop can reply to
-        // their requests (terminal/fs/edit) via `dispatch_acp_inbound`.
-        while let Ok((wt, client)) = acp_reg_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Other);
-            tracing::debug!(target: "thegn::acp", worktree = %wt, "agent ACP client registered");
-            acp_clients.insert(wt, client);
-        }
-
-        // Agent ACP connection lifecycle (connecting/online/exited/error) → the
-        // per-worktree activity entry, so the chip can show failure states.
-        while let Ok((wt, conn)) = acp_status_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Other);
-            acp_activity.entry(wt).or_default().conn = conn;
-            dirty = true;
-        }
-
-        // Service inbound ACP messages from agents. Requests are dispatched
-        // off-loop (their replies are async); session updates fold into the
-        // sending worktree's activity entry and mark the frame dirty.
-        while let Ok((wt, inbound)) = acp_inbound_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Other);
-            match inbound {
-                // Notifications mutate per-worktree activity (the loop owns it);
-                // requests are serviced off-loop with a reply.
-                thegn_svc::acp::client::AcpInbound::SessionUpdate(update) => {
-                    // Agent finished → notification inbox (desktop + Notifications
-                    // panel). Fires for user-driven turns too.
-                    if let thegn_core::acp::methods::SessionUpdateEvent::AgentEnd { success } =
-                        &update
-                    {
-                        let ev = if *success {
-                            thegn_core::event_bus::Event::AgentDone {
-                                worktree: wt.clone(),
-                                agent: "pi".to_string(),
-                                success: true,
-                            }
-                        } else {
-                            thegn_core::event_bus::Event::AgentFailed {
-                                worktree: wt.clone(),
-                                agent: "pi".to_string(),
-                                error: "agent turn failed".to_string(),
-                            }
-                        };
-                        event_bus.publish(&ev);
-                        // Chime on agent-turn completion (on by default via
-                        // `[notifications.sound] always_kinds`; suppressed for the
-                        // focused worktree + gated by rules/DND like any cue).
-                        let kind = if *success {
-                            "agent_done"
-                        } else {
-                            "agent_failed"
-                        };
-                        let base = thegn_core::util::basename(&wt);
-                        let msg = format!(
-                            "agent {} in {base}",
-                            if *success { "finished" } else { "failed" }
-                        );
-                        let dec = notify_state.decide(kind, &wt, &msg, &wt);
-                        notify_state.emit_sound(&dec);
-                    }
-                    apply_agent_session_update(acp_activity.entry(wt).or_default(), update);
-                    dirty = true;
-                }
-                other => {
-                    dispatch_acp_inbound(
-                        &wt,
-                        other,
-                        &acp_clients,
-                        keymap.config(),
-                        &event_bus,
-                        &acp_approval_tx,
-                        &acp_remember,
-                        &waker,
-                    );
-                }
-            }
-        }
-
-        // Drain pending bouncer approvals into the FIFO gate. When one becomes
-        // active and no other menu is open, raise the approval overlay (an
-        // overlay forces a Full frame — the render invariant handles repaint).
-        while let Ok(req) = acp_approval_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Other);
-            let became_active = acp_approvals.enqueue(req);
-            if became_active
-                && active_menu.is_none()
-                && let Some(active) = acp_approvals.active()
-            {
-                active_menu = Some(approval_overlay(active));
-                dirty = true;
-            }
-        }
-
-        // The chip tracks the FOCUSED worktree's agent (the map is per-worktree).
-        let focused_activity = session
-            .active_group()
-            .and_then(|g| acp_activity.get(&g.path).cloned());
-        if model.agent_activity != focused_activity {
-            model.agent_activity = focused_activity;
-            dirty = true;
-        }
-
         // Fresh metrics readings from the scrape supervisor (sidebar section).
         while let Ok(state) = metrics_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Metrics);
             if model.metrics != state {
                 model.metrics = state;
                 dirty = true;
-            }
-        }
-
-        // AI sidecar metrics — a SIBLING drain (audit run.rs:9046), not nested
-        // inside the metrics drain: the two producers are independent, and with
-        // `[metrics]` targets empty (the default) the metrics loop body never
-        // runs, so a nested drain would never consume ai_metrics — the unbounded
-        // channel would grow forever and every sidecar wake would be wasted.
-        while let Ok(ai_state) = ai_metrics_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Metrics);
-            if model.ai_metrics.as_ref() != Some(&ai_state) {
-                model.ai_metrics = Some(ai_state);
-                // AI metrics render in the statusbar → bars path, not full.
-                bars_dirty = true;
             }
         }
 
@@ -9265,13 +8569,7 @@ async fn event_loop<T: Terminal>(
                             &mut panes,
                             &payload.tab,
                             &payload.spec,
-                            &payload.agent,
                             chrome.center,
-                            keymap.config(),
-                            &acp_inbound_tx,
-                            &acp_reg_tx,
-                            &acp_status_tx,
-                            &waker,
                         );
                     if attached || native_provider {
                         // Only pull focus to the new pane when its tab is active
@@ -12644,36 +11942,26 @@ async fn event_loop<T: Terminal>(
                     match m.handle_key(&k.key, k.modifiers) {
                         menu::MenuOutcome::Pending => {}
                         menu::MenuOutcome::Cancel => {
-                            // Esc on the bouncer gate = deny: reject the active
-                            // tool call and advance to the next queued approval.
-                            if m.tag == menu::MenuKindTag::Approval {
-                                if let Some(done) = acp_approvals.resolve() {
-                                    let _ = done.reply.send(false);
-                                }
-                                active_menu = acp_approvals.active().map(approval_overlay);
-                                // (the common `dirty = true` after this match repaints)
-                            } else {
-                                // Dismissing the first-launch keymap picker (item
-                                // 621) counts as choosing the defaults — persist so
-                                // it never reappears.
-                                if m.tag == menu::MenuKindTag::KeymapPicker
-                                    && let Ok(db) = thegn_core::db::Db::open()
-                                {
-                                    let _ = db.set_ui_state("", "keymap_preset", "default");
-                                }
-                                // Esc on the sandbox-halt modal is a dismissal:
-                                // suppress it for this key (the row's error dot
-                                // carries the state; revisiting won't re-block).
-                                if m.tag == menu::MenuKindTag::SandboxHalt
-                                    && let Some(g) = session.worktrees.get(session.active)
-                                {
-                                    halt_dismissed.insert((g.name.clone(), g.active_tab));
-                                }
-                                active_menu = None;
-                                pending_confirm_op = None;
-                                pending_undo = None;
-                                pending_delete_workspace = None;
+                            // Dismissing the first-launch keymap picker (item
+                            // 621) counts as choosing the defaults — persist so
+                            // it never reappears.
+                            if m.tag == menu::MenuKindTag::KeymapPicker
+                                && let Ok(db) = thegn_core::db::Db::open()
+                            {
+                                let _ = db.set_ui_state("", "keymap_preset", "default");
                             }
+                            // Esc on the sandbox-halt modal is a dismissal:
+                            // suppress it for this key (the row's error dot
+                            // carries the state; revisiting won't re-block).
+                            if m.tag == menu::MenuKindTag::SandboxHalt
+                                && let Some(g) = session.worktrees.get(session.active)
+                            {
+                                halt_dismissed.insert((g.name.clone(), g.active_tab));
+                            }
+                            active_menu = None;
+                            pending_confirm_op = None;
+                            pending_undo = None;
+                            pending_delete_workspace = None;
                         }
                         menu::MenuOutcome::Pick(choice) => {
                             // Capture the tag before clearing: the `[n] dismiss`
@@ -12681,24 +11969,6 @@ async fn event_loop<T: Terminal>(
                             // dismissal below must be gated on this being one.
                             let was_halt = m.tag == menu::MenuKindTag::SandboxHalt;
                             active_menu = None;
-                            // Bouncer gate: send the user's allow/deny to the
-                            // waiting tool-servicing task, then raise the next
-                            // queued approval (if any). An "always" pick is also
-                            // remembered for this worktree + action so future
-                            // same-kind calls auto-resolve at the gate.
-                            if let menu::MenuChoice::ApproveTool { decision } = choice {
-                                if let Some(done) = acp_approvals.resolve() {
-                                    if let Some(allow) = decision.remembered()
-                                        && let Ok(mut m) = acp_remember.lock()
-                                    {
-                                        m.insert((done.worktree.clone(), done.kind), allow);
-                                    }
-                                    let _ = done.reply.send(decision.allowed());
-                                }
-                                active_menu = acp_approvals.active().map(approval_overlay);
-                                dirty = true;
-                                continue;
-                            }
                             // Sandbox-halt/ask modal `[r] retry` / `[h] run on host`.
                             {
                                 let active_wt = active_cwd(&session);

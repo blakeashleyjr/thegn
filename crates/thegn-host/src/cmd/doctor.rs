@@ -116,10 +116,6 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
             "name": cfg.sandbox.profile.as_str(),
             "policy": profile_policy(cfg.sandbox.profile),
         },
-        "agent_profile": {
-            "name": cfg.sandbox.agent_profile.as_str(),
-            "policy": profile_policy(cfg.sandbox.agent_profile),
-        },
         "limits": limits_json(cfg),
         "home": home_json(cfg),
     })
@@ -725,11 +721,6 @@ fn sandbox_report(cfg: &Config) {
         cfg.sandbox.profile.as_str(),
         profile_policy(cfg.sandbox.profile)
     );
-    outln!(
-        "  agent profile {} ({})",
-        cfg.sandbox.agent_profile.as_str(),
-        profile_policy(cfg.sandbox.agent_profile)
-    );
     cpu_cap_report(cfg);
     if all_weak {
         outln!("  note          even the strongest preset here shares the host kernel; for a");
@@ -1055,53 +1046,53 @@ mod tests {
     }
 
     #[test]
-    fn managed_tools_json_reports_pi_and_honors_override() {
-        // Default config: pi is a managed tool, resolved to the managed tier
-        // (nothing on PATH in the test env, no override) and reported.
+    fn managed_tools_json_reports_bs_and_honors_override() {
+        // Default config: bugstalker is a managed tool, resolved to the managed
+        // tier (nothing on PATH in the test env, no override) and reported.
         let cfg = Config::default();
         let tools = managed_tools_json(&cfg);
         let arr = tools.as_array().expect("array");
-        let pi = arr.iter().find(|t| t["name"] == "pi").expect("pi reported");
-        assert_eq!(
-            pi["pinned"],
-            thegn_core::managed_tool::ManagedTool::npm("pi", "p", "pi", crate::pi_assets::PI_PIN,)
-                .version
-        );
+        let bs = arr
+            .iter()
+            .find(|t| t["name"] == "bugstalker")
+            .expect("bugstalker reported");
+        assert_eq!(bs["pinned"], thegn_core::debug::bs_tool().version);
 
-        // A user override (as parsed from `[managed_tools.pi]`) wins the tier.
+        // A user override (as parsed from `[managed_tools.bugstalker]`) wins
+        // the tier.
         let mut cfg = Config::default();
         cfg.managed_tools.insert(
-            "pi".to_string(),
+            "bugstalker".to_string(),
             thegn_core::managed_tool::ToolOverride {
-                path: "/opt/custom/pi".into(),
+                path: "/opt/custom/bs".into(),
                 args: vec![],
             },
         );
         let arr = managed_tools_json(&cfg);
-        let pi = arr
+        let bs = arr
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| t["name"] == "pi")
+            .find(|t| t["name"] == "bugstalker")
             .unwrap()
             .clone();
-        assert_eq!(pi["tier"], "override");
-        assert_eq!(pi["path"], "/opt/custom/pi");
+        assert_eq!(bs["tier"], "override");
+        assert_eq!(bs["path"], "/opt/custom/bs");
         // The report runs without panicking too.
         managed_tools_report(&cfg);
     }
 
     #[test]
     fn managed_tools_override_parses_from_toml() {
-        // `[managed_tools.pi]` layers into Config like the other keyed maps.
+        // `[managed_tools.bs]` layers into Config like the other keyed maps.
         let toml = r#"
-[managed_tools.pi]
-path = "/usr/local/bin/pi"
+[managed_tools.bs]
+path = "/usr/local/bin/bs"
 args = ["--verbose"]
 "#;
         let cfg: Config = toml::from_str(toml).expect("parse");
-        let over = cfg.managed_tools.get("pi").expect("override present");
-        assert_eq!(over.path, "/usr/local/bin/pi");
+        let over = cfg.managed_tools.get("bs").expect("override present");
+        assert_eq!(over.path, "/usr/local/bin/bs");
         assert_eq!(over.args, vec!["--verbose".to_string()]);
     }
 
@@ -1110,7 +1101,7 @@ args = ["--verbose"]
         let v = sandbox_json(&Config::default());
         assert!(v.get("enabled").is_some());
         assert!(v.get("candidates").unwrap().is_array());
-        assert!(v.get("agent_profile").unwrap().get("policy").is_some());
+        assert!(v.get("shell_profile").unwrap().get("policy").is_some());
     }
 
     #[test]

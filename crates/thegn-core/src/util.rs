@@ -62,19 +62,6 @@ pub fn thegn_dir() -> PathBuf {
         .unwrap_or_else(|| home().join(".thegn"))
 }
 
-/// The thegn-MANAGED pi install root (`~/.thegn/pi`): a pinned pi binary
-/// (`node_modules/.bin/pi`) plus the managed agent dir below. Self-contained +
-/// reproducible — owned by thegn, not the host's global `pi`/`~/.pi`.
-pub fn managed_pi_dir() -> PathBuf {
-    thegn_dir().join("pi")
-}
-
-/// The managed pi's `PI_CODING_AGENT_DIR` (`~/.thegn/pi/agent`) — its config,
-/// settings, and the seeded `thegn-acp` extension package live here.
-pub fn managed_pi_agent_dir() -> PathBuf {
-    managed_pi_dir().join("agent")
-}
-
 /// Expand a leading `~` to `$HOME` (config values may contain it literally).
 pub fn expand_tilde(p: &str) -> String {
     if p == "~" {
@@ -843,14 +830,6 @@ mod tests {
         assert_eq!(basename(r"C:\Users\u/mixed\style/leaf"), "leaf");
         assert_eq!(basename("bare"), "bare");
         assert_eq!(basename(""), "");
-    }
-
-    #[test]
-    fn managed_pi_dirs_nest_under_thegn_dir() {
-        let base = thegn_dir();
-        assert_eq!(managed_pi_dir(), base.join("pi"));
-        assert_eq!(managed_pi_agent_dir(), base.join("pi").join("agent"));
-        assert!(managed_pi_agent_dir().ends_with("pi/agent"));
     }
 
     #[test]

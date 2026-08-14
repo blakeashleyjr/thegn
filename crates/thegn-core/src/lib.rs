@@ -10,7 +10,6 @@
 //! owns terminal chord→Action routing.
 
 pub mod account;
-pub mod acp;
 pub mod activity;
 pub mod aggregate;
 pub mod attention;

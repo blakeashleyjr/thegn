@@ -15,7 +15,7 @@ use std::path::Path;
 use thegn_core::config::Config;
 use thegn_core::direnv;
 
-use crate::agent::{LaunchSpec, launch_spec_with_key};
+use crate::agent::{LaunchSpec, launch_spec_full};
 
 /// Map `[sandbox] warm_direnv` to a host-side `direnv` cache warm for
 /// `worktree`. Off-loop and self-gating (`direnv::warm` is a no-op without a
@@ -77,5 +77,5 @@ pub(crate) fn launch_spec_synced(
     // (materialize / prewarm / agent tabs), so mark the spec daemon-persistent
     // when the daemon is active — a local bwrap pane then survives UI detach.
     let daemon_persistent = crate::handlers::startup::daemon_active(cfg);
-    launch_spec_with_key(cfg, worktree, branch, choice, None, true, daemon_persistent)
+    launch_spec_full(cfg, worktree, branch, choice, true, daemon_persistent)
 }

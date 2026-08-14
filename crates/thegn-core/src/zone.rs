@@ -125,13 +125,10 @@ pub fn apply_zone_ceilings(
     }
 
     // Hardening floor.
-    if let Some(floor) = zc.sandbox_floor {
-        if profile_rank(floor) > profile_rank(sb.profile) {
-            sb.profile = floor;
-        }
-        if profile_rank(floor) > profile_rank(sb.agent_profile) {
-            sb.agent_profile = floor;
-        }
+    if let Some(floor) = zc.sandbox_floor
+        && profile_rank(floor) > profile_rank(sb.profile)
+    {
+        sb.profile = floor;
     }
 
     dropped
