@@ -863,7 +863,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Host { action } => cmd::host::run(&cfg, action),
         Command::Agent { action } => cmd::agent::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),
-        Command::Mcp { action } => cmd::mcp::run(&cfg, action),
+        Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Doctor { json } => cmd::doctor::run(&cfg, json),

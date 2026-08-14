@@ -124,6 +124,14 @@ check "sandbox vpn config parses and surfaces the provider" \
 check "config get reads a nested vpn key" \
   "[[ \$('$SZ' config get sandbox.vpn.provider 2>/dev/null) == 'tailscale' || -n \$('$SZ' config show | grep -A2 'sandbox.vpn') ]]"
 
+# mcp serve: the read-only docs endpoint answers JSON-RPC over stdio.
+check "mcp serve initialize reports the docs server" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}' | '$SZ' mcp serve | grep -q 'thegn-docs'"
+check "mcp serve tools/list advertises search_docs" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' | '$SZ' mcp serve | grep -q 'search_docs'"
+check "mcp serve search_docs finds the merge-queue help page" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"search_docs\",\"arguments\":{\"query\":\"merge queue\"}}}' | '$SZ' mcp serve | grep -q 'merge-queue'"
+
 # A hand-built worktree exercises diff/pr/list against real git state without
 # the interactive host (worktree creation is a compositor action now).
 WT="$TMP/wt/feature"

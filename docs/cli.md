@@ -67,6 +67,33 @@ or a unique repo basename) and:
   compositor on that workspace;
 - `--no-launch` — records the pointer/intent only (for scripts).
 
+## Docs endpoint for agents (`mcp serve`)
+
+`thegn mcp serve` runs thegn itself as a **read-only MCP server over stdio** — a
+Context7-style endpoint a coding agent connects to in order to learn how thegn
+works and inspect the live config. Register it once:
+
+```sh
+claude mcp add thegn -- thegn mcp serve
+# or, generic MCP config:  { "command": "thegn", "args": ["mcp", "serve"] }
+```
+
+It speaks newline-delimited JSON-RPC (`initialize`, `tools/list`, `tools/call`,
+`resources/list`, `resources/read`) and exposes:
+
+| Tool             | What it returns                                                                  |
+| ---------------- | -------------------------------------------------------------------------------- |
+| `search_docs`    | full-text search of the in-app help corpus → matching page ids                   |
+| `read_doc`       | a help page's markdown by id (incl. generated `keybindings`, `config-reference`) |
+| `list_docs`      | every help page (id + title) — the browse index                                  |
+| `get_config`     | your current effective config as JSON (secrets redacted); optional dotted `key`  |
+| `explain_config` | how a config key resolves — effective value + which layer set it                 |
+
+Resources mirror these: `thegn://help/<id>` per page, `thegn://config/current`,
+`thegn://config/schema`, `thegn://doc/cli`, `thegn://doc/readme`. The endpoint is
+**read-only** and never serves secrets — token/key/credential fields are masked
+before `get_config` / `thegn://config/current` go out.
+
 ## Completions
 
 `thegn completions bash|zsh|fish|elvish|powershell` generates completions
