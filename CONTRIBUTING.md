@@ -106,8 +106,8 @@ experience differs from unix — nix/devenv and the justfile don't apply:
 - **What's intentionally absent on Windows:** container sandboxing (Linux
   containers in a VM can't bind-mount the worktree at its real path — use
   WSL2 if you want sandboxed panes; native panes run on the host, scoped by
-  kill-on-close Job Objects), the sealed-agent model relay, the SIGUSR2
-  flamegraph profiler, and the merge-queue headless agent (POSIX quoting).
+  kill-on-close Job Objects), the SIGUSR2 flamegraph profiler, and the
+  merge-queue headless agent (POSIX quoting).
 - **CI:** every PR cross-checks the whole workspace for
   `x86_64-pc-windows-gnu` on Linux (`just check-cross`); the full
   `windows-latest` msvc job (check + IPC/Job-Object kernel tests) is opt-in —

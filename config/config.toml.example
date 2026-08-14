@@ -7,10 +7,9 @@
 # workspace shell — git/worktrees/panes/sidebar/panel, the command palette,
 # sessions, sandboxing, and the CLI merge/land/integrate queue. Several
 # subsystems are still experimental and are DISABLED in the stable build even if
-# the keys below are set: remotes ([sandbox.remote]), the LLM proxy + agents
-# the Observe dashboards ([observe]), the placement
-# engine ([placement]), and the non-GitHub issue trackers ([issues]: Linear /
-# Jira / Kaneo). GitHub PR/issue viewing stays available in both channels.
+# the keys below are set: remotes ([sandbox.remote]), the Observe dashboards
+# ([observe]), the placement engine ([placement]), and the non-GitHub issue
+# trackers ([issues]: Linear / Jira / Kaneo). GitHub PR/issue viewing stays available in both channels.
 # To enable the experimental subsystems, run the dev build (`nix run .#dev`,
 # installed as `thegn-dev`) or set THEGN_CHANNEL=dev for one run. `thegn doctor`
 # prints the resolved channel and which features it allows. There is no config
@@ -861,11 +860,8 @@ command = "git diff"
 #                                                #   equal-or-stricter (auto < packed <
 #                                                #   dedicated). See [placement].
 # [zone.clientA.budget]
-# limit_tokens = 5000000                         # rolled up as the `zone:clientA` proxy scope
-# limit_cost   = 100.0                           # USD ceiling for the period
 # limit_compute_cost = 50.0                      # COMPUTE USD ceiling (placement ledger:
-#                                                #   autoscaled hosts + spillover; separate
-#                                                #   from the model-spend caps above)
+#                                                #   autoscaled hosts + spillover)
 #
 # Manage zones from the CLI: `thegn zone list|create <name>|rm <name> [--force]|
 # assign <zone> [repo]`. Reassignment takes effect on the next worktree launch.
@@ -2575,8 +2571,7 @@ enabled = false
 #                             #   scope (0 = uncapped). Breach pauses PAID
 #                             #   lanes (autoscale + spillover) per
 #                             #   on_exhaustion; packing onto already-paid
-#                             #   hosts keeps serving. Separate from the LLM
-#                             #   proxy's model-spend ledger by design.
+#                             #   hosts keeps serving.
 # [placement.price]           # hourly USD rates for the compute ledger
 # "hetzner:cx33" = 0.0154     #   autoscaled hosts ("provider:size", fallback
 # "hetzner" = 0.008           #   "provider"); unpriced resources meter at $0

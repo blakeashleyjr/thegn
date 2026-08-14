@@ -2,29 +2,23 @@
 
 ## Purpose
 
-Hosting and exposing MCP servers over core (tools, resources, recursive spawn), advertised to agents including over the ACP channel.
+Declaring, acquiring (grant-checked), and inspecting user-configured MCP
+servers; thegn emits them as a standard `mcpServers` settings block that a
+user's coding agents can consume.
 
 ## Requirements
 
-### Requirement: Users declare MCP servers the agent consumes
+### Requirement: Users declare MCP servers agents consume
 
 thegn SHALL let users declare MCP servers in config (`[mcp_servers.<name>]`)
 with a launch command, arguments, and environment, and MUST emit them as a
-standard `mcpServers` settings block that the managed agent consumes. `thegn
-agent setup` MUST merge that block into the managed pi's settings additively,
-preserving existing keys, so declared servers ride alongside the built-in
-`thegn-acp` house tools.
+standard `mcpServers` settings block (`thegn mcp emit`) that a coding agent's
+settings can consume.
 
-#### Scenario: A declared server appears in the agent settings block
+#### Scenario: A declared server appears in the settings block
 
 - **WHEN** a `[mcp_servers.<name>]` is configured and the settings block is built
 - **THEN** the block contains an `<name>` entry with its command, args, and env
-
-#### Scenario: agent setup injects declared servers additively
-
-- **WHEN** `thegn agent setup` runs with declared MCP servers
-- **THEN** the managed pi's settings gain an `mcpServers` key with those servers
-  while its existing keys (packages, …) are preserved
 
 ### Requirement: MCP server binaries are acquired via the resolver, grant-checked
 

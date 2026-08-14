@@ -1,5 +1,7 @@
 # Add agent observability ("Agents")
 
+> **Archived unimplemented (2026-08-14):** the AI/agent layer was removed from the codebase before the public alpha; revisit when the AI track reopens.
+
 ## Summary
 
 Surface what every coding agent is doing — across all worktrees — **without

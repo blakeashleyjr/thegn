@@ -56,20 +56,21 @@ saying so.
 
 ### Requirement: Unix-substrate features stub with explicit errors on Windows
 
-Features whose substrate is inherently unix — the sealed-sandbox model relay
-(its consumers are Linux containers that bind-mount the socket), the
-merge-queue headless agent (POSIX `sh_quote` templating), the SIGUSR2
-profiler, `thegn debug` exec-replace, and the ACP unix-socket transport —
-SHALL return an explicit error (or logged warning, for best-effort paths) on
-Windows rather than silently no-op or panic. The pane daemon, control client,
-and the profile singleton lock are NOT in this set: the daemon IPC runs over
-named pipes and the singleton lock uses std's cross-platform `File::try_lock`.
+Features whose substrate is inherently unix — the merge-queue headless agent
+(POSIX `sh_quote` templating), the SIGUSR2 profiler, and `thegn debug`
+exec-replace — SHALL return an explicit error (or logged warning, for
+best-effort paths) on Windows rather than silently no-op or panic. The pane
+daemon, control client, and the profile singleton lock are NOT in this set:
+the daemon IPC runs over named pipes and the singleton lock uses std's
+cross-platform `File::try_lock`.
 
-#### Scenario: Sealed-sandbox relay on Windows
+#### Scenario: Merge-queue headless agent on Windows
 
-- **WHEN** a sealed-agent launch asks for the model relay on native Windows
-- **THEN** relay spawn returns an `Unsupported` error naming Linux containers
-  as the missing substrate, and the caller surfaces it
+- **WHEN** a merge-queue drain would dispatch the headless conflict agent
+  (`agent_command`) on native Windows
+- **THEN** the dispatch returns an explicit error naming the missing POSIX
+  shell substrate rather than silently no-opping, and the branch is left for
+  a human
 
 #### Scenario: Singleton detection on Windows
 

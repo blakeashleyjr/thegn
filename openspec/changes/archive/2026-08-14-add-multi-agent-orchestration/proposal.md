@@ -1,5 +1,7 @@
 # Add multi-agent orchestration
 
+> **Archived unimplemented (2026-08-14):** the AI/agent layer was removed from the codebase before the public alpha; revisit when the AI track reopens.
+
 ## Summary
 
 Give thegn a way to run **several agents against one task** and to

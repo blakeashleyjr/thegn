@@ -28,8 +28,10 @@ never a session change.
 | **Pins**      | daemon panes in a top strip   | `Ctrl-Alt-1..9` launch/focus a `[[pins]]` program                       |
 
 - **Worktree = tab.** `Alt-w` creates a new git worktree off the base branch,
-  opens a tab named after the branch, and prompts for a **coding agent**, a
-  tool, or a plain shell — optionally inside a sandbox (see below).
+  opens a tab named after the branch, and prompts for what to run there — a
+  plain shell, or any configured `[[agents]]` / `[[tools]]` entry (claude,
+  aider, …) launched as an ordinary command — optionally inside a sandbox
+  (see below).
 - **Right panel.** For the focused worktree: the git diff and the branch's PR —
   state, CI check rollup, review decision — plus CI runs, merge queue,
   notifications, and shares, organized in panel tabs.
@@ -173,7 +175,7 @@ Bare `thegn` launches the compositor; subcommands run non-interactively:
 `pr`, `issue`, `ci`, `diff`, `list`, `integrate` (drain the local merge
 queue), `disk` / `clean` (per-worktree disk usage / reclaim `target/`),
 `repos`, `recent`, `config`, `env` (named execution environments), `theme`,
-`share`, `forward`, `agent`, `notify`, `logs`, `doctor`. `--profile <name>`
+`share`, `forward`, `notify`, `logs`, `doctor`. `--profile <name>`
 runs everything under a separate whole-process profile (own state/DB/config).
 
 `thegn mcp serve` runs thegn as a read-only **MCP server** so a coding agent can
@@ -198,7 +200,7 @@ repo-root `.thegn.{toml,yaml,yml,json}` overlays per-repo settings
 - `[metrics]` — Prometheus `/metrics` endpoints to scrape; target health and
   allowlisted values render in the chrome, no Prometheus server needed.
 - `[merge_queue]`, `[share]`, `[forward]`, `[media]`, `[replay]`,
-  `[llm_proxy]`, `[lifecycle]` — the optional feature groups.
+  `[lifecycle]` — the optional feature groups.
 
 ## Terminal compatibility
 

@@ -1,5 +1,7 @@
 # Add AI review enhancements
 
+> **Archived unimplemented (2026-08-14):** the AI/agent layer was removed from the codebase before the public alpha; revisit when the AI track reopens.
+
 ## Summary
 
 A cluster of **AI-additive niceties** on the review/commit surface, each of which
