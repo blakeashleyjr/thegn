@@ -78,6 +78,15 @@ impl WorkspacePool {
         self.parked.iter().any(|(k, _)| k == repo)
     }
 
+    /// Every parked workspace's worktree groups. Their `PtyPane`s stay live in
+    /// the global `Panes` table, so the sidebar's dynamic-title collector reads
+    /// their OSC window titles the same way it reads the active session's —
+    /// keeping a parked (unfocused) workspace's dynamic names fresh, not just
+    /// last-known.
+    pub(crate) fn resident_groups(&self) -> impl Iterator<Item = &crate::session::WorktreeGroup> {
+        self.parked.iter().flat_map(|(_, rw)| rw.worktrees.iter())
+    }
+
     /// Restore a parked workspace, removing it from the pool (it becomes the
     /// active workspace, which is never held here).
     pub(crate) fn take(&mut self, repo: &str) -> Option<ResidentWorkspace> {
