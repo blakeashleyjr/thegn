@@ -36,7 +36,7 @@ pub struct ZoneConfig {
     /// Minimum sandbox hardening: a member profile may only be ≥ this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_floor: Option<SandboxProfile>,
-    /// Spend cap for the zone scope (`zone:<name>`), rolled up in the proxy.
+    /// Compute-spend cap for the zone scope (`zone:<name>`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget: Option<ZoneBudget>,
     /// Placement-mode floor for member worktrees: a member's requested mode
@@ -50,14 +50,8 @@ pub struct ZoneConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ZoneBudget {
-    /// Token ceiling for the period (`0`/absent ⇒ none).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit_tokens: Option<i64>,
-    /// Cost ceiling in USD for the period (`0`/absent ⇒ none).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit_cost: Option<f64>,
     /// COMPUTE cost ceiling in USD for the period (the placement engine's
-    /// ledger — separate from the model-spend caps above).
+    /// ledger).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_compute_cost: Option<f64>,
 }
@@ -141,31 +135,9 @@ pub fn bundle_visible(bundle_zone: &str, worktree_zone: &str) -> bool {
     bundle_zone.is_empty() || bundle_zone == worktree_zone
 }
 
-/// Push each `[zone.<name>.budget]` cap into the proxy's `zone:<name>` budget
-/// scope (spend is preserved — the setter only touches the limits). Call at
-/// host startup + config reload so the proxy's per-request rollup
-/// ([`crate::store::ProxyStore`]) enforces the config-declared caps. Best-effort.
-pub fn sync_budget_caps<S: crate::store::ProxyStore>(
-    zones: &std::collections::BTreeMap<String, ZoneConfig>,
-    db: &S,
-) {
-    for (name, zc) in zones {
-        if let Some(budget) = &zc.budget {
-            let scope = format!("zone:{name}");
-            let _ = db.set_proxy_budget_limits(
-                &scope,
-                "monthly",
-                budget.limit_tokens,
-                budget.limit_cost,
-                0,
-            );
-        }
-    }
-}
-
 /// Push each zone's COMPUTE cap (+ the global `[placement] max_monthly_spend`)
-/// into the compute ledger — spend preserved, same contract as
-/// [`sync_budget_caps`]. Best-effort; call at startup + placement CLI.
+/// into the compute ledger — spend preserved. Best-effort; call at startup +
+/// the placement CLI.
 pub fn sync_compute_budget_caps<S: crate::store::ComputeLedgerStore>(
     cfg: &crate::config::Config,
     db: &S,
@@ -272,40 +244,5 @@ mod tests {
         assert!(bundle_visible("clientA", "clientA")); // own zone
         assert!(!bundle_visible("clientA", "clientB")); // foreign zone
         assert!(!bundle_visible("clientA", "")); // unzoned worktree
-    }
-
-    #[test]
-    fn sync_budget_caps_sets_limits_without_clobbering_spend() {
-        use crate::db::Db;
-        use crate::store::ProxyStore;
-        let db = Db::open_memory().unwrap();
-        // Pre-existing spend on the zone scope.
-        db.add_proxy_spend("zone:clientA", 500, 1.0, 1).unwrap();
-        let mut zones = std::collections::BTreeMap::new();
-        zones.insert(
-            "clientA".to_string(),
-            ZoneConfig {
-                budget: Some(ZoneBudget {
-                    limit_tokens: Some(10_000),
-                    limit_cost: Some(50.0),
-                    limit_compute_cost: None,
-                }),
-                ..Default::default()
-            },
-        );
-        sync_budget_caps(&zones, &db);
-        let b = db.proxy_budget("zone:clientA").unwrap().unwrap();
-        assert_eq!(b.limit_tokens, Some(10_000));
-        assert_eq!(b.limit_cost, Some(50.0));
-        assert_eq!(b.spent_tokens, 500, "spend preserved");
-        // Idempotent: re-syncing keeps spend.
-        sync_budget_caps(&zones, &db);
-        assert_eq!(
-            db.proxy_budget("zone:clientA")
-                .unwrap()
-                .unwrap()
-                .spent_tokens,
-            500
-        );
     }
 }

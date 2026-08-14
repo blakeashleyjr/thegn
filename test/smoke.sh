@@ -28,8 +28,8 @@ export XDG_RUNTIME_DIR="$TMP/run"
 mkdir -p "$XDG_RUNTIME_DIR"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # Exercise the full product surface: the experimental verbs (host/placement/
-# proxy/agent/kaneo) are dev-channel-only, so run smoke in the dev channel. A
-# dedicated section below verifies the stable channel refuses them + clamps.
+# kaneo) are dev-channel-only, so run smoke in the dev channel. A dedicated
+# section below verifies the stable channel refuses them + clamps.
 export THEGN_CHANNEL=dev
 
 mkdir -p "$XDG_CONFIG_HOME/thegn"
@@ -292,7 +292,7 @@ check "env show resolves an environment for a worktree" \
 check "env set/show round-trips a selection" \
   "'$SZ' env set company-k8s '$WT' >/dev/null 2>&1 && '$SZ' env show '$WT' >/dev/null 2>&1"
 
-# ── agent-driven merge queue (`merge` namespace, the fold-actor) ─────────────
+# ── merge queue (`merge` namespace, the fold-actor) ──────────────────────────
 # Assign a worktree branch to the queue and drain it: a clean branch folds onto
 # the target and lands (no agent needed). Exercises the CLI + DB round-trip.
 check "merge list starts empty" \
@@ -686,7 +686,7 @@ check "doctor reports the stable channel + disabled remote" \
 check "doctor reports the dev channel + enabled remote" \
   "env THEGN_CHANNEL=dev '$SZ' doctor --json | grep -A8 '\"features\"' | grep -q '\"remote\": true'"
 CHCFG="$TMP/channel.toml"
-printf '[observe]\nenabled = true\n\n[llm_proxy]\nenabled = true\n' >"$CHCFG"
+printf '[observe]\nenabled = true\n' >"$CHCFG"
 check "stable clamps experimental toggles off" \
   "env THEGN_CHANNEL=stable '$SZ' --config '$CHCFG' config show | grep -A1 '^\[observe\]' | grep -q 'enabled = false'"
 check "dev honours the same toggles" \

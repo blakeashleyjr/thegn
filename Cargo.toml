@@ -3,11 +3,9 @@ resolver = "2"
 members = [
   "crates/thegn-core",
   "crates/thegn-svc",
-  "crates/thegn-agent",
   "crates/thegn-metrics",
   "crates/thegn-media",
   "crates/thegn-host",
-  "crates/thegn-proxy",
   "crates/tg-kit",
   "crates/gtui-core",
   "crates/gtui-query",

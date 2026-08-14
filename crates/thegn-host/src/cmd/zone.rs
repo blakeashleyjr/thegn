@@ -33,11 +33,8 @@ pub enum Action {
     },
 }
 
-pub fn run(cfg: &Config, action: Action) -> Result<()> {
+pub fn run(_cfg: &Config, action: Action) -> Result<()> {
     let db = Db::open()?;
-    // Propagate `[zone.<name>.budget]` caps into the proxy budget rows so the
-    // per-request rollup enforces them (spend preserved). Cheap; idempotent.
-    thegn_core::zone::sync_budget_caps(&cfg.zone, &db);
     match action {
         Action::List => {
             let zones = db.list_zones()?;

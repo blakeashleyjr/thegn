@@ -4,13 +4,13 @@
 //! (`[placement] spillover_envs`), each riding the EXISTING provider pipeline
 //! (adapters, pool, checkpoints, exec) untouched. This module is the pure
 //! choice-and-health half, mirroring the proxy router's exhaustion shape
-//! (reusing [`crate::proxy::backoff`]): a payment failure marks a provider
+//! (reusing [`crate::backoff`]): a payment failure marks a provider
 //! budget-dead until the compute ledger clears it (surviving restarts via
 //! `placement_health` under `provider:` keys), a quota rejection cools it
 //! down honoring Retry-After, a create failure cools down with capped
 //! escalation — and every marker fails back implicitly on expiry.
 
-use crate::proxy::backoff::{ExhaustionKind, calculate_backoff};
+use crate::backoff::{ExhaustionKind, calculate_backoff};
 
 /// Why a spillover provider is exhausted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
