@@ -12,7 +12,7 @@ Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 | ------------ | ----------------------------------------------------------------------------------------- |
 | Workspace    | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `integrate` |
 | Forge        | `pr` · `issue` · `ci`                                                                     |
-| Environments | `env` · `host` · `agent` · `debug` · `mcp`                                                |
+| Environments | `env` · `host` · `debug` · `mcp`                                                          |
 | Session      | `notify` · `logs` · `share` · `forward` · `sandbox-argv`                                  |
 | Meta         | `config` · `theme` · `doctor` · `completions`                                             |
 

@@ -1,5 +1,7 @@
 # Add agent containment stance
 
+> **Archived unimplemented (2026-08-14):** the AI/agent layer was removed from the codebase before the public alpha; revisit when the AI track reopens.
+
 ## Summary
 
 Record thegn's deliberate opsec / scope posture as enforceable requirements:

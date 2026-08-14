@@ -1,5 +1,7 @@
 # Add agent auto-registration + agent-addressed error markers
 
+> **Archived unimplemented (2026-08-14):** the AI/agent layer was removed from the codebase before the public alpha; revisit when the AI track reopens.
+
 ## Summary
 
 Make thegn discoverable by the external agents already installed on a machine,

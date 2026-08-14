@@ -1,5 +1,7 @@
 # Add the per-identity agent gateway (tool-filtering + injection chokepoint)
 
+> **Archived unimplemented (2026-08-14):** the AI/agent layer was removed from the codebase before the public alpha; revisit when the AI track reopens.
+
 ## Summary
 
 thegn already routes foreign agents through the proxy — `route_agent` mints a

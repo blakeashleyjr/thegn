@@ -1,5 +1,7 @@
 # Add agent-team fan-out into sandboxed worktrees
 
+> **Archived unimplemented (2026-08-14):** the AI/agent layer was removed from the codebase before the public alpha; revisit when the AI track reopens.
+
 ## Summary
 
 A single verb — `thegn team <task>` — fans one task out to **N agents, each in

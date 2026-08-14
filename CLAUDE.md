@@ -6,20 +6,27 @@ Guidance for working in this repo. See `README.md` for the user-facing tour and
 ## What this is
 
 **thegn** (binary `thegn`, with a short `tg` alias) — a terminal-native git-worktree IDE that is its own terminal
-multiplexer. One process, one session: each repo is a workspace, each git
+multiplexer. One UI process, one session: each repo is a workspace, each git
 **worktree** is a tab, and the chrome (sidebar tree, diff/PR panel, tabbar,
-statusbar, pin strip) is rendered in-process. There is **no zellij, no WASM
-plugins, no IPC** — all of that was stripped (Phase 0, commit `bb2ecd4`);
-mentions of it in older docs/comments are historical.
+statusbar, pin strip) is rendered in-process. There is **no zellij and no WASM
+plugins** — those were stripped (Phase 0, commit `bb2ecd4`); mentions in older
+docs/comments are historical. The one IPC seam that DOES exist today is the
+**pane daemon**: PTYs are owned by a background `thegn daemon` process (unix
+socket, plus TCP for `thegn serve` thin clients), so sessions survive UI detach
+and warm-reattach — `[daemon] enabled = false` restores fully in-process panes.
+See `crates/thegn-host/src/daemon/`.
 
-The long game (see `tasks.md`): two tracks joined by one keystone — an
-**AI-free workspace shell** (the current, shippable product) and an AI/agent
-layer bridged by an **LLM proxy**. The shell must never hard-depend on the AI
-layers; AI is strictly additive.
+The **AI/agent layer was removed before the public alpha** (the old two-track
+plan's LLM proxy, ACP/bouncer, and managed agent are gone; see `tasks.md`). The
+product is the AI-free workspace shell. What remains agent-adjacent is strictly
+generic: the `[[agents]]`/`[[tools]]` picker launches any configured CLI as a
+plain command, and `[merge_queue] agent_command` is an arbitrary subprocess
+hook. If the AI track reopens, it must be additive — the shell never
+hard-depends on it.
 
 ## Architecture
 
-- **Cargo workspace, three crates:**
+- **Cargo workspace.** The load-bearing crates:
   - `crates/thegn-core` — substrate-agnostic, testable domain logic: layered
     config, SQLite DB, keymap registry, theme, sandbox backends, activity
     state machine, `gh` wrapper. No tokio/termwiz deps.
@@ -28,7 +35,12 @@ layers; AI is strictly additive.
     `gh`), SSH (russh / `ssh`). Native gaps always fall back to subprocess.
   - `crates/thegn-host` — the compositor: tokio runtime, portable-pty panes
     through a pluggable `PaneEmulator` (vt100 today), termwiz `Surface`
-    diff-flush rendering, in-process chrome.
+    diff-flush rendering, in-process chrome, and the pane-daemon client/server.
+
+  Support crates: `thegn-metrics` (system metrics collection), `thegn-media`
+  (MPRIS/SMTC/mpv media control), `tg-kit` and the `gtui-*` family (UI/embed
+  frameworks).
+
 - **Event model (a hard invariant: ~0% idle CPU).** When idle, the loop blocks
   on termwiz `poll_input(None)` — no tick, no timeout. (One sanctioned
   exception: while there is already work in hand — `dirty`, queued input, or an

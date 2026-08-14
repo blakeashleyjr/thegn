@@ -1,5 +1,7 @@
 # Add the agent-driven merge-queue driver (fold-actor autopilot)
 
+> **Archived completed (2026-08-14):** implemented and shipped. The fold-actor merge-queue driver (`[merge_queue].agent_command` conflict/gate handoff) and the `thegn merge` CLI namespace remain in the product; the delta specs below are merged into `openspec/specs/merge-queue/spec.md`. Only the deferred in-TUI follow-ups (7.1/7.2) stay open.
+
 ## Summary
 
 Stop babysitting merges into local `main`. The fold-actor merge queue

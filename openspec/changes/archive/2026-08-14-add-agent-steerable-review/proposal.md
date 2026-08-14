@@ -1,5 +1,7 @@
 # Add agent-steerable review (shared live diff surface)
 
+> **Archived unimplemented (2026-08-14):** the AI/agent layer was removed from the codebase before the public alpha; revisit when the AI track reopens.
+
 ## Summary
 
 Turn the worktree-scoped diff/PR panel into a **shared review surface an agent and
