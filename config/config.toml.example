@@ -2931,3 +2931,23 @@ poll_interval_secs = 3
 # socket = "127.0.0.1:6600"    # host:port, or an absolute path to MPD's unix socket.
                                # $MPD_HOST / $MPD_PORT override when left at default.
 # password = "hunter2"         # only if your MPD requires one
+
+[usage]
+# AI-account usage tracker (open-usage / command palette "AI account usage"): a
+# detail overlay of per-account rate-limit windows (session / weekly / …) as usage
+# bars with a "resets in …" countdown, modeled on orca. Strictly additive — the
+# AI-free shell never depends on it. It only READS credentials the harnesses
+# already wrote locally; thegn never asks for or stores an API key.
+enabled = true
+# Which harnesses to track, in display order. Unknown ids are ignored.
+providers = ["codex", "claude", "antigravity"]
+# Allow the outward-facing live fetches. Only Codex persists its rate-limit
+# snapshot to disk (read offline from ~/.codex/sessions/); Claude and Antigravity
+# don't, so their windows require a lightweight authenticated request using the
+# on-disk OAuth token (Anthropic /api/oauth/usage; Antigravity quota summary),
+# run off the event loop. Left false, those two show "unavailable" and no network
+# call is ever made. Opt in to see Claude/Antigravity usage.
+allow_network = false
+# Reserved: re-poll cadence (seconds) for a live refresh while the overlay is open.
+# v1 gathers once when the overlay is opened, so this is currently advisory.
+poll_interval_secs = 60

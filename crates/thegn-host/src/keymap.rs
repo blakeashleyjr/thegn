@@ -149,6 +149,8 @@ pub enum Action {
     OpenMergeQueue,
     /// Summon the LLM-proxy dashboard overlay (spend, tokens/sec, budgets).
     OpenProxyDash,
+    /// Summon the AI-account usage overlay (per-account rate-limit windows).
+    OpenUsage,
     /// Prompt for a port and expose it from the active worktree (`[share]`).
     ShareWorktreePort,
     /// Stop all ingress shares on the active worktree.
@@ -427,6 +429,7 @@ impl Action {
             Action::OpenCi => "open-ci",
             Action::OpenMergeQueue => "open-merge-queue",
             Action::OpenProxyDash => "open-proxy-dash",
+            Action::OpenUsage => "open-usage",
             Action::ShareWorktreePort => "share-worktree-port",
             Action::StopWorktreeShare => "stop-worktree-share",
             Action::OpenShares => "open-shares",
@@ -548,6 +551,7 @@ impl Action {
             "open-ci" => Action::OpenCi,
             "open-merge-queue" => Action::OpenMergeQueue,
             "open-proxy-dash" => Action::OpenProxyDash,
+            "open-usage" => Action::OpenUsage,
             "share-worktree-port" => Action::ShareWorktreePort,
             "stop-worktree-share" => Action::StopWorktreeShare,
             "open-shares" => Action::OpenShares,
