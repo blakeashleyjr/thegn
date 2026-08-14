@@ -1,8 +1,7 @@
 //! In-process supervisor for ingress shares (`[share]`).
 //!
-//! The inbound sibling of [`crate::proxy_daemon`]: it manages per-worktree
-//! `bore` (or future) tunnel-client children as **background subprocesses** (not
-//! PTY panes). Each share runs on its own OS thread that drives
+//! It manages per-worktree `bore` (or future) tunnel-client children as
+//! **background subprocesses** (not PTY panes). Each share runs on its own OS thread that drives
 //! [`thegn_svc::share`] — spawn the client, wait for its URL, then block on
 //! the child — and reports state back over a tokio mpsc channel, pulsing the
 //! `TerminalWaker` exactly as the config/LSP/refresh producers do.

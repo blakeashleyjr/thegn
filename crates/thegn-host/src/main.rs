@@ -134,7 +134,6 @@ mod provider_factory;
 mod provider_workdir;
 mod provision_gate;
 mod provision_recover;
-mod proxy_daemon;
 mod pty_drain;
 mod queries;
 mod rasterize;
@@ -351,12 +350,6 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::env::Action,
     },
-    /// Inspect and manage the LLM proxy: status, stats (tokens/sec, cost),
-    /// virtual keys (scoped accounts), budgets, and standalone `serve`.
-    Proxy {
-        #[command(subcommand)]
-        action: cmd::proxy::Action,
-    },
     /// Manage zones (workspace groups with credential/egress/budget sub-scoping).
     Zone {
         #[command(subcommand)]
@@ -468,7 +461,7 @@ pub enum Command {
     /// Hidden: run the reverse-tunnel agent over stdio. The host spawns this
     /// *inside* a remote env; it binds `127.0.0.1:<port>` in the sandbox and
     /// multiplexes every connection to that port back to the host (which dials the
-    /// real target, e.g. the local `tgproxy`) over this stdio channel. stdout is
+    /// real target, e.g. the host nix cache) over this stdio channel. stdout is
     /// the protocol channel — not for interactive use.
     #[command(hide = true)]
     BridgeRevtunnel {
@@ -773,7 +766,6 @@ fn main() -> anyhow::Result<()> {
 fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::channel::Feature)> {
     use thegn_core::channel::Feature;
     Some(match command {
-        Command::Proxy { .. } => ("proxy", Feature::Ai),
         Command::Host { .. } => ("host", Feature::Providers),
         Command::Placement { .. } => ("placement", Feature::Placement),
         Command::Kaneo { .. } => ("kaneo", Feature::Trackers),
@@ -842,7 +834,6 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Recent { count, json } => cmd::repos::recent(count, json),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
         Command::Env { action } => cmd::env::run(&cfg, action),
-        Command::Proxy { action } => cmd::proxy::run(&cfg, action),
         Command::Zone { action } => cmd::zone::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),

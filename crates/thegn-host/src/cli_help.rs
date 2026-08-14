@@ -20,7 +20,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     ("Forge", &["pr", "issue", "kaneo", "ci"]),
     (
         "Environments",
-        &["env", "zone", "host", "placement", "proxy", "debug", "mcp"],
+        &["env", "zone", "host", "placement", "debug", "mcp"],
     ),
     (
         "Session",

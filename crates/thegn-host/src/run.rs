@@ -623,10 +623,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // agents launched there discover it (best-effort; new worktrees seeded on
     // create — see `cmd/wt.rs`/`wizard.rs`). Gated on `[merge_queue] enabled`.
     crate::mq_assets::seed_persisted_worktrees(&cfg);
-    // Auto-launch the LLM-proxy daemon when enabled (disabled by default — AI is
-    // additive). Held for the lifetime of `main`; the supervisor thread keeps it
-    // alive and `Drop` stops it on graceful return (process-group exit otherwise).
-    let _proxy_daemon = crate::proxy_daemon::launch_from_config(&cfg);
     // Embedded host nix cache: when any env opts into `[env.<name>.provider]
     // host_cache`, serve the host /nix/store on an ephemeral loopback port for the
     // whole session. Each provider worktree's reverse tunnel then forwards a fixed
@@ -1558,18 +1554,12 @@ fn connect_worktree_bridge(
             );
         }
         // Reverse host→sandbox tunnels, all over the resident bridge:
-        //  • P0b model-proxy: when an in-sandbox agent should reach the host
-        //    `tgproxy` by default (`[llm_proxy] route_agent` + `remote_base_url =
-        //    "auto"`) → bind the proxy port in the sandbox → host tgproxy, so any
-        //    agent there routes through it via the injected ANTHROPIC_BASE_URL.
-        //  • P1 host services / host-bound MCP: each `[sandbox.home]
+        //  • host services / host-bound MCP: each `[sandbox.home]
         //    reverse_forwards` spec → bind a sandbox port → a host target.
+        //  • the embedded host nix cache (below).
         // No-op when not a provider / nothing configured.
         if let thegn_core::placement::Placement::Provider(p) = &env.placement {
             let mut tunnels: Vec<(u16, String)> = Vec::new();
-            if let Some(port) = cfg.llm_proxy.remote_tunnel_port() {
-                tunnels.push((port, format!("127.0.0.1:{}", cfg.llm_proxy.listen_port())));
-            }
             // Embedded host nix cache: bind the cache port in the sandbox → the
             // host's ephemeral cache server, so the sprite's `extra-substituters =
             // http://127.0.0.1:<SANDBOX_PORT>` (baked into nix.conf) resolves.

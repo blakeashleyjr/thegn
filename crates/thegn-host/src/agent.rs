@@ -1071,10 +1071,6 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
     // code, hermes) work like local. Remote-safe filter drops host-local socket
     // vars (SSH_AUTH_SOCK/GPG_*) that would dangle in the VM. THEGN_* win.
     let mut env = environment.sandbox.passthrough_env_remote();
-    // Route any agent in the sprite (pi, claude code, hermes) through tgproxy by
-    // default — sets ANTHROPIC_BASE_URL etc. when a reachable remote proxy URL is
-    // configured. No-op otherwise (the agent talks upstream directly).
-    env.extend(cfg.llm_proxy.remote_agent_env(None));
     // Let an in-sandbox `nix develop` / direnv `use flake` fetch PRIVATE flake
     // inputs: nix's fetcher ignores git's credential helper, so without a
     // `github.com` access-token a private `github:org/repo` flake input 404s even
