@@ -7690,6 +7690,18 @@ async fn event_loop<T: Terminal>(
                 // sandbox bring-up phases into the splash).
                 let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
                 let quiet = panes.tab_has_live_pane(&session.worktrees[session.active].tabs[ti]);
+                // Seed the splash for THIS worktree's effective backend, not the
+                // global default: `path`/`name` are the active group, so
+                // `model.active_sandbox_backend` (hydrated for it) is the saved
+                // per-worktree `sandbox_backend` — no DB read on the loop. A
+                // session "run on host" pin overrides both.
+                let sandbox_override = if crate::agent::force_host_requested(&path) {
+                    Some("none")
+                } else if !model.active_sandbox_backend.is_empty() {
+                    Some(model.active_sandbox_backend.as_str())
+                } else {
+                    None
+                };
                 crate::handlers::materialize::maybe_materialize(
                     &mut crate::handlers::materialize::MaterializeCtx {
                         materialize_inflight: &mut materialize_inflight,
@@ -7713,6 +7725,7 @@ async fn event_loop<T: Terminal>(
                     ti,
                     is_terminal,
                     quiet,
+                    sandbox_override,
                 );
             }
         }
