@@ -39,6 +39,48 @@ pub(crate) fn apply(
         LifecycleAction::RemoveWorktree { delete_branch } => {
             remove_landed(db, repo_root, worktree, branch, delete_branch)
         }
+        LifecycleAction::Unfile => unfile(cfg, db, repo_root, worktree),
+    }
+}
+
+/// Un-file a worktree from its lifecycle folder (Merging / Needs attention /
+/// Merged) back to the ungrouped repo root — the cleanup a plain dequeue
+/// (`merge rm` / `merge clear`) needs, since it neither lands nor fails. Guarded
+/// so it only clears membership of a folder the lifecycle itself manages: if the
+/// user has since hand-filed the worktree into a folder of their own, it is left
+/// alone. Best-effort — sidebar bookkeeping must never fail a queue mutation.
+fn unfile(cfg: &MergeQueueConfig, db: &Db, repo_root: &Path, worktree: &str) {
+    // The worktree's current folder, if any. No row / no folder ⇒ nothing to do.
+    let Some(fid) = db.worktrees().ok().and_then(|rows| {
+        rows.into_iter()
+            .find(|w| w.worktree == worktree)
+            .and_then(|w| w.folder_id)
+    }) else {
+        return;
+    };
+    // Resolve that folder's name (keyed by the worktree's own workspace string,
+    // the same resolution `file_into` uses) and only un-file when it is one the
+    // lifecycle manages.
+    let recorded = db.repo_root_for(worktree).ok().flatten();
+    let repo_path = workspace_repo_path(db, repo_root, recorded.as_deref());
+    let name = db
+        .folders_for_workspace(&repo_path)
+        .ok()
+        .and_then(|folders| {
+            folders
+                .into_iter()
+                .find(|f| f.folder_id == fid)
+                .map(|f| f.name)
+        });
+    let is_lifecycle_folder = |n: &str| {
+        let n = n.trim();
+        !n.is_empty()
+            && (n == cfg.queued_folder.trim()
+                || n == cfg.failed_folder.trim()
+                || n == cfg.merged_folder.trim())
+    };
+    if name.as_deref().map(is_lifecycle_folder).unwrap_or(false) {
+        let _ = db.set_worktree_folder(worktree, None);
     }
 }
 
