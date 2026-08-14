@@ -6706,6 +6706,14 @@ async fn event_loop<T: Terminal>(
     // (`loop_policy::frame_gate`): streaming output renders at most once per
     // window, with the trailing frame guaranteed via the poll timeout.
     let mut last_flush_at = std::time::Instant::now();
+    // Flash-free drift-heal cadence. Guards against the outer terminal drifting
+    // out-of-band from our `front` baseline (e.g. Ghostty's imperfect alt-screen
+    // repaint on window refocus, which sends no SIGWINCH), which otherwise leaves
+    // orphaned "doubled" rows the bounded diff never repaints. See
+    // `hydrate_tuning::resync_interval`. `last_resync` also advances on every real
+    // full repaint (a full re-emit resets the drift clock).
+    let resync_interval = crate::hydrate_tuning::resync_interval();
+    let mut last_resync = std::time::Instant::now();
     // True while a fold-actor run is off the loop; blocks a second concurrent
     // trigger (a fold advances `main` globally, so one at a time).
     let mut fold_inflight = false;
@@ -10747,6 +10755,18 @@ async fn event_loop<T: Terminal>(
             // panel-tinted right column EVERY line ends in `panel` bg, so a
             // repaint paints row 0 and erases all other content. An explicit
             // diff has no such fallback and keeps damage-tracking exact.
+            // Flash-free drift heal: on a frame that is already being produced,
+            // once the resync cadence has elapsed, reset the baseline so the
+            // `diff_screens` below re-emits every cell IN PLACE — no ClearScreen,
+            // so no visible flash (unchanged cells overwrite themselves, drifted
+            // cells heal). `scratch` always holds a complete, correct frame (the
+            // last full compose plus every incremental pane update), so a full
+            // diff against a blank `front` faithfully repaints the whole screen.
+            // Never fires when idle (this is inside `should_render`), so 0%-idle
+            // holds. Suppressed when `full_repaint` already heals this frame.
+            let resync_now = !full_repaint
+                && !resync_interval.is_zero()
+                && last_resync.elapsed() >= resync_interval;
             let mut wire: Vec<Change> = Vec::new();
             if full_repaint {
                 // Full heal: reset the baseline so no stale cell survives (the
@@ -10761,6 +10781,12 @@ async fn event_loop<T: Terminal>(
                 wire.push(clear);
                 wire_renderer.invalidate();
                 full_repaint = false;
+                last_resync = std::time::Instant::now();
+            } else if resync_now {
+                tracing::debug!(target: "thegn::frame", "resync");
+                front = Surface::new(cols, rows);
+                wire_renderer.invalidate();
+                last_resync = std::time::Instant::now();
             }
             // Bounded diff: the incremental path recomposed just a few rects
             // (changed panes and/or the bars) over the reused `scratch`, so diff
@@ -10770,13 +10796,16 @@ async fn event_loop<T: Terminal>(
             let mut pending = if matches!(
                 frame_plan,
                 crate::render_plan::RenderPlan::Incremental { .. }
-            ) {
+            ) && !resync_now
+            {
                 let mut changes = Vec::new();
                 for r in &pane_diff_rects {
                     changes.extend(front.diff_region(r.x, r.y, r.cols, r.rows, &scratch, r.x, r.y));
                 }
                 changes
             } else {
+                // Full diff: either a genuine Full frame, or a `resync_now` heal
+                // whose blank baseline makes this re-emit the entire screen.
                 front.diff_screens(&scratch)
             };
             // A fullscreen modal owns the screen + draws its own caret; park the
@@ -12765,6 +12794,13 @@ async fn event_loop<T: Terminal>(
                                 let initialized =
                                     thegn_core::util::git_cmd(std::path::Path::new(&path))
                                         .arg("init")
+                                        // The compositor owns the alt-screen; git's
+                                        // "Initialized empty Git repository in …" on the
+                                        // inherited stdout would scroll it and drift the
+                                        // render baseline (`front`). We only need the exit
+                                        // code here, so null both streams.
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
                                         .status()
                                         .map(|s| s.success())
                                         .unwrap_or(false);
