@@ -167,6 +167,7 @@ pub mod theme;
 pub mod toolchain;
 pub mod transport_error;
 pub mod trust_class;
+pub mod usage;
 pub mod util;
 pub mod viz;
 pub mod work;

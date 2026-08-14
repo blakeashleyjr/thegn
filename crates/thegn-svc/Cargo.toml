@@ -33,7 +33,9 @@ tracing.workspace = true
 # git reads go native via gix (Phase 2); GitHub via octocrab GraphQL (Phase 4).
 gix.workspace = true
 octocrab.workspace = true
-reqwest.workspace = true
+# `blocking` on top of the workspace features: the usage tracker's live fetches
+# (Claude /api/oauth/usage, Antigravity quota) run on a blocking gather thread.
+reqwest = { workspace = true, features = ["blocking"] }
 tokio.workspace = true
 chrono.workspace = true
 base64 = "0.22"
