@@ -168,10 +168,8 @@ impl DetailAction {
 /// `crate::detail::{apply_ci_detail, CiDetailPayload}`.
 mod ci_drill;
 pub use ci_drill::{CiDetailPayload, apply_ci_detail};
-mod proxy_dash;
 mod usage_dash;
 use ci_drill::{ci_fmt_secs, ci_glyph_marker, ci_state_word};
-pub use proxy_dash::{ProxyDashPayload, apply_proxy_dash, proxy_dash_loading};
 pub use usage_dash::{UsagePayload, apply_usage, usage_loading};
 
 /// One scrollable list row: a colored marker glyph, the body text, and an

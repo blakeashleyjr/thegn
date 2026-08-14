@@ -854,22 +854,6 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
-        id: "open-proxy-dash",
-        label: "LLM proxy dashboard",
-        hint: "proxy",
-        default_chords: &["Ctrl Alt l"],
-        palette: true,
-        keywords: &[
-            "llm proxy",
-            "proxy dashboard",
-            "proxy",
-            "ai proxy",
-            "model proxy",
-            "tokens",
-            "usage dashboard",
-        ],
-    },
-    ActionSpec {
         id: "open-usage",
         label: "AI account usage",
         hint: "usage",

@@ -329,51 +329,6 @@ pub(crate) fn spawn_ci_detail(
     });
 }
 
-/// Gather the proxy dashboard's data off the loop (audit-row rollup, budgets,
-/// active keys, cooling backends — all from the shared DB) and deliver it into
-/// the live overlay via `RefreshKind::ProxyDash` (applied by
-/// `crate::detail::apply_proxy_dash`). The loop already painted the loading
-/// shell, so a missing DB just leaves it showing "gathering".
-pub(crate) fn spawn_proxy_dash(refresh_tx: &UnboundedSender<RefreshKind>, waker: &TerminalWaker) {
-    use thegn_core::store::ProxyStore;
-    let tx = refresh_tx.clone();
-    let waker = waker.clone();
-    tokio::task::spawn_blocking(move || {
-        let Ok(db) = thegn_core::db::Db::open() else {
-            return;
-        };
-        let now_ms = thegn_core::util::now() * 1000;
-        let since_secs = 86_400i64;
-        let rows = db
-            .proxy_requests_since(now_ms - since_secs * 1000, 10_000)
-            .unwrap_or_default();
-        let payload = crate::detail::ProxyDashPayload {
-            since_secs,
-            rollup: thegn_core::proxy::stats::rollup(&rows),
-            budgets: db.proxy_budgets_all().unwrap_or_default(),
-            keys_active: db
-                .proxy_virtual_keys_all()
-                .map(|v| v.iter().filter(|k| k.revoked_at.is_none()).count())
-                .unwrap_or(0),
-            cooling: db
-                .load_proxy_health(now_ms)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|h| {
-                    (
-                        format!("{}:{}", h.backend, h.model),
-                        h.reason,
-                        h.next_probe_ms,
-                    )
-                })
-                .collect(),
-        };
-        if tx.send(RefreshKind::ProxyDash(Box::new(payload))).is_ok() {
-            let _ = waker.wake();
-        }
-    });
-}
-
 /// Gather AI-account usage off the loop (each harness's local state: Codex rollup
 /// files offline, Claude/Antigravity via their on-disk OAuth token + a live fetch
 /// when `[usage] allow_network`) and deliver it into the live overlay via

@@ -131,9 +131,6 @@ pub(crate) enum RefreshKind {
     /// off-loop, delivered into the live modal overlay by
     /// [`crate::detail::apply_ci_detail`].
     CiDetail(Box<crate::detail::CiDetailPayload>),
-    /// The proxy dashboard's off-loop DB gather (stats/budgets/health),
-    /// delivered into the live overlay by `crate::detail::apply_proxy_dash`.
-    ProxyDash(Box<crate::detail::ProxyDashPayload>),
     /// The usage overlay's off-loop gather (per-account rate-limit windows),
     /// delivered into the live overlay by `crate::detail::apply_usage`.
     Usage(Box<crate::detail::UsagePayload>),
