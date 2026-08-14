@@ -68,7 +68,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::List { json } => list(json),
         Action::Add { worktrees, all } => add(cfg, worktrees, all),
-        Action::Rm { target } => rm(target.get()),
+        Action::Rm { target } => rm(cfg, target.get()),
         Action::Clear => clear(cfg),
         Action::Drain { all, json } => drain(cfg, all, json),
         Action::Land { target } => land(cfg, target.get()),
@@ -208,7 +208,7 @@ fn add(cfg: &Config, worktrees: Vec<String>, all: bool) -> Result<()> {
     Ok(())
 }
 
-fn rm(worktree: Option<String>) -> Result<()> {
+fn rm(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let wt = super::resolve_worktree(worktree);
     let wt_s = wt.to_string_lossy().to_string();
     let db = Db::open()?;
@@ -216,7 +216,9 @@ fn rm(worktree: Option<String>) -> Result<()> {
     // outcome — otherwise `rm` reports success (exit 0) even when it removed
     // nothing, which scripting/CI can't distinguish from a real removal.
     let was_queued = db.list_merge_queue()?.iter().any(|r| r.worktree == wt_s);
-    db.remove_merge_entry(&wt_s)?;
+    // Dequeue AND un-file from the lifecycle folder, so `rm` doesn't strand the
+    // worktree in "Merging"/"Needs attention" (the sidebar/queue de-sync).
+    crate::merge_ops::dequeue_worktree(&cfg.merge_queue, &db, &wt)?;
     if !was_queued {
         anyhow::bail!("{wt_s} was not in the queue.");
     }
@@ -227,8 +229,7 @@ fn rm(worktree: Option<String>) -> Result<()> {
 fn clear(cfg: &Config) -> Result<()> {
     let root = repo_root()?;
     let db = Db::open()?;
-    let n = crate::merge_ops::clear_repo(&db, &root)?;
-    let _ = cfg;
+    let n = crate::merge_ops::clear_repo(&cfg.merge_queue, &db, &root)?;
     outln!("Queue cleared ({n} removed).");
     Ok(())
 }

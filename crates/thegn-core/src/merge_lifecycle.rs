@@ -26,6 +26,14 @@ pub enum LifecycleEvent {
     /// The branch could not land — conflict, red gate, or the agent gave up
     /// (`deferred` / `gate_failed` / `needs_human`).
     Failed,
+    /// The branch left the queue WITHOUT landing or failing — a plain dequeue
+    /// (`merge rm` / `merge clear`, or the in-app remove/clear). Unlike
+    /// `Landed`/`Failed` there is no new home for the worktree, so it should
+    /// simply leave the lifecycle folder its enqueue filed it into and return to
+    /// the ungrouped repo root. Without emitting this, a dequeued worktree is
+    /// stranded in "Merging"/"Needs attention" forever — the sidebar/queue
+    /// de-sync this event closes.
+    Dequeued,
 }
 
 /// What the host should do for a worktree in response to a [`LifecycleEvent`].
@@ -37,6 +45,10 @@ pub enum LifecycleAction {
     FileInto(String),
     /// Remove the worktree; also delete its branch when `delete_branch`.
     RemoveWorktree { delete_branch: bool },
+    /// Un-file the worktree from its lifecycle folder back to the ungrouped repo
+    /// root, IF it currently sits in one. The host guards on the worktree's
+    /// present folder so a folder the user filed it into by hand is left alone.
+    Unfile,
 }
 
 /// Map a lifecycle event to an action under the current config. The master
@@ -49,6 +61,7 @@ pub fn decide(cfg: &MergeQueueConfig, event: LifecycleEvent) -> LifecycleAction 
     match event {
         LifecycleEvent::Enqueued => file_into(&cfg.queued_folder),
         LifecycleEvent::Failed => file_into(&cfg.failed_folder),
+        LifecycleEvent::Dequeued => LifecycleAction::Unfile,
         LifecycleEvent::Landed => match cfg.on_landed {
             OnLanded::Off => LifecycleAction::Noop,
             OnLanded::Move => file_into(&cfg.merged_folder),
@@ -94,9 +107,22 @@ mod tests {
             LifecycleEvent::Enqueued,
             LifecycleEvent::Landed,
             LifecycleEvent::Failed,
+            LifecycleEvent::Dequeued,
         ] {
             assert_eq!(decide(&c, ev), LifecycleAction::Noop);
         }
+    }
+
+    #[test]
+    fn dequeue_unfiles_from_lifecycle_folder() {
+        // A plain dequeue (rm/clear) has no land/fail destination — it just pulls
+        // the worktree back out of the folder its enqueue filed it into. The host
+        // guards which folders are actually un-filed; the decision is unconditional
+        // once organizing is on. This is the fix for the sidebar/queue de-sync.
+        assert_eq!(
+            decide(&cfg(), LifecycleEvent::Dequeued),
+            LifecycleAction::Unfile
+        );
     }
 
     #[test]
