@@ -9205,8 +9205,7 @@ async fn event_loop<T: Terminal>(
                             center_dormant = true;
                         }
                         materialize_failed.insert(key);
-                        model.status =
-                            format!("{} unavailable: {}", halt.placement, halt.reason);
+                        model.status = format!("{} unavailable: {}", halt.placement, halt.reason);
                         need_relayout = true;
                         dirty = true;
                     }
@@ -9656,9 +9655,6 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::Onboarding(r) => {
                     dirty |=
                         crate::handlers::onboarding::apply_probe(&mut onboarding, *r, &mut model)
-                }
-                RefreshKind::ProxyDash(p) => {
-                    dirty |= crate::detail::apply_proxy_dash(&mut bar_detail, *p)
                 }
                 RefreshKind::Usage(p) => dirty |= crate::detail::apply_usage(&mut bar_detail, *p),
                 // Branch ref moved: heal the checkout off-loop + drop the cache.
@@ -16751,11 +16747,6 @@ async fn event_loop<T: Terminal>(
                                     &mut share_supervisor,
                                     &session,
                                 );
-                            }
-                            Action::OpenProxyDash => {
-                                // Loading shell now; DB gather lands off-loop.
-                                bar_detail = Some(crate::detail::proxy_dash_loading(cols, rows));
-                                crate::actions::spawn_proxy_dash(&refresh_tx, &waker);
                             }
                             Action::OpenUsage => {
                                 // Loading shell now; the per-harness gather lands off-loop.

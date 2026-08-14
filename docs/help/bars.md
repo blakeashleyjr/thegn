@@ -11,7 +11,6 @@ actions:
     attention-next,
     mark-all-read,
     open-ci,
-    open-proxy-dash,
     open-usage,
   ]
 ---
@@ -64,8 +63,7 @@ and CPU history, the pane daemon's memory, and the event-loop rollup
 The notification cluster carries its own actions (palette-runnable, all
 bindable): toggle the notifications view, cycle notification modes, toggle
 do-not-disturb, mark everything read, and jump to the next item that needs
-you. The CI item opens the CI runs section; the proxy item opens the LLM
-proxy dashboard when configured.
+you. The CI item opens the CI runs section.
 
 The inbox `⚑`/`✉` chip, the needs-you `✋` chip, and the merge-queue chip
 all open the **one unified surface** — a single grouped list of _Needs
