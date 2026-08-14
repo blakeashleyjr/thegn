@@ -999,54 +999,68 @@ fn summon_pin(
     }
 }
 
-/// Map each live worktree to the OSC window title of its active tab's focused
-/// pane. Main-loop only — reads the live `panes` table, which the background
-/// hydration thread can't touch. Pure in-memory map reads, so it never blocks
-/// the loop. Empty/whitespace titles are skipped so the sidebar falls back to
-/// the branch name.
+/// Map each live worktree — in the active workspace AND every parked (warm)
+/// workspace held in `pool`, whose panes stay live — to the OSC window title of
+/// its active tab's focused pane. Main-loop only — reads the live `panes` table,
+/// which the background hydration thread can't touch. Pure in-memory map reads,
+/// so it never blocks the loop. Empty/whitespace titles are skipped so the
+/// sidebar falls back to the branch name.
 fn collect_window_titles(
     session: &crate::session::Session,
+    pool: &WorkspacePool,
     panes: &Panes,
 ) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
-    for g in &session.worktrees {
-        if g.path.is_empty() {
-            continue;
+    // The active workspace's worktrees, then every parked (warm) workspace's —
+    // their panes stay live in `panes`, so a parked worktree's dynamic name stays
+    // fresh instead of only showing its last-known value. The two sets are
+    // disjoint (the active workspace is never in the pool).
+    for g in session.worktrees.iter().chain(pool.resident_groups()) {
+        collect_group_title(g, panes, &mut out);
+    }
+    out
+}
+
+/// Map one worktree group to the OSC window title of its active tab's focused
+/// pane (scanning the group's other tabs as a fallback), inserting into `out`.
+/// Empty/whitespace titles are skipped so the sidebar falls back to the branch
+/// name.
+fn collect_group_title(
+    g: &crate::session::WorktreeGroup,
+    panes: &Panes,
+    out: &mut std::collections::BTreeMap<String, String>,
+) {
+    if g.path.is_empty() {
+        return;
+    }
+    let Some(tab) = g.tabs.get(g.active_tab) else {
+        return;
+    };
+
+    // Scan all tabs in the group, preferring the active one, to find a valid window title.
+    // This ensures titles don't disappear from the sidebar when an unfocused worktree
+    // has its title in a tab that happens to not be active.
+    if let Some(p) = panes.table.get(&tab.focused_pane)
+        && let Some(title) = p.emulator().title()
+    {
+        let title = title.trim();
+        if !title.is_empty() {
+            out.insert(g.path.clone(), title.to_string());
+            return;
         }
-        let Some(tab) = g.tabs.get(g.active_tab) else {
-            continue;
-        };
+    }
 
-        // Scan all tabs in the group, preferring the active one, to find a valid window title.
-        // This ensures titles don't disappear from the sidebar when an unfocused worktree
-        // has its title in a tab that happens to not be active.
-        let mut title_found = false;
-
-        if let Some(p) = panes.table.get(&tab.focused_pane)
+    for t in &g.tabs {
+        if let Some(p) = panes.table.get(&t.focused_pane)
             && let Some(title) = p.emulator().title()
         {
             let title = title.trim();
             if !title.is_empty() {
                 out.insert(g.path.clone(), title.to_string());
-                title_found = true;
-            }
-        }
-
-        if !title_found {
-            for t in &g.tabs {
-                if let Some(p) = panes.table.get(&t.focused_pane)
-                    && let Some(title) = p.emulator().title()
-                {
-                    let title = title.trim();
-                    if !title.is_empty() {
-                        out.insert(g.path.clone(), title.to_string());
-                        break;
-                    }
-                }
+                break;
             }
         }
     }
-    out
 }
 
 // The full sidebar/model rebuild for a switch lives beside its light sibling
@@ -8703,6 +8717,13 @@ async fn event_loop<T: Terminal>(
             // The warm-pool chip is loop-set (by the pool maintainer), not hydration
             // data — preserve it across the model swap or it blinks off every tick.
             let pool = model.pool;
+            // The dynamic (OSC) worktree titles map is seeded once from the DB in
+            // `build_initial_model` and merged in place each frame by
+            // `collect_window_titles`; `build_model` never populates it, so the swap
+            // would wipe it to empty and only the ACTIVE workspace's titles would be
+            // re-merged next frame — every parked/unfocused workspace's row would fall
+            // back to its branch name. Carry the accumulated map over.
+            let window_titles = std::mem::take(&mut model.sidebar_window_titles);
             // Rows carry-over: `hydration_eq` compares every `build_rows` input
             // (locked by model_eq.rs tests), so an unchanged hydration can reuse
             // the on-screen rows instead of paying an O(worktrees) rebuild on
@@ -8728,6 +8749,7 @@ async fn event_loop<T: Terminal>(
             model.load_steps = load_steps;
             model.load_context = load_context;
             model.pool = pool;
+            model.sidebar_window_titles = window_titles;
             model.panel.task_last_runs = task_last_runs;
             model.panel.log_lines_structured = log_lines_structured;
             model.panel.diagnostics = task_diagnostics;
@@ -9205,8 +9227,7 @@ async fn event_loop<T: Terminal>(
                             center_dormant = true;
                         }
                         materialize_failed.insert(key);
-                        model.status =
-                            format!("{} unavailable: {}", halt.placement, halt.reason);
+                        model.status = format!("{} unavailable: {}", halt.placement, halt.reason);
                         need_relayout = true;
                         dirty = true;
                     }
@@ -10220,7 +10241,7 @@ async fn event_loop<T: Terminal>(
             // `collect_window_titles` is stable frame-to-frame, so this collects
             // only real title changes — usually empty, so no DB open per frame.
             let mut title_writes: Vec<(String, String)> = Vec::new();
-            for (path, title) in collect_window_titles(&session, &panes) {
+            for (path, title) in collect_window_titles(&session, &workspace_pool, &panes) {
                 if model.sidebar_window_titles.get(&path) != Some(&title) {
                     title_writes.push((path.clone(), title.clone()));
                     model.sidebar_window_titles.insert(path, title);
