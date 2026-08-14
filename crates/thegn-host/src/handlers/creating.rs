@@ -531,6 +531,46 @@ pub(crate) fn on_failed(
     true
 }
 
+/// `CreateEvent::Halted`: a RECOVERABLE env bring-up failure. Unlike [`on_failed`],
+/// the git worktree + its registry row survive — so retire this creation's
+/// progress + "creating" markers but KEEP the tab, and focus it so the ask/halt
+/// modal the caller raises (and its retry / run-on-host choices, which act on the
+/// active worktree) target it. Returns the kept tab's `(group, tab)` key so the
+/// caller can mark it needs-bring-up (`materialize_failed`), or `None` when this
+/// generation had no live tab (nothing to keep).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn on_halted(
+    session: &mut Session,
+    model: &mut FrameModel,
+    sb: &mut SidebarState,
+    loading_state: &mut LoadingState,
+    creating_tabs: &mut HashSet<Key>,
+    inflight: &mut InFlight,
+    wizard_ui: &mut Option<crate::wizard::NewWorktreeWizard>,
+    wizard_cmd_tx: &mut Option<std::sync::mpsc::Sender<crate::wizard::WizardCmd>>,
+    generation: u64,
+) -> Option<Key> {
+    inflight.progress.remove(&generation)?;
+    if inflight.wizard_gen == Some(generation) {
+        *wizard_ui = None;
+        *wizard_cmd_tx = None;
+        inflight.wizard_gen = None;
+    }
+    let (name, idx) = inflight.gen_tab.remove(&generation)?;
+    let key = (name.clone(), idx);
+    // Retire the "creating" spinner/splash but leave the group + its tab standing.
+    creating_tabs.remove(&key);
+    loading_state.remove(&key);
+    sb.creating.remove(&name);
+    // Focus the kept worktree so the ask/halt modal + its retry/run-on-host act
+    // on it (they key off the active worktree).
+    if let Some(i) = session.worktrees.iter().position(|g| g.name == name) {
+        session.active = i;
+    }
+    refresh_tab_model(model, session, sb);
+    Some(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1026,5 +1066,105 @@ mod tests {
             "the wizard's local host pick is recorded on the optimistic splash key, \
              so the context never falls through to the provider default_env",
         );
+    }
+
+    /// A recoverable env halt during create KEEPS the worktree: `on_halted`
+    /// retires the "creating" markers + progress but leaves the group standing,
+    /// focuses it, and returns its key so the loop can mark it needs-bring-up.
+    /// (Contrast `on_failed`, whose `abort_gen` deletes the group.)
+    #[test]
+    fn halted_keeps_worktree_and_returns_key() {
+        let mut session = Session::default();
+        let mut model = FrameModel::default();
+        let mut sb = SidebarState::default();
+        let mut loading = LoadingState::default();
+        let mut creating_tabs: HashSet<Key> = HashSet::new();
+        let mut inflight = InFlight::default();
+        let mut wizard_ui = None;
+        let mut wizard_cmd_tx = None;
+
+        // A second, settled worktree so focus landing on the halted one is proven.
+        session.add_group(WorktreeGroup::new(
+            "repo/other".to_string(),
+            GroupKind::Branch,
+            "/wt/other".to_string(),
+        ));
+        seed_placeholder(
+            &mut session,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut inflight.gen_tab,
+            9,
+            "repo/sz-machine0",
+            "/wt/sz-machine0",
+        );
+        inflight
+            .progress
+            .insert(9, CreationProgress::new("repo/sz-machine0".to_string()));
+
+        let key = on_halted(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut inflight,
+            &mut wizard_ui,
+            &mut wizard_cmd_tx,
+            9,
+        );
+
+        assert_eq!(
+            key,
+            Some(("repo/sz-machine0".to_string(), 0)),
+            "returns the kept tab's key"
+        );
+        assert!(
+            session
+                .worktrees
+                .iter()
+                .any(|g| g.name == "repo/sz-machine0"),
+            "the halted worktree is KEPT, not deleted"
+        );
+        assert!(!creating_tabs.contains(&("repo/sz-machine0".to_string(), 0)));
+        assert!(!loading.contains_key(&("repo/sz-machine0".to_string(), 0)));
+        assert!(!sb.creating.contains("repo/sz-machine0"));
+        assert!(inflight.progress.get(&9).is_none(), "progress retired");
+        assert_eq!(
+            session
+                .worktrees
+                .get(session.active)
+                .map(|g| g.name.as_str()),
+            Some("repo/sz-machine0"),
+            "focus lands on the halted worktree so the ask/halt modal targets it",
+        );
+    }
+
+    /// A stale straggler with no in-flight progress for the generation is a
+    /// no-op — nothing to keep, nothing returned.
+    #[test]
+    fn halted_noop_without_progress() {
+        let mut session = Session::default();
+        let mut model = FrameModel::default();
+        let mut sb = SidebarState::default();
+        let mut loading = LoadingState::default();
+        let mut creating_tabs: HashSet<Key> = HashSet::new();
+        let mut inflight = InFlight::default();
+        let mut wizard_ui = None;
+        let mut wizard_cmd_tx = None;
+
+        let key = on_halted(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &mut loading,
+            &mut creating_tabs,
+            &mut inflight,
+            &mut wizard_ui,
+            &mut wizard_cmd_tx,
+            42,
+        );
+        assert_eq!(key, None);
     }
 }
