@@ -45,4 +45,13 @@ src="$canonical/$cfg"
 if [ "$src" != "$(pwd)/$cfg" ] && [ -e "$src" ]; then
   ln -sf "$src" "$cfg"
 fi
+
+# Pre-trust this worktree for devenv so direnv's `use devenv` (the host default
+# in .envrc) loads without a manual `devenv allow` on first entry -- thegn spins
+# up many worktrees, so "just cd in and it runs" needs this. Best-effort: guarded
+# on the tool + a devenv.nix, and never blocks the checkout (read-only ~/.config
+# in a sandbox just no-ops).
+if command -v devenv >/dev/null 2>&1 && [ -f devenv.nix ]; then
+  devenv allow >/dev/null 2>&1 || true
+fi
 exit 0
