@@ -10200,7 +10200,27 @@ async fn event_loop<T: Terminal>(
             // Refresh the live OSC window titles from the panes table (main loop
             // only) so the sidebar's dynamic row titles track the focused pane's
             // current title. Cheap in-memory map build; never blocks the loop.
-            model.sidebar_window_titles = collect_window_titles(&session, &panes);
+            // Merge (never replace) so a worktree keeps its last-known title when
+            // its workspace is parked / cold-resurrected (its live pane isn't
+            // observable then); persist on change so titles also survive restart.
+            // `collect_window_titles` is stable frame-to-frame, so this collects
+            // only real title changes — usually empty, so no DB open per frame.
+            let mut title_writes: Vec<(String, String)> = Vec::new();
+            for (path, title) in collect_window_titles(&session, &panes) {
+                if model.sidebar_window_titles.get(&path) != Some(&title) {
+                    title_writes.push((path.clone(), title.clone()));
+                    model.sidebar_window_titles.insert(path, title);
+                }
+            }
+            if !title_writes.is_empty()
+                && let Ok(db) = thegn_core::db::Db::open()
+            {
+                for (path, title) in &title_writes {
+                    // best-effort: the DB is a cache; a failed title write must
+                    // never take down the compositor.
+                    let _ = db.set_worktree_window_title(path, title);
+                }
+            }
             // Notification routing chip state (DND + active mode), read fresh so a
             // scheduled DND window flips the chip as time passes (evaluated at
             // render time — no timer).
