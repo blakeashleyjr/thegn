@@ -205,6 +205,11 @@ pub(crate) fn init_new_project(leaf: &std::path::Path) -> Result<()> {
     #[expect(clippy::disallowed_methods)]
     let status = thegn_core::util::git_cmd(leaf)
         .arg("init")
+        // Null stdio: the compositor owns the alt-screen, so git's
+        // "Initialized empty Git repository in …" on the inherited stdout would
+        // scroll it and drift the render baseline. Only the exit code matters.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .with_context(|| format!("git init {}", leaf.display()))?;
     anyhow::ensure!(status.success(), "git init failed for {}", leaf.display());

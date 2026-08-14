@@ -47,3 +47,24 @@ pub(crate) fn bg_glyph_ttl() -> Duration {
         .unwrap_or(5000);
     Duration::from_millis(ms)
 }
+
+/// Cadence for the flash-free full-screen "resync" heal. thegn's diff renderer
+/// assumes `front` (its baseline) mirrors the physical screen EXACTLY; every
+/// frame it emits only the `front`→`scratch` delta. If the outer terminal
+/// drifts out-of-band — the classic case is Ghostty (and other terminals that
+/// send NO same-size SIGWINCH on window refocus, see the resize handler in
+/// `run.rs`) repainting its alt-screen imperfectly when you focus back — the
+/// bounded diff can't know, so it leaves the orphaned rows stale forever: the
+/// "doubled lines" bug. Periodically we reset the baseline and let the normal
+/// `diff_screens` re-emit every cell IN PLACE — no `ClearScreen`, so no flash;
+/// unchanged cells are overwritten with themselves while any drifted cell
+/// heals. This only ever runs on a frame that is ALREADY being produced (it
+/// piggybacks inside `should_render`), so an idle loop stays idle — the 0%-idle
+/// invariant holds. Default 3s; `THEGN_RESYNC_MS=0` disables it entirely.
+pub(crate) fn resync_interval() -> Duration {
+    let ms = std::env::var("THEGN_RESYNC_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(3000);
+    Duration::from_millis(ms)
+}
