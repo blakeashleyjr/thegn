@@ -45,7 +45,7 @@ concurrency:
 #   gh variable set CI_RUNS_ON --body '["ubuntu-latest"]'
 #   gh variable delete CI_RUNS_ON        # ← back to self-hosted
 # `ci-setup` adapts either way (installs nix + caches only on github-hosted).
-# The `macos` job is always GitHub-hosted (macos-14).
+# The `macos` job is always GitHub-hosted (macos-15).
 jobs:
   fmt:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
@@ -233,11 +233,11 @@ jobs:
       - run: nix develop --command just e2e
   macos:
     # OPT-IN (10x minute cost): runs only via dispatch or a `[ci-macos]` commit
-    # message marker. macos-14 = GitHub-hosted Apple silicon; covers the
+    # message marker. macos-15 = GitHub-hosted Apple silicon; covers the
     # aarch64-darwin build + unit tests (end-to-end `apple` backend verification
     # is the on-device checklist, tasks.md §AX).
     if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-macos]') }}
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
@@ -277,8 +277,8 @@ jobs:
       # dropping the last handle (KILL_ON_JOB_CLOSE) reaps it too.
       - run: "cargo test -p thegn-host --locked platform::"
       # Distribution: a release thegn.exe from every run — the download for
-      # native Windows installs until a tagged-release pipeline exists
-      # (documented install path: `cargo install --path crates/thegn-host`).
+      # native Windows installs between tagged releases (release.yml ships the
+      # windows-msvc archive on `v*` tags).
       - run: cargo build --release --locked -p thegn-host
       - uses: actions/upload-artifact@v4
         with:

@@ -2,8 +2,8 @@
 #
 # This installs the prebuilt macOS binary from a GitHub Release. On each release,
 # bump `version`, the two `url`s, and their `sha256`s (from the release's
-# `thegn-<tag>-<target>.tar.gz.sha256` files). Once a tap exists, users install
-# with `brew install <owner>/tap/thegn`.
+# `thegn-<tag>-<target>.sha256` files — note: no `.tar.gz` infix). Once a tap
+# exists, users install with `brew install <owner>/tap/thegn`.
 #
 # Until the first tagged release exists these URLs 404 — see RELEASING.md.
 class Thegn < Formula
