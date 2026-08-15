@@ -16094,58 +16094,46 @@ async fn event_loop<T: Terminal>(
                         which_key_filter = None;
                         // Resolve the Alt+arrow (`Nav*`) actions here so they reuse
                         // the existing focus/switch code paths and never reach the
-                        // match below as `Nav*`. The two axes behave differently:
+                        // match below as `Nav*`. Alt navigation walks panes only and
+                        // never enters chrome (the sidebar/panel/bars are Ctrl's job):
                         //
-                        // - Vertical (Alt+↑/↓) is a pure worktree switch within the
-                        //   current workspace — no focus routing, and it must never
-                        //   select the top/bottom bars (that is Ctrl+↑/↓'s job).
-                        // - Horizontal (Alt+←/→) is one seamless motion: it walks the
-                        //   same spatial focus graph as Ctrl+←/→ (hand off to the
-                        //   coalesced focus gesture below), and only when a move
-                        //   dead-ends at the outer edge does it fall through to the
-                        //   prev/next-tab switch Alt historically owned.
+                        // - If a pane exists in the direction, move focus to it.
+                        // - Otherwise fall through by axis — ←/→ cycle tabs within the
+                        //   current worktree, ↑/↓ cycle worktrees within the workspace.
+                        //
+                        // `focus::resolve_nav` is the pure, unit-tested decision; we
+                        // just map its result onto the existing `Focus*`/tab/worktree
+                        // actions.
                         let mut action = action;
                         if let Action::NavLeft
                         | Action::NavRight
                         | Action::NavUp
                         | Action::NavDown = action
                         {
-                            action = match action {
-                                Action::NavUp => Action::PrevWorktree,
-                                Action::NavDown => Action::NextWorktree,
-                                // NavLeft / NavRight — consult the focus graph.
-                                _ => {
-                                    use crate::center::Move;
-                                    use crate::focus::{FocusMove, RouteCtx};
-                                    let mv = if matches!(action, Action::NavLeft) {
-                                        Move::Left
-                                    } else {
-                                        Move::Right
-                                    };
-                                    let cur_focused =
-                                        session.active_tab().map(|t| t.focused_pane).unwrap_or(0);
-                                    let pane_layout = session
-                                        .active_tab()
-                                        .map(|t| t.center.layout(chrome.center))
-                                        .unwrap_or_default();
-                                    let ctx = RouteCtx {
-                                        sidebar_visible: want_sidebar && chrome.sidebar.is_some(),
-                                        panel_visible: want_panel && chrome.panel.is_some(),
-                                        drawer_visible: chrome.drawer.is_some(),
-                                        layout: &pane_layout,
-                                        focused_pane: cur_focused,
-                                    };
-                                    let dead_end = matches!(
-                                        crate::focus::route(focus.zone, mv, &ctx),
-                                        FocusMove::None
-                                    );
-                                    match (matches!(action, Action::NavLeft), dead_end) {
-                                        (true, true) => Action::PrevTab,
-                                        (false, true) => Action::NextTab,
-                                        (true, false) => Action::FocusLeft,
-                                        (false, false) => Action::FocusRight,
-                                    }
-                                }
+                            use crate::center::Move;
+                            use crate::focus::{NavMove, Zone, resolve_nav};
+                            let dir = match action {
+                                Action::NavLeft => Move::Left,
+                                Action::NavRight => Move::Right,
+                                Action::NavUp => Move::Up,
+                                _ => Move::Down,
+                            };
+                            let in_center = focus.zone == Zone::Center;
+                            let cur_focused =
+                                session.active_tab().map(|t| t.focused_pane).unwrap_or(0);
+                            let pane_layout = session
+                                .active_tab()
+                                .map(|t| t.center.layout(chrome.center))
+                                .unwrap_or_default();
+                            action = match resolve_nav(in_center, dir, &pane_layout, cur_focused) {
+                                NavMove::Focus(Move::Left) => Action::FocusLeft,
+                                NavMove::Focus(Move::Right) => Action::FocusRight,
+                                NavMove::Focus(Move::Up) => Action::FocusUp,
+                                NavMove::Focus(Move::Down) => Action::FocusDown,
+                                NavMove::PrevTab => Action::PrevTab,
+                                NavMove::NextTab => Action::NextTab,
+                                NavMove::PrevWorktree => Action::PrevWorktree,
+                                NavMove::NextWorktree => Action::NextWorktree,
                             };
                         }
                         match action {

@@ -533,8 +533,12 @@ format = "text"           # text | json
 # [keybinds.vim_normal]
 # new-worktree = "Space g w"   # press Space, then g, then w
 # Sidebar navigation (global):
-#   Alt ↑/↓        navigate worktrees, wrapping WITHIN the current workspace
-#                  (in the TERMINALS region, cycles terminals within the host)
+#   Alt ↑/↓        move to the pane above/below; at the top/bottom pane, cycle
+#                  worktrees WITHIN the current workspace (in the TERMINALS
+#                  region, cycles terminals within the host). Never focuses
+#                  chrome — that is Ctrl ↑/↓.
+#   Alt ←/→        move to the pane left/right; at the pane edge, cycle tabs
+#                  within the active worktree. Never focuses chrome (Ctrl ←/→).
 #   Shift+Alt ↑/↓  switch to the previous/next *workspace* (a real context
 #                  switch); at the boundary it overflows into the TERMINALS
 #                  region (and its host groups) and wraps back around
