@@ -116,7 +116,7 @@ build-musl: _apps
 # needed) and drop it next to BOTH the debug and release host binaries as
 # `thegn-musl`, where `bridge_sup::bridge_binary_path()` auto-discovers it. Without
 # it, `bridge_binary_path()` is None, the bridge is never pushed to provider envs,
-# and every reverse tunnel (nix cache :8484 / proxy :8383) execs a missing binary →
+# and every reverse tunnel (nix cache :8484) execs a missing binary →
 # in-sandbox `:8484 could not connect` + slow from-source devShell builds. Run once
 # (nix caches it, so unchanged rebuilds are instant); re-run after source changes,
 # then restart the instance so the fresh bridge is pushed.
@@ -349,14 +349,7 @@ e2e-glitch: build
 # above are excluded).
 cov_ignore := 'thegn-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|plugin_api|profile|forge/mod)\.rs'
 
-# The LLM-proxy crate is gated separately at 88% lines (its decision logic lives
-# in the 95%-gated core::proxy; this covers the I/O shell — router, server, relay,
-# upstream — via unit + integration (`tests/e2e.rs`) tests, hence `--tests`).
-# EXCLUDED: `main.rs`/`lib.rs` — the bind+serve loop, signal handling, and binary
-# entry can't be unit-covered (same rationale as core's seams; exercised live).
-proxy_cov_ignore := 'thegn-proxy/src/(main|lib)\.rs'
-
-# Coverage gate: core ≥95% lines + proxy ≥88% lines. Writes lcov to target/coverage.
+# Coverage gate: core ≥95% lines. Writes lcov to target/coverage.
 coverage: _apps
     mkdir -p target/coverage
     # Discard any stale .profraw from earlier instrumented runs — merging them
@@ -367,10 +360,6 @@ coverage: _apps
       --ignore-filename-regex '{{cov_ignore}}' \
       --lcov --output-path target/coverage/lcov.info
     @echo "coverage: core ≥95% lines"
-    cargo llvm-cov -p thegn-proxy --lib --tests --fail-under-lines 88 \
-      --ignore-filename-regex '{{proxy_cov_ignore}}' \
-      --lcov --output-path target/coverage/lcov-proxy.info
-    @echo "coverage: proxy ≥88% lines"
 
 # Coverage as a browsable HTML report (target/llvm-cov/html).
 coverage-html:
@@ -724,7 +713,7 @@ start-term name="dev" backend="": build-profiling (_apply-backend backend)
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
       echo "profiler: 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/"; \
       echo "logs: $state/thegn/logs/thegn.log (startup waterfall + frame/hydrate/perf)"; \
-      echo "bridge: $([ -x "$PWD/target/debug/thegn-musl" ] && echo "present (reverse tunnels :8484/:8383 live)" || echo "MISSING — run 'just bridge'; nix cache :8484 + proxy :8383 tunnels are disabled")"; \
+      echo "bridge: $([ -x "$PWD/target/debug/thegn-musl" ] && echo "present (reverse tunnel :8484 live)" || echo "MISSING — run 'just bridge'; the nix-cache :8484 tunnel is disabled")"; \
       setsid -f ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
       'pidfile="$1"; shift; echo $$ > "$pidfile"; exec env "$@"' \
       sh "$pidfile" \
@@ -763,14 +752,14 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
       echo "profiler: 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/"; \
       echo "logs: $logs/thegn.log (full trace: startup/frame/hydrate/perf + every crate) + $logs/stderr.log (panic message + full backtrace)"; \
       echo "sprites token: $([ -n "${SPRITES_TOKEN:-}" ] && echo "loaded (len ${#SPRITES_TOKEN})" || echo "NOT set — sprites envs will halt; put SPRITES_TOKEN in .envrc.local")"; \
-      echo "bridge: $([ -x "$PWD/target/release/thegn-musl" ] && echo "present (reverse tunnels :8484/:8383 live)" || echo "MISSING — run 'just bridge'; nix cache :8484 + proxy :8383 tunnels are disabled")"; \
+      echo "bridge: $([ -x "$PWD/target/release/thegn-musl" ] && echo "present (reverse tunnel :8484 live)" || echo "MISSING — run 'just bridge'; the nix-cache :8484 tunnel is disabled")"; \
       setsid -f ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
       'pidfile="$1"; errlog="$2"; shift 2; echo $$ > "$pidfile"; exec env "$@" 2>"$errlog"' \
       sh "$pidfile" "$logs/stderr.log" \
       "XDG_STATE_HOME=$state" \
       "SPRITES_TOKEN=${SPRITES_TOKEN:-}" \
       "RUST_BACKTRACE=full" \
-      "THEGN_LOG=debug,thegn=trace,thegn_core=trace,thegn_svc=trace,thegn_proxy=trace" \
+      "THEGN_LOG=debug,thegn=trace,thegn_core=trace,thegn_svc=trace" \
       "THEGN_PERF=1" \
       "$PWD/target/release/thegn"
 

@@ -227,28 +227,18 @@ fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text
 }
 
 /// Write `text` into a pane as input, wrapping it in the bracketed-paste
-/// markers when the app has requested them (so editors don't auto-indent).
-/// Strip bracketed-paste markers embedded in pasted content. Without this, a
-/// clipboard payload containing `ESC[201~` closes the paste bracket early and its
-/// tail is interpreted as keystrokes (bracketed-paste command injection); a stray
-/// start marker is dropped too so the payload can't re-open a nested bracket.
-fn neutralize_paste_markers(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.contains("\x1b[201~") || text.contains("\x1b[200~") {
-        std::borrow::Cow::Owned(text.replace("\x1b[201~", "").replace("\x1b[200~", ""))
-    } else {
-        std::borrow::Cow::Borrowed(text)
-    }
-}
-
-fn paste_text_into_pane(pane: &mut crate::pane::PtyPane, text: &str) -> anyhow::Result<()> {
-    if pane.emulator().bracketed_paste() {
-        pane.write_input(b"\x1b[200~")?;
-        pane.write_input(neutralize_paste_markers(text).as_bytes())?;
-        pane.write_input(b"\x1b[201~")?;
-    } else {
-        pane.write_input(text.as_bytes())?;
-    }
-    Ok(())
+/// markers when the app has requested them (so editors don't auto-indent),
+/// with embedded markers neutralized (bracketed-paste injection hardening —
+/// see [`crate::pane_writer::build_paste_bytes`]). The whole paste is ONE
+/// queued chunk, so a congestion drop ([`StdinSendError::Full`]) can never
+/// leave the app inside an open paste bracket, and no keystroke can land
+/// between the markers.
+fn paste_text_into_pane(
+    pane: &mut crate::pane::PtyPane,
+    text: &str,
+) -> Result<(), crate::pane_writer::StdinSendError> {
+    let bracketed = pane.emulator().bracketed_paste();
+    pane.write_input_owned(crate::pane_writer::build_paste_bytes(text, bracketed))
 }
 
 fn toggle_recorder(
@@ -623,10 +613,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // agents launched there discover it (best-effort; new worktrees seeded on
     // create — see `cmd/wt.rs`/`wizard.rs`). Gated on `[merge_queue] enabled`.
     crate::mq_assets::seed_persisted_worktrees(&cfg);
-    // Auto-launch the LLM-proxy daemon when enabled (disabled by default — AI is
-    // additive). Held for the lifetime of `main`; the supervisor thread keeps it
-    // alive and `Drop` stops it on graceful return (process-group exit otherwise).
-    let _proxy_daemon = crate::proxy_daemon::launch_from_config(&cfg);
     // Embedded host nix cache: when any env opts into `[env.<name>.provider]
     // host_cache`, serve the host /nix/store on an ephemeral loopback port for the
     // whole session. Each provider worktree's reverse tunnel then forwards a fixed
@@ -644,19 +630,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         None
     };
     let host_cache_port = _nix_cache.as_ref().map(|h| h.port);
-    // Self-heal the managed pi: if a configured agent runs the managed pi
-    // (`~/.thegn/pi`) but it's missing/stale, install+seed it off-thread (npm +
-    // extension seed — never blocks the loop). Explicit `thegn agent setup` does
-    // the same; this just means the "Agent" entry works without a manual step.
-    if !crate::cmd::agent::is_current()
-        && cfg.agents.iter().any(|a| a.command.contains(".thegn/pi"))
-    {
-        tokio::task::spawn_blocking(|| {
-            if let Err(e) = crate::cmd::agent::setup(false) {
-                tracing::warn!(target: "thegn::startup", error = %e, "managed pi setup failed; run `thegn agent setup`");
-            }
-        });
-    }
     let keymap = rebuild_keymap(&cfg, &session);
     let mode = crate::keymap::startup_mode(&cfg);
     // Validate that no keybinding scope has ambiguous duplicates. Cross-scope
@@ -724,19 +697,21 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
 
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
-    let (orphan_tx, orphan_rx) = tokio_mpsc::unbounded_channel::<Vec<String>>();
     {
-        let gc_waker = waker.clone();
         tokio::task::spawn_blocking(move || {
             let Ok(db) = thegn_core::db::Db::open() else {
                 return;
             };
-            let db_worktrees: Vec<String> = db
-                .worktrees()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| r.worktree)
-                .collect();
+            // CRITICAL: a FAILED worktrees query must NOT be treated as "no
+            // worktrees" — with an empty list every thegn container looks like an
+            // orphan and run_gc would delete ALL of them, including live panes'.
+            // Skip the sweep entirely on a query error (transient SQLITE_BUSY from
+            // a concurrent instance is exactly the case CLAUDE.md warns about).
+            let Ok(rows) = db.worktrees() else {
+                tracing::warn!(target: "thegn::sandbox", "orphan GC skipped: worktrees query failed");
+                return;
+            };
+            let db_worktrees: Vec<String> = rows.into_iter().map(|r| r.worktree).collect();
             let removed = thegn_core::sandbox::run_gc(&db_worktrees);
             if !removed.is_empty() {
                 thegn_core::msg::info(&format!(
@@ -744,13 +719,9 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                     removed.len(),
                     removed.join(", ")
                 ));
-                let _ = orphan_tx.send(removed);
-                let _ = gc_waker.wake();
             }
         });
     }
-    // orphan_rx drained in the event loop to surface the notice in the System panel.
-    let _ = orphan_rx; // placeholder until wired into event_loop
 
     // Config reload events ride a tokio channel so the loop drains them on wake;
     // the notify watcher thread `send`s + pulses the waker.
@@ -830,9 +801,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (daemon_status_tx, daemon_status_rx) =
         tokio_mpsc::unbounded_channel::<crate::chrome::DaemonStatus>();
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
-    let (ai_metrics_tx, ai_metrics_rx) =
-        tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
-    crate::ai_sidecar::spawn_ai_sidecar(waker.clone(), ai_metrics_tx);
     crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
     // The stats cadence is user-cyclable at runtime (click the top-right
     // stats block); the ticker thread reads it per tick.
@@ -926,7 +894,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         container_rx,
         daemon_status_rx,
         metrics_rx,
-        ai_metrics_rx,
         sandbox_event_rx,
         stats_interval_ms,
         stats_live,
@@ -1590,18 +1557,12 @@ fn connect_worktree_bridge(
             );
         }
         // Reverse host→sandbox tunnels, all over the resident bridge:
-        //  • P0b model-proxy: when an in-sandbox agent should reach the host
-        //    `tgproxy` by default (`[llm_proxy] route_agent` + `remote_base_url =
-        //    "auto"`) → bind the proxy port in the sandbox → host tgproxy, so any
-        //    agent there routes through it via the injected ANTHROPIC_BASE_URL.
-        //  • P1 host services / host-bound MCP: each `[sandbox.home]
+        //  • host services / host-bound MCP: each `[sandbox.home]
         //    reverse_forwards` spec → bind a sandbox port → a host target.
+        //  • the embedded host nix cache (below).
         // No-op when not a provider / nothing configured.
         if let thegn_core::placement::Placement::Provider(p) = &env.placement {
             let mut tunnels: Vec<(u16, String)> = Vec::new();
-            if let Some(port) = cfg.llm_proxy.remote_tunnel_port() {
-                tunnels.push((port, format!("127.0.0.1:{}", cfg.llm_proxy.listen_port())));
-            }
             // Embedded host nix cache: bind the cache port in the sandbox → the
             // host's ephemeral cache server, so the sprite's `extra-substituters =
             // http://127.0.0.1:<SANDBOX_PORT>` (baked into nix.conf) resolves.
@@ -2501,16 +2462,25 @@ fn spawn_blame_fetch(
         // Via the scrubbed `git_cmd` (supplies `-C wt` + strips GIT_ENV_VARS).
         // off-loop: inside spawn_blocking
         #[expect(clippy::disallowed_methods)]
-        let output = thegn_core::util::git_cmd(&wt)
-            .args(&args)
-            .output()
-            .unwrap_or_else(|_| std::process::Output {
-                status: std::process::ExitStatus::default(),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            });
-        let text = String::from_utf8_lossy(&output.stdout);
-        let rows = crate::panel::parse_blame_porcelain(&text);
+        let output = thegn_core::util::git_cmd(&wt).args(&args).output();
+        // Don't silently paint an empty blame as if it succeeded: a spawn failure
+        // (no git) or a non-zero exit (bad rev / not tracked) is logged at warn so
+        // the empty view is diagnosable; the empty rows still resolve the loading
+        // state rather than hanging.
+        let rows = match output {
+            Ok(out) if out.status.success() => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                crate::panel::parse_blame_porcelain(&text)
+            }
+            Ok(out) => {
+                tracing::warn!(target: "thegn::git", "blame failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!(target: "thegn::git", "blame spawn failed: {e}");
+                Vec::new()
+            }
+        };
         if tx.send((generation, GitDoc::Blame(rows))).is_ok() {
             let _ = wk.wake();
         }
@@ -4044,9 +4014,6 @@ fn dispatch_menu_choice(
         // New-project creation is intercepted at the call site (it owns
         // session/panes/pool); never routes through this git dispatcher.
         MenuChoice::ConfirmCreateProject { .. } => {}
-        // The bouncer approval gate is resolved directly in the loop (it owns the
-        // approval queue + oneshots); it never routes through this git dispatcher.
-        MenuChoice::ApproveTool { .. } => {}
         // Sandbox-halt retry / run-on-host are resolved directly in the loop
         // (re-arm the lazy materialize); they never route through this dispatcher.
         MenuChoice::SandboxRetry | MenuChoice::SandboxRunOnHost => {}
@@ -4687,7 +4654,9 @@ fn smart_split_dir(cols: usize, rows: usize) -> crate::center::Dir {
 /// local shell) and the sandbox backend wraps a local shell ("" = uncontained).
 /// Returns `("", "")` when the row is gone or the DB can't be opened — a safe
 /// fall back to a local, uncontained shell. Call this off the event loop (it
-/// opens the DB).
+/// opens the DB), and prefer `handlers::terminal::live_choice` first: for a
+/// terminal created by this session's wizard the registry carries the user's
+/// actual pick even when the best-effort persist failed.
 pub(crate) fn terminal_launch_for(name: &str) -> (String, String) {
     thegn_core::db::Db::open()
         .ok()
@@ -4713,27 +4682,17 @@ fn bundle_scope_slug(db: &thegn_core::db::Db, worktree: &str) -> Option<String> 
 }
 
 /// Spawn the worktree's interactive shell pane in `dir`, routing through the
-/// env/sandbox resolution (`launch_spec`), the native-provider exec, or the
-/// terminal connection as appropriate. Resolution can open the DB / probe the
-/// sandbox — call off the hot path where possible.
+/// env/sandbox resolution (`launch_spec`) or the native-provider exec as
+/// appropriate. Resolution can open the DB / probe the sandbox — call off the
+/// hot path where possible. Terminal-connection panes never spawn here: they
+/// materialize off-thread (`handlers::materialize` / the prewarm worker) via
+/// `panes::terminal_launch_spec`.
 pub(crate) fn spawn_worktree_shell_pane(
     panes: &mut Panes,
     cfg: &thegn_core::config::Config,
     dir: Option<&std::path::Path>,
     center: Rect,
-    is_terminal: bool,
-    terminal_connection: Option<&str>,
-    terminal_sandbox: &str,
 ) -> Result<u32> {
-    if is_terminal {
-        let spec = crate::panes::terminal_launch_spec(
-            cfg,
-            terminal_connection.unwrap_or(""),
-            terminal_sandbox,
-        );
-        return panes.spawn_argv_env(&spec.argv, dir, &spec.env, center);
-    }
-
     if let Some(dir) = dir
         && dir.is_dir()
     {
@@ -4878,8 +4837,7 @@ fn apply_layout_to_active_tab(
         .unwrap_or_default();
     // Spawn a shell per leaf; a leaf carrying a command runs it in that shell.
     let mut spawn = |cmd: Option<&str>| -> Option<u32> {
-        let id =
-            spawn_worktree_shell_pane(panes, cfg, dir.as_deref(), center, false, None, "").ok()?;
+        let id = spawn_worktree_shell_pane(panes, cfg, dir.as_deref(), center).ok()?;
         if let Some(c) = cmd
             && let Some(p) = panes.table.get_mut(&id)
         {
@@ -5180,6 +5138,19 @@ pub(crate) fn persist_session_layout(session: &mut crate::session::Session, pane
     }
 }
 
+/// Status line for a palette command injected into the focused pane's shell:
+/// the optimistic `ok` message when the bytes queued, or a "not reading" note
+/// when the pane's bounded stdin queue was Full (a wedged / flow-stopped child)
+/// so the command was dropped. Without this the palette would claim success
+/// (`Switched to branch …`) for a command that never reached the shell.
+fn injected_command_status(queued: bool, ok: String) -> String {
+    if queued {
+        ok
+    } else {
+        "pane isn't reading input — command dropped".into()
+    }
+}
+
 /// Persist a pure focus change (worktree/tab switch) without blocking the loop.
 ///
 /// A switch is structurally a no-op — only the active pointer moved — so it
@@ -5207,92 +5178,23 @@ pub(crate) fn persist_active_focus(session: &crate::session::Session) {
     });
 }
 
-use crate::acp_gate::AgentChannel;
-
-/// Connect to the agent's ACP server over the resolved channel. TCP connects
-/// after a fixed warm-up; the unix socket is created by the in-container pi
-/// extension only once it boots, so we retry until it appears (or time out).
-async fn connect_agent_channel(
-    channel: &AgentChannel,
-) -> anyhow::Result<(
-    thegn_svc::acp::client::AcpClient,
-    tokio::sync::mpsc::Receiver<thegn_svc::acp::client::AcpInbound>,
-)> {
-    use thegn_svc::acp::client::AcpClient;
-    match channel {
-        AgentChannel::Tcp(port) => {
-            // A freshly-spawned agent may not have bound its ACP port yet; retry on
-            // a fixed cadence (like the unix path's boot wait) rather than racing a
-            // single connect against the spawn — a lost race left the agent showing
-            // `Error` permanently despite coming up moments later (ECONNREFUSED).
-            // ~15s total (60 × 250ms); connects immediately once the port is up.
-            // Covers a cold managed pi that binds ACP_PORT ~12s after launch, so a
-            // healthy agent connects on attempt 1 (no transient error/backoff).
-            AcpClient::connect_retry(*port, 60, std::time::Duration::from_millis(250)).await
-        }
-        AgentChannel::Unix(path) => {
-            let path_s = path.to_string_lossy().into_owned();
-            // The sealed agent boots pi, then the extension `listen`s on the
-            // bind-mounted socket — which can take a few seconds on a cold image.
-            let mut last = None;
-            for _ in 0..40 {
-                if path.exists() {
-                    match AcpClient::connect_unix(&path_s).await {
-                        Ok(conn) => return Ok(conn),
-                        Err(e) => last = Some(e),
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-            Err(last.unwrap_or_else(|| anyhow::anyhow!("agent ACP socket {path_s} never appeared")))
-        }
-        AgentChannel::None => Err(anyhow::anyhow!("no ACP channel reserved")),
-    }
-}
-
 /// Attach a freshly-created worktree's agent pane: spawn the pre-resolved
 /// launch spec (openpty+exec — fast, the blocking sandbox/compose work already
 /// ran on the wizard worker) into the tab named `tab_name` and point that
 /// tab's center at the live pane so `materialize` won't also spawn a plain
 /// shell. No-op (returns false) if the tab is gone.
-///
-/// ACP is armed only when `agent_name` is the managed pi (see
-/// [`crate::acp_gate::resolve_agent_channel`]); a plain shell spawns the pane and
-/// nothing more (no phantom `⚠ agent error`).
-#[allow(clippy::too_many_arguments)]
 fn attach_agent_pane(
     session: &mut crate::session::Session,
     panes: &mut Panes,
     tab_name: &str,
     spec: &crate::agent::LaunchSpec,
-    agent_name: &str,
     center: Rect,
-    cfg: &thegn_core::config::Config,
-    acp_inbound_tx: &tokio_mpsc::UnboundedSender<(String, thegn_svc::acp::client::AcpInbound)>,
-    acp_reg_tx: &tokio_mpsc::UnboundedSender<(
-        String,
-        std::sync::Arc<thegn_svc::acp::client::AcpClient>,
-    )>,
-    acp_status_tx: &tokio_mpsc::UnboundedSender<(String, crate::chrome::AgentConn)>,
-    waker: &TerminalWaker,
 ) -> bool {
     let Some(gi) = session.worktrees.iter().position(|g| g.name == tab_name) else {
         return false;
     };
     let cwd = spec.cwd.clone();
-    let mut env = spec.env.clone();
-    let wt_path = session.worktrees[gi].path.clone();
-
-    // Resolve the ACP reach-back channel + proxy side effects, gated on whether
-    // this agent actually speaks ACP (the managed pi). For a shell / claude / etc.
-    // this returns `None` — no port, no env, no supervisor — so the pane spawns
-    // clean without a phantom `⚠ agent error`. See `crate::acp_gate`.
-    let crate::acp_gate::AcpArming {
-        channel: acp_channel,
-        revoke_key,
-        relay,
-    } = crate::acp_gate::resolve_agent_channel(cfg, agent_name, &wt_path, &spec.backend, &mut env);
-
+    let env = spec.env.clone();
     let argv = spec.argv.clone();
     match panes.spawn_argv_env(&argv, cwd.as_deref(), &env, center) {
         Ok(id) => {
@@ -5308,458 +5210,12 @@ fn attach_agent_pane(
             }
             tab.center = crate::center::CenterTree::Leaf(id);
             tab.focused_pane = id;
-
-            // Connect to ACP in the background over the resolved channel. The task
-            // registers its client with the loop (so the loop can reply) and then
-            // forwards every inbound message tagged with the worktree path; the
-            // loop owns servicing + replies (see `dispatch_acp_inbound`).
-            if !matches!(acp_channel, AgentChannel::None) {
-                let inbound_tx = acp_inbound_tx.clone();
-                let reg_tx = acp_reg_tx.clone();
-                let waker_clone = waker.clone();
-                let wt_name = g.path.clone();
-                // `revoke_key` (revoked on disconnect) and `relay` (the model
-                // relay, whose `Drop` tears down the socket) are captured by the
-                // `move` task below — they live exactly as long as the connection.
-
-                // Surface lifecycle in the statusbar chip (the only native signal).
-                let emit = {
-                    let status_tx = acp_status_tx.clone();
-                    let waker = waker_clone.clone();
-                    let wt = wt_name.clone();
-                    move |conn: crate::chrome::AgentConn| {
-                        let _ = status_tx.send((wt.clone(), conn));
-                        let _ = waker.wake();
-                    }
-                };
-                emit(crate::chrome::AgentConn::Connecting);
-
-                tokio::spawn(async move {
-                    let _relay = relay; // keep alive for the life of this task
-                    // Supervisor: retry with bounded backoff (500ms→30s) so a
-                    // slow-booting agent doesn't get a permanent red chip.
-                    let finish = |conn| {
-                        emit(conn);
-                        if let Some(key) = &revoke_key {
-                            crate::proxy_keys::revoke_agent_proxy_key(key);
-                        }
-                    };
-                    let mut backoff = std::time::Duration::from_millis(500);
-                    let mut failures: u32 = 0;
-                    loop {
-                        match connect_agent_channel(&acp_channel).await {
-                            Ok((client, mut rx)) => {
-                                // NOTE: do NOT reset failures/backoff here (audit
-                                // run.rs:5421). An endpoint that accepts TCP but
-                                // fails `initialize()` (wrong port, stale protocol)
-                                // would otherwise reset the counter every cycle —
-                                // the >=5 give-up would be unreachable and the loop
-                                // would spin at 2Hz forever, spamming the log. Reset
-                                // only on a *fully successful* connect (after
-                                // initialize succeeds, below).
-                                let client = std::sync::Arc::new(client);
-                                if let Err(e) = client.initialize().await {
-                                    failures += 1;
-                                    // Transient warmup failures stay at WARN so a
-                                    // slow-but-successful agent never trips the
-                                    // "error in thegn.log" badge; ERROR is reserved
-                                    // for the final give-up.
-                                    if failures >= 5 {
-                                        tracing::error!(target: "thegn::acp", attempt = failures, "ACP initialize failed, giving up: {e}");
-                                        finish(crate::chrome::AgentConn::Error);
-                                        return;
-                                    }
-                                    tracing::warn!(target: "thegn::acp", attempt = failures, "ACP initialize failed (retrying): {e}");
-                                    emit(crate::chrome::AgentConn::Connecting);
-                                } else {
-                                    // A fully-successful connect serves the message
-                                    // stream and then `return`s — it never loops
-                                    // back, so no failures/backoff reset is needed
-                                    // (audit run.rs:5421). The counter must NOT be
-                                    // reset before `initialize()`: a listener that
-                                    // accepts TCP but fails initialize would reset
-                                    // every cycle, making the >=5 give-up
-                                    // unreachable and spinning at 2Hz forever.
-                                    if let Err(e) = client.connect_mcp("thegn-house").await {
-                                        tracing::warn!(target: "thegn::acp", "mcp/connect failed: {e}");
-                                    }
-                                    if reg_tx.send((wt_name.clone(), client.clone())).is_err() {
-                                        finish(crate::chrome::AgentConn::Exited);
-                                        return;
-                                    }
-                                    emit(crate::chrome::AgentConn::Online);
-                                    while let Some(msg) = rx.recv().await {
-                                        if inbound_tx.send((wt_name.clone(), msg)).is_err() {
-                                            break;
-                                        }
-                                        let _ = waker_clone.wake();
-                                    }
-                                    finish(crate::chrome::AgentConn::Exited);
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                failures += 1;
-                                // Transient warmup failures stay at WARN; ERROR only
-                                // on the final give-up (see the initialize arm).
-                                if failures >= 5 {
-                                    tracing::error!(target: "thegn::acp", attempt = failures, "failed to connect to agent ACP channel, giving up: {e}");
-                                    finish(crate::chrome::AgentConn::Error);
-                                    return;
-                                }
-                                tracing::warn!(target: "thegn::acp", attempt = failures, "failed to connect to agent ACP channel (retrying): {e}");
-                                emit(crate::chrome::AgentConn::Connecting);
-                            }
-                        }
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
-                    }
-                });
-            }
-
             true
         }
         Err(e) => {
             thegn_core::msg::warn(&format!("agent launch failed: {e}"));
             false
         }
-    }
-}
-
-/// Service one inbound ACP message from an agent's `pi` subprocess. Requests are
-/// dispatched OFF the event loop (their replies are `async`; the loop must never
-/// block) via `tokio::spawn` + `spawn_blocking`, using the registered
-/// `AcpClient` to send the reply. Returns whether the frame should be repainted.
-///
-/// The reply shapes match the `thegn-acp.ts` pi extension exactly:
-/// `terminal/create → {output}`, `fs/read_text_file → {text}`,
-/// `thegn/edit`/`thegn/write → {status:"approved"|"rejected"}`. All file
-/// access is scoped to the worktree; shell commands run inside its sandbox.
-///
-/// NOTE: as of the "additive" integration, the extension no longer overrides
-/// pi's built-in bash/read/edit/write — pi runs those natively in-process — so
-/// the terminal/fs/edit arms below are currently UNEXERCISED. They are retained
-/// for the deferred "real bouncer" path (a sealed sandbox reachable via a
-/// unix-socket ACP transport + a review/approval gate), at which point the
-/// extension would re-route the core tools and these arms light up again.
-///
-/// Notifications (`session/update`) are handled by the caller against the
-/// rendered model; this services only requests that need a reply.
-/// Session-scoped bouncer remember-choice store: `(worktree, kind) -> allow`,
-/// shared between the loop (writer, on an "always" pick) and the off-loop gate
-/// tasks (readers, for the auto-resolve fast path).
-type AcpRemember = std::sync::Arc<
-    std::sync::Mutex<std::collections::HashMap<(String, crate::bouncer::ApprovalKind), bool>>,
->;
-
-#[allow(clippy::too_many_arguments)]
-fn dispatch_acp_inbound(
-    wt: &str,
-    inbound: thegn_svc::acp::client::AcpInbound,
-    acp_clients: &std::collections::HashMap<
-        String,
-        std::sync::Arc<thegn_svc::acp::client::AcpClient>,
-    >,
-    cfg: &thegn_core::config::Config,
-    event_bus: &thegn_core::event_bus::EventBus,
-    approval_tx: &tokio_mpsc::UnboundedSender<
-        crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>,
-    >,
-    remember: &AcpRemember,
-    waker: &TerminalWaker,
-) {
-    use thegn_svc::acp::client::AcpInbound;
-    let client = acp_clients.get(wt).cloned();
-    // In bouncer mode the consequential tools (shell/edit/write) are gated behind
-    // the user's approval; reads + MCP pass through. Off by default.
-    let bouncer = cfg.llm_proxy.bouncer;
-    match inbound {
-        AcpInbound::Initialized(caps) => {
-            tracing::debug!(target: "thegn::acp", worktree = %wt, ?caps, "agent initialized");
-        }
-        // Handled by the loop against the model; defensively ignored here.
-        AcpInbound::SessionUpdate(_) => {}
-        AcpInbound::FsReadRequest { id, path } => {
-            if let Some(client) = client {
-                let wt = wt.to_string();
-                tokio::spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::handlers::scoped_fs::read_scoped_file(&wt, &path)
-                    })
-                    .await
-                    .unwrap_or_else(|_| Err("read task panicked".to_string()));
-                    let reply = match result {
-                        // The pi `read` tool reads `result.text`.
-                        Ok(text) => {
-                            client
-                                .reply_result(id, serde_json::json!({ "text": text }))
-                                .await
-                        }
-                        Err(e) => client.reply_error(id, -32000, &e).await,
-                    };
-                    if let Err(e) = reply {
-                        tracing::error!(target: "thegn::acp", "fs/read reply failed: {e}");
-                    }
-                });
-            }
-        }
-        AcpInbound::TerminalCreateRequest { id, command, .. } => {
-            if let Some(client) = client {
-                let wt = wt.to_string();
-                let cfg = cfg.clone();
-                let approval_tx = approval_tx.clone();
-                let remember = remember.clone();
-                let waker = waker.clone();
-                tokio::spawn(async move {
-                    if !gate_approval(
-                        bouncer,
-                        &wt,
-                        crate::bouncer::ApprovalKind::Shell,
-                        command.clone(),
-                        &approval_tx,
-                        &remember,
-                        &waker,
-                    )
-                    .await
-                    {
-                        let _ = client
-                            .reply_error(id, -32001, "shell command denied by the thegn bouncer")
-                            .await;
-                        return;
-                    }
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::agent::run_in_sandbox(&cfg, &wt, &command)
-                    })
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("terminal task panicked")));
-                    let reply = match result {
-                        // The pi `bash` tool reads `result.output`.
-                        Ok(output) => {
-                            client
-                                .reply_result(id, serde_json::json!({ "output": output }))
-                                .await
-                        }
-                        Err(e) => client.reply_error(id, -32000, &e.to_string()).await,
-                    };
-                    if let Err(e) = reply {
-                        tracing::error!(target: "thegn::acp", "terminal/create reply failed: {e}");
-                    }
-                });
-            }
-        }
-        AcpInbound::ThegnWriteRequest { id, path, content } => {
-            if let Some(client) = client {
-                let wt = wt.to_string();
-                let approval_tx = approval_tx.clone();
-                let remember = remember.clone();
-                let waker = waker.clone();
-                tokio::spawn(async move {
-                    if !gate_approval(
-                        bouncer,
-                        &wt,
-                        crate::bouncer::ApprovalKind::Write,
-                        path.clone(),
-                        &approval_tx,
-                        &remember,
-                        &waker,
-                    )
-                    .await
-                    {
-                        let _ = client
-                            .reply_error(id, -32001, "write denied by the thegn bouncer")
-                            .await;
-                        return;
-                    }
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::handlers::scoped_fs::write_scoped_file(&wt, &path, &content)
-                    })
-                    .await
-                    .unwrap_or_else(|_| Err("write task panicked".to_string()));
-                    reply_edit_status(&client, id, result).await;
-                });
-            }
-        }
-        AcpInbound::ThegnEditRequest { id, path, edits } => {
-            if let Some(client) = client {
-                let wt = wt.to_string();
-                let approval_tx = approval_tx.clone();
-                let remember = remember.clone();
-                let waker = waker.clone();
-                tokio::spawn(async move {
-                    if !gate_approval(
-                        bouncer,
-                        &wt,
-                        crate::bouncer::ApprovalKind::Edit,
-                        path.clone(),
-                        &approval_tx,
-                        &remember,
-                        &waker,
-                    )
-                    .await
-                    {
-                        let _ = client
-                            .reply_error(id, -32001, "edit denied by the thegn bouncer")
-                            .await;
-                        return;
-                    }
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::handlers::scoped_fs::apply_scoped_edits(&wt, &path, &edits)
-                    })
-                    .await
-                    .unwrap_or_else(|_| Err("edit task panicked".to_string()));
-                    reply_edit_status(&client, id, result).await;
-                });
-            }
-        }
-        // MCP-over-ACP: route the agent's encapsulated MCP request through the
-        // host's McpRouter (budget/fleet/worktree-status/house tools) and reply
-        // with a `mcp/message` notification. Off-loop; the router opens the DB
-        // (`Connection` is !Send, so it's built + used inside spawn_blocking).
-        AcpInbound::McpMessage {
-            connection_id,
-            inner,
-        } => {
-            if let Some(client) = client {
-                let bus = event_bus.clone();
-                let wt_owned = wt.to_string();
-                // The merge house tools ride along only when the queue is enabled;
-                // the router build + DB open happen on the blocking thread (Db is
-                // !Send). Body lives in `mcp_merge` to keep this god-file lean.
-                let mq = cfg.merge_queue.enabled.then(|| cfg.merge_queue.clone());
-                tokio::spawn(async move {
-                    let resp = tokio::task::spawn_blocking(move || {
-                        crate::mcp_merge::handle_house_request(&inner, bus, &wt_owned, mq)
-                    })
-                    .await
-                    .unwrap_or_else(|_| {
-                        serde_json::json!({
-                            "jsonrpc": "2.0", "id": serde_json::Value::Null,
-                            "error": { "code": -32603, "message": "mcp task panicked" }
-                        })
-                    });
-                    if let Err(e) = client
-                        .send_notification(
-                            "mcp/message",
-                            serde_json::json!({ "connectionId": connection_id, "message": resp }),
-                        )
-                        .await
-                    {
-                        tracing::error!(target: "thegn::acp", "mcp/message reply failed: {e}");
-                    }
-                });
-            }
-        }
-    }
-}
-
-/// Build the approval overlay for a pending bouncer request: a 2-item allow/deny
-/// menu titled with the worktree + action, bodied with the command/path summary.
-fn approval_overlay<R>(req: &crate::bouncer::ApprovalRequest<R>) -> MenuOverlay {
-    let wt_name = thegn_core::util::basename(&req.worktree);
-    let title = format!(
-        "{} {wt_name} · agent wants to {}",
-        req.kind.glyph(),
-        req.kind.verb()
-    );
-    menu::approval_menu(title, crate::bouncer::summary(&req.detail))
-}
-
-/// Ask the bouncer gate for permission to run a consequential tool call (bouncer
-/// mode only). Sends an `ApprovalRequest` to the loop, pulses the waker so the
-/// overlay is raised, and awaits the user's decision. Returns `true` to proceed;
-/// a deny — or a gone loop — returns `false`. A no-op (`true`) when not gating.
-///
-/// A prior "always" pick for this `(worktree, kind)` short-circuits the overlay:
-/// the remembered decision is returned immediately without prompting.
-async fn gate_approval(
-    bouncer: bool,
-    wt: &str,
-    kind: crate::bouncer::ApprovalKind,
-    detail: String,
-    approval_tx: &tokio_mpsc::UnboundedSender<
-        crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>,
-    >,
-    remember: &AcpRemember,
-    waker: &TerminalWaker,
-) -> bool {
-    if !bouncer {
-        return true;
-    }
-    // Fast path: a remembered "always" decision auto-resolves without prompting.
-    // Copy out under the lock (never held across the await below).
-    if let Some(allow) = remember
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&(wt.to_string(), kind)).copied())
-    {
-        return allow;
-    }
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if approval_tx
-        .send(crate::bouncer::ApprovalRequest {
-            worktree: wt.to_string(),
-            kind,
-            detail,
-            reply: reply_tx,
-        })
-        .is_err()
-    {
-        return false; // loop gone
-    }
-    let _ = waker.wake();
-    reply_rx.await.unwrap_or(false)
-}
-
-/// Fold an ACP `session/update` into a worktree's agent-activity entry: track the
-/// latest tool call + its running state and the context-window usage. Message /
-/// thought / config chunks don't change the chip (a richer follow-along panel is
-/// a future addition), so they're ignored here. The connection lifecycle
-/// (`conn`) is owned by the status channel, not touched here.
-fn apply_agent_session_update(
-    a: &mut crate::chrome::AgentActivity,
-    update: thegn_core::acp::methods::SessionUpdateEvent,
-) {
-    use thegn_core::acp::methods::SessionUpdateEvent as E;
-    match update {
-        E::ToolCall { tool_name, .. } => {
-            a.last_tool = Some(tool_name);
-            a.running = true;
-        }
-        E::ToolCallUpdate { status, .. } => {
-            a.running = matches!(status.as_str(), "pending" | "in_progress");
-        }
-        E::UsageUpdate { used, size } => {
-            a.context_used = used;
-            a.context_size = size;
-        }
-        E::AgentEnd { .. } => {
-            // Turn finished: no tool is running. (Notification is published by
-            // the loop drain, which owns the EventBus.)
-            a.running = false;
-        }
-        E::AgentMessageChunk { .. }
-        | E::AgentThoughtChunk { .. }
-        | E::ConfigOptionUpdate { .. } => {}
-    }
-}
-
-/// Reply to a `thegn/edit` / `thegn/write` request with the
-/// `{status:"approved"}` shape the pi extension expects, or a JSON-RPC error.
-async fn reply_edit_status(
-    client: &thegn_svc::acp::client::AcpClient,
-    id: thegn_core::acp::types::Id,
-    result: Result<(), String>,
-) {
-    let reply = match result {
-        Ok(()) => {
-            client
-                .reply_result(id, serde_json::json!({ "status": "approved" }))
-                .await
-        }
-        Err(e) => client.reply_error(id, -32000, &e).await,
-    };
-    if let Err(e) = reply {
-        tracing::error!(target: "thegn::acp", "edit/write reply failed: {e}");
     }
 }
 
@@ -5811,7 +5267,6 @@ async fn event_loop<T: Terminal>(
     mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<thegn_core::sandbox::ContainerInfo>>,
     mut daemon_status_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::DaemonStatus>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
-    mut ai_metrics_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::AiMetrics>,
     mut sandbox_event_rx: tokio_mpsc::UnboundedReceiver<crate::sandbox_events::SandboxEventBatch>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -6512,50 +5967,6 @@ async fn event_loop<T: Terminal>(
     let mut pending_paste_register = false;
     let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(PANE_EVENT_CHANNEL_CAPACITY);
     let mut panes = Panes::with_waker(tx, waker.clone());
-
-    // ACP (upper control plane) request/reply plumbing. Each agent pane spawns a
-    // background `AcpClient` connect task; once connected it (1) registers its
-    // `Arc<AcpClient>` here so the loop can reply, and (2) forwards every inbound
-    // JSON-RPC message tagged with its worktree. The loop drains both channels on
-    // wake and services requests OFF-loop (replies are async; we never await on
-    // the loop — see `dispatch_acp_inbound`).
-    let (acp_inbound_tx, mut acp_inbound_rx) =
-        tokio_mpsc::unbounded_channel::<(String, thegn_svc::acp::client::AcpInbound)>();
-    let (acp_reg_tx, mut acp_reg_rx) = tokio_mpsc::unbounded_channel::<(
-        String,
-        std::sync::Arc<thegn_svc::acp::client::AcpClient>,
-    )>();
-    let mut acp_clients: std::collections::HashMap<
-        String,
-        std::sync::Arc<thegn_svc::acp::client::AcpClient>,
-    > = std::collections::HashMap::new();
-    // Per-worktree agent activity (the statusbar chip's source of truth) + a
-    // lifecycle-status channel the connect task feeds (connecting/online/exited/
-    // error). The chip is the *only* native agent signal, so it must reflect
-    // both progress (session updates) and connection failures. `model`'s single
-    // `agent_activity` is set from the FOCUSED worktree's entry each turn.
-    let (acp_status_tx, mut acp_status_rx) =
-        tokio_mpsc::unbounded_channel::<(String, crate::chrome::AgentConn)>();
-    let mut acp_activity: std::collections::HashMap<String, crate::chrome::AgentActivity> =
-        std::collections::HashMap::new();
-
-    // The bouncer's tool-approval gate (B1). When the agent runs sealed, its
-    // shell/edit/write tool calls are routed back over ACP and gated here: the
-    // off-loop servicing task sends an `ApprovalRequest` carrying a oneshot, and
-    // awaits the user's allow/deny. The loop drains the channel into a FIFO
-    // `ApprovalQueue`, shows one `approval_menu` overlay at a time, and resolves
-    // each request's oneshot on the pick. (No-op unless `[llm_proxy].bouncer`.)
-    type AcpApproval = crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>;
-    let (acp_approval_tx, mut acp_approval_rx) = tokio_mpsc::unbounded_channel::<AcpApproval>();
-    let mut acp_approvals: crate::bouncer::ApprovalQueue<tokio::sync::oneshot::Sender<bool>> =
-        crate::bouncer::ApprovalQueue::new();
-    // Session-scoped remember-choice store for the bouncer gate: an "always"
-    // pick records `(worktree, kind) -> allow` here, and the gate task consults
-    // it (off-loop) to auto-resolve matching calls without re-prompting. Shared
-    // with the gate tasks; the loop only ever writes it (on an "always" pick).
-    let acp_remember: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<(String, crate::bouncer::ApprovalKind), bool>>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     // The resurrected session restored each tab's tree with pane ids the
     // PREVIOUS process allocated (numbered from 1). This process's `next_id`
@@ -7274,6 +6685,7 @@ async fn event_loop<T: Terminal>(
             persist_session_layout(&mut session, &panes);
             // SIGTERM/SIGINT quit is a detach too — see Action::Quit.
             crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
+            crate::handlers::daemon_lifecycle::mark_parked_panes_detached(&workspace_pool, &panes);
             return Ok(());
         }
         // Writer-thread health: a transient write failure means the terminal's
@@ -7537,7 +6949,10 @@ async fn event_loop<T: Terminal>(
                 let wk = waker.clone();
                 task::spawn_blocking(move || {
                     let specs = if is_terminal {
-                        let (conn, sandbox) = terminal_launch_for(&name);
+                        // This session's wizard choice wins over the DB row (a
+                        // failed best-effort persist must not change the spawn).
+                        let (conn, sandbox) = crate::handlers::terminal::live_choice(&name)
+                            .unwrap_or_else(|| terminal_launch_for(&name));
                         let spec = crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox);
                         Ok(missing.into_iter().map(|id| (id, spec.clone())).collect())
                     } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
@@ -7885,8 +7300,6 @@ async fn event_loop<T: Terminal>(
                 loading_remote: &mut loading_remote,
                 loading_retired: &mut loading_retired,
                 respawn_crash_count: &mut respawn_crash_count,
-                active_menu: &mut active_menu,
-                halt_dismissed: &mut halt_dismissed,
                 center_dormant: &mut center_dormant,
                 shutdown: &shutdown,
                 event_bus: &event_bus,
@@ -7921,9 +7334,21 @@ async fn event_loop<T: Terminal>(
             &refresh_tx,
             &waker,
         );
+        // A sole pane's exit left its dead leaf for the materialize pipeline —
+        // but the lazy-materialize block runs BEFORE this drain in the loop
+        // body, so without a pulse the respawn would wait for the next
+        // incidental wake (up to the ~2s ticker). Self-wake so the next
+        // (immediate) turn kicks `maybe_materialize`. Exceptional exit path
+        // only: the idle loop still never polls.
+        if drain_summary.left_for_materialize {
+            // best-effort: a missed pulse only delays the respawn to the next
+            // incidental wake.
+            let _ = waker.wake();
+        }
         if drain_summary.disconnected {
             // Teardown, not an explicit close: keep daemon panes running.
             crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
+            crate::handlers::daemon_lifecycle::mark_parked_panes_detached(&workspace_pool, &panes);
             return Ok(());
         }
         if session.worktrees.is_empty() {
@@ -8966,128 +8391,12 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
-        // Register newly-connected agent ACP clients so the loop can reply to
-        // their requests (terminal/fs/edit) via `dispatch_acp_inbound`.
-        while let Ok((wt, client)) = acp_reg_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Other);
-            tracing::debug!(target: "thegn::acp", worktree = %wt, "agent ACP client registered");
-            acp_clients.insert(wt, client);
-        }
-
-        // Agent ACP connection lifecycle (connecting/online/exited/error) → the
-        // per-worktree activity entry, so the chip can show failure states.
-        while let Ok((wt, conn)) = acp_status_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Other);
-            acp_activity.entry(wt).or_default().conn = conn;
-            dirty = true;
-        }
-
-        // Service inbound ACP messages from agents. Requests are dispatched
-        // off-loop (their replies are async); session updates fold into the
-        // sending worktree's activity entry and mark the frame dirty.
-        while let Ok((wt, inbound)) = acp_inbound_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Other);
-            match inbound {
-                // Notifications mutate per-worktree activity (the loop owns it);
-                // requests are serviced off-loop with a reply.
-                thegn_svc::acp::client::AcpInbound::SessionUpdate(update) => {
-                    // Agent finished → notification inbox (desktop + Notifications
-                    // panel). Fires for user-driven turns too.
-                    if let thegn_core::acp::methods::SessionUpdateEvent::AgentEnd { success } =
-                        &update
-                    {
-                        let ev = if *success {
-                            thegn_core::event_bus::Event::AgentDone {
-                                worktree: wt.clone(),
-                                agent: "pi".to_string(),
-                                success: true,
-                            }
-                        } else {
-                            thegn_core::event_bus::Event::AgentFailed {
-                                worktree: wt.clone(),
-                                agent: "pi".to_string(),
-                                error: "agent turn failed".to_string(),
-                            }
-                        };
-                        event_bus.publish(&ev);
-                        // Chime on agent-turn completion (on by default via
-                        // `[notifications.sound] always_kinds`; suppressed for the
-                        // focused worktree + gated by rules/DND like any cue).
-                        let kind = if *success {
-                            "agent_done"
-                        } else {
-                            "agent_failed"
-                        };
-                        let base = thegn_core::util::basename(&wt);
-                        let msg = format!(
-                            "agent {} in {base}",
-                            if *success { "finished" } else { "failed" }
-                        );
-                        let dec = notify_state.decide(kind, &wt, &msg, &wt);
-                        notify_state.emit_sound(&dec);
-                    }
-                    apply_agent_session_update(acp_activity.entry(wt).or_default(), update);
-                    dirty = true;
-                }
-                other => {
-                    dispatch_acp_inbound(
-                        &wt,
-                        other,
-                        &acp_clients,
-                        keymap.config(),
-                        &event_bus,
-                        &acp_approval_tx,
-                        &acp_remember,
-                        &waker,
-                    );
-                }
-            }
-        }
-
-        // Drain pending bouncer approvals into the FIFO gate. When one becomes
-        // active and no other menu is open, raise the approval overlay (an
-        // overlay forces a Full frame — the render invariant handles repaint).
-        while let Ok(req) = acp_approval_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Other);
-            let became_active = acp_approvals.enqueue(req);
-            if became_active
-                && active_menu.is_none()
-                && let Some(active) = acp_approvals.active()
-            {
-                active_menu = Some(approval_overlay(active));
-                dirty = true;
-            }
-        }
-
-        // The chip tracks the FOCUSED worktree's agent (the map is per-worktree).
-        let focused_activity = session
-            .active_group()
-            .and_then(|g| acp_activity.get(&g.path).cloned());
-        if model.agent_activity != focused_activity {
-            model.agent_activity = focused_activity;
-            dirty = true;
-        }
-
         // Fresh metrics readings from the scrape supervisor (sidebar section).
         while let Ok(state) = metrics_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Metrics);
             if model.metrics != state {
                 model.metrics = state;
                 dirty = true;
-            }
-        }
-
-        // AI sidecar metrics — a SIBLING drain (audit run.rs:9046), not nested
-        // inside the metrics drain: the two producers are independent, and with
-        // `[metrics]` targets empty (the default) the metrics loop body never
-        // runs, so a nested drain would never consume ai_metrics — the unbounded
-        // channel would grow forever and every sidecar wake would be wasted.
-        while let Ok(ai_state) = ai_metrics_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Metrics);
-            if model.ai_metrics.as_ref() != Some(&ai_state) {
-                model.ai_metrics = Some(ai_state);
-                // AI metrics render in the statusbar → bars path, not full.
-                bars_dirty = true;
             }
         }
 
@@ -9296,13 +8605,7 @@ async fn event_loop<T: Terminal>(
                             &mut panes,
                             &payload.tab,
                             &payload.spec,
-                            &payload.agent,
                             chrome.center,
-                            keymap.config(),
-                            &acp_inbound_tx,
-                            &acp_reg_tx,
-                            &acp_status_tx,
-                            &waker,
                         );
                     if attached || native_provider {
                         // Only pull focus to the new pane when its tab is active
@@ -9687,9 +8990,6 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::Onboarding(r) => {
                     dirty |=
                         crate::handlers::onboarding::apply_probe(&mut onboarding, *r, &mut model)
-                }
-                RefreshKind::ProxyDash(p) => {
-                    dirty |= crate::detail::apply_proxy_dash(&mut bar_detail, *p)
                 }
                 RefreshKind::Usage(p) => dirty |= crate::detail::apply_usage(&mut bar_detail, *p),
                 // Branch ref moved: heal the checkout off-loop + drop the cache.
@@ -10257,14 +9557,16 @@ async fn event_loop<T: Terminal>(
                     model.sidebar_window_titles.insert(path, title);
                 }
             }
-            if !title_writes.is_empty()
-                && let Ok(db) = thegn_core::db::Db::open()
-            {
-                for (path, title) in &title_writes {
-                    // best-effort: the DB is a cache; a failed title write must
-                    // never take down the compositor.
-                    let _ = db.set_worktree_window_title(path, title);
-                }
+            if !title_writes.is_empty() {
+                // Persist off the loop: `Db::open()` + write on the render path
+                // ran a synchronous DB open per title change (frequent during a
+                // build/ls that repaints the title). The background writer thread
+                // owns these best-effort cache writes (DB is a cache; git is truth).
+                crate::db_task::persist(move |db| {
+                    for (path, title) in &title_writes {
+                        let _ = db.set_worktree_window_title(path, title);
+                    }
+                });
             }
             // Notification routing chip state (DND + active mode), read fresh so a
             // scheduled DND window flips the chip as time passes (evaluated at
@@ -11912,10 +11214,21 @@ async fn event_loop<T: Terminal>(
                         match text {
                             Some(t) if !t.is_empty() => {
                                 if let Some(p) = panes.table.get_mut(&focused) {
-                                    // best-effort: pasting into a just-closed pane
-                                    // must not take down the whole compositor.
-                                    if let Err(e) = paste_text_into_pane(p, &t) {
-                                        tracing::debug!(error = %e, "register paste failed (pane closing)");
+                                    match paste_text_into_pane(p, &t) {
+                                        Ok(()) => {}
+                                        // Congestion-drop of a user-invoked paste
+                                        // must be surfaced, not swallowed.
+                                        Err(crate::pane_writer::StdinSendError::Full) => {
+                                            toasts.info(
+                                                "pane isn't reading input — paste dropped",
+                                                std::time::Instant::now(),
+                                            );
+                                        }
+                                        // best-effort: pasting into a just-closed pane
+                                        // must not take down the whole compositor.
+                                        Err(e) => {
+                                            tracing::debug!(error = %e, "register paste failed (pane closing)");
+                                        }
                                     }
                                 }
                             }
@@ -12186,8 +11499,16 @@ async fn event_loop<T: Terminal>(
                 let mut forced_which_key: Option<crate::sequence::Key> = None;
                 // Worktree creation is non-modal (its own tab's loading splash);
                 // it swallows no input. Failure removes the tab + shows status.
-                // Modal: the new-terminal wizard captures all keys; submit is
-                // synchronous (DB upsert + pane spawn), handled inline below.
+                // Modal: the new-terminal wizard captures all keys; submit only
+                // persists the row + stages a placeholder leaf — the spawn
+                // resolution (SQLite open, git subprocess, backend probe inside
+                // `terminal_launch_spec`) rides the off-thread lazy-materialize
+                // kick on the next loop turn, same as sidebar activation of a
+                // non-resident terminal. Accepted deltas of sharing that path:
+                // Esc during the (ms-scale, local) materialize splash pins the
+                // group to host via the sticky `request_force_host` registry,
+                // and keys typed before the spec lands are dropped rather than
+                // reaching the shell — both match sidebar activation today.
                 if let Some(w) = terminal_wizard_ui.as_mut() {
                     match w.handle_key(&k.key, k.modifiers) {
                         crate::terminal_wizard::Outcome::Pending => {}
@@ -12195,35 +11516,42 @@ async fn event_loop<T: Terminal>(
                             terminal_wizard_ui = None;
                             model.status = "new terminal cancelled".into();
                         }
-                        crate::terminal_wizard::Outcome::Submit(choice) => {
+                        crate::terminal_wizard::Outcome::Submit(mut choice) => {
                             terminal_wizard_ui = None;
-                            crate::handlers::terminal::persist(&choice);
-                            session
-                                .worktrees
-                                .push(crate::session::WorktreeGroup::terminal(&choice.name));
-                            session.active = session.worktrees.len() - 1;
-                            let cwd = active_cwd(&session);
-                            let new = match spawn_worktree_shell_pane(
-                                &mut panes,
-                                keymap.config(),
-                                cwd.as_deref(),
-                                chrome.center,
-                                true,
-                                Some(&choice.connection),
-                                &choice.sandbox,
-                            ) {
-                                Ok(id) => id,
-                                Err(e) => {
-                                    model.status = format!("Terminal spawn failed: {e}");
-                                    continue;
-                                }
-                            };
-                            if let Some(tab) = session.active_tab_mut() {
-                                tab.center = crate::center::CenterTree::Leaf(new);
-                                tab.focused_pane = new;
+                            // Uniquify the terminal name against existing groups
+                            // BEFORE persist / registry / push. Spec batches are
+                            // routed by group name (drain_specs resolves the
+                            // FIRST group with a matching name), so a duplicate
+                            // name would route the new group's placeholder leaf
+                            // to the wrong group — the departed-leaf guard eats
+                            // it and the new terminal never materializes. The
+                            // wizard already dedupes its random slug; a typed
+                            // name reaches here verbatim, so dedupe it here too.
+                            {
+                                let taken = thegn_core::worktree::BranchSet::from_names(
+                                    session.worktrees.iter().map(|g| g.name.clone()),
+                                );
+                                choice.name = thegn_core::worktree::dedupe(&choice.name, &taken);
                             }
+                            // The tiny upsert stays synchronous (sanctioned
+                            // best-effort-persist family); the live spawn reads
+                            // the in-process choice registry, so a failed write
+                            // only loses restart persistence — surface it.
+                            if !crate::handlers::terminal::persist(&choice) {
+                                model.status =
+                                    "terminal not saved — it won't be remembered across restarts"
+                                        .into();
+                            }
+                            crate::handlers::terminal::push_terminal_group(
+                                &mut session,
+                                &mut panes,
+                                &choice,
+                            );
                             focus.zone = crate::focus::Zone::Center;
                             refresh_tab_model(&mut model, &session, &mut sb);
+                            // Structural change (new group): mirror sidebar
+                            // activation so it survives a non-graceful exit.
+                            persist_session_layout(&mut session, &panes);
                             need_relayout = true;
                         }
                     }
@@ -12704,36 +12032,26 @@ async fn event_loop<T: Terminal>(
                     match m.handle_key(&k.key, k.modifiers) {
                         menu::MenuOutcome::Pending => {}
                         menu::MenuOutcome::Cancel => {
-                            // Esc on the bouncer gate = deny: reject the active
-                            // tool call and advance to the next queued approval.
-                            if m.tag == menu::MenuKindTag::Approval {
-                                if let Some(done) = acp_approvals.resolve() {
-                                    let _ = done.reply.send(false);
-                                }
-                                active_menu = acp_approvals.active().map(approval_overlay);
-                                // (the common `dirty = true` after this match repaints)
-                            } else {
-                                // Dismissing the first-launch keymap picker (item
-                                // 621) counts as choosing the defaults — persist so
-                                // it never reappears.
-                                if m.tag == menu::MenuKindTag::KeymapPicker
-                                    && let Ok(db) = thegn_core::db::Db::open()
-                                {
-                                    let _ = db.set_ui_state("", "keymap_preset", "default");
-                                }
-                                // Esc on the sandbox-halt modal is a dismissal:
-                                // suppress it for this key (the row's error dot
-                                // carries the state; revisiting won't re-block).
-                                if m.tag == menu::MenuKindTag::SandboxHalt
-                                    && let Some(g) = session.worktrees.get(session.active)
-                                {
-                                    halt_dismissed.insert((g.name.clone(), g.active_tab));
-                                }
-                                active_menu = None;
-                                pending_confirm_op = None;
-                                pending_undo = None;
-                                pending_delete_workspace = None;
+                            // Dismissing the first-launch keymap picker (item
+                            // 621) counts as choosing the defaults — persist so
+                            // it never reappears.
+                            if m.tag == menu::MenuKindTag::KeymapPicker
+                                && let Ok(db) = thegn_core::db::Db::open()
+                            {
+                                let _ = db.set_ui_state("", "keymap_preset", "default");
                             }
+                            // Esc on the sandbox-halt modal is a dismissal:
+                            // suppress it for this key (the row's error dot
+                            // carries the state; revisiting won't re-block).
+                            if m.tag == menu::MenuKindTag::SandboxHalt
+                                && let Some(g) = session.worktrees.get(session.active)
+                            {
+                                halt_dismissed.insert((g.name.clone(), g.active_tab));
+                            }
+                            active_menu = None;
+                            pending_confirm_op = None;
+                            pending_undo = None;
+                            pending_delete_workspace = None;
                         }
                         menu::MenuOutcome::Pick(choice) => {
                             // Capture the tag before clearing: the `[n] dismiss`
@@ -12741,24 +12059,6 @@ async fn event_loop<T: Terminal>(
                             // dismissal below must be gated on this being one.
                             let was_halt = m.tag == menu::MenuKindTag::SandboxHalt;
                             active_menu = None;
-                            // Bouncer gate: send the user's allow/deny to the
-                            // waiting tool-servicing task, then raise the next
-                            // queued approval (if any). An "always" pick is also
-                            // remembered for this worktree + action so future
-                            // same-kind calls auto-resolve at the gate.
-                            if let menu::MenuChoice::ApproveTool { decision } = choice {
-                                if let Some(done) = acp_approvals.resolve() {
-                                    if let Some(allow) = decision.remembered()
-                                        && let Ok(mut m) = acp_remember.lock()
-                                    {
-                                        m.insert((done.worktree.clone(), done.kind), allow);
-                                    }
-                                    let _ = done.reply.send(decision.allowed());
-                                }
-                                active_menu = acp_approvals.active().map(approval_overlay);
-                                dirty = true;
-                                continue;
-                            }
                             // Sandbox-halt/ask modal `[r] retry` / `[h] run on host`.
                             {
                                 let active_wt = active_cwd(&session);
@@ -13414,7 +12714,9 @@ async fn event_loop<T: Terminal>(
                                             .or_else(|_| std::env::var("VISUAL"))
                                             .unwrap_or_else(|_| "vi".into());
                                         let line_arg = format!("+{line_no}");
-                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                        let queued = if let Some(focused_pane) =
+                                            panes.table.get_mut(&focused)
+                                        {
                                             // Shell-quote the path: it's written into
                                             // the pane's live shell, and a filename
                                             // with a space or metacharacter would
@@ -13425,9 +12727,14 @@ async fn event_loop<T: Terminal>(
                                                     &abs_path.display().to_string()
                                                 )
                                             );
-                                            let _ = focused_pane.write_input(cmd.as_bytes());
-                                        }
-                                        model.status = format!("Opening {}:{line_no}", rel_path);
+                                            focused_pane.write_input(cmd.as_bytes()).is_ok()
+                                        } else {
+                                            false
+                                        };
+                                        model.status = injected_command_status(
+                                            queued,
+                                            format!("Opening {}:{line_no}", rel_path),
+                                        );
                                     }
                                     palette = None;
                                     dirty = true;
@@ -13458,17 +12765,25 @@ async fn event_loop<T: Terminal>(
                                                 thegn_core::util::now(),
                                             );
                                         }
-                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                        let queued = if let Some(focused_pane) =
+                                            panes.table.get_mut(&focused)
+                                        {
                                             let cmd = format!(
                                                 "{}={} {}\n",
                                                 p.home_env,
                                                 dir_s,
                                                 p.login_argv.join(" ")
                                             );
-                                            let _ = focused_pane.write_input(cmd.as_bytes());
-                                        }
-                                        model.status = format!(
-                                            "Logging into {provider}:{name} — finish in the terminal"
+                                            focused_pane.write_input(cmd.as_bytes()).is_ok()
+                                        } else {
+                                            false
+                                        };
+                                        model.status = injected_command_status(
+                                            queued,
+                                            format!(
+                                                "Logging into {provider}:{name} — \
+                                                 finish in the terminal"
+                                            ),
                                         );
                                     }
                                     palette = None;
@@ -13628,22 +12943,28 @@ async fn event_loop<T: Terminal>(
                                     continue;
                                 } else if let Some(branch) = key.strip_prefix("git-branch:") {
                                     let wt_path = active_tab_path(&session);
-                                    if let Some(focused_pane) = panes.table.get_mut(&focused) {
-                                        // Both the worktree path and the branch name
-                                        // are shell-quoted: they're written into the
-                                        // pane's live shell, and git allows branch
-                                        // names with characters a shell would treat
-                                        // as metacharacters (injection otherwise).
-                                        let cmd = format!(
-                                            "git -C {} checkout {}\n",
-                                            thegn_core::util::sh_quote(
-                                                &wt_path.display().to_string()
-                                            ),
-                                            thegn_core::util::sh_quote(branch),
-                                        );
-                                        let _ = focused_pane.write_input(cmd.as_bytes());
-                                    }
-                                    model.status = format!("Switched to branch {branch}");
+                                    let queued =
+                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                            // Both the worktree path and the branch name
+                                            // are shell-quoted: they're written into the
+                                            // pane's live shell, and git allows branch
+                                            // names with characters a shell would treat
+                                            // as metacharacters (injection otherwise).
+                                            let cmd = format!(
+                                                "git -C {} checkout {}\n",
+                                                thegn_core::util::sh_quote(
+                                                    &wt_path.display().to_string()
+                                                ),
+                                                thegn_core::util::sh_quote(branch),
+                                            );
+                                            focused_pane.write_input(cmd.as_bytes()).is_ok()
+                                        } else {
+                                            false
+                                        };
+                                    model.status = injected_command_status(
+                                        queued,
+                                        format!("Switched to branch {branch}"),
+                                    );
                                     palette = None;
                                     dirty = true;
                                     continue;
@@ -13654,16 +12975,22 @@ async fn event_loop<T: Terminal>(
                                     continue;
                                 } else if let Some(idx_str) = key.strip_prefix("git-stash:") {
                                     let wt_path = active_tab_path(&session);
-                                    if let Some(focused_pane) = panes.table.get_mut(&focused) {
-                                        let cmd = format!(
-                                            "git -C {} stash pop --index {idx_str}\n",
-                                            thegn_core::util::sh_quote(
-                                                &wt_path.display().to_string()
-                                            )
-                                        );
-                                        let _ = focused_pane.write_input(cmd.as_bytes());
-                                    }
-                                    model.status = format!("Popped stash {idx_str}");
+                                    let queued =
+                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                            let cmd = format!(
+                                                "git -C {} stash pop --index {idx_str}\n",
+                                                thegn_core::util::sh_quote(
+                                                    &wt_path.display().to_string()
+                                                )
+                                            );
+                                            focused_pane.write_input(cmd.as_bytes()).is_ok()
+                                        } else {
+                                            false
+                                        };
+                                    model.status = injected_command_status(
+                                        queued,
+                                        format!("Popped stash {idx_str}"),
+                                    );
                                     palette = None;
                                     dirty = true;
                                     continue;
@@ -13691,10 +13018,17 @@ async fn event_loop<T: Terminal>(
                                             }
                                             _ => format!("{cmd}\n"),
                                         };
-                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
-                                            let _ = focused_pane.write_input(line.as_bytes());
-                                        }
-                                        model.status = format!("Running task {name}");
+                                        let queued = if let Some(focused_pane) =
+                                            panes.table.get_mut(&focused)
+                                        {
+                                            focused_pane.write_input(line.as_bytes()).is_ok()
+                                        } else {
+                                            false
+                                        };
+                                        model.status = injected_command_status(
+                                            queued,
+                                            format!("Running task {name}"),
+                                        );
                                     } else {
                                         model.status = format!("task {name} not found");
                                     }
@@ -13843,6 +13177,10 @@ async fn event_loop<T: Terminal>(
                                     persist_session_layout(&mut session, &panes);
                                     crate::handlers::daemon_lifecycle::mark_session_panes_detached(
                                         &session, &panes,
+                                    );
+                                    crate::handlers::daemon_lifecycle::mark_parked_panes_detached(
+                                        &workspace_pool,
+                                        &panes,
                                     );
                                     return Ok(());
                                 } else if let Some(payload) = key.strip_prefix("wt:") {
@@ -14152,7 +13490,12 @@ async fn event_loop<T: Terminal>(
                         let app = p.emulator().application_cursor();
                         if let Some(bytes) = crate::input::key_bytes_mode(&k.key, k.modifiers, app)
                         {
-                            p.write_input(&bytes)?;
+                            // best-effort: a locked-keys write to a congested or
+                            // dead pane must NEVER tear down the compositor —
+                            // drop the keystroke like the unlocked path does.
+                            if let Err(e) = p.write_input(&bytes) {
+                                tracing::debug!(target: "thegn::pane", pane = target_pane, "pane write dropped (queue full or child exited): {e}");
+                            }
                         }
                     }
                     continue;
@@ -16281,9 +15624,6 @@ async fn event_loop<T: Terminal>(
                                                     keymap.config(),
                                                     pane_cwd.as_deref(),
                                                     chrome.center,
-                                                    false,
-                                                    None,
-                                                    "",
                                                 ),
                                             };
                                             match spawned {
@@ -16359,9 +15699,17 @@ async fn event_loop<T: Terminal>(
                             Action::Quit | Action::Detach => {
                                 persist_session_layout(&mut session, &panes);
                                 // Quit is a detach: daemon-backed center panes
-                                // keep running; the next launch reattaches.
+                                // keep running; the next launch reattaches. Cover
+                                // BOTH the active session and the parked
+                                // (resident-pool) workspaces — the latter's panes
+                                // stay live in the table but aren't in `session`,
+                                // so they'd otherwise be killed on drop.
                                 crate::handlers::daemon_lifecycle::mark_session_panes_detached(
                                     &session, &panes,
+                                );
+                                crate::handlers::daemon_lifecycle::mark_parked_panes_detached(
+                                    &workspace_pool,
+                                    &panes,
                                 );
                                 return Ok(());
                             }
@@ -16795,11 +16143,6 @@ async fn event_loop<T: Terminal>(
                                     &mut share_supervisor,
                                     &session,
                                 );
-                            }
-                            Action::OpenProxyDash => {
-                                // Loading shell now; DB gather lands off-loop.
-                                bar_detail = Some(crate::detail::proxy_dash_loading(cols, rows));
-                                crate::actions::spawn_proxy_dash(&refresh_tx, &waker);
                             }
                             Action::OpenUsage => {
                                 // Loading shell now; the per-harness gather lands off-loop.
@@ -18337,7 +17680,20 @@ async fn event_loop<T: Terminal>(
                             if let Some(p) = panes.table.get_mut(&relaunch_target)
                                 && let Some(cmd) = p.take_pending_relaunch()
                             {
-                                let _ = p.write_input(format!("{cmd}\r").as_bytes());
+                                // A `Full` drop (child wedged / not reading) must
+                                // NOT lose the user's only copy of the crashed
+                                // pane's command — re-arm the overlay so Enter can
+                                // be retried. Closed ⇒ the pane is gone, drop it.
+                                match p.write_input(format!("{cmd}\r").as_bytes()) {
+                                    Ok(()) => {}
+                                    Err(crate::pane_writer::StdinSendError::Full) => {
+                                        p.set_pending_relaunch(Some(cmd));
+                                        model.status = "pane isn't reading input — \
+                                             press Enter again to relaunch"
+                                            .into();
+                                    }
+                                    Err(crate::pane_writer::StdinSendError::Closed) => {}
+                                }
                             }
                             keymap.reset();
                             dirty = true;
@@ -18418,29 +17774,42 @@ async fn event_loop<T: Terminal>(
                             }
                         }
                     } else if let Some(p) = panes.table.get_mut(&target_pane) {
-                        p.write_input(&batched)?;
+                        // best-effort: a write to a pane whose queue is congested
+                        // (child not reading) or whose child already exited must
+                        // NEVER tear down the compositor — the writer warns once
+                        // per congestion episode and the reaper retires a dead
+                        // pane on its next EOF/exit event. On a failed write
+                        // there is nothing to echo, so skip prediction.
+                        let wrote = match p.write_input(&batched) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::debug!(target: "thegn::pane", pane = target_pane, "pane write dropped (queue full or child exited): {e}");
+                                false
+                            }
+                        };
                         // Predictive local echo: show the keystroke(s) instantly
                         // (PtyPane gates this to slow links + prompt rows, never in
                         // a TUI) and dirty the pane so the overlay paints THIS frame
                         // — ~one RTT before the server's echo lands and retires it.
-                        let predicted = match k.key {
-                            KeyCode::Char(c)
-                                if !c.is_control()
-                                    && !k.modifiers.intersects(
-                                        Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER,
-                                    ) =>
-                            {
-                                let mut any = false;
-                                for _ in 0..repeat.max(1) {
-                                    any |= p.predict_key(c);
+                        let predicted = wrote
+                            && match k.key {
+                                KeyCode::Char(c)
+                                    if !c.is_control()
+                                        && !k.modifiers.intersects(
+                                            Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER,
+                                        ) =>
+                                {
+                                    let mut any = false;
+                                    for _ in 0..repeat.max(1) {
+                                        any |= p.predict_key(c);
+                                    }
+                                    any
                                 }
-                                any
-                            }
-                            KeyCode::Backspace => p.predict_backspace(),
-                            // Enter + any non-printable key retire the overlay (the
-                            // server redraws the line / screen).
-                            _ => p.predict_flush(),
-                        };
+                                KeyCode::Backspace => p.predict_backspace(),
+                                // Enter + any non-printable key retire the overlay (the
+                                // server redraws the line / screen).
+                                _ => p.predict_flush(),
+                            };
                         if predicted {
                             dirty_panes.insert(target_pane);
                         }
@@ -18553,13 +17922,25 @@ async fn event_loop<T: Terminal>(
                 };
                 if let Some(p) = panes.table.get_mut(&target_pane) {
                     // Honor bracketed paste when the app requested it, so
-                    // editors don't auto-indent pasted blocks.
-                    if p.emulator().bracketed_paste() {
-                        p.write_input(b"\x1b[200~")?;
-                        p.write_input(s.as_bytes())?;
-                        p.write_input(b"\x1b[201~")?;
-                    } else {
-                        p.write_input(s.as_bytes())?;
+                    // editors don't auto-indent pasted blocks. The paste is
+                    // queued as ONE chunk (embedded markers neutralized) and a
+                    // user-invoked drop is surfaced, never `?`-propagated — a
+                    // paste into a congested or dead pane must not tear down
+                    // the compositor.
+                    match paste_text_into_pane(p, &s) {
+                        Ok(()) => {}
+                        Err(crate::pane_writer::StdinSendError::Full) => {
+                            toasts.info(
+                                "pane isn't reading input — paste dropped",
+                                std::time::Instant::now(),
+                            );
+                            dirty = true;
+                        }
+                        // best-effort: the reaper retires the dead pane on its
+                        // next EOF/exit event; nothing to surface beyond debug.
+                        Err(e) => {
+                            tracing::debug!(target: "thegn::pane", pane = target_pane, "terminal paste dropped (pane closing): {e}");
+                        }
                     }
                     keymap.reset();
                 }

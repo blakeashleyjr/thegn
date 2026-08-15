@@ -3,9 +3,9 @@
 //! For a provider worktree, run an in-sandbox `thegn bridge-revtunnel <port>` (the
 //! resident musl bridge) and pump [`thegn_svc::revtunnel::run_host`] over the
 //! provider exec stream, so a process *inside* the sprite reaching
-//! `127.0.0.1:<port>` transparently hits a real **host** service — by default the
-//! local `tgproxy` (so any agent there routes through the proxy), and (P1) host
-//! `localhost` DB/API or a host-bound MCP server.
+//! `127.0.0.1:<port>` transparently hits a real **host** service — e.g. the
+//! embedded host nix cache, a host `localhost` DB/API, or a host-bound MCP
+//! server.
 //!
 //! The tunnel mechanics ([`run_host`]/`run_sandbox`/`exec_stream`) are mock-tested
 //! in `thegn-svc`; this is the thin lifecycle glue (start per worktree, stop on
@@ -73,8 +73,8 @@ impl ReverseTunnelSupervisor {
 
     /// Start a reverse tunnel for `worktree`: bind `sandbox_port` inside the
     /// sandbox (via the resident bridge at `bridge_path`) and forward every
-    /// connection to the host `host_target` (`host:port`, e.g. `127.0.0.1:8383`
-    /// for `tgproxy`). Idempotent per `(worktree, sandbox_port)`. `handle` is the
+    /// connection to the host `host_target` (`host:port`, e.g. the host nix
+    /// cache). Idempotent per `(worktree, sandbox_port)`. `handle` is the
     /// tokio runtime to spawn the pump on (callers run inside `spawn_blocking`,
     /// which has no ambient runtime).
     #[allow(clippy::too_many_arguments)]
@@ -178,8 +178,8 @@ impl ReverseTunnelSupervisor {
         if crate::bridge_sup::bridge_binary_path().is_none() {
             if !BRIDGE_MISSING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 thegn_core::msg::warn(
-                    "reverse tunnels (nix cache :8484 / proxy :8383) disabled: no resident \
-                     bridge binary — build it (`just bridge` / `nix build .#thegn-musl`) and set \
+                    "reverse tunnels (nix cache :8484) disabled: no resident bridge binary — \
+                     build it (`just bridge` / `nix build .#thegn-musl`) and set \
                      THEGN_BRIDGE_BINARY",
                 );
             }

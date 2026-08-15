@@ -15,7 +15,7 @@
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 
-use crate::chrome::{self, BarBadge, BarItemId, FrameModel, S};
+use crate::chrome::{BarBadge, BarItemId, FrameModel, S};
 use crate::compositor::Rect;
 use crate::layer::{self, Anchor, LayerSpec};
 use crate::seg::{self, Line, Tok, seg};
@@ -168,10 +168,8 @@ impl DetailAction {
 /// `crate::detail::{apply_ci_detail, CiDetailPayload}`.
 mod ci_drill;
 pub use ci_drill::{CiDetailPayload, apply_ci_detail};
-mod proxy_dash;
 mod usage_dash;
 use ci_drill::{ci_fmt_secs, ci_glyph_marker, ci_state_word};
-pub use proxy_dash::{ProxyDashPayload, apply_proxy_dash, proxy_dash_loading};
 pub use usage_dash::{UsagePayload, apply_usage, usage_loading};
 
 /// One scrollable list row: a colored marker glyph, the body text, and an
@@ -2058,37 +2056,6 @@ fn badge_detail(
         BarBadge::Notifications | BarBadge::Attention | BarBadge::MergeQueue => {
             unified_detail(model)
         }
-        BarBadge::Agent => {
-            let a = model.agent_activity.as_ref()?;
-            let conn = match a.conn {
-                chrome::AgentConn::Online => "online",
-                chrome::AgentConn::Connecting => "connecting",
-                chrome::AgentConn::Exited => "offline",
-                chrome::AgentConn::Error => "error",
-            };
-            let mut pairs = vec![
-                ("connection".into(), conn.into(), Tok::Slot(S::Text)),
-                (
-                    "last tool".into(),
-                    a.last_tool.clone().unwrap_or_else(|| "—".into()),
-                    Tok::Slot(S::Dim),
-                ),
-                (
-                    "running".into(),
-                    if a.running { "yes".into() } else { "no".into() },
-                    Tok::Slot(S::Dim),
-                ),
-            ];
-            if a.context_size > 0 {
-                let pct = (a.context_used * 100 / a.context_size).clamp(0, 100);
-                pairs.push((
-                    "context".into(),
-                    format!("{pct}% ({}/{})", a.context_used, a.context_size),
-                    Tok::Slot(S::Dim),
-                ));
-            }
-            Some(keyval("Agent", pairs, 56, Placement::Center))
-        }
         BarBadge::Ci => {
             if model.panel.ci_runs.is_empty() {
                 return None;
@@ -2196,27 +2163,6 @@ fn badge_detail(
                 vec![("track".into(), text, Tok::Hue(Hue::Green))],
                 50,
                 near,
-            ))
-        }
-        BarBadge::AiCost => {
-            let m = model.ai_metrics.as_ref()?;
-            Some(keyval(
-                "Agent spend",
-                vec![
-                    ("agent".into(), m.agent.clone(), Tok::Slot(S::Text)),
-                    (
-                        "cost".into(),
-                        format!("${:.2}", m.cost),
-                        Tok::Hue(Hue::Teal),
-                    ),
-                    (
-                        "tokens".into(),
-                        format!("{}", m.tokens.input + m.tokens.output),
-                        Tok::Slot(S::Dim),
-                    ),
-                ],
-                44,
-                Placement::Center,
             ))
         }
         BarBadge::DiskWarn => {
@@ -2739,7 +2685,7 @@ fn logs_row(model: &FrameModel, notes: &[thegn_core::notification::Notification]
 }
 
 /// The notification marker glyph + color — a thin caps-aware adapter over the
-/// single core vocabulary ([`NotificationKind::hued_glyph`]) so the overlay and
+/// single core vocabulary ([`thegn_core::notification::NotificationKind::hued_glyph`]) so the overlay and
 /// the panel inbox section can never diverge.
 fn notif_glyph(kind: thegn_core::notification::NotificationKind) -> (&'static str, Tok) {
     let (glyph, hue) = kind.hued_glyph(crate::caps::active_glyphs());

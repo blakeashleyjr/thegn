@@ -220,6 +220,9 @@ impl Control for GrpcControl {
                 kind,
                 r.rows.min(u16::MAX as u32) as u16,
                 r.cols.min(u16::MAX as u32) as u16,
+                // The proto has no history flag yet; gRPC attaches are always
+                // fresh clients, so the full-context snapshot is correct.
+                true,
             )
             .await
             .map_err(Status::from)?;

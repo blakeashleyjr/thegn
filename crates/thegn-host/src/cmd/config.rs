@@ -53,8 +53,70 @@ pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
         Action::Get { key, json } => get(cfg, &key, json)?,
         Action::Edit => edit(&path)?,
         Action::Set { key, value } => {
+            // Capture the prior file so a bad write can be rolled back: a mistyped
+            // value for a typed field would otherwise make the WHOLE config
+            // unparseable, silently reverting every setting to defaults on the
+            // next load. Re-validate after writing and restore on failure.
+            let prior = std::fs::read(&path).ok();
             thegn_core::config_write::set_key(&path, &key, &value)?;
+            let written = std::fs::read_to_string(&path).unwrap_or_default();
+            let parse_err = toml::from_str::<Config>(&written)
+                .err()
+                .map(|e| e.to_string());
+            let enum_errs = thegn_core::config::validate_str(&written);
+            // Only enum errors this write INTRODUCED should roll it back. A stale
+            // bad value in some OTHER (now-covered) key was already
+            // warn-defaulting on every load — refusing to set an unrelated key
+            // because of it (and blaming the key just set) is a false rejection.
+            // Diff against the prior file's errors so pre-existing problems don't
+            // block an unrelated `config set`.
+            let prior_errs: std::collections::HashSet<String> = prior
+                .as_deref()
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(thegn_core::config::validate_str)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let new_enum_errs: Vec<&String> = enum_errs
+                .iter()
+                .filter(|e| !prior_errs.contains(*e))
+                .collect();
+            if parse_err.is_some() || !new_enum_errs.is_empty() {
+                // Roll back to exactly the prior state (bytes, or remove the file
+                // if we created it) so the user's config is never left broken.
+                match &prior {
+                    Some(bytes) => {
+                        let _ = std::fs::write(&path, bytes);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                if let Some(e) = parse_err {
+                    anyhow::bail!(
+                        "{key} = {value:?} would make the config unparseable ({e}); not written"
+                    );
+                }
+                for e in &new_enum_errs {
+                    msg::error(e);
+                }
+                anyhow::bail!(
+                    "{key} = {value:?} is invalid ({} problem(s)); not written",
+                    new_enum_errs.len()
+                );
+            }
             outln!("set {key} = {value:?} in {}", path.display());
+            // The write is valid, but the file still carries pre-existing bad
+            // values in other keys — surface them so they don't linger unnoticed
+            // (they were already warn-defaulting on every load; not the fault of
+            // this set, so they don't block it).
+            if !enum_errs.is_empty() {
+                msg::warn(&format!(
+                    "note: {} pre-existing problem(s) remain in {} — run `thegn config validate`",
+                    enum_errs.len(),
+                    path.display()
+                ));
+            }
         }
         Action::Validate => validate(&path)?,
         Action::Schema => {

@@ -1194,7 +1194,14 @@ fn oci_local_secrets_go_to_env_file_not_argv() {
     // must NOT ride the world-readable `-e K=V` argv; it goes to a 0600
     // `--env-file`. A synthetic pair (value absent from the host env) stays
     // inline as `-e`.
-    let _env = crate::testenv::EnvGuard::set(&[("GH_TOKEN", "ghp_secret")]);
+    // Also clear ambient THEGN_SANDBOX (a live thegn shell sets it) — these
+    // tests use it as a SYNTHETIC inline pair, so its ambient presence would
+    // divert it to the env-file and break the assertion. Hermetic under nextest
+    // AND in-process `cargo test`.
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("GH_TOKEN", Some("ghp_secret")),
+        ("THEGN_SANDBOX", None),
+    ]);
     let mut s = spec(Backend::Podman);
     s.name = "thegn-test-envfile-oci".into();
     s.env = vec![
@@ -1233,7 +1240,10 @@ fn oci_local_secrets_go_to_env_file_not_argv() {
 
 #[test]
 fn systemd_local_secrets_go_to_environment_file_not_argv() {
-    let _env = crate::testenv::EnvGuard::set(&[("API_KEY", "sk_secret")]);
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("API_KEY", Some("sk_secret")),
+        ("THEGN_SANDBOX", None),
+    ]);
     let mut s = spec(Backend::Systemd);
     s.image = None;
     s.name = "thegn-test-envfile-systemd".into();
@@ -1269,7 +1279,14 @@ fn remote_oci_keeps_all_env_inline_as_carrier() {
     // Over ssh the argv is the ONLY env carrier — a remote spec must keep
     // every pair inline (never divert a host-matching value to a local
     // env-file the remote daemon can't read).
-    let _env = crate::testenv::EnvGuard::set(&[("GH_TOKEN", "ghp_secret")]);
+    // Also clear ambient THEGN_SANDBOX (a live thegn shell sets it) — these
+    // tests use it as a SYNTHETIC inline pair, so its ambient presence would
+    // divert it to the env-file and break the assertion. Hermetic under nextest
+    // AND in-process `cargo test`.
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("GH_TOKEN", Some("ghp_secret")),
+        ("THEGN_SANDBOX", None),
+    ]);
     let mut s = spec(Backend::Podman);
     s.env = vec![("GH_TOKEN".into(), "ghp_secret".into())];
     s.placement = Placement::Ssh(SshPlacement::plain(

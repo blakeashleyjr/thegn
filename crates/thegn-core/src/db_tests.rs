@@ -1,8 +1,7 @@
 use super::*;
 // Relocated domain methods now live behind store-seam traits (`db_*.rs`).
 use crate::store::{
-    AccountStore, CacheStore, NotificationStore, PoolStore, ProxyStore, WorkspaceStore,
-    WorktreeAuxStore,
+    AccountStore, CacheStore, NotificationStore, PoolStore, WorkspaceStore, WorktreeAuxStore,
 };
 use rusqlite::params;
 
@@ -1820,107 +1819,6 @@ fn container_events_limit_honoured() {
 }
 
 #[test]
-fn proxy_health_roundtrip_and_window() {
-    let db = db();
-    // A live marker (probe in the future) loads; a stale one (past) does not.
-    db.put_proxy_health(
-        "openrouter",
-        "ds-pro",
-        "rate_limit",
-        "HTTP 429",
-        1000,
-        9_999_999,
-        false,
-        2,
-        None,
-        None,
-    )
-    .unwrap();
-    db.put_proxy_health(
-        "kilo", "ds-pro", "payment", "HTTP 402", 1000, 500, true, 1, None, None,
-    )
-    .unwrap();
-    let live = db.load_proxy_health(1_000_000).unwrap();
-    assert_eq!(live.len(), 1);
-    assert_eq!(live[0].backend, "openrouter");
-    assert_eq!(live[0].consecutive_failures, 2);
-    // Upsert overwrites in place.
-    db.put_proxy_health(
-        "openrouter",
-        "ds-pro",
-        "rate_limit",
-        "HTTP 429",
-        1000,
-        9_999_999,
-        false,
-        5,
-        None,
-        None,
-    )
-    .unwrap();
-    assert_eq!(
-        db.load_proxy_health(1_000_000).unwrap()[0].consecutive_failures,
-        5
-    );
-    db.clear_proxy_health("openrouter", "ds-pro").unwrap();
-    assert!(db.load_proxy_health(1_000_000).unwrap().is_empty());
-}
-
-#[test]
-fn proxy_budget_spend_caps_and_window() {
-    let db = db();
-    let (tokens, cost, killed) = db
-        .add_proxy_spend("agent:reviewer", 100, 0.5, 1000)
-        .unwrap();
-    assert_eq!(tokens, 100);
-    assert!((cost - 0.5).abs() < 1e-9);
-    assert!(!killed);
-    // A second add accumulates.
-    let (tokens, _, _) = db
-        .add_proxy_spend("agent:reviewer", 50, 0.25, 1000)
-        .unwrap();
-    assert_eq!(tokens, 150);
-    // Kill switch flips and is visible on the budget row.
-    db.set_proxy_kill_switch("agent:reviewer", true).unwrap();
-    assert!(db.proxy_budget("agent:reviewer").unwrap().unwrap().killed);
-}
-
-#[test]
-fn proxy_spend_window_resets_when_due() {
-    let db = db();
-    db.add_proxy_spend("global", 100, 1.0, 1000).unwrap();
-    // Arm a rolling window that has already elapsed by `now_ms`.
-    db.conn
-        .execute(
-            "UPDATE proxy_budgets SET reset_ms=2000 WHERE scope='global'",
-            [],
-        )
-        .unwrap();
-    // now_ms past reset → accumulators reset before the add.
-    let (tokens, _, _) = db.add_proxy_spend("global", 10, 0.1, 3000).unwrap();
-    assert_eq!(tokens, 10);
-}
-
-#[test]
-fn proxy_virtual_key_lookup_and_revoke() {
-    let db = db();
-    db.put_proxy_virtual_key(
-        "vk_1",
-        "hash",
-        "reviewer",
-        "agent:reviewer",
-        Some("anthropic"),
-        1000,
-    )
-    .unwrap();
-    let got = db.proxy_virtual_key("vk_1").unwrap().unwrap();
-    assert_eq!(got.0, "agent:reviewer");
-    assert_eq!(got.1.as_deref(), Some("anthropic"));
-    db.revoke_proxy_virtual_key("vk_1", 2000).unwrap();
-    assert!(db.proxy_virtual_key("vk_1").unwrap().is_none());
-}
-
-#[test]
 fn loc_cache_entry_returns_value_and_timestamp() {
     let db = db();
     // Cold cache misses.
@@ -1936,37 +1834,6 @@ fn loc_cache_entry_returns_value_and_timestamp() {
     assert!(fetched_at > 0, "fetch timestamp is stamped for TTL refresh");
     // A different worktree is isolated.
     assert!(db.get_loc_cache_entry("/other").unwrap().is_none());
-}
-
-#[test]
-fn set_proxy_budget_limits_creates_and_updates_caps() {
-    let db = db();
-    // No budget row yet.
-    assert!(db.proxy_budget("agent:r").unwrap().is_none());
-
-    // Setting limits creates the row without touching (zero) spend.
-    db.set_proxy_budget_limits("agent:r", "weekly", Some(1_000), Some(2.5), 5000)
-        .unwrap();
-    let b = db.proxy_budget("agent:r").unwrap().unwrap();
-    assert_eq!(b.period, "weekly");
-    assert_eq!(b.limit_tokens, Some(1_000));
-    assert_eq!(b.limit_cost, Some(2.5));
-    assert_eq!(b.reset_ms, 5000);
-    assert_eq!(b.spent_tokens, 0);
-    assert!((b.spent_cost).abs() < 1e-9);
-    assert!(!b.killed);
-
-    // Accumulate spend, then re-set caps: spend must be preserved, caps updated.
-    db.add_proxy_spend("agent:r", 300, 0.9, 100).unwrap();
-    db.set_proxy_budget_limits("agent:r", "monthly", None, None, 9000)
-        .unwrap();
-    let b = db.proxy_budget("agent:r").unwrap().unwrap();
-    assert_eq!(b.period, "monthly");
-    assert_eq!(b.limit_tokens, None, "None means no cap");
-    assert_eq!(b.limit_cost, None);
-    assert_eq!(b.reset_ms, 9000);
-    assert_eq!(b.spent_tokens, 300, "re-setting caps preserves spend");
-    assert!((b.spent_cost - 0.9).abs() < 1e-9);
 }
 
 #[test]
@@ -2049,32 +1916,6 @@ fn env_name_set_get_and_effective_precedence() {
 }
 
 #[test]
-fn proxy_kill_switch_set_clear_creates_row() {
-    let db = db();
-    // Setting the kill switch on an unknown scope creates the row.
-    db.set_proxy_kill_switch("worktree:/wt", true).unwrap();
-    assert!(db.proxy_budget("worktree:/wt").unwrap().unwrap().killed);
-    // Clearing it flips back.
-    db.set_proxy_kill_switch("worktree:/wt", false).unwrap();
-    assert!(!db.proxy_budget("worktree:/wt").unwrap().unwrap().killed);
-}
-
-#[test]
-fn proxy_virtual_key_upsert_unrevokes() {
-    let db = db();
-    db.put_proxy_virtual_key("vk", "h1", "lbl", "global", None, 1)
-        .unwrap();
-    db.revoke_proxy_virtual_key("vk", 2).unwrap();
-    assert!(db.proxy_virtual_key("vk").unwrap().is_none());
-    // Re-registering the same key id clears the revocation (revoked_at=NULL).
-    db.put_proxy_virtual_key("vk", "h2", "lbl2", "agent:x", Some("kilo"), 3)
-        .unwrap();
-    let got = db.proxy_virtual_key("vk").unwrap().unwrap();
-    assert_eq!(got.0, "agent:x");
-    assert_eq!(got.1.as_deref(), Some("kilo"));
-}
-
-#[test]
 fn migrate_v6_skips_extra_kind_rows_with_empty_name() {
     // A legacy tab_layout where one row has an empty tab_name (the `continue`
     // branch) and another session has no recorded active_tab (active_idx
@@ -2147,29 +1988,6 @@ fn migrates_v2_drops_and_recreates_session_tables() {
     assert!(db.worktrees().unwrap().is_empty());
     assert!(db.workspaces().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn proxy_request_audit_insert() {
-    let db = db();
-    let row = ProxyRequestRow {
-        ts_ms: 1234,
-        protocol: "openai".into(),
-        route: "standard".into(),
-        agent: Some("reviewer".into()),
-        worktree: Some("/wt/feat".into()),
-        client_model: "model-proxy/standard".into(),
-        backend: "openrouter".into(),
-        backend_model: "ds-pro".into(),
-        input_tokens: 100,
-        output_tokens: 50,
-        cost_usd: 0.01,
-        cost_source: "estimate".into(),
-        outcome: "ok".into(),
-        ..Default::default()
-    };
-    let id = db.put_proxy_request(&row).unwrap();
-    assert!(id > 0);
 }
 
 // --- migration ladder ---------------------------------------------------

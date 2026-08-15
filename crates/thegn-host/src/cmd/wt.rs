@@ -16,8 +16,8 @@ use thegn_core::{outln, util, worktree};
 /// Args shared by `diff` and `wt diff`.
 #[derive(clap::Args, Clone)]
 pub struct DiffArgs {
-    #[arg(long)]
-    pub worktree: Option<String>,
+    #[command(flatten)]
+    pub target: super::target::WorktreeFlag,
     /// Diff against this base ref (default: the repo's default branch).
     #[arg(long)]
     pub base: Option<String>,
@@ -124,7 +124,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             delete_branch,
             force,
         } => rm(cfg, &target, delete_branch, force),
-        Action::Diff(a) => super::diff::run(a.worktree, a.base, a.stat, a.file),
+        Action::Diff(a) => super::diff::run(a.target.worktree, a.base, a.stat, a.file),
         Action::Disk(a) => super::disk::disk(cfg, a.worktree, a.all, a.json),
         Action::Clean(a) => super::disk::clean(cfg, a.worktree, a.all, a.force),
     }
@@ -287,18 +287,25 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
     if root_s == path {
         anyhow::bail!("refusing to remove the main worktree: {path}");
     }
-    if !force
-        && !super::confirm(&format!(
+    if !force {
+        let prompt = format!(
             "remove worktree {path} (branch {branch}{})?",
             if delete_branch {
                 ", branch deleted"
             } else {
                 ""
             }
-        ))
-    {
-        outln!("aborted");
-        return Ok(());
+        );
+        // Without a TTY there's no way to answer the prompt — refuse (non-zero)
+        // rather than silently no-op on a piped/scripted invocation that forgot
+        // --force; an interactive decline is a clean abort.
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            anyhow::bail!("{prompt} refusing without a TTY — pass --force to confirm");
+        }
+        if !super::confirm(&prompt) {
+            outln!("aborted");
+            return Ok(());
+        }
     }
 
     // Provider/sandbox teardown, synchronous (unlike the TUI's fire-and-forget

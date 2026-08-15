@@ -7,10 +7,9 @@
 # workspace shell — git/worktrees/panes/sidebar/panel, the command palette,
 # sessions, sandboxing, and the CLI merge/land/integrate queue. Several
 # subsystems are still experimental and are DISABLED in the stable build even if
-# the keys below are set: remotes ([sandbox.remote]), the LLM proxy + agents
-# ([llm_proxy], [[agents]]), the Observe dashboards ([observe]), the placement
-# engine ([placement]), and the non-GitHub issue trackers ([issues]: Linear /
-# Jira / Kaneo). GitHub PR/issue viewing stays available in both channels.
+# the keys below are set: remotes ([sandbox.remote]), the Observe dashboards
+# ([observe]), the placement engine ([placement]), and the non-GitHub issue
+# trackers ([issues]: Linear / Jira / Kaneo). GitHub PR/issue viewing stays available in both channels.
 # To enable the experimental subsystems, run the dev build (`nix run .#dev`,
 # installed as `thegn-dev`) or set THEGN_CHANNEL=dev for one run. `thegn doctor`
 # prints the resolved channel and which features it allows. There is no config
@@ -722,8 +721,8 @@ format = "text"           # text | json
 # (installs + carries config/login for): every entry you surface here is set up in
 # the sandbox; an entry you remove is NOT (so the picker both surfaces custom agents
 # and disables defaults you don't want). The agent KIND is the entry's `provider`,
-# else its command's program basename — kinds dedup (e.g. a managed-pi "Agent" +
-# a "Vanilla Pi" → one `pi`). `[sandbox.home] agents = [...]` overrides this with an
+# else its command's program basename — kinds dedup (e.g. two `claude` entries
+# → one `claude`). `[sandbox.home] agents = [...]` overrides this with an
 # explicit install list; only when NO `[[agents]]` are configured at all does
 # thegn fall back to detecting the host's agents.
 #
@@ -743,43 +742,21 @@ command = "claude"
 name = "aider"
 command = "aider --model sonnet"
 
-# The MANAGED pi coding agent, embedded over ACP (the upper control plane). pi runs
-# its own tools natively; thegn is ADDITIVE — it observes activity (the statusbar
-# chip), routes pi's model through the proxy, and exposes its house tools
-# (budget / fleet / worktree status) to pi via MCP-over-ACP.
-#
-# thegn OWNS this pi under `~/.thegn/pi`: a pinned binary + a managed agent
-# dir (PI_CODING_AGENT_DIR) seeded with the thegn-acp extension package. Run
-# `thegn agent setup` once (thegn also self-heals it on launch when this entry
-# is present). The command sets PI_CODING_AGENT_DIR and runs the pinned binary;
-# `$HOME` resolves per-context, so the SAME entry works on the host AND inside a
-# sprite (where the managed pi is provisioned to `<home>/.thegn/pi`). The
-# thegn-acp extension registers the proxy-routed model from the THEGN_PROXY_*
-# env when [llm_proxy].route_agent is on. (A "Vanilla Pi" entry that does NOT set
-# PI_CODING_AGENT_DIR — e.g. `command = "npx -y @earendil-works/pi-coding-agent"` —
-# stays unmanaged, using the default ~/.pi.)
-[[agents]]
-name = "Agent"
-command = 'PI_CODING_AGENT_DIR="$HOME/.thegn/pi/agent" exec "$HOME/.thegn/pi/node_modules/.bin/pi"'
-provider = "pi"
-
 # ── Managed tools ([managed_tools.<name>]) ──────────────────────────────────
 # Per-tool overrides for thegn's managed-tool resolver (the pinned external
-# binaries it acquires: the pi agent, the `bs` debugger, MCP servers). The
+# binaries it acquires: the `bs` debugger, MCP servers). The
 # resolver picks a binary in a fixed order — this override → the tool's name on
 # PATH → thegn's own pinned download under `~/.thegn`. Declare an override
 # only to force a specific binary; omit the table to use PATH/managed. Inspect
 # resolution with `thegn doctor`.
-# [managed_tools.pi]
-# path = "/usr/local/bin/pi"      # explicit binary (highest-priority tier)
+# [managed_tools.bugstalker]
+# path = "/usr/local/bin/bs"      # explicit binary (highest-priority tier)
 # args = ["--flag"]               # optional extra launch arguments
 
 # ── MCP servers ([mcp_servers.<name>]) ──────────────────────────────────────
-# User-declared Model Context Protocol servers the agent consumes. `thegn agent
-# setup` merges these into the managed pi's settings (the de-facto `mcpServers`
-# key) alongside the built-in thegn-acp house tools. Inspect with `thegn mcp
-# list` / `thegn mcp emit`; install a server's binary (grant-checked) with
-# `thegn mcp install <name>`.
+# User-declared Model Context Protocol servers agents consume. Inspect with
+# `thegn mcp list` / `thegn mcp emit`; install a server's binary
+# (grant-checked) with `thegn mcp install <name>`.
 # [mcp_servers.git]
 # command = ["npx", "-y", "@modelcontextprotocol/server-git"]  # launch argv
 # args    = ["--repo", "."]                                     # extra args
@@ -913,11 +890,8 @@ command = "git diff"
 #                                                #   equal-or-stricter (auto < packed <
 #                                                #   dedicated). See [placement].
 # [zone.clientA.budget]
-# limit_tokens = 5000000                         # rolled up as the `zone:clientA` proxy scope
-# limit_cost   = 100.0                           # USD ceiling for the period
 # limit_compute_cost = 50.0                      # COMPUTE USD ceiling (placement ledger:
-#                                                #   autoscaled hosts + spillover; separate
-#                                                #   from the model-spend caps above)
+#                                                #   autoscaled hosts + spillover)
 #
 # Manage zones from the CLI: `thegn zone list|create <name>|rm <name> [--force]|
 # assign <zone> [repo]`. Reassignment takes effect on the next worktree launch.
@@ -1390,17 +1364,9 @@ enabled = true
 # can persist its runtime state (session-env, todos, shell snapshots) instead of
 # its startup hooks dying "read-only file system". ~/.claude-profiles is carved
 # too, for HOME-swapping profile wrappers (claude-profile / claude-multiplex).
-# Sealed agents are excluded from all three: an untrusted network=none agent must
-# not write the host's real credential dirs.
 # `profile = "open"` restores a fully-writable $HOME (zsh history/zoxide/
 # keychain) as the escape hatch; add more writable paths under `mounts` below.
 profile = "hardened"
-
-# Hardening preset for the embedded agent's tool container. When it differs from
-# `profile`, the agent runs in its OWN separate, more-locked-down container
-# (named `thegn-<slug>-szagent`); when equal, it reuses the worktree
-# container. Defaults to `sealed` so agent-run commands have no network egress.
-agent_profile = "sealed"
 
 # ── Backend selection ────────────────────────────────────────────────────────
 # Which containment backend to use. "auto" walks backend_chain until one works.
@@ -2635,8 +2601,7 @@ enabled = false
 #                             #   scope (0 = uncapped). Breach pauses PAID
 #                             #   lanes (autoscale + spillover) per
 #                             #   on_exhaustion; packing onto already-paid
-#                             #   hosts keeps serving. Separate from the LLM
-#                             #   proxy's model-spend ledger by design.
+#                             #   hosts keeps serving.
 # [placement.price]           # hourly USD rates for the compute ledger
 # "hetzner:cx33" = 0.0154     #   autoscaled hosts ("provider:size", fallback
 # "hetzner" = 0.008           #   "provider"); unpriced resources meter at $0
@@ -2680,14 +2645,19 @@ enabled = false
 # die with the UI. Set `enabled = false` for plain in-process PTYs that die
 # with the compositor.
 [daemon]
+# Disabling the route (here, or per-run with THEGN_NO_DAEMON=1) while
+# daemon-backed panes are persisted STOPS those daemon sessions on the next
+# launch: each pane respawns without the daemon and its now-orphaned daemon
+# copy is killed (best-effort) rather than left running invisibly forever.
 enabled = true
 # Control-socket override. Empty (default) resolves to
 # $XDG_RUNTIME_DIR/thegn/daemon.sock, falling back to
 # $XDG_STATE_HOME/thegn/run/daemon.sock (so isolated state dirs — `just
 # start`, smoke tests — get isolated daemons).
 socket = ""
-# The daemon exits after this long with no sessions and no attached clients.
-# 0 = never exit on idle.
+# The daemon exits after this long with no live sessions. 0 = never exit on
+# idle. Ignored by `thegn serve`: a serving daemon keeps its TCP listener up for
+# thin clients that haven't attached yet, so it never idle-exits.
 idle_exit_secs = 1800
 # When the last client detaches from a session, keep its PTY warm this long
 # (the relay lease). Reconnect within the grace resumes the same live screen;
@@ -2703,8 +2673,11 @@ lease_grace_secs = 0
 # bind to a trusted network interface (tailscale/wireguard) or reach it over
 # `ssh -L`; every request is still token-gated.
 [serve]
-# Default TCP bind (override per-run with `thegn serve --bind`).
-bind = "0.0.0.0:5380"
+# Default TCP bind (override per-run with `thegn serve --bind`). Loopback by
+# default — the control plane carries full PTY I/O over plaintext, so exposing
+# it beyond localhost is opt-in. For remote clients, front it with a
+# tailnet/VPN address or an explicit `bind = "0.0.0.0:5380"` behind a firewall.
+bind = "127.0.0.1:5380"
 # Require in-app / `thegn pair approve` approval before a redeemed pairing
 # token becomes usable. Default off: possession of the single-use pairing URL
 # is the credential.
@@ -2712,96 +2685,6 @@ require_approval = false
 # Local unix-socket peers (same uid) get implicit admin, so local CLI verbs
 # (`thegn session …`) need no token. Tokens are always required on TCP.
 local_admin = true
-
-# ── LLM proxy (group U/V) ──────────────────────────────────────────────────
-# The AI-traffic chokepoint daemon (binary `tgproxy`). The shell never hard-
-# depends on this — AI is strictly additive — so it is OFF by default. When
-# enabled, the host launches tgproxy and agents point OPENAI_BASE_URL /
-# ANTHROPIC_BASE_URL at `listen`.
-[llm_proxy]
-enabled = false
-# Address the daemon binds (and agents target).
-listen = "127.0.0.1:8383"
-# Backend selection: "sequential" (ordered failover, the M1 behavior),
-# "load_balanced", or "speculative" (cascade — reserved for the AR work).
-routing = "sequential"
-# On a budget-cap breach: refuse the request (true) or downgrade to a cheaper
-# tier (false). The kill-switch always refuses regardless of this setting.
-refuse_on_breach = true
-# Path to the proxy's routes document (JSON: { "routes": [ { "name", "strategy",
-# "backends": [ { "name", "base_url", "model", "api_key_env" (or multi-key
-# "api_key_envs" + "key_strategy" roundrobin|failover|random|weighted +
-# "key_weights"), "anthropic", "rpm", "burst", "inflight_cap", "context_limit",
-# "defaults" } ] } ], "aliases": { "<client-model-id>": "<route>" },
-# "last_resort": false }). `aliases` maps extra client model ids onto routes
-# (U 281); `last_resort` lets a fully-failed route borrow every OTHER route's
-# backends as a final tier. Passed to tgproxy as TGPROXY_CONFIG.
-config_path = ""
-# Streaming tunables (seconds). first_byte_timeout: wait for a backend's first
-# usable token before falling through; idle_timeout: kill a stream gone silent
-# this long; heartbeat: keep-alive cadence during upstream silence.
-first_byte_timeout_secs = 45
-idle_timeout_secs = 120
-heartbeat_secs = 10
-# In-flight token reduction: compress noisy tool/command output before it's sent
-# upstream (strip ANSI, fold progress redraws, collapse blank/repeated lines, and
-# at higher levels minify JSON / truncate huge blocks). Off by default — only
-# `tool`-role content is touched, never the system prompt, so prompt caching
-# holds. Levels: off | conservative | balanced | aggressive.
-token_reduction = false
-token_reduction_level = "conservative"
-# Route a launched agent's model traffic through the proxy at `listen` by
-# injecting provider config into the agent's environment at spawn. `route_agent`
-# and `enabled` are ORTHOGONAL: `enabled` launches thegn's OWN tgproxy;
-# `route_agent` only injects the env — the pi extension's THEGN_PROXY_* vars
-# (NOT ANTHROPIC_BASE_URL; see `route_claude`) → `listen`, and for a
-# remote/provider sandbox an empty/"auto" `remote_base_url` stands up the reverse
-# tunnel to it. So point agents at an EXTERNAL proxy already on `listen` (e.g. a
-# separate model-proxy) with `route_agent = true` + `enabled = false` (thegn
-# won't try to bind the same port); run thegn's own proxy with `enabled = true`
-# (+ a `config_path` routes file, else it 404s — thegn warns at startup).
-# `agent_api` is the pi-side API id for that endpoint — the proxy serves
-# the Anthropic Messages API (/v1/messages), and pi's OpenAI client speaks the
-# Responses API (which the proxy doesn't implement), so keep "anthropic-messages".
-# `agent_model` is the model id the agent requests (the proxy maps it to a real
-# backend, e.g. "model-proxy/standard" / "model-proxy/fast").
-route_agent = false
-# Additionally route Claude Code / the Anthropic SDK (anything honoring
-# ANTHROPIC_BASE_URL) through the proxy. OFF by default: claude talks to Anthropic
-# directly, so a down/racing proxy tunnel can't break it (a forced
-# ANTHROPIC_BASE_URL pointing at a dead loopback port yields ConnectionRefused with
-# no upstream fallback). pi routes regardless via THEGN_PROXY_*; flip this on
-# only if you also want claude's traffic on the proxy. Requires `route_agent`.
-route_claude = false
-agent_api = "anthropic-messages"
-agent_model = "model-proxy/standard"
-# Pin this scope's model traffic to one upstream provider's lanes (scoped
-# accounts, V 287). Layered like every key, so a WORKSPACE overlay can bind its
-# worktrees to a dedicated account: minted per-worktree virtual keys carry the
-# binding and the proxy leads with that provider (other lanes stay as failover).
-# The value is the provider `name` from the routes document. Empty = no pinning.
-upstream = ""
-# "The bouncer" (opt-in). When true, a launched agent runs inside its sealed
-# `[sandbox] agent_profile` container and its built-in bash/read/edit/write tools
-# are routed back through thegn over a bind-mounted unix-socket ACP channel.
-# The consequential ones — shell, edit, write — are gated behind an interactive
-# allow/deny overlay (read is auto-served). If `agent_profile` forces no network
-# (the default `sealed`), the agent's only egress is the proxy, relayed over a
-# unix socket (full exfil seal); a network-permitting profile (e.g. `hardened`)
-# reaches the proxy via the container gateway instead. Off = the additive model:
-# pi runs its own tools in-process and edits auto-apply.
-bouncer = false
-# Base URL an agent running INSIDE a remote/provider sandbox (a sprite VM that
-# can't reach host loopback) uses to reach tgproxy — a tunnel/public endpoint.
-# With `route_agent`, thegn injects the THEGN_PROXY_* vars (and, when
-# `route_claude` is also on, ANTHROPIC_BASE_URL + the per-worktree virtual key)
-# into the sprite's shell so pi (and, with route_claude, claude code / the SDK)
-# routes through the proxy. (Local/OCI agents already reach the proxy via
-# loopback/gateway/unix.) EMPTY (the default) under `route_agent` ⇒ "auto": thegn
-# stands up a reverse tunnel (the in-sandbox resident bridge ⇄ host) so the sprite
-# reaches tgproxy at http://127.0.0.1:<listen-port> with ZERO public exposure. Set
-# an explicit reachable URL (e.g. a tailnet/proxy endpoint) to skip the tunnel.
-# remote_base_url = ""   # "" or "auto" = reverse tunnel; or an explicit URL
 
 # ── Local merge queue: the "fold-actor" (optional) ─────────────────────────
 # Stop hand-sequencing parallel branches into main. The fold-actor folds every

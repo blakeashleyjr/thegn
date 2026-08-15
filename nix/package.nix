@@ -22,7 +22,7 @@
   yaziDeps ? [],
   # Release channel: "stable" (regular pre-alpha) or "dev". The dev build only
   # flips the compiled-in default channel via the host's `dev` Cargo feature —
-  # no extra code — so experimental subsystems (remotes, AI/proxy, observe,
+  # no extra code — so experimental subsystems (remotes, observe,
   # placement, non-GitHub trackers) are honoured instead of clamped off. It
   # installs as `thegn-dev`/`tg-dev` so it can sit beside a stable install.
   # `THEGN_CHANNEL` overrides the default at runtime for either binary.

@@ -1,5 +1,5 @@
 //! [`ComputeLedgerStore`] — the placement engine's spend ledger, deliberately
-//! SEPARATE from the LLM proxy's ([`crate::store::ProxyStore`]) but identical
+//! SEPARATE from the (removed) LLM proxy's spend ledger but identical
 //! in shape (scope → zone → global caps, monthly window, kill-switch) so the
 //! mental model transfers. Two cost categories: `fixed` (managed hosts:
 //! hourly rate × lifetime, idempotent watermark accrual) and `metered`
@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-/// One `compute_budgets` row (mirror of the proxy's budget row minus tokens).
+/// One `compute_budgets` row (spend + cap for a compute scope).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputeBudgetRow {
     /// `global` | `zone:<name>` | `provider:<name>` | `worktree:<path>`.

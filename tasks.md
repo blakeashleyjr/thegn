@@ -1,5 +1,14 @@
 # thegn — roadmap & progress
 
+> **2026-08-14 — AI-layer excision.** The AI track's shipped code (thegn-proxy,
+> thegn-agent, `[llm_proxy]`, ACP/bouncer, the managed pi) was **removed from the
+> codebase** to ship the public alpha as the AI-free shell. The AI-track groups
+> below (U/V/W, R, Q/S/T, AL, AR) are **deferred, not cancelled** — their `[x]`
+> marks record history, but the implementations no longer exist on main; a
+> revival starts from the archived openspec changes
+> (`openspec/changes/archive/2026-08-14-*`), not from live code. The generic
+> `[[agents]]` picker and the `[merge_queue] agent_command` fold-actor were kept.
+
 **725 features across 50 groups (A–AX).** The list is **two tracks joined by one
 keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**. The
 control plane has **two layers** (see

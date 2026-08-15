@@ -37,11 +37,11 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::chrome::FrameModel;
 use crate::compositor::Rect;
 use crate::pane::PaneEvent;
-use crate::panes::{Panes, replace_single_dead_center_pane};
+use crate::panes::Panes;
 use crate::pins::pin_cwd;
 use crate::run::{
-    DrawerPool, SidebarState, active_cwd, group_cwd, persist_pin_state, prospective_corner_rect,
-    spawn_worktree_shell_pane, update_crash_count,
+    DrawerPool, SidebarState, active_cwd, persist_pin_state, prospective_corner_rect,
+    update_crash_count,
 };
 
 /// A pane that exits within this of being spawned is a "fast crash" —
@@ -62,15 +62,19 @@ fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str) {
         return;
     }
     let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(wt));
-    let repo_root: PathBuf = thegn_core::db::Db::open()
-        .ok()
+    // One DB handle for both reads (each `Db::open` re-runs pragmas). This path
+    // is order-dependent — the health mark below must land before the respawn's
+    // `env_halt_reason` check — so it stays synchronous, but need not open twice.
+    let db = thegn_core::db::Db::open().ok();
+    let repo_root: PathBuf = db
+        .as_ref()
         .and_then(|db| db.repo_root_for(wt).ok().flatten())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| thegn_core::repo::main_worktree(Path::new(wt)))
         .unwrap_or_else(|| PathBuf::from(wt));
-    let selected = thegn_core::db::Db::open()
-        .ok()
+    let selected = db
+        .as_ref()
         .and_then(|db| db.effective_env(wt, &repo_root.to_string_lossy()));
     let env = cfg.resolve_env(&repo_root, &loc, Path::new(wt), selected.as_deref());
     if env.placement.is_local() {
@@ -196,6 +200,14 @@ pub(crate) struct DrainSummary {
     /// Panes whose child exited this pass (the onboarding wizard watches for
     /// its spawned `gh auth login` / agent-setup tab closing).
     pub exited: Vec<u32>,
+    /// An active tab's sole pane died and its dead leaf was left in the tree
+    /// for the off-thread materialize pipeline. The loop's lazy-materialize
+    /// block runs BEFORE the drain each turn, so the caller pulses the waker
+    /// on this to kick the respawn on the next (immediate) turn instead of
+    /// waiting for an incidental wake. Set only in that branch — never for
+    /// pins/drawer/corner/terminal exits, non-sole removals, background tabs,
+    /// or the keeps-crashing give-up.
+    pub left_for_materialize: bool,
 }
 
 /// Everything the moved Output/Exit handlers touch, borrowed from the loop.
@@ -230,12 +242,6 @@ pub(crate) struct DrainCtx<'a> {
     pub loading_remote: &'a mut HashMap<(String, usize), bool>,
     pub loading_retired: &'a mut HashSet<(String, usize)>,
     pub respawn_crash_count: &'a mut HashMap<(usize, usize), u32>,
-    /// The loop's modal slot + the (group, tab) keys whose sandbox-halt modal the
-    /// user already dismissed. A fast-crashing remote env's "cannot connect" halt
-    /// raises the blocking modal exactly ONCE (then a row error dot), reusing the
-    /// same gate as the provision drain.
-    pub active_menu: &'a mut Option<crate::menu::MenuOverlay>,
-    pub halt_dismissed: &'a mut std::collections::HashSet<(String, usize)>,
     pub center_dormant: &'a mut bool,
     /// The loop's shutdown flag. A terminal shell exiting while this is set is
     /// teardown, not a user close — its `terminals` registry row must be kept so
@@ -297,7 +303,7 @@ pub(crate) fn drain<T: Terminal>(
         if !tail.is_empty() {
             handle_output(ctx, id, &tail);
         }
-        handle_exit(ctx, id, code);
+        summary.left_for_materialize |= handle_exit(ctx, id, code);
     }
 
     // 3+4. Parse round-robin under the byte/deadline budget, with input
@@ -409,7 +415,14 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
                         ctx.corner_gfx.push(seq);
                     }
                     crate::kitty_relay::Piece::GfxAnswer(ans) => {
-                        let _ = p.write_reply(&ans);
+                        // Must-deliver kitty graphics answer; warn on a rare
+                        // Full drop (see the query-reply sites below).
+                        if let Err(e) = p.write_reply(&ans) {
+                            tracing::warn!(
+                                target: "thegn::pane",
+                                "dropped a kitty graphics reply ({e}); an inner program may hang"
+                            );
+                        }
                     }
                 }
             }
@@ -421,7 +434,17 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
                     crate::queries::query_responses(&emu_text, emu.cursor(), emu.size())
                 };
                 if !resp.is_empty() {
-                    let _ = p.write_reply(&resp);
+                    // A terminal-query reply (DA/DSR/kitty) is host-generated and
+                    // must-deliver — an inner program (yazi, etc.) warns or times
+                    // out without it. It shares the pane's bounded stdin queue, so
+                    // a Full drop (child not reading its 256-chunk backlog) is
+                    // rare but worth a warn so a hung inner app is diagnosable.
+                    if let Err(e) = p.write_reply(&resp) {
+                        tracing::warn!(
+                            target: "thegn::pane",
+                            "dropped a terminal-query reply ({e}); an inner program may hang"
+                        );
+                    }
                 }
                 let fwd = crate::queries::osc_passthrough(&emu_text);
                 if !fwd.is_empty() {
@@ -484,7 +507,12 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
 /// respawn-or-remove logic with fast-crash detection and process-exit
 /// notification routing. Moved verbatim from the run.rs drain (`continue`s
 /// became early returns).
-fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
+///
+/// Returns `true` when an active tab's sole pane died and its dead leaf was
+/// left in the tree for the off-thread materialize pipeline (see
+/// [`DrainSummary::left_for_materialize`]). No spawn — and no sandbox
+/// resolution — happens here on the loop.
+fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool {
     // Program name is needed for attention routing after the pane leaves the
     // table (item 524).
     let exited_program = ctx.panes.table.get(&id).map(|p| p.program().to_string());
@@ -497,7 +525,19 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
         .get(&id)
         .map(|p| p.history_tail(12))
         .unwrap_or_default();
+    // A longer tail for a sole worktree pane's respawn scrollback refresh
+    // (mirrors the persist-time capture in `snapshot.rs`, including its
+    // server-side-replay skip) — must also be grabbed before the pane leaves
+    // the table. Cheap: exits are rare and the ring is bounded.
+    let respawn_tail = ctx
+        .panes
+        .table
+        .get(&id)
+        .filter(|p| p.is_daemon_backed() || p.provider_session().is_none())
+        .map(|p| p.history_tail(ctx.current_config.session.scrollback_lines as usize));
     ctx.panes.table.remove(&id);
+    // Set only in the sole-pane leave-for-materialize branch below.
+    let mut left_for_materialize = false;
     // The visible yazi drawer's process ended. Clear it, mark the worktree's
     // drawer closed, hand focus back to the center, and relayout to reclaim
     // the bottom slice.
@@ -519,12 +559,12 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
         }
         *ctx.need_relayout = true;
         *ctx.dirty = true;
-        return;
+        return false;
     }
     // A pooled (hidden) drawer's yazi exited; just forget it.
     if ctx.drawer_pool.remove_id(id) {
         *ctx.dirty = true;
-        return;
+        return false;
     }
     // The corner overlay pin died (e.g. mpv quit on `q`). It's a supervised
     // pin, so still drive `on_exit` for the chip/health + restart policy, but
@@ -584,7 +624,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
         persist_pin_state(ctx.supervisor, &ctx.session.id);
         *ctx.need_relayout = true;
         *ctx.dirty = true;
-        return;
+        return false;
     }
     // Pin panes are supervised separately from tab panes: the supervisor
     // applies the restart policy. A clean exit (code 0) is reported as such so
@@ -620,7 +660,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
         persist_pin_state(ctx.supervisor, &ctx.session.id);
         *ctx.need_relayout = true;
         *ctx.dirty = true;
-        return;
+        return false;
     }
     // Find the owning (group, tab) and either drop the pane from its split or,
     // if its only shell died, keep the tab and respawn a fresh shell. Explicit
@@ -652,7 +692,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
             let shutting_down = ctx.shutdown.load(std::sync::atomic::Ordering::Relaxed);
             let interactive_close = !shutting_down && age >= CRASH_THRESHOLD;
             close_exited_terminal(ctx, gi, ti, interactive_close);
-            return;
+            return false;
         }
         let is_active_tab = gi == ctx.session.active && ti == ctx.session.worktrees[gi].active_tab;
         // A pane that exits within CRASH_THRESHOLD of being spawned is a
@@ -673,23 +713,17 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
         };
         // A remote env's interactive pane is a `*-ssh` self-bridge subprocess, so a
         // fast failed exit is a connect/resolve failure the compositor can't observe
-        // any other way. Mark the provider unhealthy so the respawn's
-        // `env_halt_reason` halts (→ the "cannot connect" modal raised in the Err
-        // arm below) instead of silently husking pane after pane.
+        // any other way. Mark the provider unhealthy so the respawn's off-thread
+        // `env_halt_reason` check (in the materialize worker) halts — surfacing the
+        // "cannot connect" modal via `drain_specs`' Err arm — instead of silently
+        // husking pane after pane. Order-dependent: the mark must land before the
+        // materialize worker reads it, which the mark-here / read-later-off-thread
+        // sequencing guarantees.
         if failed && age < CRASH_THRESHOLD {
             // Resolve with the SAME config the respawn's `env_halt_reason` uses
             // (`keymap_config`), so the mark and the halt check agree.
             report_pane_connect_failure(ctx.keymap_config, &ctx.session.worktrees[gi].path);
         }
-        // What this pane was last running (captured at persist time) —
-        // offered for relaunch after a crash. Grabbed before the pane's tab
-        // is mutated.
-        let remembered = ctx
-            .session
-            .tab_mut(gi, ti)
-            .and_then(|t| t.pane_cmds.get(&id))
-            .map(|c| c.display())
-            .filter(|s| !s.is_empty());
         {
             let wt = ctx.session.worktrees[gi].path.clone();
             if !wt.is_empty() {
@@ -790,78 +824,68 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
             }
         }
         if sole {
+            // NO respawn happens here. The dead id already left `panes.table`
+            // (top of fn) and its leaf stays in `tab.center`, so it is now a
+            // "missing leaf" the loop's off-thread materialize pipeline
+            // (`maybe_materialize` → spec channel → `materialize_with_specs`)
+            // respawns — sandbox resolution (DB open, container ensure:
+            // seconds to minutes on a wedged podman) runs on a blocking task,
+            // never on the loop. A sandbox halt (`env_halt_reason`) surfaces
+            // via the same pipeline's Err arm (`drain_specs` raises the
+            // once-per-key modal), replacing the inline handling that lived
+            // here. The bookkeeping runs for EVERY sole exit — active tab or
+            // not — so a background tab's switch-back materialize sees the
+            // same prepared state (no dead-daemon-session reattach, no stale
+            // relaunch after a clean exit).
+            if let Some(tab) = ctx.session.tab_mut(gi, ti) {
+                // `exit_code == None` is a transport-loss exit (the relay's
+                // reconnect ladder exhausted, pane.rs) — the daemon/provider
+                // session may still be alive. Keep its record so switch-back
+                // materialize can warm-reattach instead of orphaning it.
+                let transport_loss = exit_code.is_none();
+                crate::handlers::crash::prep_leaf_for_respawn(
+                    tab,
+                    id,
+                    failed,
+                    transport_loss,
+                    respawn_tail,
+                );
+            }
             if is_active_tab {
-                if crashes >= 3 {
-                    // Crashing on every startup — stop respawning and surface the
-                    // pane's real last error (e.g. a container/exec failure) so it
-                    // isn't a silent black hole.
-                    tracing::error!(
-                        worktree = %ctx.session.worktrees[gi].name,
-                        tail = %crash_tail,
-                        "sandbox pane kept crashing; not respawning"
-                    );
-                    ctx.loading_state
-                        .remove(&(ctx.session.worktrees[gi].name.clone(), ti));
-                    ctx.model.load_steps.clear();
-                    *ctx.center_dormant = true;
-                    ctx.model.status = crate::handlers::crash::keeps_crashing_status(&crash_tail);
-                } else {
-                    // Worktree dir first, then current_dir, then $HOME.
-                    let cwd = group_cwd(&ctx.session.worktrees[gi])
-                        .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from));
-                    match spawn_worktree_shell_pane(
-                        ctx.panes,
-                        ctx.keymap_config,
-                        cwd.as_deref(),
-                        ctx.chrome_center,
-                        false,
-                        None,
-                        "",
-                    ) {
-                        Ok(fresh) => {
-                            if let Some(tab) = ctx.session.tab_mut(gi, ti) {
-                                replace_single_dead_center_pane(tab, id, fresh);
-                            }
-                            // On a crash, offer to relaunch what was running
-                            // (if known) over the fresh shell; a clean exit
-                            // just lands at a prompt.
-                            if failed && let Some(cmd) = remembered.clone() {
-                                if let Some(p) = ctx.panes.table.get_mut(&fresh) {
-                                    p.set_pending_relaunch(Some(cmd));
-                                }
-                                ctx.model.status = "Pane crashed; press Enter to relaunch \
-                                     (Esc for a shell)"
-                                    .into();
-                            } else {
-                                ctx.model.status = "Pane exited; spawned a fresh shell".into();
-                            }
-                            *ctx.need_relayout = true;
-                        }
-                        Err(err) => {
-                            let k = (ctx.session.worktrees[gi].name.clone(), ti);
-                            ctx.loading_state.remove(&k);
-                            ctx.loading_remote.remove(&k);
-                            ctx.model.load_steps.clear();
-                            *ctx.center_dormant = true;
-                            // A failover-off env that can't come up (token unset, or
-                            // — for a remote — a connect failure just marked above)
-                            // surfaces as a `SandboxHalt`: raise the blocking modal
-                            // exactly ONCE per (group, tab), matching the provision
-                            // drain. Once dismissed the row's error dot carries the
-                            // state; a `[r]` retry re-attempts. Anything else is a
-                            // plain status line.
-                            if let Some(halt) = crate::handlers::provision::sandbox_halt_in(&err) {
-                                ctx.model.status =
-                                    format!("{} unavailable: {}", halt.placement, halt.reason);
-                                if !ctx.halt_dismissed.contains(&k) {
-                                    *ctx.active_menu = Some(
-                                        crate::handlers::provision::sandbox_halt_overlay(halt),
-                                    );
-                                }
-                            } else {
-                                ctx.model.status = format!("Respawn failed: {err:#}");
-                            }
-                        }
+                match crate::handlers::crash::respawn_action(crashes, failed) {
+                    crate::handlers::crash::RespawnAction::GiveUp => {
+                        // Crashing on every startup — stop respawning and surface
+                        // the pane's real last error (e.g. a container/exec
+                        // failure) so it isn't a silent black hole. `center_dormant`
+                        // also gates the materialize block off.
+                        tracing::error!(
+                            worktree = %ctx.session.worktrees[gi].name,
+                            tail = %crash_tail,
+                            "sandbox pane kept crashing; not respawning"
+                        );
+                        ctx.loading_state
+                            .remove(&(ctx.session.worktrees[gi].name.clone(), ti));
+                        ctx.model.load_steps.clear();
+                        *ctx.center_dormant = true;
+                        ctx.model.status =
+                            crate::handlers::crash::keeps_crashing_status(&crash_tail);
+                    }
+                    crate::handlers::crash::RespawnAction::LeaveForMaterialize { .. } => {
+                        // The materialize half owns the relaunch offer: it arms
+                        // `set_pending_relaunch` (host backend + remembered cmd
+                        // only), so no Enter-to-relaunch promise here. Note: on a
+                        // native-exec provider worktree the respawn relaunches the
+                        // worktree's remembered AGENT (materialize's
+                        // `db.worktree_agent` rule), not the forced plain shell the
+                        // old inline path spawned — an agent crash loop stays
+                        // bounded by the 3-crash give-up above.
+                        ctx.model.status = if failed {
+                            "Pane crashed; restarting shell…".into()
+                        } else {
+                            "Pane exited; restarting shell…".into()
+                        };
+                        left_for_materialize = true;
+                        *ctx.need_relayout = true;
                     }
                 }
             }
@@ -876,6 +900,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) {
         }
     }
     *ctx.dirty = true;
+    left_for_materialize
 }
 
 /// A standalone terminal's last shell exited: tear the terminal down instead of

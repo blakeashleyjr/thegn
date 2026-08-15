@@ -2,6 +2,36 @@ use super::super::*;
 use super::{map_env, tmpdir};
 
 #[test]
+fn config_enum_defaults_and_displays() {
+    // Default variant matches the macro `default =` clause for every enum.
+    assert_eq!(Picker::default(), Picker::Auto);
+    assert_eq!(UndercurlMode::default(), UndercurlMode::Auto);
+    assert_eq!(WorktreeMode::default(), WorktreeMode::Global);
+    assert_eq!(NameScheme::default(), NameScheme::Words);
+    assert_eq!(SandboxBackend::default(), SandboxBackend::Auto);
+    assert_eq!(Network::default(), Network::Nat);
+    assert_eq!(OnMissing::default(), OnMissing::Warn);
+    assert_eq!(RemoteTransport::default(), RemoteTransport::Mosh);
+    assert_eq!(RemoteMode::default(), RemoteMode::Remote);
+    assert_eq!(LogLevel::default(), LogLevel::Info);
+    assert_eq!(LogFormat::default(), LogFormat::Text);
+    assert_eq!(PinLocation::default(), PinLocation::Tab);
+    assert_eq!(PinScope::default(), PinScope::Global);
+    assert_eq!(GitCmdOutput::default(), GitCmdOutput::Popup);
+    assert_eq!(IssueProviderKind::default(), IssueProviderKind::None);
+
+    // Display delegates to as_str (canonical form).
+    assert_eq!(UndercurlMode::On.to_string(), "on");
+    assert_eq!(UndercurlMode::Off.to_string(), "off");
+    assert_eq!(WorktreeMode::InRepo.to_string(), "in_repo");
+    assert_eq!(NameScheme::Numbered.to_string(), "numbered");
+    assert_eq!(LogLevel::Trace.to_string(), "trace");
+    assert_eq!(GitCmdOutput::Terminal.to_string(), "terminal");
+    assert_eq!(GitCmdOutput::None.to_string(), "none");
+    assert_eq!(IssueProviderKind::Jira.to_string(), "jira");
+}
+
+#[test]
 fn expand_env_ref_returns_none_for_empty() {
     assert_eq!(expand_env_ref(""), None);
     assert_eq!(expand_env_ref("   "), None);
@@ -285,82 +315,7 @@ fn notifications_overlay_apply_covers_every_field() {
     assert_eq!(base.active_mode, "focus");
 }
 
-#[test]
-fn llm_proxy_disabled_by_default_no_launch() {
-    let cfg = Config::default();
-    assert!(!cfg.llm_proxy.enabled);
-    assert_eq!(cfg.llm_proxy.listen, "127.0.0.1:8383");
-    assert_eq!(cfg.llm_proxy.routing, RoutingStrategy::Sequential);
-    assert!(cfg.llm_proxy.launch_spec().is_none());
-}
-
-#[test]
-fn llm_proxy_launch_spec_when_enabled() {
-    let mut cfg = LlmProxyConfig {
-        enabled: true,
-        config_path: "/etc/tgproxy.json".into(),
-        ..Default::default()
-    };
-    let (prog, args, env) = cfg.launch_spec().unwrap();
-    assert_eq!(prog, "tgproxy");
-    assert!(args.is_empty());
-    assert_eq!(env.get("TGPROXY_LISTEN").unwrap(), "127.0.0.1:8383");
-    assert_eq!(env.get("TGPROXY_CONFIG").unwrap(), "/etc/tgproxy.json");
-    // No config path → no TGPROXY_CONFIG env entry.
-    cfg.config_path = String::new();
-    let (_, _, env) = cfg.launch_spec().unwrap();
-    assert!(!env.contains_key("TGPROXY_CONFIG"));
-}
-
-#[test]
-fn routing_strategy_aliases_and_fallback() {
-    assert_eq!(
-        RoutingStrategy::from_str_validated("failover").unwrap(),
-        RoutingStrategy::Sequential
-    );
-    assert_eq!(
-        RoutingStrategy::from_str_validated("cascade").unwrap(),
-        RoutingStrategy::Speculative
-    );
-    // Unknown deserializes to the default without panic.
-    let s: RoutingStrategy = serde_json::from_str(r#""nonsense""#).unwrap();
-    assert_eq!(s, RoutingStrategy::Sequential);
-}
-
 // ---- config_enum! Default + Display + from_str_validated round-trips ----
-
-#[test]
-fn config_enum_defaults_and_displays() {
-    // Default variant matches the macro `default =` clause for every enum.
-    assert_eq!(Picker::default(), Picker::Auto);
-    assert_eq!(UndercurlMode::default(), UndercurlMode::Auto);
-    assert_eq!(WorktreeMode::default(), WorktreeMode::Global);
-    assert_eq!(NameScheme::default(), NameScheme::Words);
-    assert_eq!(SandboxBackend::default(), SandboxBackend::Auto);
-    assert_eq!(Network::default(), Network::Nat);
-    assert_eq!(OnMissing::default(), OnMissing::Warn);
-    assert_eq!(RemoteTransport::default(), RemoteTransport::Mosh);
-    assert_eq!(RemoteMode::default(), RemoteMode::Remote);
-    assert_eq!(LogLevel::default(), LogLevel::Info);
-    assert_eq!(LogFormat::default(), LogFormat::Text);
-    assert_eq!(PinLocation::default(), PinLocation::Tab);
-    assert_eq!(PinScope::default(), PinScope::Global);
-    assert_eq!(RoutingStrategy::default(), RoutingStrategy::Sequential);
-    assert_eq!(CompressionLevel::default(), CompressionLevel::Conservative);
-    assert_eq!(GitCmdOutput::default(), GitCmdOutput::Popup);
-    assert_eq!(IssueProviderKind::default(), IssueProviderKind::None);
-
-    // Display delegates to as_str (canonical form).
-    assert_eq!(UndercurlMode::On.to_string(), "on");
-    assert_eq!(UndercurlMode::Off.to_string(), "off");
-    assert_eq!(WorktreeMode::InRepo.to_string(), "in_repo");
-    assert_eq!(NameScheme::Numbered.to_string(), "numbered");
-    assert_eq!(LogLevel::Trace.to_string(), "trace");
-    assert_eq!(GitCmdOutput::Terminal.to_string(), "terminal");
-    assert_eq!(GitCmdOutput::None.to_string(), "none");
-    assert_eq!(CompressionLevel::Aggressive.to_string(), "aggressive");
-    assert_eq!(IssueProviderKind::Jira.to_string(), "jira");
-}
 
 #[test]
 fn config_enum_every_variant_roundtrips_canon_and_aliases() {
@@ -522,27 +477,6 @@ fn pin_location_aliases_parse() {
     ] {
         assert_eq!(PinLocation::from_str_validated(s).unwrap(), v, "{s}");
     }
-}
-
-#[test]
-fn compression_level_aliases_and_serde() {
-    assert_eq!(
-        CompressionLevel::from_str_validated("none").unwrap(),
-        CompressionLevel::Off
-    );
-    assert_eq!(CompressionLevel::Off.as_str(), "off");
-    assert_eq!(
-        CompressionLevel::from_str_validated("balanced").unwrap(),
-        CompressionLevel::Balanced
-    );
-    // Unknown deserializes to default (Conservative) without panic.
-    let c: CompressionLevel = serde_json::from_str(r#""nonsense""#).unwrap();
-    assert_eq!(c, CompressionLevel::Conservative);
-    // Serialize round-trips to canonical.
-    assert_eq!(
-        serde_json::to_string(&CompressionLevel::Aggressive).unwrap(),
-        r#""aggressive""#
-    );
 }
 
 // ---- Default impls (non-trivial fields) ----
@@ -879,39 +813,6 @@ fn sandbox_warm_direnv_and_prepare_parse() {
 }
 
 // ---- launch_spec full env coverage ----
-
-#[test]
-fn llm_proxy_launch_spec_sets_all_stream_env() {
-    let cfg = LlmProxyConfig {
-        enabled: true,
-        listen: "0.0.0.0:9000".into(),
-        config_path: String::new(),
-        routing: RoutingStrategy::Speculative,
-        first_byte_timeout_secs: 7,
-        idle_timeout_secs: 99,
-        heartbeat_secs: 3,
-        token_reduction: true,
-        token_reduction_level: CompressionLevel::Aggressive,
-        ..Default::default()
-    };
-    let (prog, _args, env) = cfg.launch_spec().unwrap();
-    assert_eq!(prog, "tgproxy");
-    assert_eq!(env.get("TGPROXY_LISTEN").unwrap(), "0.0.0.0:9000");
-    assert_eq!(env.get("TGPROXY_FIRST_BYTE_TIMEOUT").unwrap(), "7");
-    assert_eq!(env.get("TGPROXY_STREAM_IDLE_TIMEOUT").unwrap(), "99");
-    assert_eq!(env.get("TGPROXY_STREAM_HEARTBEAT_INTERVAL").unwrap(), "3");
-    assert_eq!(env.get("TGPROXY_COMPRESS").unwrap(), "1");
-    assert_eq!(env.get("TGPROXY_COMPRESS_LEVEL").unwrap(), "aggressive");
-    assert_eq!(env.get("TGPROXY_ROUTING").unwrap(), "speculative");
-    // token_reduction off → TGPROXY_COMPRESS = "0".
-    let off = LlmProxyConfig {
-        enabled: true,
-        token_reduction: false,
-        ..Default::default()
-    };
-    let (_, _, env) = off.launch_spec().unwrap();
-    assert_eq!(env.get("TGPROXY_COMPRESS").unwrap(), "0");
-}
 
 // ---- AppsConfig::effective_tab_order / normalized_default_tab edges ----
 
@@ -1284,148 +1185,6 @@ fn load_layered_recovers_on_parse_error_and_still_applies_layers() {
     assert_eq!(c.branch_prefix, "env/");
     assert_eq!(c.picker, Picker::Fzf);
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn remote_agent_env_routes_through_proxy_when_configured() {
-    // Off by default (no route_agent → no injection).
-    assert!(LlmProxyConfig::default().remote_agent_env(None).is_empty());
-    // `route_agent` alone is the single switch: an empty remote_base_url resolves
-    // to the auto reverse-tunnel loopback, so the pi (`THEGN_PROXY_*`) env IS
-    // injected and the tunnel port is signalled — but NOT `ANTHROPIC_BASE_URL`
-    // (claude talks to Anthropic directly unless `route_claude`).
-    let only_route = LlmProxyConfig {
-        route_agent: true,
-        ..Default::default()
-    };
-    let oenv = only_route.remote_agent_env(None);
-    assert!(
-        oenv.iter()
-            .any(|(k, v)| k == "THEGN_PROXY_BASE_URL" && v == "http://127.0.0.1:8383"),
-        "route_agent alone → pi proxy vars injected at the auto loopback"
-    );
-    assert!(
-        !oenv.iter().any(|(k, _)| k == "ANTHROPIC_BASE_URL"),
-        "claude is NOT routed by default (route_claude off)"
-    );
-    assert_eq!(only_route.remote_tunnel_port(), Some(8383));
-    // Configured, route_claude ON → additionally inject the ANTHROPIC_* vars.
-    let lp = LlmProxyConfig {
-        route_agent: true,
-        route_claude: true,
-        remote_base_url: "https://proxy.example".into(),
-        ..Default::default()
-    };
-    let env = lp.remote_agent_env(Some("vk-1"));
-    assert!(
-        env.iter()
-            .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "https://proxy.example"),
-        "route_claude → claude code / SDK honor ANTHROPIC_BASE_URL"
-    );
-    assert!(
-        env.iter()
-            .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "vk-1")
-    );
-    assert!(env.iter().any(|(k, _)| k == "THEGN_PROXY_BASE_URL"));
-    assert!(
-        env.iter()
-            .any(|(k, v)| k == "THEGN_PROXY_KEY" && v == "vk-1"),
-        "pi always gets the virtual key regardless of route_claude"
-    );
-    assert_eq!(
-        lp.remote_tunnel_port(),
-        None,
-        "explicit URL needs no tunnel"
-    );
-    // route_claude OFF with a virtual key: pi key present, ANTHROPIC_* absent.
-    let keyed_no_claude = LlmProxyConfig {
-        route_agent: true,
-        remote_base_url: "https://proxy.example".into(),
-        ..Default::default()
-    };
-    let kenv = keyed_no_claude.remote_agent_env(Some("vk-2"));
-    assert!(
-        kenv.iter()
-            .any(|(k, v)| k == "THEGN_PROXY_KEY" && v == "vk-2")
-    );
-    assert!(!kenv.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
-    assert!(!kenv.iter().any(|(k, _)| k == "ANTHROPIC_BASE_URL"));
-
-    // "auto" → derive the in-sandbox tunnel URL from the proxy port + signal
-    // the host to stand a reverse tunnel up on that port (pi still needs it).
-    let auto = LlmProxyConfig {
-        route_agent: true,
-        route_claude: true,
-        remote_base_url: "auto".into(),
-        listen: "127.0.0.1:9999".into(),
-        ..Default::default()
-    };
-    assert_eq!(
-        auto.remote_base_url().as_deref(),
-        Some("http://127.0.0.1:9999")
-    );
-    assert_eq!(auto.remote_tunnel_port(), Some(9999));
-    let aenv = auto.remote_agent_env(None);
-    assert!(
-        aenv.iter()
-            .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "http://127.0.0.1:9999")
-    );
-}
-
-#[test]
-fn local_agent_env_targets_host_loopback_regardless_of_remote_base_url() {
-    // Off by default.
-    assert!(LlmProxyConfig::default().local_agent_env().is_empty());
-    // `route_agent` on: always the LOCAL listen loopback, even when
-    // `remote_base_url` points at an external endpoint for remote sandboxes.
-    let lp = LlmProxyConfig {
-        route_agent: true,
-        route_claude: true,
-        remote_base_url: "https://proxy.example.ts.net".into(),
-        listen: "127.0.0.1:8383".into(),
-        ..Default::default()
-    };
-    let env = lp.local_agent_env();
-    let url = "http://127.0.0.1:8383";
-    assert!(
-        env.iter()
-            .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == url),
-        "route_claude → host agent uses the local loopback, not the external remote URL"
-    );
-    assert!(
-        env.iter()
-            .any(|(k, v)| k == "THEGN_PROXY_BASE_URL" && v == url),
-        "the pi extension's base URL is the local proxy"
-    );
-    assert!(env.iter().any(|(k, _)| k == "THEGN_PROXY_API"));
-    assert!(env.iter().any(|(k, _)| k == "THEGN_PROXY_MODEL"));
-    // Keyless (like the sprite path) — the pi extension falls back to default.
-    assert!(!env.iter().any(|(k, _)| k == "THEGN_PROXY_KEY"));
-    assert!(!env.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
-    // Default (route_claude off): pi vars only, claude talks upstream directly.
-    let no_claude = LlmProxyConfig {
-        route_agent: true,
-        listen: "127.0.0.1:8383".into(),
-        ..Default::default()
-    };
-    let nenv = no_claude.local_agent_env();
-    assert!(nenv.iter().any(|(k, _)| k == "THEGN_PROXY_BASE_URL"));
-    assert!(
-        !nenv.iter().any(|(k, _)| k == "ANTHROPIC_BASE_URL"),
-        "claude not routed on the host by default"
-    );
-    // Honors a custom listen port.
-    let custom = LlmProxyConfig {
-        route_agent: true,
-        listen: "127.0.0.1:7000".into(),
-        ..Default::default()
-    };
-    assert!(
-        custom
-            .local_agent_env()
-            .iter()
-            .any(|(k, v)| k == "THEGN_PROXY_BASE_URL" && v == "http://127.0.0.1:7000")
-    );
 }
 
 #[test]
@@ -1835,53 +1594,6 @@ extra_flags = ["--assignee", "@me"]
         cfg.issues.github_issues.extra_flags,
         vec!["--assignee", "@me"]
     );
-}
-
-#[test]
-fn llm_proxy_full_table_parses() {
-    let cfg: Config = toml::from_str(
-        r#"
-[llm_proxy]
-enabled = true
-listen = "127.0.0.1:9999"
-routing = "speculative"
-refuse_on_breach = false
-config_path = "/x.json"
-first_byte_timeout_secs = 10
-idle_timeout_secs = 20
-heartbeat_secs = 5
-token_reduction = true
-token_reduction_level = "balanced"
-route_agent = true
-bouncer = true
-"#,
-    )
-    .unwrap();
-    assert!(cfg.llm_proxy.enabled);
-    assert_eq!(cfg.llm_proxy.listen, "127.0.0.1:9999");
-    assert_eq!(cfg.llm_proxy.routing, RoutingStrategy::Speculative);
-    assert!(!cfg.llm_proxy.refuse_on_breach);
-    assert_eq!(cfg.llm_proxy.first_byte_timeout_secs, 10);
-    assert_eq!(cfg.llm_proxy.idle_timeout_secs, 20);
-    assert_eq!(cfg.llm_proxy.heartbeat_secs, 5);
-    assert!(cfg.llm_proxy.token_reduction);
-    assert_eq!(
-        cfg.llm_proxy.token_reduction_level,
-        CompressionLevel::Balanced
-    );
-    assert!(cfg.llm_proxy.route_agent);
-    assert!(cfg.llm_proxy.bouncer);
-}
-
-#[test]
-fn llm_proxy_bouncer_off_by_default() {
-    // The bouncer is opt-in: the additive integration (pi runs its own
-    // tools in-process) stays the default.
-    let cfg = LlmProxyConfig::default();
-    assert!(!cfg.bouncer, "bouncer must default off — AI is additive");
-    // A table that omits the key keeps the default.
-    let parsed: Config = toml::from_str("[llm_proxy]\nenabled = true\n").unwrap();
-    assert!(!parsed.llm_proxy.bouncer);
 }
 
 #[test]

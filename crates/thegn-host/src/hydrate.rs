@@ -170,9 +170,6 @@ pub(crate) enum RefreshKind {
     /// off-loop, delivered into the live modal overlay by
     /// [`crate::detail::apply_ci_detail`].
     CiDetail(Box<crate::detail::CiDetailPayload>),
-    /// The proxy dashboard's off-loop DB gather (stats/budgets/health),
-    /// delivered into the live overlay by `crate::detail::apply_proxy_dash`.
-    ProxyDash(Box<crate::detail::ProxyDashPayload>),
     /// The usage overlay's off-loop gather (per-account rate-limit windows),
     /// delivered into the live overlay by `crate::detail::apply_usage`.
     Usage(Box<crate::detail::UsagePayload>),
@@ -538,7 +535,25 @@ pub(crate) fn load_or_seed_session(
         );
     };
 
-    let mut session = Session::resurrect_with_cfg(&db, &session_name, cfg).unwrap_or_default();
+    // A resurrect ERROR (not an empty Ok) must not become an empty session: the
+    // startup/quit persist does clear-then-insert, so an empty session from a
+    // transient read failure (SQLITE_BUSY under a concurrent instance) would
+    // DELETE the user's real persisted layout. Retry with a short backoff (the
+    // busy-timeout usually clears it); only fall to default after logging loudly.
+    let mut session = {
+        let mut attempt = Session::resurrect_with_cfg(&db, &session_name, cfg);
+        for _ in 0..3 {
+            if attempt.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            attempt = Session::resurrect_with_cfg(&db, &session_name, cfg);
+        }
+        attempt.unwrap_or_else(|e| {
+            tracing::error!(target: "thegn::session", session = %session_name, "resurrect failed after retries ({e}); starting empty — the layout persist may be stale");
+            Session::default()
+        })
+    };
 
     // git is the source of truth for worktrees on disk: drop resurrected
     // groups whose local dir vanished (deleted/moved outside thegn). Remote
@@ -1543,7 +1558,6 @@ pub(crate) fn build_model(
     hints: HydrateHints,
 ) -> FrameModel {
     use thegn_core::remote::GitLoc;
-    use thegn_core::store::ProxyStore;
 
     let t0 = std::time::Instant::now();
     let cwd = active_tab_path(session);
@@ -1745,11 +1759,10 @@ pub(crate) fn build_model(
         // on `podman ps` subprocess calls.
         containers: vec![],
         container_events: db.container_events(&loc.path(), 10).unwrap_or_default(),
-        // Unified timeline: sandbox audit + proxy spend, merged newest-first.
-        // Two small off-loop reads on the hydration thread (never the event loop).
+        // Unified timeline: sandbox audit events, newest-first. A small
+        // off-loop read on the hydration thread (never the event loop).
         timeline: thegn_core::models::merge_timeline(
             &db.container_events(&loc.path(), 20).unwrap_or_default(),
-            &db.proxy_requests(&loc.path(), 20).unwrap_or_default(),
             20,
         ),
         panel,

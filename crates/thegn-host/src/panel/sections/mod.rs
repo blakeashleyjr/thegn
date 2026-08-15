@@ -1601,17 +1601,7 @@ mod spec {
                 exit_code: Some(0),
             },
         ];
-        // A proxy request folds into the same timeline as the sandbox events.
-        let proxy = vec![thegn_core::db::ProxyRequestRow {
-            ts_ms: 2_500_000,
-            backend_model: "claude-opus-4-8".into(),
-            input_tokens: 100,
-            output_tokens: 20,
-            cost_usd: 0.0123,
-            outcome: "ok".into(),
-            ..Default::default()
-        }];
-        m.timeline = thegn_core::models::merge_timeline(&events, &proxy, 20);
+        m.timeline = thegn_core::models::merge_timeline(&events, 20);
         // Half width → deep() == true
         let rendered = sandbox_rows(&m, PanelWidth::Half);
         assert!(
@@ -1624,15 +1614,6 @@ mod spec {
             "expected network event: {rendered}"
         );
         assert!(rendered.contains("die"), "expected die event: {rendered}");
-        // The proxy request is merged in (model + cost visible).
-        assert!(
-            rendered.contains("request"),
-            "expected proxy request row: {rendered}"
-        );
-        assert!(
-            rendered.contains("claude-opus-4-8"),
-            "expected proxy model in detail: {rendered}"
-        );
     }
 
     #[test]

@@ -120,6 +120,11 @@ impl SidebarState {
     }
 
     /// Persist a single `ui_state` key in the global [`SIDEBAR_SCOPE`].
+    ///
+    /// Kept synchronous: a view-preference toggle is rare and the write is tiny,
+    /// and callers (+ tests) rely on read-after-write within the same session
+    /// (re-loading a fresh `SidebarState` immediately reflects the change). The
+    /// off-loop background writer would break that ordering for negligible gain.
     pub(crate) fn persist(&self, key: &str, value: &str) {
         if let Ok(db) = thegn_core::db::Db::open() {
             // best-effort: the DB is a cache; a failed persist only loses a

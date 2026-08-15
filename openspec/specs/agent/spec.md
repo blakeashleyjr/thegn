@@ -2,78 +2,109 @@
 
 ## Purpose
 
-thegn embeds a coding agent that is bound to a worktree, routes its model
-traffic through the LLM proxy, and services its tool requests off the event loop
-within the worktree's sandbox boundary. The agent layer is strictly additive — the
-AI-free shell never depends on it — and the in-shell surface is intentionally
-minimal.
-
-> Note: the concrete agent harness is in transition (the embedded termite-agent is
-> being superseded by a pi fork over ACP). The requirements below capture the
-> decision-stable invariants that hold across that transition; harness-specific
-> details belong in their own in-flight changes.
+thegn's agent surface is a thin, config-driven launcher: coding agents are
+external CLIs the user declares in config, launched as ordinary pane processes
+inside the worktree's sandbox boundary. thegn remembers which agent a worktree
+runs, carries agent logins into sandboxes, and folds agent output into the
+per-worktree activity signal. There is no embedded agent harness and no model
+traffic routing — the AI/agent layer (LLM proxy, ACP harness, managed pi) was
+removed from the codebase before the public alpha; the shell is AI-free and any
+future AI layer must be strictly additive.
 
 ## Requirements
 
-### Requirement: Agent binds per worktree with a minimal surface
+### Requirement: Agents and tools are config-driven argv launchers
 
-An embedded agent SHALL bind to a worktree with a per-worktree activity indicator and a connection lifecycle, and the in-shell surface is intentionally minimal (the activity chip) with agent edits auto-applied rather than gated, per the current product decision.
+thegn SHALL let users declare coding agents (`[[agents]]`) and per-worktree
+tools (`[[tools]]`) in config as named argv commands, and the picker SHALL
+offer every configured agent, then every tool, then a literal `shell` entry
+(the `__shell__` sentinel resolves to a login shell). Launching an entry MUST
+compose its sandbox-wrapped argv + env and spawn it as the pane's own process.
 
-#### Scenario: Agent activity shows on its worktree
+#### Scenario: A configured agent launches as the pane process
 
-- **WHEN** an agent bound to a worktree is active
-- **THEN** that worktree's activity chip reflects the agent's state
+- **WHEN** a user picks a configured `[[agents]]` entry for a worktree
+- **THEN** its command is resolved to a sandbox-wrapped argv and spawned as
+  that pane's own process
 
-#### Scenario: Edits auto-apply
+#### Scenario: The shell sentinel launches a plain shell
 
-- **WHEN** the agent edits files in its worktree
-- **THEN** the edits are applied without a blocking in-shell review gate
+- **WHEN** a user picks the `shell` entry (or an agent whose command is
+  `__shell__`)
+- **THEN** the pane runs a plain login shell rather than an agent
 
-### Requirement: Agent model traffic routes through the proxy
+### Requirement: The worktree remembers its agent
 
-Agent model traffic SHALL route through `tgproxy` via per-worktree virtual keys so spend and budgets attribute to the worktree.
+thegn SHALL record which agent a worktree runs (the DB `worktrees.agent`
+column) so the choice survives across sessions and attributes per-worktree
+state: session resurrection relaunches the remembered agent, the sidebar agent
+marker reflects it, and activity signals distinguish agent-bearing worktrees
+from plain shell/tool panes.
 
-#### Scenario: Requests carry the worktree key
+#### Scenario: The agent choice survives a restart
 
-- **WHEN** the agent makes a model request
-- **THEN** it is routed through the proxy under the worktree's virtual key
+- **WHEN** a worktree was created with a configured agent and thegn restarts
+- **THEN** the worktree's remembered agent is restored from `worktrees.agent`
+  and used for resurrection and attribution
 
-### Requirement: Agent tool services run off the loop and scoped
+### Requirement: Agent logins sync into sandboxes
 
-The terminal/filesystem/edit services the agent requests SHALL run off the event loop and be scoped to the worktree (and its sandbox boundary), never blocking the loop or adding a polling timeout.
+When a worktree's interactive process runs in a provider sandbox, thegn SHALL
+upload the relevant agents' host config/credential files so the agent is
+logged in there. Auth-critical files (a small explicit allowlist) MUST always
+be uploaded first without a budget check; the remaining config tree is
+uploaded best-effort under a time budget with bounded concurrency, and
+executable bits MUST be preserved.
 
-#### Scenario: File edit serviced off-loop
+#### Scenario: Auth-critical files guarantee a usable agent
 
-- **WHEN** the agent requests a file edit
-- **THEN** it is serviced off the loop, scoped to the worktree, without blocking
-  rendering
+- **WHEN** an agent's login sync runs against a slow provider and the full
+  config tree cannot finish within the budget
+- **THEN** the auth-critical allowlist has already been uploaded, so the agent
+  is authenticated and usable; only non-critical extras may be missing
+
+### Requirement: Agent output feeds the activity signal
+
+Unsolicited PTY output from panes of an agent-bearing worktree SHALL count as
+a busy signal for the activity state machine, so an agent that is working but
+using ~0% CPU (blocked on a model response, redrawing a spinner) is not marked
+waiting mid-turn. Output within the solicited-echo gap after user input,
+output from freshly spawned panes (spawn grace), and panes whose spawn program
+is a shell or a configured tool MUST NOT count.
+
+#### Scenario: A spinner keeps the agent working
+
+- **WHEN** an agent-bearing worktree's pane keeps emitting unsolicited output
+  with no user keystrokes
+- **THEN** the worktree's activity stays busy rather than flipping to waiting
+
+#### Scenario: A quiet agent flips to waiting
+
+- **WHEN** the agent stops emitting output and its CPU signal is quiet past
+  the grace period
+- **THEN** the worktree's activity flips to waiting (unread)
+
+### Requirement: Sandboxes provision the configured agents
+
+The `[[agents]]` list SHALL be the source of truth for which coding-agent CLIs
+a sandbox provisions (install + login carry), deduplicated by agent kind
+(`provider`, else the command's program basename). The `[sandbox.home] agents`
+list MUST override it with an explicit install list, and only when no
+`[[agents]]` are configured at all does thegn fall back to detecting the
+host's agents.
+
+#### Scenario: An explicit install list overrides the picker set
+
+- **WHEN** `[sandbox.home] agents = ["claude"]` is set alongside several
+  `[[agents]]` entries
+- **THEN** the sandbox installs and carries login for `claude` only
 
 ### Requirement: The agent layer is strictly additive
 
-The shell SHALL function fully with no agent configured; agent features MUST NOT be a hard dependency of the AI-free shell.
+The shell SHALL function fully with no agent configured; agent features MUST
+NOT be a hard dependency of the AI-free shell.
 
 #### Scenario: No agent configured
 
 - **WHEN** no agent is configured
 - **THEN** the shell operates normally with agent features simply unavailable
-
-### Requirement: The managed pi is acquired through the managed-tool resolver
-
-The managed `pi` binary under `~/.thegn/pi` SHALL be described as a
-`managed-tools` spec and acquired through the shared resolver rather than a
-bespoke install path. `thegn agent setup` MUST remain idempotent and preserve
-its observable behavior: install/refresh the pinned pi, always re-seed the
-`thegn-acp` package, register it, and record the pinned version marker.
-
-#### Scenario: agent setup installs via the shared resolver
-
-- **WHEN** `thegn agent setup` runs and the pinned pi is not yet current
-- **THEN** the pinned pi is installed through the managed-tool resolver and the
-  `thegn-acp` package is (re)seeded and registered
-
-#### Scenario: agent setup is idempotent when already pinned
-
-- **WHEN** `thegn agent setup` runs and the pinned pi is already at the pinned
-  version
-- **THEN** the binary install is skipped while the `thegn-acp` package is
-  still re-seeded and registered

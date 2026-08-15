@@ -121,6 +121,11 @@ async fn run(
     let sock = socket_override.unwrap_or_else(|| socket_path(&cfg.daemon));
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent).ok();
+        // Owner-only (0700) on the run-dir holding the control socket: the
+        // XDG_RUNTIME_DIR path is already 0700, but the state-dir fallback
+        // (`$XDG_STATE_HOME/thegn/run`, used when XDG_RUNTIME_DIR is unset —
+        // ssh-without-logind, cron, containers) inherits the umask. Best-effort.
+        let _ = thegn_core::fsperm::restrict_dir_to_owner(parent);
     }
     let ep = thegn_svc::ipc::IpcEndpoint::for_socket_path(&sock);
 
@@ -133,6 +138,19 @@ async fn run(
     {
         thegn_svc::ipc::BindOutcome::Bound(l) => l,
         thegn_svc::ipc::BindOutcome::AlreadyRunning => {
+            // `thegn daemon` (the compositor's pane-daemon ensure): the spawn
+            // race's loser exits 0 quietly — a live daemon on the socket is the
+            // whole point. But `thegn serve` needs to OPEN a TCP listener, which
+            // the AlreadyRunning path never reaches; returning Ok here means serve
+            // silently no-ops (exit 0, no listener) whenever a pane daemon already
+            // holds the socket — the common case after any TUI use. Surface it.
+            if serve.is_some() {
+                anyhow::bail!(
+                    "a pane daemon already owns {} — stop it (or set [daemon] enabled = false) \
+                     before running `thegn serve`, or point serve at a different [daemon] socket",
+                    ep.display()
+                );
+            }
             tracing::info!(target: "thegn::daemon", "daemon already running on {}", ep.display());
             return Ok(());
         }
@@ -159,27 +177,30 @@ async fn run(
     // tty hangup; what it wrongly added — dying with the forking *thread* — is
     // what we shed. Per-session teardown while the daemon lives is handled by
     // the actor's explicit child-terminate (see `SessionActor::run`).
+    //
+    // Our registry row is kept in scope for the daemon's lifetime: serve mode
+    // re-puts it with `tcp_addr` filled in, WITHOUT re-reading it from the DB
+    // (a transient SQLITE_BUSY read there used to become a guaranteed panic).
+    let mut daemon_row = DaemonRow {
+        daemon_id: daemon_id.clone(),
+        pid: std::process::id() as i64,
+        scope: scope.clone(),
+        // The endpoint's stable string form: the socket path on unix, the
+        // `\\.\pipe\…` name on Windows. Discovery classifies by prefix.
+        endpoint: ep.display(),
+        tcp_addr: None,
+        hostname: hostname(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at: now_ms(),
+        heartbeat_at: now_ms(),
+    };
     {
         let db = db.lock().expect("daemon db lock");
-        for row in db.daemons().unwrap_or_default() {
-            if row.scope == scope && !pid_alive(row.pid) {
-                let _ = db.clear_daemon_leases(&row.daemon_id);
-                let _ = db.del_daemon(&row.daemon_id);
-            }
+        for stale in boot_sweep_targets(&db.daemons().unwrap_or_default(), &scope, pid_alive) {
+            let _ = db.clear_daemon_leases(&stale);
+            let _ = db.del_daemon(&stale);
         }
-        db.put_daemon(&DaemonRow {
-            daemon_id: daemon_id.clone(),
-            pid: std::process::id() as i64,
-            scope: scope.clone(),
-            // The endpoint's stable string form: the socket path on unix, the
-            // `\\.\pipe\…` name on Windows. Discovery classifies by prefix.
-            endpoint: ep.display(),
-            tcp_addr: None,
-            hostname: hostname(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            started_at: now_ms(),
-            heartbeat_at: now_ms(),
-        })?;
+        db.put_daemon(&daemon_row)?;
     }
 
     let (events, _) = broadcast::channel::<Arc<EventFrame>>(1024);
@@ -204,13 +225,12 @@ async fn run(
     tokio::spawn(heartbeat_loop(db.clone(), daemon_id.clone()));
     // Lease bookkeeping: idle/busy transitions + expiry reaping.
     tokio::spawn(lease_loop(svc.clone(), idle_rx));
-    // Idle-exit: leave no orphan daemon behind an unused state dir.
-    if cfg.daemon.idle_exit_secs > 0 {
-        tokio::spawn(idle_exit_loop(
-            svc.clone(),
-            shutdown.clone(),
-            std::time::Duration::from_secs(cfg.daemon.idle_exit_secs),
-        ));
+    // Idle-exit: leave no orphan daemon behind an unused state dir. `thegn
+    // serve` is exempt — its TCP listener exists precisely for thin clients
+    // that haven't connected yet, and self-terminating would tear the control
+    // plane down under them.
+    if let Some(window) = idle_exit_window(cfg.daemon.idle_exit_secs, serve.is_some()) {
+        tokio::spawn(idle_exit_loop(svc.clone(), shutdown.clone(), window));
     }
 
     let state = thegn_svc::control::http::ControlState {
@@ -233,16 +253,15 @@ async fn run(
             .await
             .with_context(|| format!("bind {bind}"))?;
         let actual = tcp.local_addr().context("serve local_addr")?;
+        // Advertise the TCP address on our registry row (`put_daemon` replaces
+        // by daemon_id). Surfaced with `?`: a serve invocation that can't
+        // register its address is undiscoverable and should fail loudly.
+        daemon_row.tcp_addr = Some(actual.to_string());
+        daemon_row.heartbeat_at = now_ms();
         {
             let db = db.lock().expect("daemon db lock");
-            let mut row = db
-                .daemons()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|d| d.daemon_id == daemon_id)
-                .expect("own daemon row");
-            row.tcp_addr = Some(actual.to_string());
-            let _ = db.put_daemon(&row);
+            db.put_daemon(&daemon_row)
+                .context("record serve tcp_addr in the daemon registry")?;
         }
         let tcp_state = thegn_svc::control::http::ControlState {
             api: svc.clone(),
@@ -321,6 +340,28 @@ fn pid_alive(pid: i64) -> bool {
     crate::platform::pid_alive(pid)
 }
 
+/// Boot-sweep decision (pure): which registry rows a starting daemon removes —
+/// SAME-scope rows whose pid is gone (their PTYs died with the process, so the
+/// row and its leases are meaningless). Rows for other scopes belong to other
+/// state dirs' daemons and are never touched, dead or alive.
+fn boot_sweep_targets(
+    rows: &[DaemonRow],
+    scope: &str,
+    pid_alive: impl Fn(i64) -> bool,
+) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.scope == scope && !pid_alive(r.pid))
+        .map(|r| r.daemon_id.clone())
+        .collect()
+}
+
+/// Idle-exit policy (pure): a plain pane daemon with a nonzero window runs the
+/// janitor; `0` disables it; serve mode ALWAYS disables it — the TCP control
+/// plane must outlive "no sessions yet" (`[daemon] idle_exit_secs` docs).
+fn idle_exit_window(idle_exit_secs: u64, serve_mode: bool) -> Option<std::time::Duration> {
+    (!serve_mode && idle_exit_secs > 0).then(|| std::time::Duration::from_secs(idle_exit_secs))
+}
+
 async fn heartbeat_loop(db: service::SharedDb, daemon_id: String) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -394,9 +435,9 @@ async fn lease_loop(svc: Arc<DaemonService>, mut idle_rx: mpsc::UnboundedReceive
     }
 }
 
-/// Exit when the daemon has had no sessions and no attached clients for
-/// `idle_exit`. Coarse check (10s cadence, capped at the idle window) — this
-/// is a janitor, not a hot path.
+/// Exit when the daemon has had no live sessions for `idle_exit`. Never
+/// spawned in serve mode (see [`idle_exit_window`]). Coarse check (10s
+/// cadence, capped at the idle window) — this is a janitor, not a hot path.
 async fn idle_exit_loop(
     svc: Arc<DaemonService>,
     shutdown: Arc<tokio::sync::Notify>,
@@ -417,5 +458,57 @@ async fn idle_exit_loop(
             shutdown.notify_waiters();
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &str, scope: &str, pid: i64) -> DaemonRow {
+        DaemonRow {
+            daemon_id: id.into(),
+            pid,
+            scope: scope.into(),
+            endpoint: format!("/run/{id}.sock"),
+            tcp_addr: None,
+            hostname: "h".into(),
+            version: "0".into(),
+            started_at: 0,
+            heartbeat_at: 0,
+        }
+    }
+
+    /// The boot sweep removes exactly the same-scope rows whose pid is dead:
+    /// a live same-scope daemon and any other scope's rows (even dead ones —
+    /// their own next boot sweeps them) are kept.
+    #[test]
+    fn boot_sweep_removes_only_same_scope_dead_daemons() {
+        let rows = vec![
+            row("dead-same", "/scope/a", 11),
+            row("alive-same", "/scope/a", 22),
+            row("dead-other", "/scope/b", 33),
+        ];
+        let alive = |pid: i64| pid == 22;
+        assert_eq!(
+            boot_sweep_targets(&rows, "/scope/a", alive),
+            vec!["dead-same".to_string()]
+        );
+        // Nothing dead in-scope ⇒ nothing swept.
+        assert!(boot_sweep_targets(&rows, "/scope/c", alive).is_empty());
+    }
+
+    /// The idle-exit janitor arms only for a plain pane daemon: `0` = never,
+    /// and serve mode is always exempt (the TCP listener must keep serving
+    /// thin clients that haven't connected yet).
+    #[test]
+    fn idle_exit_only_arms_for_a_plain_daemon() {
+        assert_eq!(
+            idle_exit_window(1800, false),
+            Some(std::time::Duration::from_secs(1800))
+        );
+        assert_eq!(idle_exit_window(0, false), None, "0 = never");
+        assert_eq!(idle_exit_window(1800, true), None, "serve never idle-exits");
+        assert_eq!(idle_exit_window(0, true), None);
     }
 }

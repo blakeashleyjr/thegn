@@ -2,7 +2,7 @@
 //! branch point. Range = everything since the merge-base with the resolved base
 //! branch, so it shows "what this branch changes," including uncommitted work.
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use std::io::Write;
 use thegn_core::diff_highlight;
 use thegn_core::remote::GitLoc;
@@ -21,38 +21,62 @@ pub fn run(
     let loc = GitLoc::for_worktree(&wt);
 
     let base = base.unwrap_or_else(|| default_branch(&loc));
+    // Validate an explicitly-resolvable base ref up front. A typo'd `--base`
+    // must NOT silently diff against HEAD: exit non-zero so scripts/CI notice
+    // the mistake instead of trusting an empty/HEAD-only diff.
+    if !loc.git_ok(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{base}^{{commit}}"),
+    ]) {
+        bail!("unknown base ref '{base}'");
+    }
     // Diff against the merge-base so we capture the branch's full delta; fall
-    // back to HEAD (uncommitted-only) if no merge-base exists.
+    // back to HEAD (uncommitted-only) if no merge-base exists (unrelated
+    // histories — the base is valid, there's just no common ancestor).
     let target = loc
         .git_out(&["merge-base", &base, "HEAD"])
         .unwrap_or_else(|| "HEAD".to_string());
 
-    let emit_highlighted = |git_args: &[&str], file_path: Option<&str>| {
+    let emit_highlighted = |git_args: &[&str], file_path: Option<&str>| -> Result<()> {
         // CLI path: `thegn diff` runs synchronously, no event loop.
         #[expect(clippy::disallowed_methods)]
-        if let Ok(output) = loc.git_command(git_args).output() {
-            let raw = String::from_utf8_lossy(&output.stdout);
-            let highlighted = diff_highlight::highlight_diff(&raw, file_path.unwrap_or(""));
-            let _ = std::io::stdout().write_all(highlighted.as_bytes());
+        let output = loc
+            .git_command(git_args)
+            .output()
+            .context("failed to run git diff")?;
+        // Surface git failures instead of swallowing them; the exit code must be
+        // non-zero so scripts/CI don't mistake a git error for an empty diff.
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            bail!("git diff failed: {}", err.trim());
         }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let highlighted = diff_highlight::highlight_diff(&raw, file_path.unwrap_or(""));
+        let _ = std::io::stdout().write_all(highlighted.as_bytes());
+        Ok(())
     };
 
     if let Some(fp) = file_path {
-        emit_highlighted(&["diff", "--no-color", &target, "--", &fp], Some(&fp));
-        return Ok(());
+        return emit_highlighted(&["diff", "--no-color", &target, "--", &fp], Some(&fp));
     }
 
     if !stat {
-        emit_highlighted(&["diff", "--no-color", &target], None);
-        return Ok(());
+        return emit_highlighted(&["diff", "--no-color", &target], None);
     }
 
     // --stat: stream straight through (colors / large diffs).
     // CLI path: `thegn diff` runs synchronously, no event loop.
     #[expect(clippy::disallowed_methods)]
-    let _ = loc
+    let status = loc
         .git_command(&["-c", "color.ui=always", "diff", "--stat", &target])
-        .status();
+        .status()
+        .context("failed to run git diff --stat")?;
+    // Propagate git's failure: exit non-zero so scripts/CI notice.
+    if !status.success() {
+        bail!("git diff --stat failed");
+    }
     Ok(())
 }
 

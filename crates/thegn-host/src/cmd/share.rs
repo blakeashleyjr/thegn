@@ -9,7 +9,7 @@
 //! The in-process host supervisor (live respawn on restart, badge, panel) builds
 //! on the same `[share]` config + `thegn_svc::share` seam this CLI uses.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::outln;
@@ -25,8 +25,8 @@ pub enum Action {
     Start {
         /// The local TCP port to expose (e.g. a dev server on 3000).
         port: u16,
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         /// Reach intent: public | team | peer (maps to `[share] <reach>`).
         /// Omitted ⇒ the single `[share] provider`.
         #[arg(long)]
@@ -41,8 +41,8 @@ pub enum Action {
     /// Remove a recorded share for a worktree port.
     Stop {
         port: u16,
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
     },
 }
 
@@ -50,11 +50,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::Start {
             port,
-            worktree,
+            target,
             reach,
-        } => start(cfg, port, worktree, reach),
+        } => start(cfg, port, target.worktree, reach),
         Action::List { json } => list(json),
-        Action::Stop { port, worktree } => stop(port, worktree),
+        Action::Stop { port, target } => stop(port, target.worktree),
     }
 }
 
@@ -64,20 +64,18 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
     let reach = match reach.as_deref() {
         Some(s) => match thegn_core::config::ShareReach::from_str_validated(s) {
             Ok(r) => Some(r),
-            Err(e) => {
-                outln!("share: {e}");
-                return Ok(());
-            }
+            // Refusal must exit non-zero so scripts/CI see the misuse.
+            Err(e) => bail!("share: {e}"),
         },
         None => None,
     };
     let Some(spec) = build_share_spec(&cfg.share, &label, port, reach) else {
-        outln!("share: disabled (set [share] provider, or that reach)");
-        return Ok(());
+        // Refusal must exit non-zero so scripts/CI see the misuse.
+        bail!("share: disabled (set [share] provider, or that reach)");
     };
     if spec.visibility == thegn_core::config::ShareVisibility::Public && !cfg.share.allow_public {
-        outln!("share: public sharing is disabled (set [share] allow_public = true)");
-        return Ok(());
+        // Refusal must exit non-zero so scripts/CI see the misuse.
+        bail!("share: public sharing is disabled (set [share] allow_public = true)");
     }
     let provider = share::for_provider(&spec);
     let kind = provider.kind().to_string();

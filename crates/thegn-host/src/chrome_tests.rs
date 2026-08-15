@@ -185,7 +185,6 @@ fn statusbar_items_includes_badges_so_they_are_navigable() {
             alert_notifications: 2,
             ..Default::default()
         },
-        agent_activity: Some(AgentActivity::default()),
         zoomed: true,
         ..Default::default()
     };
@@ -195,56 +194,7 @@ fn statusbar_items_includes_badges_so_they_are_navigable() {
         .collect();
     assert_eq!(ids[0], BarItemId::Widget("loc".into()), "widgets first");
     assert!(ids.contains(&BarItemId::Badge(BarBadge::Notifications)));
-    assert!(ids.contains(&BarItemId::Badge(BarBadge::Agent)));
     assert!(ids.contains(&BarItemId::Badge(BarBadge::Zoom)));
-}
-
-#[test]
-fn agent_and_ai_cost_chips_are_bmp_only() {
-    // Regression: the agent / AI-cost chips hardcoded astral-plane emoji
-    // (🤖 U+1F916, 🛠 U+1F6E0), violating the BMP-only chrome policy — they
-    // rendered as mojibake on degraded terminals and their emoji cell width
-    // diverged from unicode-width. Every glyph in these chips must now be BMP
-    // (routed through caps::active_glyphs) and degrade to ASCII.
-    let model = FrameModel {
-        ai_metrics: Some(AiMetrics {
-            agent: "pi".into(),
-            session_id: "s".into(),
-            tokens: TokenUsage {
-                input: 10,
-                output: 5,
-            },
-            cost: 0.42,
-        }),
-        agent_activity: Some(AgentActivity {
-            conn: AgentConn::Online,
-            last_tool: Some("bash".into()),
-            running: true,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let text = |m: &FrameModel| -> String {
-        statusbar_items(m)
-            .into_iter()
-            .flat_map(|(_, segs)| segs)
-            .map(|s| s.text)
-            .collect()
-    };
-    // Full/Basic glyphs: still BMP (no char outside the Basic Multilingual Plane).
-    let full = text(&model);
-    assert!(
-        full.chars().all(|c| (c as u32) <= 0xFFFF),
-        "no astral-plane glyphs in agent/cost chips: {full:?}"
-    );
-    // And on an ASCII terminal the chips degrade cleanly to 7-bit ASCII.
-    crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
-        let ascii = text(&model);
-        assert!(
-            ascii.is_ascii(),
-            "agent/cost chips degrade to ASCII: {ascii:?}"
-        );
-    });
 }
 
 #[test]

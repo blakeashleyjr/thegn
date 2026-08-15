@@ -56,9 +56,6 @@ impl SandboxOverlay {
         if let Some(v) = self.profile {
             base.profile = v;
         }
-        if let Some(v) = self.agent_profile {
-            base.agent_profile = v;
-        }
         if let Some(v) = self.network {
             base.network = v;
         }
@@ -149,7 +146,6 @@ impl SandboxOverlay {
             && self.backend_chain.is_none()
             && self.image.is_none()
             && self.profile.is_none()
-            && self.agent_profile.is_none()
             && self.network.is_none()
             && self.file_access.is_none()
             && self.ports.is_none()

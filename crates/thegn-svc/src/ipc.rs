@@ -176,6 +176,29 @@ fn unsupported(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, what.to_string())
 }
 
+/// Take the advisory lock serializing [`IpcListener::bind_exclusive`]'s
+/// probe→unlink→bind critical section for `sock`. The sidecar `<sock>.lock`
+/// is created once and NEVER unlinked (unlinking it would resurrect the very
+/// race it closes); the flock (std's `File::lock`) dies with the process, so
+/// it can't go stale. Contention lasts a probe + a bind (milliseconds), and
+/// the caller is already on a blocking thread. Best-effort: `None` (exotic
+/// fs, permissions) degrades to the old raced path rather than refusing to
+/// serve.
+#[cfg(unix)]
+fn bind_lock(sock: &Path) -> Option<std::fs::File> {
+    let mut path = sock.as_os_str().to_owned();
+    path.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(std::path::Path::new(&path))
+        .ok()?;
+    file.lock().ok()?;
+    Some(file)
+}
+
 /// Outcome of [`IpcListener::bind_exclusive`]: the caller either *is* the
 /// daemon or found a live one.
 pub enum BindOutcome {
@@ -206,21 +229,56 @@ impl IpcListener {
                 #[cfg(unix)]
                 {
                     // A connectable socket ⇒ a live daemon; a stale file
-                    // (bind would fail with AddrInUse) is unlinked.
-                    if sock.exists() {
-                        match tokio::net::UnixStream::connect(sock).await {
-                            Ok(_) => return Ok(BindOutcome::AlreadyRunning),
-                            Err(_) => {
-                                let _ = std::fs::remove_file(sock);
+                    // (bind would fail with AddrInUse) is unlinked. The whole
+                    // probe→unlink→bind sequence runs under the advisory bind
+                    // lock (see [`bind_lock`]) on a blocking thread — two
+                    // racing binders could otherwise BOTH probe-fail the same
+                    // stale socket, and the loser's `remove_file` would unlink
+                    // the winner's freshly-bound live socket (unlink succeeds
+                    // on bound sockets), stranding every future client.
+                    // `ensure_daemon`'s lazy spawn makes concurrent binders
+                    // over one stale socket the expected case, not a freak.
+                    enum UnixBind {
+                        Bound(std::os::unix::net::UnixListener),
+                        AlreadyRunning,
+                    }
+                    let sock = sock.clone();
+                    let decision = tokio::task::spawn_blocking(move || -> io::Result<UnixBind> {
+                        let _lock = bind_lock(&sock);
+                        if sock.exists() {
+                            match std::os::unix::net::UnixStream::connect(&sock) {
+                                Ok(_) => return Ok(UnixBind::AlreadyRunning),
+                                Err(_) => {
+                                    let _ = std::fs::remove_file(&sock);
+                                }
                             }
                         }
-                    }
-                    match tokio::net::UnixListener::bind(sock) {
-                        Ok(l) => Ok(BindOutcome::Bound(IpcListener::Unix(l))),
-                        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-                            Ok(BindOutcome::AlreadyRunning)
+                        match std::os::unix::net::UnixListener::bind(&sock) {
+                            Ok(l) => {
+                                // Owner-only (0600) on the socket: the local control
+                                // plane grants admin to any connector, so the umask
+                                // must not leave it cross-user-connectable. On Linux a
+                                // 0600 socket inode denies connect(2) to other uids —
+                                // defense in depth for the state-dir fallback path
+                                // (no XDG_RUNTIME_DIR). Best-effort: a chmod failure
+                                // must not down the daemon.
+                                let _ = thegn_core::fsperm::restrict_to_owner(&sock);
+                                l.set_nonblocking(true)?;
+                                Ok(UnixBind::Bound(l))
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                                Ok(UnixBind::AlreadyRunning)
+                            }
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
+                    })
+                    .await
+                    .map_err(io::Error::other)??;
+                    match decision {
+                        UnixBind::Bound(l) => Ok(BindOutcome::Bound(IpcListener::Unix(
+                            tokio::net::UnixListener::from_std(l)?,
+                        ))),
+                        UnixBind::AlreadyRunning => Ok(BindOutcome::AlreadyRunning),
                     }
                 }
                 #[cfg(not(unix))]
@@ -412,6 +470,47 @@ mod tests {
             IpcListener::bind_exclusive(&ep).await.unwrap(),
             BindOutcome::Bound(_)
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stale-socket TOCTOU: N binders racing one stale socket file must
+    /// elect exactly one daemon, and the losers' probe/unlink path must not
+    /// strip the winner's freshly-bound socket out of the filesystem. Without
+    /// the `<sock>.lock` serialization this is a race (unlink succeeds on
+    /// bound sockets); with it the outcome is deterministic.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn racing_binders_on_a_stale_socket_elect_exactly_one_daemon() {
+        let dir = std::env::temp_dir().join(format!("thegn-ipc-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.sock");
+        // A dead daemon's leftover: a socket file nothing is listening on.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let ep = IpcEndpoint::for_socket_path(&path);
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let ep = ep.clone();
+            tasks.push(tokio::spawn(async move {
+                IpcListener::bind_exclusive(&ep).await
+            }));
+        }
+        let mut bound = Vec::new();
+        let mut already = 0usize;
+        for t in tasks {
+            match t.await.unwrap().unwrap() {
+                BindOutcome::Bound(l) => bound.push(l),
+                BindOutcome::AlreadyRunning => already += 1,
+            }
+        }
+        assert_eq!(bound.len(), 1, "exactly one binder may win the socket");
+        assert_eq!(already, 7);
+        // The winner's socket survived the losers' stale-file handling.
+        connect(&ep)
+            .await
+            .expect("the surviving socket accepts connections");
+        drop(bound);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -153,10 +153,35 @@ pub fn run(cfg: &Config, action: PairAction) -> Result<()> {
             }
         }
         PairAction::Revoke { id } => {
+            // Look up first so a nonexistent / already-revoked id fails loudly
+            // instead of claiming success: the exit code is what scripts/CI
+            // branch on, and the DB UPDATE is a no-op (0 rows) in those cases.
+            let row = db
+                .pairings()?
+                .into_iter()
+                .find(|p| p.pairing_id == id)
+                .ok_or_else(|| anyhow::anyhow!("no pairing with id {id}"))?;
+            if row.revoked_at.is_some() {
+                anyhow::bail!("pairing {id} is already revoked");
+            }
             db.revoke_pairing(&id, now_ms())?;
             outln!("revoked {id}");
         }
         PairAction::Approve { id } => {
+            // Same reasoning as Revoke: don't report success for a missing id
+            // or one already approved/revoked (the UPDATE matches 0 rows) —
+            // the non-zero exit is what scripting/CI relies on.
+            let row = db
+                .pairings()?
+                .into_iter()
+                .find(|p| p.pairing_id == id)
+                .ok_or_else(|| anyhow::anyhow!("no pairing with id {id}"))?;
+            if row.revoked_at.is_some() {
+                anyhow::bail!("pairing {id} is revoked; cannot approve");
+            }
+            if row.approved_at.is_some() {
+                anyhow::bail!("pairing {id} is already approved");
+            }
             db.approve_pairing(&id, now_ms())?;
             outln!("approved {id}");
         }

@@ -14,7 +14,6 @@
 
 use anyhow::{Context, Result};
 use portable_pty::{MasterPty, PtySize};
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use termwiz::terminal::TerminalWaker;
@@ -24,13 +23,18 @@ use thegn_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history};
 use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession};
 
 use crate::emulator::{AlacrittyEmulator, PaneEmulator};
+use crate::pane_writer::StdinSendError;
 
 /// How a pane talks to its process: a local PTY, or a provider exec session.
 enum PaneIo {
-    /// A local child on a pseudo-terminal.
+    /// A local child on a pseudo-terminal. `stdin` is the bounded queue to the
+    /// pane's dedicated writer thread (see [`crate::pane_writer`]): the raw
+    /// PTY writer blocks once the child stops draining stdin, so it never
+    /// lives on the event loop. `master` stays for resize — an ioctl on a
+    /// different channel, needing no ordering with stdin.
     Pty {
         master: Box<dyn MasterPty + Send>,
-        writer: Box<dyn Write + Send>,
+        stdin: crate::pane_writer::StdinTx,
     },
     /// A native provider exec session: stdin/resize go to the relay task over
     /// `control`; the task owns the underlying socket. `provider`/`sandbox_id`
@@ -327,7 +331,10 @@ impl PtyPane {
         Ok(Self {
             io: PaneIo::Pty {
                 master: pty.master,
-                writer: pty.writer,
+                stdin: crate::pane_writer::spawn_stdin_writer(
+                    pty.writer,
+                    crate::pane_writer::WriterLog::Pane { pane: id },
+                ),
             },
             emulator,
             rows,
@@ -635,7 +642,18 @@ impl PtyPane {
 
     /// Forward user input bytes to the child. Typing snaps the viewport back to
     /// the live tail (the usual terminal behavior when scrolled into history).
-    pub fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
+    ///
+    /// Non-blocking: input is queued to the pane's writer thread (PTY) or relay
+    /// task (Stream); a full queue / dead child returns the typed
+    /// [`StdinSendError`] immediately instead of parking the event loop.
+    pub fn write_input(&mut self, bytes: &[u8]) -> Result<(), StdinSendError> {
+        self.write_input_owned(bytes.to_vec())
+    }
+
+    /// [`Self::write_input`] taking ownership of the buffer — the paste path
+    /// builds one large chunk ([`crate::pane_writer::build_paste_bytes`]) and
+    /// must not copy it a second time on the way into the queue.
+    pub fn write_input_owned(&mut self, bytes: Vec<u8>) -> Result<(), StdinSendError> {
         self.last_input_at = Some(std::time::Instant::now());
         if self.emulator.scrollback() > 0 {
             self.emulator.scroll_reset();
@@ -647,8 +665,8 @@ impl PtyPane {
     /// child: bytes WITHOUT counting as user input — a reply must not mask the
     /// querying app's own output as "keystroke echo" for the activity signal —
     /// and without snapping the viewport out of scrollback.
-    pub fn write_reply(&mut self, bytes: &[u8]) -> Result<()> {
-        self.write_bytes(bytes)
+    pub fn write_reply(&mut self, bytes: &[u8]) -> Result<(), StdinSendError> {
+        self.write_bytes(bytes.to_vec())
     }
 
     /// `(last_output_at, last_input_at)` for the activity output-hint publisher.
@@ -656,19 +674,19 @@ impl PtyPane {
         (self.last_output_at, self.last_input_at)
     }
 
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+    /// Queue `bytes` toward the child. Both transports are non-blocking and
+    /// surface congestion identically: `Full` (queue/channel full — the
+    /// consumer isn't keeping up) or `Closed` (writer thread / relay task
+    /// gone). A dead session additionally surfaces its exit on the frames side.
+    fn write_bytes(&mut self, bytes: Vec<u8>) -> Result<(), StdinSendError> {
         match &mut self.io {
-            PaneIo::Pty { writer, .. } => {
-                writer.write_all(bytes).context("pty write")?;
-                writer.flush().ok();
-            }
-            // Drop on a full/closed control channel rather than blocking the
-            // loop — a dead session will surface its exit on the frames side.
-            PaneIo::Stream { control, .. } => {
-                let _ = control.try_send(ExecControl::Stdin(bytes.to_vec()));
-            }
+            PaneIo::Pty { stdin, .. } => stdin.send(bytes),
+            PaneIo::Stream { control, .. } => match control.try_send(ExecControl::Stdin(bytes)) {
+                Ok(()) => Ok(()),
+                Err(tokio_mpsc::error::TrySendError::Full(_)) => Err(StdinSendError::Full),
+                Err(tokio_mpsc::error::TrySendError::Closed(_)) => Err(StdinSendError::Closed),
+            },
         }
-        Ok(())
     }
 
     /// Resize the transport and the emulator together.
@@ -1313,13 +1331,67 @@ mod tests {
     }
 
     #[test]
+    fn pty_write_input_delivers_through_writer_thread() {
+        // End-to-end delivery through the real wiring: loop-side write_input →
+        // StdinTx → writer thread → child stdin. `read x` blocks the child on
+        // stdin, so the echoed reply proves the queued bytes actually reached
+        // the PTY (no unit-level fake can prove this).
+        let (tx, mut rx) = tokio_mpsc::channel(1024);
+        let mut pane = PtyPane::spawn_with_env(
+            0,
+            &sh("read x; echo \"got-$x\""),
+            None,
+            &[],
+            24,
+            80,
+            tx,
+            None,
+        )
+        .unwrap();
+        pane.write_input(b"hi\n").unwrap();
+        assert!(
+            drain_until_exit(&mut pane, &mut rx, 10_000),
+            "child should exit after reading stdin"
+        );
+        let grid: Vec<String> = (0..4)
+            .filter_map(|r| pane.emulator().row_text(r))
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        assert!(
+            grid.iter().any(|l| l.contains("got-hi")),
+            "stdin round-trip output must land in the grid: {grid:?}"
+        );
+    }
+
+    #[test]
+    fn large_write_does_not_block() {
+        // Regression for the deferred large-paste hang: a ~1MB write into a
+        // child that never reads stdin must queue-and-return immediately, not
+        // park the caller (the old write_all blocked once the kernel's ~64KB
+        // PTY buffer filled). 500ms is generous; the block used to be 2s+.
+        let (tx, _rx) = tokio_mpsc::channel(1024);
+        let mut pane =
+            PtyPane::spawn_with_env(0, &sh("sleep 2"), None, &[], 24, 80, tx, None).unwrap();
+        let big = vec![b'x'; 1024 * 1024];
+        let start = std::time::Instant::now();
+        let res = pane.write_input_owned(big);
+        assert!(res.is_ok(), "one large chunk fits the queue: {res:?}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "write_input must not block the caller: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
     fn spawn_with_env_firewalls_launcher_creds_but_keeps_infra() {
         // The clear-then-allowlist firewall: a credential-shaped var present in
         // thegn's OWN environment must NOT reach a spawned pane, while curated
-        // infrastructure (PATH) still does. Setting GH_TOKEN here is safe under
-        // test parallelism because `host_base_env` filters it out regardless —
-        // it can never enter any child — so a transient set corrupts nothing.
-        unsafe { std::env::set_var("GH_TOKEN", "leak-me-if-you-can") };
+        // infrastructure (PATH) still does. Mutate GH_TOKEN under the shared
+        // ENV_LOCK (via EnvGuard) so it serializes with — and can't be seen by —
+        // other env-reading tests in this binary; the guard restores the prior
+        // value on drop.
+        let _env = crate::testenv::EnvVarGuard::set(&[("GH_TOKEN", "leak-me-if-you-can")]);
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane = PtyPane::spawn_with_env(
             0,
@@ -1336,7 +1408,7 @@ mod tests {
             drain_until_exit(&mut pane, &mut rx, 5000),
             "child should exit"
         );
-        unsafe { std::env::remove_var("GH_TOKEN") };
+        // `_env` (EnvGuard) restores the prior GH_TOKEN on drop — no manual unset.
         let line = pane
             .emulator()
             .row_text(0)

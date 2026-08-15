@@ -26,7 +26,7 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 
 use thegn_core::control::{ScopeSet, TokenKind, Verb, required_scope};
-use thegn_core::control_wire::{EventFrame, Hello, PROTO_VERSION};
+use thegn_core::control_wire::{EventFrame, Hello, PROTO_VERSION, PairingState};
 use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
@@ -167,13 +167,29 @@ async fn pair(State(state): State<ControlState>, body: axum::Json<PairBody>) -> 
         )
     };
     match minted {
-        Ok(Some(m)) => axum::Json(json!({
-            "token": m.token,
-            "pairing_id": m.row.pairing_id,
-            "scopes": m.row.scope,
-            "approved": m.row.approved_at.is_some(),
-        }))
-        .into_response(),
+        Ok(Some(m)) => {
+            let approved = m.row.approved_at.is_some();
+            // Surface the redeem on the event feed: with `require_approval`
+            // the token parks until approved, and without a `Requested` frame
+            // the approval UX never learns a device is waiting.
+            state.api.publish_pairing(
+                &m.row.pairing_id,
+                &m.row.label,
+                &m.row.scope,
+                if approved {
+                    PairingState::Approved
+                } else {
+                    PairingState::Requested
+                },
+            );
+            axum::Json(json!({
+                "token": m.token,
+                "pairing_id": m.row.pairing_id,
+                "scopes": m.row.scope,
+                "approved": approved,
+            }))
+            .into_response()
+        }
         Ok(None) => error_json(
             StatusCode::UNAUTHORIZED,
             "invalid, expired, or already-redeemed pairing code",
@@ -270,6 +286,20 @@ async fn list_pairings(State(state): State<ControlState>, headers: HeaderMap) ->
     }
 }
 
+/// Broadcast a pairing lifecycle frame for `pairing_id`, best-effort filling
+/// label/scope from the store (the approve/revoke handlers only carry the id).
+fn publish_pairing_state(state: &ControlState, pairing_id: &str, ps: PairingState) {
+    let row = {
+        let store = state.store.lock().expect("control store lock");
+        store
+            .pairings()
+            .ok()
+            .and_then(|rows| rows.into_iter().find(|p| p.pairing_id == pairing_id))
+    };
+    let (label, scope) = row.map(|r| (r.label, r.scope)).unwrap_or_default();
+    state.api.publish_pairing(pairing_id, &label, &scope, ps);
+}
+
 async fn revoke_pairing(
     State(state): State<ControlState>,
     headers: HeaderMap,
@@ -283,7 +313,10 @@ async fn revoke_pairing(
         store.revoke_pairing(&id, now_ms())
     };
     match res {
-        Ok(()) => axum::Json(json!({ "revoked": id })).into_response(),
+        Ok(()) => {
+            publish_pairing_state(&state, &id, PairingState::Revoked);
+            axum::Json(json!({ "revoked": id })).into_response()
+        }
         Err(e) => ControlError::Internal(e).into_response(),
     }
 }
@@ -301,7 +334,10 @@ async fn approve_pairing(
         store.approve_pairing(&id, now_ms())
     };
     match res {
-        Ok(()) => axum::Json(json!({ "approved": id })).into_response(),
+        Ok(()) => {
+            publish_pairing_state(&state, &id, PairingState::Approved);
+            axum::Json(json!({ "approved": id })).into_response()
+        }
         Err(e) => ControlError::Internal(e).into_response(),
     }
 }
@@ -872,6 +908,10 @@ pub fn frame_json(frame: &EventFrame) -> serde_json::Value {
     }
 }
 
+fn default_history() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 struct AttachQuery {
     client_id: String,
@@ -879,6 +919,12 @@ struct AttachQuery {
     observer: bool,
     rows: Option<u16>,
     cols: Option<u16>,
+    /// Include the scrollback history tail in the warm-attach snapshot.
+    /// Defaults to true (a fresh client emulator wants the context); reconnect
+    /// paths pass `false` so the tail isn't duplicated into scrollback the
+    /// client already holds.
+    #[serde(default = "default_history")]
+    history: bool,
 }
 
 /// Client → daemon messages on an attach WebSocket (JSON text frames; the
@@ -929,6 +975,7 @@ async fn pump_attach(
             kind,
             q.rows.unwrap_or(24),
             q.cols.unwrap_or(80),
+            q.history,
         )
         .await
     {

@@ -1,17 +1,25 @@
 # thegn
 
-A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
-One process, one session: each git repo is a **workspace**, each git
-**worktree** is a **tab**, and the chrome — a left sidebar tree, a right
-diff/PR panel, tabbar, statusbar, and a pinned-program strip — is rendered
-in-process by a native compositor. No plugins, no IPC, no external multiplexer.
-(thegn was originally built on zellij; that architecture was fully stripped
-and it is now a from-scratch native compositor.)
+> **Status: public alpha** (`0.1.0-alpha.1`). Linux and macOS, best-effort
+> native Windows. Expect rough edges; see [`CHANGELOG.md`](CHANGELOG.md) and
+> [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
-A single **Rust** binary (`thegn`, with a short `tg` alias) drives portable-pty panes, composites them with the chrome into a
-termwiz surface, and diff-flushes to your terminal. A bundled SQLite store
-keeps repo history, worktree state, session layout, and a PR cache. Everything
-is instant by construction: sub-300ms launch, <16ms renders, ~0% idle CPU.
+A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
+One session: each git repo is a **workspace**, each git **worktree** is a
+**tab**, and the chrome — a left sidebar tree, a right diff/PR panel, tabbar,
+statusbar, and a pinned-program strip — is rendered in-process by a native
+compositor. No plugins, no external multiplexer. (thegn was originally built
+on zellij; that architecture was fully stripped and it is now a from-scratch
+native compositor.)
+
+A single **Rust** binary (`thegn`, with a short `tg` alias) drives
+portable-pty panes, composites them with the chrome into a termwiz surface,
+and diff-flushes to your terminal. Panes are owned by a background **pane
+daemon**, so quitting the UI detaches your sessions and the next launch
+reattaches them, scrollback intact (tmux semantics — disable with `[daemon]
+enabled = false`). A bundled SQLite store keeps repo history, worktree state,
+session layout, and a PR cache. Everything is instant by construction:
+sub-300ms launch, <16ms renders, ~0% idle CPU.
 
 ## Mental model
 
@@ -28,8 +36,10 @@ never a session change.
 | **Pins**      | daemon panes in a top strip   | `Ctrl-Alt-1..9` launch/focus a `[[pins]]` program                       |
 
 - **Worktree = tab.** `Alt-w` creates a new git worktree off the base branch,
-  opens a tab named after the branch, and prompts for a **coding agent**, a
-  tool, or a plain shell — optionally inside a sandbox (see below).
+  opens a tab named after the branch, and prompts for what to run there — a
+  plain shell, or any configured `[[agents]]` / `[[tools]]` entry (claude,
+  aider, …) launched as an ordinary command — optionally inside a sandbox
+  (see below).
 - **Right panel.** For the focused worktree: the git diff and the branch's PR —
   state, CI check rollup, review decision — plus CI runs, merge queue,
   notifications, and shares, organized in panel tabs.
@@ -101,7 +111,7 @@ familiar IDE chords._
 
 ```nix
 # flake.nix inputs
-thegn.url = "github:youruser/thegn";
+thegn.url = "github:blakeashleyjr/thegn";
 
 # home-manager config
 imports = [ inputs.thegn.homeManagerModules.default ];
@@ -118,7 +128,18 @@ programs.thegn = {
 };
 ```
 
-Or just the binary: `nix profile install .#default`.
+Or just the binary: `nix profile install github:blakeashleyjr/thegn`.
+
+### Prebuilt binary (no Nix)
+
+Each tagged release attaches a `thegn` binary for Linux (gnu + musl), macOS
+(arm + Intel), and Windows to the [releases page][releases]. Download the
+archive for your platform, verify the `.sha256`, and drop `thegn` on your
+`PATH`. Homebrew (macOS): `brew install <owner>/tap/thegn` once the tap carries
+the release. See [`RELEASING.md`](RELEASING.md) for the release process and the
+crates.io / `cargo binstall` status.
+
+[releases]: https://github.com/blakeashleyjr/thegn/releases
 
 ### Standalone
 
@@ -150,12 +171,12 @@ CONTRIBUTING "Windows (native) notes" for details.
 
 ## How it works
 
-- **Three crates.** `thegn-core` (substrate-agnostic domain logic: layered
-  config, SQLite, keymap registry, theme, sandbox backends), `thegn-svc`
-  (service seams with graceful degradation: gix-native git reads with CLI
-  fallback, GitHub via octocrab/`gh`, SSH via russh/`ssh`), and
+- **A small Rust workspace.** `thegn-core` (substrate-agnostic domain logic:
+  layered config, SQLite, keymap registry, theme, sandbox backends),
+  `thegn-svc` (service seams with graceful degradation: gix-native git reads
+  with CLI fallback, GitHub via octocrab/`gh`, SSH via russh/`ssh`), and
   `thegn-host` (the compositor: tokio, portable-pty panes, termwiz
-  diff-flush rendering, in-process chrome).
+  diff-flush rendering, in-process chrome, and the pane daemon).
 - **Fully event-driven.** The loop blocks on terminal input with no tick or
   timeout; PTY readers, hydration, and fs-watchers wake it over channels. A
   damage-region render planner repaints only what changed — pane output costs
@@ -173,7 +194,7 @@ Bare `thegn` launches the compositor; subcommands run non-interactively:
 `pr`, `issue`, `ci`, `diff`, `list`, `integrate` (drain the local merge
 queue), `disk` / `clean` (per-worktree disk usage / reclaim `target/`),
 `repos`, `recent`, `config`, `env` (named execution environments), `theme`,
-`share`, `forward`, `agent`, `notify`, `logs`, `doctor`. `--profile <name>`
+`share`, `forward`, `notify`, `logs`, `doctor`. `--profile <name>`
 runs everything under a separate whole-process profile (own state/DB/config).
 
 `thegn mcp serve` runs thegn as a read-only **MCP server** so a coding agent can
@@ -198,7 +219,7 @@ repo-root `.thegn.{toml,yaml,yml,json}` overlays per-repo settings
 - `[metrics]` — Prometheus `/metrics` endpoints to scrape; target health and
   allowlisted values render in the chrome, no Prometheus server needed.
 - `[merge_queue]`, `[share]`, `[forward]`, `[media]`, `[replay]`,
-  `[llm_proxy]`, `[lifecycle]` — the optional feature groups.
+  `[lifecycle]` — the optional feature groups.
 
 ## Terminal compatibility
 

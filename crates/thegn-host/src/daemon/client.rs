@@ -98,6 +98,34 @@ pub(crate) struct DaemonSource {
     pub worktree: Option<String>,
 }
 
+/// Sessions this process has already warm-attached once. The FIRST attach
+/// feeds a fresh client emulator, so its snapshot should carry the scrollback
+/// history tail; every later attach to the same session is `relay_exec`'s
+/// reconnect ladder re-feeding an emulator that already holds that history —
+/// replaying the tail would append up to 2000 duplicate lines to scrollback
+/// on every transient drop. Session ids are short and few; entries live for
+/// the process.
+fn history_registry() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// Should an attach to `session` request the history tail? True until
+/// [`mark_attached`] records a successful attach from this process.
+fn wants_history(session: &str) -> bool {
+    history_registry()
+        .lock()
+        .map(|s| !s.contains(session))
+        .unwrap_or(true)
+}
+
+fn mark_attached(session: &str) {
+    if let Ok(mut s) = history_registry().lock() {
+        s.insert(session.to_string());
+    }
+}
+
 impl DaemonSource {
     async fn open_and_attach(&self, spec: &ExecSpec) -> Result<ExecSession> {
         let info: SessionInfo = self
@@ -111,14 +139,24 @@ impl DaemonSource {
                 worktree: self.worktree.clone(),
             })
             .await?;
-        self.attach_session(&info.id, spec.cols, spec.rows).await
+        // A just-opened session has no history yet; record it so a later
+        // reconnect counts as a re-attach.
+        mark_attached(&info.id);
+        self.attach_session(&info.id, spec.cols, spec.rows, true)
+            .await
     }
 
-    async fn attach_session(&self, session: &str, cols: u16, rows: u16) -> Result<ExecSession> {
+    async fn attach_session(
+        &self,
+        session: &str,
+        cols: u16,
+        rows: u16,
+        include_history: bool,
+    ) -> Result<ExecSession> {
         let client_id = format!("compositor-{}", std::process::id());
         let stream = self
             .client
-            .attach(session, &client_id, rows, cols, false)
+            .attach_opts(session, &client_id, rows, cols, false, include_history)
             .await?;
         Ok(adapt(session.to_string(), stream))
     }
@@ -145,7 +183,14 @@ impl ExecSource for DaemonSource {
         cols: u16,
         rows: u16,
     ) -> BoxFuture<'a, Result<ExecSession>> {
-        Box::pin(self.attach_session(session, cols, rows))
+        Box::pin(async move {
+            // First attach in this process (resurrect warm attach) restores
+            // the scrollback context; reconnects repaint without it.
+            let history = wants_history(session);
+            let s = self.attach_session(session, cols, rows, history).await?;
+            mark_attached(session);
+            Ok(s)
+        })
     }
 
     fn kill_session<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<()>> {
@@ -155,6 +200,18 @@ impl ExecSource for DaemonSource {
     fn session_pid<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Option<u32>> {
         Box::pin(self.lookup_pid(session))
     }
+}
+
+/// Exit code reported when the daemon couldn't reap a real status
+/// (`SessionExit { code: None }`: the child was killed, reaped out-of-band,
+/// or lost). A deliberate non-zero sentinel — mapping unknown to 0 would let
+/// a killed session masquerade as success to anything keying off the pane's
+/// exit code. 254 avoids the shell's 126/127/128+N conventions.
+const EXIT_STATUS_UNKNOWN: i32 = 254;
+
+/// Lower a daemon exit report onto the `ExecFrame::Exit` integer contract.
+fn exec_exit_code(code: Option<i32>) -> i32 {
+    code.unwrap_or(EXIT_STATUS_UNKNOWN)
 }
 
 /// Bridge an [`AttachStream`] (decoded control-wire frames) to the pane
@@ -183,7 +240,7 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
                         }
                     }
                     Some(EventFrame::SessionExit { code, .. }) => {
-                        let _ = out_tx.send(ExecFrame::Exit(code.unwrap_or(0))).await;
+                        let _ = out_tx.send(ExecFrame::Exit(exec_exit_code(code))).await;
                         return;
                     }
                     Some(_) => {} // Hello / feed frames: not pane bytes
@@ -248,10 +305,12 @@ impl ExecSource for LazyDaemonSource {
         rows: u16,
     ) -> BoxFuture<'a, Result<ExecSession>> {
         Box::pin(async move {
-            self.source()
-                .await?
-                .attach_session(session, cols, rows)
-                .await
+            let source = self.source().await?;
+            // Same first-attach/reconnect split as `DaemonSource::attach`.
+            let history = wants_history(session);
+            let s = source.attach_session(session, cols, rows, history).await?;
+            mark_attached(session);
+            Ok(s)
         })
     }
 
@@ -261,5 +320,40 @@ impl ExecSource for LazyDaemonSource {
 
     fn session_pid<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Option<u32>> {
         Box::pin(async move { self.source().await.ok()?.lookup_pid(session).await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The daemon reports `code: None` exactly when the exit is unreapable
+    /// (killed / reaped out-of-band). That must surface as a distinct
+    /// non-zero sentinel, never as success.
+    #[test]
+    fn unknown_exit_maps_to_the_nonzero_sentinel() {
+        assert_eq!(exec_exit_code(Some(0)), 0);
+        assert_eq!(exec_exit_code(Some(1)), 1);
+        assert_eq!(exec_exit_code(Some(137)), 137);
+        assert_eq!(exec_exit_code(None), EXIT_STATUS_UNKNOWN);
+        assert_ne!(
+            exec_exit_code(None),
+            0,
+            "an unknown exit must not read as success"
+        );
+    }
+
+    /// Only the first attach of a session in this process requests the
+    /// history tail; reconnects (and anything after `mark_attached`) do not.
+    #[test]
+    fn only_the_first_attach_requests_history() {
+        let sid = format!("history-test-{}", std::process::id());
+        assert!(wants_history(&sid), "fresh session: history wanted");
+        assert!(wants_history(&sid), "peeking must not consume the slot");
+        mark_attached(&sid);
+        assert!(
+            !wants_history(&sid),
+            "reconnects must skip the history tail"
+        );
     }
 }
