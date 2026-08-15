@@ -746,6 +746,15 @@ fn main() -> anyhow::Result<()> {
     // exit. The writer is its own std thread, so it outlives the runtime and this
     // catches every quit path with one call.
     db_task::flush(std::time::Duration::from_secs(2));
+    // A daemon-disabled resurrect fire-and-forgets kills for the daemon
+    // sessions it claimed; their pane_sessions records are already consumed,
+    // so letting shutdown_background() abort an in-flight kill would silently
+    // recreate the permanent invisible orphan the claim exists to prevent.
+    // Bounded flush of any still-pending kills — a no-op (empty latch) on
+    // every normal quit, so this adds nothing to the ordinary exit path.
+    rt.block_on(handlers::daemon_lifecycle::flush_orphan_kills(
+        std::time::Duration::from_secs(2),
+    ));
     rt.shutdown_background();
     report_kept_sessions(handlers::daemon_lifecycle::kept_sessions());
     // termwiz opens /dev/tty without O_CLOEXEC; child pane shells inherit that

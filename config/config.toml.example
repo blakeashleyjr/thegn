@@ -2645,6 +2645,10 @@ enabled = false
 # die with the UI. Set `enabled = false` for plain in-process PTYs that die
 # with the compositor.
 [daemon]
+# Disabling the route (here, or per-run with THEGN_NO_DAEMON=1) while
+# daemon-backed panes are persisted STOPS those daemon sessions on the next
+# launch: each pane respawns without the daemon and its now-orphaned daemon
+# copy is killed (best-effort) rather than left running invisibly forever.
 enabled = true
 # Control-socket override. Empty (default) resolves to
 # $XDG_RUNTIME_DIR/thegn/daemon.sock, falling back to
