@@ -36,6 +36,7 @@ pub mod config_resolve;
 pub mod config_sandbox;
 pub mod config_theme;
 pub mod config_ui;
+pub mod config_validate;
 pub mod config_vpn;
 pub mod config_write;
 pub mod connectivity;
