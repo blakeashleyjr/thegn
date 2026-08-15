@@ -5,7 +5,7 @@
 //!
 //! Graceful degradation is the whole contract: [`gather`] **never errors**. A
 //! missing file, a disabled provider, a network failure, or an unparseable body
-//! all yield that account as [`UsageState::Unavailable`] with a short reason,
+//! all yield that account as [`thegn_core::usage::UsageState::Unavailable`] with a short reason,
 //! mirroring orca's `unavailable` bar. Providers are independent — one failing
 //! never hides the others.
 //!

@@ -50,7 +50,6 @@ pub enum Step {
     Hosts,
     Sandbox,
     Appearance,
-    Agent,
     Tour,
 }
 
@@ -62,7 +61,6 @@ const STEPS: &[Step] = &[
     Step::Hosts,
     Step::Sandbox,
     Step::Appearance,
-    Step::Agent,
     Step::Tour,
 ];
 
@@ -97,8 +95,6 @@ enum Field {
     // Appearance
     ThemePreset,
     KeymapPreset,
-    // Agent
-    AgentAction,
 }
 
 /// An off-thread probe the loop should run for the wizard.
@@ -186,8 +182,6 @@ pub struct Effects {
     pub probe: Option<ProbeRequest>,
     /// Spawn `gh auth login` in an interactive pane; re-probe on exit.
     pub login: bool,
-    /// Spawn `thegn agent setup` in an interactive pane.
-    pub agent_setup: bool,
     /// Live-apply this theme preset to the runtime palette (preview only, not
     /// persisted): set while cycling the Appearance step's theme field.
     pub preview_theme: Option<String>,
@@ -267,8 +261,6 @@ pub struct OnboardingWizard {
     // Appearance
     theme_sel: usize,
     keymap_sel: usize,
-    // Agent
-    agent_run: bool,
     keyring: bool,
     // Tour chord hints, resolved once from the live keymap.
     hint_new_worktree: String,
@@ -383,7 +375,6 @@ impl OnboardingWizard {
                 .position(|p| *p == theme)
                 .unwrap_or(0),
             keymap_sel: pos(KEYMAP_PRESETS, &keymap),
-            agent_run: false,
             keyring: crate::secret::keyring_available(),
             hint_new_worktree: crate::keymap::chord_hint_for(cfg, "new-worktree")
                 .unwrap_or_else(|| "alt-w".to_string()),
@@ -458,7 +449,6 @@ impl OnboardingWizard {
             Step::Hosts => vec![Field::HostName, Field::HostSsh],
             Step::Sandbox => vec![Field::SandboxBackend, Field::SandboxProfile],
             Step::Appearance => vec![Field::ThemePreset, Field::KeymapPreset],
-            Step::Agent => vec![Field::AgentAction],
         }
     }
 
@@ -799,7 +789,6 @@ impl OnboardingWizard {
                 | Field::SandboxProfile
                 | Field::ThemePreset
                 | Field::KeymapPreset
-                | Field::AgentAction
         )
     }
 
@@ -833,7 +822,6 @@ impl OnboardingWizard {
                 self.theme_sel = wrap(self.theme_sel, thegn_core::theme::PRESETS.len())
             }
             Field::KeymapPreset => self.keymap_sel = wrap(self.keymap_sel, KEYMAP_PRESETS.len()),
-            Field::AgentAction => self.agent_run = !self.agent_run,
             _ => {}
         }
     }
@@ -935,18 +923,6 @@ impl OnboardingWizard {
                         _ => self.advance(),
                     };
                 }
-                if self.step == Step::Agent && self.focus == Field::AgentAction {
-                    // enter on the action row runs setup AND advances; plain
-                    // enter with "skip" selected just advances.
-                    if self.agent_run_selected() {
-                        let mut out = self.advance();
-                        if let Outcome::Do(e) | Outcome::Close { effects: e, .. } = &mut out {
-                            e.agent_setup = true;
-                        }
-                        return out;
-                    }
-                    return self.advance();
-                }
                 if on_last {
                     return self.advance();
                 }
@@ -968,10 +944,6 @@ impl OnboardingWizard {
             _ => {}
         }
         Outcome::Pending
-    }
-
-    fn agent_run_selected(&self) -> bool {
-        self.agent_run
     }
 
     /// When the Appearance theme field is focused, an effect that live-applies
@@ -1041,7 +1013,6 @@ impl OnboardingWizard {
             Step::Hosts => "remote hosts",
             Step::Sandbox => "sandbox",
             Step::Appearance => "appearance",
-            Step::Agent => "coding agent",
             Step::Tour => "you're set",
         }
     }
@@ -1348,20 +1319,6 @@ impl OnboardingWizard {
                 )),
                 blank(),
                 note("vscode/jetbrains layer familiar chords over the defaults."),
-            ],
-            Step::Agent => vec![
-                Line::segs(self.cycle_row(
-                    "agent     ",
-                    self.focus == Field::AgentAction,
-                    if self.agent_run {
-                        "run `thegn agent setup` now"
-                    } else {
-                        "skip"
-                    },
-                )),
-                blank(),
-                note("installs + configures the managed coding agent (pi)."),
-                note("also available later: `thegn agent setup`."),
             ],
             Step::Tour => vec![
                 Line::segs(vec![
@@ -1777,18 +1734,6 @@ mod tests {
             }
             o => panic!("expected Do, got {o:?}"),
         }
-    }
-
-    #[test]
-    fn agent_toggle_requests_setup_spawn() {
-        let mut w = wiz();
-        goto(&mut w, Step::Agent);
-        w.handle_key(&KeyCode::RightArrow, NONE); // skip → run
-        match enter(&mut w) {
-            Outcome::Do(e) => assert!(e.agent_setup),
-            o => panic!("expected Do, got {o:?}"),
-        }
-        assert_eq!(w.step, Step::Tour);
     }
 
     #[test]

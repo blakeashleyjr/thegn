@@ -313,18 +313,6 @@ fn run_effects(
             applied,
         );
     }
-    if effects.agent_setup {
-        spawn_wait_tab(
-            "thegn agent setup",
-            false,
-            wait,
-            model,
-            session,
-            panes,
-            center,
-            applied,
-        );
-    }
 }
 
 /// Spawn `command` into a new center tab and suspend the wizard until the
