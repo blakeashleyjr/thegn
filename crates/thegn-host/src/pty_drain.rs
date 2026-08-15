@@ -62,15 +62,19 @@ fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str) {
         return;
     }
     let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(wt));
-    let repo_root: PathBuf = thegn_core::db::Db::open()
-        .ok()
+    // One DB handle for both reads (each `Db::open` re-runs pragmas). This path
+    // is order-dependent — the health mark below must land before the respawn's
+    // `env_halt_reason` check — so it stays synchronous, but need not open twice.
+    let db = thegn_core::db::Db::open().ok();
+    let repo_root: PathBuf = db
+        .as_ref()
         .and_then(|db| db.repo_root_for(wt).ok().flatten())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| thegn_core::repo::main_worktree(Path::new(wt)))
         .unwrap_or_else(|| PathBuf::from(wt));
-    let selected = thegn_core::db::Db::open()
-        .ok()
+    let selected = db
+        .as_ref()
         .and_then(|db| db.effective_env(wt, &repo_root.to_string_lossy()));
     let env = cfg.resolve_env(&repo_root, &loc, Path::new(wt), selected.as_deref());
     if env.placement.is_local() {

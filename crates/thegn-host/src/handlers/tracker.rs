@@ -191,7 +191,15 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                         assignee_me: Some(true),
                         ..Default::default()
                     };
-                    let _ = rt.block_on(router.update_issue(&issue.id, &patch));
+                    // Don't swallow a provider failure on this user action: the
+                    // optimistic "Assigning…" status was already set on the loop,
+                    // so surface the error (matches dispatch_agent's off-thread
+                    // reporting) instead of silently claiming success.
+                    if let Err(e) = rt.block_on(router.update_issue(&issue.id, &patch)) {
+                        thegn_core::msg::warn(&format!("assign failed: {e}"));
+                        let _ = waker2.wake();
+                        return;
+                    }
                     crate::hydrate_tracker::spawn_issue_cache_refresh(cwd2, cfg, Some(waker2));
                 });
                 ctx.model.status = format!("Assigning {} to you…", issue.number);

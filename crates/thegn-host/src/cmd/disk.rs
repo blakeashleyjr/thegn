@@ -101,7 +101,7 @@ pub fn disk(cfg: &Config, worktree_arg: Option<String>, all: bool, json: bool) -
         rows.len()
     );
     outln!(
-        "Reclaimable (target/): {} — `thegn clean --all` to recover.",
+        "Reclaimable (target/): {} — `thegn wt clean --all` to recover.",
         disk::human(grand_target)
     );
 

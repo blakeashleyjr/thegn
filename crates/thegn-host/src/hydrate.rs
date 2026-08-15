@@ -496,7 +496,25 @@ pub(crate) fn load_or_seed_session(
         );
     };
 
-    let mut session = Session::resurrect_with_cfg(&db, &session_name, cfg).unwrap_or_default();
+    // A resurrect ERROR (not an empty Ok) must not become an empty session: the
+    // startup/quit persist does clear-then-insert, so an empty session from a
+    // transient read failure (SQLITE_BUSY under a concurrent instance) would
+    // DELETE the user's real persisted layout. Retry with a short backoff (the
+    // busy-timeout usually clears it); only fall to default after logging loudly.
+    let mut session = {
+        let mut attempt = Session::resurrect_with_cfg(&db, &session_name, cfg);
+        for _ in 0..3 {
+            if attempt.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            attempt = Session::resurrect_with_cfg(&db, &session_name, cfg);
+        }
+        attempt.unwrap_or_else(|e| {
+            tracing::error!(target: "thegn::session", session = %session_name, "resurrect failed after retries ({e}); starting empty — the layout persist may be stale");
+            Session::default()
+        })
+    };
 
     // git is the source of truth for worktrees on disk: drop resurrected
     // groups whose local dir vanished (deleted/moved outside thegn). Remote

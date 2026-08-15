@@ -650,7 +650,10 @@ fn forward(cfg: &Config, worktree: Option<String>, spec: &str) -> Result<()> {
 /// Resolve the [`Environment`](thegn_core::env::Environment) for a worktree
 /// (cwd default), honouring the DB worktree/workspace selection.
 pub(crate) fn resolve_for(cfg: &Config, worktree: Option<String>) -> thegn_core::env::Environment {
-    let wt = resolve_worktree(worktree);
+    // Shared resolver: arg → $THEGN_WORKTREE → git toplevel → cwd (returns PathBuf).
+    let wt = super::resolve_worktree(worktree)
+        .to_string_lossy()
+        .into_owned();
     let loc = GitLoc::for_worktree(Path::new(&wt));
     let repo_root = repo_root_for(&wt);
     let selected = Db::open()
@@ -735,7 +738,9 @@ fn placement_ssh_target(e: &thegn_core::config::EnvConfig, cfg: &Config) -> Stri
 }
 
 fn show(cfg: &Config, worktree: Option<String>) -> Result<()> {
-    let wt = resolve_worktree(worktree);
+    let wt = super::resolve_worktree(worktree)
+        .to_string_lossy()
+        .into_owned();
     let loc = GitLoc::for_worktree(Path::new(&wt));
     let repo_root = repo_root_for(&wt);
     let selected = Db::open()
@@ -803,7 +808,9 @@ fn set(cfg: &Config, name: &str, worktree: Option<String>, workspace: bool) -> R
             "environment {name:?} is not defined under [env.{name}]; it will resolve to the default until you add it"
         ));
     }
-    let wt = resolve_worktree(worktree);
+    let wt = super::resolve_worktree(worktree)
+        .to_string_lossy()
+        .into_owned();
     let db = Db::open()?;
     if workspace {
         let repo_root = repo_root_for(&wt);
@@ -823,16 +830,6 @@ fn set(cfg: &Config, name: &str, worktree: Option<String>, workspace: bool) -> R
         }
     }
     Ok(())
-}
-
-fn resolve_worktree(worktree: Option<String>) -> String {
-    worktree
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        })
-        .unwrap_or_default()
 }
 
 fn repo_root_for(wt: &str) -> PathBuf {

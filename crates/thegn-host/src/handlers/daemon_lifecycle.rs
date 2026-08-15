@@ -43,6 +43,30 @@ pub(crate) fn mark_session_panes_detached(session: &Session, panes: &Panes) -> u
     kept
 }
 
+/// Mark PARKED (resident-pool) workspaces' center panes detached-on-drop too.
+/// Their `PtyPane`s stay live in the table but are absent from the active
+/// `Session`, so [`mark_session_panes_detached`] alone would let a parked
+/// workspace's daemon-backed sessions die on quit instead of persisting.
+/// Returns the additional daemon-backed sessions kept (added to the latch).
+pub(crate) fn mark_parked_panes_detached(
+    pool: &crate::workspace_pool::WorkspacePool,
+    panes: &Panes,
+) -> usize {
+    let mut kept = 0usize;
+    for id in pool.parked_pane_ids() {
+        if let Some(p) = panes.table.get(&id) {
+            p.set_detach_on_drop(true);
+            if p.is_daemon_backed() {
+                kept += 1;
+            }
+        }
+    }
+    if kept > 0 {
+        KEPT_SESSIONS.fetch_add(kept, Ordering::Relaxed);
+    }
+    kept
+}
+
 /// Quit-and-kill: best-effort kill of every daemon-backed session owned by a
 /// live pane, waited on (bounded) so the kills land before the process exits
 /// — the post-return `shutdown_background()` would abort fire-and-forget
