@@ -2106,3 +2106,26 @@ fn center_shows_splash_agrees_across_render_paths() {
     assert_eq!(split_frames.len(), 2);
     assert!(!center_shows_splash(&split_frames, &loading, |_| true));
 }
+
+#[test]
+fn splash_retires_when_a_pane_goes_live_with_no_load_steps() {
+    // The "loading screen never went away" edge: `load_steps` is ALREADY empty
+    // (bring-up finished, no chrome `dirty` will flip) and then the pane goes
+    // live. `center_shows_splash` must go true→false purely on the `any_live`
+    // flip — the signal the render loop watches to force a full frame so the
+    // splash's blank rows are cleared instead of sticking under incremental
+    // pane output. Guards the state the fix keys on.
+    use crate::center::CenterTree;
+    let area = Rect {
+        x: 0,
+        y: 0,
+        cols: 40,
+        rows: 20,
+    };
+    let frames = CenterTree::single(1).layout_framed(area);
+    let no_steps = FrameModel::default();
+    // Before the pane forks: no live leaf, no steps ⇒ splash.
+    assert!(center_shows_splash(&frames, &no_steps, |_| false));
+    // The instant the pane is live (still no steps) ⇒ splash retires.
+    assert!(!center_shows_splash(&frames, &no_steps, |_| true));
+}
