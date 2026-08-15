@@ -6370,6 +6370,13 @@ async fn event_loop<T: Terminal>(
     // chrome + sibling-pane recompose). `scroll_pane` names the pane to repaint.
     let mut scroll_only = false;
     let mut scroll_pane: Option<u32> = None;
+    // Last frame's fullscreen-splash state (see `chrome::center_shows_splash`).
+    // The splash true→false edge (splash retires because a pane went live while
+    // `load_steps` was already empty) sets no chrome `dirty`, so the incremental
+    // pane-output path would paint the pane over the reused splash `scratch` and
+    // the bounded diff would leave the splash's blank rows on screen forever (the
+    // "loading screen never went away" bug). Force a full frame on that edge.
+    let mut prev_splash = false;
     // Per-pane content damage: PTY output records the affected (visible) pane
     // ids here instead of the master `dirty` flag. When a wake touches ONLY
     // pane content — no chrome/overlay/geometry change set `dirty`/`full_repaint`
@@ -10288,6 +10295,23 @@ async fn event_loop<T: Terminal>(
                 full_repaint = true;
                 clear_on_next_frame = false;
             }
+            // Splash-retire edge: when the fullscreen loading splash gives way to
+            // pane content (a pane went live while `load_steps` was already empty,
+            // so no chrome `dirty` flipped) the incremental pane-output path would
+            // paint the pane over the reused splash `scratch` and the bounded diff
+            // would leave the splash's blank rows stuck on screen. Force a full
+            // frame on the true→false edge so `clear_frame` + `diff_screens` wipe
+            // the splash. Detected here (before `plan()`), from the same
+            // `center_shows_splash` both render paths consult, so they agree.
+            let splash_now = crate::chrome::center_shows_splash(
+                &tree.layout_framed(chrome.center),
+                &model,
+                |id| panes.table.get(&id).map(|p| p.emulator()).is_some(),
+            );
+            if prev_splash && !splash_now {
+                full_repaint = true;
+            }
+            prev_splash = splash_now;
             let app_tile_active = app_host.active_tile_mut().is_some();
             // FAST PATH: a pure selection-drag move only changes the highlighted
             // cells. Reuse the last full frame already in `scratch` (skip the
@@ -10892,9 +10916,17 @@ async fn event_loop<T: Terminal>(
                     changes.extend(front.diff_region(r.x, r.y, r.cols, r.rows, &scratch, r.x, r.y));
                 }
                 changes
+            } else if resync_now {
+                // Drift heal: re-emit EVERY cell of `scratch` (blanks as spaces),
+                // not a diff against the just-blanked `front`. `diff_screens`
+                // against a blank baseline skips cells equal to the default space,
+                // so it can't clear an orphaned physical ghost where the current
+                // frame is blank — writing every cell does, still flash-free (no
+                // ClearScreen). `front.add_changes(pending)` below reproduces
+                // `scratch`, keeping the baseline in sync for later bounded diffs.
+                crate::compositor::full_repaint_changes(&mut scratch)
             } else {
-                // Full diff: either a genuine Full frame, or a `resync_now` heal
-                // whose blank baseline makes this re-emit the entire screen.
+                // Genuine Full frame: bounded-to-full diff against the live baseline.
                 front.diff_screens(&scratch)
             };
             // A fullscreen modal owns the screen + draws its own caret; park the
