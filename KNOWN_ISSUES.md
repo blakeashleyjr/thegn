@@ -53,6 +53,12 @@ they were silently orphaned).
 - A few best-effort persists (focus / active-tab pointer, corner-pane parsing)
   have benign unordered-writer races; last-writer-wins, no corruption. (The
   merge-gate cross-process race is now fixed with an flock.)
+- Closing a **local** pane whose child both ignores `SIGHUP` and has stopped
+  reading its stdin (a wedged process with a full input queue) can leave its
+  per-pane writer thread parked on the final flush, holding one file descriptor,
+  until the child dies. Bounded (one thread + fd per such pane) and strictly
+  better than the pre-alpha behavior (which blocked the whole UI on that flush);
+  the daemon-backed transport (the default) is unaffected.
 
 ## Platform
 

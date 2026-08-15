@@ -123,6 +123,11 @@ check "sandbox vpn config parses and surfaces the provider" \
   "'$SZ' config show | grep -q 'tailscale'"
 check "config get reads a nested vpn key" \
   "[[ \$('$SZ' config get sandbox.vpn.provider 2>/dev/null) == 'tailscale' || -n \$('$SZ' config show | grep -A2 'sandbox.vpn') ]]"
+# A pre-existing bad enum value in some OTHER key must NOT block setting an
+# unrelated valid key (the whole-file re-validate only rolls back NEW errors).
+# Isolated config dir so the seeded config above stays clean.
+check "config set of a valid key survives a pre-existing bad value elsewhere" \
+  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf 'lifecycle.eager = \"bogus\"\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config set picker fzf >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' config get picker | grep -q fzf"
 
 # mcp serve: the read-only docs endpoint answers JSON-RPC over stdio.
 check "mcp serve initialize reports the docs server" \
