@@ -36,6 +36,7 @@ pub mod pr;
 pub mod repos;
 pub mod session;
 pub mod share;
+pub mod target;
 pub mod theme;
 pub mod wt;
 pub mod zone;

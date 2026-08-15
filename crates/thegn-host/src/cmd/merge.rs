@@ -36,8 +36,8 @@ pub enum Action {
     },
     /// Remove a worktree from the queue.
     Rm {
-        /// Worktree path (default: the current worktree).
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
     },
     /// Empty the queue for this repo.
     Clear,
@@ -52,8 +52,8 @@ pub enum Action {
     },
     /// Land a branch that is `ready` (gated green, held by `auto_land = false`).
     Land {
-        /// Worktree path (default: the current worktree).
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
     },
 }
 
@@ -68,10 +68,10 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::List { json } => list(json),
         Action::Add { worktrees, all } => add(cfg, worktrees, all),
-        Action::Rm { worktree } => rm(worktree),
+        Action::Rm { target } => rm(target.get()),
         Action::Clear => clear(cfg),
         Action::Drain { all, json } => drain(cfg, all, json),
-        Action::Land { worktree } => land(cfg, worktree),
+        Action::Land { target } => land(cfg, target.get()),
     }
 }
 

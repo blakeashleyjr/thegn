@@ -428,7 +428,7 @@ this summary and are superseded by it.
 - **Evidence:** `Land { /// Worktree path (default: the current worktree). worktree: Option<String>, }` (positional) — likewise `merge rm/land`, `env show/set/up/down/…`, `sandbox-argv` take positional worktrees, while `pr`/`issue`/`ci`/`wt diff|disk|clean`/`share`/`forward` all take `#[arg(long)] worktree: Option<String>` (e.g. pr.rs:23-25). `wt rm` uses a positional named `target` (wt.rs:96).
 - **Impact:** The same concept is spelled two ways depending on the namespace; users must remember per-verb whether it's `thegn land <path>` or `thegn pr status --worktree <path>`. Alpha is the last cheap moment to unify before the shapes become the stable scripting API docs/cli.md promises.
 - **Fix:** Pick one convention (accepting a positional AND keeping `--worktree` as an alias is backward-compatible: add `#[arg(long)]` fallbacks to the positional verbs or positionals to the flag verbs) and document it in docs/cli.md.
-- **Status:** ⏳
+- **Status:** ✅ fixed (2026-08-15) — `--worktree` is the canonical scope flag everywhere; the legacy positionals still parse but are hidden/deprecated (see docs/cli.md "Worktree targeting").
 
 ### [cli-api] `wt clean` per-target failures and `wt rm` abort exit 0
 

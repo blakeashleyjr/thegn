@@ -24,8 +24,8 @@ pub enum Action {
     Stop {
         /// The container (sandbox-internal) port whose forward to drop.
         container_port: u16,
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
     },
 }
 
@@ -34,8 +34,8 @@ pub fn run(action: Action) -> Result<()> {
         Action::List { json } => list(json),
         Action::Stop {
             container_port,
-            worktree,
-        } => stop(container_port, worktree),
+            target,
+        } => stop(container_port, target.worktree),
     }
 }
 

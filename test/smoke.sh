@@ -291,6 +291,21 @@ check "env show resolves an environment for a worktree" \
   "'$SZ' env show '$WT' | grep -q '^env:'"
 check "env set/show round-trips a selection" \
   "'$SZ' env set company-k8s '$WT' >/dev/null 2>&1 && '$SZ' env show '$WT' >/dev/null 2>&1"
+# The canonical `--worktree` flag form (the positionals above stay as the
+# hidden back-compat spelling — see docs/cli.md "Worktree targeting").
+check "env show accepts the canonical --worktree flag" \
+  "'$SZ' env show --worktree '$WT' | grep -q '^env:'"
+check "env set accepts the canonical --worktree flag" \
+  "'$SZ' env set company-k8s --worktree '$WT' >/dev/null 2>&1"
+# Passing BOTH forms is a usage error: non-zero exit (no specific code promised).
+check "env show refuses --worktree plus a positional (non-zero)" \
+  "! '$SZ' env show --worktree '$WT' '$WT' >/dev/null 2>&1"
+# sandbox-argv takes the same flag and resolves like every other scoped verb.
+# Target the repo root ($WT now carries the deliberately undefined company-k8s
+# env selection, which launch_spec correctly refuses) and switch the seeded
+# tailscale VPN off for this one call — its auth key is unset here by design.
+check "sandbox-argv accepts the canonical --worktree flag" \
+  "'$SZ' --set sandbox.vpn.provider=none sandbox-argv --worktree '$R' | grep -q ."
 
 # ── merge queue (`merge` namespace, the fold-actor) ──────────────────────────
 # Assign a worktree branch to the queue and drain it: a clean branch folds onto
@@ -314,6 +329,12 @@ fi
 # the worktree still exists — a clean land now auto-removes it (see below).
 check "merge rm deletes the entry by the same path" \
   "'$SZ' merge rm '$MP' >/dev/null 2>&1"
+# Flag-form twin: `merge rm` on a non-queued path exits non-zero, so it needs
+# its own preceding add before the canonical `--worktree` removal.
+check "merge add queues the branch again for the flag-form rm" \
+  "'$SZ' merge add '$MP' | grep -q 'queued'"
+check "merge rm accepts the canonical --worktree flag" \
+  "'$SZ' merge rm --worktree '$MP' >/dev/null 2>&1"
 check "merge add re-queues the branch after rm" \
   "'$SZ' merge add '$MP' | grep -q 'queued'"
 check "merge drain lands the clean branch" \
@@ -332,6 +353,8 @@ check "clean land deletes the merged branch" \
 # written — the byte-compatibility invariant's shell-visible face.
 check "placement plan reports passthrough while the engine is off" \
   "'$SZ' placement plan '$R' | grep -q 'engine off'"
+check "placement plan accepts the canonical --worktree flag" \
+  "'$SZ' placement plan --worktree '$R' | grep -q 'engine off'"
 check "placement list renders the seeded host (unknown size)" \
   "'$SZ' placement list | grep -q 'smoke-local'"
 check "placement events is empty while the engine is off" \

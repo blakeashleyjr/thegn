@@ -20,13 +20,13 @@ use crate::cmd::{confirm, resolve_worktree};
 pub enum Action {
     /// PR + checks + review state (human summary).
     Status {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
     },
     /// Create a PR for the worktree's branch.
     Create {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -42,20 +42,20 @@ pub enum Action {
     },
     /// Open the PR in a browser.
     Open {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
     },
     /// Approve the PR.
     Approve {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         #[arg(long)]
         body: Option<String>,
     },
     /// Merge the PR.
     Merge {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         #[arg(long, value_enum, default_value_t = MergeMethod::Squash)]
         method: MergeMethod,
         #[arg(long)]
@@ -68,25 +68,25 @@ pub enum Action {
     },
     /// Re-run failed checks.
     RerunChecks {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
     },
     /// Print the PR's reviews as JSON.
     Reviews {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
     },
     /// Post a PR-level comment.
     Comment {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         #[arg(long)]
         body: String,
     },
     /// Submit a review (approve / request-changes / comment).
     Review {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         #[arg(long, value_enum)]
         state: ReviewState,
         /// Required for request-changes / comment.
@@ -95,23 +95,23 @@ pub enum Action {
     },
     /// Print the PR's unified diff (or `--json` for the parsed structure).
     Diff {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         #[arg(long)]
         json: bool,
     },
     /// Mark the PR ready for review (or `--undo` back to draft).
     Ready {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         /// Convert the PR back to a draft instead of marking it ready.
         #[arg(long)]
         undo: bool,
     },
     /// Enable (or `--disable`) auto-merge for the PR.
     AutoMerge {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         /// Disable auto-merge instead of enabling it.
         #[arg(long)]
         disable: bool,
@@ -120,36 +120,36 @@ pub enum Action {
 
 pub fn run(action: Action) -> Result<()> {
     match action {
-        Action::Status { worktree } => status(worktree),
+        Action::Status { target } => status(target.worktree),
         Action::Create {
-            worktree,
+            target,
             title,
             body,
             base,
             draft,
             web,
             fill,
-        } => create(worktree, title, body, base, draft, web, fill),
-        Action::Open { worktree } => open(worktree),
-        Action::Approve { worktree, body } => approve(worktree, body),
+        } => create(target.worktree, title, body, base, draft, web, fill),
+        Action::Open { target } => open(target.worktree),
+        Action::Approve { target, body } => approve(target.worktree, body),
         Action::Merge {
-            worktree,
+            target,
             method,
             delete_branch,
             auto,
             yes,
-        } => merge(worktree, method, delete_branch, auto, yes),
-        Action::RerunChecks { worktree } => rerun(worktree),
-        Action::Reviews { worktree } => reviews(worktree),
-        Action::Comment { worktree, body } => comment(worktree, body),
+        } => merge(target.worktree, method, delete_branch, auto, yes),
+        Action::RerunChecks { target } => rerun(target.worktree),
+        Action::Reviews { target } => reviews(target.worktree),
+        Action::Comment { target, body } => comment(target.worktree, body),
         Action::Review {
-            worktree,
+            target,
             state,
             body,
-        } => review(worktree, state, body),
-        Action::Diff { worktree, json } => diff(worktree, json),
-        Action::Ready { worktree, undo } => ready(worktree, undo),
-        Action::AutoMerge { worktree, disable } => auto_merge(worktree, disable),
+        } => review(target.worktree, state, body),
+        Action::Diff { target, json } => diff(target.worktree, json),
+        Action::Ready { target, undo } => ready(target.worktree, undo),
+        Action::AutoMerge { target, disable } => auto_merge(target.worktree, disable),
     }
 }
 
