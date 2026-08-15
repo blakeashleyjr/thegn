@@ -1316,10 +1316,11 @@ mod tests {
     fn spawn_with_env_firewalls_launcher_creds_but_keeps_infra() {
         // The clear-then-allowlist firewall: a credential-shaped var present in
         // thegn's OWN environment must NOT reach a spawned pane, while curated
-        // infrastructure (PATH) still does. Setting GH_TOKEN here is safe under
-        // test parallelism because `host_base_env` filters it out regardless —
-        // it can never enter any child — so a transient set corrupts nothing.
-        unsafe { std::env::set_var("GH_TOKEN", "leak-me-if-you-can") };
+        // infrastructure (PATH) still does. Mutate GH_TOKEN under the shared
+        // ENV_LOCK (via EnvGuard) so it serializes with — and can't be seen by —
+        // other env-reading tests in this binary; the guard restores the prior
+        // value on drop.
+        let _env = crate::testenv::EnvVarGuard::set(&[("GH_TOKEN", "leak-me-if-you-can")]);
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane = PtyPane::spawn_with_env(
             0,
@@ -1336,7 +1337,7 @@ mod tests {
             drain_until_exit(&mut pane, &mut rx, 5000),
             "child should exit"
         );
-        unsafe { std::env::remove_var("GH_TOKEN") };
+        // `_env` (EnvGuard) restores the prior GH_TOKEN on drop — no manual unset.
         let line = pane
             .emulator()
             .row_text(0)
