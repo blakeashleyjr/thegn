@@ -620,7 +620,7 @@ mod tests {
                 server: "oldhost thegn 0.0".into(),
                 scopes: vec![],
             });
-            let _ = ws.send(Message::Binary(hello.encode().into())).await;
+            let _ = ws.send(Message::Binary(hello.encode())).await;
             let _ = ws.next().await; // hold the socket open until the client reacts
         });
 
