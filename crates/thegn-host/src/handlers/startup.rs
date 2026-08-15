@@ -17,6 +17,18 @@ use thegn_core::store::WorkspaceStore;
 /// never-reaped daemon sessions (one leaked daemon + shell per iteration/case),
 /// and the racy "persist" chip would flake the snapshots. Those harnesses opt
 /// out via env, forcing plain in-process panes.
+///
+/// DESTRUCTIVE toward persisted daemon sessions: ANY launch with the route
+/// disabled — `[daemon] enabled = false`, `THEGN_NO_DAEMON=1`, or
+/// `THEGN_BENCH_FIRST_FRAME_EXIT` — claims each persisted daemon-backed pane
+/// record at materialize and best-effort KILLS its daemon session (see
+/// `handlers::provision::drain_specs`). The alternative was worse: the pane
+/// respawned in-process while the daemon copy kept running forever under the
+/// untimed default lease, invisible after the next persist pruned the record.
+/// But it means a one-off `THEGN_NO_DAEMON=1` debugging run against a real
+/// state dir stops the user's persisted daemon sessions — the harnesses only
+/// stay side-effect-free because they isolate `XDG_STATE_HOME` (no daemon,
+/// nothing persisted, so the connect-only kill is a no-op).
 pub(crate) fn daemon_active(cfg: &thegn_core::config::Config) -> bool {
     cfg.daemon.enabled
         && std::env::var_os("THEGN_BENCH_FIRST_FRAME_EXIT").is_none()

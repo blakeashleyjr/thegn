@@ -360,6 +360,14 @@ impl Panes {
         self.daemon_cfg = if cfg.enabled { Some(cfg) } else { None };
     }
 
+    /// Whether the daemon route is installed for new local panes — the exact
+    /// gate [`Self::materialize_with_specs`]' warm-reattach branch tests, so
+    /// the drain's disabled-daemon claim (`handlers::provision::drain_specs`)
+    /// agrees by construction with the fallback materialize will take.
+    pub(crate) fn daemon_route_enabled(&self) -> bool {
+        self.daemon_cfg.is_some()
+    }
+
     /// Attach a fresh recording ring to a just-spawned pane when replay is on.
     fn maybe_record(&mut self, id: u32, rows: u16, cols: u16) {
         if let Some(cfg) = &self.replay_cfg
