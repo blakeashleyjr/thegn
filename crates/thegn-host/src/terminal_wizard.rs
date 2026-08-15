@@ -1,9 +1,12 @@
 //! The new-terminal wizard (`Alt T` / command palette → "New terminal…").
 //!
 //! A compact, single-plane modal mirroring the new-worktree wizard
-//! ([`crate::wizard::NewWorktreeWizard`]) but without a background worker —
-//! creating a terminal is a synchronous DB insert + pane spawn, so the loop
-//! handles submit inline. The form collects:
+//! ([`crate::wizard::NewWorktreeWizard`]) but without a worker of its own —
+//! on submit the loop does only a tiny best-effort DB upsert and stages a
+//! placeholder leaf (`handlers::terminal::push_terminal_group`); the pane then
+//! spawns via the shared off-thread lazy-materialize path
+//! (`handlers::materialize`), exactly like sidebar activation of a
+//! non-resident terminal. The form collects:
 //!
 //! - **name** — free text; when left untouched it defaults to a random
 //!   `adj-noun` slug (e.g. `snappy-shark`). For a remote target the selected

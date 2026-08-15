@@ -434,6 +434,30 @@ pub(crate) fn drain_specs(
         let Some(tab) = ctx.session.worktrees[gi].tabs.get_mut(ti) else {
             continue;
         };
+        // Daemon route disabled (`[daemon] enabled = false`, THEGN_NO_DAEMON,
+        // or a harness env) with persisted daemon-backed records on this
+        // batch's dead leaves: claim (consume) the records BEFORE materialize
+        // — the warm-reattach branch is off, so an unclaimed record would (a)
+        // respawn the same program on the fallback path while the daemon copy
+        // keeps running under its untimed default lease (a duplicated
+        // process, then a permanent invisible orphan once the post-remap
+        // persist prunes the record), and (b) let the native provider-exec
+        // fallback attach a daemon session id without a provider filter.
+        // Only NOT-already-live leaves are claimed (mirroring materialize's
+        // own skip): a daemon pane spawned before a live config reload
+        // disabled the route keeps its session. The kill itself is dispatched
+        // only after materialize succeeds, below — on a spawn failure the
+        // daemon copies stay alive exactly as before this fix.
+        let orphaned = if !ctx.panes.daemon_route_enabled() {
+            let stale: Vec<u32> = specs
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| !ctx.panes.table.contains_key(id))
+                .collect();
+            super::daemon_lifecycle::claim_disabled_daemon_sessions(tab, &stale)
+        } else {
+            Vec::new()
+        };
         {
             // Everything but the shell attach is done → shell active. (The
             // Ok-arm already advanced the plan; this re-advance is a no-op
@@ -450,6 +474,18 @@ pub(crate) fn drain_specs(
             ctx.panes
                 .materialize_with_specs(ctx.current_config, tab, &wt, &specs, ctx.center)
         {
+            if !orphaned.is_empty() {
+                // The records were already consumed, but the batch aborted
+                // before any replacement pane came up: killing the daemon
+                // copies now would lose BOTH processes. Leave them running —
+                // the same orphan the pre-fix code left — and say so.
+                tracing::warn!(
+                    target: "thegn::daemon",
+                    sessions = orphaned.len(),
+                    "materialize failed after claiming daemon-disabled records; \
+                     leaving the daemon sessions running (inspect: `thegn session list`)"
+                );
+            }
             ctx.model.status = format!("Pane spawn failed: {e}");
             ctx.loading_remote.insert(tab_key.clone(), tab_remote);
             // The shell step is the active one after `advance_to_shell`.
@@ -462,6 +498,22 @@ pub(crate) fn drain_specs(
             // no blank flash between fork and first render.
             if is_active && !warnings.is_empty() {
                 ctx.model.status = format!("⚠ Sandbox fallback: {}", warnings.join("; "));
+            }
+            if !orphaned.is_empty() {
+                // Set AFTER the sandbox-fallback warning so the rarer, more
+                // consequential daemon-disabled note wins this frame's status.
+                // "respawned without the daemon", not "fresh shells": the
+                // fallback may have taken the ssh/native/sandbox branch, which
+                // carries no scrollback repaint or relaunch offer.
+                ctx.model.status = format!(
+                    "[daemon] disabled — stopping {} persisted daemon session(s); \
+                     panes respawned without the daemon",
+                    orphaned.len()
+                );
+                super::daemon_lifecycle::kill_orphaned_daemon_sessions(
+                    ctx.current_config.daemon.clone(),
+                    orphaned,
+                );
             }
         }
         if is_active {
@@ -518,4 +570,142 @@ pub(crate) fn pool_target_adjust(
         return Some(format!("warm pool: persist failed: {e}"));
     }
     Some(format!("warm pool target: {new} spare(s)"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pane::PaneEvent;
+    use crate::session::{GroupKind, ProviderSession, Session, WorktreeGroup};
+    use tokio::sync::mpsc as tokio_mpsc;
+
+    /// THE regression gate for the daemon-disabled claim, at the level where
+    /// it can break: a real `SpecBatch` flows through the real `drain_specs`
+    /// with the daemon route disabled (`daemon_cfg` unset) and a persisted
+    /// `provider = "daemon"` record on the tab. The record must be consumed
+    /// (exactly-once claim — no later persist can resurrect it, no daemon sid
+    /// reaches the native-exec attach), the leaf must come up as exactly one
+    /// live NON-daemon pane, and the status must say what happened. Dropping
+    /// the claim call in `drain_specs` — or inverting its
+    /// `!daemon_route_enabled()` gate — fails this test; the pure-helper unit
+    /// tests alone would not notice.
+    ///
+    /// The kill dispatch is exercised up to its no-runtime no-op contract
+    /// (`kill_orphaned_daemon_sessions` returns before latching when no tokio
+    /// runtime exists — this test runs without one); the kill's best-effort
+    /// semantics are pinned in `handlers::daemon_lifecycle::tests`.
+    #[test]
+    fn drain_specs_with_daemon_disabled_claims_persisted_daemon_records() {
+        // Serialize env access; the spawned argv below is explicit (/bin/sh).
+        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", "/bin/sh")]);
+        let mut session = Session {
+            id: "s1".into(),
+            // Empty worktree path: the ssh-over-wss and native-exec fallbacks
+            // are gated on a non-empty worktree, so the leaf takes the plain
+            // spawn path (and no DB is touched).
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "")],
+            active: 0,
+        };
+        let leaf = 7u32;
+        {
+            let tab = &mut session.worktrees[0].tabs[0];
+            tab.center = crate::center::CenterTree::Leaf(leaf);
+            tab.focused_pane = leaf;
+            tab.pane_sessions.insert(
+                leaf,
+                ProviderSession {
+                    provider: "daemon".into(),
+                    id: "local".into(),
+                    session: "sess-1".into(),
+                },
+            );
+        }
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        // `Panes::new` leaves `daemon_cfg` unset — the daemon route is OFF,
+        // exactly the resurrect-after-disable shape.
+        let mut panes = crate::panes::Panes::new(tx);
+        assert!(!panes.daemon_route_enabled());
+
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.sandbox.enabled = false;
+        let mut model = crate::chrome::FrameModel::default();
+        let mut active_menu: Option<MenuOverlay> = None;
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let mut loading_remote = std::collections::HashMap::new();
+        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut prewarm_inflight = std::collections::HashSet::new();
+        let mut materialize_failed = std::collections::HashSet::new();
+        let mut prewarm_failed = std::collections::HashSet::new();
+        let mut halt_dismissed = std::collections::HashSet::new();
+        let mut last_pool_reconcile = None;
+        let mut center_dormant = false;
+        let mut need_relayout = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+
+        let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel::<SpecBatch>();
+        let spec = crate::agent::LaunchSpec {
+            argv: vec!["/bin/sh".into()],
+            cwd: None,
+            env: Vec::new(),
+            backend: "host".into(),
+            warnings: Vec::new(),
+            degraded: false,
+        };
+        spec_tx
+            .send((
+                "app/home".into(),
+                String::new(),
+                0,
+                SpecOrigin::Materialize,
+                Ok(vec![(leaf, spec)]),
+            ))
+            .unwrap();
+
+        drain_specs(
+            &mut spec_rx,
+            &mut SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &cfg,
+                center: crate::layout::compute(160, 40, true, true).center,
+                loading_state: &mut loading_state,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
+
+        let tab = &session.worktrees[0].tabs[0];
+        assert!(
+            tab.pane_sessions.is_empty(),
+            "the persisted daemon record must be consumed by the claim"
+        );
+        assert_eq!(panes.table.len(), 1, "exactly one live pane — no duplicate");
+        let id = tab.center.pane_ids()[0];
+        assert!(
+            !panes
+                .table
+                .get(&id)
+                .expect("remapped pane")
+                .is_daemon_backed(),
+            "the replacement pane must not be daemon-backed"
+        );
+        assert!(
+            model.status.contains("[daemon] disabled"),
+            "status must surface the claim: {:?}",
+            model.status
+        );
+        assert!(dirty, "the drain leaves the frame dirty");
+    }
 }
