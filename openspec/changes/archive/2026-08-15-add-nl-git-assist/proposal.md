@@ -1,5 +1,7 @@
 # Add natural-language git assist (explain + warn + confirm)
 
+> **Archived unimplemented (2026-08-14):** AI-scope — depends on the AI/agent layer (model-driven git assist / proxy-ACP tool filtering) that was removed from the codebase before the public alpha; revisit when the AI track reopens.
+
 ## Summary
 
 Add a natural-language → git action, modeled on
