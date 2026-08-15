@@ -128,7 +128,18 @@ programs.thegn = {
 };
 ```
 
-Or just the binary: `nix profile install .#default`.
+Or just the binary: `nix profile install github:blakeashleyjr/thegn`.
+
+### Prebuilt binary (no Nix)
+
+Each tagged release attaches a `thegn` binary for Linux (gnu + musl), macOS
+(arm + Intel), and Windows to the [releases page][releases]. Download the
+archive for your platform, verify the `.sha256`, and drop `thegn` on your
+`PATH`. Homebrew (macOS): `brew install <owner>/tap/thegn` once the tap carries
+the release. See [`RELEASING.md`](RELEASING.md) for the release process and the
+crates.io / `cargo binstall` status.
+
+[releases]: https://github.com/blakeashleyjr/thegn/releases
 
 ### Standalone
 
