@@ -25,8 +25,8 @@ pub enum Action {
     Start {
         /// The local TCP port to expose (e.g. a dev server on 3000).
         port: u16,
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         /// Reach intent: public | team | peer (maps to `[share] <reach>`).
         /// Omitted ⇒ the single `[share] provider`.
         #[arg(long)]
@@ -41,8 +41,8 @@ pub enum Action {
     /// Remove a recorded share for a worktree port.
     Stop {
         port: u16,
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
     },
 }
 
@@ -50,11 +50,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::Start {
             port,
-            worktree,
+            target,
             reach,
-        } => start(cfg, port, worktree, reach),
+        } => start(cfg, port, target.worktree, reach),
         Action::List { json } => list(json),
-        Action::Stop { port, worktree } => stop(port, worktree),
+        Action::Stop { port, target } => stop(port, target.worktree),
     }
 }
 

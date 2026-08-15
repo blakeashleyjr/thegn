@@ -14,8 +14,8 @@ use crate::cmd::resolve_worktree;
 pub enum Action {
     /// List issues for the repository.
     List {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         /// Filter by state (open, closed, all).
         #[arg(long, default_value = "open")]
         state: String,
@@ -24,16 +24,16 @@ pub enum Action {
     },
     /// View a specific issue.
     View {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         number: u64,
         #[arg(long)]
         json: bool,
     },
     /// Create a new issue.
     Create {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         title: String,
         #[arg(long)]
         body: Option<String>,
@@ -43,8 +43,8 @@ pub enum Action {
     },
     /// Add a comment to an issue.
     Comment {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         number: u64,
         body: String,
     },
@@ -53,26 +53,26 @@ pub enum Action {
 pub fn run(action: Action) -> Result<()> {
     match action {
         Action::List {
-            worktree,
+            target,
             state,
             json,
-        } => list_issues(worktree, state, json),
+        } => list_issues(target.worktree, state, json),
         Action::View {
-            worktree,
+            target,
             number,
             json,
-        } => view_issue(worktree, number, json),
+        } => view_issue(target.worktree, number, json),
         Action::Create {
-            worktree,
+            target,
             title,
             body,
             labels,
-        } => create_issue(worktree, title, body, labels),
+        } => create_issue(target.worktree, title, body, labels),
         Action::Comment {
-            worktree,
+            target,
             number,
             body,
-        } => comment_issue(worktree, number, body),
+        } => comment_issue(target.worktree, number, body),
     }
 }
 
