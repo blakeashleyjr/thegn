@@ -32,6 +32,14 @@ the target resolves in order:
 2. the git toplevel of the current directory;
 3. the current directory itself.
 
+Note that step 1 **overrides your current directory** inside a thegn pane: a
+script that `cd`s into a _different_ repo and runs, say, `thegn sandbox-argv`
+or `thegn placement plan` with no `--worktree` targets the **pane's** worktree,
+not the directory it stands in. Pass `--worktree .` (or an explicit path) to
+target the cwd regardless of the pane. (`sandbox-argv` and `placement plan`
+adopted this shared resolution in 0.1.0-alpha.1; they previously used the raw
+cwd only.)
+
 Verbs whose argument **is** the object keep positionals: `wt rm <target>`
 (path or branch), `wt new [name]`, `merge add [worktrees…]` (multi-target),
 `open <repo>` (a repo, not a worktree).
@@ -43,7 +51,10 @@ shows the most recent decision overall unless `--worktree` filters it.
 The legacy trailing positional on `env *`, `placement plan|explain`,
 `merge rm|land`, `land`, and `sandbox-argv` still parses but is deprecated
 and hidden from help; passing both the flag and the positional is a usage
-error (non-zero exit). Scripts should move to `--worktree`.
+error. Scripts should move to `--worktree`. A usage error exits with clap's
+argument-parse code (`2`) and is **permanent — do not retry it** (see the
+exit-code note below); it is distinct from the retryable runtime failures the
+table describes.
 
 ## Headless worktree lifecycle
 
@@ -79,6 +90,13 @@ text-only today — `zone list`, `mcp list`, and `theme list` have no `--json`.
 | 1    | error                                                               |
 | 2    | transient/retryable (e.g. a `host provision` step worth re-running) |
 | 3    | target not found (repo, worktree, branch, env)                      |
+
+Caveat: code `2` is **overloaded**. thegn returns it for retryable runtime
+failures (above), but `clap` also uses `2` for argument/usage parse errors
+(unknown flag, mutually-exclusive args, bad value) — those are **permanent**,
+not retryable. A script that retries on `2` should first confirm the command
+parsed (e.g. it is not a usage error printed to stderr) before treating the
+exit as transient.
 
 ## Remote control (`open`)
 

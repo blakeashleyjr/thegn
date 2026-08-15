@@ -12,15 +12,25 @@ still welcome.
 ## Performance (event loop)
 
 Idle CPU stays ~0% and pane bring-up (creation, crash respawn, the new-terminal
-wizard) resolves sandboxes off-thread. Two narrow paths remain on the loop:
+wizard) resolves sandboxes off-thread — the seconds-to-minutes container work is
+gone from the loop. A few small, deliberately **synchronous** DB writes remain
+on structural events (this is the sanctioned best-effort-persist family; git,
+not the DB, is the source of truth):
 
-- `persist_session_layout` is a deliberately **synchronous** whole-session
-  persist on structural changes (documented; the lightweight focus-change
-  persist already runs off-loop). ~50–100 ms in release on a large session.
+- `persist_session_layout` — a whole-session persist on structural changes
+  (documented; the lightweight focus-change persist already runs off-loop).
+  ~50–100 ms in release on a large session.
+- Tiny per-event upserts on the loop: the new-terminal wizard's terminal-row
+  persist and the sidebar `ui_state` write. Each is a single `Db::open` + one
+  small upsert (a few ms), bounded by the DB's 5 s busy-timeout ceiling under a
+  concurrent writer.
 - The startup-shell **watchdog's clean-shell fallback** (fired only when a
   freshly materialized shell produces no output before its deadline) still
   resolves its launch spec synchronously — an exceptional failure-recovery
   path.
+
+None of these block indefinitely, and all are one-shot reactions to a
+user-driven structural change (a switch/open/close), not steady-state work.
 
 ## Daemon / remote serving (`thegn serve`)
 

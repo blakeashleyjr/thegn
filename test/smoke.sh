@@ -295,17 +295,31 @@ check "env set/show round-trips a selection" \
 # hidden back-compat spelling — see docs/cli.md "Worktree targeting").
 check "env show accepts the canonical --worktree flag" \
   "'$SZ' env show --worktree '$WT' | grep -q '^env:'"
-check "env set accepts the canonical --worktree flag" \
-  "'$SZ' env set company-k8s --worktree '$WT' >/dev/null 2>&1"
+# Round-trip: the flag-form WRITE must land on the SAME worktree a positional
+# READ resolves (cross-checks that --worktree isn't silently dropped in favor of
+# the cwd — `env set` exits 0 even when the selection is wrong, so assert the
+# effect, not just the exit code). `env set` persists the selection unconditionally
+# and the read preserves the requested name, so this leaves $WT carrying
+# company-k8s exactly as the sandbox-argv check below documents.
+check "env set --worktree lands the selection (flag-write / positional-read round-trip)" \
+  "'$SZ' env set company-k8s --worktree '$WT' >/dev/null 2>&1 && '$SZ' env show '$WT' | grep -q company-k8s"
 # Passing BOTH forms is a usage error: non-zero exit (no specific code promised).
 check "env show refuses --worktree plus a positional (non-zero)" \
   "! '$SZ' env show --worktree '$WT' '$WT' >/dev/null 2>&1"
+# The conflict guard is per-verb (flatten site): spot-check a second verb.
+check "placement explain refuses --worktree plus a positional (non-zero)" \
+  "! '$SZ' placement explain --worktree '$WT' '$WT' >/dev/null 2>&1"
 # sandbox-argv takes the same flag and resolves like every other scoped verb.
 # Target the repo root ($WT now carries the deliberately undefined company-k8s
 # env selection, which launch_spec correctly refuses) and switch the seeded
 # tailscale VPN off for this one call — its auth key is unset here by design.
 check "sandbox-argv accepts the canonical --worktree flag" \
   "'$SZ' --set sandbox.vpn.provider=none sandbox-argv --worktree '$R' | grep -q ."
+# No-arg default resolution: with $THEGN_WORKTREE exported to the repo root, a
+# flag-less sandbox-argv resolves to it (the shared chain, not the old raw cwd).
+# Run from a scratch cwd to prove $THEGN_WORKTREE — not the cwd — wins.
+check "sandbox-argv with no --worktree resolves via the THEGN_WORKTREE env" \
+  "(cd / && THEGN_WORKTREE='$R' '$SZ' --set sandbox.vpn.provider=none sandbox-argv | grep -q .)"
 
 # ── merge queue (`merge` namespace, the fold-actor) ──────────────────────────
 # Assign a worktree branch to the queue and drain it: a clean branch folds onto
