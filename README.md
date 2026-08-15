@@ -1,17 +1,25 @@
 # thegn
 
-A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
-One process, one session: each git repo is a **workspace**, each git
-**worktree** is a **tab**, and the chrome — a left sidebar tree, a right
-diff/PR panel, tabbar, statusbar, and a pinned-program strip — is rendered
-in-process by a native compositor. No plugins, no IPC, no external multiplexer.
-(thegn was originally built on zellij; that architecture was fully stripped
-and it is now a from-scratch native compositor.)
+> **Status: public alpha** (`0.1.0-alpha.1`). Linux and macOS, best-effort
+> native Windows. Expect rough edges; see [`CHANGELOG.md`](CHANGELOG.md) and
+> [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
-A single **Rust** binary (`thegn`, with a short `tg` alias) drives portable-pty panes, composites them with the chrome into a
-termwiz surface, and diff-flushes to your terminal. A bundled SQLite store
-keeps repo history, worktree state, session layout, and a PR cache. Everything
-is instant by construction: sub-300ms launch, <16ms renders, ~0% idle CPU.
+A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
+One session: each git repo is a **workspace**, each git **worktree** is a
+**tab**, and the chrome — a left sidebar tree, a right diff/PR panel, tabbar,
+statusbar, and a pinned-program strip — is rendered in-process by a native
+compositor. No plugins, no external multiplexer. (thegn was originally built
+on zellij; that architecture was fully stripped and it is now a from-scratch
+native compositor.)
+
+A single **Rust** binary (`thegn`, with a short `tg` alias) drives
+portable-pty panes, composites them with the chrome into a termwiz surface,
+and diff-flushes to your terminal. Panes are owned by a background **pane
+daemon**, so quitting the UI detaches your sessions and the next launch
+reattaches them, scrollback intact (tmux semantics — disable with `[daemon]
+enabled = false`). A bundled SQLite store keeps repo history, worktree state,
+session layout, and a PR cache. Everything is instant by construction:
+sub-300ms launch, <16ms renders, ~0% idle CPU.
 
 ## Mental model
 
@@ -103,7 +111,7 @@ familiar IDE chords._
 
 ```nix
 # flake.nix inputs
-thegn.url = "github:youruser/thegn";
+thegn.url = "github:blakeashleyjr/thegn";
 
 # home-manager config
 imports = [ inputs.thegn.homeManagerModules.default ];
@@ -152,12 +160,12 @@ CONTRIBUTING "Windows (native) notes" for details.
 
 ## How it works
 
-- **Three crates.** `thegn-core` (substrate-agnostic domain logic: layered
-  config, SQLite, keymap registry, theme, sandbox backends), `thegn-svc`
-  (service seams with graceful degradation: gix-native git reads with CLI
-  fallback, GitHub via octocrab/`gh`, SSH via russh/`ssh`), and
+- **A small Rust workspace.** `thegn-core` (substrate-agnostic domain logic:
+  layered config, SQLite, keymap registry, theme, sandbox backends),
+  `thegn-svc` (service seams with graceful degradation: gix-native git reads
+  with CLI fallback, GitHub via octocrab/`gh`, SSH via russh/`ssh`), and
   `thegn-host` (the compositor: tokio, portable-pty panes, termwiz
-  diff-flush rendering, in-process chrome).
+  diff-flush rendering, in-process chrome, and the pane daemon).
 - **Fully event-driven.** The loop blocks on terminal input with no tick or
   timeout; PTY readers, hydration, and fs-watchers wake it over channels. A
   damage-region render planner repaints only what changed — pane output costs

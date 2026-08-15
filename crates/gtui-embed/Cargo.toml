@@ -15,4 +15,4 @@ thegn-core = { path = "../thegn-core" }
 chrono = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
-gtui-core = { version = "0.1.0", path = "../gtui-core" }
+gtui-core = { path = "../gtui-core" }
