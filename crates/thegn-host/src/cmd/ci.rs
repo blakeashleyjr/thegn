@@ -156,7 +156,17 @@ fn runs(
     limit: Option<usize>,
     json_out: bool,
 ) -> Result<()> {
-    let (loc, client) = client(cfg, worktree)?;
+    // `runs` is a READ verb: unlike the mutation verbs, listing when no CI
+    // provider resolves is graceful degradation, not an error — emit an empty
+    // JSON array (valid for scripts) / a friendly note and exit 0.
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let Some(client) = provider_for(&loc, &cfg.ci) else {
+        if json_out {
+            return super::emit_json(&Vec::<CiRun>::new());
+        }
+        outln!("no CI provider for this worktree (set [ci] provider, or check the remote)");
+        return Ok(());
+    };
     let limit = limit.unwrap_or(cfg.ci.max_runs);
     let branch_q = branch.as_deref();
     match block(client.runs(&loc, branch_q, limit)) {
@@ -191,12 +201,15 @@ fn runs(
                 );
             }
         }
-        // Under --json, never write a human string to stdout: propagate so
-        // main() reports it on stderr and exits non-zero (scripting/CI reads
-        // stdout as JSON). Human mode degrades gracefully (exit 0 with a note)
-        // — the "never crashes, always a readable state" contract the panel
-        // relies on.
-        Err(e) if json_out => bail!("ci: {e}"),
+        // A fetch failure degrades gracefully — the "never crashes, always a
+        // readable state" contract. Under --json, stdout must stay valid JSON,
+        // so emit an empty array and send the reason to stderr (exit 0); human
+        // mode prints a note. The finding this fixes was a NON-JSON string on
+        // stdout under --json, not a missing non-zero exit.
+        Err(e) if json_out => {
+            msg::warn(&format!("ci: {e}"));
+            return super::emit_json(&Vec::<CiRun>::new());
+        }
         Err(e) => outln!("ci: {e}"),
     }
     Ok(())
