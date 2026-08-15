@@ -691,8 +691,8 @@ format = "text"           # text | json
 # (installs + carries config/login for): every entry you surface here is set up in
 # the sandbox; an entry you remove is NOT (so the picker both surfaces custom agents
 # and disables defaults you don't want). The agent KIND is the entry's `provider`,
-# else its command's program basename — kinds dedup (e.g. a managed-pi "Agent" +
-# a "Vanilla Pi" → one `pi`). `[sandbox.home] agents = [...]` overrides this with an
+# else its command's program basename — kinds dedup (e.g. two `claude` entries
+# → one `claude`). `[sandbox.home] agents = [...]` overrides this with an
 # explicit install list; only when NO `[[agents]]` are configured at all does
 # thegn fall back to detecting the host's agents.
 #

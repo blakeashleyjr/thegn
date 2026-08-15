@@ -1130,7 +1130,7 @@ mod tests {
         assert!(!creating_tabs.contains(&("repo/sz-machine0".to_string(), 0)));
         assert!(!loading.contains_key(&("repo/sz-machine0".to_string(), 0)));
         assert!(!sb.creating.contains("repo/sz-machine0"));
-        assert!(inflight.progress.get(&9).is_none(), "progress retired");
+        assert!(!inflight.progress.contains_key(&9), "progress retired");
         assert_eq!(
             session
                 .worktrees

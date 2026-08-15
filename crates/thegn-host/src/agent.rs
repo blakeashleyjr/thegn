@@ -932,7 +932,7 @@ pub(crate) use crate::agent_ssh::{
 /// is a `provider` placement whose provider has a native exec API, whose `exec`
 /// mode isn't `cli`, and whose API token is present; `None` ⇒ use [`launch_spec`].
 ///
-/// Resolves the env exactly as [`launch_spec_with_key`] does (DB repo-root +
+/// Resolves the env exactly as [`launch_spec_full`] does (DB repo-root +
 /// effective env) so the two paths never disagree about which env is in play.
 /// The agent KINDS surfaced in the `[[agents]]` picker — what gets provisioned
 /// into a sandbox (installed + config-carried). Each entry maps to its kind via

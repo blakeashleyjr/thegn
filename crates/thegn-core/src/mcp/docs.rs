@@ -3,11 +3,9 @@
 //! the generated keybindings / config-reference pages, inspect the user's
 //! current (secret-redacted) config, and trace how a config key resolves.
 //!
-//! This is deliberately **separate** from [`super::router::McpRouter`]: that one
-//! is for the embedded agent (git/forge/merge writes, budget, spawn) and needs a
-//! DB + the event bus; this one is read-only, DB-free, and safe to hand to any
-//! agent. Like `McpRouter` it speaks the JSON-RPC envelope in
-//! [`super::protocol`], and the host drives it over stdio (`thegn mcp serve`).
+//! Read-only and DB-free by design, so it is safe to hand to any agent. It
+//! speaks the JSON-RPC envelope in [`super::protocol`], and the host drives it
+//! over stdio (`thegn mcp serve`).
 //!
 //! Purity: everything the router needs is injected by the host — the built
 //! [`HelpRegistry`], the already-serialized-and-redacted config `Value`, the
@@ -66,9 +64,7 @@ impl<'a> DocsRouter<'a> {
         }
     }
 
-    /// Handle one JSON-RPC request and return the response value. Mirrors
-    /// [`super::router::McpRouter::handle_request`] so the host stdio loop is
-    /// identical for both routers.
+    /// Handle one JSON-RPC request and return the response value.
     pub fn handle(&self, req_raw: &Value) -> Value {
         let req: JsonRpcRequest = match serde_json::from_value(req_raw.clone()) {
             Ok(r) => r,
@@ -305,7 +301,7 @@ fn is_sensitive(key: &str) -> bool {
 /// Mask secret scalar values in a resolved-config JSON tree in place, so the
 /// docs endpoint can serve `get_config` / `thegn://config/current` without
 /// leaking tokens or credentials. A scalar (string/number) directly under a
-/// [`is_sensitive`] key becomes `"***redacted***"`; objects/arrays are always
+/// sensitive key becomes `"***redacted***"`; objects/arrays are always
 /// recursed (so nested secrets are caught, and non-secret subtrees survive).
 pub fn redact(v: &mut Value) {
     match v {

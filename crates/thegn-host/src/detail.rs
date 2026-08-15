@@ -2685,7 +2685,7 @@ fn logs_row(model: &FrameModel, notes: &[thegn_core::notification::Notification]
 }
 
 /// The notification marker glyph + color — a thin caps-aware adapter over the
-/// single core vocabulary ([`NotificationKind::hued_glyph`]) so the overlay and
+/// single core vocabulary ([`thegn_core::notification::NotificationKind::hued_glyph`]) so the overlay and
 /// the panel inbox section can never diverge.
 fn notif_glyph(kind: thegn_core::notification::NotificationKind) -> (&'static str, Tok) {
     let (glyph, hue) = kind.hued_glyph(crate::caps::active_glyphs());
