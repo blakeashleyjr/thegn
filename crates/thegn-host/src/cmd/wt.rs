@@ -16,8 +16,8 @@ use thegn_core::{outln, util, worktree};
 /// Args shared by `diff` and `wt diff`.
 #[derive(clap::Args, Clone)]
 pub struct DiffArgs {
-    #[arg(long)]
-    pub worktree: Option<String>,
+    #[command(flatten)]
+    pub target: super::target::WorktreeFlag,
     /// Diff against this base ref (default: the repo's default branch).
     #[arg(long)]
     pub base: Option<String>,
@@ -124,7 +124,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             delete_branch,
             force,
         } => rm(cfg, &target, delete_branch, force),
-        Action::Diff(a) => super::diff::run(a.worktree, a.base, a.stat, a.file),
+        Action::Diff(a) => super::diff::run(a.target.worktree, a.base, a.stat, a.file),
         Action::Disk(a) => super::disk::disk(cfg, a.worktree, a.all, a.json),
         Action::Clean(a) => super::disk::clean(cfg, a.worktree, a.all, a.force),
     }

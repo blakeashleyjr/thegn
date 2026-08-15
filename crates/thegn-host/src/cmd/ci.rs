@@ -24,8 +24,8 @@ use crate::cmd::resolve_worktree;
 pub enum Action {
     /// Recent runs (newest first); `--branch` to filter, `--limit` to cap.
     Runs {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         #[arg(long)]
         branch: Option<String>,
         #[arg(long)]
@@ -37,8 +37,8 @@ pub enum Action {
     /// One run's jobs and steps.
     View {
         run_id: String,
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
     },
     /// A job's log ("why did it fail") with a jump-to-failure marker.
     Log {
@@ -46,64 +46,64 @@ pub enum Action {
         run_id: String,
         /// The job id.
         job_id: String,
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
     },
     /// Re-run a run (`--failed` for only the failed jobs).
     Rerun {
         run_id: String,
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         #[arg(long)]
         failed: bool,
     },
     /// Trigger a workflow with `-i key=value` inputs (workflow_dispatch).
     Trigger {
         workflow: String,
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
         #[arg(short = 'i', long = "input", value_name = "KEY=VALUE")]
         input: Vec<String>,
     },
     /// Cancel an in-flight run.
     Cancel {
         run_id: String,
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
     },
     /// Show which CI systems the worktree is configured for + the active provider.
     Detect {
-        #[arg(long)]
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
     },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::Runs {
-            worktree,
+            target,
             branch,
             limit,
             json,
-        } => runs(cfg, worktree, branch, limit, json),
-        Action::View { run_id, worktree } => view(cfg, worktree, &run_id),
+        } => runs(cfg, target.worktree, branch, limit, json),
+        Action::View { run_id, target } => view(cfg, target.worktree, &run_id),
         Action::Log {
             run_id,
             job_id,
-            worktree,
-        } => log(cfg, worktree, &run_id, &job_id),
+            target,
+        } => log(cfg, target.worktree, &run_id, &job_id),
         Action::Rerun {
             run_id,
-            worktree,
+            target,
             failed,
-        } => rerun(cfg, worktree, &run_id, failed),
+        } => rerun(cfg, target.worktree, &run_id, failed),
         Action::Trigger {
             workflow,
-            worktree,
+            target,
             input,
-        } => trigger(cfg, worktree, &workflow, input),
-        Action::Cancel { run_id, worktree } => cancel(cfg, worktree, &run_id),
-        Action::Detect { worktree } => detect(cfg, worktree),
+        } => trigger(cfg, target.worktree, &workflow, input),
+        Action::Cancel { run_id, target } => cancel(cfg, target.worktree, &run_id),
+        Action::Detect { target } => detect(cfg, target.worktree),
     }
 }
 
