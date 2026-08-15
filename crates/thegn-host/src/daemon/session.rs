@@ -37,6 +37,10 @@ const SUB_CHANNEL_CAP: usize = 256;
 /// History lines folded into a warm-attach snapshot (scrollback context).
 const SNAPSHOT_HISTORY_LINES: usize = 2_000;
 
+/// Stdin chunks queued to the PTY writer thread before overflow drops them.
+/// Keystrokes are tiny; even paste bursts fit comfortably.
+const STDIN_CHANNEL_CAP: usize = 256;
+
 /// The actor's control mailbox.
 pub(crate) enum SessionMsg {
     Attach {
@@ -44,6 +48,10 @@ pub(crate) enum SessionMsg {
         kind: AttachKind,
         rows: u16,
         cols: u16,
+        /// Include the scrollback history tail in the snapshot (first attach
+        /// of a fresh client emulator); reconnects pass `false` so the tail
+        /// isn't duplicated into scrollback the client already holds.
+        history: bool,
         reply: oneshot::Sender<Result<AttachReply, ControlError>>,
     },
     Detach {
@@ -110,6 +118,9 @@ pub(crate) struct IdleTransition {
 
 struct Subscriber {
     client_id: String,
+    /// Observers are excluded from the interactive busy-count that drives the
+    /// lease bookkeeping — an `Observer` never holds the relay lease open.
+    kind: AttachKind,
     tx: mpsc::Sender<EventFrame>,
     lagged: bool,
 }
@@ -123,6 +134,10 @@ pub(crate) struct SessionActor {
     history_partial: Vec<u8>,
     history_stripper: AnsiStripper,
     subs: Vec<Subscriber>,
+    /// Interactive subscriber count after the last `after_sub_change`, so only
+    /// 0↔nonzero transitions signal the lease bookkeeping (observer churn on a
+    /// detached session must not refresh its relay grace).
+    prev_interactive: u32,
     /// Monotone per-output-chunk sequence; a snapshot at `seq` folds chunks
     /// `..=seq`, the next delta carries `seq + 1`.
     seq: u64,
@@ -155,6 +170,7 @@ impl SessionActor {
             history_partial: Vec::new(),
             history_stripper: AnsiStripper::default(),
             subs: Vec::new(),
+            prev_interactive: 0,
             seq: 0,
             events,
             idle_tx,
@@ -175,6 +191,34 @@ impl SessionActor {
         mut pane_rx: mpsc::Receiver<PaneEvent>,
         mut msg_rx: mpsc::Receiver<SessionMsg>,
     ) {
+        // PTY stdin rides a dedicated writer thread: `write_all` blocks once
+        // the child stops draining stdin and the kernel's ~64KB PTY buffer
+        // fills, and a blocked actor can neither fan out output nor process
+        // Kill (the compositor's keep-blocking-I/O-off-the-loop rule applies
+        // to the actor task too). Bounded + `try_send` keeps the mailbox
+        // live; overflow drops the chunk with one warning per congestion
+        // episode — the pane is wedged until the child reads anyway. The
+        // thread exits when the sender drops (actor teardown) or the child's
+        // side of the PTY dies (write error after kill/exit).
+        let (stdin_tx, stdin_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(STDIN_CHANNEL_CAP);
+        {
+            let mut writer = std::mem::replace(&mut self.pty.writer, Box::new(std::io::sink()));
+            let session = self.meta.id.clone();
+            // best-effort: if the thread can't spawn, stdin degrades to warn-drop
+            let _ = std::thread::Builder::new()
+                .name(format!("pty-writer-{session}"))
+                .spawn(move || {
+                    use std::io::Write;
+                    while let Ok(bytes) = stdin_rx.recv() {
+                        if let Err(e) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
+                            tracing::warn!(target: "thegn::daemon", session = %session, "pty write failed: {e}");
+                            return; // child gone/broken — remaining input has nowhere to go
+                        }
+                    }
+                });
+        }
+        let mut stdin_drop_warned = false;
+
         // `child_exited` distinguishes a natural child exit (the reader thread
         // already reaped it) from a teardown while the child may still be alive
         // (Kill / mailbox closed) — the latter must actively terminate the PTY
@@ -189,21 +233,31 @@ impl SessionActor {
                     None => break (None, true), // reader gone ⇒ child already EOF'd
                 },
                 msg = msg_rx.recv() => match msg {
-                    Some(SessionMsg::Attach { client_id, kind, rows, cols, reply }) => {
-                        let r = self.on_attach(client_id, kind, rows, cols);
+                    Some(SessionMsg::Attach { client_id, kind, rows, cols, history, reply }) => {
+                        let r = self.on_attach(client_id, kind, rows, cols, history);
                         let _ = reply.send(r);
                     }
                     Some(SessionMsg::Detach { client_id }) => self.on_detach(&client_id),
-                    Some(SessionMsg::Stdin(bytes)) => {
-                        use std::io::Write;
-                        if let Err(e) = self.pty.writer.write_all(&bytes) {
-                            tracing::warn!(target: "thegn::daemon", session = %self.meta.id, "pty write failed: {e}");
+                    Some(SessionMsg::Stdin(bytes)) => match stdin_tx.try_send(bytes) {
+                        Ok(()) => stdin_drop_warned = false,
+                        // Full (child not reading) or disconnected (child's
+                        // PTY died): drop the input, warn once per episode.
+                        Err(e) => {
+                            if !stdin_drop_warned {
+                                stdin_drop_warned = true;
+                                tracing::warn!(
+                                    target: "thegn::daemon",
+                                    session = %self.meta.id,
+                                    "pty stdin stalled; dropping input: {e}"
+                                );
+                            }
                         }
-                        let _ = self.pty.writer.flush();
-                    }
+                    },
                     Some(SessionMsg::Resize { rows, cols }) => self.on_resize(rows, cols),
                     Some(SessionMsg::Snapshot { reply }) => {
-                        let _ = reply.send(self.snapshot_frame());
+                        // One-shot capture (`thegn session snapshot`): full
+                        // context, history included.
+                        let _ = reply.send(self.snapshot_frame(true));
                     }
                     Some(SessionMsg::Kill) | None => break (None, false),
                 },
@@ -284,7 +338,10 @@ impl SessionActor {
             }
         });
         if !recovered.is_empty() {
-            let frame = self.snapshot_frame();
+            // Resync is a repaint of an emulator that already holds the
+            // scrollback — omit the history tail or it duplicates on every
+            // lag recovery.
+            let frame = self.snapshot_frame(false);
             for sub in self
                 .subs
                 .iter()
@@ -304,17 +361,19 @@ impl SessionActor {
         kind: AttachKind,
         rows: u16,
         cols: u16,
+        history: bool,
     ) -> Result<AttachReply, ControlError> {
         // Last interactive writer wins the PTY size; observers never resize.
         if kind == AttachKind::Interactive {
             self.on_resize(rows, cols);
         }
-        let snapshot = self.snapshot_frame();
+        let snapshot = self.snapshot_frame(history);
         let (tx, rx) = mpsc::channel(self.sub_cap);
         // Replace a stale subscription from the same client (reconnect).
         self.subs.retain(|s| s.client_id != client_id);
         self.subs.push(Subscriber {
             client_id,
+            kind,
             tx,
             lagged: false,
         });
@@ -333,17 +392,29 @@ impl SessionActor {
         }
     }
 
-    /// Maintain the live listing row + signal idle/busy transitions for the
-    /// lease bookkeeping.
+    /// Maintain the live listing row + signal interactive idle/busy
+    /// transitions for the lease bookkeeping. The listing count includes
+    /// observers, but the idle signal counts INTERACTIVE subscribers only (an
+    /// `Observer` never holds the relay lease open), and only 0↔nonzero
+    /// transitions are signaled — observer churn on a detached session must
+    /// not refresh (re-open and extend) its relay grace.
     fn after_sub_change(&mut self) {
         let attached = self.subs.len() as u32;
         if let Ok(mut live) = self.live.lock() {
             live.attached = attached;
         }
-        let _ = self.idle_tx.send(IdleTransition {
-            session: self.meta.id.clone(),
-            idle: attached == 0,
-        });
+        let interactive = self
+            .subs
+            .iter()
+            .filter(|s| s.kind == AttachKind::Interactive)
+            .count() as u32;
+        if (interactive == 0) != (self.prev_interactive == 0) {
+            let _ = self.idle_tx.send(IdleTransition {
+                session: self.meta.id.clone(),
+                idle: interactive == 0,
+            });
+        }
+        self.prev_interactive = interactive;
     }
 
     fn on_resize(&mut self, rows: u16, cols: u16) {
@@ -367,12 +438,19 @@ impl SessionActor {
     }
 
     /// Serialize the authoritative screen as an ANSI repaint frame at the
-    /// current `seq` (the warm-attach snapshot).
-    fn snapshot_frame(&self) -> EventFrame {
+    /// current `seq` (the warm-attach snapshot). `include_history` folds the
+    /// scrollback tail in — wanted by a fresh client emulator, skipped on
+    /// resyncs/reconnects whose emulator already holds it.
+    fn snapshot_frame(&self, include_history: bool) -> EventFrame {
+        let history_lines = if include_history {
+            SNAPSHOT_HISTORY_LINES
+        } else {
+            0
+        };
         let snap = snapshot_of(
             self.emulator.as_ref(),
             &self.history,
-            SNAPSHOT_HISTORY_LINES,
+            history_lines,
             self.seq,
         );
         EventFrame::PaneSnapshot {
@@ -531,6 +609,7 @@ mod tests {
                 kind,
                 rows,
                 cols,
+                history: true,
                 reply: tx,
             })
             .await
@@ -614,6 +693,88 @@ mod tests {
                 session: "s1".into(),
                 idle: true
             })
+        );
+    }
+
+    /// Observer attaches/detaches must not signal idle/busy transitions: an
+    /// `Observer` never holds the relay lease open, and observer churn on a
+    /// detached session must not refresh its relay grace. The last INTERACTIVE
+    /// subscriber leaving signals idle even with observers still attached.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn observers_do_not_drive_idle_transitions() {
+        let mut h = spawn_actor("cat", None);
+        let _obs = attach(&h, "obs", AttachKind::Observer, 24, 80).await;
+        // The attach reply already round-tripped the actor, so any transition
+        // it were going to send would be queued by now.
+        assert!(
+            h.idle_rx.try_recv().is_err(),
+            "observer attach must not signal a transition"
+        );
+        let _int = attach(&h, "int", AttachKind::Interactive, 24, 80).await;
+        assert_eq!(
+            h.idle_rx.recv().await,
+            Some(IdleTransition {
+                session: "s1".into(),
+                idle: false
+            }),
+            "first interactive in signals busy"
+        );
+        h.msg_tx
+            .send(SessionMsg::Detach {
+                client_id: "int".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            h.idle_rx.recv().await,
+            Some(IdleTransition {
+                session: "s1".into(),
+                idle: true
+            }),
+            "last interactive out signals idle even with an observer attached"
+        );
+        // The remaining observer leaving must not re-signal idle (that would
+        // release-and-replace — i.e. refresh — the relay lease).
+        h.msg_tx
+            .send(SessionMsg::Detach {
+                client_id: "obs".into(),
+            })
+            .await
+            .unwrap();
+        let _snap = attach(&h, "obs2", AttachKind::Observer, 24, 80).await; // round-trip the actor
+        assert!(
+            h.idle_rx.try_recv().is_err(),
+            "observer churn while idle must not signal transitions"
+        );
+    }
+
+    /// The `include_history` seam: a no-history snapshot omits the scrollback
+    /// tail entirely while the with-history snapshot carries it — the
+    /// resync/reconnect duplication fix.
+    #[test]
+    fn no_history_snapshot_omits_the_scrollback_tail() {
+        let mut emu = AlacrittyEmulator::new(4, 20, 100);
+        emu.advance(b"screen\r\n");
+        let mut history = HistoryBuffer::new(100);
+        let mut partial = Vec::new();
+        let mut stripper = AnsiStripper::default();
+        feed_bytes_to_history(
+            b"old-line\nnewer-line\n",
+            &mut history,
+            &mut partial,
+            &mut stripper,
+        );
+        let with = snapshot_of(&emu, &history, 2_000, 1);
+        assert!(
+            with.history_tail.contains("old-line"),
+            "full snapshot carries the tail: {:?}",
+            with.history_tail
+        );
+        let without = snapshot_of(&emu, &history, 0, 1);
+        assert!(
+            without.history_tail.is_empty(),
+            "no-history snapshot must omit the tail: {:?}",
+            without.history_tail
         );
     }
 

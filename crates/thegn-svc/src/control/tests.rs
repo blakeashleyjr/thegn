@@ -70,6 +70,7 @@ impl ControlApi for FakeApi {
         _kind: AttachKind,
         _rows: u16,
         _cols: u16,
+        _history: bool,
     ) -> BoxFuture<'a, ControlResult<AttachReply>> {
         self.record("attach");
         Box::pin(async {
@@ -180,6 +181,15 @@ impl ControlApi for FakeApi {
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>> {
         self.record("lease_status");
         Box::pin(async { Ok(vec![]) })
+    }
+    fn publish_pairing(
+        &self,
+        _pairing_id: &str,
+        _label: &str,
+        _scope: &str,
+        state: thegn_core::control_wire::PairingState,
+    ) {
+        self.record(&format!("publish_pairing:{state:?}"));
     }
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Arc<EventFrame>> {
         self.events
@@ -487,6 +497,85 @@ async fn unauthenticated_pair_redeem_mints_a_scoped_token() {
             .unwrap()
             .status(),
         StatusCode::UNAUTHORIZED
+    );
+}
+
+/// The pairing lifecycle must be visible on the event feed: redeem announces
+/// `Requested` (the `require_approval` park that used to be silent), approve
+/// announces `Approved`, revoke announces `Revoked`.
+#[tokio::test]
+async fn pairing_lifecycle_publishes_feed_frames() {
+    let api = Arc::new(FakeApi::default());
+    let db = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let state = ControlState {
+        api: api.clone(),
+        store: db.clone(),
+        local_admin: true,
+        require_approval: true, // redeemed tokens park ⇒ Requested
+        server_label: "test thegn".into(),
+    };
+    let code = auth::mint(
+        TokenKind::PairingCode,
+        ScopeSet::parse("read"),
+        "",
+        None,
+        None,
+        1_000,
+    );
+    {
+        use thegn_core::store::ControlStore;
+        db.lock().unwrap().put_pairing(&code.row).unwrap();
+    }
+
+    // Redeem → Requested.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/pair")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"code":"{}","label":"phone"}}"#,
+            code.token
+        )))
+        .unwrap();
+    let res = router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v.get("approved").and_then(|a| a.as_bool()), Some(false));
+    let pid = v
+        .get("pairing_id")
+        .and_then(|p| p.as_str())
+        .unwrap()
+        .to_string();
+
+    // Approve → Approved; revoke → Revoked (local_admin listener: no token).
+    for (method, path) in [
+        ("POST", format!("/v1/pairings/{pid}/approve")),
+        ("DELETE", format!("/v1/pairings/{pid}")),
+    ] {
+        let req = Request::builder()
+            .method(method)
+            .uri(&path)
+            .body(Body::empty())
+            .unwrap();
+        let res = router(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{method} {path}");
+    }
+
+    let published: Vec<String> = api
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("publish_pairing:"))
+        .collect();
+    assert_eq!(
+        published,
+        vec![
+            "publish_pairing:Requested".to_string(),
+            "publish_pairing:Approved".to_string(),
+            "publish_pairing:Revoked".to_string(),
+        ]
     );
 }
 

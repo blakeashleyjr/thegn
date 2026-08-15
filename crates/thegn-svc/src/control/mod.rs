@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use thegn_core::control::Scope;
-use thegn_core::control_wire::EventFrame;
+use thegn_core::control_wire::{EventFrame, PairingState};
 use thegn_core::store::LeaseRow;
 
 pub mod auth;
@@ -202,7 +202,12 @@ pub trait ControlApi: Send + Sync + 'static {
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>>;
 
     /// Warm-attach: registers `client_id` as a subscriber and returns the
-    /// current screen snapshot + live stream. Cancels any relay lease.
+    /// current screen snapshot + live stream. An `Interactive` attach cancels
+    /// any relay lease; an `Observer` never touches it. `history` selects
+    /// whether the snapshot carries the scrollback history tail — the first
+    /// attach of a fresh client emulator wants it, a reconnect re-feeding an
+    /// emulator that already holds the history must pass `false` or the tail
+    /// duplicates in the client's scrollback.
     fn attach<'a>(
         &'a self,
         client_id: &'a str,
@@ -210,6 +215,7 @@ pub trait ControlApi: Send + Sync + 'static {
         kind: AttachKind,
         rows: u16,
         cols: u16,
+        history: bool,
     ) -> BoxFuture<'a, ControlResult<AttachReply>>;
 
     /// Detach without killing the PTY; the last client out opens a relay lease.
@@ -313,6 +319,15 @@ pub trait ControlApi: Send + Sync + 'static {
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::db::MergeQueueRow>>>;
 
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>>;
+
+    /// Publish a pairing lifecycle event on the broadcast feed
+    /// ([`EventFrame::Pairing`]). The transport adapters call this after a
+    /// successful pair/approve/revoke so `require_approval` pairings surface
+    /// instead of parking silently. Default no-op: transport-only impls and
+    /// test fakes need no feed wiring.
+    fn publish_pairing(&self, pairing_id: &str, label: &str, scope: &str, state: PairingState) {
+        let _ = (pairing_id, label, scope, state);
+    }
 
     /// The broadcast event feed (activity, lease, pairing, session-list
     /// events). Pane bytes ride attach streams, not this feed.

@@ -13,7 +13,7 @@ use futures::future::BoxFuture;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use thegn_core::control::relay_expiry;
-use thegn_core::control_wire::{EventFrame, LeaseEventKind};
+use thegn_core::control_wire::{EventFrame, LeaseEventKind, PairingState};
 use thegn_core::db::Db;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow};
 use thegn_svc::control::{
@@ -122,6 +122,35 @@ impl DaemonService {
         }
     }
 
+    /// Confine a control-plane git/merge verb to a thegn-REGISTERED worktree.
+    /// The control plane must never run git against an arbitrary caller-supplied
+    /// path — a token-holding remote `serve` client is not the daemon's uid — so
+    /// reject anything absent from the worktree registry (compared canonically to
+    /// tolerate trailing-slash / symlink variation). NotFound, not a hard error,
+    /// so an unknown path reads the same as a gone session.
+    async fn confine_worktree(&self, wt: &str) -> ControlResult<()> {
+        let canon =
+            |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+        let want = canon(wt);
+        let known = self
+            .with_db(move |db| {
+                use thegn_core::store::WorkspaceStore;
+                Ok(db.worktrees()?.into_iter().any(|r| {
+                    std::fs::canonicalize(&r.worktree)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(&r.worktree))
+                        == want
+                }))
+            })
+            .await?;
+        if known {
+            Ok(())
+        } else {
+            Err(ControlError::NotFound(format!(
+                "worktree not registered with thegn: {wt}"
+            )))
+        }
+    }
+
     /// Release a session's relay lease (a subscriber attached, or the session
     /// ended entirely).
     pub(crate) async fn on_session_busy(&self, session: &str) {
@@ -212,16 +241,22 @@ impl ControlApi for DaemonService {
                 self.idle_tx.clone(),
                 self.sessions.clone(),
             );
-            tokio::spawn(actor.run(pane_rx, msg_rx));
-
             let info = {
                 let live = live.lock().expect("live meta lock");
                 meta.info(&live, None)
             };
+            // Insert the entry BEFORE spawning the actor. The actor's teardown
+            // removes its own entry (session.rs) — if the child exits instantly
+            // (exec failure / `sh -c true`) and the actor is scheduled first, a
+            // spawn-then-insert order runs the remove before the insert, leaving
+            // a PHANTOM entry for a dead actor: listed forever, `kill` no-ops, and
+            // idle-exit (busy = sessions non-empty) never fires. Inserting first
+            // guarantees the teardown removal always observes the entry.
             self.sessions
                 .lock()
                 .await
                 .insert(id, SessionEntry { msg_tx, meta, live });
+            tokio::spawn(actor.run(pane_rx, msg_rx));
             self.emit(EventFrame::Sessions);
             Ok(info)
         })
@@ -234,6 +269,7 @@ impl ControlApi for DaemonService {
         kind: AttachKind,
         rows: u16,
         cols: u16,
+        history: bool,
     ) -> BoxFuture<'a, ControlResult<AttachReply>> {
         Box::pin(async move {
             let tx = self.entry_tx(session).await?;
@@ -243,6 +279,7 @@ impl ControlApi for DaemonService {
                 kind,
                 rows,
                 cols,
+                history,
                 reply: reply_tx,
             })
             .await
@@ -250,8 +287,13 @@ impl ControlApi for DaemonService {
             let reply = reply_rx
                 .await
                 .map_err(|_| ControlError::NotFound(format!("session {session}")))??;
-            // Attaching cancels the relay grace period.
-            self.on_session_busy(session).await;
+            // Attaching cancels the relay grace period — but ONLY for an
+            // interactive attach. An Observer never resizes the PTY and must not
+            // hold the relay lease open (the AttachKind contract), so a watcher
+            // attaching/detaching must not extend a detached session's life.
+            if !matches!(kind, AttachKind::Observer) {
+                self.on_session_busy(session).await;
+            }
             Ok(reply)
         })
     }
@@ -417,6 +459,7 @@ impl ControlApi for DaemonService {
         worktree: &'a str,
     ) -> BoxFuture<'a, ControlResult<Vec<GitFileStatus>>> {
         Box::pin(async move {
+            self.confine_worktree(worktree).await?;
             let wt = worktree.to_string();
             tokio::task::spawn_blocking(move || {
                 let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
@@ -443,6 +486,7 @@ impl ControlApi for DaemonService {
         paths: &'a [String],
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
+            self.confine_worktree(worktree).await?;
             let wt = worktree.to_string();
             let paths = paths.to_vec();
             tokio::task::spawn_blocking(move || {
@@ -464,6 +508,7 @@ impl ControlApi for DaemonService {
         message: &'a str,
     ) -> BoxFuture<'a, ControlResult<String>> {
         Box::pin(async move {
+            self.confine_worktree(worktree).await?;
             let wt = worktree.to_string();
             let message = message.to_string();
             tokio::task::spawn_blocking(move || {
@@ -489,6 +534,7 @@ impl ControlApi for DaemonService {
 
     fn merge_add<'a>(&'a self, worktree: &'a str) -> BoxFuture<'a, ControlResult<String>> {
         Box::pin(async move {
+            self.confine_worktree(worktree).await?;
             let wt = worktree.to_string();
             let mq = self.merge_queue.clone();
             // Fresh DB handle (like the CLI) so we don't hold the daemon's shared
@@ -541,6 +587,15 @@ impl ControlApi for DaemonService {
             let daemon_id = self.daemon_id.clone();
             self.with_db(move |db| db.leases(&daemon_id)).await
         })
+    }
+
+    fn publish_pairing(&self, pairing_id: &str, label: &str, scope: &str, state: PairingState) {
+        self.emit(EventFrame::Pairing {
+            pairing_id: pairing_id.to_string(),
+            label: label.to_string(),
+            scope: scope.to_string(),
+            state,
+        });
     }
 
     fn subscribe(&self) -> broadcast::Receiver<Arc<EventFrame>> {
@@ -711,5 +766,219 @@ mod tests {
         let remaining = leases(&svc);
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].session_id, "forever", "untimed lease survives");
+    }
+
+    /// Insert a live-looking session entry backed by a stub actor task that
+    /// answers `Attach` with an empty snapshot — enough to exercise the
+    /// service-level attach path (lease bookkeeping included) without a PTY.
+    async fn insert_stub_session(svc: &DaemonService, id: &str) {
+        let (msg_tx, mut msg_rx) = mpsc::channel(8);
+        let meta = SessionMeta {
+            id: id.into(),
+            worktree: None,
+            program: "sh".into(),
+            cwd: None,
+            created_at_ms: 0,
+            pid: None,
+        };
+        let live = Arc::new(Mutex::new(LiveMeta {
+            rows: 24,
+            cols: 80,
+            attached: 0,
+        }));
+        svc.sessions
+            .lock()
+            .await
+            .insert(id.to_string(), SessionEntry { msg_tx, meta, live });
+        tokio::spawn(async move {
+            while let Some(msg) = msg_rx.recv().await {
+                if let SessionMsg::Attach { reply, .. } = msg {
+                    let (_tx, rx) = mpsc::channel(1);
+                    let _ = reply.send(Ok(AttachReply {
+                        snapshot: EventFrame::PaneSnapshot {
+                            session: "stub".into(),
+                            seq: 0,
+                            cols: 80,
+                            rows: 24,
+                            bytes: vec![],
+                        },
+                        frames: rx,
+                    }));
+                }
+            }
+        });
+    }
+
+    /// The Observer contract at the service seam: an observer attach must NOT
+    /// release (cancel) the relay lease keeping a detached session in grace;
+    /// an interactive attach must.
+    #[tokio::test]
+    async fn observer_attach_leaves_the_relay_lease_open() {
+        let (svc, _rx) = service(60_000);
+        insert_stub_session(&svc, "s1").await;
+        svc.on_session_idle("s1").await;
+        assert_eq!(leases(&svc).len(), 1, "detached session holds its lease");
+
+        svc.attach("obs", "s1", AttachKind::Observer, 24, 80, true)
+            .await
+            .expect("observer attach");
+        assert_eq!(
+            leases(&svc).len(),
+            1,
+            "an Observer must not cancel the relay grace"
+        );
+
+        svc.attach("int", "s1", AttachKind::Interactive, 24, 80, true)
+            .await
+            .expect("interactive attach");
+        assert!(
+            leases(&svc).is_empty(),
+            "an interactive attach cancels the relay grace"
+        );
+    }
+
+    /// `publish_pairing` lands on the broadcast feed — the producer half of
+    /// the pairing lifecycle events the HTTP handlers emit.
+    #[tokio::test]
+    async fn publish_pairing_reaches_the_event_feed() {
+        let (svc, mut rx) = service(0);
+        svc.publish_pairing("p1", "phone", "read,git", PairingState::Requested);
+        loop {
+            let frame = rx.try_recv().expect("a pairing frame was emitted");
+            if let EventFrame::Pairing {
+                pairing_id,
+                label,
+                scope,
+                state,
+            } = &*frame
+            {
+                assert_eq!(pairing_id, "p1");
+                assert_eq!(label, "phone");
+                assert_eq!(scope, "read,git");
+                assert_eq!(*state, PairingState::Requested);
+                return;
+            }
+        }
+    }
+
+    /// The daemon WS warm-attach pipeline, end to end and in process: a real
+    /// `DaemonService` behind the real axum router on a real unix socket,
+    /// attached through the real `ControlClient` WS path. Locks the seq
+    /// contract (first frame after `Hello` is the snapshot; the first delta is
+    /// `snapshot.seq + 1`), input echo, and the exit frame on kill.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ws_warm_attach_pipeline_over_a_real_socket() {
+        use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
+
+        async fn next_frame(rx: &mut mpsc::Receiver<EventFrame>) -> EventFrame {
+            tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("frame within 10s")
+                .expect("stream open")
+        }
+
+        let dir = std::env::temp_dir().join(format!("thegn-daemon-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("d.sock");
+        let ep = thegn_svc::ipc::IpcEndpoint::for_socket_path(&sock);
+        let listener = match thegn_svc::ipc::IpcListener::bind_exclusive(&ep)
+            .await
+            .unwrap()
+        {
+            thegn_svc::ipc::BindOutcome::Bound(l) => l,
+            thegn_svc::ipc::BindOutcome::AlreadyRunning => panic!("fresh socket must bind"),
+        };
+
+        let (svc, _events) = service(0);
+        let svc = Arc::new(svc);
+        let state = thegn_svc::control::http::ControlState {
+            api: svc.clone(),
+            store: svc.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+            local_admin: true,
+            require_approval: false,
+            server_label: "test thegn".into(),
+        };
+        let app = thegn_svc::control::http::router(state);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
+        // Resolve `cat` via PATH — `/bin/cat` doesn't exist on NixOS (no FHS
+        // /bin except /bin/sh); this keeps the test portable across distros/CI.
+        let cat = thegn_core::util::which_path("cat").unwrap_or_else(|| "/bin/cat".into());
+        let info = client
+            .open(&OpenSpec {
+                argv: vec![cat],
+                cwd: None,
+                env: vec![],
+                rows: 24,
+                cols: 80,
+                worktree: None,
+            })
+            .await
+            .expect("open a session over the socket");
+
+        let mut stream = client
+            .attach(&info.id, "itest", 24, 80, false)
+            .await
+            .expect("warm-attach over WS");
+
+        // (a) Greeting, then the snapshot; the next delta continues its seq.
+        match next_frame(&mut stream.frames).await {
+            EventFrame::Hello(h) => {
+                assert_eq!(h.proto, thegn_core::control_wire::PROTO_VERSION);
+            }
+            other => panic!("first frame must be Hello, got {other:?}"),
+        }
+        let snap_seq = match next_frame(&mut stream.frames).await {
+            EventFrame::PaneSnapshot { seq, session, .. } => {
+                assert_eq!(session, info.id);
+                seq
+            }
+            other => panic!("second frame must be the warm snapshot, got {other:?}"),
+        };
+
+        // (b) Input echoes back through `cat`; the first delta is seq + 1.
+        stream
+            .control
+            .send(AttachControl::Input(b"marker\n".to_vec()))
+            .await
+            .expect("control channel open");
+        let mut echoed: Vec<u8> = Vec::new();
+        let mut first_delta_seq = None;
+        while !String::from_utf8_lossy(&echoed).contains("marker") {
+            match next_frame(&mut stream.frames).await {
+                EventFrame::PaneDelta { seq, bytes, .. } => {
+                    if first_delta_seq.is_none() {
+                        first_delta_seq = Some(seq);
+                    }
+                    echoed.extend_from_slice(&bytes);
+                }
+                other => panic!("expected deltas, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            first_delta_seq,
+            Some(snap_seq + 1),
+            "the first live delta continues the snapshot's sequence"
+        );
+
+        // (c) Kill ends the session; the attach stream reports the exit.
+        client.kill(&info.id).await.expect("kill over the socket");
+        loop {
+            match next_frame(&mut stream.frames).await {
+                EventFrame::SessionExit { session, .. } => {
+                    assert_eq!(session, info.id);
+                    break;
+                }
+                EventFrame::PaneDelta { .. } | EventFrame::PaneSnapshot { .. } => continue,
+                other => panic!("unexpected frame while awaiting exit: {other:?}"),
+            }
+        }
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
