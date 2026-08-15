@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 license.workspace = true
+repository.workspace = true
 description = "thegn native terminal host: the compositor + in-process chrome"
 
 # The binary is `thegn` in-tree; the Nix package + install.sh add a short

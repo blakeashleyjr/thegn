@@ -24,8 +24,32 @@ on:
 permissions:
   contents: write # create the release + upload assets
 jobs:
+  # Create the (draft) GitHub Release the build legs upload into.
+  # upload-rust-binary-action only uploads — it never creates a release — so
+  # without this job every `gh release upload` fails with "release not found".
+  # Draft so a maintainer writes notes by hand before publishing (RELEASING.md
+  # step 4); no `changelog:` input — notes are pasted manually.
+  #
+  # CAUTION: create-gh-release-action deletes any existing release for the tag
+  # before recreating it. Re-dispatching this workflow for a tag whose release
+  # already exists (even a published one) wipes that release — notes included —
+  # and replaces it with an empty draft. To retry a partially failed matrix,
+  # use "Re-run failed jobs" on the original run instead: create-release is not
+  # re-run, the draft and its assets survive, and the upload's `--clobber`
+  # makes the retried leg safe.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          # Prerelease tags (e.g. v0.1.0-alpha.1) are auto-marked prerelease.
+          draft: true
+          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
   upload:
     name: ${{ matrix.target }}
+    needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,11 +62,15 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # On workflow_dispatch, build the tag itself — not the dispatched
+          # branch tip. Empty string = default behavior on tag push.
+          ref: ${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || '' }}
       - name: Install musl tools
         if: endsWith(matrix.target, '-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -55,7 +83,8 @@ jobs:
           # tar.gz on unix, zip on windows (the action's default).
           archive: thegn-$tag-$target
           checksum: sha256
-          # Draft the release so a maintainer writes notes before publishing.
+          # Build against the committed Cargo.lock.
+          locked: true
           ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
