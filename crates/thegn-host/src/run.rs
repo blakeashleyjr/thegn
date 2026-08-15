@@ -5138,6 +5138,19 @@ pub(crate) fn persist_session_layout(session: &mut crate::session::Session, pane
     }
 }
 
+/// Status line for a palette command injected into the focused pane's shell:
+/// the optimistic `ok` message when the bytes queued, or a "not reading" note
+/// when the pane's bounded stdin queue was Full (a wedged / flow-stopped child)
+/// so the command was dropped. Without this the palette would claim success
+/// (`Switched to branch …`) for a command that never reached the shell.
+fn injected_command_status(queued: bool, ok: String) -> String {
+    if queued {
+        ok
+    } else {
+        "pane isn't reading input — command dropped".into()
+    }
+}
+
 /// Persist a pure focus change (worktree/tab switch) without blocking the loop.
 ///
 /// A switch is structurally a no-op — only the active pointer moved — so it
@@ -11503,8 +11516,23 @@ async fn event_loop<T: Terminal>(
                             terminal_wizard_ui = None;
                             model.status = "new terminal cancelled".into();
                         }
-                        crate::terminal_wizard::Outcome::Submit(choice) => {
+                        crate::terminal_wizard::Outcome::Submit(mut choice) => {
                             terminal_wizard_ui = None;
+                            // Uniquify the terminal name against existing groups
+                            // BEFORE persist / registry / push. Spec batches are
+                            // routed by group name (drain_specs resolves the
+                            // FIRST group with a matching name), so a duplicate
+                            // name would route the new group's placeholder leaf
+                            // to the wrong group — the departed-leaf guard eats
+                            // it and the new terminal never materializes. The
+                            // wizard already dedupes its random slug; a typed
+                            // name reaches here verbatim, so dedupe it here too.
+                            {
+                                let taken = thegn_core::worktree::BranchSet::from_names(
+                                    session.worktrees.iter().map(|g| g.name.clone()),
+                                );
+                                choice.name = thegn_core::worktree::dedupe(&choice.name, &taken);
+                            }
                             // The tiny upsert stays synchronous (sanctioned
                             // best-effort-persist family); the live spawn reads
                             // the in-process choice registry, so a failed write
@@ -12686,7 +12714,9 @@ async fn event_loop<T: Terminal>(
                                             .or_else(|_| std::env::var("VISUAL"))
                                             .unwrap_or_else(|_| "vi".into());
                                         let line_arg = format!("+{line_no}");
-                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                        let queued = if let Some(focused_pane) =
+                                            panes.table.get_mut(&focused)
+                                        {
                                             // Shell-quote the path: it's written into
                                             // the pane's live shell, and a filename
                                             // with a space or metacharacter would
@@ -12697,9 +12727,14 @@ async fn event_loop<T: Terminal>(
                                                     &abs_path.display().to_string()
                                                 )
                                             );
-                                            let _ = focused_pane.write_input(cmd.as_bytes());
-                                        }
-                                        model.status = format!("Opening {}:{line_no}", rel_path);
+                                            focused_pane.write_input(cmd.as_bytes()).is_ok()
+                                        } else {
+                                            false
+                                        };
+                                        model.status = injected_command_status(
+                                            queued,
+                                            format!("Opening {}:{line_no}", rel_path),
+                                        );
                                     }
                                     palette = None;
                                     dirty = true;
@@ -12730,17 +12765,25 @@ async fn event_loop<T: Terminal>(
                                                 thegn_core::util::now(),
                                             );
                                         }
-                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                        let queued = if let Some(focused_pane) =
+                                            panes.table.get_mut(&focused)
+                                        {
                                             let cmd = format!(
                                                 "{}={} {}\n",
                                                 p.home_env,
                                                 dir_s,
                                                 p.login_argv.join(" ")
                                             );
-                                            let _ = focused_pane.write_input(cmd.as_bytes());
-                                        }
-                                        model.status = format!(
-                                            "Logging into {provider}:{name} — finish in the terminal"
+                                            focused_pane.write_input(cmd.as_bytes()).is_ok()
+                                        } else {
+                                            false
+                                        };
+                                        model.status = injected_command_status(
+                                            queued,
+                                            format!(
+                                                "Logging into {provider}:{name} — \
+                                                 finish in the terminal"
+                                            ),
                                         );
                                     }
                                     palette = None;
@@ -12900,22 +12943,28 @@ async fn event_loop<T: Terminal>(
                                     continue;
                                 } else if let Some(branch) = key.strip_prefix("git-branch:") {
                                     let wt_path = active_tab_path(&session);
-                                    if let Some(focused_pane) = panes.table.get_mut(&focused) {
-                                        // Both the worktree path and the branch name
-                                        // are shell-quoted: they're written into the
-                                        // pane's live shell, and git allows branch
-                                        // names with characters a shell would treat
-                                        // as metacharacters (injection otherwise).
-                                        let cmd = format!(
-                                            "git -C {} checkout {}\n",
-                                            thegn_core::util::sh_quote(
-                                                &wt_path.display().to_string()
-                                            ),
-                                            thegn_core::util::sh_quote(branch),
-                                        );
-                                        let _ = focused_pane.write_input(cmd.as_bytes());
-                                    }
-                                    model.status = format!("Switched to branch {branch}");
+                                    let queued =
+                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                            // Both the worktree path and the branch name
+                                            // are shell-quoted: they're written into the
+                                            // pane's live shell, and git allows branch
+                                            // names with characters a shell would treat
+                                            // as metacharacters (injection otherwise).
+                                            let cmd = format!(
+                                                "git -C {} checkout {}\n",
+                                                thegn_core::util::sh_quote(
+                                                    &wt_path.display().to_string()
+                                                ),
+                                                thegn_core::util::sh_quote(branch),
+                                            );
+                                            focused_pane.write_input(cmd.as_bytes()).is_ok()
+                                        } else {
+                                            false
+                                        };
+                                    model.status = injected_command_status(
+                                        queued,
+                                        format!("Switched to branch {branch}"),
+                                    );
                                     palette = None;
                                     dirty = true;
                                     continue;
@@ -12926,16 +12975,22 @@ async fn event_loop<T: Terminal>(
                                     continue;
                                 } else if let Some(idx_str) = key.strip_prefix("git-stash:") {
                                     let wt_path = active_tab_path(&session);
-                                    if let Some(focused_pane) = panes.table.get_mut(&focused) {
-                                        let cmd = format!(
-                                            "git -C {} stash pop --index {idx_str}\n",
-                                            thegn_core::util::sh_quote(
-                                                &wt_path.display().to_string()
-                                            )
-                                        );
-                                        let _ = focused_pane.write_input(cmd.as_bytes());
-                                    }
-                                    model.status = format!("Popped stash {idx_str}");
+                                    let queued =
+                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                            let cmd = format!(
+                                                "git -C {} stash pop --index {idx_str}\n",
+                                                thegn_core::util::sh_quote(
+                                                    &wt_path.display().to_string()
+                                                )
+                                            );
+                                            focused_pane.write_input(cmd.as_bytes()).is_ok()
+                                        } else {
+                                            false
+                                        };
+                                    model.status = injected_command_status(
+                                        queued,
+                                        format!("Popped stash {idx_str}"),
+                                    );
                                     palette = None;
                                     dirty = true;
                                     continue;
@@ -12963,10 +13018,17 @@ async fn event_loop<T: Terminal>(
                                             }
                                             _ => format!("{cmd}\n"),
                                         };
-                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
-                                            let _ = focused_pane.write_input(line.as_bytes());
-                                        }
-                                        model.status = format!("Running task {name}");
+                                        let queued = if let Some(focused_pane) =
+                                            panes.table.get_mut(&focused)
+                                        {
+                                            focused_pane.write_input(line.as_bytes()).is_ok()
+                                        } else {
+                                            false
+                                        };
+                                        model.status = injected_command_status(
+                                            queued,
+                                            format!("Running task {name}"),
+                                        );
                                     } else {
                                         model.status = format!("task {name} not found");
                                     }
@@ -17618,7 +17680,20 @@ async fn event_loop<T: Terminal>(
                             if let Some(p) = panes.table.get_mut(&relaunch_target)
                                 && let Some(cmd) = p.take_pending_relaunch()
                             {
-                                let _ = p.write_input(format!("{cmd}\r").as_bytes());
+                                // A `Full` drop (child wedged / not reading) must
+                                // NOT lose the user's only copy of the crashed
+                                // pane's command — re-arm the overlay so Enter can
+                                // be retried. Closed ⇒ the pane is gone, drop it.
+                                match p.write_input(format!("{cmd}\r").as_bytes()) {
+                                    Ok(()) => {}
+                                    Err(crate::pane_writer::StdinSendError::Full) => {
+                                        p.set_pending_relaunch(Some(cmd));
+                                        model.status = "pane isn't reading input — \
+                                             press Enter again to relaunch"
+                                            .into();
+                                    }
+                                    Err(crate::pane_writer::StdinSendError::Closed) => {}
+                                }
                             }
                             keymap.reset();
                             dirty = true;

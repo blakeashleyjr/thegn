@@ -477,8 +477,12 @@ pub(crate) fn drain_specs(
             if !orphaned.is_empty() {
                 // The records were already consumed, but the batch aborted
                 // before any replacement pane came up: killing the daemon
-                // copies now would lose BOTH processes. Leave them running —
-                // the same orphan the pre-fix code left — and say so.
+                // copies now would lose BOTH processes (the spawn failed, so
+                // there is no replacement). Leave them running — recoverable via
+                // `thegn session list` — the same orphan the pre-fix code left.
+                // The `materialize_failed` mark below stops the retry loop, so
+                // this stays a single recoverable orphan rather than a
+                // duplicate-forever storm.
                 tracing::warn!(
                     target: "thegn::daemon",
                     sessions = orphaned.len(),
@@ -491,6 +495,25 @@ pub(crate) fn drain_specs(
             // The shell step is the active one after `advance_to_shell`.
             ctx.loading_state
                 .fail_active(tab_key.clone(), &format!("{e}"));
+            // A spawn (openpty/fork) failure — EMFILE/ENOMEM, or a vanished
+            // sandbox-wrapper binary — leaves the leaf missing and un-remapped.
+            // Mark the tab failed (and dormant when active) exactly like the
+            // spec-resolution Err arm above: without this, `maybe_materialize`
+            // (which gates only on `materialize_inflight`/`materialize_failed`,
+            // and inflight was cleared at batch receipt) re-kicks the leaf every
+            // loop turn — an unbounded self-waking spec-resolution hot loop. The
+            // mark routes recovery through the [r]-retry UX instead.
+            match origin {
+                SpecOrigin::Materialize => {
+                    if is_active {
+                        *ctx.center_dormant = true;
+                    }
+                    ctx.materialize_failed.insert(tab_key.clone());
+                }
+                SpecOrigin::Prewarm => {
+                    ctx.prewarm_failed.insert(tab_key.clone());
+                }
+            }
         } else {
             // Keep the loading entry until first PTY output arrives (cleared in
             // the PaneEvent::Output handler above) so the loading screen
