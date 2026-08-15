@@ -37,10 +37,6 @@ const SUB_CHANNEL_CAP: usize = 256;
 /// History lines folded into a warm-attach snapshot (scrollback context).
 const SNAPSHOT_HISTORY_LINES: usize = 2_000;
 
-/// Stdin chunks queued to the PTY writer thread before overflow drops them.
-/// Keystrokes are tiny; even paste bursts fit comfortably.
-const STDIN_CHANNEL_CAP: usize = 256;
-
 /// The actor's control mailbox.
 pub(crate) enum SessionMsg {
     Attach {
@@ -199,25 +195,18 @@ impl SessionActor {
         // live; overflow drops the chunk with one warning per congestion
         // episode — the pane is wedged until the child reads anyway. The
         // thread exits when the sender drops (actor teardown) or the child's
-        // side of the PTY dies (write error after kill/exit).
-        let (stdin_tx, stdin_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(STDIN_CHANNEL_CAP);
-        {
-            let mut writer = std::mem::replace(&mut self.pty.writer, Box::new(std::io::sink()));
-            let session = self.meta.id.clone();
-            // best-effort: if the thread can't spawn, stdin degrades to warn-drop
-            let _ = std::thread::Builder::new()
-                .name(format!("pty-writer-{session}"))
-                .spawn(move || {
-                    use std::io::Write;
-                    while let Ok(bytes) = stdin_rx.recv() {
-                        if let Err(e) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
-                            tracing::warn!(target: "thegn::daemon", session = %session, "pty write failed: {e}");
-                            return; // child gone/broken — remaining input has nowhere to go
-                        }
-                    }
-                });
-        }
-        let mut stdin_drop_warned = false;
+        // side of the PTY dies (write error after kill/exit). Shared with
+        // local compositor panes (`crate::pane_writer`); the `DaemonSession`
+        // log context keeps `target: "thegn::daemon"` + the session id.
+        let mut stdin_tx = {
+            let writer = std::mem::replace(&mut self.pty.writer, Box::new(std::io::sink()));
+            crate::pane_writer::spawn_stdin_writer(
+                writer,
+                crate::pane_writer::WriterLog::DaemonSession {
+                    session: self.meta.id.clone(),
+                },
+            )
+        };
 
         // `child_exited` distinguishes a natural child exit (the reader thread
         // already reaped it) from a teardown while the child may still be alive
@@ -238,21 +227,12 @@ impl SessionActor {
                         let _ = reply.send(r);
                     }
                     Some(SessionMsg::Detach { client_id }) => self.on_detach(&client_id),
-                    Some(SessionMsg::Stdin(bytes)) => match stdin_tx.try_send(bytes) {
-                        Ok(()) => stdin_drop_warned = false,
-                        // Full (child not reading) or disconnected (child's
-                        // PTY died): drop the input, warn once per episode.
-                        Err(e) => {
-                            if !stdin_drop_warned {
-                                stdin_drop_warned = true;
-                                tracing::warn!(
-                                    target: "thegn::daemon",
-                                    session = %self.meta.id,
-                                    "pty stdin stalled; dropping input: {e}"
-                                );
-                            }
-                        }
-                    },
+                    // best-effort: Full (child not reading) or Closed (child's
+                    // PTY died) drops the input — `StdinTx` warns once per
+                    // congestion episode under the daemon's log target.
+                    Some(SessionMsg::Stdin(bytes)) => {
+                        let _ = stdin_tx.send(bytes);
+                    }
                     Some(SessionMsg::Resize { rows, cols }) => self.on_resize(rows, cols),
                     Some(SessionMsg::Snapshot { reply }) => {
                         // One-shot capture (`thegn session snapshot`): full

@@ -227,28 +227,18 @@ fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text
 }
 
 /// Write `text` into a pane as input, wrapping it in the bracketed-paste
-/// markers when the app has requested them (so editors don't auto-indent).
-/// Strip bracketed-paste markers embedded in pasted content. Without this, a
-/// clipboard payload containing `ESC[201~` closes the paste bracket early and its
-/// tail is interpreted as keystrokes (bracketed-paste command injection); a stray
-/// start marker is dropped too so the payload can't re-open a nested bracket.
-fn neutralize_paste_markers(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.contains("\x1b[201~") || text.contains("\x1b[200~") {
-        std::borrow::Cow::Owned(text.replace("\x1b[201~", "").replace("\x1b[200~", ""))
-    } else {
-        std::borrow::Cow::Borrowed(text)
-    }
-}
-
-fn paste_text_into_pane(pane: &mut crate::pane::PtyPane, text: &str) -> anyhow::Result<()> {
-    if pane.emulator().bracketed_paste() {
-        pane.write_input(b"\x1b[200~")?;
-        pane.write_input(neutralize_paste_markers(text).as_bytes())?;
-        pane.write_input(b"\x1b[201~")?;
-    } else {
-        pane.write_input(text.as_bytes())?;
-    }
-    Ok(())
+/// markers when the app has requested them (so editors don't auto-indent),
+/// with embedded markers neutralized (bracketed-paste injection hardening —
+/// see [`crate::pane_writer::build_paste_bytes`]). The whole paste is ONE
+/// queued chunk, so a congestion drop ([`StdinSendError::Full`]) can never
+/// leave the app inside an open paste bracket, and no keystroke can land
+/// between the markers.
+fn paste_text_into_pane(
+    pane: &mut crate::pane::PtyPane,
+    text: &str,
+) -> Result<(), crate::pane_writer::StdinSendError> {
+    let bracketed = pane.emulator().bracketed_paste();
+    pane.write_input_owned(crate::pane_writer::build_paste_bytes(text, bracketed))
 }
 
 fn toggle_recorder(
@@ -11208,10 +11198,21 @@ async fn event_loop<T: Terminal>(
                         match text {
                             Some(t) if !t.is_empty() => {
                                 if let Some(p) = panes.table.get_mut(&focused) {
-                                    // best-effort: pasting into a just-closed pane
-                                    // must not take down the whole compositor.
-                                    if let Err(e) = paste_text_into_pane(p, &t) {
-                                        tracing::debug!(error = %e, "register paste failed (pane closing)");
+                                    match paste_text_into_pane(p, &t) {
+                                        Ok(()) => {}
+                                        // Congestion-drop of a user-invoked paste
+                                        // must be surfaced, not swallowed.
+                                        Err(crate::pane_writer::StdinSendError::Full) => {
+                                            toasts.info(
+                                                "pane isn't reading input — paste dropped",
+                                                std::time::Instant::now(),
+                                            );
+                                        }
+                                        // best-effort: pasting into a just-closed pane
+                                        // must not take down the whole compositor.
+                                        Err(e) => {
+                                            tracing::debug!(error = %e, "register paste failed (pane closing)");
+                                        }
                                     }
                                 }
                             }
@@ -13424,7 +13425,12 @@ async fn event_loop<T: Terminal>(
                         let app = p.emulator().application_cursor();
                         if let Some(bytes) = crate::input::key_bytes_mode(&k.key, k.modifiers, app)
                         {
-                            p.write_input(&bytes)?;
+                            // best-effort: a locked-keys write to a congested or
+                            // dead pane must NEVER tear down the compositor —
+                            // drop the keystroke like the unlocked path does.
+                            if let Err(e) = p.write_input(&bytes) {
+                                tracing::debug!(target: "thegn::pane", pane = target_pane, "pane write dropped (queue full or child exited): {e}");
+                            }
                         }
                     }
                     continue;
@@ -17693,14 +17699,16 @@ async fn event_loop<T: Terminal>(
                             }
                         }
                     } else if let Some(p) = panes.table.get_mut(&target_pane) {
-                        // best-effort: a write to a pane whose child already exited
-                        // (closed fd) must NEVER tear down the compositor — the reaper
-                        // retires the dead pane on its next EOF/exit event. On a
-                        // failed write there is nothing to echo, so skip prediction.
+                        // best-effort: a write to a pane whose queue is congested
+                        // (child not reading) or whose child already exited must
+                        // NEVER tear down the compositor — the writer warns once
+                        // per congestion episode and the reaper retires a dead
+                        // pane on its next EOF/exit event. On a failed write
+                        // there is nothing to echo, so skip prediction.
                         let wrote = match p.write_input(&batched) {
                             Ok(()) => true,
                             Err(e) => {
-                                tracing::debug!(target: "thegn::pane", pane = target_pane, "pane write failed (child likely exited): {e}");
+                                tracing::debug!(target: "thegn::pane", pane = target_pane, "pane write dropped (queue full or child exited): {e}");
                                 false
                             }
                         };
@@ -17839,13 +17847,25 @@ async fn event_loop<T: Terminal>(
                 };
                 if let Some(p) = panes.table.get_mut(&target_pane) {
                     // Honor bracketed paste when the app requested it, so
-                    // editors don't auto-indent pasted blocks.
-                    if p.emulator().bracketed_paste() {
-                        p.write_input(b"\x1b[200~")?;
-                        p.write_input(s.as_bytes())?;
-                        p.write_input(b"\x1b[201~")?;
-                    } else {
-                        p.write_input(s.as_bytes())?;
+                    // editors don't auto-indent pasted blocks. The paste is
+                    // queued as ONE chunk (embedded markers neutralized) and a
+                    // user-invoked drop is surfaced, never `?`-propagated — a
+                    // paste into a congested or dead pane must not tear down
+                    // the compositor.
+                    match paste_text_into_pane(p, &s) {
+                        Ok(()) => {}
+                        Err(crate::pane_writer::StdinSendError::Full) => {
+                            toasts.info(
+                                "pane isn't reading input — paste dropped",
+                                std::time::Instant::now(),
+                            );
+                            dirty = true;
+                        }
+                        // best-effort: the reaper retires the dead pane on its
+                        // next EOF/exit event; nothing to surface beyond debug.
+                        Err(e) => {
+                            tracing::debug!(target: "thegn::pane", pane = target_pane, "terminal paste dropped (pane closing): {e}");
+                        }
                     }
                     keymap.reset();
                 }
