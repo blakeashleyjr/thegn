@@ -7,7 +7,7 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0-alpha.1] — 2026-08-14
+## [0.1.0-alpha.1] — 2026-08-15
 
 The first public release: the AI-free workspace shell. Everything below is the
 initial feature set rather than a delta.
@@ -47,7 +47,18 @@ initial feature set rather than a delta.
   mouse feature-gating. `thegn doctor` prints what was detected.
 - **Performance invariants** — sub-300ms launch to first frame, damage-region
   rendering (<16ms frames), and ~0% idle CPU (the idle loop blocks; it never
-  polls). Enforced by unit-tested render-plan invariants in CI.
+  polls). Enforced by unit-tested render-plan invariants in CI. Pane spawns
+  (including crash respawns and the new-terminal wizard) resolve their sandbox
+  off-thread, and pane stdin rides a bounded per-pane writer queue — a
+  flow-stopped or wedged child can never freeze the UI (a dropped paste
+  surfaces as a toast instead).
+- **Input safety** — bracketed pastes are delivered to the child as one atomic
+  chunk with embedded `ESC[200~`/`ESC[201~` markers neutralized on every paste
+  path, so pasted content can't close the bracket early and inject keystrokes.
+- **CLI** — a stable, documented exit-code contract; worktree targeting
+  unified on a canonical `--worktree` flag across verbs (legacy positionals
+  still parse); `thegn config validate` strict-checks every enum-valued config
+  key, and `thegn config set` rolls back values the loader would reject.
 - **Config** — layered TOML (global → repo → env/profile overlays → env vars
   → `--set`), every key documented in `config/config.toml.example`, hot
   reload, and an in-app F1 help system with generated keybinding/config
