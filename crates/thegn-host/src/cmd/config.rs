@@ -53,7 +53,41 @@ pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
         Action::Get { key, json } => get(cfg, &key, json)?,
         Action::Edit => edit(&path)?,
         Action::Set { key, value } => {
+            // Capture the prior file so a bad write can be rolled back: a mistyped
+            // value for a typed field would otherwise make the WHOLE config
+            // unparseable, silently reverting every setting to defaults on the
+            // next load. Re-validate after writing and restore on failure.
+            let prior = std::fs::read(&path).ok();
             thegn_core::config_write::set_key(&path, &key, &value)?;
+            let written = std::fs::read_to_string(&path).unwrap_or_default();
+            let parse_err = toml::from_str::<Config>(&written)
+                .err()
+                .map(|e| e.to_string());
+            let enum_errs = thegn_core::config::validate_str(&written);
+            if parse_err.is_some() || !enum_errs.is_empty() {
+                // Roll back to exactly the prior state (bytes, or remove the file
+                // if we created it) so the user's config is never left broken.
+                match &prior {
+                    Some(bytes) => {
+                        let _ = std::fs::write(&path, bytes);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                if let Some(e) = parse_err {
+                    anyhow::bail!(
+                        "{key} = {value:?} would make the config unparseable ({e}); not written"
+                    );
+                }
+                for e in &enum_errs {
+                    msg::error(e);
+                }
+                anyhow::bail!(
+                    "{key} = {value:?} is invalid ({} problem(s)); not written",
+                    enum_errs.len()
+                );
+            }
             outln!("set {key} = {value:?} in {}", path.display());
         }
         Action::Validate => validate(&path)?,

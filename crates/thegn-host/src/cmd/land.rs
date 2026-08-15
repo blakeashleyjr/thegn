@@ -63,18 +63,21 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
             );
         }
         AttemptOutcome::UpToDate => outln!("{branch} already in {target}."),
+        // A failed land must exit non-zero: `thegn land` is scripted (CI, the
+        // fold-actor, git aliases), so an exit-0 conflict/gate-red would look
+        // like a success. The message rides the returned error (anyhow prints it).
         AttemptOutcome::Conflict { paths } => {
-            outln!("✗ {branch} conflicts with {target}: {}", paths.join(", "));
+            anyhow::bail!("{branch} conflicts with {target}: {}", paths.join(", "));
         }
         AttemptOutcome::GateFailed { .. } => {
-            outln!("✗ {branch} breaks the build (gate red); not landed.");
+            anyhow::bail!("{branch} breaks the build (gate red); not landed.");
         }
         AttemptOutcome::Unreachable { detail } => {
-            outln!("✗ {branch}: {detail}");
+            anyhow::bail!("{branch}: {detail}");
         }
         AttemptOutcome::Ready { .. } => {
             // Unreachable with auto_land forced on, but handle for completeness.
-            outln!("{branch} is ready but was not landed.");
+            anyhow::bail!("{branch} is ready but was not landed.");
         }
     }
     Ok(())

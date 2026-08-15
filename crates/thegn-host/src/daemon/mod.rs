@@ -121,6 +121,11 @@ async fn run(
     let sock = socket_override.unwrap_or_else(|| socket_path(&cfg.daemon));
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent).ok();
+        // Owner-only (0700) on the run-dir holding the control socket: the
+        // XDG_RUNTIME_DIR path is already 0700, but the state-dir fallback
+        // (`$XDG_STATE_HOME/thegn/run`, used when XDG_RUNTIME_DIR is unset —
+        // ssh-without-logind, cron, containers) inherits the umask. Best-effort.
+        let _ = thegn_core::fsperm::restrict_dir_to_owner(parent);
     }
     let ep = thegn_svc::ipc::IpcEndpoint::for_socket_path(&sock);
 
@@ -133,6 +138,19 @@ async fn run(
     {
         thegn_svc::ipc::BindOutcome::Bound(l) => l,
         thegn_svc::ipc::BindOutcome::AlreadyRunning => {
+            // `thegn daemon` (the compositor's pane-daemon ensure): the spawn
+            // race's loser exits 0 quietly — a live daemon on the socket is the
+            // whole point. But `thegn serve` needs to OPEN a TCP listener, which
+            // the AlreadyRunning path never reaches; returning Ok here means serve
+            // silently no-ops (exit 0, no listener) whenever a pane daemon already
+            // holds the socket — the common case after any TUI use. Surface it.
+            if serve.is_some() {
+                anyhow::bail!(
+                    "a pane daemon already owns {} — stop it (or set [daemon] enabled = false) \
+                     before running `thegn serve`, or point serve at a different [daemon] socket",
+                    ep.display()
+                );
+            }
             tracing::info!(target: "thegn::daemon", "daemon already running on {}", ep.display());
             return Ok(());
         }

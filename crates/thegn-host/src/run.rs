@@ -17625,29 +17625,40 @@ async fn event_loop<T: Terminal>(
                             }
                         }
                     } else if let Some(p) = panes.table.get_mut(&target_pane) {
-                        p.write_input(&batched)?;
+                        // best-effort: a write to a pane whose child already exited
+                        // (closed fd) must NEVER tear down the compositor — the reaper
+                        // retires the dead pane on its next EOF/exit event. On a
+                        // failed write there is nothing to echo, so skip prediction.
+                        let wrote = match p.write_input(&batched) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::debug!(target: "thegn::pane", pane = target_pane, "pane write failed (child likely exited): {e}");
+                                false
+                            }
+                        };
                         // Predictive local echo: show the keystroke(s) instantly
                         // (PtyPane gates this to slow links + prompt rows, never in
                         // a TUI) and dirty the pane so the overlay paints THIS frame
                         // — ~one RTT before the server's echo lands and retires it.
-                        let predicted = match k.key {
-                            KeyCode::Char(c)
-                                if !c.is_control()
-                                    && !k.modifiers.intersects(
-                                        Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER,
-                                    ) =>
-                            {
-                                let mut any = false;
-                                for _ in 0..repeat.max(1) {
-                                    any |= p.predict_key(c);
+                        let predicted = wrote
+                            && match k.key {
+                                KeyCode::Char(c)
+                                    if !c.is_control()
+                                        && !k.modifiers.intersects(
+                                            Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER,
+                                        ) =>
+                                {
+                                    let mut any = false;
+                                    for _ in 0..repeat.max(1) {
+                                        any |= p.predict_key(c);
+                                    }
+                                    any
                                 }
-                                any
-                            }
-                            KeyCode::Backspace => p.predict_backspace(),
-                            // Enter + any non-printable key retire the overlay (the
-                            // server redraws the line / screen).
-                            _ => p.predict_flush(),
-                        };
+                                KeyCode::Backspace => p.predict_backspace(),
+                                // Enter + any non-printable key retire the overlay (the
+                                // server redraws the line / screen).
+                                _ => p.predict_flush(),
+                            };
                         if predicted {
                             dirty_panes.insert(target_pane);
                         }

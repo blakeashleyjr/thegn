@@ -9,7 +9,7 @@
 //! The in-process host supervisor (live respawn on restart, badge, panel) builds
 //! on the same `[share]` config + `thegn_svc::share` seam this CLI uses.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::outln;
@@ -64,20 +64,18 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
     let reach = match reach.as_deref() {
         Some(s) => match thegn_core::config::ShareReach::from_str_validated(s) {
             Ok(r) => Some(r),
-            Err(e) => {
-                outln!("share: {e}");
-                return Ok(());
-            }
+            // Refusal must exit non-zero so scripts/CI see the misuse.
+            Err(e) => bail!("share: {e}"),
         },
         None => None,
     };
     let Some(spec) = build_share_spec(&cfg.share, &label, port, reach) else {
-        outln!("share: disabled (set [share] provider, or that reach)");
-        return Ok(());
+        // Refusal must exit non-zero so scripts/CI see the misuse.
+        bail!("share: disabled (set [share] provider, or that reach)");
     };
     if spec.visibility == thegn_core::config::ShareVisibility::Public && !cfg.share.allow_public {
-        outln!("share: public sharing is disabled (set [share] allow_public = true)");
-        return Ok(());
+        // Refusal must exit non-zero so scripts/CI see the misuse.
+        bail!("share: public sharing is disabled (set [share] allow_public = true)");
     }
     let provider = share::for_provider(&spec);
     let kind = provider.kind().to_string();

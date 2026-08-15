@@ -2638,8 +2638,11 @@ lease_grace_secs = 0
 # bind to a trusted network interface (tailscale/wireguard) or reach it over
 # `ssh -L`; every request is still token-gated.
 [serve]
-# Default TCP bind (override per-run with `thegn serve --bind`).
-bind = "0.0.0.0:5380"
+# Default TCP bind (override per-run with `thegn serve --bind`). Loopback by
+# default — the control plane carries full PTY I/O over plaintext, so exposing
+# it beyond localhost is opt-in. For remote clients, front it with a
+# tailnet/VPN address or an explicit `bind = "0.0.0.0:5380"` behind a firewall.
+bind = "127.0.0.1:5380"
 # Require in-app / `thegn pair approve` approval before a redeemed pairing
 # token becomes usable. Default off: possession of the single-use pairing URL
 # is the credential.

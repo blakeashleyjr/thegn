@@ -216,7 +216,17 @@ impl IpcListener {
                         }
                     }
                     match tokio::net::UnixListener::bind(sock) {
-                        Ok(l) => Ok(BindOutcome::Bound(IpcListener::Unix(l))),
+                        Ok(l) => {
+                            // Owner-only (0600) on the socket: the local control
+                            // plane grants admin to any connector, so the umask
+                            // must not leave it cross-user-connectable. On Linux a
+                            // 0600 socket inode denies connect(2) to other uids —
+                            // defense in depth for the state-dir fallback path
+                            // (no XDG_RUNTIME_DIR). Best-effort: a chmod failure
+                            // must not down the daemon.
+                            let _ = thegn_core::fsperm::restrict_to_owner(sock);
+                            Ok(BindOutcome::Bound(IpcListener::Unix(l)))
+                        }
                         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
                             Ok(BindOutcome::AlreadyRunning)
                         }
