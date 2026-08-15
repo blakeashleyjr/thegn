@@ -12,9 +12,16 @@
 //! Ordering is structurally preserved: a single producer (the loop / the
 //! actor), a single FIFO channel, and a single consumer thread that owns the
 //! writer and completes each `write_all` before the next `recv` — bytes hit
-//! the kernel in exactly enqueue order. Drops truncate (remove whole chunks),
-//! never reorder; [`build_paste_bytes`] makes a paste ONE chunk so a drop can
-//! never leave the app inside an open bracketed-paste marker.
+//! the kernel in exactly enqueue order. Drops remove whole chunks and never
+//! reorder; [`build_paste_bytes`] makes a paste ONE chunk so a drop can never
+//! leave the app inside an open bracketed-paste marker. Note: because the
+//! consumer keeps draining, a chunk dropped mid-stream under *sustained*
+//! congestion (the 256-slot queue stays full across several sends) is a gap at
+//! that chunk boundary, not tail truncation — the surviving chunks keep their
+//! relative order, but a keystroke can be missing from the middle of a burst.
+//! In practice this only bites a pane whose child has ignored stdin long enough
+//! to back up 256 chunks (a visibly wedged pane); pastes are atomic, so only
+//! individual keystrokes typed into such a pane can gap.
 //!
 //! Both PTY owners share this: the compositor's local panes
 //! ([`crate::pane::PtyPane`]) and the pane daemon's session actor

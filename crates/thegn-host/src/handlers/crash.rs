@@ -47,7 +47,15 @@ pub(crate) fn respawn_action(crashes: u32, failed: bool) -> RespawnAction {
 ///
 /// - the dead pane's daemon/provider session is forgotten — its process is
 ///   gone, so a warm reattach could only degrade via `SessionFallback` (an
-///   extra relay round-trip);
+///   extra relay round-trip) — UNLESS this was a transport-loss exit
+///   (`transport_loss`, i.e. `PaneEvent::Exit(id, None)` minted after the
+///   reconnect ladder exhausted), where the daemon/provider session and its
+///   child may still be ALIVE, merely unreachable. There we KEEP the record so
+///   switch-back materialize's warm-reattach ladder can recover the live
+///   session (or cleanly degrade via `SessionFallback` if it is truly gone);
+///   dropping it would orphan a still-running daemon session while a duplicate
+///   fresh session spawns beside it — exactly the leak the daemon-disable
+///   claim fix targets;
 /// - on a clean exit the remembered foreground command is dropped so
 ///   materialize won't arm a stale relaunch (a failed exit keeps it — that is
 ///   exactly what `materialize_with_specs` reads to arm `set_pending_relaunch`);
@@ -62,9 +70,15 @@ pub(crate) fn prep_leaf_for_respawn(
     tab: &mut crate::session::Tab,
     id: u32,
     failed: bool,
+    transport_loss: bool,
     scrollback_tail: Option<String>,
 ) {
-    tab.pane_sessions.remove(&id);
+    // Transport-loss (Exit code `None`): the process may still be alive but
+    // unreachable — keep the session record for warm reattach. A real process
+    // death (Exit code `Some(_)`) forgets it.
+    if !transport_loss {
+        tab.pane_sessions.remove(&id);
+    }
     if !failed {
         tab.pane_cmds.remove(&id);
     }
@@ -189,7 +203,7 @@ mod tests {
     #[test]
     fn prep_leaf_for_respawn_failed_exit_keeps_cmd_drops_session() {
         let mut tab = tab_with_dead_pane(7);
-        prep_leaf_for_respawn(&mut tab, 7, true, Some("live tail".into()));
+        prep_leaf_for_respawn(&mut tab, 7, true, false, Some("live tail".into()));
         // The leaf stays in the tree — that's what makes it a missing leaf for
         // the off-thread materialize pipeline.
         assert_eq!(tab.center.pane_ids(), vec![7]);
@@ -207,7 +221,7 @@ mod tests {
     #[test]
     fn prep_leaf_for_respawn_clean_exit_drops_stale_relaunch() {
         let mut tab = tab_with_dead_pane(7);
-        prep_leaf_for_respawn(&mut tab, 7, false, None);
+        prep_leaf_for_respawn(&mut tab, 7, false, false, None);
         assert_eq!(tab.center.pane_ids(), vec![7], "leaf stays in the tree");
         assert!(!tab.pane_sessions.contains_key(&7));
         assert!(
@@ -222,9 +236,23 @@ mod tests {
     }
 
     #[test]
+    fn prep_leaf_for_respawn_transport_loss_keeps_session_for_reattach() {
+        // Exit code `None` (relay reconnect ladder exhausted): the daemon/
+        // provider session may still be alive but unreachable — the record MUST
+        // survive so switch-back materialize warm-reattaches instead of
+        // orphaning a live session and spawning a duplicate beside it.
+        let mut tab = tab_with_dead_pane(7);
+        prep_leaf_for_respawn(&mut tab, 7, true, true, Some("live tail".into()));
+        assert!(
+            tab.pane_sessions.contains_key(&7),
+            "transport-loss exit must keep the session record for warm reattach"
+        );
+    }
+
+    #[test]
     fn prep_leaf_for_respawn_empty_tail_keeps_persisted_snapshot() {
         let mut tab = tab_with_dead_pane(9);
-        prep_leaf_for_respawn(&mut tab, 9, true, Some(String::new()));
+        prep_leaf_for_respawn(&mut tab, 9, true, false, Some(String::new()));
         assert_eq!(
             tab.pane_scrollback.get(&9).map(String::as_str),
             Some("persisted tail"),

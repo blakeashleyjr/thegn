@@ -415,7 +415,14 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
                         ctx.corner_gfx.push(seq);
                     }
                     crate::kitty_relay::Piece::GfxAnswer(ans) => {
-                        let _ = p.write_reply(&ans);
+                        // Must-deliver kitty graphics answer; warn on a rare
+                        // Full drop (see the query-reply sites below).
+                        if let Err(e) = p.write_reply(&ans) {
+                            tracing::warn!(
+                                target: "thegn::pane",
+                                "dropped a kitty graphics reply ({e}); an inner program may hang"
+                            );
+                        }
                     }
                 }
             }
@@ -427,7 +434,17 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
                     crate::queries::query_responses(&emu_text, emu.cursor(), emu.size())
                 };
                 if !resp.is_empty() {
-                    let _ = p.write_reply(&resp);
+                    // A terminal-query reply (DA/DSR/kitty) is host-generated and
+                    // must-deliver — an inner program (yazi, etc.) warns or times
+                    // out without it. It shares the pane's bounded stdin queue, so
+                    // a Full drop (child not reading its 256-chunk backlog) is
+                    // rare but worth a warn so a hung inner app is diagnosable.
+                    if let Err(e) = p.write_reply(&resp) {
+                        tracing::warn!(
+                            target: "thegn::pane",
+                            "dropped a terminal-query reply ({e}); an inner program may hang"
+                        );
+                    }
                 }
                 let fwd = crate::queries::osc_passthrough(&emu_text);
                 if !fwd.is_empty() {
@@ -821,7 +838,18 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
             // same prepared state (no dead-daemon-session reattach, no stale
             // relaunch after a clean exit).
             if let Some(tab) = ctx.session.tab_mut(gi, ti) {
-                crate::handlers::crash::prep_leaf_for_respawn(tab, id, failed, respawn_tail);
+                // `exit_code == None` is a transport-loss exit (the relay's
+                // reconnect ladder exhausted, pane.rs) — the daemon/provider
+                // session may still be alive. Keep its record so switch-back
+                // materialize can warm-reattach instead of orphaning it.
+                let transport_loss = exit_code.is_none();
+                crate::handlers::crash::prep_leaf_for_respawn(
+                    tab,
+                    id,
+                    failed,
+                    transport_loss,
+                    respawn_tail,
+                );
             }
             if is_active_tab {
                 match crate::handlers::crash::respawn_action(crashes, failed) {

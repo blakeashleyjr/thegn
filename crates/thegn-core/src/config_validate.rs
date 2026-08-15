@@ -288,6 +288,13 @@ mod tests {
     /// marked definitions. 62 `config_enum!` invocations exist; `ShareReach`
     /// is intentionally absent (no config.toml key — CLI/runtime vocabulary
     /// only), so 61 must be present, and `ShareReach` explicitly must not be.
+    ///
+    /// This count MUST stay platform-independent: never `#[cfg(...)]`- or
+    /// feature-gate a `config_enum!`-typed config *field*, or this pin passes on
+    /// one platform and fails on another (e.g. the Windows CI leg) with a
+    /// message that reads like a coverage regression. If a platform-specific
+    /// config field is ever unavoidable, switch this pin to a per-platform
+    /// expected `BTreeSet` built with the same cfg gates.
     #[test]
     fn marked_definition_count_is_pinned() {
         let defs = marked_definitions();
