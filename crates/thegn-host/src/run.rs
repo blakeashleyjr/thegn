@@ -7303,8 +7303,6 @@ async fn event_loop<T: Terminal>(
                 loading_remote: &mut loading_remote,
                 loading_retired: &mut loading_retired,
                 respawn_crash_count: &mut respawn_crash_count,
-                active_menu: &mut active_menu,
-                halt_dismissed: &mut halt_dismissed,
                 center_dormant: &mut center_dormant,
                 shutdown: &shutdown,
                 event_bus: &event_bus,
@@ -7339,6 +7337,17 @@ async fn event_loop<T: Terminal>(
             &refresh_tx,
             &waker,
         );
+        // A sole pane's exit left its dead leaf for the materialize pipeline —
+        // but the lazy-materialize block runs BEFORE this drain in the loop
+        // body, so without a pulse the respawn would wait for the next
+        // incidental wake (up to the ~2s ticker). Self-wake so the next
+        // (immediate) turn kicks `maybe_materialize`. Exceptional exit path
+        // only: the idle loop still never polls.
+        if drain_summary.left_for_materialize {
+            // best-effort: a missed pulse only delays the respawn to the next
+            // incidental wake.
+            let _ = waker.wake();
+        }
         if drain_summary.disconnected {
             // Teardown, not an explicit close: keep daemon panes running.
             crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);

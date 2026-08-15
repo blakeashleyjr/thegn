@@ -1,9 +1,77 @@
-//! Pane fast-crash messaging, split out of the ratchet-capped `run.rs`.
+//! Pane fast-crash messaging + the sole-pane respawn decision, split out of the
+//! ratchet-capped `run.rs`/`pty_drain.rs`.
 //!
 //! When a sole shell keeps crashing on startup the loop stops respawning it. A
 //! sandbox/exec failure (e.g. a broken `--userns keep-id` podman exec) writes its
 //! real error to the pane before dying; [`keeps_crashing_status`] surfaces that
 //! captured tail so the failure is legible instead of a pane that just vanished.
+//!
+//! A sole pane's crash respawn no longer spawns synchronously on the event loop
+//! (which re-resolved the sandbox — DB open + container ensure — inline):
+//! [`respawn_action`] decides give-up vs leave-the-dead-leaf, and
+//! [`prep_leaf_for_respawn`] does the pure `session::Tab` bookkeeping so the
+//! existing off-thread materialize pipeline (`maybe_materialize` → spec channel
+//! → `materialize_with_specs`) performs the actual respawn.
+
+/// What the exit handler should do about a sole worktree pane that died.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RespawnAction {
+    /// Crashing on every startup — stop respawning (dormant + status), so a
+    /// broken sandbox isn't a silent respawn loop.
+    GiveUp,
+    /// Leave the dead leaf in `tab.center`: it becomes a "missing leaf" the
+    /// off-thread materialize pipeline respawns (sandbox resolution on a
+    /// blocking task, never on the loop). `keep_remembered_cmd` records whether
+    /// the pane's last foreground command should survive for relaunch arming
+    /// (crashes keep it; a clean exit lands at a plain prompt).
+    LeaveForMaterialize { keep_remembered_cmd: bool },
+}
+
+/// The sole-pane respawn decision, pure for unit testing. `crashes` is the
+/// consecutive fast-crash count for this (group, tab); `failed` is the exit's
+/// failure classification (non-zero code, or the fast-crash heuristic).
+pub(crate) fn respawn_action(crashes: u32, failed: bool) -> RespawnAction {
+    if crashes >= 3 {
+        RespawnAction::GiveUp
+    } else {
+        RespawnAction::LeaveForMaterialize {
+            keep_remembered_cmd: failed,
+        }
+    }
+}
+
+/// Pure `session::Tab` bookkeeping for a sole worktree pane whose process died
+/// and whose leaf is being left in the tree for the off-thread materialize
+/// pipeline. Runs for EVERY sole exit (active tab or not) so switch-back
+/// materialize sees the same state the active-tab respawn does:
+///
+/// - the dead pane's daemon/provider session is forgotten — its process is
+///   gone, so a warm reattach could only degrade via `SessionFallback` (an
+///   extra relay round-trip);
+/// - on a clean exit the remembered foreground command is dropped so
+///   materialize won't arm a stale relaunch (a failed exit keeps it — that is
+///   exactly what `materialize_with_specs` reads to arm `set_pending_relaunch`);
+/// - the scrollback snapshot is refreshed with the tail captured just before
+///   the pane left the table, so the respawned pane repaints what the user
+///   actually last saw instead of the last-persist snapshot (an empty tail —
+///   e.g. an instant crash with no output — keeps the richer persisted entry).
+///
+/// Deliberately does NOT touch `tab.center`: the dead id staying in the tree is
+/// what makes it a missing leaf for `panes.missing_leaves`.
+pub(crate) fn prep_leaf_for_respawn(
+    tab: &mut crate::session::Tab,
+    id: u32,
+    failed: bool,
+    scrollback_tail: Option<String>,
+) {
+    tab.pane_sessions.remove(&id);
+    if !failed {
+        tab.pane_cmds.remove(&id);
+    }
+    if let Some(tail) = scrollback_tail.filter(|t| !t.is_empty()) {
+        tab.pane_scrollback.insert(id, tail);
+    }
+}
 
 /// The last non-blank line of a crashed pane's output tail, trimmed and
 /// length-capped — the concrete reason to show the user. `None` when the pane
@@ -69,5 +137,98 @@ mod tests {
         let s = keeps_crashing_status("");
         assert!(s.contains("Check your sandbox backend"), "{s}");
         assert!(!s.contains("Last error:"), "{s}");
+    }
+
+    #[test]
+    fn respawn_action_gives_up_at_three_fast_crashes() {
+        assert_eq!(respawn_action(3, true), RespawnAction::GiveUp);
+        assert_eq!(respawn_action(7, false), RespawnAction::GiveUp);
+    }
+
+    #[test]
+    fn respawn_action_keeps_remembered_cmd_only_on_failure() {
+        // A failed exit leaves the leaf AND keeps the last foreground command
+        // for relaunch arming; a clean exit leaves the leaf but drops it.
+        assert_eq!(
+            respawn_action(1, true),
+            RespawnAction::LeaveForMaterialize {
+                keep_remembered_cmd: true
+            }
+        );
+        assert_eq!(
+            respawn_action(0, false),
+            RespawnAction::LeaveForMaterialize {
+                keep_remembered_cmd: false
+            }
+        );
+    }
+
+    fn tab_with_dead_pane(id: u32) -> crate::session::Tab {
+        let mut tab = crate::session::Tab::new("1");
+        tab.center = crate::center::CenterTree::Leaf(id);
+        tab.focused_pane = id;
+        tab.pane_sessions.insert(
+            id,
+            crate::session::ProviderSession {
+                provider: "daemon".into(),
+                id: "sb1".into(),
+                session: "sess-1".into(),
+            },
+        );
+        tab.pane_cmds.insert(
+            id,
+            crate::session::PaneCmd {
+                argv: vec!["nvim".into(), "src/main.rs".into()],
+                cwd: None,
+            },
+        );
+        tab.pane_scrollback.insert(id, "persisted tail".into());
+        tab
+    }
+
+    #[test]
+    fn prep_leaf_for_respawn_failed_exit_keeps_cmd_drops_session() {
+        let mut tab = tab_with_dead_pane(7);
+        prep_leaf_for_respawn(&mut tab, 7, true, Some("live tail".into()));
+        // The leaf stays in the tree — that's what makes it a missing leaf for
+        // the off-thread materialize pipeline.
+        assert_eq!(tab.center.pane_ids(), vec![7]);
+        // Dead process ⇒ no daemon/provider reattach attempt on switch-back.
+        assert!(!tab.pane_sessions.contains_key(&7));
+        // Failed exit keeps the remembered command for relaunch arming.
+        assert!(tab.pane_cmds.contains_key(&7));
+        // Scrollback refreshed with what the user actually last saw.
+        assert_eq!(
+            tab.pane_scrollback.get(&7).map(String::as_str),
+            Some("live tail")
+        );
+    }
+
+    #[test]
+    fn prep_leaf_for_respawn_clean_exit_drops_stale_relaunch() {
+        let mut tab = tab_with_dead_pane(7);
+        prep_leaf_for_respawn(&mut tab, 7, false, None);
+        assert_eq!(tab.center.pane_ids(), vec![7], "leaf stays in the tree");
+        assert!(!tab.pane_sessions.contains_key(&7));
+        assert!(
+            !tab.pane_cmds.contains_key(&7),
+            "clean exit must not arm a stale relaunch"
+        );
+        // No/empty captured tail keeps the richer persisted snapshot.
+        assert_eq!(
+            tab.pane_scrollback.get(&7).map(String::as_str),
+            Some("persisted tail")
+        );
+    }
+
+    #[test]
+    fn prep_leaf_for_respawn_empty_tail_keeps_persisted_snapshot() {
+        let mut tab = tab_with_dead_pane(9);
+        prep_leaf_for_respawn(&mut tab, 9, true, Some(String::new()));
+        assert_eq!(
+            tab.pane_scrollback.get(&9).map(String::as_str),
+            Some("persisted tail"),
+            "an instant crash with no output must not blank the snapshot"
+        );
     }
 }
