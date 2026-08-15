@@ -252,15 +252,24 @@ pub fn parse_bisect(refs_out: &str, terms: Option<&str>, head: &str) -> BisectSt
     state
 }
 
-/// Scan bisect command stdout for `"<full-sha> is the first bad commit"`,
-/// anchored to the start of a line with a 40-hex sha (so a commit subject
-/// quoting the phrase mid-line can't fool it).
+/// Scan bisect command stdout for the culprit line, anchored to the start of a
+/// line with a 40-hex sha (so a commit subject quoting the phrase mid-line can't
+/// fool it). git prints `"<full-sha> is the first <term> commit"`, where older
+/// git used the bare term (`bad`) and git >= 2.55 quotes it (`'bad'`); custom
+/// bisect terms flow through the same way (`'broken'`). We accept a single
+/// space-free token between the fixed `is the first` / `commit` anchors, which
+/// matches every form without being fooled by a subject that keeps going.
 pub fn find_culprit(stdout: &str) -> Option<String> {
     stdout.lines().find_map(|line| {
         let (sha, rest) = line.split_at_checked(40)?;
-        (sha.bytes().all(|b| b.is_ascii_hexdigit())
-            && rest.trim_end() == " is the first bad commit")
-            .then(|| sha.to_string())
+        if !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let term = rest
+            .trim_end()
+            .strip_prefix(" is the first ")?
+            .strip_suffix(" commit")?;
+        (!term.is_empty() && !term.contains(' ')).then(|| sha.to_string())
     })
 }
 
@@ -544,6 +553,20 @@ mod tests {
         assert_eq!(
             find_culprit(&format!("{sha} is the first bad commit\r\n")).as_deref(),
             Some(sha)
+        );
+        // git >= 2.55 quotes the term; custom terms flow through the same shape.
+        assert_eq!(
+            find_culprit(&format!("{sha} is the first 'bad' commit")).as_deref(),
+            Some(sha)
+        );
+        assert_eq!(
+            find_culprit(&format!("{sha} is the first 'broken' commit\r\n")).as_deref(),
+            Some(sha)
+        );
+        // A multi-word tail between the anchors is still rejected.
+        assert_eq!(
+            find_culprit(&format!("{sha} is the first really bad commit")),
+            None
         );
     }
 

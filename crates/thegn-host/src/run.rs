@@ -976,54 +976,68 @@ fn summon_pin(
     }
 }
 
-/// Map each live worktree to the OSC window title of its active tab's focused
-/// pane. Main-loop only — reads the live `panes` table, which the background
-/// hydration thread can't touch. Pure in-memory map reads, so it never blocks
-/// the loop. Empty/whitespace titles are skipped so the sidebar falls back to
-/// the branch name.
+/// Map each live worktree — in the active workspace AND every parked (warm)
+/// workspace held in `pool`, whose panes stay live — to the OSC window title of
+/// its active tab's focused pane. Main-loop only — reads the live `panes` table,
+/// which the background hydration thread can't touch. Pure in-memory map reads,
+/// so it never blocks the loop. Empty/whitespace titles are skipped so the
+/// sidebar falls back to the branch name.
 fn collect_window_titles(
     session: &crate::session::Session,
+    pool: &WorkspacePool,
     panes: &Panes,
 ) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
-    for g in &session.worktrees {
-        if g.path.is_empty() {
-            continue;
+    // The active workspace's worktrees, then every parked (warm) workspace's —
+    // their panes stay live in `panes`, so a parked worktree's dynamic name stays
+    // fresh instead of only showing its last-known value. The two sets are
+    // disjoint (the active workspace is never in the pool).
+    for g in session.worktrees.iter().chain(pool.resident_groups()) {
+        collect_group_title(g, panes, &mut out);
+    }
+    out
+}
+
+/// Map one worktree group to the OSC window title of its active tab's focused
+/// pane (scanning the group's other tabs as a fallback), inserting into `out`.
+/// Empty/whitespace titles are skipped so the sidebar falls back to the branch
+/// name.
+fn collect_group_title(
+    g: &crate::session::WorktreeGroup,
+    panes: &Panes,
+    out: &mut std::collections::BTreeMap<String, String>,
+) {
+    if g.path.is_empty() {
+        return;
+    }
+    let Some(tab) = g.tabs.get(g.active_tab) else {
+        return;
+    };
+
+    // Scan all tabs in the group, preferring the active one, to find a valid window title.
+    // This ensures titles don't disappear from the sidebar when an unfocused worktree
+    // has its title in a tab that happens to not be active.
+    if let Some(p) = panes.table.get(&tab.focused_pane)
+        && let Some(title) = p.emulator().title()
+    {
+        let title = title.trim();
+        if !title.is_empty() {
+            out.insert(g.path.clone(), title.to_string());
+            return;
         }
-        let Some(tab) = g.tabs.get(g.active_tab) else {
-            continue;
-        };
+    }
 
-        // Scan all tabs in the group, preferring the active one, to find a valid window title.
-        // This ensures titles don't disappear from the sidebar when an unfocused worktree
-        // has its title in a tab that happens to not be active.
-        let mut title_found = false;
-
-        if let Some(p) = panes.table.get(&tab.focused_pane)
+    for t in &g.tabs {
+        if let Some(p) = panes.table.get(&t.focused_pane)
             && let Some(title) = p.emulator().title()
         {
             let title = title.trim();
             if !title.is_empty() {
                 out.insert(g.path.clone(), title.to_string());
-                title_found = true;
-            }
-        }
-
-        if !title_found {
-            for t in &g.tabs {
-                if let Some(p) = panes.table.get(&t.focused_pane)
-                    && let Some(title) = p.emulator().title()
-                {
-                    let title = title.trim();
-                    if !title.is_empty() {
-                        out.insert(g.path.clone(), title.to_string());
-                        break;
-                    }
-                }
+                break;
             }
         }
     }
-    out
 }
 
 // The full sidebar/model rebuild for a switch lives beside its light sibling
@@ -1125,6 +1139,7 @@ impl SidebarState {
         model.sidebar_menu = self.menu.clone();
         model.sidebar_scroll = self.scroll;
         model.sidebar_rail = self.mode == crate::layout::SidebarMode::Rail;
+        model.sidebar_display = self.view.display.clone();
     }
 
     pub(crate) fn focus_active_row(&mut self, model: &mut FrameModel) {
@@ -5571,6 +5586,7 @@ async fn event_loop<T: Terminal>(
     let mut sb = SidebarState::default();
     sb.view.workspace_sort = keymap.config().ui.sidebar_workspace_sort;
     sb.view.terminals_section = keymap.config().ui.sidebar_terminals_section;
+    sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&keymap.config().ui);
     let mut panel_ui = crate::panel::PanelUi::default();
     if let Ok(db) = thegn_core::db::Db::open() {
         sb.load(&db, SIDEBAR_SCOPE);
@@ -5817,6 +5833,13 @@ async fn event_loop<T: Terminal>(
     // chrome + sibling-pane recompose). `scroll_pane` names the pane to repaint.
     let mut scroll_only = false;
     let mut scroll_pane: Option<u32> = None;
+    // Last frame's fullscreen-splash state (see `chrome::center_shows_splash`).
+    // The splash true→false edge (splash retires because a pane went live while
+    // `load_steps` was already empty) sets no chrome `dirty`, so the incremental
+    // pane-output path would paint the pane over the reused splash `scratch` and
+    // the bounded diff would leave the splash's blank rows on screen forever (the
+    // "loading screen never went away" bug). Force a full frame on that edge.
+    let mut prev_splash = false;
     // Per-pane content damage: PTY output records the affected (visible) pane
     // ids here instead of the master `dirty` flag. When a wake touches ONLY
     // pane content — no chrome/overlay/geometry change set `dirty`/`full_repaint`
@@ -8122,6 +8145,13 @@ async fn event_loop<T: Terminal>(
             // The warm-pool chip is loop-set (by the pool maintainer), not hydration
             // data — preserve it across the model swap or it blinks off every tick.
             let pool = model.pool;
+            // The dynamic (OSC) worktree titles map is seeded once from the DB in
+            // `build_initial_model` and merged in place each frame by
+            // `collect_window_titles`; `build_model` never populates it, so the swap
+            // would wipe it to empty and only the ACTIVE workspace's titles would be
+            // re-merged next frame — every parked/unfocused workspace's row would fall
+            // back to its branch name. Carry the accumulated map over.
+            let window_titles = std::mem::take(&mut model.sidebar_window_titles);
             // Rows carry-over: `hydration_eq` compares every `build_rows` input
             // (locked by model_eq.rs tests), so an unchanged hydration can reuse
             // the on-screen rows instead of paying an O(worktrees) rebuild on
@@ -8147,6 +8177,7 @@ async fn event_loop<T: Terminal>(
             model.load_steps = load_steps;
             model.load_context = load_context;
             model.pool = pool;
+            model.sidebar_window_titles = window_titles;
             model.panel.task_last_runs = task_last_runs;
             model.panel.log_lines_structured = log_lines_structured;
             model.panel.diagnostics = task_diagnostics;
@@ -8834,6 +8865,7 @@ async fn event_loop<T: Terminal>(
                     keymap = rebuild_keymap(&new_cfg, &session);
                     sb.view.workspace_sort = new_cfg.ui.sidebar_workspace_sort;
                     sb.view.terminals_section = new_cfg.ui.sidebar_terminals_section;
+                    sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&new_cfg.ui);
                     // Live fullscreen-bar reload: recompute the chrome now if the
                     // user is currently in full-window zoom so the kept/dropped
                     // bars apply immediately (the reload relayouts below anyway).
@@ -9513,7 +9545,7 @@ async fn event_loop<T: Terminal>(
             // `collect_window_titles` is stable frame-to-frame, so this collects
             // only real title changes — usually empty, so no DB open per frame.
             let mut title_writes: Vec<(String, String)> = Vec::new();
-            for (path, title) in collect_window_titles(&session, &panes) {
+            for (path, title) in collect_window_titles(&session, &workspace_pool, &panes) {
                 if model.sidebar_window_titles.get(&path) != Some(&title) {
                     title_writes.push((path.clone(), title.clone()));
                     model.sidebar_window_titles.insert(path, title);
@@ -9562,6 +9594,23 @@ async fn event_loop<T: Terminal>(
                 full_repaint = true;
                 clear_on_next_frame = false;
             }
+            // Splash-retire edge: when the fullscreen loading splash gives way to
+            // pane content (a pane went live while `load_steps` was already empty,
+            // so no chrome `dirty` flipped) the incremental pane-output path would
+            // paint the pane over the reused splash `scratch` and the bounded diff
+            // would leave the splash's blank rows stuck on screen. Force a full
+            // frame on the true→false edge so `clear_frame` + `diff_screens` wipe
+            // the splash. Detected here (before `plan()`), from the same
+            // `center_shows_splash` both render paths consult, so they agree.
+            let splash_now = crate::chrome::center_shows_splash(
+                &tree.layout_framed(chrome.center),
+                &model,
+                |id| panes.table.get(&id).map(|p| p.emulator()).is_some(),
+            );
+            if prev_splash && !splash_now {
+                full_repaint = true;
+            }
+            prev_splash = splash_now;
             let app_tile_active = app_host.active_tile_mut().is_some();
             // FAST PATH: a pure selection-drag move only changes the highlighted
             // cells. Reuse the last full frame already in `scratch` (skip the
@@ -10166,9 +10215,17 @@ async fn event_loop<T: Terminal>(
                     changes.extend(front.diff_region(r.x, r.y, r.cols, r.rows, &scratch, r.x, r.y));
                 }
                 changes
+            } else if resync_now {
+                // Drift heal: re-emit EVERY cell of `scratch` (blanks as spaces),
+                // not a diff against the just-blanked `front`. `diff_screens`
+                // against a blank baseline skips cells equal to the default space,
+                // so it can't clear an orphaned physical ghost where the current
+                // frame is blank — writing every cell does, still flash-free (no
+                // ClearScreen). `front.add_changes(pending)` below reproduces
+                // `scratch`, keeping the baseline in sync for later bounded diffs.
+                crate::compositor::full_repaint_changes(&mut scratch)
             } else {
-                // Full diff: either a genuine Full frame, or a `resync_now` heal
-                // whose blank baseline makes this re-emit the entire screen.
+                // Genuine Full frame: bounded-to-full diff against the live baseline.
                 front.diff_screens(&scratch)
             };
             // A fullscreen modal owns the screen + draws its own caret; park the
@@ -15309,58 +15366,46 @@ async fn event_loop<T: Terminal>(
                         which_key_filter = None;
                         // Resolve the Alt+arrow (`Nav*`) actions here so they reuse
                         // the existing focus/switch code paths and never reach the
-                        // match below as `Nav*`. The two axes behave differently:
+                        // match below as `Nav*`. Alt navigation walks panes only and
+                        // never enters chrome (the sidebar/panel/bars are Ctrl's job):
                         //
-                        // - Vertical (Alt+↑/↓) is a pure worktree switch within the
-                        //   current workspace — no focus routing, and it must never
-                        //   select the top/bottom bars (that is Ctrl+↑/↓'s job).
-                        // - Horizontal (Alt+←/→) is one seamless motion: it walks the
-                        //   same spatial focus graph as Ctrl+←/→ (hand off to the
-                        //   coalesced focus gesture below), and only when a move
-                        //   dead-ends at the outer edge does it fall through to the
-                        //   prev/next-tab switch Alt historically owned.
+                        // - If a pane exists in the direction, move focus to it.
+                        // - Otherwise fall through by axis — ←/→ cycle tabs within the
+                        //   current worktree, ↑/↓ cycle worktrees within the workspace.
+                        //
+                        // `focus::resolve_nav` is the pure, unit-tested decision; we
+                        // just map its result onto the existing `Focus*`/tab/worktree
+                        // actions.
                         let mut action = action;
                         if let Action::NavLeft
                         | Action::NavRight
                         | Action::NavUp
                         | Action::NavDown = action
                         {
-                            action = match action {
-                                Action::NavUp => Action::PrevWorktree,
-                                Action::NavDown => Action::NextWorktree,
-                                // NavLeft / NavRight — consult the focus graph.
-                                _ => {
-                                    use crate::center::Move;
-                                    use crate::focus::{FocusMove, RouteCtx};
-                                    let mv = if matches!(action, Action::NavLeft) {
-                                        Move::Left
-                                    } else {
-                                        Move::Right
-                                    };
-                                    let cur_focused =
-                                        session.active_tab().map(|t| t.focused_pane).unwrap_or(0);
-                                    let pane_layout = session
-                                        .active_tab()
-                                        .map(|t| t.center.layout(chrome.center))
-                                        .unwrap_or_default();
-                                    let ctx = RouteCtx {
-                                        sidebar_visible: want_sidebar && chrome.sidebar.is_some(),
-                                        panel_visible: want_panel && chrome.panel.is_some(),
-                                        drawer_visible: chrome.drawer.is_some(),
-                                        layout: &pane_layout,
-                                        focused_pane: cur_focused,
-                                    };
-                                    let dead_end = matches!(
-                                        crate::focus::route(focus.zone, mv, &ctx),
-                                        FocusMove::None
-                                    );
-                                    match (matches!(action, Action::NavLeft), dead_end) {
-                                        (true, true) => Action::PrevTab,
-                                        (false, true) => Action::NextTab,
-                                        (true, false) => Action::FocusLeft,
-                                        (false, false) => Action::FocusRight,
-                                    }
-                                }
+                            use crate::center::Move;
+                            use crate::focus::{NavMove, Zone, resolve_nav};
+                            let dir = match action {
+                                Action::NavLeft => Move::Left,
+                                Action::NavRight => Move::Right,
+                                Action::NavUp => Move::Up,
+                                _ => Move::Down,
+                            };
+                            let in_center = focus.zone == Zone::Center;
+                            let cur_focused =
+                                session.active_tab().map(|t| t.focused_pane).unwrap_or(0);
+                            let pane_layout = session
+                                .active_tab()
+                                .map(|t| t.center.layout(chrome.center))
+                                .unwrap_or_default();
+                            action = match resolve_nav(in_center, dir, &pane_layout, cur_focused) {
+                                NavMove::Focus(Move::Left) => Action::FocusLeft,
+                                NavMove::Focus(Move::Right) => Action::FocusRight,
+                                NavMove::Focus(Move::Up) => Action::FocusUp,
+                                NavMove::Focus(Move::Down) => Action::FocusDown,
+                                NavMove::PrevTab => Action::PrevTab,
+                                NavMove::NextTab => Action::NextTab,
+                                NavMove::PrevWorktree => Action::PrevWorktree,
+                                NavMove::NextWorktree => Action::NextWorktree,
                             };
                         }
                         match action {
