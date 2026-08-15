@@ -287,18 +287,25 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
     if root_s == path {
         anyhow::bail!("refusing to remove the main worktree: {path}");
     }
-    if !force
-        && !super::confirm(&format!(
+    if !force {
+        let prompt = format!(
             "remove worktree {path} (branch {branch}{})?",
             if delete_branch {
                 ", branch deleted"
             } else {
                 ""
             }
-        ))
-    {
-        outln!("aborted");
-        return Ok(());
+        );
+        // Without a TTY there's no way to answer the prompt — refuse (non-zero)
+        // rather than silently no-op on a piped/scripted invocation that forgot
+        // --force; an interactive decline is a clean abort.
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            anyhow::bail!("{prompt} refusing without a TTY — pass --force to confirm");
+        }
+        if !super::confirm(&prompt) {
+            outln!("aborted");
+            return Ok(());
+        }
     }
 
     // Provider/sandbox teardown, synchronous (unlike the TUI's fire-and-forget

@@ -355,6 +355,37 @@ fn gate_base(repo_root: &Path) -> PathBuf {
         .join(format!("{name}-{key:016x}"))
 }
 
+/// Blocking advisory lock serializing gate runs on a reused worktree. The
+/// sidecar `<wt>.lock` file is created once and never removed (the worktree dir
+/// itself is churned; the lock must survive that). `File::lock` dies with the
+/// process, so it can't go stale. Best-effort: `None` (exotic fs / permissions)
+/// degrades to the old unserialized path rather than refusing to gate.
+#[cfg(unix)]
+fn gate_lock(wt: &Path) -> Option<std::fs::File> {
+    let lock_path = {
+        let mut p = wt.as_os_str().to_owned();
+        p.push(".lock");
+        PathBuf::from(p)
+    };
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    f.lock().ok()?; // blocks until the prior gate releases
+    Some(f)
+}
+
+#[cfg(not(unix))]
+fn gate_lock(_wt: &Path) -> Option<std::fs::File> {
+    None
+}
+
 /// Build/test the folded tip. By default (`gate_reuse_worktree`) this runs in a
 /// stable per-repo worktree kept between folds, with a persistent
 /// `CARGO_TARGET_DIR` — so cargo does a warm incremental rebuild instead of a
@@ -400,6 +431,16 @@ pub(crate) fn gate_tip(
         )
     };
     let wt_s = wt.to_string_lossy().to_string();
+
+    // Serialize concurrent gate runs on the SAME reused worktree: two `land` /
+    // `drain` processes (e.g. a CLI land + a running instance's autopilot) would
+    // otherwise check out DIFFERENT OIDs into one worktree and clobber each
+    // other's checkout + gate. The queue design assumes serialization but nothing
+    // enforced it ACROSS processes. A blocking flock on a persistent sidecar lock
+    // makes the second run wait its turn (a gate can take minutes — waiting is
+    // correct). Reuse mode only; throwaway mode already uses unique /tmp paths.
+    // Held for the whole prepare→gate→cleanup below (RAII: released on return).
+    let _gate_lock = if reuse { gate_lock(&wt) } else { None };
 
     // (Re)create the gate worktree fresh at `wt`, pruning any stale registration
     // for a path whose dir was removed out from under us.
