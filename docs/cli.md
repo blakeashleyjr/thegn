@@ -22,6 +22,29 @@ keep working forever with byte-identical output; they are merely hidden from
 `--help`. Global flags everywhere: `--config`, `--log-level`,
 `--set key=value` (repeatable), `--profile <name>`.
 
+## Worktree targeting
+
+Every verb that acts **on** a worktree (rather than taking one as its object)
+uses the same scope selector: `--worktree <path>`. When the flag is omitted,
+the target resolves in order:
+
+1. `$THEGN_WORKTREE` (injected into every thegn pane), if it exists locally;
+2. the git toplevel of the current directory;
+3. the current directory itself.
+
+Verbs whose argument **is** the object keep positionals: `wt rm <target>`
+(path or branch), `wt new [name]`, `merge add [worktrees…]` (multi-target),
+`open <repo>` (a repo, not a worktree).
+
+Two verbs keep their own default rule: `wt disk` scans **all** known
+worktrees unless `--worktree` narrows it to one, and `placement explain`
+shows the most recent decision overall unless `--worktree` filters it.
+
+The legacy trailing positional on `env *`, `placement plan|explain`,
+`merge rm|land`, `land`, and `sandbox-argv` still parses but is deprecated
+and hidden from help; passing both the flag and the positional is a usage
+error (non-zero exit). Scripts should move to `--worktree`.
+
 ## Headless worktree lifecycle
 
 ```sh

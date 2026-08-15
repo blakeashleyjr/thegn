@@ -24,45 +24,59 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
-    /// Show the environment that resolves for a worktree (defaults to cwd).
-    Show { worktree: Option<String> },
+    /// Show the environment that resolves for a worktree (defaults to the
+    /// current one).
+    Show {
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
+    },
     /// Select an environment for a worktree (persists to the DB).
     Set {
         /// The `[env.<name>]` to use.
         name: String,
-        /// Worktree path (defaults to the current directory).
-        worktree: Option<String>,
         /// Apply to the whole workspace (repo) instead of just this worktree.
         #[arg(long)]
         workspace: bool,
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
     },
     /// Clear a worktree's (or workspace's) env selection (inherit the default).
     Clear {
-        worktree: Option<String>,
         #[arg(long)]
         workspace: bool,
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
     },
     /// Bring a worktree's environment up (k8s: spawn the pod and wait for Ready).
-    Up { worktree: Option<String> },
+    Up {
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
+    },
     /// Tear a worktree's environment down (k8s: delete the pod/manifest).
-    Down { worktree: Option<String> },
+    Down {
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
+    },
     /// Forward a port from the environment to localhost (k8s `port-forward`).
     /// Runs in the foreground until interrupted. `spec` is `local:remote` or `port`.
     Forward {
         spec: String,
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
     },
     /// Create a new managed-sandbox via the env's API provider (Daytona/Sprites)
     /// and print its id. Requires `[env.<name>.provider]` (+ `api_key_env`); on
     /// create it also applies the env's network allow/block as the sandbox's
     /// egress policy when the provider supports it.
-    Provision { worktree: Option<String> },
+    Provision {
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
+    },
     /// Destroy managed-sandbox(es) via the env's API provider. Pass an `id`, or
     /// `--all` to destroy every sandbox the provider can see. `--env <name>`
     /// targets a named env's provider instead of the worktree's resolved one.
     Deprovision {
         id: Option<String>,
-        worktree: Option<String>,
         #[arg(long)]
         all: bool,
         #[arg(long)]
@@ -71,25 +85,35 @@ pub enum Action {
         /// a TTY).
         #[arg(long)]
         yes: bool,
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
     },
     /// Create a checkpoint/snapshot of the env's sandbox (providers that support it).
     Snapshot {
-        worktree: Option<String>,
         /// Optional label/comment for the checkpoint.
         #[arg(long)]
         label: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
     },
     /// List the env sandbox's checkpoints.
-    Snapshots { worktree: Option<String> },
+    Snapshots {
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
+    },
     /// Restore the env's sandbox to a checkpoint id.
     Restore {
         id: String,
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
     },
     /// Bake a reusable VPS base image (nix + direnv + docker preinstalled) and
     /// print the `template = "snapshot:<id>"` to use it — the VPS stand-in for
     /// checkpoints (~3-6 min cold provisions drop to ~30-90 s).
-    ImageBake { worktree: Option<String> },
+    ImageBake {
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
+    },
     /// Create (or update — upsert) a `[env.<name>]` in the global config. The
     /// authoring path behind the TUI setup wizard; also scriptable on its own.
     Create {
@@ -137,31 +161,28 @@ pub enum Action {
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::List { json } => list(cfg, json),
-        Action::Show { worktree } => show(cfg, worktree),
+        Action::Show { target } => show(cfg, target.get()),
         Action::Set {
             name,
-            worktree,
             workspace,
-        } => set(cfg, &name, worktree, workspace),
-        Action::Clear {
-            worktree,
-            workspace,
-        } => set(cfg, "", worktree, workspace),
-        Action::Up { worktree } => lifecycle(cfg, worktree, Lifecycle::Up),
-        Action::Down { worktree } => lifecycle(cfg, worktree, Lifecycle::Down),
-        Action::Forward { spec, worktree } => forward(cfg, worktree, &spec),
-        Action::Provision { worktree } => provision(cfg, worktree),
+            target,
+        } => set(cfg, &name, target.get(), workspace),
+        Action::Clear { workspace, target } => set(cfg, "", target.get(), workspace),
+        Action::Up { target } => lifecycle(cfg, target.get(), Lifecycle::Up),
+        Action::Down { target } => lifecycle(cfg, target.get(), Lifecycle::Down),
+        Action::Forward { spec, target } => forward(cfg, target.get(), &spec),
+        Action::Provision { target } => provision(cfg, target.get()),
         Action::Deprovision {
             id,
-            worktree,
             all,
             env,
             yes,
-        } => deprovision(cfg, worktree, id, all, env, yes),
-        Action::Snapshot { worktree, label } => snapshot(cfg, worktree, label),
-        Action::Snapshots { worktree } => snapshots(cfg, worktree),
-        Action::Restore { id, worktree } => restore(cfg, worktree, &id),
-        Action::ImageBake { worktree } => super::env_image::run(cfg, worktree),
+            target,
+        } => deprovision(cfg, target.get(), id, all, env, yes),
+        Action::Snapshot { label, target } => snapshot(cfg, target.get(), label),
+        Action::Snapshots { target } => snapshots(cfg, target.get()),
+        Action::Restore { id, target } => restore(cfg, target.get(), &id),
+        Action::ImageBake { target } => super::env_image::run(cfg, target.get()),
         Action::Create {
             name,
             provider,
@@ -266,7 +287,7 @@ pub(crate) fn create_env(a: CreateArgs) -> Result<()> {
     let path = Config::path();
     upsert_env(&path, &spec)?;
     outln!("created env '{}' ({kind}) in {}", a.name, path.display());
-    outln!("  bind it: thegn env set {} [worktree]", a.name);
+    outln!("  bind it: thegn env set {} [--worktree <path>]", a.name);
     Ok(())
 }
 

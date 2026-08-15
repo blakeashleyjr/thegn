@@ -291,8 +291,8 @@ pub enum Command {
     /// the main checkout is read-only. The blessed one-shot alternative to
     /// `git checkout main && git merge`.
     Land {
-        /// Worktree path (default: the current worktree).
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: cmd::target::WorktreeTarget,
     },
     /// Agent-driven merge queue: assign branches (`merge add`) and drain them one
     /// by one (`merge drain`), dispatching a headless CLI agent to resolve
@@ -382,8 +382,8 @@ pub enum Command {
     },
     /// Print the exact sandbox argv for a worktree (for debugging).
     SandboxArgv {
-        /// Path to the worktree (defaults to the current directory).
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: cmd::target::WorktreeTarget,
     },
     /// Push, list, dismiss, or read notifications (plugin/script API).
     Notify {
@@ -828,7 +828,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Diff { args } => cmd::wt::run(&cfg, cmd::wt::Action::Diff(args)),
         Command::List { args } => cmd::wt::run(&cfg, cmd::wt::Action::List(args)),
         Command::Integrate => cmd::integrate::run(&cfg),
-        Command::Land { worktree } => cmd::land::run(&cfg, worktree),
+        Command::Land { target } => cmd::land::run(&cfg, target.get()),
         Command::Merge { action } => cmd::merge::run(&cfg, action),
         Command::Disk { args } => cmd::wt::run(&cfg, cmd::wt::Action::Disk(args)),
         Command::Clean { args } => cmd::wt::run(&cfg, cmd::wt::Action::Clean(args)),
@@ -915,10 +915,12 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::VpsSsh { name, cmd } => vps_bridge::run(&cfg, &name, &cmd),
         Command::Machine0Ssh { name, cmd } => machine0_bridge::run(&cfg, &name, &cmd),
         Command::SpriteExec { id, cmd } => sprite_bridge::run(&cfg, &id, &cmd),
-        Command::SandboxArgv { worktree } => {
-            let wt = worktree
-                .or_else(|| std::env::current_dir().ok()?.to_str().map(str::to_string))
-                .unwrap_or_default();
+        Command::SandboxArgv { target } => {
+            // Resolve like every other worktree-scoped verb (explicit →
+            // $THEGN_WORKTREE → git toplevel → cwd) — previously raw cwd only.
+            let wt = cmd::resolve_worktree(target.get())
+                .to_string_lossy()
+                .into_owned();
             match crate::agent::launch_spec(&cfg, &wt, None, "shell") {
                 Ok(spec) => {
                     thegn_core::outln!("{}", spec.argv.join(" "));
