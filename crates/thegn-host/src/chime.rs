@@ -148,7 +148,10 @@ fn detect_player() -> Option<Player> {
     None
 }
 
-/// Whether `prog` is on PATH.
+/// Whether `prog` is on PATH. Only the macOS (`afplay`) + Linux (paplay/…)
+/// player-detection paths consult it; the Windows path uses PowerShell's built-in
+/// audio, so gate it out there to avoid a dead-code warning on the -gnu cross-check.
+#[cfg(not(windows))]
 fn have(prog: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
