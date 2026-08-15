@@ -4664,7 +4664,9 @@ fn smart_split_dir(cols: usize, rows: usize) -> crate::center::Dir {
 /// local shell) and the sandbox backend wraps a local shell ("" = uncontained).
 /// Returns `("", "")` when the row is gone or the DB can't be opened — a safe
 /// fall back to a local, uncontained shell. Call this off the event loop (it
-/// opens the DB).
+/// opens the DB), and prefer `handlers::terminal::live_choice` first: for a
+/// terminal created by this session's wizard the registry carries the user's
+/// actual pick even when the best-effort persist failed.
 pub(crate) fn terminal_launch_for(name: &str) -> (String, String) {
     thegn_core::db::Db::open()
         .ok()
@@ -4690,27 +4692,17 @@ fn bundle_scope_slug(db: &thegn_core::db::Db, worktree: &str) -> Option<String> 
 }
 
 /// Spawn the worktree's interactive shell pane in `dir`, routing through the
-/// env/sandbox resolution (`launch_spec`), the native-provider exec, or the
-/// terminal connection as appropriate. Resolution can open the DB / probe the
-/// sandbox — call off the hot path where possible.
+/// env/sandbox resolution (`launch_spec`) or the native-provider exec as
+/// appropriate. Resolution can open the DB / probe the sandbox — call off the
+/// hot path where possible. Terminal-connection panes never spawn here: they
+/// materialize off-thread (`handlers::materialize` / the prewarm worker) via
+/// `panes::terminal_launch_spec`.
 pub(crate) fn spawn_worktree_shell_pane(
     panes: &mut Panes,
     cfg: &thegn_core::config::Config,
     dir: Option<&std::path::Path>,
     center: Rect,
-    is_terminal: bool,
-    terminal_connection: Option<&str>,
-    terminal_sandbox: &str,
 ) -> Result<u32> {
-    if is_terminal {
-        let spec = crate::panes::terminal_launch_spec(
-            cfg,
-            terminal_connection.unwrap_or(""),
-            terminal_sandbox,
-        );
-        return panes.spawn_argv_env(&spec.argv, dir, &spec.env, center);
-    }
-
     if let Some(dir) = dir
         && dir.is_dir()
     {
@@ -4855,8 +4847,7 @@ fn apply_layout_to_active_tab(
         .unwrap_or_default();
     // Spawn a shell per leaf; a leaf carrying a command runs it in that shell.
     let mut spawn = |cmd: Option<&str>| -> Option<u32> {
-        let id =
-            spawn_worktree_shell_pane(panes, cfg, dir.as_deref(), center, false, None, "").ok()?;
+        let id = spawn_worktree_shell_pane(panes, cfg, dir.as_deref(), center).ok()?;
         if let Some(c) = cmd
             && let Some(p) = panes.table.get_mut(&id)
         {
@@ -6955,7 +6946,10 @@ async fn event_loop<T: Terminal>(
                 let wk = waker.clone();
                 task::spawn_blocking(move || {
                     let specs = if is_terminal {
-                        let (conn, sandbox) = terminal_launch_for(&name);
+                        // This session's wizard choice wins over the DB row (a
+                        // failed best-effort persist must not change the spawn).
+                        let (conn, sandbox) = crate::handlers::terminal::live_choice(&name)
+                            .unwrap_or_else(|| terminal_launch_for(&name));
                         let spec = crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox);
                         Ok(missing.into_iter().map(|id| (id, spec.clone())).collect())
                     } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
@@ -11491,8 +11485,16 @@ async fn event_loop<T: Terminal>(
                 let mut forced_which_key: Option<crate::sequence::Key> = None;
                 // Worktree creation is non-modal (its own tab's loading splash);
                 // it swallows no input. Failure removes the tab + shows status.
-                // Modal: the new-terminal wizard captures all keys; submit is
-                // synchronous (DB upsert + pane spawn), handled inline below.
+                // Modal: the new-terminal wizard captures all keys; submit only
+                // persists the row + stages a placeholder leaf — the spawn
+                // resolution (SQLite open, git subprocess, backend probe inside
+                // `terminal_launch_spec`) rides the off-thread lazy-materialize
+                // kick on the next loop turn, same as sidebar activation of a
+                // non-resident terminal. Accepted deltas of sharing that path:
+                // Esc during the (ms-scale, local) materialize splash pins the
+                // group to host via the sticky `request_force_host` registry,
+                // and keys typed before the spec lands are dropped rather than
+                // reaching the shell — both match sidebar activation today.
                 if let Some(w) = terminal_wizard_ui.as_mut() {
                     match w.handle_key(&k.key, k.modifiers) {
                         crate::terminal_wizard::Outcome::Pending => {}
@@ -11502,33 +11504,25 @@ async fn event_loop<T: Terminal>(
                         }
                         crate::terminal_wizard::Outcome::Submit(choice) => {
                             terminal_wizard_ui = None;
-                            crate::handlers::terminal::persist(&choice);
-                            session
-                                .worktrees
-                                .push(crate::session::WorktreeGroup::terminal(&choice.name));
-                            session.active = session.worktrees.len() - 1;
-                            let cwd = active_cwd(&session);
-                            let new = match spawn_worktree_shell_pane(
-                                &mut panes,
-                                keymap.config(),
-                                cwd.as_deref(),
-                                chrome.center,
-                                true,
-                                Some(&choice.connection),
-                                &choice.sandbox,
-                            ) {
-                                Ok(id) => id,
-                                Err(e) => {
-                                    model.status = format!("Terminal spawn failed: {e}");
-                                    continue;
-                                }
-                            };
-                            if let Some(tab) = session.active_tab_mut() {
-                                tab.center = crate::center::CenterTree::Leaf(new);
-                                tab.focused_pane = new;
+                            // The tiny upsert stays synchronous (sanctioned
+                            // best-effort-persist family); the live spawn reads
+                            // the in-process choice registry, so a failed write
+                            // only loses restart persistence — surface it.
+                            if !crate::handlers::terminal::persist(&choice) {
+                                model.status =
+                                    "terminal not saved — it won't be remembered across restarts"
+                                        .into();
                             }
+                            crate::handlers::terminal::push_terminal_group(
+                                &mut session,
+                                &mut panes,
+                                &choice,
+                            );
                             focus.zone = crate::focus::Zone::Center;
                             refresh_tab_model(&mut model, &session, &mut sb);
+                            // Structural change (new group): mirror sidebar
+                            // activation so it survives a non-graceful exit.
+                            persist_session_layout(&mut session, &panes);
                             need_relayout = true;
                         }
                     }
@@ -15562,9 +15556,6 @@ async fn event_loop<T: Terminal>(
                                                     keymap.config(),
                                                     pane_cwd.as_deref(),
                                                     chrome.center,
-                                                    false,
-                                                    None,
-                                                    "",
                                                 ),
                                             };
                                             match spawned {

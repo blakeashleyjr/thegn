@@ -140,7 +140,11 @@ pub(crate) fn maybe_materialize(
             f()
         };
         let specs = if is_terminal {
-            let (conn, sandbox) = crate::run::terminal_launch_for(&gname);
+            // Prefer this session's wizard-submitted choice (registry) over the
+            // DB row: a failed best-effort persist must not silently downgrade
+            // what spawns in the live session.
+            let (conn, sandbox) = crate::handlers::terminal::live_choice(&gname)
+                .unwrap_or_else(|| crate::run::terminal_launch_for(&gname));
             // Honor a host pin (the splash Esc-cancel, keyed by group name or
             // worktree path): drop the sandbox wrap so the retry opens a plain
             // host shell instead of re-entering the bring-up the user bailed on.

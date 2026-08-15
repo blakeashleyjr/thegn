@@ -134,9 +134,11 @@ pub(crate) fn pane_shell_argv(
 
 /// Build a host [`crate::agent::LaunchSpec`] for a terminal connection (local
 /// shell / ssh / mosh). Terminals never run inside a sandbox — a terminal is a
-/// host process that itself reaches out (ssh/mosh) — so this is the shared spec
-/// builder used by both the synchronous creation path and the off-thread
-/// materialize/pre-warm paths, keeping the two from diverging.
+/// host process that itself reaches out (ssh/mosh) — so this is the single spec
+/// builder shared by every terminal spawn, all of which run OFF-THREAD (the
+/// lazy materialize in `handlers::materialize` and the run-loop prewarm
+/// worker, both on `spawn_blocking`): `sandbox_wrap_shell` below opens SQLite
+/// and shells out to git, so this must not be called on the event loop.
 pub(crate) fn terminal_launch_spec(
     cfg: &thegn_core::config::Config,
     connection: &str,
@@ -146,10 +148,12 @@ pub(crate) fn terminal_launch_spec(
     let mut argv = vec![cmd];
     argv.extend(args);
     // Wrap a LOCAL shell in the chosen sandbox (a remote ssh/mosh terminal is
-    // isolated by the remote end, so it's never wrapped here). This stays PURE —
-    // it only builds the wrapping argv; the sandbox command self-provisions at
-    // exec (bwrap runs immediately, `podman run` pulls on first use), so no
-    // blocking `ensure()` runs on the event loop.
+    // isolated by the remote end, so it's never wrapped here). No container
+    // ensure/create/pull happens while building the wrap — the sandbox command
+    // self-provisions at exec (bwrap runs immediately, `podman run` pulls on
+    // first use) — but resolution itself is NOT free: `sandbox_wrap_shell`
+    // opens SQLite, runs a git subprocess, and probes backends, which is why
+    // every caller of this builder runs off-thread.
     let backend = sandbox_backend.trim();
     if connection.is_empty()
         && !backend.is_empty()
@@ -181,8 +185,12 @@ pub(crate) fn terminal_launch_spec(
 /// and `exec` the shell inside it (via
 /// [`thegn_core::sandbox::enter_argv`]). Returns `None` — so the caller falls
 /// back to a plain host shell — when the backend name is unknown or the spec
-/// can't be built (e.g. sandboxing disabled). Pure: no provisioning, safe on the
-/// event loop.
+/// can't be built (e.g. sandboxing disabled). No provisioning happens here, but
+/// this is NOT loop-safe: `GitLoc::for_worktree` opens + reads SQLite (up to
+/// the 5s busy-timeout under a writer), `resolve_placed` shells out to
+/// `git rev-parse`, and backend availability probing can run
+/// `sudo -n podman version` — run it off-thread (`handlers::materialize` /
+/// the prewarm worker do).
 fn sandbox_wrap_shell(
     cfg: &thegn_core::config::Config,
     backend: &str,
