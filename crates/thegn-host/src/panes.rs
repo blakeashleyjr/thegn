@@ -703,7 +703,19 @@ impl Panes {
 
         let spawn_t0 = std::time::Instant::now();
         let mut map = std::collections::HashMap::new();
+        // A leaf explicitly closed while its spec batch was in flight is no
+        // longer in the tree: spawning for its departed id would orphan the
+        // fresh pane (the remap below would find no leaf to attach it to).
+        let leaves: std::collections::HashSet<u32> = tab.center.pane_ids().into_iter().collect();
         for (old, spec) in specs {
+            if !leaves.contains(old) {
+                tracing::debug!(
+                    target: "thegn::startup",
+                    leaf = old,
+                    "materialize spec for a departed leaf; skipping"
+                );
+                continue;
+            }
             if self.table.contains_key(old) || map.contains_key(old) {
                 continue; // raced a direct spawn; keep the live pane
             }
@@ -1256,6 +1268,47 @@ mod tests {
                 spec.argv
             );
         }
+    }
+
+    #[test]
+    fn materialize_spawns_nothing_for_a_departed_leaf() {
+        // The user closed the pane/tab while its spec batch was in flight: the
+        // spec's `old` id is no longer a leaf of `tab.center`. The guard must
+        // short-circuit BEFORE any PTY fork — nothing enters `panes.table` and
+        // the tree is left un-remapped (no orphaned pane). The batch contains
+        // ONLY the departed id so a real spawn would be detectable.
+        let mut session = one_tab_session();
+        let path = session.worktrees[0].path.clone();
+        let tab = &mut session.worktrees[0].tabs[0];
+        let leaf = tab.center.pane_ids()[0];
+        let departed = leaf + 1000;
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = Panes::new(tx);
+        let cfg = thegn_core::config::Config::default();
+        let spec = crate::agent::LaunchSpec {
+            argv: vec!["/bin/sh".into()],
+            cwd: None,
+            env: Vec::new(),
+            backend: "host".into(),
+            warnings: Vec::new(),
+            degraded: false,
+        };
+        let chrome = layout::compute(160, 40, true, true);
+
+        panes
+            .materialize_with_specs(&cfg, tab, &path, &[(departed, spec)], chrome.center)
+            .unwrap();
+
+        assert!(
+            panes.table.is_empty(),
+            "no pane may be spawned for a departed leaf"
+        );
+        assert_eq!(
+            tab.center.pane_ids(),
+            vec![leaf],
+            "the tree stays un-remapped"
+        );
+        assert_eq!(tab.focused_pane, leaf, "focus stays on the surviving leaf");
     }
 
     #[test]
