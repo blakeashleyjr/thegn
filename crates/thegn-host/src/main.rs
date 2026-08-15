@@ -754,7 +754,14 @@ fn main() -> anyhow::Result<()> {
     // kills the whole process group atomically, matching what alacritty/kitty do.
     let code: i32 = match &result {
         Ok(()) => cmd::EXIT_OK,
-        Err(_) => cmd::EXIT_ERROR,
+        Err(e) => {
+            // Print the error chain: the compositor redirected stderr to the
+            // logfile during the session, and the alt screen is now torn down,
+            // so an early `?` (e.g. "term capabilities", "open terminal") would
+            // otherwise exit 1 with a blank terminal and no explanation.
+            thegn_core::msg::error(&format!("{e:#}"));
+            cmd::EXIT_ERROR
+        }
     };
     std::process::exit(code);
 }

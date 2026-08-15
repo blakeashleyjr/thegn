@@ -4197,9 +4197,23 @@ impl Config {
             p.notifications.clone().apply(&mut n);
         }
         if let Some(root) = repo_root
-            && let Some(overlay) = load_repo_overlay(root)
+            && let Some(mut overlay) = load_repo_overlay(root)
             && !overlay.notifications.is_empty()
         {
+            // A repo's `.thegn.*` is UNTRUSTED. A hostile overlay must not be able
+            // to supply a `[notifications.sound] mode = "command"` (+ a command /
+            // per-priority command / chime file it controls), which would reach
+            // `sh -c` on the next notification — RCE merely on opening the repo.
+            // De-fang the repo-supplied sound before folding it; the user's own
+            // config + profile keep the feature.
+            if let Some(s) = overlay.notifications.sound.as_mut() {
+                if s.mode == SoundMode::Command {
+                    s.mode = SoundMode::Chime;
+                }
+                s.command.clear();
+                s.per_priority.clear();
+                s.chime_file.clear();
+            }
             overlay.notifications.apply(&mut n);
         }
         n
@@ -4544,6 +4558,28 @@ pub fn validate_str(body: &str) -> Vec<String> {
                 );
             }
         }
+    }
+    if let Some(th) = t.get("theme").and_then(|v| v.as_table()) {
+        check(&mut errs, "theme.color", th.get("color"), |s| {
+            ColorMode::from_str_validated(s).map(|_| ())
+        });
+        check(&mut errs, "theme.glyphs", th.get("glyphs"), |s| {
+            GlyphMode::from_str_validated(s).map(|_| ())
+        });
+    }
+    if let Some(mq) = t.get("merge_queue").and_then(|v| v.as_table()) {
+        check(
+            &mut errs,
+            "merge_queue.conflict_handoff",
+            mq.get("conflict_handoff"),
+            |s| ConflictHandoff::from_str_validated(s).map(|_| ()),
+        );
+        check(
+            &mut errs,
+            "merge_queue.on_landed",
+            mq.get("on_landed"),
+            |s| OnLanded::from_str_validated(s).map(|_| ()),
+        );
     }
     errs
 }

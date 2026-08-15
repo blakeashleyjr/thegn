@@ -151,8 +151,16 @@ impl Db {
         let path = db_path();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+            // Owner-only (0700) on the state dir + 0600 on the DB file below:
+            // thegn.db holds live bearer credentials (Kaneo device-flow token,
+            // iroh pair secrets) sent verbatim, plus per-repo history — it must
+            // not be world-readable under a lax umask. Best-effort, matching the
+            // secret-file writes elsewhere (sandbox/vpn/share).
+            let _ = crate::fsperm::restrict_dir_to_owner(dir);
         }
-        Self::init(Connection::open(&path)?)
+        let db = Self::init(Connection::open(&path)?)?;
+        let _ = crate::fsperm::restrict_to_owner(&path);
+        Ok(db)
     }
 
     /// An isolated in-memory DB (tests): same schema/migration, no file.
@@ -223,9 +231,10 @@ impl Db {
                  DROP TABLE IF EXISTS issue_projects;",
             );
         }
-        if ver < SCHEMA_VERSION {
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
+        // NB: user_version is stamped at the END of init (not here), AFTER the
+        // schema batch + every `ver`-gated post-batch cleanup, so a crash mid-init
+        // leaves the OLD version on disk and the next open re-runs the (idempotent)
+        // gated steps rather than skipping a migration that never actually ran.
         // A newer-schema DB (different branch sharing this file): warn + tolerate.
         let schema_mismatch = crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION);
 
@@ -639,6 +648,13 @@ impl Db {
                 "UPDATE notifications SET read=1 WHERE kind='process_failed' AND read=0",
                 [],
             );
+        }
+        // Stamp the schema version LAST — only now that the whole batch + every
+        // `ver`-gated cleanup above has run. A crash before this point leaves the
+        // OLD version on disk so the next open re-runs the (idempotent) steps
+        // instead of skipping a migration that never completed.
+        if ver < SCHEMA_VERSION {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         let db = Db {
             conn,
