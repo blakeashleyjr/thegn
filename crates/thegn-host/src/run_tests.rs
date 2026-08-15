@@ -1,4 +1,29 @@
 use super::*;
+
+/// Sets `XDG_STATE_HOME` for a test's lifetime and RESTORES the prior value on
+/// drop — a blind `remove_var` at test end leaked an unset into later
+/// in-process tests that read `XDG_STATE_HOME` (only visible under `cargo test`,
+/// not the process-isolated `nextest` gate). The caller already holds ENV_LOCK.
+struct XdgGuard(Option<std::ffi::OsString>);
+impl XdgGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let prev = std::env::var_os("XDG_STATE_HOME");
+        // SAFETY: the caller holds ENV_LOCK for the guard's whole lifetime.
+        unsafe { std::env::set_var("XDG_STATE_HOME", path) };
+        XdgGuard(prev)
+    }
+}
+impl Drop for XdgGuard {
+    fn drop(&mut self) {
+        // SAFETY: ENV_LOCK is still held until the guard finishes dropping.
+        unsafe {
+            match self.0.take() {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+}
 use crate::center::CenterTree;
 use crate::hydrate::build_model;
 use crate::naming::issue_branch_tail;
@@ -846,7 +871,7 @@ fn move_active_worktree_reorders_within_workspace_and_anchors_home() {
         now_secs()
     ));
     // SAFETY: test holds ENV_LOCK; sets/clears an XDG var around the calls.
-    unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+    let _xdg = XdgGuard::set(&state_home);
 
     let mut session = three_worktree_session();
     let mut model = build_initial_model(&session, None);
@@ -869,7 +894,6 @@ fn move_active_worktree_reorders_within_workspace_and_anchors_home() {
     let order: Vec<&str> = session.worktrees.iter().map(|g| g.name.as_str()).collect();
     assert_eq!(order, vec!["app/home", "app/beta", "app/alpha"]);
 
-    unsafe { std::env::remove_var("XDG_STATE_HOME") };
     let _ = std::fs::remove_dir_all(&state_home);
 }
 
@@ -882,7 +906,7 @@ fn move_under_computed_sort_flips_to_manual() {
         now_secs()
     ));
     // SAFETY: test holds ENV_LOCK; sets/clears an XDG var around the calls.
-    unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+    let _xdg = XdgGuard::set(&state_home);
 
     let mut session = three_worktree_session();
     let mut model = build_initial_model(&session, None);
@@ -896,7 +920,6 @@ fn move_under_computed_sort_flips_to_manual() {
     assert!(sb.move_active_worktree(&mut model, &mut session, true));
     assert_eq!(sb.view.sort, crate::sidebar::SortMode::Manual);
 
-    unsafe { std::env::remove_var("XDG_STATE_HOME") };
     let _ = std::fs::remove_dir_all(&state_home);
 }
 
@@ -962,7 +985,7 @@ fn sidebar_width_adjust_clamps_and_relayouts() {
     // test never touches the user's state (mirrors the other DB tests here).
     let state_home = std::env::temp_dir().join(format!("tg-host-width-{}", std::process::id()));
     // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
-    unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+    let _xdg = XdgGuard::set(&state_home);
 
     let session = one_tab_session();
     let mut model = build_initial_model(&session, None);
@@ -976,7 +999,6 @@ fn sidebar_width_adjust_clamps_and_relayouts() {
     assert!(matches!(out, SidebarOutcome::Relayout));
 
     // SAFETY: test is single-threaded.
-    unsafe { std::env::remove_var("XDG_STATE_HOME") };
     let _ = std::fs::remove_dir_all(&state_home);
 }
 
@@ -1002,7 +1024,7 @@ fn sidebar_e_toggles_wide_expand_and_persists() {
     // Persisting the flag opens the global DB; redirect it to a temp dir.
     let state_home = std::env::temp_dir().join(format!("tg-host-expand-{}", std::process::id()));
     // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
-    unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+    let _xdg = XdgGuard::set(&state_home);
 
     let session = one_tab_session();
     let mut model = build_initial_model(&session, None);
@@ -1035,7 +1057,6 @@ fn sidebar_e_toggles_wide_expand_and_persists() {
     assert!(!sb.expanded);
 
     // SAFETY: test is single-threaded.
-    unsafe { std::env::remove_var("XDG_STATE_HOME") };
     let _ = std::fs::remove_dir_all(&state_home);
 }
 
@@ -1058,7 +1079,7 @@ fn workspace_pin_persists_globally_not_per_active_workspace() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let state_home = std::env::temp_dir().join(format!("tg-host-wspin-{}", std::process::id()));
     // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
-    unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+    let _xdg = XdgGuard::set(&state_home);
 
     // Two DB-backed workspaces; the active one is "/tmp/app" (session.id).
     let session = Session {
@@ -1116,7 +1137,6 @@ fn workspace_pin_persists_globally_not_per_active_workspace() {
     );
 
     // SAFETY: test is single-threaded.
-    unsafe { std::env::remove_var("XDG_STATE_HOME") };
     let _ = std::fs::remove_dir_all(&state_home);
 }
 
@@ -1162,12 +1182,10 @@ fn load_or_seed_session_recovers_tabs_from_db_when_present() {
     .unwrap();
 
     // SAFETY: test is single-threaded; sets/clears an XDG var around one call.
-    unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+    let _xdg = XdgGuard::set(&state_home);
 
     let (session, seeded) =
         load_or_seed_session(std::path::Path::new("/tmp/app"), &Default::default());
-
-    unsafe { std::env::remove_var("XDG_STATE_HOME") };
 
     assert_eq!(session.worktrees.len(), 1);
     assert_eq!(session.worktrees[0].name, "app/feat");
@@ -1203,13 +1221,12 @@ fn load_or_seed_session_ignores_launch_directory() {
     .unwrap();
 
     // SAFETY: test holds ENV_LOCK; sets/clears an XDG var around one call.
-    unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+    let _xdg = XdgGuard::set(&state_home);
     // Launch from a directory unrelated to either workspace.
     let (session, _) = load_or_seed_session(
         std::path::Path::new("/tmp/somewhere-unrelated"),
         &Default::default(),
     );
-    unsafe { std::env::remove_var("XDG_STATE_HOME") };
     let _ = std::fs::remove_dir_all(&state_home);
 
     assert_eq!(
@@ -1231,10 +1248,9 @@ fn load_or_seed_session_reports_fresh_seed() {
     std::fs::create_dir_all(state_home.join("thegn")).unwrap();
 
     // SAFETY: test holds ENV_LOCK; sets/clears an XDG var around one call.
-    unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+    let _xdg = XdgGuard::set(&state_home);
     let (session, seeded) =
         load_or_seed_session(std::path::Path::new("/tmp/Fresh-Repo"), &Default::default());
-    unsafe { std::env::remove_var("XDG_STATE_HOME") };
 
     assert!(seeded, "an empty DB seeds a fresh home group");
     assert_eq!(session.worktrees.len(), 1);
@@ -1259,13 +1275,11 @@ fn hydration_worker_loads_real_workspaces_into_sidebar() {
     let _ = db.put_workspace("/tmp/repo2", "repo2", "repo");
 
     // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
-    unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+    let _xdg = XdgGuard::set(&state_home);
 
     let (session, _) =
         load_or_seed_session(std::path::Path::new("/tmp/repo1"), &Default::default());
     let model = build_model(&session, &db, crate::hydrate::HydrateHints::default());
-
-    unsafe { std::env::remove_var("XDG_STATE_HOME") };
 
     let slugs: Vec<&str> = model
         .sidebar_workspaces
