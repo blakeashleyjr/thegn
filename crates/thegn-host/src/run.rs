@@ -1162,6 +1162,7 @@ impl SidebarState {
         model.sidebar_menu = self.menu.clone();
         model.sidebar_scroll = self.scroll;
         model.sidebar_rail = self.mode == crate::layout::SidebarMode::Rail;
+        model.sidebar_display = self.view.display.clone();
     }
 
     pub(crate) fn focus_active_row(&mut self, model: &mut FrameModel) {
@@ -6124,6 +6125,7 @@ async fn event_loop<T: Terminal>(
     let mut sb = SidebarState::default();
     sb.view.workspace_sort = keymap.config().ui.sidebar_workspace_sort;
     sb.view.terminals_section = keymap.config().ui.sidebar_terminals_section;
+    sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&keymap.config().ui);
     let mut panel_ui = crate::panel::PanelUi::default();
     if let Ok(db) = thegn_core::db::Db::open() {
         sb.load(&db, SIDEBAR_SCOPE);
@@ -9566,6 +9568,7 @@ async fn event_loop<T: Terminal>(
                     keymap = rebuild_keymap(&new_cfg, &session);
                     sb.view.workspace_sort = new_cfg.ui.sidebar_workspace_sort;
                     sb.view.terminals_section = new_cfg.ui.sidebar_terminals_section;
+                    sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&new_cfg.ui);
                     // Live fullscreen-bar reload: recompute the chrome now if the
                     // user is currently in full-window zoom so the kept/dropped
                     // bars apply immediately (the reload relayouts below anyway).

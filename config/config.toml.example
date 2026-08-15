@@ -85,6 +85,32 @@ sidebar_terminals_section = "always"
 # more immersive (or fully borderless) fullscreen.
 fullscreen_keep_masthead = true
 fullscreen_keep_statusbar = true
+# Worktree-row display in the sidebar. The main line is the dynamic name (the
+# OSC window title a running agent/shell sets), falling back to the branch name.
+# The right cluster carries, in order: the dirty status icon, the uncommitted
+# working-tree line stat (+adds in green / -dels in red, from [theme.hues]
+# green/red), the ↑ahead / ↓behind upstream counts, and a compact open-PR chip
+# (⬡N). Each is an independent toggle:
+sidebar_show_status_icon = true
+sidebar_show_diff_stat = true
+sidebar_show_ahead_behind = true
+sidebar_show_pr_chip = true
+# The focused detail line (branch name + more) hangs under a worktree row while
+# the sidebar owns focus. "all" expands every worktree row; "cursor" expands only
+# the highlighted row; "off" never shows it.
+sidebar_focus_detail = "all"
+# Which fields the focused detail line carries (branch name first, then the total
+# branch-vs-default-branch line stat, then the open PR — env/backend/disk badges
+# always show when present):
+sidebar_detail_branch = true
+sidebar_detail_branch_stat = true
+sidebar_detail_pr = true
+# Override the marker glyphs. Empty = the built-ins (↑ / ↓ / ●, which degrade to
+# ^ / v / * under ASCII caps). A non-empty override is used verbatim and does NOT
+# ASCII-degrade — pick glyphs your terminal renders.
+sidebar_icon_ahead = ""
+sidebar_icon_behind = ""
+sidebar_icon_status = ""
 
 # Visual tuning. The focus accent recolors every thegn surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused
