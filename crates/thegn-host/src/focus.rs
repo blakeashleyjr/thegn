@@ -160,6 +160,43 @@ pub fn forwards_to_pane(zone: Zone) -> bool {
     matches!(zone, Zone::Center | Zone::Drawer | Zone::Corner)
 }
 
+/// Where an Alt+arrow navigation gesture resolves. Unlike `route` (Ctrl focus),
+/// Alt navigation never enters chrome: it moves between center panes, and at the
+/// pane-layout edge falls through to a tab switch (horizontal) or a worktree
+/// switch (vertical). The sidebar/panel/bars stay Ctrl's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavMove {
+    /// An adjacent pane exists in this direction; focus it.
+    Focus(Move),
+    PrevTab,
+    NextTab,
+    PrevWorktree,
+    NextWorktree,
+}
+
+/// Resolve an Alt+arrow gesture. `in_center` is whether the center panes
+/// currently own focus — when focus is on chrome (sidebar/panel/bars/drawer)
+/// there is no "current pane", so Alt always falls through to the tab/worktree
+/// switch. Otherwise, if there is a neighbouring pane in `dir` we move to it;
+/// at the pane-layout edge ←/→ cycle tabs (within the worktree) and ↑/↓ cycle
+/// worktrees (within the workspace).
+pub fn resolve_nav(
+    in_center: bool,
+    dir: Move,
+    layout: &[(PaneId, Rect)],
+    focused_pane: PaneId,
+) -> NavMove {
+    if in_center && neighbor(layout, focused_pane, dir).is_some() {
+        return NavMove::Focus(dir);
+    }
+    match dir {
+        Move::Left => NavMove::PrevTab,
+        Move::Right => NavMove::NextTab,
+        Move::Up => NavMove::PrevWorktree,
+        Move::Down => NavMove::NextWorktree,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +412,46 @@ mod tests {
             locked: false,
         };
         assert!(f.corner() && !f.center());
+    }
+
+    #[test]
+    fn nav_moves_between_panes_before_falling_through() {
+        // Two side-by-side panes: from the left one, Alt+→ focuses the right
+        // pane; from the right one, Alt+← focuses the left pane.
+        let l = two_panes();
+        assert_eq!(
+            resolve_nav(true, Move::Right, &l, 1),
+            NavMove::Focus(Move::Right)
+        );
+        assert_eq!(
+            resolve_nav(true, Move::Left, &l, 2),
+            NavMove::Focus(Move::Left)
+        );
+    }
+
+    #[test]
+    fn nav_edges_fall_through_by_axis_never_chrome() {
+        // No pane in the direction ⇒ ←/→ cycle tabs, ↑/↓ cycle worktrees —
+        // regardless of whether the sidebar/panel are visible (Alt never enters
+        // chrome, so visibility is irrelevant here).
+        let l = two_panes();
+        assert_eq!(resolve_nav(true, Move::Left, &l, 1), NavMove::PrevTab);
+        assert_eq!(resolve_nav(true, Move::Right, &l, 2), NavMove::NextTab);
+        // A single pane has no vertical neighbour either way.
+        assert_eq!(resolve_nav(true, Move::Up, &l, 1), NavMove::PrevWorktree);
+        assert_eq!(resolve_nav(true, Move::Down, &l, 1), NavMove::NextWorktree);
+    }
+
+    #[test]
+    fn nav_from_chrome_always_falls_through() {
+        // When focus is on chrome (not the center), there is no current pane,
+        // so every direction falls through to the tab/worktree switch — Alt
+        // never re-enters the center via a pane move.
+        let l = two_panes();
+        assert_eq!(resolve_nav(false, Move::Left, &l, 1), NavMove::PrevTab);
+        assert_eq!(resolve_nav(false, Move::Right, &l, 1), NavMove::NextTab);
+        assert_eq!(resolve_nav(false, Move::Up, &l, 1), NavMove::PrevWorktree);
+        assert_eq!(resolve_nav(false, Move::Down, &l, 1), NavMove::NextWorktree);
     }
 
     #[test]

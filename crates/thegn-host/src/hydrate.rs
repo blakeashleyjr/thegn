@@ -23,10 +23,21 @@ const PR_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 const ISSUE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Cached git-glyph row for one worktree: `(dirty, ahead, behind, branch,
-/// repo_root)`. Computing it runs a full `git status` (50-150ms), so only the
-/// *active* worktree pays that every Model tick; background worktrees reuse the
-/// last value until it goes stale (see [`should_rescan_glyphs`]).
-pub(crate) type GlyphRow = (bool, usize, usize, Option<String>, String);
+/// repo_root, uncommitted_add, uncommitted_del, branch_diff)`. Computing it runs
+/// a full `git status` (50-150ms), so only the *active* worktree pays that every
+/// Model tick; background worktrees reuse the last value until it goes stale (see
+/// [`should_rescan_glyphs`]). `branch_diff` is the `(added, deleted)` total vs
+/// the default branch, `None` when no base is resolvable.
+pub(crate) type GlyphRow = (
+    bool,
+    usize,
+    usize,
+    Option<String>,
+    String,
+    u32,
+    u32,
+    Option<(u32, u32)>,
+);
 
 /// Process-global staleness cache for background-worktree git glyphs. Mirrors
 /// the global-state pattern of the sibling `activity` subsystem, so it needs no
@@ -78,6 +89,8 @@ pub(crate) fn merge_glyph_scan(
     ahead_behind: std::result::Result<Option<(usize, usize)>, ()>,
     branch: std::result::Result<Option<String>, ()>,
     repo_root: String,
+    uncommitted: std::result::Result<(u32, u32), ()>,
+    branch_diff: std::result::Result<Option<(u32, u32)>, ()>,
 ) -> (GlyphRow, bool) {
     let mut clean = true;
     let dirty = match dirty {
@@ -102,7 +115,33 @@ pub(crate) fn merge_glyph_scan(
             prior.and_then(|p| p.3.clone())
         }
     };
-    ((dirty, ahead, behind, branch, repo_root), clean)
+    let (add, del) = match uncommitted {
+        Ok(ad) => ad,
+        Err(()) => {
+            clean = false;
+            prior.map(|p| (p.5, p.6)).unwrap_or((0, 0))
+        }
+    };
+    let branch_diff = match branch_diff {
+        Ok(bd) => bd,
+        Err(()) => {
+            clean = false;
+            prior.and_then(|p| p.7)
+        }
+    };
+    (
+        (
+            dirty,
+            ahead,
+            behind,
+            branch,
+            repo_root,
+            add,
+            del,
+            branch_diff,
+        ),
+        clean,
+    )
 }
 
 /// A refresh request delivered to the event loop. `Model` rehydrates the
@@ -1060,6 +1099,9 @@ fn collect_sidebar_status(
                         0,
                         None,
                         String::new(),
+                        0,
+                        0,
+                        None,
                     ));
                     reused.push((p.clone(), row));
                     continue;
@@ -1098,6 +1140,8 @@ fn collect_sidebar_status(
                     let dirty = reads.dirty.map_err(|_| ());
                     let ahead_behind = reads.ahead_behind.map_err(|_| ());
                     let branch = reads.branch.map(Some).map_err(|_| ());
+                    let uncommitted = reads.uncommitted.map_err(|_| ());
+                    let branch_diff = reads.branch_diff.map_err(|_| ());
                     let repo_root = thegn_core::repo::main_worktree(wt)
                         .map(|r| r.to_string_lossy().into_owned())
                         .unwrap_or_else(|| p.clone());
@@ -1107,6 +1151,8 @@ fn collect_sidebar_status(
                         ahead_behind,
                         branch,
                         repo_root,
+                        uncommitted,
+                        branch_diff,
                     );
                     (p.clone(), row, clean)
                 })
@@ -1155,16 +1201,31 @@ fn collect_sidebar_status(
         .into_iter()
         .map(|(p, row, _clean)| (p, row))
         .chain(reused)
-        .map(|(p, (dirty, ahead, behind, branch, repo_root))| {
-            (p, dirty, ahead, behind, branch, repo_root)
-        });
-    for (path, dirty, ahead, behind, branch, repo_root) in git_rows {
+        .map(
+            |(p, (dirty, ahead, behind, branch, repo_root, add, del, branch_diff))| {
+                (
+                    p,
+                    dirty,
+                    ahead,
+                    behind,
+                    branch,
+                    repo_root,
+                    add,
+                    del,
+                    branch_diff,
+                )
+            },
+        );
+    for (path, dirty, ahead, behind, branch, repo_root, add, del, branch_diff) in git_rows {
         status.git.insert(
             path.clone(),
             crate::sidebar::GitGlyphs {
                 dirty,
                 ahead,
                 behind,
+                add,
+                del,
+                branch_diff,
             },
         );
         if let Ok(Some(agent)) = db.worktree_agent(&path)

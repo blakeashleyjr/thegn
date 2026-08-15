@@ -1893,6 +1893,72 @@ fn workspace_pool_evicts_lru_and_reaps_its_panes_past_the_limit() {
     assert!(panes.table.contains_key(&3));
 }
 
+/// A one-tab workspace group whose single leaf pane (`pane_id`) is live in
+/// `panes` and has emitted the OSC-2 window title `title`. `focused_pane` is
+/// wired to `pane_id` so [`collect_window_titles`] finds it.
+#[cfg(test)]
+fn titled_group(
+    panes: &mut Panes,
+    name: &str,
+    path: &str,
+    pane_id: u32,
+    title: &str,
+) -> WorktreeGroup {
+    let mut g = WorktreeGroup::new(name, GroupKind::Home, path);
+    g.tabs[0].center = CenterTree::Leaf(pane_id);
+    g.tabs[0].focused_pane = pane_id;
+    panes.insert_test_pane(pane_id);
+    // Feed an OSC-2 set-title sequence so the pane's emulator reports `title`.
+    panes
+        .table
+        .get_mut(&pane_id)
+        .expect("just inserted")
+        .repaint_scrollback(&format!("\x1b]2;{title}\x07"));
+    g
+}
+
+/// The dynamic (OSC) worktree titles are collected for BOTH the active
+/// workspace and every parked (warm) workspace whose panes stay live — so an
+/// unfocused workspace's rows keep their dynamic names instead of reverting to
+/// the branch name.
+#[test]
+fn collect_window_titles_covers_active_and_parked_workspaces() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+
+    // Active workspace: its worktree's live pane emits a title.
+    let active = titled_group(&mut panes, "a/home", "/r/a", 1, "active-title");
+    let session = Session {
+        id: "/r/a".into(),
+        worktrees: vec![active],
+        active: 0,
+    };
+
+    // Parked workspace: its pane stays live in the same table.
+    let parked = titled_group(&mut panes, "b/home", "/r/b", 2, "parked-title");
+    let mut pool = WorkspacePool::default();
+    pool.stash(
+        "/r/b".into(),
+        ResidentWorkspace {
+            worktrees: vec![parked],
+            active: 0,
+        },
+        &mut panes,
+    );
+
+    let titles = collect_window_titles(&session, &pool, &panes);
+    assert_eq!(
+        titles.get("/r/a").map(String::as_str),
+        Some("active-title"),
+        "active workspace title collected"
+    );
+    assert_eq!(
+        titles.get("/r/b").map(String::as_str),
+        Some("parked-title"),
+        "parked workspace's live pane title collected, not dropped to the branch name"
+    );
+}
+
 #[test]
 fn workspace_pool_limit_zero_reaps_on_every_stash() {
     let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);

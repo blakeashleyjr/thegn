@@ -51,8 +51,9 @@ of PTY panes.
 
 - `Alt-t` — new tab on the _same_ worktree; `Alt-T` — a standalone
   terminal tab (no worktree).
-- `Alt-←/→` — move focus left / right (see Splits); at the outer edge, with
-  no pane or chrome left to focus, it switches to the previous / next tab.
+- `Alt-←/→` — move to the pane on the left / right (see Splits); at the pane
+  edge, with no pane left in that direction, it switches to the previous / next
+  tab. It never focuses the [[sidebar]] / [[panel]] — that is `Ctrl-←/→`.
 
 ## Splits
 
@@ -60,11 +61,13 @@ of PTY panes.
 - `Alt-n` / `Alt-N` — split down / split right
 - `Ctrl-←/↓/↑/→` (or `h/j/k/l`) — move focus between panes and out to the
   [[sidebar]] / [[panel]]
-- `Alt-←/→` — the same seamless horizontal motion, but a move that runs off
-  the outer edge falls through to a previous / next tab switch, so one key
-  walks the whole row and keeps going
-- `Alt-↑/↓` — cycle the previous / next worktree within the current workspace.
-  This never focuses the top / bottom bars — that is `Ctrl-↑/↓`.
+- `Alt-←/→` — move to the pane on the left / right, but a move that runs off
+  the pane edge falls through to a previous / next tab switch, so one key walks
+  the row of panes and keeps going into tabs. Unlike `Ctrl-←/→` it never steps
+  into the [[sidebar]] / [[panel]].
+- `Alt-↑/↓` — move to the pane above / below; at the top / bottom pane it
+  switches to the previous / next worktree within the current workspace. This
+  never focuses the top / bottom bars — that is `Ctrl-↑/↓`.
 - `Ctrl-Alt-z` — zoom the focused pane; cycles tiled → maximized → full-window
 - `Ctrl-Alt-y` — sync panes: broadcast typed input to every pane in the tab
 

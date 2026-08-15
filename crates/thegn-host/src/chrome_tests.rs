@@ -467,6 +467,7 @@ fn sidebar_renders_glyphs_caret_and_dirty() {
         dirty: true,
         ahead: 2,
         behind: 1,
+        ..Default::default()
     });
     wt.activity = ActivityState::Active;
     let model = FrameModel {
@@ -505,6 +506,7 @@ fn sidebar_ascii_caps_render_pure_ascii() {
         dirty: true,
         ahead: 2,
         behind: 1,
+        ..Default::default()
     });
     wt.activity = ActivityState::Active;
     wt.alert_count = 3;
@@ -625,8 +627,10 @@ fn sidebar_renders_badges_for_pr_unread_and_alert() {
     let model = FrameModel {
         sidebar_rows: vec![ws, wt],
         // Select the worktree so its two-tier detail line (PR/unread)
-        // expands; the alert badge is always-on on the primary line.
+        // expands; the alert badge is always-on on the primary line. The detail
+        // line only shows while the sidebar owns focus.
         sidebar_selected: 1,
+        sidebar_focused: true,
         ..Default::default()
     };
     let mut s = Surface::new(40, 6);
@@ -637,6 +641,93 @@ fn sidebar_renders_badges_for_pr_unread_and_alert() {
     assert!(text.contains('\u{26a0}'), "alert badge glyph ⚠: {text:?}");
     // Counts render alongside the glyphs.
     assert!(text.contains('2') && text.contains('3') && text.contains('1'));
+}
+
+#[test]
+fn sidebar_worktree_row_shows_diff_stat_pr_chip_and_focus_detail() {
+    use crate::sidebar::{GitGlyphs, RowKind};
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 60,
+        rows: 6,
+    };
+    let mut ws = row(RowKind::Workspace, "app");
+    ws.collapsed = false;
+    let mut wt = row(RowKind::Worktree, "feat");
+    wt.git = Some(GitGlyphs {
+        dirty: true,
+        ahead: 2,
+        behind: 1,
+        add: 42,
+        del: 7,
+        branch_diff: Some((310, 84)),
+    });
+    wt.pr_number = Some(123);
+    let model = FrameModel {
+        sidebar_rows: vec![ws, wt],
+        sidebar_selected: 1,
+        sidebar_focused: true,
+        ..Default::default()
+    };
+    let mut s = Surface::new(rect.cols, rect.rows);
+    draw_sidebar(&mut s, rect, &model);
+    let text = s.screen_chars_to_string();
+    // Uncommitted diff stat (green +adds / red -dels) on the main line.
+    assert!(text.contains("+42"), "additions: {text:?}");
+    assert!(text.contains("-7"), "deletions: {text:?}");
+    // Ahead/behind arrows still render.
+    assert!(
+        text.contains('\u{2191}') && text.contains('\u{2193}'),
+        "arrows: {text:?}"
+    );
+    // Compact PR chip (⬡123), NOT the old `[PR: …]` name wrap.
+    assert!(
+        text.contains('\u{2b21}') && text.contains("123"),
+        "PR chip: {text:?}"
+    );
+    assert!(
+        !text.contains("[PR:"),
+        "PR no longer wraps the name: {text:?}"
+    );
+    // Focused detail line leads with the branch name + the branch-vs-base stat.
+    assert!(text.contains("feat"), "branch on detail line: {text:?}");
+    assert!(
+        text.contains("+310") && text.contains("-84"),
+        "branch stat: {text:?}"
+    );
+}
+
+#[test]
+fn sidebar_worktree_detail_hidden_when_sidebar_unfocused() {
+    use crate::sidebar::{GitGlyphs, RowKind};
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 60,
+        rows: 6,
+    };
+    let mut ws = row(RowKind::Workspace, "app");
+    ws.collapsed = false;
+    let mut wt = row(RowKind::Worktree, "feat");
+    wt.git = Some(GitGlyphs {
+        branch_diff: Some((310, 84)),
+        ..Default::default()
+    });
+    let model = FrameModel {
+        sidebar_rows: vec![ws, wt],
+        sidebar_selected: 1,
+        sidebar_focused: false,
+        ..Default::default()
+    };
+    let mut s = Surface::new(rect.cols, rect.rows);
+    draw_sidebar(&mut s, rect, &model);
+    let text = s.screen_chars_to_string();
+    // No focus → no detail line, so the branch-vs-base stat is absent.
+    assert!(
+        !text.contains("+310"),
+        "detail hidden when unfocused: {text:?}"
+    );
 }
 
 #[test]
@@ -655,8 +746,10 @@ fn sidebar_renders_disk_size_badge() {
     wt.target_bytes = Some(60 * 1024 * 1024 * 1024);
     let model = FrameModel {
         sidebar_rows: vec![ws, wt],
-        // The disk size rides the expanded detail line of the selected row.
+        // The disk size rides the expanded detail line of the selected row,
+        // which shows while the sidebar owns focus.
         sidebar_selected: 1,
+        sidebar_focused: true,
         ..Default::default()
     };
     let mut s = Surface::new(40, 6);
@@ -2055,4 +2148,27 @@ fn center_shows_splash_agrees_across_render_paths() {
     let split_frames = tree.layout_framed(area);
     assert_eq!(split_frames.len(), 2);
     assert!(!center_shows_splash(&split_frames, &loading, |_| true));
+}
+
+#[test]
+fn splash_retires_when_a_pane_goes_live_with_no_load_steps() {
+    // The "loading screen never went away" edge: `load_steps` is ALREADY empty
+    // (bring-up finished, no chrome `dirty` will flip) and then the pane goes
+    // live. `center_shows_splash` must go true→false purely on the `any_live`
+    // flip — the signal the render loop watches to force a full frame so the
+    // splash's blank rows are cleared instead of sticking under incremental
+    // pane output. Guards the state the fix keys on.
+    use crate::center::CenterTree;
+    let area = Rect {
+        x: 0,
+        y: 0,
+        cols: 40,
+        rows: 20,
+    };
+    let frames = CenterTree::single(1).layout_framed(area);
+    let no_steps = FrameModel::default();
+    // Before the pane forks: no live leaf, no steps ⇒ splash.
+    assert!(center_shows_splash(&frames, &no_steps, |_| false));
+    // The instant the pane is live (still no steps) ⇒ splash retires.
+    assert!(!center_shows_splash(&frames, &no_steps, |_| true));
 }

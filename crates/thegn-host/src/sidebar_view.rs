@@ -17,6 +17,102 @@ use crate::chrome::{
 };
 use crate::compositor::Rect;
 
+/// Resolved sidebar row-display options, mirrored from `[ui]` config onto the
+/// [`FrameModel`] so the pure row composers stay config-free (same pattern as
+/// the other model-carried presentation flags). `Default` matches the config
+/// defaults (everything on) so unit-built models render the full row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarDisplay {
+    pub show_status_icon: bool,
+    pub show_diff_stat: bool,
+    pub show_ahead_behind: bool,
+    pub show_pr_chip: bool,
+    pub focus_detail: thegn_core::config::FocusDetail,
+    pub detail_branch: bool,
+    pub detail_branch_stat: bool,
+    pub detail_pr: bool,
+    pub icon_ahead: String,
+    pub icon_behind: String,
+    pub icon_status: String,
+}
+
+impl Default for SidebarDisplay {
+    fn default() -> Self {
+        Self {
+            show_status_icon: true,
+            show_diff_stat: true,
+            show_ahead_behind: true,
+            show_pr_chip: true,
+            focus_detail: thegn_core::config::FocusDetail::All,
+            detail_branch: true,
+            detail_branch_stat: true,
+            detail_pr: true,
+            icon_ahead: String::new(),
+            icon_behind: String::new(),
+            icon_status: String::new(),
+        }
+    }
+}
+
+impl SidebarDisplay {
+    /// Snapshot the row-display options from `[ui]` config.
+    pub fn from_ui(ui: &thegn_core::config::UiConfig) -> Self {
+        Self {
+            show_status_icon: ui.sidebar_show_status_icon,
+            show_diff_stat: ui.sidebar_show_diff_stat,
+            show_ahead_behind: ui.sidebar_show_ahead_behind,
+            show_pr_chip: ui.sidebar_show_pr_chip,
+            focus_detail: ui.sidebar_focus_detail,
+            detail_branch: ui.sidebar_detail_branch,
+            detail_branch_stat: ui.sidebar_detail_branch_stat,
+            detail_pr: ui.sidebar_detail_pr,
+            icon_ahead: ui.sidebar_icon_ahead.clone(),
+            icon_behind: ui.sidebar_icon_behind.clone(),
+            icon_status: ui.sidebar_icon_status.clone(),
+        }
+    }
+
+    /// The `ahead` marker glyph: the config override, or the caps default (`↑` /
+    /// ASCII `^`).
+    fn ahead_glyph(&self) -> String {
+        if self.icon_ahead.is_empty() {
+            crate::caps::active_glyphs().arrow_up.to_string()
+        } else {
+            self.icon_ahead.clone()
+        }
+    }
+
+    /// The `behind` marker glyph: override or caps default (`↓` / `v`).
+    fn behind_glyph(&self) -> String {
+        if self.icon_behind.is_empty() {
+            crate::caps::active_glyphs().arrow_down.to_string()
+        } else {
+            self.icon_behind.clone()
+        }
+    }
+
+    /// The dirty-status marker glyph: override or caps default (`●` / `*`).
+    fn status_glyph(&self) -> String {
+        if self.icon_status.is_empty() {
+            crate::caps::active_glyphs().dot_filled.to_string()
+        } else {
+            self.icon_status.clone()
+        }
+    }
+
+    /// Whether a row's detail line shows, given focus and whether it's the
+    /// cursor row. The detail line only appears while the sidebar owns focus.
+    fn show_detail(&self, focused: bool, is_cursor: bool) -> bool {
+        use thegn_core::config::FocusDetail;
+        match self.focus_detail {
+            FocusDetail::Off => false,
+            _ if !focused => false,
+            FocusDetail::All => true,
+            FocusDetail::Cursor => is_cursor,
+        }
+    }
+}
+
 /// A row context menu (item 27): a short list of actions scoped to the row the
 /// cursor sat on when it opened.
 #[derive(Debug, Clone, Default)]
@@ -371,7 +467,19 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
             } else {
                 None
             };
-            compose_row_lines(row, wt, is_cursor, is_last, slots[i], pool)
+            let show_detail = model
+                .sidebar_display
+                .show_detail(model.sidebar_focused, is_cursor);
+            compose_row_lines(
+                row,
+                wt,
+                is_cursor,
+                show_detail,
+                is_last,
+                slots[i],
+                pool,
+                &model.sidebar_display,
+            )
         };
         // A section banner gets a breathing gap above it (except at the top).
         if !rail && row.kind == RowKind::SectionHeading && i > 0 {
@@ -823,20 +931,24 @@ fn activity_dot_tok(state: crate::sidebar::ActivityState) -> crate::seg::Tok {
 
 /// Compose the on-screen line(s) for one visible row. Headers (workspace / host
 /// / folder) are a single bold styled line; section banners render like the
-/// "WORKSPACES" title; worktrees are a name/status split, and the cursor row
-/// (`expanded`) grows a second detail line carrying the secondary metadata
-/// (env / backend / PR / unread / disk). `slot` is the Ctrl+1..9 quick-jump
-/// digit for switchable workspace rows. Every line starts with a 1-col gutter
-/// so the focus bar can overpaint col 0.
+/// "WORKSPACES" title; worktrees are a name/status split. `is_cursor` renders the
+/// name in full (vs dim) for the highlighted row; `show_detail` grows a second
+/// detail line carrying the branch + secondary metadata (env / backend / PR /
+/// unread / disk), gated by the focused-detail policy. `slot` is the Ctrl+1..9
+/// quick-jump digit for switchable workspace rows. Every line starts with a
+/// 1-col gutter so the focus bar can overpaint col 0.
+#[allow(clippy::too_many_arguments)]
 fn compose_row_lines(
     row: &crate::sidebar::SidebarRow,
     window_title: Option<&str>,
-    expanded: bool,
+    is_cursor: bool,
+    show_detail: bool,
     is_last: bool,
     slot: Option<u8>,
     // Warm-spare-pool `(ready, target)` for THIS row — `Some` only on the active
     // workspace's row (pool is per-workspace); `None` hides the chip.
     pool: Option<(usize, usize)>,
+    disp: &SidebarDisplay,
 ) -> Vec<crate::seg::Line> {
     use crate::seg::{Line, Seg, Tok, seg, sp};
     use crate::sidebar::{ActivityState, RowKind};
@@ -955,7 +1067,7 @@ fn compose_row_lines(
             }
             let name_fg = if row.active {
                 Tok::Slot(S::Focus)
-            } else if expanded {
+            } else if is_cursor {
                 Tok::Slot(S::Text)
             } else {
                 Tok::Slot(S::Dim)
@@ -965,10 +1077,13 @@ fn compose_row_lines(
             if let Some(prefix) = &row.repo_prefix {
                 left.push(seg(Tok::Slot(S::Faint), format!("{prefix}/")));
             }
-            let label = crate::sidebar::compose_row_label(row.pr_number, window_title, &row.label);
+            // Main line is the dynamic name (OSC window title) or the branch; PR
+            // moves to a compact right-cluster chip + the focused detail line.
+            let label = crate::sidebar::compose_row_label(window_title, &row.label);
             left.push(seg(name_fg, label));
 
-            // Right cluster (always-on): git status + alert badge (PR/unread/disk move to the detail line).
+            // Right cluster (always-on): git status icon + uncommitted diff stat +
+            // ahead/behind + PR chip + alert badge (the rest moves to the detail).
             let mut right: Vec<Seg> = Vec::new();
             let push_sp = |v: &mut Vec<Seg>| {
                 if !v.is_empty() {
@@ -976,24 +1091,42 @@ fn compose_row_lines(
                 }
             };
             if let Some(g) = row.git {
-                if g.dirty {
-                    right.push(seg(Tok::Hue(theme::Hue::Amber), gl.dot_filled)); // ●
+                if g.dirty && disp.show_status_icon {
+                    right.push(seg(Tok::Hue(theme::Hue::Amber), disp.status_glyph())); // ●
                 }
-                if g.ahead > 0 {
-                    push_sp(&mut right);
-                    right.push(seg(
-                        Tok::Slot(S::Dim),
-                        format!("{}{}", gl.arrow_up, g.ahead),
-                    )); // ↑N
+                if disp.show_diff_stat {
+                    if g.add > 0 {
+                        push_sp(&mut right);
+                        right.push(seg(Tok::Hue(theme::Hue::Green), format!("+{}", g.add)));
+                    }
+                    if g.del > 0 {
+                        push_sp(&mut right);
+                        right.push(seg(Tok::Hue(theme::Hue::Red), format!("-{}", g.del)));
+                    }
                 }
-                if g.behind > 0 {
-                    push_sp(&mut right);
-                    right.push(seg(
-                        Tok::Slot(S::Dim),
-                        format!("{}{}", gl.arrow_down, g.behind),
-                    ));
-                    // ↓N
+                if disp.show_ahead_behind {
+                    if g.ahead > 0 {
+                        push_sp(&mut right);
+                        right.push(seg(
+                            Tok::Slot(S::Dim),
+                            format!("{}{}", disp.ahead_glyph(), g.ahead),
+                        )); // ↑N
+                    }
+                    if g.behind > 0 {
+                        push_sp(&mut right);
+                        right.push(seg(
+                            Tok::Slot(S::Dim),
+                            format!("{}{}", disp.behind_glyph(), g.behind),
+                        )); // ↓N
+                    }
                 }
+            }
+            // Compact open-PR chip (⬡N) — the full `PR #N` moves to the detail line.
+            if disp.show_pr_chip
+                && let Some(n) = row.pr_number
+            {
+                push_sp(&mut right);
+                right.push(seg(Tok::Hue(theme::Hue::Green), format!("{}{}", gl.hex, n)));
             }
             if row.alert_count > 0 {
                 push_sp(&mut right);
@@ -1017,7 +1150,7 @@ fn compose_row_lines(
             } else {
                 Line::Split { l: left, r: right }
             }];
-            if expanded && let Some(detail) = crate::sidebar::compose_detail_line(row) {
+            if show_detail && let Some(detail) = crate::sidebar::compose_detail_line(row, disp) {
                 lines.push(detail);
             }
             lines

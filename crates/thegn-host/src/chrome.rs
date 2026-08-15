@@ -322,6 +322,9 @@ pub struct FrameModel {
     /// True when the sidebar is in its slim collapsed rail mode (activity dots
     /// + initials only); false renders the full panel.
     pub sidebar_rail: bool,
+    /// Resolved worktree-row display options (from `[ui]` config): which right-
+    /// cluster fields show, the focused-detail policy, and icon overrides.
+    pub sidebar_display: crate::sidebar_view::SidebarDisplay,
     /// Live sidebar drag feedback (source lift + drop affordance). Mouse-
     /// gesture-transient: set per drag sample, cleared on release/cancel;
     /// never part of `hydration_eq` (a mid-gesture model swap just clears it
