@@ -58,7 +58,8 @@ initial feature set rather than a delta.
 - **CLI** — a stable, documented exit-code contract; worktree targeting
   unified on a canonical `--worktree` flag across verbs (legacy positionals
   still parse); `thegn config validate` strict-checks every enum-valued config
-  key, and `thegn config set` rolls back values the loader would reject.
+  key, and `thegn config set` rolls back a value the loader would reject
+  (without being blocked by a pre-existing bad value elsewhere in the file).
 - **Config** — layered TOML (global → repo → env/profile overlays → env vars
   → `--set`), every key documented in `config/config.toml.example`, hot
   reload, and an in-app F1 help system with generated keybinding/config
