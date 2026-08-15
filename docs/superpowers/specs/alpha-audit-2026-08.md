@@ -6,7 +6,38 @@ dimension was surveyed by an independent finder; every finding below survived
 data-loss/security-critical · **P1** correctness or security on a user path ·
 **P2** notable defect / hardening gap · **P3** polish.
 
-**Confirmed: 73** (9 P1, 34 P2, 30 P3). Fix status is tracked inline (✅ fixed · ⏳ deferred → KNOWN_ISSUES).
+**Confirmed: 73** (9 P1, 34 P2, 30 P3).
+
+## Fix status (2026-08-14 remediation pass)
+
+**Fixed this pass** (commits `fix(audit):` + `fix(excise):`):
+
+- **P1** — compositor teardown on a single pane's PTY write error (`run.rs`);
+  lost persisted scrollback on the cold-workspace id-remap (`workspace_pool.rs`);
+  `thegn land` exit-0-on-failure (`cmd/land.rs`); onboarding wizard's removed
+  `thegn agent setup` step (`onboarding.rs`).
+- **P2** — control-socket owner-only (0600) + run-dir 0700 hardening, and the
+  documented-but-unimplemented "same uid" claim (`ipc.rs`, `daemon/mod.rs`,
+  `config_daemon.rs`); `[serve] bind` default → loopback; `thegn serve` silent
+  exit-0 when the pane daemon owns the socket; `config set` re-validate + roll
+  back a config-bricking value; the CLI exit-code / silent-refusal family
+  (`pr merge`, `merge`/`merge rm`, `env deprovision --all`, `wt diff --base`,
+  `pair`, `ci`, `share`, `wt clean`/`rm`).
+- **P3** — revtunnel + config.toml.example excision stragglers.
+
+**Deferred → [`KNOWN_ISSUES.md`](../../../KNOWN_ISSUES.md)** (regression risk in
+the ~18k-line loop, or large test-writing efforts not worth taking right before
+the first release): the event-loop off-thread moves (sandbox ensure / PTY paste
+/ ui_state & layout persists on the loop); daemon/serve edges (version-skew
+handshake, idle-exit with the TCP listener up, disable-with-persisted-panes
+duplication, resync history replay, worktree-path confinement); the merge-gate
+cross-process lock; the daemon-janitor + warm-attach test gaps; test-hermeticity
+flakes (shared-gate integrate tests under in-process `cargo test` — green under
+the nextest gate — and `THEGN_SANDBOX=1`-sensitive sandbox tests); the remaining
+CLI-shape (`--worktree` flag vs positional) and optimistic-tracker polish.
+
+Full detail per finding follows; the inline **Status: ⏳** markers below predate
+this summary and are superseded by it.
 
 ## P1
 
