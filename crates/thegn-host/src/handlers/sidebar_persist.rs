@@ -120,26 +120,27 @@ impl SidebarState {
     }
 
     /// Persist a single `ui_state` key in the global [`SIDEBAR_SCOPE`].
+    ///
+    /// Kept synchronous: a view-preference toggle is rare and the write is tiny,
+    /// and callers (+ tests) rely on read-after-write within the same session
+    /// (re-loading a fresh `SidebarState` immediately reflects the change). The
+    /// off-loop background writer would break that ordering for negligible gain.
     pub(crate) fn persist(&self, key: &str, value: &str) {
-        // Off the loop via the background writer: a `Db::open` + write on the
-        // event loop stalls it (5s busy-timeout ceiling under a concurrent
-        // instance) for a mere view preference. Best-effort — a lost write only
-        // loses a preference, never sidebar correctness.
-        let (key, value) = (key.to_string(), value.to_string());
-        crate::db_task::persist(move |db| {
-            let _ = db.set_ui_state(SIDEBAR_SCOPE, &key, &value);
-        });
+        if let Ok(db) = thegn_core::db::Db::open() {
+            // best-effort: the DB is a cache; a failed persist only loses a
+            // view preference, never sidebar correctness
+            let _ = db.set_ui_state(SIDEBAR_SCOPE, key, value);
+        }
     }
 
     /// Delete a single `ui_state` key in the global [`SIDEBAR_SCOPE`] — the
     /// counterpart of [`Self::persist`] for boolean keys returning to their
     /// default (unpinned / expanded), which are removed rather than tombstoned.
     pub(crate) fn unpersist(&self, key: &str) {
-        let key = key.to_string();
-        crate::db_task::persist(move |db| {
+        if let Ok(db) = thegn_core::db::Db::open() {
             // best-effort: same cache rule as `persist`
-            let _ = db.del_ui_state(SIDEBAR_SCOPE, &key);
-        });
+            let _ = db.del_ui_state(SIDEBAR_SCOPE, key);
+        }
     }
 
     /// The currently-selected visible row, if any.
