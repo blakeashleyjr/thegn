@@ -19,7 +19,9 @@ pub struct DaemonConfig {
     pub enabled: bool,
     /// Control-socket override; empty ⇒ resolved per [`DaemonConfig::socket_path`].
     pub socket: String,
-    /// Exit after this long with no sessions and no clients; `0` = never.
+    /// Exit after this long with no live sessions; `0` = never. Ignored by
+    /// `thegn serve` — a serving daemon keeps its TCP listener up for thin
+    /// clients that haven't connected yet, so it never idle-exits.
     pub idle_exit_secs: u64,
     /// Keep a detached session's PTY warm this long (the relay lease grace);
     /// `0` = never reap — a detached session lives until explicitly killed

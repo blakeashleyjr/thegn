@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use thegn_core::control_wire::{EventDecoder, EventFrame};
+use thegn_core::control_wire::{EventDecoder, EventFrame, PROTO_VERSION};
 use thegn_core::store::{ControlStore, DaemonRow};
 
 use super::{OpenSpec, SessionInfo};
@@ -263,7 +263,10 @@ impl ControlClient {
     }
 
     /// Warm-attach over WebSocket. The first frames on `frames` are `Hello`
-    /// then the `PaneSnapshot`; live deltas follow.
+    /// then the `PaneSnapshot`; live deltas follow. The snapshot carries the
+    /// scrollback history tail (a fresh client emulator wants the context);
+    /// reconnect paths use [`Self::attach_opts`] with `include_history =
+    /// false`.
     pub async fn attach(
         &self,
         session: &str,
@@ -272,8 +275,25 @@ impl ControlClient {
         cols: u16,
         observer: bool,
     ) -> Result<AttachStream> {
+        self.attach_opts(session, client_id, rows, cols, observer, true)
+            .await
+    }
+
+    /// [`Self::attach`] with explicit control over the snapshot's scrollback
+    /// context: a reconnect re-feeds an emulator that already holds the
+    /// history, so it passes `include_history = false` and the daemon omits
+    /// the tail (repaint only — no duplicated scrollback).
+    pub async fn attach_opts(
+        &self,
+        session: &str,
+        client_id: &str,
+        rows: u16,
+        cols: u16,
+        observer: bool,
+        include_history: bool,
+    ) -> Result<AttachStream> {
         let path = format!(
-            "/v1/sessions/{session}/attach?client_id={client_id}&rows={rows}&cols={cols}&observer={observer}"
+            "/v1/sessions/{session}/attach?client_id={client_id}&rows={rows}&cols={cols}&observer={observer}&history={include_history}"
         );
         let (host, token) = match &self.addr {
             ControlAddr::Unix(_) => ("localhost".to_string(), None),
@@ -295,7 +315,9 @@ impl ControlClient {
         }
         let req = req.body(()).context("build attach request")?;
 
-        let ws = match &self.addr {
+        let (frame_tx, frame_rx) = tokio_mpsc::channel::<EventFrame>(256);
+        let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<AttachControl>(64);
+        match &self.addr {
             ControlAddr::Unix(sock) => {
                 let ep = crate::ipc::IpcEndpoint::for_socket_path(sock);
                 let stream = crate::ipc::connect(&ep)
@@ -304,7 +326,7 @@ impl ControlClient {
                 let (ws, _) = tokio_tungstenite::client_async(req, stream)
                     .await
                     .context("attach websocket handshake")?;
-                WsEither::Ipc(ws)
+                start_attach(ws, frame_tx, ctrl_rx).await?;
             }
             ControlAddr::Tcp { addr, .. } => {
                 let stream = tokio::net::TcpStream::connect(addr)
@@ -313,13 +335,9 @@ impl ControlClient {
                 let (ws, _) = tokio_tungstenite::client_async(req, stream)
                     .await
                     .context("attach websocket handshake")?;
-                WsEither::Tcp(ws)
+                start_attach(ws, frame_tx, ctrl_rx).await?;
             }
-        };
-
-        let (frame_tx, frame_rx) = tokio_mpsc::channel::<EventFrame>(256);
-        let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<AttachControl>(64);
-        tokio::spawn(pump_attach_ws(ws, frame_tx, ctrl_rx));
+        }
         Ok(AttachStream {
             frames: frame_rx,
             control: ctrl_tx,
@@ -329,33 +347,89 @@ impl ControlClient {
 
 type Ws<S> = tokio_tungstenite::WebSocketStream<S>;
 
-/// The two attach transports, unified for the pump.
-enum WsEither {
-    /// Local daemon IPC (unix socket / Windows named pipe).
-    Ipc(Ws<crate::ipc::IpcStream>),
-    Tcp(Ws<tokio::net::TcpStream>),
-}
+/// Longest we wait for the daemon's greeting after the WS handshake before
+/// declaring the connect wedged. The `Hello` is sent immediately after the
+/// server-side attach succeeds, so a healthy connect never comes near this.
+const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-async fn pump_attach_ws(
-    ws: WsEither,
+/// Read the daemon's greeting, enforce protocol compatibility, forward the
+/// initial frame(s), then hand the socket to the long-lived pump.
+///
+/// This is the version-skew guard: the daemon greets every attach with
+/// [`EventFrame::Hello`] carrying its `PROTO_VERSION`, and an incompatible
+/// daemon (an old binary surviving an upgrade, or vice versa) is refused HERE
+/// with an actionable error instead of misdecoding frames mid-session. The
+/// same-version path pays no extra round trip — the greeting bytes are
+/// already in flight behind the handshake.
+async fn start_attach<S>(
+    mut ws: Ws<S>,
     frames: tokio_mpsc::Sender<EventFrame>,
     ctrl: tokio_mpsc::Receiver<AttachControl>,
-) {
-    match ws {
-        WsEither::Ipc(ws) => pump_attach_inner(ws, frames, ctrl).await,
-        WsEither::Tcp(ws) => pump_attach_inner(ws, frames, ctrl).await,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio_tungstenite::tungstenite::Message;
+    let mut decoder = EventDecoder::new();
+    let deadline = tokio::time::Instant::now() + HELLO_TIMEOUT;
+    let first = loop {
+        let msg = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .map_err(|_| anyhow!("pane daemon sent no greeting within {HELLO_TIMEOUT:?}"))?;
+        match msg {
+            Some(Ok(Message::Binary(bytes))) => {
+                decoder.push(&bytes);
+                let ready = decoder.drain().map_err(|e| {
+                    anyhow!(
+                        "undecodable greeting from the pane daemon ({e}) — likely a \
+                         protocol-incompatible daemon; restart it (`thegn daemon`) or \
+                         quit stale daemons"
+                    )
+                })?;
+                if !ready.is_empty() {
+                    break ready;
+                }
+            }
+            // The server's attach-failure envelope (a JSON text frame).
+            Some(Ok(Message::Text(text))) => {
+                let msg = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_else(|| text.to_string());
+                return Err(anyhow!("attach refused: {msg}"));
+            }
+            Some(Ok(_)) => continue, // ping/pong
+            Some(Err(e)) => return Err(anyhow!("attach websocket error: {e}")),
+            None => return Err(anyhow!("attach stream closed before the daemon's greeting")),
+        }
+    };
+    if let Some(EventFrame::Hello(h)) = first.first()
+        && h.proto != PROTO_VERSION
+    {
+        return Err(anyhow!(
+            "pane daemon ({}) speaks control protocol v{}, this thegn speaks v{PROTO_VERSION} — \
+             restart the daemon (`thegn daemon`) or quit stale daemons",
+            h.server,
+            h.proto,
+        ));
     }
+    for f in first {
+        // The channel is fresh (cap 256); the greeting burst always fits.
+        let _ = frames.send(f).await;
+    }
+    tokio::spawn(pump_attach_inner(ws, decoder, frames, ctrl));
+    Ok(())
 }
 
 async fn pump_attach_inner<S>(
     mut ws: Ws<S>,
+    mut decoder: EventDecoder,
     frames: tokio_mpsc::Sender<EventFrame>,
     mut ctrl: tokio_mpsc::Receiver<AttachControl>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     use tokio_tungstenite::tungstenite::Message;
-    let mut decoder = EventDecoder::new();
     loop {
         tokio::select! {
             msg = ws.next() => match msg {
@@ -454,4 +528,115 @@ where
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
     Ok((status, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thegn_core::db::Db;
+
+    fn daemon_row(id: &str, scope: &str, endpoint: &str, heartbeat_at: i64) -> DaemonRow {
+        DaemonRow {
+            daemon_id: id.into(),
+            pid: 1,
+            scope: scope.into(),
+            endpoint: endpoint.into(),
+            tcp_addr: None,
+            hostname: "h".into(),
+            version: "0".into(),
+            started_at: 0,
+            heartbeat_at,
+        }
+    }
+
+    /// Discovery is scope-bound and freshness-bound: a stale-heartbeat row and
+    /// a fresh row for ANOTHER scope must both lose to the fresh same-scope
+    /// daemon (freshest heartbeat wins among candidates).
+    #[test]
+    fn discover_picks_the_fresh_same_scope_daemon() {
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        db.put_daemon(&daemon_row(
+            "stale-same",
+            "/scope/a",
+            "/run/stale.sock",
+            now - DAEMON_HEARTBEAT_TTL_MS - 1,
+        ))
+        .unwrap();
+        db.put_daemon(&daemon_row(
+            "fresh-other",
+            "/scope/b",
+            "/run/other.sock",
+            now - 1,
+        ))
+        .unwrap();
+        db.put_daemon(&daemon_row(
+            "fresh-same",
+            "/scope/a",
+            "/run/fresh.sock",
+            now - 10,
+        ))
+        .unwrap();
+
+        let got = discover(&db, "/scope/a", now).expect("a live same-scope daemon exists");
+        match got {
+            ControlAddr::Unix(p) => assert_eq!(p, PathBuf::from("/run/fresh.sock")),
+            other => panic!("expected a unix addr, got {other:?}"),
+        }
+    }
+
+    /// All same-scope heartbeats stale ⇒ `None` (callers degrade gracefully —
+    /// no daemon is spawned as a side effect of discovery).
+    #[test]
+    fn discover_returns_none_when_every_heartbeat_is_stale() {
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        db.put_daemon(&daemon_row(
+            "stale-1",
+            "/scope/a",
+            "/run/1.sock",
+            now - DAEMON_HEARTBEAT_TTL_MS - 1,
+        ))
+        .unwrap();
+        db.put_daemon(&daemon_row("stale-2", "/scope/a", "/run/2.sock", 0))
+            .unwrap();
+        assert!(discover(&db, "/scope/a", now).is_none());
+    }
+
+    /// The version-skew guard: a daemon greeting with an incompatible
+    /// `Hello.proto` must fail the attach with an actionable error instead of
+    /// handing the caller a stream it will misdecode.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attach_refuses_an_incompatible_daemon_proto() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = EventFrame::Hello(thegn_core::control_wire::Hello {
+                proto: PROTO_VERSION + 1,
+                server: "oldhost thegn 0.0".into(),
+                scopes: vec![],
+            });
+            let _ = ws.send(Message::Binary(hello.encode().into())).await;
+            let _ = ws.next().await; // hold the socket open until the client reacts
+        });
+
+        let client = ControlClient::new(ControlAddr::Tcp {
+            addr,
+            token: "t".into(),
+        });
+        let err = client
+            .attach("s1", "c1", 24, 80, false)
+            .await
+            .err()
+            .expect("a proto mismatch must refuse the connect");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("restart the daemon"),
+            "error must be actionable: {msg}"
+        );
+    }
 }
