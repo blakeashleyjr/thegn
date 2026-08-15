@@ -1,9 +1,9 @@
 # Known issues — 0.1.0-alpha.1
 
 This is a public **alpha**. The items below are known, tracked, and deferred to
-a later release — each is a narrow edge case or a change whose fix carries more
-regression risk than it's worth right before the first release. The pre-alpha
-audit (73 verified findings) is otherwise fully remediated; full detail lives in
+a later release — each is a narrow edge case or a deliberate design trade-off.
+The pre-alpha audit (73 verified findings) is otherwise fully remediated; full
+detail lives in
 [`docs/superpowers/specs/alpha-audit-2026-08.md`](docs/superpowers/specs/alpha-audit-2026-08.md).
 
 If you hit one of these it's a known limitation — but a reproducible report is
@@ -11,55 +11,38 @@ still welcome.
 
 ## Performance (event loop)
 
-A few paths still do work on the event loop rather than off-thread. None block
-indefinitely (the DB uses a 5s busy-timeout ceiling) and idle CPU stays ~0%, but
-under contention they can cost a frame:
+Idle CPU stays ~0% and pane bring-up (creation, crash respawn, the new-terminal
+wizard) resolves sandboxes off-thread. Two narrow paths remain on the loop:
 
-- **Crash respawn** re-resolves the sandbox on the loop (`pty_drain.rs`) — a slow
-  container (re)create can stall the frame while a crashed pane respawns. Steady
-  state is unaffected; only the exceptional respawn path.
-- A **large paste** into a non-reading / flow-controlled local PTY does a
-  blocking `write_all` on the loop (`pane.rs`). Bounded by the kernel PTY buffer
-  (~64 KB); the daemon-backed transport already drops instead of blocking.
 - `persist_session_layout` is a deliberately **synchronous** whole-session
-  persist on structural changes (documented; the lightweight focus-change persist
-  already runs off-loop). ~50–100 ms in release on a large session.
-- The new-terminal wizard spawns its shell synchronously on submit (a one-shot,
-  user-triggered action).
-
-Moving these off-thread is mechanical but touches the ~18k-line loop; deferred to
-keep the alpha's render invariants stable.
+  persist on structural changes (documented; the lightweight focus-change
+  persist already runs off-loop). ~50–100 ms in release on a large session.
+- The startup-shell **watchdog's clean-shell fallback** (fired only when a
+  freshly materialized shell produces no output before its deadline) still
+  resolves its launch spec synchronously — an exceptional failure-recovery
+  path.
 
 ## Daemon / remote serving (`thegn serve`)
 
-`thegn serve` (remote thin clients) is the newest surface. Hardened substantially
-this release (loopback-default bind, owner-only socket + run-dir, control-plane
-worktree-path confinement, protocol version-skew handshake, no idle-exit while
-serving, no scrollback re-replay on reconnect, TOCTOU-safe socket election).
-Remaining edge:
+`thegn serve` (remote thin clients) is the newest surface. Hardened
+substantially this release (loopback-default bind, owner-only socket + run-dir,
+control-plane worktree-path confinement, protocol version-skew handshake, no
+idle-exit while serving, no scrollback re-replay on reconnect, TOCTOU-safe
+socket election), and disabling the daemon with persisted daemon-backed panes
+now claims each persisted session exactly once (respawning it in-process and
+stopping the daemon copy) instead of duplicating panes. No open issues are
+tracked here at release time — treat surprises on this surface as reportable
+bugs, not known limitations.
 
-- Disabling the daemon (`[daemon] enabled = false` / `THEGN_NO_DAEMON`) while
-  panes were persisted daemon-backed can duplicate a pane on the in-process
-  fallback path.
+Note: launching with `THEGN_NO_DAEMON=1` while daemon-backed sessions are
+persisted now actively stops those daemon sessions as it claims them (previously
+they were silently orphaned).
 
 ## Concurrency
 
 - A few best-effort persists (focus / active-tab pointer, corner-pane parsing)
   have benign unordered-writer races; last-writer-wins, no corruption. (The
   merge-gate cross-process race is now fixed with an flock.)
-
-## CLI
-
-- Several worktree-targeting verbs mix a `--worktree` flag with a positional
-  argument; this will be unified in a later release.
-
-## Config
-
-- `thegn config validate` type-checks the common enum keys (sandbox, log, theme,
-  merge_queue, pins, …) but not yet every one of the ~50 `config_enum!` types, so
-  an out-of-range value for an uncovered enum can still pass `validate`. It is
-  caught — and rolled back — by `thegn config set`, which re-parses the whole
-  file after writing.
 
 ## Platform
 

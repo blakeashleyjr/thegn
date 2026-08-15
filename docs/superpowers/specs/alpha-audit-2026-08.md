@@ -53,6 +53,35 @@ flakes (shared-gate integrate tests under in-process `cargo test` — green unde
 the nextest gate — and `THEGN_SANDBOX=1`-sensitive sandbox tests); the remaining
 CLI-shape (`--worktree` flag vs positional) and optimistic-tracker polish.
 
+### Third pass (2026-08-15 — KNOWN_ISSUES clearance)
+
+The deferred set was then cleared ahead of the tag. **Fixed** (commits
+`fix(respawn):`, `fix(daemon):`, `fix(wizard):`, `fix(pane):`, `fix(cli):`,
+`fix(config):`, `chore(release):`):
+
+- **Crash respawn off-loop** — the active-tab sole-pane crash path no longer
+  resolves the sandbox synchronously; the dead leaf rides the off-thread
+  materialize pipeline (with a departed-leaf guard in `materialize_with_specs`).
+- **Daemon-disable duplication** — persisted daemon-backed panes are claimed
+  exactly once on the in-process fallback; the daemon copies are stopped
+  (quit-race latch flushed in `main.rs`), not leaked.
+- **Wizard off-thread spawn** — new-terminal submit stages a placeholder leaf
+  for materialize; the user's connection/sandbox choice rides an in-process
+  registry so a failed persist can't downgrade the live spawn.
+- **Large-paste blocking write** — per-pane stdin writer thread (shared with
+  the daemon session actor), typed Full/Closed congestion errors at every call
+  site, atomic bracketed-paste chunks with marker neutralization on all paths.
+- **CLI `--worktree` unification** — canonical flag across scope-selector
+  verbs, hidden deprecated positionals, `resolve_worktree` everywhere.
+- **`config validate` enum coverage** — schema-driven walker strict-checks
+  every `config_enum!` key (61 pinned by a completeness test).
+- **Release pipeline** — the tag workflow now actually creates the draft
+  release; `macos-15-intel` replaces the retired `macos-13`; LICENSE added.
+
+Still deferred (by design / exceptional-path, see `KNOWN_ISSUES.md`):
+synchronous `persist_session_layout`, the startup-watchdog clean-shell
+fallback's on-loop spec resolve, and the benign unordered best-effort persists.
+
 Full detail per finding follows; the inline **Status: ⏳** markers below predate
 this summary and are superseded by it.
 
