@@ -434,8 +434,11 @@ allow_public = false
 server_addr = "x"
 subdomain_host = "y"
 EOF
+# A refused public share exits non-zero (misuse a script must detect) AND names
+# the reason. Capture output so the message check works under `set -e`/pipefail
+# even though the command is expected to fail.
 check "share allow_public guard refuses public shares" \
-  "'$SZ' --config '$TMP/share-guard.toml' share start 3000 --worktree '$WT' 2>&1 | grep -q 'public sharing is disabled'"
+  "out=\$('$SZ' --config '$TMP/share-guard.toml' share start 3000 --worktree '$WT' 2>&1) || printf '%s' \"\$out\" | grep -q 'public sharing is disabled'"
 
 # Intent-first reach mapping: `--reach peer` resolves to the iroh provider.
 cat >"$TMP/share-reach.toml" <<EOF
@@ -459,9 +462,9 @@ check "share --reach peer resolves to the iroh provider" \
 kill "$REACH_PID" 2>/dev/null || true
 wait "$REACH_PID" 2>/dev/null || true
 
-# An invalid reach is rejected cleanly (exit 0 with a message).
+# An invalid reach is rejected: exit non-zero (misuse) with a message naming it.
 check "share rejects an invalid --reach value" \
-  "'$SZ' --config '$TMP/share-reach.toml' share start 3000 --reach bogus --worktree '$WT' 2>&1 | grep -q 'reach'"
+  "out=\$('$SZ' --config '$TMP/share-reach.toml' share start 3000 --reach bogus --worktree '$WT' 2>&1) || printf '%s' \"\$out\" | grep -q 'reach'"
 
 # ── auto port forwarding (`[forward]`) ───────────────────────────────────────
 # Config round-trips (the [forward] block parses + serializes) and the
