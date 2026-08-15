@@ -2353,27 +2353,5 @@ fn crash_count_keys_are_independent() {
     assert!(!counts.contains_key(&key_b));
 }
 
-#[test]
-fn neutralize_paste_markers_strips_embedded_brackets() {
-    // A clipboard payload that tries to close the paste bracket early and inject
-    // a command must have its markers removed before it is written into the pane.
-    let hostile = "ls\x1b[201~\nrm -rf ~\n";
-    let safe = neutralize_paste_markers(hostile);
-    assert!(!safe.contains("\x1b[201~"), "end marker survived: {safe:?}");
-    assert!(
-        safe.contains("rm -rf ~"),
-        "content preserved (just defused)"
-    );
-
-    // A stray start marker is dropped too.
-    let with_start = "a\x1b[200~b";
-    assert_eq!(neutralize_paste_markers(with_start), "ab");
-
-    // Clean text is passed through by reference (no allocation, no change).
-    let clean = "plain text\nline two";
-    assert!(matches!(
-        neutralize_paste_markers(clean),
-        std::borrow::Cow::Borrowed(_)
-    ));
-    assert_eq!(neutralize_paste_markers(clean), clean);
-}
+// `neutralize_paste_markers` and its tests moved to `crate::pane_writer`
+// alongside `build_paste_bytes` (the bracketed-paste chunk builder).

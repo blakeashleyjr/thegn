@@ -114,6 +114,7 @@ mod palette;
 mod pane;
 mod pane_pty;
 mod pane_source;
+mod pane_writer;
 mod panel;
 mod panel_header_cache;
 mod panel_util;
