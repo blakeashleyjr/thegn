@@ -40,9 +40,9 @@ database only caches and resurrects what git already knows.
 
 ## Switching
 
-- `Alt-↑/↓` — move focus up/down through panes and chrome; at the top/bottom
-  edge, with nowhere left to focus, it switches to the previous/next worktree
-  within the workspace.
+- `Alt-↑/↓` — move to the pane above/below; at the top/bottom pane, with no
+  pane left in that direction, it switches to the previous/next worktree within
+  the workspace. It never focuses the top/bottom bars — that is `Ctrl-↑/↓`.
 - `Shift-Alt-↑/↓` — previous/next workspace.
 - `Alt-o` — workspace switcher; `Alt-1..9` / `Ctrl-1..9` jump by sidebar
   slot; the palette's `~` mode ranks everything by frecency.

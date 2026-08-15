@@ -1136,12 +1136,12 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl j", Action::FocusDown).unwrap();
     map.insert_all("Ctrl k", Action::FocusUp).unwrap();
     map.insert_all("Ctrl l", Action::FocusRight).unwrap();
-    // Rule 1, Alt tier — one seamless motion: Alt+arrow walks the SAME spatial
-    // focus graph as Ctrl+arrow (panes ← → sidebar / panel, out to the bars /
-    // drawer), and only when a move dead-ends at the outer edge does it fall
-    // through to the tab/worktree switch Alt historically owned — ←/→ cycles
-    // tabs WITHIN the active worktree, ↑/↓ navigates worktrees (wrapping within
-    // the current workspace). The run loop resolves this per keypress.
+    // Rule 1, Alt tier — Alt+arrow navigates panes/tabs/worktrees and never
+    // enters chrome (the sidebar/panel/bars stay Ctrl's job). Within the center
+    // it moves to the pane in that direction; at the pane-layout edge it falls
+    // through by axis — ←/→ cycles tabs WITHIN the active worktree, ↑/↓ navigates
+    // worktrees (wrapping within the current workspace). The run loop resolves
+    // this per keypress via `focus::resolve_nav`.
     map.insert_all("Alt Left", Action::NavLeft).unwrap();
     map.insert_all("Alt Right", Action::NavRight).unwrap();
     map.insert_all("Alt Up", Action::NavUp).unwrap();
