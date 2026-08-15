@@ -2621,8 +2621,9 @@ enabled = true
 # $XDG_STATE_HOME/thegn/run/daemon.sock (so isolated state dirs — `just
 # start`, smoke tests — get isolated daemons).
 socket = ""
-# The daemon exits after this long with no sessions and no attached clients.
-# 0 = never exit on idle.
+# The daemon exits after this long with no live sessions. 0 = never exit on
+# idle. Ignored by `thegn serve`: a serving daemon keeps its TCP listener up for
+# thin clients that haven't attached yet, so it never idle-exits.
 idle_exit_secs = 1800
 # When the last client detaches from a session, keep its PTY warm this long
 # (the relay lease). Reconnect within the grace resumes the same live screen;

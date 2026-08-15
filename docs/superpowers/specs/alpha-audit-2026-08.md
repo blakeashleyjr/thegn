@@ -8,9 +8,26 @@ data-loss/security-critical · **P1** correctness or security on a user path ·
 
 **Confirmed: 73** (9 P1, 34 P2, 30 P3).
 
-## Fix status (2026-08-14 remediation pass)
+## Fix status (2026-08-14/15 — full remediation)
 
-**Fixed this pass** (commits `fix(audit):` + `fix(excise):`):
+A second remediation pass cleared essentially the whole backlog (event-loop
+safety, the daemon/serve subsystem, security hardening, config/DB integrity,
+test hermeticity), leaving only the narrow items in `KNOWN_ISSUES.md`. The
+daemon/serve/svc batch (ghost-session ordering, blocking-PTY-write → writer
+thread, serve idle-exit, masked-read panic, observer lease, exit sentinel,
+stale-socket TOCTOU flock, pairing-feed frames, snapshot history-replay flag,
+**and a protocol version-skew handshake**) landed with full unit + a real WS
+warm-attach integration test. Also fixed after this section was first written:
+the merge-gate cross-process flock, control-plane git-verb worktree confinement,
+db.rs at-rest 0600/0700 + user_version ordering, the repo-overlay
+notification-sound RCE gate, config-validate enum coverage, the session-resurrect
+data-loss retry, the parked-workspace persistence-on-quit bug, the startup
+orphan-GC nuke-on-error, and the CLI/doc/hint polish. The remaining deferred set
+is in `KNOWN_ISSUES.md`.
+
+### First pass (2026-08-14)
+
+**Fixed** (commits `fix(audit):` + `fix(excise):`):
 
 - **P1** — compositor teardown on a single pane's PTY write error (`run.rs`);
   lost persisted scrollback on the cold-workspace id-remap (`workspace_pool.rs`);

@@ -13,6 +13,17 @@ description = "thegn native terminal host: the compositor + in-process chrome"
 name = "thegn"
 path = "src/main.rs"
 
+# Staged for when the workspace crates become publishable (see RELEASING.md):
+# `cargo binstall thegn` will then resolve the release assets the `release`
+# workflow uploads, whose names match this pkg-url. Inert while `publish = false`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/thegn-v{ version }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+bin-dir = "thegn{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [features]
 # In-process sampling profiler (SIGUSR2 → flamegraph dump from the live process,
 # sidestepping ptrace_scope=1). Zero cost when off: the `pprof` dep and the

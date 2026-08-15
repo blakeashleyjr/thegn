@@ -1,0 +1,61 @@
+# Cut prebuilt `thegn` binaries on a version tag.
+#
+# Trigger: push a `v*` tag (e.g. `v0.1.0-alpha.1`). Builds the `thegn` binary for
+# the common desktop targets and attaches per-target archives + a checksums file
+# to a GitHub Release. Uses taiki-e/upload-rust-binary-action, whose archive
+# naming (`thegn-<tag>-<target>.{tar.gz,zip}`) matches the `[package.metadata.
+# binstall]` pkg-url in crates/thegn-host/Cargo.toml, so a future `cargo binstall`
+# (once the crates are published) resolves the same assets.
+#
+# The workspace's canonical build is Nix (`nix build .#default`); this workflow is
+# the cross-platform binary path for users who don't run Nix. The C deps (bundled
+# sqlite + vendored libgit2) build from source on every runner, so no system libs
+# are required beyond a C toolchain (present on the GitHub runners).
+name: release
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0-alpha.1)"
+        required: true
+permissions:
+  contents: write # create the release + upload assets
+jobs:
+  upload:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl tools
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: thegn
+          target: ${{ matrix.target }}
+          # The binary lives in the thegn-host crate.
+          manifest-path: crates/thegn-host/Cargo.toml
+          # tar.gz on unix, zip on windows (the action's default).
+          archive: thegn-$tag-$target
+          checksum: sha256
+          # Draft the release so a maintainer writes notes before publishing.
+          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
