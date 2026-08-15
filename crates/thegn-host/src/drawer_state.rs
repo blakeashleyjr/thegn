@@ -287,7 +287,7 @@ pub(crate) fn open_resolved(
             .spawn_argv_env_local(&argv, cwd.as_deref().or(Some(dir)), &env, rect)
             .ok(),
         DrawerLaunch::ShellFallback => {
-            crate::run::spawn_worktree_shell_pane(panes, cfg, Some(dir), rect, false, None, "").ok()
+            crate::run::spawn_worktree_shell_pane(panes, cfg, Some(dir), rect).ok()
         }
     }
 }

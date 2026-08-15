@@ -134,9 +134,11 @@ pub(crate) fn pane_shell_argv(
 
 /// Build a host [`crate::agent::LaunchSpec`] for a terminal connection (local
 /// shell / ssh / mosh). Terminals never run inside a sandbox — a terminal is a
-/// host process that itself reaches out (ssh/mosh) — so this is the shared spec
-/// builder used by both the synchronous creation path and the off-thread
-/// materialize/pre-warm paths, keeping the two from diverging.
+/// host process that itself reaches out (ssh/mosh) — so this is the single spec
+/// builder shared by every terminal spawn, all of which run OFF-THREAD (the
+/// lazy materialize in `handlers::materialize` and the run-loop prewarm
+/// worker, both on `spawn_blocking`): `sandbox_wrap_shell` below opens SQLite
+/// and shells out to git, so this must not be called on the event loop.
 pub(crate) fn terminal_launch_spec(
     cfg: &thegn_core::config::Config,
     connection: &str,
@@ -146,10 +148,12 @@ pub(crate) fn terminal_launch_spec(
     let mut argv = vec![cmd];
     argv.extend(args);
     // Wrap a LOCAL shell in the chosen sandbox (a remote ssh/mosh terminal is
-    // isolated by the remote end, so it's never wrapped here). This stays PURE —
-    // it only builds the wrapping argv; the sandbox command self-provisions at
-    // exec (bwrap runs immediately, `podman run` pulls on first use), so no
-    // blocking `ensure()` runs on the event loop.
+    // isolated by the remote end, so it's never wrapped here). No container
+    // ensure/create/pull happens while building the wrap — the sandbox command
+    // self-provisions at exec (bwrap runs immediately, `podman run` pulls on
+    // first use) — but resolution itself is NOT free: `sandbox_wrap_shell`
+    // opens SQLite, runs a git subprocess, and probes backends, which is why
+    // every caller of this builder runs off-thread.
     let backend = sandbox_backend.trim();
     if connection.is_empty()
         && !backend.is_empty()
@@ -181,8 +185,12 @@ pub(crate) fn terminal_launch_spec(
 /// and `exec` the shell inside it (via
 /// [`thegn_core::sandbox::enter_argv`]). Returns `None` — so the caller falls
 /// back to a plain host shell — when the backend name is unknown or the spec
-/// can't be built (e.g. sandboxing disabled). Pure: no provisioning, safe on the
-/// event loop.
+/// can't be built (e.g. sandboxing disabled). No provisioning happens here, but
+/// this is NOT loop-safe: `GitLoc::for_worktree` opens + reads SQLite (up to
+/// the 5s busy-timeout under a writer), `resolve_placed` shells out to
+/// `git rev-parse`, and backend availability probing can run
+/// `sudo -n podman version` — run it off-thread (`handlers::materialize` /
+/// the prewarm worker do).
 fn sandbox_wrap_shell(
     cfg: &thegn_core::config::Config,
     backend: &str,
@@ -358,6 +366,14 @@ impl Panes {
     /// startup and on config reload; existing panes keep their transport.
     pub(crate) fn set_daemon_config(&mut self, cfg: thegn_core::config::DaemonConfig) {
         self.daemon_cfg = if cfg.enabled { Some(cfg) } else { None };
+    }
+
+    /// Whether the daemon route is installed for new local panes — the exact
+    /// gate [`Self::materialize_with_specs`]' warm-reattach branch tests, so
+    /// the drain's disabled-daemon claim (`handlers::provision::drain_specs`)
+    /// agrees by construction with the fallback materialize will take.
+    pub(crate) fn daemon_route_enabled(&self) -> bool {
+        self.daemon_cfg.is_some()
     }
 
     /// Attach a fresh recording ring to a just-spawned pane when replay is on.
@@ -703,7 +719,19 @@ impl Panes {
 
         let spawn_t0 = std::time::Instant::now();
         let mut map = std::collections::HashMap::new();
+        // A leaf explicitly closed while its spec batch was in flight is no
+        // longer in the tree: spawning for its departed id would orphan the
+        // fresh pane (the remap below would find no leaf to attach it to).
+        let leaves: std::collections::HashSet<u32> = tab.center.pane_ids().into_iter().collect();
         for (old, spec) in specs {
+            if !leaves.contains(old) {
+                tracing::debug!(
+                    target: "thegn::startup",
+                    leaf = old,
+                    "materialize spec for a departed leaf; skipping"
+                );
+                continue;
+            }
             if self.table.contains_key(old) || map.contains_key(old) {
                 continue; // raced a direct spawn; keep the live pane
             }
@@ -1256,6 +1284,47 @@ mod tests {
                 spec.argv
             );
         }
+    }
+
+    #[test]
+    fn materialize_spawns_nothing_for_a_departed_leaf() {
+        // The user closed the pane/tab while its spec batch was in flight: the
+        // spec's `old` id is no longer a leaf of `tab.center`. The guard must
+        // short-circuit BEFORE any PTY fork — nothing enters `panes.table` and
+        // the tree is left un-remapped (no orphaned pane). The batch contains
+        // ONLY the departed id so a real spawn would be detectable.
+        let mut session = one_tab_session();
+        let path = session.worktrees[0].path.clone();
+        let tab = &mut session.worktrees[0].tabs[0];
+        let leaf = tab.center.pane_ids()[0];
+        let departed = leaf + 1000;
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = Panes::new(tx);
+        let cfg = thegn_core::config::Config::default();
+        let spec = crate::agent::LaunchSpec {
+            argv: vec!["/bin/sh".into()],
+            cwd: None,
+            env: Vec::new(),
+            backend: "host".into(),
+            warnings: Vec::new(),
+            degraded: false,
+        };
+        let chrome = layout::compute(160, 40, true, true);
+
+        panes
+            .materialize_with_specs(&cfg, tab, &path, &[(departed, spec)], chrome.center)
+            .unwrap();
+
+        assert!(
+            panes.table.is_empty(),
+            "no pane may be spawned for a departed leaf"
+        );
+        assert_eq!(
+            tab.center.pane_ids(),
+            vec![leaf],
+            "the tree stays un-remapped"
+        );
+        assert_eq!(tab.focused_pane, leaf, "focus stays on the surviving leaf");
     }
 
     #[test]
