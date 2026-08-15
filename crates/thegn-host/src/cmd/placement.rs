@@ -28,10 +28,10 @@ pub enum Action {
         target: super::target::WorktreeTarget,
     },
     /// Why the last spawn landed where it did (newest decision trace).
-    ///
-    /// Bespoke `--worktree` (not the shared [`super::target::WorktreeTarget`]):
-    /// its no-arg default is "the most recent decision overall", NOT the
-    /// current worktree, so it must never be resolved against the cwd.
+    //
+    // Bespoke `--worktree` (not the shared `super::target::WorktreeTarget`):
+    // its no-arg default is "the most recent decision overall", NOT the
+    // current worktree, so it must never be resolved against the cwd.
     Explain {
         /// Worktree path (defaults to the most recent decision overall).
         #[arg(long)]
