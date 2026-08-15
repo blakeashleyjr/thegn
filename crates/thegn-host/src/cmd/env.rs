@@ -67,6 +67,10 @@ pub enum Action {
         all: bool,
         #[arg(long)]
         env: Option<String>,
+        /// Skip the confirmation prompt (required for `--all` when stdin is not
+        /// a TTY).
+        #[arg(long)]
+        yes: bool,
     },
     /// Create a checkpoint/snapshot of the env's sandbox (providers that support it).
     Snapshot {
@@ -152,7 +156,8 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             worktree,
             all,
             env,
-        } => deprovision(cfg, worktree, id, all, env),
+            yes,
+        } => deprovision(cfg, worktree, id, all, env, yes),
         Action::Snapshot { worktree, label } => snapshot(cfg, worktree, label),
         Action::Snapshots { worktree } => snapshots(cfg, worktree),
         Action::Restore { id, worktree } => restore(cfg, worktree, &id),
@@ -283,6 +288,7 @@ fn deprovision(
     id: Option<String>,
     all: bool,
     env: Option<String>,
+    yes: bool,
 ) -> Result<()> {
     let provider = match env.as_deref() {
         Some(name) => {
@@ -304,6 +310,20 @@ fn deprovision(
         if ids.is_empty() {
             outln!("no managed sandboxes to destroy");
             return Ok(());
+        }
+        // `--all` destroys EVERY sandbox on the provider account (not just this
+        // repo's), which is irreversible — gate it on an explicit confirmation.
+        // `--yes` bypasses; without a TTY and without `--yes`, refuse rather than
+        // silently blocking on a stdin read a script can't answer.
+        if !yes {
+            let prompt = format!("Destroy ALL {} managed sandbox(es)?", ids.len());
+            if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                anyhow::bail!("{prompt} refusing without a TTY — pass --yes to confirm");
+            }
+            if !super::confirm(&prompt) {
+                outln!("aborted");
+                return Ok(());
+            }
         }
         let mut destroyed = 0usize;
         for id in &ids {

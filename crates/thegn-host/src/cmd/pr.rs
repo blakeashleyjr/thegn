@@ -62,6 +62,9 @@ pub enum Action {
         delete_branch: bool,
         #[arg(long)]
         auto: bool,
+        /// Skip the confirmation prompt (required for non-interactive/CI use).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Re-run failed checks.
     RerunChecks {
@@ -134,7 +137,8 @@ pub fn run(action: Action) -> Result<()> {
             method,
             delete_branch,
             auto,
-        } => merge(worktree, method, delete_branch, auto),
+            yes,
+        } => merge(worktree, method, delete_branch, auto, yes),
         Action::RerunChecks { worktree } => rerun(worktree),
         Action::Reviews { worktree } => reviews(worktree),
         Action::Comment { worktree, body } => comment(worktree, body),
@@ -240,11 +244,21 @@ fn merge(
     method: MergeMethod,
     delete_branch: bool,
     auto: bool,
+    yes: bool,
 ) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    if !confirm(&format!("Merge this PR ({method:?})?")) {
-        msg::info("cancelled");
-        return Ok(());
+    // Confirmation is required unless `--yes` is passed. Without a TTY (CI /
+    // piped scripts) a stdin prompt can't be answered, so refuse with a
+    // non-zero exit rather than silently cancelling and reporting success —
+    // scripts branch on the exit code.
+    if !yes {
+        let prompt = format!("Merge this PR ({method:?})?");
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            anyhow::bail!("{prompt} refusing to merge without confirmation — pass --yes");
+        }
+        if !confirm(&prompt) {
+            anyhow::bail!("merge cancelled");
+        }
     }
     match github::merge_pr(&loc, method, delete_branch, auto) {
         Ok(()) => msg::info("PR merged"),

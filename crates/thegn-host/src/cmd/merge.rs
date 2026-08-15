@@ -59,10 +59,11 @@ pub enum Action {
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     if !cfg.merge_queue.enabled {
-        outln!(
+        // Refusal, not success: bail so the process exits non-zero — scripts/CI
+        // must be able to tell "did nothing because disabled" from "did the work".
+        anyhow::bail!(
             "Merge queue disabled. Set `[merge_queue]` `enabled = true` in your config to use it."
         );
-        return Ok(());
     }
     match action {
         Action::List { json } => list(json),
@@ -209,8 +210,16 @@ fn add(cfg: &Config, worktrees: Vec<String>, all: bool) -> Result<()> {
 
 fn rm(worktree: Option<String>) -> Result<()> {
     let wt = super::resolve_worktree(worktree);
+    let wt_s = wt.to_string_lossy().to_string();
     let db = Db::open()?;
-    db.remove_merge_entry(&wt.to_string_lossy())?;
+    // Check membership before deleting so "not queued" is a distinct, non-zero
+    // outcome — otherwise `rm` reports success (exit 0) even when it removed
+    // nothing, which scripting/CI can't distinguish from a real removal.
+    let was_queued = db.list_merge_queue()?.iter().any(|r| r.worktree == wt_s);
+    db.remove_merge_entry(&wt_s)?;
+    if !was_queued {
+        anyhow::bail!("{wt_s} was not in the queue.");
+    }
     outln!("Removed from queue.");
     Ok(())
 }
@@ -234,8 +243,8 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         && let Ok(db) = Db::open()
         && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root)
     {
-        outln!("{msg}");
-        return Ok(());
+        // Guard refusal: bail so the exit code is non-zero for scripting/CI.
+        anyhow::bail!("{msg}");
     }
     if all {
         add(cfg, Vec::new(), true)?;
@@ -316,8 +325,8 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
         && let Some(root) = integrate::main_checkout(&wt)
         && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root)
     {
-        outln!("{msg}");
-        return Ok(());
+        // Guard refusal: bail so the exit code is non-zero for scripting/CI.
+        anyhow::bail!("{msg}");
     }
     // Share the fold/gate/CAS core with `thegn land`; this queue-aware path
     // additionally records the outcome on the worktree's merge-queue row.
@@ -329,6 +338,9 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
             crate::merge_lifecycle::apply(&cfg.merge_queue, &db, &root, &wt_s, &branch, event);
         }
     };
+    // A failed land still records its fate (DB + lifecycle) below, but must exit
+    // non-zero afterward so scripting/CI sees the failure rather than a clean 0.
+    let mut failure: Option<String> = None;
     match outcome {
         AttemptOutcome::Landed { commit } => {
             let _ = db.update_merge_status(&wt_s, "landed", Some(&commit), None, None);
@@ -343,20 +355,29 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
         AttemptOutcome::Conflict { paths } => {
             lifecycle(LifecycleEvent::Failed);
             outln!("✗ {branch} conflicts: {}", paths.join(", "));
+            failure = Some(format!("land failed: {branch} conflicts"));
         }
         AttemptOutcome::GateFailed { .. } => {
             lifecycle(LifecycleEvent::Failed);
             outln!("✗ {branch} breaks the build (gate red).");
+            failure = Some(format!("land failed: {branch} gate red"));
         }
         AttemptOutcome::Unreachable { detail } => {
             let _ = db.update_merge_status(&wt_s, "deferred", None, Some(&detail), None);
             lifecycle(LifecycleEvent::Failed);
             outln!("✗ {branch}: {detail}");
+            failure = Some(format!("land failed: {branch} unreachable"));
         }
         AttemptOutcome::Ready { .. } => {
             // Unreachable with auto_land forced on, but handle for completeness.
             outln!("{branch} is ready but was not landed.");
+            failure = Some(format!("{branch} is ready but was not landed"));
         }
+    }
+    if let Some(msg) = failure {
+        // Detail already printed above (✗ line); bail with a terse, distinct
+        // reason only to exit non-zero for scripting/CI — no double-print.
+        anyhow::bail!("{msg}");
     }
     Ok(())
 }

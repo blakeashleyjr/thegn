@@ -136,6 +136,7 @@ pub fn clean(cfg: &Config, worktree_arg: Option<String>, all: bool, force: bool)
 
     let mut total_reclaimed = 0u64;
     let mut cleaned = 0u32;
+    let mut failed = 0u32;
     for path in targets {
         let p = std::path::Path::new(&path);
         if !p.is_dir() {
@@ -166,7 +167,10 @@ pub fn clean(cfg: &Config, worktree_arg: Option<String>, all: bool, force: bool)
                 cleaned += 1;
                 outln!("cleaned {} from {path}", disk::human(reclaimed));
             }
-            Err(e) => outln!("failed to clean {path}: {e}"),
+            Err(e) => {
+                outln!("failed to clean {path}: {e}");
+                failed += 1;
+            }
         }
     }
     // `cfg` is read for symmetry with `disk` (future per-repo policy); silence
@@ -176,5 +180,11 @@ pub fn clean(cfg: &Config, worktree_arg: Option<String>, all: bool, force: bool)
         "Reclaimed {} across {cleaned} worktree(s).",
         disk::human(total_reclaimed)
     );
+    // Exit code matters for scripting/CI: a partial failure (one or more targets
+    // failed to clean) must be non-zero so callers can detect it. A fully
+    // successful run — including one that cleaned nothing — stays Ok(()).
+    if failed > 0 {
+        anyhow::bail!("{failed} worktree(s) failed to clean");
+    }
     Ok(())
 }

@@ -155,6 +155,14 @@ pub(crate) fn remap_cold_workspace_ids(session: &mut crate::session::Session, pa
                 .into_iter()
                 .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
                 .collect();
+            // Scrollback is keyed by pane id too; without this remap the
+            // persisted scrollback stays under the OLD id and is lost when the
+            // resurrected pane reads it under its new id (data loss on the
+            // cold-workspace id-collision-avoidance path).
+            tab.pane_scrollback = std::mem::take(&mut tab.pane_scrollback)
+                .into_iter()
+                .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
+                .collect();
         }
     }
 }

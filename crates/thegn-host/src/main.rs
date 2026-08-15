@@ -414,7 +414,7 @@ pub enum Command {
     /// in PLAINTEXT — bind to a trusted network (tailscale/wireguard) or
     /// tunnel over `ssh -L`.
     Serve {
-        /// TCP bind address (defaults to `[serve] bind`, e.g. 0.0.0.0:5380).
+        /// TCP bind address (defaults to `[serve] bind`, e.g. 127.0.0.1:5380).
         #[arg(long)]
         bind: Option<String>,
         /// Skip minting + printing the startup pairing URL.

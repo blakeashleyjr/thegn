@@ -59,21 +59,26 @@ impl DaemonConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ServeConfig {
-    /// Default TCP bind for `thegn serve` (overridable with `--bind`).
+    /// Default TCP bind for `thegn serve` (overridable with `--bind`). Loopback
+    /// by default — the control plane carries full PTY I/O over plaintext HTTP,
+    /// so exposing it beyond localhost is opt-in. For remote thin clients, front
+    /// it with a tailnet/VPN address or an explicit `--bind 0.0.0.0` behind a
+    /// firewall + TLS terminator.
     pub bind: String,
     /// Redeemed pairings wait for in-app / `thegn pair approve` approval
     /// instead of auto-approving (possession of the single-use URL is the
     /// credential by default).
     pub require_approval: bool,
-    /// Unix-socket peers (same uid, via peer credentials) get implicit admin —
-    /// local CLI verbs need zero setup. Tokens are always required on TCP.
+    /// Unix-socket peers get implicit admin so local CLI verbs need zero setup.
+    /// The socket is created owner-only (0600) and its run-dir 0700, so on unix
+    /// only the same uid can connect. Tokens are always required on TCP.
     pub local_admin: bool,
 }
 
 impl Default for ServeConfig {
     fn default() -> Self {
         Self {
-            bind: "0.0.0.0:5380".into(),
+            bind: "127.0.0.1:5380".into(),
             require_approval: false,
             local_admin: true,
         }
@@ -130,7 +135,7 @@ mod tests {
     #[test]
     fn serve_defaults() {
         let s = ServeConfig::default();
-        assert_eq!(s.bind, "0.0.0.0:5380");
+        assert_eq!(s.bind, "127.0.0.1:5380");
         assert!(!s.require_approval);
         assert!(s.local_admin);
     }

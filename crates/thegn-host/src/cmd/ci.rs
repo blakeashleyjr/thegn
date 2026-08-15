@@ -9,7 +9,7 @@
 //! `runs` also warms the `ci_runs_cache` the native host paints from, exactly as
 //! `pr status` warms `pr_cache`.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use thegn_core::ci::{self, CiJob, CiRun, CiState, RerunScope};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
@@ -117,16 +117,15 @@ fn block<F: std::future::Future>(fut: F) -> F::Output {
         .block_on(fut)
 }
 
-/// Resolve the worktree + its CI provider, or print a readable note and return
-/// `None` (CI disabled / undetected / provider not yet implemented).
-fn client(cfg: &Config, worktree: Option<String>) -> Option<(GitLoc, CiClient)> {
+/// Resolve the worktree + its CI provider. An unresolved provider is a hard
+/// error (returned `Err`), not a silent no-op: main() propagates it so the
+/// process exits non-zero — mutation verbs (trigger/rerun/cancel) must never
+/// report success to a script/CI when nothing was actually done.
+fn client(cfg: &Config, worktree: Option<String>) -> Result<(GitLoc, CiClient)> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
     match provider_for(&loc, &cfg.ci) {
-        Some(c) => Some((loc, c)),
-        None => {
-            outln!("no CI provider for this worktree (set [ci] provider, or check the remote)");
-            None
-        }
+        Some(c) => Ok((loc, c)),
+        None => bail!("no CI provider for this worktree (set [ci] provider, or check the remote)"),
     }
 }
 
@@ -157,9 +156,7 @@ fn runs(
     limit: Option<usize>,
     json_out: bool,
 ) -> Result<()> {
-    let Some((loc, client)) = client(cfg, worktree) else {
-        return Ok(());
-    };
+    let (loc, client) = client(cfg, worktree)?;
     let limit = limit.unwrap_or(cfg.ci.max_runs);
     let branch_q = branch.as_deref();
     match block(client.runs(&loc, branch_q, limit)) {
@@ -194,17 +191,19 @@ fn runs(
                 );
             }
         }
-        // Read verbs degrade gracefully (exit 0 with a note) — the "never
-        // crashes, always a readable state" contract the panel relies on.
+        // Under --json, never write a human string to stdout: propagate so
+        // main() reports it on stderr and exits non-zero (scripting/CI reads
+        // stdout as JSON). Human mode degrades gracefully (exit 0 with a note)
+        // — the "never crashes, always a readable state" contract the panel
+        // relies on.
+        Err(e) if json_out => bail!("ci: {e}"),
         Err(e) => outln!("ci: {e}"),
     }
     Ok(())
 }
 
 fn view(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
-    let Some((loc, client)) = client(cfg, worktree) else {
-        return Ok(());
-    };
+    let (loc, client) = client(cfg, worktree)?;
     match block(client.run_detail(&loc, run_id)) {
         Ok(run) => print_run_detail(&run),
         Err(e) => outln!("ci: {e}"),
@@ -246,9 +245,7 @@ fn print_job(j: &CiJob) {
 }
 
 fn log(cfg: &Config, worktree: Option<String>, run_id: &str, job_id: &str) -> Result<()> {
-    let Some((loc, client)) = client(cfg, worktree) else {
-        return Ok(());
-    };
+    let (loc, client) = client(cfg, worktree)?;
     match block(client.logs(&loc, run_id, job_id)) {
         Ok(mut log) => {
             // Apply the configured tail cap.
@@ -272,9 +269,7 @@ fn log(cfg: &Config, worktree: Option<String>, run_id: &str, job_id: &str) -> Re
 }
 
 fn rerun(cfg: &Config, worktree: Option<String>, run_id: &str, failed: bool) -> Result<()> {
-    let Some((loc, client)) = client(cfg, worktree) else {
-        return Ok(());
-    };
+    let (loc, client) = client(cfg, worktree)?;
     if !client.caps().rerun {
         msg::die("this provider can't re-run runs");
     }
@@ -304,9 +299,7 @@ fn trigger(
     workflow: &str,
     input: Vec<String>,
 ) -> Result<()> {
-    let Some((loc, client)) = client(cfg, worktree) else {
-        return Ok(());
-    };
+    let (loc, client) = client(cfg, worktree)?;
     if !client.caps().trigger {
         msg::die("this provider can't trigger workflows");
     }
@@ -325,9 +318,7 @@ fn trigger(
 }
 
 fn cancel(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
-    let Some((loc, client)) = client(cfg, worktree) else {
-        return Ok(());
-    };
+    let (loc, client) = client(cfg, worktree)?;
     if !client.caps().cancel {
         msg::die("this provider can't cancel runs");
     }
