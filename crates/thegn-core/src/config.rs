@@ -87,8 +87,40 @@ macro_rules! config_enum {
         } default = $def:ident;
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, schemars::JsonSchema)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         $vis enum $name { $( $variant ),+ }
+
+        // Manual `JsonSchema`: the derive would advertise the Rust variant
+        // identifiers (`InRepo`, `SealedTunnel`, …) which `from_str_validated`
+        // rejects. Emit the canonical strings instead, plus an
+        // `x-thegn-enum` extension (kind + aliases) that marks the node for
+        // the schema-driven walker in `config_validate` — every enum this
+        // macro defines is strict-checked by `config validate` by
+        // construction, no hand-maintained key list.
+        impl schemars::JsonSchema for $name {
+            fn schema_name() -> String {
+                stringify!($name).into()
+            }
+            fn json_schema(
+                _: &mut schemars::r#gen::SchemaGenerator,
+            ) -> schemars::schema::Schema {
+                let mut obj = schemars::schema::SchemaObject {
+                    instance_type: Some(schemars::schema::InstanceType::String.into()),
+                    enum_values: Some(vec![$( serde_json::Value::from($canon) ),+]),
+                    ..Default::default()
+                };
+                obj.extensions.insert(
+                    crate::config_validate::ENUM_MARKER.to_string(),
+                    serde_json::json!({
+                        "kind": $kind,
+                        // Comma inside the inner repetition so zero-alias
+                        // variants expand to nothing (never `[, ]`).
+                        "aliases": [ $($( $alias, )*)+ ],
+                    }),
+                );
+                schemars::schema::Schema::Object(obj)
+            }
+        }
 
         impl $name {
             /// Strict parse: `Err` (with the valid set) on an unknown value.
@@ -4475,114 +4507,10 @@ impl Config {
     }
 }
 
-/// Strictly validate a raw `config.toml` body, collecting human-readable errors
-/// for `config validate` (the only place a bad value is treated as an error
-/// rather than warned-and-defaulted). Returns the list of problems (empty = ok).
-pub fn validate_str(body: &str) -> Vec<String> {
-    let mut errs = Vec::new();
-    let val: toml::Value = match body.parse() {
-        Ok(v) => v,
-        Err(e) => return vec![format!("TOML syntax error: {e}")],
-    };
-    // The wholesale check load_layered enforces: if the body fails to
-    // deserialize into `Config`, the entire file is discarded for defaults. The
-    // enum spot-checks below only cover warn-and-default cases.
-    if let Err(e) = toml::from_str::<Config>(body) {
-        errs.push(format!("config would be rejected on load: {e}"));
-    }
-    fn check(
-        errs: &mut Vec<String>,
-        path: &str,
-        opt: Option<&toml::Value>,
-        f: fn(&str) -> Result<(), String>,
-    ) {
-        if let Some(toml::Value::String(s)) = opt
-            && let Err(e) = f(s)
-        {
-            errs.push(format!("{path}: {e}"));
-        }
-    }
-    let Some(t) = val.as_table() else {
-        return errs;
-    };
-    check(&mut errs, "picker", t.get("picker"), |s| {
-        Picker::from_str_validated(s).map(|_| ())
-    });
-    check(&mut errs, "worktree_mode", t.get("worktree_mode"), |s| {
-        WorktreeMode::from_str_validated(s).map(|_| ())
-    });
-    check(&mut errs, "name_scheme", t.get("name_scheme"), |s| {
-        NameScheme::from_str_validated(s).map(|_| ())
-    });
-    if let Some(sb) = t.get("sandbox").and_then(|v| v.as_table()) {
-        check(&mut errs, "sandbox.backend", sb.get("backend"), |s| {
-            SandboxBackend::from_str_validated(s).map(|_| ())
-        });
-        check(&mut errs, "sandbox.network", sb.get("network"), |s| {
-            Network::from_str_validated(s).map(|_| ())
-        });
-        check(&mut errs, "sandbox.profile", sb.get("profile"), |s| {
-            SandboxProfile::from_str_validated(s).map(|_| ())
-        });
-        check(&mut errs, "sandbox.on_missing", sb.get("on_missing"), |s| {
-            OnMissing::from_str_validated(s).map(|_| ())
-        });
-        if let Some(rm) = sb.get("remote").and_then(|v| v.as_table()) {
-            check(
-                &mut errs,
-                "sandbox.remote.transport",
-                rm.get("transport"),
-                |s| RemoteTransport::from_str_validated(s).map(|_| ()),
-            );
-            check(&mut errs, "sandbox.remote.mode", rm.get("mode"), |s| {
-                RemoteMode::from_str_validated(s).map(|_| ())
-            });
-        }
-    }
-    if let Some(lg) = t.get("log").and_then(|v| v.as_table()) {
-        check(&mut errs, "log.level", lg.get("level"), |s| {
-            LogLevel::from_str_validated(s).map(|_| ())
-        });
-        check(&mut errs, "log.format", lg.get("format"), |s| {
-            LogFormat::from_str_validated(s).map(|_| ())
-        });
-    }
-    if let Some(pins) = t.get("pins").and_then(|v| v.as_array()) {
-        for (i, pin) in pins.iter().enumerate() {
-            if let Some(pin) = pin.as_table() {
-                check(
-                    &mut errs,
-                    &format!("pins[{i}].location"),
-                    pin.get("location"),
-                    |s| PinLocation::from_str_validated(s).map(|_| ()),
-                );
-            }
-        }
-    }
-    if let Some(th) = t.get("theme").and_then(|v| v.as_table()) {
-        check(&mut errs, "theme.color", th.get("color"), |s| {
-            ColorMode::from_str_validated(s).map(|_| ())
-        });
-        check(&mut errs, "theme.glyphs", th.get("glyphs"), |s| {
-            GlyphMode::from_str_validated(s).map(|_| ())
-        });
-    }
-    if let Some(mq) = t.get("merge_queue").and_then(|v| v.as_table()) {
-        check(
-            &mut errs,
-            "merge_queue.conflict_handoff",
-            mq.get("conflict_handoff"),
-            |s| ConflictHandoff::from_str_validated(s).map(|_| ()),
-        );
-        check(
-            &mut errs,
-            "merge_queue.on_landed",
-            mq.get("on_landed"),
-            |s| OnLanded::from_str_validated(s).map(|_| ()),
-        );
-    }
-    errs
-}
+// Strict `config validate` lives in the sibling `config_validate` module
+// (schema-driven: every `config_enum!` reachable from `Config` is checked).
+// Re-exported here so callers keep the historical `config::validate_str` path.
+pub use crate::config_validate::validate_str;
 
 /// Load and parse a repo-root `.thegn.*` overlay, if present. Tries TOML,
 /// YAML, then JSON (first existing file wins); parse errors warn and are ignored
