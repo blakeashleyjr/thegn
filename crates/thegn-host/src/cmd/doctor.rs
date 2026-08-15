@@ -116,10 +116,6 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
             "name": cfg.sandbox.profile.as_str(),
             "policy": profile_policy(cfg.sandbox.profile),
         },
-        "agent_profile": {
-            "name": cfg.sandbox.agent_profile.as_str(),
-            "policy": profile_policy(cfg.sandbox.agent_profile),
-        },
         "limits": limits_json(cfg),
         "home": home_json(cfg),
     })
@@ -215,6 +211,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     if json {
         let v = serde_json::json!({
             "channel": channel_json(),
+            "core_deps": core_deps_json(),
             "env": {
                 "TERM": env.term,
                 "COLORTERM": env.colorterm,
@@ -249,6 +246,8 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
     channel_report();
+    outln!("");
+    core_deps_report();
     outln!("");
     outln!("Terminal environment");
     show("TERM", &env.term);
@@ -582,6 +581,92 @@ fn which_ok(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The output of `<bin> <args…>` trimmed to one line, or `None` if the binary is
+/// absent or the invocation failed — used to fetch `git --version` etc. without
+/// panicking when the tool is missing (the whole point of the core-deps section).
+// off-loop: doctor is a synchronous CLI verb
+#[expect(clippy::disallowed_methods)]
+fn cmd_first_line(bin: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(bin)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().next().map(|l| l.trim().to_string())
+}
+
+/// Whether `gh auth status` reports an authenticated account. Robust to a
+/// missing `gh` (returns `false`) — the section only reports, never fails.
+// off-loop: doctor is a synchronous CLI verb
+#[expect(clippy::disallowed_methods)]
+fn gh_authenticated() -> bool {
+    std::process::Command::new("gh")
+        .args(["auth", "status"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Report the core CLI dependencies every startup git read leans on: `git`
+/// (presence + version) and `gh` (presence + auth). These are best-effort at
+/// runtime, so a missing binary otherwise produces no message — doctor is where
+/// it surfaces. Detection only; never panics if git/gh are absent.
+fn core_deps_report() {
+    outln!("Core dependencies");
+    match thegn_core::util::which_path("git") {
+        Some(path) => {
+            let ver =
+                cmd_first_line("git", &["--version"]).unwrap_or_else(|| "unknown version".into());
+            outln!("  git           {ver}");
+            outln!("                {path}");
+        }
+        None => outln!("  git           MISSING — git reads will silently fail; install git"),
+    }
+    match thegn_core::util::which_path("gh") {
+        Some(path) => {
+            let auth = if gh_authenticated() {
+                "authenticated"
+            } else {
+                "not authenticated (run: gh auth login)"
+            };
+            outln!("  gh            present, {auth}");
+            outln!("                {path}");
+        }
+        None => outln!("  gh            absent (optional — GitHub PR/issue features degrade)"),
+    }
+}
+
+/// The core-dependency surface for `--json`: git presence/version/path and gh
+/// presence/auth/path. Never panics when a binary is absent.
+fn core_deps_json() -> serde_json::Value {
+    let git_path = thegn_core::util::which_path("git");
+    let gh_path = thegn_core::util::which_path("gh");
+    // Resolve version/auth up front so the json! move of the paths is unambiguous.
+    let git_version = git_path
+        .as_ref()
+        .and_then(|_| cmd_first_line("git", &["--version"]));
+    let gh_auth = gh_path.as_ref().map(|_| gh_authenticated());
+    serde_json::json!({
+        "git": {
+            "present": git_path.is_some(),
+            "path": git_path,
+            "version": git_version,
+        },
+        "gh": {
+            "present": gh_path.is_some(),
+            "path": gh_path,
+            "authenticated": gh_auth,
+        },
+    })
+}
+
 /// "Will my shell work here?" — the personal-shell layer: the resolved strategy,
 /// per-env overrides, and a scan of the host dotfiles for transplant pitfalls
 /// (absent `/nix/store` paths, undeclared tools). Detection only.
@@ -724,11 +809,6 @@ fn sandbox_report(cfg: &Config) {
         "  shell profile {} ({})",
         cfg.sandbox.profile.as_str(),
         profile_policy(cfg.sandbox.profile)
-    );
-    outln!(
-        "  agent profile {} ({})",
-        cfg.sandbox.agent_profile.as_str(),
-        profile_policy(cfg.sandbox.agent_profile)
     );
     cpu_cap_report(cfg);
     if all_weak {
@@ -1055,54 +1135,74 @@ mod tests {
     }
 
     #[test]
-    fn managed_tools_json_reports_pi_and_honors_override() {
-        // Default config: pi is a managed tool, resolved to the managed tier
-        // (nothing on PATH in the test env, no override) and reported.
+    fn managed_tools_json_reports_bs_and_honors_override() {
+        // Default config: bugstalker is a managed tool, resolved to the managed
+        // tier (nothing on PATH in the test env, no override) and reported.
         let cfg = Config::default();
         let tools = managed_tools_json(&cfg);
         let arr = tools.as_array().expect("array");
-        let pi = arr.iter().find(|t| t["name"] == "pi").expect("pi reported");
-        assert_eq!(
-            pi["pinned"],
-            thegn_core::managed_tool::ManagedTool::npm("pi", "p", "pi", crate::pi_assets::PI_PIN,)
-                .version
-        );
+        let bs = arr
+            .iter()
+            .find(|t| t["name"] == "bugstalker")
+            .expect("bugstalker reported");
+        assert_eq!(bs["pinned"], thegn_core::debug::bs_tool().version);
 
-        // A user override (as parsed from `[managed_tools.pi]`) wins the tier.
+        // A user override (as parsed from `[managed_tools.bugstalker]`) wins
+        // the tier.
         let mut cfg = Config::default();
         cfg.managed_tools.insert(
-            "pi".to_string(),
+            "bugstalker".to_string(),
             thegn_core::managed_tool::ToolOverride {
-                path: "/opt/custom/pi".into(),
+                path: "/opt/custom/bs".into(),
                 args: vec![],
             },
         );
         let arr = managed_tools_json(&cfg);
-        let pi = arr
+        let bs = arr
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| t["name"] == "pi")
+            .find(|t| t["name"] == "bugstalker")
             .unwrap()
             .clone();
-        assert_eq!(pi["tier"], "override");
-        assert_eq!(pi["path"], "/opt/custom/pi");
+        assert_eq!(bs["tier"], "override");
+        assert_eq!(bs["path"], "/opt/custom/bs");
         // The report runs without panicking too.
         managed_tools_report(&cfg);
     }
 
     #[test]
     fn managed_tools_override_parses_from_toml() {
-        // `[managed_tools.pi]` layers into Config like the other keyed maps.
+        // `[managed_tools.bs]` layers into Config like the other keyed maps.
         let toml = r#"
-[managed_tools.pi]
-path = "/usr/local/bin/pi"
+[managed_tools.bs]
+path = "/usr/local/bin/bs"
 args = ["--verbose"]
 "#;
         let cfg: Config = toml::from_str(toml).expect("parse");
-        let over = cfg.managed_tools.get("pi").expect("override present");
-        assert_eq!(over.path, "/usr/local/bin/pi");
+        let over = cfg.managed_tools.get("bs").expect("override present");
+        assert_eq!(over.path, "/usr/local/bin/bs");
         assert_eq!(over.args, vec!["--verbose".to_string()]);
+    }
+
+    #[test]
+    fn core_deps_json_reports_git_and_gh_without_panicking() {
+        // Never panics regardless of whether git/gh are installed; the shape is
+        // always present/path/(version|authenticated) for both binaries.
+        let v = core_deps_json();
+        assert!(v["git"]["present"].is_boolean());
+        assert!(v["gh"]["present"].is_boolean());
+        // `present` and `path.is_some()` agree.
+        assert_eq!(
+            v["git"]["present"].as_bool().unwrap(),
+            !v["git"]["path"].is_null()
+        );
+        assert_eq!(
+            v["gh"]["present"].as_bool().unwrap(),
+            !v["gh"]["path"].is_null()
+        );
+        // The human report also runs without panicking.
+        core_deps_report();
     }
 
     #[test]
@@ -1110,7 +1210,7 @@ args = ["--verbose"]
         let v = sandbox_json(&Config::default());
         assert!(v.get("enabled").is_some());
         assert!(v.get("candidates").unwrap().is_array());
-        assert!(v.get("agent_profile").unwrap().get("policy").is_some());
+        assert!(v.get("shell_profile").unwrap().get("policy").is_some());
     }
 
     #[test]

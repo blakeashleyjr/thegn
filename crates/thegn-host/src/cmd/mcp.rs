@@ -5,8 +5,7 @@
 //! declared servers, emits the `mcpServers` settings block the agent consumes,
 //! and installs a server's binary via the shared managed-tool resolver —
 //! grant-checked: acquisition proceeds only when the server's capability grants
-//! cover it. The agent-setup path merges the same block into the managed pi's
-//! settings (see [`crate::cmd::agent::inject_mcp_servers`]).
+//! cover it.
 //!
 //! `serve` runs thegn *as* an MCP server over stdio (a Context7-style endpoint):
 //! it exposes the in-app help corpus, the generated keybindings/config-reference

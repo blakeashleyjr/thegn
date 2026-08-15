@@ -47,6 +47,20 @@ impl ResidentWorkspace {
     }
 }
 
+impl WorkspacePool {
+    /// Every live pane id across ALL parked workspaces. Their panes stay live in
+    /// the global table but are absent from the active `Session`, so the quit
+    /// detach/kill sweep must include them or a parked workspace's daemon-backed
+    /// sessions are silently killed instead of persisted (or leaked instead of
+    /// killed) on quit.
+    pub(crate) fn parked_pane_ids(&self) -> Vec<u32> {
+        self.parked
+            .iter()
+            .flat_map(|(_, rw)| rw.pane_ids())
+            .collect()
+    }
+}
+
 /// Keeps recently-visited workspaces' panes alive in memory, keyed by
 /// `repo_path` (`Session::id`). Switching parks the outgoing workspace and
 /// restores the target's live panes instead of killing and respawning them.
@@ -161,6 +175,14 @@ pub(crate) fn remap_cold_workspace_ids(session: &mut crate::session::Session, pa
                 .map(|(id, cmd)| (map.get(&id).copied().unwrap_or(id), cmd))
                 .collect();
             tab.pane_sessions = std::mem::take(&mut tab.pane_sessions)
+                .into_iter()
+                .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
+                .collect();
+            // Scrollback is keyed by pane id too; without this remap the
+            // persisted scrollback stays under the OLD id and is lost when the
+            // resurrected pane reads it under its new id (data loss on the
+            // cold-workspace id-collision-avoidance path).
+            tab.pane_scrollback = std::mem::take(&mut tab.pane_scrollback)
                 .into_iter()
                 .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
                 .collect();

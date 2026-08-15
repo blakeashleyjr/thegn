@@ -87,9 +87,6 @@ pub enum Feature {
     /// Cloud execution providers (Fly / DO / VPS / Machine0 / Daytona) and the
     /// managed-sprite pool (`[host.*]`).
     Providers,
-    /// The LLM proxy, agent dispatch, bouncer, and ACP surfaces
-    /// (`[llm_proxy]`, `[[agents]]`). Strictly additive per the architecture.
-    Ai,
     /// The Observe dashboards + fleet-view app tab (`[observe]`).
     Observe,
     /// The multi-host placement / host-as-resource engine (`[placement]`).
@@ -102,10 +99,9 @@ pub enum Feature {
 impl Feature {
     /// Every gated feature, for exhaustive iteration (e.g. the `doctor` table
     /// and the config clamp). Order is stable and display-friendly.
-    pub const ALL: [Feature; 6] = [
+    pub const ALL: [Feature; 5] = [
         Feature::Remote,
         Feature::Providers,
-        Feature::Ai,
         Feature::Observe,
         Feature::Placement,
         Feature::Trackers,
@@ -116,7 +112,6 @@ impl Feature {
         match self {
             Feature::Remote => "remote",
             Feature::Providers => "providers",
-            Feature::Ai => "ai",
             Feature::Observe => "observe",
             Feature::Placement => "placement",
             Feature::Trackers => "trackers",
@@ -130,7 +125,6 @@ impl Feature {
             // The confirmed experimental set for the pre-alpha.
             Feature::Remote
             | Feature::Providers
-            | Feature::Ai
             | Feature::Observe
             | Feature::Placement
             | Feature::Trackers => Stability::Experimental,
@@ -190,7 +184,7 @@ mod tests {
         // ALL must cover every variant so the clamp/doctor never miss one.
         // (Compile-time exhaustiveness is enforced by `stability`'s match; this
         // guards ALL against drift.)
-        assert_eq!(Feature::ALL.len(), 6);
+        assert_eq!(Feature::ALL.len(), 5);
         let mut ids: Vec<&str> = Feature::ALL.iter().map(|f| f.id()).collect();
         ids.sort_unstable();
         ids.dedup();

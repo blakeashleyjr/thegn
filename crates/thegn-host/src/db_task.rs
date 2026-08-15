@@ -116,9 +116,14 @@ mod tests {
     use thegn_core::store::WorkspaceStore;
 
     /// A writer over a throwaway on-disk DB, plus a flush helper bound to its
-    /// own channel (not the process-global one).
+    /// own channel (not the process-global one). The dir is unique per CALL
+    /// (pid + counter), not just per process — the module's tests run as
+    /// parallel threads of one process, and a shared dir would let one test's
+    /// `remove_dir_all` delete another's live DB mid-test.
     fn temp_writer() -> (Sender<Msg>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("tg-dbtask-{}", std::process::id()));
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("tg-dbtask-{}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.db");

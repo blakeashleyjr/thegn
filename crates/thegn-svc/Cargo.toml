@@ -43,8 +43,6 @@ base64 = "0.22"
 # the host's pin so the workspace resolves one version.
 notify = "6"
 # ACP client transport (newline-JSON over TCP) + request/reply plumbing.
-tokio-util = { version = "0.7.18", features = ["codec"] }
-futures-channel = "0.3.32"
 futures-util = "0.3.32"
 # Native provider exec transport (Sprites WSS PTY exec — see provider::SpritesProvider).
 tokio-tungstenite.workspace = true

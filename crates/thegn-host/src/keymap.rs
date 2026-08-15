@@ -147,8 +147,6 @@ pub enum Action {
     OpenCi,
     /// Open the right panel to the Work ▸ Merge queue section (fold-actor).
     OpenMergeQueue,
-    /// Summon the LLM-proxy dashboard overlay (spend, tokens/sec, budgets).
-    OpenProxyDash,
     /// Summon the AI-account usage overlay (per-account rate-limit windows).
     OpenUsage,
     /// Prompt for a port and expose it from the active worktree (`[share]`).
@@ -428,7 +426,6 @@ impl Action {
             Action::FocusPanel => "focus-panel",
             Action::OpenCi => "open-ci",
             Action::OpenMergeQueue => "open-merge-queue",
-            Action::OpenProxyDash => "open-proxy-dash",
             Action::OpenUsage => "open-usage",
             Action::ShareWorktreePort => "share-worktree-port",
             Action::StopWorktreeShare => "stop-worktree-share",
@@ -550,7 +547,6 @@ impl Action {
             "focus-panel" => Action::FocusPanel,
             "open-ci" => Action::OpenCi,
             "open-merge-queue" => Action::OpenMergeQueue,
-            "open-proxy-dash" => Action::OpenProxyDash,
             "open-usage" => Action::OpenUsage,
             "share-worktree-port" => Action::ShareWorktreePort,
             "stop-worktree-share" => Action::StopWorktreeShare,
@@ -1098,8 +1094,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt p", Action::NewPane).unwrap();
     map.insert_all("Ctrl Alt z", Action::ToggleZoom).unwrap();
     // Force full redraw — the Ctrl-L "fix my screen" escape hatch. Plain
-    // `Ctrl l` is FocusRight and `Ctrl Alt l` is the proxy dashboard, so this
-    // keeps the mnemonic L in the `Ctrl Shift` namespace.
+    // `Ctrl l` is FocusRight, so this keeps the mnemonic L in the
+    // `Ctrl Shift` namespace.
     map.insert_all("Ctrl Shift l", Action::Redraw).unwrap();
     map.insert_all("Ctrl Alt y", Action::ToggleSyncPanes)
         .unwrap();

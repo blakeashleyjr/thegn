@@ -199,15 +199,6 @@ pub struct SandboxOutcome {
 /// human-visible fallback warnings; an explicit choice (config or
 /// `backend_choice`) must not silently fall back — it errors instead. Host is
 /// the last fallback for the auto chain only.
-/// Which container a sandbox is being prepared for. The interactive shell uses
-/// the worktree's `profile`; the embedded agent uses `agent_profile` and, when
-/// that differs, runs in its own separately-hardened container.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SandboxScope {
-    Shell,
-    Agent,
-}
-
 /// Prepare the sandbox for a worktree with an explicitly-selected execution
 /// environment name (or `None` to fall through to repo/global selection).
 /// Resolves via [`crate::handlers::repo_trust`] (honours TOFU approvals).
@@ -223,7 +214,6 @@ pub fn prepare_sandbox_env(
     loc: &GitLoc,
     backend_choice: Option<&str>,
     choice_is_explicit: bool,
-    scope: SandboxScope,
     selected_env: Option<&str>,
 ) -> anyhow::Result<SandboxOutcome> {
     use crate::handlers::repo_trust::resolve_env_trusted;
@@ -375,19 +365,8 @@ pub fn prepare_sandbox_env(
             Some(profile_slug)
         },
     );
-    // Pick the hardening preset + container for this scope. The agent gets its
-    // own (more-locked-down) container only when `agent_profile` differs from
-    // the worktree `profile`; otherwise it reuses the worktree container.
-    let agent_separate = scope == SandboxScope::Agent && sb.agent_profile != sb.profile;
-    let hardening = match scope {
-        SandboxScope::Agent => sb.agent_profile,
-        SandboxScope::Shell => sb.profile,
-    };
-    let cname = if agent_separate {
-        sandbox::agent_container_name(&base_cname)
-    } else {
-        base_cname
-    };
+    let hardening = sb.profile;
+    let cname = base_cname;
     // Bring the execution placement up (k8s pod / provider sandbox) BEFORE
     // resolving the backend — a no-op for the default local `in_env` env. Warm-on-
     // open: create the API sandbox first if `auto_provision` is set so the
@@ -953,7 +932,7 @@ pub(crate) use crate::agent_ssh::{
 /// is a `provider` placement whose provider has a native exec API, whose `exec`
 /// mode isn't `cli`, and whose API token is present; `None` ⇒ use [`launch_spec`].
 ///
-/// Resolves the env exactly as [`launch_spec_with_key`] does (DB repo-root +
+/// Resolves the env exactly as [`launch_spec_full`] does (DB repo-root +
 /// effective env) so the two paths never disagree about which env is in play.
 /// The agent KINDS surfaced in the `[[agents]]` picker — what gets provisioned
 /// into a sandbox (installed + config-carried). Each entry maps to its kind via
@@ -1092,10 +1071,6 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
     // code, hermes) work like local. Remote-safe filter drops host-local socket
     // vars (SSH_AUTH_SOCK/GPG_*) that would dangle in the VM. THEGN_* win.
     let mut env = environment.sandbox.passthrough_env_remote();
-    // Route any agent in the sprite (pi, claude code, hermes) through tgproxy by
-    // default — sets ANTHROPIC_BASE_URL etc. when a reachable remote proxy URL is
-    // configured. No-op otherwise (the agent talks upstream directly).
-    env.extend(cfg.llm_proxy.remote_agent_env(None));
     // Let an in-sandbox `nix develop` / direnv `use flake` fetch PRIVATE flake
     // inputs: nix's fetcher ignores git's credential helper, so without a
     // `github.com` access-token a private `github:org/repo` flake input 404s even
@@ -1642,11 +1617,6 @@ pub fn provision_provider_env_named(
         // is dead and nix wastes minutes timing out before falling back to source.
         host_cache_url: (pc.host_cache && crate::bridge_sup::bridge_binary_path().is_some())
             .then(|| format!("http://127.0.0.1:{}", crate::nixcache::SANDBOX_PORT)),
-        // Provision the managed pi in the sandbox when a configured agent runs it
-        // (its command references `~/.thegn/pi`), so the "Agent" entry's snippet
-        // resolves in-sprite. A real worktree only (a spare stays generic).
-        managed_pi: name_override.is_none()
-            && cfg.agents.iter().any(|a| a.command.contains(".thegn/pi")),
         toolchain: cfg.toolchain.clone(),
     };
     let plan = envplan::plan(&req, &opts);
@@ -1790,20 +1760,6 @@ pub fn provision_provider_env_named(
                 crate::hibernator::apply_snapshot_restore(
                     &provider, &id, cfg, wt, wd, snap, &exec_env,
                 )
-            }
-            StepKind::ManagedPi => {
-                // Host-executed: provision the managed pi inside the sandbox so the
-                // "Agent" entry's `$HOME/.thegn/pi` snippet resolves in-sprite.
-                // Best-effort throughout — a failure just means the Agent entry won't
-                // work in this sprite (the host one still does).
-                if let Err(e) =
-                    crate::agent_pi::provision_managed_pi(&provider, &id, &sprite_home, &exec_env)
-                {
-                    thegn_core::msg::warn(&format!(
-                        "managed pi: {e}; the \"Agent\" entry may not work in this sandbox."
-                    ));
-                }
-                Ok(())
             }
             StepKind::Checkpoint => {
                 with_provision_timeout("checkpoint", std::time::Duration::from_secs(600), || {
@@ -2684,11 +2640,6 @@ pub fn compose_spec(
 ///
 /// `branch` is the worktree's branch (for the pane env + title); `None` falls
 /// back to the worktree basename.
-///
-/// `scoped_key` is an optional per-agent API key (e.g. a virtual key from the
-/// LLM proxy). When set, it is injected into the sandbox environment as
-/// `ANTHROPIC_API_KEY`, masking the host passthrough value so the master key
-/// is never exposed inside the sandbox.
 pub fn launch_spec(
     cfg: &Config,
     worktree: &str,
@@ -2699,10 +2650,10 @@ pub fn launch_spec(
     // one-shot CLI shells, and tests — in-process panes that keep the bwrap
     // `--die-with-parent` guard. Daemon-routed center tabs go through
     // `launch_spec_synced` / `terminal_launch_spec`, which pass `true`.
-    launch_spec_with_key(cfg, worktree, branch, choice, None, false, false)
+    launch_spec_full(cfg, worktree, branch, choice, false, false)
 }
 
-/// Like [`launch_spec`] but injects a scoped API key for the sandbox.
+/// Like [`launch_spec`] but with the full set of launch knobs.
 ///
 /// `sync_warm` gates the `direnv` cache warm: `false` kicks the async
 /// background warm (the first launch of a cold worktree falls back), `true`
@@ -2713,12 +2664,11 @@ pub fn launch_spec(
 /// a local bwrap pane drops `--die-with-parent` and survives UI detach instead
 /// of being reaped with its forking thread. Set `true` for daemon-routed center
 /// tabs, `false` for ephemeral in-process panes (drawer/CLI).
-pub fn launch_spec_with_key(
+pub fn launch_spec_full(
     cfg: &Config,
     worktree: &str,
     branch: Option<&str>,
     choice: &str,
-    scoped_key: Option<String>,
     sync_warm: bool,
     daemon_persistent: bool,
 ) -> anyhow::Result<LaunchSpec> {
@@ -2770,7 +2720,6 @@ pub fn launch_spec_with_key(
         &loc,
         saved_backend.as_deref(),
         saved_is_override,
-        launch_scope(cfg, choice),
         selected_env.as_deref(),
     )?;
     // NB: the resolved backend is intentionally NOT written back. `sandbox_backend`
@@ -2814,22 +2763,6 @@ pub fn launch_spec_with_key(
         choice,
         outcome.location.is_some(),
     )?;
-
-    // Bouncer (opt-in): inject the agent's proxy + tool-override env into the
-    // sealed container's `env_overrides` (+ the control-socket mounts) before the
-    // argv is composed. No-op unless bouncer is on and `choice` is an agent.
-    let bouncer = apply_bouncer_launch(cfg, worktree, choice, &mut outcome);
-
-    // Apply per-agent credential scoping: when a virtual key is provided,
-    // inject it as an override and mask the master key so it's never forwarded.
-    if let (Some(key), Some(spec)) = (scoped_key, outcome.spec.as_mut()) {
-        spec.env_overrides
-            .insert("ANTHROPIC_API_KEY".to_string(), key);
-        spec.env_block.push("ANTHROPIC_API_KEY".to_string());
-        // Remove the master key from the spec's env vec too so it doesn't
-        // reach the container via the passthrough path.
-        spec.env.retain(|(k, _)| k != "ANTHROPIC_API_KEY");
-    }
 
     // Environment bundles (AU): resolve the active bundle(s) for this scope into
     // env overrides + credential/config-dir redirection + account selection, and
@@ -2943,10 +2876,6 @@ pub fn launch_spec_with_key(
     if outcome.spec.is_none() {
         spec.env.extend(resolved.env_pairs());
         spec.env.extend(build_env);
-        // Host agent panes: proxy-routing vars ride the pane env (from bouncer
-        // mode's host fallback, or plain `route_agent` host routing). Sandboxed
-        // agents already got them via env_overrides; shells get nothing.
-        spec.env.extend(bouncer.host_env);
     }
     // Host (no-sandbox) devShell injection rides the pane env directly.
     if outcome.spec.is_none()
@@ -2955,175 +2884,6 @@ pub fn launch_spec_with_key(
         inject_devshell_host(&mut spec, dev);
     }
     Ok(spec)
-}
-
-/// Resolve `worktree`'s sandbox and run a one-shot shell command inside it,
-/// returning combined stdout+stderr. Services ACP `terminal/create` so the
-/// agent's shell commands run inside the same policy boundary (container /
-/// bwrap / none) as its interactive pane — thegn is the agent's "hands and
-/// bouncer". BLOCKING (sandbox resolution may ensure a container); callers must
-/// run it off the event loop.
-// off-loop: only called inside spawn_blocking (ACP terminal/create servicing, run.rs).
-#[expect(clippy::disallowed_methods)]
-pub fn run_in_sandbox(cfg: &Config, worktree: &str, command: &str) -> anyhow::Result<String> {
-    let loc = GitLoc::for_worktree(Path::new(worktree));
-    // One DB handle for the whole resolution (each open re-runs pragmas).
-    let db = Db::open().ok();
-    let db_ref = db.as_ref();
-    let saved_backend = db_ref.and_then(|db| db.worktree_sandbox(worktree).ok().flatten());
-    let repo_root: PathBuf = db_ref
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| repo::main_worktree(Path::new(worktree)))
-        .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env =
-        db_ref.and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
-
-    // In bouncer mode the command came from the *sealed agent* — run it inside the
-    // agent's own (`agent_profile`) container, the same boundary its interactive
-    // pane runs in, not the worktree shell. Otherwise the worktree shell scope.
-    let scope = if cfg.llm_proxy.bouncer {
-        SandboxScope::Agent
-    } else {
-        SandboxScope::Shell
-    };
-    // A recorded per-worktree backend is a deliberate override (see
-    // `launch_spec_with_key`); honour it so ACP shell commands run in the same
-    // boundary as the interactive pane. Empty/NULL → auto (re-resolve vs config).
-    let saved_is_override = saved_backend
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|s| !s.is_empty() && s != "auto");
-    let outcome = prepare_sandbox_env(
-        cfg,
-        &repo_root,
-        worktree,
-        &loc,
-        saved_backend.as_deref(),
-        saved_is_override,
-        scope,
-        selected_env.as_deref(),
-    )?;
-
-    let argv = match &outcome.spec {
-        Some(spec) => sandbox::enter_argv(spec, command),
-        None => vec![
-            thegn_core::util::shell(),
-            "-lc".to_string(),
-            command.to_string(),
-        ],
-    };
-
-    let mut cmd = std::process::Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
-    // Local worktree: run from its dir so relative paths resolve as the agent expects.
-    if !loc.is_remote() && !outcome.is_remote {
-        cmd.current_dir(worktree);
-    }
-    let out = cmd
-        .output()
-        .map_err(|e| anyhow::anyhow!("spawn `{}` failed: {e}", argv.join(" ")))?;
-    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if !stderr.is_empty() {
-        if !combined.is_empty() && !combined.ends_with('\n') {
-            combined.push('\n');
-        }
-        combined.push_str(&stderr);
-    }
-    Ok(combined)
-}
-
-/// The sandbox scope for launching `choice`: the sealed `agent_profile` when the
-/// bouncer is on and `choice` is a configured agent (so the agent runs in its
-/// own hardened container), else the worktree's interactive shell scope.
-pub fn launch_scope(cfg: &Config, choice: &str) -> SandboxScope {
-    if cfg.llm_proxy.bouncer && cfg.agent_command(choice).is_some() {
-        SandboxScope::Agent
-    } else {
-        SandboxScope::Shell
-    }
-}
-
-/// What a bouncer launch produced for the caller to carry forward.
-#[derive(Debug, Default)]
-pub struct BouncerLaunch {
-    /// Env vars for a **host** (non-sandboxed) agent pane — already injected into
-    /// the sandbox spec's `env_overrides` when sandboxed, so empty in that case.
-    pub host_env: Vec<(String, String)>,
-}
-
-/// Whether `choice` is a real routable agent (not the plain/clean shell). The
-/// picker carries "shell"/"clean-shell" as `[[agents]]` entries with the
-/// `__shell__` sentinel command, so a name lookup alone isn't enough.
-fn is_agent_choice(cfg: &Config, choice: &str) -> bool {
-    !choice.is_empty()
-        && choice != SHELL
-        && choice != "clean-shell"
-        && cfg
-            .agent_command(choice)
-            .map(|c| c.trim() != "__shell__")
-            .unwrap_or(false)
-}
-
-/// Inject the agent's proxy env into the launch, for a configured agent `choice`
-/// (never a plain shell). Two modes:
-///
-/// - **Bouncer on:** the full proxy + tool-override plan (+ control-socket mounts)
-///   into the sealed sandbox's `env_overrides`, minting the stable per-worktree
-///   proxy key thegn's own tgproxy validates. A host fallback returns the vars
-///   to ride the pane env.
-/// - **Bouncer off, `route_agent` on, HOST pane:** point the agent at the proxy
-///   over the host loopback directly (no tunnel/relay). Local sandboxes are left to
-///   the bouncer; remote sprites to the native-exec path (`remote_agent_env`).
-///
-/// No-op otherwise. See [`crate::bouncer::agent_env_plan`] /
-/// [`thegn_core::config::LlmProxyConfig::local_agent_env`].
-pub fn apply_bouncer_launch(
-    cfg: &Config,
-    worktree: &str,
-    choice: &str,
-    outcome: &mut SandboxOutcome,
-) -> BouncerLaunch {
-    // Only a configured agent routes through the proxy; a plain shell never does
-    // (the picker lists "shell"/"clean-shell" as `[[agents]]` entries whose command
-    // is the `__shell__` sentinel — `agent_command` finds them, so exclude them).
-    if !is_agent_choice(cfg, choice) {
-        return BouncerLaunch::default();
-    }
-    if cfg.llm_proxy.bouncer {
-        let lp = &cfg.llm_proxy;
-        let key = lp
-            .route_agent
-            .then(|| crate::proxy_keys::mint_stable_proxy_key(worktree, lp.upstream_binding()))
-            .flatten();
-        let sandbox = outcome.spec.as_ref().map(|s| (s.backend, s.network));
-        let plan = crate::bouncer::agent_env_plan(cfg, worktree, sandbox, key.as_deref());
-        return match outcome.spec.as_mut() {
-            Some(spec) => {
-                for (k, v) in plan.vars {
-                    spec.env_overrides.insert(k, v);
-                }
-                spec.mounts.extend(plan.mounts);
-                BouncerLaunch::default()
-            }
-            // Host fallback (no isolation): the bouncer override is inert, but the
-            // proxy vars still ride the pane env.
-            None => BouncerLaunch {
-                host_env: plan.vars,
-            },
-        };
-    }
-    // No bouncer, but `route_agent` on for a HOST pane: route the agent through the
-    // proxy over the host loopback directly. (Sandboxed panes can't reach host
-    // loopback without a relay — that's the bouncer's / sprite tunnel's job.)
-    if cfg.llm_proxy.route_agent && outcome.spec.is_none() {
-        return BouncerLaunch {
-            host_env: cfg.llm_proxy.local_agent_env(),
-        };
-    }
-    BouncerLaunch::default()
 }
 
 /// Tier A inject for a sandboxed pane: prepend the devShell `PATH` via a raw

@@ -44,7 +44,7 @@ pub struct NotifyState {
     /// the bundled chime. Read on every `Chime` emit.
     chime_file: Mutex<String>,
     /// Sender for the transient in-app toast projection, installed once at loop
-    /// startup ([`set_toast_tx`]). `None` before wiring (or in headless tests),
+    /// startup ([`Self::set_toast_tx`]). `None` before wiring (or in headless tests),
     /// so an emit is a silent no-op rather than a panic.
     toast_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>>>,
     /// Wakes the event loop so a latched bell (or DND/mode chip change) paints.

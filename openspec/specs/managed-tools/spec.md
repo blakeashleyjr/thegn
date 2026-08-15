@@ -84,9 +84,8 @@ recheck.
 The download/install side effects SHALL live in `thegn-host`, driven by the
 core spec: npm-sourced tools install via an `npm` subprocess and GitHub-release
 tools download the selected asset and mark it executable. The fetch MUST NOT run
-on the event loop (it runs on the CLI path or `spawn_blocking`, as the managed pi
-install does today) and MUST surface failures rather than silently degrading the
-primary action.
+on the event loop (it runs on the CLI path or `spawn_blocking`) and MUST surface
+failures rather than silently degrading the primary action.
 
 #### Scenario: Fetch stays off the event loop
 

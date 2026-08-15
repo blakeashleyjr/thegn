@@ -28,8 +28,8 @@ export XDG_RUNTIME_DIR="$TMP/run"
 mkdir -p "$XDG_RUNTIME_DIR"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # Exercise the full product surface: the experimental verbs (host/placement/
-# proxy/agent/kaneo) are dev-channel-only, so run smoke in the dev channel. A
-# dedicated section below verifies the stable channel refuses them + clamps.
+# kaneo) are dev-channel-only, so run smoke in the dev channel. A dedicated
+# section below verifies the stable channel refuses them + clamps.
 export THEGN_CHANNEL=dev
 
 mkdir -p "$XDG_CONFIG_HOME/thegn"
@@ -123,6 +123,11 @@ check "sandbox vpn config parses and surfaces the provider" \
   "'$SZ' config show | grep -q 'tailscale'"
 check "config get reads a nested vpn key" \
   "[[ \$('$SZ' config get sandbox.vpn.provider 2>/dev/null) == 'tailscale' || -n \$('$SZ' config show | grep -A2 'sandbox.vpn') ]]"
+# A pre-existing bad enum value in some OTHER key must NOT block setting an
+# unrelated valid key (the whole-file re-validate only rolls back NEW errors).
+# Isolated config dir so the seeded config above stays clean.
+check "config set of a valid key survives a pre-existing bad value elsewhere" \
+  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf 'lifecycle.eager = \"bogus\"\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config set picker fzf >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' config get picker | grep -q fzf"
 
 # mcp serve: the read-only docs endpoint answers JSON-RPC over stdio.
 check "mcp serve initialize reports the docs server" \
@@ -291,8 +296,37 @@ check "env show resolves an environment for a worktree" \
   "'$SZ' env show '$WT' | grep -q '^env:'"
 check "env set/show round-trips a selection" \
   "'$SZ' env set company-k8s '$WT' >/dev/null 2>&1 && '$SZ' env show '$WT' >/dev/null 2>&1"
+# The canonical `--worktree` flag form (the positionals above stay as the
+# hidden back-compat spelling — see docs/cli.md "Worktree targeting").
+check "env show accepts the canonical --worktree flag" \
+  "'$SZ' env show --worktree '$WT' | grep -q '^env:'"
+# Round-trip: the flag-form WRITE must land on the SAME worktree a positional
+# READ resolves (cross-checks that --worktree isn't silently dropped in favor of
+# the cwd — `env set` exits 0 even when the selection is wrong, so assert the
+# effect, not just the exit code). `env set` persists the selection unconditionally
+# and the read preserves the requested name, so this leaves $WT carrying
+# company-k8s exactly as the sandbox-argv check below documents.
+check "env set --worktree lands the selection (flag-write / positional-read round-trip)" \
+  "'$SZ' env set company-k8s --worktree '$WT' >/dev/null 2>&1 && '$SZ' env show '$WT' | grep -q company-k8s"
+# Passing BOTH forms is a usage error: non-zero exit (no specific code promised).
+check "env show refuses --worktree plus a positional (non-zero)" \
+  "! '$SZ' env show --worktree '$WT' '$WT' >/dev/null 2>&1"
+# The conflict guard is per-verb (flatten site): spot-check a second verb.
+check "placement explain refuses --worktree plus a positional (non-zero)" \
+  "! '$SZ' placement explain --worktree '$WT' '$WT' >/dev/null 2>&1"
+# sandbox-argv takes the same flag and resolves like every other scoped verb.
+# Target the repo root ($WT now carries the deliberately undefined company-k8s
+# env selection, which launch_spec correctly refuses) and switch the seeded
+# tailscale VPN off for this one call — its auth key is unset here by design.
+check "sandbox-argv accepts the canonical --worktree flag" \
+  "'$SZ' --set sandbox.vpn.provider=none sandbox-argv --worktree '$R' | grep -q ."
+# No-arg default resolution: with $THEGN_WORKTREE exported to the repo root, a
+# flag-less sandbox-argv resolves to it (the shared chain, not the old raw cwd).
+# Run from a scratch cwd to prove $THEGN_WORKTREE — not the cwd — wins.
+check "sandbox-argv with no --worktree resolves via the THEGN_WORKTREE env" \
+  "(cd / && THEGN_WORKTREE='$R' '$SZ' --set sandbox.vpn.provider=none sandbox-argv | grep -q .)"
 
-# ── agent-driven merge queue (`merge` namespace, the fold-actor) ─────────────
+# ── merge queue (`merge` namespace, the fold-actor) ──────────────────────────
 # Assign a worktree branch to the queue and drain it: a clean branch folds onto
 # the target and lands (no agent needed). Exercises the CLI + DB round-trip.
 check "merge list starts empty" \
@@ -314,6 +348,12 @@ fi
 # the worktree still exists — a clean land now auto-removes it (see below).
 check "merge rm deletes the entry by the same path" \
   "'$SZ' merge rm '$MP' >/dev/null 2>&1"
+# Flag-form twin: `merge rm` on a non-queued path exits non-zero, so it needs
+# its own preceding add before the canonical `--worktree` removal.
+check "merge add queues the branch again for the flag-form rm" \
+  "'$SZ' merge add '$MP' | grep -q 'queued'"
+check "merge rm accepts the canonical --worktree flag" \
+  "'$SZ' merge rm --worktree '$MP' >/dev/null 2>&1"
 check "merge add re-queues the branch after rm" \
   "'$SZ' merge add '$MP' | grep -q 'queued'"
 check "merge drain lands the clean branch" \
@@ -332,6 +372,8 @@ check "clean land deletes the merged branch" \
 # written — the byte-compatibility invariant's shell-visible face.
 check "placement plan reports passthrough while the engine is off" \
   "'$SZ' placement plan '$R' | grep -q 'engine off'"
+check "placement plan accepts the canonical --worktree flag" \
+  "'$SZ' placement plan --worktree '$R' | grep -q 'engine off'"
 check "placement list renders the seeded host (unknown size)" \
   "'$SZ' placement list | grep -q 'smoke-local'"
 check "placement events is empty while the engine is off" \
@@ -434,8 +476,11 @@ allow_public = false
 server_addr = "x"
 subdomain_host = "y"
 EOF
+# A refused public share exits non-zero (misuse a script must detect) AND names
+# the reason. Capture output so the message check works under `set -e`/pipefail
+# even though the command is expected to fail.
 check "share allow_public guard refuses public shares" \
-  "'$SZ' --config '$TMP/share-guard.toml' share start 3000 --worktree '$WT' 2>&1 | grep -q 'public sharing is disabled'"
+  "out=\$('$SZ' --config '$TMP/share-guard.toml' share start 3000 --worktree '$WT' 2>&1) || printf '%s' \"\$out\" | grep -q 'public sharing is disabled'"
 
 # Intent-first reach mapping: `--reach peer` resolves to the iroh provider.
 cat >"$TMP/share-reach.toml" <<EOF
@@ -459,9 +504,9 @@ check "share --reach peer resolves to the iroh provider" \
 kill "$REACH_PID" 2>/dev/null || true
 wait "$REACH_PID" 2>/dev/null || true
 
-# An invalid reach is rejected cleanly (exit 0 with a message).
+# An invalid reach is rejected: exit non-zero (misuse) with a message naming it.
 check "share rejects an invalid --reach value" \
-  "'$SZ' --config '$TMP/share-reach.toml' share start 3000 --reach bogus --worktree '$WT' 2>&1 | grep -q 'reach'"
+  "out=\$('$SZ' --config '$TMP/share-reach.toml' share start 3000 --reach bogus --worktree '$WT' 2>&1) || printf '%s' \"\$out\" | grep -q 'reach'"
 
 # ── auto port forwarding (`[forward]`) ───────────────────────────────────────
 # Config round-trips (the [forward] block parses + serializes) and the
@@ -686,7 +731,7 @@ check "doctor reports the stable channel + disabled remote" \
 check "doctor reports the dev channel + enabled remote" \
   "env THEGN_CHANNEL=dev '$SZ' doctor --json | grep -A8 '\"features\"' | grep -q '\"remote\": true'"
 CHCFG="$TMP/channel.toml"
-printf '[observe]\nenabled = true\n\n[llm_proxy]\nenabled = true\n' >"$CHCFG"
+printf '[observe]\nenabled = true\n' >"$CHCFG"
 check "stable clamps experimental toggles off" \
   "env THEGN_CHANNEL=stable '$SZ' --config '$CHCFG' config show | grep -A1 '^\[observe\]' | grep -q 'enabled = false'"
 check "dev honours the same toggles" \

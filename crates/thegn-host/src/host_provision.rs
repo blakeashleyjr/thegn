@@ -21,7 +21,7 @@ use thegn_core::store::WorkspaceStore;
 use thegn_core::toolchain;
 use thegn_svc::host::{HostRunner, OciRunner, oci_runner_for};
 
-use crate::agent::{ProvisionState, ProvisionStepView, SandboxScope};
+use crate::agent::{ProvisionState, ProvisionStepView};
 
 /// Marker inside the container `$HOME`: the per-container pipeline ran.
 /// (Volumes/images dedup the heavy parts; this only skips the cheap replay.)
@@ -54,7 +54,6 @@ pub(crate) fn provision_worktree_on_host(
         &loc,
         None,
         false,
-        SandboxScope::Shell,
         Some(env_name),
     ) {
         Ok(o) => o,
@@ -239,8 +238,7 @@ pub(crate) fn provision_worktree_on_host(
             | StepKind::HomeClosurePush(_)
             | StepKind::DevShellClosurePush
             | StepKind::LocalParity { .. }
-            | StepKind::SnapshotRestore { .. }
-            | StepKind::ManagedPi => {
+            | StepKind::SnapshotRestore { .. } => {
                 tracing::debug!(target: "thegn::host", step = %step.id, "skipped (provider-only)");
                 Ok(())
             }

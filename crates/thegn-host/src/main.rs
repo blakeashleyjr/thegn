@@ -4,23 +4,19 @@
 //! portable-pty pane through a `PaneEmulator` grid, composited into a termwiz
 //! `Surface` that diff-flushes to the outer terminal (the "no-flash" mechanism).
 
-mod acp_gate;
 mod actions;
 mod agent;
 mod agent_configs;
 mod agent_home;
 mod agent_output;
-mod agent_pi;
 mod agent_ssh;
 mod agent_teardown;
-mod ai_sidecar;
 mod apps;
 mod attention_status;
 mod autoscale;
 mod bar_nav;
 mod blast_radius;
 mod borders;
-mod bouncer;
 mod branch_cache;
 mod bridge_sup;
 mod build_cache;
@@ -94,7 +90,6 @@ mod machine0_bridge;
 mod managed_tool;
 mod mascot;
 mod masthead;
-mod mcp_merge;
 mod media_art;
 mod media_ctl;
 mod media_overlay;
@@ -119,13 +114,13 @@ mod palette;
 mod pane;
 mod pane_pty;
 mod pane_source;
+mod pane_writer;
 mod panel;
 mod panel_header_cache;
 mod panel_util;
 mod panes;
 mod parity;
 mod perf;
-mod pi_assets;
 mod pins;
 mod placement_flow;
 mod platform;
@@ -140,13 +135,10 @@ mod provider_factory;
 mod provider_workdir;
 mod provision_gate;
 mod provision_recover;
-mod proxy_daemon;
-mod proxy_keys;
 mod pty_drain;
 mod queries;
 mod rasterize;
 mod recorder;
-mod relay;
 mod remote_sync;
 mod render_plan;
 mod replay;
@@ -300,8 +292,8 @@ pub enum Command {
     /// the main checkout is read-only. The blessed one-shot alternative to
     /// `git checkout main && git merge`.
     Land {
-        /// Worktree path (default: the current worktree).
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: cmd::target::WorktreeTarget,
     },
     /// Agent-driven merge queue: assign branches (`merge add`) and drain them one
     /// by one (`merge drain`), dispatching a headless CLI agent to resolve
@@ -359,12 +351,6 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::env::Action,
     },
-    /// Inspect and manage the LLM proxy: status, stats (tokens/sec, cost),
-    /// virtual keys (scoped accounts), budgets, and standalone `serve`.
-    Proxy {
-        #[command(subcommand)]
-        action: cmd::proxy::Action,
-    },
     /// Manage zones (workspace groups with credential/egress/budget sub-scoping).
     Zone {
         #[command(subcommand)]
@@ -382,12 +368,6 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::host::Action,
     },
-    /// Install + configure thegn's managed pi under `~/.thegn/pi` (the
-    /// "Agent" picker entry): a pinned binary + the thegn-acp extension.
-    Agent {
-        #[command(subcommand)]
-        action: cmd::agent::Action,
-    },
     /// BugStalker debugger: install/pin `bs`, or start a session (`debug run
     /// <program>` / `debug attach <pid>`) — run inside a pane to debug within
     /// its sandbox/placement.
@@ -403,8 +383,8 @@ pub enum Command {
     },
     /// Print the exact sandbox argv for a worktree (for debugging).
     SandboxArgv {
-        /// Path to the worktree (defaults to the current directory).
-        worktree: Option<String>,
+        #[command(flatten)]
+        target: cmd::target::WorktreeTarget,
     },
     /// Push, list, dismiss, or read notifications (plugin/script API).
     Notify {
@@ -435,7 +415,7 @@ pub enum Command {
     /// in PLAINTEXT — bind to a trusted network (tailscale/wireguard) or
     /// tunnel over `ssh -L`.
     Serve {
-        /// TCP bind address (defaults to `[serve] bind`, e.g. 0.0.0.0:5380).
+        /// TCP bind address (defaults to `[serve] bind`, e.g. 127.0.0.1:5380).
         #[arg(long)]
         bind: Option<String>,
         /// Skip minting + printing the startup pairing URL.
@@ -482,7 +462,7 @@ pub enum Command {
     /// Hidden: run the reverse-tunnel agent over stdio. The host spawns this
     /// *inside* a remote env; it binds `127.0.0.1:<port>` in the sandbox and
     /// multiplexes every connection to that port back to the host (which dials the
-    /// real target, e.g. the local `tgproxy`) over this stdio channel. stdout is
+    /// real target, e.g. the host nix cache) over this stdio channel. stdout is
     /// the protocol channel — not for interactive use.
     #[command(hide = true)]
     BridgeRevtunnel {
@@ -767,6 +747,15 @@ fn main() -> anyhow::Result<()> {
     // exit. The writer is its own std thread, so it outlives the runtime and this
     // catches every quit path with one call.
     db_task::flush(std::time::Duration::from_secs(2));
+    // A daemon-disabled resurrect fire-and-forgets kills for the daemon
+    // sessions it claimed; their pane_sessions records are already consumed,
+    // so letting shutdown_background() abort an in-flight kill would silently
+    // recreate the permanent invisible orphan the claim exists to prevent.
+    // Bounded flush of any still-pending kills — a no-op (empty latch) on
+    // every normal quit, so this adds nothing to the ordinary exit path.
+    rt.block_on(handlers::daemon_lifecycle::flush_orphan_kills(
+        std::time::Duration::from_secs(2),
+    ));
     rt.shutdown_background();
     report_kept_sessions(handlers::daemon_lifecycle::kept_sessions());
     // termwiz opens /dev/tty without O_CLOEXEC; child pane shells inherit that
@@ -775,7 +764,14 @@ fn main() -> anyhow::Result<()> {
     // kills the whole process group atomically, matching what alacritty/kitty do.
     let code: i32 = match &result {
         Ok(()) => cmd::EXIT_OK,
-        Err(_) => cmd::EXIT_ERROR,
+        Err(e) => {
+            // Print the error chain: the compositor redirected stderr to the
+            // logfile during the session, and the alt screen is now torn down,
+            // so an early `?` (e.g. "term capabilities", "open terminal") would
+            // otherwise exit 1 with a blank terminal and no explanation.
+            thegn_core::msg::error(&format!("{e:#}"));
+            cmd::EXIT_ERROR
+        }
     };
     std::process::exit(code);
 }
@@ -787,8 +783,6 @@ fn main() -> anyhow::Result<()> {
 fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::channel::Feature)> {
     use thegn_core::channel::Feature;
     Some(match command {
-        Command::Proxy { .. } => ("proxy", Feature::Ai),
-        Command::Agent { .. } => ("agent", Feature::Ai),
         Command::Host { .. } => ("host", Feature::Providers),
         Command::Placement { .. } => ("placement", Feature::Placement),
         Command::Kaneo { .. } => ("kaneo", Feature::Trackers),
@@ -844,7 +838,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Diff { args } => cmd::wt::run(&cfg, cmd::wt::Action::Diff(args)),
         Command::List { args } => cmd::wt::run(&cfg, cmd::wt::Action::List(args)),
         Command::Integrate => cmd::integrate::run(&cfg),
-        Command::Land { worktree } => cmd::land::run(&cfg, worktree),
+        Command::Land { target } => cmd::land::run(&cfg, target.get()),
         Command::Merge { action } => cmd::merge::run(&cfg, action),
         Command::Disk { args } => cmd::wt::run(&cfg, cmd::wt::Action::Disk(args)),
         Command::Clean { args } => cmd::wt::run(&cfg, cmd::wt::Action::Clean(args)),
@@ -857,11 +851,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Recent { count, json } => cmd::repos::recent(count, json),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
         Command::Env { action } => cmd::env::run(&cfg, action),
-        Command::Proxy { action } => cmd::proxy::run(&cfg, action),
         Command::Zone { action } => cmd::zone::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),
-        Command::Agent { action } => cmd::agent::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
         Command::Notify { action } => cmd::notify::run(action),
@@ -933,10 +925,12 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::VpsSsh { name, cmd } => vps_bridge::run(&cfg, &name, &cmd),
         Command::Machine0Ssh { name, cmd } => machine0_bridge::run(&cfg, &name, &cmd),
         Command::SpriteExec { id, cmd } => sprite_bridge::run(&cfg, &id, &cmd),
-        Command::SandboxArgv { worktree } => {
-            let wt = worktree
-                .or_else(|| std::env::current_dir().ok()?.to_str().map(str::to_string))
-                .unwrap_or_default();
+        Command::SandboxArgv { target } => {
+            // Resolve like every other worktree-scoped verb (explicit →
+            // $THEGN_WORKTREE → git toplevel → cwd) — previously raw cwd only.
+            let wt = cmd::resolve_worktree(target.get())
+                .to_string_lossy()
+                .into_owned();
             match crate::agent::launch_spec(&cfg, &wt, None, "shell") {
                 Ok(spec) => {
                     thegn_core::outln!("{}", spec.argv.join(" "));

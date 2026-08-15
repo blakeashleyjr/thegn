@@ -22,15 +22,23 @@ pub enum Action {
     /// Pure dry-run: what would the broker decide for this worktree right
     /// now, and why was each candidate (in)eligible? No reservation is made.
     Plan {
-        /// Worktree path (defaults to the current directory).
-        worktree: Option<String>,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
     },
     /// Why the last spawn landed where it did (newest decision trace).
+    //
+    // Bespoke `--worktree` (not the shared `super::target::WorktreeTarget`):
+    // its no-arg default is "the most recent decision overall", NOT the
+    // current worktree, so it must never be resolved against the cwd.
     Explain {
         /// Worktree path (defaults to the most recent decision overall).
+        #[arg(long)]
         worktree: Option<String>,
+        /// Hidden legacy spelling: the trailing positional worktree.
+        #[arg(value_name = "WORKTREE", hide = true, conflicts_with = "worktree")]
+        worktree_pos: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -59,8 +67,12 @@ pub enum Action {
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::List { json } => list(cfg, json),
-        Action::Plan { worktree, json } => plan(cfg, worktree, json),
-        Action::Explain { worktree, json } => explain(worktree, json),
+        Action::Plan { json, target } => plan(cfg, target.get(), json),
+        Action::Explain {
+            worktree,
+            worktree_pos,
+            json,
+        } => explain(worktree.or(worktree_pos), json),
         Action::Events { limit } => events(limit),
         Action::Budget {
             scope,
@@ -126,14 +138,6 @@ fn budget(
         );
     }
     Ok(())
-}
-
-fn cwd_worktree(explicit: Option<String>) -> String {
-    explicit.unwrap_or_else(|| {
-        std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    })
 }
 
 /// One row of the unified resource view, JSON-shaped for scripting.
@@ -273,7 +277,11 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
 }
 
 fn plan(cfg: &Config, worktree: Option<String>, json: bool) -> Result<()> {
-    let wt = cwd_worktree(worktree);
+    // Resolve like every other worktree-scoped verb (explicit → $THEGN_WORKTREE
+    // → git toplevel → cwd) — previously a bespoke raw-cwd default.
+    let wt = super::resolve_worktree(worktree)
+        .to_string_lossy()
+        .into_owned();
     let out = crate::placement_flow::plan(cfg, &wt);
     if json {
         outln!("{}", serde_json::to_string_pretty(&out)?);

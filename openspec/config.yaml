@@ -45,10 +45,14 @@ context: |
   (podman -> docker -> bwrap -> none); the worktree stays on the host,
   bind-mounted at its real path so host-side git reads keep working.
 
-  The long game (see tasks.md) is two tracks joined by one keystone: an AI-free
-  workspace shell (the current shippable product) and an AI/agent layer bridged
-  by an LLM proxy. The shell must NEVER hard-depend on the AI layers; AI is
-  strictly additive.
+  thegn is an AI-free workspace shell. The former AI/agent layer (the
+  thegn-agent and thegn-proxy crates, LLM proxy, ACP bridge, managed pi) was
+  removed from the codebase before the public alpha. What remains agent-wise is
+  deliberately thin: the config-driven [[agents]]/[[tools]] picker (a plain
+  argv launcher), per-worktree agent memory, agent-login sync into sandboxes,
+  the agent-output activity signal, and the merge-queue agent_command
+  fold-actor. If an AI track reopens, it must be strictly additive — the shell
+  must NEVER hard-depend on AI layers.
 
   Conventions:
   - Coverage gate is thegn-core only, 95% lines; new core logic needs unit
@@ -75,5 +79,6 @@ rules:
     - New interactive surfaces must state which help context key (`zone:*` / `panel:*`) maps to their docs/help/ page.
   tasks:
     - Core logic tasks must include unit tests (95% line gate on thegn-core).
-    - Any task adding or renaming a user-facing action, keybind, zone, panel section, or config table must include a task updating the matching docs/help/ page(s); the help ratchet test enforces action-to-page coverage and test/help-ratchet.txt may only shrink.
+    - Tasks adding or renaming an action, keybind, zone, panel section, or config table must update docs/help/.
+    - The help ratchet test enforces action-to-page coverage; test/help-ratchet.txt may only shrink.
     - End with a task to run `just ci` (includes openspec-validate).

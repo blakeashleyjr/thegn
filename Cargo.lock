@@ -3521,7 +3521,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-app"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "chrono",
  "gtui-core",
@@ -3530,7 +3530,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "chrono",
  "serde",
@@ -3540,7 +3540,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-embed"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "chrono",
  "gtui-app",
@@ -3555,7 +3555,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-query"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "chrono",
  "gtui-core",
@@ -3568,7 +3568,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-render"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "gtui-core",
  "ratatui",
@@ -7060,14 +7060,12 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
- "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots 1.0.8",
 ]
@@ -7105,7 +7103,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams 0.5.0",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -8340,21 +8338,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "thegn-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "iroh",
- "portable-pty",
- "thegn-core",
- "thegn-svc",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "thegn-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8393,7 +8378,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-host"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8441,7 +8426,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-media"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "futures",
  "serde",
@@ -8454,7 +8439,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-metrics"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "nix 0.29.0",
  "starship-battery",
@@ -8463,33 +8448,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "thegn-proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "futures",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "thegn-core",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "thegn-svc"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "axum",
  "base64",
  "chrono",
  "criterion",
- "futures-channel",
  "futures-util",
  "getrandom 0.3.4",
  "gix",
@@ -8511,7 +8477,6 @@ dependencies = [
  "thegn-core",
  "tokio",
  "tokio-tungstenite 0.24.0",
- "tokio-util",
  "tonic",
  "tonic-build",
  "tower",
@@ -9533,19 +9498,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "wasm-streams"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
-dependencies = [
- "futures-util",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
 ]
 
 [[package]]

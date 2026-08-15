@@ -1,0 +1,477 @@
+//! Strict validation for `thegn config validate` / `config set`.
+//!
+//! Schema-driven: `config_enum!` emits a manual `JsonSchema` impl carrying the
+//! canonical values + aliases under the [`ENUM_MARKER`] extension, and
+//! [`validate_str`] walks the raw TOML document in lockstep with
+//! `schema_for!(Config)`, strict-checking every marked string node. Because
+//! the schema is generated from the exact serde structure that loads the file,
+//! every enum reachable from [`Config`]'s type tree is covered by
+//! construction — new enums and new fields need no registration here.
+//!
+//! Honest coverage contract: "every `config_enum!` reachable from `Config`'s
+//! serde tree is validated". `ShareReach` is intentionally out of scope (it
+//! has no config.toml key — CLI/runtime vocabulary only), and the flattened
+//! `[keybinds]` map is skipped (schemars 0.8 drops a flattened map's
+//! `additionalProperties`, so its free-form keys are simply not traversed).
+
+use std::sync::OnceLock;
+
+use schemars::schema::{RootSchema, Schema, SchemaObject, SingleOrVec};
+
+use crate::config::Config;
+
+/// Schema-extension key `config_enum!` stamps on every enum it defines; the
+/// value is `{ "kind": <human kind>, "aliases": [<accepted aliases>] }`.
+pub const ENUM_MARKER: &str = "x-thegn-enum";
+
+/// The `Config` schema, generated once (it is pure and deterministic).
+fn config_schema() -> &'static RootSchema {
+    static SCHEMA: OnceLock<RootSchema> = OnceLock::new();
+    SCHEMA.get_or_init(|| schemars::schema_for!(Config))
+}
+
+/// Strictly validate a raw `config.toml` body, collecting human-readable errors
+/// for `config validate` (the only place a bad value is treated as an error
+/// rather than warned-and-defaulted). Returns the list of problems (empty = ok).
+pub fn validate_str(body: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    let val: toml::Value = match body.parse() {
+        Ok(v) => v,
+        Err(e) => return vec![format!("TOML syntax error: {e}")],
+    };
+    // The wholesale check load_layered enforces: if the body fails to
+    // deserialize into `Config`, the entire file is discarded for defaults.
+    // This catches shape/type errors; the schema walk below catches the
+    // warn-and-default enum values `Deserialize` never rejects.
+    if let Err(e) = toml::from_str::<Config>(body) {
+        errs.push(format!("config would be rejected on load: {e}"));
+    }
+    let root = config_schema();
+    walk_object(&root.schema, root, &val, "", &mut errs);
+    errs
+}
+
+/// Resolve a `$ref` (`#/definitions/Name`) to its definition name.
+fn ref_name(reference: &str) -> &str {
+    reference.rsplit('/').next().unwrap_or(reference)
+}
+
+fn walk_schema(
+    schema: &Schema,
+    root: &RootSchema,
+    value: &toml::Value,
+    path: &str,
+    errs: &mut Vec<String>,
+) {
+    // `Schema::Bool` (e.g. `additionalProperties: false`) constrains shape,
+    // which the wholesale `Config` parse already enforces — nothing enum-shaped
+    // to check.
+    if let Schema::Object(obj) = schema {
+        walk_object(obj, root, value, path, errs);
+    }
+}
+
+/// Walk one schema node in lockstep with the TOML value it describes.
+fn walk_object(
+    obj: &SchemaObject,
+    root: &RootSchema,
+    value: &toml::Value,
+    path: &str,
+    errs: &mut Vec<String>,
+) {
+    // Resolve `$ref` through the root's definitions.
+    if let Some(reference) = &obj.reference {
+        if let Some(def) = root.definitions.get(ref_name(reference)) {
+            walk_schema(def, root, value, path, errs);
+        }
+        return;
+    }
+    // schemars 0.8 wraps a `$ref` field in `allOf` whenever the field carries
+    // ANY metadata (a `default`, a doc comment, …), and `Option<Enum>` becomes
+    // `anyOf [$ref, null]` — recurse all subschema lists unconditionally. Only
+    // the resolved enum definition carries [`ENUM_MARKER`], so a value reached
+    // through a wrapper is still checked exactly once (never double-reported).
+    if let Some(sub) = &obj.subschemas {
+        for list in [&sub.all_of, &sub.any_of, &sub.one_of]
+            .into_iter()
+            .flatten()
+        {
+            for s in list {
+                walk_schema(s, root, value, path, errs);
+            }
+        }
+    }
+    // The strict enum check: only nodes carrying the `config_enum!` marker,
+    // and only string TOML values — `failover` keys legally accept a bool
+    // (`de_failover`), and genuinely wrong types are already reported by the
+    // wholesale `Config` parse above.
+    if let toml::Value::String(s) = value
+        && let Some(marker) = obj.extensions.get(ENUM_MARKER)
+        && let Err(e) = check_enum(obj, marker, s)
+    {
+        errs.push(format!("{path}: {e}"));
+    }
+    match value {
+        toml::Value::Table(table) => {
+            if let Some(ov) = &obj.object {
+                for (key, child) in table {
+                    let child_path = join_key(path, key);
+                    if let Some(prop) = ov.properties.get(key) {
+                        walk_schema(prop, root, child, &child_path, errs);
+                    } else if let Some(additional) = &ov.additional_properties {
+                        // Map tables: `[env.<name>]`, `[host.<name>]`, …
+                        walk_schema(additional, root, child, &child_path, errs);
+                    }
+                }
+            }
+        }
+        toml::Value::Array(items) => {
+            if let Some(av) = &obj.array
+                && let Some(SingleOrVec::Single(item)) = &av.items
+            {
+                for (i, child) in items.iter().enumerate() {
+                    walk_schema(item, root, child, &format!("{path}[{i}]"), errs);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Mirror of `from_str_validated`: trim + ASCII-lowercase, match canonical
+/// values then aliases, and reproduce its exact error message on a miss.
+fn check_enum(obj: &SchemaObject, marker: &serde_json::Value, raw: &str) -> Result<(), String> {
+    let norm = raw.trim().to_ascii_lowercase();
+    let canon: Vec<&str> = obj
+        .enum_values
+        .iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .collect();
+    if canon.iter().any(|c| *c == norm) {
+        return Ok(());
+    }
+    if marker
+        .get("aliases")
+        .and_then(|a| a.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .any(|a| a == norm)
+    {
+        return Ok(());
+    }
+    let kind = marker
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("value");
+    Err(format!(
+        "unknown {kind} {norm:?}; expected one of: {}",
+        canon.join(", ")
+    ))
+}
+
+/// Dotted key join; arrays use bracket form (`pins[0].location`).
+fn join_key(path: &str, key: &str) -> String {
+    if path.is_empty() {
+        key.to_string()
+    } else {
+        format!("{path}.{key}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Structural walk of the schema (no TOML document): collect every
+    /// `(path, enum name)` pair reachable from the root. Maps contribute a `*`
+    /// path segment, arrays `[]`. Definition recursion is cycle-guarded.
+    fn collect_enum_paths(
+        schema: &Schema,
+        root: &RootSchema,
+        path: &str,
+        stack: &mut Vec<String>,
+        out: &mut Vec<(String, String)>,
+    ) {
+        let Schema::Object(obj) = schema else { return };
+        if let Some(reference) = &obj.reference {
+            let name = ref_name(reference).to_string();
+            if stack.contains(&name) {
+                return; // cycle guard
+            }
+            if let Some(def) = root.definitions.get(&name) {
+                if let Schema::Object(dobj) = def
+                    && dobj.extensions.contains_key(ENUM_MARKER)
+                {
+                    out.push((path.to_string(), name.clone()));
+                }
+                stack.push(name);
+                collect_enum_paths(def, root, path, stack, out);
+                stack.pop();
+            }
+            return;
+        }
+        if let Some(sub) = &obj.subschemas {
+            for list in [&sub.all_of, &sub.any_of, &sub.one_of]
+                .into_iter()
+                .flatten()
+            {
+                for s in list {
+                    collect_enum_paths(s, root, path, stack, out);
+                }
+            }
+        }
+        if let Some(ov) = &obj.object {
+            for (key, prop) in &ov.properties {
+                collect_enum_paths(prop, root, &join_key(path, key), stack, out);
+            }
+            if let Some(additional) = &ov.additional_properties {
+                collect_enum_paths(additional, root, &join_key(path, "*"), stack, out);
+            }
+        }
+        if let Some(av) = &obj.array
+            && let Some(SingleOrVec::Single(item)) = &av.items
+        {
+            collect_enum_paths(item, root, &format!("{path}[]"), stack, out);
+        }
+    }
+
+    fn all_enum_paths() -> Vec<(String, String)> {
+        let root = config_schema();
+        let mut out = Vec::new();
+        collect_enum_paths(
+            &Schema::Object(root.schema.clone()),
+            root,
+            "",
+            &mut Vec::new(),
+            &mut out,
+        );
+        out
+    }
+
+    /// Every definition carrying the marker (i.e. every `config_enum!` type
+    /// schemars pulled into the `Config` schema).
+    fn marked_definitions() -> Vec<String> {
+        config_schema()
+            .definitions
+            .iter()
+            .filter(
+                |(_, s)| matches!(s, Schema::Object(o) if o.extensions.contains_key(ENUM_MARKER)),
+            )
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    // ---- completeness gate -------------------------------------------------
+
+    /// The "impossible to miss" cross-check: every `config_enum!` type that
+    /// enters the `Config` schema must be REACHED by the walker at >= 1 key
+    /// path. If a future enum lands inside a container shape the walker can't
+    /// traverse, this fails loudly.
+    #[test]
+    fn every_marked_definition_is_reachable() {
+        let pairs = all_enum_paths();
+        let reached: std::collections::BTreeSet<&str> =
+            pairs.iter().map(|(_, n)| n.as_str()).collect();
+        for def in marked_definitions() {
+            assert!(
+                reached.contains(def.as_str()),
+                "config_enum {def} is in the schema but the validate walker \
+                 never reaches it — container shape not traversed?"
+            );
+        }
+    }
+
+    /// Guard against an enum silently dropping OUT of the schema (which would
+    /// make the reachability gate above pass vacuously): pin the count of
+    /// marked definitions. 62 `config_enum!` invocations exist; `ShareReach`
+    /// is intentionally absent (no config.toml key — CLI/runtime vocabulary
+    /// only), so 61 must be present, and `ShareReach` explicitly must not be.
+    ///
+    /// This count MUST stay platform-independent: never `#[cfg(...)]`- or
+    /// feature-gate a `config_enum!`-typed config *field*, or this pin passes on
+    /// one platform and fails on another (e.g. the Windows CI leg) with a
+    /// message that reads like a coverage regression. If a platform-specific
+    /// config field is ever unavoidable, switch this pin to a per-platform
+    /// expected `BTreeSet` built with the same cfg gates.
+    #[test]
+    fn marked_definition_count_is_pinned() {
+        let defs = marked_definitions();
+        assert!(
+            !defs.iter().any(|d| d == "ShareReach"),
+            "ShareReach grew a config key — remove it from the exclusion \
+             list and bump the pinned count"
+        );
+        assert_eq!(
+            defs.len(),
+            61,
+            "config_enum definitions in the Config schema changed; update the \
+             pin (and the exclusion note) deliberately: {defs:?}"
+        );
+    }
+
+    // ---- path spot-checks --------------------------------------------------
+
+    #[test]
+    fn walker_reaches_legacy_and_previously_uncovered_paths() {
+        let pairs = all_enum_paths();
+        let has = |path: &str, name: &str| {
+            assert!(
+                pairs.iter().any(|(p, n)| p == path && n == name),
+                "expected ({path}, {name}) reachable; got {pairs:#?}"
+            );
+        };
+        // All 16 legacy hand-checked paths.
+        has("picker", "Picker");
+        has("worktree_mode", "WorktreeMode");
+        has("name_scheme", "NameScheme");
+        has("sandbox.backend", "SandboxBackend");
+        has("sandbox.network", "Network");
+        has("sandbox.profile", "SandboxProfile");
+        has("sandbox.on_missing", "OnMissing");
+        has("sandbox.remote.transport", "RemoteTransport");
+        has("sandbox.remote.mode", "RemoteMode");
+        has("log.level", "LogLevel");
+        has("log.format", "LogFormat");
+        has("pins[].location", "PinLocation");
+        has("theme.color", "ColorMode");
+        has("theme.glyphs", "GlyphMode");
+        has("merge_queue.conflict_handoff", "ConflictHandoff");
+        has("merge_queue.on_landed", "OnLanded");
+        // Previously-uncovered keys, one per family.
+        has("lifecycle.eager", "EagerScope");
+        has("sandbox.failover", "FailoverMode");
+        has("toolchain.mode", "ToolchainMode");
+        has("issues.provider", "IssueProviderKind");
+        has("ui.sidebar_focus_detail", "FocusDetail");
+        // Maps via additionalProperties.
+        has("env.*.provider.connect", "ProviderConnect");
+        has("host.*.reach", "HostReach");
+        has("host.*.install_runtime", "InstallConsent");
+        // Arrays of tables beyond pins.
+        assert!(
+            pairs
+                .iter()
+                .any(|(p, n)| p == "forges[].kind" && n == "ForgeKind"),
+            "forges[].kind (ForgeKind) missing: {pairs:#?}"
+        );
+        // Theme + vpn + placement families.
+        assert!(
+            pairs
+                .iter()
+                .any(|(p, n)| p.starts_with("theme.mascot") && n == "MascotKind"),
+            "theme mascot enum missing: {pairs:#?}"
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(p, n)| p.starts_with("sandbox.vpn.") && n == "VpnMode"),
+            "sandbox.vpn mode enum missing: {pairs:#?}"
+        );
+        has("placement.mode", "PlacementModePref");
+        has("env.*.placement", "PlacementMode");
+    }
+
+    // ---- behavior ----------------------------------------------------------
+
+    #[test]
+    fn newly_covered_keys_error_with_dotted_path_and_valid_set() {
+        let errs = validate_str("[lifecycle]\neager = \"bogus\"\n");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].starts_with("lifecycle.eager: "), "{errs:?}");
+        assert!(errs[0].contains("expected one of:"), "{errs:?}");
+
+        let errs = validate_str("[env.foo.provider]\nconnect = \"bogus\"\n");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].starts_with("env.foo.provider.connect: "),
+            "{errs:?}"
+        );
+
+        let errs = validate_str("[[forges]]\nkind = \"bogus\"\n");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].starts_with("forges[0].kind: "), "{errs:?}");
+
+        let errs = validate_str("[host.box]\nreach = \"bogus\"\n");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].starts_with("host.box.reach: "), "{errs:?}");
+    }
+
+    #[test]
+    fn aliases_and_bool_failover_stay_clean() {
+        // Alias accepted exactly like from_str_validated.
+        assert!(validate_str("[sandbox]\nprofile = \"guarded\"\n").is_empty());
+        // Bool-typed failover is legal (de_failover accepts bool OR string) —
+        // the walker only inspects string values.
+        assert!(validate_str("[sandbox]\nfailover = true\n").is_empty());
+        let errs = validate_str("[sandbox]\nfailover = \"bogus\"\n");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].starts_with("sandbox.failover: "), "{errs:?}");
+        // A wrong non-string type for a plain enum key is still caught — by
+        // the wholesale Config parse, not the walker.
+        let errs = validate_str("picker = 3\n");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("rejected on load"), "{errs:?}");
+    }
+
+    /// Walker matching == `from_str_validated` matching by construction: both
+    /// lowercase+trim the input, so every canonical value and alias must
+    /// already be its own normalized form.
+    #[test]
+    fn canonical_values_and_aliases_are_normalization_stable() {
+        for name in marked_definitions() {
+            let Some(Schema::Object(obj)) = config_schema().definitions.get(&name) else {
+                unreachable!()
+            };
+            for v in obj.enum_values.iter().flatten() {
+                let s = v.as_str().expect("canonical values are strings");
+                assert_eq!(s, s.trim().to_ascii_lowercase(), "{name}: {s:?}");
+            }
+            let marker = &obj.extensions[ENUM_MARKER];
+            for a in marker["aliases"].as_array().into_iter().flatten() {
+                let s = a.as_str().expect("aliases are strings");
+                assert_eq!(s, s.trim().to_ascii_lowercase(), "{name}: {s:?}");
+            }
+        }
+    }
+
+    /// No false positives on every documented key: the shipped example config
+    /// must validate clean.
+    #[test]
+    fn example_config_validates_clean() {
+        let body = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/config.toml.example"
+        ));
+        let errs = validate_str(body);
+        assert!(errs.is_empty(), "{errs:#?}");
+    }
+
+    /// Pins the published-schema fix: `config schema` / the MCP feed now
+    /// advertise the canonical strings `from_str_validated` accepts, not the
+    /// Rust variant identifiers.
+    #[test]
+    fn published_schema_advertises_canonical_strings() {
+        let picker = schemars::schema_for!(crate::config::Picker);
+        let values: Vec<&str> = picker
+            .schema
+            .enum_values
+            .iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(values, ["auto", "gum", "fzf", "select"]);
+
+        let wm = schemars::schema_for!(crate::config::WorktreeMode);
+        let values: Vec<&str> = wm
+            .schema
+            .enum_values
+            .iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(values.contains(&"in_repo"), "{values:?}");
+        assert!(!values.contains(&"InRepo"), "{values:?}");
+    }
+}

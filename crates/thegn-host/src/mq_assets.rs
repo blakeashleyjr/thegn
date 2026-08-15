@@ -1,9 +1,8 @@
 //! Bundled `/mq` merge-queue skill, embedded in the binary and auto-seeded into
 //! each worktree's project skills dir (`.claude/skills/mq/SKILL.md`) so any
 //! Claude-family agent a user runs inside thegn discovers the merge-queue
-//! commands without hand-installing anything. Mirrors the `pi_assets` embed
-//! pattern. The pi (ACP) and control-API surfaces expose the same actions
-//! natively; this is the discoverability layer for plain shell-pane agents.
+//! commands without hand-installing anything. The `thegn merge` CLI exposes the
+//! same actions; this is the discoverability layer for shell-pane agents.
 
 use std::path::Path;
 use thegn_core::config::Config;

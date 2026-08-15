@@ -27,12 +27,11 @@ use std::path::PathBuf;
 /// `issue_projects` (sprint/milestone/epic cache per repo+provider).
 /// v11: adds `notifications` inbox (kind, issue ref, message, read flag).
 /// v12: adds `agent_dispatches` (AI agent assignments: issue→worktree→agent).
-/// v13: adds the LLM-proxy state tables — `proxy_health` (exhaustion markers,
-/// replacing the Go proxy's `health.json`), `proxy_requests` (per-request
-/// audit/query log; never stores prompt/completion bodies), `proxy_virtual_keys`
-/// (per-agent keys → upstream binding + scope), and `proxy_budgets` (per-scope
-/// spend + caps). Also formalizes the already-present `container_events` /
-/// `layouts` tables under this version.
+/// v13: added the LLM-proxy state tables (removed with the AI layer before the
+/// public alpha — pre-existing `proxy_*` tables are simply ignored, never
+/// dropped, per the never-reset-user-data migration contract). Also formalizes
+/// the already-present `container_events` / `layouts` tables under this
+/// version.
 /// v14: adds `group_tabs.pane_cwds` (per-leaf working directories) so
 /// resurrected panes respawn where they last were.
 /// v15: adds `group_tabs.pane_cmds` (per-leaf last foreground command, JSON
@@ -120,74 +119,6 @@ pub struct MergeQueueRow {
 // `crate::db::{ShareRow, ForwardRow}` paths stay valid via this re-export.
 pub use crate::models::{ForwardRow, ShareRow};
 
-/// A persisted LLM-proxy exhaustion marker (one per backend+model).
-#[derive(Debug, Clone)]
-pub struct ProxyHealthRow {
-    pub backend: String,
-    pub model: String,
-    pub kind: String,
-    pub reason: String,
-    pub since_ms: i64,
-    pub next_probe_ms: i64,
-    pub is_stale: bool,
-    pub consecutive_failures: i64,
-    pub cred_file: Option<String>,
-    pub cred_mtime_ms: Option<i64>,
-}
-
-/// A per-request audit row for the proxy. Carries only routing/usage/cost
-/// metadata — never prompt or completion bodies.
-#[derive(Debug, Clone, Default)]
-pub struct ProxyRequestRow {
-    pub ts_ms: i64,
-    pub protocol: String,
-    pub route: String,
-    pub virtual_key: Option<String>,
-    pub agent: Option<String>,
-    pub worktree: Option<String>,
-    pub workspace: Option<String>,
-    pub client_model: String,
-    pub backend: String,
-    pub backend_model: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cost_usd: f64,
-    pub cost_source: String,
-    pub outcome: String,
-    pub error_code: Option<String>,
-    /// Wall-clock request duration (dispatch → last byte). 0 = not measured.
-    pub duration_ms: i64,
-    /// Streaming time-to-first-byte (dispatch → commit); `None` for
-    /// non-streaming requests. `duration_ms - ttfb_ms` is the generation time
-    /// behind the tokens-per-second stats (v43).
-    pub ttfb_ms: Option<i64>,
-}
-
-/// A registered virtual key (metadata only — the token itself is never stored,
-/// only its hash, and the hash is not returned by list queries).
-#[derive(Debug, Clone)]
-pub struct ProxyVirtualKeyRow {
-    pub key_id: String,
-    pub label: String,
-    pub scope: String,
-    pub upstream: Option<String>,
-    pub created_at: i64,
-    pub revoked_at: Option<i64>,
-}
-
-/// A per-scope spend/budget row.
-#[derive(Debug, Clone)]
-pub struct ProxyBudgetRow {
-    pub scope: String,
-    pub period: String,
-    pub spent_tokens: i64,
-    pub spent_cost: f64,
-    pub limit_tokens: Option<i64>,
-    pub limit_cost: Option<f64>,
-    pub reset_ms: i64,
-    pub killed: bool,
-}
-
 /// One pre-provisioned spare in the warm pool (`pool_spares`). A spare is created
 /// generically (not bound to a worktree), fully provisioned + checkpointed, then
 /// `claimed` by a new worktree which binds it via `worktrees.provider_sandbox_id`.
@@ -220,8 +151,16 @@ impl Db {
         let path = db_path();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+            // Owner-only (0700) on the state dir + 0600 on the DB file below:
+            // thegn.db holds live bearer credentials (Kaneo device-flow token,
+            // iroh pair secrets) sent verbatim, plus per-repo history — it must
+            // not be world-readable under a lax umask. Best-effort, matching the
+            // secret-file writes elsewhere (sandbox/vpn/share).
+            let _ = crate::fsperm::restrict_dir_to_owner(dir);
         }
-        Self::init(Connection::open(&path)?)
+        let db = Self::init(Connection::open(&path)?)?;
+        let _ = crate::fsperm::restrict_to_owner(&path);
+        Ok(db)
     }
 
     /// An isolated in-memory DB (tests): same schema/migration, no file.
@@ -292,9 +231,10 @@ impl Db {
                  DROP TABLE IF EXISTS issue_projects;",
             );
         }
-        if ver < SCHEMA_VERSION {
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
+        // NB: user_version is stamped at the END of init (not here), AFTER the
+        // schema batch + every `ver`-gated post-batch cleanup, so a crash mid-init
+        // leaves the OLD version on disk and the next open re-runs the (idempotent)
+        // gated steps rather than skipping a migration that never actually ran.
         // A newer-schema DB (different branch sharing this file): warn + tolerate.
         let schema_mismatch = crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION);
 
@@ -592,80 +532,6 @@ impl Db {
               spec       TEXT NOT NULL,
               created_at INTEGER NOT NULL
             );
-            -- v13: LLM-proxy state. The proxy daemon is the single chokepoint all
-            -- agent model traffic crosses; these tables replace the Go proxy's
-            -- flat files (health.json, queries.jsonl) and add per-agent identity
-            -- + budget machinery the Go version never had.
-            --
-            -- proxy_health: one exhaustion marker per (backend, model). Survives
-            -- restarts so a cooled-down backend isn't re-hammered immediately.
-            CREATE TABLE IF NOT EXISTS proxy_health (
-              backend              TEXT    NOT NULL,
-              model                TEXT    NOT NULL,
-              kind                 TEXT    NOT NULL,
-              reason               TEXT    NOT NULL DEFAULT '',
-              since_ms             INTEGER NOT NULL,
-              next_probe_ms        INTEGER NOT NULL,
-              is_stale             INTEGER NOT NULL DEFAULT 0,
-              consecutive_failures INTEGER NOT NULL DEFAULT 0,
-              cred_file            TEXT,
-              cred_mtime_ms        INTEGER,
-              PRIMARY KEY (backend, model)
-            );
-            -- proxy_requests: per-request audit/query log. NEVER stores prompt or
-            -- completion bodies — only routing/usage/cost metadata (preserves the
-            -- Go proxy's privacy invariant). virtual_key/agent/worktree/workspace
-            -- carry the resolved caller identity for spend attribution.
-            CREATE TABLE IF NOT EXISTS proxy_requests (
-              id            INTEGER PRIMARY KEY AUTOINCREMENT,
-              ts_ms         INTEGER NOT NULL,
-              protocol      TEXT    NOT NULL DEFAULT 'openai',
-              route         TEXT    NOT NULL DEFAULT '',
-              virtual_key   TEXT,
-              agent         TEXT,
-              worktree      TEXT,
-              workspace     TEXT,
-              client_model  TEXT    NOT NULL DEFAULT '',
-              backend       TEXT    NOT NULL DEFAULT '',
-              backend_model TEXT    NOT NULL DEFAULT '',
-              input_tokens  INTEGER NOT NULL DEFAULT 0,
-              output_tokens INTEGER NOT NULL DEFAULT 0,
-              cost_usd      REAL    NOT NULL DEFAULT 0,
-              cost_source   TEXT    NOT NULL DEFAULT 'unknown',
-              outcome       TEXT    NOT NULL DEFAULT '',
-              error_code    TEXT,
-              duration_ms   INTEGER NOT NULL DEFAULT 0,
-              ttfb_ms       INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_proxy_requests_ts
-              ON proxy_requests (ts_ms DESC);
-            CREATE INDEX IF NOT EXISTS idx_proxy_requests_scope
-              ON proxy_requests (agent, worktree, ts_ms DESC);
-            -- proxy_virtual_keys: per-agent tokens. The proxy holds the real
-            -- upstream credentials; agents authenticate with a virtual key that
-            -- resolves to a caller identity (scope) + upstream binding (V 287).
-            CREATE TABLE IF NOT EXISTS proxy_virtual_keys (
-              key_id       TEXT PRIMARY KEY,
-              token_hash   TEXT NOT NULL,
-              label        TEXT NOT NULL DEFAULT '',
-              scope        TEXT NOT NULL DEFAULT 'global',
-              upstream     TEXT,
-              created_at   INTEGER NOT NULL,
-              revoked_at   INTEGER
-            );
-            -- proxy_budgets: per-scope spend + caps (V 292/295). scope is one of
-            -- 'global', 'worktree:<path>', 'agent:<name>'. A null limit means no
-            -- cap; reset_ms anchors the rolling daily/weekly/monthly window.
-            CREATE TABLE IF NOT EXISTS proxy_budgets (
-              scope          TEXT PRIMARY KEY,
-              period         TEXT NOT NULL DEFAULT 'monthly',
-              spent_tokens   INTEGER NOT NULL DEFAULT 0,
-              spent_cost     REAL    NOT NULL DEFAULT 0,
-              limit_tokens   INTEGER,
-              limit_cost     REAL,
-              reset_ms       INTEGER NOT NULL DEFAULT 0,
-              killed         INTEGER NOT NULL DEFAULT 0
-            );
             -- accounts: thegn-managed coding-agent credential homes for
             -- client-side account switching (item 656). Config `[[accounts]]`
             -- entries are merged in read-only at the call site; this table holds
@@ -782,6 +648,13 @@ impl Db {
                 "UPDATE notifications SET read=1 WHERE kind='process_failed' AND read=0",
                 [],
             );
+        }
+        // Stamp the schema version LAST — only now that the whole batch + every
+        // `ver`-gated cleanup above has run. A crash before this point leaves the
+        // OLD version on disk so the next open re-runs the (idempotent) steps
+        // instead of skipping a migration that never completed.
+        if ver < SCHEMA_VERSION {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         let db = Db {
             conn,

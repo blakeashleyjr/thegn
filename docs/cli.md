@@ -8,18 +8,53 @@ rely on.
 
 Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 
-| Group        | Commands                                                                                  |
-| ------------ | ----------------------------------------------------------------------------------------- |
-| Workspace    | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `integrate` |
-| Forge        | `pr` · `issue` · `ci`                                                                     |
-| Environments | `env` · `host` · `agent` · `debug` · `mcp`                                                |
-| Session      | `notify` · `logs` · `share` · `forward` · `sandbox-argv`                                  |
-| Meta         | `config` · `theme` · `doctor` · `completions`                                             |
+| Group         | Commands                                                                                                     |
+| ------------- | ------------------------------------------------------------------------------------------------------------ |
+| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `land` · `integrate` · `merge` |
+| Forge         | `pr` · `issue` · `kaneo` · `ci`                                                                              |
+| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp`                                                      |
+| Session       | `notify` · `logs` · `share` · `forward` · `sandbox-argv`                                                     |
+| Control plane | `serve` · `session` · `attach` · `pair`                                                                      |
+| Meta          | `config` · `theme` · `doctor` · `setup` · `completions`                                                      |
 
 The legacy bare verbs (`list`, `diff`, `disk`, `clean`, `repos`, `recent`)
 keep working forever with byte-identical output; they are merely hidden from
 `--help`. Global flags everywhere: `--config`, `--log-level`,
 `--set key=value` (repeatable), `--profile <name>`.
+
+## Worktree targeting
+
+Every verb that acts **on** a worktree (rather than taking one as its object)
+uses the same scope selector: `--worktree <path>`. When the flag is omitted,
+the target resolves in order:
+
+1. `$THEGN_WORKTREE` (injected into every thegn pane), if it exists locally;
+2. the git toplevel of the current directory;
+3. the current directory itself.
+
+Note that step 1 **overrides your current directory** inside a thegn pane: a
+script that `cd`s into a _different_ repo and runs, say, `thegn sandbox-argv`
+or `thegn placement plan` with no `--worktree` targets the **pane's** worktree,
+not the directory it stands in. Pass `--worktree .` (or an explicit path) to
+target the cwd regardless of the pane. (`sandbox-argv` and `placement plan`
+adopted this shared resolution in 0.1.0-alpha.1; they previously used the raw
+cwd only.)
+
+Verbs whose argument **is** the object keep positionals: `wt rm <target>`
+(path or branch), `wt new [name]`, `merge add [worktrees…]` (multi-target),
+`open <repo>` (a repo, not a worktree).
+
+Two verbs keep their own default rule: `wt disk` scans **all** known
+worktrees unless `--worktree` narrows it to one, and `placement explain`
+shows the most recent decision overall unless `--worktree` filters it.
+
+The legacy trailing positional on `env *`, `placement plan|explain`,
+`merge rm|land`, `land`, and `sandbox-argv` still parses but is deprecated
+and hidden from help; passing both the flag and the positional is a usage
+error. Scripts should move to `--worktree`. A usage error exits with clap's
+argument-parse code (`2`) and is **permanent — do not retry it** (see the
+exit-code note below); it is distinct from the retryable runtime failures the
+table describes.
 
 ## Headless worktree lifecycle
 
@@ -38,13 +73,14 @@ removed worktree is never resurrected at the next launch).
 
 ## Machine-readable output (`--json`)
 
-Every list-shaped read surface accepts `--json` and emits exactly **one
+Most list-shaped read surfaces accept `--json` and emit exactly **one
 compact JSON document** on stdout with no ANSI sequences: `wt list` / `list`,
 `repo list`, `repo recent`, `env list`, `host list`, `ci runs`, `share list`,
-`forward list`, `disk`, and `wt new --json` (`{branch, path, root, base}`).
-Treat the shapes as a stable API. (Two pre-existing surfaces keep their
-historical shapes: `notify list --json` is NDJSON, `doctor --json` is one
-object.)
+`forward list`, `merge list`, `session list`, `pair list`, `disk`, and
+`wt new --json` (`{branch, path, root, base}`). Treat the shapes as a stable
+API. (Two pre-existing surfaces keep their historical shapes: `notify list
+--json` is NDJSON, `doctor --json` is one object.) A few list surfaces are
+text-only today — `zone list`, `mcp list`, and `theme list` have no `--json`.
 
 ## Exit codes
 
@@ -54,6 +90,13 @@ object.)
 | 1    | error                                                               |
 | 2    | transient/retryable (e.g. a `host provision` step worth re-running) |
 | 3    | target not found (repo, worktree, branch, env)                      |
+
+Caveat: code `2` is **overloaded**. thegn returns it for retryable runtime
+failures (above), but `clap` also uses `2` for argument/usage parse errors
+(unknown flag, mutually-exclusive args, bad value) — those are **permanent**,
+not retryable. A script that retries on `2` should first confirm the command
+parsed (e.g. it is not a usage error printed to stderr) before treating the
+exit as transient.
 
 ## Remote control (`open`)
 

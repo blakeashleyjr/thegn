@@ -26,8 +26,7 @@
 //! session/UI/folders/layouts/env/pins/terminals), [`CacheStore`] (TTL caches),
 //! [`AccountStore`], [`NotificationStore`] (feed + agent dispatch),
 //! [`WorktreeAuxStore`] (registers/shares/forwards/merge-queue/disk/undo/audit),
-//! [`PoolStore`] (warm-spare pool), [`HostStore`] (host state machine), and
-//! [`ProxyStore`] (the `thegn-proxy` daemon's state).
+//! [`PoolStore`] (warm-spare pool), and [`HostStore`] (host state machine).
 
 mod account;
 mod aux;
@@ -40,7 +39,6 @@ mod intent;
 mod notification;
 mod placement;
 mod pool;
-mod proxy;
 mod semantic;
 mod trust;
 mod workspace;
@@ -60,7 +58,6 @@ pub use placement::{
     TenancyRow, TenancyState,
 };
 pub use pool::PoolStore;
-pub use proxy::{ProxyStore, budget_period_len_ms};
 pub use semantic::{SemEdgeRow, SemEntityRow, SemanticStore};
 pub use trust::{RepoTrustRow, RepoTrustStore};
 pub use workspace::WorkspaceStore;

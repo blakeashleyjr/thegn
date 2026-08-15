@@ -479,24 +479,17 @@ fn map_env(pairs: &[(&str, &str)]) -> MapEnv {
 
 #[test]
 fn sandbox_profile_defaults_and_env_overlay() {
-    // Safe-by-default: the worktree shell is hardened, the embedded agent
-    // gets its own sealed container.
+    // Safe-by-default: the worktree shell is hardened.
     let c = SandboxConfig::default();
     assert_eq!(c.profile, SandboxProfile::Hardened);
-    assert_eq!(c.agent_profile, SandboxProfile::Sealed);
 
-    let o = env_overlay(&map_env(&[
-        ("THEGN_SANDBOX_PROFILE", "open"),
-        ("THEGN_SANDBOX_AGENT_PROFILE", "hardened"),
-    ]));
+    let o = env_overlay(&map_env(&[("THEGN_SANDBOX_PROFILE", "open")]));
     assert_eq!(o.sandbox.profile, Some(SandboxProfile::Open));
-    assert_eq!(o.sandbox.agent_profile, Some(SandboxProfile::Hardened));
 
     // Overlay precedence: a present key overrides the global default.
     let mut base = SandboxConfig::default();
     o.sandbox.apply(&mut base);
     assert_eq!(base.profile, SandboxProfile::Open);
-    assert_eq!(base.agent_profile, SandboxProfile::Hardened);
 }
 
 // The same overlay expressed in each format must produce identical results,
@@ -2184,7 +2177,6 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
 
     let mut cfg = Config::default();
     // Turn on every experimental toggle the way a user's config might.
-    cfg.llm_proxy.enabled = true;
     cfg.observe.enabled = true;
     cfg.placement.enabled = true;
     cfg.sandbox.remote.host = "box.example".into();
@@ -2195,7 +2187,6 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     let clamped = cfg.clamp_to_channel(Channel::Stable);
 
     // Every gated master toggle is forced off.
-    assert!(!cfg.llm_proxy.enabled);
     assert!(!cfg.observe.enabled);
     assert!(!cfg.placement.enabled);
     assert!(cfg.sandbox.remote.host.is_empty());
@@ -2203,7 +2194,7 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     // Trackers: GitHub survives, Linear/Kaneo are dropped.
     assert_eq!(cfg.issues.provider, K::None);
     assert_eq!(cfg.issues.providers, vec![K::Github]);
-    // All six gated features report as clamped.
+    // Every gated feature reports as clamped.
     assert_eq!(clamped.len(), Feature::ALL.len());
 }
 
@@ -2211,7 +2202,6 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
 fn clamp_to_channel_is_a_noop_in_dev() {
     use crate::channel::Channel;
     let mut cfg = Config::default();
-    cfg.llm_proxy.enabled = true;
     cfg.observe.enabled = true;
     cfg.sandbox.remote.host = "box.example".into();
     let before = cfg.clone();
@@ -2219,7 +2209,6 @@ fn clamp_to_channel_is_a_noop_in_dev() {
     let clamped = cfg.clamp_to_channel(Channel::Dev);
 
     assert!(clamped.is_empty(), "dev honours every feature");
-    assert_eq!(cfg.llm_proxy.enabled, before.llm_proxy.enabled);
     assert_eq!(cfg.observe.enabled, before.observe.enabled);
     assert_eq!(cfg.sandbox.remote.host, before.sandbox.remote.host);
 }

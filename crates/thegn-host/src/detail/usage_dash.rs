@@ -1,7 +1,7 @@
 //! The AI-account usage overlay (V 300): per-account rate-limit windows
 //! (session / weekly / …) rendered as usage bars with a `used %` and a "resets
 //! in …" countdown — the TUI take on orca's account-usage view. A child module
-//! of `detail` (like `proxy_dash`) so it reaches the private `DetailOverlay`
+//! of `detail` (like `ci_drill`) so it reaches the private `DetailOverlay`
 //! fields.
 //!
 //! Opened by `Action::OpenUsage`: the loop paints a loading shell instantly,
