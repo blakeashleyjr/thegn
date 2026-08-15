@@ -707,19 +707,21 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
 
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
-    let (orphan_tx, orphan_rx) = tokio_mpsc::unbounded_channel::<Vec<String>>();
     {
-        let gc_waker = waker.clone();
         tokio::task::spawn_blocking(move || {
             let Ok(db) = thegn_core::db::Db::open() else {
                 return;
             };
-            let db_worktrees: Vec<String> = db
-                .worktrees()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| r.worktree)
-                .collect();
+            // CRITICAL: a FAILED worktrees query must NOT be treated as "no
+            // worktrees" — with an empty list every thegn container looks like an
+            // orphan and run_gc would delete ALL of them, including live panes'.
+            // Skip the sweep entirely on a query error (transient SQLITE_BUSY from
+            // a concurrent instance is exactly the case CLAUDE.md warns about).
+            let Ok(rows) = db.worktrees() else {
+                tracing::warn!(target: "thegn::sandbox", "orphan GC skipped: worktrees query failed");
+                return;
+            };
+            let db_worktrees: Vec<String> = rows.into_iter().map(|r| r.worktree).collect();
             let removed = thegn_core::sandbox::run_gc(&db_worktrees);
             if !removed.is_empty() {
                 thegn_core::msg::info(&format!(
@@ -727,13 +729,9 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                     removed.len(),
                     removed.join(", ")
                 ));
-                let _ = orphan_tx.send(removed);
-                let _ = gc_waker.wake();
             }
         });
     }
-    // orphan_rx drained in the event loop to surface the notice in the System panel.
-    let _ = orphan_rx; // placeholder until wired into event_loop
 
     // Config reload events ride a tokio channel so the loop drains them on wake;
     // the notify watcher thread `send`s + pulses the waker.
@@ -2459,16 +2457,25 @@ fn spawn_blame_fetch(
         // Via the scrubbed `git_cmd` (supplies `-C wt` + strips GIT_ENV_VARS).
         // off-loop: inside spawn_blocking
         #[expect(clippy::disallowed_methods)]
-        let output = thegn_core::util::git_cmd(&wt)
-            .args(&args)
-            .output()
-            .unwrap_or_else(|_| std::process::Output {
-                status: std::process::ExitStatus::default(),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            });
-        let text = String::from_utf8_lossy(&output.stdout);
-        let rows = crate::panel::parse_blame_porcelain(&text);
+        let output = thegn_core::util::git_cmd(&wt).args(&args).output();
+        // Don't silently paint an empty blame as if it succeeded: a spawn failure
+        // (no git) or a non-zero exit (bad rev / not tracked) is logged at warn so
+        // the empty view is diagnosable; the empty rows still resolve the loading
+        // state rather than hanging.
+        let rows = match output {
+            Ok(out) if out.status.success() => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                crate::panel::parse_blame_porcelain(&text)
+            }
+            Ok(out) => {
+                tracing::warn!(target: "thegn::git", "blame failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!(target: "thegn::git", "blame spawn failed: {e}");
+                Vec::new()
+            }
+        };
         if tx.send((generation, GitDoc::Blame(rows))).is_ok() {
             let _ = wk.wake();
         }
@@ -6661,6 +6668,7 @@ async fn event_loop<T: Terminal>(
             persist_session_layout(&mut session, &panes);
             // SIGTERM/SIGINT quit is a detach too — see Action::Quit.
             crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
+            crate::handlers::daemon_lifecycle::mark_parked_panes_detached(&workspace_pool, &panes);
             return Ok(());
         }
         // Writer-thread health: a transient write failure means the terminal's
@@ -7311,6 +7319,7 @@ async fn event_loop<T: Terminal>(
         if drain_summary.disconnected {
             // Teardown, not an explicit close: keep daemon panes running.
             crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
+            crate::handlers::daemon_lifecycle::mark_parked_panes_detached(&workspace_pool, &panes);
             return Ok(());
         }
         if session.worktrees.is_empty() {
@@ -9510,14 +9519,16 @@ async fn event_loop<T: Terminal>(
                     model.sidebar_window_titles.insert(path, title);
                 }
             }
-            if !title_writes.is_empty()
-                && let Ok(db) = thegn_core::db::Db::open()
-            {
-                for (path, title) in &title_writes {
-                    // best-effort: the DB is a cache; a failed title write must
-                    // never take down the compositor.
-                    let _ = db.set_worktree_window_title(path, title);
-                }
+            if !title_writes.is_empty() {
+                // Persist off the loop: `Db::open()` + write on the render path
+                // ran a synchronous DB open per title change (frequent during a
+                // build/ls that repaints the title). The background writer thread
+                // owns these best-effort cache writes (DB is a cache; git is truth).
+                crate::db_task::persist(move |db| {
+                    for (path, title) in &title_writes {
+                        let _ = db.set_worktree_window_title(path, title);
+                    }
+                });
             }
             // Notification routing chip state (DND + active mode), read fresh so a
             // scheduled DND window flips the chip as time passes (evaluated at
@@ -13044,6 +13055,10 @@ async fn event_loop<T: Terminal>(
                                     crate::handlers::daemon_lifecycle::mark_session_panes_detached(
                                         &session, &panes,
                                     );
+                                    crate::handlers::daemon_lifecycle::mark_parked_panes_detached(
+                                        &workspace_pool,
+                                        &panes,
+                                    );
                                     return Ok(());
                                 } else if let Some(payload) = key.strip_prefix("wt:") {
                                     if let Some((repo_path, tab_name)) = payload.split_once('\t')
@@ -15571,9 +15586,17 @@ async fn event_loop<T: Terminal>(
                             Action::Quit | Action::Detach => {
                                 persist_session_layout(&mut session, &panes);
                                 // Quit is a detach: daemon-backed center panes
-                                // keep running; the next launch reattaches.
+                                // keep running; the next launch reattaches. Cover
+                                // BOTH the active session and the parked
+                                // (resident-pool) workspaces — the latter's panes
+                                // stay live in the table but aren't in `session`,
+                                // so they'd otherwise be killed on drop.
                                 crate::handlers::daemon_lifecycle::mark_session_panes_detached(
                                     &session, &panes,
+                                );
+                                crate::handlers::daemon_lifecycle::mark_parked_panes_detached(
+                                    &workspace_pool,
+                                    &panes,
                                 );
                                 return Ok(());
                             }

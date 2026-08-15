@@ -8,13 +8,14 @@ rely on.
 
 Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 
-| Group        | Commands                                                                                  |
-| ------------ | ----------------------------------------------------------------------------------------- |
-| Workspace    | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `integrate` |
-| Forge        | `pr` · `issue` · `ci`                                                                     |
-| Environments | `env` · `host` · `debug` · `mcp`                                                          |
-| Session      | `notify` · `logs` · `share` · `forward` · `sandbox-argv`                                  |
-| Meta         | `config` · `theme` · `doctor` · `completions`                                             |
+| Group         | Commands                                                                                                     |
+| ------------- | ------------------------------------------------------------------------------------------------------------ |
+| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `land` · `integrate` · `merge` |
+| Forge         | `pr` · `issue` · `kaneo` · `ci`                                                                              |
+| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp`                                                      |
+| Session       | `notify` · `logs` · `share` · `forward` · `sandbox-argv`                                                     |
+| Control plane | `serve` · `session` · `attach` · `pair`                                                                      |
+| Meta          | `config` · `theme` · `doctor` · `setup` · `completions`                                                      |
 
 The legacy bare verbs (`list`, `diff`, `disk`, `clean`, `repos`, `recent`)
 keep working forever with byte-identical output; they are merely hidden from
@@ -38,13 +39,14 @@ removed worktree is never resurrected at the next launch).
 
 ## Machine-readable output (`--json`)
 
-Every list-shaped read surface accepts `--json` and emits exactly **one
+Most list-shaped read surfaces accept `--json` and emit exactly **one
 compact JSON document** on stdout with no ANSI sequences: `wt list` / `list`,
 `repo list`, `repo recent`, `env list`, `host list`, `ci runs`, `share list`,
-`forward list`, `disk`, and `wt new --json` (`{branch, path, root, base}`).
-Treat the shapes as a stable API. (Two pre-existing surfaces keep their
-historical shapes: `notify list --json` is NDJSON, `doctor --json` is one
-object.)
+`forward list`, `merge list`, `session list`, `pair list`, `disk`, and
+`wt new --json` (`{branch, path, root, base}`). Treat the shapes as a stable
+API. (Two pre-existing surfaces keep their historical shapes: `notify list
+--json` is NDJSON, `doctor --json` is one object.) A few list surfaces are
+text-only today — `zone list`, `mcp list`, and `theme list` have no `--json`.
 
 ## Exit codes
 

@@ -211,6 +211,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     if json {
         let v = serde_json::json!({
             "channel": channel_json(),
+            "core_deps": core_deps_json(),
             "env": {
                 "TERM": env.term,
                 "COLORTERM": env.colorterm,
@@ -245,6 +246,8 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
     channel_report();
+    outln!("");
+    core_deps_report();
     outln!("");
     outln!("Terminal environment");
     show("TERM", &env.term);
@@ -576,6 +579,92 @@ fn which_ok(bin: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// The output of `<bin> <args…>` trimmed to one line, or `None` if the binary is
+/// absent or the invocation failed — used to fetch `git --version` etc. without
+/// panicking when the tool is missing (the whole point of the core-deps section).
+// off-loop: doctor is a synchronous CLI verb
+#[expect(clippy::disallowed_methods)]
+fn cmd_first_line(bin: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(bin)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().next().map(|l| l.trim().to_string())
+}
+
+/// Whether `gh auth status` reports an authenticated account. Robust to a
+/// missing `gh` (returns `false`) — the section only reports, never fails.
+// off-loop: doctor is a synchronous CLI verb
+#[expect(clippy::disallowed_methods)]
+fn gh_authenticated() -> bool {
+    std::process::Command::new("gh")
+        .args(["auth", "status"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Report the core CLI dependencies every startup git read leans on: `git`
+/// (presence + version) and `gh` (presence + auth). These are best-effort at
+/// runtime, so a missing binary otherwise produces no message — doctor is where
+/// it surfaces. Detection only; never panics if git/gh are absent.
+fn core_deps_report() {
+    outln!("Core dependencies");
+    match thegn_core::util::which_path("git") {
+        Some(path) => {
+            let ver =
+                cmd_first_line("git", &["--version"]).unwrap_or_else(|| "unknown version".into());
+            outln!("  git           {ver}");
+            outln!("                {path}");
+        }
+        None => outln!("  git           MISSING — git reads will silently fail; install git"),
+    }
+    match thegn_core::util::which_path("gh") {
+        Some(path) => {
+            let auth = if gh_authenticated() {
+                "authenticated"
+            } else {
+                "not authenticated (run: gh auth login)"
+            };
+            outln!("  gh            present, {auth}");
+            outln!("                {path}");
+        }
+        None => outln!("  gh            absent (optional — GitHub PR/issue features degrade)"),
+    }
+}
+
+/// The core-dependency surface for `--json`: git presence/version/path and gh
+/// presence/auth/path. Never panics when a binary is absent.
+fn core_deps_json() -> serde_json::Value {
+    let git_path = thegn_core::util::which_path("git");
+    let gh_path = thegn_core::util::which_path("gh");
+    // Resolve version/auth up front so the json! move of the paths is unambiguous.
+    let git_version = git_path
+        .as_ref()
+        .and_then(|_| cmd_first_line("git", &["--version"]));
+    let gh_auth = gh_path.as_ref().map(|_| gh_authenticated());
+    serde_json::json!({
+        "git": {
+            "present": git_path.is_some(),
+            "path": git_path,
+            "version": git_version,
+        },
+        "gh": {
+            "present": gh_path.is_some(),
+            "path": gh_path,
+            "authenticated": gh_auth,
+        },
+    })
 }
 
 /// "Will my shell work here?" — the personal-shell layer: the resolved strategy,
@@ -1094,6 +1183,26 @@ args = ["--verbose"]
         let over = cfg.managed_tools.get("bs").expect("override present");
         assert_eq!(over.path, "/usr/local/bin/bs");
         assert_eq!(over.args, vec!["--verbose".to_string()]);
+    }
+
+    #[test]
+    fn core_deps_json_reports_git_and_gh_without_panicking() {
+        // Never panics regardless of whether git/gh are installed; the shape is
+        // always present/path/(version|authenticated) for both binaries.
+        let v = core_deps_json();
+        assert!(v["git"]["present"].is_boolean());
+        assert!(v["gh"]["present"].is_boolean());
+        // `present` and `path.is_some()` agree.
+        assert_eq!(
+            v["git"]["present"].as_bool().unwrap(),
+            !v["git"]["path"].is_null()
+        );
+        assert_eq!(
+            v["gh"]["present"].as_bool().unwrap(),
+            !v["gh"]["path"].is_null()
+        );
+        // The human report also runs without panicking.
+        core_deps_report();
     }
 
     #[test]

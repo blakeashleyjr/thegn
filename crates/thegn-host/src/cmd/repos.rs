@@ -122,7 +122,7 @@ pub fn trust(
             .find(|p| repo_trust::request_id(&p.canonical()) == id)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no pending request with id {id:?}; run `repo-trust {}` to list",
+                    "no pending request with id {id:?}; run `repo trust {}` to list",
                     root.display()
                 )
             })?;
@@ -157,7 +157,7 @@ pub fn trust(
     }
     if !resolved.pending.is_empty() {
         outln!(
-            "approve with: thegn repo-trust {} --approve <id>",
+            "approve with: thegn repo trust {} --approve <id>",
             root.display()
         );
     }
