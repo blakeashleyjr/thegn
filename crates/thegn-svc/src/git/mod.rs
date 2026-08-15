@@ -702,6 +702,24 @@ fn parse_status_porcelain(out: &str) -> Vec<FileStatus> {
     v
 }
 
+/// Sum a `git diff --numstat` output into `(added, deleted)` line totals.
+/// Binary files emit `-\t-\t<path>` (non-numeric) and contribute nothing. Shared
+/// by the batched [`glyph_reads`] sidebar diff-stat reads.
+pub(crate) fn sum_numstat(out: &str) -> (u32, u32) {
+    let mut add = 0u32;
+    let mut del = 0u32;
+    for line in out.lines() {
+        let mut it = line.splitn(3, '\t');
+        let a = it.next().and_then(|s| s.parse::<u32>().ok());
+        let d = it.next().and_then(|s| s.parse::<u32>().ok());
+        if let (Some(a), Some(d)) = (a, d) {
+            add += a;
+            del += d;
+        }
+    }
+    (add, del)
+}
+
 /// Parse `git rev-list --left-right --count @{u}...HEAD` output ("<behind>\t
 /// <ahead>") into `(ahead, behind)`. Shared by [`CliGit::ahead_behind`] and the
 /// batched [`glyph_reads`].
@@ -727,6 +745,11 @@ pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
             &["status", "--porcelain=v1", "-z", "--no-renames"][..],
             &["rev-list", "--left-right", "--count", "@{u}...HEAD"][..],
             &["rev-parse", "--abbrev-ref", "HEAD"][..],
+            // Uncommitted working-tree stat (staged + unstaged) vs HEAD.
+            &["diff", "--numstat", "HEAD"][..],
+            // Total branch change vs the repo default branch (`origin/HEAD`); a
+            // non-zero exit (no `origin/HEAD`) is "no base" — data, not an error.
+            &["diff", "--numstat", "origin/HEAD...HEAD"][..],
         ]
         .iter()
         .map(|args| {
@@ -736,7 +759,7 @@ pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
         })
         .collect();
         match b.exec_batch(&cmds, &[]) {
-            Ok(r) if r.len() == 3 => {
+            Ok(r) if r.len() == 5 => {
                 let dirty = if r[0].exit == 0 {
                     Ok(!parse_status_porcelain(&r[0].stdout).is_empty())
                 } else {
@@ -754,10 +777,18 @@ pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
                         r[2].stderr.trim()
                     ))
                 };
+                let uncommitted = if r[3].exit == 0 {
+                    Ok(sum_numstat(&r[3].stdout))
+                } else {
+                    Err(anyhow::anyhow!("git diff failed: {}", r[3].stderr.trim()))
+                };
+                let branch_diff = Ok((r[4].exit == 0).then(|| sum_numstat(&r[4].stdout)));
                 return GlyphReads {
                     dirty,
                     ahead_behind,
                     branch,
+                    uncommitted,
+                    branch_diff,
                 };
             }
             _ => {
@@ -766,6 +797,8 @@ pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
                     dirty: Err(err()),
                     ahead_behind: Err(err()),
                     branch: Err(err()),
+                    uncommitted: Err(err()),
+                    branch_diff: Err(err()),
                 };
             }
         }
@@ -775,6 +808,12 @@ pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
         dirty: git.is_dirty(loc),
         ahead_behind: git.ahead_behind(loc),
         branch: git.current_branch(loc),
+        // Diff stats aren't in the gix backend; the CLI `--numstat` reads are
+        // cheap and run off the loop (in the host's `thread::scope` glyph scan).
+        uncommitted: run_status(loc, &["diff", "--numstat", "HEAD"])
+            .map(|(exit, out)| if exit == 0 { sum_numstat(&out) } else { (0, 0) }),
+        branch_diff: run_status(loc, &["diff", "--numstat", "origin/HEAD...HEAD"])
+            .map(|(exit, out)| (exit == 0).then(|| sum_numstat(&out))),
     }
 }
 
@@ -785,6 +824,11 @@ pub struct GlyphReads {
     pub dirty: Result<bool>,
     pub ahead_behind: Result<Option<(usize, usize)>>,
     pub branch: Result<String>,
+    /// Uncommitted working-tree change (added, deleted) vs HEAD.
+    pub uncommitted: Result<(u32, u32)>,
+    /// Total branch change (added, deleted) vs the default branch; `None` when no
+    /// base (`origin/HEAD`) is resolvable.
+    pub branch_diff: Result<Option<(u32, u32)>>,
 }
 
 /// The write-op runner: like [`run`] but with extra env, a null stdin, and
@@ -1368,6 +1412,19 @@ mod tests {
         assert_eq!(parse_ahead_behind("garbage"), None);
         assert_eq!(parse_ahead_behind("3"), None); // single field
         assert_eq!(parse_ahead_behind("a\tb"), None); // non-numeric
+    }
+
+    #[test]
+    fn sum_numstat_totals_added_and_deleted() {
+        assert_eq!(sum_numstat(""), (0, 0));
+        // `--numstat` is "<added>\t<deleted>\t<path>" per line.
+        let out = "5\t2\tsrc/a.rs\n10\t0\tsrc/b.rs\n";
+        assert_eq!(sum_numstat(out), (15, 2));
+        // Binary files emit "-\t-\t<path>" and contribute nothing.
+        let out = "3\t1\tsrc/a.rs\n-\t-\tlogo.png\n";
+        assert_eq!(sum_numstat(out), (3, 1));
+        // A path with spaces/tabs still parses (splitn(3) keeps the path intact).
+        assert_eq!(sum_numstat("4\t4\tdir/a b.rs\n"), (4, 4));
     }
 
     fn repo_root() -> std::path::PathBuf {

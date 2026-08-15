@@ -79,12 +79,17 @@ impl ActivityState {
 }
 
 /// Git status summary for a worktree row (item 18). `dirty` = uncommitted
-/// changes; `ahead`/`behind` are vs the upstream (absent when no upstream).
+/// changes; `ahead`/`behind` are vs the upstream (absent when no upstream);
+/// `add`/`del` are the uncommitted working-tree line stat vs HEAD; `branch_diff`
+/// is the `(added, deleted)` total vs the default branch (`None` when no base).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GitGlyphs {
     pub dirty: bool,
     pub ahead: usize,
     pub behind: usize,
+    pub add: u32,
+    pub del: u32,
+    pub branch_diff: Option<(u32, u32)>,
 }
 
 /// Tree ordering for worktree groups within a workspace (item 23).
@@ -367,6 +372,10 @@ pub struct ViewState {
     /// recency-ordered list of every worktree, each tagged with its repo.
     /// Persisted as the `sidebar_flat` ui_state key; independent of `sort`.
     pub flat: bool,
+    /// Worktree-row display options, from `[ui]` config (mirrored here on
+    /// startup/reload like `workspace_sort`). Which right-cluster fields show,
+    /// the focused-detail policy, and glyph overrides.
+    pub display: crate::sidebar_view::SidebarDisplay,
 }
 
 /// What activating a sidebar row does.
@@ -460,24 +469,15 @@ fn strip_prompt_sigil(title: &str) -> String {
     t.trim_end().to_string()
 }
 
-/// Compose a worktree row's displayed title:
-/// - PR present:     `[PR: <n> | <window-title-or-branch>]`
-/// - title present:  `<window-title>` (sigil-stripped)
-/// - otherwise:      `<branch>`
-pub fn compose_row_label(
-    pr_number: Option<u64>,
-    window_title: Option<&str>,
-    branch: &str,
-) -> String {
-    let title = window_title
+/// Compose a worktree row's displayed title: the dynamic name (the OSC window
+/// title a running agent/shell sets, sigil-stripped) when present, else the
+/// branch. PR state is no longer wrapped into the title — it shows as a compact
+/// `⬡N` chip in the row's right cluster and `PR #N` on the focused detail line.
+pub fn compose_row_label(window_title: Option<&str>, branch: &str) -> String {
+    window_title
         .map(strip_prompt_sigil)
-        .filter(|t| !t.is_empty());
-    match (pr_number, title) {
-        (Some(n), Some(t)) => format!("[PR: {n} | {t}]"),
-        (Some(n), None) => format!("[PR: {n} | {branch}]"),
-        (None, Some(t)) => t,
-        (None, None) => branch.to_string(),
-    }
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| branch.to_string())
 }
 
 /// A workspace's worktree, ready to sort and render: the branch label plus its
@@ -531,17 +531,42 @@ pub(crate) fn terminal_host(conn: &str, kind: &str) -> (String, String, bool) {
     (host.to_lowercase(), host.to_string(), false)
 }
 
-/// The expanded cursor row's second line: the secondary metadata that would
-/// crowd the always-on row — execution env, sandbox backend, hibernation,
-/// open PRs, unread notifications, and disk size. `None` when the row has
-/// nothing extra to show. (Extracted from the ratchet-pinned `chrome.rs`.)
-pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> {
+/// The focused row's second line: the branch name plus the secondary metadata
+/// that would crowd the always-on row — branch-vs-default-branch line stat,
+/// execution env, sandbox backend, hibernation, open PRs, unread notifications,
+/// and disk size. Field visibility follows the `[ui]` sidebar toggles carried on
+/// `disp`. `None` when the row has nothing to show. (Extracted from the
+/// ratchet-pinned `chrome.rs`.)
+pub(crate) fn compose_detail_line(
+    row: &SidebarRow,
+    disp: &crate::sidebar_view::SidebarDisplay,
+) -> Option<crate::seg::Line> {
     use crate::chrome::S;
     use crate::seg::{Line, Seg, Tok, seg, sp};
     use thegn_core::theme;
     // Gutter + indent so the detail reads as hanging under the name.
     let mut segs: Vec<Seg> = vec![sp(5)];
     let start = segs.len();
+    // Lead with the branch name — the main line now shows the dynamic name.
+    if disp.detail_branch && !row.label.is_empty() {
+        segs.push(seg(Tok::Slot(S::Dim), format!("{} ", row.label)));
+    }
+    // Total branch change vs the default branch (`+adds` green / `-dels` red).
+    if disp.detail_branch_stat
+        && let Some((add, del)) = row.git.and_then(|g| g.branch_diff)
+        && (add > 0 || del > 0)
+    {
+        if add > 0 {
+            segs.push(seg(Tok::Hue(theme::Hue::Green), format!("+{add}")));
+        }
+        if del > 0 {
+            if add > 0 {
+                segs.push(sp(1));
+            }
+            segs.push(seg(Tok::Hue(theme::Hue::Red), format!("-{del}")));
+        }
+        segs.push(sp(1));
+    }
     let dirty = row.git.is_some_and(|g| g.dirty);
     crate::sidebar_legend::push_row_markers(dirty, &mut segs);
 
@@ -580,9 +605,15 @@ pub(crate) fn compose_detail_line(row: &SidebarRow) -> Option<crate::seg::Line> 
         let moon = crate::caps::active_glyphs().moon;
         segs.push(seg(Tok::Slot(S::Faint), format!("{moon} hibernated ")));
     }
-    if let Some(pr) = row.pr_count.filter(|&c| c > 0) {
+    if disp.detail_pr {
         let hex = crate::caps::active_glyphs().hex;
-        segs.push(seg(Tok::Hue(theme::Hue::Green), format!("{hex} {pr} PR "))); // ⬡N PR
+        // Prefer the concrete PR number (`⬡ PR #123`); fall back to the count
+        // (`⬡ 2 PR`) when only a count is known for this branch.
+        if let Some(n) = row.pr_number {
+            segs.push(seg(Tok::Hue(theme::Hue::Green), format!("{hex} PR #{n} ")));
+        } else if let Some(pr) = row.pr_count.filter(|&c| c > 0) {
+            segs.push(seg(Tok::Hue(theme::Hue::Green), format!("{hex} {pr} PR ")));
+        }
     }
     if let Some((glyph, hue)) = row.mq_status.and_then(mq_chip) {
         segs.push(seg(Tok::Hue(hue), format!("{glyph} MQ ")));
@@ -1506,30 +1537,22 @@ mod tests {
     }
 
     #[test]
-    fn compose_row_label_follows_pr_title_branch_rules() {
-        // PR + window title.
+    fn compose_row_label_prefers_dynamic_name_else_branch() {
+        // Window title (dynamic name), sigil-stripped, wins over the branch.
         assert_eq!(
-            compose_row_label(Some(142), Some("thegn dev $"), "feat/x"),
-            "[PR: 142 | thegn dev]"
+            compose_row_label(Some("thegn dev $"), "feat/x"),
+            "thegn dev"
         );
-        // PR, no window title → branch inside the brackets.
         assert_eq!(
-            compose_row_label(Some(7), None, "feat/x"),
-            "[PR: 7 | feat/x]"
-        );
-        // PR with a window title that strips to empty → branch fallback.
-        assert_eq!(
-            compose_row_label(Some(9), Some(" $"), "main"),
-            "[PR: 9 | main]"
-        );
-        // No PR, window title only.
-        assert_eq!(
-            compose_row_label(None, Some("cargo build"), "feat/x"),
+            compose_row_label(Some("cargo build"), "feat/x"),
             "cargo build"
         );
-        // No PR, no title → branch.
-        assert_eq!(compose_row_label(None, None, "feat/x"), "feat/x");
-        assert_eq!(compose_row_label(None, Some("   "), "feat/x"), "feat/x");
+        // No title → branch.
+        assert_eq!(compose_row_label(None, "feat/x"), "feat/x");
+        // A title that strips to empty → branch fallback (PR is no longer wrapped
+        // into the title; it shows as a right-cluster chip + detail line).
+        assert_eq!(compose_row_label(Some(" $"), "main"), "main");
+        assert_eq!(compose_row_label(Some("   "), "feat/x"), "feat/x");
     }
 
     fn tab(name: &str, wt: &str) -> WorktreeGroup {

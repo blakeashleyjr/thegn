@@ -30,6 +30,16 @@ config_enum! {
     } default = Always;
 }
 
+config_enum! {
+    /// Which worktree rows show the secondary detail line (branch + extra info)
+    /// while the sidebar is focused. "all" expands every worktree row; "cursor"
+    /// expands only the highlighted row; "off" never shows the detail line. The
+    /// detail line only appears while the sidebar owns focus.
+    pub enum FocusDetail: "focus detail" {
+        All = "all", Cursor = "cursor", Off = "off",
+    } default = All;
+}
+
 /// UI/Presentation settings (`[ui]`).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -52,6 +62,32 @@ pub struct UiConfig {
     pub fullscreen_keep_masthead: bool,
     /// In full-window pane fullscreen, keep the bottom status bar visible.
     pub fullscreen_keep_statusbar: bool,
+    /// Show the dirty status icon in a worktree row's right cluster.
+    pub sidebar_show_status_icon: bool,
+    /// Show the uncommitted working-tree line stat (`+adds` green / `-dels` red)
+    /// in a worktree row's right cluster.
+    pub sidebar_show_diff_stat: bool,
+    /// Show the `↑ahead` / `↓behind` upstream counts in a worktree row.
+    pub sidebar_show_ahead_behind: bool,
+    /// Show the compact open-PR chip (`⬡N`) in a worktree row's right cluster.
+    pub sidebar_show_pr_chip: bool,
+    /// Which rows expand to a detail line while the sidebar is focused (see
+    /// [`FocusDetail`]).
+    pub sidebar_focus_detail: FocusDetail,
+    /// Lead the focused detail line with the branch name.
+    pub sidebar_detail_branch: bool,
+    /// Show the total branch-vs-default-branch line stat on the focused detail
+    /// line.
+    pub sidebar_detail_branch_stat: bool,
+    /// Show the open PR (`#N`) on the focused detail line.
+    pub sidebar_detail_pr: bool,
+    /// Override glyph for the `ahead` marker; empty = the built-in (`↑`, ASCII
+    /// `^`). A non-empty override is used verbatim (no ASCII degradation).
+    pub sidebar_icon_ahead: String,
+    /// Override glyph for the `behind` marker; empty = the built-in (`↓`/`v`).
+    pub sidebar_icon_behind: String,
+    /// Override glyph for the dirty status marker; empty = the built-in (`●`/`*`).
+    pub sidebar_icon_status: String,
 }
 
 impl Default for UiConfig {
@@ -65,6 +101,17 @@ impl Default for UiConfig {
             sidebar_terminals_section: TerminalsSection::default(),
             fullscreen_keep_masthead: true,
             fullscreen_keep_statusbar: true,
+            sidebar_show_status_icon: true,
+            sidebar_show_diff_stat: true,
+            sidebar_show_ahead_behind: true,
+            sidebar_show_pr_chip: true,
+            sidebar_focus_detail: FocusDetail::default(),
+            sidebar_detail_branch: true,
+            sidebar_detail_branch_stat: true,
+            sidebar_detail_pr: true,
+            sidebar_icon_ahead: String::new(),
+            sidebar_icon_behind: String::new(),
+            sidebar_icon_status: String::new(),
         }
     }
 }
@@ -118,6 +165,43 @@ mod tests {
         let cfg: UiConfig = toml::from_str("").unwrap();
         assert!(cfg.confirm_delete_workspace);
         assert_eq!(cfg.language, "auto");
+    }
+
+    #[test]
+    fn focus_detail_parses_and_defaults_all() {
+        assert_eq!(
+            FocusDetail::from_str_validated("cursor").unwrap(),
+            FocusDetail::Cursor
+        );
+        assert_eq!(
+            FocusDetail::from_str_validated("off").unwrap(),
+            FocusDetail::Off
+        );
+        assert!(FocusDetail::from_str_validated("bogus").is_err());
+        assert_eq!(FocusDetail::default(), FocusDetail::All);
+        // Unknown value degrades to the default with a warning, not an error.
+        let cfg: UiConfig = toml::from_str("sidebar_focus_detail = \"zzz\"").unwrap();
+        assert_eq!(cfg.sidebar_focus_detail, FocusDetail::All);
+    }
+
+    #[test]
+    fn sidebar_row_display_defaults_on_and_toggle() {
+        let cfg = UiConfig::default();
+        assert!(cfg.sidebar_show_status_icon);
+        assert!(cfg.sidebar_show_diff_stat);
+        assert!(cfg.sidebar_show_ahead_behind);
+        assert!(cfg.sidebar_show_pr_chip);
+        assert!(cfg.sidebar_detail_branch);
+        assert!(cfg.sidebar_icon_ahead.is_empty());
+        // Defaults survive an empty table.
+        let cfg: UiConfig = toml::from_str("").unwrap();
+        assert!(cfg.sidebar_show_diff_stat);
+        // Each toggle and icon override is independent.
+        let cfg: UiConfig =
+            toml::from_str("sidebar_show_diff_stat = false\nsidebar_icon_ahead = \"»\"").unwrap();
+        assert!(!cfg.sidebar_show_diff_stat);
+        assert!(cfg.sidebar_show_ahead_behind);
+        assert_eq!(cfg.sidebar_icon_ahead, "»");
     }
 
     #[test]
