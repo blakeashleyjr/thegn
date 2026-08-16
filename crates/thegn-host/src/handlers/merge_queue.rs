@@ -566,9 +566,15 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
             };
             // Optimistic: drop the row now; the refresh confirms.
             ctx.model.panel.merge_queue.retain(|r| r.worktree != wt);
+            let mq = mq.clone();
             tokio::task::spawn_blocking(move || {
-                note.send(match Db::open().and_then(|db| db.remove_merge_entry(&wt)) {
-                    Ok(()) => "Removed from queue".to_string(),
+                // Dequeue + un-file, so removing from the queue also pulls the
+                // worktree out of its "Merging"/"Needs attention" folder.
+                note.send(match Db::open() {
+                    Ok(db) => match crate::merge_ops::dequeue_worktree(&mq, &db, Path::new(&wt)) {
+                        Ok(()) => "Removed from queue".to_string(),
+                        Err(e) => format!("Remove failed: {e}"),
+                    },
                     Err(e) => format!("Remove failed: {e}"),
                 });
             });
@@ -713,13 +719,18 @@ pub(crate) fn sidebar_action(action: SidebarMq, ctx: MqKeyCtx) {
             let wt_s = wt.to_string_lossy().to_string();
             // Optimistic: drop the row now; the refresh confirms.
             ctx.model.panel.merge_queue.retain(|r| r.worktree != wt_s);
+            let mq = mq.clone();
             tokio::task::spawn_blocking(move || {
-                note.send(
-                    match Db::open().and_then(|db| db.remove_merge_entry(&wt_s)) {
-                        Ok(()) => "Removed from queue".to_string(),
-                        Err(e) => format!("Remove failed: {e}"),
-                    },
-                );
+                // Dequeue + un-file: leaving the queue also leaves the folder.
+                note.send(match Db::open() {
+                    Ok(db) => {
+                        match crate::merge_ops::dequeue_worktree(&mq, &db, Path::new(&wt_s)) {
+                            Ok(()) => "Removed from queue".to_string(),
+                            Err(e) => format!("Remove failed: {e}"),
+                        }
+                    }
+                    Err(e) => format!("Remove failed: {e}"),
+                });
             });
         }
         SidebarMq::Land => {
@@ -737,7 +748,8 @@ pub(crate) fn sidebar_action(action: SidebarMq, ctx: MqKeyCtx) {
         }
         SidebarMq::Clear => {
             ctx.model.status = "Merge queue: clearing…".into();
-            tokio::task::spawn_blocking(move || note.send(clear_repo_note(&wt)));
+            let mq = mq.clone();
+            tokio::task::spawn_blocking(move || note.send(clear_repo_note(&wt, &mq)));
         }
         SidebarMq::Drain => {
             dispatch_drain(
@@ -755,7 +767,7 @@ pub(crate) fn sidebar_action(action: SidebarMq, ctx: MqKeyCtx) {
 
 /// Clear every queue row for the repo `any_path` belongs to (the workspace
 /// menu's "Clear merge queue"). Mirrors the CLI `thegn merge clear`.
-fn clear_repo_note(any_path: &Path) -> String {
+fn clear_repo_note(any_path: &Path, mq: &MergeQueueConfig) -> String {
     let Some(root) = integrate::main_checkout(any_path) else {
         return "Clear failed: not inside a git repository".into();
     };
@@ -763,7 +775,7 @@ fn clear_repo_note(any_path: &Path) -> String {
         Ok(d) => d,
         Err(e) => return format!("Clear failed: {e}"),
     };
-    match crate::merge_ops::clear_repo(&db, &root) {
+    match crate::merge_ops::clear_repo(mq, &db, &root) {
         Ok(0) => "Merge queue already empty".into(),
         Ok(n) => format!("Cleared {n} queued branch(es)"),
         Err(e) => format!("Clear failed: {e}"),

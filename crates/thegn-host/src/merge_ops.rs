@@ -114,12 +114,32 @@ pub fn enqueue_worktree(mq: &MergeQueueConfig, db: &Db, worktree: &Path) -> Resu
     Ok(format!("queued {branch}"))
 }
 
-/// Drop every queue row for `root`'s repo. Returns the number removed.
-pub fn clear_repo(db: &Db, root: &Path) -> Result<usize> {
+/// Remove one worktree's branch from the queue AND un-file it from its
+/// lifecycle folder — the symmetric teardown to [`enqueue_worktree`]. A plain
+/// dequeue neither lands nor fails, so without the `Dequeued` lifecycle the
+/// worktree would be stranded in the "Merging"/"Needs attention" folder its
+/// enqueue filed it into (the sidebar/queue de-sync). The un-file is best-effort
+/// and guarded host-side to lifecycle-managed folders; dropping the row is the
+/// operation that can fail.
+pub fn dequeue_worktree(mq: &MergeQueueConfig, db: &Db, worktree: &Path) -> Result<()> {
+    let wt_s = worktree.to_string_lossy().to_string();
+    db.remove_merge_entry(&wt_s)?;
+    // `apply` only needs the worktree + repo root for a dequeue (the branch is
+    // unused by the un-file), so an empty branch is fine; skip only if the repo
+    // root can't be resolved (worktree dir already gone — nothing to un-file).
+    if let Some(root) = integrate::main_checkout(worktree) {
+        crate::merge_lifecycle::apply(mq, db, &root, &wt_s, "", LifecycleEvent::Dequeued);
+    }
+    Ok(())
+}
+
+/// Drop every queue row for `root`'s repo, un-filing each from its lifecycle
+/// folder. Returns the number removed.
+pub fn clear_repo(mq: &MergeQueueConfig, db: &Db, root: &Path) -> Result<usize> {
     let rows = rows_for_repo(db, root);
     let n = rows.len();
     for r in &rows {
-        db.remove_merge_entry(&r.worktree)?;
+        dequeue_worktree(mq, db, Path::new(&r.worktree))?;
     }
     Ok(n)
 }
