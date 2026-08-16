@@ -550,13 +550,14 @@ impl ControlApi for DaemonService {
     }
 
     fn merge_clear<'a>(&'a self, worktree: &'a str) -> BoxFuture<'a, ControlResult<usize>> {
+        let mq = self.merge_queue.clone();
         Box::pin(async move {
             let wt = worktree.to_string();
             tokio::task::spawn_blocking(move || {
                 let db = thegn_core::db::Db::open()?;
                 let root = crate::merge_ops::repo_root_of(std::path::Path::new(&wt))
                     .ok_or_else(|| anyhow::anyhow!("{wt}: not inside a git repository"))?;
-                crate::merge_ops::clear_repo(&db, &root)
+                crate::merge_ops::clear_repo(&mq, &db, &root)
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge task join: {e}")))?
