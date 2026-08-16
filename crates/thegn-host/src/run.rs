@@ -10822,13 +10822,26 @@ async fn event_loop<T: Terminal>(
                         // terminal, clicking a row switches to it but keeps the
                         // keyboard in the pane (see the activation arm below).
                         let was_center = focus.zone == crate::focus::Zone::Center;
+                        // Resolve the click against the geometry CURRENTLY on
+                        // screen — the sidebar's pre-click focus state. Focusing
+                        // the sidebar expands rows to detail lines (`show_detail`),
+                        // which changes their heights; flipping `sb.focused` /
+                        // `model.sidebar_focused` before the hit-test would resolve
+                        // the click against the taller, not-yet-painted layout and
+                        // land it on the wrong (higher) row. And since activating a
+                        // row hands focus back to the center pane (`was_center`
+                        // below), every sidebar click is a focus transition, so the
+                        // miss would be persistent, not a one-off. We therefore only
+                        // move the focus ZONE here (geometry-neutral —
+                        // `model.sidebar_focused` is recomputed from `focus.zone` at
+                        // the top of the next loop iteration, so the detail
+                        // expansion lands on the next painted frame, which the next
+                        // click's hit-test then matches). Caret clicks, Ctrl-marks,
+                        // double-click, and drag arming live in the handler; the
+                        // click now resolves against the same `build_sidebar` pass
+                        // the renderer actually painted, so two-tier rows map to the
+                        // right index.
                         focus.zone = crate::focus::Zone::Sidebar;
-                        sb.focused = true;
-                        sb.sync(&mut model);
-                        // Caret clicks, Ctrl-marks, double-click, and drag
-                        // arming live in the handler; the click resolves
-                        // against the same `build_sidebar` pass the renderer
-                        // painted, so two-tier rows map to the right index.
                         match crate::handlers::sidebar_mouse::on_left_press(
                             &mut sidebar_mouse_ui,
                             &mut sb,
