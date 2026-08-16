@@ -1353,4 +1353,60 @@ mod tests {
         assert_eq!(row_at(&hits, 4).map(|h| h.y), Some(4));
         assert!(row_at(&hits, 5).is_none(), "below the last row");
     }
+
+    // Regression: focusing the sidebar expands rows to a detail line
+    // (`show_detail` + `compose_detail_line`), growing their heights and pushing
+    // every row below downward. Paint (`draw_sidebar`) and the click hit-test
+    // (`hit_rows`) share this `build_sidebar` pass, so a click MUST be resolved
+    // against the focus state that was actually PAINTED. Flipping
+    // `sidebar_focused` before the hit-test (the bug: `run.rs` used to set
+    // `sb.focused = true` + sync before `on_left_press`) resolves the click
+    // against the taller, not-yet-painted layout and lands it on the wrong
+    // (higher) row — persistently, since activating a row hands focus back to the
+    // center pane so every sidebar click is a focus transition. This locks that
+    // focus really does shift the geometry.
+    #[test]
+    fn focus_expands_rows_and_shifts_geometry() {
+        use crate::sidebar::SidebarRow;
+        use thegn_core::config::FocusDetail;
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 20,
+        };
+        let mut model = FrameModel {
+            sidebar_rows: vec![
+                SidebarRow::base(RowKind::Worktree, 1, "feat-a", "ws"),
+                SidebarRow::base(RowKind::Worktree, 1, "feat-b", "ws"),
+            ],
+            ..FrameModel::default()
+        };
+        // Detail-on-focus for all rows, leading with the branch name — so a
+        // focused row grows a second line regardless of git/PR/env data.
+        model.sidebar_display = SidebarDisplay {
+            focus_detail: FocusDetail::All,
+            detail_branch: true,
+            ..SidebarDisplay::default()
+        };
+        let y_of = |f: &SidebarFrame, idx: usize| {
+            f.rows.iter().find(|p| p.visible_index == idx).map(|p| p.y)
+        };
+
+        model.sidebar_focused = false;
+        let compact = build_sidebar(&model, rect, 0);
+        model.sidebar_focused = true;
+        let focused = build_sidebar(&model, rect, 0);
+
+        // Same rows, same rect — but the second row sits lower once focused,
+        // because the first row grew a detail line. A hit-test that used the
+        // focused geometry against the compact pixels would mis-resolve by that
+        // delta.
+        assert!(
+            y_of(&focused, 1) > y_of(&compact, 1),
+            "focus must push the second row down: compact={:?} focused={:?}",
+            y_of(&compact, 1),
+            y_of(&focused, 1),
+        );
+    }
 }
