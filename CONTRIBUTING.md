@@ -45,6 +45,11 @@ If something is off, `just doctor` diagnoses the dev environment.
 
 ## Dev loop
 
+**Enter the dev shell once, right after cloning** (`nix develop`, or `direnv
+allow` to auto-enter per-cd). The pre-commit / pre-push git hooks are generated
+and installed by the dev shell — a bare clone that never enters it silently has
+no hooks, so formatting and the heavy gates won't run until you push into CI.
+
 The heavy gates are full-workspace compiles — don't run them per-edit:
 
 - **While iterating:** `just quick [crate]` — clippy on lib/bin code only,
@@ -125,3 +130,11 @@ experience differs from unix — nix/devenv and the justfile don't apply:
 Read [`CLAUDE.md`](CLAUDE.md) before touching the event loop or render path —
 the 0%-idle and render-plan invariants are enforced by tests. Prefer sibling
 modules over growing the large legacy files (run.rs, config.rs, …).
+
+## License
+
+thegn is dual-licensed under either [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE), at your option. Unless you state otherwise, any
+contribution you intentionally submit for inclusion in thegn is dual-licensed
+under those same terms, with no additional terms or conditions (per the Apache
+2.0 license, Section 5).

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & ideas (Discussions)
+    url: https://github.com/blakeashleyjr/thegn/discussions
+    about: Ask questions, share setups, and discuss ideas here.
+  - name: Security vulnerability
+    url: https://github.com/blakeashleyjr/thegn/security/advisories/new
+    about: Report security issues privately. Do not open a public issue.
