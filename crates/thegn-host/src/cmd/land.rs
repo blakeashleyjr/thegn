@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use thegn_core::config::Config;
 use thegn_core::db::Db;
+use thegn_core::merge_lifecycle::LifecycleEvent;
 use thegn_core::{outln, util};
 
 use crate::integrate::{self, AttemptOutcome};
@@ -55,14 +56,42 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         return Ok(());
     }
     let (branch, target, outcome) = land_branch(cfg, &wt)?;
+    // On a successful land, un-file the worktree from any lifecycle folder its
+    // enqueue filed it into ("Merging"/"Needs attention"). `thegn land` shares the
+    // fold/gate/CAS core with the queue but deliberately leaves the worktree in
+    // place (no `on_landed` removal, no queue-row bookkeeping), so without this the
+    // worktree is stranded in "Merging" forever after a fold-actor land — the
+    // sidebar/queue de-sync. `Dequeued` (un-file, not `Landed`) is deliberate: it
+    // clears the stale folder membership without the destructive worktree/branch
+    // removal `Landed` would trigger, preserving `thegn land`'s leave-in-place
+    // contract. Best-effort and guarded host-side to lifecycle folders, so a
+    // user-filed folder is left alone and a DB hiccup never fails the land.
+    let unfile = |branch: &str| {
+        if let Ok(db) = Db::open()
+            && let Some(root) = integrate::main_checkout(&wt)
+        {
+            crate::merge_lifecycle::apply(
+                &cfg.merge_queue,
+                &db,
+                &root,
+                &wt.to_string_lossy(),
+                branch,
+                LifecycleEvent::Dequeued,
+            );
+        }
+    };
     match outcome {
         AttemptOutcome::Landed { commit } => {
+            unfile(&branch);
             outln!(
                 "✓ landed {branch} → {target} @ {}",
                 &commit[..commit.len().min(12)]
             );
         }
-        AttemptOutcome::UpToDate => outln!("{branch} already in {target}."),
+        AttemptOutcome::UpToDate => {
+            unfile(&branch);
+            outln!("{branch} already in {target}.");
+        }
         // A failed land must exit non-zero: `thegn land` is scripted (CI, the
         // fold-actor, git aliases), so an exit-0 conflict/gate-red would look
         // like a success. The message rides the returned error (anyhow prints it).

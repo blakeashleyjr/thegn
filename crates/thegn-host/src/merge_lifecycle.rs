@@ -528,6 +528,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&feat);
     }
 
+    // A plain dequeue (`merge rm`/`clear`, and now a successful `thegn land`)
+    // pulls the worktree back out of the lifecycle folder its enqueue filed it
+    // into — the fix for worktrees stranded in "Merging" after a fold-actor land.
+    #[test]
+    fn dequeue_unfiles_from_lifecycle_folder() {
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "deq");
+        let (root_s, feat_s) = (
+            root.to_string_lossy().to_string(),
+            feat.to_string_lossy().to_string(),
+        );
+        apply(
+            &cfg(OnLanded::Move),
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            LifecycleEvent::Enqueued,
+        );
+        assert_eq!(folder_of(&db, &root_s, &feat_s).as_deref(), Some("Merging"));
+        // The branch is unused by the un-file, so an empty branch (what `thegn
+        // land` / `dequeue_worktree` pass) is fine.
+        apply(
+            &cfg(OnLanded::Move),
+            &db,
+            &root,
+            &feat_s,
+            "",
+            LifecycleEvent::Dequeued,
+        );
+        assert_eq!(folder_of(&db, &root_s, &feat_s), None, "un-filed to root");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&feat);
+    }
+
+    // The un-file guard: a dequeue must only clear membership of a
+    // lifecycle-managed folder (Merging / Needs attention / Merged). A folder the
+    // user hand-filed the worktree into is left strictly alone.
+    #[test]
+    fn dequeue_leaves_user_filed_folder_alone() {
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "dequser");
+        let (root_s, feat_s) = (
+            root.to_string_lossy().to_string(),
+            feat.to_string_lossy().to_string(),
+        );
+        let fid = db.ensure_folder(&root_s, "My stuff").unwrap();
+        db.set_worktree_folder(&feat_s, Some(fid)).unwrap();
+        apply(
+            &cfg(OnLanded::Move),
+            &db,
+            &root,
+            &feat_s,
+            "",
+            LifecycleEvent::Dequeued,
+        );
+        assert_eq!(
+            folder_of(&db, &root_s, &feat_s).as_deref(),
+            Some("My stuff"),
+            "user folder untouched by dequeue"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&feat);
+    }
+
     #[test]
     fn home_worktree_is_never_touched() {
         let db = Db::open_memory().unwrap();
