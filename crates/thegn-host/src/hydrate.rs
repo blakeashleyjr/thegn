@@ -1233,6 +1233,11 @@ fn collect_sidebar_status(
         {
             status.agent.insert(path.clone(), agent);
         }
+        // The live HEAD branch drives the row's displayed branch — the tab name
+        // is a creation-time identity and never tracks a `git checkout`.
+        if let Some(branch) = &branch {
+            status.branches.insert(path.clone(), branch.clone());
+        }
         // PR badge: open PRs for this worktree's current branch, joined from the
         // repo-wide `pr_branch_cache` (keyed by repo root, so every worktree of
         // the repo — not just the active one — resolves its branch's count).
@@ -1246,7 +1251,11 @@ fn collect_sidebar_status(
     }
     // Serve other workspaces' last-known glyphs from cache (never scanning, never
     // wakes a sandbox) so a switch shows them instantly instead of blank.
-    crate::glyph_refresh::seed_from_global_cache(&mut status.git, all_wt_paths.iter().cloned());
+    crate::glyph_refresh::seed_from_global_cache(
+        &mut status.git,
+        &mut status.branches,
+        all_wt_paths.iter().cloned(),
+    );
 
     // Attention scores + hysteresis-stable ranks (pure DB/snapshot reads; the
     // branching lives in core). After the git pass so `dirty` is fresh.
