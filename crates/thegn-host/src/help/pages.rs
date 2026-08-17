@@ -88,7 +88,11 @@ mod tests {
         let (reg, _) = build_registry(&thegn_core::config::Config::default());
         assert_eq!(reg.page_for_context("zone:sidebar"), Some("sidebar"));
         assert_eq!(reg.page_for_context("panel:merge"), Some("merge-queue"));
-        // Unclaimed contexts land on index, never nowhere.
-        assert_eq!(reg.page_for_context("panel:telemetry"), Some("index"));
+        // Sections with no dedicated page fall back to the panel overview,
+        // which documents every section and its keys.
+        assert_eq!(reg.page_for_context("panel:telemetry"), Some("panel"));
+        // A context nobody claims lands on index, never nowhere. (`panel:debug`
+        // is a dev-only section — see test/help-context-ratchet.txt.)
+        assert_eq!(reg.page_for_context("panel:debug"), Some("index"));
     }
 }

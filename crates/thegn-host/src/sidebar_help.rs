@@ -1,23 +1,18 @@
-//! The sidebar's curated statusbar hints. The old `?` cheatsheet card was
+//! The sidebar's statusbar hint strip. The old `?` cheatsheet card was
 //! subsumed by the built-in help system (`docs/help/sidebar.md`, opened by
 //! `?`/F1 at `zone:sidebar`); what remains is the always-on essentials strip.
-//! Change a key in `handlers/sidebar_keys.rs` → update this table AND the
-//! sidebar help page.
+//!
+//! The rows are **derived**, not restated: they come from
+//! [`crate::sidebar_keytable::SIDEBAR_KEYS`], the same table that drives
+//! dispatch. Adding a sidebar key surfaces it here automatically; there is no
+//! second list to keep in sync.
 
-/// The curated always-on statusbar pairs while the sidebar owns focus (spliced
-/// ahead of the registry hints): the five keys a newcomer needs first.
+use crate::sidebar_keytable::{HintTier, hints};
+
+/// The always-on statusbar pairs while the sidebar owns focus, spliced ahead of
+/// the registry hints by [`crate::keyhint::context_hints`].
 pub(crate) fn statusbar_pairs() -> Vec<(String, String)> {
-    [
-        ("↵", "open"),
-        ("n", "new"),
-        ("d", "delete"),
-        ("m", "menu"),
-        ("s", "sort"),
-        ("?", "help"),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect()
+    hints(HintTier::Essential)
 }
 
 #[cfg(test)]
@@ -31,15 +26,9 @@ mod tests {
         assert!(pairs.iter().any(|(k, _)| k == "?"));
     }
 
+    /// The strip is the table's Essential tier, not a parallel list.
     #[test]
-    fn sidebar_help_page_covers_the_key_surface() {
-        // The `?` card's guarantee, carried forward: the sidebar help page
-        // documents the essential sidebar keys, so the cheatsheet can't rot.
-        let page = include_str!("../../../docs/help/sidebar.md");
-        for key in [
-            "`n`", "`N`", "`b`", "`f`", "`F2`", "`d`", "`s`", "`p`", "`m`",
-        ] {
-            assert!(page.contains(key), "docs/help/sidebar.md missing key {key}");
-        }
+    fn statusbar_pairs_track_the_key_table() {
+        assert_eq!(statusbar_pairs(), hints(HintTier::Essential));
     }
 }

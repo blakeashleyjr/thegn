@@ -487,8 +487,16 @@ max_files = 5
 format = "text"           # text | json
 
 # ── Keybindings ───────────────────────────────────────────────────────────────
-# thegn owns its keybinds. Inspect with `thegn keys list`; check with
-# `thegn keys validate`.
+# thegn owns its keybinds. Inspect with `thegn keys list` (add `--zone sidebar`
+# / `--zone panel:logs` to scope it, `--json` for machine output); check for
+# conflicts with `thegn keys validate` (exits non-zero, so it works in a hook);
+# see exactly what a zone's hint strip renders with `thegn keys hints --zone
+# sidebar`.
+#
+# `keys list` covers three sources. Registry actions (`[registry]`/`[host]`) are
+# rebindable by id below. **Zone-table** entries — the sidebar's row keys and the
+# panel sections' row-mode action keys — are handled by the focused zone itself
+# and are NOT rebindable today; they are listed so they stay discoverable.
 #
 # By default, thegn has four modes: Normal, VimNormal, VimInsert, and Emacs.
 # - Normal: The classic `Ctrl` and `Alt` chorded UI.

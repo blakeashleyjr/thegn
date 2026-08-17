@@ -415,6 +415,21 @@ pub struct FrameModel {
     /// pairs (rebuilt per focus zone — the dynamic replacement for per-panel
     /// help rows). Rendered as key chips + dim labels.
     pub keyhints: Vec<(String, String)>,
+    /// The sidebar's NAVIGATE footer rows as (chord, label) pairs. Built by
+    /// `sidebar_keytable::footer_hints` — registry-derived jump chords (so they
+    /// follow rebinds) plus the sidebar key table's advertised keys. Carried on
+    /// the model because the pure row composer has no access to `Config`.
+    pub sidebar_hints: Vec<(String, String)>,
+    /// The idle splash's keybind block as (chord, label) pairs, derived from
+    /// the registry (`logotype::splash_hints`) so a rebind updates the splash
+    /// instead of leaving a stale literal on the first screen users ever see.
+    pub splash_hints: Vec<crate::logotype::SplashHint>,
+    /// Resolved chords for actions the chrome names inline, keyed by action id.
+    /// Rebuilt per frame from the effective keymap by `run.rs`, so a draw site
+    /// can print the live chord (`model.chord("help")`) instead of a literal
+    /// that goes stale on rebind. Use `keyhints`/`sidebar_hints` for whole
+    /// hint strips; this is for one-off mentions.
+    pub chord_hints: std::collections::BTreeMap<String, String>,
     /// The input-mode chip letter for the statusbar ("N", "V", "I", "E").
     pub mode_chip: String,
     /// Latest system stats reading for the top bar.
@@ -601,7 +616,19 @@ impl LoadStep {
     }
 }
 
+/// Action ids whose chords the chrome prints inline, resolved into
+/// [`FrameModel::chord_hints`] each frame. Add an id here when a draw site
+/// needs to name a key, rather than writing the chord as a literal.
+pub const INLINE_CHORD_IDS: &[&str] = &["help", "palette", "toggle-key-lock"];
+
 impl FrameModel {
+    /// The live chord for an action id, for chrome that names a key inline.
+    /// Falls back to `id` so a draw site always has something to print (and a
+    /// missing binding reads as the action's name, never as a wrong chord).
+    pub fn chord<'a>(&'a self, id: &'a str) -> &'a str {
+        self.chord_hints.get(id).map(String::as_str).unwrap_or(id)
+    }
+
     pub fn accent_or_default(&self) -> &str {
         if self.accent.is_empty() {
             theme::TEAL

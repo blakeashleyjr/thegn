@@ -23,6 +23,7 @@ pub mod host;
 pub mod integrate;
 pub mod issue;
 pub mod kaneo;
+pub mod keys;
 pub mod land;
 pub mod list;
 pub mod logs;

@@ -37,7 +37,16 @@ thegn config show        # the effective merged config
 thegn config get ui.language
 thegn config validate
 thegn doctor             # resolved terminal capabilities
+thegn keys list          # every binding, grouped by zone (--json, --zone)
+thegn keys validate      # chord conflicts; exits non-zero, so it fits a hook
+thegn keys hints --zone sidebar   # what that zone's hint strip renders
 ```
+
+`keys list` covers the keymap registry **and** the zone-local tables — the
+sidebar's row keys and each panel section's row-mode keys. Those are handled
+by the focused zone rather than the registry, so they are not rebindable, but
+they are listed so nothing is hidden. See [[keybindings]] for the rebindable
+set.
 
 The complete key-by-key documentation is the generated
 [[config-reference]] — it can never drift from the shipped example.

@@ -31,7 +31,8 @@ pub fn keybindings_page(cfg: &thegn_core::config::Config) -> String {
     });
 
     let mut out = String::from(
-        "---\nid: keybindings\ntitle: Keybindings\norder: 35\ngenerated: true\n---\n\n\
+        "---\nid: keybindings\ntitle: Keybindings\norder: 35\ngenerated: true\n\
+         contexts: [panel:keys]\n---\n\n\
          # Keybindings\n\n\
          Your **effective** keymap: built-in defaults, `[keybinds]` rebinds, and \
          custom `[[actions]]`, exactly as they resolve right now. Rebind any row \

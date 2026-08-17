@@ -14,6 +14,7 @@
 //! | `sidebar_expanded`   | `"1"`/`"0"`          | `e` wide toggle                   |
 //! | `sidebar_mode`       | `SidebarMode::as_key()` | ToggleSidebar cycle            |
 //! | `sidebar_flat`       | `"1"` (absent=grouped) | toggle_flat (`g`)               |
+//! | `sidebar_focus_detail` | `FocusDetail::as_str()` (absent=`[ui]` config) | cycle_focus_detail (`i`) |
 //!
 //! `<key>` is the row's stable identity: a workspace slug, `{slug}/{branch}`
 //! for worktrees, `{slug}/folder:{id}` for folders, `terminals/host:{key}` for
@@ -63,6 +64,10 @@ pub(crate) struct SidebarState {
     /// Wide expand toggle (`e`): mirrors the panel's expand affordance. When
     /// set, the sidebar claims ~half the window, ignoring `width`.
     pub(crate) expanded: bool,
+    /// Runtime override for `[ui] sidebar_focus_detail`, cycled by `i`.
+    /// `None` = follow config. Held separately from `view.display` because a
+    /// config reload rebuilds that struct from `[ui]` and would drop it.
+    pub(crate) focus_detail_override: Option<thegn_core::config::FocusDetail>,
     /// Display mode cycled by `ToggleSidebar`: full panel, slim rail, hidden.
     pub(crate) mode: crate::layout::SidebarMode,
     /// Desired top visible-row index of the scroll window; `build_sidebar`
@@ -113,10 +118,22 @@ impl SidebarState {
                 self.expanded = value == "1";
             } else if key == "sidebar_flat" {
                 self.view.flat = value == "1";
+            } else if key == "sidebar_focus_detail" {
+                // best-effort: an unparseable stored value just falls back to
+                // the `[ui]` config value rather than failing the load.
+                self.focus_detail_override =
+                    thegn_core::config::FocusDetail::from_str_validated(&value).ok();
             } else if key == "sidebar_mode" {
                 self.mode = crate::layout::SidebarMode::from_key(&value);
             }
         }
+    }
+
+    /// The effective per-row detail mode: the runtime override (`i`) if the
+    /// user has cycled it this install, else whatever `[ui]` config resolved to.
+    pub(crate) fn focus_detail(&self) -> thegn_core::config::FocusDetail {
+        self.focus_detail_override
+            .unwrap_or(self.view.display.focus_detail)
     }
 
     /// Persist a single `ui_state` key in the global [`SIDEBAR_SCOPE`].
@@ -179,5 +196,32 @@ mod tests {
         let mut sb2 = SidebarState::default();
         sb2.load(&db2, SIDEBAR_SCOPE);
         assert!(!sb2.view.flat);
+    }
+
+    #[test]
+    fn load_reads_sidebar_focus_detail() {
+        use thegn_core::config::FocusDetail;
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.set_ui_state(SIDEBAR_SCOPE, "sidebar_focus_detail", "cursor")
+            .unwrap();
+        let mut sb = SidebarState::default();
+        sb.load(&db, SIDEBAR_SCOPE);
+        assert_eq!(sb.focus_detail_override, Some(FocusDetail::Cursor));
+        assert_eq!(sb.focus_detail(), FocusDetail::Cursor);
+    }
+
+    /// With no stored override the effective mode follows `[ui]` config, and a
+    /// junk stored value degrades to config rather than failing the load.
+    #[test]
+    fn focus_detail_falls_back_to_config() {
+        use thegn_core::config::FocusDetail;
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.set_ui_state(SIDEBAR_SCOPE, "sidebar_focus_detail", "nonsense")
+            .unwrap();
+        let mut sb = SidebarState::default();
+        sb.view.display.focus_detail = FocusDetail::Off;
+        sb.load(&db, SIDEBAR_SCOPE);
+        assert_eq!(sb.focus_detail_override, None);
+        assert_eq!(sb.focus_detail(), FocusDetail::Off, "config wins");
     }
 }

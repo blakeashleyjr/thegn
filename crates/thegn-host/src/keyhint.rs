@@ -113,11 +113,13 @@ pub(crate) fn context_hints(
 
     let mut out: Vec<(String, String)> = Vec::new();
 
+    // Zone-local keys lead: these are handled by the focused zone itself, not
+    // the keymap registry, so they'd otherwise never appear. Both come from the
+    // zone's single-source key table (`panel::section_keys`,
+    // `sidebar_keytable`), which is drift-tested against the real dispatch.
     if focus.zone == crate::focus::Zone::Panel {
         out = crate::panel::hints::panel_help_pairs(panel_ui);
     }
-    // Sidebar zone: the curated essentials first (the real keys live in
-    // `handlers/sidebar_keys.rs`, invisible to the keymap registry).
     if focus.zone == crate::focus::Zone::Sidebar {
         out = crate::sidebar_help::statusbar_pairs();
     }
@@ -572,6 +574,54 @@ mod tests {
             "has a worktree row: {all:?}"
         );
         assert!(all.iter().all(|r| !r.chord.is_empty()));
+    }
+
+    /// The statusbar strip is supposed to be *contextual*. It only is if the
+    /// registry's `Context` tags actually discriminate — when nearly every
+    /// action was `Global`, focusing the sidebar showed the same chords as the
+    /// center, so a sidebar-specific key had nowhere to appear.
+    #[test]
+    fn each_zone_gets_a_distinct_hint_set() {
+        use crate::focus::{FocusState, Zone};
+        let cfg = thegn_core::config::Config::default();
+        let panel = crate::panel::PanelUi::default();
+        let hints_for = |zone| {
+            context_hints(
+                &FocusState {
+                    zone,
+                    ..Default::default()
+                },
+                &panel,
+                &cfg,
+            )
+        };
+
+        let center = hints_for(Zone::Center);
+        let sidebar = hints_for(Zone::Sidebar);
+        let panel_hints = hints_for(Zone::Panel);
+        assert_ne!(center, sidebar, "sidebar hints must differ from the center");
+        assert_ne!(center, panel_hints, "panel hints must differ too");
+
+        // Pane tools are center-only: they say nothing useful while the tree
+        // has focus (and `Alt-g` there is the flat/grouped toggle's neighbour,
+        // not lazygit).
+        let labels =
+            |v: &Vec<(String, String)>| v.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>();
+        assert!(labels(&center).iter().any(|l| l == "lazygit"));
+        assert!(
+            !labels(&sidebar).iter().any(|l| l == "lazygit"),
+            "center-only hints must not leak into the sidebar: {:?}",
+            labels(&sidebar)
+        );
+
+        // Truly global affordances still show everywhere.
+        for set in [&center, &sidebar, &panel_hints] {
+            assert!(
+                labels(set).iter().any(|l| l == "menu"),
+                "the palette hint is global: {:?}",
+                labels(set)
+            );
+        }
     }
 
     #[test]
