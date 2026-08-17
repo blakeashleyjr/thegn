@@ -28,12 +28,14 @@ pub(crate) fn glyphs_from_row(row: &GlyphRow) -> GitGlyphs {
     }
 }
 
-/// Overlay last-known-good glyphs onto `git` for every path in `paths` that has
-/// a cached row and is not already present. Never overwrites a row that a fresh
-/// scan already populated (path already in `git`); a path with no cache entry is
-/// left absent (renders blank, same as a never-scanned worktree).
+/// Overlay last-known-good glyphs onto `git` (and the cached HEAD branch onto
+/// `branches`) for every path in `paths` that has a cached row and is not
+/// already present. Never overwrites a row that a fresh scan already populated
+/// (path already in `git`); a path with no cache entry is left absent (renders
+/// blank, same as a never-scanned worktree).
 pub(crate) fn seed_glyphs_from_cache(
     git: &mut BTreeMap<String, GitGlyphs>,
+    branches: &mut BTreeMap<String, String>,
     paths: impl IntoIterator<Item = String>,
     cache: &HashMap<String, (GlyphRow, Instant)>,
 ) {
@@ -42,6 +44,13 @@ pub(crate) fn seed_glyphs_from_cache(
             continue;
         }
         if let Some((row, _)) = cache.get(&p) {
+            // The cached row carries the branch HEAD pointed at when it was
+            // scanned — the right fallback for a row whose live scan is gated
+            // (suspended sandbox, other workspace), and still fresher than the
+            // creation-time tab name.
+            if let Some(branch) = &row.3 {
+                branches.entry(p.clone()).or_insert_with(|| branch.clone());
+            }
             git.insert(p, glyphs_from_row(row));
         }
     }
@@ -52,10 +61,11 @@ pub(crate) fn seed_glyphs_from_cache(
 /// so it's safe to call on the event loop.
 pub(crate) fn seed_from_global_cache(
     git: &mut BTreeMap<String, GitGlyphs>,
+    branches: &mut BTreeMap<String, String>,
     paths: impl IntoIterator<Item = String>,
 ) {
     let cache = crate::hydrate::glyph_cache().lock().unwrap();
-    seed_glyphs_from_cache(git, paths, &cache);
+    seed_glyphs_from_cache(git, branches, paths, &cache);
 }
 
 #[cfg(test)]
@@ -104,7 +114,13 @@ mod tests {
         cache.insert("/a".to_string(), row(true, 1, 0));
         cache.insert("/b".to_string(), row(false, 0, 4));
         let mut git = BTreeMap::new();
-        seed_glyphs_from_cache(&mut git, ["/a".to_string(), "/b".to_string()], &cache);
+        let mut branches = BTreeMap::new();
+        seed_glyphs_from_cache(
+            &mut git,
+            &mut branches,
+            ["/a".to_string(), "/b".to_string()],
+            &cache,
+        );
         assert_eq!(
             git.get("/a"),
             Some(&GitGlyphs {
@@ -137,15 +153,52 @@ mod tests {
             ..Default::default()
         };
         git.insert("/a".to_string(), fresh); // fresh scan already present
-        seed_glyphs_from_cache(&mut git, ["/a".to_string()], &cache);
+        let mut branches = BTreeMap::new();
+        seed_glyphs_from_cache(&mut git, &mut branches, ["/a".to_string()], &cache);
         assert_eq!(git.get("/a"), Some(&fresh), "must not clobber a fresh scan");
+    }
+
+    #[test]
+    fn seeds_the_cached_head_branch_alongside_the_glyphs() {
+        // A row served from cache (other workspace / gated remote scan) still
+        // needs a branch, or its sidebar label falls back to the creation-time
+        // tab name and reads stale.
+        let mut cache = HashMap::new();
+        cache.insert(
+            "/a".to_string(),
+            (
+                (
+                    false,
+                    0,
+                    0,
+                    Some("tg/live".to_string()),
+                    String::new(),
+                    0,
+                    0,
+                    None,
+                ),
+                Instant::now(),
+            ),
+        );
+        let mut git = BTreeMap::new();
+        let mut branches = BTreeMap::new();
+        seed_glyphs_from_cache(&mut git, &mut branches, ["/a".to_string()], &cache);
+        assert_eq!(branches.get("/a").map(String::as_str), Some("tg/live"));
+
+        // A fresher branch already in the map (from this pass's live scan) wins.
+        let mut branches = BTreeMap::new();
+        branches.insert("/a".to_string(), "tg/fresh".to_string());
+        let mut git = BTreeMap::new();
+        seed_glyphs_from_cache(&mut git, &mut branches, ["/a".to_string()], &cache);
+        assert_eq!(branches.get("/a").map(String::as_str), Some("tg/fresh"));
     }
 
     #[test]
     fn leaves_uncached_paths_absent() {
         let cache = HashMap::new();
         let mut git = BTreeMap::new();
-        seed_glyphs_from_cache(&mut git, ["/nope".to_string()], &cache);
+        let mut branches = BTreeMap::new();
+        seed_glyphs_from_cache(&mut git, &mut branches, ["/nope".to_string()], &cache);
         assert!(git.is_empty(), "no cache entry -> no glyph inserted");
     }
 }
