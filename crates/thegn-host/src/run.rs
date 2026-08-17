@@ -9558,6 +9558,13 @@ async fn event_loop<T: Terminal>(
                 }
             }
             if !title_writes.is_empty() {
+                // The sidebar's main line IS this title, so a change is sidebar
+                // damage. Without it the frame in progress is whatever the pane
+                // output asked for — `Incremental { panes }`, which never
+                // recomposes the sidebar — and the new title sits in the model
+                // unpainted until some unrelated chrome change forces a repaint.
+                // Set BEFORE the `Damage` snapshot below, so this frame carries it.
+                sidebar_dirty = true;
                 // Persist off the loop: `Db::open()` + write on the render path
                 // ran a synchronous DB open per title change (frequent during a
                 // build/ls that repaints the title). The background writer thread
