@@ -1,0 +1,7 @@
+# help-context-ratchet — `panel:*` context keys not yet claimed by a docs/help/
+# page. An unclaimed context falls back to the generic index page when F1 is
+# pressed there. This list may only SHRINK: claim a context in a page's
+# `contexts:` frontmatter, then delete its line. A NEW panel section must ship
+# a help page — the ratchet test refuses additions.
+panel:db
+panel:debug

@@ -1520,9 +1520,12 @@ fn render_tab_shows_splash_when_no_live_panes() {
     let cols = 160usize;
     let rows = 40usize;
     let chrome = layout::compute(cols, rows, true, true);
+    let cfg = thegn_core::config::Config::default();
     let model = FrameModel {
         worktree: "repo/home".into(),
         tabs: vec!["1".into()],
+        // The splash block is registry-derived; the loop fills this each frame.
+        splash_hints: crate::logotype::splash_hints(&cfg),
         ..Default::default()
     };
     let center = crate::center::CenterTree::Leaf(1);
@@ -1550,8 +1553,9 @@ fn render_tab_shows_splash_when_no_live_panes() {
                 .collect::<String>()
         })
         .collect();
+    let palette_chord = crate::keymap::chord_hint_for(&cfg, "palette").expect("palette binding");
     assert!(
-        band.contains("Ctrl-Space"),
+        band.contains(&palette_chord),
         "splash hints in center: {mid:?}"
     );
     assert!(band.chars().any(|c| "▀▄█".contains(c)), "splash wordmark");

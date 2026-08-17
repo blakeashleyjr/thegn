@@ -12,6 +12,16 @@ actions:
     shrink-strip,
     promote-pin,
     unpin,
+    files,
+    pin-1,
+    pin-2,
+    pin-3,
+    pin-4,
+    pin-5,
+    pin-6,
+    pin-7,
+    pin-8,
+    pin-9,
   ]
 ---
 

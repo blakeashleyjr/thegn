@@ -49,84 +49,14 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
         }
         return pairs;
     }
-    let pairs: &[(&str, &str)] = match ui.open {
-        Section::Changes | Section::Commits | Section::Branches | Section::Stash => {
-            unreachable!("git-family sections returned above")
-        }
-        Section::Mine => &[
-            ("j/k", "row"),
-            ("↵", "open"),
-            ("b", "branch"),
-            ("o", "browser"),
-            ("R", "refresh"),
-        ],
-        Section::Pr => &[
-            ("j/k", "row"),
-            ("M", "merge"),
-            ("A", "approve"),
-            ("r", "rerun"),
-            ("o", "browser"),
-        ],
-        Section::Tests => &[("r", "run"), ("R", "all"), ("f", "failed"), ("↵", "open")],
-        Section::Ci => &[
-            ("j/k", "row"),
-            ("↵", "view"),
-            ("r", "rerun"),
-            ("o", "browser"),
-        ],
-        Section::MergeQueue => &[("a/A", "add"), ("D", "drain"), ("l/r/x", "act")],
-        Section::Files => &[("↵", "open"), ("y", "yazi")],
-        Section::Issues => &[
-            ("j/k", "row"),
-            ("↵", "link"),
-            ("o", "open"),
-            ("n", "new"),
-            ("e", "edit"),
-        ],
-        Section::Notifications => &[
-            ("j/k", "row"),
-            ("↵", "go to"),
-            ("/ ", "search"),
-            ("r", "read"),
-            ("d", "dismiss"),
-            ("A", "show all"),
-        ],
-        Section::Jobs => &[
-            ("↵", "run"),
-            ("r", "re-run"),
-            ("s", "stop"),
-            ("o", "output"),
-            ("j/k", "select"),
-        ],
-        Section::Logs => &[
-            ("j/k", "row"),
-            ("/ ", "filter"),
-            ("l", "level"),
-            ("y", "copy"),
-            ("e", "export"),
-        ],
-        Section::Problems => &[("↵", "open"), ("j/k", "select")],
-        Section::Symbols => &[
-            ("↵", "go to def"),
-            ("r", "refs"),
-            ("h", "hover"),
-            ("o", "outline"),
-            ("j/k", "select"),
-        ],
-        Section::Media => &[
-            ("space", "play/pause"),
-            ("n/p", "next/prev"),
-            ("s", "shuffle"),
-            ("L", "loop"),
-            ("≡", "playlist"),
-        ],
-        Section::Share => &[("j/k", "row"), ("↵", "copy url")],
-        Section::Forward => &[("j/k", "row"), ("o", "open in browser"), ("↵", "copy url")],
-        // Row-nav-only sections (Debug, Sandbox, Db, Telemetry, Keys, Across, …).
-        _ => &[("j/k", "row")],
-    };
+    // Per-section keys come from the single-source table, which is checked
+    // against the real dispatch arms by `section_keys`' drift test.
+    let pairs: Vec<(String, String)> = crate::panel::section_keys::section_keys(ui.open)
+        .iter()
+        .map(|sk| (sk.chord.to_string(), sk.label.to_string()))
+        .collect();
     // "esc back" leads every row-mode hint list so the exit path is always visible.
     let mut result: Vec<(String, String)> = vec![("esc".to_string(), "back".to_string())];
-    result.extend(pairs.iter().map(|(c, l)| (c.to_string(), l.to_string())));
+    result.extend(pairs);
     result
 }

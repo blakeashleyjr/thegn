@@ -4,32 +4,19 @@
 //!
 //! ## The sidebar key surface
 //!
-//! | key            | action                                                  |
-//! |----------------|---------------------------------------------------------|
-//! | j/k/↑/↓        | move cursor                                             |
-//! | Enter          | open row / toggle header / run an EmptyHint's action    |
-//! | h/l/←/→        | collapse/expand (h on a leaf folds its parent)          |
-//! | `/`            | filter                                                  |
-//! | Space          | mark for bulk actions                                   |
-//! | m              | context menu (the canonical action catalog)             |
-//! | d / Delete     | close-or-delete chooser (row-kind aware, bulk-aware)    |
-//! | r / F2         | rename (worktree branch, folder)                        |
-//! | n              | new worktree here (terminals region: new terminal)      |
-//! | N              | new workspace                                           |
-//! | b              | branch a new worktree from this one                     |
-//! | f              | move to folder… (workspace/folder row: new folder…)     |
-//! | c              | copy path                                               |
-//! | p              | pin / unpin                                             |
-//! | s              | sort menu                                               |
-//! | Shift+↑/↓      | reorder selection                                       |
-//! | `<`/`>`, e     | resize / wide toggle                                    |
-//! | ?              | help overlay                                            |
-//! | q / Esc        | back to the terminal                                    |
+//! The key surface itself is declared **once**, in
+//! [`crate::sidebar_keytable::SIDEBAR_KEYS`] — chord, help label, and dispatch
+//! id as a single datum. This module owns only the behaviour behind each id;
+//! [`crate::sidebar_keytable::resolve`] does the key matching, and the same
+//! table feeds the statusbar strip, the sidebar's NAVIGATE footer, and the
+//! drift test against `docs/help/sidebar.md`. Do not add a bare `KeyCode` arm
+//! here — add a table row, then handle its id.
 
 use termwiz::input::{KeyCode, Modifiers};
 
 use crate::chrome::FrameModel;
 use crate::handlers::sidebar_persist::SidebarState;
+use crate::sidebar_keytable::{SidebarKeyId as Id, chord_of};
 use crate::sidebar_view::{RowMenuEntry, menu_step};
 
 /// What the event loop should do after a sidebar key was handled.
@@ -269,26 +256,34 @@ impl SidebarState {
         match row.kind {
             RowKind::Worktree => {
                 if row.tab_target.is_some() {
-                    entries.push(e("open", "Open", Some("↵")));
+                    entries.push(e("open", "Open", Some(chord_of(Id::Activate))));
                 }
                 entries.push(sep());
-                entries.push(e("new-worktree", "New worktree here…", Some("n")));
+                entries.push(e(
+                    "new-worktree",
+                    "New worktree here…",
+                    Some(chord_of(Id::NewWorktree)),
+                ));
                 if row.worktree_path.is_some() {
-                    entries.push(e("fork", "Branch from this…", Some("b")));
+                    entries.push(e("fork", "Branch from this…", Some(chord_of(Id::Fork))));
                 }
                 let is_home = self.cursor_is_home(model, session);
                 if !is_home {
-                    entries.push(e("rename", "Rename…", Some("r")));
+                    entries.push(e("rename", "Rename…", Some(chord_of(Id::Rename))));
                 }
                 entries.push(sep());
                 if row.worktree_path.is_some() {
-                    entries.push(e("move-to-folder", "Move to folder…", Some("f")));
+                    entries.push(e(
+                        "move-to-folder",
+                        "Move to folder…",
+                        Some(chord_of(Id::Folder)),
+                    ));
                 }
                 if !row.pin_key.is_empty() {
-                    entries.push(e("pin", "Pin / unpin", Some("p")));
+                    entries.push(e("pin", "Pin / unpin", Some(chord_of(Id::TogglePin))));
                 }
                 if row.worktree_path.is_some() {
-                    entries.push(e("copy-path", "Copy path", Some("c")));
+                    entries.push(e("copy-path", "Copy path", Some(chord_of(Id::CopyPath))));
                 }
                 // Merge-queue controls (status-aware, mirroring the panel keys).
                 // Skipped for the home row (it sits on the target branch).
@@ -301,7 +296,14 @@ impl SidebarState {
                 if !is_home {
                     entries.push(sep());
                     entries.push(e("close", "Close — keep files on disk", None));
-                    entries.push(e("delete", "Delete branch + files…", Some("d")).danger());
+                    entries.push(
+                        e(
+                            "delete",
+                            "Delete branch + files…",
+                            Some(chord_of(Id::Delete)),
+                        )
+                        .danger(),
+                    );
                 }
             }
             RowKind::Workspace => {
@@ -309,15 +311,36 @@ impl SidebarState {
                 if row.tab_target.is_some() {
                     entries.push(e("open", "Open", None));
                 }
-                entries.push(e("toggle", "Collapse / expand", Some("↵")));
+                entries.push(e(
+                    "toggle",
+                    "Collapse / expand",
+                    Some(chord_of(Id::Activate)),
+                ));
                 entries.push(sep());
-                entries.push(e("new-worktree", "New worktree…", Some("n")));
-                entries.push(e("new-folder", "New folder…", Some("f")));
+                entries.push(e(
+                    "new-worktree",
+                    "New worktree…",
+                    Some(chord_of(Id::NewWorktree)),
+                ));
+                entries.push(e("new-folder", "New folder…", Some(chord_of(Id::Folder))));
                 if !row.pin_key.is_empty() {
-                    entries.push(e("pin", "Pin / unpin", Some("p")));
+                    entries.push(e("pin", "Pin / unpin", Some(chord_of(Id::TogglePin))));
                 }
-                entries.push(e("sort", "Sort worktrees by…", Some("s")));
-                entries.push(e("toggle-flat", "Flat / grouped view", Some("g")));
+                entries.push(e(
+                    "sort",
+                    "Sort worktrees by…",
+                    Some(chord_of(Id::SortMenu)),
+                ));
+                entries.push(e(
+                    "toggle-flat",
+                    "Flat / grouped view",
+                    Some(chord_of(Id::ToggleFlat)),
+                ));
+                entries.push(e(
+                    "cycle-detail",
+                    "Row detail: all / cursor / off",
+                    Some(chord_of(Id::CycleDetail)),
+                ));
                 // Workspace-wide merge-queue controls (panel `A` / clear / `D`).
                 entries.push(sep());
                 entries.push(e("mq-add-all", "Queue all worktrees", None));
@@ -325,37 +348,75 @@ impl SidebarState {
                 entries.push(e("mq-drain", "Drain merge queue", None));
                 if row.worktree_path.is_some() {
                     entries.push(sep());
-                    entries.push(e("remove-workspace", "Remove workspace…", Some("d")).danger());
+                    entries.push(
+                        e(
+                            "remove-workspace",
+                            "Remove workspace…",
+                            Some(chord_of(Id::Delete)),
+                        )
+                        .danger(),
+                    );
                 }
             }
             RowKind::Folder => {
-                entries.push(e("toggle", "Collapse / expand", Some("↵")));
-                entries.push(e("rename-folder", "Rename folder…", Some("r")));
-                entries.push(e("new-worktree", "New worktree here…", Some("n")));
+                entries.push(e(
+                    "toggle",
+                    "Collapse / expand",
+                    Some(chord_of(Id::Activate)),
+                ));
+                entries.push(e(
+                    "rename-folder",
+                    "Rename folder…",
+                    Some(chord_of(Id::Rename)),
+                ));
+                entries.push(e(
+                    "new-worktree",
+                    "New worktree here…",
+                    Some(chord_of(Id::NewWorktree)),
+                ));
                 entries.push(sep());
                 entries.push(
                     e(
                         "delete-folder",
                         "Delete folder (keeps worktrees)",
-                        Some("d"),
+                        Some(chord_of(Id::Delete)),
                     )
                     .danger(),
                 );
             }
             RowKind::TerminalHost => {
-                entries.push(e("toggle", "Collapse / expand", Some("↵")));
-                entries.push(e("new-terminal", "New terminal here…", Some("n")));
+                entries.push(e(
+                    "toggle",
+                    "Collapse / expand",
+                    Some(chord_of(Id::Activate)),
+                ));
+                entries.push(e(
+                    "new-terminal",
+                    "New terminal here…",
+                    Some(chord_of(Id::NewWorktree)),
+                ));
             }
             RowKind::Terminal => {
                 if row.tab_target.is_some() {
-                    entries.push(e("open", "Open", Some("↵")));
+                    entries.push(e("open", "Open", Some(chord_of(Id::Activate))));
                 }
                 if !row.pin_key.is_empty() {
-                    entries.push(e("pin", "Pin / unpin", Some("p")));
+                    entries.push(e("pin", "Pin / unpin", Some(chord_of(Id::TogglePin))));
                 }
-                entries.push(e("new-terminal", "New terminal…", Some("n")));
+                entries.push(e(
+                    "new-terminal",
+                    "New terminal…",
+                    Some(chord_of(Id::NewWorktree)),
+                ));
                 entries.push(sep());
-                entries.push(e("close-terminal", "Close terminal…", Some("d")).danger());
+                entries.push(
+                    e(
+                        "close-terminal",
+                        "Close terminal…",
+                        Some(chord_of(Id::Delete)),
+                    )
+                    .danger(),
+                );
             }
             RowKind::SectionHeading | RowKind::EmptyHint => return None,
         }
@@ -443,26 +504,31 @@ impl SidebarState {
         }
 
         let visible = Self::visible_len(model);
-        match key {
-            key if crate::input::is_escape_key(key) => return SidebarOutcome::Defocus,
-            KeyCode::Char('q') => return SidebarOutcome::Defocus,
+        // Every key below is declared once in `sidebar_keytable::SIDEBAR_KEYS`,
+        // which also feeds the statusbar strip, the NAVIGATE footer, and the
+        // help-page drift test — so a key can't exist without surfacing.
+        let Some(id) = crate::sidebar_keytable::resolve(key, mods) else {
+            return SidebarOutcome::NotHandled;
+        };
+        match id {
+            Id::Defocus => return SidebarOutcome::Defocus,
             // Shift+↑/↓ reorders the selection (the loop has `&mut Session`).
             // Only the arrows carry Shift here — Shift+j/k normalise to J/K.
-            KeyCode::UpArrow if mods.contains(Modifiers::SHIFT) => {
+            Id::ReorderUp => {
                 return SidebarOutcome::ReorderSelection { up: true };
             }
-            KeyCode::DownArrow if mods.contains(Modifiers::SHIFT) => {
+            Id::ReorderDown => {
                 return SidebarOutcome::ReorderSelection { up: false };
             }
-            KeyCode::DownArrow | KeyCode::Char('j') => {
+            Id::CursorDown => {
                 if visible > 0 {
                     self.cursor = (self.cursor + 1).min(visible - 1);
                 }
             }
-            KeyCode::UpArrow | KeyCode::Char('k') => {
+            Id::CursorUp => {
                 self.cursor = self.cursor.saturating_sub(1);
             }
-            KeyCode::Enter => {
+            Id::Activate => {
                 // On a collapsible header (workspace or terminal host), Enter
                 // toggles collapse; on an EmptyHint it runs the hinted action;
                 // elsewhere it opens the row.
@@ -478,7 +544,7 @@ impl SidebarState {
                     }
                 }
             }
-            KeyCode::Char('l') | KeyCode::RightArrow => {
+            Id::Expand => {
                 // Expand a collapsed header.
                 if let Some(row) = self.selected_row(model)
                     && row.kind.is_collapsible()
@@ -487,7 +553,7 @@ impl SidebarState {
                     return self.toggle_collapse(model, session);
                 }
             }
-            KeyCode::Char('h') | KeyCode::LeftArrow => {
+            Id::Collapse => {
                 // On an expanded collapsible header: collapse it. Otherwise (a
                 // leaf sub-item, or an already-collapsed header): collapse the
                 // nearest collapsible ancestor and move the cursor onto it.
@@ -498,14 +564,15 @@ impl SidebarState {
                     return self.collapse_parent(model, session);
                 }
             }
-            KeyCode::Char('/') => {
+            Id::Filter => {
                 self.filtering = true;
                 self.sync(model);
             }
-            KeyCode::Char('s') => return SidebarOutcome::SortMenu,
-            KeyCode::Char('g') => return self.toggle_flat(model, session),
-            KeyCode::Char('p') => return self.toggle_pin(model, session),
-            KeyCode::Char(' ') => {
+            Id::SortMenu => return SidebarOutcome::SortMenu,
+            Id::ToggleFlat => return self.toggle_flat(model, session),
+            Id::TogglePin => return self.toggle_pin(model, session),
+            Id::CycleDetail => return self.cycle_focus_detail(model),
+            Id::Mark => {
                 // Multi-select toggle (item 26): mark/unmark the cursor row if it
                 // is a worktree or workspace. Collapse now lives solely on
                 // Enter/←/→ and the caret click, so headers can be selected too.
@@ -519,21 +586,21 @@ impl SidebarState {
                     self.sync(model);
                 }
             }
-            KeyCode::Char('m') => {
+            Id::RowMenu => {
                 self.menu = self.menu_for_cursor(model, session);
                 self.sync(model);
             }
-            KeyCode::Char('d') | KeyCode::Delete => {
+            Id::Delete => {
                 if let Some(out) = self.delete_outcome(model, session) {
                     return out;
                 }
             }
-            KeyCode::Char('r') | KeyCode::Function(2) => {
+            Id::Rename => {
                 if let Some(out) = self.rename_outcome(model, session) {
                     return out;
                 }
             }
-            KeyCode::Char('n') => {
+            Id::NewWorktree => {
                 if self.cursor_in_terminals(model) {
                     return SidebarOutcome::Synthetic(crate::keymap::Action::NewTerminal);
                 }
@@ -542,20 +609,20 @@ impl SidebarState {
                     None => SidebarOutcome::Synthetic(crate::keymap::Action::NewWorktree),
                 };
             }
-            KeyCode::Char('N') => {
+            Id::NewWorkspace => {
                 return SidebarOutcome::Synthetic(crate::keymap::Action::NewWorkspace);
             }
-            KeyCode::Char('b') => {
+            Id::Fork => {
                 if let Some(out) = self.fork_outcome(model) {
                     return out;
                 }
             }
-            KeyCode::Char('f') => {
+            Id::Folder => {
                 if let Some(out) = self.folder_outcome(model) {
                     return out;
                 }
             }
-            KeyCode::Char('c') => {
+            Id::CopyPath => {
                 if let Some(p) = self
                     .selected_row(model)
                     .and_then(|r| r.worktree_path.clone())
@@ -563,21 +630,20 @@ impl SidebarState {
                     return SidebarOutcome::CopyText(p);
                 }
             }
-            KeyCode::Char('?') => return SidebarOutcome::ShowHelp,
-            KeyCode::Char('<') | KeyCode::Char(',') => {
+            Id::Help => return SidebarOutcome::ShowHelp,
+            Id::WidthDec => {
                 return self.adjust_width(-2);
             }
-            KeyCode::Char('>') | KeyCode::Char('.') => {
+            Id::WidthInc => {
                 return self.adjust_width(2);
             }
-            KeyCode::Char('e') => {
+            Id::ToggleWide => {
                 // Toggle the Wide expand (mirrors the panel's `e`): ~half the
                 // window vs. the fine-nudged width.
                 self.expanded = !self.expanded;
                 self.persist("sidebar_expanded", if self.expanded { "1" } else { "0" });
                 return SidebarOutcome::Relayout;
             }
-            _ => return SidebarOutcome::NotHandled,
         }
         self.sync(model);
         SidebarOutcome::Redraw
@@ -798,6 +864,32 @@ impl SidebarState {
         SidebarOutcome::Redraw
     }
 
+    /// Cycle how much per-row detail the focused sidebar shows (`i`):
+    /// `all` → `cursor` → `off` → `all`.
+    ///
+    /// This is the runtime toggle for `[ui] sidebar_focus_detail`, which was
+    /// previously reachable only by editing config. The choice is held as an
+    /// *override* rather than written into `self.view.display`, because a
+    /// config reload rebuilds `view.display` wholesale from `[ui]`
+    /// (`SidebarDisplay::from_ui`) and would silently discard it.
+    pub(crate) fn cycle_focus_detail(&mut self, model: &mut FrameModel) -> SidebarOutcome {
+        use thegn_core::config::FocusDetail;
+        let next = match self.focus_detail() {
+            FocusDetail::All => FocusDetail::Cursor,
+            FocusDetail::Cursor => FocusDetail::Off,
+            FocusDetail::Off => FocusDetail::All,
+        };
+        self.focus_detail_override = Some(next);
+        self.persist("sidebar_focus_detail", next.as_str());
+        model.sidebar_display.focus_detail = next;
+        model.status = match next {
+            FocusDetail::All => "Sidebar detail: all rows".into(),
+            FocusDetail::Cursor => "Sidebar detail: cursor row only".into(),
+            FocusDetail::Off => "Sidebar detail: off".into(),
+        };
+        SidebarOutcome::Redraw
+    }
+
     /// Drop out of the Wide expand back to the resting width (mirrors the
     /// panel's Esc collapse). Returns whether anything changed so the caller can
     /// gate a relayout. Persists "0" so an unfocused bar doesn't re-expand on
@@ -841,6 +933,7 @@ impl SidebarState {
             }
             "toggle" => return self.toggle_collapse(model, session),
             "toggle-flat" => return self.toggle_flat(model, session),
+            "cycle-detail" => return self.cycle_focus_detail(model),
             "pin" => return self.toggle_pin(model, session),
             "close" => {
                 let targets = self.action_targets(model);

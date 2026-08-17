@@ -22,11 +22,12 @@ terminals. `Alt-s` (or `Ctrl-←` from the leftmost pane) focuses it;
 
 ## Navigate
 
-- `↑↓` / `j k` — move; `↵` opens the row (or folds a header)
-- `← →` — collapse / expand
+- `↑↓` / `j` `k` — move; `↵` opens the row (or folds a header)
+- `← →` / `h` `l` — collapse / expand
 - `/` — filter the tree
 - `Alt-1..9` / `Ctrl-1..9` — jump to worktree / workspace by slot
 - `Alt-\`` — bounce between the workspaces and terminals regions
+- `q` or `Esc` — back to the terminal
 
 ## Create
 
@@ -52,11 +53,16 @@ terminals. `Alt-s` (or `Ctrl-←` from the leftmost pane) focuses it;
 
 ## View
 
-- `< >` — resize the sidebar; `e` — wide mode
+- `<` / `>` (or `,` / `.`) — resize the sidebar; `e` — wide mode
+- `?` — this page
 - `g` — flat / grouped: toggle between one recency-ordered list of every
   worktree across all repos (each tagged with its repo) and the
   per-workspace grouping. Pair with the `s` → live sort to always see the
   latest-changed worktree at the top, regardless of workspace
+- `i` — row detail: cycle the secondary line (branch, ahead/behind, PR)
+  between **all** rows, the **cursor** row only, and **off**. The detail
+  line only ever shows while the sidebar has focus. This overrides
+  `sidebar_focus_detail` from [[config-reference]] `[ui]` and persists
 
 Workspace ordering is configurable: `sidebar_workspace_sort = "attention"`
 bubbles the workspace that most needs you to the top. See
