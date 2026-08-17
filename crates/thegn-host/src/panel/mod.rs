@@ -27,6 +27,7 @@ pub mod graph;
 pub mod hints;
 pub mod rollback;
 pub mod scope;
+pub mod section_keys;
 pub mod sections;
 pub mod skeleton;
 pub mod staging;

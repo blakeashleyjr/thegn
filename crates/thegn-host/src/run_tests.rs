@@ -1060,6 +1060,47 @@ fn sidebar_e_toggles_wide_expand_and_persists() {
     let _ = std::fs::remove_dir_all(&state_home);
 }
 
+/// `i` cycles the per-row detail line and the choice survives a reload. This
+/// is the runtime toggle for `[ui] sidebar_focus_detail`, which used to be
+/// reachable only by editing config.
+#[test]
+fn sidebar_i_cycles_row_detail_and_persists() {
+    use thegn_core::config::FocusDetail;
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let state_home = std::env::temp_dir().join(format!("tg-host-detail-{}", std::process::id()));
+    // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
+    let _xdg = XdgGuard::set(&state_home);
+
+    let session = one_tab_session();
+    let mut model = build_initial_model(&session, None);
+    let mut sb = focused_state(&mut model, &session);
+
+    // Resting: config default (all rows), no override held.
+    assert_eq!(sb.focus_detail(), FocusDetail::All);
+
+    for expected in [
+        FocusDetail::Cursor,
+        FocusDetail::Off,
+        FocusDetail::All,
+        FocusDetail::Cursor,
+    ] {
+        let out = press(&mut sb, 'i', &mut model, &session);
+        assert!(matches!(out, SidebarOutcome::Redraw));
+        assert_eq!(sb.focus_detail(), expected);
+        // The model the renderer reads follows immediately.
+        assert_eq!(model.sidebar_display.focus_detail, expected);
+    }
+    assert!(!model.status.is_empty(), "the mode change is announced");
+
+    // Round-trips through the DB.
+    let db = thegn_core::db::Db::open().unwrap();
+    let mut reloaded = SidebarState::default();
+    reloaded.load(&db, SIDEBAR_SCOPE);
+    assert_eq!(reloaded.focus_detail_override, Some(FocusDetail::Cursor));
+
+    let _ = std::fs::remove_dir_all(&state_home);
+}
+
 #[test]
 fn sidebar_escape_defocuses() {
     let session = one_tab_session();

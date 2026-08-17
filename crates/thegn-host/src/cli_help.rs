@@ -29,7 +29,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     ("Control plane", &["serve", "session", "attach", "pair"]),
     (
         "Meta",
-        &["config", "theme", "doctor", "setup", "completions"],
+        &["config", "keys", "theme", "doctor", "setup", "completions"],
     ),
 ];
 

@@ -1547,6 +1547,30 @@ fn merge_total(
     }
 }
 
+/// The first-frame status line: a few orienting chords plus the build stamp.
+///
+/// Chords resolve through the keymap registry (each action's `hint` supplies
+/// the label), so a rebind is reflected here instead of leaving a wrong chord
+/// on the very first thing a user reads. An action with no binding is dropped
+/// rather than rendered stale.
+fn startup_status_line(cfg: &thegn_core::config::Config) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for id in ["palette", "new-worktree", "switch-workspace", "quit"] {
+        let (Some(chord), Some(spec)) = (
+            crate::keymap::chord_hint_for(cfg, id),
+            crate::keymap::action_spec(id),
+        ) else {
+            continue;
+        };
+        parts.push(format!("{chord} {}", spec.hint));
+    }
+    format!(
+        "{}  [build {}]",
+        parts.join("   "),
+        env!("THEGN_BUILD_TIME")
+    )
+}
+
 /// Build the chrome model from the resurrected session + the current worktree's
 /// git state (best-effort — the host stays up even with no repo / no DB). This
 /// is the in-process data flow the chrome relies on: read core + svc directly,
@@ -1770,10 +1794,7 @@ pub(crate) fn build_model(
         // `thegn open` mailbox: claim-and-delete on this hydration pass;
         // tolerates a DB missing the table (unmerged parallel-branch schema).
         intents: db.take_intents("focus_workspace").unwrap_or_default(),
-        status: format!(
-            "Ctrl-Space menu   Alt-w worktree   Alt-o switch   Ctrl-q quit  [build {}]",
-            env!("THEGN_BUILD_TIME")
-        ),
+        status: startup_status_line(&app_cfg),
         accent: thegn_core::theme::TEAL.to_string(),
         connectivity: thegn_core::connectivity::current(),
         ..Default::default()

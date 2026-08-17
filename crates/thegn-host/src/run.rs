@@ -1130,6 +1130,9 @@ impl SidebarState {
         model.sidebar_scroll = self.scroll;
         model.sidebar_rail = self.mode == crate::layout::SidebarMode::Rail;
         model.sidebar_display = self.view.display.clone();
+        // The `i` runtime override wins over the `[ui]` config value the
+        // display struct carries (see `SidebarState::focus_detail`).
+        model.sidebar_display.focus_detail = self.focus_detail();
     }
 
     pub(crate) fn focus_active_row(&mut self, model: &mut FrameModel) {
@@ -6478,7 +6481,8 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 SidebarOutcome::ShowHelp => {
-                    help_overlay = crate::help::open_at(&help_registry, "zone:sidebar");
+                    help_overlay =
+                        crate::help::open_at(&help_registry, keymap.config(), "zone:sidebar");
                     dirty = true;
                     continue;
                 }
@@ -9259,6 +9263,17 @@ async fn event_loop<T: Terminal>(
         model.maximized = maximized;
         model.sync_panes = sync_panes;
         model.keyhints = crate::keyhint::context_hints(&focus, &panel_ui, keymap.config());
+        model.sidebar_hints = crate::sidebar_keytable::footer_hints(keymap.config());
+        model.splash_hints = crate::logotype::splash_hints(keymap.config());
+        // Chords the chrome names inline (see `FrameModel::chord`). Kept to the
+        // handful of ids actually mentioned in draw code, not the whole registry.
+        model.chord_hints = crate::chrome::INLINE_CHORD_IDS
+            .iter()
+            .filter_map(|id| {
+                crate::keymap::chord_hint_for_mode(keymap.config(), id, mode)
+                    .map(|c| ((*id).to_string(), c))
+            })
+            .collect();
         // The ticker samples at live (500ms) cadence while the telemetry
         // section is on screen, so its graphs actually move.
         let telemetry_now =
@@ -14149,7 +14164,7 @@ async fn event_loop<T: Terminal>(
                                         // full notification is readable — the
                                         // resting width truncates it. It
                                         // deliberately does NOT mark the
-                                        // notification read (that's `r`) or
+                                        // notification read (that's `x`) or
                                         // navigate away: reading shouldn't
                                         // dismiss it.
                                         Section::Notifications
@@ -15751,7 +15766,12 @@ async fn event_loop<T: Terminal>(
                                 }
                             },
                             Action::Help => {
-                                help_overlay = crate::help::open(&help_registry, &focus, &panel_ui);
+                                help_overlay = crate::help::open(
+                                    &help_registry,
+                                    keymap.config(),
+                                    &focus,
+                                    &panel_ui,
+                                );
                             }
                             Action::OpenPalette => {
                                 if let Ok(db) = thegn_core::db::Db::open() {

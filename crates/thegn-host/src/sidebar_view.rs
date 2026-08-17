@@ -263,7 +263,7 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     }
 
     if let Some(hrect) = frame.hints {
-        draw_sidebar_hints(surface, hrect);
+        draw_sidebar_hints(surface, hrect, &model.sidebar_hints);
     }
 
     // Live drag affordance: an accent insertion rule at the drop boundary
@@ -520,15 +520,22 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
     let hints = if rail || !model.sidebar_focused {
         None
     } else {
-        let hint_h = sidebar_hint_rows().len() + 1; // rule/title + one row per tip
-        // Require a one-row gap between the last row and the footer. `then`
-        // (not `then_some`): the rect math must stay lazy — `bottom - hint_h`
-        // underflows on a column shorter than the footer.
-        (bottom.saturating_sub(y) > hint_h).then(|| Rect {
-            x: rect.x,
-            y: bottom - hint_h,
-            cols: rect.cols,
-            rows: hint_h,
+        // Adaptive: show as many tips as the blank tail affords, rather than
+        // all-or-nothing. The list is ordered most-discoverable-first, so
+        // clipping the tail degrades gracefully — and growing the key table
+        // can never make the whole footer vanish.
+        let blank = bottom.saturating_sub(y);
+        // 1 row for the rule/title + 1 row of gap above it.
+        let max_tips = blank.saturating_sub(2);
+        (max_tips >= MIN_SIDEBAR_HINT_ROWS).then(|| {
+            let tips = max_tips.min(model.sidebar_hints.len());
+            let hint_h = tips + 1;
+            Rect {
+                x: rect.x,
+                y: bottom - hint_h,
+                cols: rect.cols,
+                rows: hint_h,
+            }
         })
     };
     SidebarFrame {
@@ -539,26 +546,17 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
     }
 }
 
-/// The navigation tips shown at the foot of the focused sidebar, as
-/// `(chord, label)` pairs. Kept ASCII so they survive glyph degradation and
-/// stay legible in a narrow column; the chords mirror the real keymap
-/// (`Alt/Ctrl+N` jumps, tree motion, filter, the `?` card — see
-/// `handlers/sidebar_keys.rs`).
-fn sidebar_hint_rows() -> [(&'static str, &'static str); 7] {
-    [
-        ("Alt+1-9", "jump worktree"),
-        ("Ctrl+1-9", "jump workspace"),
-        ("j / k", "move up/down"),
-        ("Enter", "open / fold"),
-        ("/", "filter"),
-        ("s", "sort"),
-        ("?", "all keys"),
-    ]
-}
+/// Don't bother with a NAVIGATE footer that can't show at least this many tips
+/// — a one- or two-row stub reads as clutter rather than help.
+const MIN_SIDEBAR_HINT_ROWS: usize = 3;
 
 /// Paint the navigation-hints footer: a rule + " NAVIGATE " title (matching the
 /// metrics section) over a column of dim chord / label pairs.
-fn draw_sidebar_hints(surface: &mut Surface, rect: Rect) {
+///
+/// `tips` comes from `model.sidebar_hints`
+/// ([`crate::sidebar_keytable::footer_hints`]) — registry-derived jump chords
+/// plus the sidebar key table — so nothing here is a hard-coded key.
+fn draw_sidebar_hints(surface: &mut Surface, rect: Rect, tips: &[(String, String)]) {
     if rect.rows < 2 || rect.cols == 0 {
         return;
     }
@@ -582,7 +580,9 @@ fn draw_sidebar_hints(surface: &mut Surface, rect: Rect) {
         rect.cols.saturating_sub(1),
     );
 
-    let tips = sidebar_hint_rows();
+    // Only the tips that actually fit contribute to the label column width, so
+    // a clipped-off wide chord can't leave the visible rows over-indented.
+    let tips = &tips[..tips.len().min(rect.rows.saturating_sub(1))];
     let chord_w = tips
         .iter()
         .map(|(c, _)| c.chars().count())

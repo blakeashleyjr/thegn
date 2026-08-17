@@ -230,6 +230,99 @@ pub const WORDMARK: &str = "THEGN";
 /// the anchor math is state-free.
 const IDLE_BODY_ROWS: usize = 6;
 
+/// Hint rows inside the idle splash's ruled block. Part of [`IDLE_BODY_ROWS`],
+/// so [`splash_hints`] must not exceed it.
+const SPLASH_HINT_ROWS: usize = 3;
+
+/// One row of the idle splash's keybind block: the live chord plus the two
+/// label widths the two splash variants need (the ruled block has ~18 columns;
+/// the compact one-liner shares its row with the wordmark).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplashHint {
+    pub chord: String,
+    pub label: &'static str,
+    pub short: &'static str,
+}
+
+/// The idle splash's keybind block, resolved against the live keymap so a
+/// rebind is reflected on the first screen a user ever sees.
+///
+/// Ids are registry actions; a row with no binding is omitted rather than
+/// falling back to a stale literal, and the caller clamps to
+/// [`SPLASH_HINT_ROWS`]. `nav-up`/`nav-down` collapse into one row when they
+/// share a modifier, which is the default (`Alt Up` / `Alt Down`).
+pub fn splash_hints(cfg: &thegn_core::config::Config) -> Vec<SplashHint> {
+    use crate::keymap::chord_hint_for;
+    let mut out = Vec::new();
+    if let Some(chord) = chord_hint_for(cfg, "palette") {
+        out.push(SplashHint {
+            chord,
+            label: "command palette",
+            short: "palette",
+        });
+    }
+    let nav = match (
+        chord_hint_for(cfg, "nav-up"),
+        chord_hint_for(cfg, "nav-down"),
+    ) {
+        (Some(up), Some(down)) => Some(merge_arrow_pair(&up, &down)),
+        (Some(c), None) | (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
+    if let Some(chord) = nav {
+        out.push(SplashHint {
+            chord,
+            label: "prev/next worktree",
+            short: "worktree",
+        });
+    }
+    if let Some(chord) = chord_hint_for(cfg, "toggle-key-lock") {
+        out.push(SplashHint {
+            chord,
+            label: "lock keys to pane",
+            short: "lock",
+        });
+    }
+    out
+}
+
+/// The one-line form of [`splash_hints`] for the compact splash variant: the
+/// first and last rows (palette · lock) as coloured parts. Takes the already
+/// resolved hints so both splash variants share one source.
+fn compact_splash_parts(hints: &[SplashHint]) -> Vec<(String, ColorAttribute)> {
+    // The middle row (worktree nav) is dropped for width; first and last keep
+    // the two chords worth advertising on a single line.
+    let picks: Vec<&SplashHint> = match hints {
+        [] => return Vec::new(),
+        [only] => vec![only],
+        [first, .., last] => vec![first, last],
+    };
+    let mut out: Vec<(String, ColorAttribute)> = Vec::new();
+    for (i, h) in picks.iter().enumerate() {
+        if i > 0 {
+            out.push(("\u{b7}".to_string(), col(S::Ghost)));
+        }
+        out.push((format!(" {}", h.chord), col(S::Dim)));
+        out.push((format!(" {} ", h.short), col(S::Faint)));
+    }
+    out
+}
+
+/// Collapse two chords that differ only in their final key into one label:
+/// `("Alt-Up", "Alt-Down")` → `"Alt-↑↓"`. Falls back to `"a / b"` when they
+/// share no prefix (e.g. after an asymmetric rebind).
+fn merge_arrow_pair(up: &str, down: &str) -> String {
+    let arrow = |c: &str| match c.rsplit_once('-') {
+        Some((prefix, "Up")) => Some((prefix.to_string(), '\u{2191}')),
+        Some((prefix, "Down")) => Some((prefix.to_string(), '\u{2193}')),
+        _ => None,
+    };
+    match (arrow(up), arrow(down)) {
+        (Some((pu, au)), Some((pd, ad))) if pu == pd => format!("{pu}-{au}{ad}"),
+        _ => format!("{up} / {down}"),
+    }
+}
+
 /// (cols, rows) `text` occupies in `face`: glyph widths + 1-px letter spacing.
 /// Unknown characters are skipped and contribute nothing (no gap either).
 pub fn measure(face: Face, text: &str) -> (usize, usize) {
@@ -452,17 +545,12 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
                     parts.iter().map(|(t, fg)| (t.as_str(), *fg)).collect();
                 centered_parts(surface, y0 + 5, &borrowed);
             } else {
-                centered_parts(
-                    surface,
-                    y0 + 5,
-                    &[
-                        ("Ctrl-Space", col(S::Dim)),
-                        (" palette ", col(S::Faint)),
-                        ("·", col(S::Ghost)),
-                        (" Ctrl-g", col(S::Dim)),
-                        (" lock", col(S::Faint)),
-                    ],
-                );
+                // Same registry-derived source as the idle block: the palette
+                // row and the key-lock row, rendered inline.
+                let compact = compact_splash_parts(&model.splash_hints);
+                let borrowed: Vec<(&str, ColorAttribute)> =
+                    compact.iter().map(|(t, fg)| (t.as_str(), *fg)).collect();
+                centered_parts(surface, y0 + 5, &borrowed);
             }
         }
         SplashVariant::Text => {
@@ -495,11 +583,9 @@ fn draw_idle_body(
     centered_parts: &PartsPainter<'_>,
 ) {
     let g = crate::caps::active_glyphs();
-    let hints = [
-        ("Ctrl-Space", "command palette"),
-        ("Alt-↑↓", "prev/next worktree"),
-        ("Ctrl-g", "lock keys to pane"),
-    ];
+    // The block's height is fixed (`IDLE_BODY_ROWS`): rule, three hint rows,
+    // rule. Clamp rather than reflow so the splash geometry stays constant.
+    let hints = &model.splash_hints[..model.splash_hints.len().min(SPLASH_HINT_ROWS)];
     let key_w = 10;
     let block_w = key_w + 2 + 18;
     let hx = rect.x + rect.cols.saturating_sub(block_w) / 2;
@@ -510,15 +596,15 @@ fn draw_idle_body(
     // Row 1: rule · rows 2..4: hints · row 5: rule.
     let rule = g.box_h.repeat(block_w);
     chrome::draw_text(surface, hx, y0 + 1, &rule, col(S::Ghost), bg, block_w);
-    for (i, (key, label)) in hints.iter().enumerate() {
+    for (i, h) in hints.iter().enumerate() {
         let y = y0 + 2 + i;
-        chrome::draw_text(surface, hx, y, key, col(S::Dim), bg, rect.cols);
+        chrome::draw_text(surface, hx, y, &h.chord, col(S::Dim), bg, rect.cols);
         let lx = hx + key_w + 2;
         chrome::draw_text(
             surface,
             lx,
             y,
-            label,
+            h.label,
             col(S::Faint),
             bg,
             (rect.x + rect.cols).saturating_sub(lx),
@@ -537,6 +623,57 @@ mod tests {
             .iter()
             .map(|row| row.iter().map(|c| c.str()).collect::<String>())
             .collect()
+    }
+
+    /// Populate the registry-derived splash hints the way the event loop does
+    /// (`run.rs`), so the splash tests exercise real resolved chords.
+    fn splash_model(mut model: crate::chrome::FrameModel) -> crate::chrome::FrameModel {
+        model.splash_hints = splash_hints(&thegn_core::config::Config::default());
+        model
+    }
+
+    /// The chord an action is bound to under the default config — what the
+    /// splash must show. Asserting against this instead of a literal means a
+    /// rebind (or a changed default) can't silently desync the splash.
+    fn chord(id: &str) -> String {
+        crate::keymap::chord_hint_for(&thegn_core::config::Config::default(), id)
+            .unwrap_or_else(|| panic!("`{id}` has no default binding"))
+    }
+
+    /// The splash block is registry-derived: rebinding an action changes what
+    /// the first screen advertises, with no stale literal left behind.
+    #[test]
+    fn splash_hints_follow_rebinds() {
+        let cfg = thegn_core::config::Config::default();
+        let default = splash_hints(&cfg);
+        assert_eq!(default.len(), SPLASH_HINT_ROWS, "{default:?}");
+        assert_eq!(default[0].chord, "Ctrl-Space");
+        // The nav pair collapses to one arrow row.
+        assert_eq!(default[1].chord, "Alt-\u{2191}\u{2193}");
+        assert_eq!(default[2].chord, "Ctrl-g");
+
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.keybinds
+            .insert("palette".to_string(), "Super k".to_string());
+        cfg.keybinds
+            .insert("toggle-key-lock".to_string(), "Ctrl Alt l".to_string());
+        let rebound = splash_hints(&cfg);
+        assert_eq!(rebound[0].chord, "Super-k");
+        assert_eq!(rebound[2].chord, "Ctrl-Alt-l");
+    }
+
+    /// An asymmetric nav rebind can't produce a nonsense merged chord.
+    #[test]
+    fn merge_arrow_pair_falls_back_when_prefixes_differ() {
+        assert_eq!(
+            merge_arrow_pair("Alt-Up", "Alt-Down"),
+            "Alt-\u{2191}\u{2193}"
+        );
+        assert_eq!(
+            merge_arrow_pair("Alt-Up", "Ctrl-Down"),
+            "Alt-Up / Ctrl-Down"
+        );
+        assert_eq!(merge_arrow_pair("Alt-k", "Alt-j"), "Alt-k / Alt-j");
     }
 
     #[test]
@@ -628,7 +765,7 @@ mod tests {
             cols: 80,
             rows: 14,
         };
-        let model = crate::chrome::FrameModel::default();
+        let model = splash_model(crate::chrome::FrameModel::default());
         draw_splash(&mut s, rect, &model);
         let l = lines(&mut s);
         // Block of 12 rows centered: wordmark starts at (14-12)/2 = 1.
@@ -644,8 +781,8 @@ mod tests {
             l[8].contains(crate::caps::active_glyphs().box_h),
             "top rule"
         );
-        assert!(l[9].contains("Ctrl-Space"));
-        assert!(l[11].contains("Ctrl-g"));
+        assert!(l[9].contains(&chord("palette")));
+        assert!(l[11].contains(&chord("toggle-key-lock")));
         assert!(
             l[12].contains(crate::caps::active_glyphs().box_h),
             "bottom rule"
@@ -664,16 +801,16 @@ mod tests {
             cols: 80,
             rows: 14,
         };
-        let model = crate::chrome::FrameModel {
+        let model = splash_model(crate::chrome::FrameModel {
             worktree: "repo/sz-vivid-eagle".into(),
             ..Default::default()
-        };
+        });
         draw_splash(&mut s, rect, &model);
         let l = lines(&mut s);
         // Identity on the body's first row (y0+6 = 7); geometry otherwise
         // identical to the anonymous splash (constant IDLE_BODY_ROWS).
         assert!(l[7].contains("repo/sz-vivid-eagle"), "{:?}", l[7]);
-        assert!(l[9].contains("Ctrl-Space"));
+        assert!(l[9].contains(&chord("palette")));
     }
 
     #[test]
@@ -687,7 +824,7 @@ mod tests {
             cols: 80,
             rows: 28,
         };
-        let model = crate::chrome::FrameModel::default();
+        let model = splash_model(crate::chrome::FrameModel::default());
         draw_splash(&mut s, rect, &model);
         let l = lines(&mut s);
         // total 24 rows centered at top=(28-24)/2=2: mascot rows 2..12.
@@ -707,7 +844,7 @@ mod tests {
             l[14]
         );
         assert!(l[18].contains(env!("CARGO_PKG_VERSION")));
-        assert!(l[22].contains("Ctrl-Space"));
+        assert!(l[22].contains(&chord("palette")));
     }
 
     #[test]
