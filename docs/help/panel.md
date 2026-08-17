@@ -2,7 +2,21 @@
 id: panel
 title: Diff / PR panel
 order: 5
-contexts: [zone:panel]
+contexts:
+  [
+    zone:panel,
+    panel:mine,
+    panel:across,
+    panel:issues,
+    panel:problems,
+    panel:jobs,
+    panel:tests,
+    panel:symbols,
+    panel:notifications,
+    panel:logs,
+    panel:hosts,
+    panel:telemetry,
+  ]
 actions: [focus-panel, toggle-panel]
 ---
 

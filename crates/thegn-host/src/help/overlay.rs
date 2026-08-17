@@ -54,6 +54,10 @@ pub struct HelpOverlay {
     /// Key handling clamps against it; before the first render the defaults
     /// only make scrolling conservative, never wrong.
     last_dims: (usize, usize),
+    /// The chord that opens this overlay, resolved from the keymap at open
+    /// time and shown as the layer badge — so a rebind of `help` is reflected
+    /// instead of the badge always claiming `F1`.
+    badge: String,
 }
 
 fn flatten_toc(
@@ -73,7 +77,7 @@ fn flatten_toc(
 }
 
 impl HelpOverlay {
-    pub fn new(reg: Arc<HelpRegistry>, page: String) -> Self {
+    pub fn new(reg: Arc<HelpRegistry>, page: String, badge: String) -> Self {
         let mut toc_rows = Vec::new();
         flatten_toc(reg.toc(), 0, &reg, &mut toc_rows);
         let toc_sel = toc_rows
@@ -93,6 +97,7 @@ impl HelpOverlay {
             back: Vec::new(),
             fwd: Vec::new(),
             last_dims: (72, 20),
+            badge,
         }
     }
 
@@ -328,10 +333,10 @@ impl HelpOverlay {
         self.scroll = self.scroll.saturating_add_signed(delta).min(max);
     }
 
-    fn spec(screen: Rect) -> LayerSpec {
+    fn spec(&self, screen: Rect) -> LayerSpec {
         LayerSpec {
             title: "help".into(),
-            badge: Some(" F1 ".into()),
+            badge: Some(format!(" {} ", self.badge)),
             cols: (screen.cols * 4 / 5).max(60),
             rows: (screen.rows * 4 / 5).max(16),
             anchor: Anchor::Center,
@@ -344,12 +349,12 @@ impl HelpOverlay {
 
     /// The overlay's outer box for mouse hit-testing (mirrors DetailOverlay).
     pub fn box_rect(&self, screen: Rect) -> Option<Rect> {
-        crate::layer::box_rect(&Self::spec(screen), screen)
+        crate::layer::box_rect(&self.spec(screen), screen)
     }
 
     pub fn render(&mut self, surface: &mut Surface, screen: Rect) {
         let panel = Tok::Slot(S::Panel);
-        let Some(inner) = open_layer(surface, screen, &Self::spec(screen)) else {
+        let Some(inner) = open_layer(surface, screen, &self.spec(screen)) else {
             return;
         };
         if inner.rows < 4 || inner.cols < 20 {
@@ -560,7 +565,7 @@ mod tests {
     }
 
     fn overlay() -> HelpOverlay {
-        HelpOverlay::new(registry(), "index".to_string())
+        HelpOverlay::new(registry(), "index".to_string(), "F1".to_string())
     }
 
     fn key(ov: &mut HelpOverlay, k: KeyCode) -> HelpOutcome {

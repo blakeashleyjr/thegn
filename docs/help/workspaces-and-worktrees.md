@@ -16,6 +16,7 @@ actions:
     next-workspace,
     prev-workspace,
     new-worktree-from-template,
+    switch-repo,
   ]
 ---
 

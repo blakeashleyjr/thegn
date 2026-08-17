@@ -53,6 +53,9 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     ]))];
     rows.extend(rendered.lines.into_iter().skip(2).map(PanelRow::plain));
     rows.push(PanelRow::blank());
-    rows.push(hint_row(&[("e", "read full-width"), ("F1", "full help")]));
+    rows.push(hint_row(&[
+        ("e", "read full-width"),
+        (ctx.model.chord("help"), "full help"),
+    ]));
     rows
 }

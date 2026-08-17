@@ -157,6 +157,7 @@ mod share;
 mod shell_snippet;
 mod sidebar;
 mod sidebar_help;
+mod sidebar_keytable;
 mod sidebar_legend;
 mod sidebar_view;
 mod snapshot;
@@ -395,6 +396,11 @@ pub enum Command {
     Logs {
         #[command(subcommand)]
         action: cmd::logs::Action,
+    },
+    /// Inspect and check keybindings: `list`, `validate`, `hints`.
+    Keys {
+        #[command(subcommand)]
+        action: cmd::keys::Action,
     },
     /// Report detected terminal capabilities and the resulting feature
     /// degradation (color depth, glyphs, undercurl, mouse).
@@ -858,6 +864,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
+        Command::Keys { action } => cmd::keys::run(&cfg, &action),
         Command::Doctor { json } => cmd::doctor::run(&cfg, json),
         // Dispatched before run_subcommand (it falls through to the TUI);
         // unreachable here, kept for match exhaustiveness.

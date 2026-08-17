@@ -349,12 +349,69 @@ pub fn action_spec(id: &str) -> Option<&'static ActionSpec> {
     ACTION_SPECS.iter().find(|s| s.id == id)
 }
 
+/// Modifier prefixes for the three digit-slot ("summon") binding families.
+/// `default_keymap` builds the 1..=9 bindings from these, and
+/// [`summon_default_chord`] reads them back so hint surfaces don't restate the
+/// chord as a literal.
+pub(crate) const SUMMON_WORKTREE_MOD: &str = "Alt";
+pub(crate) const SUMMON_WORKSPACE_MOD: &str = "Ctrl";
+pub(crate) const SUMMON_PIN_MOD: &str = "Ctrl Alt";
+
+/// The default chord for a parametric `summon-{worktree,workspace,pin}-N` id.
+///
+/// These families are bound in a loop by `default_keymap` rather than declared
+/// in `ACTION_SPECS`, so [`action_spec`] can't supply their default — without
+/// this, [`chord_hint_for`] would return `None` for them and the hint would
+/// silently vanish.
+fn summon_default_chord(id: &str) -> Option<String> {
+    let (family, slot) = id.rsplit_once('-')?;
+    let n: u8 = slot.parse().ok()?;
+    if !(1..=9).contains(&n) {
+        return None;
+    }
+    let prefix = match family {
+        "summon-worktree" | "worktree" => SUMMON_WORKTREE_MOD,
+        "summon-workspace" | "workspace" => SUMMON_WORKSPACE_MOD,
+        "summon-pin" | "pin" => SUMMON_PIN_MOD,
+        _ => return None,
+    };
+    Some(format!("{prefix} {n}"))
+}
+
+/// The chord an action is bound to right now in the default (Normal) mode.
+/// See [`chord_hint_for_mode`] when the active mode is known.
 pub fn chord_hint_for(cfg: &thegn_core::config::Config, id: &str) -> Option<String> {
+    chord_hint_for_mode(cfg, id, Mode::Normal)
+}
+
+/// The chord an action is bound to right now: its default, then each config
+/// layer's override applied in precedence order. Returns the display form
+/// (`"Ctrl Alt s"` → `"Ctrl-Alt-s"`), or `None` if the action has no binding.
+///
+/// A mode-scoped override (`[keybinds.vim_normal]`, `[keybinds.emacs]`, …)
+/// wins over the flat `[keybinds]` table for that mode, matching how
+/// `apply_keybind_layer` actually binds them — otherwise a hint would show the
+/// Normal-mode chord while the user is in vim or emacs mode.
+pub fn chord_hint_for_mode(
+    cfg: &thegn_core::config::Config,
+    id: &str,
+    mode: Mode,
+) -> Option<String> {
     let mut chord = action_spec(id)
         .and_then(|s| s.default_chords.first().copied())
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| summon_default_chord(id));
     for layer in cfg.effective_keybinds(None, None) {
         if let Some(override_chord) = layer.normal.get(id) {
+            chord = Some(override_chord.clone());
+        }
+        let mode_table = match mode {
+            Mode::Normal => None,
+            Mode::VimNormal => Some(&layer.vim_normal),
+            Mode::VimInsert => Some(&layer.vim_insert),
+            Mode::Emacs => Some(&layer.emacs),
+        };
+        if let Some(override_chord) = mode_table.and_then(|t| t.get(id)) {
             chord = Some(override_chord.clone());
         }
     }
@@ -1171,19 +1228,25 @@ pub fn default_keymap() -> KeyMap {
     // visible sidebar order (matches the digit hints revealed on worktree rows
     // while the sidebar is focused).
     for n in 1u8..=9 {
-        map.insert_all(&format!("Alt {n}"), Action::SummonWorktree(n))
-            .unwrap();
+        map.insert_all(
+            &format!("{SUMMON_WORKTREE_MOD} {n}"),
+            Action::SummonWorktree(n),
+        )
+        .unwrap();
     }
     // Workspaces: Ctrl-1..9 jump directly to the workspace at that slot in the
     // visible sidebar order (matches the digit hints revealed on workspace rows).
     for n in 1u8..=9 {
-        map.insert_all(&format!("Ctrl {n}"), Action::SummonWorkspace(n))
-            .unwrap();
+        map.insert_all(
+            &format!("{SUMMON_WORKSPACE_MOD} {n}"),
+            Action::SummonWorkspace(n),
+        )
+        .unwrap();
     }
     // Pins: Ctrl-Alt-1..9 launch-or-focus the configured pin in registration
     // order (moved off Alt-1..9, which now jumps to worktrees).
     for n in 1u8..=9 {
-        map.insert_all(&format!("Ctrl Alt {n}"), Action::SummonPin(n))
+        map.insert_all(&format!("{SUMMON_PIN_MOD} {n}"), Action::SummonPin(n))
             .unwrap();
     }
     map.insert_all("Ctrl Alt b", Action::ToggleStrip).unwrap();

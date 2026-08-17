@@ -12,6 +12,8 @@ actions:
     mark-all-read,
     open-ci,
     open-usage,
+    select-topbar,
+    select-bottombar,
   ]
 ---
 

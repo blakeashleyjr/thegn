@@ -2,6 +2,7 @@
 id: help
 title: About this help
 order: 50
+contexts: [panel:help]
 actions: [help]
 ---
 

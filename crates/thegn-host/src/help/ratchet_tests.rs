@@ -15,13 +15,36 @@ fn ratchet_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/help-ratchet.txt")
 }
 
-fn allowlist() -> Vec<String> {
-    let raw = std::fs::read_to_string(ratchet_path()).unwrap_or_default();
+fn context_ratchet_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/help-context-ratchet.txt")
+}
+
+fn read_allowlist(path: PathBuf) -> Vec<String> {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
     raw.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(str::to_string)
         .collect()
+}
+
+fn allowlist() -> Vec<String> {
+    read_allowlist(ratchet_path())
+}
+
+/// Every action id a user can bind: the host's palette specs **plus** the core
+/// registry's builtins. The ratchet used to iterate only `ACTION_SPECS`, which
+/// left the ~14 core-only ids (`tool-lazygit`, `switch-repo`, `pr-open`, …)
+/// bindable but undocumented with no test noticing.
+fn bindable_ids() -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = ACTION_SPECS.iter().map(|s| s.id).collect();
+    for a in thegn_core::keymap::BUILTINS {
+        if !ids.contains(&a.id) {
+            ids.push(a.id);
+        }
+    }
+    ids.sort_unstable();
+    ids
 }
 
 fn registry() -> thegn_core::help::HelpRegistry {
@@ -88,6 +111,61 @@ fn every_zone_has_a_documentation_page() {
     }
 }
 
+/// The panel-section half of the same contract. A `panel:*` context nobody
+/// claims silently falls back to the generic index page, so pressing F1 in
+/// (say) the Logs section teaches you nothing about the Logs section.
+///
+/// Frozen like the action ratchet: `test/help-context-ratchet.txt` pins the
+/// existing debt and may only shrink; a NEW panel section must ship a help
+/// page claiming it.
+#[test]
+fn every_panel_context_has_a_documentation_page() {
+    let reg = registry();
+    let claimed: BTreeSet<&str> = reg.contexts().map(|(k, _)| k).collect();
+    let allow = read_allowlist(context_ratchet_path());
+
+    let mut sorted = allow.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        allow, sorted,
+        "test/help-context-ratchet.txt must be sorted and duplicate-free"
+    );
+
+    let vocab = crate::help::context::vocabulary();
+    for id in &allow {
+        assert!(
+            vocab.contains(id),
+            "`{id}` in test/help-context-ratchet.txt is not a context key — remove the stale line"
+        );
+    }
+
+    let allow: BTreeSet<String> = allow.into_iter().collect();
+    let mut undocumented_new: Vec<String> = Vec::new();
+    let mut now_documented: Vec<String> = Vec::new();
+    for key in vocab.iter().filter(|k| k.starts_with("panel:")) {
+        let documented = claimed.contains(key.as_str());
+        let allowed = allow.contains(key);
+        if !documented && !allowed {
+            undocumented_new.push(key.clone());
+        }
+        if documented && allowed {
+            now_documented.push(key.clone());
+        }
+    }
+    assert!(
+        undocumented_new.is_empty(),
+        "panel section(s) with no help page: {undocumented_new:?}\n\
+         Add `contexts: [<key>]` to a docs/help/ page.\n\
+         Do NOT add to test/help-context-ratchet.txt — the allowlist only shrinks."
+    );
+    assert!(
+        now_documented.is_empty(),
+        "context(s) now claimed but still allowlisted: {now_documented:?}\n\
+         Delete those lines from test/help-context-ratchet.txt to lock in the win."
+    );
+}
+
 #[test]
 fn action_docs_ratchet() {
     let reg = registry();
@@ -102,25 +180,26 @@ fn action_docs_ratchet() {
         allow, sorted,
         "test/help-ratchet.txt must be sorted and duplicate-free"
     );
-    let spec_ids: BTreeSet<&str> = ACTION_SPECS.iter().map(|s| s.id).collect();
+    let bindable: BTreeSet<&str> = bindable_ids().into_iter().collect();
     for id in &allow {
         assert!(
-            spec_ids.contains(id.as_str()),
-            "`{id}` in test/help-ratchet.txt is not an ACTION_SPECS id — remove the stale line"
+            bindable.contains(id.as_str()),
+            "`{id}` in test/help-ratchet.txt is not a bindable action id \
+             (ACTION_SPECS or core BUILTINS) — remove the stale line"
         );
     }
 
     let allow: BTreeSet<String> = allow.into_iter().collect();
     let mut undocumented_new: Vec<&str> = Vec::new();
     let mut now_documented: Vec<&str> = Vec::new();
-    for spec in ACTION_SPECS {
-        let documented = documented.contains(spec.id);
-        let allowed = allow.contains(spec.id);
+    for id in bindable_ids() {
+        let documented = documented.contains(id);
+        let allowed = allow.contains(id);
         if !documented && !allowed {
-            undocumented_new.push(spec.id);
+            undocumented_new.push(id);
         }
         if documented && allowed {
-            now_documented.push(spec.id);
+            now_documented.push(id);
         }
     }
     assert!(
@@ -148,15 +227,16 @@ fn help_ratchet_update() {
     let reg = registry();
     let documented = documented_ids(&reg);
     let mut lines = vec![
-        "# help-ratchet — ACTION_SPECS ids not yet documented by any docs/help/ page.".to_string(),
+        "# help-ratchet — bindable action ids (ACTION_SPECS + core BUILTINS) not yet".to_string(),
+        "# documented by any docs/help/ page.".to_string(),
         "# This list may only SHRINK: document an action, delete its line".to_string(),
         "# (or run `just help-ratchet-update`). New actions must be documented".to_string(),
         "# immediately — the ratchet test refuses additions.".to_string(),
     ];
     lines.extend(
-        ACTION_SPECS
-            .iter()
-            .map(|s| s.id.to_string())
+        bindable_ids()
+            .into_iter()
+            .map(str::to_string)
             .filter(|id| !documented.contains(id))
             .collect::<BTreeSet<_>>(),
     );
