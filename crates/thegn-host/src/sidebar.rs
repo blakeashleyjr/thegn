@@ -303,6 +303,12 @@ impl SidebarRow {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SidebarStatus {
     pub git: std::collections::BTreeMap<String, GitGlyphs>,
+    /// The worktree's LIVE `HEAD` branch, keyed by path — read by the same git
+    /// scan that produces `git`. The row's `{slug}/{branch}` tab name is only a
+    /// creation-time identity (it never moves when you `git checkout` inside the
+    /// worktree), so the displayed branch must come from here or it goes stale
+    /// forever. Absent for a detached HEAD or a worktree never scanned.
+    pub branches: std::collections::BTreeMap<String, String>,
     pub agent: std::collections::BTreeMap<String, String>,
     pub activity: std::collections::BTreeMap<String, ActivityState>,
     /// Badge: open PR count per worktree (item 28).
@@ -480,6 +486,25 @@ pub fn compose_row_label(window_title: Option<&str>, branch: &str) -> String {
         .unwrap_or_else(|| branch.to_string())
 }
 
+/// The branch a worktree row shows on its MAIN line when no OSC window title is
+/// set: the live `HEAD` ([`SidebarRow::branch`], refreshed by the git scan) so a
+/// `git checkout` inside the worktree is reflected, falling back to the
+/// creation-time tab name ([`SidebarRow::label`]) before the first scan lands.
+///
+/// The one exception is the **home** row, which is named `home` — not after a
+/// branch — in every workspace. Substituting its live branch there would rename
+/// it to `main` and break the identity users navigate by; its actual branch
+/// still shows on the detail line. Pure, so the exception is unit-tested.
+pub fn row_display_branch(row: &SidebarRow) -> &str {
+    if row.label == "home" {
+        return &row.label;
+    }
+    row.branch
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .unwrap_or(&row.label)
+}
+
 /// A workspace's worktree, ready to sort and render: the branch label plus its
 /// sort key, status, and what activating its row does. Built from either a live
 /// session group or a dormant DB row, so the tree renders identically whether
@@ -548,8 +573,15 @@ pub(crate) fn compose_detail_line(
     let mut segs: Vec<Seg> = vec![sp(5)];
     let start = segs.len();
     // Lead with the branch name — the main line now shows the dynamic name.
-    if disp.detail_branch && !row.label.is_empty() {
-        segs.push(seg(Tok::Slot(S::Dim), format!("{} ", row.label)));
+    // `row.branch` is the LIVE `HEAD` (it tracks a `git checkout`); `row.label`
+    // is the creation-time tab name and is only the fallback.
+    let branch = row
+        .branch
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .unwrap_or(&row.label);
+    if disp.detail_branch && !branch.is_empty() {
+        segs.push(seg(Tok::Slot(S::Dim), format!("{branch} ")));
     }
     // Total branch change vs the default branch (`+adds` green / `-dels` red).
     if disp.detail_branch_stat
@@ -1158,12 +1190,22 @@ fn worktree_row(
         .and_then(|p| status.alert_counts.get(p))
         .copied()
         .unwrap_or(0);
+    // The DISPLAYED branch is the live `HEAD` from the git scan, not `gr.label`
+    // (the `{slug}/{branch}` tab name, which is fixed at creation and never
+    // follows a `git checkout` inside the worktree). Falls back to the label
+    // when the scan hasn't landed yet / HEAD is detached. `label` itself stays
+    // the tab identity — sort order, `pin_key`, filter and the `== "home"`
+    // checks all key off it.
+    let live_branch = wt_path
+        .as_deref()
+        .and_then(|p| status.branches.get(p))
+        .cloned();
     SidebarRow {
         tab_target: Some(gr.target.clone()),
         active: gr.active,
         worktree_path: wt_path,
         pin_key,
-        branch: Some(gr.label.clone()),
+        branch: Some(live_branch.unwrap_or_else(|| gr.label.clone())),
         git,
         sandbox_backend: gr.sandbox_backend.clone(),
         env_name: gr.env_name.clone(),
@@ -1557,6 +1599,80 @@ mod tests {
 
     fn tab(name: &str, wt: &str) -> WorktreeGroup {
         WorktreeGroup::new(name, GroupKind::Branch, wt)
+    }
+
+    #[test]
+    fn row_display_branch_prefers_the_live_head() {
+        // The regression: `git checkout` inside a worktree moves HEAD but never
+        // the `{slug}/{branch}` tab name, so a label-only row went stale forever.
+        let mut row = SidebarRow::base(RowKind::Worktree, 1, "tg/old", "app");
+        row.branch = Some("tg/new".into());
+        assert_eq!(row_display_branch(&row), "tg/new");
+        // Before the first scan lands (or on a detached HEAD) the tab name is
+        // still the best name we have.
+        row.branch = None;
+        assert_eq!(row_display_branch(&row), "tg/old");
+        row.branch = Some(String::new());
+        assert_eq!(row_display_branch(&row), "tg/old");
+    }
+
+    #[test]
+    fn row_display_branch_keeps_home_named_home() {
+        // `home` is an identity, not a branch: substituting its live branch would
+        // rename the row to `main` in every workspace.
+        let mut row = SidebarRow::base(RowKind::Worktree, 1, "home", "app");
+        row.branch = Some("main".into());
+        assert_eq!(row_display_branch(&row), "home");
+    }
+
+    #[test]
+    fn worktree_rows_carry_the_live_branch_not_the_tab_name() {
+        let s = session(vec![tab("app/tg-old", "/wt/a")], 0);
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let mut status = no_activity();
+        status
+            .branches
+            .insert("/wt/a".into(), "tg/checked-out-later".into());
+        let rows = build_rows(&s, &ws, &ViewState::default(), &status, &[], &[], &[]);
+        let row = rows
+            .iter()
+            .find(|r| r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some("/wt/a"))
+            .expect("worktree row");
+        assert_eq!(row.branch.as_deref(), Some("tg/checked-out-later"));
+        // `label` stays the tab identity — sort order, `pin_key`, the filter and
+        // the `== "home"` checks all key off it.
+        assert_eq!(row.label, "tg-old");
+        assert_eq!(row.pin_key, "app/tg-old");
+    }
+
+    #[test]
+    fn worktree_rows_fall_back_to_the_tab_name_before_the_scan_lands() {
+        let s = session(vec![tab("app/tg-old", "/wt/a")], 0);
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &[],
+        );
+        let row = rows
+            .iter()
+            .find(|r| r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some("/wt/a"))
+            .expect("worktree row");
+        assert_eq!(row.branch.as_deref(), Some("tg-old"));
     }
 
     fn session(worktrees: Vec<WorktreeGroup>, active: usize) -> Session {

@@ -1079,7 +1079,10 @@ fn compose_row_lines(
             }
             // Main line is the dynamic name (OSC window title) or the branch; PR
             // moves to a compact right-cluster chip + the focused detail line.
-            let label = crate::sidebar::compose_row_label(window_title, &row.label);
+            let label = crate::sidebar::compose_row_label(
+                window_title,
+                crate::sidebar::row_display_branch(row),
+            );
             left.push(seg(name_fg, label));
 
             // Right cluster (always-on): git status icon + uncommitted diff stat +

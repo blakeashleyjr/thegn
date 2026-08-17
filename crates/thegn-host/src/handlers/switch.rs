@@ -103,8 +103,10 @@ pub(crate) fn refresh_tab_model(model: &mut FrameModel, session: &Session, sb: &
     // persistent cache so dirty-dots / ahead-behind arrows persist instantly
     // across a switch instead of blanking until the async hydration lands (the
     // stale map still holds the outgoing workspace's paths). In-memory only.
+    let crate::sidebar::SidebarStatus { git, branches, .. } = &mut model.sidebar_status;
     crate::glyph_refresh::seed_from_global_cache(
-        &mut model.sidebar_status.git,
+        git,
+        branches,
         session
             .worktrees
             .iter()
