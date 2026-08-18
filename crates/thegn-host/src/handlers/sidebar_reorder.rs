@@ -1,26 +1,33 @@
-//! Sidebar reorder: move worktrees/workspaces up or down one slot and persist
-//! the new `position` order. Extracted from `run.rs` (pinned by the file-size
-//! ratchet).
+//! Sidebar reorder: move worktrees / folders / workspaces / terminals up or
+//! down one slot and persist the new order. Extracted from `run.rs` (pinned by
+//! the file-size ratchet).
 //!
 //! Two entry points share the same primitives:
-//! - **Ctrl+Alt+↑/↓** (`move_active_worktree` / `move_selected_workspace`) move
-//!   a single item — the active worktree, or the workspace under the cursor.
+//! - **Ctrl+Alt+↑/↓** (`move_cursor_worktree` / `move_folder_id` /
+//!   `move_selected_workspace` / `move_cursor_terminal`) move the single item
+//!   under the sidebar cursor — or the active worktree when the sidebar isn't
+//!   focused.
 //! - **Shift+↑/↓** (`reorder_selection`) move the whole multi-select: every
 //!   marked row of the cursor row's kind (or the cursor row alone when nothing
 //!   is marked), one slot, as a block.
 //!
-//! Motion always walks the *on-screen* order so it matches what the user sees;
-//! same-workspace worktrees are contiguous there. A move under a computed sort
-//! first flips the workspace back to Manual so the move is visible and sticks.
+//! Worktree motion is confined to the row's **sibling run** — the loose list or
+//! the folder it is filed into — as resolved by [`crate::sidebar_order`];
+//! pushing past a run's edge crosses into the adjacent run and re-files. `home`
+//! anchors the head of the loose run. A move under a computed sort first flips
+//! the workspace back to Manual so the move is visible and sticks.
+//!
+//! Persistence writes the workspace's exact new order (`position = index`) once
+//! per move rather than swapping two positions, for the same reason
+//! `set_workspace_order` exists: a swap leans on the normalize pass and can seed
+//! a sequence that differs from the tree.
 
 use std::collections::HashSet;
 
 use thegn_core::store::WorkspaceStore;
 
 use crate::chrome::FrameModel;
-use crate::run::{
-    SidebarState, sidebar_worktree_order, visible_index_of_active, visible_index_of_workspace,
-};
+use crate::run::{SidebarState, visible_index_of_active, visible_index_of_workspace};
 
 /// The visible-row index of the row with this `pin_key`, if present. The cursor
 /// travels with the item it moved by re-resolving this after the rebuild.
@@ -32,17 +39,91 @@ fn visible_index_of_pin_key(model: &FrameModel, key: &str) -> Option<usize> {
         .position(|r| r.pin_key == key)
 }
 
+/// The visible-row index of the worktree row for `path`. A move that crosses a
+/// folder boundary re-keys the row (`pin_key` embeds the folder), so the cursor
+/// falls back to the path, which is stable across a re-file.
+fn visible_index_of_worktree_path(model: &FrameModel, path: &str) -> Option<usize> {
+    model
+        .sidebar_rows
+        .iter()
+        .filter(|r| r.visible)
+        .position(|r| {
+            r.kind == crate::sidebar::RowKind::Worktree && r.worktree_path.as_deref() == Some(path)
+        })
+}
+
+/// The workspace slug owning the worktree row at `path`.
+fn workspace_slug_of_path(model: &FrameModel, path: &str) -> Option<String> {
+    model
+        .sidebar_rows
+        .iter()
+        .find(|r| {
+            r.kind == crate::sidebar::RowKind::Worktree && r.worktree_path.as_deref() == Some(path)
+        })
+        .map(|r| r.workspace_slug.clone())
+}
+
+/// Run a best-effort DB write off the event loop. Falls back to running inline
+/// when there is no tokio runtime (unit tests) — the DB is a cache, so the
+/// in-memory reorder is the user-visible change either way.
+fn off_loop(job: impl FnOnce() + Send + 'static) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            tokio::task::spawn_blocking(job);
+        }
+        Err(_) => job(),
+    }
+}
+
+/// Persist a worktree reorder: the membership change (when the move crossed a
+/// run) and then the workspace's exact new order as `position = index`.
+///
+/// Writing the whole order rather than swapping two positions is the same
+/// reasoning as `set_workspace_order` (see [`SidebarState::move_workspace_by_slug`]):
+/// a swap leans on `normalize_worktree_positions` to heal NULL/tied values and
+/// can seed a different sequence than the tree is showing.
+fn persist_worktree_order(order: Vec<String>, refile: Option<(String, Option<i64>)>) {
+    off_loop(move || {
+        let Ok(db) = thegn_core::db::Db::open() else {
+            return;
+        };
+        if let Some((path, folder)) = refile {
+            // best-effort: the DB is a cache — the optimistic model regroup is
+            // the user-visible change; a failed write only loses it on restart
+            let _ = db.set_worktree_folder(&path, folder);
+        }
+        let _ = db.set_worktree_order(&order);
+    });
+}
+
+/// Persist a folder reorder as `position = index` within one workspace.
+fn persist_folder_order(repo_path: String, order: Vec<i64>) {
+    off_loop(move || {
+        if let Ok(db) = thegn_core::db::Db::open() {
+            // best-effort: see `persist_worktree_order`
+            let _ = db.set_folder_order(&repo_path, &order);
+        }
+    });
+}
+
 impl SidebarState {
-    /// Move the active worktree one slot within its workspace (Ctrl+Alt+↑/↓),
-    /// keeping the highlight on the moved (still active) group.
+    /// Move the active worktree one slot within its run (Ctrl+Alt+↑/↓ with the
+    /// sidebar unfocused), keeping the highlight on the moved (still active)
+    /// group.
     pub(crate) fn move_active_worktree(
         &mut self,
         model: &mut FrameModel,
         session: &mut crate::session::Session,
         up: bool,
     ) -> bool {
-        let gi = session.active;
-        if self.move_worktree_group(model, session, gi, up) {
+        let Some(path) = session
+            .worktrees
+            .get(session.active)
+            .map(|g| g.path.clone())
+        else {
+            return false;
+        };
+        if self.move_worktree_path(model, session, &path, up) {
             // Keep the highlight on the worktree that just moved (now the active
             // group), the way workspace reorders already do.
             self.cursor = visible_index_of_active(model);
@@ -53,77 +134,199 @@ impl SidebarState {
         }
     }
 
-    /// Move worktree group `gi` one slot within its workspace, swapping it with
-    /// the adjacent *same-workspace* branch sibling in both the live session
-    /// order and the persisted registry `position`. `home` is a fixed top
-    /// anchor: a worktree can't move above it, and home itself never moves.
-    /// Rebuilds the tree; the caller places the cursor. Returns whether it moved.
-    pub(crate) fn move_worktree_group(
+    /// Move the worktree under the sidebar cursor one slot within its run,
+    /// keeping the cursor on it — the worktree analogue of
+    /// [`Self::move_cursor_terminal`] / [`Self::move_selected_workspace`].
+    ///
+    /// The Ctrl+Alt dispatch used to fall through to [`Self::move_active_worktree`]
+    /// for every non-workspace, non-terminal row, so parking the cursor on an
+    /// inactive worktree and pressing the key moved a *different* row than the
+    /// highlighted one. This is the cursor-based path the other two row kinds
+    /// already had.
+    pub(crate) fn move_cursor_worktree(
         &mut self,
         model: &mut FrameModel,
         session: &mut crate::session::Session,
-        gi: usize,
         up: bool,
     ) -> bool {
-        use crate::session::GroupKind;
-        let a = gi;
-        // Home never moves.
-        if session.worktrees.get(a).map(|g| g.kind) == Some(GroupKind::Home) {
-            return false;
-        }
-        // Walk the on-screen order so the motion matches what the user sees.
-        let order = sidebar_worktree_order(model);
-        let Some(p) = order.iter().position(|&g| g == a) else {
+        let Some(row) = self.selected_row(model) else {
             return false;
         };
-        let neighbor = if up {
-            p.checked_sub(1)
+        let cursor_key = row.pin_key.clone();
+        let Some(path) = row.worktree_path.clone() else {
+            return false;
+        };
+        if self.move_worktree_path(model, session, &path, up) {
+            // The pin key of a filed worktree embeds its folder, so a move that
+            // crosses runs re-keys the row; fall back to the path.
+            self.cursor = visible_index_of_pin_key(model, &cursor_key)
+                .or_else(|| visible_index_of_worktree_path(model, &path))
+                .unwrap_or(self.cursor);
+            self.sync(model);
+            true
         } else {
-            (p + 1 < order.len()).then_some(p + 1)
+            false
+        }
+    }
+
+    /// Move the worktree at `path` one slot within its **sibling run** — the
+    /// loose list, or the folder it is filed into — crossing into the adjacent
+    /// run (and re-filing) when pushed past an edge. `home` is a fixed anchor at
+    /// the head of the loose run: it never moves and nothing lands above it.
+    /// Rebuilds the tree; the caller places the cursor. Returns whether it moved.
+    pub(crate) fn move_worktree_path(
+        &mut self,
+        model: &mut FrameModel,
+        session: &mut crate::session::Session,
+        path: &str,
+        up: bool,
+    ) -> bool {
+        let Some(slug) = workspace_slug_of_path(model, path) else {
+            return false;
         };
-        let Some(np) = neighbor else { return false };
-        let b = order[np];
-        // Stay within the same workspace, and never cross above home.
-        let slug = |gi: usize| {
-            session
+        let Some(plan) = crate::sidebar_order::step(&model.sidebar_rows, &slug, path, up) else {
+            return false;
+        };
+        self.apply_order_plan(model, session, &slug, plan)
+    }
+
+    /// Apply a resolved [`crate::sidebar_order::Plan`]: optimistically regroup
+    /// and reorder the model so the tree shows the move on this frame, permute
+    /// the live session groups to match, then persist off-loop.
+    ///
+    /// The optimistic-model + deferred-write shape mirrors
+    /// [`crate::handlers::sidebar_folder::file_worktree_path`]; unlike that path
+    /// it does **not** fire a `RefreshKind::Model` afterwards, because a reorder
+    /// only ever targets folders that already exist (no synthetic id to
+    /// reconcile) and a held-down arrow key must not queue a full hydration per
+    /// repeat.
+    pub(crate) fn apply_order_plan(
+        &mut self,
+        model: &mut FrameModel,
+        session: &mut crate::session::Session,
+        slug: &str,
+        plan: crate::sidebar_order::Plan,
+    ) -> bool {
+        // 1. Membership, optimistically — this is what moves a row between a
+        //    folder and the loose list on the same frame.
+        if let Some(folder) = plan.refile
+            && let Some(w) = model
+                .sidebar_db_worktrees
+                .iter_mut()
+                .find(|w| w.path == plan.path)
+        {
+            w.folder_id = folder;
+        }
+
+        // 2. Order, optimistically. A *dormant* workspace's rows are rebuilt
+        //    from this list (in `db.worktrees()` position order), so sorting it
+        //    here is what makes reorder work without a live session group.
+        let rank = |p: &str| plan.order.iter().position(|q| q == p).unwrap_or(usize::MAX);
+        model
+            .sidebar_db_worktrees
+            .sort_by_key(|w| (w.slug != slug, rank(&w.path)));
+
+        // 3. The live session order: `gather_groups` reads `session.worktrees`
+        //    slot order for a loaded workspace, so permute this workspace's
+        //    slots in place (other workspaces' groups keep their slots).
+        let slots: Vec<usize> = session
+            .worktrees
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| {
+                crate::sidebar::split_tab(&g.name)
+                    .map(|(s, _)| s)
+                    .as_deref()
+                    == Some(slug)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if !slots.is_empty() {
+            // Track the active group by name: a permutation moves indices
+            // around in a way the old pairwise index fixup can't express.
+            let active_name = session
                 .worktrees
-                .get(gi)
-                .and_then(|g| crate::sidebar::split_tab(&g.name).map(|(s, _)| s))
-        };
-        if slug(a) != slug(b) {
-            return false;
-        }
-        if session.worktrees.get(b).map(|g| g.kind) == Some(GroupKind::Home) {
-            return false;
-        }
-
-        // Persist the new order: swap the durable `position` of the two paths…
-        if let Ok(db) = thegn_core::db::Db::open() {
-            let (pa, pb) = (
-                session.worktrees[a].path.clone(),
-                session.worktrees[b].path.clone(),
-            );
-            // best-effort: the DB is a cache — a failed persist only loses the
-            // order across restart; the live session swap below still applies
-            let _ = db.swap_worktree_positions(&pa, &pb);
-        }
-        // …and the live session order, preserving which group stays active
-        // across the vec swap (its index moves with it).
-        let was_active = session.active;
-        session.worktrees.swap(a, b);
-        if was_active == a {
-            session.active = b;
-        } else if was_active == b {
-            session.active = a;
+                .get(session.active)
+                .map(|g| g.name.clone());
+            let mut taken: Vec<crate::session::WorktreeGroup> = slots
+                .iter()
+                .map(|&i| session.worktrees[i].clone())
+                .collect();
+            // Stable sort: a group missing from `order` (not yet hydrated into
+            // the DB list) keeps its relative slot at the end of the run.
+            taken.sort_by_key(|g| rank(&g.path));
+            for (&slot, g) in slots.iter().zip(taken) {
+                session.worktrees[slot] = g;
+            }
+            if let Some(name) = active_name
+                && let Some(i) = session.worktrees.iter().position(|g| g.name == name)
+            {
+                session.active = i;
+            }
         }
 
-        // A manual move only makes sense under Manual order; flip + persist if a
-        // computed sort was active so the move is visible and survives restart.
+        // 4. A manual move only makes sense under Manual order; flip + persist
+        //    if a computed sort was active so the move is visible and sticks.
         if self.view.sort != crate::sidebar::SortMode::Manual {
             self.view.sort = crate::sidebar::SortMode::Manual;
             self.persist("sort_mode", self.view.sort.as_str());
         }
         self.rebuild(model, session);
+
+        persist_worktree_order(plan.order, plan.refile.map(|f| (plan.path, f)));
+        true
+    }
+
+    /// Move folder `fid` one slot among its workspace's folders (its worktrees
+    /// travel with the header, so no worktree position changes). Rebuilds; the
+    /// caller places the cursor. Returns whether it moved.
+    pub(crate) fn move_folder_id(
+        &mut self,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+        slug: &str,
+        fid: i64,
+        up: bool,
+    ) -> bool {
+        let Some(order) = crate::sidebar_order::step_folder(&model.sidebar_rows, slug, fid, up)
+        else {
+            return false;
+        };
+        self.apply_folder_order(model, session, slug, order)
+    }
+
+    /// Apply a new folder id order for `slug`: renumber the in-model
+    /// `FolderRow`s so the tree shows it now, then persist off-loop.
+    pub(crate) fn apply_folder_order(
+        &mut self,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+        slug: &str,
+        order: Vec<i64>,
+    ) -> bool {
+        let Some(repo_path) = model
+            .sidebar_workspaces
+            .iter()
+            .find(|(s, ..)| s == slug)
+            .map(|(_, _, _, p)| p.clone())
+            .filter(|p| !p.is_empty())
+        else {
+            return false;
+        };
+        for f in model.sidebar_db_folders.iter_mut() {
+            if f.repo_path == repo_path
+                && let Some(i) = order.iter().position(|id| *id == f.folder_id)
+            {
+                f.position = i as i64;
+            }
+        }
+        self.rebuild(model, session);
+
+        // A folder created optimistically carries a synthetic negative id that
+        // has no DB row yet; the deferred filing write will assign the real one,
+        // so skip those rather than renumber a row that doesn't exist.
+        let real: Vec<i64> = order.into_iter().filter(|id| *id > 0).collect();
+        persist_folder_order(repo_path, real);
         true
     }
 
@@ -333,93 +536,110 @@ impl SidebarState {
         session: &mut crate::session::Session,
         up: bool,
     ) -> bool {
-        use crate::sidebar::{RowKind, RowTarget};
+        use crate::sidebar::RowKind;
         let Some(cursor_row) = self.selected_row(model) else {
             return false;
         };
+        // Owned up front: the arms below mutate `model`, which ends the borrow.
         let cursor_kind = cursor_row.kind;
         let cursor_key = cursor_row.pin_key.clone();
+        let cursor_path = cursor_row.worktree_path.clone();
+        let cursor_folder = cursor_row.folder_id;
+        let cursor_slug = cursor_row.workspace_slug.clone();
 
         match cursor_kind {
             RowKind::Worktree => {
-                // Selected worktree groups (marked rows of this kind, else the
-                // cursor's group), captured as stable group *names* since a swap
-                // shifts vec indices.
-                let mut sel_groups: Vec<usize> = model
+                // Selected worktrees (marked rows of this kind, else the cursor
+                // row), keyed by **path** — stable across a re-file, unlike the
+                // pin key, and available on dormant rows that have no session
+                // group.
+                let mut sel_paths: Vec<String> = model
                     .sidebar_rows
                     .iter()
                     .filter(|r| {
                         r.visible && r.kind == RowKind::Worktree && self.marked.contains(&r.pin_key)
                     })
-                    .filter_map(|r| match r.tab_target {
-                        Some(RowTarget::Tab(g, _)) => Some(g),
-                        _ => None,
-                    })
+                    .filter_map(|r| r.worktree_path.clone())
                     .collect();
-                if sel_groups.is_empty()
-                    && let Some(RowTarget::Tab(g, _)) = self.cursor_target(model)
+                if sel_paths.is_empty()
+                    && let Some(p) = cursor_path.clone()
                 {
-                    sel_groups.push(g);
+                    sel_paths.push(p);
                 }
-                let sel_names: HashSet<String> = sel_groups
-                    .iter()
-                    .filter_map(|&g| session.worktrees.get(g).map(|x| x.name.clone()))
-                    .collect();
-                if sel_names.is_empty() {
+                if sel_paths.is_empty() {
                     return false;
                 }
+                let sel: HashSet<String> = sel_paths.iter().cloned().collect();
                 // Worktrees only reorder within their own workspace.
-                let slugs: HashSet<String> = sel_names
+                let slugs: HashSet<String> = model
+                    .sidebar_rows
                     .iter()
-                    .filter_map(|n| crate::sidebar::split_tab(n).map(|(s, _)| s))
+                    .filter(|r| {
+                        r.kind == RowKind::Worktree
+                            && r.worktree_path.as_deref().is_some_and(|p| sel.contains(p))
+                    })
+                    .map(|r| r.workspace_slug.clone())
                     .collect();
                 if slugs.len() > 1 {
                     model.status = "Can't move a selection across workspaces".into();
                     return false;
                 }
+                let Some(slug) = slugs.into_iter().next() else {
+                    return false;
+                };
                 // Process in display order — top-first for up, bottom-first for
                 // down — so a block moves as a unit and two selected neighbours
                 // never swap with each other.
-                let mut ordered: Vec<String> = sidebar_worktree_order(model)
+                let mut ordered: Vec<String> = model
+                    .sidebar_rows
                     .iter()
-                    .filter_map(|&g| session.worktrees.get(g).map(|x| x.name.clone()))
-                    .filter(|n| sel_names.contains(n))
+                    .filter(|r| r.kind == RowKind::Worktree)
+                    .filter_map(|r| r.worktree_path.clone())
+                    .filter(|p| sel.contains(p))
                     .collect();
                 if !up {
                     ordered.reverse();
                 }
                 let mut moved = false;
-                for name in &ordered {
-                    let order = sidebar_worktree_order(model);
-                    let Some(gi) = session.worktrees.iter().position(|g| &g.name == name) else {
-                        continue;
-                    };
-                    let Some(p) = order.iter().position(|&g| g == gi) else {
-                        continue;
-                    };
-                    let neighbor = if up {
-                        p.checked_sub(1)
-                    } else {
-                        (p + 1 < order.len()).then_some(p + 1)
-                    };
-                    // Don't swap two selected items past each other.
-                    if let Some(np) = neighbor
-                        && let Some(nb_name) =
-                            session.worktrees.get(order[np]).map(|g| g.name.clone())
-                        && sel_names.contains(&nb_name)
+                for path in &ordered {
+                    // Don't swap two selected items past each other. At a run
+                    // edge there is no in-run neighbour, so the block crosses
+                    // into the adjacent run one member at a time.
+                    if let Some(nb) =
+                        crate::sidebar_order::in_run_neighbor(&model.sidebar_rows, &slug, path, up)
+                        && sel.contains(&nb)
                     {
                         continue;
                     }
-                    if self.move_worktree_group(model, session, gi, up) {
+                    if self.move_worktree_path(model, session, path, up) {
                         moved = true;
                     }
                 }
                 if moved {
-                    self.cursor =
-                        visible_index_of_pin_key(model, &cursor_key).unwrap_or(self.cursor);
+                    self.cursor = visible_index_of_pin_key(model, &cursor_key)
+                        .or_else(|| {
+                            cursor_path
+                                .as_deref()
+                                .and_then(|p| visible_index_of_worktree_path(model, p))
+                        })
+                        .unwrap_or(self.cursor);
                     self.sync(model);
                 }
                 moved
+            }
+            RowKind::Folder => {
+                // Folders aren't markable, so this is always the cursor row.
+                let Some(fid) = cursor_folder else {
+                    return false;
+                };
+                if self.move_folder_id(model, session, &cursor_slug, fid, up) {
+                    self.cursor =
+                        visible_index_of_pin_key(model, &cursor_key).unwrap_or(self.cursor);
+                    self.sync(model);
+                    true
+                } else {
+                    false
+                }
             }
             RowKind::Workspace => {
                 // Selected workspace slugs (marked headers, else the cursor's).
@@ -1017,5 +1237,394 @@ mod tests {
         sb.cursor = vidx(&model, "loc");
         sb.sync(&mut model);
         assert!(!sb.reorder_selection(&mut model, &mut session, false));
+    }
+
+    // --- folder-aware ordering ------------------------------------------
+
+    const REPO: &str = "/repo/app";
+
+    /// A model whose workspace has a real repo path plus DB folder/worktree
+    /// rows, so `build_rows` renders folder headers and files worktrees under
+    /// them (the plain `one_ws_model` has an empty repo path and no folders).
+    fn foldered_model(
+        session: &Session,
+        folders: &[(i64, &str)],
+        filed: &[(&str, Option<i64>)],
+    ) -> FrameModel {
+        let mut m = build_initial_model(session, None);
+        m.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), REPO.into())];
+        m.sidebar_db_folders = folders
+            .iter()
+            .enumerate()
+            .map(|(i, (id, name))| thegn_core::models::FolderRow {
+                folder_id: *id,
+                repo_path: REPO.into(),
+                name: (*name).into(),
+                position: i as i64,
+                created_at: 0,
+            })
+            .collect();
+        m.sidebar_db_worktrees = filed
+            .iter()
+            .map(|(label, fid)| crate::sidebar::DbWorktree {
+                slug: "app".into(),
+                branch: (*label).into(),
+                repo_path: REPO.into(),
+                tab_name: format!("app/{label}"),
+                path: format!("/tmp/app-{label}"),
+                folder_id: *fid,
+                sandbox_backend: None,
+                env_name: None,
+                env_degraded: false,
+            })
+            .collect();
+        m
+    }
+
+    /// The visible workspaces tree as `(depth, label)` pairs — the shape the
+    /// user sees. The TERMINALS section (and its "no terminals" hint) is
+    /// dropped: it's a static peer section, not part of the ordering under test.
+    fn tree(model: &FrameModel) -> Vec<(u8, String)> {
+        model
+            .sidebar_rows
+            .iter()
+            .filter(|r| {
+                r.visible
+                    && r.kind != crate::sidebar::RowKind::SectionHeading
+                    && !r.workspace_slug.starts_with("terminals")
+            })
+            .map(|r| (r.depth, r.label.clone()))
+            .collect()
+    }
+
+    fn cursor_on(sb: &mut SidebarState, model: &mut FrameModel, label: &str) {
+        sb.cursor = vidx(model, label);
+        sb.sync(model);
+    }
+
+    #[test]
+    fn reorder_inside_a_folder_does_not_disturb_the_loose_run() {
+        let _g = DbGuard::new("folder-inner");
+        let mut session = app_session(&["home", "alpha", "beta", "gamma", "delta"]);
+        let mut model = foldered_model(
+            &session,
+            &[(1, "One")],
+            &[
+                ("home", None),
+                ("alpha", None),
+                ("beta", None),
+                ("gamma", Some(1)),
+                ("delta", Some(1)),
+            ],
+        );
+        let mut sb = focused(&mut model, &session);
+        assert_eq!(
+            tree(&model),
+            vec![
+                (0, "app".into()),
+                (1, "home".into()),
+                (1, "alpha".into()),
+                (1, "beta".into()),
+                (1, "One".into()),
+                (2, "gamma".into()),
+                (2, "delta".into()),
+            ]
+        );
+
+        cursor_on(&mut sb, &mut model, "delta");
+        assert!(sb.reorder_selection(&mut model, &mut session, true));
+        assert_eq!(
+            tree(&model),
+            vec![
+                (0, "app".into()),
+                (1, "home".into()),
+                (1, "alpha".into()),
+                (1, "beta".into()),
+                (1, "One".into()),
+                (2, "delta".into()),
+                (2, "gamma".into()),
+            ],
+            "delta rose within the folder; the loose run is untouched"
+        );
+    }
+
+    #[test]
+    fn stepping_up_off_a_folder_head_unfiles_into_the_loose_run() {
+        let _g = DbGuard::new("folder-cross-up");
+        let mut session = app_session(&["home", "alpha", "beta"]);
+        let mut model = foldered_model(
+            &session,
+            &[(1, "One")],
+            &[("home", None), ("alpha", None), ("beta", Some(1))],
+        );
+        let mut sb = focused(&mut model, &session);
+
+        cursor_on(&mut sb, &mut model, "beta");
+        assert!(sb.reorder_selection(&mut model, &mut session, true));
+        assert_eq!(
+            tree(&model),
+            vec![
+                (0, "app".into()),
+                (1, "home".into()),
+                (1, "alpha".into()),
+                (1, "beta".into()),
+                (1, "One".into()),
+            ],
+            "beta left the folder and landed at the end of the loose run"
+        );
+        let beta = model
+            .sidebar_db_worktrees
+            .iter()
+            .find(|w| w.branch == "beta")
+            .unwrap();
+        assert_eq!(
+            beta.folder_id, None,
+            "membership was re-filed, not just moved"
+        );
+    }
+
+    #[test]
+    fn stepping_down_off_the_loose_tail_files_into_the_first_folder() {
+        let _g = DbGuard::new("folder-cross-down");
+        let mut session = app_session(&["home", "alpha", "beta"]);
+        let mut model = foldered_model(
+            &session,
+            &[(1, "One")],
+            &[("home", None), ("alpha", None), ("beta", Some(1))],
+        );
+        let mut sb = focused(&mut model, &session);
+
+        cursor_on(&mut sb, &mut model, "alpha");
+        assert!(sb.reorder_selection(&mut model, &mut session, false));
+        assert_eq!(
+            tree(&model),
+            vec![
+                (0, "app".into()),
+                (1, "home".into()),
+                (1, "One".into()),
+                (2, "alpha".into()),
+                (2, "beta".into()),
+            ]
+        );
+        let alpha = model
+            .sidebar_db_worktrees
+            .iter()
+            .find(|w| w.branch == "alpha")
+            .unwrap();
+        assert_eq!(alpha.folder_id, Some(1));
+    }
+
+    #[test]
+    fn a_collapsed_folder_is_hopped_over_not_entered() {
+        let _g = DbGuard::new("folder-collapsed");
+        let mut session = app_session(&["home", "alpha", "beta", "gamma"]);
+        let mut model = foldered_model(
+            &session,
+            &[(1, "One"), (2, "Two")],
+            &[
+                ("home", None),
+                ("alpha", None),
+                ("beta", Some(1)),
+                ("gamma", Some(2)),
+            ],
+        );
+        let mut sb = focused(&mut model, &session);
+        sb.view.collapsed.insert("app/folder:1".into());
+        sb.rebuild(&mut model, &session);
+
+        cursor_on(&mut sb, &mut model, "alpha");
+        assert!(sb.reorder_selection(&mut model, &mut session, false));
+        let alpha = model
+            .sidebar_db_worktrees
+            .iter()
+            .find(|w| w.branch == "alpha")
+            .unwrap();
+        assert_eq!(
+            alpha.folder_id,
+            Some(2),
+            "skipped the collapsed folder rather than hiding alpha inside it"
+        );
+    }
+
+    #[test]
+    fn the_active_worktree_stays_active_across_a_reorder() {
+        let _g = DbGuard::new("folder-active");
+        let mut session = app_session(&["home", "alpha", "beta", "gamma"]);
+        session.active = 3; // gamma
+        let mut model = foldered_model(
+            &session,
+            &[],
+            &[
+                ("home", None),
+                ("alpha", None),
+                ("beta", None),
+                ("gamma", None),
+            ],
+        );
+        let mut sb = focused(&mut model, &session);
+
+        cursor_on(&mut sb, &mut model, "gamma");
+        assert!(sb.reorder_selection(&mut model, &mut session, true));
+        assert_eq!(names(&session)[1..], ["app/alpha", "app/gamma", "app/beta"]);
+        assert_eq!(
+            session.worktrees[session.active].name, "app/gamma",
+            "the active index followed the permuted group"
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_moves_the_cursor_row_not_the_active_worktree() {
+        let _g = DbGuard::new("cursor-not-active");
+        let mut session = app_session(&["home", "alpha", "beta"]);
+        session.active = 1; // alpha is active…
+        let mut model = foldered_model(
+            &session,
+            &[],
+            &[("home", None), ("alpha", None), ("beta", None)],
+        );
+        let mut sb = focused(&mut model, &session);
+
+        // …but the cursor sits on beta, which is the row that must move.
+        cursor_on(&mut sb, &mut model, "beta");
+        assert!(sb.move_cursor_worktree(&mut model, &mut session, true));
+        assert_eq!(names(&session)[1..], ["app/beta", "app/alpha"]);
+    }
+
+    #[test]
+    fn folders_reorder_and_carry_their_worktrees() {
+        let _g = DbGuard::new("folder-move");
+        let session = app_session(&["home", "alpha", "beta"]);
+        let mut model = foldered_model(
+            &session,
+            &[(1, "One"), (2, "Two")],
+            &[("home", None), ("alpha", Some(1)), ("beta", Some(2))],
+        );
+        let mut sb = focused(&mut model, &session);
+
+        assert!(sb.move_folder_id(&mut model, &session, "app", 2, true));
+        assert_eq!(
+            tree(&model),
+            vec![
+                (0, "app".into()),
+                (1, "home".into()),
+                (1, "Two".into()),
+                (2, "beta".into()),
+                (1, "One".into()),
+                (2, "alpha".into()),
+            ],
+            "the folder moved and its worktree travelled with it"
+        );
+        // Already first: no further move.
+        assert!(!sb.move_folder_id(&mut model, &session, "app", 2, true));
+    }
+
+    #[test]
+    fn a_dormant_workspace_reorders_without_a_session_group() {
+        let _g = DbGuard::new("folder-dormant");
+        // No session groups for "app" at all — the rows come from the DB list.
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: vec![],
+            active: 0,
+        };
+        let mut model = foldered_model(
+            &session,
+            &[],
+            &[("home", None), ("alpha", None), ("beta", None)],
+        );
+        let mut sb = focused(&mut model, &session);
+        assert_eq!(
+            tree(&model),
+            vec![
+                (0, "app".into()),
+                (1, "home".into()),
+                (1, "alpha".into()),
+                (1, "beta".into()),
+            ]
+        );
+
+        cursor_on(&mut sb, &mut model, "beta");
+        assert!(sb.reorder_selection(&mut model, &mut session, true));
+        assert_eq!(
+            tree(&model),
+            vec![
+                (0, "app".into()),
+                (1, "home".into()),
+                (1, "beta".into()),
+                (1, "alpha".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reorder_persists_the_exact_on_screen_order() {
+        use thegn_core::store::WorkspaceStore;
+        let _g = DbGuard::new("folder-persist");
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_workspace(REPO, "app", "repo").unwrap();
+        for l in ["home", "alpha", "beta"] {
+            db.put_worktree(
+                &format!("app/{l}"),
+                REPO,
+                &format!("/tmp/app-{l}"),
+                l,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let mut session = app_session(&["home", "alpha", "beta"]);
+        let mut model = foldered_model(
+            &session,
+            &[],
+            &[("home", None), ("alpha", None), ("beta", None)],
+        );
+        let mut sb = focused(&mut model, &session);
+        cursor_on(&mut sb, &mut model, "beta");
+        assert!(sb.reorder_selection(&mut model, &mut session, true));
+
+        // The durable order must reproduce the tree, not a normalized tiebreak.
+        let on_screen: Vec<String> = model
+            .sidebar_rows
+            .iter()
+            .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Worktree)
+            .filter_map(|r| r.worktree_path.clone())
+            .collect();
+        let persisted: Vec<String> = db
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.worktree)
+            .collect();
+        assert_eq!(persisted, on_screen);
+    }
+
+    #[test]
+    fn flat_mode_reorders_without_dissolving_folders() {
+        let _g = DbGuard::new("folder-flat");
+        let mut session = app_session(&["home", "alpha", "beta"]);
+        let mut model = foldered_model(
+            &session,
+            &[(1, "One")],
+            &[("home", None), ("alpha", None), ("beta", Some(1))],
+        );
+        let mut sb = focused(&mut model, &session);
+        sb.view.flat = true;
+        sb.view.sort = SortMode::Manual;
+        sb.rebuild(&mut model, &session);
+
+        cursor_on(&mut sb, &mut model, "beta");
+        assert!(sb.reorder_selection(&mut model, &mut session, true));
+        let beta = model
+            .sidebar_db_worktrees
+            .iter()
+            .find(|w| w.branch == "beta")
+            .unwrap();
+        assert_eq!(
+            beta.folder_id,
+            Some(1),
+            "flat mode hides folders; it must not dissolve them"
+        );
     }
 }
