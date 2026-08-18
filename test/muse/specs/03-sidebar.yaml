@@ -32,8 +32,14 @@ steps:
   - begin_step: "hide sidebar"
   - key: {key: s, mods: [ctrl, alt]}
   - sleep_ms: 100
-  # Confirm no sidebar content visible when hidden
-  - expect_not_visible: {text: "sidebar", timeout_ms: 200}
+  # Confirm no sidebar content visible when hidden.
+  # The deadline is the time allowed for the hide repaint to land, not a
+  # tightness knob: expect_not_visible polls until the locator stops matching
+  # and fails if it still matches at the deadline, so a longer window cannot
+  # make a genuinely-unhidden sidebar pass. 200ms was marginal on a shared CI
+  # runner and failed at 160x40 (more cells to repaint) while passing at
+  # 100x30 and passing at both sizes locally.
+  - expect_not_visible: {text: "sidebar", timeout_ms: 3000}
   - begin_step: "restore sidebar"
   - key: {key: s, mods: [ctrl, alt]}
   - sleep_ms: 100
