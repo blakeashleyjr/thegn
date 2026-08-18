@@ -179,11 +179,31 @@ pub trait WorkspaceStore {
     /// order after a manual move.
     fn set_worktree_position(&self, wt: &str, position: i64) -> Result<()>;
 
+    /// Persist the full sidebar worktree order for a workspace — the worktree
+    /// analogue of [`Self::set_workspace_order`], and for the same reason: a
+    /// two-position swap leans on `normalize_worktree_positions` to heal
+    /// NULL/tied values and can seed a different order than the tree shows,
+    /// while writing `position = index` over the caller's sequence makes the
+    /// reload via [`Self::worktrees`] reproduce exactly what was on screen.
+    ///
+    /// The sidebar's manual reorder passes one workspace's on-screen order
+    /// (loose run first, then each folder's run). `position` is a *table-wide*
+    /// sequence, so a per-workspace rewrite can tie with another workspace's
+    /// values — harmless, because order is only ever compared within a
+    /// workspace once `worktrees()` has been grouped by `repo_path`.
+    fn set_worktree_order(&self, order: &[String]) -> Result<()>;
+
     fn folders_for_workspace(&self, repo_path: &str) -> Result<Vec<crate::models::FolderRow>>;
 
     fn create_folder(&self, repo_path: &str, name: &str) -> Result<i64>;
 
     fn rename_folder(&self, folder_id: i64, new_name: &str) -> Result<()>;
+
+    /// Persist the folder order within a workspace: `position = index` over
+    /// `order` (folder ids, top to bottom as the sidebar shows them). Folder
+    /// contents follow their header, so reordering folders never touches
+    /// `worktrees.position`. Ids not in `order` keep their current position.
+    fn set_folder_order(&self, repo_path: &str, order: &[i64]) -> Result<()>;
 
     fn del_folder(&self, folder_id: i64) -> Result<()>;
 

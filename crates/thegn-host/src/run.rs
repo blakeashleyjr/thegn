@@ -16614,10 +16614,9 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::MoveItemUp | Action::MoveItemDown => {
-                                // Reorder the selected item: the workspace under
-                                // the sidebar cursor if the sidebar is focused on
-                                // one, else the active worktree within its
-                                // workspace. The move methods rebuild the tree and
+                                // Reorder the item under the sidebar cursor when
+                                // the sidebar is focused, else the active
+                                // worktree. The move methods rebuild the tree and
                                 // persist the new order themselves; the active
                                 // group's content is unchanged, so only a redraw
                                 // is needed.
@@ -16633,6 +16632,23 @@ async fn event_loop<T: Terminal>(
                                     // A terminal reorders within its host group.
                                     Some(crate::sidebar::RowKind::Terminal) => {
                                         sb.move_cursor_terminal(&mut model, &session, up)
+                                    }
+                                    // A folder reorders among its workspace's
+                                    // folders; its worktrees travel with it.
+                                    Some(crate::sidebar::RowKind::Folder) => sb
+                                        .selected_row(&model)
+                                        .and_then(|r| {
+                                            r.folder_id.map(|f| (f, r.workspace_slug.clone()))
+                                        })
+                                        .is_some_and(|(fid, slug)| {
+                                            sb.move_folder_id(&mut model, &session, &slug, fid, up)
+                                        }),
+                                    // A worktree row moves the row under the
+                                    // cursor, matching the two arms above —
+                                    // this used to move the *active* worktree
+                                    // no matter where the cursor sat.
+                                    Some(crate::sidebar::RowKind::Worktree) => {
+                                        sb.move_cursor_worktree(&mut model, &mut session, up)
                                     }
                                     _ => sb.move_active_worktree(&mut model, &mut session, up),
                                 };

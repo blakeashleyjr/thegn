@@ -159,6 +159,7 @@ mod sidebar;
 mod sidebar_help;
 mod sidebar_keytable;
 mod sidebar_legend;
+mod sidebar_order;
 mod sidebar_view;
 mod snapshot;
 mod sprite_bridge;
