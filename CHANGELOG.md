@@ -14,12 +14,16 @@ initial feature set rather than a delta.
 
 ### Platforms
 
-Prebuilt binaries ship for **x86_64 Linux** (gnu + musl) only. macOS and
-Windows are **not validated** in this release — the code carries per-OS paths
-and cross-checks for them, but `thegn-host` has never been compiled or run on
-either, so no binaries are published and neither platform is supported yet.
-Building from source on them is untested. Nix (`nix profile install
-github:blakeashleyjr/thegn`) and `./install.sh` cover Linux.
+Prebuilt binaries ship for **x86_64 Linux** (gnu + musl) only. Nix
+(`nix profile install github:blakeashleyjr/thegn`) and `./install.sh` cover
+Linux too.
+
+macOS and Windows are **not supported** in this release and neither has been
+run interactively. Windows now type-checks on msvc — the repo was previously
+unclonable there, because a source file used the reserved DOS device name
+`aux` — but its named-pipe daemon IPC tests still fail. macOS has never been
+compiled: it cannot be cross-checked from Linux, since `thegn-host`'s build
+scripts need a real darwin C toolchain.
 
 ### The shell
 
