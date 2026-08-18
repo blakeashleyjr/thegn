@@ -82,6 +82,13 @@ jobs:
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      # deny.toml keeps the advisory clone at target/advisory-dbs (CARGO_HOME is
+      # read-only in the dev sandboxes). That path is inside the restored rust
+      # cache, which prunes it — cargo-deny then finds the directory present but
+      # gutted, declines to refetch, and dies with "failed to load any advisories
+      # in the database". Discard it so the fetch is always fresh; it costs one
+      # shallow clone and it is the difference between auditing and pretending to.
+      - run: rm -rf target/advisory-dbs
       - run: nix develop --command just deps-audit
   test:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
