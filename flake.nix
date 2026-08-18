@@ -225,6 +225,23 @@
           })
         else thegn;
 
+      # mingw-w64 cross C toolchain for `just check-cross`'s whole-workspace
+      # windows-gnu leg. `cargo check` still runs build scripts, and libz-sys /
+      # libgit2-sys compile C, so without a cross cc the check dies with
+      # "implicit declaration of function 'lseek'".
+      #
+      # This used to live ONLY in devenv.nix, which meant `just check-cross`
+      # passed in a devenv shell and failed under a bare `nix develop` — exactly
+      # what CI runs (`nix develop --command just check-cross`), so the gate broke
+      # the moment it moved to a runner without devenv. Keep the two in sync;
+      # the flake is the one CI depends on.
+      mingwCrossEnv = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+        export CC_x86_64_pc_windows_gnu="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-cc"
+        export CXX_x86_64_pc_windows_gnu="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-c++"
+        export AR_x86_64_pc_windows_gnu="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-ar"
+        export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-cc"
+      '';
+
       # Shared dev-shell shellHook (mold linker, sccache on a per-mount-ns socket,
       # CARGO_BUILD_JOBS headroom, pinned yazi, OpenSpec seeding). Used by BOTH the
       # full `default` shell and the trimmed `sprite-full` shell so they never drift.
@@ -430,7 +447,7 @@
           # below. Linux-only in nixpkgs — gate it so the shell evaluates on
           # macOS (where the default ld64 is used instead).
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.mold];
-        shellHook = devShellHook;
+        shellHook = devShellHook + mingwCrossEnv;
       };
 
       # Trimmed "full replica" shell for sprites / provider sandboxes: everything
