@@ -233,8 +233,11 @@ pub fn main_checkout(start: &Path) -> Option<PathBuf> {
 /// target branch, gather candidate branches, fold/gate/CAS-advance, and mirror
 /// the outcome into the queue cache. The shared entry point for both the CLI
 /// command and the in-app (off-loop) runner.
-pub fn fold_active_repo(mq: &MergeQueueConfig, any_path: &Path) -> Result<FoldReport> {
+pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Result<FoldReport> {
     let repo_root = main_checkout(any_path).context("not inside a git repository")?;
+    // Resolved here (off the loop — this runs inside spawn_fold's blocking task)
+    // because the per-repo `[merge_queue]` layer needs the repo root.
+    let mq = &cfg.repo_merge_queue(&repo_root);
     let target = resolve_target(mq, &repo_root);
     let cands = candidate_branches(mq, &repo_root, &target)?;
     let report = run_fold(mq, &repo_root, cands.branches.clone())?;

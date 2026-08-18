@@ -12,6 +12,11 @@ built-in defaults < the config file < `THEGN_*` environment variables <
 CLI flags. A repo-root `.thegn.{toml,yaml,yml,json}` overlays per-repo
 settings (sandbox, keybinds, env selection).
 
+`[workspace.<slug>]` in your own config refines settings for one repo —
+including `[workspace.<slug>.merge_queue]`, which is where a repo whose
+gate or integration branch differs from your defaults belongs. `thegn
+config explain <key>`, run inside the repo, names the layer that won.
+
 The file is watched: edits apply live, no restart.
 
 ## Highlights

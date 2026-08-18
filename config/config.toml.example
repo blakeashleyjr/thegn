@@ -2718,6 +2718,19 @@ local_admin = true
 # On by default; the core (fold + integrate) is AI-free — the agent handoff is
 # the only AI touch and only fires on a conflict. Set enabled = false to remove
 # the command, panel section, and badge entirely.
+# PER-REPO: every interesting key below describes a *repository* — its build
+# tool, its integration branch, its lockfiles — so a repo that differs from your
+# defaults belongs in a `[workspace.<slug>.merge_queue]` block rather than in
+# `--set` flags on every invocation. The slug is the repo directory name,
+# slugified. It overrides the global table for that repo only:
+#
+#   [workspace.datahub.merge_queue]
+#   target_branch      = "ba/rearch"          # this repo integrates elsewhere
+#   gate_setup_command = "pnpm install --frozen-lockfile"
+#   gate_command       = "pnpm test"          # not the global "just test"
+#
+# `thegn config explain merge_queue.gate_command`, run inside the repo, shows
+# which layer won.
 [merge_queue]
 enabled = true
 remote_mode = "route_to_host" # how a REMOTE-host (sprite) worktree lands onto the target;

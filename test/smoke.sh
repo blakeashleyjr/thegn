@@ -415,6 +415,28 @@ check "an unrunnable gate never dispatches the fixing agent" \
 # at enqueue time (two different targets used to be shown for one operation).
 check "merge list shows the run's effective target" \
   "'$SZ' merge list | grep -q '$GB'"
+# Per-repo `[merge_queue]`: the whole table used to be global-only, so a repo
+# whose gate or integration branch differed from the user's defaults could only
+# be handled with `--set` flags on every invocation.
+WSLUG="$(basename "$R")"
+cat >>"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
+
+[workspace.$WSLUG.merge_queue]
+target_branch = "smoke-target"
+EOF
+check "a [workspace.<slug>] block refines merge_queue for that repo" \
+  "[[ \$('$SZ' config explain merge_queue.target_branch --repo '$R' --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"value\"])') == 'smoke-target' ]]"
+check "config explain names the workspace layer as the origin" \
+  "'$SZ' config explain merge_queue.target_branch --repo '$R' | grep -q 'workspace'"
+# Trim it again so the rest of the merge checks see the plain global config.
+python3 - "$XDG_CONFIG_HOME/thegn/config.toml" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+i = s.rindex("[workspace.")
+open(p, "w").write(s[:i])
+PYEOF
+
 # `merge retry` re-arms a blocked row (the CLI twin of the panel's `r`), and is
 # a distinct non-zero outcome when there is nothing to re-arm.
 check "merge retry re-queues a blocked row" \

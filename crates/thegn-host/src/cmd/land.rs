@@ -39,7 +39,7 @@ pub(crate) fn land_branch(
         .filter(|s| !s.is_empty())
         .with_context(|| format!("{}: not on a branch (detached HEAD?)", worktree.display()))?;
     // This IS the manual land, so force it on regardless of queue policy.
-    let mut mq = cfg.merge_queue.clone();
+    let mut mq = cfg.repo_merge_queue(&root);
     mq.auto_land = true;
     let target = integrate::resolve_target(&mq, &root);
     // `thegn land` lands the branch checked out in `worktree`; its loc tells
@@ -74,7 +74,9 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
             && let Some(root) = integrate::main_checkout(&wt)
         {
             crate::merge_lifecycle::apply(
-                &cfg.merge_queue,
+                // Repo-resolved, so a `[workspace.<slug>]` folder setting is
+                // honored here as well as on the land itself.
+                &cfg.repo_merge_queue(&root),
                 &db,
                 &root,
                 &wt.to_string_lossy(),
