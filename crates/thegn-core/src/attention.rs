@@ -57,6 +57,7 @@ pub enum AttentionReason {
     PrConflict,
     ChangesRequested,
     GateFailed,
+    GateError,
     Deferred,
     // Waiting
     AgentWaiting,
@@ -88,6 +89,7 @@ impl AttentionReason {
             Self::PrConflict => "PR has conflicts",
             Self::ChangesRequested => "changes requested",
             Self::GateFailed => "merge gate failed",
+            Self::GateError => "merge gate could not run",
             Self::Deferred => "merge deferred",
             Self::AgentWaiting => "agent finished",
             Self::AgentDone => "agent done",
@@ -281,6 +283,11 @@ pub enum MqStatus {
     Ready,
     Deferred,
     GateFailed,
+    /// The gate could not RUN (missing binary, unprovisioned gate worktree,
+    /// killed). Distinct from [`MqStatus::GateFailed`], which is a verdict about
+    /// the branch: this one says nothing about the code, so no agent is
+    /// dispatched and no bisect is attempted.
+    GateError,
     AgentRunning,
     NeedsHuman,
 }
@@ -295,6 +302,7 @@ impl MqStatus {
             "ready" => Self::Ready,
             "deferred" => Self::Deferred,
             "gate_failed" => Self::GateFailed,
+            "gate_error" => Self::GateError,
             "agent_running" => Self::AgentRunning,
             "needs_human" => Self::NeedsHuman,
             _ => return None,
@@ -313,6 +321,9 @@ impl MqStatus {
             Self::Landed => (gl.check, Hue::Green),
             Self::Ready => (gl.diamond_filled, Hue::Green), // gated green, awaiting a land
             Self::Deferred | Self::GateFailed => (gl.flag, Hue::Red),
+            // Amber, not red: nothing is wrong with the *branch*, so this must
+            // not read as a code verdict alongside GateFailed.
+            Self::GateError => (gl.attention, Hue::Amber),
             Self::NeedsHuman => (gl.attention, Hue::Red), // agent tried and gave up
             Self::Folding | Self::Verifying => (gl.dot_filled, Hue::Amber),
             Self::AgentRunning => (gl.half_dot, Hue::Amber), // agent fixing the branch
@@ -392,6 +403,9 @@ pub fn score(inputs: &AttentionInputs) -> AttentionScore {
         match mq.status {
             MqStatus::NeedsHuman => consider(T::Blocked, 1, R::QueueNeedsHuman, at),
             MqStatus::GateFailed => consider(T::Failure, 7, R::GateFailed, at),
+            // Blocked, not Failure: nothing is wrong with the branch, and no
+            // agent or retry can clear it — only the user fixing the gate can.
+            MqStatus::GateError => consider(T::Blocked, 2, R::GateError, at),
             MqStatus::Deferred => consider(T::Failure, 8, R::Deferred, at),
             MqStatus::Ready => consider(T::Ready, 1, R::QueueReady, at),
             MqStatus::Queued | MqStatus::Folding | MqStatus::Verifying | MqStatus::AgentRunning => {

@@ -101,6 +101,15 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         AttemptOutcome::GateFailed { .. } => {
             anyhow::bail!("{branch} breaks the build (gate red); not landed.");
         }
+        AttemptOutcome::GateError { reason, .. } => {
+            // The gate never ran, so this says nothing about the branch. Naming
+            // it "breaks the build" would be a false accusation.
+            anyhow::bail!(
+                "{branch} was NOT gated — {reason}. The branch was not judged; \
+                 fix the gate environment (see `[merge_queue] gate_setup_command`) \
+                 and re-run."
+            );
+        }
         AttemptOutcome::Unreachable { detail } => {
             anyhow::bail!("{branch}: {detail}");
         }

@@ -64,6 +64,17 @@ pub trait WorktreeAuxStore {
         error_detail: Option<&str>,
     ) -> Result<()>;
 
+    /// Re-stamp a queued row's target branch to the one a run is actually
+    /// folding into.
+    ///
+    /// `enqueue_merge` freezes `target_branch` at enqueue time, but the
+    /// effective target is resolved per run (`--set
+    /// merge_queue.target_branch=…`, or `"auto"` following the repo's default
+    /// branch as it moves). Without this the queue keeps reporting the stale
+    /// value while the drain folds somewhere else — two different targets shown
+    /// for one operation.
+    fn set_merge_target(&self, worktree: &str, target_branch: &str) -> Result<()>;
+
     /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
     /// elsewhere, or the worktree is removed).
     fn remove_merge_entry(&self, worktree: &str) -> Result<()>;

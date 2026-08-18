@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thegn_core::config::MergeQueueConfig;
 use thegn_core::db::Db;
 use thegn_core::fold::{self, Branch, ConflictKind, FoldGit, FoldPlan, MergeOutcome};
+use thegn_core::gate;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::WorktreeAuxStore;
 use thegn_core::util;
@@ -154,6 +155,10 @@ pub enum GateOutcome {
     /// The gate went red. `offender` names the branch bisect isolated as the
     /// cause, if it could localize one (else the whole batch was held back).
     Failed { offender: Option<String> },
+    /// The gate could not RUN (missing binary, unprovisioned worktree, killed).
+    /// Distinct from `Failed`: it is a fact about the environment, so no branch
+    /// is blamed and no bisect is attempted.
+    Errored { reason: String },
 }
 
 /// A branch that landed in this fold.
@@ -386,6 +391,29 @@ fn gate_lock(_wt: &Path) -> Option<std::fs::File> {
     None
 }
 
+/// What one gate invocation established. The distinction between `Failed` and
+/// `Error` is load-bearing, not cosmetic: only `Failed` is a verdict about the
+/// *branch*. An `Error` (missing binary, non-executable, killed, unprovisioned
+/// worktree) says nothing about the code, so it must never reach the fixing
+/// agent and must never be bisected — see [`thegn_core::gate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateVerdict {
+    /// The gate ran and went green (or no gate was configured).
+    Passed,
+    /// The gate ran and went red. `log` is the tail of its output.
+    Failed { log: String },
+    /// The gate could not run. `reason` is the short headline, `log` whatever
+    /// output there was.
+    Error { reason: String, log: String },
+}
+
+impl GateVerdict {
+    /// Did the folded tip clear the gate?
+    pub(crate) fn passed(&self) -> bool {
+        matches!(self, GateVerdict::Passed)
+    }
+}
+
 /// Build/test the folded tip. By default (`gate_reuse_worktree`) this runs in a
 /// stable per-repo worktree kept between folds, with a persistent
 /// `CARGO_TARGET_DIR` — so cargo does a warm incremental rebuild instead of a
@@ -397,15 +425,11 @@ fn gate_lock(_wt: &Path) -> Option<std::fs::File> {
 // off-loop: the fold runs from the CLI (`thegn integrate`) or from
 // spawn_fold's spawn_blocking (see the module doc) — never on the loop.
 #[expect(clippy::disallowed_methods)]
-pub(crate) fn gate_tip(
-    repo_root: &Path,
-    oid: &str,
-    cfg: &MergeQueueConfig,
-) -> Result<(bool, String)> {
+pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> Result<GateVerdict> {
     // Callers only reach here with a non-empty command (`gate_on` already checks
     // it), but guard anyway: an empty gate is a green no-op, not a worktree churn.
     if cfg.gate_command.is_empty() {
-        return Ok((true, String::new()));
+        return Ok(GateVerdict::Passed);
     }
 
     let reuse = cfg.gate_reuse_worktree;
@@ -483,13 +507,28 @@ pub(crate) fn gate_tip(
     if !reuse {
         let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]);
     }
+    // Classify rather than collapsing to a bool: the raw exit status is the only
+    // place "the command never ran" is distinguishable from "the tests failed",
+    // and dropping it here is what let `turbo: command not found` be recorded as
+    // a verdict about the branch. See `thegn_core::gate`.
     Ok(match out {
         Ok(o) => {
             let mut log = String::from_utf8_lossy(&o.stdout).into_owned();
             log.push_str(&String::from_utf8_lossy(&o.stderr));
-            (o.status.success(), tail(&log, 4000))
+            let log = tail(&log, 4000);
+            match gate::classify_exit(o.status.code(), false) {
+                gate::GateClass::Passed => GateVerdict::Passed,
+                gate::GateClass::Failed => GateVerdict::Failed { log },
+                gate::GateClass::Error => GateVerdict::Error {
+                    reason: gate::error_reason(o.status.code(), false).to_string(),
+                    log,
+                },
+            }
         }
-        Err(e) => (false, format!("gate command failed to start: {e}")),
+        Err(e) => GateVerdict::Error {
+            reason: gate::error_reason(None, true).to_string(),
+            log: format!("gate command failed to start: {e}"),
+        },
     })
 }
 
@@ -510,6 +549,11 @@ fn tail(s: &str, max: usize) -> String {
 /// prefix whose gate goes red names its last branch as the offender. Returns
 /// `None` when it can't localize one (e.g. a flaky gate), in which case the
 /// whole batch is held back.
+///
+/// Aborts on a [`GateVerdict::Error`]: an environment failure reproduces at
+/// every prefix, so bisecting one would burn a full gate run per branch and
+/// then blame whichever branch happened to be first. The error is returned so
+/// the caller reports the environment, not a branch.
 fn bisect_offender(
     repo_root: &Path,
     adapter: &PlumbingAdapter,
@@ -527,12 +571,34 @@ fn bisect_offender(
             tip: branch_tip(repo_root, &l.branch)?,
         });
         let plan = fold::fold(adapter, base, prefix.clone(), &cfg.regenerate_paths)?;
-        if plan.advanced() && !gate_tip(repo_root, &plan.final_tip, cfg)?.0 {
-            return Ok(Some(l.branch.clone()));
+        if plan.advanced() {
+            match gate_tip(repo_root, &plan.final_tip, cfg)? {
+                GateVerdict::Passed => {}
+                GateVerdict::Failed { .. } => return Ok(Some(l.branch.clone())),
+                // Environmental: identical at every prefix, so stop rather than
+                // blame `l.branch` for a missing binary.
+                v @ GateVerdict::Error { .. } => return Err(BisectAborted(v).into()),
+            }
         }
     }
     Ok(None)
 }
+
+/// A bisect that stopped because the gate could not run. Carries the verdict so
+/// the caller can report the environment failure verbatim.
+#[derive(Debug)]
+pub(crate) struct BisectAborted(pub(crate) GateVerdict);
+
+impl std::fmt::Display for BisectAborted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            GateVerdict::Error { reason, .. } => write!(f, "{reason}"),
+            _ => write!(f, "gate could not run"),
+        }
+    }
+}
+
+impl std::error::Error for BisectAborted {}
 
 fn branch_tip(repo_root: &Path, branch: &str) -> Result<String> {
     let loc = GitLoc::for_worktree(repo_root);
@@ -647,7 +713,22 @@ pub fn run_fold(
 
         // Test-gate the union before blessing it.
         let gate = if gate_on {
-            if gate_tip(repo_root, &plan.final_tip, cfg)?.0 {
+            let verdict = gate_tip(repo_root, &plan.final_tip, cfg)?;
+            // The gate could not run: report the environment and hold everything
+            // back. Never bisect — the failure is identical at every prefix.
+            if let GateVerdict::Error { reason, .. } = &verdict {
+                return Ok(build_report(
+                    &target_branch,
+                    &original,
+                    &plan,
+                    &gate_offenders,
+                    GateOutcome::Errored {
+                        reason: reason.clone(),
+                    },
+                    cas_attempts,
+                ));
+            }
+            if verdict.passed() {
                 GateOutcome::Passed
             } else if cfg.bisect_on_red {
                 let landed: Vec<LandedReport> = plan
@@ -658,7 +739,26 @@ pub fn run_fold(
                         commit: l.commit.clone(),
                     })
                     .collect();
-                if let Some(off) = bisect_offender(repo_root, &adapter, &base, &landed, cfg)? {
+                let bisected = match bisect_offender(repo_root, &adapter, &base, &landed, cfg) {
+                    Ok(o) => o,
+                    // The gate stopped being runnable mid-bisect: report the
+                    // environment rather than blaming whichever branch was next.
+                    Err(e) => {
+                        let reason = match e.downcast_ref::<BisectAborted>() {
+                            Some(b) => b.to_string(),
+                            None => return Err(e),
+                        };
+                        return Ok(build_report(
+                            &target_branch,
+                            &original,
+                            &plan,
+                            &gate_offenders,
+                            GateOutcome::Errored { reason },
+                            cas_attempts,
+                        ));
+                    }
+                };
+                if let Some(off) = bisected {
                     excluded.insert(off.clone());
                     gate_offenders.push(off);
                     continue; // re-fold without the offender
@@ -739,7 +839,12 @@ pub(crate) enum AttemptOutcome {
     /// A textual (or unresolved regenerable) conflict against the current target.
     Conflict { paths: Vec<String> },
     /// Merged clean but the gate went red. `log` is the tail of the gate output.
+    /// A verdict about the *branch* — this is the one a fixing agent can act on.
     GateFailed { log: String },
+    /// Merged clean, but the gate could not RUN (missing binary, unprovisioned
+    /// gate worktree, killed). A fact about the *environment*, so the branch is
+    /// not blamed and the fixing agent is never dispatched — it cannot help.
+    GateError { reason: String, log: String },
     /// The branch tip is already an ancestor of the target — nothing to do.
     UpToDate,
     /// The branch lives on another host and its tip could not be fetched into
@@ -810,9 +915,14 @@ pub(crate) fn attempt_land(
         }
         let folded_tip = plan.final_tip.clone();
         if gate_on {
-            let (ok, log) = gate_tip(repo_root, &folded_tip, cfg)?;
-            if !ok {
-                return Ok(AttemptOutcome::GateFailed { log });
+            match gate_tip(repo_root, &folded_tip, cfg)? {
+                GateVerdict::Passed => {}
+                GateVerdict::Failed { log } => {
+                    return Ok(AttemptOutcome::GateFailed { log });
+                }
+                GateVerdict::Error { reason, log } => {
+                    return Ok(AttemptOutcome::GateError { reason, log });
+                }
             }
         }
         if !cfg.auto_land {
