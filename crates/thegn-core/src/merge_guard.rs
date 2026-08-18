@@ -14,12 +14,18 @@
 //! `merge --ff-only` fails — it must rewrite the read-only tree — but the fold
 //! path succeeds: it writes objects and advances `refs/heads/main` by
 //! compare-and-swap (`update-ref <ref> <new> <old>`), never touching the tree.
-//! The tree then re-coheres on its own: a running instance whose live checkout
-//! is on the advanced branch fast-forwards its **own** working tree on the ref
-//! move (`util::heal_main_checkout_worktree`, driven by the ref fs-watcher — see
-//! the host's `git_watch::spawn_main_checkout_heal`). Never hand-roll a
+//! The tree is then re-cohered by the fold itself: on a successful CAS,
+//! `util::resync_branch_checkouts` fast-forwards **every** worktree that has the
+//! advanced branch checked out (`git read-tree -m -u`, which aborts rather than
+//! clobber). A checkout with genuine uncommitted work is deliberately left
+//! alone — and *reported*, with the exact `git reset --keep` that syncs it,
+//! because a ref that moved under a live tree makes `git status` show the whole
+//! fold as pending deletions. A running instance additionally self-heals on the
+//! ref move (`util::heal_main_checkout_worktree`, driven by the ref fs-watcher —
+//! see the host's `git_watch::spawn_main_checkout_heal`), but that path is
+//! compositor-only and must never be relied on by the CLI. Never hand-roll a
 //! `git update-ref` to "merge to main"; use `thegn land`, which folds, gates,
-//! CAS-advances, and lets the live instance sync itself.
+//! CAS-advances, and syncs the checkouts.
 //!
 //! This module ships a `pre-merge-commit` hook that detects exactly that
 //! situation and refuses, pointing at `thegn integrate`. thegn installs it

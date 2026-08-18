@@ -64,6 +64,9 @@ pub(crate) struct DriveOutcome {
     /// separately from `deferred` so a caller never reads "the branch is bad"
     /// out of "the gate binary is missing".
     pub gate_error: Vec<String>,
+    /// Live checkouts of the target branch and what the ref advance did to them.
+    /// Advisory; the CLI warns about the ones it could not fast-forward.
+    pub resyncs: Vec<thegn_core::util::CheckoutResync>,
 }
 
 /// Why a branch didn't land — the material a fixing agent needs.
@@ -160,7 +163,10 @@ pub(crate) fn drive_queue(
             };
 
             let failure = match attempt {
-                AttemptOutcome::Landed { commit } => {
+                AttemptOutcome::Landed { commit, resyncs } => {
+                    // Carried out to the caller so the CLI can warn about any
+                    // live checkout of the target left stale by the ref move.
+                    out.resyncs.extend(resyncs);
                     set(db, "landed", Some(&commit), None);
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Landed);
                     progress(&DriveStep {

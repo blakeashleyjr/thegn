@@ -267,7 +267,9 @@ part of the shipped `thegn` binary.
 git merge` / `merge --ff-only` fail (they rewrite the read-only tree), while
   the object-DB fold succeeds. Use **`thegn land`** (one-shot: fold + gate +
   CAS-advance `refs/heads/main`, no target checkout) — or `thegn integrate` for
-  the whole queue. A running instance on `main` then fast-forwards its own tree
-  on the ref move (`git_watch`/`util::heal_main_checkout_worktree`). Don't
+  the whole queue. The land itself
+  fast-forwards every worktree holding the target (`util::resync_branch_checkouts`)
+  and reports any it had to leave alone; a running instance additionally
+  self-heals on the ref move (`git_watch`/`util::heal_main_checkout_worktree`). Don't
   hand-roll `git update-ref` to "merge to main" (it moves the ref but leaves the
   live tree stale). See `crates/thegn-core/src/merge_guard.rs`.

@@ -28,8 +28,13 @@ persisted; entries survive restarts.
   resolve, then continues.
 - `thegn integrate` does the same from any shell.
 
-A running instance sitting on `main` fast-forwards its own tree when the
-ref moves — no stale checkout.
+The fold advances the ref without checking anything out, so any worktree
+sitting **on** the target would be left with a stale working tree. Every
+such checkout — the main one or a linked worktree — is fast-forwarded as
+part of the land. One with real uncommitted work is left alone and
+_named_, with the `git reset --keep` that syncs it: don't commit the
+pending deletions `git status` shows there, they are the fold, not a
+deletion.
 
 ## Across hosts
 
