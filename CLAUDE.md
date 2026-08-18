@@ -141,14 +141,24 @@ Run inside `nix develop` (rust toolchain + tools). Human-contributor
 onboarding (prerequisites per platform, macOS notes) lives in
 `CONTRIBUTING.md`.
 
-**`nix develop`, not `devenv shell`, for the cross gates.** The two shells
-resolve different rust toolchains: `nix develop` gets the flake's
-`rustToolchain` (rust-overlay), which declares the `aarch64-apple-darwin` and
-`x86_64-pc-windows-gnu` `rust-std` sets; `devenv shell` gets a nixpkgs
-toolchain with **no cross targets**, so `just check-cross` (and therefore
-`just ci`) fails there with `can't find crate for 'core'` — an environment
-failure that reads like a code failure. Use `nix develop` for `check-cross` /
-`ci`. (`devenv shell` remains the one that regenerates the pre-commit config.)
+**`nix develop`, not `devenv shell`, for the cross gates** — and note the two
+shells have historically disagreed, in both directions:
+
+- `nix develop` gets the flake's `rustToolchain` (rust-overlay), which declares
+  the `aarch64-apple-darwin` + `x86_64-pc-windows-gnu` `rust-std` sets.
+  `devenv shell` gets a nixpkgs toolchain with **no cross targets**, so
+  `just check-cross` fails there with `can't find crate for 'core'`.
+- Conversely the mingw cross **C** toolchain (`CC_x86_64_pc_windows_gnu` &c.)
+  used to be set only in `devenv.nix`, so check-cross passed in devenv and
+  failed under a bare `nix develop` with `implicit declaration of function
+'lseek'` from libz-sys. It is now also exported by the flake devShell
+  (`mingwCrossEnv`) — **keep the two in sync; CI depends on the flake one**
+  (every CI job runs `nix develop --command just <gate>`).
+
+Beware nesting: a `nix develop` launched _inside_ a devenv shell inherits
+devenv's env, so a gate can pass locally for reasons CI does not have. Test
+cross gates from a clean shell. (`devenv shell` remains the one that
+regenerates the pre-commit config.)
 
 ```sh
 just quick [crate]   # fast inner-loop: clippy on lib/bin only (no test targets)
