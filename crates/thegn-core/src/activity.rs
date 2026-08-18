@@ -1203,6 +1203,13 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         // Poll thread: hammers load→mutate→save on the same file with an
         // advancing clock so the MIN_SCAN_INTERVAL guard never short-circuits it.
+        //
+        // The tiny per-cycle sleep is load-bearing, not politeness. `WRITE_LOCK`
+        // is a std Mutex (not fair): a poller that re-acquires immediately after
+        // unlocking barges the waiting main thread, which starved this test for
+        // minutes on a many-core box. Pausing between cycles still interleaves
+        // thousands of poll/ack pairs — which is what the race is about — while
+        // letting the acker make progress.
         let poller = {
             let (path, stop, managed) = (path.clone(), stop.clone(), managed.clone());
             std::thread::spawn(move || {
@@ -1210,6 +1217,7 @@ mod tests {
                 while !stop.load(Ordering::Relaxed) {
                     poll_and_save_at(&path, &managed, t);
                     t += 2.0;
+                    std::thread::sleep(std::time::Duration::from_micros(50));
                 }
             })
         };

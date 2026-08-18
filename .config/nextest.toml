@@ -1,6 +1,15 @@
 # cargo-nextest configuration. Read automatically by `cargo nextest run`
 # (both the CI `test` job and the pre-push hook run `just test`).
 
+# Bound a hung test. Without `terminate-after`, nextest warns forever and a
+# wedged test only surfaces at the CI job's `timeout-minutes: 50` — as a
+# timed-out job rather than a named failing test. A lock-starved test
+# (activity::tests::concurrent_ack_and_poll_never_lose_ack_or_tear) sat here for
+# minutes before this was added. 60s x 5 = 5 minutes is far above any healthy
+# test in this suite (the whole 4200-test run finishes well inside that).
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # Concurrency cap for git-subprocess-heavy tests.
 #
 # The worktree / wizard-worker / git-backend / mcp-git tests each shell out to
