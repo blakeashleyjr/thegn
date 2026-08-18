@@ -20,10 +20,12 @@ thegn versions follow SemVer with pre-release tags: `0.1.0-alpha.N` →
    ```
 
    The [`release`](.github/workflows/release.yml) workflow builds the `thegn`
-   binary for linux (gnu + musl), macOS (arm + x86-64), and windows-msvc, and
-   attaches per-target archives + `.sha256` checksums (named
-   `thegn-<tag>-<target>.sha256` — no `.tar.gz` infix) to a **draft** GitHub
-   Release. Write the release notes (crib from the changelog) and publish.
+   binary for **x86_64 linux (gnu + musl)** and attaches per-target archives +
+   `.sha256` checksums (named `thegn-<tag>-<target>.sha256` — no `.tar.gz`
+   infix) to a **draft** GitHub Release. The macOS and windows-msvc legs were
+   removed as of `v0.1.0-alpha.1`: `thegn-host` has never been compiled for
+   either, and `fail-fast: false` meant an unbuilt target silently produced a
+   partial asset set. Re-add a target only once its CI job is green. Write the release notes (crib from the changelog) and publish.
    Pre-release tags (`-alpha.N` / `-beta.N`) are auto-marked as a prerelease
    by the workflow — no manual checkbox needed.
 
@@ -35,22 +37,24 @@ thegn versions follow SemVer with pre-release tags: `0.1.0-alpha.N` →
    > `workflow_dispatch` for full from-scratch rebuilds where losing the
    > release is acceptable.
 
-5. **Bump the Homebrew formula** (`packaging/homebrew/thegn.rb`): update
-   `version` and paste the two macOS `sha256` values from the release's
-   `*-apple-darwin.sha256` assets. Note: the tap repo does not exist yet —
-   create `blakeashleyjr/homebrew-tap` and commit the formula there (or keep
-   the formula in-repo until then; users can
+5. **Bump the Homebrew formula** (`packaging/homebrew/thegn.rb`) — _blocked
+   until the macOS legs are back in the matrix._ The formula needs the two
+   macOS `sha256` values from the release's `*-apple-darwin.sha256` assets, and
+   the release no longer produces them. The tap repo does not exist yet either;
+   when both are true, create `blakeashleyjr/homebrew-tap` and commit the
+   formula there (or keep it in-repo — users can
    `brew install --formula ./packaging/homebrew/thegn.rb`).
 
 ## Install paths this enables
 
-- **Prebuilt binary** — download the archive for your platform from the release
-  page, extract `thegn` onto your `PATH`.
-- **Homebrew** — `brew install <owner>/tap/thegn` (once the tap carries the
-  bumped formula).
+- **Prebuilt binary** — download the linux-gnu or linux-musl archive from the
+  release page, verify the `.sha256`, extract `thegn` onto your `PATH`.
 - **Nix** — `nix profile install github:blakeashleyjr/thegn` (works off any ref,
-  no release needed).
+  no release needed). The flake has no private inputs, so this works for anyone;
+  keep it that way — adding a private input silently breaks this path for
+  everyone but the maintainer.
 - **From source** — `./install.sh` (needs Rust/Cargo).
+- **Homebrew** — not yet; see step 5.
 
 ## Not yet: crates.io / `cargo binstall`
 
