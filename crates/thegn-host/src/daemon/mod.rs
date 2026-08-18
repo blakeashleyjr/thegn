@@ -214,7 +214,7 @@ async fn run(
         grace_ms: (cfg.daemon.lease_grace_secs as i64).saturating_mul(1000),
         idle_tx,
         shutdown: shutdown.clone(),
-        merge_queue: cfg.merge_queue.clone(),
+        config: std::sync::Arc::new(cfg.clone()),
     });
 
     // SIGTERM/SIGINT (console-close on Windows) → the same graceful-shutdown

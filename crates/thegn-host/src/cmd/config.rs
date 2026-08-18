@@ -144,11 +144,27 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
     use thegn_core::config::ProcessEnv;
     use thegn_core::config_resolve;
     let origin = config_resolve::explain(&ProcessEnv, &[], Some(path), key);
+    // The per-repo layers are NOT part of the preference cascade `explain`
+    // replays, so without this the trace confidently reported the global value
+    // for a key a `[workspace.<slug>]` block had already overridden — the probe
+    // lied. Default the repo to the cwd's, so running `config explain` inside a
+    // repo tells the truth without needing to remember `--repo`.
+    let repo_root = repo
+        .clone()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .and_then(|p| thegn_core::repo::main_worktree(&p));
+    let ws = repo_root
+        .as_ref()
+        .and_then(|root| workspace_layer(cfg, root, key));
     if json {
         let mut obj = serde_json::json!({
             "key": origin.key,
-            "value": origin.value,
-            "origin": origin.origin.as_str(),
+            "value": ws.as_ref().map_or(origin.value.clone(), |(_, v)| v.clone()),
+            "origin": ws.as_ref().map_or(origin.origin.as_str().to_string(), |(s, _)| {
+                format!("workspace [workspace.{s}]")
+            }),
+            "cascade_value": origin.value,
         });
         if let Some(repo) = &repo {
             let (events, pending) = repo_clamp(cfg, repo, key);
@@ -158,10 +174,24 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
         outln!("{}", serde_json::to_string_pretty(&obj)?);
         return Ok(());
     }
-    outln!("{} = {}", origin.key, origin.value);
-    outln!("  set by: {}", origin.origin.as_str());
+    match &ws {
+        Some((slug, v)) => {
+            outln!("{} = {v}", origin.key);
+            outln!("  set by: workspace `[workspace.{slug}]`");
+        }
+        None => {
+            outln!("{} = {}", origin.key, origin.value);
+            outln!("  set by: {}", origin.origin.as_str());
+        }
+    }
     for (layer, val) in &origin.trace {
         outln!("    {}: {val}", layer.as_str());
+    }
+    if let (Some((slug, v)), Some(root)) = (&ws, &repo_root) {
+        outln!(
+            "    workspace `[workspace.{slug}]`: {v}   (for {})",
+            root.display()
+        );
     }
     if let Some(repo) = &repo {
         let (events, pending) = repo_clamp(cfg, repo, key);
@@ -176,6 +206,29 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
         }
     }
     Ok(())
+}
+
+/// The `[workspace.<slug>]` layer's value for `key` in this repo, when it
+/// differs from the plain cascade — plus the slug, so the trace can name the
+/// exact block the user has to edit.
+///
+/// Only `merge_queue.*` is carried by that layer today; other keys return
+/// `None` and explain as before.
+fn workspace_layer(
+    cfg: &Config,
+    repo_root: &std::path::Path,
+    key: &str,
+) -> Option<(String, serde_json::Value)> {
+    let sub = key.strip_prefix("merge_queue.")?;
+    let slug = thegn_core::config::workspace_slug(repo_root);
+    let ws = cfg.workspace.get(&slug)?;
+    if ws.merge_queue.is_empty() {
+        return None;
+    }
+    let resolved = serde_json::to_value(cfg.repo_merge_queue(repo_root)).ok()?;
+    let global = serde_json::to_value(&cfg.merge_queue).ok()?;
+    let v = resolved.get(sub)?;
+    (v != global.get(sub)?).then(|| (slug, v.clone()))
 }
 
 /// Repo-overlay clamp events + pending summaries filtered to a key prefix, using

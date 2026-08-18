@@ -598,6 +598,204 @@ impl Default for MergeQueueConfig {
     }
 }
 
+/// The `[workspace.<slug>]` key for a repo.
+///
+/// One definition so every consumer of the workspace layer agrees on the slug —
+/// it was previously inlined in `config_resolve::resolve_repo_sandbox`, and a
+/// second copy that drifted would silently stop matching the user's block.
+pub fn workspace_slug(repo_root: &Path) -> String {
+    let base = crate::util::slugify(&crate::repo::repo_name(repo_root));
+    if base.is_empty() {
+        "repo".to_string()
+    } else {
+        base
+    }
+}
+
+/// An `Option`-per-field overlay of `[merge_queue]`, for the layers that refine
+/// it per repo: `[workspace.<slug>] merge_queue` in the user's own config
+/// (trusted) and a repo-root `.thegn.*` `[merge_queue]` (untrusted, clamped).
+///
+/// Every key in `[merge_queue]` describes a *repository* — its build tool, its
+/// integration branch, its lockfiles — yet the table could only be set once for
+/// every repo at once, so a repo that differed from the user's defaults could
+/// only be handled with `--set` flags on every invocation.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MergeQueueOverlay {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_mode: Option<MergeRemoteMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_setup_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_on: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_reuse_worktree: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_target_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bisect_on_red: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_dirty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regenerate_paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regenerate_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_handoff: Option<ConflictHandoff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_land: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_max_attempts: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organize_folders: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queued_folder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_landed: Option<OnLanded>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_folder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_folder: Option<String>,
+}
+
+impl MergeQueueOverlay {
+    /// True when nothing is set (lets the carrying struct skip serialization).
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.remote_mode.is_none()
+            && self.target_branch.is_none()
+            && self.gate_command.is_none()
+            && self.gate_setup_command.is_none()
+            && self.gate_on.is_none()
+            && self.gate_reuse_worktree.is_none()
+            && self.gate_target_dir.is_none()
+            && self.bisect_on_red.is_none()
+            && self.snapshot_dirty.is_none()
+            && self.regenerate_paths.is_none()
+            && self.regenerate_command.is_none()
+            && self.conflict_handoff.is_none()
+            && self.agent_command.is_none()
+            && self.auto_land.is_none()
+            && self.agent_max_attempts.is_none()
+            && self.agent_timeout_secs.is_none()
+            && self.organize_folders.is_none()
+            && self.queued_folder.is_none()
+            && self.on_landed.is_none()
+            && self.merged_folder.is_none()
+            && self.failed_folder.is_none()
+    }
+
+    /// Apply present fields onto `base` (present wins, absent inherits).
+    ///
+    /// Destructured exhaustively on purpose — no `..`. A field added to
+    /// `MergeQueueConfig` later must fail to compile here rather than be
+    /// silently dropped from the per-repo layers, which is the same discipline
+    /// `config_resolve::classify_repo_overlay` uses for the sandbox overlay.
+    pub fn apply(self, base: &mut MergeQueueConfig) {
+        let MergeQueueOverlay {
+            enabled,
+            remote_mode,
+            target_branch,
+            gate_command,
+            gate_setup_command,
+            gate_on,
+            gate_reuse_worktree,
+            gate_target_dir,
+            bisect_on_red,
+            snapshot_dirty,
+            regenerate_paths,
+            regenerate_command,
+            conflict_handoff,
+            agent_command,
+            auto_land,
+            agent_max_attempts,
+            agent_timeout_secs,
+            organize_folders,
+            queued_folder,
+            on_landed,
+            merged_folder,
+            failed_folder,
+        } = self;
+        if let Some(v) = enabled {
+            base.enabled = v;
+        }
+        if let Some(v) = remote_mode {
+            base.remote_mode = v;
+        }
+        if let Some(v) = target_branch {
+            base.target_branch = v;
+        }
+        if let Some(v) = gate_command {
+            base.gate_command = v;
+        }
+        if let Some(v) = gate_setup_command {
+            base.gate_setup_command = v;
+        }
+        if let Some(v) = gate_on {
+            base.gate_on = v;
+        }
+        if let Some(v) = gate_reuse_worktree {
+            base.gate_reuse_worktree = v;
+        }
+        if let Some(v) = gate_target_dir {
+            base.gate_target_dir = v;
+        }
+        if let Some(v) = bisect_on_red {
+            base.bisect_on_red = v;
+        }
+        if let Some(v) = snapshot_dirty {
+            base.snapshot_dirty = v;
+        }
+        if let Some(v) = regenerate_paths {
+            base.regenerate_paths = v;
+        }
+        if let Some(v) = regenerate_command {
+            base.regenerate_command = v;
+        }
+        if let Some(v) = conflict_handoff {
+            base.conflict_handoff = v;
+        }
+        if let Some(v) = agent_command {
+            base.agent_command = v;
+        }
+        if let Some(v) = auto_land {
+            base.auto_land = v;
+        }
+        if let Some(v) = agent_max_attempts {
+            base.agent_max_attempts = v;
+        }
+        if let Some(v) = agent_timeout_secs {
+            base.agent_timeout_secs = v;
+        }
+        if let Some(v) = organize_folders {
+            base.organize_folders = v;
+        }
+        if let Some(v) = queued_folder {
+            base.queued_folder = v;
+        }
+        if let Some(v) = on_landed {
+            base.on_landed = v;
+        }
+        if let Some(v) = merged_folder {
+            base.merged_folder = v;
+        }
+        if let Some(v) = failed_folder {
+            base.failed_folder = v;
+        }
+    }
+}
+
 /// `[replay]` — per-pane time-travel recording. Every byte a pane emits is
 /// appended to a bounded in-memory ring with periodic keyframe markers, so the
 /// user can scrub a pane's history like a video (`Alt+r`) and search for any
@@ -1204,6 +1402,15 @@ pub struct WorkspaceConfig {
     /// bundle — the same precedence shape as `accounts`. See [`crate::bundle`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_bundle: Option<String>,
+    /// Per-repo `[merge_queue]` refinements (`[workspace.<slug>.merge_queue]`).
+    ///
+    /// The TRUSTED per-repo layer: it lives in the user's own config, so unlike
+    /// a repo-root `.thegn.*` it needs no clamping and never blocks a
+    /// non-interactive drain. This is where a repo whose gate differs from your
+    /// global default belongs (`gate_command = "pnpm test"`), and the only place
+    /// the command-shaped keys can be set without an approval step.
+    #[serde(skip_serializing_if = "MergeQueueOverlay::is_empty")]
+    pub merge_queue: MergeQueueOverlay,
 }
 
 /// A named **environment bundle** (`[bundle.<name>]`) — a composable unit of env
@@ -3440,6 +3647,14 @@ pub struct Config {
     pub serve: ServeConfig,
     /// `[merge_queue]` — the local fold-actor (parallel-branch integration).
     /// On by default; the core is AI-free (agent handoff only fires on conflict).
+    /// The RAW global `[merge_queue]` table.
+    ///
+    /// Do NOT read this on a repo-scoped path — use
+    /// [`Config::repo_merge_queue`], or the `[workspace.<slug>] merge_queue`
+    /// layer silently does nothing there. Reading it directly is correct only
+    /// where no repo is in scope (a global enable check for command/palette
+    /// registration, or an enqueue being forwarded to another host before a repo
+    /// root exists).
     pub merge_queue: MergeQueueConfig,
     /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
     /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
@@ -4374,6 +4589,24 @@ impl Config {
         approvals: &crate::config_resolve::Approvals,
     ) -> crate::config_resolve::ResolvedRepoSandbox {
         crate::config_resolve::resolve_repo_sandbox(self, repo_root, approvals)
+    }
+
+    /// The effective `[merge_queue]` for a repo: the global table with the
+    /// `[workspace.<slug>] merge_queue` overlay applied on top.
+    ///
+    /// Every repo-scoped merge-queue consumer MUST go through here rather than
+    /// reading `Config::merge_queue` directly, or the per-repo layer silently
+    /// does nothing on that path. `repo_root` identifies the repo; the slug is
+    /// derived the same way `[workspace.<slug>]`'s other keys are.
+    pub fn repo_merge_queue(&self, repo_root: &Path) -> MergeQueueConfig {
+        let mut mq = self.merge_queue.clone();
+        if !self.workspace.is_empty()
+            && let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
+            && !ws.merge_queue.is_empty()
+        {
+            ws.merge_queue.clone().apply(&mut mq);
+        }
+        mq
     }
 
     /// The name of the env a repo's `.thegn.*` overlay selects (`env = "…"`),

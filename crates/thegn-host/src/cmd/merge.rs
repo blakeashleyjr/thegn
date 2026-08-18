@@ -65,7 +65,15 @@ pub enum Action {
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
-    if !cfg.merge_queue.enabled {
+    // `enabled` is checked against the REPO-resolved table, so a
+    // `[workspace.<slug>] merge_queue.enabled = false` can turn the queue off for
+    // one repo. Resolving needs a repo root; when there isn't one (not inside a
+    // repo) fall back to the global table so the refusal message below still
+    // beats a confusing "not inside a git repository" from the subcommand.
+    let enabled = repo_root()
+        .map(|root| cfg.repo_merge_queue(&root).enabled)
+        .unwrap_or(cfg.merge_queue.enabled);
+    if !enabled {
         // Refusal, not success: bail so the process exits non-zero — scripts/CI
         // must be able to tell "did nothing because disabled" from "did the work".
         anyhow::bail!(
@@ -202,12 +210,14 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
     // env) sends the enqueue to the host's daemon so the host's queue owns the
     // row. `--all` enumerates local branches, so it stays on the local path.
     if !all
+        // Global table on purpose: this branch runs BEFORE a repo root is known
+        // (the enqueue is being forwarded to another host), so there is nothing
+        // to resolve against yet.
         && cfg.merge_queue.remote_mode == thegn_core::config::MergeRemoteMode::RouteToHost
         && let Some((url, token)) = control_endpoint_from_env()
     {
         return add_via_host(&url, &token, worktrees);
     }
-    let mq = &cfg.merge_queue;
     let db = Db::open()?;
 
     if all {
@@ -216,6 +226,7 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
         // demanding one here made `merge add <path>` from outside a repo fail
         // with "not inside a git repository", pointing at the wrong thing.
         let root = repo_root()?;
+        let mq = &cfg.repo_merge_queue(&root);
         let target = integrate::resolve_target(mq, &root);
         let cands = integrate::candidate_branches(mq, &root, &target)?;
         for s in &cands.skipped_dirty {
@@ -241,7 +252,7 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
         worktrees.iter().map(PathBuf::from).collect()
     };
     for wt in paths {
-        let msg = crate::merge_ops::enqueue_worktree(mq, &db, &wt)?;
+        let msg = crate::merge_ops::enqueue_worktree(cfg, &db, &wt)?;
         let mark = if msg.starts_with("skipped") {
             "•"
         } else {
@@ -265,7 +276,7 @@ fn rm(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let was_queued = db.list_merge_queue()?.iter().any(|r| r.worktree == wt_s);
     // Dequeue AND un-file from the lifecycle folder, so `rm` doesn't strand the
     // worktree in "Merging"/"Needs attention" (the sidebar/queue de-sync).
-    crate::merge_ops::dequeue_worktree(&cfg.merge_queue, &db, &wt)?;
+    crate::merge_ops::dequeue_worktree(cfg, &db, &wt)?;
     if !was_queued {
         anyhow::bail!("{wt_s} was not in the queue.");
     }
@@ -276,14 +287,14 @@ fn rm(cfg: &Config, worktree: Option<String>) -> Result<()> {
 fn clear(cfg: &Config) -> Result<()> {
     let root = repo_root()?;
     let db = Db::open()?;
-    let n = crate::merge_ops::clear_repo(&cfg.merge_queue, &db, &root)?;
+    let n = crate::merge_ops::clear_repo(cfg, &db, &root)?;
     outln!("Queue cleared ({n} removed).");
     Ok(())
 }
 
 fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     let root = repo_root()?;
-    let mq = &cfg.merge_queue;
+    let mq = &cfg.repo_merge_queue(&root);
     // `push` mode drains this clone locally and pushes to origin, so it skips the
     // remote-target guard; `route_to_host` keeps the fold on the target host.
     let push_mode = mq.remote_mode == thegn_core::config::MergeRemoteMode::Push;
@@ -482,7 +493,14 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
     // Apply the sidebar-folder lifecycle for this worktree once we know its fate.
     let lifecycle = |event: LifecycleEvent| {
         if let Some(root) = integrate::main_checkout(&wt) {
-            crate::merge_lifecycle::apply(&cfg.merge_queue, &db, &root, &wt_s, &branch, event);
+            crate::merge_lifecycle::apply(
+                &cfg.repo_merge_queue(&root),
+                &db,
+                &root,
+                &wt_s,
+                &branch,
+                event,
+            );
         }
     };
     // A failed land still records its fate (DB + lifecycle) below, but must exit

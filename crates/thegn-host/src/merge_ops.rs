@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use thegn_core::config::MergeQueueConfig;
+use thegn_core::config::Config;
 use thegn_core::db::{Db, MergeQueueRow};
 use thegn_core::merge_lifecycle::LifecycleEvent;
 use thegn_core::remote::GitLoc;
@@ -127,9 +127,12 @@ fn resolve_repo_root(worktree: &Path) -> Result<PathBuf> {
 /// sidebar-folder lifecycle. Returns a short human message describing the
 /// outcome (queued / skipped). Errors only on a genuinely broken worktree
 /// (detached HEAD, not a repo) or a DB write failure.
-pub fn enqueue_worktree(mq: &MergeQueueConfig, db: &Db, worktree: &Path) -> Result<String> {
+pub fn enqueue_worktree(cfg: &Config, db: &Db, worktree: &Path) -> Result<String> {
     let worktree = &canonical_worktree(worktree);
     let root = resolve_repo_root(worktree)?;
+    // Takes the whole `Config` rather than a `MergeQueueConfig`: only here is the
+    // repo root known, and the per-repo layer can't be applied without it.
+    let mq = &cfg.repo_merge_queue(&root);
     let target = integrate::resolve_target(mq, &root);
     let branch = branch_of(worktree)
         .with_context(|| format!("{}: not on a branch (detached HEAD?)", worktree.display()))?;
@@ -149,7 +152,7 @@ pub fn enqueue_worktree(mq: &MergeQueueConfig, db: &Db, worktree: &Path) -> Resu
 /// enqueue filed it into (the sidebar/queue de-sync). The un-file is best-effort
 /// and guarded host-side to lifecycle-managed folders; dropping the row is the
 /// operation that can fail.
-pub fn dequeue_worktree(mq: &MergeQueueConfig, db: &Db, worktree: &Path) -> Result<()> {
+pub fn dequeue_worktree(cfg: &Config, db: &Db, worktree: &Path) -> Result<()> {
     let worktree = &canonical_worktree(worktree);
     let wt_s = worktree.to_string_lossy().to_string();
     db.remove_merge_entry(&wt_s)?;
@@ -157,6 +160,7 @@ pub fn dequeue_worktree(mq: &MergeQueueConfig, db: &Db, worktree: &Path) -> Resu
     // unused by the un-file), so an empty branch is fine; skip only if the repo
     // root can't be resolved (worktree dir already gone — nothing to un-file).
     if let Some(root) = integrate::main_checkout(worktree) {
+        let mq = &cfg.repo_merge_queue(&root);
         crate::merge_lifecycle::apply(mq, db, &root, &wt_s, "", LifecycleEvent::Dequeued);
     }
     Ok(())
@@ -164,11 +168,11 @@ pub fn dequeue_worktree(mq: &MergeQueueConfig, db: &Db, worktree: &Path) -> Resu
 
 /// Drop every queue row for `root`'s repo, un-filing each from its lifecycle
 /// folder. Returns the number removed.
-pub fn clear_repo(mq: &MergeQueueConfig, db: &Db, root: &Path) -> Result<usize> {
+pub fn clear_repo(cfg: &Config, db: &Db, root: &Path) -> Result<usize> {
     let rows = rows_for_repo(db, root);
     let n = rows.len();
     for r in &rows {
-        dequeue_worktree(mq, db, Path::new(&r.worktree))?;
+        dequeue_worktree(cfg, db, Path::new(&r.worktree))?;
     }
     Ok(n)
 }

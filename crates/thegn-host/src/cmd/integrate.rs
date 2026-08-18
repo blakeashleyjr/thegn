@@ -17,19 +17,23 @@ fn short(oid: &str) -> &str {
 }
 
 pub fn run(cfg: &Config) -> Result<()> {
-    if !cfg.merge_queue.enabled {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let repo_root = integrate::main_checkout(&cwd).context("not inside a git repository")?;
+    // Resolve the repo's effective `[merge_queue]` FIRST, so `enabled` (and
+    // everything below) honors a `[workspace.<slug>]` refinement rather than the
+    // bare global table.
+    let resolved = cfg.repo_merge_queue(&repo_root);
+    if !resolved.enabled {
         outln!(
             "Merge queue disabled. Set `[merge_queue]` `enabled = true` in your config to use it."
         );
         return Ok(());
     }
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let repo_root = integrate::main_checkout(&cwd).context("not inside a git repository")?;
     // `push` mode lands the sprite's OWN clone and pushes to origin, so it skips
     // the remote-target guard (which otherwise redirects an off-host target to
     // its host). In `route_to_host` mode the fold still runs in the target repo's
     // object store, so a remote target must be folded on its own host.
-    let push_mode = cfg.merge_queue.remote_mode == thegn_core::config::MergeRemoteMode::Push;
+    let push_mode = resolved.remote_mode == thegn_core::config::MergeRemoteMode::Push;
     if !push_mode
         && let Ok(db) = Db::open()
         && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &repo_root)
@@ -37,7 +41,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         outln!("{msg}");
         return Ok(());
     }
-    let mq = &cfg.merge_queue;
+    let mq = &resolved;
     let target = integrate::resolve_target(mq, &repo_root);
 
     let cands = integrate::candidate_branches(mq, &repo_root, &target)?;

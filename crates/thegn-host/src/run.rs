@@ -16224,7 +16224,7 @@ async fn event_loop<T: Terminal>(
                                     &mut toasts,
                                     &fold_tx,
                                     &waker,
-                                    current_config.merge_queue.clone(),
+                                    current_config.clone(),
                                     crate::hydrate::active_tab_path(&session),
                                 );
                             }
@@ -16235,7 +16235,10 @@ async fn event_loop<T: Terminal>(
                                     &mut toasts,
                                     &drive_tx,
                                     &waker,
-                                    current_config.merge_queue.clone(),
+                                    // The whole Config: the drain resolves the
+                                    // repo's `[merge_queue]` off-loop, once it
+                                    // knows which repo it is draining.
+                                    current_config.clone(),
                                     crate::hydrate::active_tab_path(&session),
                                 );
                             }
