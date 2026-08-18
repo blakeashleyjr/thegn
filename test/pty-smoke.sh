@@ -21,7 +21,15 @@ command -v timeout >/dev/null 2>&1 || {
 }
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# Best-effort teardown preserving the real exit status — see the same guard in
+# test/smoke.sh: a container backend can leave storage under $TMP that this
+# user cannot unlink, and cleanup must never decide the verdict.
+cleanup() {
+  local rc=$?
+  rm -rf "$TMP" 2>/dev/null || true
+  exit "$rc"
+}
+trap cleanup EXIT
 
 fail=0
 ok() { printf '  \033[32mok\033[0m   %s\n' "$1"; }

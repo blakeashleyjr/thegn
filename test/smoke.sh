@@ -18,7 +18,18 @@ SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
 }
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# Best-effort teardown that preserves the real exit status. $HOME is inside
+# $TMP, so if any check exercised a container backend, podman leaves overlay
+# storage under $TMP/.local/share/containers/storage/overlay/ that this user
+# cannot unlink. Under `set -e` a failing `rm -rf` in the trap became the
+# script's exit code — CI reported "all smoke checks passed" and then failed
+# the job. Never let cleanup decide the verdict.
+cleanup() {
+  local rc=$?
+  rm -rf "$TMP" 2>/dev/null || true
+  exit "$rc"
+}
+trap cleanup EXIT
 
 export HOME="$TMP" XDG_CONFIG_HOME="$TMP/.config" XDG_STATE_HOME="$TMP/.local/state"
 # Isolate the runtime dir too: the daemon control socket prefers
