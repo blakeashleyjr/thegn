@@ -17,7 +17,7 @@ Discussion for anything security-sensitive.
 
 - **Preferred:** GitHub's [private vulnerability reporting](https://github.com/blakeashleyjr/thegn/security/advisories/new)
   (Security tab -> Report a vulnerability).
-- **Email:** blake.ashley@hubonesystems.com
+- **Email:** blake@ashleyjr.com
 
 Please include enough detail to reproduce: affected version or commit, platform,
 and a proof of concept if you have one.

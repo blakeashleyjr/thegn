@@ -1,7 +1,9 @@
 # thegn
 
-> **Status: public alpha** (`0.1.0-alpha.1`). Linux and macOS, best-effort
-> native Windows. Expect rough edges; see [`CHANGELOG.md`](CHANGELOG.md) and
+> **Status: public alpha** (`0.1.0-alpha.1`). **x86_64 Linux only** — macOS and
+> Windows are not validated or supported in this release (the code carries
+> per-OS paths for both, but neither has been compiled or run, so no binaries
+> ship). Expect rough edges; see [`CHANGELOG.md`](CHANGELOG.md) and
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
 A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
@@ -132,12 +134,13 @@ Or just the binary: `nix profile install github:blakeashleyjr/thegn`.
 
 ### Prebuilt binary (no Nix)
 
-Each tagged release attaches a `thegn` binary for Linux (gnu + musl), macOS
-(arm + Intel), and Windows to the [releases page][releases]. Download the
-archive for your platform, verify the `.sha256`, and drop `thegn` on your
-`PATH`. Homebrew (macOS): `brew install <owner>/tap/thegn` once the tap carries
-the release. See [`RELEASING.md`](RELEASING.md) for the release process and the
-crates.io / `cargo binstall` status.
+Each tagged release attaches a `thegn` binary for **x86_64 Linux (gnu + musl)**
+to the [releases page][releases]. Download the archive, verify the `.sha256`,
+and drop `thegn` on your `PATH`. macOS and Windows binaries are not published in
+`0.1.0-alpha.1` (see the status note at the top); a Homebrew formula is staged at
+`packaging/homebrew/thegn.rb` for when they are. See
+[`RELEASING.md`](RELEASING.md) for the release process and the crates.io /
+`cargo binstall` status.
 
 [releases]: https://github.com/blakeashleyjr/thegn/releases
 
@@ -158,16 +161,20 @@ owl icon (Exec `tg --standalone`), searchable/pinnable in GNOME/KDE/rofi/wofi.
 thegn shells out to `git` (and `gh`/`ssh` as fallbacks where native support has
 gaps); `lazygit` is optional.
 
-**macOS:** `./setup-macos.sh` checks every prerequisite (Xcode CLT, Nix or
-rustup + Homebrew deps) and offers to install what's missing, then builds.
-Nothing is installed without asking.
+**macOS and Windows are unvalidated in this release.** The per-OS code paths
+exist and the scaffolding below is real, but neither platform has been compiled
+or run, so treat both as work-in-progress rather than supported:
 
-**Windows (native, no WSL):** with [rustup](https://rustup.rs) + the VS Build
-Tools installed, `cargo install --path crates/thegn-host` (or grab the
-`thegn-x86_64-pc-windows-msvc` artifact from any CI run). Run it inside
-[Windows Terminal](https://aka.ms/terminal). Container sandboxing is a
-Linux/WSL2 feature — native panes run host-side, scoped by Job Objects. See
-CONTRIBUTING "Windows (native) notes" for details.
+- **macOS:** `./setup-macos.sh` checks every prerequisite (Xcode CLT, Nix or
+  rustup + Homebrew deps) and offers to install what's missing, then builds.
+  Nothing is installed without asking.
+- **Windows (native, no WSL):** with [rustup](https://rustup.rs) + the VS Build
+  Tools installed, `cargo install --path crates/thegn-host`. Run it inside
+  [Windows Terminal](https://aka.ms/terminal). Container sandboxing is a
+  Linux/WSL2 feature — native panes run host-side, scoped by Job Objects. See
+  CONTRIBUTING "Windows (native) notes" for details.
+
+Reports (and fixes) from either platform are welcome — that is how they graduate.
 
 ## How it works
 
@@ -255,13 +262,29 @@ path**, so host-side git reads (sidebar, panel, PR) keep working.
   / `sealed` (no network, read-only root, all caps dropped).
 - **Named environments** (`[env.<name>]`) place a worktree locally, over
   `ssh`, on Kubernetes, or on a managed provider; `thegn env` inspects and
-  selects them.
+  selects them. _(Non-local placement is **dev channel only** — see Channels.)_
 - **Remote** (`[sandbox.remote]`) runs worktrees on another machine — the
   interactive pane over **mosh** by default, git reads and lifecycle over
-  **ssh**; composes with the container backends.
+  **ssh**; composes with the container backends. _(**Dev channel only.**)_
 - **Opt out** — `backend = "none"` (or `enabled = false`). Agents need
   network and credentials, so `network` defaults to `nat` and
   `env_passthrough` forwards `SSH_AUTH_SOCK`/tokens.
+
+## Channels
+
+The **stable** build — what you get from a release binary, `nix profile install`,
+or `./install.sh` — ships the shell described above. A set of experimental
+subsystems is compiled in but **clamped off** outside the dev channel:
+
+- remote worktrees over SSH and named non-local environments,
+- cloud execution providers,
+- the Observe dashboards and the placement engine,
+- non-GitHub issue trackers (GitHub PR/issue viewing stays available).
+
+Enable them with `THEGN_CHANNEL=dev`, or install the dev build
+(`nix run .#dev` / `nix profile install .#dev`, which lands as `thegn-dev`
+alongside a stable install). `thegn doctor` prints which channel you are on and
+what is clamped.
 
 ## Development
 

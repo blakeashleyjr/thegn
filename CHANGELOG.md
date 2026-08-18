@@ -7,10 +7,19 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0-alpha.1] — 2026-08-15
+## [0.1.0-alpha.1] — 2026-08-18
 
 The first public release: the AI-free workspace shell. Everything below is the
 initial feature set rather than a delta.
+
+### Platforms
+
+Prebuilt binaries ship for **x86_64 Linux** (gnu + musl) only. macOS and
+Windows are **not validated** in this release — the code carries per-OS paths
+and cross-checks for them, but `thegn-host` has never been compiled or run on
+either, so no binaries are published and neither platform is supported yet.
+Building from source on them is untested. Nix (`nix profile install
+github:blakeashleyjr/thegn`) and `./install.sh` cover Linux.
 
 ### The shell
 
@@ -25,12 +34,15 @@ initial feature set rather than a delta.
 - **Git, first-class** — sidebar tree with live status/activity, diff and PR
   panels, blame, semantic (entity-level) diff summaries, visual staging,
   branch actions, undo/redo of repo operations, and a GitHub PR/issue/CI
-  surface (`gh`-backed with native fallbacks).
+  surface (`gh`-backed with native fallbacks). Worktree rows track the live
+  HEAD branch, drag-and-drop reordering is scoped to folder-aware sibling runs,
+  and click hit-testing resolves against the painted focus state.
 - **Merge queue (“fold-actor”)** — `thegn merge` / `land` / `integrate` fold
   queued branches into the target branch in the object database (no target
   checkout), gate the folded tip on your test command in a reusable gate
   worktree, and advance the ref by compare-and-swap. Conflicts can be handed
-  to any configured `agent_command` subprocess or deferred to you.
+  to any configured `agent_command` subprocess or deferred to you. Landing or
+  dequeuing a worktree un-files it from its lifecycle folder.
 - **Sandboxing** — each worktree's interactive process can run in a container
   (`podman` → `docker` → `bwrap` → `none` auto-chain) with hardening presets
   (`open`/`hardened`/`sealed`/`sealed-tunnel`), egress allow/block lists, a
@@ -63,7 +75,8 @@ initial feature set rather than a delta.
 - **Config** — layered TOML (global → repo → env/profile overlays → env vars
   → `--set`), every key documented in `config/config.toml.example`, hot
   reload, and an in-app F1 help system with generated keybinding/config
-  references.
+  references. Per-zone key tables are single-sourced from the dispatch, so
+  every live key surfaces in the help rather than drifting out of it.
 
 ### Channels
 

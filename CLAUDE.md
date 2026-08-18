@@ -141,6 +141,15 @@ Run inside `nix develop` (rust toolchain + tools). Human-contributor
 onboarding (prerequisites per platform, macOS notes) lives in
 `CONTRIBUTING.md`.
 
+**`nix develop`, not `devenv shell`, for the cross gates.** The two shells
+resolve different rust toolchains: `nix develop` gets the flake's
+`rustToolchain` (rust-overlay), which declares the `aarch64-apple-darwin` and
+`x86_64-pc-windows-gnu` `rust-std` sets; `devenv shell` gets a nixpkgs
+toolchain with **no cross targets**, so `just check-cross` (and therefore
+`just ci`) fails there with `can't find crate for 'core'` — an environment
+failure that reads like a code failure. Use `nix develop` for `check-cross` /
+`ci`. (`devenv shell` remains the one that regenerates the pre-commit config.)
+
 ```sh
 just quick [crate]   # fast inner-loop: clippy on lib/bin only (no test targets)
 just build           # cargo build --workspace (debug)

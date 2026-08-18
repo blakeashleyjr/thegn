@@ -77,11 +77,15 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
   with no container runtime installed everything still works — panes just run
   directly on the host. `[sandbox] backend = "apple"` selects the macOS
   `container` backend explicitly.
-- **Cross-checks run on every PR.** CI type-checks `aarch64-apple-darwin` on
-  Linux (`just check-cross`), so compile breakage is caught automatically.
-  The full macOS build+test job (`macos-14`) is opt-in because GitHub bills
-  those minutes at 10x: add `[ci-macos]` to a commit message (or dispatch the
-  workflow manually) for any platform-sensitive change.
+- **Cross-checks are partial — mind the gap.** `just check-cross` type-checks
+  only the C-dep-free leaf crates (`thegn-metrics`, `thegn-media`) against
+  `aarch64-apple-darwin`; `thegn-host` itself **cannot** be checked from Linux,
+  because its build scripts (`ring`, bundled sqlite) need a real darwin C
+  toolchain. So a darwin break in the host crate is invisible to the routine
+  gate. The full macOS build+test job (`macos-15`) is opt-in because GitHub
+  bills those minutes at 10x: add `[ci-macos]` to a commit message (or dispatch
+  the workflow manually) for any platform-sensitive change — and note it has
+  never actually run, so macOS is unvalidated as of `v0.1.0-alpha.1`.
 - **State paths** follow XDG conventions (`~/.config/thegn`,
   `~/.local/state/thegn`) on macOS too; set `XDG_CONFIG_HOME`/
   `XDG_STATE_HOME` if you prefer `~/Library`.
@@ -90,7 +94,12 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
 
 ## Windows (native) notes
 
-Native Windows is a supported build target (no WSL required). The dev
+Native Windows is a build target **under development**, not a supported
+platform — as of `v0.1.0-alpha.1` `thegn-host` has never been compiled or run
+on Windows (the msvc CI job has never executed), and no Windows binaries ship.
+The per-OS code paths below are written and reviewed but unproven; getting a
+first green msvc run is open work — see
+`openspec/changes/add-windows-native-compile`. No WSL is required. The dev
 experience differs from unix — nix/devenv and the justfile don't apply:
 
 - **Toolchain:** [rustup](https://rustup.rs) with the default

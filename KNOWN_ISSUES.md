@@ -62,16 +62,31 @@ they were silently orphaned).
 
 ## Platform
 
-- **Windows** support is best-effort: native panes only (no container
-  sandboxing — that's a Linux/WSL2 feature), and requires a modern terminal
-  (Windows Terminal; legacy conhost is refused).
+- **Only x86_64 Linux is supported.** Prebuilt binaries ship for linux-gnu and
+  linux-musl.
+- **macOS and Windows are unvalidated.** Both have per-OS code paths in tree
+  (and Windows has native panes, Job-Object process scoping, and a
+  named-pipe daemon transport written), but `thegn-host` has **never been
+  compiled or run** on either: the macOS CI job is opt-in and has never
+  executed, the Windows msvc job has never executed, and darwin cannot be
+  cross-checked from Linux (no darwin C toolchain for the `ring`/sqlite build
+  scripts). No binaries are published for them and building from source is
+  untested. When Windows does come up: native panes only (container sandboxing
+  is a Linux/WSL2 feature) and a modern terminal is required (Windows Terminal;
+  legacy conhost is refused).
 - Cloud execution providers, remote worktrees over SSH, the Observe dashboards,
   the placement engine, and non-GitHub issue trackers are **dev-channel only** in
   this release (`THEGN_CHANNEL=dev`).
 
 ## Distribution
 
-- Prebuilt binaries (all desktop platforms) and a Homebrew formula are wired via
-  the release workflow but require a maintainer to cut the first tag; until then,
-  install via Nix or `./install.sh`. `crates.io` / `cargo binstall` need the
-  workspace crates made publishable first — see [`RELEASING.md`](RELEASING.md).
+- Prebuilt binaries cover **x86_64 Linux (gnu + musl) only** — the macOS and
+  windows-msvc legs were removed from the release matrix because those targets
+  have never been built (see Platform above). Nix
+  (`nix profile install github:blakeashleyjr/thegn`) and `./install.sh` are the
+  other Linux paths.
+- The Homebrew formula (`packaging/homebrew/thegn.rb`) is staged but inert: it
+  needs macOS release assets, and the `blakeashleyjr/homebrew-tap` repo does not
+  exist yet.
+- `crates.io` / `cargo binstall` need the workspace crates made publishable
+  first — see [`RELEASING.md`](RELEASING.md).
