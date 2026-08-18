@@ -152,6 +152,7 @@ pub(crate) fn spawn_drive(
                 worktree: r.worktree,
                 branch: r.branch,
                 location: r.location,
+                agent_attempts: r.agent_attempts,
             })
             .collect();
         if items.is_empty() {
@@ -408,6 +409,7 @@ pub(crate) fn apply_step(
                 conflict_paths: None,
                 error_detail: None,
                 location: String::new(),
+                agent_attempts: 0,
             });
             panel.merge_queue.last_mut().expect("just pushed")
         }
@@ -977,6 +979,7 @@ mod tests {
             conflict_paths: None,
             error_detail: None,
             location: String::new(),
+            agent_attempts: 0,
         }
     }
 

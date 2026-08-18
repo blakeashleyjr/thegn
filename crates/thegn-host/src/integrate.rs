@@ -1136,6 +1136,15 @@ mod tests {
             auto_land: true,
             agent_max_attempts: 2,
             agent_timeout_secs: 0,
+            // Throwaway gate worktree (a unique /tmp path) rather than the
+            // reused one, which lives under `$XDG_STATE_HOME`. Rust runs these
+            // tests as threads in ONE process, and `testenv::EnvVarGuard`
+            // repoints `XDG_STATE_HOME` process-globally — its lock only
+            // excludes other ENV_LOCK-respecting tests, which these are not. So
+            // a reused gate would be built inside a *different* test's temp dir
+            // and vanish under it when that test's guard dropped. Depending on
+            // ambient env here is the bug; not depending on it is the fix.
+            gate_reuse_worktree: false,
             ..MergeQueueConfig::default()
         }
     }

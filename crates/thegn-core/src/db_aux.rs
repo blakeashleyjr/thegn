@@ -203,6 +203,25 @@ impl WorktreeAuxStore for Db {
         Ok(())
     }
 
+    fn set_merge_agent_attempts(&self, worktree: &str, attempts: u32) -> Result<()> {
+        self.conn().execute(
+            "UPDATE merge_queue SET agent_attempts=?2, updated_at=?3 WHERE worktree=?1",
+            params![worktree, attempts, util::now()],
+        )?;
+        Ok(())
+    }
+
+    fn retry_merge_entry(&self, worktree: &str) -> Result<bool> {
+        let n = self.conn().execute(
+            r#"UPDATE merge_queue SET
+                 status='queued', agent_attempts=0, updated_at=?2,
+                 result_oid=NULL, conflict_paths=NULL, error_detail=NULL
+               WHERE worktree=?1"#,
+            params![worktree, util::now()],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
     /// elsewhere, or the worktree is removed).
     fn remove_merge_entry(&self, worktree: &str) -> Result<()> {
@@ -217,7 +236,7 @@ impl WorktreeAuxStore for Db {
     fn list_merge_queue(&self) -> Result<Vec<MergeQueueRow>> {
         let mut stmt = self.conn().prepare(
             r#"SELECT worktree,branch,target_branch,status,queued_at,updated_at,
-                      result_oid,conflict_paths,error_detail,location
+                      result_oid,conflict_paths,error_detail,location,agent_attempts
                FROM merge_queue ORDER BY queued_at"#,
         )?;
         let rows = stmt.query_map([], |r| {
@@ -233,6 +252,7 @@ impl WorktreeAuxStore for Db {
                 error_detail: r.get(8)?,
                 // NULL (pre-v44 / unregistered worktree) = local / same store.
                 location: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                agent_attempts: r.get::<_, Option<u32>>(10)?.unwrap_or_default(),
             })
         })?;
         let mut v = Vec::new();

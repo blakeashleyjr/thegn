@@ -27,6 +27,10 @@ persisted; entries survive restarts.
 - **Drain (agent autopilot)** hands conflicts to a coding agent to
   resolve, then continues.
 - `thegn integrate` does the same from any shell.
+- A blocked branch is re-attempted by the next drain automatically. Once
+  it has burned its `agent_max_attempts` the agent stops being
+  dispatched for it — `thegn merge retry` (or the section's `r`) re-arms
+  it after you've fixed something.
 
 The fold advances the ref without checking anything out, so any worktree
 sitting **on** the target would be left with a stale working tree. Every

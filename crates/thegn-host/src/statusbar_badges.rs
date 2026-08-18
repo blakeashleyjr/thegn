@@ -298,6 +298,7 @@ mod tests {
             conflict_paths: None,
             error_detail: None,
             location: String::new(),
+            agent_attempts: 0,
         }
     }
 
