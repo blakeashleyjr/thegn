@@ -179,12 +179,16 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
     {
         return add_via_host(&url, &token, worktrees);
     }
-    let root = repo_root()?;
     let mq = &cfg.merge_queue;
-    let target = integrate::resolve_target(mq, &root);
     let db = Db::open()?;
 
     if all {
+        // `--all` enumerates the CWD's repo, so it needs a repo root. An
+        // explicit path argument does not — it resolves its own root — and
+        // demanding one here made `merge add <path>` from outside a repo fail
+        // with "not inside a git repository", pointing at the wrong thing.
+        let root = repo_root()?;
+        let target = integrate::resolve_target(mq, &root);
         let cands = integrate::candidate_branches(mq, &root, &target)?;
         for s in &cands.skipped_dirty {
             if !quiet {
@@ -223,7 +227,8 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
 }
 
 fn rm(cfg: &Config, worktree: Option<String>) -> Result<()> {
-    let wt = super::resolve_worktree(worktree);
+    // Same normalization the enqueue used, or the row won't be found.
+    let wt = crate::merge_ops::canonical_worktree(&super::resolve_worktree(worktree));
     let wt_s = wt.to_string_lossy().to_string();
     let db = Db::open()?;
     // Check membership before deleting so "not queued" is a distinct, non-zero
@@ -432,7 +437,7 @@ fn first_line(detail: &str) -> &str {
 }
 
 fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
-    let wt = super::resolve_worktree(worktree);
+    let wt = crate::merge_ops::canonical_worktree(&super::resolve_worktree(worktree));
     let wt_s = wt.to_string_lossy().to_string();
     if let Ok(db) = Db::open()
         && let Some(root) = integrate::main_checkout(&wt)
