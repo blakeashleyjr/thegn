@@ -710,6 +710,93 @@ fn set_workspace_order_writes_exact_sequence_even_from_null_positions() {
 }
 
 #[test]
+fn set_worktree_order_writes_exact_sequence_even_from_null_positions() {
+    // The worktree analogue of `set_workspace_order`: the sidebar's manual
+    // reorder persists the workspace's whole on-screen order (loose run first,
+    // then each folder's run), so `worktrees()` reloads that exact sequence
+    // rather than a normalize/tiebreak of two swapped positions.
+    let db = db();
+    for (tab, wt) in [
+        ("app/home", "/wt/home"),
+        ("app/a", "/wt/a"),
+        ("app/b", "/wt/b"),
+    ] {
+        db.put_worktree(tab, "/repo/app", wt, "br", None, None)
+            .unwrap();
+    }
+    // Wipe the insert-time positions: NULLs are the case a swap+normalize
+    // could reseed in a different order than the tree is showing.
+    db.conn()
+        .execute("UPDATE worktrees SET position = NULL", [])
+        .unwrap();
+
+    let order = |db: &Db| -> Vec<String> {
+        db.worktrees()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.worktree)
+            .collect()
+    };
+
+    let arranged = vec![
+        "/wt/b".to_string(),
+        "/wt/home".to_string(),
+        "/wt/a".to_string(),
+    ];
+    db.set_worktree_order(&arranged).unwrap();
+    assert_eq!(
+        order(&db),
+        arranged,
+        "reload matches the arranged order verbatim"
+    );
+
+    // A second arrangement over the now-contiguous positions round-trips too.
+    let arranged2 = vec![
+        "/wt/a".to_string(),
+        "/wt/b".to_string(),
+        "/wt/home".to_string(),
+    ];
+    db.set_worktree_order(&arranged2).unwrap();
+    assert_eq!(order(&db), arranged2);
+}
+
+#[test]
+fn set_folder_order_renumbers_only_its_own_workspace() {
+    // `folders.position` had no mutator at all before manual folder ordering:
+    // it was assigned MAX+1 at creation and never written again.
+    let db = db();
+    // `folders.repo_path` is a FK onto `workspaces`.
+    db.put_workspace("/x/app", "app", "repo").unwrap();
+    db.put_workspace("/x/lib", "lib", "repo").unwrap();
+    let a1 = db.create_folder("/x/app", "One").unwrap();
+    let a2 = db.create_folder("/x/app", "Two").unwrap();
+    let a3 = db.create_folder("/x/app", "Three").unwrap();
+    let b1 = db.create_folder("/x/lib", "Only").unwrap();
+
+    let names = |db: &Db, repo: &str| -> Vec<String> {
+        db.folders_for_workspace(repo)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect()
+    };
+    assert_eq!(names(&db, "/x/app"), ["One", "Two", "Three"]);
+
+    db.set_folder_order("/x/app", &[a3, a1, a2]).unwrap();
+    assert_eq!(names(&db, "/x/app"), ["Three", "One", "Two"]);
+
+    // A foreign id can't renumber another workspace's folders: the `repo_path`
+    // predicate drops it, and /x/lib is untouched.
+    db.set_folder_order("/x/app", &[b1, a1]).unwrap();
+    assert_eq!(names(&db, "/x/lib"), ["Only"]);
+    assert_eq!(
+        db.folders_for_workspace("/x/lib").unwrap()[0].folder_id,
+        b1,
+        "the other workspace's folder kept its identity and position"
+    );
+}
+
+#[test]
 fn swap_workspace_positions_heals_null_and_duplicate_positions() {
     // Regression: some insert paths (migrate_brand, db_zones) create workspace
     // rows without a `position` (NULL), and ties in the backfill can leave

@@ -44,6 +44,47 @@ terminals. `Alt-s` (or `Ctrl-←` from the leftmost pane) focuses it;
   worktrees by most-recent process/agent activity, newest first)
 - `Space` — mark rows for bulk actions; `Shift-↑↓` — reorder manually
 
+## Reorder
+
+`Shift-↑↓` moves the row under the cursor (or every marked row, as a
+block); `Ctrl-Alt-↑↓` moves one item and works from anywhere.
+
+A worktree moves within its **run** — the loose list under its workspace,
+or the folder it is filed into. Push it past the end of a run and it
+crosses into the next one, leaving or joining that folder as it goes: one
+key both reorders and re-files. `home` is anchored at the top of the loose
+list; it never moves and nothing lands above it. A collapsed folder is
+stepped over rather than entered, so a worktree can't vanish into a folder
+you have closed.
+
+Put the cursor on a folder header to reorder the folder itself among its
+workspace's folders — its worktrees travel with it. Workspace headers and
+terminals reorder among their own kind the same way.
+
+Manual reordering implies the manual sort, so a move under a computed sort
+(`s`) switches back to manual first. Order is saved per workspace and
+restored on the next launch.
+
+## Mouse
+
+Mouse support turns on only when the outer terminal reports it; every
+gesture below has a keyboard equivalent.
+
+- **Click** selects and opens the row; clicking the caret glyph folds or
+  unfolds a header instead
+- **Double-click** moves keyboard focus into the pane (or folds a header)
+- **Ctrl-click** marks a row for bulk actions, like `Space`
+- **Right-click** opens that row's action menu, anchored under it; the menu
+  then takes clicks and the wheel until you pick an entry or click away
+- **Wheel** scrolls the tree
+- **Drag** a worktree to reorder it. Release between two rows to drop it
+  there — including _inside_ a folder, which files and positions it in one
+  go; on a folder header to file it at the end of that folder; or on its
+  workspace header to move it back out. Drag a folder header to reorder
+  folders, or a workspace header to reorder workspaces. Dragging across
+  workspaces is refused, and the insertion rule shows exactly where a
+  release will land.
+
 ## Act
 
 - `d` / `Del` — close or delete… (deleting files from disk is always the

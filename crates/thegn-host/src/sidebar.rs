@@ -827,10 +827,11 @@ pub fn build_rows(
 
         // Folders section: home → loose → folders by `position`. Filed
         // worktrees render at depth 2 under their folder header, in the order
-        // the user arranged them (Move Up/Down on the worktree row will
-        // eventually resequence via `swap_worktree_positions`; for now we
-        // preserve the existing sort for visibility). Computed BEFORE the loose
-        // pass so it can see which folders will actually get a header.
+        // the user arranged them: this emission order defines the **sibling
+        // runs** that `crate::sidebar_order` reorders within, so the loose list
+        // and each folder are independent runs and a manual move never swaps a
+        // filed worktree with a loose one. Computed BEFORE the loose pass so it
+        // can see which folders will actually get a header.
         let mut workspace_folders: Vec<&thegn_core::models::FolderRow> = db_folders
             .iter()
             .filter(|f| f.repo_path == *repo_path)

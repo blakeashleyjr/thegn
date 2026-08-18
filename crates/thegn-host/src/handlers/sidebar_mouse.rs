@@ -7,9 +7,15 @@
 //! ([`crate::sidebar_view::hit_rows`], the same `build_sidebar` pass the
 //! renderer painted), so transitions are unit-testable without a terminal.
 //! Drag feedback rides `FrameModel::sidebar_drag`; drops reuse the keyboard
-//! paths (`move_worktree_group` / `move_workspace_by_slug` — inheriting the
-//! computed-sort→Manual flip and home anchoring — and `file_worktree_path` /
-//! `unfile_worktree_path`).
+//! paths (`apply_order_plan` / `apply_folder_order` / `move_workspace_by_slug` —
+//! inheriting the computed-sort→Manual flip and home anchoring — and
+//! `file_worktree_path` / `unfile_worktree_path`).
+//!
+//! Worktree drops resolve through [`crate::sidebar_order`], so a release
+//! *between two rows inside a folder* files the worktree into that folder and
+//! positions it there in one write. The drop is a single resolved plan, not the
+//! bounded step-swap loop this used to run — that loop stepped through a flat,
+//! folder-blind run and could bail out mid-way after churning other rows.
 
 use std::time::Instant;
 
@@ -36,12 +42,20 @@ pub(crate) enum DragSrc {
     },
     /// A DB-backed workspace header.
     Workspace { pin_key: String, slug: String },
+    /// A folder header — reorders among its workspace's folders.
+    Folder {
+        pin_key: String,
+        slug: String,
+        folder_id: i64,
+    },
 }
 
 impl DragSrc {
     fn pin_key(&self) -> &str {
         match self {
-            DragSrc::Worktree { pin_key, .. } | DragSrc::Workspace { pin_key, .. } => pin_key,
+            DragSrc::Worktree { pin_key, .. }
+            | DragSrc::Workspace { pin_key, .. }
+            | DragSrc::Folder { pin_key, .. } => pin_key,
         }
     }
 }
@@ -51,8 +65,15 @@ impl DragSrc {
 pub(crate) enum Spot {
     /// Land the source at this position among its siblings: before the sibling
     /// with `before_pin_key`, or at the end of the run (`None`).
+    ///
+    /// `folder` is the **destination run** for a worktree drag — `None` for the
+    /// loose list, `Some(id)` for a folder. Carrying it here is what lets a drop
+    /// *between two rows inside a folder* both file and position the worktree;
+    /// without it the drop reordered a flat workspace-wide run and the renderer
+    /// put the row straight back where it came from.
     Reorder {
         before_pin_key: Option<String>,
+        folder: Option<i64>,
         viz: DragSpotViz,
     },
     /// File the worktree into this folder (same workspace only).
@@ -398,6 +419,18 @@ fn drag_src_for(
             pin_key: row.pin_key.clone(),
             slug: row.workspace_slug.clone(),
         }),
+        // A folder header drags among its workspace's folders; its worktrees
+        // travel with it. Optimistically-created folders carry a synthetic
+        // negative id with no DB row yet, so they can't be reordered until the
+        // deferred filing write assigns the real one.
+        RowKind::Folder => row
+            .folder_id
+            .filter(|id| *id > 0)
+            .map(|folder_id| DragSrc::Folder {
+                pin_key: row.pin_key.clone(),
+                slug: row.workspace_slug.clone(),
+                folder_id,
+            }),
         _ => None,
     }
 }
@@ -445,30 +478,128 @@ fn spot_at(
                     if is_home && top_half {
                         return Spot::Invalid;
                     }
+                    // The hovered row's own run is the destination — this is
+                    // what makes a drop *inside* a folder file as well as order.
+                    let Some(hovered) = row.worktree_path.as_deref() else {
+                        return Spot::Invalid;
+                    };
+                    let Some(folder) =
+                        crate::sidebar_order::run_of(&model.sidebar_rows, slug, hovered)
+                    else {
+                        return Spot::Invalid;
+                    };
                     if top_half {
                         Spot::Reorder {
                             before_pin_key: Some(row.pin_key.clone()),
+                            folder,
                             viz: DragSpotViz::InsertBefore(hit.visible_index),
                         }
                     } else {
-                        // Bottom half: before the NEXT same-workspace worktree,
-                        // or at the end of the run.
-                        let next = visible.iter().enumerate().skip(hit.visible_index + 1).find(
-                            |(_, r)| r.kind == RowKind::Worktree && r.workspace_slug == *slug,
-                        );
-                        match next {
+                        // Bottom half: before the next worktree **in the same
+                        // run** (not merely the next one on screen — that could
+                        // be the first child of the following folder), or at the
+                        // end of this run.
+                        let next =
+                            crate::sidebar_order::next_in_run(&model.sidebar_rows, slug, hovered);
+                        let next_row = next.as_deref().and_then(|p| {
+                            visible.iter().enumerate().find(|(_, r)| {
+                                r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some(p)
+                            })
+                        });
+                        match next_row {
                             Some((i, r)) => Spot::Reorder {
                                 before_pin_key: Some(r.pin_key.clone()),
+                                folder,
                                 viz: DragSpotViz::InsertBefore(i),
                             },
                             None => Spot::Reorder {
                                 before_pin_key: None,
+                                folder,
                                 viz: DragSpotViz::InsertAfter(hit.visible_index),
                             },
                         }
                     }
                 }
                 _ => Spot::Invalid,
+            }
+        }
+        DragSrc::Folder {
+            slug, folder_id, ..
+        } => {
+            // Folders reorder among their own workspace's folders. Any row
+            // resolves to the folder that encloses it; the workspace header
+            // means "first".
+            if row.workspace_slug != *slug {
+                return Spot::Invalid;
+            }
+            if row.kind == RowKind::Workspace {
+                let first = crate::sidebar_order::folder_order(&model.sidebar_rows, slug)
+                    .into_iter()
+                    .next();
+                if first == Some(*folder_id) {
+                    return Spot::Invalid; // already first
+                }
+                let header = visible
+                    .iter()
+                    .enumerate()
+                    .find(|(_, r)| r.kind == RowKind::Folder && r.folder_id == first);
+                return match header {
+                    Some((i, r)) => Spot::Reorder {
+                        before_pin_key: Some(r.pin_key.clone()),
+                        folder: None,
+                        viz: DragSpotViz::InsertBefore(i),
+                    },
+                    None => Spot::Invalid,
+                };
+            }
+            // The folder header owning the hovered row (a depth-2 worktree
+            // belongs to the header above it); loose worktrees have none.
+            let owner = visible
+                .iter()
+                .enumerate()
+                .take(hit.visible_index + 1)
+                .filter(|(_, r)| r.workspace_slug == *slug)
+                .fold(None, |acc, (i, r)| match r.kind {
+                    RowKind::Folder => Some((i, r)),
+                    RowKind::Worktree if r.depth < 2 => None,
+                    _ => acc,
+                });
+            let Some((hi, hrow)) = owner else {
+                return Spot::Invalid;
+            };
+            if hrow.folder_id == Some(*folder_id) {
+                return Spot::Invalid; // hovering itself
+            }
+            // Top half of the header inserts before it; anywhere else in its
+            // subtree inserts after — i.e. before the following folder.
+            let before = hit.visible_index == hi && my < hit.y + hit.height.div_ceil(2);
+            if before {
+                Spot::Reorder {
+                    before_pin_key: Some(hrow.pin_key.clone()),
+                    folder: None,
+                    viz: DragSpotViz::InsertBefore(hi),
+                }
+            } else {
+                let next = visible
+                    .iter()
+                    .enumerate()
+                    .skip(hi + 1)
+                    .find(|(_, r)| r.kind == RowKind::Folder && r.workspace_slug == *slug);
+                match next {
+                    Some((i, r)) if r.folder_id != Some(*folder_id) => Spot::Reorder {
+                        before_pin_key: Some(r.pin_key.clone()),
+                        folder: None,
+                        viz: DragSpotViz::InsertBefore(i),
+                    },
+                    // The next folder IS the source: dropping just above itself
+                    // is a no-op, but landing last is not.
+                    Some(_) => Spot::Invalid,
+                    None => Spot::Reorder {
+                        before_pin_key: None,
+                        folder: None,
+                        viz: DragSpotViz::InsertAfter(hi),
+                    },
+                }
             }
         }
         DragSrc::Workspace { slug, .. } => {
@@ -494,6 +625,7 @@ fn spot_at(
             if before {
                 Spot::Reorder {
                     before_pin_key: Some(hrow.pin_key.clone()),
+                    folder: None,
                     viz: DragSpotViz::InsertBefore(hi),
                 }
             } else {
@@ -506,10 +638,12 @@ fn spot_at(
                 match next {
                     Some((i, r)) => Spot::Reorder {
                         before_pin_key: Some(r.pin_key.clone()),
+                        folder: None,
                         viz: DragSpotViz::InsertBefore(i),
                     },
                     None => Spot::Reorder {
                         before_pin_key: None,
+                        folder: None,
                         viz: DragSpotViz::InsertAfter(hi),
                     },
                 }
@@ -551,80 +685,111 @@ pub(crate) fn perform_drop(
                 ) {
                     Ok(msg) | Err(msg) => model.status = msg,
                 }
+                // Land it at the end of the folder rather than wherever its old
+                // position happens to sort it among the folder's members.
+                move_to_end_of_run(sb, model, session, path);
             }
         }
         (DragSrc::Worktree { path, .. }, Spot::Unfile { .. }) => {
             model.status = crate::handlers::sidebar_folder::unfile_worktree_path(
                 session, sb, model, path, refresh_tx, waker,
             );
+            // Land it at the end of the loose run rather than wherever its old
+            // position happens to sort it.
+            move_to_end_of_run(sb, model, session, path);
         }
-        (DragSrc::Worktree { pin_key, slug, .. }, Spot::Reorder { before_pin_key, .. }) => {
-            reorder_worktree_to(sb, model, session, pin_key, slug, before_pin_key.as_deref());
+        (
+            DragSrc::Worktree { path, slug, .. },
+            Spot::Reorder {
+                before_pin_key,
+                folder,
+                ..
+            },
+        ) => {
+            // Resolve the insertion anchor's pin key back to a path — the
+            // ordering model is keyed on paths, which survive a re-file.
+            let before = before_pin_key
+                .as_deref()
+                .and_then(|k| path_of_pin_key(model, k));
+            if let Some(plan) = crate::sidebar_order::drop_at(
+                &model.sidebar_rows,
+                slug,
+                path,
+                *folder,
+                before.as_deref(),
+            ) {
+                sb.apply_order_plan(model, session, slug, plan);
+            }
         }
         (DragSrc::Workspace { slug, .. }, Spot::Reorder { before_pin_key, .. }) => {
             reorder_workspace_to(sb, model, session, slug, before_pin_key.as_deref());
         }
-        // Workspaces can't file/unfile.
-        (DragSrc::Workspace { .. }, Spot::FileInto { .. } | Spot::Unfile { .. }) => {}
+        (
+            DragSrc::Folder {
+                slug, folder_id, ..
+            },
+            Spot::Reorder { before_pin_key, .. },
+        ) => {
+            let before = before_pin_key
+                .as_deref()
+                .and_then(|k| folder_id_of_pin_key(model, k));
+            if let Some(order) =
+                crate::sidebar_order::drop_folder_at(&model.sidebar_rows, slug, *folder_id, before)
+            {
+                sb.apply_folder_order(model, session, slug, order);
+            }
+        }
+        // Workspaces and folders can't file/unfile.
+        (
+            DragSrc::Workspace { .. } | DragSrc::Folder { .. },
+            Spot::FileInto { .. } | Spot::Unfile { .. },
+        ) => {}
     }
 }
 
-/// The same-workspace worktree pin keys in current visual order.
-fn worktree_run(model: &FrameModel, slug: &str) -> Vec<String> {
-    model
-        .sidebar_rows
-        .iter()
-        .filter(|r| r.visible && r.kind == RowKind::Worktree && r.workspace_slug == slug)
-        .map(|r| r.pin_key.clone())
-        .collect()
-}
-
-/// Step-move the source worktree until it sits at the target slot, one
-/// validated neighbor swap at a time (each swap persists + respects home).
-fn reorder_worktree_to(
+/// Move the worktree at `path` to the end of the run it is currently in. Used
+/// after a header drop (file / unfile), which changes membership but leaves the
+/// row's stale `position` deciding where inside the run it lands.
+fn move_to_end_of_run(
     sb: &mut SidebarState,
     model: &mut FrameModel,
     session: &mut crate::session::Session,
-    src_pin: &str,
-    slug: &str,
-    before_pin: Option<&str>,
+    path: &str,
 ) {
-    // Cap the step loop: each step must make progress; the run length bounds it.
-    let max_steps = worktree_run(model, slug).len() + 1;
-    for _ in 0..max_steps {
-        let run = worktree_run(model, slug);
-        let Some(cur) = run.iter().position(|k| k == src_pin) else {
-            return;
-        };
-        let target = match before_pin {
-            Some(bp) => match run.iter().position(|k| k == bp) {
-                Some(t) => t,
-                None => return, // target vanished (filed/deleted mid-drag)
-            },
-            None => run.len(),
-        };
-        // Moving down past `target` means landing at target-1 (the source's
-        // removal shifts later slots up by one).
-        let dest = if target > cur { target - 1 } else { target };
-        if dest == cur {
-            return;
-        }
-        let up = dest < cur;
-        // Resolve the source's CURRENT session group index by pin key.
-        let gi = model
-            .sidebar_rows
-            .iter()
-            .filter(|r| r.visible)
-            .find(|r| r.pin_key == src_pin)
-            .and_then(|r| match r.tab_target {
-                Some(RowTarget::Tab(gi, _)) => Some(gi),
-                _ => None,
-            });
-        let Some(gi) = gi else { return };
-        if !sb.move_worktree_group(model, session, gi, up) {
-            return; // blocked (home anchor / edge): stop rather than spin
-        }
+    let Some(slug) = model
+        .sidebar_rows
+        .iter()
+        .find(|r| r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some(path))
+        .map(|r| r.workspace_slug.clone())
+    else {
+        return;
+    };
+    let Some(folder) = crate::sidebar_order::run_of(&model.sidebar_rows, &slug, path) else {
+        return;
+    };
+    if let Some(plan) =
+        crate::sidebar_order::drop_at(&model.sidebar_rows, &slug, path, folder, None)
+    {
+        sb.apply_order_plan(model, session, &slug, plan);
     }
+}
+
+/// The worktree path behind a worktree row's `pin_key`.
+fn path_of_pin_key(model: &FrameModel, key: &str) -> Option<String> {
+    model
+        .sidebar_rows
+        .iter()
+        .find(|r| r.kind == RowKind::Worktree && r.pin_key == key)
+        .and_then(|r| r.worktree_path.clone())
+}
+
+/// The folder id behind a folder row's `pin_key`.
+fn folder_id_of_pin_key(model: &FrameModel, key: &str) -> Option<i64> {
+    model
+        .sidebar_rows
+        .iter()
+        .find(|r| r.kind == RowKind::Folder && r.pin_key == key)
+        .and_then(|r| r.folder_id)
 }
 
 /// Step-move the source workspace to the target slot (see
@@ -894,5 +1059,178 @@ mod tests {
                 spot
             }
         );
+    }
+
+    // --- folder-aware drop resolution ------------------------------------
+
+    fn filed_row(slug: &str, branch: &str, fid: i64, gi: usize) -> SidebarRow {
+        SidebarRow {
+            tab_target: Some(RowTarget::Tab(gi, 0)),
+            worktree_path: Some(format!("/wt/{branch}")),
+            pin_key: format!("{slug}/{branch}/folder:{fid}"),
+            branch: Some(branch.into()),
+            ..SidebarRow::base(RowKind::Worktree, 2, branch, slug)
+        }
+    }
+
+    /// app: home, feat loose; folder 1 "Backend" { api, db }; folder 2
+    /// "Frontend" { web }.
+    fn folder_fixture() -> (crate::chrome::FrameModel, crate::compositor::Rect) {
+        let model = crate::chrome::FrameModel {
+            sidebar_rows: vec![
+                ws_row("app"),
+                wt_row("app", "home", 0),
+                wt_row("app", "feat", 1),
+                folder_row("app", 1, "Backend"),
+                filed_row("app", "api", 1, 2),
+                filed_row("app", "db", 1, 3),
+                folder_row("app", 2, "Frontend"),
+                filed_row("app", "web", 2, 4),
+            ],
+            sidebar_workspaces: vec![(
+                "app".into(),
+                "app".into(),
+                "repo".into(),
+                "/repos/app".into(),
+            )],
+            ..Default::default()
+        };
+        let rect = crate::compositor::Rect {
+            x: 0,
+            y: 0,
+            cols: 30,
+            rows: 20,
+        };
+        (model, rect)
+    }
+
+    #[test]
+    fn dropping_inside_a_folder_targets_that_folders_run() {
+        let (model, rect) = folder_fixture();
+        let sb = SidebarState::default();
+        let session = crate::session::Session::default();
+        // Top half of `db`, which lives in folder 1 → insert before it, in
+        // folder 1. Without the `folder` field this resolved to a flat
+        // workspace-wide reorder and the renderer put the row straight back.
+        let y = y_of(&model, rect, "app/db/folder:1");
+        match spot_at(&sb, &model, &session, rect, &src_feat(), y) {
+            Spot::Reorder {
+                before_pin_key,
+                folder,
+                ..
+            } => {
+                assert_eq!(before_pin_key.as_deref(), Some("app/db/folder:1"));
+                assert_eq!(folder, Some(1));
+            }
+            other => panic!("expected a folder-targeted reorder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bottom_half_drop_stops_at_the_run_boundary() {
+        let (mut model, rect) = folder_fixture();
+        // Only the cursor row of a focused sidebar renders a detail line, and
+        // only a >1-line row *has* a bottom half to aim at.
+        model.sidebar_focused = true;
+        model.sidebar_selected = 5; // db
+        let sb = SidebarState::default();
+        let session = crate::session::Session::default();
+        // Bottom half of `db` — the last member of folder 1. The next row on
+        // screen is folder 2's header, but the insertion must stay in folder 1
+        // and land at the end of its run.
+        let y = y_of(&model, rect, "app/db/folder:1") + 1;
+        match spot_at(&sb, &model, &session, rect, &src_feat(), y) {
+            Spot::Reorder {
+                before_pin_key,
+                folder,
+                ..
+            } => {
+                assert_eq!(folder, Some(1));
+                assert_eq!(
+                    before_pin_key, None,
+                    "must not spill into the following folder's run"
+                );
+            }
+            other => panic!("expected reorder at the end of folder 1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bottom_half_drop_in_the_loose_run_stays_loose() {
+        let (mut model, rect) = folder_fixture();
+        model.sidebar_focused = true;
+        model.sidebar_selected = 2; // feat
+        let sb = SidebarState::default();
+        let session = crate::session::Session::default();
+        let src = DragSrc::Worktree {
+            pin_key: "app/api/folder:1".into(),
+            slug: "app".into(),
+            path: "/wt/api".into(),
+        };
+        // Bottom half of `feat`, the last loose worktree: land at the end of
+        // the loose run — which unfiles the dragged worktree.
+        let y = y_of(&model, rect, "app/feat") + 1;
+        match spot_at(&sb, &model, &session, rect, &src, y) {
+            Spot::Reorder {
+                before_pin_key,
+                folder,
+                ..
+            } => {
+                assert_eq!(folder, None);
+                assert_eq!(before_pin_key, None);
+            }
+            other => panic!("expected a loose reorder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_folder_header_drags_among_its_workspaces_folders() {
+        let (model, rect) = folder_fixture();
+        let sb = SidebarState::default();
+        let session = crate::session::Session::default();
+        let src = DragSrc::Folder {
+            pin_key: "app/folder:2".into(),
+            slug: "app".into(),
+            folder_id: 2,
+        };
+        // Top half of folder 1's header → insert before it.
+        let y = y_of(&model, rect, "app/folder:1");
+        match spot_at(&sb, &model, &session, rect, &src, y) {
+            Spot::Reorder { before_pin_key, .. } => {
+                assert_eq!(before_pin_key.as_deref(), Some("app/folder:1"));
+            }
+            other => panic!("expected a folder reorder, got {other:?}"),
+        }
+        // Hovering its own subtree is a no-op.
+        let y = y_of(&model, rect, "app/web/folder:2");
+        assert_eq!(spot_at(&sb, &model, &session, rect, &src, y), Spot::Invalid);
+        // A loose worktree encloses no folder → nothing to order against.
+        let y = y_of(&model, rect, "app/feat");
+        assert_eq!(spot_at(&sb, &model, &session, rect, &src, y), Spot::Invalid);
+    }
+
+    #[test]
+    fn a_synthetic_folder_is_not_draggable_until_its_row_exists() {
+        let (model, rect) = folder_fixture();
+        let sb = SidebarState::default();
+        let session = crate::session::Session::default();
+        let hits = hit_rows(&model, rect);
+        let visible: Vec<&SidebarRow> = model.sidebar_rows.iter().filter(|r| r.visible).collect();
+
+        // A real folder header is a drag source…
+        let hit = hits
+            .iter()
+            .find(|h| visible[h.visible_index].pin_key == "app/folder:1")
+            .unwrap();
+        assert!(matches!(
+            drag_src_for(&sb, &model, &session, hit),
+            Some(DragSrc::Folder { folder_id: 1, .. })
+        ));
+
+        // …but an optimistically-created one (synthetic negative id, no DB row)
+        // has no position to renumber yet.
+        let mut model2 = model.clone();
+        model2.sidebar_rows[3].folder_id = Some(-1);
+        assert!(drag_src_for(&sb, &model2, &session, hit).is_none());
     }
 }
