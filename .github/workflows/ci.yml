@@ -183,6 +183,11 @@ jobs:
     # only the final `thegn-host` compile+link left, so give it 60m; once it
     # succeeds the nix-store cache warms and later runs are far quicker.
     timeout-minutes: 60
+    env:
+      # step `if:` can't reference `secrets` directly (GitHub rejects the whole
+      # workflow run at validation time, before any job is scheduled, if it
+      # does) — thread it through `env` instead, which secrets can populate.
+      HAS_CACHIX: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -197,7 +202,7 @@ jobs:
       # realized below is pushed. No-op until CACHIX_AUTH_TOKEN is set (+ optionally
       # the CACHIX_CACHE_NAME repo variable), so the gate is safe before standup.
       - name: Set up binary cache (optional)
-        if: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}
+        if: ${{ env.HAS_CACHIX == 'true' }}
         uses: cachix/cachix-action@v15
         with:
           name: ${{ vars.CACHIX_CACHE_NAME || 'thegn' }}
@@ -208,7 +213,7 @@ jobs:
       # depends on every build input, so pushing it caches the whole shell). Only
       # when a cache is configured — otherwise it's wasted work.
       - name: Seed cache with provider dev-env closures
-        if: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}
+        if: ${{ env.HAS_CACHIX == 'true' }}
         run: |
           nix build --print-build-logs \
             .#thegn-musl \
