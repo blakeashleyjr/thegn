@@ -17,7 +17,7 @@
 //! - Meanwhile plenty of live keys were never advertised at all (`Tests` has
 //!   nine, of which four showed).
 //!
-//! [`hint_table_matches_dispatch`] (in the tests below) now reads the dispatch
+//! `hint_table_matches_dispatch` (in the tests below) now reads the dispatch
 //! match out of `run.rs` and fails if a table advertises a key the section does
 //! not actually claim. It is a source-level check rather than a type-level one
 //! — the per-section dispatch still lives in the `run.rs` loop, coupled to its
