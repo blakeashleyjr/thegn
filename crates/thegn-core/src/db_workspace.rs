@@ -491,6 +491,19 @@ impl WorkspaceStore for Db {
         Ok(())
     }
 
+    /// Persist the full sidebar worktree order (see the trait docs). One
+    /// transaction so a reorder can never half-apply, and a plain
+    /// `position = index` write so the reload through `worktrees()` reproduces
+    /// the caller's sequence verbatim — no normalize/tiebreak drift.
+    fn set_worktree_order(&self, order: &[String]) -> Result<()> {
+        self.transaction(|db| {
+            for (i, wt) in order.iter().enumerate() {
+                db.set_worktree_position(wt, i as i64)?;
+            }
+            Ok(())
+        })
+    }
+
     fn folders_for_workspace(&self, repo_path: &str) -> Result<Vec<crate::models::FolderRow>> {
         let mut stmt = self.conn().prepare(
             "SELECT folder_id, repo_path, name, position, created_at
@@ -524,6 +537,21 @@ impl WorkspaceStore for Db {
             params![new_name, folder_id],
         )?;
         Ok(())
+    }
+
+    /// Persist the folder order within a workspace (see the trait docs). The
+    /// `repo_path` predicate keeps a stale/foreign id from renumbering another
+    /// workspace's folders.
+    fn set_folder_order(&self, repo_path: &str, order: &[i64]) -> Result<()> {
+        self.transaction(|db| {
+            for (i, fid) in order.iter().enumerate() {
+                db.conn().execute(
+                    "UPDATE folders SET position = ?1 WHERE folder_id = ?2 AND repo_path = ?3",
+                    params![i as i64, fid, repo_path],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     fn del_folder(&self, folder_id: i64) -> Result<()> {
