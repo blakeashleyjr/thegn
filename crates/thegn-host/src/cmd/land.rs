@@ -5,9 +5,12 @@
 //! or a hand-rolled `git update-ref`: the fold runs in the object DB (no target
 //! checkout) and advances the target ref by compare-and-swap, so it lands even
 //! when the main checkout's working tree is read-only to the caller (a sandboxed
-//! agent). The working-tree sync then defers to the running instance's own
-//! self-heal — a clean checkout on the target fast-forwards itself once it sees
-//! the ref move (see [`crate::git_watch::spawn_main_checkout_heal`]).
+//! agent). On a successful advance it fast-forwards every worktree that has the
+//! target checked out — main or linked — and prints the exact resync command for
+//! any it had to leave alone (see `thegn_core::util::resync_branch_checkouts`).
+//! A running instance also self-heals on the ref move (see
+//! [`crate::git_watch::spawn_main_checkout_heal`]), but that is a belt-and-braces
+//! second path: the CLI must not depend on an instance being up.
 //!
 //! Unlike `thegn merge land`, this neither requires `[merge_queue] enabled`
 //! nor touches the queue's DB rows; it shares only the fold/gate/CAS core
@@ -81,12 +84,13 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         }
     };
     match outcome {
-        AttemptOutcome::Landed { commit } => {
+        AttemptOutcome::Landed { commit, resyncs } => {
             unfile(&branch);
             outln!(
                 "✓ landed {branch} → {target} @ {}",
                 &commit[..commit.len().min(12)]
             );
+            crate::integrate::report_resyncs(&target, &resyncs);
         }
         AttemptOutcome::UpToDate => {
             unfile(&branch);

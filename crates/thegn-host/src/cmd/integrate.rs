@@ -109,6 +109,7 @@ pub fn run(cfg: &Config) -> Result<()> {
             short(&report.original),
             short(&report.final_tip)
         );
+        crate::integrate::report_resyncs(&target, &report.resyncs);
     } else {
         outln!("{target} unchanged ({}).", short(&report.original));
     }

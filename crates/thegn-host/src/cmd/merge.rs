@@ -375,6 +375,7 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             out.gate_error.len(),
             out.needs_human.len()
         );
+        integrate::report_resyncs(&target, &out.resyncs);
         if !out.gate_error.is_empty() {
             outln!(
                 "Note: {} branch(es) were never judged — the gate could not run. \
@@ -401,6 +402,20 @@ fn drain_json(target: &str, out: &merge_driver::DriveOutcome) -> serde_json::Val
         // script never reads "the branch is bad" out of "the gate is missing".
         "gate_error": out.gate_error,
         "needs_human": out.needs_human,
+        // Live checkouts of the target the fold could not fast-forward. A script
+        // that lands into a checked-out branch needs to know its working tree is
+        // now stale — silence here is what made this dangerous.
+        "stale_checkouts": out
+            .resyncs
+            .iter()
+            .filter(|r| !matches!(r.outcome, thegn_core::util::ResyncOutcome::Healed))
+            .map(|r| {
+                serde_json::json!({
+                    "path": r.path.to_string_lossy(),
+                    "fix": r.manual_fix(),
+                })
+            })
+            .collect::<Vec<_>>(),
         "counts": {
             "landed": out.landed.len(),
             "ready": out.ready.len(),
@@ -428,7 +443,7 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
     }
     // Share the fold/gate/CAS core with `thegn land`; this queue-aware path
     // additionally records the outcome on the worktree's merge-queue row.
-    let (branch, _target, outcome) = super::land::land_branch(cfg, &wt)?;
+    let (branch, target, outcome) = super::land::land_branch(cfg, &wt)?;
     let db = Db::open()?;
     // Apply the sidebar-folder lifecycle for this worktree once we know its fate.
     let lifecycle = |event: LifecycleEvent| {
@@ -440,10 +455,11 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
     // non-zero afterward so scripting/CI sees the failure rather than a clean 0.
     let mut failure: Option<String> = None;
     match outcome {
-        AttemptOutcome::Landed { commit } => {
+        AttemptOutcome::Landed { commit, resyncs } => {
             let _ = db.update_merge_status(&wt_s, "landed", Some(&commit), None, None);
             lifecycle(LifecycleEvent::Landed);
             outln!("✓ landed {branch} → {}", &commit[..commit.len().min(12)]);
+            integrate::report_resyncs(&target, &resyncs);
         }
         AttemptOutcome::UpToDate => {
             let _ = db.update_merge_status(&wt_s, "landed", None, Some("already merged"), None);

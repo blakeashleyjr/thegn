@@ -19,6 +19,7 @@ use thegn_core::config::MergeQueueConfig;
 use thegn_core::db::Db;
 use thegn_core::fold::{self, Branch, ConflictKind, FoldGit, FoldPlan, MergeOutcome};
 use thegn_core::gate;
+use thegn_core::outln;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::WorktreeAuxStore;
 use thegn_core::util;
@@ -191,6 +192,11 @@ pub struct FoldReport {
     pub gate: GateOutcome,
     /// How many CAS attempts it took (main moving under the fold forces a re-fold).
     pub cas_attempts: u32,
+    /// What happened to each live checkout of the target branch when the ref
+    /// advanced. Advisory, like `Candidates::skipped_dirty`: the caller reports
+    /// the ones we could not fast-forward, so a stale working tree is never a
+    /// silent surprise. Empty when nothing advanced.
+    pub resyncs: Vec<util::CheckoutResync>,
 }
 
 /// Resolve the branch the fold advances. `"auto"` (or empty) → the repo's
@@ -642,6 +648,7 @@ fn build_report(
         })
         .collect();
     FoldReport {
+        resyncs: Vec::new(),
         target_branch: target_branch.to_string(),
         original: original.to_string(),
         final_tip: plan.final_tip.clone(),
@@ -794,20 +801,28 @@ pub fn run_fold(
             // there shows the folded files as pending, and a read-only sandbox
             // mount of it can't self-heal. Fast-forward it host-side (a safe
             // no-op when the checkout has real uncommitted work; see the guards).
-            match util::resync_ff_checkout(repo_root, &target_branch, &base, &plan.final_tip) {
-                util::ResyncOutcome::Healed => thegn_core::msg::info(&format!(
-                    "merge queue: synced {target_branch} checkout to {}",
-                    &plan.final_tip[..plan.final_tip.len().min(9)]
-                )),
-                util::ResyncOutcome::Skipped(why) => tracing::debug!(
-                    target: "thegn::integrate",
-                    why,
-                    "left main checkout working tree as-is"
-                ),
-                util::ResyncOutcome::Failed => tracing::warn!(
-                    target: "thegn::integrate",
-                    "could not fast-forward the main checkout; run `git -C <repo> reset --hard {target_branch}` to sync it"
-                ),
+            let resyncs =
+                util::resync_branch_checkouts(repo_root, &target_branch, &base, &plan.final_tip);
+            for r in &resyncs {
+                match &r.outcome {
+                    util::ResyncOutcome::Healed => thegn_core::msg::info(&format!(
+                        "merge queue: synced {} to {}",
+                        r.path.display(),
+                        &plan.final_tip[..plan.final_tip.len().min(9)]
+                    )),
+                    // NOT silent any more — the caller renders these on stdout.
+                    util::ResyncOutcome::Skipped(why) => tracing::debug!(
+                        target: "thegn::integrate",
+                        why,
+                        path = %r.path.display(),
+                        "left checkout working tree as-is"
+                    ),
+                    util::ResyncOutcome::Failed => tracing::warn!(
+                        target: "thegn::integrate",
+                        path = %r.path.display(),
+                        "could not fast-forward the checkout"
+                    ),
+                }
             }
             let mut report = build_report(
                 &target_branch,
@@ -818,6 +833,7 @@ pub fn run_fold(
                 cas_attempts,
             );
             report.advanced = true;
+            report.resyncs = resyncs;
             return Ok(report);
         }
         if cas_attempts >= 5 {
@@ -827,12 +843,46 @@ pub fn run_fold(
     }
 }
 
+/// Print a warning for every checkout of `branch` the fold could NOT
+/// fast-forward, with the exact command that syncs it.
+///
+/// The ref moved under those working trees, so `git status` there now shows the
+/// whole fold as pending deletions — which reads as a catastrophic accidental
+/// deletion, and which `git commit` would turn into a revert of the merge that
+/// just landed. Deriving the recovery is the hard part, so we spell it out
+/// rather than leaving the user to work it out from a wall of `D ` lines.
+///
+/// Goes to stdout, deliberately: this used to be a `tracing::warn!` that was
+/// invisible without `THEGN_LOG`, and a `Skipped` outcome was dropped entirely.
+pub(crate) fn report_resyncs(branch: &str, resyncs: &[util::CheckoutResync]) {
+    for r in resyncs {
+        let why = match &r.outcome {
+            // Healed is the happy path and needs no warning.
+            util::ResyncOutcome::Healed => continue,
+            util::ResyncOutcome::Skipped(why) => *why,
+            util::ResyncOutcome::Failed => "the fast-forward could not be applied",
+        };
+        outln!(
+            "! {} is on {branch} and was NOT resynced ({why}).",
+            r.path.display()
+        );
+        outln!("  Its working tree still holds the pre-fold content, so `git status`");
+        outln!("  there mixes this fold in with your own changes — don't commit it");
+        outln!("  blindly. Reconcile your changes, then sync it with:");
+        outln!("    {}", r.manual_fix());
+    }
+}
+
 /// What the driver's single-branch land attempt decided.
 #[derive(Debug, Clone)]
 pub(crate) enum AttemptOutcome {
     /// Merged clean, gated green, and CAS-advanced the target. `commit` is the
-    /// fold tip now at the target ref.
-    Landed { commit: String },
+    /// fold tip now at the target ref. `resyncs` reports what happened to each
+    /// live checkout of the target branch (see `util::resync_branch_checkouts`).
+    Landed {
+        commit: String,
+        resyncs: Vec<util::CheckoutResync>,
+    },
     /// Merged clean and gated green, but `auto_land` is off — held for a manual
     /// land. `tip` is the (unreferenced) fold commit in the object DB.
     Ready { tip: String },
@@ -930,15 +980,15 @@ pub(crate) fn attempt_land(
         }
         cas_attempts += 1;
         if CliGit.update_ref_cas(&loc, &target_ref, &folded_tip, &base)? {
-            if util::resync_ff_checkout(repo_root, &target_branch, &base, &folded_tip)
-                == util::ResyncOutcome::Failed
-            {
-                tracing::warn!(
-                    target: "thegn::integrate",
-                    "could not fast-forward the main checkout; run `git -C <repo> reset --hard {target_branch}` to sync it"
-                );
-            }
-            return Ok(AttemptOutcome::Landed { commit: folded_tip });
+            // Every live checkout of the target, not just the main one — and the
+            // outcomes ride out on the result so the caller can report the ones
+            // left stale. Dropping `Skipped` here is what made the desync silent.
+            let resyncs =
+                util::resync_branch_checkouts(repo_root, &target_branch, &base, &folded_tip);
+            return Ok(AttemptOutcome::Landed {
+                commit: folded_tip,
+                resyncs,
+            });
         }
         if cas_attempts >= 5 {
             anyhow::bail!("merge queue: {target_branch} kept moving under the fold");
@@ -1206,7 +1256,7 @@ mod tests {
         let before = repo.out(&["rev-parse", "main"]);
 
         match attempt_land(&cfg(""), &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap() {
-            AttemptOutcome::Landed { commit } => assert!(!commit.is_empty()),
+            AttemptOutcome::Landed { commit, .. } => assert!(!commit.is_empty()),
             o => panic!("expected Landed, got {o:?}"),
         }
         assert_ne!(repo.out(&["rev-parse", "main"]), before, "main advanced");

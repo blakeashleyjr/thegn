@@ -887,7 +887,20 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         }
     };
     match outcome {
-        AttemptOutcome::Landed { commit } => {
+        AttemptOutcome::Landed { commit, resyncs } => {
+            // In-app, a checkout on the target is fast-forwarded by the ref
+            // watcher (`git_watch::spawn_main_checkout_heal`); anything the fold
+            // could not sync is real uncommitted work, so log it rather than
+            // interrupting with a toast the user can't act on mid-drain.
+            for r in &resyncs {
+                if !matches!(r.outcome, thegn_core::util::ResyncOutcome::Healed) {
+                    tracing::warn!(
+                        target: "thegn::merge",
+                        path = %r.path.display(),
+                        "checkout of the target was left stale by the fold"
+                    );
+                }
+            }
             record("landed", Some(&commit), None);
             lifecycle(LifecycleEvent::Landed, &branch);
             DriveMsg::Done(DriveOutcome {
