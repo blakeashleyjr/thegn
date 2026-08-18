@@ -29,7 +29,6 @@
 //! [`PoolStore`] (warm-spare pool), and [`HostStore`] (host state machine).
 
 mod account;
-mod aux;
 mod cache;
 mod compute;
 mod control;
@@ -42,10 +41,14 @@ mod pool;
 mod semantic;
 mod trust;
 mod workspace;
+// NOT `aux` — `AUX` is a reserved DOS device name, so Windows git refuses to
+// create the file at all ("invalid path"), which made the repo unclonable on
+// Windows and failed the msvc CI job at checkout. Same trap: con, prn, nul,
+// com1-9, lpt1-9 (the extension is irrelevant).
+mod worktree_aux;
 mod zone;
 
 pub use account::AccountStore;
-pub use aux::WorktreeAuxStore;
 pub use cache::CacheStore;
 pub use compute::{ComputeBudgetRow, ComputeLedgerStore, ComputeMeterRow};
 pub use control::{ControlStore, DaemonRow, LeaseRow, PairingRow};
@@ -61,4 +64,5 @@ pub use pool::PoolStore;
 pub use semantic::{SemEdgeRow, SemEntityRow, SemanticStore};
 pub use trust::{RepoTrustRow, RepoTrustStore};
 pub use workspace::WorkspaceStore;
+pub use worktree_aux::WorktreeAuxStore;
 pub use zone::{ZoneDeleteOutcome, ZoneRow, ZoneStore};
