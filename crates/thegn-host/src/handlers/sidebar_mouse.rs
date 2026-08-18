@@ -792,8 +792,8 @@ fn folder_id_of_pin_key(model: &FrameModel, key: &str) -> Option<i64> {
         .and_then(|r| r.folder_id)
 }
 
-/// Step-move the source workspace to the target slot (see
-/// [`reorder_worktree_to`]; workspaces move via `move_workspace_by_slug`).
+/// Step-move the source workspace to the target slot (the worktree counterpart
+/// is `move_worktree_path`; workspaces move via `move_workspace_by_slug`).
 fn reorder_workspace_to(
     sb: &mut SidebarState,
     model: &mut FrameModel,

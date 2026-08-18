@@ -230,7 +230,7 @@ fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text
 /// markers when the app has requested them (so editors don't auto-indent),
 /// with embedded markers neutralized (bracketed-paste injection hardening —
 /// see [`crate::pane_writer::build_paste_bytes`]). The whole paste is ONE
-/// queued chunk, so a congestion drop ([`StdinSendError::Full`]) can never
+/// queued chunk, so a congestion drop ([`crate::pane_writer::StdinSendError::Full`]) can never
 /// leave the app inside an open paste bracket, and no keystroke can land
 /// between the markers.
 fn paste_text_into_pane(
