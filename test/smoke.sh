@@ -415,6 +415,12 @@ check "an unrunnable gate never dispatches the fixing agent" \
 # at enqueue time (two different targets used to be shown for one operation).
 check "merge list shows the run's effective target" \
   "'$SZ' merge list | grep -q '$GB'"
+# `merge retry` re-arms a blocked row (the CLI twin of the panel's `r`), and is
+# a distinct non-zero outcome when there is nothing to re-arm.
+check "merge retry re-queues a blocked row" \
+  "'$SZ' merge retry --worktree '$GP' | grep -qi 're-queued'"
+check "merge retry on an unqueued path exits non-zero" \
+  "! '$SZ' merge retry --worktree '$R' >/dev/null 2>&1"
 "$SZ" merge rm --worktree "$GP" >/dev/null 2>&1 || true
 
 # ── placement engine ─────────────────────────────────────────────────────────

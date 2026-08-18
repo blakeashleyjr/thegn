@@ -41,6 +41,11 @@ pub(crate) struct QueueItem {
     /// else an ssh/provider blob. Resolves the branch's `GitLoc` so the drain
     /// knows whether to fetch its tip into the target store (cross-host).
     pub location: String,
+    /// Agent-dispatch cycles already spent on this row (from the queue row).
+    /// The `agent_max_attempts` budget belongs to the BRANCH, not to one drain
+    /// invocation — otherwise a `needs_human` row that had already exhausted it
+    /// got the full budget again on every subsequent drain.
+    pub agent_attempts: u32,
 }
 
 /// One status transition the driver made, handed to the caller's `progress`
@@ -143,7 +148,9 @@ pub(crate) fn drive_queue(
             (!item.location.is_empty()).then_some(item.location.as_str()),
         );
 
-        let mut agent_runs = 0u32;
+        // Seeded from the persisted count, so the budget survives the drain that
+        // spent it. `merge retry` (or a re-enqueue) resets it to 0.
+        let mut agent_runs = item.agent_attempts;
         loop {
             let attempt = match integrate::attempt_land(cfg, repo_root, &item.branch, &branch_loc) {
                 Ok(a) => a,
@@ -243,6 +250,7 @@ pub(crate) fn drive_queue(
             // A land failure. Dispatch the agent to fix it, if we still can.
             if use_agent && agent_runs < cfg.agent_max_attempts {
                 agent_runs += 1;
+                let _ = db.set_merge_agent_attempts(&item.worktree, agent_runs);
                 let note = format!("agent fixing ({agent_runs}/{})", cfg.agent_max_attempts);
                 set(db, "agent_running", None, Some(&note));
                 progress(&DriveStep {
@@ -512,12 +520,14 @@ fn detail_with_log(headline: &str, log: &str) -> String {
     format!("{headline}\n{body}")
 }
 
-/// The last non-empty line of a log (for a one-line status detail).
+/// The last non-empty line of a log (for a one-line status detail), falling back
+/// to a headline when the command produced no output at all — a bare `exit 1`
+/// gate would otherwise render as "needs a human — " with nothing after it.
 fn tail_line(log: &str) -> String {
     log.lines()
         .rev()
         .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
+        .unwrap_or("breaks build (gate exited non-zero, no output)")
         .to_string()
 }
 
@@ -569,7 +579,27 @@ mod tests {
     #[test]
     fn tail_line_picks_last_nonempty() {
         assert_eq!(tail_line("a\nb\n\n"), "b");
-        assert_eq!(tail_line(""), "");
+        // A gate that fails silently (a bare `exit 1`) still needs SOMETHING to
+        // show, or the status line reads "needs a human — " and stops.
+        assert!(tail_line("").contains("no output"));
+        assert!(tail_line("   \n\n").contains("no output"));
+    }
+
+    #[test]
+    fn detail_with_log_keeps_the_headline_and_bounds_the_log() {
+        // No log: headline alone, no stray separator.
+        assert_eq!(detail_with_log("breaks build", ""), "breaks build");
+        assert_eq!(detail_with_log("breaks build", "   \n "), "breaks build");
+        // With a log: headline first (that is what one-line renderers show),
+        // the log after.
+        let d = detail_with_log("breaks build", "line1\nline2");
+        assert_eq!(d.lines().next(), Some("breaks build"));
+        assert!(d.contains("line2"));
+        // Bounded, and still valid UTF-8 at the cut.
+        let huge = "é".repeat(4000);
+        let d = detail_with_log("boom", &huge);
+        assert!(d.len() < 2200, "len {}", d.len());
+        assert_eq!(d.lines().next(), Some("boom"));
     }
 
     // ── End-to-end drive with a fake headless agent (real git) ────────────────
@@ -674,6 +704,7 @@ mod tests {
                     worktree: feat_wt.to_string_lossy().into(),
                     branch: "feat".into(),
                     location: String::new(),
+                    agent_attempts: 0,
                 }],
                 |_| {},
             );
@@ -702,6 +733,7 @@ mod tests {
                     worktree: feat_wt.to_string_lossy().into(),
                     branch: "feat".into(),
                     location: String::new(),
+                    agent_attempts: 0,
                 }],
                 |_| {},
             );

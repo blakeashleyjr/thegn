@@ -76,7 +76,7 @@ use std::path::PathBuf;
 /// v48: adds `worktree_titles` (the last OSC window title per worktree, so the
 /// sidebar keeps a worktree's dynamic title across switches, parking, cold
 /// resurrects, and restarts — seeded at startup, refreshed live).
-pub const SCHEMA_VERSION: i64 = 48;
+pub const SCHEMA_VERSION: i64 = 49;
 
 pub struct Db {
     conn: Connection,
@@ -113,6 +113,11 @@ pub struct MergeQueueRow {
     /// branch tip must be fetched into the target store. See [`crate::remote`].
     #[serde(default)]
     pub location: String,
+    /// How many agent-dispatch → re-fold cycles have been spent on this row.
+    /// Persisted (v49) so `agent_max_attempts` is a budget for the branch, not
+    /// for one invocation of the drain.
+    #[serde(default)]
+    pub agent_attempts: u32,
 }
 
 // Share/forward resurrection rows live in `models` (size-capped file); the
@@ -571,7 +576,12 @@ impl Db {
               -- v44: the worktree's location (mirrored from worktrees.location at
               -- enqueue) so a cross-host drain can attribute a row to a host and
               -- decide whether to fetch its tip into the target store.
-              location       TEXT
+              location       TEXT,
+              -- v49: agent-dispatch attempts spent on this row, so the budget
+              -- survives the drain that spent it. It used to be a per-call local,
+              -- so a `needs_human` row that had already exhausted
+              -- `agent_max_attempts` got the full budget again on every drain.
+              agent_attempts INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_merge_queue_status
               ON merge_queue (status, queued_at);

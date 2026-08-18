@@ -2769,7 +2769,9 @@ conflict_handoff = "agent"    # agent | notify | manual — fate of a deferred b
 # object-DB fold + CAS itself. {prompt}/{branch}/{target} are substituted.
 agent_command = ""            # e.g. 'claude -p "{prompt}" --permission-mode acceptEdits'; "" ⇒ agent handoff degrades to notify
 auto_land = true              # queue driver: CAS-advance on green; false ⇒ stop at "ready" for a manual land
-agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human"
+agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human".
+                              # The budget belongs to the BRANCH and is persisted, so a later drain
+                              # doesn't spend it again; `thegn merge retry` re-arms a row.
 agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
 #
 # Sidebar organization (ON by default). As a branch moves through the queue,

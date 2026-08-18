@@ -55,6 +55,13 @@ pub enum Action {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
+    /// Re-arm a blocked branch for the next drain: back to `queued`, agent
+    /// budget reset, prior failure detail cleared. The "I fixed it, try again"
+    /// gesture (the panel's `r` key).
+    Retry {
+        #[command(flatten)]
+        target: super::target::WorktreeTarget,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -72,7 +79,28 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Clear => clear(cfg),
         Action::Drain { all, json } => drain(cfg, all, json),
         Action::Land { target } => land(cfg, target.get()),
+        Action::Retry { target } => retry(target.get()),
     }
+}
+
+/// `merge retry [worktree]` — re-arm a blocked row.
+///
+/// A plain drain already re-attempts every non-settled row, but the agent budget
+/// is now persisted per branch, so an exhausted `needs_human` row would keep
+/// deferring without ever dispatching again. This resets it — and gives the
+/// gesture a name in `merge --help`, which it never had on the CLI even though
+/// the panel has bound `r` to it all along.
+fn retry(worktree: Option<String>) -> Result<()> {
+    let wt = crate::merge_ops::canonical_worktree(&super::resolve_worktree(worktree));
+    let wt_s = wt.to_string_lossy().to_string();
+    let db = Db::open()?;
+    if !db.retry_merge_entry(&wt_s)? {
+        // Not queued is a distinct, non-zero outcome — scripting must be able to
+        // tell "re-armed" from "there was nothing to re-arm".
+        anyhow::bail!("{wt_s} is not in the merge queue.");
+    }
+    outln!("Re-queued for the next drain.");
+    Ok(())
 }
 
 /// The repo root (main checkout) reachable from the cwd.
@@ -285,6 +313,7 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             worktree: r.worktree,
             branch: r.branch,
             location: r.location,
+            agent_attempts: r.agent_attempts,
         })
         .collect();
     if items.is_empty() {

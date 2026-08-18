@@ -419,6 +419,13 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // whether the branch tip must be fetched into the target store. Additive;
     // NULL on pre-v44 rows = treated as local (same store as the target).
     let _ = conn.execute("ALTER TABLE merge_queue ADD COLUMN location TEXT", []);
+    // v49: persist the agent-dispatch budget spent on a queue row. Additive;
+    // pre-v49 rows start at 0, which is the pre-change behavior for their first
+    // drain and correct thereafter.
+    let _ = conn.execute(
+        "ALTER TABLE merge_queue ADD COLUMN agent_attempts INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
 }
 
 #[cfg(test)]
@@ -433,6 +440,48 @@ mod tests {
         assert_eq!(super::detect_newer_schema(5, 10), None);
         assert_eq!(super::detect_newer_schema(10, 10), None);
         assert_eq!(super::detect_newer_schema(12, 10), Some(12));
+    }
+
+    #[test]
+    fn pre_v49_merge_queue_gains_agent_attempts_defaulting_to_zero() {
+        use crate::store::WorktreeAuxStore;
+        // A merge_queue table shaped like v48 (no agent_attempts), with a row in
+        // it, must survive the additive migration and read back as 0 attempts —
+        // which is the pre-change behavior for that row's next drain.
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v49-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE merge_queue (
+                   worktree TEXT PRIMARY KEY, branch TEXT NOT NULL,
+                   target_branch TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
+                   queued_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                   result_oid TEXT, conflict_paths TEXT, error_detail TEXT, location TEXT);
+                 INSERT INTO merge_queue
+                   (worktree,branch,target_branch,status,queued_at,updated_at)
+                   VALUES ('/wt/a','feat','main','gate_failed',1,1);
+                 PRAGMA user_version = 48;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        let rows = db.list_merge_queue().unwrap();
+        assert_eq!(rows.len(), 1, "the pre-v49 row must survive");
+        assert_eq!(rows[0].branch, "feat");
+        assert_eq!(rows[0].agent_attempts, 0);
+        // And the new column is writable on that migrated row.
+        db.set_merge_agent_attempts("/wt/a", 2).unwrap();
+        assert_eq!(db.list_merge_queue().unwrap()[0].agent_attempts, 2);
+        // `retry` clears both the status and the budget.
+        assert!(db.retry_merge_entry("/wt/a").unwrap());
+        let r = &db.list_merge_queue().unwrap()[0];
+        assert_eq!(r.status, "queued");
+        assert_eq!(r.agent_attempts, 0);
+        assert!(!db.retry_merge_entry("/wt/nope").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
