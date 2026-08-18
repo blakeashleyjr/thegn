@@ -114,7 +114,10 @@ fn worktree_mq_entries(
             }
             if matches!(
                 status,
-                MqStatus::Deferred | MqStatus::GateFailed | MqStatus::NeedsHuman
+                MqStatus::Deferred
+                    | MqStatus::GateFailed
+                    | MqStatus::GateError
+                    | MqStatus::NeedsHuman
             ) {
                 v.push(("mq-retry", "Retry"));
             }

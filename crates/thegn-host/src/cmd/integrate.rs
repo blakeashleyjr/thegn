@@ -86,6 +86,13 @@ pub fn run(cfg: &Config) -> Result<()> {
             Some(b) => outln!("Gate failed — isolated {b}; main not advanced."),
             None => outln!("Gate failed — main not advanced."),
         },
+        GateOutcome::Errored { reason } => {
+            // Not a verdict about any branch — say so, and say what to fix.
+            outln!("Gate could NOT RUN — {reason}; {target} not advanced.");
+            outln!("  No branch was blamed. Check `[merge_queue] gate_command`");
+            outln!("  and `gate_setup_command` — the gate worktree is a bare");
+            outln!("  checkout with no dependencies installed.");
+        }
         GateOutcome::Skipped => {}
     }
     if report.advanced {

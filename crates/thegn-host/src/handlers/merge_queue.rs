@@ -912,10 +912,29 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 detail.replace('\n', ", ")
             ))
         }
-        AttemptOutcome::GateFailed { .. } => {
-            record("gate_failed", None, Some("breaks build"));
+        AttemptOutcome::GateFailed { log } => {
+            // Keep the gate output on the row: "breaks build" alone never told
+            // the user which test failed.
+            let detail = if log.trim().is_empty() {
+                "breaks build".to_string()
+            } else {
+                format!("breaks build\n{}", log.trim())
+            };
+            record("gate_failed", None, Some(&detail));
             lifecycle(LifecycleEvent::Failed, &branch);
             DriveMsg::Failed(format!("{branch} breaks the build (gate red)"))
+        }
+        AttemptOutcome::GateError { reason, log } => {
+            // The gate could not run — an environment fact, not a verdict about
+            // the branch, so it gets its own state and never reaches the agent.
+            let detail = if log.trim().is_empty() {
+                reason.clone()
+            } else {
+                format!("{reason}\n{}", log.trim())
+            };
+            record("gate_error", None, Some(&detail));
+            lifecycle(LifecycleEvent::Failed, &branch);
+            DriveMsg::Failed(format!("{branch} was NOT gated — {reason}"))
         }
         AttemptOutcome::Unreachable { detail } => {
             record("deferred", None, Some(&detail));

@@ -60,6 +60,10 @@ pub(crate) struct DriveOutcome {
     pub ready: Vec<String>,
     pub deferred: Vec<String>,
     pub needs_human: Vec<String>,
+    /// Branches whose gate could not RUN — an environment failure, reported
+    /// separately from `deferred` so a caller never reads "the branch is bad"
+    /// out of "the gate binary is missing".
+    pub gate_error: Vec<String>,
 }
 
 /// Why a branch didn't land — the material a fixing agent needs.
@@ -206,6 +210,26 @@ pub(crate) fn drive_queue(
                     out.deferred.push(item.branch.clone());
                     break;
                 }
+                AttemptOutcome::GateError { reason, log } => {
+                    // The gate could not RUN. This is a fact about the
+                    // environment, not a verdict about the branch, so it must
+                    // NOT become a `Failure`: handing it to the fixing agent
+                    // would set a coding model loose on source code in response
+                    // to `command not found`. Record it as its own state and
+                    // stop; the row is retried on the next drain, by which time
+                    // the environment may be fixed.
+                    let detail = detail_with_log(&reason, &log);
+                    set(db, "gate_error", None, Some(&detail));
+                    lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
+                    progress(&DriveStep {
+                        worktree: &item.worktree,
+                        branch: &item.branch,
+                        status: "gate_error",
+                        detail: &detail,
+                    });
+                    out.gate_error.push(item.branch.clone());
+                    break;
+                }
                 AttemptOutcome::Conflict { paths } => Failure::Conflict(paths),
                 AttemptOutcome::GateFailed { log } => Failure::Gate(log),
             };
@@ -262,7 +286,11 @@ pub(crate) fn drive_queue(
                     } else {
                         "gate_failed"
                     };
-                    set(db, status, None, Some("breaks build"));
+                    // Persist the actual gate output, not a fixed two-word
+                    // string: "breaks build" told the user nothing about WHY,
+                    // and the log was otherwise discarded entirely.
+                    let detail = detail_with_log("breaks build", &log);
+                    set(db, status, None, Some(&detail));
                     progress(&DriveStep {
                         worktree: &item.worktree,
                         branch: &item.branch,
@@ -457,6 +485,25 @@ fn run_agent(
         "merge queue: headless agent runs are not yet supported on Windows"
     );
     false
+}
+
+/// A queue row's `error_detail`: a short headline plus the tail of the gate log.
+///
+/// The log used to be discarded at this boundary — the row kept only the fixed
+/// string "breaks build", so neither `merge list` nor the panel could ever say
+/// what actually went wrong. Bounded so a runaway gate can't bloat the row.
+fn detail_with_log(headline: &str, log: &str) -> String {
+    const MAX_LOG: usize = 2000;
+    let log = log.trim();
+    if log.is_empty() {
+        return headline.to_string();
+    }
+    let mut cut = log.len().saturating_sub(MAX_LOG);
+    while cut < log.len() && !log.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let body = if cut > 0 { &log[cut..] } else { log };
+    format!("{headline}\n{body}")
 }
 
 /// The last non-empty line of a log (for a one-line status detail).

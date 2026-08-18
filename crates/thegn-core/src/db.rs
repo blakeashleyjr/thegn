@@ -551,7 +551,13 @@ impl Db {
             -- merge_queue (v22): the local fold-actor's queue + result cache,
             -- keyed by worktree. Git stays the source of truth; this is the UI
             -- feed and the durable record of what landed / what was deferred.
-            -- status: queued | folding | verifying | landed | deferred | gate_failed
+            -- status (the full vocabulary; MqStatus::parse is the one decoder):
+            --   queued | folding | verifying | agent_running
+            --   landed | ready
+            --   deferred | gate_failed | gate_error | needs_human
+            -- gate_failed = the gate RAN and went red (a verdict about the code);
+            -- gate_error  = the gate could not RUN (an environment fact). They are
+            -- separate because only the former may wake the fixing agent.
             CREATE TABLE IF NOT EXISTS merge_queue (
               worktree       TEXT PRIMARY KEY,
               branch         TEXT NOT NULL,

@@ -64,21 +64,33 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         if let Some(host) = host_label(&r.location) {
             left.push(seg(hue(Hue::Blue), format!(" @{host}")));
         }
-        // Blocked rows carry the reason: the conflicting paths, "breaks build"
-        // for a gate failure, or the recorded detail when an agent gave up.
-        if r.status == "deferred" || r.status == "gate_failed" || r.status == "needs_human" {
-            let reason = if r.status == "gate_failed" {
-                "breaks build".to_string()
-            } else if let Some(d) = r.error_detail.as_deref().filter(|s| !s.is_empty()) {
-                d.replace('\n', ", ")
+        // Blocked rows carry the reason recorded on the row. The gate branch
+        // used to hardcode "breaks build" here, ignoring `error_detail` — so the
+        // panel could never show WHICH test failed, and an environment failure
+        // read as a verdict about the code. Always prefer the recorded detail;
+        // only the headline's first line is shown (the log tail is in the row).
+        if matches!(
+            r.status.as_str(),
+            "deferred" | "gate_failed" | "gate_error" | "needs_human"
+        ) {
+            let reason = if let Some(d) = r.error_detail.as_deref().filter(|s| !s.is_empty()) {
+                d.lines().next().unwrap_or(d).to_string()
             } else {
                 match r.conflict_paths.as_deref() {
                     Some(p) if !p.is_empty() => p.replace('\n', ", "),
+                    _ if r.status == "gate_failed" => "breaks build".to_string(),
+                    _ if r.status == "gate_error" => "gate could not run".to_string(),
                     _ => "conflict".to_string(),
                 }
             };
+            // Amber for an environment failure: nothing is wrong with the branch.
+            let tone = if r.status == "gate_error" {
+                Hue::Amber
+            } else {
+                Hue::Red
+            };
             left.push(seg(g(), "  "));
-            left.push(seg(hue(Hue::Red), reason));
+            left.push(seg(hue(tone), reason));
         }
         // Each queue row carries a `Row` hit so the enumerate index lines up
         // with `ui.cursor` and with `model.panel.merge_queue`.

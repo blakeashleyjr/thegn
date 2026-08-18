@@ -194,6 +194,15 @@ impl WorktreeAuxStore for Db {
         Ok(())
     }
 
+    fn set_merge_target(&self, worktree: &str, target_branch: &str) -> Result<()> {
+        self.conn().execute(
+            r#"UPDATE merge_queue SET target_branch=?2, updated_at=?3
+               WHERE worktree=?1"#,
+            params![worktree, target_branch, util::now()],
+        )?;
+        Ok(())
+    }
+
     /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
     /// elsewhere, or the worktree is removed).
     fn remove_merge_entry(&self, worktree: &str) -> Result<()> {

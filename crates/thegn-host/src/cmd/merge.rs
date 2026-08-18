@@ -164,6 +164,12 @@ fn add_via_host(url: &str, token: &str, worktrees: Vec<String>) -> Result<()> {
 }
 
 fn add(cfg: &Config, worktrees: Vec<String>, all: bool) -> Result<()> {
+    add_quiet(cfg, worktrees, all, false)
+}
+
+/// `add`, with its human output suppressible so `drain --all --json` can enqueue
+/// without printing prose ahead of the single JSON document.
+fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Result<()> {
     // route_to_host: a provisioned sprite (host control endpoint + token in its
     // env) sends the enqueue to the host's daemon so the host's queue owns the
     // row. `--all` enumerates local branches, so it stays on the local path.
@@ -181,12 +187,18 @@ fn add(cfg: &Config, worktrees: Vec<String>, all: bool) -> Result<()> {
     if all {
         let cands = integrate::candidate_branches(mq, &root, &target)?;
         for s in &cands.skipped_dirty {
-            outln!("  • skipped {s} (dirty — set [merge_queue] snapshot_dirty = true to queue it)");
+            if !quiet {
+                outln!(
+                    "  • skipped {s} (dirty — set [merge_queue] snapshot_dirty = true to queue it)"
+                );
+            }
         }
         for (branch, wt) in &cands.worktrees {
             db.enqueue_merge(wt, branch, &target)?;
             crate::merge_lifecycle::apply(mq, &db, &root, wt, branch, LifecycleEvent::Enqueued);
-            outln!("  + queued {branch}");
+            if !quiet {
+                outln!("  + queued {branch}");
+            }
         }
         return Ok(());
     }
@@ -203,7 +215,9 @@ fn add(cfg: &Config, worktrees: Vec<String>, all: bool) -> Result<()> {
         } else {
             "+"
         };
-        outln!("  {mark} {msg}");
+        if !quiet {
+            outln!("  {mark} {msg}");
+        }
     }
     Ok(())
 }
@@ -247,11 +261,20 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         // Guard refusal: bail so the exit code is non-zero for scripting/CI.
         anyhow::bail!("{msg}");
     }
+    // `--json` means EXACTLY one document on stdout (see `cmd::emit_json`), so
+    // every human line below is suppressed under it — including the enqueue
+    // chatter from `--all`, the banner, per-branch progress, and the push
+    // footer. Previously all of those printed regardless, so `--json` emitted a
+    // stream of prose with one JSON object somewhere in the middle.
     if all {
-        add(cfg, Vec::new(), true)?;
+        add_quiet(cfg, Vec::new(), true, json)?;
     }
+    let target = integrate::resolve_target(mq, &root);
     let items: Vec<QueueItem> = rows_for_repo(&root)?
         .into_iter()
+        // Only settled-good rows are excluded. `gate_failed`/`gate_error`/
+        // `deferred`/`needs_human` are all retried by a plain drain — an
+        // environment failure especially, since it may simply be fixed by now.
         .filter(|r| r.status != "landed" && r.status != "ready")
         .map(|r| QueueItem {
             worktree: r.worktree,
@@ -260,63 +283,137 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         })
         .collect();
     if items.is_empty() {
+        // The empty path is the one a cron/CI loop hits most often, so it must
+        // honour `--json` like every other path rather than printing prose.
+        if json {
+            return super::emit_json(&drain_json(&target, &merge_driver::DriveOutcome::default()));
+        }
         outln!("Nothing to drain.");
         return Ok(());
     }
-    let target = integrate::resolve_target(mq, &root);
-    outln!(
-        "Draining {} branch(es) into {target}{}…",
-        items.len(),
-        if mq.gate_on && !mq.gate_command.is_empty() {
-            format!(" (gate: {})", mq.gate_command)
-        } else {
-            String::new()
-        }
-    );
+    if !json {
+        outln!(
+            "Draining {} branch(es) into {target}{}…",
+            items.len(),
+            match (mq.gate_on, mq.gate_command.is_empty()) {
+                (true, false) => format!(" (gate: {})", mq.gate_command),
+                // Say "ungated" out loud: an unintentionally ungated drain used
+                // to look identical to a gated one (the suffix was just absent).
+                _ => " (UNGATED — no gate_command)".to_string(),
+            }
+        );
+    }
 
     let db = Db::open()?;
+    // The run's effective target may differ from the one frozen on each row at
+    // enqueue time (e.g. under `--set merge_queue.target_branch=…`), which is
+    // why `merge list` used to keep showing the stale value. Re-stamp it.
+    for it in &items {
+        let _ = db.set_merge_target(&it.worktree, &target);
+    }
     let out = merge_driver::drive_queue(mq, &root, &db, items, |step: &DriveStep| {
+        if json {
+            return;
+        }
         // Only the settled transitions are worth a CLI line; folding/agent_running
         // are transient and would just be noise before the outcome.
         match step.status {
             "landed" => outln!("  ✓ landed {} ({})", step.branch, step.detail),
             "ready" => outln!("  ◆ ready  {} ({})", step.branch, step.detail),
             "deferred" | "gate_failed" => {
-                outln!("  ✗ {} deferred — {}", step.branch, step.detail)
+                outln!("  ✗ {} deferred — {}", step.branch, first_line(step.detail))
             }
-            "needs_human" => outln!("  ⚑ {} needs a human — {}", step.branch, step.detail),
+            // Not a verdict about the branch — worded so it can't be misread.
+            "gate_error" => outln!(
+                "  ! {} was NOT gated — {}",
+                step.branch,
+                first_line(step.detail)
+            ),
+            "needs_human" => outln!(
+                "  ⚑ {} needs a human — {}",
+                step.branch,
+                first_line(step.detail)
+            ),
             "agent_running" => outln!("  … {} — {}", step.branch, step.detail),
             _ => {}
         }
     });
 
-    if json {
-        super::emit_json(&serde_json::json!({
-            "landed": out.landed,
-            "ready": out.ready,
-            "deferred": out.deferred,
-            "needs_human": out.needs_human,
-        }))?;
-    } else {
-        outln!(
-            "Done: {} landed, {} ready, {} deferred, {} need a human.",
-            out.landed.len(),
-            out.ready.len(),
-            out.deferred.len(),
-            out.needs_human.len()
-        );
-    }
-    // push mode: converge by pushing the advanced target to origin.
+    // push mode: converge by pushing the advanced target to origin. Done before
+    // emitting JSON so its result can ride inside the single document.
+    let mut push_err: Option<anyhow::Error> = None;
+    let mut pushed = false;
     if push_mode && !out.landed.is_empty() {
         match crate::merge_ops::push_target(&root, &target) {
-            Ok(()) => outln!("Pushed {target} to origin."),
+            Ok(()) => {
+                pushed = true;
+                if !json {
+                    outln!("Pushed {target} to origin.");
+                }
+            }
             Err(e) => {
-                outln!("Push failed — {target} advanced locally but NOT on origin: {e}");
-                return Err(e);
+                if !json {
+                    outln!("Push failed — {target} advanced locally but NOT on origin: {e}");
+                }
+                push_err = Some(e);
             }
         }
     }
+
+    if json {
+        let mut doc = drain_json(&target, &out);
+        if push_mode {
+            doc["pushed"] = serde_json::json!(pushed);
+        }
+        super::emit_json(&doc)?;
+    } else {
+        outln!(
+            "Done: {} landed, {} ready, {} deferred, {} ungated, {} need a human.",
+            out.landed.len(),
+            out.ready.len(),
+            out.deferred.len(),
+            out.gate_error.len(),
+            out.needs_human.len()
+        );
+        if !out.gate_error.is_empty() {
+            outln!(
+                "Note: {} branch(es) were never judged — the gate could not run. \
+                 That is an environment failure, not a verdict about the code.",
+                out.gate_error.len()
+            );
+        }
+    }
+    if let Some(e) = push_err {
+        return Err(e);
+    }
     Ok(())
+}
+
+/// The `drain --json` document. One shape for every exit path, including the
+/// empty queue — scripts must not have to special-case the common no-op.
+fn drain_json(target: &str, out: &merge_driver::DriveOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "target": target,
+        "landed": out.landed,
+        "ready": out.ready,
+        "deferred": out.deferred,
+        // The gate could not RUN for these — reported apart from `deferred` so a
+        // script never reads "the branch is bad" out of "the gate is missing".
+        "gate_error": out.gate_error,
+        "needs_human": out.needs_human,
+        "counts": {
+            "landed": out.landed.len(),
+            "ready": out.ready.len(),
+            "deferred": out.deferred.len(),
+            "gate_error": out.gate_error.len(),
+            "needs_human": out.needs_human.len(),
+        },
+    })
+}
+
+/// First line of a multi-line status detail (the rest is the retained gate log).
+fn first_line(detail: &str) -> &str {
+    detail.lines().next().unwrap_or(detail)
 }
 
 fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
@@ -362,6 +459,20 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
             lifecycle(LifecycleEvent::Failed);
             outln!("✗ {branch} breaks the build (gate red).");
             failure = Some(format!("land failed: {branch} gate red"));
+        }
+        AttemptOutcome::GateError { reason, log } => {
+            // The gate never ran: record it as an environment failure, not as a
+            // verdict about the branch, and keep the log so the row can say why.
+            let detail = if log.trim().is_empty() {
+                reason.clone()
+            } else {
+                format!("{reason}\n{}", log.trim())
+            };
+            let _ = db.update_merge_status(&wt_s, "gate_error", None, None, Some(&detail));
+            lifecycle(LifecycleEvent::Failed);
+            outln!("✗ {branch} was NOT gated — {reason}.");
+            outln!("  The branch was not judged; fix the gate environment and re-run.");
+            failure = Some(format!("land failed: {branch} gate could not run"));
         }
         AttemptOutcome::Unreachable { detail } => {
             let _ = db.update_merge_status(&wt_s, "deferred", None, Some(&detail), None);
