@@ -50,6 +50,34 @@ Run the drain **where the target repo lives**. If you invoke it from a
 machine other than the target's host, thegn tells you which host to run
 it on — the fold, gate, and ref-advance must be co-located with `main`.
 
+## The gate
+
+The folded tip is checked out into a **bare** gate worktree — a fresh
+checkout of the merge commit with no dependencies installed. That is the
+point (it tests the union, which exists nowhere else), but it means
+`gate_command` cannot rely on a project-local toolchain: no
+`node_modules`, no virtualenv, no `.direnv`. Rust works out of the box
+only because `cargo` is global.
+
+Provision it with `gate_setup_command`, which runs first and is **not**
+part of the verdict:
+
+```toml
+[merge_queue]
+gate_setup_command = "pnpm install --frozen-lockfile"
+gate_command = "pnpm test"
+```
+
+That split matters, because a gate can fail two different ways and only
+one of them is about your branch:
+
+- **`gate_failed`** — the gate ran and went red. A verdict about the
+  code, and the one a fixing agent can act on.
+- **`gate_error`** — the gate could not run at all (missing binary,
+  setup failed, killed). An environment fact. It never wakes the agent,
+  never triggers a bisect, and never blames a branch — but it is retried
+  on the next drain, since the environment may be fixed by then.
+
 ## Watching
 
 The masthead shows queue depth ([[bars]]); the _merge_ section lists

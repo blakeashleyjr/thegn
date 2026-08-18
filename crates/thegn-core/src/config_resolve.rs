@@ -1257,7 +1257,7 @@ pub struct KeyOrigin {
 
 /// Turn a dotted key (`sandbox.network_allow`) into a JSON pointer
 /// (`/sandbox/network_allow`).
-fn dotted_to_pointer(key: &str) -> String {
+pub(crate) fn dotted_to_pointer(key: &str) -> String {
     let mut p = String::new();
     for seg in key.split('.') {
         p.push('/');

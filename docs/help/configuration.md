@@ -34,7 +34,9 @@ The file is watched: edits apply live, no restart.
 
 ```sh
 thegn config show        # the effective merged config
-thegn config get ui.language
+thegn config get ui.language          # any dotted key; --json for real types
+thegn config set merge_queue.regenerate_paths '["Cargo.lock", "pnpm-lock.yaml"]'
+thegn config explain merge_queue.gate_command   # value + which layer set it
 thegn config validate
 thegn doctor             # resolved terminal capabilities
 thegn keys list          # every binding, grouped by zone (--json, --zone)

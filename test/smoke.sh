@@ -129,6 +129,24 @@ check "config get reads a nested vpn key" \
 check "config set of a valid key survives a pre-existing bad value elsewhere" \
   "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf 'lifecycle.eager = \"bogus\"\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config set picker fzf >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' config get picker | grep -q fzf"
 
+# `config get` resolves ANY dotted key, not a hand-maintained allowlist — the
+# whole nested surface (every [merge_queue] key, ui.*, …) used to exit 1 with
+# empty output while `config explain` resolved the same path fine.
+check "config get reads a nested merge_queue key" \
+  "[[ -n \$('$SZ' config get merge_queue.on_landed) ]]"
+check "config get --json emits a real bool, not a quoted string" \
+  "[[ \$('$SZ' config get merge_queue.auto_land --json) == 'true' ]]"
+check "config get still errors on an unknown key" \
+  "! '$SZ' config get merge_queue.no_such_key >/dev/null 2>&1"
+# `config set` can write sequence values; every value used to be written as a
+# TOML string, so array-typed keys had no CLI path at all.
+check "config set writes a real TOML array" \
+  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config set merge_queue.regenerate_paths '[\"a.lock\", \"b.lock\"]' >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' config get merge_queue.regenerate_paths --json | grep -q '\\[\"a.lock\",\"b.lock\"\\]'"
+# doctor surfaces the resolved paths, so a missing repo_root / a relocated $HOME
+# is one glance instead of "you have no repos".
+check "doctor reports a Paths section" \
+  "'$SZ' doctor | grep -q '^Paths'"
+
 # mcp serve: the read-only docs endpoint answers JSON-RPC over stdio.
 check "mcp serve initialize reports the docs server" \
   "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}' | '$SZ' mcp serve | grep -q 'thegn-docs'"
@@ -366,6 +384,38 @@ check "clean land auto-removes the merged worktree" \
   "[[ ! -d '$MP' ]]"
 check "clean land deletes the merged branch" \
   "[[ -z \$(git -C '$R' branch --list '$MB') ]]"
+
+# `--json` must emit EXACTLY one document on every path. The empty queue is the
+# case a cron/CI loop hits most often, and it used to print prose ("Nothing to
+# drain.") with no JSON at all.
+check "merge drain --json emits JSON on the empty queue" \
+  "'$SZ' merge drain --json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
+
+# An unrunnable gate is an ENVIRONMENT failure, not a verdict about the branch:
+# it must record `gate_error` (never `gate_failed`/"breaks build") and must not
+# dispatch the fixing agent — which would set a coding model loose on source
+# code in response to `command not found`.
+GP="$("$SZ" wt new smoke-gate --repo "$R")"
+GB="$(git -C "$GP" symbolic-ref --short HEAD)"
+echo hi >"$GP/smoke-gate.txt"
+git -C "$GP" add -A && git -C "$GP" commit -q -m "smoke gate change"
+"$SZ" merge add "$GP" >/dev/null 2>&1
+AGENT_MARK="$XDG_STATE_HOME/agent-fired"
+check "an unrunnable gate is reported as gate_error, not a build verdict" \
+  "'$SZ' --set merge_queue.gate_on=true \
+     --set merge_queue.gate_command=definitely-not-a-real-binary \
+     --set merge_queue.conflict_handoff=agent \
+     --set merge_queue.agent_command=\"touch $AGENT_MARK\" \
+     merge drain 2>&1 | grep -q 'NOT gated'"
+check "the queue row records gate_error with the real reason" \
+  "'$SZ' merge list | grep -q 'gate_error'"
+check "an unrunnable gate never dispatches the fixing agent" \
+  "[[ ! -e '$AGENT_MARK' ]]"
+# The row must show the target the run actually folded into, not the one frozen
+# at enqueue time (two different targets used to be shown for one operation).
+check "merge list shows the run's effective target" \
+  "'$SZ' merge list | grep -q '$GB'"
+"$SZ" merge rm --worktree "$GP" >/dev/null 2>&1 || true
 
 # ── placement engine ─────────────────────────────────────────────────────────
 # Engine OFF (the default): the dry-run reports passthrough and no state is
