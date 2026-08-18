@@ -95,12 +95,23 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
 ## Windows (native) notes
 
 Native Windows is a build target **under development**, not a supported
-platform — as of `v0.1.0-alpha.1` `thegn-host` has never been compiled or run
-on Windows (the msvc CI job has never executed), and no Windows binaries ship.
-The per-OS code paths below are written and reviewed but unproven; getting a
-first green msvc run is open work — see
-`openspec/changes/add-windows-native-compile`. No WSL is required. The dev
-experience differs from unix — nix/devenv and the justfile don't apply:
+platform, and no Windows binaries ship in `v0.1.0-alpha.1`. Current state, from
+the first msvc CI run:
+
+- `cargo check --workspace` **passes** — the port compiles.
+- `cargo test -p thegn-svc --lib ipc` **fails** on
+  `pipe_bind_is_the_lock_and_round_trips`: a second
+  `IpcListener::bind_exclusive` on a named pipe does not report the endpoint as
+  already held, so the bind-is-the-lock invariant the unix socket path relies on
+  does not hold on Windows yet (`crates/thegn-svc/src/ipc.rs`). Fix that first —
+  the Job-Object tests and the release build are gated behind it and have never
+  been reached. See `openspec/changes/add-windows-daemon-ipc`.
+- The msvc job is opt-in: dispatch, or `[ci-windows]` in the commit subject.
+  Careful — the marker is matched anywhere in the commit _message_, so merely
+  mentioning it in a body will trigger the job.
+
+No WSL is required. The dev experience differs from unix — nix/devenv and the
+justfile don't apply:
 
 - **Toolchain:** [rustup](https://rustup.rs) with the default
   `x86_64-pc-windows-msvc` toolchain + the Visual Studio Build Tools

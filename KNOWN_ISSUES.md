@@ -64,16 +64,24 @@ they were silently orphaned).
 
 - **Only x86_64 Linux is supported.** Prebuilt binaries ship for linux-gnu and
   linux-musl.
-- **macOS and Windows are unvalidated.** Both have per-OS code paths in tree
-  (and Windows has native panes, Job-Object process scoping, and a
-  named-pipe daemon transport written), but `thegn-host` has **never been
-  compiled or run** on either: the macOS CI job is opt-in and has never
-  executed, the Windows msvc job has never executed, and darwin cannot be
-  cross-checked from Linux (no darwin C toolchain for the `ring`/sqlite build
-  scripts). No binaries are published for them and building from source is
-  untested. When Windows does come up: native panes only (container sandboxing
-  is a Linux/WSL2 feature) and a modern terminal is required (Windows Terminal;
-  legacy conhost is refused).
+- **macOS and Windows are unvalidated.** No binaries are published for either,
+  and neither has ever been run interactively.
+  - **Windows** got its first real CI run for this release. Until now the repo
+    could not even be _cloned_ on Windows: `crates/thegn-core/src/store/aux.rs`
+    used a reserved DOS device name, so git refused it with `invalid path`.
+    With that renamed, `cargo check --workspace` **passes on msvc** — the port
+    compiles. What still fails is the named-pipe daemon IPC:
+    `ipc::tests::pipe_bind_is_the_lock_and_round_trips` (`thegn-svc/src/ipc.rs`),
+    where a second `bind_exclusive` does not report the endpoint as already
+    held. The Job-Object tests and the release build have not been reached yet.
+    The msvc job is opt-in (`[ci-windows]`) until it passes. When Windows does
+    land: native panes only (container sandboxing is a Linux/WSL2 feature) and
+    a modern terminal is required (Windows Terminal; legacy conhost is refused).
+  - **macOS** has never been compiled at all. Its CI job is opt-in
+    (`[ci-macos]`) and has never executed, and darwin cannot be cross-checked
+    from Linux — `just check-cross` covers only the C-dep-free leaf crates,
+    because `thegn-host`'s build scripts (`ring`, bundled sqlite) need a real
+    darwin C toolchain.
 - Cloud execution providers, remote worktrees over SSH, the Observe dashboards,
   the placement engine, and non-GitHub issue trackers are **dev-channel only** in
   this release (`THEGN_CHANNEL=dev`).

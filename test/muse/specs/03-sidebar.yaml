@@ -33,13 +33,21 @@ steps:
   - key: {key: s, mods: [ctrl, alt]}
   - sleep_ms: 100
   # Confirm no sidebar content visible when hidden.
-  # The deadline is the time allowed for the hide repaint to land, not a
+  #
+  # The deadline is how long the hide repaint is allowed to take, not a
   # tightness knob: expect_not_visible polls until the locator stops matching
-  # and fails if it still matches at the deadline, so a longer window cannot
-  # make a genuinely-unhidden sidebar pass. 200ms was marginal on a shared CI
-  # runner and failed at 160x40 (more cells to repaint) while passing at
-  # 100x30 and passing at both sizes locally.
-  - expect_not_visible: {text: "sidebar", timeout_ms: 3000}
+  # and fails only if it STILL matches at the deadline, so a generous window
+  # cannot make a genuinely-unhidden sidebar pass — it only tolerates a slow
+  # frame. Matched to the spec's own max_settle_ms.
+  #
+  # History: this was 200ms and failed on GitHub-hosted runners at 160x40 only
+  # (the largest grid = the most cells to compose and diff) while passing at
+  # 100x30 there. It could not be reproduced locally — the full suite passes
+  # 60/60 with the identical `--workers 2` command — which fits the runner
+  # being 2 vCPU with two compositors and two muse drivers contending for them.
+  # If this ever fails again at a size that renders promptly elsewhere, suspect
+  # the hide path rather than the clock.
+  - expect_not_visible: {text: "sidebar", timeout_ms: 10000}
   - begin_step: "restore sidebar"
   - key: {key: s, mods: [ctrl, alt]}
   - sleep_ms: 100

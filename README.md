@@ -1,9 +1,9 @@
 # thegn
 
 > **Status: public alpha** (`0.1.0-alpha.1`). **x86_64 Linux only** — macOS and
-> Windows are not validated or supported in this release (the code carries
-> per-OS paths for both, but neither has been compiled or run, so no binaries
-> ship). Expect rough edges; see [`CHANGELOG.md`](CHANGELOG.md) and
+> Windows are not supported in this release and no binaries ship for them
+> (Windows compiles on msvc but its daemon IPC tests fail; macOS has never been
+> built). Expect rough edges; see [`CHANGELOG.md`](CHANGELOG.md) and
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
 A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
@@ -161,9 +161,9 @@ owl icon (Exec `tg --standalone`), searchable/pinnable in GNOME/KDE/rofi/wofi.
 thegn shells out to `git` (and `gh`/`ssh` as fallbacks where native support has
 gaps); `lazygit` is optional.
 
-**macOS and Windows are unvalidated in this release.** The per-OS code paths
-exist and the scaffolding below is real, but neither platform has been compiled
-or run, so treat both as work-in-progress rather than supported:
+**macOS and Windows are unvalidated in this release.** Neither has been run
+interactively; Windows type-checks on msvc but its daemon IPC tests fail, and
+macOS has never been compiled. Treat both as work-in-progress:
 
 - **macOS:** `./setup-macos.sh` checks every prerequisite (Xcode CLT, Nix or
   rustup + Homebrew deps) and offers to install what's missing, then builds.
