@@ -11,13 +11,6 @@
     # independent of the user's system and of the main `nixpkgs`. Bump it
     # deliberately with `nix flake update nixpkgs-yazi`.
     nixpkgs-yazi.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    # Embedded app crates are git submodules. Local flake `self` sources contain
-    # only gitlinks for submodules, so package builds need them as explicit
-    # non-flake inputs and then copy them into Cargo's expected path-dep dirs.
-    termiteChat = {
-      url = "github:blakeashleyjr/termite-chat/26b0aebfb8284cf7d1dfd76dcbb786c96eeface2";
-      flake = false;
-    };
     # The muse visual-regression e2e harness (`just e2e`). Pinned as a non-flake
     # source and built with the same rust toolchain so `nix develop` and CI run
     # an identical, reproducible muse. Bump deliberately with `nix flake update muse`.
@@ -33,7 +26,6 @@
     flake-utils,
     rust-overlay,
     nixpkgs-yazi,
-    termiteChat,
     muse,
   }:
     flake-utils.lib.eachDefaultSystem (system: let
@@ -100,19 +92,14 @@
             || pkgs.lib.hasPrefix ".direnv" rel
             || pkgs.lib.hasPrefix ".git/" rel);
       };
-      # Local flake sources do not materialize git submodule contents in `self`,
-      # but Cargo path dependencies need these embedded app crates at package
-      # build time. Compose an explicit source tree with the submodule sources
-      # copied into the paths declared by crates/thegn-host/Cargo.toml.
-      thegnSrc = pkgs.runCommand "thegn-source" {} ''
-        mkdir -p $out
-        cp -R ${rootSrc}/. $out/
-        chmod -R u+w $out
-
-        rm -rf $out/apps/termite-chat
-        mkdir -p $out/apps
-        cp -R ${termiteChat} $out/apps/termite-chat
-      '';
+      # The package source is just the filtered repo. This used to splice the
+      # private `apps/*` submodules in (local flake `self` sources carry only
+      # gitlinks), but nothing in the cargo workspace has a path dep into
+      # `apps/` any more — `Cargo.toml` excludes it and
+      # `crates/thegn-host/src/apps/mod.rs` is inert scaffolding. Keeping those
+      # inputs made the flake unevaluable for anyone without access to the
+      # private repos, which broke `nix profile install github:…/thegn`.
+      thegnSrc = rootSrc;
       thegn = pkgs.callPackage ./nix/package.nix {
         src = thegnSrc;
         yazi = yaziPinned;
