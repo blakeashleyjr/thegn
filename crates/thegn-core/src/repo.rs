@@ -121,6 +121,15 @@ pub fn discover_repos(cfg: &Config) -> Vec<String> {
     for root in &cfg.repo_roots {
         let root = Path::new(root);
         if !root.is_dir() {
+            // Warn rather than skipping in silence. A typo'd or not-yet-created
+            // root produced no stdout, no stderr and exit 0 from `repo list` —
+            // which reads as "you have no repos" rather than "I looked in a
+            // directory that isn't there". Also fires for the default
+            // `repo_roots = [workspaces_dir]` when `~/code` doesn't exist.
+            crate::msg::warn(&format!(
+                "repo_roots: {} does not exist — skipping it",
+                root.display()
+            ));
             continue;
         }
         for entry in WalkDir::new(root)

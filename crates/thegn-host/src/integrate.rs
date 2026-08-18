@@ -500,13 +500,64 @@ pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> R
         anyhow::bail!("merge queue: could not prepare gate worktree at {wt_s}");
     }
 
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c").arg(&cfg.gate_command).current_dir(&wt);
-    if let Some(td) = &target_dir {
-        let _ = std::fs::create_dir_all(td); // best-effort: create_dir_all is idempotent
-        cmd.env("CARGO_TARGET_DIR", td);
+    // One shell setup for both the (optional) provisioning step and the gate,
+    // so they see an identical environment.
+    let spawn = |command: &str| {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(command).current_dir(&wt);
+        if let Some(td) = &target_dir {
+            let _ = std::fs::create_dir_all(td); // best-effort: create_dir_all is idempotent
+            cmd.env("CARGO_TARGET_DIR", td);
+        }
+        // Scrub the git environment, exactly as `run_agent` does. An inherited
+        // GIT_DIR/GIT_INDEX_FILE would otherwise point the gate's own `git` at
+        // whatever repo invoked thegn instead of at the gate worktree.
+        for var in util::GIT_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.env("THEGN_GATE", "1");
+        cmd.env("THEGN_WORKTREE", &wt);
+        cmd.env("THEGN_GATE_OID", oid);
+        cmd.output()
+    };
+
+    // Provision the worktree first. It is a bare checkout of the folded tip —
+    // no node_modules, no venv — so any gate whose entry point is a
+    // project-local binary dies instantly without this. Deliberately NOT part of
+    // the verdict: a failed setup is an environment failure, so it can neither
+    // blame the branch nor wake the fixing agent.
+    if !cfg.gate_setup_command.is_empty() {
+        match spawn(&cfg.gate_setup_command) {
+            Ok(o) if !o.status.success() => {
+                let mut log = String::from_utf8_lossy(&o.stdout).into_owned();
+                log.push_str(&String::from_utf8_lossy(&o.stderr));
+                if !reuse {
+                    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]);
+                }
+                return Ok(GateVerdict::Error {
+                    reason: format!(
+                        "gate_setup_command failed (exit {})",
+                        o.status
+                            .code()
+                            .map_or_else(|| "signal".to_string(), |c| c.to_string())
+                    ),
+                    log: tail(&log, 4000),
+                });
+            }
+            Err(e) => {
+                if !reuse {
+                    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]);
+                }
+                return Ok(GateVerdict::Error {
+                    reason: "gate_setup_command could not be started".to_string(),
+                    log: format!("{e}"),
+                });
+            }
+            Ok(_) => {}
+        }
     }
-    let out = cmd.output();
+
+    let out = spawn(&cfg.gate_command);
 
     // A throwaway worktree is always removed; a reused one is kept — its warm
     // target/ is the whole point.

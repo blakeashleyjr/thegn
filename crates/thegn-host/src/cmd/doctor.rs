@@ -301,6 +301,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     network_report(cfg);
 
     outln!("");
+    paths_report(cfg);
+
+    outln!("");
     outln!("Summary");
     outln!("  {}", summary(&resolved));
     Ok(())
@@ -618,6 +621,55 @@ fn gh_authenticated() -> bool {
 /// (presence + version) and `gh` (presence + auth). These are best-effort at
 /// runtime, so a missing binary otherwise produces no message — doctor is where
 /// it surfaces. Detection only; never panics if git/gh are absent.
+/// Where thegn resolves its paths, and whether they exist.
+///
+/// Two different notions of "home" are in play and they normally coincide, so
+/// the difference stays invisible until something moves `$HOME` (a sandbox, a CI
+/// runner, a tool that reparents it) or sets `XDG_STATE_HOME`: `~` in config
+/// values expands via `$HOME`, while the state/DB/gate directories follow
+/// `$XDG_STATE_HOME`. A named `--profile` deliberately reroots the latter and
+/// not the former. Printing both, plus each `repo_roots` entry with an
+/// exists/missing marker, turns "thegn says I have no repos" into one glance.
+fn paths_report(cfg: &Config) {
+    outln!("Paths");
+    let mark = |p: &std::path::Path| if p.exists() { "" } else { "  (MISSING)" };
+    let home = thegn_core::util::home();
+    outln!("  {:<15} {}{}", "$HOME", home.display(), mark(&home));
+    for (label, var) in [
+        ("XDG_STATE_HOME", "XDG_STATE_HOME"),
+        ("XDG_CONFIG_HOME", "XDG_CONFIG_HOME"),
+        ("THEGN_DIR", "THEGN_DIR"),
+        ("THEGN_PROFILE", "THEGN_PROFILE"),
+    ] {
+        if let Ok(v) = std::env::var(var)
+            && !v.is_empty()
+        {
+            outln!("  ${label:<14} {v}");
+        }
+    }
+    for (label, path) in [
+        ("state", thegn_core::util::xdg_state_home().join("thegn")),
+        ("config", thegn_core::config::Config::path()),
+        ("thegn dir", thegn_core::util::thegn_dir()),
+        (
+            "gate",
+            thegn_core::util::xdg_state_home().join("thegn/gate"),
+        ),
+        ("worktrees", std::path::PathBuf::from(&cfg.worktrees_dir)),
+        ("workspaces", std::path::PathBuf::from(&cfg.workspaces_dir)),
+    ] {
+        outln!("  {label:<15} {}{}", path.display(), mark(&path));
+    }
+    if cfg.repo_roots.is_empty() {
+        outln!("  {:<15} (none configured)", "repo_roots");
+    }
+    for (i, r) in cfg.repo_roots.iter().enumerate() {
+        let p = std::path::PathBuf::from(r);
+        let label = if i == 0 { "repo_roots" } else { "" };
+        outln!("  {label:<15} {}{}", p.display(), mark(&p));
+    }
+}
+
 fn core_deps_report() {
     outln!("Core dependencies");
     match thegn_core::util::which_path("git") {

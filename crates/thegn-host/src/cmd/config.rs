@@ -105,7 +105,19 @@ pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
                     new_enum_errs.len()
                 );
             }
-            outln!("set {key} = {value:?} in {}", path.display());
+            // Echo what was actually WRITTEN, not the raw argument: an array
+            // argument is now written as a real TOML array, and debug-quoting it
+            // made the confirmation look like it had been stored as a string.
+            let written_value = written
+                .lines()
+                .rev()
+                .find_map(|l| {
+                    let (k, v) = l.split_once('=')?;
+                    (k.trim() == key.rsplit('.').next().unwrap_or(key.as_str()))
+                        .then(|| v.trim().to_string())
+                })
+                .unwrap_or_else(|| format!("{value:?}"));
+            outln!("set {key} = {written_value} in {}", path.display());
             // The write is valid, but the file still carries pre-existing bad
             // values in other keys — surface them so they don't linger unnoticed
             // (they were already warn-defaulting on every load; not the fault of
@@ -203,13 +215,20 @@ fn show(cfg: &Config, json: bool) -> Result<()> {
 }
 
 fn get(cfg: &Config, key: &str, json: bool) -> Result<()> {
+    if json {
+        // Emit the value's REAL type (number, bool, array, table) rather than a
+        // stringified scalar, so `config get --json` composes with `jq`.
+        return match cfg.value_at(key) {
+            Some(v) => {
+                outln!("{}", serde_json::to_string(&v)?);
+                Ok(())
+            }
+            None => anyhow::bail!("unknown config key: {key}"),
+        };
+    }
     match cfg.get_dotted(key) {
         Some(v) => {
-            if json {
-                outln!("{}", serde_json::to_string(&v)?);
-            } else {
-                outln!("{v}");
-            }
+            outln!("{v}");
             Ok(())
         }
         None => anyhow::bail!("unknown config key: {key}"),
@@ -277,5 +296,27 @@ mod tests {
         assert!(get(&cfg, "picker", false).is_ok());
         assert!(get(&cfg, "picker", true).is_ok());
         assert!(get(&cfg, "nonexistent.key", false).is_err());
+        assert!(get(&cfg, "nonexistent.key", true).is_err());
+    }
+
+    #[test]
+    fn get_reaches_nested_keys_the_allowlist_never_listed() {
+        // The regression: every `[merge_queue]` key (and the whole nested
+        // surface) reported "unknown config key" while `config explain`
+        // resolved the same dotted path fine.
+        let cfg = Config::default();
+        for key in [
+            "merge_queue.on_landed",
+            "merge_queue.gate_command",
+            "merge_queue.auto_land",
+            "merge_queue.regenerate_paths",
+            "ui.language",
+        ] {
+            assert!(
+                get(&cfg, key, false).is_ok(),
+                "config get {key} should resolve"
+            );
+            assert!(get(&cfg, key, true).is_ok(), "config get --json {key}");
+        }
     }
 }
