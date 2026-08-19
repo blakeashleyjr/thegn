@@ -575,6 +575,10 @@ pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
         .create(true)
         .read(true)
         .write(true)
+        // Never truncate: this is a lock file whose existence is the signal,
+        // and a truncating open would race a concurrent holder. Matches the
+        // unix arm above (which spells the same intent out).
+        .truncate(false)
         .share_mode(0) // 0 = exclusive lock
         .open(&path)
         .ok()?;
