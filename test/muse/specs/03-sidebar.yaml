@@ -2,13 +2,7 @@ name: sidebar
 case_tmp_env: XDG_STATE_HOME
 matrix:
   profiles: [xterm]
-  # 160x40 is temporarily dropped: the hide-sidebar assertion below fails there
-  # on GitHub-hosted runners and nowhere else, for reasons not yet identified
-  # (see the comment on that step for what has been ruled out). Restore the size
-  # once the assertion is made specific enough to be trustworthy — the wider
-  # layout is exactly where a sidebar/panel regression would show up, so this is
-  # a real coverage gap, not dead weight.
-  sizes: ["100x30"]
+  sizes: ["100x30", "160x40"]
 spawn: ["thegn"]
 env:
   XDG_STATE_HOME: "{case_tmp}"
@@ -35,29 +29,25 @@ steps:
   - begin_step: "unfocus sidebar"
   - key: {key: escape}
   - sleep_ms: 100
+  # The sidebar is showing: its section header proves it, and asserting that
+  # first keeps the hide assertion below from passing vacuously.
+  - expect_visible: {text: "WORKSPACES", timeout_ms: 3000}
   - begin_step: "hide sidebar"
   - key: {key: s, mods: [ctrl, alt]}
   - sleep_ms: 100
-  # Confirm no sidebar content visible when hidden.
+  # Confirm no sidebar CONTENT is visible when hidden.
   #
-  # KNOWN CI-ONLY FAILURE (unexplained) at 160x40, on GitHub-hosted runners
-  # only, since the gate was revived for v0.1.0-alpha.1. Ruled out so far:
-  #   - timing / repaint latency: locally this passes even with timeout_ms: 1,
-  #     so the word is never on screen here at any deadline. Widening
-  #     200ms -> 3s -> 10s changed nothing on CI.
-  #   - CPU starvation: passes pinned to 2 cores with --workers 2.
-  #   - developer environment: passes under the full `_e2e_env` isolation.
-  #   - repo state: passes from a fresh detached-HEAD clone with no worktrees.
-  # So on the runner something renders the literal word "sidebar" and keeps it
-  # there. Note this assertion matches that bare word ANYWHERE on screen, which
-  # conflates real sidebar content (repo/worktree rows never contain the word)
-  # with any chrome that merely mentions it — a key hint, say. Diagnosing it
-  # needs a screen capture from the runner; muse's reporters don't dump one.
-  #
-  # The deadline is only how long the hide repaint may take: expect_not_visible
-  # polls until the locator stops matching and fails only if it STILL matches
-  # at the deadline, so a wide window cannot mask a sidebar that never hides.
-  - expect_not_visible: {text: "sidebar", timeout_ms: 10000}
+  # Assert on a sidebar section header, not on the word "sidebar". The bare word
+  # is not sidebar content at all — no repo or worktree row contains it — but it
+  # IS the `hint:` label of the toggle-sidebar / focus-sidebar actions
+  # (`keymap_specs.rs`), which the statusbar key-hint row renders. That made the
+  # old assertion environment-dependent: the hint row's budget is whatever the
+  # system-metrics segment leaves, so on a cloud runner (no battery, no thermal
+  # sensors, idle network) there is room for it and on a developer laptop there
+  # is not. It failed at 160x40 on GitHub-hosted runners and nowhere else, and
+  # probes on the runner confirmed the word was present once, before any hide,
+  # and never adjacent to a chord — i.e. the hint label, not the sidebar.
+  - expect_not_visible: {text: "WORKSPACES", timeout_ms: 10000}
   - begin_step: "restore sidebar"
   - key: {key: s, mods: [ctrl, alt]}
   - sleep_ms: 100
