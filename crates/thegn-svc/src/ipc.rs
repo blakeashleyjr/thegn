@@ -5,9 +5,12 @@
 //! **The endpoint is the lock.** On unix, whoever binds the socket is the
 //! daemon (a connectable socket ⇒ a live daemon; a stale file is unlinked).
 //! On Windows, `first_pipe_instance(true)` gives the same semantics — the
-//! first creator owns the pipe name, a second daemon gets `ACCESS_DENIED`
-//! (⇒ [`BindOutcome::AlreadyRunning`]), and pipes die with the process, so
-//! there is no stale-file case at all.
+//! first creator owns the pipe name and a second daemon gets `ACCESS_DENIED`
+//! (⇒ [`BindOutcome::AlreadyRunning`]). Pipes die with their handles, so
+//! there is no stale *file* to clean up — but the name stays reserved for a
+//! few milliseconds after the last handle of an instance that carried a
+//! connection closes, so `bind_exclusive` retries briefly before believing
+//! ACCESS_DENIED (see the comment there).
 //!
 //! Pipe names are derived from the same per-state-dir socket *path* the unix
 //! side uses (`\\.\pipe\thegn-<hex(sha256(path))[..16]>`), so the
@@ -292,35 +295,57 @@ impl IpcListener {
                 {
                     use tokio::net::windows::named_pipe::ServerOptions;
                     // ERROR_ACCESS_DENIED (5): an instance of the name already
-                    // exists ⇒ a live daemon owns it.
+                    // exists. Usually that means a live daemon owns it — but
+                    // not always, so retry briefly before concluding it.
+                    //
+                    // Windows keeps the name reserved for a moment after the
+                    // last handle closes, if any of its instances ever carried
+                    // a connection. Measured on the runner: a bind right after
+                    // the previous owner drops its handles needs ONE ~5ms retry
+                    // when there was a client, and zero when there wasn't. A
+                    // daemon restarting into that window (`thegn daemon`
+                    // straight after the old one exits) would otherwise decide
+                    // a rival owned the pipe and exit, leaving no daemon at all.
                     //
                     // Deliberately NOT probed by connecting, unlike the unix
                     // arm. A unix probe connect is free — the listener's
                     // backlog absorbs it. A pipe probe is destructive: it
                     // consumes the one free instance the listener pre-created,
-                    // and Windows then requires the server to
-                    // DisconnectNamedPipe before that instance can serve anyone
-                    // else, so the next `accept_stream` hands out a corpse and
-                    // its first read fails with "early eof". Measured on the
-                    // runner. The create error is the whole signal here, and it
-                    // is sufficient: named pipes die with their handles, so
-                    // there is no stale-endpoint case to disambiguate (a
-                    // rebind immediately after the previous owner drops its
-                    // handles succeeds on the first try — also measured).
+                    // and Windows then wants an explicit DisconnectNamedPipe
+                    // before that instance can serve anyone else, so the next
+                    // `accept_stream` hands out a corpse whose first read fails
+                    // with "early eof". Also measured, the hard way.
                     const ERROR_ACCESS_DENIED: i32 = 5;
-                    match ServerOptions::new()
-                        .first_pipe_instance(true)
-                        .reject_remote_clients(true)
-                        .create(name)
-                    {
-                        Ok(server) => Ok(BindOutcome::Bound(IpcListener::Pipe {
-                            name: name.clone(),
-                            next: Some(server),
-                        })),
-                        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
-                            Ok(BindOutcome::AlreadyRunning)
+                    // ~122ms total. Only ever paid on daemon startup, and only
+                    // when the name is taken — a losing racer is exiting anyway.
+                    const REBIND_BACKOFF_MS: [u64; 5] = [2, 5, 15, 40, 60];
+                    let mut backoff = REBIND_BACKOFF_MS.iter();
+                    loop {
+                        match ServerOptions::new()
+                            .first_pipe_instance(true)
+                            .reject_remote_clients(true)
+                            .create(name)
+                        {
+                            Ok(server) => {
+                                return Ok(BindOutcome::Bound(IpcListener::Pipe {
+                                    name: name.clone(),
+                                    next: Some(server),
+                                }));
+                            }
+                            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+                                match backoff.next() {
+                                    Some(ms) => {
+                                        tokio::time::sleep(std::time::Duration::from_millis(*ms))
+                                            .await;
+                                    }
+                                    // Still held after the whole budget: a real
+                                    // daemon. Refusing to start is recoverable;
+                                    // stealing a live daemon's pipe is not.
+                                    None => return Ok(BindOutcome::AlreadyRunning),
+                                }
+                            }
+                            Err(e) => return Err(e),
                         }
-                        Err(e) => Err(e),
                     }
                 }
                 #[cfg(not(windows))]
@@ -526,89 +551,6 @@ mod tests {
             .expect("the surviving socket accepts connections");
         drop(bound);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// TEMPORARY DIAGNOSTIC — delete once the rebind failure is understood.
-    /// Isolates the one thing that differs between the failing test and a
-    /// sequence that rebinds fine: the extra `bind_exclusive` that asserts
-    /// AlreadyRunning. No accept, no client — bind, second-bind, drop, rebind.
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn diag_second_bind_then_rebind() {
-        let ep = IpcEndpoint::Pipe(format!(r"\\.\pipe\thegn-diagB-{}", std::process::id()));
-        let mut r = String::new();
-        let listener = match IpcListener::bind_exclusive(&ep).await.unwrap() {
-            BindOutcome::Bound(l) => l,
-            BindOutcome::AlreadyRunning => panic!("fresh pipe must bind"),
-        };
-        r.push_str("bound#1");
-        match IpcListener::bind_exclusive(&ep).await.unwrap() {
-            BindOutcome::AlreadyRunning => r.push_str("; second=AlreadyRunning"),
-            BindOutcome::Bound(_) => r.push_str("; second=Bound(!!)"),
-        }
-        drop(listener);
-        r.push_str("; dropped listener");
-        r.push_str(&rebind_report(&ep).await);
-        panic!("DIAG(second-bind): {r}");
-    }
-
-    /// TEMPORARY DIAGNOSTIC — the exact failing sequence, but reporting how
-    /// many retries a rebind needs instead of asserting, so the CI log says
-    /// whether the name is briefly held or held forever.
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn diag_full_sequence_rebind() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let ep = IpcEndpoint::Pipe(format!(r"\\.\pipe\thegn-diagC-{}", std::process::id()));
-        let mut r = String::new();
-        let mut listener = match IpcListener::bind_exclusive(&ep).await.unwrap() {
-            BindOutcome::Bound(l) => l,
-            BindOutcome::AlreadyRunning => panic!("fresh pipe must bind"),
-        };
-        match IpcListener::bind_exclusive(&ep).await.unwrap() {
-            BindOutcome::AlreadyRunning => r.push_str("second=AlreadyRunning"),
-            BindOutcome::Bound(_) => r.push_str("second=Bound(!!)"),
-        }
-        let client = tokio::spawn({
-            let ep = ep.clone();
-            async move {
-                let mut c = connect(&ep).await.unwrap();
-                c.write_all(b"hi").await.unwrap();
-                let mut buf = [0u8; 2];
-                c.read_exact(&mut buf).await.unwrap();
-                buf
-            }
-        });
-        let mut server_side = listener.accept_stream().await.unwrap();
-        let mut buf = [0u8; 2];
-        match server_side.read_exact(&mut buf).await {
-            Ok(_) => r.push_str("; read=ok"),
-            Err(e) => r.push_str(&format!("; read=Err({})", e.kind())),
-        }
-        server_side.write_all(b"ok").await.ok();
-        let _ = client.await;
-        drop(server_side);
-        drop(listener);
-        r.push_str("; dropped both");
-        r.push_str(&rebind_report(&ep).await);
-        panic!("DIAG(full-seq): {r}");
-    }
-
-    /// Retry `bind_exclusive` with escalating sleeps, reporting the outcome.
-    #[cfg(windows)]
-    async fn rebind_report(ep: &IpcEndpoint) -> String {
-        for attempt in 0..7u32 {
-            match IpcListener::bind_exclusive(ep).await.unwrap() {
-                BindOutcome::Bound(l) => {
-                    drop(l);
-                    return format!("; REBOUND after {attempt} retries");
-                }
-                BindOutcome::AlreadyRunning => {
-                    tokio::time::sleep(std::time::Duration::from_millis(5 << attempt)).await;
-                }
-            }
-        }
-        "; NEVER REBOUND (>630ms)".to_string()
     }
 
     #[cfg(windows)]
