@@ -2,8 +2,9 @@
 
 > **Status: public alpha** (`0.1.0-alpha.1`). **x86_64 Linux only** — macOS and
 > Windows are not supported in this release and no binaries ship for them
-> (Windows compiles on msvc but its daemon IPC tests fail; macOS has never been
-> built). Expect rough edges; see [`CHANGELOG.md`](CHANGELOG.md) and
+> (Windows compiles and passes its tests on msvc but has never been run
+> interactively; macOS has never been built at all). Expect rough edges; see
+> [`CHANGELOG.md`](CHANGELOG.md) and
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
 A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
@@ -162,8 +163,8 @@ thegn shells out to `git` (and `gh`/`ssh` as fallbacks where native support has
 gaps); `lazygit` is optional.
 
 **macOS and Windows are unvalidated in this release.** Neither has been run
-interactively; Windows type-checks on msvc but its daemon IPC tests fail, and
-macOS has never been compiled. Treat both as work-in-progress:
+interactively. Windows compiles on msvc and passes its IPC and Job-Object
+tests; macOS has never been compiled at all. Treat both as work-in-progress:
 
 - **macOS:** `./setup-macos.sh` checks every prerequisite (Xcode CLT, Nix or
   rustup + Homebrew deps) and offers to install what's missing, then builds.

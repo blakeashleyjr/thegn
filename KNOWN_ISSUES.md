@@ -66,17 +66,19 @@ they were silently orphaned).
   linux-musl.
 - **macOS and Windows are unvalidated.** No binaries are published for either,
   and neither has ever been run interactively.
-  - **Windows** got its first real CI run for this release. Until now the repo
-    could not even be _cloned_ on Windows: `crates/thegn-core/src/store/aux.rs`
-    used a reserved DOS device name, so git refused it with `invalid path`.
-    With that renamed, `cargo check --workspace` **passes on msvc** — the port
-    compiles. What still fails is the named-pipe daemon IPC:
-    `ipc::tests::pipe_bind_is_the_lock_and_round_trips` (`thegn-svc/src/ipc.rs`),
-    where a second `bind_exclusive` does not report the endpoint as already
-    held. The Job-Object tests and the release build have not been reached yet.
-    The msvc job is opt-in (`[ci-windows]`) until it passes. When Windows does
-    land: native panes only (container sandboxing is a Linux/WSL2 feature) and
-    a modern terminal is required (Windows Terminal; legacy conhost is refused).
+  - **Windows** got its first real CI runs for this release, and now compiles
+    and passes its tests. Until recently the repo could not even be _cloned_ on
+    Windows: `crates/thegn-core/src/store/aux.rs` used a reserved DOS device
+    name, so git refused it with `invalid path`. With that renamed,
+    `cargo check --workspace` passes on msvc; the named-pipe daemon IPC tests
+    pass (a bind through the pipe-name teardown window was mistaking its own
+    predecessor for a live daemon); and the Job-Object process-scoping tests
+    pass. What has **not** completed is the release build, which the opt-in
+    msvc job has so far run out of time on, and nobody has run thegn
+    interactively on Windows — so no binaries ship and it stays unsupported.
+    When it does land: native panes only (container sandboxing is a Linux/WSL2
+    feature) and a modern terminal is required (Windows Terminal; legacy
+    conhost is refused).
   - **macOS** has never been compiled at all. Its CI job is opt-in
     (`[ci-macos]`) and has never executed, and darwin cannot be cross-checked
     from Linux — `just check-cross` covers only the C-dep-free leaf crates,

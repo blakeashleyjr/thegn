@@ -19,11 +19,13 @@ Prebuilt binaries ship for **x86_64 Linux** (gnu + musl) only. Nix
 Linux too.
 
 macOS and Windows are **not supported** in this release and neither has been
-run interactively. Windows now type-checks on msvc — the repo was previously
-unclonable there, because a source file used the reserved DOS device name
-`aux` — but its named-pipe daemon IPC tests still fail. macOS has never been
-compiled: it cannot be cross-checked from Linux, since `thegn-host`'s build
-scripts need a real darwin C toolchain.
+run interactively. Windows compiles on msvc and passes its named-pipe IPC and
+Job-Object tests — the repo was previously unclonable there, because a source
+file used the reserved DOS device name `aux` — but its release build has not
+yet completed inside the CI job budget. macOS has never been compiled at all:
+it cannot be cross-checked from Linux, since `thegn-host`'s build scripts need
+a real darwin C toolchain, and the macOS job cannot currently construct the dev
+shell (the `openspec` derivation's `pnpm install` is OOM-killed on the runner).
 
 ### The shell
 
