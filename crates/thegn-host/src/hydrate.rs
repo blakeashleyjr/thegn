@@ -1995,6 +1995,26 @@ pub(crate) fn build_panel(
         apply_pr_cache(&mut panel, cached);
     }
 
+    // Reconcile against the repo-wide open-PR list (`pr_branch_cache`): surface a
+    // PR for the current branch that `gh pr view` missed (e.g. no upstream
+    // tracking), and expose the repo's *other* open PRs so the git section can
+    // list them when this branch has none — a PR opened off a branch that isn't
+    // an open tab is otherwise invisible everywhere. See `panel::repo_pr_surface`.
+    if let Some(root) = repo_root.as_deref()
+        && let Ok(Some((json, _))) = db.get_pr_branch_cache(&root.to_string_lossy())
+    {
+        let (surfaced, others) = crate::panel::repo_pr_surface(
+            &panel.branch,
+            thegn_core::github::parse_pr_headers(&json),
+            panel.pr.is_some(),
+        );
+        if let Some(pr) = surfaced {
+            panel.pr = Some(pr);
+            panel.pr_note = None;
+        }
+        panel.repo_prs = others;
+    }
+
     // The CI run-history cache feeds the `Ci` section rollup (AV group), with
     // its fetch age (the summary's "Ns ago" stamp) and any fetch-health note.
     if let Ok(Some((json, fetched_at))) = db.get_ci_cache(&loc.path())

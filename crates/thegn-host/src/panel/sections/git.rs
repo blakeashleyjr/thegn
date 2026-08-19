@@ -149,6 +149,28 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
                     .clone()
                     .unwrap_or_else(|| "no pull request".into()),
             )])));
+            // This branch has no PR, but the repo may — list the other open PRs
+            // (from `pr_branch_cache`) so one isn't invisible just because you're
+            // not on its branch. Read-only rows (open via the PR's URL/number).
+            if !data.repo_prs.is_empty() {
+                rows.push(PanelRow::blank());
+                rows.push(PanelRow::plain(Line::split(
+                    vec![seg(g2(), "OPEN PRS").bold()],
+                    vec![seg(g(), format!("{} in repo", data.repo_prs.len()))],
+                )));
+                for h in data.repo_prs.iter().take(6) {
+                    rows.push(PanelRow::plain(Line::split(
+                        vec![
+                            seg(ac(), format!("#{} ", h.number)),
+                            seg(f(), h.head_ref.clone()),
+                        ],
+                        vec![Seg::chip(
+                            pr_state_hue(&h.state, h.is_draft),
+                            format!(" {} ", h.state),
+                        )],
+                    )));
+                }
+            }
             rows.push(PanelRow::blank());
         }
     }
