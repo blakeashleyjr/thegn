@@ -84,8 +84,11 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
   toolchain. So a darwin break in the host crate is invisible to the routine
   gate. The full macOS build+test job (`macos-15`) is opt-in because GitHub
   bills those minutes at 10x: add `[ci-macos]` to a commit message (or dispatch
-  the workflow manually) for any platform-sensitive change — and note it has
-  never actually run, so macOS is unvalidated as of `v0.1.0-alpha.1`.
+  the workflow manually) for any platform-sensitive change. As of
+  `v0.1.0-alpha.1` it has never got as far as compiling thegn — the job dies
+  building the dev shell, because the `openspec` derivation's `pnpm install` is
+  OOM-killed on the runner (`Killed: 9`). Fixing that is the first step to any
+  macOS validation.
 - **State paths** follow XDG conventions (`~/.config/thegn`,
   `~/.local/state/thegn`) on macOS too; set `XDG_CONFIG_HOME`/
   `XDG_STATE_HOME` if you prefer `~/Library`.
@@ -96,16 +99,19 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
 
 Native Windows is a build target **under development**, not a supported
 platform, and no Windows binaries ship in `v0.1.0-alpha.1`. Current state, from
-the first msvc CI run:
+the msvc CI runs:
 
 - `cargo check --workspace` **passes** — the port compiles.
-- `cargo test -p thegn-svc --lib ipc` **fails** on
-  `pipe_bind_is_the_lock_and_round_trips`: a second
-  `IpcListener::bind_exclusive` on a named pipe does not report the endpoint as
-  already held, so the bind-is-the-lock invariant the unix socket path relies on
-  does not hold on Windows yet (`crates/thegn-svc/src/ipc.rs`). Fix that first —
-  the Job-Object tests and the release build are gated behind it and have never
-  been reached. See `openspec/changes/add-windows-daemon-ipc`.
+- The named-pipe daemon IPC tests **pass**. They used to fail on
+  `pipe_bind_is_the_lock_and_round_trips`: Windows keeps a pipe _name_ reserved
+  for a few milliseconds after the last handle of an instance that carried a
+  connection closes, and `bind_exclusive` read that window as a rival daemon.
+  It now retries briefly (`crates/thegn-svc/src/ipc.rs`).
+- The Job-Object process-scoping tests **pass**.
+- The release build has **not** completed inside the job budget yet, and nobody
+  has run thegn interactively on Windows. Those are the remaining gaps before
+  the platform can be called supported — see
+  `openspec/changes/add-windows-compositor-validation`.
 - The msvc job is opt-in: dispatch, or `[ci-windows]` in the commit subject.
   Careful — the marker is matched anywhere in the commit _message_, so merely
   mentioning it in a body will trigger the job.
