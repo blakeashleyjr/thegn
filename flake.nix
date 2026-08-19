@@ -81,17 +81,9 @@
           imagemagick
         ])
         ++ [yaziPkgs.poppler-utils];
-      rootSrc = pkgs.lib.cleanSourceWith {
-        src = ./.;
-        # Drop build artifacts so the store path is stable across rebuilds.
-        filter = path: _type: let
-          rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
-        in
-          !(pkgs.lib.hasPrefix "target" rel
-            || pkgs.lib.hasPrefix "result" rel
-            || pkgs.lib.hasPrefix ".direnv" rel
-            || pkgs.lib.hasPrefix ".git/" rel);
-      };
+      # Allowlisted build source — see nix/source.nix for why it is an
+      # allowlist and what has to be on it.
+      rootSrc = import ./nix/source.nix {inherit (pkgs) lib;} ./.;
       # The package source is just the filtered repo. This used to splice the
       # private `apps/*` submodules in (local flake `self` sources carry only
       # gitlinks), but nothing in the cargo workspace has a path dep into
@@ -323,6 +315,15 @@
     in {
       packages.default = defaultPkg;
       packages.thegn = defaultPkg;
+      # The host binary WITHOUT the adjacent x86_64-linux musl bridge.
+      #
+      # `default` builds the workspace twice on x86_64-linux — once natively and
+      # once cross-compiled to musl for `thegn-musl` — so it costs roughly double
+      # what the shipped stable binary costs. The bridge only serves provider
+      # microVMs, which are dev-channel-only, so the routine CI gate builds this
+      # instead (`just nix-build`) and the full install is verified on demand
+      # (`just nix-build-full`, and before cutting a release).
+      packages.thegn-nobridge = thegn;
       # The dev release channel (`nix build .#dev` / `nix run .#dev`): the same
       # host with experimental subsystems enabled, installed as `thegn-dev`.
       packages.dev = thegnDev;
