@@ -12,7 +12,13 @@ thegn versions follow SemVer with pre-release tags: `0.1.0-alpha.N` →
    `## [<version>] — <date>` heading in `CHANGELOG.md`; add the compare/tag
    links at the bottom.
 3. **Land on `main`** (via `thegn land` / the merge queue) and pull.
-4. **Tag + push.**
+4. **Verify the full Nix install:** `just nix-build-full` (or dispatch `ci.yml`,
+   which builds `.#default` on `workflow_dispatch`). The routine gate only
+   builds `.#thegn-nobridge` — the shipped binary without the static-musl
+   provider bridge — because building the bridge doubles the job. `nix profile
+install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
+   so it must be proven before a tag even though no release asset comes from it.
+5. **Tag + push.**
 
    ```sh
    git tag -a v<version> -m "thegn v<version>"
@@ -37,7 +43,7 @@ thegn versions follow SemVer with pre-release tags: `0.1.0-alpha.N` →
    > `workflow_dispatch` for full from-scratch rebuilds where losing the
    > release is acceptable.
 
-5. **Bump the Homebrew formula** (`packaging/homebrew/thegn.rb`) — _blocked
+6. **Bump the Homebrew formula** (`packaging/homebrew/thegn.rb`) — _blocked
    until the macOS legs are back in the matrix._ The formula needs the two
    macOS `sha256` values from the release's `*-apple-darwin.sha256` assets, and
    the release no longer produces them. The tap repo does not exist yet either;
@@ -54,7 +60,7 @@ thegn versions follow SemVer with pre-release tags: `0.1.0-alpha.N` →
   keep it that way — adding a private input silently breaks this path for
   everyone but the maintainer.
 - **From source** — `./install.sh` (needs Rust/Cargo).
-- **Homebrew** — not yet; see step 5.
+- **Homebrew** — not yet; see step 6.
 
 ## Not yet: crates.io / `cargo binstall`
 

@@ -27,18 +27,9 @@
   # installs as `thegn-dev`/`tg-dev` so it can sit beside a stable install.
   # `THEGN_CHANNEL` overrides the default at runtime for either binary.
   channel ? "stable",
-  src ?
-    lib.cleanSourceWith {
-      src = ../.;
-      # Drop build artifacts so the store path is stable across rebuilds.
-      filter = path: _type: let
-        rel = lib.removePrefix (toString ../. + "/") (toString path);
-      in
-        !(lib.hasPrefix "target" rel
-          || lib.hasPrefix "result" rel
-          || lib.hasPrefix ".direnv" rel
-          || lib.hasPrefix ".git/" rel);
-    },
+  # Defaults to the same allowlisted source the flake passes in, so a bare
+  # `callPackage ./nix/package.nix {}` cannot drift from `nix build`.
+  src ? import ./source.nix {inherit lib;} ../.,
 }: let
   runtimeDeps = [git fzf gum lazygit yazi delta gh coreutils] ++ yaziDeps;
   isDev = channel == "dev";
@@ -60,6 +51,13 @@ in
 
     # The `dev` Cargo feature (host crate) flips the default channel to dev.
     buildFeatures = lib.optionals isDev ["dev"];
+
+    # Build ONLY the user-facing binary. Without this cargo builds every bin in
+    # the workspace, which both wastes time and shipped `fake_lsp` — a test
+    # fixture for the LSP client, reached in tests via `CARGO_BIN_EXE_fake_lsp`
+    # — straight onto the PATH of anyone who ran `nix profile install`. Matches
+    # what release.yml builds (`--bin thegn`).
+    cargoBuildFlags = ["-p" "thegn-host" "--bin" "thegn"];
 
     cargoLock.lockFile = ../Cargo.lock;
 

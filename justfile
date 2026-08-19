@@ -227,6 +227,14 @@ profile *args: release-profiling
 
 # Build the Nix package; symlinks ./result.
 nix-build:
+    nix build .#thegn-nobridge
+
+# The full default install — host binary plus the adjacent static-musl bridge,
+# i.e. exactly what `nix profile install github:blakeashleyjr/thegn` produces.
+# On x86_64-linux that is TWO release compiles of the workspace (native +
+# cross-to-musl), so it is roughly double `nix-build` and is kept out of the
+# routine gate. Run it before cutting a release, or via a CI dispatch.
+nix-build-full:
     nix build .#default
 
 # Print the store path without creating ./result.

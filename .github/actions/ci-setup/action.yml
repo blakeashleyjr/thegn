@@ -9,6 +9,15 @@ inputs:
     description: Upper bound for the cached /nix/store before GC.
     required: false
     default: 5G
+  # Jobs sharing a lane share one /nix/store cache entry, and since the action
+  # purges its own prefix, the last job to finish decides what survives — so a
+  # cheap job's store can evict an expensive one's built artifacts. Give a job
+  # its own lane when what it builds is worth keeping (nix-build); leave the
+  # default everywhere else.
+  cache-lane:
+    description: Cache lane; jobs sharing one share a /nix/store cache entry.
+    required: false
+    default: shared
 runs:
   using: composite
   steps:
@@ -54,11 +63,11 @@ runs:
     - uses: nix-community/cache-nix-action@v6
       if: runner.environment == 'github-hosted'
       with:
-        primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/Cargo.lock') }}
-        restore-prefixes-first-match: nix-${{ runner.os }}-
+        primary-key: nix-${{ runner.os }}-${{ inputs.cache-lane }}-${{ hashFiles('flake.lock', '**/Cargo.lock') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-${{ inputs.cache-lane }}-
         gc-max-store-size: ${{ inputs.gc-max-store-size }}
         purge: true
-        purge-prefixes: nix-${{ runner.os }}-
+        purge-prefixes: nix-${{ runner.os }}-${{ inputs.cache-lane }}-
         purge-created: 0
         purge-primary-key: never
     - uses: Swatinem/rust-cache@v2
