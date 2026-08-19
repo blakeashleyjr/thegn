@@ -1,0 +1,30 @@
+# TEMPORARY DIAGNOSTIC — delete once the 160x40 sidebar failure is understood.
+#
+# `03-sidebar.yaml`'s post-hide `expect_not_visible: {text: "sidebar"}` fails at
+# 160x40 on GitHub-hosted runners and nowhere else. muse has no screen-dump
+# reporter, so this reconstructs the screen from a pass/fail matrix: each probe
+# spec drives the identical hide sequence, then asserts ONE hypothesis. The
+# specs are independent cases, so one CI run reports all of them; whichever pass
+# on the runner (while failing here) identify the text.
+name: diag_probe_keyhint_context
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["160x40"]
+spawn: ["thegn"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  THEGN_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 10000
+steps:
+  - expect_visible: {regex: "thegn|dashboard|work|\\$|>", timeout_ms: 20000}
+  - key: {key: q}
+  - sleep_ms: 200
+  - key: {key: s, mods: [ctrl, alt]}
+  - sleep_ms: 500
+  # A key hint like "^\u2325s sidebar" / "alt-s sidebar" => the zone key tables.
+  - expect_visible: {regex: "(?i)(alt|ctrl|\\^|⌥|⌘)[^a-z]{0,6}s[^a-z]{0,3}sidebar", timeout_ms: 3000}
