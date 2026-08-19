@@ -260,7 +260,11 @@ jobs:
     # loop, see CONTRIBUTING "Windows (native)").
     if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-windows]') }}
     runs-on: windows-latest
-    timeout-minutes: 40
+    # 40 was not enough: with every test now passing, the job got as far as the
+    # release build and was cancelled mid-link. A cold msvc release build of the
+    # workspace is the long pole here, and the job is opt-in, so the budget can
+    # afford to be generous.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

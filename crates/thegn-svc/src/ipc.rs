@@ -5,9 +5,12 @@
 //! **The endpoint is the lock.** On unix, whoever binds the socket is the
 //! daemon (a connectable socket ⇒ a live daemon; a stale file is unlinked).
 //! On Windows, `first_pipe_instance(true)` gives the same semantics — the
-//! first creator owns the pipe name, a second daemon gets `ACCESS_DENIED`
-//! (⇒ [`BindOutcome::AlreadyRunning`]), and pipes die with the process, so
-//! there is no stale-file case at all.
+//! first creator owns the pipe name and a second daemon gets `ACCESS_DENIED`
+//! (⇒ [`BindOutcome::AlreadyRunning`]). Pipes die with their handles, so
+//! there is no stale *file* to clean up — but the name stays reserved for a
+//! few milliseconds after the last handle of an instance that carried a
+//! connection closes, so `bind_exclusive` retries briefly before believing
+//! ACCESS_DENIED (see the comment there).
 //!
 //! Pipe names are derived from the same per-state-dir socket *path* the unix
 //! side uses (`\\.\pipe\thegn-<hex(sha256(path))[..16]>`), so the
@@ -291,22 +294,58 @@ impl IpcListener {
                 #[cfg(windows)]
                 {
                     use tokio::net::windows::named_pipe::ServerOptions;
-                    // ERROR_ACCESS_DENIED (5): another process already owns
-                    // the first instance ⇒ a live daemon.
+                    // ERROR_ACCESS_DENIED (5): an instance of the name already
+                    // exists. Usually that means a live daemon owns it — but
+                    // not always, so retry briefly before concluding it.
+                    //
+                    // Windows keeps the name reserved for a moment after the
+                    // last handle closes, if any of its instances ever carried
+                    // a connection. Measured on the runner: a bind right after
+                    // the previous owner drops its handles needs ONE ~5ms retry
+                    // when there was a client, and zero when there wasn't. A
+                    // daemon restarting into that window (`thegn daemon`
+                    // straight after the old one exits) would otherwise decide
+                    // a rival owned the pipe and exit, leaving no daemon at all.
+                    //
+                    // Deliberately NOT probed by connecting, unlike the unix
+                    // arm. A unix probe connect is free — the listener's
+                    // backlog absorbs it. A pipe probe is destructive: it
+                    // consumes the one free instance the listener pre-created,
+                    // and Windows then wants an explicit DisconnectNamedPipe
+                    // before that instance can serve anyone else, so the next
+                    // `accept_stream` hands out a corpse whose first read fails
+                    // with "early eof". Also measured, the hard way.
                     const ERROR_ACCESS_DENIED: i32 = 5;
-                    match ServerOptions::new()
-                        .first_pipe_instance(true)
-                        .reject_remote_clients(true)
-                        .create(name)
-                    {
-                        Ok(server) => Ok(BindOutcome::Bound(IpcListener::Pipe {
-                            name: name.clone(),
-                            next: Some(server),
-                        })),
-                        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
-                            Ok(BindOutcome::AlreadyRunning)
+                    // ~122ms total. Only ever paid on daemon startup, and only
+                    // when the name is taken — a losing racer is exiting anyway.
+                    const REBIND_BACKOFF_MS: [u64; 5] = [2, 5, 15, 40, 60];
+                    let mut backoff = REBIND_BACKOFF_MS.iter();
+                    loop {
+                        match ServerOptions::new()
+                            .first_pipe_instance(true)
+                            .reject_remote_clients(true)
+                            .create(name)
+                        {
+                            Ok(server) => {
+                                return Ok(BindOutcome::Bound(IpcListener::Pipe {
+                                    name: name.clone(),
+                                    next: Some(server),
+                                }));
+                            }
+                            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+                                match backoff.next() {
+                                    Some(ms) => {
+                                        tokio::time::sleep(std::time::Duration::from_millis(*ms))
+                                            .await;
+                                    }
+                                    // Still held after the whole budget: a real
+                                    // daemon. Refusing to start is recoverable;
+                                    // stealing a live daemon's pipe is not.
+                                    None => return Ok(BindOutcome::AlreadyRunning),
+                                }
+                            }
+                            Err(e) => return Err(e),
                         }
-                        Err(e) => Err(e),
                     }
                 }
                 #[cfg(not(windows))]
