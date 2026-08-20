@@ -17,6 +17,7 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// One styled cell, renderer-agnostic.
@@ -114,6 +115,22 @@ pub trait PaneEmulator: Send {
     }
     /// Cursor position as `(row, col)`.
     fn cursor(&self) -> (u16, u16);
+    /// The cursor as of the last [`Self::grid_snapshot`] — the position that
+    /// belongs to the cells currently composed into the frame.
+    ///
+    /// The grid is parsed on the pane's READER thread (`pane_pty::open_pty`),
+    /// so it advances between any two lock acquisitions the loop makes. Reading
+    /// the live cursor at flush time therefore paints a frame whose content is
+    /// from the compose-time snapshot but whose caret is from some later state
+    /// — visibly, the caret teleports to where the app is mid-redraw (typically
+    /// the start of the next line) and snaps back a frame later. Taking the
+    /// cursor inside the snapshot's lock keeps caret and cells consistent.
+    ///
+    /// Emulators without a snapshot read the grid per cell anyway, so they fall
+    /// back to the live cursor.
+    fn snapshot_cursor(&self) -> (u16, u16) {
+        self.cursor()
+    }
     /// Scroll the viewport up into history by `n` rows (copy-mode / scrollback).
     fn scroll_up(&mut self, _n: usize) {}
     /// Scroll the viewport back down toward the live tail by `n` rows.
@@ -208,6 +225,24 @@ pub struct AlacrittyEmulator {
     parser: Processor,
     /// Shared with the [`EventProxy`] inside `term`; holds the last OSC title.
     title: Arc<Mutex<Option<String>>>,
+    /// The cursor read inside the last [`PaneEmulator::grid_snapshot`] lock,
+    /// packed `row << 16 | col` ([`NO_SNAP_CURSOR`] until the first snapshot).
+    /// An atomic because the compositor holds only `&dyn PaneEmulator`, and it
+    /// keeps the render hot path lock-free — same pattern as the undercurl
+    /// atomic in `seg.rs` and the caps atomics in `caps.rs`.
+    snap_cursor: AtomicU32,
+}
+
+/// `snap_cursor` sentinel: no snapshot has been taken yet, so
+/// [`PaneEmulator::snapshot_cursor`] falls back to the live cursor.
+const NO_SNAP_CURSOR: u32 = u32::MAX;
+
+fn pack_cursor(row: u16, col: u16) -> u32 {
+    ((row as u32) << 16) | col as u32
+}
+
+fn unpack_cursor(v: u32) -> (u16, u16) {
+    ((v >> 16) as u16, (v & 0xffff) as u16)
 }
 
 #[derive(Clone, Copy)]
@@ -246,6 +281,7 @@ impl AlacrittyEmulator {
             term: Arc::new(FairMutex::new(term)),
             parser: Processor::new(),
             title,
+            snap_cursor: AtomicU32::new(NO_SNAP_CURSOR),
         }
     }
 }
@@ -356,6 +392,13 @@ impl PaneEmulator for AlacrittyEmulator {
         let (rows, cols) = (term.screen_lines(), term.columns());
         let display_offset = term.grid().display_offset() as i32;
         let grid = term.grid();
+        // Same lock, same instant as the cells: the caret this frame paints
+        // must belong to the grid this frame paints. See `snapshot_cursor`.
+        let cursor = grid.cursor.point;
+        self.snap_cursor.store(
+            pack_cursor(cursor.line.0 as u16, cursor.column.0 as u16),
+            Ordering::Relaxed,
+        );
         let mut out = Vec::with_capacity(rows);
         for row in 0..rows {
             let mut line = Vec::with_capacity(cols);
@@ -386,6 +429,13 @@ impl PaneEmulator for AlacrittyEmulator {
         let term = self.term.lock();
         let point = term.grid().cursor.point;
         (point.line.0 as u16, point.column.0 as u16)
+    }
+
+    fn snapshot_cursor(&self) -> (u16, u16) {
+        match self.snap_cursor.load(Ordering::Relaxed) {
+            NO_SNAP_CURSOR => self.cursor(),
+            packed => unpack_cursor(packed),
+        }
     }
 
     fn scroll_up(&mut self, n: usize) {
@@ -475,6 +525,45 @@ mod tests {
             Some("hello world".to_string())
         );
         assert_eq!(e.cursor(), (0, 11));
+    }
+
+    #[test]
+    fn snapshot_cursor_belongs_to_the_snapshotted_grid() {
+        let mut e = AlacrittyEmulator::new(24, 80, 0);
+        e.advance(b"hello");
+        // Before any snapshot there is nothing cached, so fall back to live.
+        assert_eq!(e.snapshot_cursor(), e.cursor());
+
+        let snap = e.grid_snapshot().expect("alacritty exposes a snapshot");
+        assert_eq!(snap[0][0].text, "h");
+        assert_eq!(e.snapshot_cursor(), (0, 5));
+
+        // The pane's reader thread advances the grid between the compose and
+        // the flush. The live cursor moves; the snapshot's must not, or the
+        // frame paints row 0's cells with row 1's caret.
+        e.advance(b"\r\nworld");
+        assert_eq!(e.cursor(), (1, 5));
+        assert_eq!(
+            e.snapshot_cursor(),
+            (0, 5),
+            "the caret must stay with the grid the frame composed"
+        );
+
+        // A fresh compose re-syncs both.
+        let _ = e.grid_snapshot();
+        assert_eq!(e.snapshot_cursor(), e.cursor());
+    }
+
+    #[test]
+    fn cursor_packing_round_trips_to_the_grid_edges() {
+        for (row, col) in [(0u16, 0u16), (0, 65534), (65534, 0), (4095, 511)] {
+            assert_eq!(unpack_cursor(pack_cursor(row, col)), (row, col));
+            assert_ne!(
+                pack_cursor(row, col),
+                NO_SNAP_CURSOR,
+                "a real position must never collide with the sentinel"
+            );
+        }
     }
 
     #[test]
