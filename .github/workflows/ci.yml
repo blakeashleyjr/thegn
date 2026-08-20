@@ -30,11 +30,10 @@ name: ci
 # private flake inputs (muse) AND public ones, so it must be a CLASSIC PAT with
 # `repo` scope.
 #
-# NOTE: the checkout steps deliberately do NOT set `submodules: recursive`. The
-# `apps/*` submodules are private repos, and a GitHub-hosted runner's ephemeral
-# GITHUB_TOKEN cannot read them — every job would fail at checkout. Nothing in
-# the cargo workspace has a path dep into `apps/` (the root manifest excludes
-# it), so they are not needed to build or test. Don't add it back.
+# NOTE: this repo has no submodules, and the checkout steps deliberately do not
+# set `submodules: recursive`. It used to carry private `apps/*` submodules that
+# an ephemeral GITHUB_TOKEN could not read, failing every job at checkout. They
+# are gone and nothing in the workspace depends on them. Don't add either back.
 on:
   push:
     branches: [main]

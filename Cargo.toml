@@ -13,11 +13,9 @@ members = [
   "crates/gtui-app",
   "crates/gtui-embed",
 ]
-# Integrated app repos live under apps/ as git submodules, each with its OWN
-# cargo workspace; keep these out of thegn's workspace so commands run from
-# an arbitrary cwd don't try to absorb them. (thegn-host reaches their
-# crates via explicit path deps — that resolves against each submodule's own
-# [workspace], not this one.)
+# Belt-and-braces: nothing in-tree lives at these paths, but if a contributor
+# drops a scratch checkout at apps/ or vendor/, cargo must not absorb it into
+# this workspace when a command runs from an arbitrary cwd.
 exclude = ["apps", "vendor"]
 
 [workspace.package]
