@@ -704,6 +704,41 @@ command = "git notes add {{.SelectedCommit.Sha}}"
 }
 
 #[test]
+fn git_auto_fetch_defaults_on_and_is_overridable() {
+    // Defaults: polling on, 5-minute cadence, 1-minute per-repo floor — and
+    // NOTIFICATIONS OFF. The ambient `↓N` badge is the whole default surface;
+    // an inbox entry per upstream commit is opt-in.
+    let cfg = GitConfig::default();
+    assert!(cfg.auto_fetch);
+    assert_eq!(cfg.auto_fetch_interval_secs, 300);
+    assert_eq!(cfg.auto_fetch_min_interval_secs, 60);
+    assert!(!cfg.auto_fetch_notify);
+
+    // Every knob is independently settable — notably `auto_fetch_interval_secs
+    // = 0`, which keeps the startup / on-switch polls but drops the cadence.
+    let cfg: Config = toml::from_str(
+        r#"
+[git]
+auto_fetch = true
+auto_fetch_interval_secs = 0
+auto_fetch_min_interval_secs = 5
+auto_fetch_notify = true
+"#,
+    )
+    .unwrap();
+    assert!(cfg.git.auto_fetch);
+    assert_eq!(cfg.git.auto_fetch_interval_secs, 0);
+    assert_eq!(cfg.git.auto_fetch_min_interval_secs, 5);
+    assert!(cfg.git.auto_fetch_notify);
+
+    // Opting out entirely leaves the other knobs at their defaults (nothing
+    // reads them once `auto_fetch` is false).
+    let cfg: Config = toml::from_str("[git]\nauto_fetch = false\n").unwrap();
+    assert!(!cfg.git.auto_fetch);
+    assert_eq!(cfg.git.auto_fetch_interval_secs, 300);
+}
+
+#[test]
 fn panel_sections_parse_and_default_empty() {
     let cfg: Config =
         toml::from_str("[panel]\nsections = [\"pr\", \"changes\", \"telemetry\"]\n").unwrap();

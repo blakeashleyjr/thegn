@@ -73,6 +73,9 @@ pub enum NotificationKind {
     QueueReady,
     /// The merge-queue agent gave up on a branch — human intervention needed.
     QueueNeedsHuman,
+    /// A background fetch found new upstream commits on a worktree's branch —
+    /// the branch is now behind its remote and can be pulled.
+    UpstreamBehind,
 }
 
 /// Attention priority of a notification — the single source of truth that drives
@@ -131,7 +134,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 18] = [
+    pub const ALL: [NotificationKind; 19] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,
@@ -150,6 +153,7 @@ impl NotificationKind {
         Self::QueueLanded,
         Self::QueueReady,
         Self::QueueNeedsHuman,
+        Self::UpstreamBehind,
     ];
 
     /// The snake_case identifier for this kind — matches both the serde
@@ -175,6 +179,7 @@ impl NotificationKind {
             Self::QueueLanded => "queue_landed",
             Self::QueueReady => "queue_ready",
             Self::QueueNeedsHuman => "queue_needs_human",
+            Self::UpstreamBehind => "upstream_behind",
         }
     }
 
@@ -202,7 +207,8 @@ impl NotificationKind {
             | Self::Overdue
             | Self::PrStateChanged
             | Self::AgentDone
-            | Self::QueueReady => Priority::Notice,
+            | Self::QueueReady
+            | Self::UpstreamBehind => Priority::Notice,
         }
     }
 
@@ -226,6 +232,7 @@ impl NotificationKind {
             Self::QueueLanded => "✓",
             Self::QueueReady => "◆",
             Self::QueueNeedsHuman => "✋",
+            Self::UpstreamBehind => "↓",
         }
     }
 
@@ -259,6 +266,7 @@ impl NotificationKind {
             Self::QueueLanded => (gl.check, Hue::Green),
             Self::QueueReady => (gl.diamond_filled, Hue::Green),
             Self::QueueNeedsHuman => (gl.attention, Hue::Red),
+            Self::UpstreamBehind => (gl.arrow_down, Hue::Blue),
         }
     }
 
@@ -282,6 +290,7 @@ impl NotificationKind {
             Self::QueueLanded => "merge queue landed",
             Self::QueueReady => "merge queue ready to land",
             Self::QueueNeedsHuman => "merge queue needs you",
+            Self::UpstreamBehind => "upstream updates",
         }
     }
 }
@@ -318,7 +327,7 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 18, "ALL is missing kinds");
+        assert_eq!(seen.len(), 19, "ALL is missing kinds");
     }
 
     #[test]
