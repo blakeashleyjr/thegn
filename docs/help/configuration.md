@@ -12,6 +12,11 @@ built-in defaults < the config file < `THEGN_*` environment variables <
 CLI flags. A repo-root `.thegn.{toml,yaml,yml,json}` overlays per-repo
 settings (sandbox, keybinds, env selection).
 
+`[workspace.<slug>]` in your own config refines settings for one repo —
+including `[workspace.<slug>.merge_queue]`, which is where a repo whose
+gate or integration branch differs from your defaults belongs. `thegn
+config explain <key>`, run inside the repo, names the layer that won.
+
 The file is watched: edits apply live, no restart.
 
 ## Highlights
@@ -34,7 +39,9 @@ The file is watched: edits apply live, no restart.
 
 ```sh
 thegn config show        # the effective merged config
-thegn config get ui.language
+thegn config get ui.language          # any dotted key; --json for real types
+thegn config set merge_queue.regenerate_paths '["Cargo.lock", "pnpm-lock.yaml"]'
+thegn config explain merge_queue.gate_command   # value + which layer set it
 thegn config validate
 thegn doctor             # resolved terminal capabilities
 thegn keys list          # every binding, grouped by zone (--json, --zone)

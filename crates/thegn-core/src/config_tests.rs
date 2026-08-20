@@ -2213,5 +2213,101 @@ fn clamp_to_channel_is_a_noop_in_dev() {
     assert_eq!(cfg.sandbox.remote.host, before.sandbox.remote.host);
 }
 
+// ── Per-repo `[merge_queue]` (the `[workspace.<slug>]` layer) ───────────────
+// Every interesting key in `[merge_queue]` describes a repository — its build
+// tool, its integration branch, its lockfiles — but the table was global-only,
+// so a repo that differed from the user's defaults could only be handled with
+// `--set` flags on every single invocation.
+
+#[test]
+fn merge_queue_overlay_applies_present_fields_and_inherits_absent_ones() {
+    let mut base = MergeQueueConfig {
+        gate_command: "just test".into(),
+        target_branch: "auto".into(),
+        auto_land: true,
+        ..MergeQueueConfig::default()
+    };
+    let overlay = MergeQueueOverlay {
+        gate_command: Some("pnpm test".into()),
+        target_branch: Some("ba/rearch".into()),
+        ..MergeQueueOverlay::default()
+    };
+    overlay.apply(&mut base);
+    assert_eq!(base.gate_command, "pnpm test", "present wins");
+    assert_eq!(base.target_branch, "ba/rearch");
+    assert!(base.auto_land, "absent inherits");
+}
+
+#[test]
+fn merge_queue_overlay_is_empty_only_when_nothing_is_set() {
+    assert!(MergeQueueOverlay::default().is_empty());
+    let o = MergeQueueOverlay {
+        gate_on: Some(false),
+        ..MergeQueueOverlay::default()
+    };
+    assert!(!o.is_empty());
+    // A false/empty value is still "set" — the overlay is Option-based precisely
+    // so a repo can turn something OFF, which a truthiness check would lose.
+    let o = MergeQueueOverlay {
+        gate_command: Some(String::new()),
+        ..MergeQueueOverlay::default()
+    };
+    assert!(!o.is_empty());
+}
+
+#[test]
+fn repo_merge_queue_applies_the_workspace_layer_for_that_repo_only() {
+    let mut cfg = Config {
+        merge_queue: MergeQueueConfig {
+            gate_command: "just test".into(),
+            ..MergeQueueConfig::default()
+        },
+        ..Config::default()
+    };
+    let dir = std::env::temp_dir().join(format!("thegn-mqws-{}", std::process::id()));
+    let datahub = dir.join("DataHub");
+    let other = dir.join("Other");
+    std::fs::create_dir_all(&datahub).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+
+    // No workspace block yet: every repo sees the global gate.
+    assert_eq!(cfg.repo_merge_queue(&datahub).gate_command, "just test");
+    assert_eq!(cfg.repo_merge_queue(&other).gate_command, "just test");
+
+    cfg.workspace.insert(
+        workspace_slug(&datahub),
+        WorkspaceConfig {
+            merge_queue: MergeQueueOverlay {
+                gate_command: Some("pnpm install && pnpm test".into()),
+                target_branch: Some("ba/rearch".into()),
+                ..MergeQueueOverlay::default()
+            },
+            ..WorkspaceConfig::default()
+        },
+    );
+
+    // The named repo is refined...
+    let mq = cfg.repo_merge_queue(&datahub);
+    assert_eq!(mq.gate_command, "pnpm install && pnpm test");
+    assert_eq!(mq.target_branch, "ba/rearch");
+    // ...and no other repo is disturbed. Pinning `target_branch` globally would
+    // point every repo's fold at a branch that exists in exactly one of them,
+    // which is the reason this has to be per-repo rather than a global default.
+    let mq = cfg.repo_merge_queue(&other);
+    assert_eq!(mq.gate_command, "just test");
+    assert_eq!(mq.target_branch, "auto");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn workspace_slug_is_the_repo_directory_name_slugified() {
+    let dir = std::env::temp_dir().join(format!("thegn-slug-{}", std::process::id()));
+    let repo = dir.join("Sage.DataHub");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert_eq!(workspace_slug(&repo), "sage-datahub");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[path = "config_tests_coverage.rs"]
 mod coverage;

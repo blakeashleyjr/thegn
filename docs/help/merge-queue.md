@@ -27,9 +27,18 @@ persisted; entries survive restarts.
 - **Drain (agent autopilot)** hands conflicts to a coding agent to
   resolve, then continues.
 - `thegn integrate` does the same from any shell.
+- A blocked branch is re-attempted by the next drain automatically. Once
+  it has burned its `agent_max_attempts` the agent stops being
+  dispatched for it — `thegn merge retry` (or the section's `r`) re-arms
+  it after you've fixed something.
 
-A running instance sitting on `main` fast-forwards its own tree when the
-ref moves — no stale checkout.
+The fold advances the ref without checking anything out, so any worktree
+sitting **on** the target would be left with a stale working tree. Every
+such checkout — the main one or a linked worktree — is fast-forwarded as
+part of the land. One with real uncommitted work is left alone and
+_named_, with the `git reset --keep` that syncs it: don't commit the
+pending deletions `git status` shows there, they are the fold, not a
+deletion.
 
 ## Across hosts
 
@@ -44,6 +53,34 @@ the reason), never silently dropped, and retried on the next drain.
 Run the drain **where the target repo lives**. If you invoke it from a
 machine other than the target's host, thegn tells you which host to run
 it on — the fold, gate, and ref-advance must be co-located with `main`.
+
+## The gate
+
+The folded tip is checked out into a **bare** gate worktree — a fresh
+checkout of the merge commit with no dependencies installed. That is the
+point (it tests the union, which exists nowhere else), but it means
+`gate_command` cannot rely on a project-local toolchain: no
+`node_modules`, no virtualenv, no `.direnv`. Rust works out of the box
+only because `cargo` is global.
+
+Provision it with `gate_setup_command`, which runs first and is **not**
+part of the verdict:
+
+```toml
+[merge_queue]
+gate_setup_command = "pnpm install --frozen-lockfile"
+gate_command = "pnpm test"
+```
+
+That split matters, because a gate can fail two different ways and only
+one of them is about your branch:
+
+- **`gate_failed`** — the gate ran and went red. A verdict about the
+  code, and the one a fixing agent can act on.
+- **`gate_error`** — the gate could not run at all (missing binary,
+  setup failed, killed). An environment fact. It never wakes the agent,
+  never triggers a bisect, and never blames a branch — but it is retried
+  on the next drain, since the environment may be fixed by then.
 
 ## Watching
 

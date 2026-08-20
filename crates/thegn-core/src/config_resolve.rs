@@ -1041,16 +1041,10 @@ pub fn resolve_repo_sandbox(
     // Per-workspace bind dirs ([workspace.<slug>] sandbox_mounts) extend the
     // global/profile/repo mounts. Workspace config is user-authored (more
     // trusted than the repo), so this is an ungated accumulate.
-    if !cfg.workspace.is_empty() {
-        let base = crate::util::slugify(&crate::repo::repo_name(repo_root));
-        let slug = if base.is_empty() {
-            "repo".to_string()
-        } else {
-            base
-        };
-        if let Some(ws) = cfg.workspace.get(&slug) {
-            sb.mounts.extend(ws.sandbox_mounts.iter().cloned());
-        }
+    if !cfg.workspace.is_empty()
+        && let Some(ws) = cfg.workspace.get(&crate::config::workspace_slug(repo_root))
+    {
+        sb.mounts.extend(ws.sandbox_mounts.iter().cloned());
     }
     sb.mounts = sb
         .mounts
@@ -1257,7 +1251,7 @@ pub struct KeyOrigin {
 
 /// Turn a dotted key (`sandbox.network_allow`) into a JSON pointer
 /// (`/sandbox/network_allow`).
-fn dotted_to_pointer(key: &str) -> String {
+pub(crate) fn dotted_to_pointer(key: &str) -> String {
     let mut p = String::new();
     for seg in key.split('.') {
         p.push('/');

@@ -33,6 +33,12 @@ const ALLOWLIST: &[&str] = &[
     // `[profiles.<name>.notifications]` is likewise an all-Option overlay
     // mirror of `[notifications]`; the example points at the canonical table.
     "profiles.*.notifications",
+    // `[workspace.<slug>.merge_queue]` is the same shape again: an all-Option
+    // overlay mirror of `[merge_queue]`, letting one repo refine its gate,
+    // target branch and lockfile set. Every key is documented once at its
+    // canonical `[merge_queue]` location, and the example shows the overlay
+    // pattern there with a representative subset.
+    "workspace.*.merge_queue",
     // `[[plugins]]` manifests are developer-facing (see `plugin_api.rs`); the
     // schema (id/name/version/api/capabilities/contributions) is an internal
     // contract for bundled plugins, not an end-user configuration surface.

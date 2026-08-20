@@ -28,6 +28,8 @@ pub fn seed(worktree: &Path) -> std::io::Result<()> {
 /// when the merge queue is disabled. Kept here (not `run.rs`) to keep that
 /// god-file lean.
 pub fn seed_persisted_worktrees(cfg: &Config) {
+    // Global on purpose: this seeds a discoverability asset at startup, with no
+    // repo in scope. See `Config::merge_queue`.
     if !cfg.merge_queue.enabled {
         return;
     }

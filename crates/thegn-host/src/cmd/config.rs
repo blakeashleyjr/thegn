@@ -105,7 +105,19 @@ pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
                     new_enum_errs.len()
                 );
             }
-            outln!("set {key} = {value:?} in {}", path.display());
+            // Echo what was actually WRITTEN, not the raw argument: an array
+            // argument is now written as a real TOML array, and debug-quoting it
+            // made the confirmation look like it had been stored as a string.
+            let written_value = written
+                .lines()
+                .rev()
+                .find_map(|l| {
+                    let (k, v) = l.split_once('=')?;
+                    (k.trim() == key.rsplit('.').next().unwrap_or(key.as_str()))
+                        .then(|| v.trim().to_string())
+                })
+                .unwrap_or_else(|| format!("{value:?}"));
+            outln!("set {key} = {written_value} in {}", path.display());
             // The write is valid, but the file still carries pre-existing bad
             // values in other keys — surface them so they don't linger unnoticed
             // (they were already warn-defaulting on every load; not the fault of
@@ -132,11 +144,27 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
     use thegn_core::config::ProcessEnv;
     use thegn_core::config_resolve;
     let origin = config_resolve::explain(&ProcessEnv, &[], Some(path), key);
+    // The per-repo layers are NOT part of the preference cascade `explain`
+    // replays, so without this the trace confidently reported the global value
+    // for a key a `[workspace.<slug>]` block had already overridden — the probe
+    // lied. Default the repo to the cwd's, so running `config explain` inside a
+    // repo tells the truth without needing to remember `--repo`.
+    let repo_root = repo
+        .clone()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .and_then(|p| thegn_core::repo::main_worktree(&p));
+    let ws = repo_root
+        .as_ref()
+        .and_then(|root| workspace_layer(cfg, root, key));
     if json {
         let mut obj = serde_json::json!({
             "key": origin.key,
-            "value": origin.value,
-            "origin": origin.origin.as_str(),
+            "value": ws.as_ref().map_or(origin.value.clone(), |(_, v)| v.clone()),
+            "origin": ws.as_ref().map_or(origin.origin.as_str().to_string(), |(s, _)| {
+                format!("workspace [workspace.{s}]")
+            }),
+            "cascade_value": origin.value,
         });
         if let Some(repo) = &repo {
             let (events, pending) = repo_clamp(cfg, repo, key);
@@ -146,10 +174,24 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
         outln!("{}", serde_json::to_string_pretty(&obj)?);
         return Ok(());
     }
-    outln!("{} = {}", origin.key, origin.value);
-    outln!("  set by: {}", origin.origin.as_str());
+    match &ws {
+        Some((slug, v)) => {
+            outln!("{} = {v}", origin.key);
+            outln!("  set by: workspace `[workspace.{slug}]`");
+        }
+        None => {
+            outln!("{} = {}", origin.key, origin.value);
+            outln!("  set by: {}", origin.origin.as_str());
+        }
+    }
     for (layer, val) in &origin.trace {
         outln!("    {}: {val}", layer.as_str());
+    }
+    if let (Some((slug, v)), Some(root)) = (&ws, &repo_root) {
+        outln!(
+            "    workspace `[workspace.{slug}]`: {v}   (for {})",
+            root.display()
+        );
     }
     if let Some(repo) = &repo {
         let (events, pending) = repo_clamp(cfg, repo, key);
@@ -164,6 +206,29 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
         }
     }
     Ok(())
+}
+
+/// The `[workspace.<slug>]` layer's value for `key` in this repo, when it
+/// differs from the plain cascade — plus the slug, so the trace can name the
+/// exact block the user has to edit.
+///
+/// Only `merge_queue.*` is carried by that layer today; other keys return
+/// `None` and explain as before.
+fn workspace_layer(
+    cfg: &Config,
+    repo_root: &std::path::Path,
+    key: &str,
+) -> Option<(String, serde_json::Value)> {
+    let sub = key.strip_prefix("merge_queue.")?;
+    let slug = thegn_core::config::workspace_slug(repo_root);
+    let ws = cfg.workspace.get(&slug)?;
+    if ws.merge_queue.is_empty() {
+        return None;
+    }
+    let resolved = serde_json::to_value(cfg.repo_merge_queue(repo_root)).ok()?;
+    let global = serde_json::to_value(&cfg.merge_queue).ok()?;
+    let v = resolved.get(sub)?;
+    (v != global.get(sub)?).then(|| (slug, v.clone()))
 }
 
 /// Repo-overlay clamp events + pending summaries filtered to a key prefix, using
@@ -203,13 +268,20 @@ fn show(cfg: &Config, json: bool) -> Result<()> {
 }
 
 fn get(cfg: &Config, key: &str, json: bool) -> Result<()> {
+    if json {
+        // Emit the value's REAL type (number, bool, array, table) rather than a
+        // stringified scalar, so `config get --json` composes with `jq`.
+        return match cfg.value_at(key) {
+            Some(v) => {
+                outln!("{}", serde_json::to_string(&v)?);
+                Ok(())
+            }
+            None => anyhow::bail!("unknown config key: {key}"),
+        };
+    }
     match cfg.get_dotted(key) {
         Some(v) => {
-            if json {
-                outln!("{}", serde_json::to_string(&v)?);
-            } else {
-                outln!("{v}");
-            }
+            outln!("{v}");
             Ok(())
         }
         None => anyhow::bail!("unknown config key: {key}"),
@@ -277,5 +349,27 @@ mod tests {
         assert!(get(&cfg, "picker", false).is_ok());
         assert!(get(&cfg, "picker", true).is_ok());
         assert!(get(&cfg, "nonexistent.key", false).is_err());
+        assert!(get(&cfg, "nonexistent.key", true).is_err());
+    }
+
+    #[test]
+    fn get_reaches_nested_keys_the_allowlist_never_listed() {
+        // The regression: every `[merge_queue]` key (and the whole nested
+        // surface) reported "unknown config key" while `config explain`
+        // resolved the same dotted path fine.
+        let cfg = Config::default();
+        for key in [
+            "merge_queue.on_landed",
+            "merge_queue.gate_command",
+            "merge_queue.auto_land",
+            "merge_queue.regenerate_paths",
+            "ui.language",
+        ] {
+            assert!(
+                get(&cfg, key, false).is_ok(),
+                "config get {key} should resolve"
+            );
+            assert!(get(&cfg, key, true).is_ok(), "config get --json {key}");
+        }
     }
 }

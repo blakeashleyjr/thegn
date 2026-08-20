@@ -432,6 +432,127 @@ pub fn resync_ff_checkout(root: &Path, branch: &str, old: &str, new: &str) -> Re
     }
 }
 
+/// Parse `git worktree list --porcelain` into `(path, branch)` pairs.
+///
+/// Porcelain emits a blank-line-separated record per worktree, opening with
+/// `worktree <path>` and carrying `branch refs/heads/<name>` only when a branch
+/// is checked out (a detached or bare entry has none). Kept pure so the
+/// selection below is unit-tested rather than inferred from a live repo.
+pub fn parse_worktree_branches(porcelain: &str) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for line in porcelain.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            out.push((p.trim().to_string(), None));
+        } else if let Some(b) = line.strip_prefix("branch ")
+            && let Some(last) = out.last_mut()
+        {
+            last.1 = Some(b.trim().trim_start_matches("refs/heads/").to_string());
+        }
+    }
+    out
+}
+
+/// The worktree paths with `branch` checked out.
+///
+/// Git allows at most one, but "at most one" is not "the main checkout": a
+/// linked worktree can hold the branch while the main checkout sits elsewhere.
+/// Returning a list keeps the caller honest about that (and about a `--force`d
+/// duplicate checkout).
+pub fn checkouts_of_branch(pairs: &[(String, Option<String>)], branch: &str) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(_, b)| b.as_deref() == Some(branch))
+        .map(|(p, _)| p.clone())
+        .collect()
+}
+
+/// One worktree's resync result, for reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutResync {
+    pub path: PathBuf,
+    pub outcome: ResyncOutcome,
+    /// The tip the working tree still holds, and the one the ref moved to —
+    /// both needed to state a recovery command that can actually work.
+    pub old: String,
+    pub new: String,
+}
+
+impl CheckoutResync {
+    /// The command that syncs this checkout by hand, for the cases git itself
+    /// refused.
+    ///
+    /// It must be the same two-way merge the fold attempts, with the explicit
+    /// old/new tips. The obvious-looking alternatives are all wrong here:
+    /// `reset --hard` discards the uncommitted work that caused the skip, and
+    /// `reset --keep <branch>` is a no-op for the working tree because `HEAD`
+    /// *already* resolves to the new tip — it only unstages, leaving the landed
+    /// files still missing from disk.
+    pub fn manual_fix(&self) -> String {
+        format!(
+            "git -C {} read-tree -m -u {} {}",
+            self.path.to_string_lossy(),
+            self.old,
+            self.new
+        )
+    }
+}
+
+/// Fast-forward EVERY worktree of `root` that has `branch` checked out.
+///
+/// The fold advances the target ref by pure plumbing, which moves it out from
+/// under any live checkout of that branch: `HEAD` resolves to the new tip while
+/// the index and working tree still hold `old`, so `git status` reports the
+/// whole fold as pending deletions. That reads as a catastrophic accidental
+/// deletion — and reacting to it with `git commit` reverts the merge that just
+/// landed.
+///
+/// This used to run against the main checkout only, so a target branch living in
+/// a linked worktree was never healed at all. Each candidate goes through
+/// [`resync_ff_checkout`], which is safe by construction (it aborts rather than
+/// clobber); the outcomes are returned so the caller can *say* what happened,
+/// which is the other half of the fix — silence was the actual defect.
+pub fn resync_branch_checkouts(
+    root: &Path,
+    branch: &str,
+    old: &str,
+    new: &str,
+) -> Vec<CheckoutResync> {
+    let Some(porc) = git_out(root, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    let pairs = parse_worktree_branches(&porc);
+    checkouts_of_branch(&pairs, branch)
+        .into_iter()
+        .map(|p| {
+            let path = PathBuf::from(p);
+            let mut outcome = resync_ff_checkout(&path, branch, old, new);
+            // `resync_ff_checkout` refuses preemptively on ANY uncommitted work,
+            // which is stricter than the operation needs: `read-tree -m -u` is a
+            // two-way merge that keeps local edits to untouched paths and aborts
+            // rather than clobber. So for the dirty case, ask git directly —
+            // the common shape (an unrelated edit elsewhere in the tree) then
+            // heals instead of being reported as a manual chore. A genuine
+            // overlap still refuses, and is reported.
+            if outcome == ResyncOutcome::Skipped("checkout has uncommitted changes") {
+                outcome = if git_ok(&path, &["read-tree", "-m", "-u", old, new]) {
+                    ResyncOutcome::Healed
+                } else {
+                    // git refused: the local edits genuinely overlap the landed
+                    // paths. Say that, rather than the generic "has uncommitted
+                    // changes" — the user needs to know it's an overlap.
+                    ResyncOutcome::Skipped("uncommitted changes overlap the landed files")
+                };
+            }
+            CheckoutResync {
+                path,
+                outcome,
+                old: old.to_string(),
+                new: new.to_string(),
+            }
+        })
+        .collect()
+}
+
 /// Repair (2): a startup/switch-time coherence pass. If the main checkout's
 /// working tree drifted stale (its branch ref moved but the tree didn't — e.g. a
 /// fold in another process advanced it), fast-forward it. The working tree is
@@ -1122,6 +1243,71 @@ mod tests {
         std::fs::remove_file(dir.join("a.txt")).ok(); // main's tree is c0 again
         g(&["update-ref", "refs/heads/main", &c1, &c0]);
         (dir, c0, c1)
+    }
+
+    #[test]
+    fn parse_worktree_branches_pairs_paths_with_their_branch() {
+        // Real porcelain shape: blank-line-separated records, `branch` absent on
+        // a detached or bare entry.
+        let porc = "\
+worktree /repo
+HEAD aaaa
+branch refs/heads/main
+
+worktree /wt/feature
+HEAD bbbb
+branch refs/heads/ba/rearch
+
+worktree /wt/detached
+HEAD cccc
+detached
+
+worktree /repo/bare
+bare
+";
+        let pairs = parse_worktree_branches(porc);
+        assert_eq!(
+            pairs,
+            vec![
+                ("/repo".to_string(), Some("main".to_string())),
+                ("/wt/feature".to_string(), Some("ba/rearch".to_string())),
+                ("/wt/detached".to_string(), None),
+                ("/repo/bare".to_string(), None),
+            ]
+        );
+        assert!(parse_worktree_branches("").is_empty());
+    }
+
+    #[test]
+    fn checkouts_of_branch_finds_linked_worktrees_not_just_the_main_one() {
+        let pairs = parse_worktree_branches(
+            "worktree /repo\nbranch refs/heads/main\n\nworktree /wt/x\nbranch refs/heads/ba/rearch\n",
+        );
+        // The regression this exists for: the target branch is checked out in a
+        // LINKED worktree while the main checkout sits on another branch.
+        assert_eq!(checkouts_of_branch(&pairs, "ba/rearch"), vec!["/wt/x"]);
+        assert_eq!(checkouts_of_branch(&pairs, "main"), vec!["/repo"]);
+        assert!(checkouts_of_branch(&pairs, "nope").is_empty());
+        // A branch-shaped prefix must not match by accident.
+        assert!(checkouts_of_branch(&pairs, "ba").is_empty());
+    }
+
+    #[test]
+    fn manual_fix_is_the_two_way_merge_not_a_reset() {
+        let r = CheckoutResync {
+            path: PathBuf::from("/wt/x"),
+            outcome: ResyncOutcome::Skipped("checkout has uncommitted changes"),
+            old: "aaa".into(),
+            new: "bbb".into(),
+        };
+        let cmd = r.manual_fix();
+        assert_eq!(cmd, "git -C /wt/x read-tree -m -u aaa bbb");
+        // `reset --hard` would destroy the uncommitted work that caused the
+        // skip; `reset --keep <branch>` is a working-tree no-op here, because
+        // HEAD already resolves to `new` — it unstages but leaves the landed
+        // files missing from disk. Neither is a valid suggestion.
+        assert!(!cmd.contains("--hard"));
+        assert!(!cmd.contains("reset"));
     }
 
     #[test]

@@ -2718,6 +2718,19 @@ local_admin = true
 # On by default; the core (fold + integrate) is AI-free — the agent handoff is
 # the only AI touch and only fires on a conflict. Set enabled = false to remove
 # the command, panel section, and badge entirely.
+# PER-REPO: every interesting key below describes a *repository* — its build
+# tool, its integration branch, its lockfiles — so a repo that differs from your
+# defaults belongs in a `[workspace.<slug>.merge_queue]` block rather than in
+# `--set` flags on every invocation. The slug is the repo directory name,
+# slugified. It overrides the global table for that repo only:
+#
+#   [workspace.datahub.merge_queue]
+#   target_branch      = "ba/rearch"          # this repo integrates elsewhere
+#   gate_setup_command = "pnpm install --frozen-lockfile"
+#   gate_command       = "pnpm test"          # not the global "just test"
+#
+# `thegn config explain merge_queue.gate_command`, run inside the repo, shows
+# which layer won.
 [merge_queue]
 enabled = true
 remote_mode = "route_to_host" # how a REMOTE-host (sprite) worktree lands onto the target;
@@ -2732,6 +2745,19 @@ gate_command = ""             # e.g. "just test" / "cargo nextest run --workspac
                               # Prefer a LEAN gate: the pre-push hook already ran clippy + full
                               # test + smoke before enqueue, so "just lint && just test" mostly
                               # repeats that compile work. "just test" alone is ~3x cheaper.
+                              # NOTE: this runs in a BARE checkout of the folded tip — no
+                              # node_modules, no virtualenv, no .direnv. A command whose entry
+                              # point is a project-local binary (turbo, pytest in a venv, a Go
+                              # tool dir) will NOT resolve; provision it with gate_setup_command
+                              # below. Rust works out of the box only because cargo is global.
+gate_setup_command = ""       # run in the gate worktree BEFORE gate_command, to install what the
+                              # gate needs: "pnpm install --frozen-lockfile", "uv sync",
+                              # "bundle install", … "" skips it. NOT part of the pass/fail
+                              # verdict — a non-zero exit is reported as a gate ENVIRONMENT
+                              # failure ("gate_error"), never as "this branch breaks the build",
+                              # so a broken setup can neither blame a branch nor wake the agent.
+                              # Runs on every gate invocation (including an in-place refresh of a
+                              # reused worktree), so keep it idempotent and cheap when warm.
 gate_on = true                # run gate_command before advancing main
 gate_reuse_worktree = true    # reuse a stable per-repo gate worktree + target dir between folds
                               # (warm incremental rebuild instead of a cold from-scratch compile).
@@ -2739,7 +2765,12 @@ gate_reuse_worktree = true    # reuse a stable per-repo gate worktree + target d
 gate_target_dir = ""          # CARGO_TARGET_DIR for the gate; "" = $XDG_STATE_HOME/thegn/gate/<repo>/target
 bisect_on_red = true          # on a red gate, defer just the offending branch
 snapshot_dirty = false        # auto-commit uncommitted worktree work before folding
-regenerate_paths = ["Cargo.lock"]  # conflicts confined to these are "regenerable", not handed off
+regenerate_paths = ["Cargo.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock",
+                    "bun.lockb", "poetry.lock", "uv.lock", "Pipfile.lock", "go.sum",
+                    "Gemfile.lock", "composer.lock"]
+                              # conflicts confined to these are "regenerable", not handed off.
+                              # Matched by exact path OR basename. A name costs nothing in a repo
+                              # that doesn't have that file, so the default spans ecosystems.
 regenerate_command = ""        # e.g. "cargo update --workspace"; rebuilds regenerate_paths to auto-land them ("" defers instead)
 conflict_handoff = "agent"    # agent | notify | manual — fate of a deferred branch
 #
@@ -2751,7 +2782,9 @@ conflict_handoff = "agent"    # agent | notify | manual — fate of a deferred b
 # object-DB fold + CAS itself. {prompt}/{branch}/{target} are substituted.
 agent_command = ""            # e.g. 'claude -p "{prompt}" --permission-mode acceptEdits'; "" ⇒ agent handoff degrades to notify
 auto_land = true              # queue driver: CAS-advance on green; false ⇒ stop at "ready" for a manual land
-agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human"
+agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human".
+                              # The budget belongs to the BRANCH and is persisted, so a later drain
+                              # doesn't spend it again; `thegn merge retry` re-arms a row.
 agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
 #
 # Sidebar organization (ON by default). As a branch moves through the queue,

@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thegn_core::config::MergeQueueConfig;
 use thegn_core::db::Db;
 use thegn_core::fold::{self, Branch, ConflictKind, FoldGit, FoldPlan, MergeOutcome};
+use thegn_core::gate;
+use thegn_core::outln;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::WorktreeAuxStore;
 use thegn_core::util;
@@ -154,6 +156,10 @@ pub enum GateOutcome {
     /// The gate went red. `offender` names the branch bisect isolated as the
     /// cause, if it could localize one (else the whole batch was held back).
     Failed { offender: Option<String> },
+    /// The gate could not RUN (missing binary, unprovisioned worktree, killed).
+    /// Distinct from `Failed`: it is a fact about the environment, so no branch
+    /// is blamed and no bisect is attempted.
+    Errored { reason: String },
 }
 
 /// A branch that landed in this fold.
@@ -186,6 +192,11 @@ pub struct FoldReport {
     pub gate: GateOutcome,
     /// How many CAS attempts it took (main moving under the fold forces a re-fold).
     pub cas_attempts: u32,
+    /// What happened to each live checkout of the target branch when the ref
+    /// advanced. Advisory, like `Candidates::skipped_dirty`: the caller reports
+    /// the ones we could not fast-forward, so a stale working tree is never a
+    /// silent surprise. Empty when nothing advanced.
+    pub resyncs: Vec<util::CheckoutResync>,
 }
 
 /// Resolve the branch the fold advances. `"auto"` (or empty) → the repo's
@@ -222,8 +233,11 @@ pub fn main_checkout(start: &Path) -> Option<PathBuf> {
 /// target branch, gather candidate branches, fold/gate/CAS-advance, and mirror
 /// the outcome into the queue cache. The shared entry point for both the CLI
 /// command and the in-app (off-loop) runner.
-pub fn fold_active_repo(mq: &MergeQueueConfig, any_path: &Path) -> Result<FoldReport> {
+pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Result<FoldReport> {
     let repo_root = main_checkout(any_path).context("not inside a git repository")?;
+    // Resolved here (off the loop — this runs inside spawn_fold's blocking task)
+    // because the per-repo `[merge_queue]` layer needs the repo root.
+    let mq = &cfg.repo_merge_queue(&repo_root);
     let target = resolve_target(mq, &repo_root);
     let cands = candidate_branches(mq, &repo_root, &target)?;
     let report = run_fold(mq, &repo_root, cands.branches.clone())?;
@@ -386,6 +400,29 @@ fn gate_lock(_wt: &Path) -> Option<std::fs::File> {
     None
 }
 
+/// What one gate invocation established. The distinction between `Failed` and
+/// `Error` is load-bearing, not cosmetic: only `Failed` is a verdict about the
+/// *branch*. An `Error` (missing binary, non-executable, killed, unprovisioned
+/// worktree) says nothing about the code, so it must never reach the fixing
+/// agent and must never be bisected — see [`thegn_core::gate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateVerdict {
+    /// The gate ran and went green (or no gate was configured).
+    Passed,
+    /// The gate ran and went red. `log` is the tail of its output.
+    Failed { log: String },
+    /// The gate could not run. `reason` is the short headline, `log` whatever
+    /// output there was.
+    Error { reason: String, log: String },
+}
+
+impl GateVerdict {
+    /// Did the folded tip clear the gate?
+    pub(crate) fn passed(&self) -> bool {
+        matches!(self, GateVerdict::Passed)
+    }
+}
+
 /// Build/test the folded tip. By default (`gate_reuse_worktree`) this runs in a
 /// stable per-repo worktree kept between folds, with a persistent
 /// `CARGO_TARGET_DIR` — so cargo does a warm incremental rebuild instead of a
@@ -397,15 +434,11 @@ fn gate_lock(_wt: &Path) -> Option<std::fs::File> {
 // off-loop: the fold runs from the CLI (`thegn integrate`) or from
 // spawn_fold's spawn_blocking (see the module doc) — never on the loop.
 #[expect(clippy::disallowed_methods)]
-pub(crate) fn gate_tip(
-    repo_root: &Path,
-    oid: &str,
-    cfg: &MergeQueueConfig,
-) -> Result<(bool, String)> {
+pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> Result<GateVerdict> {
     // Callers only reach here with a non-empty command (`gate_on` already checks
     // it), but guard anyway: an empty gate is a green no-op, not a worktree churn.
     if cfg.gate_command.is_empty() {
-        return Ok((true, String::new()));
+        return Ok(GateVerdict::Passed);
     }
 
     let reuse = cfg.gate_reuse_worktree;
@@ -470,26 +503,92 @@ pub(crate) fn gate_tip(
         anyhow::bail!("merge queue: could not prepare gate worktree at {wt_s}");
     }
 
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c").arg(&cfg.gate_command).current_dir(&wt);
-    if let Some(td) = &target_dir {
-        let _ = std::fs::create_dir_all(td); // best-effort: create_dir_all is idempotent
-        cmd.env("CARGO_TARGET_DIR", td);
+    // One shell setup for both the (optional) provisioning step and the gate,
+    // so they see an identical environment.
+    let spawn = |command: &str| {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(command).current_dir(&wt);
+        if let Some(td) = &target_dir {
+            let _ = std::fs::create_dir_all(td); // best-effort: create_dir_all is idempotent
+            cmd.env("CARGO_TARGET_DIR", td);
+        }
+        // Scrub the git environment, exactly as `run_agent` does. An inherited
+        // GIT_DIR/GIT_INDEX_FILE would otherwise point the gate's own `git` at
+        // whatever repo invoked thegn instead of at the gate worktree.
+        for var in util::GIT_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.env("THEGN_GATE", "1");
+        cmd.env("THEGN_WORKTREE", &wt);
+        cmd.env("THEGN_GATE_OID", oid);
+        cmd.output()
+    };
+
+    // Provision the worktree first. It is a bare checkout of the folded tip —
+    // no node_modules, no venv — so any gate whose entry point is a
+    // project-local binary dies instantly without this. Deliberately NOT part of
+    // the verdict: a failed setup is an environment failure, so it can neither
+    // blame the branch nor wake the fixing agent.
+    if !cfg.gate_setup_command.is_empty() {
+        match spawn(&cfg.gate_setup_command) {
+            Ok(o) if !o.status.success() => {
+                let mut log = String::from_utf8_lossy(&o.stdout).into_owned();
+                log.push_str(&String::from_utf8_lossy(&o.stderr));
+                if !reuse {
+                    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]);
+                }
+                return Ok(GateVerdict::Error {
+                    reason: format!(
+                        "gate_setup_command failed (exit {})",
+                        o.status
+                            .code()
+                            .map_or_else(|| "signal".to_string(), |c| c.to_string())
+                    ),
+                    log: tail(&log, 4000),
+                });
+            }
+            Err(e) => {
+                if !reuse {
+                    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]);
+                }
+                return Ok(GateVerdict::Error {
+                    reason: "gate_setup_command could not be started".to_string(),
+                    log: format!("{e}"),
+                });
+            }
+            Ok(_) => {}
+        }
     }
-    let out = cmd.output();
+
+    let out = spawn(&cfg.gate_command);
 
     // A throwaway worktree is always removed; a reused one is kept — its warm
     // target/ is the whole point.
     if !reuse {
         let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]);
     }
+    // Classify rather than collapsing to a bool: the raw exit status is the only
+    // place "the command never ran" is distinguishable from "the tests failed",
+    // and dropping it here is what let `turbo: command not found` be recorded as
+    // a verdict about the branch. See `thegn_core::gate`.
     Ok(match out {
         Ok(o) => {
             let mut log = String::from_utf8_lossy(&o.stdout).into_owned();
             log.push_str(&String::from_utf8_lossy(&o.stderr));
-            (o.status.success(), tail(&log, 4000))
+            let log = tail(&log, 4000);
+            match gate::classify_exit(o.status.code(), false) {
+                gate::GateClass::Passed => GateVerdict::Passed,
+                gate::GateClass::Failed => GateVerdict::Failed { log },
+                gate::GateClass::Error => GateVerdict::Error {
+                    reason: gate::error_reason(o.status.code(), false).to_string(),
+                    log,
+                },
+            }
         }
-        Err(e) => (false, format!("gate command failed to start: {e}")),
+        Err(e) => GateVerdict::Error {
+            reason: gate::error_reason(None, true).to_string(),
+            log: format!("gate command failed to start: {e}"),
+        },
     })
 }
 
@@ -510,6 +609,11 @@ fn tail(s: &str, max: usize) -> String {
 /// prefix whose gate goes red names its last branch as the offender. Returns
 /// `None` when it can't localize one (e.g. a flaky gate), in which case the
 /// whole batch is held back.
+///
+/// Aborts on a [`GateVerdict::Error`]: an environment failure reproduces at
+/// every prefix, so bisecting one would burn a full gate run per branch and
+/// then blame whichever branch happened to be first. The error is returned so
+/// the caller reports the environment, not a branch.
 fn bisect_offender(
     repo_root: &Path,
     adapter: &PlumbingAdapter,
@@ -527,12 +631,34 @@ fn bisect_offender(
             tip: branch_tip(repo_root, &l.branch)?,
         });
         let plan = fold::fold(adapter, base, prefix.clone(), &cfg.regenerate_paths)?;
-        if plan.advanced() && !gate_tip(repo_root, &plan.final_tip, cfg)?.0 {
-            return Ok(Some(l.branch.clone()));
+        if plan.advanced() {
+            match gate_tip(repo_root, &plan.final_tip, cfg)? {
+                GateVerdict::Passed => {}
+                GateVerdict::Failed { .. } => return Ok(Some(l.branch.clone())),
+                // Environmental: identical at every prefix, so stop rather than
+                // blame `l.branch` for a missing binary.
+                v @ GateVerdict::Error { .. } => return Err(BisectAborted(v).into()),
+            }
         }
     }
     Ok(None)
 }
+
+/// A bisect that stopped because the gate could not run. Carries the verdict so
+/// the caller can report the environment failure verbatim.
+#[derive(Debug)]
+pub(crate) struct BisectAborted(pub(crate) GateVerdict);
+
+impl std::fmt::Display for BisectAborted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            GateVerdict::Error { reason, .. } => write!(f, "{reason}"),
+            _ => write!(f, "gate could not run"),
+        }
+    }
+}
+
+impl std::error::Error for BisectAborted {}
 
 fn branch_tip(repo_root: &Path, branch: &str) -> Result<String> {
     let loc = GitLoc::for_worktree(repo_root);
@@ -576,6 +702,7 @@ fn build_report(
         })
         .collect();
     FoldReport {
+        resyncs: Vec::new(),
         target_branch: target_branch.to_string(),
         original: original.to_string(),
         final_tip: plan.final_tip.clone(),
@@ -647,7 +774,22 @@ pub fn run_fold(
 
         // Test-gate the union before blessing it.
         let gate = if gate_on {
-            if gate_tip(repo_root, &plan.final_tip, cfg)?.0 {
+            let verdict = gate_tip(repo_root, &plan.final_tip, cfg)?;
+            // The gate could not run: report the environment and hold everything
+            // back. Never bisect — the failure is identical at every prefix.
+            if let GateVerdict::Error { reason, .. } = &verdict {
+                return Ok(build_report(
+                    &target_branch,
+                    &original,
+                    &plan,
+                    &gate_offenders,
+                    GateOutcome::Errored {
+                        reason: reason.clone(),
+                    },
+                    cas_attempts,
+                ));
+            }
+            if verdict.passed() {
                 GateOutcome::Passed
             } else if cfg.bisect_on_red {
                 let landed: Vec<LandedReport> = plan
@@ -658,7 +800,26 @@ pub fn run_fold(
                         commit: l.commit.clone(),
                     })
                     .collect();
-                if let Some(off) = bisect_offender(repo_root, &adapter, &base, &landed, cfg)? {
+                let bisected = match bisect_offender(repo_root, &adapter, &base, &landed, cfg) {
+                    Ok(o) => o,
+                    // The gate stopped being runnable mid-bisect: report the
+                    // environment rather than blaming whichever branch was next.
+                    Err(e) => {
+                        let reason = match e.downcast_ref::<BisectAborted>() {
+                            Some(b) => b.to_string(),
+                            None => return Err(e),
+                        };
+                        return Ok(build_report(
+                            &target_branch,
+                            &original,
+                            &plan,
+                            &gate_offenders,
+                            GateOutcome::Errored { reason },
+                            cas_attempts,
+                        ));
+                    }
+                };
+                if let Some(off) = bisected {
                     excluded.insert(off.clone());
                     gate_offenders.push(off);
                     continue; // re-fold without the offender
@@ -694,20 +855,28 @@ pub fn run_fold(
             // there shows the folded files as pending, and a read-only sandbox
             // mount of it can't self-heal. Fast-forward it host-side (a safe
             // no-op when the checkout has real uncommitted work; see the guards).
-            match util::resync_ff_checkout(repo_root, &target_branch, &base, &plan.final_tip) {
-                util::ResyncOutcome::Healed => thegn_core::msg::info(&format!(
-                    "merge queue: synced {target_branch} checkout to {}",
-                    &plan.final_tip[..plan.final_tip.len().min(9)]
-                )),
-                util::ResyncOutcome::Skipped(why) => tracing::debug!(
-                    target: "thegn::integrate",
-                    why,
-                    "left main checkout working tree as-is"
-                ),
-                util::ResyncOutcome::Failed => tracing::warn!(
-                    target: "thegn::integrate",
-                    "could not fast-forward the main checkout; run `git -C <repo> reset --hard {target_branch}` to sync it"
-                ),
+            let resyncs =
+                util::resync_branch_checkouts(repo_root, &target_branch, &base, &plan.final_tip);
+            for r in &resyncs {
+                match &r.outcome {
+                    util::ResyncOutcome::Healed => thegn_core::msg::info(&format!(
+                        "merge queue: synced {} to {}",
+                        r.path.display(),
+                        &plan.final_tip[..plan.final_tip.len().min(9)]
+                    )),
+                    // NOT silent any more — the caller renders these on stdout.
+                    util::ResyncOutcome::Skipped(why) => tracing::debug!(
+                        target: "thegn::integrate",
+                        why,
+                        path = %r.path.display(),
+                        "left checkout working tree as-is"
+                    ),
+                    util::ResyncOutcome::Failed => tracing::warn!(
+                        target: "thegn::integrate",
+                        path = %r.path.display(),
+                        "could not fast-forward the checkout"
+                    ),
+                }
             }
             let mut report = build_report(
                 &target_branch,
@@ -718,6 +887,7 @@ pub fn run_fold(
                 cas_attempts,
             );
             report.advanced = true;
+            report.resyncs = resyncs;
             return Ok(report);
         }
         if cas_attempts >= 5 {
@@ -727,19 +897,58 @@ pub fn run_fold(
     }
 }
 
+/// Print a warning for every checkout of `branch` the fold could NOT
+/// fast-forward, with the exact command that syncs it.
+///
+/// The ref moved under those working trees, so `git status` there now shows the
+/// whole fold as pending deletions — which reads as a catastrophic accidental
+/// deletion, and which `git commit` would turn into a revert of the merge that
+/// just landed. Deriving the recovery is the hard part, so we spell it out
+/// rather than leaving the user to work it out from a wall of `D ` lines.
+///
+/// Goes to stdout, deliberately: this used to be a `tracing::warn!` that was
+/// invisible without `THEGN_LOG`, and a `Skipped` outcome was dropped entirely.
+pub(crate) fn report_resyncs(branch: &str, resyncs: &[util::CheckoutResync]) {
+    for r in resyncs {
+        let why = match &r.outcome {
+            // Healed is the happy path and needs no warning.
+            util::ResyncOutcome::Healed => continue,
+            util::ResyncOutcome::Skipped(why) => *why,
+            util::ResyncOutcome::Failed => "the fast-forward could not be applied",
+        };
+        outln!(
+            "! {} is on {branch} and was NOT resynced ({why}).",
+            r.path.display()
+        );
+        outln!("  Its working tree still holds the pre-fold content, so `git status`");
+        outln!("  there mixes this fold in with your own changes — don't commit it");
+        outln!("  blindly. Reconcile your changes, then sync it with:");
+        outln!("    {}", r.manual_fix());
+    }
+}
+
 /// What the driver's single-branch land attempt decided.
 #[derive(Debug, Clone)]
 pub(crate) enum AttemptOutcome {
     /// Merged clean, gated green, and CAS-advanced the target. `commit` is the
-    /// fold tip now at the target ref.
-    Landed { commit: String },
+    /// fold tip now at the target ref. `resyncs` reports what happened to each
+    /// live checkout of the target branch (see `util::resync_branch_checkouts`).
+    Landed {
+        commit: String,
+        resyncs: Vec<util::CheckoutResync>,
+    },
     /// Merged clean and gated green, but `auto_land` is off — held for a manual
     /// land. `tip` is the (unreferenced) fold commit in the object DB.
     Ready { tip: String },
     /// A textual (or unresolved regenerable) conflict against the current target.
     Conflict { paths: Vec<String> },
     /// Merged clean but the gate went red. `log` is the tail of the gate output.
+    /// A verdict about the *branch* — this is the one a fixing agent can act on.
     GateFailed { log: String },
+    /// Merged clean, but the gate could not RUN (missing binary, unprovisioned
+    /// gate worktree, killed). A fact about the *environment*, so the branch is
+    /// not blamed and the fixing agent is never dispatched — it cannot help.
+    GateError { reason: String, log: String },
     /// The branch tip is already an ancestor of the target — nothing to do.
     UpToDate,
     /// The branch lives on another host and its tip could not be fetched into
@@ -810,9 +1019,14 @@ pub(crate) fn attempt_land(
         }
         let folded_tip = plan.final_tip.clone();
         if gate_on {
-            let (ok, log) = gate_tip(repo_root, &folded_tip, cfg)?;
-            if !ok {
-                return Ok(AttemptOutcome::GateFailed { log });
+            match gate_tip(repo_root, &folded_tip, cfg)? {
+                GateVerdict::Passed => {}
+                GateVerdict::Failed { log } => {
+                    return Ok(AttemptOutcome::GateFailed { log });
+                }
+                GateVerdict::Error { reason, log } => {
+                    return Ok(AttemptOutcome::GateError { reason, log });
+                }
             }
         }
         if !cfg.auto_land {
@@ -820,15 +1034,15 @@ pub(crate) fn attempt_land(
         }
         cas_attempts += 1;
         if CliGit.update_ref_cas(&loc, &target_ref, &folded_tip, &base)? {
-            if util::resync_ff_checkout(repo_root, &target_branch, &base, &folded_tip)
-                == util::ResyncOutcome::Failed
-            {
-                tracing::warn!(
-                    target: "thegn::integrate",
-                    "could not fast-forward the main checkout; run `git -C <repo> reset --hard {target_branch}` to sync it"
-                );
-            }
-            return Ok(AttemptOutcome::Landed { commit: folded_tip });
+            // Every live checkout of the target, not just the main one — and the
+            // outcomes ride out on the result so the caller can report the ones
+            // left stale. Dropping `Skipped` here is what made the desync silent.
+            let resyncs =
+                util::resync_branch_checkouts(repo_root, &target_branch, &base, &folded_tip);
+            return Ok(AttemptOutcome::Landed {
+                commit: folded_tip,
+                resyncs,
+            });
         }
         if cas_attempts >= 5 {
             anyhow::bail!("merge queue: {target_branch} kept moving under the fold");
@@ -925,6 +1139,15 @@ mod tests {
             auto_land: true,
             agent_max_attempts: 2,
             agent_timeout_secs: 0,
+            // Throwaway gate worktree (a unique /tmp path) rather than the
+            // reused one, which lives under `$XDG_STATE_HOME`. Rust runs these
+            // tests as threads in ONE process, and `testenv::EnvVarGuard`
+            // repoints `XDG_STATE_HOME` process-globally — its lock only
+            // excludes other ENV_LOCK-respecting tests, which these are not. So
+            // a reused gate would be built inside a *different* test's temp dir
+            // and vanish under it when that test's guard dropped. Depending on
+            // ambient env here is the bug; not depending on it is the fix.
+            gate_reuse_worktree: false,
             ..MergeQueueConfig::default()
         }
     }
@@ -1096,7 +1319,7 @@ mod tests {
         let before = repo.out(&["rev-parse", "main"]);
 
         match attempt_land(&cfg(""), &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap() {
-            AttemptOutcome::Landed { commit } => assert!(!commit.is_empty()),
+            AttemptOutcome::Landed { commit, .. } => assert!(!commit.is_empty()),
             o => panic!("expected Landed, got {o:?}"),
         }
         assert_ne!(repo.out(&["rev-parse", "main"]), before, "main advanced");
