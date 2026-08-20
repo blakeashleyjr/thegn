@@ -58,6 +58,15 @@ The heavy gates are full-workspace compiles — don't run them per-edit:
 - **Once, before opening a PR:** `just ci` — fmt-check + lint + build + test +
   coverage + smoke + nix-build. This is the merge gate; save it for the end.
 
+> **Run `just ci` from `nix develop`, not from the direnv/devenv shell.** The
+> two shells carry different Rust toolchains: the flake's (rust-overlay) adds
+> `llvm-tools-preview` and the macOS/Windows cross targets, and `devenv.nix`
+> uses the plain nixpkgs toolchain, which has neither. Everything else works in
+> both, but under devenv the `coverage` stage fails with
+> `failed to find llvm-tools-preview` and `check-cross` fails with
+> `can't find crate for 'core'`. CI runs every gate through
+> `nix develop --command`, so that is the shell to reproduce it in.
+
 `just` with no arguments lists every recipe. Commits follow conventional
 style (`feat(scope):`, `fix(scope):`); branch off `main`.
 

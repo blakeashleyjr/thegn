@@ -7,6 +7,68 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] — 2026-08-20
+
+A packaging and hygiene release. `v0.1.0-alpha.1` was tagged but never
+published; this is the first release the public actually gets, and it fixes the
+things a first-time cloner hit rather than anything about the running shell.
+
+### Fixed — first-clone experience
+
+- **`git clone --recurse-submodules` failed.** A stale `.gitmodules` still
+  listed two private `apps/*` repos that are not reachable anonymously and are
+  no longer submodules of this project. Removed.
+- **Every `just` build printed a warning about private code.** The `_apps`
+  recipe — a dependency of `build`, `quick`, `release`, `build-musl`, `lint`,
+  `test`, `coverage` and `build-profiling` — warned that the host's chat/agent
+  tabs would not build whenever no `apps/` checkout existed, which for everyone
+  outside the maintainer's machine is always. Nothing depends on it.
+- **The default agent picker offered a binary nobody has.** With no user
+  config, `[[agents]]` was seeded with `termite`/`termite tui`, an unpublished
+  TUI. The defaults are now `claude` and `shell`.
+- **The project read as MIT-only.** A stray bare `LICENSE` (naming a different
+  copyright holder than `LICENSE-MIT`) overrode GitHub's detection of the
+  `MIT OR Apache-2.0` dual license declared in every manifest. The README now
+  states the licensing too.
+
+### Fixed — `install.sh`
+
+- No longer deletes four pre-rename entry-point names and two `.desktop` files
+  from your `bin` directory. No public user ever had the old brand, and one of
+  those names is short enough to plausibly belong to an unrelated tool. An
+  installer must not remove what it did not create.
+- Installs a **copy** of the release binary instead of a symlink into
+  `target/release/`. The symlink broke silently on `cargo clean`, a pruned
+  worktree, or a moved repo. Re-run `./install.sh` after a rebuild.
+- Fails loudly when the build produced no binary, instead of installing a
+  dangling symlink.
+
+### Fixed — CI and tooling
+
+- **`pull_request` jobs no longer default to self-hosted runners.** On a public
+  repo that fallback meant fork-PR code running on a personal machine against a
+  persistent nix store, sccache and `CARGO_HOME`. GitHub-hosted is now the
+  default and self-hosted is an explicit opt-in.
+- **`NIX_GITHUB_TOKEN` is documented as optional.** Four places claimed it was
+  required for "private flake inputs"; every flake input is public, and fork
+  PRs — which receive no secrets — were being told their CI was unfixable.
+- **Three gates were narrower than they claimed.** `doc-check` ran rustdoc
+  without `--document-private-items` on a codebase that is overwhelmingly
+  private, hiding seven broken intra-doc links and unclosed-HTML-tag errors
+  (all fixed); `shellcheck` ran a hand-kept list that had drifted to 9 of 20
+  tracked scripts, excluding the user-facing `setup-macos.sh`; and `taplo lint`
+  was linting `.direnv`, `.devenv` and `target/` — 122 files, almost none ours.
+- `CONTRIBUTING.md` now says that `just ci` must run under `nix develop`: the
+  direnv/devenv shell's toolchain has neither `llvm-tools-preview` nor the
+  cross targets, so `coverage` and `check-cross` fail there.
+
+### Removed
+
+Dead artifacts carrying no references: the Python LLM sidecar and its
+agent adapters (`src/`, `tests/`), 196 directories of visual-regression
+baselines for a harness that no longer exists (`snapshots/`), and ~195 KB of
+mascot design-exploration scripts.
+
 ## [0.1.0-alpha.1] — 2026-08-18
 
 The first public release: the AI-free workspace shell. Everything below is the
@@ -100,5 +162,6 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.1...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.2...HEAD
+[0.1.0-alpha.2]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.1...v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/blakeashleyjr/thegn/releases/tag/v0.1.0-alpha.1

@@ -9,8 +9,10 @@
 class Thegn < Formula
   desc "Terminal-native git-worktree IDE that is its own terminal multiplexer"
   homepage "https://github.com/blakeashleyjr/thegn"
-  version "0.1.0-alpha.1"
-  license "MIT" # match the workspace license
+  version "0.1.0-alpha.2"
+  # Matches the workspace's `MIT OR Apache-2.0` (Cargo.toml, LICENSE-MIT,
+  # LICENSE-APACHE) — not plain MIT, which is what this said before.
+  license any_of: ["MIT", "Apache-2.0"]
 
   on_macos do
     on_arm do

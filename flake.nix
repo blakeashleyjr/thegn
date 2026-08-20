@@ -90,13 +90,11 @@
       # Allowlisted build source — see nix/source.nix for why it is an
       # allowlist and what has to be on it.
       rootSrc = import ./nix/source.nix {inherit (pkgs) lib;} ./.;
-      # The package source is just the filtered repo. This used to splice the
+      # The package source is just the filtered repo. This used to splice
       # private `apps/*` submodules in (local flake `self` sources carry only
-      # gitlinks), but nothing in the cargo workspace has a path dep into
-      # `apps/` any more — `Cargo.toml` excludes it and
-      # `crates/thegn-host/src/apps/mod.rs` is inert scaffolding. Keeping those
-      # inputs made the flake unevaluable for anyone without access to the
-      # private repos, which broke `nix profile install github:…/thegn`.
+      # gitlinks), which made the flake unevaluable for anyone without access to
+      # those repos and broke `nix profile install github:…/thegn`. Nothing in
+      # the workspace depends on them; the submodules are gone. Keep it that way.
       thegnSrc = rootSrc;
       # crane, pinned to the same toolchain everything else uses.
       craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
