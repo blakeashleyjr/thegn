@@ -16,8 +16,8 @@ out="$("$repo"/install.sh --dry-run "$tmp/bin")"
   echo "$out" >&2
   exit 1
 }
-[[ $out == *"$tmp/bin/tg wrapper -> $tmp/bin/tg-tui (current terminal); tg -s|--standalone -> ghostty --config-file $repo/config/ghostty.config -e $tmp/bin/tg-tui"* ]] || {
-  echo "dry-run did not plan tg current-terminal + ghostty standalone wrapper" >&2
+[[ $out == *"$tmp/bin/tg wrapper -> $tmp/bin/tg-tui (current terminal); tg -s|--standalone -> alacritty --config-file $repo/config/alacritty.toml -e $tmp/bin/tg-tui"* ]] || {
+  echo "dry-run did not plan tg current-terminal + alacritty standalone wrapper" >&2
   echo "$out" >&2
   exit 1
 }
@@ -45,11 +45,11 @@ cat >"$fakebin/delta" <<'EOF'
 exit 0
 EOF
 chmod 0755 "$fakebin/delta"
-cat >"$fakebin/ghostty" <<'EOF'
+cat >"$fakebin/alacritty" <<'EOF'
 #!/usr/bin/env sh
-printf '%s\n' "$@" >"${TG_GHOSTTY_LOG:?}"
+printf '%s\n' "$@" >"${TG_ALACRITTY_LOG:?}"
 EOF
-chmod 0755 "$fakebin/ghostty"
+chmod 0755 "$fakebin/alacritty"
 
 install_out="$(PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" "$repo/install.sh" "$tmp/bin")"
 [[ -L $tmp/bin/thegn && $(readlink "$tmp/bin/thegn") == "$repo/target/release/thegn" ]] || {
@@ -67,23 +67,23 @@ install_out="$(PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/conf
   sed -n '1,120p' "$tmp/bin/tg-tui" >&2
   exit 1
 }
-# tg with no standalone flag execs tg-tui directly (current terminal), never ghostty.
+# tg with no standalone flag execs tg-tui directly (current terminal), never alacritty.
 [[ $(<"$tmp/bin/tg") == *"exec $tmp/bin/tg-tui"* ]] || {
   echo "tg should exec tg-tui directly in the current terminal by default" >&2
   sed -n '1,120p' "$tmp/bin/tg" >&2
   exit 1
 }
-# tg -s / --standalone launches the dedicated ghostty profile.
-[[ $(<"$tmp/bin/tg") == *"exec ghostty --config-default-files=false --config-file=$repo/config/ghostty.config -e $tmp/bin/tg-tui"* ]] || {
-  echo "tg --standalone should launch the dedicated ghostty profile" >&2
+# tg -s / --standalone launches the dedicated alacritty profile.
+[[ $(<"$tmp/bin/tg") == *"exec alacritty --config-file $repo/config/alacritty.toml -e $tmp/bin/tg-tui"* ]] || {
+  echo "tg --standalone should launch the dedicated alacritty profile" >&2
   sed -n '1,120p' "$tmp/bin/tg" >&2
   exit 1
 }
-TG_GHOSTTY_LOG="$tmp/ghostty.args" PATH="$fakebin:$PATH" "$tmp/bin/tg" --standalone
-ghostty_args="$(<"$tmp/ghostty.args")"
-[[ $ghostty_args == *$'--config-file='"$repo/config/ghostty.config"*$'\n-e\n'"$tmp/bin/tg-tui"* ]] || {
-  echo "tg --standalone did not invoke ghostty with the bundled config and tg-tui" >&2
-  printf '%s\n' "$ghostty_args" >&2
+TG_ALACRITTY_LOG="$tmp/alacritty.args" PATH="$fakebin:$PATH" "$tmp/bin/tg" --standalone
+alacritty_args="$(<"$tmp/alacritty.args")"
+[[ $alacritty_args == *$'--config-file\n'"$repo/config/alacritty.toml"$'\n-e\n'"$tmp/bin/tg-tui"* ]] || {
+  echo "tg --standalone did not invoke alacritty with the bundled config and tg-tui" >&2
+  printf '%s\n' "$alacritty_args" >&2
   exit 1
 }
 
