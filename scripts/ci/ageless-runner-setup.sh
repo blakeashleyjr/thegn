@@ -5,7 +5,7 @@
 #
 # Run this ON ageless-studio, as the runner user (default: targe):
 #
-#   NIX_GITHUB_TOKEN=<classic PAT, repo scope> \
+#   NIX_GITHUB_TOKEN=<optional PAT; raises the anonymous rate limit> \
 #   GH_PAT=<PAT with repo admin, to auto-register runners> \
 #     bash scripts/ci/ageless-runner-setup.sh
 #
@@ -30,7 +30,7 @@ RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,x64,ageless,nix}"
 RUNNER_BASE="${RUNNER_BASE:-/home/$RUNNER_USER/actions-runners}"
 CACHE_BASE="${CACHE_BASE:-/home/$RUNNER_USER/gha-cache}"
 SCCACHE_SIZE="${SCCACHE_SIZE:-60G}"
-NIX_GITHUB_TOKEN="${NIX_GITHUB_TOKEN:-}" # PAT for the workflow's private flake inputs
+NIX_GITHUB_TOKEN="${NIX_GITHUB_TOKEN:-}" # optional; all flake inputs are public
 GH_PAT="${GH_PAT:-}"                     # PAT (repo admin) used to mint runner registration tokens
 
 log() { printf '\033[1;36m▸ %s\033[0m\n' "$*"; }

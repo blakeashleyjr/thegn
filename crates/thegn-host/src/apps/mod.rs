@@ -1,6 +1,11 @@
 //! App tabs — a generic framework for hosting full sibling TUIs as top-level
-//! tabs alongside the `work` IDE. No builders are registered today (`work` is
-//! the only tab); the machinery below is kept for future embedded apps.
+//! tabs alongside the `work` IDE. One app is registered today: **`observe`**,
+//! the gtui dashboards tile ([`start_slot_tile`] → [`build_observe_tile`] →
+//! `gtui_embed::embed::ObserveTile`), which [`AppHost::from_config`] gives a
+//! slot when `[observe]` is enabled. It is live code, not scaffolding — the
+//! run loop drives it (input routing, frame takeover, the app-event channel).
+//! What *is* speculative is the plural: the slot vector, chip strip, and
+//! multi-tab switching are built for more apps than the one that exists.
 //!
 //! Each app implements [`tg_kit::AppTile`] and is driven by the host loop the
 //! same way standalone runs drive it: [`pump`] folds async results delivered
@@ -17,7 +22,6 @@
 //! [`pump`]: tg_kit::AppTile::pump
 //! [`render`]: tg_kit::AppTile::render
 //! [`ChangeHook`]: tg_kit::ChangeHook
-#![allow(dead_code)] // wired into run.rs incrementally (Phase 2)
 
 pub mod bridge;
 pub mod input;
@@ -40,10 +44,15 @@ pub enum SlotState {
     Unloaded,
     /// Construction kicked off (e.g. a daemon connect on a blocking task);
     /// the chip shows a spinner until the tile arrives.
+    // `observe` builds synchronously in `start_slot_tile`, so nothing takes the
+    // async-start path yet; kept for the first tile that connects off-thread.
+    #[allow(dead_code)]
     Starting,
     /// Live and drivable.
     Running(Box<dyn AppTile>),
     /// Construction or the connection failed; carries a user-facing reason.
+    // `build_observe_tile` is infallible, so no caller reports a failure yet.
+    #[allow(dead_code)]
     Failed(String),
 }
 
@@ -66,6 +75,9 @@ pub struct AppSlot {
     pub state: SlotState,
     /// The last rendered buffer, re-blitted on frames where the tile reported
     /// no change.
+    // Not read yet: the run loop re-renders the focused tile every frame rather
+    // than reusing this. Wiring it is the caching optimization, not a fix.
+    #[allow(dead_code)]
     pub last_buf: Option<Buffer>,
 }
 
@@ -98,6 +110,9 @@ pub struct AppHost {
 }
 
 impl AppHost {
+    /// Build from an explicit slot list. `from_config` is what the host calls;
+    /// this stays as the seam tests and future callers construct through.
+    #[allow(dead_code)]
     pub fn new(slots: Vec<AppSlot>) -> AppHost {
         let tab_order = std::iter::once(ActiveApp::Work)
             .chain((0..slots.len()).map(ActiveApp::Tile))
@@ -273,6 +288,7 @@ pub fn build_observe_tile(
 }
 
 /// Parse a `Palette` `"R;G;B"` fragment to an sRGB triple (missing channels → 0).
+#[allow(dead_code)] // exercised by the kit_theme tests below; see kit_theme
 fn rgb(frag: &str) -> tg_kit::Rgb {
     let mut it = frag.split(';').map(|n| n.trim().parse::<u8>().unwrap_or(0));
     (
@@ -286,6 +302,12 @@ fn rgb(frag: &str) -> tg_kit::Rgb {
 /// embedded tiles render in the user's exact thegn colors (theme-cycle and
 /// `[theme.colors]` overrides included). The field mapping mirrors
 /// [`tg_kit::Theme::prism`]; a parity test pins the two together.
+///
+/// NOTE: no render-path caller yet — `build_observe_tile` does not pass a
+/// theme, so the Observe tile currently draws in gtui's own default colors
+/// rather than the user's palette. The converter and its parity tests are
+/// ready for whoever threads it through.
+#[allow(dead_code)]
 pub fn kit_theme(p: &Palette) -> Theme {
     Theme {
         bg0: rgb(&p.bg0),

@@ -1,8 +1,8 @@
 # Dependabot version updates. Docs:
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
 #
-# apps/ and vendor/ are excluded from the cargo workspace (see Cargo.toml), so
-# the root manifest at "/" is the single Cargo surface Dependabot needs to see.
+# The root manifest at "/" is the single Cargo surface Dependabot needs to see:
+# every crate is a member of the one workspace it declares.
 version: 2
 updates:
   - package-ecosystem: "cargo"

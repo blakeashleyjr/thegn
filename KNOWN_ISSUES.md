@@ -1,10 +1,13 @@
-# Known issues — 0.1.0-alpha.1
+# Known issues — 0.1.0-alpha.2
 
 This is a public **alpha**. The items below are known, tracked, and deferred to
 a later release — each is a narrow edge case or a deliberate design trade-off.
 The pre-alpha audit (73 verified findings) is otherwise fully remediated; full
 detail lives in
 [`docs/superpowers/specs/alpha-audit-2026-08.md`](docs/superpowers/specs/alpha-audit-2026-08.md).
+A second pass before `0.1.0-alpha.2` covered packaging, licensing, CI and gate
+coverage rather than runtime behavior — see that release's
+[`CHANGELOG.md`](CHANGELOG.md) entry. It left no known issues open.
 
 If you hit one of these it's a known limitation — but a reproducible report is
 still welcome.
@@ -35,7 +38,7 @@ user-driven structural change (a switch/open/close), not steady-state work.
 ## Daemon / remote serving (`thegn serve`)
 
 `thegn serve` (remote thin clients) is the newest surface. Hardened
-substantially this release (loopback-default bind, owner-only socket + run-dir,
+substantially in `0.1.0-alpha.1` (loopback-default bind, owner-only socket + run-dir,
 control-plane worktree-path confinement, protocol version-skew handshake, no
 idle-exit while serving, no scrollback re-replay on reconnect, TOCTOU-safe
 socket election), and disabling the daemon with persisted daemon-backed panes
@@ -66,7 +69,7 @@ they were silently orphaned).
   linux-musl.
 - **macOS and Windows are unvalidated.** No binaries are published for either,
   and neither has ever been run interactively.
-  - **Windows** got its first real CI runs for this release, and now compiles
+  - **Windows** got its first real CI runs in `0.1.0-alpha.1`, and now compiles
     and passes its tests. Until recently the repo could not even be _cloned_ on
     Windows: `crates/thegn-core/src/store/aux.rs` used a reserved DOS device
     name, so git refused it with `invalid path`. With that renamed,

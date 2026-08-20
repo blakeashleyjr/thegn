@@ -4388,12 +4388,6 @@ impl Config {
                     provider: None,
                 },
                 NamedCommand {
-                    name: "termite".into(),
-                    command: "termite tui".into(),
-                    hints: vec![],
-                    provider: None,
-                },
-                NamedCommand {
                     name: "shell".into(),
                     command: "__shell__".into(),
                     hints: vec![],

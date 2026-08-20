@@ -6,7 +6,9 @@
 #                            or the `msg` helpers
 #
 # Bare print/eprint/dbg are banned so a stray diagnostic never corrupts the
-# stdout contract the WASM plugins parse. The sanctioned sinks (src/out.rs,
+# stdout contract that `--json` consumers and the smoke tests parse. (This rule
+# predates the native compositor, when zellij WASM plugins were the consumer;
+# the discipline outlived them.) The sanctioned sinks (src/out.rs,
 # src/msg.rs, src/log.rs) and a handful of interactive prompts / terminal-control
 # writers carry a local `#[allow(clippy::disallowed_macros)]`.
 disallowed-macros = [
