@@ -8352,10 +8352,14 @@ async fn event_loop<T: Terminal>(
         // headline numbers are unchanged.
         let telemetry_visible =
             chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Telemetry;
+        // Whether anything the status modal shows moved this iteration. Used
+        // only to refresh an already-open modal — see below.
+        let mut status_data_moved = false;
         while let Ok(snap) = stats_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Stats);
             panel_ui.docs.telemetry.push(&snap);
             panel_ui.docs.tick = panel_ui.docs.tick.wrapping_add(1);
+            status_data_moved = true;
             if telemetry_visible {
                 // The telemetry graphs live in the panel and animate every tick,
                 // so this is a real chrome change → full frame.
@@ -8377,7 +8381,24 @@ async fn event_loop<T: Terminal>(
             if panel_ui.docs.daemon != status {
                 panel_ui.docs.daemon = status;
                 bars_dirty = true;
+                status_data_moved = true;
             }
+        }
+        // Keep an OPEN status modal live: its graphs advance and its heartbeat
+        // age ticks over as new samples land. Costs nothing when the modal is
+        // closed (`refresh_open` is title-guarded and returns immediately), and
+        // adds no wake source — this rides drains that already happened.
+        if status_data_moved && bar_detail.is_some() {
+            dirty |= crate::detail::status_modal::refresh_open(
+                &mut bar_detail,
+                &model,
+                &crate::detail::StatusCtx::new(
+                    &panel_ui.docs,
+                    start.elapsed().as_secs(),
+                    Rect::full(cols, rows),
+                    &current_config.daemon,
+                ),
+            );
         }
 
         // Container list from the 5s ticker — replaces the old inline call
@@ -9031,6 +9052,20 @@ async fn event_loop<T: Terminal>(
                         crate::handlers::onboarding::apply_probe(&mut onboarding, *r, &mut model)
                 }
                 RefreshKind::Usage(p) => dirty |= crate::detail::apply_usage(&mut bar_detail, *p),
+                // The daemon's answer to the status modal's session probe.
+                RefreshKind::DaemonSessions(p) => {
+                    panel_ui.docs.daemon_sessions = *p;
+                    dirty |= crate::detail::status_modal::refresh_open(
+                        &mut bar_detail,
+                        &model,
+                        &crate::detail::StatusCtx::new(
+                            &panel_ui.docs,
+                            start.elapsed().as_secs(),
+                            Rect::full(cols, rows),
+                            &current_config.daemon,
+                        ),
+                    );
+                }
                 // Branch ref moved: heal the checkout off-loop + drop the cache.
                 RefreshKind::MainRefMoved => crate::branch_cache::ref_moved(&mut want_main_sync),
                 RefreshKind::HostHeal => want_host_heal = true,
@@ -9645,6 +9680,13 @@ async fn event_loop<T: Terminal>(
                 .table
                 .get(&focused)
                 .is_some_and(|p| p.is_daemon_backed());
+            // Same table, same pass: the status modal's "panes here" share.
+            model.pane_count = panes.table.len();
+            model.daemon_panes = panes
+                .table
+                .values()
+                .filter(|p| p.is_daemon_backed())
+                .count();
             // The always-on far-right daemon/status chip: resolve its glyph state
             // from the cached daemon record + this pane's persistence.
             model.daemon_state = crate::handlers::status::daemon_chip_state(
@@ -10803,14 +10845,22 @@ async fn event_loop<T: Terminal>(
                                     cols,
                                     rows,
                                 };
+                                crate::handlers::status::probe_sessions(
+                                    &id,
+                                    &current_config.daemon,
+                                    &mut panel_ui.docs.daemon_sessions,
+                                    &refresh_tx,
+                                    &waker,
+                                );
                                 bar_detail = crate::detail::open_detail_for(
                                     &id,
                                     rect,
-                                    screen,
                                     &model,
                                     &crate::detail::StatusCtx::new(
                                         &panel_ui.docs,
                                         start.elapsed().as_secs(),
+                                        screen,
+                                        &current_config.daemon,
                                     ),
                                 );
                             }
@@ -10850,14 +10900,22 @@ async fn event_loop<T: Terminal>(
                             {
                                 open_media_overlay!();
                             } else if id.has_detail() {
+                                crate::handlers::status::probe_sessions(
+                                    &id,
+                                    &current_config.daemon,
+                                    &mut panel_ui.docs.daemon_sessions,
+                                    &refresh_tx,
+                                    &waker,
+                                );
                                 bar_detail = crate::detail::open_detail_for(
                                     &id,
                                     rect,
-                                    Rect::full(cols, rows),
                                     &model,
                                     &crate::detail::StatusCtx::new(
                                         &panel_ui.docs,
                                         start.elapsed().as_secs(),
+                                        Rect::full(cols, rows),
+                                        &current_config.daemon,
                                     ),
                                 );
                             }
@@ -13639,14 +13697,22 @@ async fn event_loop<T: Terminal>(
                             {
                                 open_media_overlay!();
                             } else if id.has_detail() {
+                                crate::handlers::status::probe_sessions(
+                                    &id,
+                                    &current_config.daemon,
+                                    &mut panel_ui.docs.daemon_sessions,
+                                    &refresh_tx,
+                                    &waker,
+                                );
                                 bar_detail = crate::detail::open_detail_for(
                                     &id,
                                     rect,
-                                    Rect::full(cols, rows),
                                     &model,
                                     &crate::detail::StatusCtx::new(
                                         &panel_ui.docs,
                                         start.elapsed().as_secs(),
+                                        Rect::full(cols, rows),
+                                        &current_config.daemon,
                                     ),
                                 );
                             }
@@ -16143,14 +16209,22 @@ async fn event_loop<T: Terminal>(
                                         cols: 0,
                                         rows: 0,
                                     });
+                                    crate::handlers::status::probe_sessions(
+                                        &id,
+                                        &current_config.daemon,
+                                        &mut panel_ui.docs.daemon_sessions,
+                                        &refresh_tx,
+                                        &waker,
+                                    );
                                     bar_detail = crate::detail::open_detail_for(
                                         &id,
                                         rect,
-                                        screen,
                                         &model,
                                         &crate::detail::StatusCtx::new(
                                             &panel_ui.docs,
                                             start.elapsed().as_secs(),
+                                            screen,
+                                            &current_config.daemon,
                                         ),
                                     );
                                 }
