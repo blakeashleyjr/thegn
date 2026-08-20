@@ -2649,8 +2649,34 @@ pub fn launch_spec(
     // `daemon_persistent = false`: the convenience path serves the tool drawer,
     // one-shot CLI shells, and tests — in-process panes that keep the bwrap
     // `--die-with-parent` guard. Daemon-routed center tabs go through
-    // `launch_spec_synced` / `terminal_launch_spec`, which pass `true`.
+    // `launch_spec_center` / `launch_spec_synced` / `terminal_launch_spec`,
+    // which resolve the flag from the live daemon route.
     launch_spec_full(cfg, worktree, branch, choice, false, false)
+}
+
+/// [`launch_spec`] for a **daemon-routed center pane resolved ON the loop** —
+/// a split (`spawn_worktree_shell_pane`) or the startup watchdog's clean-shell
+/// fallback. Identical to `launch_spec` (async direnv warm, safe on the loop)
+/// except that it marks the sandbox spec pane-daemon-owned when the daemon
+/// route is active, so a local bwrap pane drops `--die-with-parent`.
+///
+/// That guard is `prctl(PR_SET_PDEATHSIG)`, keyed to the *thread* that forked
+/// bwrap, not the process — on a daemon-owned pane it reaps a shell that is
+/// supposed to survive, which is exactly the "switched away, came back, my
+/// terminal started over" failure. `launch_spec` (⇒ `daemon_persistent =
+/// false`) is correct only for panes that really do die with the compositor.
+///
+/// The off-loop sibling is [`crate::direnv_warm::launch_spec_synced`]; both
+/// resolve the flag from the one source of truth,
+/// [`crate::handlers::startup::daemon_active`].
+pub fn launch_spec_center(
+    cfg: &Config,
+    worktree: &str,
+    branch: Option<&str>,
+    choice: &str,
+) -> anyhow::Result<LaunchSpec> {
+    let daemon_persistent = crate::handlers::startup::daemon_active(cfg);
+    launch_spec_full(cfg, worktree, branch, choice, false, daemon_persistent)
 }
 
 /// Like [`launch_spec`] but with the full set of launch knobs.

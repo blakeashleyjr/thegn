@@ -500,6 +500,25 @@ impl Panes {
             .rt
             .clone()
             .ok_or_else(|| anyhow::anyhow!("daemon panes need a tokio runtime handle"))?;
+        debug_assert!(
+            !argv.iter().any(|a| a == "--die-with-parent"),
+            "daemon-routed pane argv carries --die-with-parent: {argv:?}"
+        );
+        // A daemon session is *supposed* to outlive the forking thread, and
+        // `--die-with-parent` is `PR_SET_PDEATHSIG` keyed to exactly that
+        // thread — the combination silently reaps a backgrounded shell (the
+        // "my terminal started over after I switched away" bug). The spec
+        // builders gate the flag on `daemon_persistent`; anything reaching
+        // here with it set resolved its spec through the wrong builder.
+        if argv.iter().any(|a| a == "--die-with-parent") {
+            tracing::warn!(
+                target: "thegn::daemon",
+                program = %crate::pane::program_name(argv),
+                "daemon-routed pane still carries --die-with-parent; its shell \
+                 may be reaped in the background (spec resolved without \
+                 daemon_persistent)"
+            );
+        }
         let rows = center.rows.max(1) as u16;
         let cols = center.cols.max(1) as u16;
         let cwd_s = cwd.map(|p| p.to_string_lossy().into_owned());
