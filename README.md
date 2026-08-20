@@ -1,6 +1,6 @@
 # thegn
 
-> **Status: public alpha** (`0.1.0-alpha.1`). **x86_64 Linux only** — macOS and
+> **Status: public alpha** (`0.1.0-alpha.2`). **x86_64 Linux only** — macOS and
 > Windows are not supported in this release and no binaries ship for them
 > (Windows compiles and passes its tests on msvc but has never been run
 > interactively; macOS has never been built at all). Expect rough edges; see
@@ -138,7 +138,7 @@ Or just the binary: `nix profile install github:blakeashleyjr/thegn`.
 Each tagged release attaches a `thegn` binary for **x86_64 Linux (gnu + musl)**
 to the [releases page][releases]. Download the archive, verify the `.sha256`,
 and drop `thegn` on your `PATH`. macOS and Windows binaries are not published in
-`0.1.0-alpha.1` (see the status note at the top); a Homebrew formula is staged at
+`0.1.0-alpha.2` (see the status note at the top); a Homebrew formula is staged at
 `packaging/homebrew/thegn.rb` for when they are. See
 [`RELEASING.md`](RELEASING.md) for the release process and the crates.io /
 `cargo binstall` status.
