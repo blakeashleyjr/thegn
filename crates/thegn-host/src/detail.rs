@@ -113,12 +113,15 @@ pub enum DetailAction {
     /// machinery `Alt a` (jump-attention) uses.
     ActivateTarget(crate::sidebar::RowTarget),
     /// Acknowledge (quiet) one worktree's live "Needs you" signal, carrying the
-    /// exact `(reason, since)` showing so the ack only covers that episode.
+    /// exact `(reason, since, episode)` showing so the ack only covers that
+    /// episode — the `episode` is what identifies a cache-derived signal (a CI
+    /// run, a PR head commit), which has no honest `since` of its own.
     /// Fired on highlight; keeps the overlay open.
     AckAttention {
         path: String,
         reason: thegn_core::attention::AttentionReason,
         since: Option<i64>,
+        episode: thegn_core::attention::Episode,
     },
     /// Acknowledge every current needs-you worktree (the "Needs you" mark-all).
     AckAllAttention,
@@ -2499,7 +2502,16 @@ fn unified_detail(model: &FrameModel) -> Option<DetailOverlay> {
         rows.extend(inbox);
     }
 
-    // 5. Logs — always one dim entry point into thegn.log.
+    // 5. Other repos — needs-you worktrees the active-repo scope held back. Kept
+    //    below the local groups (it is context, not this repo's alarm) but still
+    //    actionable: Enter switches workspace, `x` quiets that episode.
+    let others = other_repo_rows(model);
+    if !others.is_empty() {
+        rows.push(DetailRow::header(format!("Other repos ({})", others.len())));
+        rows.extend(others);
+    }
+
+    // 6. Logs — always one dim entry point into thegn.log.
     rows.push(DetailRow::header("Logs"));
     rows.push(logs_row(model, &notes));
 
@@ -2567,72 +2579,95 @@ fn mq_row(r: &thegn_core::db::MergeQueueRow, gl: &thegn_core::termcaps::GlyphSet
     row
 }
 
-/// The "Needs you" rows (live attention rollup) plus the set of worktree paths
-/// they cover — the caller uses the set to suppress duplicate Alert rows.
-fn needs_you_rows(model: &FrameModel) -> (Vec<DetailRow>, std::collections::HashSet<String>) {
+/// One "Needs you" row for a scored worktree. Shared by the in-scope group and
+/// the "Other repos" rollup so the two can never render or act differently.
+fn attention_row(
+    model: &FrameModel,
+    path: &str,
+    score: thegn_core::attention::AttentionScore,
+) -> DetailRow {
     use thegn_core::attention::AttentionTier;
     let g = crate::caps::active_glyphs();
+    // Branch label from the tree when the row exists; else the path's
+    // basename (registered-but-unlisted edge).
+    let label = model
+        .sidebar_rows
+        .iter()
+        .find(|r| r.worktree_path.as_deref() == Some(path))
+        .map(|r| r.label.clone())
+        .unwrap_or_else(|| {
+            std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string())
+        });
+    let (glyph, marker) = match score.tier {
+        AttentionTier::Blocked => (g.attention, Tok::Hue(Hue::Red)),
+        AttentionTier::Failure => (g.cross, Tok::Hue(Hue::Red)),
+        _ => (g.dot_filled, Tok::Hue(Hue::Amber)),
+    };
+    let text = format!("{label} \u{2014} {}", score.reason.label());
+    // Enter resolves the sidebar row's target (live tab OR a
+    // dormant-workspace switch) so activation never dead-ends on
+    // "isn't open"; only the no-row edge falls back to the open-tab-only
+    // `FocusWorktree`. Same machinery as `Alt a`.
+    let enter = model
+        .sidebar_rows
+        .iter()
+        .find(|r| {
+            r.kind == crate::sidebar::RowKind::Worktree
+                && r.worktree_path.as_deref() == Some(path)
+                && r.tab_target.is_some()
+        })
+        .and_then(|r| r.tab_target.clone())
+        .map(DetailAction::ActivateTarget)
+        .unwrap_or_else(|| DetailAction::FocusWorktree(path.to_string()));
+    let mut row = DetailRow::new(marker, glyph, text)
+        .on_enter(enter)
+        // `x` quiets this episode explicitly; a/R quiet them all.
+        // No quiet-on-highlight: navigating the list must never
+        // silently ack an item the user only meant to inspect.
+        .action(
+            'x',
+            DetailAction::AckAttention {
+                path: path.to_string(),
+                reason: score.reason,
+                since: score.since,
+                episode: score.episode,
+            },
+        )
+        .action('a', DetailAction::AckAllAttention)
+        .action('R', DetailAction::AckAllAttention);
+    if let Some(at) = score.since {
+        row = row.note(format!("{} ago", thegn_core::util::age(at)));
+    }
+    row
+}
+
+/// The "Needs you" rows (live attention rollup, scoped to the active repo) plus
+/// the set of worktree paths they cover — the caller uses the set to suppress
+/// duplicate Alert rows.
+fn needs_you_rows(model: &FrameModel) -> (Vec<DetailRow>, std::collections::HashSet<String>) {
     let mut paths = std::collections::HashSet::new();
     let rows = crate::handlers::attention::needs_user_ordered(model)
         .into_iter()
         .map(|(path, score)| {
             paths.insert(path.clone());
-            // Branch label from the tree when the row exists; else the path's
-            // basename (registered-but-unlisted edge).
-            let label = model
-                .sidebar_rows
-                .iter()
-                .find(|r| r.worktree_path.as_deref() == Some(path.as_str()))
-                .map(|r| r.label.clone())
-                .unwrap_or_else(|| {
-                    std::path::Path::new(&path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.clone())
-                });
-            let (glyph, marker) = match score.tier {
-                AttentionTier::Blocked => (g.attention, Tok::Hue(Hue::Red)),
-                AttentionTier::Failure => (g.cross, Tok::Hue(Hue::Red)),
-                _ => (g.dot_filled, Tok::Hue(Hue::Amber)),
-            };
-            let text = format!("{label} \u{2014} {}", score.reason.label());
-            // Enter resolves the sidebar row's target (live tab OR a
-            // dormant-workspace switch) so activation never dead-ends on
-            // "isn't open"; only the no-row edge falls back to the open-tab-only
-            // `FocusWorktree`. Same machinery as `Alt a`.
-            let enter = model
-                .sidebar_rows
-                .iter()
-                .find(|r| {
-                    r.kind == crate::sidebar::RowKind::Worktree
-                        && r.worktree_path.as_deref() == Some(path.as_str())
-                        && r.tab_target.is_some()
-                })
-                .and_then(|r| r.tab_target.clone())
-                .map(DetailAction::ActivateTarget)
-                .unwrap_or_else(|| DetailAction::FocusWorktree(path.clone()));
-            let mut row = DetailRow::new(marker, glyph, text)
-                .on_enter(enter)
-                // `x` quiets this episode explicitly; a/R quiet them all.
-                // No quiet-on-highlight: navigating the list must never
-                // silently ack an item the user only meant to inspect.
-                .action(
-                    'x',
-                    DetailAction::AckAttention {
-                        path: path.clone(),
-                        reason: score.reason,
-                        since: score.since,
-                    },
-                )
-                .action('a', DetailAction::AckAllAttention)
-                .action('R', DetailAction::AckAllAttention);
-            if let Some(at) = score.since {
-                row = row.note(format!("{} ago", thegn_core::util::age(at)));
-            }
-            row
+            attention_row(model, &path, score)
         })
         .collect();
     (rows, paths)
+}
+
+/// The needs-you rows for worktrees in *other* repos — what the default scope
+/// held back. Rendered as its own group so scoping stays honest: another repo's
+/// failure is still one keystroke away, it just doesn't nag from here. Empty
+/// when the "all" toggle is on (everything is then in scope).
+fn other_repo_rows(model: &FrameModel) -> Vec<DetailRow> {
+    crate::handlers::attention::needs_user_out_of_scope(model)
+        .into_iter()
+        .map(|(path, score)| attention_row(model, &path, score))
+        .collect()
 }
 
 /// One inbox row for the Alerts / Notifications groups (log rows are handled by

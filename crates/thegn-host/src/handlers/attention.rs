@@ -23,24 +23,43 @@ pub(crate) fn active_worktree_path(model: &FrameModel) -> Option<&str> {
         .and_then(|r| r.worktree_path.as_deref())
 }
 
-/// The worktrees currently needing the user (tiers T0–T2), most urgent first
-/// — the hysteresis-stable hydration order, so the jump ring matches what the
-/// Attention sort displays.
-pub(crate) fn needs_user_ordered(model: &FrameModel) -> Vec<(String, AttentionScore)> {
-    let status = &model.sidebar_status;
-    let active = active_worktree_path(model);
-    let mut v: Vec<(String, AttentionScore)> = status
-        .attention
-        .iter()
-        // Acknowledged (quieted) worktrees drop out of the needs-you set, as
-        // does the focused worktree itself: the "Needs you" popup, the `✋`
-        // badge, and the `Alt a` jump ring all read this, so acking silences
-        // every nag surface at once and the tab you're on never self-nags.
-        .filter(|(p, s)| {
-            s.needs_user() && !status.acked.contains(p.as_str()) && Some(p.as_str()) != active
-        })
-        .map(|(p, s)| (p.clone(), *s))
-        .collect();
+/// Is `path` inside the current nag scope — the active worktree's repo?
+///
+/// Scoping the nag — but not the per-row sidebar glyphs — is what keeps a
+/// sibling repo's failing CI from raising the `✋` badge in the repo you're
+/// actually working in.
+///
+/// Pure over the model: `repo_scope` is resolved once on the hydration thread
+/// (`attention_status::collect_attention`), where the "show everything" toggle
+/// is folded in, so `None` already means "scope nothing".
+fn in_scope(status: &crate::sidebar::SidebarStatus, path: &str) -> bool {
+    status.repo_scope.as_ref().is_none_or(|s| s.contains(path))
+}
+
+/// **The** needs-you predicate. Every nag surface — the `✋` badge, the "Needs
+/// you" popup, the `Alt a` ring — goes through this; there is deliberately no
+/// second copy (the statusbar badge used to carry its own and could drift).
+///
+/// Acknowledged (quieted) worktrees drop out, as does the focused worktree
+/// itself: the tab you're already on never self-nags.
+fn is_nagging(
+    status: &crate::sidebar::SidebarStatus,
+    active: Option<&str>,
+    path: &str,
+    score: &AttentionScore,
+) -> bool {
+    score.needs_user()
+        && !status.acked.contains(path)
+        && Some(path) != active
+        && in_scope(status, path)
+}
+
+/// Order a needs-you set by the hysteresis-stable hydration rank, so every
+/// surface agrees with what the Attention sort displays.
+fn ordered_by_rank(
+    status: &crate::sidebar::SidebarStatus,
+    mut v: Vec<(String, AttentionScore)>,
+) -> Vec<(String, AttentionScore)> {
     v.sort_by_key(|(p, s)| {
         (
             status.attention_ranks.get(p).copied().unwrap_or(u32::MAX),
@@ -50,10 +69,78 @@ pub(crate) fn needs_user_ordered(model: &FrameModel) -> Vec<(String, AttentionSc
     v
 }
 
+/// The worktrees currently needing the user (tiers T0–T2) **in the active
+/// repo**, most urgent first. Out-of-scope worktrees are surfaced separately by
+/// [`needs_user_out_of_scope`] rather than silently dropped.
+pub(crate) fn needs_user_ordered(model: &FrameModel) -> Vec<(String, AttentionScore)> {
+    let status = &model.sidebar_status;
+    let active = active_worktree_path(model);
+    ordered_by_rank(
+        status,
+        status
+            .attention
+            .iter()
+            .filter(|(p, s)| is_nagging(status, active, p.as_str(), s))
+            .map(|(p, s)| (p.clone(), *s))
+            .collect(),
+    )
+}
+
+/// The needs-you worktrees that fall *outside* the active repo — everything
+/// [`needs_user_ordered`] scoped away. Drives the `+N` rollup on the `✋` badge
+/// and the "Other repos" group in the popup, so scoping stays visible instead of
+/// silently swallowing another repo's failure. Always empty when the "all"
+/// toggle is on (then everything is in scope).
+pub(crate) fn needs_user_out_of_scope(model: &FrameModel) -> Vec<(String, AttentionScore)> {
+    let status = &model.sidebar_status;
+    let active = active_worktree_path(model);
+    ordered_by_rank(
+        status,
+        status
+            .attention
+            .iter()
+            .filter(|(p, s)| {
+                s.needs_user()
+                    && !status.acked.contains(p.as_str())
+                    && Some(p.as_str()) != active
+                    && !in_scope(status, p.as_str())
+            })
+            .map(|(p, s)| (p.clone(), *s))
+            .collect(),
+    )
+}
+
+/// The set to **acknowledge** on a clear-all. Same predicate as
+/// [`needs_user_ordered`] except it also includes the *active* worktree.
+///
+/// The active worktree is hidden from the nag list because you are already
+/// there — but leaving it un-acked meant its signal re-nagged the moment focus
+/// moved, and most visibly after a restart landed you somewhere else. Exclusion
+/// is a property of the display, not of the ack, and these are separate
+/// functions so the two can't be confused again.
+pub(crate) fn needs_user_for_ack(model: &FrameModel) -> Vec<(String, AttentionScore)> {
+    let status = &model.sidebar_status;
+    ordered_by_rank(
+        status,
+        status
+            .attention
+            .iter()
+            .filter(|(p, s)| {
+                s.needs_user() && !status.acked.contains(p.as_str()) && in_scope(status, p.as_str())
+            })
+            .map(|(p, s)| (p.clone(), *s))
+            .collect(),
+    )
+}
+
 /// Resolve the jump: the next needs-you worktree after the active one, as the
 /// sidebar row target that focuses it (a live tab, or a workspace switch for a
 /// dormant workspace's worktree) plus a status line. `None` when nothing needs
 /// the user or no row resolves the path.
+///
+/// Scoped to the active repo like every other nag surface (it reads
+/// [`needs_user_ordered`]) — the dormant-workspace switch still applies within
+/// that repo, and `g` in the System tab widens the ring to every worktree.
 pub(crate) fn next_target(
     model: &FrameModel,
     session: &crate::session::Session,
@@ -75,29 +162,37 @@ pub(crate) fn next_target(
 }
 
 /// Mark everything read: every stored notification read **and** every live
-/// needs-you signal acknowledged (quieted). The full "clear the nag" gesture
-/// behind `Alt Shift R`. Snapshots the needs-you set on the caller's thread
-/// (cheap) and writes off the loop, then pulses a model refresh.
+/// needs-you signal acknowledged (quieted). The full "clear the nag" gesture —
+/// behind `Alt Shift R`, the inbox's `a`, and the unified overlay's `a`/`R`,
+/// which all route here so "clear all" means the same thing everywhere.
+///
+/// Acking the *live* signals is the load-bearing half: a CI failure is derived
+/// from the PR/CI cache, not from a notification row, so marking notifications
+/// read alone leaves it to reappear on the very next hydration pass.
+///
+/// Snapshots the ack set on the caller's thread (cheap) and writes off the loop,
+/// then pulses a model refresh.
 pub(crate) fn mark_all_read(
     model: &mut FrameModel,
     tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
 ) {
-    let acks: Vec<(String, String, Option<i64>)> = needs_user_ordered(model)
-        .into_iter()
-        .filter_map(|(p, s)| {
-            serde_json::to_string(&s.reason)
-                .ok()
-                .map(|r| (p, r, s.since))
-        })
-        .collect();
+    let acks: Vec<(String, String, Option<i64>, thegn_core::attention::Episode)> =
+        needs_user_for_ack(model)
+            .into_iter()
+            .filter_map(|(p, s)| {
+                serde_json::to_string(&s.reason)
+                    .ok()
+                    .map(|r| (p, r, s.since, s.episode))
+            })
+            .collect();
     let tx = tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
         if let Ok(db) = thegn_core::db::Db::open() {
             let _ = db.mark_all_notifications_read(); // best-effort: DB is a cache
-            for (p, r, since) in acks {
-                let _ = db.put_attention_ack(&p, &r, since);
+            for (p, r, since, episode) in acks {
+                let _ = db.put_attention_ack(&p, &r, since, episode);
             }
         }
         if tx.send(RefreshKind::Model).is_ok() {
@@ -118,6 +213,7 @@ mod tests {
             sub: 0,
             reason: AttentionReason::AgentNeedsInput,
             since: None,
+            episode: 0,
         }
     }
 
@@ -137,5 +233,74 @@ mod tests {
         let v = needs_user_ordered(&model);
         let paths: Vec<&str> = v.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(paths, vec!["/wt/b", "/wt/a"]);
+    }
+
+    /// Build a model with two repos' worktrees needing the user, scoped to the
+    /// first. `/wt/mine` is in scope, `/wt/theirs` is not.
+    fn two_repo_model() -> FrameModel {
+        let mut model = FrameModel::default();
+        let st = &mut model.sidebar_status;
+        st.attention
+            .insert("/wt/mine".into(), score(AttentionTier::Blocked));
+        st.attention
+            .insert("/wt/theirs".into(), score(AttentionTier::Failure));
+        st.attention_ranks.insert("/wt/mine".into(), 0);
+        st.attention_ranks.insert("/wt/theirs".into(), 1);
+        st.repo_scope = Some(["/wt/mine".to_string()].into_iter().collect());
+        model
+    }
+
+    #[test]
+    fn needs_user_excludes_other_repos_unless_widened() {
+        let model = two_repo_model();
+
+        let scoped: Vec<String> = needs_user_ordered(&model)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(scoped, vec!["/wt/mine"], "a sibling repo must not nag here");
+        let out: Vec<String> = needs_user_out_of_scope(&model)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(out, vec!["/wt/theirs"], "but it stays visible as a rollup");
+
+        // `repo_scope: None` is what both the "show everything" toggle and an
+        // unresolvable active repo produce: scope nothing, and then there is no
+        // "out of scope" left over. Fail-open is the point — a scoping bug must
+        // never hide a signal that needs the user.
+        let mut open = two_repo_model();
+        open.sidebar_status.repo_scope = None;
+        assert_eq!(needs_user_ordered(&open).len(), 2);
+        assert!(needs_user_out_of_scope(&open).is_empty());
+    }
+
+    #[test]
+    fn ack_set_includes_the_active_worktree_display_set_does_not() {
+        let mut model = two_repo_model();
+        // Mark `/wt/mine` as the focused row.
+        model.sidebar_rows.push(crate::sidebar::SidebarRow {
+            active: true,
+            worktree_path: Some("/wt/mine".into()),
+            ..crate::sidebar::SidebarRow::base(crate::sidebar::RowKind::Worktree, 1, "mine", "app")
+        });
+
+        // Display: the tab you're on never self-nags.
+        assert!(
+            needs_user_ordered(&model).is_empty(),
+            "the active worktree is hidden from the nag list"
+        );
+        // Ack: it must still be acknowledged, or its signal re-nags the moment
+        // focus moves — which is what made it reappear after a restart.
+        let acked: Vec<String> = needs_user_for_ack(&model)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(acked, vec!["/wt/mine"]);
+
+        // Already-acked worktrees drop out of the ack set (no pointless rewrite),
+        // and out-of-scope ones are never acked from here.
+        model.sidebar_status.acked.insert("/wt/mine".into());
+        assert!(needs_user_for_ack(&model).is_empty());
     }
 }

@@ -11,29 +11,46 @@ use thegn_core::theme::Hue;
 /// tiers T0–T2 — blocked on input, failures, finished-awaiting-review). Red
 /// while anything is blocked/failing, amber when only finished work waits.
 /// Activating it drills into the list; `Alt a` jumps to the next one.
+///
+/// Counts the *scoped* set — this repo's worktrees — and appends a dim ` +N `
+/// when other repos have needs-you worktrees too, so scoping is visible rather
+/// than silent. `g` in the System tab widens both.
+///
+/// The set comes from `needs_user_ordered`, deliberately not a filter of its own:
+/// this badge used to carry a duplicate predicate that could drift from the
+/// popup's. The extra `Vec` is free — the badge is only rebuilt on a chrome
+/// recompose, which is already the expensive `render_plan::Full` path.
 pub(crate) fn push_attention_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
+    use crate::chrome::S;
     use thegn_core::attention::AttentionTier;
-    let status = &model.sidebar_status;
-    let active = crate::handlers::attention::active_worktree_path(model);
-    let (mut n, mut urgent) = (0usize, false);
-    // Acknowledged (quieted) worktrees and the focused worktree don't count —
-    // the badge tracks the same needs-you set the "Needs you" popup shows (see
-    // `needs_user_ordered`).
-    for (_, s) in status.attention.iter().filter(|(p, s)| {
-        s.needs_user() && !status.acked.contains(p.as_str()) && Some(p.as_str()) != active
-    }) {
-        n += 1;
-        urgent |= s.tier <= AttentionTier::Failure;
-    }
-    if n == 0 {
+    let needs = crate::handlers::attention::needs_user_ordered(model);
+    let elsewhere = crate::handlers::attention::needs_user_out_of_scope(model).len();
+    if needs.is_empty() && elsewhere == 0 {
         return;
     }
+    let urgent = needs.iter().any(|(_, s)| s.tier <= AttentionTier::Failure);
     let hue = if urgent { Hue::Red } else { Hue::Amber };
     let hand = crate::caps::active_glyphs().attention;
-    items.push((
-        BarItemId::Badge(BarBadge::Attention),
-        vec![Seg::chip(Tok::Hue(hue), format!(" {hand} {n} "))],
-    ));
+    let mut segs = Vec::new();
+    if !needs.is_empty() {
+        segs.push(Seg::chip(
+            Tok::Hue(hue),
+            format!(" {hand} {} ", needs.len()),
+        ));
+    }
+    if elsewhere > 0 {
+        // Dim, and outside the hued chip: another repo needing you is context,
+        // never this repo's alarm.
+        segs.push(Seg::chip(
+            Tok::Slot(S::Dim),
+            if needs.is_empty() {
+                format!(" {hand} +{elsewhere} ")
+            } else {
+                format!("+{elsewhere} ")
+            },
+        ));
+    }
+    items.push((BarItemId::Badge(BarBadge::Attention), segs));
 }
 
 /// The always-on daemon/status chip — one glyph, no word, pinned to the far
@@ -167,6 +184,7 @@ mod tests {
             sub: 0,
             reason: AttentionReason::AgentWaiting,
             since: None,
+            episode: 0,
         }
     }
 
@@ -175,6 +193,74 @@ mod tests {
             .iter()
             .flat_map(|(_, segs)| segs.iter().map(|s| s.text.clone()))
             .collect()
+    }
+
+    /// The badge used to carry its own copy of the needs-you predicate, which
+    /// could drift from the popup's. Lock them together.
+    #[test]
+    fn attention_badge_count_equals_needs_user_ordered() {
+        let mut model = FrameModel::default();
+        let st = &mut model.sidebar_status;
+        for (p, tier) in [
+            ("/wt/a", AttentionTier::Blocked),
+            ("/wt/b", AttentionTier::Waiting),
+            ("/wt/c", AttentionTier::Working), // not needs_user
+            ("/wt/d", AttentionTier::Failure), // acked
+        ] {
+            st.attention.insert(p.into(), score(tier));
+        }
+        st.acked.insert("/wt/d".into());
+
+        let mut items = Vec::new();
+        push_attention_badge(&model, &mut items);
+        let n = crate::handlers::attention::needs_user_ordered(&model).len();
+        assert_eq!(n, 2, "blocked + waiting; working and acked drop out");
+        assert!(chip_text(&items).contains(&format!(" {n} ")));
+        // Blocked ⇒ urgent ⇒ red. `Seg::chip` paints the hue as the background.
+        assert!(
+            items
+                .iter()
+                .any(|(_, segs)| segs.iter().any(|s| s.bg == Some(Tok::Hue(Hue::Red)))),
+            "a blocked worktree must make the chip red"
+        );
+
+        // Nothing needing the user ⇒ silent (the "clean is quiet" posture).
+        model.sidebar_status.attention.clear();
+        let mut items = Vec::new();
+        push_attention_badge(&model, &mut items);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn attention_badge_shows_out_of_scope_rollup() {
+        let mut model = FrameModel::default();
+        let st = &mut model.sidebar_status;
+        st.attention
+            .insert("/wt/mine".into(), score(AttentionTier::Waiting));
+        st.attention
+            .insert("/wt/theirs".into(), score(AttentionTier::Blocked));
+        st.repo_scope = Some(["/wt/mine".to_string()].into_iter().collect());
+
+        let mut items = Vec::new();
+        push_attention_badge(&model, &mut items);
+        let text = chip_text(&items);
+        assert!(text.contains(" 1 "), "this repo's count: {text:?}");
+        assert!(text.contains("+1"), "the other repo is rolled up: {text:?}");
+
+        // With nothing local, the rollup alone still surfaces — scoping must not
+        // make another repo's blocked worktree disappear entirely.
+        model.sidebar_status.attention.remove("/wt/mine");
+        let mut items = Vec::new();
+        push_attention_badge(&model, &mut items);
+        assert!(chip_text(&items).contains("+1"));
+
+        // Widening (`repo_scope: None`, what the `g` toggle hydrates) folds the
+        // rollup back into the real count.
+        model.sidebar_status.repo_scope = None;
+        let mut items = Vec::new();
+        push_attention_badge(&model, &mut items);
+        let text = chip_text(&items);
+        assert!(text.contains(" 1 ") && !text.contains('+'), "{text:?}");
     }
 
     #[test]

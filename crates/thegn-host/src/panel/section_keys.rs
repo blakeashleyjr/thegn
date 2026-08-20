@@ -114,8 +114,16 @@ const NOTIFICATIONS: &[SectionKey] = &[
     // `x`, not `r` — the old hint advertised a key that did nothing.
     k('x', "x", "read"),
     k('d', "d", "dismiss"),
-    k('A', "A", "show all"),
-    k('/', "/", "search"),
+    // `a` and `g` are handled here but were never advertised. `a` is the only
+    // gesture that also quiets the *live* needs-you signals (failing CI &c.,
+    // which are derived from the PR/CI cache rather than an inbox row), so
+    // leaving it hidden made the `✋` badge look unclearable; `g` is the toggle
+    // between this repo and every worktree, so without it the default scoping is
+    // invisible. The strip fits ~6, so they displace `A` (show-read) and `/`
+    // (search) — both still work, and both are conventions carried by other
+    // sections' strips.
+    k('a', "a", "clear all"),
+    k('g', "g", "scope"),
 ];
 const JOBS: &[SectionKey] = &[
     nav("↵", "run"),
