@@ -4725,7 +4725,10 @@ pub(crate) fn spawn_worktree_shell_pane(
         if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
             return panes.spawn_native_shell(n, None, "sh".into(), center);
         }
-        let spec = crate::agent::launch_spec(cfg, &wt, None, "shell")?;
+        // `launch_spec_center`, not `launch_spec`: this pane goes through
+        // `spawn_argv_env`, i.e. the pane daemon when the route is on, so its
+        // bwrap must drop `--die-with-parent` (see the fn docs).
+        let spec = crate::agent::launch_spec_center(cfg, &wt, None, "shell")?;
         return panes.spawn_argv_env(
             &spec.argv,
             spec.cwd.as_deref().or(Some(dir)),
@@ -4766,7 +4769,9 @@ pub(crate) fn spawn_clean_shell_pane(
                 center,
             );
         }
-        let spec = crate::agent::launch_spec(cfg, &wt, None, "clean-shell")?;
+        // Daemon-routed like the shell it replaces — same `--die-with-parent`
+        // gate (see `launch_spec_center`).
+        let spec = crate::agent::launch_spec_center(cfg, &wt, None, "clean-shell")?;
         return panes.spawn_argv_env(
             &spec.argv,
             spec.cwd.as_deref().or(Some(dir)),
