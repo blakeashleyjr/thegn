@@ -1,13 +1,18 @@
 //! Daemon/program status: the pure state-mapping for the far-right statusbar
-//! chip and the off-loop snapshot builder that fills [`DaemonStatus`] from the
-//! control-plane store. The snapshot read happens on the ticker thread (never
-//! the event loop); the mapping is a pure function so it can be unit-tested.
-
-use std::collections::HashSet;
+//! chip, the off-loop snapshot builder that fills [`DaemonStatus`] from the
+//! control-plane registry, and the on-demand probe that asks the daemon itself
+//! for its live session list.
+//!
+//! Neither read touches the event loop: the snapshot runs on the ticker thread,
+//! and [`probe_sessions`] runs on a tokio worker. The mapping is a pure function
+//! so it can be unit-tested.
 
 use thegn_core::store::ControlStore;
+use tokio::sync::mpsc::UnboundedSender;
 
-use crate::chrome::{DaemonChipState, DaemonStatus};
+use crate::chrome::{BarBadge, BarItemId, DaemonChipState, DaemonStatus};
+use crate::detail::DaemonSessions;
+use crate::hydrate::RefreshKind;
 
 /// Resolve the always-on chip's glyph state from the cached daemon status and
 /// whether the focused pane is daemon-backed.
@@ -29,9 +34,17 @@ pub(crate) fn daemon_chip_state(status: &DaemonStatus, persistent_pane: bool) ->
 }
 
 /// Build a [`DaemonStatus`] for `scope` (the canonical state dir) from the
-/// control store. Reads the live daemon row plus its leases to derive the
-/// session / attached-client counts. Returns an absent status (`present:
-/// false`) when no live daemon is registered. Sync + cheap — ticker-thread only.
+/// control store — the daemon's **registry row**, nothing more. Returns an
+/// absent status (`present: false`) when no live daemon is registered. Sync +
+/// cheap — ticker-thread only.
+///
+/// Session counts are deliberately NOT derived here. They used to be read out
+/// of the lease table, but the daemon only writes a lease for a *detached*
+/// session (`kind = "relay"`) and deletes it again on attach, so a daemon busy
+/// serving panes reported `0`; `kind = "attached"` leases are documented but
+/// never written, so the attached count was structurally always `0`. The
+/// daemon's in-memory session registry is the source of truth — see
+/// [`probe_sessions`].
 pub(crate) fn snapshot(db: &dyn ControlStore, scope: &str, now_ms: i64) -> DaemonStatus {
     use thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS;
     let Some(row) = db
@@ -41,10 +54,6 @@ pub(crate) fn snapshot(db: &dyn ControlStore, scope: &str, now_ms: i64) -> Daemo
     else {
         return DaemonStatus::default();
     };
-    // Distinct sessions and the attached-client subset, from the lease table.
-    let leases = db.leases(&row.daemon_id).unwrap_or_default();
-    let sessions: HashSet<&str> = leases.iter().map(|l| l.session_id.as_str()).collect();
-    let attached = leases.iter().filter(|l| l.kind == "attached").count();
     DaemonStatus {
         present: true,
         pid: u32::try_from(row.pid).ok(),
@@ -53,13 +62,59 @@ pub(crate) fn snapshot(db: &dyn ControlStore, scope: &str, now_ms: i64) -> Daemo
         endpoint: row.endpoint,
         tcp_addr: row.tcp_addr.unwrap_or_default(),
         started_at_ms: row.started_at,
-        sessions: sessions.len(),
-        attached,
+        heartbeat_at: row.heartbeat_at,
+        daemon_id: row.daemon_id,
+        scope: row.scope,
         // A daemon found under the local scope is reached over the local
         // socket; remote-client detection is set by the caller when this
         // instance attaches to a daemon on another machine.
         remote: false,
     }
+}
+
+/// Ask the daemon for its live session list and deliver it into the open status
+/// modal via `RefreshKind::DaemonSessions`. No-op for any other bar item.
+///
+/// **Fired only from the chip-activation path** (a click, or `↵` on the focused
+/// chip) — never on a timer. That is what keeps the 0%-idle invariant intact:
+/// the control socket is touched exactly when a human is looking at the modal,
+/// and the modal has already painted from the cached [`DaemonStatus`] by the
+/// time this lands.
+///
+/// Uses `connect_daemon` (discovery + health probe), never `ensure_daemon`:
+/// opening a status modal must not spawn a daemon as a side effect.
+pub(crate) fn probe_sessions(
+    id: &BarItemId,
+    dcfg: &thegn_core::config::DaemonConfig,
+    slot: &mut DaemonSessions,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &termwiz::terminal::TerminalWaker,
+) {
+    if !matches!(id, BarItemId::Badge(BarBadge::Persist)) {
+        return;
+    }
+    // Flip to Probing *before* the modal is built, so its first paint says so
+    // rather than showing a stale list from a previous open.
+    *slot = DaemonSessions::Probing;
+    let (tx, waker, dcfg) = (refresh_tx.clone(), waker.clone(), dcfg.clone());
+    tokio::spawn(async move {
+        let payload = match crate::daemon::client::connect_daemon(&dcfg).await {
+            // A daemon that answers `/health` but fails `/v1/sessions` is a
+            // real anomaly, not "no sessions" — fall back to Unknown so the
+            // modal says so instead of claiming an empty daemon.
+            Some(c) => c
+                .sessions()
+                .await
+                .map_or(DaemonSessions::Unknown, DaemonSessions::Live),
+            None => DaemonSessions::NoDaemon,
+        };
+        if tx
+            .send(RefreshKind::DaemonSessions(Box::new(payload)))
+            .is_ok()
+        {
+            let _ = waker.wake();
+        }
+    });
 }
 
 #[cfg(test)]

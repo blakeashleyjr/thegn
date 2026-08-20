@@ -70,6 +70,8 @@ pub struct TelemetryHistory {
     self_cpu: VecDeque<f32>,
     /// The pane-daemon's resident-set size, raw bytes.
     daemon_rss: VecDeque<f32>,
+    /// The pane-daemon's CPU utilization, raw percent (per-core sum).
+    daemon_cpu: VecDeque<f32>,
 }
 
 impl TelemetryHistory {
@@ -116,6 +118,7 @@ impl TelemetryHistory {
             &mut self.daemon_rss,
             snap.daemon_rss_bytes.unwrap_or(0) as f32,
         );
+        push_cap(&mut self.daemon_cpu, snap.daemon_cpu_pct.unwrap_or(0.0));
     }
 
     /// CPU series (0..=1), right-aligned to `n` values.
@@ -199,12 +202,19 @@ impl TelemetryHistory {
         norm(series(&self.daemon_rss, n))
     }
 
-    /// Latest raw (thegn RSS bytes, thegn CPU %, daemon RSS bytes) for headlines.
-    pub fn last_proc(&self) -> (u64, f32, u64) {
+    /// The pane-daemon's CPU series normalized by the window's rolling max.
+    pub fn daemon_cpu_series(&self, n: usize) -> Vec<f32> {
+        norm(series(&self.daemon_cpu, n))
+    }
+
+    /// Latest raw (thegn RSS bytes, thegn CPU %, daemon RSS bytes, daemon CPU %)
+    /// for headlines.
+    pub fn last_proc(&self) -> (u64, f32, u64, f32) {
         (
             self.self_rss.back().copied().unwrap_or(0.0) as u64,
             self.self_cpu.back().copied().unwrap_or(0.0),
             self.daemon_rss.back().copied().unwrap_or(0.0) as u64,
+            self.daemon_cpu.back().copied().unwrap_or(0.0),
         )
     }
 }
@@ -293,6 +303,29 @@ mod tests {
         let tx = h.tx_series(2);
         assert_eq!(tx, vec![0.0, 0.0]);
         assert_eq!(h.last_rates(), (100, 0));
+    }
+
+    /// The per-process series behind the status modal. `daemon_cpu_pct` was
+    /// sampled every tick but never recorded until the modal grew a sparkline
+    /// for it — keep it right-aligned and window-normed like its siblings.
+    #[test]
+    fn proc_series_track_both_processes() {
+        let mut h = TelemetryHistory::default();
+        for (rss, cpu, drss, dcpu) in [(100u64, 5.0f32, 10u64, 1.0f32), (200, 10.0, 40, 4.0)] {
+            h.push(&StatsSnapshot {
+                self_rss_bytes: Some(rss),
+                self_cpu_pct: Some(cpu),
+                daemon_rss_bytes: Some(drss),
+                daemon_cpu_pct: Some(dcpu),
+                ..Default::default()
+            });
+        }
+        assert_eq!(h.daemon_cpu_series(2), vec![0.25, 1.0]);
+        assert_eq!(h.daemon_rss_series(2), vec![0.25, 1.0]);
+        assert_eq!(h.self_cpu_series(2), vec![0.5, 1.0]);
+        // Short history front-pads with zeros ("now" sits at the right edge).
+        assert_eq!(h.daemon_cpu_series(3), vec![0.0, 0.25, 1.0]);
+        assert_eq!(h.last_proc(), (200, 10.0, 40, 4.0));
     }
 
     #[test]

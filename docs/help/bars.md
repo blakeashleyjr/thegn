@@ -55,10 +55,28 @@ instance relates to the pane daemon:
 - `▽` **client** — attached to a pane daemon on another machine.
 
 (On ASCII terminals these degrade to `o`, `*`, `^`, `v`.) Activating it — a
-click, or `↵` with the bar focused — opens the **status modal**: daemon PID,
-version, uptime, live session/attached-client counts, this process's memory
-and CPU history, the pane daemon's memory, and the event-loop rollup
-(wakes/s, render latency, idle ratio).
+click, or `↵` with the bar focused — opens the **status modal**, a scrollable
+dashboard (`j`/`k` or the arrow keys, `esc` to close):
+
+- **daemon** — role, PID, version, host, uptime, heartbeat age (`healthy` while
+  the daemon is still discoverable, `stale` once its heartbeat lapses), registry
+  id, transport, endpoint and scope paths, serve address, and the live
+  `[daemon]` policy: how long a detached pane stays warm (`lease_grace_secs`),
+  when an idle daemon exits (`idle_exit_secs`), whether new panes route through
+  it at all, and how many of the panes on screen right now would survive a quit.
+- **sessions** — every session the daemon owns: id, program, worktree, size,
+  attached clients, age, and the warm-lease countdown for detached ones. Read
+  live from the daemon when you open the modal, so the counts are always
+  current.
+- **thegn process** — this process's memory over the pane daemon's in one
+  stacked plot, plus both CPU trends.
+- **loop** — the event-loop rollup: wakes/s, render / input / flush / drain /
+  switch latency, the frame mix, PTY throughput, and the idle and render-busy
+  ratios. Populated only with `THEGN_PERF=1` (or while the Telemetry panel
+  section is open); otherwise it says so.
+
+The modal narrows gracefully: below ~70 columns the two-column key/value grids
+fold to one and the session table sheds its worktree and size columns.
 
 ## Notifications & attention
 

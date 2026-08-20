@@ -256,7 +256,13 @@ pub enum DaemonChipState {
 /// A cached, render-side view of the pane daemon this instance talks to,
 /// refreshed off-loop (never a DB read on the loop) and delivered like any
 /// other hydration producer. Feeds the far-right status chip's state and the
-/// expanded status modal's key/value block.
+/// expanded status modal's identity/health block.
+///
+/// This is the **registry row**, and nothing more. Session counts deliberately
+/// do NOT live here: they were once derived from the lease table, which only
+/// records *detached* sessions, so an actively-served daemon reported zero. The
+/// daemon's in-memory registry is the source of truth and is fetched over the
+/// control socket on demand — see `detail::status_modal::DaemonSessions`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DaemonStatus {
     /// True once a daemon row has been resolved (else the modal shows a hint).
@@ -273,10 +279,13 @@ pub struct DaemonStatus {
     pub tcp_addr: String,
     /// Daemon start time (Unix ms), for the uptime line.
     pub started_at_ms: i64,
-    /// Live session count owned by the daemon.
-    pub sessions: usize,
-    /// Attached-client count across those sessions.
-    pub attached: usize,
+    /// Last registry heartbeat (Unix ms). Age against `now` is the daemon's
+    /// liveness signal — stale beyond `DAEMON_HEARTBEAT_TTL_MS`.
+    pub heartbeat_at: i64,
+    /// The daemon's registry id (its own random handle, distinct from the PID).
+    pub daemon_id: String,
+    /// Scope key: the canonicalized state dir this daemon serves.
+    pub scope: String,
     /// True when this instance reaches the daemon over a *remote* transport
     /// (drives the `Client` chip state).
     pub remote: bool,
@@ -372,6 +381,12 @@ pub struct FrameModel {
     /// running; the next launch reattaches). One input to `daemon_state`.
     /// Set each frame from the live panes table.
     pub persistent_pane: bool,
+    /// How many of this instance's live panes are daemon-backed, and how many
+    /// panes there are in total. The status modal's "panes here" row: what share
+    /// of what *this* UI shows would survive a quit. Set each frame alongside
+    /// `persistent_pane` from the same panes table.
+    pub daemon_panes: usize,
+    pub pane_count: usize,
     /// Resolved state of the always-on far-right daemon indicator. Computed each
     /// frame from `persistent_pane` + the cached [`DaemonStatus`]. Drives the
     /// glyph the chip shows (`handlers::status::daemon_chip_state`).
