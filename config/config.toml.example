@@ -456,6 +456,20 @@ merge_guard = true     # install a pre-merge-commit hook that refuses `git merge
                        # its FS view can be incoherent and corrupt the merge);
                        # points at `thegn integrate`. No-op outside a sandbox or
                        # in linked worktrees. Escape hatch: THEGN_MERGE_GUARD_OFF=1
+auto_fetch = true      # poll the remote in the background (`git fetch --prune`,
+                       # never a merge) so the ↓N badge on each sidebar row — and
+                       # ⇣N in the panel header — stays current without a manual
+                       # fetch. Ambient only: no notification, no toast. Skipped
+                       # while offline
+auto_fetch_interval_secs = 300      # periodic cadence; 0 = only fetch on startup
+                                    # and on switching worktrees. Clamped to >= 30
+auto_fetch_min_interval_secs = 60   # floor between two background fetches of the
+                                    # same repo, whatever triggered them
+auto_fetch_notify = false           # opt in to ALSO get an inbox entry (kind
+                                    # `upstream_behind`) when a fetch finds new
+                                    # upstream commits. Off by default — the badge
+                                    # is the surface. For a transient toast on top,
+                                    # see the [[notifications.rules]] example below
 
 # User-defined git commands, surfaced in the git panel's custom-commands menu
 # (`x`). `command` is a template expanded against the current selection — see
@@ -1112,6 +1126,9 @@ active_mode = ""
 # [[notifications.rules]]
 # kind = "agent_done"
 # set_priority = "alert"      # sound + break through DND when an agent finishes
+# [[notifications.rules]]
+# kind = "upstream_behind"    # needs [git] auto_fetch_notify = true to fire at all
+# route = ["inbox", "toast"]  # pop a transient in-app toast, not just an inbox row
 # All selectors / actions on one rule (each is optional):
 # [[notifications.rules]]
 # name = "work-hours PR alerts"
