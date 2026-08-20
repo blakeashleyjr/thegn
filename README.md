@@ -150,14 +150,14 @@ and drop `thegn` on your `PATH`. macOS and Windows binaries are not published in
 ```sh
 ./install.sh    # builds thegn; installs tg, tg-tui, thegn + an owl app-launcher entry
 tg              # thegn in the current terminal
-tg --standalone # dedicated Ghostty window with the bundled profile (also: tg -s)
+tg --standalone # dedicated Alacritty window with the bundled profile (also: tg -s)
 tg-tui          # same as plain `tg` — always the current terminal
 ```
 
 `./install.sh` needs Rust/Cargo. `tg` and `tg-tui` run directly in the current
 terminal, whatever it is; `tg --standalone` (`-s`) opens thegn in its own
-Ghostty window using the bundled hermetic profile, so Ghostty is only needed for
-that path. The installer also drops a `thegn.desktop` app-launcher entry with the
+Alacritty window using the bundled hermetic profile (`config/alacritty.toml`),
+so Alacritty is only needed for that path. The installer also drops a `thegn.desktop` app-launcher entry with the
 owl icon (Exec `tg --standalone`), searchable/pinnable in GNOME/KDE/rofi/wofi.
 thegn shells out to `git` (and `gh`/`ssh` as fallbacks where native support has
 gaps); `lazygit` is optional.
