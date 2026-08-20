@@ -913,8 +913,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     {
         use std::io::Write as _;
         let mut out = std::io::stdout();
+        // Trailing `?25h` restores the cursor: the last frame may have taken a
+        // Hidden branch (modal / app tile / corner focus), and terminals that
+        // don't scope DECTCEM to the 1049 buffer would leave the primary
+        // screen cursorless after we exit.
         let _ = out
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[<u")
+            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[<u\x1b[?25h")
             .and_then(|_| out.flush());
     }
     let _ = buf.terminal().exit_alternate_screen();
@@ -10219,7 +10223,9 @@ async fn event_loop<T: Terminal>(
                         .into_iter()
                         .find(|(id, _, _)| *id == focused)
                 {
-                    let (cur_row, cur_col) = p.emulator().cursor();
+                    // The snapshot cursor, not the live one: the overlay must
+                    // sit on the grid this frame composed (see below).
+                    let (cur_row, cur_col) = p.emulator().snapshot_cursor();
                     crate::compositor::overlay_predicted(
                         &mut scratch,
                         prect,
@@ -10338,17 +10344,27 @@ async fn event_loop<T: Terminal>(
                     )
                 };
                 if let (Some(rect), Some(p)) = (focused_rect, panes.table.get(&cursor_pane)) {
-                    let (cur_row, cur_col) = p.emulator().cursor();
+                    // The cursor as of this frame's grid snapshot, NOT the live
+                    // one. The grid is parsed on the pane's reader thread, so a
+                    // live read here belongs to a later state than the cells
+                    // already composed above — the caret would jump to wherever
+                    // the app is mid-redraw (typically the start of the next
+                    // line) and snap back a frame later, once per keystroke.
+                    let (cur_row, cur_col) = p.emulator().snapshot_cursor();
                     // Sit the caret AFTER any predicted (not-yet-echoed) text, so
                     // it tracks where you're typing during the round-trip.
                     let col =
                         (cur_col as usize + p.predicted().len()).min(rect.cols.saturating_sub(1));
+                    // Clamp the row like the column: a pane whose emulator is
+                    // momentarily taller than its rect (shrunk layout, PTY
+                    // resize not yet applied) must not park the caret outside.
+                    let row = (cur_row as usize).min(rect.rows.saturating_sub(1));
                     pending.push(Change::CursorVisibility(
                         termwiz::surface::CursorVisibility::Visible,
                     ));
                     pending.push(Change::CursorPosition {
                         x: Position::Absolute(rect.x + col),
-                        y: Position::Absolute(rect.y + cur_row as usize),
+                        y: Position::Absolute(rect.y + row),
                     });
                 } else {
                     pending.push(Change::CursorVisibility(
