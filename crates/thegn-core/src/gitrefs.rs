@@ -72,8 +72,9 @@ pub struct BranchInfo {
     pub subject: String,
 }
 
-/// Decompose an `%(upstream:track)` field — "" | "[ahead N]" | "[behind M]"
-/// | "[ahead N, behind M]" | "[gone]" — into (ahead, behind, gone).
+/// Decompose an `%(upstream:track)` field — `""` | `"[ahead N]"` |
+/// `"[behind M]"` | `"[ahead N, behind M]"` | `"[gone]"` — into
+/// `(ahead, behind, gone)`.
 fn parse_track(track: &str) -> (usize, usize, bool) {
     let inner = track.trim().trim_start_matches('[').trim_end_matches(']');
     if inner == "gone" {

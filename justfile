@@ -365,9 +365,15 @@ lint:
     # formats in place then exits nonzero on any change (mirrors `just fmt-check`).
     treefmt --ci
     cargo clippy --workspace --all-targets -- -D warnings
-    shellcheck -x install.sh test/smoke.sh test/brand-guard.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/git-hooks/post-checkout.sh test/git-hooks/heal-worktree.sh
+    # Every tracked shell script, not a hand-kept list — the list had drifted to
+    # 9 of 20 files, silently excluding the user-facing setup-macos.sh and all
+    # of scripts/ci/. `git ls-files` keeps new scripts covered by default.
+    git ls-files -z '*.sh' | xargs -0 shellcheck -x
     yamllint .
-    taplo lint
+    # Tracked TOML only. Bare `taplo lint` walks the whole cwd and was linting
+    # .direnv/flake-inputs (i.e. nixpkgs), .devenv/profile, and target/ — 122
+    # files, almost none of them ours.
+    git ls-files -z '*.toml' | xargs -0 taplo lint
     # Guardrail: all git must route through util::git_cmd / GitLoc so GIT_ENV_VARS
     # is scrubbed (the core.worktree-pollution class). Only the builder in util.rs
     # may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
@@ -415,8 +421,12 @@ doctor:
     exit "$miss"
 
 # Rustdoc must stay warning-clean; public API docs are part of the release gate.
+# Rustdoc gate. `--document-private-items` is load-bearing, not cosmetic: this
+# codebase is overwhelmingly private/pub(crate), so without it rustdoc never
+# looks at most of the doc comments and broken intra-doc links rot unseen (six
+# were hiding behind exactly that gap when this flag was added).
 doc-check:
-    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --document-private-items
 
 # Format everything via treefmt (rust, nix, bash, toml, yaml, markdown).
 fmt:

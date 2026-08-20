@@ -720,9 +720,9 @@ pub(crate) fn sum_numstat(out: &str) -> (u32, u32) {
     (add, del)
 }
 
-/// Parse `git rev-list --left-right --count @{u}...HEAD` output ("<behind>\t
-/// <ahead>") into `(ahead, behind)`. Shared by [`CliGit::ahead_behind`] and the
-/// batched [`glyph_reads`].
+/// Parse `git rev-list --left-right --count @{u}...HEAD` output
+/// (`"<behind>\t<ahead>"`) into `(ahead, behind)`. Shared by
+/// [`CliGit::ahead_behind`] and the batched [`glyph_reads`].
 fn parse_ahead_behind(out: &str) -> Option<(usize, usize)> {
     let mut it = out.split_whitespace();
     let behind = it.next().and_then(|s| s.parse().ok());
