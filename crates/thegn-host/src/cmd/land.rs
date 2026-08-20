@@ -5,9 +5,12 @@
 //! or a hand-rolled `git update-ref`: the fold runs in the object DB (no target
 //! checkout) and advances the target ref by compare-and-swap, so it lands even
 //! when the main checkout's working tree is read-only to the caller (a sandboxed
-//! agent). The working-tree sync then defers to the running instance's own
-//! self-heal — a clean checkout on the target fast-forwards itself once it sees
-//! the ref move (see [`crate::git_watch::spawn_main_checkout_heal`]).
+//! agent). On a successful advance it fast-forwards every worktree that has the
+//! target checked out — main or linked — and prints the exact resync command for
+//! any it had to leave alone (see `thegn_core::util::resync_branch_checkouts`).
+//! A running instance also self-heals on the ref move (see
+//! [`crate::git_watch::spawn_main_checkout_heal`]), but that is a belt-and-braces
+//! second path: the CLI must not depend on an instance being up.
 //!
 //! Unlike `thegn merge land`, this neither requires `[merge_queue] enabled`
 //! nor touches the queue's DB rows; it shares only the fold/gate/CAS core
@@ -36,7 +39,7 @@ pub(crate) fn land_branch(
         .filter(|s| !s.is_empty())
         .with_context(|| format!("{}: not on a branch (detached HEAD?)", worktree.display()))?;
     // This IS the manual land, so force it on regardless of queue policy.
-    let mut mq = cfg.merge_queue.clone();
+    let mut mq = cfg.repo_merge_queue(&root);
     mq.auto_land = true;
     let target = integrate::resolve_target(&mq, &root);
     // `thegn land` lands the branch checked out in `worktree`; its loc tells
@@ -71,7 +74,9 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
             && let Some(root) = integrate::main_checkout(&wt)
         {
             crate::merge_lifecycle::apply(
-                &cfg.merge_queue,
+                // Repo-resolved, so a `[workspace.<slug>]` folder setting is
+                // honored here as well as on the land itself.
+                &cfg.repo_merge_queue(&root),
                 &db,
                 &root,
                 &wt.to_string_lossy(),
@@ -81,12 +86,13 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         }
     };
     match outcome {
-        AttemptOutcome::Landed { commit } => {
+        AttemptOutcome::Landed { commit, resyncs } => {
             unfile(&branch);
             outln!(
                 "✓ landed {branch} → {target} @ {}",
                 &commit[..commit.len().min(12)]
             );
+            crate::integrate::report_resyncs(&target, &resyncs);
         }
         AttemptOutcome::UpToDate => {
             unfile(&branch);
@@ -100,6 +106,15 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         }
         AttemptOutcome::GateFailed { .. } => {
             anyhow::bail!("{branch} breaks the build (gate red); not landed.");
+        }
+        AttemptOutcome::GateError { reason, .. } => {
+            // The gate never ran, so this says nothing about the branch. Naming
+            // it "breaks the build" would be a false accusation.
+            anyhow::bail!(
+                "{branch} was NOT gated — {reason}. The branch was not judged; \
+                 fix the gate environment (see `[merge_queue] gate_setup_command`) \
+                 and re-run."
+            );
         }
         AttemptOutcome::Unreachable { detail } => {
             anyhow::bail!("{branch}: {detail}");

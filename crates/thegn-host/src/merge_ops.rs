@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use thegn_core::config::MergeQueueConfig;
+use thegn_core::config::Config;
 use thegn_core::db::{Db, MergeQueueRow};
 use thegn_core::merge_lifecycle::LifecycleEvent;
 use thegn_core::remote::GitLoc;
@@ -95,13 +95,44 @@ pub fn rows_for_repo(db: &Db, root: &Path) -> Vec<MergeQueueRow> {
     merge_driver::rows_for_repo(db, root)
 }
 
+/// Normalize a worktree path before it is used as a queue-row key.
+///
+/// The queue is keyed by worktree path, and the argument arrives straight from
+/// the CLI — so `merge add .` used to store the literal `"."`. That is not just
+/// ugly: the key is global across repos, so two repos would collide on it, and
+/// the row-to-repo membership test re-resolves the key against the *current*
+/// process cwd, which only matches from the directory it was added in. Git's own
+/// `worktree list` reports absolute resolved paths, so matching that form keeps
+/// the two consistent. Falls back to the input when the path can't be resolved
+/// (it may simply not exist — the caller reports that).
+pub fn canonical_worktree(worktree: &Path) -> PathBuf {
+    std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf())
+}
+
+/// The repo root for a worktree, with an error that names the actual problem.
+///
+/// `main_checkout` runs `git -C <path> worktree list` and collapses every
+/// failure to `None`, so a path that simply no longer exists (the common case
+/// after `on_landed = "remove"` deleted it) reported "not inside a git
+/// repository" — which sent the reader looking in entirely the wrong place.
+fn resolve_repo_root(worktree: &Path) -> Result<PathBuf> {
+    if !worktree.exists() {
+        anyhow::bail!("no such worktree: {}", worktree.display());
+    }
+    integrate::main_checkout(worktree)
+        .with_context(|| format!("{}: not inside a git repository", worktree.display()))
+}
+
 /// Enqueue a single worktree's current branch onto the merge queue, applying the
 /// sidebar-folder lifecycle. Returns a short human message describing the
 /// outcome (queued / skipped). Errors only on a genuinely broken worktree
 /// (detached HEAD, not a repo) or a DB write failure.
-pub fn enqueue_worktree(mq: &MergeQueueConfig, db: &Db, worktree: &Path) -> Result<String> {
-    let root = integrate::main_checkout(worktree)
-        .with_context(|| format!("{}: not inside a git repository", worktree.display()))?;
+pub fn enqueue_worktree(cfg: &Config, db: &Db, worktree: &Path) -> Result<String> {
+    let worktree = &canonical_worktree(worktree);
+    let root = resolve_repo_root(worktree)?;
+    // Takes the whole `Config` rather than a `MergeQueueConfig`: only here is the
+    // repo root known, and the per-repo layer can't be applied without it.
+    let mq = &cfg.repo_merge_queue(&root);
     let target = integrate::resolve_target(mq, &root);
     let branch = branch_of(worktree)
         .with_context(|| format!("{}: not on a branch (detached HEAD?)", worktree.display()))?;
@@ -121,13 +152,15 @@ pub fn enqueue_worktree(mq: &MergeQueueConfig, db: &Db, worktree: &Path) -> Resu
 /// enqueue filed it into (the sidebar/queue de-sync). The un-file is best-effort
 /// and guarded host-side to lifecycle-managed folders; dropping the row is the
 /// operation that can fail.
-pub fn dequeue_worktree(mq: &MergeQueueConfig, db: &Db, worktree: &Path) -> Result<()> {
+pub fn dequeue_worktree(cfg: &Config, db: &Db, worktree: &Path) -> Result<()> {
+    let worktree = &canonical_worktree(worktree);
     let wt_s = worktree.to_string_lossy().to_string();
     db.remove_merge_entry(&wt_s)?;
     // `apply` only needs the worktree + repo root for a dequeue (the branch is
     // unused by the un-file), so an empty branch is fine; skip only if the repo
     // root can't be resolved (worktree dir already gone — nothing to un-file).
     if let Some(root) = integrate::main_checkout(worktree) {
+        let mq = &cfg.repo_merge_queue(&root);
         crate::merge_lifecycle::apply(mq, db, &root, &wt_s, "", LifecycleEvent::Dequeued);
     }
     Ok(())
@@ -135,11 +168,11 @@ pub fn dequeue_worktree(mq: &MergeQueueConfig, db: &Db, worktree: &Path) -> Resu
 
 /// Drop every queue row for `root`'s repo, un-filing each from its lifecycle
 /// folder. Returns the number removed.
-pub fn clear_repo(mq: &MergeQueueConfig, db: &Db, root: &Path) -> Result<usize> {
+pub fn clear_repo(cfg: &Config, db: &Db, root: &Path) -> Result<usize> {
     let rows = rows_for_repo(db, root);
     let n = rows.len();
     for r in &rows {
-        dequeue_worktree(mq, db, Path::new(&r.worktree))?;
+        dequeue_worktree(cfg, db, Path::new(&r.worktree))?;
     }
     Ok(n)
 }

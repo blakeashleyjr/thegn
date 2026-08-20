@@ -448,6 +448,9 @@ config_enum! {
         Move = "move" | "folder",
         Detach = "detach",
         Remove = "remove" | "cleanup" | "delete",
+        // NB: `MergeQueueConfig::default()` sets `Remove`, which is the shipped
+        // default; this enum-level default only applies where an `OnLanded` is
+        // built standalone.
     } default = Off;
 }
 
@@ -464,7 +467,27 @@ pub struct MergeQueueConfig {
     pub target_branch: String,
     /// Shell command gating the CAS-advance. Empty disables it. Keep it lean
     /// (e.g. `just test`): pre-push already ran clippy + test before enqueue.
+    ///
+    /// It runs in a **bare checkout of the folded tip with no dependencies
+    /// installed** — no `node_modules`, no virtualenv, no `.direnv`. A command
+    /// whose entry point is a project-local binary (`turbo`, `pytest` in a venv,
+    /// a Go tool dir) will not resolve there; use `gate_setup_command` to
+    /// provision it first. Rust works out of the box only because `cargo` is
+    /// global.
     pub gate_command: String,
+    /// Command run in the gate worktree BEFORE `gate_command`, to install the
+    /// dependencies the gate needs (`pnpm install --frozen-lockfile`, `uv sync`,
+    /// `bundle install`, …). Empty (default) skips it.
+    ///
+    /// It is **not** part of the pass/fail verdict: a non-zero exit is reported
+    /// as a gate *environment* failure, never as "this branch breaks the build",
+    /// so a broken setup can neither blame a branch nor wake the fixing agent.
+    ///
+    /// Runs on every gate invocation, including when a reused worktree is
+    /// refreshed in place — so it must be idempotent and cheap when warm, which
+    /// every real package manager's install command is. Running it only on
+    /// worktree creation would silently rot the moment a lockfile changed.
+    pub gate_setup_command: String,
     /// Whether to run `gate_command` at all.
     pub gate_on: bool,
     /// Reuse a stable per-repo gate worktree + `target/` between folds (warm rebuild); `false` ⇒ throwaway `/tmp` (always cold).
@@ -475,7 +498,13 @@ pub struct MergeQueueConfig {
     pub bisect_on_red: bool,
     /// Auto-commit uncommitted worktree work before folding (else skip dirty ones).
     pub snapshot_dirty: bool,
-    /// Conflicts confined to these paths (exact/basename) are regenerable, not handed to a human (e.g. `Cargo.lock`).
+    /// Conflicts confined to these paths (exact/basename) are regenerable, not
+    /// handed to a human (e.g. `Cargo.lock`).
+    ///
+    /// Defaults to the common lockfiles across ecosystems, not just Rust's: a
+    /// name costs nothing in a repo that doesn't have that file, and lockfile
+    /// skew is precisely the conflict class worth automating — two branches that
+    /// both touched the lockfile conflict textually while agreeing semantically.
     pub regenerate_paths: Vec<String>,
     /// Throwaway-worktree command rebuilding `regenerate_paths` to auto-land a
     /// lockfile-only conflict. Empty defers instead.
@@ -498,7 +527,22 @@ pub struct MergeQueueConfig {
     pub organize_folders: bool,
     /// Folder for an enqueued (`queued`) worktree. Empty ⇒ don't file on enqueue.
     pub queued_folder: String,
-    /// What to do when a branch lands. See [`OnLanded`].
+    /// What to do with a worktree whose branch just landed (only when
+    /// `organize_folders = true`):
+    ///
+    /// - `"off"` (aliases `"none"`) — nothing.
+    /// - `"move"` (alias `"folder"`) — file the worktree into `merged_folder`.
+    /// - `"detach"` — remove the worktree, **keep** the branch.
+    /// - `"remove"` (aliases `"cleanup"`, `"delete"`) — remove the worktree AND
+    ///   delete the merged branch. This is the default.
+    ///
+    /// Spelled out here rather than deferred to the enum, because this doc is
+    /// what the generated JSON schema shows and a `[OnLanded]` rustdoc link is
+    /// dead there. Worth knowing: `remove` deletes the branch ref (and its
+    /// reflog with it) — the one irreversible-feeling step in an otherwise
+    /// recoverable pipeline. The commits survive as ancestors of the target;
+    /// choose `detach` to keep the branch name too. A worktree with uncommitted
+    /// changes is never removed, and keeps its branch.
     pub on_landed: OnLanded,
     /// Folder for a landed branch when `on_landed = "move"`. Empty ⇒ don't file.
     pub merged_folder: String,
@@ -513,12 +557,32 @@ impl Default for MergeQueueConfig {
             remote_mode: MergeRemoteMode::default(),
             target_branch: "auto".to_string(),
             gate_command: String::new(),
+            gate_setup_command: String::new(),
             gate_on: true,
             gate_reuse_worktree: true,
             gate_target_dir: String::new(),
             bisect_on_red: true,
             snapshot_dirty: false,
-            regenerate_paths: vec!["Cargo.lock".to_string()],
+            regenerate_paths: [
+                // Rust
+                "Cargo.lock",
+                // JS/TS
+                "pnpm-lock.yaml",
+                "package-lock.json",
+                "yarn.lock",
+                "bun.lockb",
+                // Python
+                "poetry.lock",
+                "uv.lock",
+                "Pipfile.lock",
+                // Go / Ruby / PHP
+                "go.sum",
+                "Gemfile.lock",
+                "composer.lock",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
             regenerate_command: String::new(),
             conflict_handoff: ConflictHandoff::default(),
             agent_command: String::new(),
@@ -530,6 +594,204 @@ impl Default for MergeQueueConfig {
             on_landed: OnLanded::Remove,
             merged_folder: "Merged".to_string(),
             failed_folder: "Needs attention".to_string(),
+        }
+    }
+}
+
+/// The `[workspace.<slug>]` key for a repo.
+///
+/// One definition so every consumer of the workspace layer agrees on the slug —
+/// it was previously inlined in `config_resolve::resolve_repo_sandbox`, and a
+/// second copy that drifted would silently stop matching the user's block.
+pub fn workspace_slug(repo_root: &Path) -> String {
+    let base = crate::util::slugify(&crate::repo::repo_name(repo_root));
+    if base.is_empty() {
+        "repo".to_string()
+    } else {
+        base
+    }
+}
+
+/// An `Option`-per-field overlay of `[merge_queue]`, for the layers that refine
+/// it per repo: `[workspace.<slug>] merge_queue` in the user's own config
+/// (trusted) and a repo-root `.thegn.*` `[merge_queue]` (untrusted, clamped).
+///
+/// Every key in `[merge_queue]` describes a *repository* — its build tool, its
+/// integration branch, its lockfiles — yet the table could only be set once for
+/// every repo at once, so a repo that differed from the user's defaults could
+/// only be handled with `--set` flags on every invocation.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MergeQueueOverlay {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_mode: Option<MergeRemoteMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_setup_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_on: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_reuse_worktree: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_target_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bisect_on_red: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_dirty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regenerate_paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regenerate_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_handoff: Option<ConflictHandoff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_land: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_max_attempts: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organize_folders: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queued_folder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_landed: Option<OnLanded>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_folder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_folder: Option<String>,
+}
+
+impl MergeQueueOverlay {
+    /// True when nothing is set (lets the carrying struct skip serialization).
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.remote_mode.is_none()
+            && self.target_branch.is_none()
+            && self.gate_command.is_none()
+            && self.gate_setup_command.is_none()
+            && self.gate_on.is_none()
+            && self.gate_reuse_worktree.is_none()
+            && self.gate_target_dir.is_none()
+            && self.bisect_on_red.is_none()
+            && self.snapshot_dirty.is_none()
+            && self.regenerate_paths.is_none()
+            && self.regenerate_command.is_none()
+            && self.conflict_handoff.is_none()
+            && self.agent_command.is_none()
+            && self.auto_land.is_none()
+            && self.agent_max_attempts.is_none()
+            && self.agent_timeout_secs.is_none()
+            && self.organize_folders.is_none()
+            && self.queued_folder.is_none()
+            && self.on_landed.is_none()
+            && self.merged_folder.is_none()
+            && self.failed_folder.is_none()
+    }
+
+    /// Apply present fields onto `base` (present wins, absent inherits).
+    ///
+    /// Destructured exhaustively on purpose — no `..`. A field added to
+    /// `MergeQueueConfig` later must fail to compile here rather than be
+    /// silently dropped from the per-repo layers, which is the same discipline
+    /// `config_resolve::classify_repo_overlay` uses for the sandbox overlay.
+    pub fn apply(self, base: &mut MergeQueueConfig) {
+        let MergeQueueOverlay {
+            enabled,
+            remote_mode,
+            target_branch,
+            gate_command,
+            gate_setup_command,
+            gate_on,
+            gate_reuse_worktree,
+            gate_target_dir,
+            bisect_on_red,
+            snapshot_dirty,
+            regenerate_paths,
+            regenerate_command,
+            conflict_handoff,
+            agent_command,
+            auto_land,
+            agent_max_attempts,
+            agent_timeout_secs,
+            organize_folders,
+            queued_folder,
+            on_landed,
+            merged_folder,
+            failed_folder,
+        } = self;
+        if let Some(v) = enabled {
+            base.enabled = v;
+        }
+        if let Some(v) = remote_mode {
+            base.remote_mode = v;
+        }
+        if let Some(v) = target_branch {
+            base.target_branch = v;
+        }
+        if let Some(v) = gate_command {
+            base.gate_command = v;
+        }
+        if let Some(v) = gate_setup_command {
+            base.gate_setup_command = v;
+        }
+        if let Some(v) = gate_on {
+            base.gate_on = v;
+        }
+        if let Some(v) = gate_reuse_worktree {
+            base.gate_reuse_worktree = v;
+        }
+        if let Some(v) = gate_target_dir {
+            base.gate_target_dir = v;
+        }
+        if let Some(v) = bisect_on_red {
+            base.bisect_on_red = v;
+        }
+        if let Some(v) = snapshot_dirty {
+            base.snapshot_dirty = v;
+        }
+        if let Some(v) = regenerate_paths {
+            base.regenerate_paths = v;
+        }
+        if let Some(v) = regenerate_command {
+            base.regenerate_command = v;
+        }
+        if let Some(v) = conflict_handoff {
+            base.conflict_handoff = v;
+        }
+        if let Some(v) = agent_command {
+            base.agent_command = v;
+        }
+        if let Some(v) = auto_land {
+            base.auto_land = v;
+        }
+        if let Some(v) = agent_max_attempts {
+            base.agent_max_attempts = v;
+        }
+        if let Some(v) = agent_timeout_secs {
+            base.agent_timeout_secs = v;
+        }
+        if let Some(v) = organize_folders {
+            base.organize_folders = v;
+        }
+        if let Some(v) = queued_folder {
+            base.queued_folder = v;
+        }
+        if let Some(v) = on_landed {
+            base.on_landed = v;
+        }
+        if let Some(v) = merged_folder {
+            base.merged_folder = v;
+        }
+        if let Some(v) = failed_folder {
+            base.failed_folder = v;
         }
     }
 }
@@ -1140,6 +1402,15 @@ pub struct WorkspaceConfig {
     /// bundle — the same precedence shape as `accounts`. See [`crate::bundle`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_bundle: Option<String>,
+    /// Per-repo `[merge_queue]` refinements (`[workspace.<slug>.merge_queue]`).
+    ///
+    /// The TRUSTED per-repo layer: it lives in the user's own config, so unlike
+    /// a repo-root `.thegn.*` it needs no clamping and never blocks a
+    /// non-interactive drain. This is where a repo whose gate differs from your
+    /// global default belongs (`gate_command = "pnpm test"`), and the only place
+    /// the command-shaped keys can be set without an approval step.
+    #[serde(skip_serializing_if = "MergeQueueOverlay::is_empty")]
+    pub merge_queue: MergeQueueOverlay,
 }
 
 /// A named **environment bundle** (`[bundle.<name>]`) — a composable unit of env
@@ -3376,6 +3647,14 @@ pub struct Config {
     pub serve: ServeConfig,
     /// `[merge_queue]` — the local fold-actor (parallel-branch integration).
     /// On by default; the core is AI-free (agent handoff only fires on conflict).
+    /// The RAW global `[merge_queue]` table.
+    ///
+    /// Do NOT read this on a repo-scoped path — use
+    /// [`Config::repo_merge_queue`], or the `[workspace.<slug>] merge_queue`
+    /// layer silently does nothing there. Reading it directly is correct only
+    /// where no repo is in scope (a global enable check for command/palette
+    /// registration, or an enqueue being forwarded to another host before a repo
+    /// root exists).
     pub merge_queue: MergeQueueConfig,
     /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
     /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
@@ -3989,6 +4268,33 @@ impl Config {
         Ok(())
     }
 
+    /// Coerce a `--set KEY=VALUE` string to the JSON type the field expects.
+    ///
+    /// Bools and integers were already inferred; arrays and inline tables were
+    /// not, so `apps.tab_order` needed a hand-written special case above and no
+    /// other sequence-typed key could be set at all. TOML syntax is used for the
+    /// bracketed forms because that is what the config file itself uses — a
+    /// value the user can paste either way. A bare string still wins by default,
+    /// so nothing that used to parse changes meaning.
+    fn coerce_override_value(val: &str) -> serde_json::Value {
+        let t = val.trim();
+        let bracketed =
+            (t.starts_with('[') && t.ends_with(']')) || (t.starts_with('{') && t.ends_with('}'));
+        if bracketed
+            && let Ok(parsed) = toml::from_str::<serde_json::Value>(&format!("v = {t}"))
+            && let Some(v) = parsed.get("v")
+        {
+            return v.clone();
+        }
+        if let Ok(b) = val.parse::<bool>() {
+            return serde_json::Value::Bool(b);
+        }
+        if let Ok(n) = val.parse::<u64>() {
+            return serde_json::Value::Number(n.into());
+        }
+        serde_json::Value::String(val.to_string())
+    }
+
     pub(crate) fn apply_override_str(cfg: &mut Config, key: &str, val: &str) -> Result<(), String> {
         if key == "apps.tab_order" {
             cfg.apps.tab_order = val
@@ -4009,13 +4315,7 @@ impl Config {
                 if !current.is_object() {
                     return Err(format!("Invalid path: {}", key));
                 }
-                if let Ok(b) = val.parse::<bool>() {
-                    current[*part] = serde_json::Value::Bool(b);
-                } else if let Ok(n) = val.parse::<u64>() {
-                    current[*part] = serde_json::Value::Number(n.into());
-                } else {
-                    current[*part] = serde_json::Value::String(val.to_string());
-                }
+                current[*part] = Self::coerce_override_value(val);
             } else {
                 if !current.is_object() {
                     return Err(format!("Invalid path: {}", key));
@@ -4291,6 +4591,24 @@ impl Config {
         crate::config_resolve::resolve_repo_sandbox(self, repo_root, approvals)
     }
 
+    /// The effective `[merge_queue]` for a repo: the global table with the
+    /// `[workspace.<slug>] merge_queue` overlay applied on top.
+    ///
+    /// Every repo-scoped merge-queue consumer MUST go through here rather than
+    /// reading `Config::merge_queue` directly, or the per-repo layer silently
+    /// does nothing on that path. `repo_root` identifies the repo; the slug is
+    /// derived the same way `[workspace.<slug>]`'s other keys are.
+    pub fn repo_merge_queue(&self, repo_root: &Path) -> MergeQueueConfig {
+        let mut mq = self.merge_queue.clone();
+        if !self.workspace.is_empty()
+            && let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
+            && !ws.merge_queue.is_empty()
+        {
+            ws.merge_queue.clone().apply(&mut mq);
+        }
+        mq
+    }
+
     /// The name of the env a repo's `.thegn.*` overlay selects (`env = "…"`),
     /// or empty. The repo-level layer of env selection.
     pub fn repo_env_name(&self, repo_root: &Path) -> String {
@@ -4502,8 +4820,43 @@ impl Config {
             "sandbox.remote.host" => self.sandbox.remote.host.clone(),
             "sandbox.remote.transport" => self.sandbox.remote.transport.to_string(),
             "sandbox.remote.mode" => self.sandbox.remote.mode.to_string(),
-            _ => return None,
+            // Anything not spelled out above resolves generically. The arms
+            // exist only for keys whose SCALAR rendering differs from the JSON
+            // one (`repo_roots` is newline-joined for shell consumption,
+            // `log.dir` is the resolved path, enums render as their TOML
+            // spelling). Everything else used to fall off the end and report
+            // "unknown config key" — including every key under `[merge_queue]`,
+            // `[ui]`, `[drawer]`, `[placement]`, … which made `config get`
+            // unusable for the entire nested surface even though `config
+            // explain` resolved the same dotted paths fine.
+            _ => return self.value_at(key).map(render_scalar),
         })
+    }
+
+    /// The raw JSON value at a dotted key, or `None` when the key doesn't exist.
+    ///
+    /// Distinguishes "absent" from "present but null", which a bare
+    /// `Value::Null` cannot — `config get` needs that to keep reporting an
+    /// unknown key as an error.
+    pub fn value_at(&self, key: &str) -> Option<serde_json::Value> {
+        let ptr = crate::config_resolve::dotted_to_pointer(key);
+        serde_json::to_value(self).ok()?.pointer(&ptr).cloned()
+    }
+}
+
+/// Render a JSON value the way `config get` should print it: bare scalars
+/// unquoted (so `$(thegn config get …)` is directly usable in a script), and
+/// arrays newline-joined to match the hand-written `repo_roots` arm.
+fn render_scalar(v: serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .map(render_scalar)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other.to_string(),
     }
 }
 

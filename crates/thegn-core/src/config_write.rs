@@ -152,6 +152,18 @@ fn typed_value(val: &str) -> Item {
         "true" => return value(true),
         "false" => return value(false),
         t => {
+            // An array or inline table: parse it as TOML so array-typed keys
+            // (`regenerate_paths`, `repo_roots`, …) are settable at all. Without
+            // this every value was written as a string, so the write was
+            // correctly rejected by the post-write validation and there was NO
+            // CLI path to set a sequence — it required hand-editing the file.
+            // Only attempted for bracket/brace-shaped input, so a plain string
+            // that happens to contain a bracket is unaffected.
+            let bracketed = (t.starts_with('[') && t.ends_with(']'))
+                || (t.starts_with('{') && t.ends_with('}'));
+            if bracketed && let Ok(v) = t.parse::<toml_edit::Value>() {
+                return Item::Value(v);
+            }
             if let Ok(n) = t.parse::<i64>() {
                 return value(n);
             }
@@ -615,6 +627,48 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(doc["sandbox"]["backend"].as_str(), Some("docker"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn set_key_writes_arrays_and_inline_tables() {
+        let p = tmp("set_array.toml");
+        let _ = std::fs::remove_file(&p);
+        // The regression: every value was written as a TOML string, so an
+        // array-typed key could not be set from the CLI at all — the write was
+        // (correctly) rejected by validation and the only fix was hand-editing.
+        set_key(
+            &p,
+            "merge_queue.regenerate_paths",
+            r#"["Cargo.lock", "pnpm-lock.yaml"]"#,
+        )
+        .unwrap();
+        let doc = std::fs::read_to_string(&p)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let arr = doc["merge_queue"]["regenerate_paths"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.get(0).unwrap().as_str(), Some("Cargo.lock"));
+        // And the whole file still deserializes — the point of the exercise.
+        let body = std::fs::read_to_string(&p).unwrap();
+        let cfg: crate::config::Config = toml::from_str(&body).unwrap();
+        assert_eq!(cfg.merge_queue.regenerate_paths.len(), 2);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn set_key_keeps_bracketed_prose_as_a_string() {
+        let p = tmp("set_prose.toml");
+        let _ = std::fs::remove_file(&p);
+        // Only well-formed TOML gets the array treatment; a value that merely
+        // starts with a bracket must stay the string the user typed.
+        set_key(&p, "base_branch", "[not valid toml").unwrap();
+        let doc = std::fs::read_to_string(&p)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(doc["base_branch"].as_str(), Some("[not valid toml"));
         let _ = std::fs::remove_file(&p);
     }
 

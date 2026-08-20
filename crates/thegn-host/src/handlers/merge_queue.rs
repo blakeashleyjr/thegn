@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use termwiz::terminal::TerminalWaker;
-use thegn_core::config::MergeQueueConfig;
+use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::merge_lifecycle::LifecycleEvent;
 use thegn_core::notification::NotificationKind;
@@ -94,16 +94,11 @@ impl DrainCtx<'_> {
 /// run on the loop; the result comes back on `fold_tx` and pulses the waker.
 /// `any_path` is any path inside the repo (the runner resolves the main
 /// checkout itself).
-pub(crate) fn spawn_fold(
-    fold_tx: &FoldTx,
-    waker: &TerminalWaker,
-    mq: MergeQueueConfig,
-    any_path: PathBuf,
-) {
+pub(crate) fn spawn_fold(fold_tx: &FoldTx, waker: &TerminalWaker, cfg: Config, any_path: PathBuf) {
     let tx = fold_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
-        let r = integrate::fold_active_repo(&mq, &any_path);
+        let r = integrate::fold_active_repo(&cfg, &any_path);
         if tx.send(r).is_ok() {
             let _ = waker.wake();
         }
@@ -117,7 +112,7 @@ pub(crate) fn spawn_fold(
 pub(crate) fn spawn_drive(
     drive_tx: &DriveTx,
     waker: &TerminalWaker,
-    mq: MergeQueueConfig,
+    cfg: Config,
     any_path: PathBuf,
 ) {
     let tx = drive_tx.clone();
@@ -132,6 +127,9 @@ pub(crate) fn spawn_drive(
             send(DriveMsg::Failed("not inside a git repository".into()));
             return;
         };
+        // Repo-resolved, inside the blocking task: the loop must not pay for the
+        // git call that derives the workspace slug.
+        let mq = cfg.repo_merge_queue(&root);
         let db = match Db::open() {
             Ok(d) => d,
             Err(e) => {
@@ -152,6 +150,7 @@ pub(crate) fn spawn_drive(
                 worktree: r.worktree,
                 branch: r.branch,
                 location: r.location,
+                agent_attempts: r.agent_attempts,
             })
             .collect();
         if items.is_empty() {
@@ -209,11 +208,11 @@ pub(crate) fn dispatch_integrate(
     toasts: &mut Toasts,
     fold_tx: &FoldTx,
     waker: &TerminalWaker,
-    mq: MergeQueueConfig,
+    cfg: Config,
     any_path: PathBuf,
 ) {
     if arm_fold(enabled, fold_inflight, toasts, "Integrating") {
-        spawn_fold(fold_tx, waker, mq, any_path);
+        spawn_fold(fold_tx, waker, cfg, any_path);
     }
 }
 
@@ -225,11 +224,11 @@ pub(crate) fn dispatch_drain(
     toasts: &mut Toasts,
     drive_tx: &DriveTx,
     waker: &TerminalWaker,
-    mq: MergeQueueConfig,
+    cfg: Config,
     any_path: PathBuf,
 ) {
     if arm_fold(enabled, fold_inflight, toasts, "Draining merge queue") {
-        spawn_drive(drive_tx, waker, mq, any_path);
+        spawn_drive(drive_tx, waker, cfg, any_path);
     }
 }
 
@@ -408,6 +407,7 @@ pub(crate) fn apply_step(
                 conflict_paths: None,
                 error_detail: None,
                 location: String::new(),
+                agent_attempts: 0,
             });
             panel.merge_queue.last_mut().expect("just pushed")
         }
@@ -543,7 +543,11 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
         ctx.model.status = "Merge queue disabled — set [merge_queue] enabled = true".into();
         return true;
     }
-    let mq = ctx.cfg.merge_queue.clone();
+    // Only the cheap global `enabled` flag is read on the loop; the repo-scoped
+    // resolution happens inside the spawn_blocking closures below, because
+    // deriving the workspace slug shells out to git (see `repo::repo_name`) and
+    // the loop must never block on I/O.
+    let mq = ctx.cfg.clone();
     let note = NoteWire {
         drive_tx: ctx.drive_tx.clone(),
         refresh_tx: ctx.refresh_tx.clone(),
@@ -693,7 +697,11 @@ pub(crate) fn sidebar_action(action: SidebarMq, ctx: MqKeyCtx) {
         ctx.model.status = "Merge queue disabled — set [merge_queue] enabled = true".into();
         return;
     }
-    let mq = ctx.cfg.merge_queue.clone();
+    // Only the cheap global `enabled` flag is read on the loop; the repo-scoped
+    // resolution happens inside the spawn_blocking closures below, because
+    // deriving the workspace slug shells out to git (see `repo::repo_name`) and
+    // the loop must never block on I/O.
+    let mq = ctx.cfg.clone();
     let note = NoteWire {
         drive_tx: ctx.drive_tx.clone(),
         refresh_tx: ctx.refresh_tx.clone(),
@@ -767,7 +775,7 @@ pub(crate) fn sidebar_action(action: SidebarMq, ctx: MqKeyCtx) {
 
 /// Clear every queue row for the repo `any_path` belongs to (the workspace
 /// menu's "Clear merge queue"). Mirrors the CLI `thegn merge clear`.
-fn clear_repo_note(any_path: &Path, mq: &MergeQueueConfig) -> String {
+fn clear_repo_note(any_path: &Path, cfg: &Config) -> String {
     let Some(root) = integrate::main_checkout(any_path) else {
         return "Clear failed: not inside a git repository".into();
     };
@@ -775,7 +783,7 @@ fn clear_repo_note(any_path: &Path, mq: &MergeQueueConfig) -> String {
         Ok(d) => d,
         Err(e) => return format!("Clear failed: {e}"),
     };
-    match crate::merge_ops::clear_repo(mq, &db, &root) {
+    match crate::merge_ops::clear_repo(cfg, &db, &root) {
         Ok(0) => "Merge queue already empty".into(),
         Ok(n) => format!("Cleared {n} queued branch(es)"),
         Err(e) => format!("Clear failed: {e}"),
@@ -803,10 +811,13 @@ impl NoteWire {
 
 /// Enqueue the branch a worktree is on (the section's `a`). Mirrors
 /// `cmd/merge.rs::add`'s single-worktree arm.
-fn add_worktree(mq: &MergeQueueConfig, wt: &Path) -> String {
+fn add_worktree(cfg: &Config, wt: &Path) -> String {
     let Some(root) = integrate::main_checkout(wt) else {
         return "Add failed: not inside a git repository".into();
     };
+    // Resolved HERE, off the event loop: the per-repo layer needs the repo root,
+    // and deriving the workspace slug shells out to git.
+    let mq = &cfg.repo_merge_queue(&root);
     let target = integrate::resolve_target(mq, &root);
     let branch = util::git_out(wt, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map(|s| s.trim().to_string())
@@ -833,10 +844,11 @@ fn add_worktree(mq: &MergeQueueConfig, wt: &Path) -> String {
 
 /// Enqueue every eligible worktree branch (the section's `A`). Mirrors
 /// `cmd/merge.rs::add --all`.
-fn add_all(mq: &MergeQueueConfig, any_path: &Path) -> String {
+fn add_all(cfg: &Config, any_path: &Path) -> String {
     let Some(root) = integrate::main_checkout(any_path) else {
         return "Add failed: not inside a git repository".into();
     };
+    let mq = &cfg.repo_merge_queue(&root);
     let target = integrate::resolve_target(mq, &root);
     let cands = match integrate::candidate_branches(mq, &root, &target) {
         Ok(c) => c,
@@ -883,11 +895,31 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
     // `branch` is a param (not captured) so the arms can still move it below.
     let lifecycle = |event: LifecycleEvent, branch: &str| {
         if let (Some(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
-            crate::merge_lifecycle::apply(&cfg.merge_queue, db, &root, wt, branch, event);
+            crate::merge_lifecycle::apply(
+                &cfg.repo_merge_queue(&root),
+                db,
+                &root,
+                wt,
+                branch,
+                event,
+            );
         }
     };
     match outcome {
-        AttemptOutcome::Landed { commit } => {
+        AttemptOutcome::Landed { commit, resyncs } => {
+            // In-app, a checkout on the target is fast-forwarded by the ref
+            // watcher (`git_watch::spawn_main_checkout_heal`); anything the fold
+            // could not sync is real uncommitted work, so log it rather than
+            // interrupting with a toast the user can't act on mid-drain.
+            for r in &resyncs {
+                if !matches!(r.outcome, thegn_core::util::ResyncOutcome::Healed) {
+                    tracing::warn!(
+                        target: "thegn::merge",
+                        path = %r.path.display(),
+                        "checkout of the target was left stale by the fold"
+                    );
+                }
+            }
             record("landed", Some(&commit), None);
             lifecycle(LifecycleEvent::Landed, &branch);
             DriveMsg::Done(DriveOutcome {
@@ -912,10 +944,29 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 detail.replace('\n', ", ")
             ))
         }
-        AttemptOutcome::GateFailed { .. } => {
-            record("gate_failed", None, Some("breaks build"));
+        AttemptOutcome::GateFailed { log } => {
+            // Keep the gate output on the row: "breaks build" alone never told
+            // the user which test failed.
+            let detail = if log.trim().is_empty() {
+                "breaks build".to_string()
+            } else {
+                format!("breaks build\n{}", log.trim())
+            };
+            record("gate_failed", None, Some(&detail));
             lifecycle(LifecycleEvent::Failed, &branch);
             DriveMsg::Failed(format!("{branch} breaks the build (gate red)"))
+        }
+        AttemptOutcome::GateError { reason, log } => {
+            // The gate could not run — an environment fact, not a verdict about
+            // the branch, so it gets its own state and never reaches the agent.
+            let detail = if log.trim().is_empty() {
+                reason.clone()
+            } else {
+                format!("{reason}\n{}", log.trim())
+            };
+            record("gate_error", None, Some(&detail));
+            lifecycle(LifecycleEvent::Failed, &branch);
+            DriveMsg::Failed(format!("{branch} was NOT gated — {reason}"))
         }
         AttemptOutcome::Unreachable { detail } => {
             record("deferred", None, Some(&detail));
@@ -945,6 +996,7 @@ mod tests {
             conflict_paths: None,
             error_detail: None,
             location: String::new(),
+            agent_attempts: 0,
         }
     }
 

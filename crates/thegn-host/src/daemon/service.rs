@@ -48,9 +48,11 @@ pub(crate) struct DaemonService {
     pub idle_tx: mpsc::UnboundedSender<IdleTransition>,
     /// Signals the daemon run loop to exit gracefully.
     pub shutdown: Arc<tokio::sync::Notify>,
-    /// `[merge_queue]` config — the merge verbs need it to resolve the target
-    /// branch when enqueuing.
-    pub merge_queue: thegn_core::config::MergeQueueConfig,
+    /// The daemon's config. The merge verbs resolve `[merge_queue]` PER REPO
+    /// from it (a daemon serves many repos, so a single `MergeQueueConfig`
+    /// snapshot was already the wrong shape — it could not honor a
+    /// `[workspace.<slug>]` refinement, or even a differing target branch).
+    pub config: std::sync::Arc<thegn_core::config::Config>,
 }
 
 fn now_ms() -> i64 {
@@ -536,12 +538,12 @@ impl ControlApi for DaemonService {
         Box::pin(async move {
             self.confine_worktree(worktree).await?;
             let wt = worktree.to_string();
-            let mq = self.merge_queue.clone();
+            let cfg = self.config.clone();
             // Fresh DB handle (like the CLI) so we don't hold the daemon's shared
             // db lock across the git subprocesses `enqueue_worktree` runs.
             tokio::task::spawn_blocking(move || {
                 let db = thegn_core::db::Db::open()?;
-                crate::merge_ops::enqueue_worktree(&mq, &db, std::path::Path::new(&wt))
+                crate::merge_ops::enqueue_worktree(&cfg, &db, std::path::Path::new(&wt))
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge task join: {e}")))?
@@ -550,14 +552,14 @@ impl ControlApi for DaemonService {
     }
 
     fn merge_clear<'a>(&'a self, worktree: &'a str) -> BoxFuture<'a, ControlResult<usize>> {
-        let mq = self.merge_queue.clone();
+        let cfg = self.config.clone();
         Box::pin(async move {
             let wt = worktree.to_string();
             tokio::task::spawn_blocking(move || {
                 let db = thegn_core::db::Db::open()?;
                 let root = crate::merge_ops::repo_root_of(std::path::Path::new(&wt))
                     .ok_or_else(|| anyhow::anyhow!("{wt}: not inside a git repository"))?;
-                crate::merge_ops::clear_repo(&mq, &db, &root)
+                crate::merge_ops::clear_repo(&cfg, &db, &root)
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge task join: {e}")))?
@@ -628,7 +630,7 @@ mod tests {
             grace_ms,
             idle_tx,
             shutdown: Arc::new(tokio::sync::Notify::new()),
-            merge_queue: thegn_core::config::MergeQueueConfig::default(),
+            config: std::sync::Arc::new(thegn_core::config::Config::default()),
         };
         (svc, rx)
     }

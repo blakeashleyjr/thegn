@@ -283,8 +283,20 @@ pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) -> bo
             path.display()
         ));
     }
-    if delete_branch && !branch.is_empty() && !util::git_ok(root, &["branch", "-D", branch]) {
-        msg::warn(&format!("could not delete branch {branch}"));
+    // The branch delete is gated on the removal having ACTUALLY happened. It
+    // used to run unconditionally, so a failed removal (a read-only mount is the
+    // common one) left the worktree sitting on disk with its branch ref deleted
+    // out from under it — the worst of both outcomes, and `git branch -D` is
+    // force, so the ref went without a merged-ness check.
+    if delete_branch && !branch.is_empty() {
+        if !removed {
+            msg::warn(&format!(
+                "kept branch {branch}: its worktree at {} is still on disk",
+                path.display()
+            ));
+        } else if !util::git_ok(root, &["branch", "-D", branch]) {
+            msg::warn(&format!("could not delete branch {branch}"));
+        }
     }
     removed
 }
