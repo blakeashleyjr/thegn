@@ -353,6 +353,17 @@ pub struct SidebarStatus {
     /// surfaces — the `✋` badge count and the "Needs you" popup / jump ring —
     /// while acked; the sidebar sort still reflects the true tier.
     pub acked: std::collections::BTreeSet<String>,
+    /// The worktree paths belonging to the **active worktree's repo** — the
+    /// default scope of the nag surfaces (`✋` badge, "Needs you" popup, `Alt a`
+    /// ring), mirroring how the notification inbox already scopes itself. Signals
+    /// outside it are rolled up rather than counted, and the System-tab "all"
+    /// toggle (`panel::scope::system_all`) reveals them in full.
+    ///
+    /// `None` when no active repo resolved: **fail open** and scope nothing, so a
+    /// scoping bug can never hide something that needs the user. `attention` and
+    /// `workspace_attention` above stay global regardless — every workspace's
+    /// sidebar row still shows its own tier.
+    pub repo_scope: Option<std::collections::BTreeSet<String>>,
 }
 
 /// Persisted + transient view state that shapes the tree (collapse/sort/pins/
@@ -2020,6 +2031,7 @@ mod tests {
             sub: 0,
             reason: thegn_core::attention::AttentionReason::AgentNeedsInput,
             since: Some(100),
+            episode: 0,
         };
         status.attention.insert("/wt/urgent".into(), urgent_score);
         let view = ViewState {

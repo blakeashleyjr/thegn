@@ -625,6 +625,7 @@ fn needs_you(model: &mut FrameModel, path: &str) {
             sub: 2,
             reason: AttentionReason::ProcessFailed,
             since: Some(60),
+            episode: 0,
         },
     );
 }
@@ -686,6 +687,51 @@ fn unified_surface_groups_by_section_and_dedups_worktree_alerts() {
         "notice history: {body:?}"
     );
     assert!(body.contains(&"open thegn.log"), "logs entry: {body:?}");
+}
+
+#[test]
+fn needs_you_rows_group_other_repos_separately() {
+    // Two needs-you worktrees, only one in the active repo's scope. The
+    // out-of-scope one must NOT be silently swallowed — it moves to its own
+    // "Other repos" group, still selectable and still ackable.
+    let mut model = notif_model(vec![], vec![]);
+    needs_you(&mut model, "/wt/mine");
+    needs_you(&mut model, "/wt/theirs");
+    model.sidebar_status.repo_scope = Some(["/wt/mine".to_string()].into_iter().collect());
+
+    let headers = |m: &FrameModel| {
+        let ov = open_notifications(m);
+        let DetailContent::List(l) = &ov.content else {
+            panic!("expected a list");
+        };
+        l.rows
+            .iter()
+            .filter(|r| r.header)
+            .map(|r| r.text.clone())
+            .collect::<Vec<_>>()
+    };
+    let h = headers(&model);
+    assert_eq!(h, ["Needs you", "Other repos (1)", "Logs"], "{h:?}");
+
+    // Each group holds exactly one row, and the out-of-scope one keeps its `x`
+    // ack action — scoping quiets the nag, it doesn't remove the affordance.
+    let ov = open_notifications(&model);
+    let DetailContent::List(l) = &ov.content else {
+        panic!("expected a list");
+    };
+    let body: Vec<&crate::detail::DetailRow> = l.rows.iter().filter(|r| !r.header).collect();
+    assert_eq!(body.len(), 3, "one per group plus the logs entry");
+    assert!(
+        body.iter()
+            .filter(|r| r.text.contains("process failed"))
+            .all(|r| r.actions.iter().any(|(k, _)| *k == 'x')),
+        "both needs-you rows keep the dismiss key"
+    );
+
+    // Widened (`repo_scope: None`, what the `g` toggle hydrates): one group.
+    model.sidebar_status.repo_scope = None;
+    let h = headers(&model);
+    assert_eq!(h, ["Needs you", "Logs"], "{h:?}");
 }
 
 #[test]

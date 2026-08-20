@@ -322,6 +322,13 @@ impl WorkspaceStore for Db {
         // orphaned `worktree_disk` row inflating the statusbar total forever.
         self.conn()
             .execute("DELETE FROM worktree_disk WHERE worktree=?1", params![wt])?;
+        // Likewise the attention acks: the hydration pass no longer garbage-
+        // collects them (a non-matching score means "not the winner right now",
+        // not "stale"), so removal is where a gone worktree's rows are reclaimed.
+        self.conn().execute(
+            "DELETE FROM attention_acks WHERE worktree_path=?1",
+            params![wt],
+        )?;
         Ok(())
     }
 

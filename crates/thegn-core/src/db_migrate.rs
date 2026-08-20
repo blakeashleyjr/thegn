@@ -426,6 +426,47 @@ pub(crate) fn additive_schema(conn: &Connection) {
         "ALTER TABLE merge_queue ADD COLUMN agent_attempts INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // v50: `attention_acks` is re-keyed (worktree_path) → (worktree_path, reason)
+    // and gains `episode`. SQLite cannot ALTER a primary key, and the base
+    // `CREATE TABLE IF NOT EXISTS` is a no-op against the old-shaped table, so
+    // this is a rebuild-and-copy. The rows are *copied*, not dropped: an ack the
+    // user already made must not re-nag once just because the app upgraded.
+    // Pre-v50 rows carry `episode = 0`, which still matches their (reason, since)
+    // exactly — cache-derived signals gain a real episode on their next ack.
+    if !has_column(conn, "attention_acks", "episode") {
+        let _ = conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE IF NOT EXISTS attention_acks_v50 (
+               worktree_path TEXT    NOT NULL,
+               reason        TEXT    NOT NULL,
+               since         INTEGER,
+               episode       INTEGER NOT NULL DEFAULT 0,
+               acked_at      INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (worktree_path, reason)
+             );
+             INSERT OR IGNORE INTO attention_acks_v50
+               (worktree_path, reason, since, episode, acked_at)
+               SELECT worktree_path, reason, since, 0, COALESCE(acked_at, 0)
+               FROM attention_acks;
+             DROP TABLE attention_acks;
+             ALTER TABLE attention_acks_v50 RENAME TO attention_acks;
+             COMMIT;",
+        );
+    }
+}
+
+/// Does `table` have a column named `col`? The probe for migrations that can't
+/// be expressed as an idempotent `ALTER` (a primary-key change forces a
+/// rebuild-and-copy, which must run exactly once). Returns false when the table
+/// doesn't exist — the base DDL will have created it in its current shape.
+fn has_column(conn: &Connection, table: &str, col: &str) -> bool {
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+        return false;
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(1)) else {
+        return false;
+    };
+    rows.flatten().any(|name| name == col)
 }
 
 #[cfg(test)]
@@ -440,6 +481,87 @@ mod tests {
         assert_eq!(super::detect_newer_schema(5, 10), None);
         assert_eq!(super::detect_newer_schema(10, 10), None);
         assert_eq!(super::detect_newer_schema(12, 10), Some(12));
+    }
+
+    #[test]
+    fn pre_v50_attention_acks_gain_episode_and_composite_key() {
+        use crate::attention::{AttentionAck, AttentionReason};
+        use crate::store::NotificationStore;
+        // A v49-shaped attention_acks table (worktree_path PRIMARY KEY, no
+        // `episode`) with a real ack in it. The rebuild must COPY that row, not
+        // drop it: an ack the user already made must not re-nag just because the
+        // app upgraded.
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v50-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.db");
+        let reason = serde_json::to_string(&AttentionReason::CiFailed).unwrap();
+        // A recent stamp: `Db::open` also runs the 90-day size sweep, and an
+        // ancient row is correctly reclaimed by it rather than migrated.
+        let acked_at = crate::util::now() - 3600;
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE attention_acks (
+                   worktree_path TEXT PRIMARY KEY, reason TEXT NOT NULL,
+                   since INTEGER, acked_at INTEGER);
+                 INSERT INTO attention_acks (worktree_path,reason,since,acked_at)
+                   VALUES ('/wt/a', '{reason}', NULL, {acked_at}),
+                          ('/wt/ancient', '{reason}', NULL, 77);
+                 PRAGMA user_version = 49;"
+            ))
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        let rows = db.list_attention_acks().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the pre-v50 ack must survive the rebuild (and only the ancient row \
+             is swept)"
+        );
+        assert_eq!(rows[0].worktree_path, "/wt/a");
+        assert_eq!(rows[0].since, None);
+        assert_eq!(rows[0].episode, 0, "migrated rows carry the 0 sentinel");
+        assert_eq!(
+            rows[0].acked_at, acked_at,
+            "the original stamp is preserved"
+        );
+        // And it still suppresses the signal it was made against.
+        let migrated = AttentionAck {
+            reason: AttentionReason::CiFailed,
+            since: None,
+            episode: 0,
+        };
+        assert_eq!(
+            serde_json::from_str::<AttentionReason>(&rows[0].reason).unwrap(),
+            migrated.reason
+        );
+
+        // The composite key is live: a second reason on the same worktree now
+        // coexists instead of overwriting the first (the pre-v50 behavior that
+        // made acking the most-urgent signal destroy the ack for the one it
+        // outranked).
+        let other = serde_json::to_string(&AttentionReason::AgentNeedsInput).unwrap();
+        db.put_attention_ack("/wt/a", &other, Some(5), 0).unwrap();
+        assert_eq!(db.list_attention_acks().unwrap().len(), 2);
+        // UPSERT still replaces same-(worktree, reason) with the newer episode.
+        db.put_attention_ack("/wt/a", &reason, None, 9).unwrap();
+        let rows = db.list_attention_acks().unwrap();
+        assert_eq!(rows.len(), 2, "UPSERT, not a third row");
+        assert_eq!(
+            rows.iter().find(|r| r.reason == reason).map(|r| r.episode),
+            Some(9)
+        );
+        // Targeted delete drops one reason and leaves the other.
+        db.delete_attention_ack("/wt/a", Some(&reason)).unwrap();
+        let rows = db.list_attention_acks().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reason, other);
+        // Un-targeted delete clears the worktree (the `del_worktree` cascade).
+        db.delete_attention_ack("/wt/a", None).unwrap();
+        assert!(db.list_attention_acks().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -782,15 +782,21 @@ impl CiActionCtx<'_> {
                 path,
                 reason,
                 since,
+                episode,
             } => {
-                self.ack_attention(path, reason, since);
+                self.ack_attention(path, reason, since, episode);
                 // Dim the highlighted row in place so the dot goes hollow as the
                 // cursor moves (the static snapshot won't rebuild until reopen).
                 if let Some(ov) = overlay.as_mut() {
                     ov.dim_selected();
                 }
             }
-            DetailAction::AckAllAttention => self.ack_all_attention(),
+            // "Clear all" means one thing everywhere: the inbox's `a`, the
+            // overlay's `a`/`R`, and `Alt Shift R` all land in `mark_all_read`,
+            // which marks notifications read *and* acks the live needs-you set.
+            DetailAction::AckAllAttention => {
+                crate::handlers::attention::mark_all_read(self.model, self.refresh_tx, self.waker)
+            }
             DetailAction::MarkNotificationRead { id } => {
                 self.mark_notif_read_inplace(id);
                 if let Some(ov) = overlay.as_mut() {
@@ -879,6 +885,7 @@ impl CiActionCtx<'_> {
         path: String,
         reason: thegn_core::attention::AttentionReason,
         since: Option<i64>,
+        episode: thegn_core::attention::Episode,
     ) {
         let reason = serde_json::to_string(&reason).unwrap_or_default();
         if reason.is_empty() {
@@ -888,39 +895,13 @@ impl CiActionCtx<'_> {
         let waker = self.waker.clone();
         tokio::task::spawn_blocking(move || {
             if let Ok(db) = thegn_core::db::Db::open() {
-                let _ = db.put_attention_ack(&path, &reason, since); // best-effort: DB is a cache
+                // best-effort: DB is a cache
+                let _ = db.put_attention_ack(&path, &reason, since, episode);
             }
             if tx.send(RefreshKind::Model).is_ok() {
                 let _ = waker.wake();
             }
         });
-    }
-
-    /// Acknowledge every current needs-you worktree — the "Needs you" mark-all.
-    /// Snapshots the set on the loop (cheap) and writes the acks off it.
-    fn ack_all_attention(&mut self) {
-        let items: Vec<(String, String, Option<i64>)> =
-            crate::handlers::attention::needs_user_ordered(self.model)
-                .into_iter()
-                .filter_map(|(path, score)| {
-                    serde_json::to_string(&score.reason)
-                        .ok()
-                        .map(|r| (path, r, score.since))
-                })
-                .collect();
-        let tx = self.refresh_tx.clone();
-        let waker = self.waker.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Ok(db) = thegn_core::db::Db::open() {
-                for (path, reason, since) in items {
-                    let _ = db.put_attention_ack(&path, &reason, since); // best-effort
-                }
-            }
-            if tx.send(RefreshKind::Model).is_ok() {
-                let _ = waker.wake();
-            }
-        });
-        self.model.status = "Marked all as read".into();
     }
 
     /// Open the raw thegn.log in a pager pane (`$PAGER`, else `less`), scrolled

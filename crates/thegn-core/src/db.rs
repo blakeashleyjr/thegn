@@ -76,7 +76,11 @@ use std::path::PathBuf;
 /// v48: adds `worktree_titles` (the last OSC window title per worktree, so the
 /// sidebar keeps a worktree's dynamic title across switches, parking, cold
 /// resurrects, and restarts — seeded at startup, refreshed live).
-pub const SCHEMA_VERSION: i64 = 49;
+/// v50: re-keys `attention_acks` to `(worktree_path, reason)` and adds an
+/// `episode` column, so several needs-you signals on one worktree can be acked
+/// independently and a cache-derived signal (CI run, PR head commit) has a
+/// restart-durable episode identity instead of a bare null `since`.
+pub const SCHEMA_VERSION: i64 = 50;
 
 pub struct Db {
     conn: Connection,
@@ -494,17 +498,29 @@ impl Db {
               ON notifications (read, kind, worktree_path);
             CREATE INDEX IF NOT EXISTS idx_notifications_created
               ON notifications (created_at_ms DESC);
-            -- v41: per-worktree acknowledgement of a "Needs you" attention
-            -- signal. Stores the exact (reason, since) that was showing when the
-            -- user quieted it, so the nag stays silenced for *that episode* only
-            -- (a changed reason / advanced `since` re-fires — see
-            -- `attention::AttentionScore::is_acked_by`). Purely additive cache;
-            -- git / live state is truth, so a stale row just re-nags harmlessly.
+            -- v41 (re-keyed in v50): acknowledgement of a "Needs you" attention
+            -- signal. Stores the exact (reason, since, episode) that was showing
+            -- when the user quieted it, so the nag stays silenced for *that
+            -- episode* only (a changed reason, advanced `since`, or a new
+            -- `episode` re-fires — see `attention::AttentionScore::is_acked_by`).
+            --
+            -- v50 keys on (worktree_path, reason), not worktree_path alone: a
+            -- worktree can carry several needs-you signals at once and `score`
+            -- only ever reports the most urgent, so a single-row-per-worktree key
+            -- meant acking the winner destroyed the ack for the one it outranked.
+            -- `episode` gives cache-derived signals (CI runs, PR checks) an
+            -- identity of their own; without it they had only a null `since` and
+            -- could not be told apart episode-to-episode.
+            --
+            -- Purely additive cache; git / live state is truth, so a stale row
+            -- just re-nags harmlessly.
             CREATE TABLE IF NOT EXISTS attention_acks (
-              worktree_path TEXT PRIMARY KEY,
+              worktree_path TEXT    NOT NULL,
               reason        TEXT    NOT NULL,
               since         INTEGER,
-              acked_at      INTEGER
+              episode       INTEGER NOT NULL DEFAULT 0,
+              acked_at      INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY (worktree_path, reason)
             );
             -- v12: agent dispatch registry.  Each row tracks one AI coding
             -- agent assigned to work on one issue in a dedicated worktree.
@@ -682,6 +698,14 @@ impl Db {
         // than 30 days; unread alerts are always kept. Best-effort — the DB is a
         // cache and this must never gate open.
         let _ = db.prune_notifications(30 * 24 * 3600);
+        // Same growth bound for attention acks. This is a table-size sweep, not
+        // a semantic: an ack is *released* by a new episode (see
+        // `attention::ack_expired` for the one time-based case), never by this.
+        // 90 days is well past any episode's useful life. Best-effort.
+        {
+            use crate::store::NotificationStore as _;
+            let _ = db.prune_attention_acks(90 * 24 * 3600);
+        }
         Ok(db)
     }
 
