@@ -299,7 +299,10 @@ fn item_segs(data: &PanelData, view: GitView, src: usize) -> (Vec<Seg>, usize) {
                 v.push(seg(hue(Hue::Red), format!(" ⇣{}", b.behind)));
             }
             if b.pr.is_some() {
-                v.push(seg(hue(Hue::Green), " ⬤"));
+                v.push(seg(
+                    hue(Hue::Green),
+                    format!(" {}", crate::caps::active_glyphs().dot_filled),
+                ));
             }
             (v, indent)
         }
