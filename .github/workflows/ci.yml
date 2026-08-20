@@ -26,9 +26,12 @@ name: ci
 #    Windows port (workspace check + real-pipe/Job-Object kernel tests +
 #    release thegn.exe artifact). Bare rustup, no nix.
 #
-# nix `access-tokens` comes from the NIX_GITHUB_TOKEN secret — it must read the
-# private flake inputs (muse) AND public ones, so it must be a CLASSIC PAT with
-# `repo` scope.
+# nix `access-tokens` comes from the optional NIX_GITHUB_TOKEN secret. Every
+# flake input is PUBLIC now (the private termite-chat input was dropped in
+# ce1aa41d and `muse` is public), so the token only raises GitHub's anonymous
+# API rate limit for flake fetches — it is not required to build. Fork PRs
+# receive no secrets and the expression evaluates to an empty string, which nix
+# accepts; if a fork's run trips the anonymous rate limit, that is the cause.
 #
 # NOTE: this repo has no submodules, and the checkout steps deliberately do not
 # set `submodules: recursive`. It used to carry private `apps/*` submodules that
@@ -43,17 +46,26 @@ on:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-# Runner selection (both GitHub-hosted and self-hosted are supported; default is
-# self-hosted). Every Linux job reads the repo variable `CI_RUNS_ON`; unset, it
-# targets the self-hosted ageless runners (see docs/self-hosted-ci.md). Flip the
-# whole workflow back to GitHub-hosted with one toggle, no edits:
-#   gh variable set CI_RUNS_ON --body '["ubuntu-latest"]'
-#   gh variable delete CI_RUNS_ON        # ← back to self-hosted
+# Runner selection. Every Linux job reads the repo variable `CI_RUNS_ON`; unset,
+# it falls back to GitHub-hosted `ubuntu-latest`. Opt IN to the self-hosted
+# ageless runners (see docs/self-hosted-ci.md) with one toggle, no edits:
+#   gh variable set CI_RUNS_ON --body '["self-hosted", "ageless"]'
+#   gh variable delete CI_RUNS_ON        # ← back to GitHub-hosted
 # `ci-setup` adapts either way (installs nix + caches only on github-hosted).
 # The `macos` job is always GitHub-hosted (macos-15).
+#
+# SECURITY — why GitHub-hosted is the fallback, not self-hosted. thegn is a
+# PUBLIC repo and this workflow triggers on `pull_request`, so a fork PR's code
+# runs in it. On a self-hosted runner that means an untrusted contributor's code
+# executing on a personal machine against a PERSISTENT /nix/store, sccache and
+# CARGO_HOME — which it can poison for every later run. GitHub's own guidance is
+# not to use self-hosted runners with public repos. Before setting CI_RUNS_ON to
+# the ageless labels, require approval for ALL outside contributors
+# (Settings → Actions → "Require approval for all external contributors"), and
+# treat approving a fork PR as running its code on your box.
 jobs:
   fmt:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +75,7 @@ jobs:
       - run: nix develop --command just fmt-check
   lint:
     # `just lint` also carries the git_cmd guard (no raw Command::new("git")).
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -74,7 +86,7 @@ jobs:
   deps-audit:
     # cargo-deny (advisories/licenses/dup majors) + cargo-machete; fetches the
     # RustSec DB over the network on a cold cache.
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -90,7 +102,7 @@ jobs:
       - run: rm -rf target/advisory-dbs
       - run: nix develop --command just deps-audit
   test:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     # `just build && just test` from a cold cache after a large refactor pushes
     # close to the old 40m cap; give it headroom.
     timeout-minutes: 50
@@ -109,7 +121,7 @@ jobs:
           git config --global user.name "thegn CI"
       - run: nix develop --command bash -lc "just build && just test"
   doc:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -121,7 +133,7 @@ jobs:
     # Typechecks the leaf crates' macOS/Windows code paths from Linux
     # (`cargo check --target`, no cross linker needed; targets come from the
     # flake's rust toolchain).
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -130,7 +142,7 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just check-cross
   openspec:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -139,7 +151,7 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just openspec-validate
   coverage:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -150,7 +162,7 @@ jobs:
   smoke:
     # Hermetic end-to-end CLI tests against the debug binary (isolated
     # XDG_STATE_HOME; includes the pty-smoke harness, which works on runners).
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -160,7 +172,7 @@ jobs:
       - run: nix develop --command just smoke
   sandbox-e2e:
     # Tier-1 only (DNS filter + DB audit trail) — no container runtime needed.
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -169,7 +181,7 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command bash -lc "just sandbox-e2e-dns && just sandbox-e2e-db"
   nix-build:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     # Routinely builds `.#thegn-nobridge` (the shipped stable binary). The full
     # `.#default` adds a second, cross-to-musl release compile of the whole
     # workspace for the provider bridge — dev-channel-only functionality — which
@@ -230,7 +242,7 @@ jobs:
     # deterministic and runs on every push/PR. It spawns thegn in a PTY (works on
     # ubuntu runners) and proves "doesn't crash / the pipeline works" across
     # resize/focus/input boundaries and end-to-end LSP/git flows.
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

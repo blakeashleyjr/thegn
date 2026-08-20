@@ -312,3 +312,23 @@ Iterate with `just quick`; save the heavy gates (`just test`, `just coverage`,
 Contributor docs: [`CLAUDE.md`](CLAUDE.md) (architecture + invariants),
 [`tasks.md`](tasks.md) (roadmap), `openspec/specs/` (behavior specs),
 `docs/superpowers/{plans,specs}/` (design docs per feature).
+
+## Security
+
+Please report vulnerabilities **privately** — see
+[`SECURITY.md`](SECURITY.md) for the process. Reports about sandbox escape,
+credential leakage between worktrees, or command injection through untrusted
+repo content are especially valued.
+
+## License
+
+Dual-licensed under either
+
+- [MIT](LICENSE-MIT) ([summary](https://opensource.org/licenses/MIT)), or
+- [Apache License 2.0](LICENSE-APACHE) ([summary](https://opensource.org/licenses/Apache-2.0))
+
+at your option.
+
+Unless you state otherwise, any contribution you intentionally submit for
+inclusion in thegn is dual-licensed under those same terms, with no additional
+terms or conditions (per Apache-2.0 §5).

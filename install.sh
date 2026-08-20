@@ -68,8 +68,8 @@ icon_file="$icon_dir/thegn.svg"
 
 if ((dry_run)); then
   echo "dry-run: no files will be changed"
-  echo "$bindir/thegn -> $release_bin"
-  echo "$bindir/tg-tui wrapper -> $release_bin (current terminal)"
+  echo "$bindir/thegn <- copy of $release_bin"
+  echo "$bindir/tg-tui wrapper -> $bindir/thegn (current terminal)"
   echo "$bindir/tg wrapper -> $tg_tui (current terminal); tg -s|--standalone -> alacritty --config-file $alacritty_config -e $tg_tui"
   echo "$icon_file -> $icon_src (owl app icon)"
   echo "$desktop_file -> app-launcher entry (Exec=$bindir/tg --standalone, Icon=thegn)"
@@ -84,20 +84,32 @@ command -v cargo >/dev/null || {
 echo "building release binary…"
 (cd "$here" && cargo build --release --workspace)
 
-mkdir -p "$bindir"
-ln -sfn "$release_bin" "$bindir/thegn"
+if [[ ! -f $release_bin ]]; then
+  echo "build reported success but $release_bin is missing — nothing to install." >&2
+  exit 1
+fi
 
-release_bin_q="$(shell_quote "$release_bin")"
+mkdir -p "$bindir"
+# COPY, don't symlink into target/. A symlink to $here/target/release/thegn
+# breaks the moment you `cargo clean`, prune the worktree, or move the repo —
+# silently, and only when you next try to launch. An installed binary should
+# survive the source tree it came from. Re-run install.sh to pick up a rebuild.
+install -m755 "$release_bin" "$bindir/thegn"
+installed_bin="$bindir/thegn"
+
+installed_bin_q="$(shell_quote "$installed_bin")"
 alacritty_config_q="$(shell_quote "$alacritty_config")"
 tg_tui_q="$(shell_quote "$tg_tui")"
 
 # Remove any existing wrappers first: a leftover dangling symlink (e.g. from a
 # pruned worktree) would make the heredoc redirect below fail with "No such
 # file or directory" as bash follows it to a non-existent target.
-# Also sweep the pre-rename superzej-era entry points.
-rm -f "$tg_tui" "$bindir/tg" \
-  "$bindir/sj" "$bindir/sj-tui" "$bindir/superzej" "$bindir/szhost" \
-  "$apps_dir/superzej.desktop" "$apps_dir/sj.desktop"
+#
+# Only thegn's OWN entry points are removed. The pre-rename superzej-era names
+# (sj, sj-tui, superzej, szhost) used to be swept here too — but no public user
+# ever had them, and `sj` in particular is a plausible name for something else
+# entirely. An installer must not delete binaries it did not create.
+rm -f "$tg_tui" "$bindir/tg"
 
 # tg-tui: always the current terminal. THEGN_ALACRITTY_CONFIG points the in-app
 # font picker at the alacritty profile it patches — the same bundled profile
@@ -106,7 +118,7 @@ cat >"$tg_tui" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export THEGN_ALACRITTY_CONFIG=$alacritty_config_q
-exec $release_bin_q "\$@"
+exec $installed_bin_q "\$@"
 EOF
 chmod 0755 "$tg_tui"
 
@@ -182,10 +194,10 @@ command -v delta >/dev/null || echo "warning: 'delta' not found — diff output 
 command -v alacritty >/dev/null || echo "warning: 'alacritty' not found — 'tg --standalone' opens a dedicated alacritty window; plain 'tg' opens thegn in the current terminal" >&2
 
 echo "installed:"
-echo "  $bindir/tg              -> current terminal ($release_bin)"
+echo "  $bindir/tg              -> current terminal ($bindir/thegn)"
 echo "  $bindir/tg --standalone -> dedicated alacritty window using $alacritty_config"
-echo "  $bindir/tg-tui          -> current-terminal native host ($release_bin)"
-echo "  $bindir/thegn           -> $release_bin"
+echo "  $bindir/tg-tui          -> current-terminal native host ($bindir/thegn)"
+echo "  $bindir/thegn           <- copy of $release_bin (re-run install.sh after a rebuild)"
 echo "  $icon_file              -> owl app icon"
 echo "  $desktop_file           -> app-launcher entry ('thegn')"
 echo

@@ -20,14 +20,15 @@ Run **on ageless-studio, as `targe`** (SSH in over Tailscale, or use a thegn
 git clone https://github.com/blakeashleyjr/thegn   # or cd an existing checkout
 cd thegn
 
-NIX_GITHUB_TOKEN=<classic PAT, repo scope> \  # private flake inputs (muse, termite-chat)
+NIX_GITHUB_TOKEN=<optional PAT> \            # only raises the anonymous rate limit
 GH_PAT=<PAT with repo admin> \                # to auto-register the runners
   bash scripts/ci/ageless-runner-setup.sh
 ```
 
 `NIX_GITHUB_TOKEN` is baked into the host's `~/.config/nix/nix.conf` as an
-`access-tokens` entry, so jobs resolve private flake inputs **without** a
-workflow secret. `GH_PAT` is only used to mint runner registration tokens — if
+`access-tokens` entry. Every flake input is public, so this is **optional** —
+it only raises GitHub's anonymous API rate limit for flake fetches, which
+several runners pulling at once can trip. `GH_PAT` is only used to mint runner registration tokens — if
 `gh` is already logged in as a repo admin on the box, you can omit it.
 
 The script is idempotent (re-run to add runners, refresh config, or change

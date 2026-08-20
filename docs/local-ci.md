@@ -36,13 +36,14 @@ cold-builds from scratch.
 1. `act` ships in the dev shell — enter it (`nix develop` / `direnv allow`).
 2. Start a container engine: Docker, or podman with the socket exported —
    `export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock"`.
-3. Provide the token the workflow needs:
+3. Create the secrets file `act` expects:
    ```sh
    cp .secrets.example .secrets
-   # edit .secrets: NIX_GITHUB_TOKEN=<classic PAT with repo scope>
+   # NIX_GITHUB_TOKEN may be left blank
    ```
-   `.secrets` is gitignored. The token lets in-container nix fetch the private
-   flake inputs (muse, termite-chat).
+   `.secrets` is gitignored. Every flake input is public, so the token is
+   optional — it only raises GitHub's anonymous API rate limit, which repeated
+   in-container nix fetches can trip.
 
 ### Run
 
