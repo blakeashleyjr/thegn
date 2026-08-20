@@ -949,10 +949,14 @@ async fn relay_exec(
             // repaint the persisted scrollback tail + arm the relaunch
             // overlay. Only both failing surfaces the husk below.
             Err(attach_err) => {
-                tracing::debug!(
+                // WARN, not debug: this is the moment a user's persisted shell
+                // is replaced by an empty one ("my terminal started over"). It
+                // must be visible in a default `THEGN_LOG=info` capture.
+                tracing::warn!(
                     target: "thegn::sandbox",
-                    pane = id, sandbox = %sandbox_id, %attach_err,
-                    "initial reattach failed; opening a fresh session"
+                    pane = id, sandbox = %sandbox_id, session = %session, %attach_err,
+                    "reattach to the persisted session failed; opening a FRESH session \
+                     (the previous shell's state is gone)"
                 );
                 match source.open(&fallback).await {
                     Ok(s) => {
@@ -1018,7 +1022,10 @@ async fn relay_exec(
         .await
         {
             SessionEnd::Exited(code) => {
-                tracing::debug!(
+                // INFO: distinguishes "the child really exited" from the
+                // relay giving up (the warn below) when diagnosing a pane
+                // that restarted itself.
+                tracing::info!(
                     target: "thegn::sandbox",
                     pane = id, sandbox = %sandbox_id, code,
                     "exec session exited (command returned)"
