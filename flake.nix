@@ -11,6 +11,11 @@
     # independent of the user's system and of the main `nixpkgs`. Bump it
     # deliberately with `nix flake update nixpkgs-yazi`.
     nixpkgs-yazi.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # Splits dependency compilation into its own derivation, so a change to our
+    # own crates reuses the ~600 already-compiled dependencies instead of
+    # rebuilding them. With plain `buildRustPackage` everything lives in one
+    # derivation, so touching a single line recompiles the entire tree.
+    crane.url = "github:ipetkov/crane";
     # The muse visual-regression e2e harness (`just e2e`). Pinned as a non-flake
     # source and built with the same rust toolchain so `nix develop` and CI run
     # an identical, reproducible muse. Bump deliberately with `nix flake update muse`.
@@ -26,6 +31,7 @@
     flake-utils,
     rust-overlay,
     nixpkgs-yazi,
+    crane,
     muse,
   }:
     flake-utils.lib.eachDefaultSystem (system: let
@@ -92,10 +98,27 @@
       # inputs made the flake unevaluable for anyone without access to the
       # private repos, which broke `nix profile install github:…/thegn`.
       thegnSrc = rootSrc;
+      # crane, pinned to the same toolchain everything else uses.
+      craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+      # The dependency tree, compiled ONCE into its own store path. Both channels
+      # reuse it, and — the point of the exercise — so does every later build
+      # whose Cargo.lock is unchanged: editing our own crates no longer
+      # recompiles ~600 dependencies. Must be built from the same args as the
+      # package below or cargo invalidates the artifacts.
+      cargoCommonArgs = {
+        src = thegnSrc;
+        pname = "thegn";
+        version = "0.1.0";
+        nativeBuildInputs = [pkgs.pkg-config];
+        buildInputs = [pkgs.zlib];
+        cargoExtraArgs = "-p thegn-host --bin thegn";
+        doCheck = false;
+      };
+      cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
       thegn = pkgs.callPackage ./nix/package.nix {
         src = thegnSrc;
         yazi = yaziPinned;
-        inherit yaziDeps;
+        inherit yaziDeps craneLib cargoArtifacts;
       };
 
       # The dev release channel (`nix build .#dev`): same source, built with the
@@ -106,7 +129,7 @@
       thegnDev = pkgs.callPackage ./nix/package.nix {
         src = thegnSrc;
         yazi = yaziPinned;
-        inherit yaziDeps;
+        inherit yaziDeps craneLib cargoArtifacts;
         channel = "dev";
       };
 
