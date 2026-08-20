@@ -827,6 +827,11 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         stats_live.clone(),
         disk_fs_path,
         cfg.ci.poll_interval_secs,
+        // `None` turns the remote poll off entirely (startup kick included);
+        // `Some(0)` keeps the event-driven triggers but drops the cadence.
+        cfg.git
+            .auto_fetch
+            .then_some(cfg.git.auto_fetch_interval_secs),
         waker.clone(),
     );
 
@@ -6930,6 +6935,19 @@ async fn event_loop<T: Terminal>(
                 Some(waker.clone()),
                 false, // on-switch backstop: respect the ttl guard
             );
+            // Looking at a worktree IS a freshness request: poll its remote so
+            // the `↓behind` marker reflects the remote now, not whenever the
+            // last ticker fired. Coalesced per-repo by `[git]
+            // auto_fetch_min_interval_secs`, so flipping between worktrees of
+            // one repo costs a single fetch, not one per switch.
+            crate::remote_poll::poll(
+                &session,
+                &current_config.git,
+                notify_state.clone(),
+                &refresh_tx,
+                &waker,
+                false, // the active repo only; the ticker sweeps the rest
+            );
             retarget_diff_watcher(
                 &session,
                 &mut watched_worktree,
@@ -8950,6 +8968,8 @@ async fn event_loop<T: Terminal>(
         let mut want_ci_refresh = false;
         let mut ci_refresh_force = false;
         let mut want_disk_refresh = false;
+        let mut want_auto_fetch = false;
+        let mut auto_fetch_sweep = false;
         let mut want_main_sync = false;
         let mut want_host_heal = false;
         // Fold-actor results (batch fold + agent-driven drain): toast outcomes,
@@ -8999,6 +9019,12 @@ async fn event_loop<T: Terminal>(
                 }
                 // Sizes land on the next hydrate; the scan doesn't force one.
                 RefreshKind::Disk => want_disk_refresh = true,
+                // Remote poll: a fetch that lands sends its own Model refresh,
+                // so this never forces a hydrate on its own.
+                RefreshKind::AutoFetch { sweep } => {
+                    want_auto_fetch |= !skip_net;
+                    auto_fetch_sweep |= sweep;
+                }
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
                 RefreshKind::Onboarding(r) => {
                     dirty |=
@@ -9162,6 +9188,16 @@ async fn event_loop<T: Terminal>(
         }
         if want_disk_refresh {
             crate::hydrate::spawn_disk_scan(current_config.disk.clone(), Some(waker.clone()));
+        }
+        if want_auto_fetch {
+            crate::remote_poll::poll(
+                &session,
+                &current_config.git,
+                notify_state.clone(),
+                &refresh_tx,
+                &waker,
+                auto_fetch_sweep,
+            );
         }
 
         // Derive the loading splash from the per-worktree store: `model.load_steps`

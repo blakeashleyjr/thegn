@@ -139,6 +139,7 @@ mod pty_drain;
 mod queries;
 mod rasterize;
 mod recorder;
+mod remote_poll;
 mod remote_sync;
 mod render_plan;
 mod replay;
