@@ -6,12 +6,12 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 out="$("$repo"/install.sh --dry-run "$tmp/bin")"
-[[ $out == *"$tmp/bin/thegn -> $repo/target/release/thegn"* ]] || {
-  echo "dry-run did not plan the thegn symlink" >&2
+[[ $out == *"$tmp/bin/thegn <- copy of $repo/target/release/thegn"* ]] || {
+  echo "dry-run did not plan the thegn binary copy" >&2
   echo "$out" >&2
   exit 1
 }
-[[ $out == *"$tmp/bin/tg-tui wrapper -> $repo/target/release/thegn (current terminal)"* ]] || {
+[[ $out == *"$tmp/bin/tg-tui wrapper -> $tmp/bin/thegn (current terminal)"* ]] || {
   echo "dry-run did not plan tg-tui current-terminal wrapper" >&2
   echo "$out" >&2
   exit 1
@@ -51,9 +51,28 @@ printf '%s\n' "$@" >"${TG_ALACRITTY_LOG:?}"
 EOF
 chmod 0755 "$fakebin/alacritty"
 
+# install.sh copies the built binary, so it must actually exist. The fake cargo
+# above builds nothing — stage a stub where the real build would land. (A prior
+# revision symlinked instead, so a missing binary silently produced a dangling
+# link and the test still passed.)
+staged_release=""
+if [[ ! -f $repo/target/release/thegn ]]; then
+  mkdir -p "$repo/target/release"
+  printf '#!/usr/bin/env sh\nexit 0\n' >"$repo/target/release/thegn"
+  chmod 0755 "$repo/target/release/thegn"
+  staged_release="$repo/target/release/thegn"
+fi
+cleanup() {
+  rm -rf "$tmp"
+  [[ -n $staged_release ]] && rm -f "$staged_release"
+  return 0
+}
+trap cleanup EXIT
+
 install_out="$(PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" "$repo/install.sh" "$tmp/bin")"
-[[ -L $tmp/bin/thegn && $(readlink "$tmp/bin/thegn") == "$repo/target/release/thegn" ]] || {
-  echo "install did not symlink thegn to the release binary" >&2
+# A COPY, not a symlink: the install must survive `cargo clean` / a moved repo.
+[[ -f $tmp/bin/thegn && ! -L $tmp/bin/thegn && -x $tmp/bin/thegn ]] || {
+  echo "install did not copy the release binary to bindir/thegn" >&2
   echo "$install_out" >&2
   exit 1
 }
@@ -62,8 +81,8 @@ install_out="$(PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/conf
   echo "$install_out" >&2
   exit 1
 }
-[[ $(<"$tmp/bin/tg-tui") == *"exec $repo/target/release/thegn"* ]] || {
-  echo "tg-tui should exec thegn directly in the current terminal" >&2
+[[ $(<"$tmp/bin/tg-tui") == *"exec $tmp/bin/thegn"* ]] || {
+  echo "tg-tui should exec the INSTALLED thegn, not the source tree" >&2
   sed -n '1,120p' "$tmp/bin/tg-tui" >&2
   exit 1
 }
