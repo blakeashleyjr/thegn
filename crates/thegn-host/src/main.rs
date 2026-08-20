@@ -951,3 +951,5 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         }
     }
 }
+
+// cache probe

@@ -171,10 +171,15 @@ jobs:
       - run: nix develop --command bash -lc "just sandbox-e2e-dns && just sandbox-e2e-db"
   nix-build:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}
-    # A cold `nix build .#default` compiles the whole app + deps from source
-    # (a Cargo.lock change misses the nix-store cache). It was killed at 45m with
-    # only the final `thegn-host` compile+link left, so give it 60m; once it
-    # succeeds the nix-store cache warms and later runs are far quicker.
+    # Routinely builds `.#thegn-nobridge` (the shipped stable binary). The full
+    # `.#default` adds a second, cross-to-musl release compile of the whole
+    # workspace for the provider bridge — dev-channel-only functionality — which
+    # roughly doubles the job, so it runs on dispatch instead (and before a
+    # release; see RELEASING.md).
+    #
+    # The 60m budget is for a cold build. Warm runs should now be far quicker:
+    # the source is allowlisted (nix/source.nix), so docs/CI/test commits no
+    # longer change the derivation hash and simply reuse the cached store path.
     timeout-minutes: 60
     env:
       # step `if:` can't reference `secrets` directly (GitHub rejects the whole
@@ -186,6 +191,10 @@ jobs:
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          # Its own lane, and a bigger one: this is the only job whose store
+          # holds a built thegn, and it is the one worth not losing.
+          cache-lane: nix-build
+          gc-max-store-size: 8G
       # Populate the persistent binary cache (if one is configured) so remote
       # dev-envs — sprites especially — download the devShell closure over plain
       # HTTPS instead of rebuilding it from source over the flaky host-cache
@@ -198,7 +207,12 @@ jobs:
         with:
           name: ${{ vars.CACHIX_CACHE_NAME || 'thegn' }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      # Routine: the shipped binary only. Dispatch: the full install as a user
+      # gets it, bridge included.
+      - run: nix build .#thegn-nobridge --print-build-logs
+        if: ${{ github.event_name != 'workflow_dispatch' }}
       - run: nix build .#default --print-build-logs
+        if: ${{ github.event_name == 'workflow_dispatch' }}
       # Realize the closures a provider dev-env needs so cachix pushes them: the
       # static musl bridge and the FULL closure of each devShell (`inputDerivation`
       # depends on every build input, so pushing it caches the whole shell). Only

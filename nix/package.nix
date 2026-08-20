@@ -1,8 +1,16 @@
 {
   lib,
-  rustPlatform,
+  # crane, not rustPlatform: it compiles the dependency tree into its OWN
+  # derivation (`cargoArtifacts`), so editing our crates reuses those ~600
+  # already-built dependencies. buildRustPackage puts deps and workspace in one
+  # derivation, so any source change rebuilt everything — the difference between
+  # a ten-minute CI job and an hour one.
+  craneLib,
+  # Prebuilt dependency artifacts. Passed in (rather than built here) so the
+  # stable and dev channels share one dependency build; `dev` is an empty
+  # feature that pulls in no extra crates, so the artifacts are identical.
+  cargoArtifacts,
   makeWrapper,
-  installShellFiles,
   # Native build inputs for fff-search's vendored C deps: `pkg-config` + `zlib`
   # are needed by libgit2-sys → libz-sys (git2 `vendored-libgit2`); lmdb-master-sys
   # builds its C via the `cc` crate (stdenv compiler, no extra input).
@@ -27,18 +35,9 @@
   # installs as `thegn-dev`/`tg-dev` so it can sit beside a stable install.
   # `THEGN_CHANNEL` overrides the default at runtime for either binary.
   channel ? "stable",
-  src ?
-    lib.cleanSourceWith {
-      src = ../.;
-      # Drop build artifacts so the store path is stable across rebuilds.
-      filter = path: _type: let
-        rel = lib.removePrefix (toString ../. + "/") (toString path);
-      in
-        !(lib.hasPrefix "target" rel
-          || lib.hasPrefix "result" rel
-          || lib.hasPrefix ".direnv" rel
-          || lib.hasPrefix ".git/" rel);
-    },
+  # Defaults to the same allowlisted source the flake passes in, so a bare
+  # `callPackage ./nix/package.nix {}` cannot drift from `nix build`.
+  src ? import ./source.nix {inherit lib;} ../.,
 }: let
   runtimeDeps = [git fzf gum lazygit yazi delta gh coreutils] ++ yaziDeps;
   isDev = channel == "dev";
@@ -52,18 +51,23 @@
     then "tg-dev"
     else "tg";
 in
-  rustPlatform.buildRustPackage {
+  craneLib.buildPackage {
     pname = binName;
     version = "0.1.0";
 
-    inherit src;
+    inherit src cargoArtifacts;
 
-    # The `dev` Cargo feature (host crate) flips the default channel to dev.
-    buildFeatures = lib.optionals isDev ["dev"];
+    # Build ONLY the user-facing binary, with the `dev` Cargo feature flipping
+    # the compiled-in default channel. Without the scoping cargo builds every
+    # bin in the workspace, which both wastes time and shipped `fake_lsp` — an
+    # LSP test fixture reached in tests via `CARGO_BIN_EXE_fake_lsp` — straight
+    # onto the PATH of anyone who ran `nix profile install`. Matches what
+    # release.yml builds.
+    cargoExtraArgs =
+      "-p thegn-host --bin thegn"
+      + lib.optionalString isDev " --features dev";
 
-    cargoLock.lockFile = ../Cargo.lock;
-
-    nativeBuildInputs = [makeWrapper installShellFiles pkg-config];
+    nativeBuildInputs = [makeWrapper pkg-config];
     buildInputs = [zlib];
 
     # rusqlite is vendored with the `bundled` feature → no system sqlite needed.
