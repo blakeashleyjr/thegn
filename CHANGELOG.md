@@ -33,9 +33,10 @@ things a first-time cloner hit rather than anything about the running shell.
 
 ### Fixed — `install.sh`
 
-- No longer deletes `sj`, `sj-tui`, `superzej`, `szhost` or two `.desktop`
-  files from your `bin` directory. Those were pre-rename names no public user
-  ever had, and `sj` could plausibly be something else entirely.
+- No longer deletes four pre-rename entry-point names and two `.desktop` files
+  from your `bin` directory. No public user ever had the old brand, and one of
+  those names is short enough to plausibly belong to an unrelated tool. An
+  installer must not remove what it did not create.
 - Installs a **copy** of the release binary instead of a symlink into
   `target/release/`. The symlink broke silently on `cargo clean`, a pruned
   worktree, or a moved repo. Re-run `./install.sh` after a rebuild.

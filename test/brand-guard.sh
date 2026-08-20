@@ -6,7 +6,8 @@
 # Sanctioned survivors:
 #   - the migration code (its whole job is naming the old paths),
 #   - the smoke test that seeds old-named dirs to exercise that migration,
-#   - install.sh's sweep of pre-rename entry-point symlinks,
+#   - install.sh, whose comment explains why it no longer sweeps the
+#     pre-rename entry points (the sweep itself was removed),
 #   - the migration call-site comments in host main.rs,
 #   - `blakeashleyjr/superzej` GitHub URLs in the termite apps' sz-kit git
 #     pins (pre-rename tags; retire when tg-kit-v0.1.x is tagged — allowed by
