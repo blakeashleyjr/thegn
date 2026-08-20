@@ -3521,7 +3521,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-app"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "chrono",
  "gtui-core",
@@ -3530,7 +3530,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "chrono",
  "serde",
@@ -3540,7 +3540,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-embed"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "chrono",
  "gtui-app",
@@ -3555,7 +3555,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-query"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "chrono",
  "gtui-core",
@@ -3568,7 +3568,7 @@ dependencies = [
 
 [[package]]
 name = "gtui-render"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "gtui-core",
  "ratatui",
@@ -8339,7 +8339,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8378,7 +8378,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-host"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8426,7 +8426,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-media"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "futures",
  "serde",
@@ -8439,7 +8439,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-metrics"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "nix 0.29.0",
  "starship-battery",
@@ -8449,7 +8449,7 @@ dependencies = [
 
 [[package]]
 name = "thegn-svc"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "axum",

@@ -19,7 +19,7 @@ members = [
 exclude = ["apps", "vendor"]
 
 [workspace.package]
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 # Resolves cargo-binstall's `{ repo }` template variable (thegn-host's
