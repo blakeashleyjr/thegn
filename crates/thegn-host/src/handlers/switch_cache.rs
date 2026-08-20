@@ -84,6 +84,83 @@ impl WorktreeSlice {
     }
 }
 
+/// Cache-miss switch: blank the stale per-worktree fields (skeleton), then kick
+/// a fast interactive-lane panel-only build for `cwd`. It's the same cheap
+/// `build_panel` the neighbor prefetch uses (no sidebar rebuild / `git log` /
+/// LOC / disk — the ~1s tail of the full `build_model`), but on the interactive
+/// lane so the cold worktree's changes list lands ASAP and replaces the
+/// skeleton. Ships on the prefetch channel; [`drain_prefetch_results`] applies
+/// it to the live frame the moment it arrives, while still active + pending.
+pub(crate) fn clear_and_fill(
+    model: &mut FrameModel,
+    cwd: &std::path::Path,
+    tx: &tokio::sync::mpsc::UnboundedSender<(std::path::PathBuf, crate::panel::PanelData)>,
+    hints: &crate::hydrate::HydrateHints,
+    waker: &termwiz::terminal::TerminalWaker,
+) {
+    WorktreeSlice::clear(model);
+    let (tx, cwd, hints, waker) = (tx.clone(), cwd.to_path_buf(), hints.clone(), waker.clone());
+    tokio::task::spawn_blocking(move || {
+        if !cwd.is_dir() {
+            return;
+        }
+        let Ok(db) = thegn_core::db::Db::open() else {
+            return;
+        };
+        let cfg = thegn_core::config::Config::try_load_layered(
+            &thegn_core::config::ProcessEnv,
+            &[],
+            None,
+        )
+        .unwrap_or_default();
+        let panel = {
+            let _g = crate::perf::measure(crate::perf::Subsys::Hydrate);
+            crate::hydrate::build_panel(&cwd, &db, &hints, &cfg)
+        };
+        if tx.send((cwd, panel)).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+}
+
+/// Drain the prefetch/fast-fill channel: every result seeds the switch cache;
+/// a fast-fill for the still-active, still-`panel_pending` worktree also paints
+/// the live frame (skeleton → real changes list), leaving neighbor warms
+/// repaint-free. Returns whether the live frame changed (caller repaints).
+pub(crate) fn drain_prefetch_results(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(std::path::PathBuf, crate::panel::PanelData)>,
+    cache: &mut std::collections::HashMap<std::path::PathBuf, WorktreeSlice>,
+    model: &mut FrameModel,
+    session: &crate::session::Session,
+    lsp: &crate::lsp::LspDiagnostics,
+    loop_perf: &mut crate::perf::LoopPerf,
+) -> bool {
+    let mut painted = false;
+    while let Ok((path, panel)) = rx.try_recv() {
+        loop_perf.tick(crate::perf::WakeSource::Prefetch);
+        let is_active = path == crate::hydrate::active_tab_path(session);
+        let slice = cache.entry(path).or_default();
+        slice.panel = panel.clone();
+        // A prefetched panel is fresh — stamps the re-warm TTL.
+        slice.seeded_at = Some(std::time::Instant::now());
+        // A fast-fill for the worktree the user just cold-switched to (still
+        // active + pending) paints the live frame: preserve loop-owned
+        // now-playing media and re-merge editor-global LSP diags (the fresh
+        // panel carries only git/db diags), mirroring the full model swap.
+        if is_active && model.panel_pending {
+            let media = model.panel.media.take();
+            model.panel = panel;
+            model.panel.media = media;
+            if !lsp.is_empty() {
+                lsp.merge_into(&mut model.panel.diagnostics);
+            }
+            model.panel_pending = false;
+            painted = true;
+        }
+    }
+    painted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

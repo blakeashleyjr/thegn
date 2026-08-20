@@ -6626,13 +6626,12 @@ async fn event_loop<T: Terminal>(
     // (the on-switch detector only fires for destinations reached after launch).
     {
         let hints = crate::hydrate::HydrateHints {
-            open: panel_ui.open,
-            expanded: panel_ui.width.is_expanded(),
-            profile: current_config.profile.clone(),
             // Prefetch neighbors' git summaries too, so their panel reads
-            // populated the instant the user switches in.
+            // populated the instant the user switches in. `for_switch` leaves
+            // this at its default, so it must be set on top of it here — this
+            // is the neighbor-warm path, not a plain switch.
             warm_git_summaries: true,
-            ..Default::default()
+            ..crate::hydrate::HydrateHints::for_switch(&panel_ui, &current_config)
         };
         for path in neighbor_worktree_paths(&session, &sidebar_worktree_order(&model)) {
             spawn_panel_prefetch(
@@ -6819,9 +6818,18 @@ async fn event_loop<T: Terminal>(
             // data; the background hydration below refreshes it in place a beat
             // later. A never-hydrated worktree gets blanked fields (wrong-
             // worktree data is worse than empty).
+            let hints = crate::hydrate::HydrateHints::for_switch(&panel_ui, &current_config);
+            // Cache hit: paint the stale-but-right slice instantly. Miss (cold
+            // worktree): blank + kick a fast panel-fill (see `clear_and_fill`).
             match switch_cache.get(&current_worktree) {
                 Some(slice) => slice.apply(&mut model),
-                None => crate::handlers::switch_cache::WorktreeSlice::clear(&mut model),
+                None => crate::handlers::switch_cache::clear_and_fill(
+                    &mut model,
+                    &current_worktree,
+                    &prefetch_tx,
+                    &hints,
+                    &waker,
+                ),
             }
             // The old worktree's hunk previews are meaningless here: drop them and
             // raise the acceptance cutoff so in-flight fetches die on arrival.
@@ -6866,12 +6874,6 @@ async fn event_loop<T: Terminal>(
             panel_ui.scroll = 0;
             panel_ui.diff_hunk = 0;
             sync_panel_docs(&mut panel_ui, &model, &session, docs_gen, &docs_tx, &waker);
-            let hints = crate::hydrate::HydrateHints {
-                open: panel_ui.open,
-                expanded: panel_ui.width.is_expanded(),
-                profile: current_config.profile.clone(),
-                ..Default::default()
-            };
             // D1: coalesce rapid switches — the gate hydrates only the settled worktree.
             model_refresh_pending = true;
             // Pre-warm this worktree's commit cache so opening the Commits section
@@ -8308,15 +8310,17 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
-        // Neighbor-prefetch results: seed the switch cache only. No repaint —
-        // these warm worktrees the user hasn't focused yet. Prefetch computes
-        // just the panel; keep any chip/timeline fields from a prior full seed.
-        while let Ok((path, panel)) = prefetch_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Prefetch);
-            let slice = switch_cache.entry(path).or_default();
-            slice.panel = panel;
-            // A prefetched panel is fresh — stamps the re-warm TTL.
-            slice.seeded_at = Some(std::time::Instant::now());
+        // Prefetch/fast-fill results: seed the switch cache, and paint the live
+        // frame for a cold-switch fast-fill that's still active + pending.
+        if crate::handlers::switch_cache::drain_prefetch_results(
+            &mut prefetch_rx,
+            &mut switch_cache,
+            &mut model,
+            &session,
+            &lsp_diags,
+            &mut loop_perf,
+        ) {
+            dirty = true;
         }
 
         // Fresh stats reading from the ticker thread (top-bar widgets + the
