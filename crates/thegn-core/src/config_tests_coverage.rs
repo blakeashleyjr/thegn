@@ -1142,8 +1142,14 @@ fn post_process_populates_default_agents_and_tools() {
     let dir = tmpdir("ppdefaults");
     let f = dir.join("missing.toml");
     let c = Config::load_layered(&MapEnv::default(), &[], Some(f));
-    assert!(c.agents.iter().any(|a| a.name == "claude"));
-    assert!(c.agents.iter().any(|a| a.name == "shell"));
+    // Pin the EXACT default agent set, not just membership. A stray entry here
+    // ships a picker row for a binary the user does not have — which is how a
+    // private `termite tui` default reached the public alpha. Adding a default
+    // agent is a deliberate act: update this list in the same change.
+    assert_eq!(
+        c.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+        vec!["claude", "shell"],
+    );
     assert!(c.tools.iter().any(|t| t.name == "lazygit"));
     assert!(c.tools.iter().any(|t| t.name == "editor"));
     // repo_roots defaults to [workspaces_dir] when unset.
