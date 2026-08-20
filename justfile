@@ -39,29 +39,8 @@ default:
 
 # --- build / package ------------------------------------------------------
 
-# Self-heal the embedded-app sources the host's path deps need (termite-chat,
-# termite-agent under apps/). These live ONLY in the canonical checkout: apps/
-# is gitignored + untracked, and the submodules need network/SSH (bwrap blocks
-# it), so a fresh `git worktree` has no apps/ at all and the whole workspace
-# fails to resolve — not just the host. Symlink to the shared checkout, derived
-# from the common git dir (no hardcoded path); apps/ is gitignored so the link
-# never shows in `git status`. No-op in the canonical checkout (apps/ is a real
-# dir) or once already linked. This is what lets agents in sandboxed worktrees
-# build without copying apps/ in by hand.
-_apps:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    [ -e apps ] && exit 0
-    root="$(cd "$(dirname "$(git rev-parse --git-common-dir)")" && pwd)"
-    if [ "$root" != "$PWD" ] && [ -d "$root/apps" ]; then
-      ln -s "$root/apps" apps
-      echo "linked apps/ -> $root/apps (embedded-app sources for the host build)"
-    else
-      echo "warning: no apps/ here and none at $root/apps — host chat/agent tabs will not build" >&2
-    fi
-
 # Debug build (the whole cargo workspace: core, svc, host).
-build: _apps
+build:
     cargo build --workspace
     # Keep the dev release channel compiling (the host `dev` feature flips the
     # default channel; empty feature, so this is a cheap incremental check).
@@ -71,7 +50,7 @@ build: _apps
 # targets, no tests, no coverage). Pass a crate to scope it further, e.g.
 # `just quick thegn-host`. Use this while iterating; run the heavy gates
 # (`just test` / `just coverage` / `just ci`) only when preparing to push/PR.
-quick pkg="": _apps
+quick pkg="":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ -n "{{pkg}}" ]; then scope="-p {{pkg}}"; else scope="--workspace"; fi
@@ -95,11 +74,11 @@ check-cross:
 # Debug build of the host with the in-process sampling profiler compiled in
 # (the `profiling` feature → SIGUSR2 flamegraph capture). Same artifact path as
 # `build` (target/debug/thegn), so `start-term` picks it up transparently.
-build-profiling: _apps
+build-profiling:
     cargo build --features profiling -p thegn-host
 
 # Release build (the whole cargo workspace).
-release: _apps
+release:
     cargo build --workspace --release
 
 # Build a static x86_64-linux-musl `thegn` — the resident bridge binary pushed
@@ -109,7 +88,7 @@ release: _apps
 # nix use `nix build .#thegn-musl` instead. Output:
 # target/x86_64-unknown-linux-musl/release/thegn — point THEGN_BRIDGE_BINARY
 # at it (or drop it next to the host exe as `thegn-musl`).
-build-musl: _apps
+build-musl:
     cargo build --release -p thegn-host --bin thegn --target x86_64-unknown-linux-musl
 
 # Build the resident musl bridge (hermetically, via nix — no host musl toolchain
@@ -358,7 +337,7 @@ e2e-glitch: build
 cov_ignore := 'thegn-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|plugin_api|profile|forge/mod)\.rs'
 
 # Coverage gate: core ≥95% lines. Writes lcov to target/coverage.
-coverage: _apps
+coverage:
     mkdir -p target/coverage
     # Discard any stale .profraw from earlier instrumented runs — merging them
     # produces a false-low (or false-high) line %, which can spuriously fail the
@@ -377,7 +356,7 @@ coverage-html:
 # --- quality --------------------------------------------------------------
 
 # Comprehensive linting: rust (clippy), bash (shellcheck), yaml (yamllint), toml (taplo).
-lint: _apps
+lint:
     @for t in treefmt shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
     # Formatting gate (treefmt, fail-on-change) — FIRST so drift fails fast before
     # the clippy compile. This is what makes `just lint` (and thus the merge-queue
@@ -451,7 +430,7 @@ fmt-check:
 # `cargo test`; it doesn't run doctests, so a `--doc` pass follows (a few crates
 # carry `///` doctests). This recipe is the single source of truth shared by the
 # CI `test` job and the pre-push hook.
-test: _apps
+test:
     cargo nextest run --workspace
     cargo test --doc --workspace
 
