@@ -204,7 +204,7 @@ fn preview_str(bytes: &[u8]) -> String {
 /// `sync` (when `Some`) is a startup marker the loop skips to before decoding —
 /// the host passes [`SYNC_MAGIC`] so a one-time preamble on the exec's stdout
 /// (banner/MOTD/shell echo) can't desync the framing. Beyond that, a mid-stream
-/// [`DecodeError`] triggers a bounded resync (drop garbage until the framing
+/// [`DecodeError`](thegn_core::revtunnel::DecodeError) triggers a bounded resync (drop garbage until the framing
 /// re-aligns) instead of tearing the tunnel down.
 async fn read_loop<R, F, Fut>(
     mut rd: R,

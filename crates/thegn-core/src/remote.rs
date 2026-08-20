@@ -397,7 +397,8 @@ impl GitLoc {
 
     /// Wrap a shell script to run *inside* a managed-provider env via its
     /// control-plane exec prefix, e.g. `sprite exec -s <name> -- /bin/sh -lc
-    /// "<script>"`. The provider/transport-agnostic sibling of [`ssh_command`].
+    /// "<script>"`. The provider/transport-agnostic sibling of
+    /// [`ssh_command`](Self::ssh_command).
     fn provider_command(&self, control_prefix: &[String], script: String) -> Command {
         let mut argv = control_prefix.to_vec();
         argv.push("/bin/sh".into());
@@ -436,7 +437,7 @@ impl GitLoc {
     }
 
     /// `env K=V … git -C <path> <args>` as one sh-quoted shell string (the
-    /// remote/provider form of [`git_command_env`]).
+    /// remote/provider form of [`git_command_env`](Self::git_command_env)).
     fn env_git_script(envs: &[(&str, &str)], path: &str, args: &[&str]) -> String {
         let mut parts = vec!["env".to_string()];
         for (k, v) in envs {
