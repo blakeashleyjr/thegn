@@ -52,6 +52,25 @@ pub(crate) fn glyph_cache()
     CACHE.get_or_init(|| std::sync::Mutex::new(crate::warmcache::load_glyphs()))
 }
 
+/// Drop the cached glyph rows for `paths`, so the next hydration rescans them
+/// instead of serving a row that is merely younger than [`bg_glyph_ttl`].
+///
+/// Background worktrees are TTL-cached (a rescan is a `git status` fan-out per
+/// row), which is right for ambient staleness but wrong right after an event
+/// that we KNOW changed their counts — a background `git fetch` moving
+/// `refs/remotes/…` under every worktree of the repo. Evicting turns the
+/// badge update from "within one TTL window" into "on the next hydration".
+/// Cheap (a map remove per path) and safe from any thread.
+pub(crate) fn invalidate_glyphs(paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    let mut cache = glyph_cache().lock().unwrap_or_else(|e| e.into_inner());
+    for p in paths {
+        cache.remove(p);
+    }
+}
+
 /// Decide whether a worktree's git glyphs must be rescanned now, or can be
 /// served from cache. Pure, so it's unit-tested. The active worktree always
 /// rescans (the user is looking at it, and its diff fs-watcher already forces
@@ -188,6 +207,15 @@ pub(crate) enum RefreshKind {
     /// Background host-heal tick ([`crate::handlers::host_heal`]): the handler
     /// no-ops from hydrated model state unless a Failed(retryable) host exists.
     HostHeal,
+    /// Poll the remote for new upstream commits (`[git] auto_fetch`) so the
+    /// sidebar's `↓behind` markers and the "updates available" notification are
+    /// honest without a manual fetch — see [`crate::remote_poll`]. `sweep` is set
+    /// by the periodic ticker (which also rotates through the background
+    /// worktrees) and clear for the event-driven triggers (startup, worktree
+    /// switch), which poll only the active repo.
+    AutoFetch {
+        sweep: bool,
+    },
     /// Offline recovery re-probe: emitted ONLY while offline (throttled by
     /// `connectivity::should_probe`), so an online machine pays nothing. The
     /// handler spawns one bounded PR fetch whose success flips the holder online.
@@ -217,6 +245,11 @@ const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// `[disk].scan_interval_secs`). A whole multiple of the 500ms half-tick.
 const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Ticker slot (500ms each) of the one-shot startup remote poll — 3s in, well
+/// clear of the launch→first-frame path so `[git] auto_fetch` can never show up
+/// in the startup waterfall.
+const STARTUP_FETCH_SLOT: u64 = 6;
+
 /// Background ticker: emits a `Model` refresh every [`model_refresh_interval`]
 /// and a `Pr` refresh every `PR_REFRESH_INTERVAL`, pulsing the waker so an idle loop
 /// wakes to service it. This is the staleness backstop; fs-watch + on-switch
@@ -241,6 +274,7 @@ pub(crate) fn spawn_refresh_ticker(
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     disk_path: std::path::PathBuf,
     ci_poll_secs: u64,
+    auto_fetch_secs: Option<u64>,
     waker: TerminalWaker,
 ) {
     use std::sync::atomic::Ordering;
@@ -249,6 +283,7 @@ pub(crate) fn spawn_refresh_ticker(
         let model_every = (model_refresh_interval().as_millis() as u64 / 500).max(1);
         let pr_every = PR_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let ci_every = crate::ci_refresh::ci_every_slots(ci_poll_secs);
+        let fetch_every = auto_fetch_secs.and_then(crate::remote_poll::fetch_every_slots);
         let issue_every = ISSUE_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let disk_every = DISK_REFRESH_INTERVAL.as_millis() as u64 / 500;
@@ -305,6 +340,22 @@ pub(crate) fn spawn_refresh_ticker(
             }
             if ticks.is_multiple_of(issue_every) {
                 if tx.send(RefreshKind::Issues).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            // Remote poll (`[git] auto_fetch`). The one-shot STARTUP_FETCH_SLOT
+            // kick is what makes a freshly-opened session show the night's
+            // commits; it deliberately trails the first frame by a few seconds so
+            // a network round trip can never sit on the launch path. After that
+            // the configured cadence takes over (and sweeps the background
+            // worktrees). Both are coalesced per-repo by `remote_poll`.
+            if auto_fetch_secs.is_some()
+                && (ticks == STARTUP_FETCH_SLOT
+                    || fetch_every.is_some_and(|n| ticks.is_multiple_of(n)))
+            {
+                let sweep = ticks != STARTUP_FETCH_SLOT;
+                if tx.send(RefreshKind::AutoFetch { sweep }).is_err() {
                     break;
                 }
                 wake = true;

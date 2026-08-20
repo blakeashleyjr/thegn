@@ -57,8 +57,9 @@ pub(crate) fn report_pr_panel(state: &thegn_core::github::PanelState) {
 /// Whether a ticker-driven refresh should be skipped for the given connectivity
 /// state. Only network-backed refreshes are gated, and only while offline:
 ///
-/// - `Pr` / `Issues` / `Ci { force: false }` — remote fetches; skipped offline
-///   (the local sidebar hydration still runs; caches serve stale).
+/// - `Pr` / `Issues` / `Ci { force: false }` / `AutoFetch` — remote fetches;
+///   skipped offline (the local sidebar hydration still runs; caches serve
+///   stale, and the `↓behind` markers keep their last-known counts).
 /// - `Ci { force: true }` — a user-initiated refresh (the `g` key); **never**
 ///   skipped, and doubles as a legible manual recovery probe.
 /// - Everything else (`Model`, `Disk`, `HostHeal`, `MainRefMoved`, detail
@@ -72,7 +73,10 @@ pub(crate) fn should_skip_refresh(kind: &RefreshKind, state: Connectivity) -> bo
     }
     matches!(
         kind,
-        RefreshKind::Pr | RefreshKind::Issues | RefreshKind::Ci { force: false }
+        RefreshKind::Pr
+            | RefreshKind::Issues
+            | RefreshKind::Ci { force: false }
+            | RefreshKind::AutoFetch { .. }
     )
 }
 
@@ -93,6 +97,7 @@ mod tests {
                 RefreshKind::Issues,
                 RefreshKind::Ci { force: false },
                 RefreshKind::Ci { force: true },
+                RefreshKind::AutoFetch { sweep: true },
                 RefreshKind::Model,
                 RefreshKind::Disk,
                 RefreshKind::HostHeal,
@@ -112,6 +117,16 @@ mod tests {
         assert!(should_skip_refresh(&RefreshKind::Pr, s));
         assert!(should_skip_refresh(&RefreshKind::Issues, s));
         assert!(should_skip_refresh(&RefreshKind::Ci { force: false }, s));
+        // The remote poll is a network round trip — pointless while offline
+        // (and its failure backoff would decay for no reason).
+        assert!(should_skip_refresh(
+            &RefreshKind::AutoFetch { sweep: true },
+            s
+        ));
+        assert!(should_skip_refresh(
+            &RefreshKind::AutoFetch { sweep: false },
+            s
+        ));
     }
 
     #[test]

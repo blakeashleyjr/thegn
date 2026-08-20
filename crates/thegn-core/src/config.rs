@@ -1276,6 +1276,29 @@ pub struct GitConfig {
     /// worktrees, and when a foreign hook is already present. Per-merge escape
     /// hatch: `THEGN_MERGE_GUARD_OFF=1`.
     pub merge_guard: bool,
+    /// Poll the remote in the background (`git fetch --prune`, never a merge) so
+    /// the sidebar's `↓N` badge and the panel header's `⇣N` reflect the remote
+    /// without a manual fetch. On by default; the fetch is a pure read — it only
+    /// writes `refs/remotes/…`, never the working tree. Skipped while offline.
+    /// Set `false` to keep thegn fully hands-off.
+    pub auto_fetch: bool,
+    /// Background-fetch cadence in seconds. `0` disables the periodic poll while
+    /// leaving the event-driven ones (startup, worktree switch) alive. Clamped to
+    /// ≥ 30s — each poll is a network round trip per repo.
+    pub auto_fetch_interval_secs: u64,
+    /// Floor between two background fetches of the SAME repo, whatever triggered
+    /// them (ticker, startup, switching to a worktree). Keeps rapid worktree
+    /// switching from turning into a fetch storm — worktrees of one repo share
+    /// an object store, so one fetch serves them all.
+    pub auto_fetch_min_interval_secs: u64,
+    /// Also raise an inbox notification when a background fetch finds new
+    /// upstream commits on a worktree's branch. **Off by default**: the ambient
+    /// surface for "you are behind" is the `↓N` badge on the sidebar row (and
+    /// `⇣N` in the panel header), which the poll keeps current on its own — an
+    /// interrupting notification for a routine upstream commit is noise. Opt in
+    /// for an inbox entry; a transient toast additionally needs a
+    /// `[[notifications.rules]]` with `route = ["inbox", "toast"]`.
+    pub auto_fetch_notify: bool,
 }
 
 impl Default for GitConfig {
@@ -1283,6 +1306,10 @@ impl Default for GitConfig {
         Self {
             override_gpg: false,
             merge_guard: true,
+            auto_fetch: true,
+            auto_fetch_interval_secs: 300,
+            auto_fetch_min_interval_secs: 60,
+            auto_fetch_notify: false,
         }
     }
 }
