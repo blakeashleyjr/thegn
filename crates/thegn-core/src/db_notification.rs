@@ -96,38 +96,59 @@ impl NotificationStore for Db {
         worktree_path: &str,
         reason: &str,
         since: Option<i64>,
+        episode: crate::attention::Episode,
     ) -> Result<()> {
         self.conn().execute(
-            r#"INSERT INTO attention_acks(worktree_path,reason,since,acked_at)
-               VALUES(?1,?2,?3,?4)
-               ON CONFLICT(worktree_path) DO UPDATE SET
-                 reason=excluded.reason, since=excluded.since, acked_at=excluded.acked_at"#,
-            params![worktree_path, reason, since, util::now()],
+            r#"INSERT INTO attention_acks(worktree_path,reason,since,episode,acked_at)
+               VALUES(?1,?2,?3,?4,?5)
+               ON CONFLICT(worktree_path,reason) DO UPDATE SET
+                 since=excluded.since, episode=excluded.episode, acked_at=excluded.acked_at"#,
+            params![worktree_path, reason, since, episode as i64, util::now()],
         )?;
         Ok(())
     }
 
-    fn list_attention_acks(&self) -> Result<Vec<(String, String, Option<i64>)>> {
+    fn list_attention_acks(&self) -> Result<Vec<crate::attention::AttentionAckRow>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT worktree_path, reason, since FROM attention_acks")?;
+        let mut stmt = conn.prepare(
+            "SELECT worktree_path, reason, since, episode, acked_at FROM attention_acks",
+        )?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
-                ))
+                Ok(crate::attention::AttentionAckRow {
+                    worktree_path: r.get::<_, String>(0)?,
+                    reason: r.get::<_, String>(1)?,
+                    since: r.get::<_, Option<i64>>(2)?,
+                    episode: r.get::<_, i64>(3)? as u64,
+                    acked_at: r.get::<_, i64>(4)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    fn delete_attention_ack(&self, worktree_path: &str) -> Result<()> {
-        self.conn().execute(
-            "DELETE FROM attention_acks WHERE worktree_path=?1",
-            params![worktree_path],
-        )?;
+    fn delete_attention_ack(&self, worktree_path: &str, reason: Option<&str>) -> Result<()> {
+        match reason {
+            Some(r) => self.conn().execute(
+                "DELETE FROM attention_acks WHERE worktree_path=?1 AND reason=?2",
+                params![worktree_path, r],
+            )?,
+            None => self.conn().execute(
+                "DELETE FROM attention_acks WHERE worktree_path=?1",
+                params![worktree_path],
+            )?,
+        };
         Ok(())
+    }
+
+    fn prune_attention_acks(&self, max_age_secs: i64) -> Result<usize> {
+        let cutoff = util::now().saturating_sub(max_age_secs);
+        // `acked_at > 0` spares pre-v50 rows migrated with an unknown stamp:
+        // they are aged out by `attention::ack_expired`, not deleted blind.
+        Ok(self.conn().execute(
+            "DELETE FROM attention_acks WHERE acked_at > 0 AND acked_at < ?1",
+            params![cutoff],
+        )?)
     }
 
     /// Record a new agent dispatch.  Returns the new row id.

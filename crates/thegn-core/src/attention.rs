@@ -105,16 +105,69 @@ impl AttentionReason {
     }
 }
 
+/// A restart-durable identity for the *episode* a derived signal belongs to —
+/// the CI run behind a failure, the PR head commit behind a conflict. `0` means
+/// "no identity available".
+///
+/// Signals scored from a notification carry an honest `since` (the row's
+/// creation time), which is already an episode identity. The signals derived
+/// from a *cache* (CI runs, PR checks) have no such timestamp, so without this
+/// they were indistinguishable episode-to-episode and an acknowledgement could
+/// not tell "the failure I already quieted" from "a fresh one".
+pub type Episode = u64;
+
+/// FNV-1a 64 over `s` — the episode key for a CI run id / PR head OID.
+///
+/// Deliberately **not** `DefaultHasher`: its output is explicitly not stable
+/// across Rust releases, and acks outlive both the process and the binary, so
+/// an upgrade would silently invalidate every stored ack and re-nag the user
+/// once for every quieted signal. FNV-1a is fixed by its specification.
+///
+/// The empty string maps to `0` (the "no identity" sentinel); a real input that
+/// happens to hash to `0` clamps to `1` so it stays distinguishable from it.
+pub fn episode_of(s: &str) -> Episode {
+    if s.is_empty() {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    if h == 0 { 1 } else { h }
+}
+
+/// How long an acknowledgement with **no** episode identity stays effective.
+///
+/// An ack that carries a `since` or an `episode` is precise: it is released
+/// exactly when a new episode arrives, so it never needs to expire. One with
+/// neither has nothing to compare against, so time is the only bound available.
+pub const IDENTITYLESS_ACK_TTL_SECS: i64 = 7 * 24 * 3600;
+
+/// Has an identity-less ack aged out? Always false for an ack that carries a
+/// `since` or an `episode` — those are released by a new episode, not by time.
+pub fn ack_expired(ack: &AttentionAck, acked_at: i64, now: i64) -> bool {
+    ack.episode == 0
+        && ack.since.is_none()
+        && acked_at > 0
+        && now.saturating_sub(acked_at) > IDENTITYLESS_ACK_TTL_SECS
+}
+
 /// A worktree's resolved urgency: tier, a within-tier sub-rank (signal
-/// precedence), the winning reason, and when the signal started (unix seconds)
+/// precedence), the winning reason, when the signal started (unix seconds)
 /// — `None` when the source only has fetch-time, in which case ordering falls
-/// back to home-first/manual position downstream.
+/// back to home-first/manual position downstream — and the winning signal's
+/// [`Episode`] identity (`0` when it has none beyond `since`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttentionScore {
     pub tier: AttentionTier,
     pub sub: u8,
     pub reason: AttentionReason,
     pub since: Option<i64>,
+    /// Identity of the underlying episode for cache-derived signals (CI run id,
+    /// PR head OID). `0` for signals whose `since` already identifies them.
+    #[serde(default)]
+    pub episode: Episode,
 }
 
 impl Default for AttentionScore {
@@ -124,18 +177,34 @@ impl Default for AttentionScore {
             sub: u8::MAX,
             reason: AttentionReason::Idle,
             since: None,
+            episode: 0,
         }
     }
 }
 
 /// A user's acknowledgement of a worktree's needs-you signal: the exact
-/// `(reason, since)` that was showing when they quieted it. Persisted per
-/// worktree so the "Needs you" nag stays silenced across restarts — but only
-/// for *that episode* (see [`AttentionScore::is_acked_by`]).
+/// `(reason, since, episode)` that was showing when they quieted it. Persisted
+/// per `(worktree, reason)` so the "Needs you" nag stays silenced across
+/// restarts — but only for *that episode* (see [`AttentionScore::is_acked_by`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttentionAck {
     pub reason: AttentionReason,
     pub since: Option<i64>,
+    pub episode: Episode,
+}
+
+/// One persisted acknowledgement row, as read back from the store. Named rather
+/// than a bare tuple because it is now five fields wide and two of them
+/// (`since`, `episode`) are easy to transpose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttentionAckRow {
+    pub worktree_path: String,
+    /// The serde-encoded [`AttentionReason`] as stored.
+    pub reason: String,
+    pub since: Option<i64>,
+    pub episode: Episode,
+    /// When the ack was written (unix seconds); `0` on pre-v50 rows.
+    pub acked_at: i64,
 }
 
 impl AttentionScore {
@@ -146,11 +215,13 @@ impl AttentionScore {
     }
 
     /// Is this score still covered by a prior acknowledgement? True only when
-    /// the reason **and** episode (`since`) are identical to the ack. A new
-    /// episode (advanced `since`) or a changed reason re-fires — so acking
-    /// "still waiting" quiets *this* wait, but a fresh failure later re-nags.
+    /// the reason **and** the episode are identical to the ack — where the
+    /// episode is `since` for notification-derived signals and [`Episode`] for
+    /// cache-derived ones (CI run, PR head commit). A new episode or a changed
+    /// reason re-fires — so acking "still waiting" quiets *this* wait, and
+    /// acking a CI failure quiets *that run*, but a fresh failure later re-nags.
     pub fn is_acked_by(&self, ack: &AttentionAck) -> bool {
-        self.reason == ack.reason && self.since == ack.since
+        self.reason == ack.reason && self.since == ack.since && self.episode == ack.episode
     }
 
     /// Ascending sort key: `(tier, sub, since)` — most urgent tier first, then
@@ -244,6 +315,10 @@ pub struct PrFacts {
     pub checks_failed: u32,
     pub checks_pending: u32,
     pub checks_total: u32,
+    /// Episode identity for the PR-derived signals, from the head commit OID: a
+    /// new push is a new episode (so a re-failed check re-nags), while a plain
+    /// re-fetch of the same commit is not (so an ack survives it, and restarts).
+    pub episode: Episode,
 }
 
 impl PrFacts {
@@ -263,6 +338,7 @@ impl PrFacts {
             checks_failed: pr.checks.failed,
             checks_pending: pr.checks.pending,
             checks_total: pr.checks.total,
+            episode: episode_of(&pr.head_ref_oid),
         })
     }
 
@@ -355,6 +431,12 @@ pub struct AttentionInputs {
     /// Latest cached CI run (outside any PR rollup) is failing / running.
     pub ci_failing: bool,
     pub ci_running: bool,
+    /// Identity of the run behind `ci_failing` (its run id, else its sha), so an
+    /// acknowledgement is released by a *new* run rather than by cache churn.
+    pub ci_episode: Episode,
+    /// When that run started (unix seconds) — an honest `since` for a CI failure,
+    /// which the PR-rollup path cannot supply.
+    pub ci_since: Option<i64>,
     /// The worktree's merge-queue entry, if any (callers skip `landed`).
     pub merge_queue: Option<MqFacts>,
     /// Uncommitted changes — never a tier of its own, only an idle sub-rank.
@@ -372,28 +454,31 @@ pub fn score(inputs: &AttentionInputs) -> AttentionScore {
     use AttentionTier as T;
 
     let mut best: Option<AttentionScore> = None;
-    let mut consider = |tier: T, sub: u8, reason: R, since: Option<i64>| {
+    let mut consider = |tier: T, sub: u8, reason: R, since: Option<i64>, episode: Episode| {
         let cand = AttentionScore {
             tier,
             sub,
             reason,
             since,
+            episode,
         };
         if best.is_none_or(|b| (cand.tier, cand.sub) < (b.tier, b.sub)) {
             best = Some(cand);
         }
     };
 
+    // Notification- and queue-derived signals carry an honest event timestamp,
+    // which is already their episode identity — so they pass `episode: 0`.
     for n in &inputs.unread {
         let at = Some(n.at);
         match n.kind {
-            NotificationKind::AgentAttention => consider(T::Blocked, 0, R::AgentNeedsInput, at),
-            NotificationKind::AgentFailed => consider(T::Failure, 0, R::AgentFailed, at),
-            NotificationKind::TestFailed => consider(T::Failure, 1, R::TestsFailed, at),
-            NotificationKind::ProcessFailed => consider(T::Failure, 2, R::ProcessFailed, at),
+            NotificationKind::AgentAttention => consider(T::Blocked, 0, R::AgentNeedsInput, at, 0),
+            NotificationKind::AgentFailed => consider(T::Failure, 0, R::AgentFailed, at, 0),
+            NotificationKind::TestFailed => consider(T::Failure, 1, R::TestsFailed, at, 0),
+            NotificationKind::ProcessFailed => consider(T::Failure, 2, R::ProcessFailed, at, 0),
             // LogError (thegn's own diagnostics) is deliberately quiet — it never
             // scores into any tier, so it can't put a worktree in "Needs you".
-            NotificationKind::AgentDone => consider(T::Waiting, 1, R::AgentDone, at),
+            NotificationKind::AgentDone => consider(T::Waiting, 1, R::AgentDone, at, 0),
             _ => {}
         }
     }
@@ -401,43 +486,55 @@ pub fn score(inputs: &AttentionInputs) -> AttentionScore {
     if let Some(mq) = inputs.merge_queue {
         let at = Some(mq.updated_at);
         match mq.status {
-            MqStatus::NeedsHuman => consider(T::Blocked, 1, R::QueueNeedsHuman, at),
-            MqStatus::GateFailed => consider(T::Failure, 7, R::GateFailed, at),
+            MqStatus::NeedsHuman => consider(T::Blocked, 1, R::QueueNeedsHuman, at, 0),
+            MqStatus::GateFailed => consider(T::Failure, 7, R::GateFailed, at, 0),
             // Blocked, not Failure: nothing is wrong with the branch, and no
             // agent or retry can clear it — only the user fixing the gate can.
-            MqStatus::GateError => consider(T::Blocked, 2, R::GateError, at),
-            MqStatus::Deferred => consider(T::Failure, 8, R::Deferred, at),
-            MqStatus::Ready => consider(T::Ready, 1, R::QueueReady, at),
+            MqStatus::GateError => consider(T::Blocked, 2, R::GateError, at, 0),
+            MqStatus::Deferred => consider(T::Failure, 8, R::Deferred, at, 0),
+            MqStatus::Ready => consider(T::Ready, 1, R::QueueReady, at, 0),
             MqStatus::Queued | MqStatus::Folding | MqStatus::Verifying | MqStatus::AgentRunning => {
-                consider(T::Working, 3, R::Integrating, at)
+                consider(T::Working, 3, R::Integrating, at, 0)
             }
             MqStatus::Landed => {}
         }
     }
 
     if let Some(pr) = inputs.pr {
-        // PR times are fetch-time only — no honest `since`.
+        // PR times are fetch-time only, so there is no honest `since` — identity
+        // rides `episode` (the head commit OID) instead, which is what lets an
+        // acknowledgement survive a re-fetch and a restart while still releasing
+        // on the next push.
         if pr.checks_failed > 0 {
-            consider(T::Failure, 4, R::CiFailed, None);
+            consider(T::Failure, 4, R::CiFailed, None, pr.episode);
         }
         if pr.conflicting {
-            consider(T::Failure, 5, R::PrConflict, None);
+            consider(T::Failure, 5, R::PrConflict, None, pr.episode);
         }
         if pr.changes_requested {
-            consider(T::Failure, 6, R::ChangesRequested, None);
+            consider(T::Failure, 6, R::ChangesRequested, None, pr.episode);
         }
         if !pr.is_draft && pr.approved && pr.mergeable && pr.checks_green() {
-            consider(T::Ready, 0, R::ReadyToLand, None);
+            consider(T::Ready, 0, R::ReadyToLand, None, pr.episode);
         }
         if pr.checks_pending > 0 {
-            consider(T::Working, 2, R::CiRunning, None);
+            consider(T::Working, 2, R::CiRunning, None, pr.episode);
         }
     }
     if inputs.ci_failing {
-        consider(T::Failure, 4, R::CiFailed, None);
+        // The run-history cache does have honest times, so a CI failure gets both
+        // a real `since` (it sorts oldest-first and renders "N ago") and a run
+        // identity.
+        consider(
+            T::Failure,
+            4,
+            R::CiFailed,
+            inputs.ci_since,
+            inputs.ci_episode,
+        );
     }
     if inputs.ci_running {
-        consider(T::Working, 2, R::CiRunning, None);
+        consider(T::Working, 2, R::CiRunning, None, inputs.ci_episode);
     }
 
     match inputs.activity {
@@ -447,10 +544,10 @@ pub fn score(inputs: &AttentionInputs) -> AttentionScore {
         // the sidebar's hollow-red dot (driven separately by `status.activity`)
         // still shows the worktree is stuck.
         ActivityKind::Waiting if inputs.has_agent => {
-            consider(T::Waiting, 0, R::AgentWaiting, inputs.activity_since)
+            consider(T::Waiting, 0, R::AgentWaiting, inputs.activity_since, 0)
         }
-        ActivityKind::Active => consider(T::Working, 0, R::AgentWorking, inputs.activity_since),
-        ActivityKind::Loading => consider(T::Working, 1, R::Building, None),
+        ActivityKind::Active => consider(T::Working, 0, R::AgentWorking, inputs.activity_since, 0),
+        ActivityKind::Loading => consider(T::Working, 1, R::Building, None, 0),
         ActivityKind::Waiting | ActivityKind::Read | ActivityKind::None => {}
     }
 
@@ -460,6 +557,7 @@ pub fn score(inputs: &AttentionInputs) -> AttentionScore {
         sub: if inputs.dirty { 0 } else { 1 },
         reason: R::Idle,
         since: None,
+        episode: 0,
     })
 }
 
@@ -902,6 +1000,7 @@ mod tests {
             sub: 0,
             reason: R::Idle,
             since,
+            episode: 0,
         }
     }
 
@@ -1003,11 +1102,13 @@ mod tests {
             sub: 2,
             reason: R::StillStuck,
             since: Some(500),
+            episode: 0,
         };
         // Exact (reason, since) match → acked.
         let ack = AttentionAck {
             reason: R::StillStuck,
             since: Some(500),
+            episode: 0,
         };
         assert!(s.is_acked_by(&ack));
         // A new wait episode (advanced `since`) re-fires.
@@ -1022,18 +1123,158 @@ mod tests {
             ..s
         };
         assert!(!other.is_acked_by(&ack));
-        // Timestamp-less signals (CI/PR) match on `None == None`.
+        // Timestamp-less signals (CI/PR) are identified by `episode` instead.
         let ci = AttentionScore {
             tier: T::Failure,
             sub: 4,
             reason: R::CiFailed,
             since: None,
+            episode: episode_of("run-1"),
         };
         let ci_ack = AttentionAck {
             reason: R::CiFailed,
             since: None,
+            episode: episode_of("run-1"),
         };
         assert!(ci.is_acked_by(&ci_ack));
+    }
+
+    #[test]
+    fn episode_of_is_deterministic_and_never_zero_for_nonempty() {
+        // Pinned FNV-1a 64 vectors. These are load-bearing: acks outlive the
+        // binary, so a change to the hash silently invalidates every stored ack
+        // and re-nags the user once per quieted signal. If this fails, the hash
+        // changed — that is the bug, not the assertion.
+        assert_eq!(episode_of("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(episode_of("foobar"), 0x8594_4171_f739_67e8);
+        // The empty string is the "no identity" sentinel.
+        assert_eq!(episode_of(""), 0);
+        // Same input, same key — the whole point across a restart.
+        assert_eq!(episode_of("run-42"), episode_of("run-42"));
+        assert_ne!(episode_of("run-42"), episode_of("run-43"));
+        // A real input never collides with the sentinel.
+        for s in ["a", "run-1", "deadbeef", "0", " "] {
+            assert_ne!(episode_of(s), 0, "{s:?} collided with the 0 sentinel");
+        }
+    }
+
+    #[test]
+    fn ci_failure_carries_run_episode_and_started_at() {
+        // The run-history path has honest times AND an identity, so a CI failure
+        // gets both — that is what lets an ack survive a restart.
+        let s = score(&AttentionInputs {
+            ci_failing: true,
+            ci_episode: episode_of("run-7"),
+            ci_since: Some(1_700_000_000),
+            ..Default::default()
+        });
+        assert_eq!((s.tier, s.reason), (T::Failure, R::CiFailed));
+        assert_eq!(s.since, Some(1_700_000_000));
+        assert_eq!(s.episode, episode_of("run-7"));
+
+        // An ack of that run holds; the next run re-nags.
+        let ack = AttentionAck {
+            reason: R::CiFailed,
+            since: Some(1_700_000_000),
+            episode: episode_of("run-7"),
+        };
+        assert!(s.is_acked_by(&ack));
+        let next = score(&AttentionInputs {
+            ci_failing: true,
+            ci_episode: episode_of("run-8"),
+            ci_since: Some(1_700_000_600),
+            ..Default::default()
+        });
+        assert!(!next.is_acked_by(&ack), "a new run is a new episode");
+    }
+
+    #[test]
+    fn pr_derived_failures_carry_head_oid_episode() {
+        let facts = PrFacts {
+            checks_failed: 1,
+            episode: episode_of("abc123"),
+            ..Default::default()
+        };
+        let s = score(&AttentionInputs {
+            pr: Some(facts),
+            ..Default::default()
+        });
+        assert_eq!((s.tier, s.reason), (T::Failure, R::CiFailed));
+        // PR times are fetch-time only, so identity rides `episode` alone.
+        assert_eq!(s.since, None);
+        assert_eq!(s.episode, episode_of("abc123"));
+
+        // Re-fetching the same commit is the same episode (ack survives)…
+        let ack = AttentionAck {
+            reason: R::CiFailed,
+            since: None,
+            episode: episode_of("abc123"),
+        };
+        assert!(s.is_acked_by(&ack));
+        // …but a push moves the head, which is a new episode.
+        let pushed = score(&AttentionInputs {
+            pr: Some(PrFacts {
+                episode: episode_of("def456"),
+                ..facts
+            }),
+            ..Default::default()
+        });
+        assert!(!pushed.is_acked_by(&ack), "a new head commit re-nags");
+    }
+
+    #[test]
+    fn identityless_ack_expires_after_ttl_identity_bearing_never_does() {
+        let now = 1_800_000_000;
+        let bare = AttentionAck {
+            reason: R::CiFailed,
+            since: None,
+            episode: 0,
+        };
+        // Nothing to compare against, so time is the only bound.
+        assert!(!ack_expired(&bare, now - 3600, now), "fresh");
+        assert!(!ack_expired(&bare, now - IDENTITYLESS_ACK_TTL_SECS, now));
+        assert!(ack_expired(&bare, now - IDENTITYLESS_ACK_TTL_SECS - 1, now));
+        // A pre-v50 row with an unknown stamp is never aged out blind.
+        assert!(!ack_expired(&bare, 0, now));
+
+        // An ack that carries identity is released by a NEW episode, never by
+        // time — otherwise a long-lived failure would start re-nagging weekly.
+        let with_episode = AttentionAck {
+            episode: episode_of("run-1"),
+            ..bare
+        };
+        let with_since = AttentionAck {
+            since: Some(1),
+            ..bare
+        };
+        for ack in [with_episode, with_since] {
+            assert!(!ack_expired(&ack, 1, now), "{ack:?} must not time out");
+        }
+    }
+
+    #[test]
+    fn ci_failures_sort_oldest_first_now_that_since_is_real() {
+        // Within (Failure, sub=4) the longest-failing worktree sorts first.
+        let old = score(&AttentionInputs {
+            ci_failing: true,
+            ci_since: Some(100),
+            ..Default::default()
+        });
+        let new = score(&AttentionInputs {
+            ci_failing: true,
+            ci_since: Some(900),
+            ..Default::default()
+        });
+        assert!(old.sort_key() < new.sort_key());
+        // A PR-rollup failure has no honest time and still sorts after both.
+        let timeless = score(&AttentionInputs {
+            pr: Some(PrFacts {
+                checks_failed: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(new.sort_key() < timeless.sort_key());
     }
 
     #[test]
