@@ -133,6 +133,34 @@ programs.thegn = {
 
 Or just the binary: `nix profile install github:blakeashleyjr/thegn`.
 
+### nix-darwin (macOS)
+
+The home-manager module above works on darwin unchanged. nix-darwin has no
+per-user config-file mechanism, so `darwinModules.default` only puts the binary
+on PATH system-wide — compose the two and let home-manager own the config:
+
+```nix
+darwinConfigurations."mac" = darwin.lib.darwinSystem {
+  system = "aarch64-darwin";
+  modules = [
+    inputs.thegn.darwinModules.default
+    { programs.thegn.enable = true; }        # environment.systemPackages
+
+    home-manager.darwinModules.home-manager
+    {
+      home-manager.users.you = {
+        imports = [ inputs.thegn.homeManagerModules.default ];
+        programs.thegn = { enable = true; themeAccent = "#f083ba"; };
+      };
+    }
+  ];
+};
+```
+
+Enabling both is fine — they install the same store path. Apple silicon only:
+the pinned nixpkgs has dropped `x86_64-darwin`, so the flake declares
+`aarch64-darwin`, `x86_64-linux` and `aarch64-linux`.
+
 ### Prebuilt binary (no Nix)
 
 Each tagged release attaches a `thegn` binary for **x86_64 Linux (gnu + musl)**

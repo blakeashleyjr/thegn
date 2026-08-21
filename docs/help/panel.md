@@ -62,19 +62,19 @@ use; the built-in order is the default.
 
 **work**
 
-| Section    | Shows                                                                |
-| ---------- | -------------------------------------------------------------------- |
-| `mine`     | one feed of everything assigned to you: issues, review requests, PRs |
-| `across`   | failing CI across **all** worktrees, grouped by worktree (read-only) |
-| `pr`       | PR state, CI check rollup, review decision for this branch           |
-| `ci`       | run history and per-run state across providers                       |
-| `merge`    | the local merge queue — per-branch land/defer status                 |
+| Section    | Shows                                                                 |
+| ---------- | --------------------------------------------------------------------- |
+| `mine`     | one feed of everything assigned to you: issues, review requests, PRs  |
+| `across`   | failing CI across **all** worktrees, grouped by worktree (read-only)  |
+| `pr`       | PR state, CI check rollup, review decision for this branch            |
+| `ci`       | run history and per-run state across providers                        |
+| `merge`    | the local merge queue — per-branch land/defer status                  |
 | `prq`      | the PR queue — queued pull requests on the forge and what blocks them |
-| `issues`   | tracker issues                                                       |
-| `problems` | compiler, linter, and test diagnostics                               |
-| `jobs`     | configured shell jobs (build, test, run)                             |
-| `tests`    | test results and the pass/fail rollup                                |
-| `symbols`  | the LSP / tree-sitter outline for the selected file                  |
+| `issues`   | tracker issues                                                        |
+| `problems` | compiler, linter, and test diagnostics                                |
+| `jobs`     | configured shell jobs (build, test, run)                              |
+| `tests`    | test results and the pass/fail rollup                                 |
+| `symbols`  | the LSP / tree-sitter outline for the selected file                   |
 
 **system**
 

@@ -46,12 +46,19 @@ read-only filesystem.
 ## Backends
 
 `[sandbox] backend = "auto"` walks the chain until one works: `podman` →
-`docker` → `bwrap` → `none`. Pin one to skip the probing —
+`docker` → `apple` → `bwrap` → `none`. Pin one to skip the probing —
 `podman-rootless`, `podman-rootful`, `docker`, `bwrap`, `systemd`,
 `apple`, `wsl`, `none`.
 
+One chain serves every OS: each OS-native entry is probed only on its own OS.
+
 > **NixOS tip:** set `backend = "bwrap"` to skip the podman probes and get
 > instant panes.
+
+> **macOS tip:** `apple` is Apple's `container` CLI. Each container gets its
+> own Linux VM, so it is the strongest isolation any backend here offers.
+> Without it — and without podman/docker — a Mac lands on `none` and panes
+> run directly on the host; `bwrap`/`systemd` are Linux-only.
 
 `thegn doctor` reports which backends this machine actually has.
 

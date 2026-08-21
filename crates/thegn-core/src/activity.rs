@@ -405,7 +405,7 @@ fn poll(
 /// the reusable core of the activity scan. Also served over the resident bridge
 /// (`proc.list`) so a remote env's *own* processes drive the activity dots.
 /// Longest-prefix wins (a nested worktree over its repo root). Linux reads
-/// /proc; Windows reads via sysinfo; other platforms return empty.
+/// /proc; every other platform (Windows, macOS) reads via sysinfo.
 pub fn cpu_jiffies_by_path(paths: &[String]) -> BTreeMap<String, u64> {
     let mut targets: Vec<(PathBuf, String)> = paths
         .iter()
@@ -444,11 +444,15 @@ fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
     sums
 }
 
-/// Windows: same contract via sysinfo (PEB-read cwd + accumulated CPU time).
+/// Everywhere but Linux: same contract via sysinfo (per-process cwd +
+/// accumulated CPU time) — the PEB read on Windows, `proc_pidinfo` on macOS.
 /// sysinfo reports milliseconds; we divide by 10 to convert to jiffy-equivalents
 /// (CLK_TCK = 100) so the shared busy threshold — which is expressed in jiffies —
 /// means the same fraction of a core here as it does on Linux.
-#[cfg(windows)]
+///
+/// macOS only exposes another process's cwd to the same user (or root), which is
+/// exactly the set thegn cares about: every pane it spawns is its own child.
+#[cfg(not(target_os = "linux"))]
 fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
     let mut sums: BTreeMap<String, u64> = BTreeMap::new();
@@ -461,8 +465,8 @@ fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
             .with_cpu(),
     );
     for proc in sys.processes().values() {
-        // Elevated/protected processes hide their cwd — skipped, same as
-        // unreadable /proc entries on Linux.
+        // Elevated/protected processes (and, on macOS, other users') hide their
+        // cwd — skipped, same as unreadable /proc entries on Linux.
         let Some(cwd) = proc.cwd() else { continue };
         let Some((_, wt)) = targets.iter().find(|(p, _)| cwd.starts_with(p)) else {
             continue;
@@ -475,11 +479,6 @@ fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
         *sums.entry(wt.clone()).or_insert(0) += proc.accumulated_cpu_time() / 10;
     }
     sums
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-fn scan_proc(_targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
-    BTreeMap::new()
 }
 
 /// utime+stime from /proc/PID/stat. comm (field 2) may contain spaces and

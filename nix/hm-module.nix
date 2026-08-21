@@ -73,8 +73,14 @@ self: {
       };
       backendChain = lib.mkOption {
         type = lib.types.listOf lib.types.str;
-        default = ["podman" "docker" "bwrap" "none"];
-        description = "Auto-detection order; \"none\" = run on the host.";
+        # Keep in sync with `thegn_core::config_defaults::default_backend_chain`.
+        # This module renders every key into config.toml unconditionally, so a
+        # stale default here doesn't just document the wrong order — it OVERRIDES
+        # the binary's own default for anyone who enables the module.
+        # "apple" is macOS's `container` CLI and is probed only on macOS; the
+        # win/linux-native entries are likewise inert off their own OS.
+        default = ["podman-rootless" "podman-rootful" "docker" "apple" "bwrap" "jobobject" "host"];
+        description = "Auto-detection order; \"host\" = run uncontained on the host.";
       };
       image = lib.mkOption {
         type = lib.types.str;
@@ -233,7 +239,10 @@ in {
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.system}.default;
+      # `pkgs.system` is deprecated (renamed to stdenv.hostPlatform.system) and
+      # warns on every evaluation. On darwin this resolves to the plain host
+      # binary — the adjacent static-musl bridge is x86_64-linux-only.
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
       defaultText = lib.literalExpression "thegn.packages.\${system}.default";
       description = "The thegn package to use.";
     };

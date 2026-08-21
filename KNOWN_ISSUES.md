@@ -82,11 +82,21 @@ they were silently orphaned).
     When it does land: native panes only (container sandboxing is a Linux/WSL2
     feature) and a modern terminal is required (Windows Terminal; legacy
     conhost is refused).
-  - **macOS** has never been compiled at all. Its CI job is opt-in
-    (`[ci-macos]`) and has never executed, and darwin cannot be cross-checked
-    from Linux — `just check-cross` covers only the C-dep-free leaf crates,
-    because `thegn-host`'s build scripts (`ring`, bundled sqlite) need a real
-    darwin C toolchain.
+  - **macOS** has never been compiled end-to-end. Its CI job is opt-in
+    (`[ci-macos]`) and has never got past building the dev shell, where the
+    `openspec` derivation's `pnpm install` was OOM-killed on the 7 GB runner;
+    that derivation now pins `NODE_OPTIONS`/pnpm child-concurrency to cap its
+    peak, but the job has not been re-run to confirm. The darwin-side work that
+    _is_ done: the flake's darwin outputs evaluate (the Linux-only OCI images
+    and musl bridge are gated out, and the dropped `x86_64-darwin` is no longer
+    declared), the dev-loop scripts no longer assume GNU userland, and the
+    macOS runtime gaps are filled (`sysinfo` activity scanner, `open` instead of
+    a hardcoded `xdg-open`, `apple` in the default sandbox chain, libproc-backed
+    pane cwd/foreground capture). `just check-cross` now covers every crate that
+    builds without a darwin cross C toolchain — but `thegn-core`/`-svc`/`-host`
+    still can't be checked from Linux, because their build scripts (`ring`,
+    bundled sqlite) need a real darwin one. The remaining proof is the
+    on-device checklist in [`CONTRIBUTING.md`](CONTRIBUTING.md#on-device-checklist).
 - Cloud execution providers, remote worktrees over SSH, the Observe dashboards,
   the placement engine, and non-GitHub issue trackers are **dev-channel only** in
   this release (`THEGN_CHANNEL=dev`).

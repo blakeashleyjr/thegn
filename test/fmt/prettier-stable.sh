@@ -11,10 +11,21 @@ set -euo pipefail
 
 [ "$#" -gt 0 ] || exit 0
 
-prev=$(cat "$@" | sha256sum)
+# `sha256sum` is GNU coreutils; macOS ships `shasum` instead. Any stable digest
+# will do — this only compares one pass against the next.
+if command -v sha256sum >/dev/null 2>&1; then
+  digest() { sha256sum; }
+elif command -v shasum >/dev/null 2>&1; then
+  digest() { shasum -a 256; }
+else
+  echo "prettier-stable: need sha256sum or shasum on PATH" >&2
+  exit 1
+fi
+
+prev=$(cat "$@" | digest)
 for _ in 1 2 3 4 5; do
   prettier --write --log-level warn "$@"
-  cur=$(cat "$@" | sha256sum)
+  cur=$(cat "$@" | digest)
   if [ "$cur" = "$prev" ]; then
     exit 0
   fi

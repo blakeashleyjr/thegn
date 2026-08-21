@@ -66,13 +66,24 @@ icon_src="$here/config/thegn.svg"
 icon_dir="$XDG_DATA_HOME/icons/hicolor/scalable/apps"
 icon_file="$icon_dir/thegn.svg"
 
+# Freedesktop desktop-integration (a `.desktop` launcher entry + an hicolor icon)
+# is a Linux/BSD concept. macOS has no XDG launcher to register with, so writing
+# those files there just litters ~/.local/share with something nothing reads —
+# the binaries and wrappers install exactly the same way either side.
+desktop_integration=1
+[[ "$(uname -s)" == "Darwin" ]] && desktop_integration=0
+
 if ((dry_run)); then
   echo "dry-run: no files will be changed"
   echo "$bindir/thegn <- copy of $release_bin"
   echo "$bindir/tg-tui wrapper -> $bindir/thegn (current terminal)"
   echo "$bindir/tg wrapper -> $tg_tui (current terminal); tg -s|--standalone -> alacritty --config-file $alacritty_config -e $tg_tui"
-  echo "$icon_file -> $icon_src (owl app icon)"
-  echo "$desktop_file -> app-launcher entry (Exec=$bindir/tg --standalone, Icon=thegn)"
+  if ((desktop_integration)); then
+    echo "$icon_file -> $icon_src (owl app icon)"
+    echo "$desktop_file -> app-launcher entry (Exec=$bindir/tg --standalone, Icon=thegn)"
+  else
+    echo "(macOS: no .desktop entry or hicolor icon — freedesktop launchers are Linux-only)"
+  fi
   exit 0
 fi
 
@@ -144,23 +155,24 @@ exec $tg_tui_q "\$@"
 EOF
 chmod 0755 "$bindir/tg"
 
-# Owl app icon: the same perched-sentinel mascot the loading splash draws
-# (config/thegn.svg, generated from crates/thegn-host/src/owl.rs). Installed
-# into the user's hicolor icon theme so `Icon=thegn` resolves in any launcher.
-mkdir -p "$icon_dir"
-if [[ -f $icon_src ]]; then
-  cp "$icon_src" "$icon_file"
-  echo "wrote app icon: $icon_file"
-else
-  echo "warning: $icon_src missing — desktop entry will fall back to a generic icon" >&2
-fi
+if ((desktop_integration)); then
+  # Owl app icon: the same perched-sentinel mascot the loading splash draws
+  # (config/thegn.svg, generated from crates/thegn-host/src/owl.rs). Installed
+  # into the user's hicolor icon theme so `Icon=thegn` resolves in any launcher.
+  mkdir -p "$icon_dir"
+  if [[ -f $icon_src ]]; then
+    cp "$icon_src" "$icon_file"
+    echo "wrote app icon: $icon_file"
+  else
+    echo "warning: $icon_src missing — desktop entry will fall back to a generic icon" >&2
+  fi
 
-# App-launcher entry (GNOME/KDE/rofi/wofi/…): a `.desktop` file so thegn is
-# searchable/pinnable in your launcher. A GUI launcher has no terminal, so it
-# runs `tg --standalone` to open thegn's OWN alacritty window (`Terminal=false`).
-tg_launcher="$bindir/tg"
-mkdir -p "$apps_dir"
-cat >"$desktop_file" <<EOF
+  # App-launcher entry (GNOME/KDE/rofi/wofi/…): a `.desktop` file so thegn is
+  # searchable/pinnable in your launcher. A GUI launcher has no terminal, so it
+  # runs `tg --standalone` to open thegn's OWN alacritty window (`Terminal=false`).
+  tg_launcher="$bindir/tg"
+  mkdir -p "$apps_dir"
+  cat >"$desktop_file" <<EOF
 [Desktop Entry]
 Type=Application
 Version=1.0
@@ -175,12 +187,13 @@ Categories=Development;IDE;RevisionControl;
 Keywords=git;worktree;terminal;ide;multiplexer;thegn;
 StartupNotify=true
 EOF
-chmod 0644 "$desktop_file"
-# Refresh the launcher + icon caches so the entry/icon show up without a
-# re-login (best-effort — not all environments ship the tools).
-command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$apps_dir" 2>/dev/null || true
-command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$XDG_DATA_HOME/icons/hicolor" 2>/dev/null || true
-echo "wrote app-launcher entry: $desktop_file"
+  chmod 0644 "$desktop_file"
+  # Refresh the launcher + icon caches so the entry/icon show up without a
+  # re-login (best-effort — not all environments ship the tools).
+  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$apps_dir" 2>/dev/null || true
+  command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$XDG_DATA_HOME/icons/hicolor" 2>/dev/null || true
+  echo "wrote app-launcher entry: $desktop_file"
+fi
 
 if [[ ! -f "$XDG_CONFIG_HOME/thegn/config.toml" ]]; then
   mkdir -p "$XDG_CONFIG_HOME/thegn"
