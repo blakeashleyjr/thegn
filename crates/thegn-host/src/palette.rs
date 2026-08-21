@@ -333,6 +333,12 @@ pub(crate) fn build_command_palette_items(
                 // Global on purpose: palette entry registration is not
                 // repo-scoped. See `Config::merge_queue`.
                 cfg.merge_queue.enabled
+            } else if matches!(
+                spec.id,
+                "open-pr-queue" | "pr-queue-add" | "pr-queue-refresh"
+            ) {
+                // Same reasoning for the PR queue, which is off by default.
+                cfg.pr_queue.enabled
             } else {
                 spec.palette
             }

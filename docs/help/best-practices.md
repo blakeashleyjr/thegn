@@ -21,6 +21,10 @@ Instead of switching to `main` to merge, queue finished branches
 ([[merge-queue]]) and drain. The fold-actor gates every landing, handles
 the ref advance atomically, and never needs `main` checked out.
 
+On a team, `main` belongs to the remote instead — so queue the pull
+request ([[pr-queue]]) and let the forge merge it under its own branch
+protection.
+
 ## Sandbox your agents
 
 A coding agent with shell access deserves a container. Configure

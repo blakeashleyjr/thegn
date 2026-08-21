@@ -970,6 +970,8 @@ pub enum BarBadge {
     Attention,
     Ci,
     MergeQueue,
+    /// PR queue: pull requests being shepherded on a forge.
+    PrQueue,
     /// Focused pane is daemon-backed (survives quitting the UI).
     Persist,
     DiskWarn,
@@ -1318,6 +1320,7 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
     crate::statusbar_badges::push_network_chip(model, &mut items);
     crate::statusbar_badges::push_ci_badge(model, &mut items);
     crate::statusbar_badges::push_mq_badge(model, &mut items);
+    crate::statusbar_badges::push_prq_badge(model, &mut items);
     // Low-free-space badge: trips when the worktrees' filesystem drops to/below
     // `[stats].disk_free_warn` free — amber at the warn line, red at/below
     // `disk_free_critical`. The badge selects into a detailed modal (free/used/

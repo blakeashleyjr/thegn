@@ -11,6 +11,7 @@
 
 pub mod account;
 pub mod activity;
+pub mod agent_task;
 pub mod aggregate;
 pub mod attention;
 pub mod backoff;
@@ -31,6 +32,7 @@ pub mod config_media;
 pub mod config_network;
 pub mod config_observe;
 pub mod config_placement;
+pub mod config_pr_queue;
 pub mod config_remote;
 pub mod config_resolve;
 pub mod config_sandbox;
@@ -123,6 +125,7 @@ pub mod patch;
 pub mod picker;
 pub mod placement;
 pub mod plugin_api;
+pub mod pr_queue;
 pub mod preview;
 pub mod profile;
 pub mod progress;

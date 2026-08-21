@@ -23,7 +23,7 @@ pub enum GhError {
 }
 
 /// How to merge a PR.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum MergeMethod {
     Squash,
     Merge,
@@ -348,10 +348,29 @@ const PR_FIELDS: &str = "number,title,state,url,isDraft,headRefName,headRefOid,b
 
 /// Fetch the PR state for a worktree, mapping every failure mode to a PanelState.
 pub fn pr_status(loc: &GitLoc) -> PrPanel {
+    pr_status_of(loc, None)
+}
+
+/// As [`pr_status`], but for an explicitly named pull request.
+///
+/// The PR queue tracks entries by number — including ones with no local
+/// checkout — so it cannot rely on `gh` inferring the PR from the current
+/// branch. Shares the error mapping so both paths report failures identically.
+pub fn pr_status_for(loc: &GitLoc, number: u64) -> PrPanel {
+    pr_status_of(loc, Some(number))
+}
+
+fn pr_status_of(loc: &GitLoc, number: Option<u64>) -> PrPanel {
     let branch = loc
         .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
         .unwrap_or_default();
-    let state = match gh_out(loc, &["pr", "view", "--json", PR_FIELDS]) {
+    let num = number.map(|n| n.to_string());
+    let mut args: Vec<&str> = vec!["pr", "view"];
+    if let Some(n) = num.as_deref() {
+        args.push(n);
+    }
+    args.extend_from_slice(&["--json", PR_FIELDS]);
+    let state = match gh_out(loc, &args) {
         Ok(json) => match serde_json::from_str::<PrStatus>(&json) {
             Ok(mut pr) => {
                 pr.checks = summarize(&pr.status_check_rollup);
@@ -389,6 +408,19 @@ pub fn pr_status_full(loc: &GitLoc) -> PrPanel {
         panel.threads = review_threads(loc, &owner, &repo, pr.number).unwrap_or_default();
     }
     panel.issues = issue_list(loc, 10).unwrap_or_default();
+    panel
+}
+
+/// [`pr_status_for`] plus that PR's review threads. The PR queue's fetch: it
+/// needs threads to classify "changes requested" and to feed the review agent,
+/// but never the repo's issue list.
+pub fn pr_status_with_threads(loc: &GitLoc, number: u64) -> PrPanel {
+    let mut panel = pr_status_for(loc, number);
+    if let PanelState::Pr(pr) = &panel.state
+        && let Some((owner, repo)) = owner_repo_from_url(&pr.url)
+    {
+        panel.threads = review_threads(loc, &owner, &repo, pr.number).unwrap_or_default();
+    }
     panel
 }
 

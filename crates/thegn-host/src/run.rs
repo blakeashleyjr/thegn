@@ -795,6 +795,9 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // here so the panel repaints live (see handlers::merge_queue).
     let (drive_tx, drive_rx) =
         tokio_mpsc::unbounded_channel::<crate::handlers::merge_queue::DriveMsg>();
+    // The PR queue's off-loop work (refresh passes + one-shot mutations) reports
+    // back here, so a running pass patches its panel row live.
+    let (prq_tx, prq_rx) = tokio_mpsc::unbounded_channel::<crate::handlers::pr_queue::PrqMsg>();
     let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<thegn_metrics::StatsSnapshot>();
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<Vec<thegn_core::sandbox::ContainerInfo>>();
@@ -827,6 +830,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         stats_live.clone(),
         disk_fs_path,
         cfg.ci.poll_interval_secs,
+        // `None` when the PR queue is off, so a disabled queue emits no slots.
+        cfg.pr_queue.enabled.then(|| cfg.pr_queue.poll_secs()),
         // `None` turns the remote poll off entirely (startup kick included);
         // `Some(0)` keeps the event-driven triggers but drops the cadence.
         cfg.git
@@ -895,6 +900,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         fold_rx,
         drive_tx,
         drive_rx,
+        prq_tx,
+        prq_rx,
         stats_rx,
         container_rx,
         daemon_status_rx,
@@ -5224,6 +5231,8 @@ async fn event_loop<T: Terminal>(
     mut fold_rx: tokio_mpsc::UnboundedReceiver<anyhow::Result<crate::integrate::FoldReport>>,
     drive_tx: crate::handlers::merge_queue::DriveTx,
     mut drive_rx: crate::handlers::merge_queue::DriveRx,
+    prq_tx: crate::handlers::pr_queue::PrqTx,
+    mut prq_rx: crate::handlers::pr_queue::PrqRx,
     mut stats_rx: tokio_mpsc::UnboundedReceiver<thegn_metrics::StatsSnapshot>,
     mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<thegn_core::sandbox::ContainerInfo>>,
     mut daemon_status_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::DaemonStatus>,
@@ -6112,6 +6121,9 @@ async fn event_loop<T: Terminal>(
     // True while a fold-actor run is off the loop; blocks a second concurrent
     // trigger (a fold advances `main` globally, so one at a time).
     let mut fold_inflight = false;
+    // Mutual exclusion for the PR queue's refresh pass, mirroring `fold_inflight`
+    // — two concurrent passes would race the same rows and the same forge.
+    let mut prq_inflight = false;
 
     // Kick an immediate model hydration for the CURRENT session. Used after a
     // workspace switch: `refresh_tab_model` rebuilds the sidebar from the stale
@@ -8934,6 +8946,7 @@ async fn event_loop<T: Terminal>(
         let mut want_model_refresh = false;
         let mut want_pr_refresh = false;
         let mut want_issue_refresh = false;
+        let mut want_prq_refresh = false;
         let mut want_ci_refresh = false;
         let mut ci_refresh_force = false;
         let mut want_disk_refresh = false;
@@ -8963,6 +8976,18 @@ async fn event_loop<T: Terminal>(
             crate::handlers::merge_queue::drain_fold_results(&mut fold_rx, &mut mq_ctx);
             crate::handlers::merge_queue::drain_drive_msgs(&mut drive_rx, &mut mq_ctx);
         }
+        {
+            let mut prq_ctx = crate::handlers::pr_queue::PrqDrainCtx {
+                model: &mut model,
+                toasts: &mut toasts,
+                notify_state: &notify_state,
+                event_bus: &event_bus,
+                inflight: &mut prq_inflight,
+                want_model_refresh: &mut want_model_refresh,
+                loop_perf: &mut loop_perf,
+            };
+            crate::handlers::pr_queue::drain_msgs(&mut prq_rx, &mut prq_ctx);
+        }
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             // While offline, skip the network-backed refresh backstops (the
@@ -8979,6 +9004,13 @@ async fn event_loop<T: Terminal>(
                 }
                 RefreshKind::Issues => {
                     want_issue_refresh |= !skip_net;
+                    want_model_refresh = true;
+                }
+                // A PR-queue pass talks to the forge, so it is skipped offline
+                // and while a pass is already running (two would race the same
+                // rows). The model refresh still happens so the panel repaints.
+                RefreshKind::PrQueue => {
+                    want_prq_refresh |= !skip_net;
                     want_model_refresh = true;
                 }
                 RefreshKind::Ci { force } => {
@@ -9157,6 +9189,18 @@ async fn event_loop<T: Terminal>(
                 current_config.clone(),
                 crate::panel::scope::mine_all(),
                 Some(waker.clone()),
+            );
+        }
+        // One PR-queue pass at a time: the inflight flag is the same mutual
+        // exclusion the `D` key and the palette action use, so a slow pass never
+        // stacks up behind the ticker.
+        if want_prq_refresh && !prq_inflight {
+            prq_inflight = true;
+            crate::handlers::pr_queue::spawn_drive(
+                &prq_tx,
+                &waker,
+                current_config.clone(),
+                active_tab_path(&session),
             );
         }
         if want_ci_refresh {
@@ -15438,6 +15482,26 @@ async fn event_loop<T: Terminal>(
                                 toasts: &mut toasts,
                             },
                         ),
+                        // -- PR queue: add (a), remove (x), re-watch (r), clear
+                        // (c), refresh (D), open in browser (o). Mutations run
+                        // off-loop; outcomes ride the prq channel as toasts.
+                        (
+                            Section::PrQueue,
+                            KeyCode::Char(c @ ('a' | 'x' | 'r' | 'c' | 'D' | 'o')),
+                        ) => crate::handlers::pr_queue::section_key(
+                            c,
+                            panel_ui.cursor,
+                            crate::handlers::pr_queue::PrqKeyCtx {
+                                model: &mut model,
+                                cfg: &current_config,
+                                active_wt: active_tab_path(&session),
+                                refresh_tx: &refresh_tx,
+                                waker: &waker,
+                                tx: &prq_tx,
+                                inflight: &mut prq_inflight,
+                                toasts: &mut toasts,
+                            },
+                        ),
                         // -- hosts: p/r/c/x act on the host; m menu, n add-host.
                         (Section::Hosts, key)
                             if matches!(key, KeyCode::Char('p' | 'r' | 'c' | 'x' | 'm' | 'n')) =>
@@ -16259,6 +16323,56 @@ async fn event_loop<T: Terminal>(
                                     },
                                 );
                                 focus.zone = crate::focus::Zone::Panel;
+                            }
+                            Action::OpenPrQueue => {
+                                panel_auto_revealed = None;
+                                if chrome.panel.is_none() {
+                                    want_panel = true;
+                                    panel_forced = cols < layout::PANEL_MIN_COLS;
+                                    chrome = recompute_chrome!();
+                                    need_relayout = true;
+                                }
+                                panel_ui.switch_tab(crate::panel::PanelTab::Work);
+                                open_panel_section(
+                                    crate::panel::Section::PrQueue,
+                                    &mut panel_ui,
+                                    &mut hydration_gen,
+                                    &model_tx,
+                                    &session,
+                                    &waker,
+                                    PanelDocsWiring {
+                                        model: &model,
+                                        generation: docs_gen,
+                                        tx: &docs_tx,
+                                    },
+                                );
+                                focus.zone = crate::focus::Zone::Panel;
+                            }
+                            Action::PrQueueAdd => {
+                                crate::handlers::pr_queue::spawn_add(
+                                    &prq_tx,
+                                    &waker,
+                                    active_tab_path(&session),
+                                );
+                            }
+                            Action::PrQueueRefresh => {
+                                // One pass at a time: two would race the same
+                                // rows and the same forge.
+                                if prq_inflight {
+                                    toasts.info_ttl(
+                                        "Already refreshing the PR queue…".to_string(),
+                                        std::time::Instant::now(),
+                                        std::time::Duration::from_secs(3),
+                                    );
+                                } else {
+                                    prq_inflight = true;
+                                    crate::handlers::pr_queue::spawn_drive(
+                                        &prq_tx,
+                                        &waker,
+                                        current_config.clone(),
+                                        active_tab_path(&session),
+                                    );
+                                }
                             }
                             Action::ShareWorktreePort => {
                                 // Intent-first: when ≥2 reaches are configured,

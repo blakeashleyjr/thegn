@@ -54,6 +54,46 @@ Run the drain **where the target repo lives**. If you invoke it from a
 machine other than the target's host, thegn tells you which host to run
 it on — the fold, gate, and ref-advance must be co-located with `main`.
 
+## The fixing agent
+
+Point the handoff at an agent either by naming one of your `[[agents]]`
+entries — thegn supplies the headless flags for its provider — or by
+writing the command yourself:
+
+```toml
+[merge_queue]
+conflict_handoff = "agent"
+agent = "claude"            # an [[agents]] name; thegn adds `-p …`
+# agent_command = "..."     # ...or spell it out; this wins when both are set
+```
+
+An agent thegn doesn't recognize still works: the prompt is appended as
+an argument. With neither key set the handoff quietly becomes "notify",
+so a drain says so out loud when `agent` names nothing that exists.
+
+**Write placeholders bare.** Values are shell-quoted for you, so
+`-p {prompt}` is right and `-p "{prompt}"` hands the agent a prompt
+wrapped in literal quote characters. `thegn config validate` catches it.
+
+What the agent is _told_ is yours to change. Leave a prompt empty for
+thegn's built-in instructions, or override one per blocker kind:
+
+```toml
+[merge_queue.prompts]
+conflict = "Fix {branch} for {target}. Conflicts:\n{paths}"
+# gate_failure gets {log} instead of {paths}
+```
+
+Placeholders are checked against the kind (`conflict` gets `{branch}`,
+`{target}`, `{worktree}`, `{paths}`; `gate_failure` swaps `{paths}` for
+`{log}`) — a typo is a config error, never a blank sent to the agent.
+A repo can carry its own via `[workspace.<slug>.merge_queue.prompts]`,
+merged key by key with your global ones.
+
+If you replace a prompt, keep its rules: the agent must commit on the
+branch and must **not** push or touch the target. thegn does the fold and
+ref-advance itself, which is what keeps the object store coherent.
+
 ## The gate
 
 The folded tip is checked out into a **bare** gate worktree — a fresh

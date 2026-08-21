@@ -453,6 +453,34 @@ pub(crate) fn additive_schema(conn: &Connection) {
              COMMIT;",
         );
     }
+    // v51: the PR queue. Purely additive — a `CREATE TABLE IF NOT EXISTS` here
+    // (rather than an ALTER) so an older DB gains the table on open with every
+    // other cache intact. The DDL is duplicated from `db.rs`'s init batch on
+    // purpose: init creates it for a fresh DB, this creates it for an upgrade,
+    // and both are idempotent.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS pr_queue (
+           key            TEXT PRIMARY KEY,
+           repo_root      TEXT NOT NULL,
+           number         INTEGER NOT NULL,
+           worktree       TEXT,
+           branch         TEXT NOT NULL,
+           base_branch    TEXT NOT NULL DEFAULT '',
+           forge          TEXT NOT NULL DEFAULT 'github',
+           status         TEXT NOT NULL DEFAULT 'watching',
+           blocker        TEXT,
+           detail         TEXT,
+           agent_attempts INTEGER NOT NULL DEFAULT 0,
+           last_head_oid  TEXT,
+           queued_at      INTEGER NOT NULL,
+           updated_at     INTEGER NOT NULL
+         )",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pr_queue_repo ON pr_queue (repo_root, status, queued_at)",
+        [],
+    );
 }
 
 /// Does `table` have a column named `col`? The probe for migrations that can't

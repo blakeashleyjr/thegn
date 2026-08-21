@@ -803,7 +803,7 @@ as the agent-specific side of the broader attention queue._
 - [~] 269. PR creation from review
 - [ ] 270. Semantic merge via weave
 - [ ] 654. Per-line agent-vs-human attribution overlay — track provenance on every line an agent touches; AI/human gutter markers in the diff/review pane; reassign to human on a subsequent human edit; local-only (never written to git), exportable from the diff toolbar (Orca-style; complements entity-blame X 312)
-- [~] 758. Agent-driven merge-queue driver — assign worktree branches to the queue (`merge add [--all]`) and drain them serially (`merge drain`): clean branches auto-land; a conflict or red gate dispatches a headless CLI agent (Claude Code default, any command) inside the branch's worktree to rebase/resolve/fix, then re-folds and auto-lands (configurable), marking `needs_human` after `agent_max_attempts`. Agent never touches the target — thegn does the object-DB fold + CAS, preserving the merge-guard coherence guarantee. Builds on the fold-actor (`4fbc92b`); `add-agent-merge-driver`. Follow-up: in-TUI actions + `auto_drain` (blocked on a run.rs/keymap.rs extraction). _(complements 263/268 and orchestration core Q)_
+- [~] 758. Agent-driven merge-queue driver — assign worktree branches to the queue (`merge add [--all]`) and drain them serially (`merge drain`): clean branches auto-land; a conflict or red gate dispatches a headless CLI agent (Claude Code default, any command) inside the branch's worktree to rebase/resolve/fix, then re-folds and auto-lands (configurable), marking `needs_human` after `agent_max_attempts`. Agent never touches the target — thegn does the object-DB fold + CAS, preserving the merge-guard coherence guarantee. Builds on the fold-actor (`4fbc92b`); `add-agent-merge-driver`. The dispatch layer is now shared and data-driven (`add-agent-task-engine`): prompts are per-kind templates in `[merge_queue.prompts]` (built-ins unchanged when unset), and `agent` names an `[[agents]]` entry instead of restating its headless flags. Follow-up: in-TUI actions + `auto_drain` (blocked on a run.rs/keymap.rs extraction). _(complements 263/268 and orchestration core Q)_
 
 ### U. LLM proxy
 
@@ -934,6 +934,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [~] 338. PR event notifications
 - [x] 339. gh CLI integration
 - [ ] 340. Multi-repo PR dashboard (gitv-style)
+- [x] 759. PR queue (team mode) — the merge queue's counterpart for a SHARED repo: queue a pull request (`pr queue add`), poll its forge state, classify what blocks it (red checks / conflict with base / changes requested / awaiting review), optionally dispatch a headless agent in that PR's worktree to unblock it, and let the forge merge it once green. Default `merge_mode = "auto_merge"` hands merging to the forge so branch protection stays authoritative; thegn never merges a draft or unapproved PR. Team-safety rules are pure + table-tested (`thegn_core::pr_queue`): `--force-with-lease` only, pause on a teammate's push, attempt budget refills on a foreign head, `own_prs_only`, reply-never-resolve on review threads. Behind a `PrQueueForge` trait (a down-payment on AT 631). `add-pr-queue`. _(acts on Z 331/332/333; complements T 758's local queue)_
 
 ### AA. Linear / issues
 
