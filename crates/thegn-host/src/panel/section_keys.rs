@@ -348,6 +348,12 @@ mod tests {
     /// This is the check that was missing — the Notifications strip told users
     /// to press `r` to mark a notification read for as long as the section has
     /// existed, while the dispatch has always used `x`.
+    /// A chord that is one ASCII letter (or `space`) can only be a per-section
+    /// key; the shared accordion vocabulary is arrows, `j/k`, `↵`, `1-9`, etc.
+    fn looks_like_section_key(chord: &str) -> bool {
+        chord == "space" || (chord.len() == 1 && chord.chars().all(|c| c.is_ascii_alphabetic()))
+    }
+
     #[test]
     fn hint_table_matches_dispatch() {
         let dispatched = dispatched();
@@ -372,11 +378,25 @@ mod tests {
                             "{name}: `{c}` ({}) — section has no dispatch arms",
                             sk.label
                         ));
+                    } else if looks_like_section_key(sk.chord) {
+                        dead.push(format!(
+                            "{name}: `{}` ({}) is nav() but looks like a section key",
+                            sk.chord, sk.label
+                        ));
                     }
                 }
                 continue;
             };
             for sk in section_keys(section) {
+                // A `nav()` row with a single-letter chord is a section key in
+                // disguise — declared as shared-accordion so this test would
+                // skip it (the Media table shipped four such rows).
+                if sk.key.is_none() && looks_like_section_key(sk.chord) {
+                    dead.push(format!(
+                        "{name}: `{}` ({}) is declared nav() but is a single-key chord — use k()",
+                        sk.chord, sk.label
+                    ));
+                }
                 if let Some(c) = sk.key
                     && !live.contains(&c)
                 {

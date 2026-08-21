@@ -467,10 +467,11 @@ fn notifications_are_actionable_with_dismiss_clear_keys() {
         DetailOutcome::Act(DetailAction::DismissNotification { id: 1 })
     );
     // The one clear-all key across every surface is `a` (the `X`/`R` aliases
-    // were retired).
+    // were retired) — and from a notification row it is the same total clear
+    // (acks the live needs-you set too), not a notifications-only sweep.
     assert_eq!(
         ov.handle_key(&KeyCode::Char('a'), Modifiers::NONE),
-        DetailOutcome::Act(DetailAction::ClearNotifications)
+        DetailOutcome::Act(DetailAction::AckAllAttention)
     );
 }
 
@@ -963,6 +964,7 @@ fn daemon_chip_opens_expanded_status_modal() {
         loop_perf: &crate::telemetry::LoopPerfHistory::default(),
         daemon: &daemon,
         sessions: &sessions,
+        sessions_age_secs: None,
         daemon_cfg: &dcfg,
         screen: screen(),
         now_ms: 60_000, // 60s of daemon uptime
@@ -1017,6 +1019,7 @@ fn status_modal_on(
         loop_perf: &crate::telemetry::LoopPerfHistory::default(),
         daemon: &daemon,
         sessions,
+        sessions_age_secs: None,
         daemon_cfg: &dcfg,
         screen: screen_rect,
         now_ms: 60_000,

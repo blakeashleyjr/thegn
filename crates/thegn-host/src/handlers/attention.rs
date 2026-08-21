@@ -110,14 +110,17 @@ pub(crate) fn needs_user_out_of_scope(model: &FrameModel) -> Vec<(String, Attent
     )
 }
 
-/// The set to **acknowledge** on a clear-all. Same predicate as
-/// [`needs_user_ordered`] except it also includes the *active* worktree.
+/// The set to **acknowledge** on a clear-all: every un-acked needs-you
+/// worktree — the *active* one and the out-of-scope ("Other repos") ones
+/// included.
 ///
 /// The active worktree is hidden from the nag list because you are already
 /// there — but leaving it un-acked meant its signal re-nagged the moment focus
-/// moved, and most visibly after a restart landed you somewhere else. Exclusion
-/// is a property of the display, not of the ack, and these are separate
-/// functions so the two can't be confused again.
+/// moved, and most visibly after a restart landed you somewhere else. The
+/// other-repo rows are painted in the same popup that binds `a`, so a clear-all
+/// that skipped them reported success and left them on screen. Exclusion is a
+/// property of the display, not of the ack, and these are separate functions so
+/// the two can't be confused again. (`Alt a` cycles over this set too.)
 pub(crate) fn needs_user_for_ack(model: &FrameModel) -> Vec<(String, AttentionScore)> {
     let status = &model.sidebar_status;
     ordered_by_rank(
@@ -125,9 +128,7 @@ pub(crate) fn needs_user_for_ack(model: &FrameModel) -> Vec<(String, AttentionSc
         status
             .attention
             .iter()
-            .filter(|(p, s)| {
-                s.needs_user() && !status.acked.contains(p.as_str()) && in_scope(status, p.as_str())
-            })
+            .filter(|(p, s)| s.needs_user() && !status.acked.contains(p.as_str()))
             .map(|(p, s)| (p.clone(), *s))
             .collect(),
     )
@@ -145,20 +146,29 @@ pub(crate) fn next_target(
     model: &FrameModel,
     session: &crate::session::Session,
 ) -> Option<(crate::sidebar::RowTarget, String)> {
-    let ordered = needs_user_ordered(model);
+    // The ring must *include* the active worktree (when it needs you) so the
+    // cursor has a position to advance from — `needs_user_ordered` hides the
+    // active tab for display, and cycling over that list always restarted at
+    // its head (two worktrees ping-ponged; a third was unreachable).
+    let ring = needs_user_for_ack(model);
     let active_path = session.active_group().map(|g| g.path.clone());
-    // Cycle from the active worktree even when it isn't in the needs-you set;
-    // `next_attention` then starts at the most urgent.
-    let next = attention::next_attention(&ordered, active_path.as_deref())?.to_string();
-    let score = ordered.iter().find(|(p, _)| p == &next).map(|(_, s)| *s)?;
-    let row = model.sidebar_rows.iter().find(|r| {
-        r.kind == crate::sidebar::RowKind::Worktree
-            && r.worktree_path.as_deref() == Some(next.as_str())
-            && r.tab_target.is_some()
-    })?;
-    let target = row.tab_target.clone()?;
-    let status = format!("{} — {}", row.label, score.reason.label());
-    Some((target, status))
+    let start = attention::next_attention(&ring, active_path.as_deref())?.to_string();
+    let start_ix = ring.iter().position(|(p, _)| p == &start)?;
+    // Walk from there, skipping the active tab itself and any candidate with
+    // no sidebar row to land on, so one unreachable entry never dead-ends the
+    // whole ring.
+    (0..ring.len())
+        .map(|k| &ring[(start_ix + k) % ring.len()])
+        .filter(|(p, _)| Some(p.as_str()) != active_path.as_deref())
+        .find_map(|(next, score)| {
+            let row = model.sidebar_rows.iter().find(|r| {
+                r.kind == crate::sidebar::RowKind::Worktree
+                    && r.worktree_path.as_deref() == Some(next.as_str())
+                    && r.tab_target.is_some()
+            })?;
+            let target = row.tab_target.clone()?;
+            Some((target, format!("{} — {}", row.label, score.reason.label())))
+        })
 }
 
 /// Mark everything read: every stored notification read **and** every live
@@ -240,6 +250,52 @@ mod tests {
         }
     }
 
+    /// Regression: `Alt a` must walk the *whole* needs-you ring. It used to
+    /// cycle over the display list (which hides the active tab), so the cursor
+    /// never had a position to advance from and every jump landed on the head:
+    /// two worktrees ping-ponged and a third was unreachable.
+    #[test]
+    fn next_target_cycles_through_every_needs_you_worktree() {
+        use crate::session::{GroupKind, Session, WorktreeGroup};
+        use crate::sidebar::{RowKind, RowTarget, SidebarRow};
+
+        let mut model = FrameModel::default();
+        let st = &mut model.sidebar_status;
+        for (i, p) in ["/wt/b", "/wt/c", "/wt/d"].iter().enumerate() {
+            st.attention
+                .insert((*p).into(), score(AttentionTier::Blocked));
+            st.attention_ranks.insert((*p).into(), i as u32);
+        }
+        for (i, p) in ["/wt/b", "/wt/c", "/wt/d"].iter().enumerate() {
+            model.sidebar_rows.push(SidebarRow {
+                worktree_path: Some((*p).into()),
+                tab_target: Some(RowTarget::Tab(i, 0)),
+                ..SidebarRow::base(RowKind::Worktree, 1, &p[4..], "app")
+            });
+        }
+        let mut session = Session::default();
+        for p in ["/wt/b", "/wt/c", "/wt/d"] {
+            session
+                .worktrees
+                .push(WorktreeGroup::new(&p[4..], GroupKind::Branch, p));
+        }
+
+        let mut visited = Vec::new();
+        for _ in 0..3 {
+            let (target, _) = next_target(&model, &session).expect("a target");
+            let RowTarget::Tab(g, _) = target else {
+                panic!("tab target")
+            };
+            session.active = g;
+            visited.push(session.worktrees[g].path.clone());
+        }
+        assert_eq!(
+            visited,
+            vec!["/wt/c", "/wt/d", "/wt/b"],
+            "three jumps from b must visit c, d, then wrap to b"
+        );
+    }
+
     #[test]
     fn needs_user_filters_and_orders_by_rank() {
         let mut model = FrameModel::default();
@@ -319,11 +375,13 @@ mod tests {
             .into_iter()
             .map(|(p, _)| p)
             .collect();
-        assert_eq!(acked, vec!["/wt/mine"]);
+        // The out-of-scope worktree is acked too: the popup shows it under
+        // "Other repos" and binds `a` on that row, so clear-all must cover it.
+        assert_eq!(acked, vec!["/wt/mine", "/wt/theirs"]);
 
-        // Already-acked worktrees drop out of the ack set (no pointless rewrite),
-        // and out-of-scope ones are never acked from here.
+        // Already-acked worktrees drop out of the ack set (no pointless rewrite).
         model.sidebar_status.acked.insert("/wt/mine".into());
+        model.sidebar_status.acked.insert("/wt/theirs".into());
         assert!(needs_user_for_ack(&model).is_empty());
     }
 }

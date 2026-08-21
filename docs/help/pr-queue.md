@@ -109,7 +109,7 @@ repo other people push to:
 
 ## Watching
 
-The masthead shows a `PR` chip: red when a pull request needs you, amber
+The status bar shows a `PR` chip: red when a pull request needs you, amber
 while thegn is working on one, dim when the queue is merely populated,
 silent when empty. Merged / ready / needs-you transitions toast and land
 in the notifications inbox.

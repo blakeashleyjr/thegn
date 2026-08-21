@@ -96,6 +96,16 @@ pub(crate) fn restart_media_watch(
     if let Some(h) = handle.take() {
         h.abort();
     }
+    if !cfg.enabled {
+        // No watcher will run, so nothing would ever push the clearing `None`:
+        // push it here, or the last ▶ badge / Media section stick for the rest
+        // of the session after `[media] enabled = false` (and activating the
+        // badge opened a popup for a stale track).
+        if tx.send(None).is_ok() {
+            let _ = waker.wake();
+        }
+        return;
+    }
     *handle = spawn_media_watch(cfg, tx.clone(), waker.clone());
 }
 

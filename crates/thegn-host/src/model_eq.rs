@@ -11,8 +11,8 @@ impl FrameModel {
     /// `sidebar_rows` over the model swap instead of an on-loop `build_rows`),
     /// keeping idle CPU at ~0%.
     ///
-    /// Compares exactly the fields [`crate::hydrate::build_model`] populates
-    /// (plus `status`), and nothing else: stats/metrics/containers/accent/
+    /// Compares exactly the fields [`crate::hydrate::build_model`] populates,
+    /// and nothing else (`status` is loop-owned — `handlers::status_line`): stats/metrics/containers/accent/
     /// bars/pins/app-tabs are owned by other handlers or config and have their
     /// own dirty triggers, while the session-derived tab/sidebar fields are
     /// stable during an idle period. KEEP THIS IN SYNC WITH `build_model` —
@@ -34,7 +34,6 @@ impl FrameModel {
             && self.active_placement_label == other.active_placement_label
             && self.container_events == other.container_events
             && self.timeline == other.timeline
-            && self.status == other.status
             && self.panel == other.panel
             && self.disk_warn_threshold_gb == other.disk_warn_threshold_gb
             && self.active_worktree_disk == other.active_worktree_disk
@@ -61,6 +60,7 @@ mod tests {
         other.app_tabs.push("chat".into());
         other.sidebar_selected = 3;
         other.center_focused = !base.center_focused;
+        other.status = "Copied log line".into();
         assert!(
             base.hydration_eq(&other),
             "non-hydration fields should not trip the idle guard"

@@ -376,7 +376,7 @@ pub const BUILTINS: &[Action] = &[
         menu: true,
     },
     Action {
-        id: "menu",
+        id: "palette",
         chords: &["Ctrl Space"],
         menu_label: "Command palette",
         hint: "menu",
@@ -394,7 +394,7 @@ pub const BUILTINS: &[Action] = &[
         menu: false,
     },
     Action {
-        id: "files",
+        id: "files-drawer",
         chords: &["Ctrl Alt f"],
         menu_label: "File drawer (yazi)",
         hint: "drawer",
@@ -441,7 +441,7 @@ pub const BUILTINS: &[Action] = &[
         menu: false,
     },
     Action {
-        id: "switch-repo",
+        id: "switch-workspace",
         chords: &["Alt o"],
         menu_label: "Switch repo — recents picker",
         hint: "switch repo",
@@ -484,7 +484,7 @@ pub const BUILTINS: &[Action] = &[
         menu: true,
     },
     Action {
-        id: "tool-lazygit",
+        id: "lazygit",
         chords: &["Alt g"],
         menu_label: "lazygit",
         hint: "lazygit",
@@ -495,7 +495,7 @@ pub const BUILTINS: &[Action] = &[
         menu: true,
     },
     Action {
-        id: "tool-yazi",
+        id: "yazi",
         chords: &["Alt y"],
         menu_label: "yazi — file manager",
         hint: "files",
@@ -506,7 +506,7 @@ pub const BUILTINS: &[Action] = &[
         menu: true,
     },
     Action {
-        id: "tool-editor",
+        id: "editor",
         chords: &["Alt e"],
         menu_label: "editor",
         hint: "edit",
@@ -517,7 +517,7 @@ pub const BUILTINS: &[Action] = &[
         menu: true,
     },
     Action {
-        id: "tool-diff",
+        id: "show-diff",
         chords: &["Alt /"],
         menu_label: "git diff",
         hint: "diff",
@@ -528,14 +528,10 @@ pub const BUILTINS: &[Action] = &[
         menu: true,
     },
     Action {
-        id: "prev-tab",
-        // No default chord: the host keymap binds Alt Left to the spatial
-        // `nav-*` family (which reaches the same behavior); advertising it
-        // here too made the generated keybindings page list one chord under
-        // two different rebindable ids, only one of which was wired.
-        chords: &[],
-        menu_label: "Previous tab (within worktree)",
-        hint: "tabs",
+        id: "nav-left",
+        chords: &["Alt Left"],
+        menu_label: "Navigate left (pane, then previous tab)",
+        hint: "nav←",
         invocation: Invocation::Native {
             body: "GoToPreviousTab;",
         },
@@ -545,14 +541,10 @@ pub const BUILTINS: &[Action] = &[
         menu: false,
     },
     Action {
-        id: "next-tab",
-        // No default chord: the host keymap binds Alt Right to the spatial
-        // `nav-*` family (which reaches the same behavior); advertising it
-        // here too made the generated keybindings page list one chord under
-        // two different rebindable ids, only one of which was wired.
-        chords: &[],
-        menu_label: "Next tab (within worktree)",
-        hint: "tabs",
+        id: "nav-right",
+        chords: &["Alt Right"],
+        menu_label: "Navigate right (pane, then next tab)",
+        hint: "nav→",
         invocation: Invocation::Native {
             body: "GoToNextTab;",
         },
@@ -562,14 +554,10 @@ pub const BUILTINS: &[Action] = &[
         menu: false,
     },
     Action {
-        id: "prev-worktree",
-        // No default chord: the host keymap binds Alt Up to the spatial
-        // `nav-*` family (which reaches the same behavior); advertising it
-        // here too made the generated keybindings page list one chord under
-        // two different rebindable ids, only one of which was wired.
-        chords: &[],
-        menu_label: "Previous worktree",
-        hint: "worktrees",
+        id: "nav-up",
+        chords: &["Alt Up"],
+        menu_label: "Navigate up (pane, then previous worktree)",
+        hint: "nav↑",
         invocation: Invocation::Native {
             body: "GoToPreviousTab;",
         },
@@ -579,14 +567,10 @@ pub const BUILTINS: &[Action] = &[
         menu: false,
     },
     Action {
-        id: "next-worktree",
-        // No default chord: the host keymap binds Alt Down to the spatial
-        // `nav-*` family (which reaches the same behavior); advertising it
-        // here too made the generated keybindings page list one chord under
-        // two different rebindable ids, only one of which was wired.
-        chords: &[],
-        menu_label: "Next worktree",
-        hint: "worktrees",
+        id: "nav-down",
+        chords: &["Alt Down"],
+        menu_label: "Navigate down (pane, then next worktree)",
+        hint: "nav↓",
         invocation: Invocation::Native {
             body: "GoToNextTab;",
         },
@@ -788,6 +772,32 @@ fn parse_chords(strs: &[&str], id: &str) -> Vec<Chord> {
         .collect()
 }
 
+/// Pre-alpha ids still accepted in `[keybinds]` — the registry was renamed to
+/// the host's action vocabulary (one id per action everywhere: hint strip,
+/// palette, help page, `thegn keys list`) and these are the old spellings.
+pub const LEGACY_IDS: &[(&str, &str)] = &[
+    ("menu", "palette"),
+    ("files", "files-drawer"),
+    ("switch-repo", "switch-workspace"),
+    ("tool-lazygit", "lazygit"),
+    ("tool-yazi", "yazi"),
+    ("tool-editor", "editor"),
+    ("tool-diff", "show-diff"),
+    ("prev-tab", "nav-left"),
+    ("next-tab", "nav-right"),
+    ("prev-worktree", "nav-up"),
+    ("next-worktree", "nav-down"),
+];
+
+/// The current spelling of an action id (legacy aliases folded).
+pub fn canonical_id(id: &str) -> &str {
+    LEGACY_IDS
+        .iter()
+        .find(|(old, _)| *old == id)
+        .map(|(_, new)| *new)
+        .unwrap_or(id)
+}
+
 /// The effective registry: builtins, with `[keybinds]` rebinds and `[[actions]]`
 /// custom entries applied. Bad user chords warn and keep the default.
 pub fn effective(cfg: &Config) -> Vec<Resolved> {
@@ -807,14 +817,17 @@ pub fn effective(cfg: &Config) -> Vec<Resolved> {
         })
         .collect();
 
-    // [keybinds] — rebind a builtin by id (whole chord set replaced).
+    // [keybinds] — rebind a builtin by id (whole chord set replaced). Ids the
+    // registry doesn't carry are the host's (it owns ~3× as many actions and
+    // validates them itself), so they are skipped here without a warning —
+    // warning made every valid host id (`palette`, `open-ci`, …) look broken.
     for (id, chord) in &cfg.keybinds {
-        match out.iter_mut().find(|r| &r.id == id) {
-            Some(r) => match Chord::parse_loose(chord) {
+        let id = canonical_id(id);
+        if let Some(r) = out.iter_mut().find(|r| r.id == id) {
+            match Chord::parse_loose(chord) {
                 Ok(c) => r.chords = vec![c],
                 Err(e) => crate::msg::warn(&format!("[keybinds] {id}: {e}; keeping default")),
-            },
-            None => crate::msg::warn(&format!("[keybinds] unknown action {id:?}; ignored")),
+            }
         }
     }
 
@@ -1193,6 +1206,34 @@ mod tests {
         assert_eq!(nw.chords[0].to_kdl(), "Space w");
     }
 
+    /// The registry speaks the host's id vocabulary: a `[keybinds]` rebind by
+    /// the id the palette / help page / `thegn keys list` show must land on the
+    /// same row the hint strip reads, and the pre-alpha spellings still work.
+    #[test]
+    fn legacy_ids_fold_onto_the_canonical_row() {
+        assert_eq!(canonical_id("menu"), "palette");
+        assert_eq!(canonical_id("palette"), "palette");
+        for (old, new) in LEGACY_IDS {
+            assert!(
+                BUILTINS.iter().any(|a| a.id == *new),
+                "{old} → {new}: alias target missing from the registry"
+            );
+            assert!(
+                !BUILTINS.iter().any(|a| a.id == *old),
+                "{old}: legacy id still in the registry"
+            );
+        }
+        let mut cfg = Config::default();
+        cfg.keybinds.insert("menu".into(), "Alt m".into());
+        let resolved = effective(&cfg);
+        let palette = resolved.iter().find(|r| r.id == "palette").unwrap();
+        assert_eq!(palette.chords[0].to_kdl(), "Alt m");
+        // A host-only id is not the registry's to validate: no row, no change.
+        let mut cfg = Config::default();
+        cfg.keybinds.insert("open-ci".into(), "Alt c".into());
+        assert_eq!(effective(&cfg).len(), effective(&Config::default()).len());
+    }
+
     #[test]
     fn builtins_all_parse() {
         for a in BUILTINS {
@@ -1280,10 +1321,11 @@ mod tests {
         let cols = detect_collisions(&acts);
         assert!(cols.is_empty(), "{cols:?}");
 
-        // Force a duplicate + a reserved hit. `Alt g` is tool-lazygit's
+        // Force a duplicate + a reserved hit. `Alt g` is lazygit's
         // default, so rebinding another action onto it collides.
         cfg.keybinds.insert("toggle-sidebar".into(), "Alt g".into());
-        cfg.keybinds.insert("switch-repo".into(), "Ctrl c".into()); // reserved
+        cfg.keybinds
+            .insert("switch-workspace".into(), "Ctrl c".into()); // reserved
         let cols = detect_collisions(&effective(&cfg));
         assert!(
             cols.iter()

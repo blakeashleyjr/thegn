@@ -148,9 +148,12 @@ pub(crate) fn push_mq_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<
     let blocked = q
         .clone()
         .filter(|r| {
+            // Same set the Merge-queue section paints as blocked — keep in
+            // sync with `panel::sections::merge_queue` (`gate_error` = the
+            // gate could not run; amber there, but still "needs a human").
             matches!(
                 r.status.as_str(),
-                "deferred" | "gate_failed" | "needs_human"
+                "deferred" | "gate_failed" | "gate_error" | "needs_human"
             )
         })
         .count();
@@ -471,6 +474,11 @@ mod tests {
         let (text, seg) = mq_chip_for(&["queued", "folding", "needs_human"]).unwrap();
         assert!(text.contains("⚑ 1 MQ"), "{text}");
         assert_eq!(seg.bg, Some(Tok::Hue(Hue::Red))); // chips carry the tone as bg
+        // A gate that could not run is blocked too (the section shows it in
+        // amber as "gate could not run"); the chip used to go silent on it.
+        let (text, seg) = mq_chip_for(&["gate_error"]).unwrap();
+        assert!(text.contains("⚑ 1 MQ"), "{text}");
+        assert_eq!(seg.bg, Some(Tok::Hue(Hue::Red)));
         // Only landed rows: nothing left to signal.
         assert!(mq_chip_for(&["landed"]).is_none());
     }

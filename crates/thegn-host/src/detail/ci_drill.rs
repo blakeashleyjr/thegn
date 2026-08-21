@@ -403,6 +403,6 @@ mod tests {
             .keeps_overlay()
         );
         assert!(!DetailAction::OpenUrl("x".into()).keeps_overlay());
-        assert!(!DetailAction::ClearNotifications.keeps_overlay());
+        assert!(!DetailAction::AckAllAttention.keeps_overlay());
     }
 }

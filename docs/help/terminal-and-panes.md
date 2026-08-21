@@ -39,10 +39,6 @@ actions:
     nav-right,
     nav-up,
     nav-down,
-    tool-lazygit,
-    tool-yazi,
-    tool-editor,
-    tool-diff,
   ]
 ---
 
