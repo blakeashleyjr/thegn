@@ -19,6 +19,7 @@ pub(crate) mod pane_zoom;
 pub(crate) mod panel_changes;
 pub(crate) mod provision;
 pub(crate) mod repo_trust;
+pub(crate) mod ring;
 pub(crate) mod sidebar_actions;
 pub(crate) mod sidebar_activate;
 pub(crate) mod sidebar_collapse;

@@ -1235,66 +1235,10 @@ pub(crate) fn sidebar_workspace_order(rows: &[crate::sidebar::SidebarRow]) -> Ve
         .collect()
 }
 
-/// A stop in the unified Shift+Alt+↑/↓ ring: every visible workspace (repo)
-/// followed by every terminal host, in sidebar display order. Stepping wraps
-/// across the workspaces↔terminals boundary so the two sidebar sections read as
-/// one ring. Unlike [`sidebar_workspace_order`] this KEEPS live-fallback
-/// workspaces (they carry a real slug even without a DB `repo_path`), so the
-/// current position is always locatable and the motion never silently no-ops.
-#[derive(Debug, Clone, PartialEq)]
-enum RingStop {
-    /// A workspace header. `repo_path` is `None` for a live fallback (the
-    /// currently-resident workspace with no DB row yet), which is never a
-    /// `switch_workspace` target — landing on it just leaves the terminals
-    /// region for a worktree.
-    Workspace {
-        slug: String,
-        repo_path: Option<String>,
-    },
-    /// A terminal host (its collapse key), e.g. `local` / `prod`.
-    TerminalHost { key: String },
-}
-
-/// Build the unified ring in **visible sidebar order**: workspaces then terminal
-/// hosts. Pure over the row slice + DB terminal list so it's unit-testable
-/// straight from `build_rows` output.
-fn unified_ring(
-    rows: &[crate::sidebar::SidebarRow],
-    db_terminals: &[thegn_core::models::TerminalRow],
-) -> Vec<RingStop> {
-    let mut ring: Vec<RingStop> = rows
-        .iter()
-        .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Workspace)
-        .map(|r| RingStop::Workspace {
-            slug: r.workspace_slug.clone(),
-            repo_path: r.worktree_path.clone(),
-        })
-        .collect();
-    for (key, ..) in crate::sidebar::terminal_hosts_ordered(db_terminals) {
-        ring.push(RingStop::TerminalHost { key });
-    }
-    ring
-}
-
-/// The current index in [`unified_ring`], resolved by terminal host key when the
-/// active group is a terminal, else by workspace slug. Matching by slug (not by
-/// raw repo-path equality against `session.id`) makes the lookup robust to
-/// path-form differences and live fallbacks. `None` only when the active thing
-/// isn't on screen — the caller then starts from 0 rather than no-op.
-fn ring_current_index(
-    ring: &[RingStop],
-    active_workspace_slug: Option<&str>,
-    active_host_key: Option<&str>,
-) -> Option<usize> {
-    if let Some(key) = active_host_key {
-        return ring
-            .iter()
-            .position(|s| matches!(s, RingStop::TerminalHost { key: k } if k == key));
-    }
-    let slug = active_workspace_slug?;
-    ring.iter()
-        .position(|s| matches!(s, RingStop::Workspace { slug: s2, .. } if s2 == slug))
-}
+// The unified Shift+Alt+↑/↓ ring (`RingStop` / `unified_ring` /
+// `ring_current_index` / `ring_step`) lives in a sibling handler module, out of
+// this god-file; re-exported so call sites — and the tests — read unchanged.
+pub(crate) use crate::handlers::ring::{RingStop, ring_current_index, ring_step, unified_ring};
 
 /// The repo path a `Ctrl+N` jump (`Action::SummonWorkspace(n)`) should switch
 /// to, given the visible sidebar rows and the active workspace slug. `None` when
@@ -16487,7 +16431,6 @@ async fn event_loop<T: Terminal>(
                                 // strands the ring at a silent no-op.
                                 let ring =
                                     unified_ring(&model.sidebar_rows, &model.sidebar_db_terminals);
-                                let total = ring.len();
                                 let in_term = active_is_terminal(&session);
                                 // The current workspace's slug — the anchor we
                                 // return to when a step lands back on it. Taken
@@ -16513,14 +16456,20 @@ async fn event_loop<T: Terminal>(
                                 // Fall back to the first stop rather than no-op when
                                 // the active thing somehow isn't on screen.
                                 .unwrap_or(0);
-                                if total > 1 {
-                                    let next = if action == Action::NextWorkspace {
-                                        (cur + 1) % total
-                                    } else {
-                                        (cur + total - 1) % total
-                                    };
+                                // By default the step walks PAST groups the user
+                                // has collapsed — a folded workspace/host is one
+                                // they are not working in, so navigation neither
+                                // stops on it nor un-collapses it (the arrival
+                                // `reveal_active_worktree` below would otherwise
+                                // delete its persisted collapse key).
+                                if let Some(next) = ring_step(
+                                    &ring,
+                                    cur,
+                                    action == Action::NextWorkspace,
+                                    keymap.config().ui.sidebar_nav_skips_collapsed,
+                                ) {
                                     match ring[next].clone() {
-                                        RingStop::Workspace { slug: _, repo_path } => {
+                                        RingStop::Workspace { repo_path, .. } => {
                                             // Landing back on home or a live fallback (no DB
                                             // row): path compare, not slug — slug mismatches
                                             // silently block the top workspace.
@@ -16586,7 +16535,7 @@ async fn event_loop<T: Terminal>(
                                                 );
                                             }
                                         }
-                                        RingStop::TerminalHost { key } => {
+                                        RingStop::TerminalHost { key, .. } => {
                                             // Target is a terminal host: activate its
                                             // first terminal (or the remembered one if
                                             // it belongs here), expanding the host.

@@ -44,7 +44,11 @@ database only caches and resurrects what git already knows.
 - `Alt-↑/↓` — move to the pane above/below; at the top/bottom pane, with no
   pane left in that direction, it switches to the previous/next worktree within
   the workspace. It never focuses the top/bottom bars — that is `Ctrl-↑/↓`.
-- `Shift-Alt-↑/↓` — previous/next workspace.
+- `Shift-Alt-↑/↓` — previous/next workspace. One ring: the workspaces in
+  sidebar order, then the terminal hosts, wrapping across the boundary.
+  Workspaces and hosts you have **collapsed** are stepped over — a folded group
+  is one you are not working in, so navigation neither stops on it nor expands
+  it. Set `[ui] sidebar_nav_skips_collapsed = false` to visit every group.
 - `Alt-o` — workspace switcher; `Alt-1..9` / `Ctrl-1..9` jump by sidebar
   slot; the palette's `~` mode ranks everything by frecency.
 
