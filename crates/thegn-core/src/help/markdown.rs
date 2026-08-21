@@ -4,7 +4,7 @@
 //!
 //! Blocks: `#`/`##`/`###` headings, fenced code, `-`/`*`/`1.` lists (one
 //! nesting level via 2-space indent, indented continuation lines flow into
-//! the item), `>` quotes, `---` rules, paragraphs.
+//! the item), `>` quotes, `---` rules, pipe tables, paragraphs.
 //! Inlines: `**bold**`, `*italic*` / `_italic_` (underscores only at word
 //! boundaries, so `snake_case` identifiers stay literal — prettier rewrites
 //! emphasis to underscores, so both spellings must parse), `` `code` ``,
@@ -54,6 +54,67 @@ pub enum Block {
     List(Vec<ListItem>),
     Quote(Vec<Inline>),
     Rule,
+    /// A pipe table. `header` and every row hold one cell per column; the
+    /// parser pads short rows and truncates long ones so `header.len()` is
+    /// the column count for the whole block.
+    Table {
+        header: Vec<Vec<Inline>>,
+        rows: Vec<Vec<Vec<Inline>>>,
+    },
+}
+
+/// Split one pipe-table line into raw cell texts. Leading/trailing pipes are
+/// optional; `\|` escapes a literal pipe inside a cell.
+fn table_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    let mut cells = vec![String::new()];
+    let mut escaped = false;
+    for c in t.chars() {
+        match c {
+            '\\' if !escaped => escaped = true,
+            '|' if !escaped => cells.push(String::new()),
+            _ => {
+                // A backslash before anything but `|` stays literal.
+                if escaped && c != '|' {
+                    cells.last_mut().expect("non-empty").push('\\');
+                }
+                escaped = false;
+                cells.last_mut().expect("non-empty").push(c);
+            }
+        }
+    }
+    cells.into_iter().map(|c| c.trim().to_string()).collect()
+}
+
+/// Is this the `| --- | :--: |` delimiter row under a table header?
+/// Every cell must be dashes with optional leading/trailing colons.
+fn is_table_delimiter(line: &str) -> bool {
+    let cells = table_cells(line);
+    if cells.len() < 2 {
+        return false;
+    }
+    cells.iter().all(|c| {
+        let c = c.strip_prefix(':').unwrap_or(c);
+        let c = c.strip_suffix(':').unwrap_or(c);
+        !c.is_empty() && c.chars().all(|ch| ch == '-')
+    })
+}
+
+/// Does `line` (plus the line after it) open a table? A table needs a header
+/// row of >= 2 cells followed by a delimiter row with the same cell count —
+/// anything less falls through to the paragraph rule, so a stray `|` in prose
+/// is never mistaken for a table.
+fn starts_table(line: &str, next: Option<&str>) -> bool {
+    if !line.contains('|') {
+        return false;
+    }
+    let Some(next) = next else { return false };
+    if !is_table_delimiter(next) {
+        return false;
+    }
+    table_cells(line).len() == table_cells(next).len() && table_cells(line).len() >= 2
 }
 
 /// `- item` / `* item` / `12. item`, with a 2-space indent marking depth 1.
@@ -78,12 +139,14 @@ fn is_rule(t: &str) -> bool {
 }
 
 /// Does this line open a non-paragraph block? (Used to end a paragraph run.)
-fn starts_block(t: &str) -> bool {
+/// `next` is the following line, needed only to recognize a table header.
+fn starts_block(t: &str, next: Option<&str>) -> bool {
     t.starts_with("```")
         || t.starts_with('>')
         || is_rule(t)
         || list_item(t).is_some()
         || heading_level(t).is_some()
+        || starts_table(t, next)
 }
 
 /// `(level, rest)` for `# `-style headings; `####`+ clamps to 3.
@@ -159,6 +222,28 @@ pub fn parse(body: &str) -> Vec<Block> {
             out.push(Block::Quote(inlines(&parts.join(" "))));
             continue;
         }
+        // Table — a header row, a delimiter row, then body rows until a line
+        // that isn't a pipe row. Ragged rows are padded/truncated to the
+        // header's column count so the renderer can assume a rectangle.
+        if starts_table(t, lines.get(i + 1).map(|l| l.trim())) {
+            let header: Vec<Vec<Inline>> = table_cells(t).iter().map(|c| inlines(c)).collect();
+            let cols = header.len();
+            i += 2; // header + delimiter
+            let mut rows: Vec<Vec<Vec<Inline>>> = Vec::new();
+            while i < lines.len() {
+                let rt = lines[i].trim();
+                if rt.is_empty() || !rt.contains('|') {
+                    break;
+                }
+                let mut cells: Vec<Vec<Inline>> =
+                    table_cells(rt).iter().map(|c| inlines(c)).collect();
+                cells.resize(cols, Vec::new());
+                rows.push(cells);
+                i += 1;
+            }
+            out.push(Block::Table { header, rows });
+            continue;
+        }
         // List — contiguous bullet lines form one block; an indented
         // non-bullet line flows into the item above it (the hanging-indent
         // wrap style prettier produces).
@@ -199,7 +284,7 @@ pub fn parse(body: &str) -> Vec<Block> {
         i += 1;
         while i < lines.len() {
             let next = lines[i].trim_end().trim_start();
-            if next.is_empty() || starts_block(next) {
+            if next.is_empty() || starts_block(next, lines.get(i + 1).map(|l| l.trim())) {
                 break;
             }
             parts.push(next);
@@ -362,6 +447,11 @@ pub fn links(blocks: &[Block]) -> Vec<&LinkTarget> {
                     from_spans(&it.spans, &mut out);
                 }
             }
+            Block::Table { header, rows } => {
+                for cell in header.iter().chain(rows.iter().flatten()) {
+                    from_spans(cell, &mut out);
+                }
+            }
             Block::Code { .. } | Block::Rule => {}
         }
     }
@@ -472,6 +562,83 @@ mod tests {
         let blocks = parse("> tip: use\n> the queue\nplain\n");
         assert_eq!(blocks[0], Block::Quote(vec![text("tip: use the queue")]));
         assert_eq!(blocks[1], Block::Para(vec![text("plain")]));
+    }
+
+    /// The shape the generated Keybindings page emits.
+    #[test]
+    fn table_parses_header_and_rows() {
+        let blocks = parse("| Key | Action |\n| --- | --- |\n| `Alt-n` | Split down |\n");
+        let Block::Table { header, rows } = &blocks[0] else {
+            panic!("expected a table, got {blocks:?}");
+        };
+        assert_eq!(header, &vec![vec![text("Key")], vec![text("Action")]]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], vec![Inline::Code("Alt-n".into())]);
+        assert_eq!(rows[0][1], vec![text("Split down")]);
+    }
+
+    /// Outer pipes are optional and alignment colons are accepted.
+    #[test]
+    fn table_accepts_bare_pipes_and_alignment() {
+        let blocks = parse("a | b\n:--- | ---:\n1 | 2\n");
+        let Block::Table { header, rows } = &blocks[0] else {
+            panic!("expected a table, got {blocks:?}");
+        };
+        assert_eq!(header.len(), 2);
+        assert_eq!(rows[0][1], vec![text("2")]);
+    }
+
+    /// Ragged rows are padded/truncated to the header's column count so the
+    /// renderer can assume a rectangle.
+    #[test]
+    fn table_rows_are_rectangular() {
+        let blocks = parse("| a | b | c |\n| - | - | - |\n| 1 |\n| 1 | 2 | 3 | 4 |\n");
+        let Block::Table { header, rows } = &blocks[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(header.len(), 3);
+        assert!(rows.iter().all(|r| r.len() == 3), "{rows:?}");
+        assert_eq!(rows[0][1], Vec::<Inline>::new(), "short row padded");
+    }
+
+    /// A pipe in prose must never be mistaken for a table — the delimiter row
+    /// is what makes it one. Degrading to a paragraph is the total-parser rule.
+    #[test]
+    fn pipes_without_a_delimiter_row_stay_prose() {
+        let blocks = parse("use a | b pipeline\nand more text\n");
+        assert_eq!(
+            blocks,
+            vec![Block::Para(vec![text("use a | b pipeline and more text")])]
+        );
+        // A header with no following delimiter is also just prose.
+        let blocks = parse("| a | b |\nplain\n");
+        assert!(matches!(&blocks[0], Block::Para(_)), "{blocks:?}");
+    }
+
+    /// `\|` is a literal pipe inside a cell, not a column break.
+    #[test]
+    fn escaped_pipe_stays_in_the_cell() {
+        let blocks = parse("| a | b |\n| - | - |\n| x \\| y | z |\n");
+        let Block::Table { rows, .. } = &blocks[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(rows[0][0], vec![text("x | y")]);
+        assert_eq!(rows[0][1], vec![text("z")]);
+    }
+
+    /// Links in cells are reachable by the registry's validator, so they must
+    /// be walked by `links()`.
+    #[test]
+    fn table_cell_links_are_collected() {
+        let blocks = parse("| a | b |\n| - | - |\n| [[sidebar]] | [x](http://e.com) |\n");
+        let found: Vec<LinkTarget> = links(&blocks).into_iter().cloned().collect();
+        assert_eq!(
+            found,
+            vec![
+                LinkTarget::Page("sidebar".into()),
+                LinkTarget::Url("http://e.com".into())
+            ]
+        );
     }
 
     #[test]

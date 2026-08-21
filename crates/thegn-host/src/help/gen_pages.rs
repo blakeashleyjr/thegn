@@ -31,16 +31,23 @@ fn zone_heading(zone: &str) -> String {
 }
 
 /// Escape a label for safe embedding in the help markdown subset: backticks
-/// would open code spans, `[[` would open links.
+/// would open code spans, `[[` would open links, and a bare `|` would split
+/// the table cell it sits in.
 fn escape(label: &str) -> String {
-    label.replace('`', "'").replace("[[", "[ [")
+    label
+        .replace('`', "'")
+        .replace("[[", "[ [")
+        .replace('|', "\\|")
 }
 
-/// One bullet: the chords, then the action label.
-fn bullet(b: &Binding) -> String {
+/// One table row: the chords, then the action label.
+fn row(b: &Binding) -> String {
     let chords: Vec<String> = b.chords.iter().map(|c| format!("`{c}`")).collect();
-    format!("- {} — {}\n", chords.join(" / "), escape(&b.label))
+    format!("| {} | {} |\n", chords.join(" / "), escape(&b.label))
 }
+
+/// The two-column table header.
+const HEAD: &str = "\n| Key | Action |\n| --- | --- |\n";
 
 /// Build the full page source (frontmatter + markdown) for `cfg`.
 pub fn keybindings_page(cfg: &thegn_core::config::Config) -> String {
@@ -66,9 +73,10 @@ pub fn keybindings_page(cfg: &thegn_core::config::Config) -> String {
             continue;
         }
         let zone_local = rows.iter().any(|b| b.source == Source::ZoneTable);
-        out.push_str(&format!("\n## {}\n\n", zone_heading(&zone)));
+        out.push_str(&format!("\n## {}\n", zone_heading(&zone)));
+        out.push_str(HEAD);
         for b in rows {
-            out.push_str(&bullet(b));
+            out.push_str(&row(b));
         }
         // Zone-local keys aren't in the registry, so they can't be rebound.
         if zone_local {
@@ -86,10 +94,11 @@ pub fn keybindings_page(cfg: &thegn_core::config::Config) -> String {
     if !palette_only.is_empty() {
         out.push_str(
             "\n## Palette-only\n\nNo default chord — run from the [[command-palette]] \
-             or bind in `[keybinds]` by id.\n\n",
+             or bind in `[keybinds]` by id.\n\n\
+             | Action | Id |\n| --- | --- |\n",
         );
         for b in palette_only {
-            out.push_str(&format!("- {} — `{}`\n", escape(&b.label), b.id));
+            out.push_str(&format!("| {} | `{}` |\n", escape(&b.label), b.id));
         }
     }
 
@@ -98,9 +107,10 @@ pub fn keybindings_page(cfg: &thegn_core::config::Config) -> String {
         .filter(|b| b.source == Source::Config)
         .collect();
     if !custom.is_empty() {
-        out.push_str("\n## Your actions\n\nFrom `[[actions]]` in your config.\n\n");
+        out.push_str("\n## Your actions\n\nFrom `[[actions]]` in your config.\n");
+        out.push_str(HEAD);
         for b in custom {
-            out.push_str(&bullet(b));
+            out.push_str(&row(b));
         }
     }
     out
@@ -184,13 +194,35 @@ mod tests {
             .insert("new-worktree".to_string(), "Ctrl Alt u".to_string());
         let src = keybindings_page(&cfg);
         assert!(src.contains("`Ctrl-Alt-u`"), "{src}");
-        assert!(!src.contains("`Alt-w` — New worktree"));
+        assert!(!src.contains("| `Alt-w` | New worktree |"));
     }
 
     #[test]
     fn escape_neutralizes_markup() {
         assert_eq!(escape("run `rm -rf`"), "run 'rm -rf'");
         assert_eq!(escape("open [[x]]"), "open [ [x]]");
+        assert_eq!(escape("a | b"), "a \\| b", "a pipe can't split a cell");
+    }
+
+    /// The page's tables must survive the markdown subset as tables, not
+    /// degrade to prose.
+    #[test]
+    fn sections_render_as_real_tables() {
+        let src = page();
+        let (_, body) = thegn_core::help::frontmatter::parse(&src).unwrap();
+        let blocks = thegn_core::help::markdown::parse(body);
+        let tables = blocks
+            .iter()
+            .filter(|b| matches!(b, thegn_core::help::markdown::Block::Table { .. }))
+            .count();
+        assert!(tables >= 2, "expected several tables, got {tables}");
+        // Every row is two columns wide.
+        for b in &blocks {
+            if let thegn_core::help::markdown::Block::Table { header, rows } = b {
+                assert_eq!(header.len(), 2, "two-column tables");
+                assert!(rows.iter().all(|r| r.len() == 2));
+            }
+        }
     }
 
     #[test]

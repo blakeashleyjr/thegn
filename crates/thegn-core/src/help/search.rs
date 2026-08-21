@@ -84,6 +84,16 @@ fn body_snippet(page: &HelpPage, query: &str) -> Option<Snippet> {
                     }
                 }
             }
+            // Each row is one snippet line — a table row reads as a unit
+            // ("`Alt-n` — Split pane down"), which is what a hit should show.
+            Block::Table { header, rows } => {
+                for row in std::iter::once(header).chain(rows.iter()) {
+                    let line = row.iter().map(|c| plain(c)).collect::<Vec<_>>().join(" — ");
+                    if let Some(hit) = check(line, &section) {
+                        return Some(hit);
+                    }
+                }
+            }
             Block::Rule => {}
         }
     }
