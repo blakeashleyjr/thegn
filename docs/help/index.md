@@ -26,13 +26,30 @@ list and the page; `↵` follows a link; `[` goes back.
 ## The screen, by region
 
 - [[sidebar]] — the left tree: workspaces, worktrees, terminals
-- [[terminal-and-panes]] — the center: tabs, splits, copy mode
+- [[terminal-and-panes]] — the center: tabs, splits, tools
 - [[panel]] — the right panel: diff, PRs, CI, merge queue, and more
 - [[drawer-and-corner]] — the bottom file drawer and the corner pin
 - [[bars]] — the masthead and the status bar
 
-## Everything else
+## Doing things
 
 - [[command-palette]] — fuzzy-run any action, open anything
+- [[search]] — the three search surfaces
+- [[copy-and-select]] — selections, scrollback, registers
+- [[git-and-diffs]] — the git tab, diffs, push/pull/rollback
+- [[workflows]] — task-oriented guides: [[review-a-pr]],
+  [[merge-queue]], [[sandboxing]]
+
+## Beyond one machine
+
+- [[daemon-and-sessions]] — detach, reattach, and serve thin clients
+- [[share-and-forward]] — expose a port, forward a service
+- [[cli]] — every command, for scripts and agents
+
+## Everything else
+
 - [[configuration]] — config layers and the [[config-reference]]
+- [[terminal-compatibility]] — colors, glyphs, and `thegn doctor`
+- [[release-channels]] — stable vs dev, and what's gated
+- [[media]] — the now-playing controls
 - [[help]] — how this help system itself works

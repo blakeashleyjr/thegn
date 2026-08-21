@@ -14,6 +14,7 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/workspaces-and-worktrees.md"),
     include_str!("../../../../docs/help/sidebar.md"),
     include_str!("../../../../docs/help/terminal-and-panes.md"),
+    include_str!("../../../../docs/help/copy-and-select.md"),
     include_str!("../../../../docs/help/panel.md"),
     include_str!("../../../../docs/help/drawer-and-corner.md"),
     include_str!("../../../../docs/help/bars.md"),
@@ -22,11 +23,15 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/git-and-diffs.md"),
     include_str!("../../../../docs/help/share-and-forward.md"),
     include_str!("../../../../docs/help/media.md"),
+    include_str!("../../../../docs/help/daemon-and-sessions.md"),
+    include_str!("../../../../docs/help/release-channels.md"),
+    include_str!("../../../../docs/help/cli.md"),
     include_str!("../../../../docs/help/workflows.md"),
     include_str!("../../../../docs/help/review-a-pr.md"),
     include_str!("../../../../docs/help/merge-queue.md"),
     include_str!("../../../../docs/help/sandboxing.md"),
     include_str!("../../../../docs/help/configuration.md"),
+    include_str!("../../../../docs/help/terminal-compatibility.md"),
     include_str!("../../../../docs/help/best-practices.md"),
     include_str!("../../../../docs/help/help.md"),
 ];
@@ -83,13 +88,49 @@ mod tests {
         );
     }
 
+    /// treefmt runs prettier over `docs/help/`, which pads pipe tables into
+    /// aligned columns (`| ---- | ------ |`). That form must still parse as a
+    /// table — otherwise a formatting pass would silently turn every table on
+    /// every page into paragraph soup.
+    #[test]
+    fn authored_tables_survive_the_formatter() {
+        use thegn_core::help::markdown::Block;
+        let (reg, _) = build_registry(&thegn_core::config::Config::default());
+        let mut with_tables = 0;
+        for page in reg.pages() {
+            let tables = page
+                .blocks
+                .iter()
+                .filter(|b| matches!(b, Block::Table { .. }))
+                .count();
+            if tables > 0 {
+                with_tables += 1;
+            }
+            // A page whose body has an aligned delimiter row but no Table
+            // block means the parser stopped recognising the formatted shape.
+            let looks_tabular = page
+                .body
+                .lines()
+                .any(|l| l.trim_start().starts_with("| --") || l.trim_start().starts_with("| ---"));
+            assert_eq!(
+                looks_tabular,
+                tables > 0,
+                "page `{}` has a delimiter row but parsed no table",
+                page.meta.id
+            );
+        }
+        assert!(with_tables >= 3, "several pages use tables");
+    }
+
     #[test]
     fn context_pages_resolve() {
         let (reg, _) = build_registry(&thegn_core::config::Config::default());
         assert_eq!(reg.page_for_context("zone:sidebar"), Some("sidebar"));
         assert_eq!(reg.page_for_context("panel:merge"), Some("merge-queue"));
-        // Sections with no dedicated page fall back to the panel overview,
-        // which documents every section and its keys.
+        // Sections with no dedicated page fall back to the panel overview.
+        // NOTE: that page currently describes the accordion and a handful of
+        // sections, not all of them — so this is a *reachability* guarantee,
+        // not a coverage one. Growing `panel.md` is tracked separately.
         assert_eq!(reg.page_for_context("panel:telemetry"), Some("panel"));
         // A context nobody claims lands on index, never nowhere. (`panel:debug`
         // is a dev-only section — see test/help-context-ratchet.txt.)

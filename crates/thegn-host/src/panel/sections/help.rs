@@ -24,7 +24,8 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     };
 
     let width = ctx.cols.saturating_sub(1).max(8);
-    let rendered = crate::help::render::render_page(&page.blocks, width, None);
+    let blocks = crate::help::render::page_blocks(reg, &page.meta.id);
+    let rendered = crate::help::render::render_page(&blocks, width, None);
 
     if ctx.full() {
         // Full view: the whole page, scrolled by the shared `ui.scroll`.

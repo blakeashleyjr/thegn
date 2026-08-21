@@ -52,8 +52,8 @@ pub(crate) fn pre_dispatch(
     dirty: &mut bool,
 ) -> MousePre {
     // 0. The help overlay is modal to the mouse like a detail popup: wheel
-    // scrolls the page, an outside left-press dismisses, everything else is
-    // swallowed (the overlay is keyboard-driven).
+    // scrolls the page, an outside left-press dismisses, and an inside press
+    // navigates (TOC row, search hit, or a link on the clicked line).
     if let Some(h) = help.as_mut() {
         if let Some(boxr) = h.box_rect(Rect {
             x: 0,
@@ -69,8 +69,14 @@ pub(crate) fn pre_dispatch(
                 };
                 h.scroll_by(delta);
                 *dirty = true;
-            } else if left && !*mouse_left_down && !contains(boxr, mx, my) {
-                *help = None;
+            } else if left && !*mouse_left_down {
+                // `OpenInPanel` is keyboard-only (`o`), so a click can only ask
+                // to close or to stay open.
+                if !contains(boxr, mx, my)
+                    || h.handle_click(mx, my) == crate::help::HelpOutcome::Close
+                {
+                    *help = None;
+                }
                 *dirty = true;
             }
         }

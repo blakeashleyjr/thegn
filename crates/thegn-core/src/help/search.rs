@@ -45,49 +45,61 @@ fn find_ci(hay: &str, needle: &str) -> Option<(usize, usize)> {
         .map(|s| (s, n.len()))
 }
 
-/// First body match in document order, tracking the enclosing section.
-fn body_snippet(page: &HelpPage, query: &str) -> Option<Snippet> {
+/// How many body matches one page may contribute. A page that mentions a term
+/// ten times should be reachable at each mention, but not flood the results.
+pub const MAX_SNIPPETS_PER_PAGE: usize = 4;
+
+/// Body matches in document order, tracking the enclosing section, capped at
+/// `cap`. Returning several (rather than only the first) is what lets a long
+/// page be opened at the mention you actually wanted.
+fn body_snippets(page: &HelpPage, query: &str, cap: usize) -> Vec<Snippet> {
+    let mut out: Vec<Snippet> = Vec::new();
     let mut section: Option<String> = None;
-    let check = |text: String, section: &Option<String>| {
-        find_ci(&text, query).map(|(hl_start, hl_len)| Snippet {
-            text,
-            hl_start,
-            hl_len,
-            section: section.clone(),
-        })
+    let check = |text: String, section: &Option<String>, out: &mut Vec<Snippet>| {
+        if out.len() < cap
+            && let Some((hl_start, hl_len)) = find_ci(&text, query)
+        {
+            out.push(Snippet {
+                text,
+                hl_start,
+                hl_len,
+                section: section.clone(),
+            });
+        }
     };
     for block in &page.blocks {
+        if out.len() >= cap {
+            break;
+        }
         match block {
             Block::Heading { spans, .. } => {
                 let text = plain(spans);
-                if let Some(hit) = check(text.clone(), &section) {
-                    return Some(hit);
-                }
+                check(text.clone(), &section, &mut out);
                 section = Some(text);
             }
-            Block::Para(spans) | Block::Quote(spans) => {
-                if let Some(hit) = check(plain(spans), &section) {
-                    return Some(hit);
-                }
-            }
+            Block::Para(spans) | Block::Quote(spans) => check(plain(spans), &section, &mut out),
             Block::List(items) => {
                 for item in items {
-                    if let Some(hit) = check(plain(&item.spans), &section) {
-                        return Some(hit);
-                    }
+                    check(plain(&item.spans), &section, &mut out);
                 }
             }
             Block::Code { text, .. } => {
                 for line in text.lines() {
-                    if let Some(hit) = check(line.to_string(), &section) {
-                        return Some(hit);
-                    }
+                    check(line.to_string(), &section, &mut out);
+                }
+            }
+            // Each row is one snippet line — a table row reads as a unit
+            // ("`Alt-n` — Split pane down"), which is what a hit should show.
+            Block::Table { header, rows } => {
+                for row in std::iter::once(header).chain(rows.iter()) {
+                    let line = row.iter().map(|c| plain(c)).collect::<Vec<_>>().join(" — ");
+                    check(line, &section, &mut out);
                 }
             }
             Block::Rule => {}
         }
     }
-    None
+    out
 }
 
 /// The injected fuzzy-ranker shape: `(needle, haystacks) → (index, score)`
@@ -108,25 +120,37 @@ pub fn search(pages: &[HelpPage], query: &str, ranker: &Ranker) -> Vec<SearchHit
             *slot = u32::from(score);
         }
     }
-    let mut hits: Vec<SearchHit> = pages
-        .iter()
-        .enumerate()
-        .filter_map(|(i, page)| {
-            let snippet = body_snippet(page, query);
-            let score = title_score[i].saturating_mul(2)
-                + if snippet.is_some() {
-                    BODY_MATCH_SCORE
-                } else {
-                    0
-                };
-            (score > 0).then(|| SearchHit {
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for (i, page) in pages.iter().enumerate() {
+        let snippets = body_snippets(page, query, MAX_SNIPPETS_PER_PAGE);
+        let title = title_score[i].saturating_mul(2);
+        if snippets.is_empty() {
+            if title > 0 {
+                hits.push(SearchHit {
+                    page: page.meta.id.clone(),
+                    title: page.meta.title.clone(),
+                    score: title,
+                    snippet: None,
+                });
+            }
+            continue;
+        }
+        // One hit per match, so each mention is separately openable. Only the
+        // first carries the title bonus — later mentions on the same page rank
+        // below a fresh page's first match rather than crowding it out.
+        for (n, snippet) in snippets.into_iter().enumerate() {
+            hits.push(SearchHit {
                 page: page.meta.id.clone(),
                 title: page.meta.title.clone(),
-                score,
-                snippet,
-            })
-        })
-        .collect();
+                score: if n == 0 {
+                    title + BODY_MATCH_SCORE
+                } else {
+                    BODY_MATCH_SCORE.saturating_sub(n as u32)
+                },
+                snippet: Some(snippet),
+            });
+        }
+    }
     hits.sort_by_key(|h| std::cmp::Reverse(h.score)); // stable: ties keep page order
     hits
 }
@@ -217,6 +241,50 @@ mod tests {
         assert_eq!(find_ci("naïve — Bold", "bold"), Some((8, 4)));
         assert_eq!(find_ci("short", "much longer needle"), None);
         assert_eq!(find_ci("anything", ""), None);
+    }
+
+    /// A page mentioning the query several times yields one hit per mention,
+    /// each separately openable — not just the first.
+    #[test]
+    fn repeated_mentions_yield_one_hit_each() {
+        let p = "---\nid: index\ntitle: Welcome\n---\n\
+                 # A\nqueue one\n## B\nqueue two\n## C\nqueue three\n";
+        let (reg, errors) = HelpRegistry::build(&[p], &[]);
+        assert!(errors.is_empty(), "{errors:?}");
+        let hits = search(reg.pages(), "queue", &ranker);
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        let texts: Vec<&str> = hits
+            .iter()
+            .map(|h| h.snippet.as_ref().unwrap().text.as_str())
+            .collect();
+        assert_eq!(texts, ["queue one", "queue two", "queue three"]);
+        // Each carries its own section, so `↵` jumps to the right one.
+        let sections: Vec<Option<&str>> = hits
+            .iter()
+            .map(|h| h.snippet.as_ref().unwrap().section.as_deref())
+            .collect();
+        assert_eq!(sections, [Some("A"), Some("B"), Some("C")]);
+        // The first mention ranks highest; later ones descend.
+        assert!(hits[0].score > hits[1].score && hits[1].score > hits[2].score);
+    }
+
+    /// The per-page cap keeps one page from flooding the result list.
+    #[test]
+    fn snippets_per_page_are_capped() {
+        let body: String = (0..20).map(|i| format!("queue line {i}\n\n")).collect();
+        let p = format!("---\nid: index\ntitle: Welcome\n---\n{body}");
+        let (reg, _) = HelpRegistry::build(&[&p], &[]);
+        let hits = search(reg.pages(), "queue", &ranker);
+        assert_eq!(hits.len(), MAX_SNIPPETS_PER_PAGE);
+    }
+
+    /// A title-only match (no body mention) still yields exactly one hit.
+    #[test]
+    fn title_only_match_yields_a_single_snippetless_hit() {
+        let hits = search(&pages(), "Merge", &ranker);
+        let mq: Vec<&SearchHit> = hits.iter().filter(|h| h.page == "merge-queue").collect();
+        assert_eq!(mq.len(), 1);
+        assert!(mq[0].snippet.is_none(), "no body mention of 'Merge'");
     }
 
     #[test]
