@@ -59,6 +59,10 @@ of PTY panes.
   edge, with no pane left in that direction, it switches to the previous / next
   tab. It never focuses the [[sidebar]] / [[panel]] — that is `Ctrl-←/→`.
 
+Falling off the pane edge is the usual way to change tabs, so `next-tab`
+and `prev-tab` carry no chord of their own. Bind them in `[keybinds]` if
+you want a direct key.
+
 ## Splits
 
 - `Alt-p` — smart split (along the pane's longer dimension)
@@ -110,3 +114,14 @@ automatically.
 
 Named layouts snapshot a tab's pane tree: save, apply, export, and import
 them from the [[command-palette]].
+
+## Leaving
+
+- **detach** — leave everything running and drop back to your shell.
+- **quit** — close the UI; daemon-backed panes keep running.
+- **Quit and kill sessions** (`quit-kill`) — the explicit "I'm done":
+  ends the sessions too.
+
+Only the first two are things you reach for daily; `quit-kill` has no
+default chord and lives in the palette. [[daemon-and-sessions]] explains
+what survives which.

@@ -115,11 +115,13 @@ bridge:
 host *args: build
     {{bin}} {{args}}
 
-# Regenerate test/help-ratchet.txt (the help-coverage allowlist) from the
-# current undocumented ACTION_SPECS set. The ratchet test only lets this file
+# Regenerate the help allowlists from the current state: test/help-ratchet.txt
+# (actions no page claims) and test/help-prose-ratchet.txt (actions a page
+# claims but never writes about). The ratchet tests only let these files
 # shrink; run after documenting actions in docs/help/ to lock in the win.
 help-ratchet-update:
     THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_ratchet_update -- --ignored
+    THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_prose_ratchet_update -- --ignored
 
 # Startup benchmarks (hyperfine; needs the dev shell). Not part of `just ci` —
 # timings are machine-dependent. Three numbers: process/clap baseline; cold
