@@ -568,7 +568,7 @@ pub(crate) fn terminal_host(conn: &str, kind: &str) -> (String, String, bool) {
 }
 
 /// The focused row's second line: the branch name plus the secondary metadata
-/// that would crowd the always-on row — branch-vs-default-branch line stat,
+/// that would crowd the always-on row — branch-vs-local-default-branch line stat,
 /// execution env, sandbox backend, hibernation, open PRs, unread notifications,
 /// and disk size. Field visibility follows the `[ui]` sidebar toggles carried on
 /// `disp`. `None` when the row has nothing to show. (Extracted from the
@@ -594,7 +594,9 @@ pub(crate) fn compose_detail_line(
     if disp.detail_branch && !branch.is_empty() {
         segs.push(seg(Tok::Slot(S::Dim), format!("{branch} ")));
     }
-    // Total branch change vs the default branch (`+adds` green / `-dels` red).
+    // This branch's own work over the repo's LOCAL default branch (`+adds` green
+    // / `-dels` red) — the same base `thegn diff` and the diff viewer use, so a
+    // row on the trunk (or freshly branched off it) correctly shows nothing.
     if disp.detail_branch_stat
         && let Some((add, del)) = row.git.and_then(|g| g.branch_diff)
         && (add > 0 || del > 0)

@@ -27,7 +27,9 @@ const ISSUE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// a full `git status` (50-150ms), so only the *active* worktree pays that every
 /// Model tick; background worktrees reuse the last value until it goes stale (see
 /// [`should_rescan_glyphs`]). `branch_diff` is the `(added, deleted)` total vs
-/// the default branch, `None` when no base is resolvable.
+/// the repo's LOCAL default branch (`thegn_svc::git::glyph_base` — not
+/// `origin/HEAD`, so an unpushed trunk doesn't leak its backlog into every row),
+/// `None` when no base is resolvable.
 pub(crate) type GlyphRow = (
     bool,
     usize,
