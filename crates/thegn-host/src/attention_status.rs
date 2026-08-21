@@ -46,6 +46,9 @@ pub(crate) fn collect_attention(
         slug: String,
         is_home: bool,
         position: i64,
+        /// Owning repo root — the key the nag surfaces scope by. Empty when
+        /// unresolvable.
+        repo: String,
     }
     let mut meta: BTreeMap<String, Meta> = BTreeMap::new();
     for wt in db.worktrees().unwrap_or_default() {
@@ -63,6 +66,7 @@ pub(crate) fn collect_attention(
                 slug,
                 is_home: wt.branch == "home",
                 position: wt.position,
+                repo: wt.repo_root.clone(),
             },
         );
     }
@@ -71,15 +75,51 @@ pub(crate) fn collect_attention(
             continue;
         }
         let (slug, branch) = crate::sidebar::split_tab(&g.name).unwrap_or_default();
-        meta.entry(g.path.clone()).or_insert(Meta {
+        meta.entry(g.path.clone()).or_insert_with(|| Meta {
             slug,
             is_home: branch == "home",
             position: gi as i64,
+            // Session-only groups (freshly created, not yet persisted) aren't in
+            // the registry, so resolve their repo the same way the registry rows
+            // carry it. One lookup per unpersisted group — usually zero.
+            repo: db.repo_root_for(&g.path).ok().flatten().unwrap_or_default(),
         });
     }
     if meta.is_empty() {
         return;
     }
+
+    // Nag scope: the worktrees of the *active* worktree's repo. The nag surfaces
+    // (`✋` badge, "Needs you" popup, `Alt a` ring) default to this so a sibling
+    // repo's failing CI can't nag you in the repo you're working in — matching
+    // what the notification inbox already does (`hydrate_feed::populate_notifications`).
+    //
+    // `None` means "scope nothing", from either the "show everything" toggle or
+    // an unresolvable active repo — the latter **fails open** deliberately, so a
+    // scoping bug can never *hide* a signal that needs the user. Resolving the
+    // toggle here, at the one place the scope is computed, keeps the render-time
+    // predicate (`handlers::attention::in_scope`) pure over the model; `g`
+    // rehydrates, so the flip still takes effect immediately.
+    //
+    // Note `status.attention` / `workspace_attention` stay GLOBAL below: the
+    // sidebar renders every workspace's rows with their own tier glyph, and the
+    // rollup needs every worktree. Scoping is a property of the nag, not of the
+    // score.
+    status.repo_scope = if crate::panel::scope::system_all() {
+        None
+    } else {
+        session
+            .active_group()
+            .and_then(|g| meta.get(&g.path))
+            .map(|m| m.repo.clone())
+            .filter(|r| !r.is_empty())
+            .map(|active_repo| {
+                meta.iter()
+                    .filter(|(_, m)| m.repo == active_repo)
+                    .map(|(p, _)| p.clone())
+                    .collect()
+            })
+    };
 
     // Activity FSM snapshot, path-keyed with real state timestamps.
     let activity = thegn_core::activity::read_entries();
@@ -159,6 +199,7 @@ pub(crate) fn collect_attention(
         };
         // Latest cached CI run (newest first in the cache), last-known-good.
         let (mut ci_failing, mut ci_running) = (false, false);
+        let (mut ci_episode, mut ci_since) = (0u64, None);
         if let Ok(Some((json, _))) = db.get_ci_cache(path)
             && let Ok(runs) = serde_json::from_str::<Vec<thegn_core::ci::CiRun>>(&json)
             && let Some(latest) = runs.first()
@@ -168,6 +209,19 @@ pub(crate) fn collect_attention(
                 latest.state,
                 thegn_core::ci::CiState::Running | thegn_core::ci::CiState::Pending
             );
+            // Identity + honest start time for the run, so an acknowledgement is
+            // released by the *next* run rather than by cache churn or a restart.
+            // Prefer the provider's run id; fall back to the commit sha.
+            let key = if latest.id.is_empty() {
+                &latest.sha
+            } else {
+                &latest.id
+            };
+            ci_episode = attention::episode_of(key);
+            ci_since = latest
+                .started_at
+                .as_deref()
+                .and_then(thegn_core::ci::epoch_secs);
         }
         // A real agent is bound iff `status.agent` has a non-shell entry: the
         // map is already tool-filtered in `hydrate` (yazi/lazygit/… skipped via
@@ -184,6 +238,8 @@ pub(crate) fn collect_attention(
             pr: pr.get(path).copied(),
             ci_failing,
             ci_running,
+            ci_episode,
+            ci_since,
             merge_queue: mq.get(path).copied(),
             dirty: status.git.get(path).is_some_and(|g| g.dirty),
             has_agent,
@@ -192,28 +248,47 @@ pub(crate) fn collect_attention(
     }
 
     // Acknowledgements: an acked worktree is suppressed from the nag surfaces
-    // (badge + "Needs you" popup) only while its *current* score still matches
-    // the acked `(reason, since)`. A changed reason / advanced `since` (a new
-    // episode) no longer matches — so we drop the now-stale ack (best-effort;
-    // the DB is a cache) and the item re-nags.
+    // (badge + "Needs you" popup) while its current score still matches the
+    // acked `(reason, since, episode)`.
+    //
+    // This pass is READ-ONLY apart from unparseable rows. A non-match means only
+    // "that signal isn't the winner *right now*" — not that the ack is stale —
+    // and it happens routinely for two benign reasons:
+    //
+    //   * a transient cache dip. `ci_refresh` writes the CI cache on any `Ok`,
+    //     including an empty run list, which blanks `ci_failing` for a pass.
+    //   * being outranked. `score` reports only the most urgent signal, so an
+    //     arriving `agent_attention` hides an acked CI failure until it's read.
+    //
+    // The old code deleted on any mismatch, and this runs on *every* hydration
+    // pass (every refresh tick) — so one such pass destroyed the ack forever and
+    // the signal re-nagged as soon as it resurfaced, most visibly across a
+    // restart. Staleness is instead handled where it is actually knowable: the
+    // UPSERT when the user acks a new episode, the `del_worktree` cascade,
+    // `ack_expired` for identity-less acks, and the age sweep in `Db::open`.
     status.acked.clear();
-    for (path, reason_str, since) in db.list_attention_acks().unwrap_or_default() {
+    let now = thegn_core::util::now();
+    for row in db.list_attention_acks().unwrap_or_default() {
         let Ok(reason) =
-            serde_json::from_str::<thegn_core::attention::AttentionReason>(&reason_str)
+            serde_json::from_str::<thegn_core::attention::AttentionReason>(&row.reason)
         else {
-            let _ = db.delete_attention_ack(&path); // best-effort: unparseable → prune
+            // best-effort: an unparseable reason can never match, so prune it.
+            let _ = db.delete_attention_ack(&row.worktree_path, Some(&row.reason));
             continue;
         };
-        let ack = thegn_core::attention::AttentionAck { reason, since };
-        match scores.get(&path) {
-            Some(s) if s.is_acked_by(&ack) => {
-                status.acked.insert(path);
-            }
-            // Reason/episode changed, or the worktree scores nothing now: the
-            // ack is stale. Prune so a genuinely new signal re-fires.
-            _ => {
-                let _ = db.delete_attention_ack(&path); // best-effort: DB is a cache
-            }
+        let ack = thegn_core::attention::AttentionAck {
+            reason,
+            since: row.since,
+            episode: row.episode,
+        };
+        if attention::ack_expired(&ack, row.acked_at, now) {
+            continue;
+        }
+        if scores
+            .get(&row.worktree_path)
+            .is_some_and(|s| s.is_acked_by(&ack))
+        {
+            status.acked.insert(row.worktree_path);
         }
     }
 
@@ -338,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_suppresses_matching_score_and_gcs_stale() {
+    fn ack_suppresses_matching_score_and_a_new_episode_refires() {
         let db = thegn_core::db::Db::open_memory().unwrap();
         db.put_worktree("app/f", "/repo", "/wt/f", "f", None, None)
             .unwrap();
@@ -352,26 +427,199 @@ mod tests {
         assert!(sc.needs_user());
         assert!(status.acked.is_empty(), "no acks yet");
 
-        // Ack the exact showing (reason, since) → suppressed next pass.
+        // Ack the exact showing (reason, since, episode) → suppressed next pass.
         let reason = serde_json::to_string(&sc.reason).unwrap();
-        db.put_attention_ack("/wt/f", &reason, sc.since).unwrap();
+        db.put_attention_ack("/wt/f", &reason, sc.since, sc.episode)
+            .unwrap();
         let mut status2 = crate::sidebar::SidebarStatus::default();
         collect_attention(&session, &db, &mut status2);
         assert!(status2.acked.contains("/wt/f"), "matching ack suppresses");
 
-        // A stale ack (advanced `since` = new episode) is GC'd and re-nags.
-        db.put_attention_ack("/wt/f", &reason, Some(sc.since.unwrap_or(0) + 1))
+        // A new episode (advanced `since`) no longer matches, so the signal
+        // re-fires. The row itself SURVIVES: this pass is read-only, because a
+        // non-match can also just mean "not the winner right now" and deleting on
+        // it destroyed acks that were still good.
+        db.put_attention_ack("/wt/f", &reason, Some(sc.since.unwrap_or(0) + 1), 0)
             .unwrap();
         let mut status3 = crate::sidebar::SidebarStatus::default();
         collect_attention(&session, &db, &mut status3);
         assert!(
             !status3.acked.contains("/wt/f"),
-            "stale ack does not suppress"
+            "a new episode does not suppress"
         );
+        assert_eq!(
+            db.list_attention_acks().unwrap().len(),
+            1,
+            "the ack row is not garbage-collected by a read pass"
+        );
+    }
+
+    /// The direct repro of "it came back after I cleared it": a CI failure is
+    /// derived from the run cache, and `ci_refresh` writes that cache on any
+    /// `Ok` — *including an empty run list*. That blanks the signal for a pass.
+    /// The old code deleted the ack on any non-match, so one such pass destroyed
+    /// it and the failure re-nagged the moment it reappeared.
+    #[test]
+    fn ack_survives_a_transient_score_dip() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/c", "/repo", "/wt/c", "c", None, None)
+            .unwrap();
+        let failing = serde_json::to_string(&vec![thegn_core::ci::CiRun {
+            id: "run-1".into(),
+            state: thegn_core::ci::CiState::Fail,
+            started_at: Some("2026-06-25T10:00:00Z".into()),
+            ..Default::default()
+        }])
+        .unwrap();
+        db.put_ci_cache("/wt/c", "c", &failing).unwrap();
+
+        let session = session_with(&[("app/c", "/wt/c")]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+        order_memo().lock().unwrap().clear();
+        collect_attention(&session, &db, &mut status);
+        let sc = status.attention["/wt/c"];
+        assert_eq!(sc.reason, thegn_core::attention::AttentionReason::CiFailed);
+        assert_ne!(sc.episode, 0, "the run id gives the failure an identity");
+
+        // The user quiets it.
+        let reason = serde_json::to_string(&sc.reason).unwrap();
+        db.put_attention_ack("/wt/c", &reason, sc.since, sc.episode)
+            .unwrap();
+        let mut acked = crate::sidebar::SidebarStatus::default();
+        collect_attention(&session, &db, &mut acked);
+        assert!(acked.acked.contains("/wt/c"));
+
+        // A refresh returns an empty run list: the signal vanishes for a pass.
+        db.put_ci_cache("/wt/c", "c", "[]").unwrap();
+        let mut dipped = crate::sidebar::SidebarStatus::default();
+        collect_attention(&session, &db, &mut dipped);
+        assert_eq!(
+            db.list_attention_acks().unwrap().len(),
+            1,
+            "a transient dip must not destroy the ack"
+        );
+        assert!(!dipped.acked.contains("/wt/c"), "nothing to suppress");
+
+        // The same failing run comes back → still quiet.
+        db.put_ci_cache("/wt/c", "c", &failing).unwrap();
+        let mut back = crate::sidebar::SidebarStatus::default();
+        collect_attention(&session, &db, &mut back);
         assert!(
-            db.list_attention_acks().unwrap().is_empty(),
-            "stale ack garbage-collected"
+            back.acked.contains("/wt/c"),
+            "the same run must stay acknowledged across the dip"
         );
+
+        // A genuinely NEW run is a new episode and does re-nag.
+        let next_run = serde_json::to_string(&vec![thegn_core::ci::CiRun {
+            id: "run-2".into(),
+            state: thegn_core::ci::CiState::Fail,
+            started_at: Some("2026-06-25T11:00:00Z".into()),
+            ..Default::default()
+        }])
+        .unwrap();
+        db.put_ci_cache("/wt/c", "c", &next_run).unwrap();
+        let mut fresh = crate::sidebar::SidebarStatus::default();
+        collect_attention(&session, &db, &mut fresh);
+        assert!(!fresh.acked.contains("/wt/c"), "a new run re-nags");
+    }
+
+    /// `score` reports only the most urgent signal, so an arriving
+    /// `agent_attention` hides an acked CI failure until it is read. That is not
+    /// staleness — and with the composite `(worktree, reason)` key the two acks
+    /// coexist instead of overwriting each other.
+    #[test]
+    fn ack_survives_being_outranked_by_a_higher_tier_signal() {
+        use thegn_core::attention::AttentionReason as R;
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/o", "/repo", "/wt/o", "o", None, None)
+            .unwrap();
+        let failing = serde_json::to_string(&vec![thegn_core::ci::CiRun {
+            id: "run-1".into(),
+            state: thegn_core::ci::CiState::Fail,
+            ..Default::default()
+        }])
+        .unwrap();
+        db.put_ci_cache("/wt/o", "o", &failing).unwrap();
+        let session = session_with(&[("app/o", "/wt/o")]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+        order_memo().lock().unwrap().clear();
+        collect_attention(&session, &db, &mut status);
+        let ci = status.attention["/wt/o"];
+        assert_eq!(ci.reason, R::CiFailed);
+        db.put_attention_ack(
+            "/wt/o",
+            &serde_json::to_string(&ci.reason).unwrap(),
+            ci.since,
+            ci.episode,
+        )
+        .unwrap();
+
+        // A Blocked-tier notification arrives and outranks the failure.
+        let nid = db
+            .put_notification("agent_attention", "x", "needs you", "/wt/o")
+            .unwrap();
+        let mut outranked = crate::sidebar::SidebarStatus::default();
+        collect_attention(&session, &db, &mut outranked);
+        assert_eq!(outranked.attention["/wt/o"].reason, R::AgentNeedsInput);
+        assert!(!outranked.acked.contains("/wt/o"), "the new signal nags");
+        assert_eq!(
+            db.list_attention_acks().unwrap().len(),
+            1,
+            "the CI ack must survive being outranked"
+        );
+
+        // Ack that one too — both coexist under the composite key.
+        let blocked = outranked.attention["/wt/o"];
+        db.put_attention_ack(
+            "/wt/o",
+            &serde_json::to_string(&blocked.reason).unwrap(),
+            blocked.since,
+            blocked.episode,
+        )
+        .unwrap();
+        assert_eq!(db.list_attention_acks().unwrap().len(), 2);
+
+        // Reading the notification uncovers the CI failure again — still quiet.
+        db.mark_notification_read(nid).unwrap();
+        let mut uncovered = crate::sidebar::SidebarStatus::default();
+        collect_attention(&session, &db, &mut uncovered);
+        assert_eq!(uncovered.attention["/wt/o"].reason, R::CiFailed);
+        assert!(
+            uncovered.acked.contains("/wt/o"),
+            "the CI ack still applies once the blocker clears"
+        );
+    }
+
+    #[test]
+    fn repo_scope_is_the_active_worktrees_repo_and_none_when_unresolved() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        for (tab, repo, path) in [
+            ("app/a", "/repo/app", "/wt/a"),
+            ("app/b", "/repo/app", "/wt/b"),
+            ("other/c", "/repo/other", "/wt/c"),
+        ] {
+            let branch = tab.split('/').nth(1).unwrap();
+            db.put_worktree(tab, repo, path, branch, None, None)
+                .unwrap();
+        }
+        let session = session_with(&[("app/a", "/wt/a")]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+        order_memo().lock().unwrap().clear();
+        collect_attention(&session, &db, &mut status);
+        let scope = status.repo_scope.expect("active repo resolves");
+        assert!(scope.contains("/wt/a") && scope.contains("/wt/b"));
+        assert!(!scope.contains("/wt/c"), "a sibling repo is out of scope");
+
+        // Every worktree is still SCORED — scoping is a property of the nag, not
+        // of the score, so the sidebar keeps rendering other repos' rows.
+        assert!(status.attention.contains_key("/wt/c"));
+
+        // Unresolvable active repo → fail open (scope nothing) rather than risk
+        // hiding a signal that needs the user.
+        let orphan = session_with(&[("ghost/z", "/wt/ghost")]);
+        let mut s2 = crate::sidebar::SidebarStatus::default();
+        collect_attention(&orphan, &db, &mut s2);
+        assert!(s2.repo_scope.is_none());
     }
 
     #[test]

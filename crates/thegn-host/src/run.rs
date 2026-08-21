@@ -15152,15 +15152,19 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
-                        // `a` clears all (mark all read) — the one clear-all key
-                        // shared with the unified overlay.
+                        // `a` clears all — the one clear-all key shared with the
+                        // unified overlay, and routed through the same handler so
+                        // it means the same thing. Crucially that also ACKS the
+                        // live needs-you signals: a CI failure is derived from the
+                        // PR/CI cache rather than an inbox row, so marking
+                        // notifications read alone left the `✋` badge lit and it
+                        // reappeared on the next hydration pass.
                         (Section::Notifications, KeyCode::Char('a')) => {
-                            tokio::task::spawn_blocking(|| {
-                                let Ok(db) = thegn_core::db::Db::open() else {
-                                    return;
-                                };
-                                let _ = db.mark_all_notifications_read();
-                            });
+                            crate::handlers::attention::mark_all_read(
+                                &mut model,
+                                &refresh_tx,
+                                &waker,
+                            );
                             hydration_gen += 1;
                             crate::hydrate::spawn_model_hydration(
                                 model_tx.clone(),
@@ -17793,7 +17797,21 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
                                     None => {
-                                        model.status = "Nothing needs you right now".into();
+                                        // The ring is scoped to this repo, so say
+                                        // so when another repo does have something
+                                        // — silence would read as "nothing anywhere".
+                                        let elsewhere =
+                                            crate::handlers::attention::needs_user_out_of_scope(
+                                                &model,
+                                            )
+                                            .len();
+                                        model.status = if elsewhere > 0 {
+                                            format!(
+                                                "Nothing needs you in this repo ({elsewhere} elsewhere — g in the inbox to widen)"
+                                            )
+                                        } else {
+                                            "Nothing needs you right now".into()
+                                        };
                                     }
                                 }
                             }

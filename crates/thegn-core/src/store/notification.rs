@@ -52,21 +52,30 @@ pub trait NotificationStore {
     fn delete_notification(&self, id: i64) -> Result<()>;
 
     /// Acknowledge (quiet) a worktree's live "Needs you" signal: UPSERT the
-    /// `(reason, since)` currently showing so it's suppressed until that episode
-    /// changes. `reason` is the serde-encoded [`crate::attention::AttentionReason`].
+    /// `(reason, since, episode)` currently showing so it's suppressed until that
+    /// episode changes. `reason` is the serde-encoded
+    /// [`crate::attention::AttentionReason`]; keyed per `(worktree, reason)` so
+    /// acking one signal never destroys the ack for another on the same worktree.
     fn put_attention_ack(
         &self,
         worktree_path: &str,
         reason: &str,
         since: Option<i64>,
+        episode: crate::attention::Episode,
     ) -> Result<()>;
 
-    /// Every stored attention ack as `(worktree_path, reason, since)`. The host
-    /// matches these against fresh scores and garbage-collects stale rows.
-    fn list_attention_acks(&self) -> Result<Vec<(String, String, Option<i64>)>>;
+    /// Every stored attention ack. The host matches these against fresh scores;
+    /// a non-match means only "that signal isn't the winner right now", so the
+    /// read pass never deletes — see [`crate::attention::ack_expired`].
+    fn list_attention_acks(&self) -> Result<Vec<crate::attention::AttentionAckRow>>;
 
-    /// Drop a worktree's attention ack (stale episode, or explicit un-ack).
-    fn delete_attention_ack(&self, worktree_path: &str) -> Result<()>;
+    /// Drop attention acks for a worktree — one `reason`, or all of them when
+    /// `reason` is `None` (worktree removed / explicit un-ack).
+    fn delete_attention_ack(&self, worktree_path: &str, reason: Option<&str>) -> Result<()>;
+
+    /// Drop acks older than `max_age_secs`. A table-growth bound only: acks are
+    /// released by a new episode, not by this sweep. Returns the rows removed.
+    fn prune_attention_acks(&self, max_age_secs: i64) -> Result<usize>;
 
     /// Record a new agent dispatch.  Returns the new row id.
     fn put_agent_dispatch(

@@ -87,13 +87,38 @@ you. The CI item opens the CI runs section.
 
 The inbox `⚑`/`✉` chip, the needs-you `✋` chip, and the merge-queue chip
 all open the **one unified surface** — a single grouped list of _Needs
-you · Alerts · Merge queue · Notifications · Logs_. One clear/dismiss
-convention holds throughout: `x` dismisses the row under the cursor, `a`
-clears all. Merge-queue rows act in place — `l` lands a gated-green
-branch, `r` retries a blocked one, `x` removes it, `m` jumps to the full
-Work ▸ Merge queue section. Ephemeral confirmations ("Landed", "Text
-copied") surface as transient toasts, the passing view of the same
+you · Alerts · Merge queue · Notifications · Other repos · Logs_. One
+clear/dismiss convention holds throughout: `x` dismisses the row under the
+cursor, `a` clears all. Merge-queue rows act in place — `l` lands a
+gated-green branch, `r` retries a blocked one, `x` removes it, `m` jumps to
+the full Work ▸ Merge queue section. Ephemeral confirmations ("Landed",
+"Text copied") surface as transient toasts, the passing view of the same
 routed events that also land in this inbox.
+
+### Scope: this repo by default
+
+The `✋` chip, the "Needs you" list, and `Alt a` (jump to next) are **scoped
+to the active worktree's repo**, like the notification inbox — a sibling
+repo's failing CI shouldn't nag you in the repo you're working in. Nothing is
+hidden: worktrees elsewhere are counted as a dim `+N` beside the chip and
+listed under **Other repos**, still one `↵` away (which switches workspace if
+the worktree's tab isn't open). Press `g` in the inbox to widen every scoped
+view to all worktrees, and again to narrow back.
+
+### Clearing, and what "clear" covers
+
+`a` — in the inbox, in the unified surface, and as `Alt Shift R` — is the
+total clear. It marks every notification read **and** acknowledges the live
+needs-you signals, including the worktree you're currently on. That second
+half matters: "CI failed", "PR has conflicts" and "changes requested" are
+derived from the PR/CI caches rather than from an inbox row, so marking
+notifications read alone would leave the `✋` chip lit and it would reappear
+on the next refresh. Use `x` on a "Needs you" row to quiet just that one.
+
+An acknowledgement is bound to the **episode** it was made against — the CI
+run, or the PR's head commit. So it survives restarts, refreshes, and being
+temporarily outranked by something more urgent; but a new run, or a new push,
+is a new episode and does raise the signal again.
 
 ## AI account usage
 

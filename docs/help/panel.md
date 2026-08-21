@@ -46,3 +46,14 @@ Each section documents its own keys in the status bar while it has focus.
 The PR view shows state, CI check rollup, and review decision for the
 branch's PR; the merge queue drives the local fold-actor. See
 [[merge-queue]] for the queue workflow.
+
+## Notifications
+
+In row mode: `x` marks the row read, `d` deletes it, `A` shows read rows too,
+`/` searches.
+
+`a` is the **clear-all**, and it covers more than the list: as well as marking
+every notification read it acknowledges the live "needs you" signals behind the
+`✋` chip — failing CI, PR conflicts, changes requested — which are derived from
+the PR/CI caches rather than from rows here. `g` toggles the scope between this
+repo (the default) and every worktree. Both are described under [[bars]].

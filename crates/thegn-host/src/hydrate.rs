@@ -3026,9 +3026,14 @@ pub(crate) fn toggle_mine_scope(
     }
 }
 
-/// Toggle the System tab between this repo (default) and every worktree,
-/// rehydrate the active model so the scoped notification list refreshes, and
-/// return the status line. Extracted from the panel key handler for the ratchet.
+/// Toggle between this repo (default) and every worktree, rehydrate the active
+/// model so the scoped views refresh, and return the status line. Extracted from
+/// the panel key handler for the ratchet.
+///
+/// This is the single "widen everything" escape hatch: it governs the System
+/// tab's notification list *and* the needs-you nag surfaces (the `✋` badge, the
+/// "Needs you" popup, the `Alt a` ring), which read it through
+/// `handlers::attention::in_scope`.
 pub(crate) fn toggle_system_scope(
     tx: &tokio_mpsc::UnboundedSender<(u64, FrameModel)>,
     generation: u64,
@@ -3050,9 +3055,9 @@ pub(crate) fn toggle_system_scope(
         },
     );
     if all {
-        "System: all worktrees".into()
+        "Notifications & needs-you: all worktrees".into()
     } else {
-        "System: this repo".into()
+        "Notifications & needs-you: this repo".into()
     }
 }
 

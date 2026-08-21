@@ -220,16 +220,19 @@ pub fn current_summary(runs: &[CiRun]) -> CiSummary {
     summarize(latest_per_workflow(runs).into_iter().map(|r| &r.state))
 }
 
+/// Parse one of [`CiRun`]'s RFC3339 timestamps to unix seconds. `None` on junk
+/// (providers do occasionally hand back an empty or malformed stamp).
+pub fn epoch_secs(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.timestamp())
+}
+
 /// Shared duration helper: seconds between `start` and `finish` (or `now` if
 /// still running). `None` without a parseable start. Clamped to ≥ 0.
 pub fn duration_secs(start: Option<&str>, finish: Option<&str>, now: i64) -> Option<i64> {
-    let parse = |s: &str| {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .ok()
-            .map(|t| t.timestamp())
-    };
-    let start = start.and_then(parse)?;
-    let end = finish.and_then(parse).unwrap_or(now);
+    let start = start.and_then(epoch_secs)?;
+    let end = finish.and_then(epoch_secs).unwrap_or(now);
     Some((end - start).max(0))
 }
 
@@ -695,6 +698,22 @@ mod tests {
         assert_eq!(named.workflow_key(), "pipeline #8");
         let real = run_named("7", "deploy", CiState::Fail);
         assert_eq!(real.workflow_key(), "deploy");
+    }
+
+    #[test]
+    fn epoch_secs_parses_rfc3339_and_rejects_junk() {
+        // Feeds the attention model's `since` for a failing CI run, so a bad
+        // stamp must degrade to "no honest time" rather than a bogus one.
+        assert_eq!(epoch_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(epoch_secs("2026-06-25T10:00:00Z"), Some(1_782_381_600));
+        // Offsets normalize to UTC.
+        assert_eq!(
+            epoch_secs("2026-06-25T12:00:00+02:00"),
+            epoch_secs("2026-06-25T10:00:00Z")
+        );
+        for junk in ["", "nonsense", "2026-06-25", "2026-13-99T99:99:99Z"] {
+            assert_eq!(epoch_secs(junk), None, "{junk:?}");
+        }
     }
 
     #[test]
