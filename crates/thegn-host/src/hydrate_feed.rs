@@ -84,10 +84,10 @@ pub(crate) fn populate_notifications(
     app_cfg: &thegn_core::config::Config,
     panel: &mut crate::panel::PanelData,
 ) {
-    // Fetch a deeper page than the display cap and filter AFTER: with the cap
-    // applied in SQL, a busy sibling repo's 50 newest rows crowded this repo's
-    // out entirely and the scoped inbox read "inbox zero" over real unread rows.
-    if let Ok(mut notifications) = db.get_all_notifications(400) {
+    // Scope BEFORE capping: with the cap applied first, a noisy sibling repo
+    // (50+ rows in the window) pushed this repo's rows out entirely — the
+    // ⚑/✉ chips read 0 while the ✋ chip and the sidebar badge still counted.
+    if let Ok(mut notifications) = db.get_all_notifications(FETCH_CAP) {
         use thegn_core::notification::Priority;
         if !crate::panel::scope::system_all() {
             let repo_paths = crate::hydrate::repo_worktree_paths(db, repo_root);
@@ -106,7 +106,7 @@ pub(crate) fn populate_notifications(
                     || !all_known.contains(&n.worktree_path)
             });
         }
-        notifications.truncate(50);
+        // Counts are over the whole scoped set; only the list is capped.
         let unread = notifications.iter().filter(|n| !n.read);
         let (mut alert, mut counted) = (0usize, 0usize);
         for n in unread {
@@ -121,9 +121,16 @@ pub(crate) fn populate_notifications(
         }
         panel.alert_notifications = alert;
         panel.unread_notifications = counted;
+        notifications.truncate(INBOX_ROWS);
         panel.notifications = notifications;
     }
 }
+
+/// Rows the inbox list shows (newest first).
+const INBOX_ROWS: usize = 50;
+/// Rows read from the DB before scoping — generous so scoping never starves
+/// the active repo; the table is pruned of old read rows on a schedule.
+const FETCH_CAP: usize = 2000;
 
 /// Sidebar sort weight for an issue priority (urgent → high → … → none).
 pub(crate) fn issue_urgency(p: thegn_core::issue::IssuePriority) -> u8 {

@@ -6204,7 +6204,8 @@ async fn event_loop<T: Terminal>(
     // path: keymap tab-nav, palette, sidebar) we kick an immediate model + PR
     // refresh and re-target the diff watcher — so the panel is correct for the
     // new worktree right away (stale-while-revalidate) instead of up to 2s late.
-    let mut last_active_worktree: Option<std::path::PathBuf> = Some(active_tab_path(&session));
+    let mut last_active_worktree: Option<std::path::PathBuf> =
+        Some(crate::hydrate::active_slice_key(&session));
     // Monotonic tag for model hydrations; intake drops results whose tag isn't
     // current (a pre-switch hydration landing post-switch). The startup spawn
     // in `run()` used 0, which this initial value accepts.
@@ -6872,8 +6873,12 @@ async fn event_loop<T: Terminal>(
         // Detect an active-worktree change centrally so every switch path is
         // covered without per-call-site wiring.
         let current_worktree = active_tab_path(&session);
-        if last_active_worktree.as_deref() != Some(current_worktree.as_path()) {
-            last_active_worktree = Some(current_worktree.clone());
+        // Keyed on the group identity (terminals get a synthetic key), not the
+        // dir: every terminal resolves to the same cwd, so a terminal→terminal
+        // switch was invisible here and the env chips stayed stale.
+        let current_key = crate::hydrate::active_slice_key(&session);
+        if last_active_worktree.as_deref() != Some(current_key.as_path()) {
+            last_active_worktree = Some(current_key.clone());
             // A selection anchored in the previous worktree's pane is stale.
             mouse_sel = None;
             // For a remote/provider worktree, connect its resident bridge (off
@@ -6910,8 +6915,13 @@ async fn event_loop<T: Terminal>(
             let hints = crate::hydrate::HydrateHints::for_switch(&panel_ui, &current_config);
             // Cache hit: paint the stale-but-right slice instantly. Miss (cold
             // worktree): blank + kick a fast panel-fill (see `clear_and_fill`).
-            match switch_cache.get(&current_worktree) {
+            match switch_cache.get(&current_key) {
                 Some(slice) => slice.apply(&mut model),
+                // A terminal has no worktree to fast-fill from: blank only (the
+                // hydration kicked below paints its env chips).
+                None if crate::hydrate::active_is_terminal(&session) => {
+                    crate::handlers::switch_cache::WorktreeSlice::clear(&mut model)
+                }
                 None => crate::handlers::switch_cache::clear_and_fill(
                     &mut model,
                     &current_worktree,
@@ -8435,7 +8445,7 @@ async fn event_loop<T: Terminal>(
             // and are re-merged on every paint) so a later switch back paints
             // instantly.
             switch_cache.insert(
-                active_tab_path(&session),
+                crate::hydrate::active_slice_key(&session),
                 crate::handlers::switch_cache::WorktreeSlice::seed_from(&model),
             );
             // We preserved the loop-owned diagnostics (task-sourced) across the

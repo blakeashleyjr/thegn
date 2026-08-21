@@ -721,6 +721,29 @@ pub(crate) fn load_or_seed_session(
     (session, seeded)
 }
 
+/// The identity the loop's switch detection and the switch cache key on.
+/// Worktree groups key on their dir; a terminal group has no dir and every
+/// terminal used to fall back to the process cwd — so terminal→terminal was
+/// never detected as a switch (the tab bar kept the previous terminal's
+/// `[ssh]`/backend chips) and two terminals shared one cached slice. Terminals
+/// key on a synthetic, never-on-disk path instead. Use [`active_tab_path`]
+/// when a real directory is needed (git reads, prefetch).
+pub(crate) fn active_slice_key(session: &crate::session::Session) -> std::path::PathBuf {
+    match session.active_group() {
+        Some(g) if g.kind == crate::session::GroupKind::Terminal => {
+            std::path::PathBuf::from(format!("\u{0}terminal:{}", g.name))
+        }
+        _ => active_tab_path(session),
+    }
+}
+
+/// True when the active group is a terminal (no worktree dir of its own).
+pub(crate) fn active_is_terminal(session: &crate::session::Session) -> bool {
+    session
+        .active_group()
+        .is_some_and(|g| g.kind == crate::session::GroupKind::Terminal)
+}
+
 pub(crate) fn active_tab_path(session: &crate::session::Session) -> std::path::PathBuf {
     session
         .active_group()
@@ -1907,7 +1930,12 @@ pub(crate) fn build_model(
              local placement — check the worktree's env pin / [env.*] config"
         );
     }
-    let active_sandbox_backend = if active_env.placement.is_local() && loc_is_local {
+    // A provider env that DEGRADED to the host runs in the host sandbox, so its
+    // backend chip is the truthful one to show (the placement chip is already
+    // suppressed above); blanking both left the degraded worktree
+    // indistinguishable from a plain unsandboxed local one.
+    let runs_on_host = (active_env.placement.is_local() || degraded_to_host) && loc_is_local;
+    let active_sandbox_backend = if runs_on_host {
         crate::hydrate_terminal::active_backend(db, &loc.path(), active_env.sandbox.backend)
     } else {
         String::new()
