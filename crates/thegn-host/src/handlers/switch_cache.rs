@@ -22,6 +22,12 @@ pub(crate) const FRESH_TTL: std::time::Duration = std::time::Duration::from_secs
 pub(crate) struct WorktreeSlice {
     pub panel: crate::panel::PanelData,
     pub sandbox_backend: String,
+    /// The hydration-resolved container name (profile-aware, in-env path for
+    /// remote/provider worktrees). Loop-side switch paths used to recompute
+    /// this profile-blind from the local path, flipping System ▸ Sandbox to
+    /// "not sandboxed" on every switch under a `[profile]` and defeating the
+    /// idle guard for remote worktrees; it now travels with the slice.
+    pub container_name: String,
     pub placement_kind: Option<String>,
     pub placement_label: Option<String>,
     pub loc: Option<thegn_core::loc::LocReport>,
@@ -41,6 +47,7 @@ impl WorktreeSlice {
         WorktreeSlice {
             panel: model.panel.clone(),
             sandbox_backend: model.active_sandbox_backend.clone(),
+            container_name: model.active_container_name.clone(),
             placement_kind: model.active_placement_kind.clone(),
             placement_label: model.active_placement_label.clone(),
             loc: model.loc.clone(),
@@ -65,6 +72,7 @@ impl WorktreeSlice {
         model.panel = self.panel.clone();
         model.panel.media = media;
         model.active_sandbox_backend = self.sandbox_backend.clone();
+        model.active_container_name = self.container_name.clone();
         model.active_placement_kind = self.placement_kind.clone();
         model.active_placement_label = self.placement_label.clone();
         model.loc = self.loc.clone();
@@ -134,7 +142,9 @@ pub(crate) fn drain_prefetch_results(
     let mut painted = false;
     while let Ok((path, panel)) = rx.try_recv() {
         loop_perf.tick(crate::perf::WakeSource::Prefetch);
-        let is_active = path == crate::hydrate::active_tab_path(session);
+        // Keyed like the switch detection: a terminal never matches a dir's
+        // prefetch, so the launch-dir worktree's panel can't paint onto it.
+        let is_active = path == crate::hydrate::active_slice_key(session);
         let slice = cache.entry(path).or_default();
         slice.panel = panel.clone();
         // A prefetched panel is fresh — stamps the re-warm TTL.
