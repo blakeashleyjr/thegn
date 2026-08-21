@@ -78,6 +78,14 @@ sidebar_workspace_sort = "manual"
 # "no terminals" hint when empty) so the entry point never vanishes;
 # "nonempty" hides the whole section until a terminal exists.
 sidebar_terminals_section = "always"
+# Shift+Alt+↑/↓ (previous/next workspace) steps one ring: every workspace in
+# sidebar order, then every terminal host. By default the ring steps *past* any
+# workspace or host you have collapsed — a folded group is one you are not
+# working in, so navigation neither stops on it nor expands it. Set false to
+# visit every group, folded or not (the old behaviour, which un-collapsed the
+# group it landed on). When every other stop is collapsed the step still lands
+# on the immediate neighbour, so the keybind never goes dead.
+sidebar_nav_skips_collapsed = true
 # Pane fullscreen (Ctrl+Alt+z cycles tiled → maximize-in-chrome → full-window):
 # in the full-window stop the sidebar/panel/strip are hidden. These keep the
 # top masthead and bottom status bars respectively — set either false for a

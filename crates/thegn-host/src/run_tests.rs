@@ -325,15 +325,11 @@ fn mk_term(name: &str, conn: &str, kind: &str) -> thegn_core::models::TerminalRo
     }
 }
 
-// Rebuild the ring + step helper the handler uses, purely.
-fn ring_step(ring: &[RingStop], cur: usize, next_dir: bool) -> RingStop {
-    let total = ring.len();
-    let next = if next_dir {
-        (cur + 1) % total
-    } else {
-        (cur + total - 1) % total
-    };
-    ring[next].clone()
+// The stop the handler's `ring_step` lands on, for tests that assert about the
+// destination rather than its index. Skipping is on (the shipped default);
+// these rings are fully expanded, so it only exercises the real path.
+fn stepped(ring: &[RingStop], cur: usize, next_dir: bool) -> RingStop {
+    ring[ring_step(ring, cur, next_dir, true).expect("ring can move")].clone()
 }
 
 #[test]
@@ -368,36 +364,46 @@ fn unified_ring_crosses_workspaces_and_terminals() {
             RingStop::Workspace {
                 slug: "app".into(),
                 repo_path: Some("/tmp/app".into()),
+                collapsed: false,
             },
             RingStop::TerminalHost {
-                key: "local".into()
+                key: "local".into(),
+                collapsed: false,
             },
-            RingStop::TerminalHost { key: "prod".into() },
+            RingStop::TerminalHost {
+                key: "prod".into(),
+                collapsed: false,
+            },
         ],
     );
     // From the workspace (resolved by slug), Next crosses into terminals…
     let cur = ring_current_index(&ring, Some("app"), None).unwrap();
     assert_eq!(cur, 0);
     assert_eq!(
-        ring_step(&ring, cur, true),
+        stepped(&ring, cur, true),
         RingStop::TerminalHost {
-            key: "local".into()
+            key: "local".into(),
+            collapsed: false,
         },
     );
     // …and Prev wraps backward from the workspace onto the last terminal host.
     assert_eq!(
-        ring_step(&ring, cur, false),
-        RingStop::TerminalHost { key: "prod".into() },
+        stepped(&ring, cur, false),
+        RingStop::TerminalHost {
+            key: "prod".into(),
+            collapsed: false,
+        },
     );
     // From a terminal host, resolution is by host key; Next wraps to the
     // workspace, crossing the boundary the other way.
     let cur_t = ring_current_index(&ring, None, Some("prod")).unwrap();
     assert_eq!(cur_t, 2);
     assert_eq!(
-        ring_step(&ring, cur_t, true),
+        stepped(&ring, cur_t, true),
         RingStop::Workspace {
             slug: "app".into(),
             repo_path: Some("/tmp/app".into()),
+            collapsed: false,
         },
     );
 }
@@ -436,18 +442,21 @@ fn ring_resolves_by_slug_and_keeps_live_fallback() {
             RingStop::Workspace {
                 slug: "app".into(),
                 repo_path: None,
+                collapsed: false,
             },
             RingStop::TerminalHost {
-                key: "local".into()
+                key: "local".into(),
+                collapsed: false,
             },
         ],
     );
     assert_eq!(ring_current_index(&ring, Some("app"), None), Some(0));
     // Next crosses into the terminals region rather than no-op.
     assert_eq!(
-        ring_step(&ring, 0, true),
+        stepped(&ring, 0, true),
         RingStop::TerminalHost {
-            key: "local".into()
+            key: "local".into(),
+            collapsed: false,
         },
     );
 }
@@ -460,9 +469,11 @@ fn ring_current_index_none_when_active_absent() {
         RingStop::Workspace {
             slug: "app".into(),
             repo_path: Some("/tmp/app".into()),
+            collapsed: false,
         },
         RingStop::TerminalHost {
             key: "local".into(),
+            collapsed: false,
         },
     ];
     assert_eq!(ring_current_index(&ring, Some("ghost"), None), None);
@@ -515,10 +526,12 @@ fn ring_navigates_back_to_top_workspace() {
             RingStop::Workspace {
                 slug: "thegn".into(),
                 repo_path: Some("/tmp/thegn".into()),
+                collapsed: false,
             },
             RingStop::Workspace {
                 slug: "washu".into(),
                 repo_path: Some("/tmp/washu".into()),
+                collapsed: false,
             },
         ],
     );
@@ -526,20 +539,22 @@ fn ring_navigates_back_to_top_workspace() {
     let cur = ring_current_index(&ring, Some("washu"), None).unwrap();
     assert_eq!(cur, 1);
     assert_eq!(
-        ring_step(&ring, cur, false),
+        stepped(&ring, cur, false),
         RingStop::Workspace {
             slug: "thegn".into(),
             repo_path: Some("/tmp/thegn".into()),
+            collapsed: false,
         },
     );
     // From thegn (cur=0), Next (Down) steps to washu (cur=1).
     let cur_sz = ring_current_index(&ring, Some("thegn"), None).unwrap();
     assert_eq!(cur_sz, 0);
     assert_eq!(
-        ring_step(&ring, cur_sz, true),
+        stepped(&ring, cur_sz, true),
         RingStop::Workspace {
             slug: "washu".into(),
             repo_path: Some("/tmp/washu".into()),
+            collapsed: false,
         },
     );
 }
