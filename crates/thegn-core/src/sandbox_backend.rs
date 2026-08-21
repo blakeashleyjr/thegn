@@ -380,6 +380,18 @@ fn available_probe(placement: &Placement, backend: Backend) -> RuntimeProbe {
         return RuntimeProbe::Absent;
     }
 
+    // Apple's `container` is a macOS-native runtime (its per-container Linux VM
+    // is what earns `IsolationClass::GuestKernel`). Its binary name is generic
+    // enough that a bare PATH probe could match something unrelated, so LOCALLY
+    // gate on the OS the same way the win-native backends are — otherwise
+    // putting `"apple"` in the default chain would change behaviour on a Linux
+    // box that happens to ship some other `container` executable. Remote
+    // placements fall through to the normal PATH probe, so a macOS ssh target
+    // still resolves it.
+    if placement.is_local() && backend == Backend::Apple && !cfg!(target_os = "macos") {
+        return RuntimeProbe::Absent;
+    }
+
     placement.probe_runtime(backend.binary())
 }
 

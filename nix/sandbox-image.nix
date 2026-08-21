@@ -1,3 +1,8 @@
+# LINUX ONLY. A Linux OCI image, and it cannot even be EVALUATED on darwin
+# (`shadow`/`procps` below refuse a darwin hostPlatform), so `flake.nix` exposes
+# `packages.sandbox-image` under `lib.optionalAttrs pkgs.stdenv.isLinux` — without
+# that gate `nix flake show` / `nix flake check` fail outright on a Mac.
+#
 # The thegn multi-arch base sandbox image: nix (flakes on) + devenv/direnv +
 # rust toolchain + node + the Claude Code CLI + the daily tools, with a populated
 # /nix and a warmed ~/.cargo

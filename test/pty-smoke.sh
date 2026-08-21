@@ -4,7 +4,11 @@
 # the termwiz/openpty path that ordinary non-PTY CLI smoke tests cannot touch.
 set -euo pipefail
 
-SZ="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/thegn}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=test/lib/pty.sh disable=SC1091
+source "$HERE/lib/pty.sh"
+
+SZ="${1:-$(cd "$HERE/.." && pwd)/target/debug/thegn}"
 SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
 [[ -x $SZ ]] || {
   echo "not executable: $SZ (run: cargo build)" >&2
@@ -12,11 +16,14 @@ SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
 }
 
 command -v script >/dev/null 2>&1 || {
-  echo "skip PTY smoke: util-linux script(1) not found"
+  echo "skip PTY smoke: script(1) not found"
   exit 0
 }
-command -v timeout >/dev/null 2>&1 || {
-  echo "skip PTY smoke: timeout(1) not found"
+# GNU coreutils on Linux, `gtimeout` where Homebrew/nix coreutils is installed;
+# stock macOS has neither, and a hung compositor must not hang the suite.
+TIMEOUT="$(pty_timeout_bin)"
+[[ -n $TIMEOUT ]] || {
+  echo "skip PTY smoke: no timeout(1)/gtimeout(1) — install coreutils"
   exit 0
 }
 
@@ -52,7 +59,12 @@ run_case() {
     'stty cols %q rows %q; env HOME=%q XDG_CONFIG_HOME=%q XDG_STATE_HOME=%q THEGN_BENCH_FIRST_FRAME_EXIT=1 %q' \
     "$cols" "$rows" "$home" "$config" "$state" "$SZ"
 
-  if timeout 20s script -qec "$cmd" "$log" >/dev/null; then
+  # `script`'s CLI differs between util-linux and BSD — see test/lib/pty.sh.
+  # Single quotes are deliberate: $0/$1/$2 are the INNER bash's positionals,
+  # bound by the three arguments below, not this shell's.
+  # shellcheck disable=SC2016
+  if "$TIMEOUT" 20s bash -c 'source "$0"; pty_run_to "$1" "$2"' \
+    "$HERE/lib/pty.sh" "$log" "$cmd" >/dev/null; then
     if grep -Eiq 'panicked at|thread .* panicked|fatal runtime error' "$log"; then
       bad "PTY launch $name (${cols}x${rows}) produced panic text"
       tail -80 "$log" || true

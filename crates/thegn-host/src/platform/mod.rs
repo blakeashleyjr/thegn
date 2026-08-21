@@ -18,6 +18,11 @@ mod unix;
 #[cfg(unix)]
 pub use unix::*;
 
+/// Live per-process introspection (pane cwd / foreground job / argv). Unlike the
+/// rest of this module the split is Linux-vs-macOS-vs-other rather than
+/// unix-vs-windows, because `/proc` is a Linux facility, not a POSIX one.
+pub(crate) mod proc;
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

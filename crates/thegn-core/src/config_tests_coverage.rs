@@ -750,6 +750,7 @@ fn sandbox_config_default_collections() {
             "podman-rootless",
             "podman-rootful",
             "docker",
+            "apple",
             "bwrap",
             "jobobject",
             "host"

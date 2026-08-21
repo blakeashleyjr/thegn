@@ -7,6 +7,63 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — macOS development (Apple silicon + nix-darwin)
+
+- **`darwinModules.default`** — a nix-darwin module that puts thegn on PATH
+  system-wide (`programs.thegn.enable`). It is deliberately thin: nix-darwin has
+  no per-user config-file mechanism, so configuration stays with
+  `homeManagerModules.default`, which already worked on darwin. Enabling both is
+  the intended shape and they install the same store path. See the README's
+  "nix-darwin (macOS)" section.
+- **The flake's darwin outputs evaluate.** `packages.sandbox-image`,
+  `fly-sandbox-image` and `thegn-musl` are now gated to Linux — the two OCI
+  images could not even be _evaluated_ on darwin (`shadow`/`procps` refuse a
+  darwin hostPlatform), which took `nix flake show` and `nix flake check` down
+  with them. The systems list also drops `x86_64-darwin`, which the pinned
+  nixpkgs has retired and which therefore threw on every Intel-mac attribute.
+- **`devenv shell` no longer builds a cross-compiler on a Mac.** The mingw-w64
+  cross-CC env vars were set unconditionally, so entering the shell on darwin
+  forced a from-source mingw GCC build — and `.envrc` prefers devenv, so that
+  was the shell a Mac contributor landed in. Now `isLinux`-gated, matching the
+  flake's `mingwCrossEnv`.
+- **The `openspec` derivation caps its memory** (`NODE_OPTIONS`, pnpm
+  child-concurrency). Its `pnpm install` being OOM-killed on the 7 GB macOS
+  runner is why the `[ci-macos]` job had never reached thegn at all.
+
+### Fixed — macOS runtime parity
+
+- **Activity dots work on macOS.** The per-worktree CPU scanner had a Linux
+  `/proc` arm, a Windows `sysinfo` arm, and an empty stub for everything else —
+  so dots never lit on a Mac. The `sysinfo` arm now serves every non-Linux
+  platform.
+- **`open` instead of a hardcoded `xdg-open`.** "Open in browser" now honours
+  `$BROWSER` and falls back to the platform opener, which is what the
+  `[forward] browser` docs had always promised and the code never did.
+- **`apple` joins the default sandbox chain**, after `docker` and before
+  `bwrap`. A Mac with Apple's `container` installed silently resolved `auto` to
+  an unsandboxed host pane; the backend was fully wired but unreachable without
+  naming it explicitly. Its probe is macOS-gated, so no other platform changes.
+- **Pane cwd and foreground-command capture work on macOS**, via a new
+  `platform::proc` seam (libproc/`sysctl`, no new dependency) behind what were
+  bare `/proc` reads. Restores "respawn panes where they were" and "relaunch
+  what was running" off Linux.
+- **The font picker degrades** to scanning the standard macOS font directories
+  when fontconfig (`fc-list`) is absent, instead of dead-ending.
+- A watcher failure no longer blames "inotify watches exhausted" on platforms
+  where `notify` rides FSEvents rather than inotify.
+
+### Changed — dev loop portability
+
+- **`just check-cross` covers six crates on darwin, not two** — every crate that
+  builds without a darwin cross C toolchain. Each leg now skips loudly when its
+  toolchain is missing instead of failing, so `just ci` is runnable on a Mac
+  (where the mingw cross-cc is deliberately absent) and in `devenv shell`.
+- **GNU-userland assumptions removed** from the dev loop: `sed -i`, `setsid`,
+  `script -qec` (util-linux vs BSD, now via `test/lib/pty.sh`), `sha256sum`,
+  and an `aarch64`-only `uname -m` case that Apple silicon reports as `arm64`.
+  `install.sh` skips the freedesktop `.desktop`/icon files on darwin, and
+  `test/perf/cpu-sample.sh` (hard `/proc` dependency) skips with a clear message.
+
 ### Added — PR queue (team mode)
 
 - **`thegn pr queue`** — the merge queue's counterpart for a repo other people

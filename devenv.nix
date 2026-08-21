@@ -2,7 +2,14 @@
   pkgs,
   lib,
   ...
-}: {
+}: let
+  # Prefix for the mingw-w64 cross C toolchain wrappers, or "" off Linux.
+  # `lib.optionalString` is lazy in its second argument, so on darwin the
+  # `pkgsCross.mingwW64` stdenv is never forced — see the `env.CC_*` block below.
+  mingwBin =
+    lib.optionalString pkgs.stdenv.isLinux
+    "${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-";
+in {
   # Developer environment for thegn. `devenv shell` to enter, `devenv test`
   # to run the git-hooks + smoke test.
 
@@ -77,10 +84,17 @@
   # and the `cc` crate resolves the target compiler from these vars. Scoped to
   # the windows-gnu triple — never touches host builds. Binutils (ar/dlltool)
   # ride along in the same wrapper bin dir.
-  env.CC_x86_64_pc_windows_gnu = "${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-cc";
-  env.CXX_x86_64_pc_windows_gnu = "${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-c++";
-  env.AR_x86_64_pc_windows_gnu = "${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-ar";
-  env.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-cc";
+  #
+  # LINUX ONLY, via `mingwBin` above — and this must stay in sync with the
+  # flake's `mingwCrossEnv`, which is likewise `isLinux`-gated. Interpolating
+  # `pkgsCross.mingwW64.stdenv.cc` unconditionally made entering `devenv shell`
+  # on a Mac build a mingw GCC cross-compiler from source, and `.envrc` prefers
+  # devenv — so that was the shell a Mac contributor landed in. Off Linux these
+  # are empty, and `just check-cross` skips the windows leg on that basis.
+  env.CC_x86_64_pc_windows_gnu = "${mingwBin}${lib.optionalString pkgs.stdenv.isLinux "cc"}";
+  env.CXX_x86_64_pc_windows_gnu = "${mingwBin}${lib.optionalString pkgs.stdenv.isLinux "c++"}";
+  env.AR_x86_64_pc_windows_gnu = "${mingwBin}${lib.optionalString pkgs.stdenv.isLinux "ar"}";
+  env.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${mingwBin}${lib.optionalString pkgs.stdenv.isLinux "cc"}";
 
   # Compilation cache. sccache caches per-crate rustc invocations so cold
   # worktrees / branch switches reuse artifacts instead of recompiling from

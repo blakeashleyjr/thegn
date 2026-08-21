@@ -21,6 +21,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/lib/env.sh"
 # shellcheck source=test/perf/lib/fixture.sh disable=SC1091
 source "$HERE/lib/fixture.sh"
+# shellcheck source=test/lib/pty.sh disable=SC1091
+source "$HERE/../lib/pty.sh"
 
 BIN="${TG_PERF_BIN:-target/release/thegn}"
 WORKTREES="${TG_PERF_WORKTREES:-8}"
@@ -97,7 +99,18 @@ printf -v INNER \
 # pane output, not input. A held-open FIFO keeps script from seeing EOF.
 FIFO="$PERF_TMP/keys.fifo"
 mkfifo "$FIFO"
-timeout "${DEADLINE_S}s" script -qec "$INNER" /dev/null <"$FIFO" >/dev/null 2>&1 &
+# `script`/`timeout` are both non-portable (util-linux vs BSD, GNU coreutils
+# vs absent) — test/lib/pty.sh resolves both.
+TIMEOUT="$(pty_timeout_bin)"
+[ -n "$TIMEOUT" ] || {
+  echo "flood: no timeout(1)/gtimeout(1) — install coreutils" >&2
+  exit 1
+}
+# Single quotes are deliberate: $0/$1 are the INNER bash's positionals, bound
+# by the two arguments below, not this shell's.
+# shellcheck disable=SC2016
+"$TIMEOUT" "${DEADLINE_S}s" bash -c 'source "$0"; pty_run "$1"' \
+  "$HERE/../lib/pty.sh" "$INNER" <"$FIFO" >/dev/null 2>&1 &
 LAUNCHER=$!
 exec 3>"$FIFO"
 

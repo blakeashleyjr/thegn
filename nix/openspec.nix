@@ -47,6 +47,16 @@ stdenv.mkDerivation (finalAttrs: {
   env.CI = "1";
   env.OPENSPEC_NO_COMPLETIONS = "1";
 
+  # Cap peak memory. This derivation is in `devShells.default`, so it gates
+  # `nix develop` — and on the macos-15 CI runner (~7 GB, 3 cores) `pnpm install`
+  # was OOM-killed (`Killed: 9`) before the job ever reached thegn, which is why
+  # macOS had never been built at all. V8 defaults its old-space to a fraction of
+  # total RAM and pnpm forks one child per core for the link/build phase; pinning
+  # both makes the peak predictable instead of machine-dependent. Costs a little
+  # wall-clock on big machines and nothing on the store-cached path.
+  env.NODE_OPTIONS = "--max-old-space-size=3072";
+  env.PNPM_CONFIG_CHILD_CONCURRENCY = "1";
+
   buildPhase = ''
     runHook preBuild
     pnpm run build
