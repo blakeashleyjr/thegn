@@ -402,6 +402,38 @@ check "clean land deletes the merged branch" \
 check "merge drain --json emits JSON on the empty queue" \
   "'$SZ' merge drain --json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
 
+# ── PR queue (`pr queue`, team mode) ────────────────────────────────────────
+# No forge is reachable in the smoke env, so this covers the CLI contract that
+# does NOT need one: the disabled-by-default guard, the DB round-trip through
+# `list`/`clear`, and the `--json` shapes. The classify/decide logic that needs
+# a live PR is unit-tested in `thegn_core::pr_queue` instead.
+check "pr queue refuses while disabled, naming the key to set" \
+  "! '$SZ' pr queue list >/dev/null 2>&1"
+# Capture the output so the message check works under `set -e`/pipefail even
+# though the command is expected to fail (same idiom as the share guard below).
+check "pr queue's refusal names the key to set" \
+  "out=\$('$SZ' pr queue list 2>&1) || printf '%s' \"\$out\" | grep -q 'pr_queue'"
+PRQ="--set pr_queue.enabled=true"
+check "pr queue list starts empty once enabled" \
+  "'$SZ' $PRQ pr queue list | grep -qi 'empty'"
+check "pr queue list --json emits JSON on the empty queue" \
+  "'$SZ' $PRQ pr queue list --json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
+check "pr queue status --json emits JSON on the empty queue" \
+  "'$SZ' $PRQ pr queue status --json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
+check "pr queue drain --json emits JSON on the empty queue" \
+  "'$SZ' $PRQ pr queue drain --json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
+check "pr queue clear is a no-op on an empty queue, not an error" \
+  "'$SZ' $PRQ pr queue clear | grep -q '0 removed'"
+# `add` needs a real PR, so it must fail cleanly (not panic) with none.
+check "pr queue add reports there is no pull request rather than crashing" \
+  "! '$SZ' $PRQ pr queue add >/dev/null 2>&1"
+# The schema migration created the table on this fresh DB.
+if command -v sqlite3 >/dev/null 2>&1; then
+  check "the pr_queue table exists after migration" \
+    "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
+       \"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='pr_queue'\") -eq 1 ]]"
+fi
+
 # An unrunnable gate is an ENVIRONMENT failure, not a verdict about the branch:
 # it must record `gate_error` (never `gate_failed`/"breaks build") and must not
 # dispatch the fixing agent — which would set a coding model loose on source

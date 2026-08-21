@@ -43,12 +43,133 @@ pub fn validate_str(body: &str) -> Vec<String> {
     // deserialize into `Config`, the entire file is discarded for defaults.
     // This catches shape/type errors; the schema walk below catches the
     // warn-and-default enum values `Deserialize` never rejects.
-    if let Err(e) = toml::from_str::<Config>(body) {
-        errs.push(format!("config would be rejected on load: {e}"));
+    match toml::from_str::<Config>(body) {
+        Err(e) => errs.push(format!("config would be rejected on load: {e}")),
+        // Templates are strings as far as the schema is concerned, so their
+        // placeholders can only be checked once the file has deserialized.
+        Ok(cfg) => check_templates(&cfg, &mut errs),
     }
     let root = config_schema();
     walk_object(&root.schema, root, &val, "", &mut errs);
     errs
+}
+
+/// Check every agent prompt/command template against the variables its surface
+/// actually provides. A typo like `{branchh}` would otherwise reach the agent as
+/// an empty expansion mid-drain; here it is a `config validate` error.
+fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
+    use crate::agent_task::{COMMAND_VARS, TaskKind, validate_template};
+
+    let mut check = |key: &str, template: &str, allowed: &[&str], is_command: bool| {
+        if template.trim().is_empty() {
+            return;
+        }
+        if let Err(e) = validate_template(template, allowed, is_command) {
+            errs.push(format!("{key}: {e}"));
+        }
+    };
+
+    let mq = &cfg.merge_queue;
+    check(
+        "merge_queue.agent_command",
+        &mq.agent_command,
+        COMMAND_VARS,
+        true,
+    );
+    check(
+        "merge_queue.prompts.conflict",
+        &mq.prompts.conflict,
+        TaskKind::MergeConflict.prompt_vars(),
+        false,
+    );
+    check(
+        "merge_queue.prompts.gate_failure",
+        &mq.prompts.gate_failure,
+        TaskKind::GateFailure.prompt_vars(),
+        false,
+    );
+
+    let pq = &cfg.pr_queue;
+    check(
+        "pr_queue.agent_command",
+        &pq.agent_command,
+        COMMAND_VARS,
+        true,
+    );
+    for (key, template, kind) in [
+        (
+            "pr_queue.prompts.ci_failure",
+            &pq.prompts.ci_failure,
+            TaskKind::PrCiFailure,
+        ),
+        (
+            "pr_queue.prompts.conflict",
+            &pq.prompts.conflict,
+            TaskKind::PrConflict,
+        ),
+        (
+            "pr_queue.prompts.review",
+            &pq.prompts.review,
+            TaskKind::PrReview,
+        ),
+    ] {
+        check(key, template, kind.prompt_vars(), false);
+    }
+
+    // The per-repo layer carries the same keys, so it needs the same check —
+    // otherwise a bad template hides in a `[workspace.<slug>]` block until that
+    // repo happens to drain.
+    for (slug, ws) in &cfg.workspace {
+        let p = &ws.pr_queue;
+        if let Some(c) = p.agent_command.as_deref() {
+            check(
+                &format!("workspace.{slug}.pr_queue.agent_command"),
+                c,
+                COMMAND_VARS,
+                true,
+            );
+        }
+        for (name, template, kind) in [
+            ("ci_failure", &p.prompts.ci_failure, TaskKind::PrCiFailure),
+            ("conflict", &p.prompts.conflict, TaskKind::PrConflict),
+            ("review", &p.prompts.review, TaskKind::PrReview),
+        ] {
+            if let Some(t) = template.as_deref() {
+                check(
+                    &format!("workspace.{slug}.pr_queue.prompts.{name}"),
+                    t,
+                    kind.prompt_vars(),
+                    false,
+                );
+            }
+        }
+
+        let o = &ws.merge_queue;
+        if let Some(c) = o.agent_command.as_deref() {
+            check(
+                &format!("workspace.{slug}.merge_queue.agent_command"),
+                c,
+                COMMAND_VARS,
+                true,
+            );
+        }
+        if let Some(t) = o.prompts.conflict.as_deref() {
+            check(
+                &format!("workspace.{slug}.merge_queue.prompts.conflict"),
+                t,
+                TaskKind::MergeConflict.prompt_vars(),
+                false,
+            );
+        }
+        if let Some(t) = o.prompts.gate_failure.as_deref() {
+            check(
+                &format!("workspace.{slug}.merge_queue.prompts.gate_failure"),
+                t,
+                TaskKind::GateFailure.prompt_vars(),
+                false,
+            );
+        }
+    }
 }
 
 /// Resolve a `$ref` (`#/definitions/Name`) to its definition name.
@@ -303,9 +424,11 @@ mod tests {
             "ShareReach grew a config key — remove it from the exclusion \
              list and bump the pinned count"
         );
+        // 61 → 65: `[pr_queue]` added PrMergeMode, PrMergeMethod, PrAutoEnqueue,
+        // and PrWatchKind, all strict-checked by construction via the marker.
         assert_eq!(
             defs.len(),
-            61,
+            65,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

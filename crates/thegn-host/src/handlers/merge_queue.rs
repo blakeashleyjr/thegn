@@ -157,7 +157,7 @@ pub(crate) fn spawn_drive(
             send(DriveMsg::Done(DriveOutcome::default()));
             return;
         }
-        let out = merge_driver::drive_queue(&mq, &root, &db, items, |s| {
+        let out = merge_driver::drive_queue(&mq, &cfg, &root, &db, items, |s| {
             send(DriveMsg::Step {
                 worktree: s.worktree.to_string(),
                 branch: s.branch.to_string(),
@@ -333,6 +333,12 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
             }
             DriveMsg::Done(out) => {
                 *ctx.fold_inflight = false;
+                // A configured-but-unresolvable agent turns the drain into
+                // "defer everything"; without this it looks like a clean no-op.
+                for w in &out.warnings {
+                    ctx.toasts
+                        .info_ttl(w.clone(), now, std::time::Duration::from_secs(8));
+                }
                 let total =
                     out.landed.len() + out.ready.len() + out.deferred.len() + out.needs_human.len();
                 let msg = if total == 0 {

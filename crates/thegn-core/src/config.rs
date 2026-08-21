@@ -513,7 +513,17 @@ pub struct MergeQueueConfig {
     pub conflict_handoff: ConflictHandoff,
     /// Headless CLI agent the driver runs in the branch's worktree to rebase/fix,
     /// then re-folds. Template `{prompt}`/`{branch}`/`{target}`; empty ⇒ notify.
+    ///
+    /// Placeholders are shell-quoted during substitution, so write them **bare**
+    /// (`claude -p {prompt}`) — quoting one yourself delivers the value to the
+    /// agent with literal quote characters attached.
     pub agent_command: String,
+    /// A configured `[[agents]]`/`[[tools]]` entry to run headlessly, named
+    /// instead of restating a command line. Its provider supplies the
+    /// non-interactive flags (`claude` ⇒ `-p … --permission-mode acceptEdits`),
+    /// so the agent is declared once. `agent_command` overrides this; with
+    /// neither set the handoff degrades to notifying.
+    pub agent: String,
     /// Queue driver: CAS-advance on green; off ⇒ stop at `ready` for a `merge land`.
     pub auto_land: bool,
     /// Agent-dispatch → re-fold cycles per branch before it's `needs_human`.
@@ -548,6 +558,48 @@ pub struct MergeQueueConfig {
     pub merged_folder: String,
     /// Folder for a branch that fails to land. Empty ⇒ leave it in place.
     pub failed_folder: String,
+    /// `[merge_queue.prompts]` — what the fixing agent is told, per blocker kind.
+    pub prompts: MergeQueuePrompts,
+}
+
+/// `[merge_queue.prompts]` — the task prompt handed to the fixing agent, one
+/// template per blocker kind. An empty template means "use thegn's built-in
+/// instructions for that kind", so the whole table is optional and unsetting a
+/// key restores the default rather than sending the agent an empty prompt.
+///
+/// Templates take `{var}` placeholders and are **not** shell-quoted (the prompt
+/// is prose; the *command* template is what gets quoted). Unknown placeholders
+/// are a configuration error — see `thegn config validate`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MergeQueuePrompts {
+    /// Branch conflicts textually with the target. Vars: `{branch}`, `{target}`,
+    /// `{worktree}`, `{paths}` (one `  - path` line each).
+    pub conflict: String,
+    /// Branch merges clean but the test gate is red. Vars: `{branch}`,
+    /// `{target}`, `{worktree}`, `{log}` (the gate output tail).
+    pub gate_failure: String,
+}
+
+impl MergeQueuePrompts {
+    /// The configured template for a kind, or `None` to use the built-in.
+    pub fn for_kind(&self, kind: crate::agent_task::TaskKind) -> Option<&str> {
+        let t = match kind {
+            crate::agent_task::TaskKind::MergeConflict => &self.conflict,
+            crate::agent_task::TaskKind::GateFailure => &self.gate_failure,
+            // The PR kinds belong to `[pr_queue.prompts]`; this table has no
+            // opinion on them, so they always fall through to the built-in.
+            k if k.is_pr() => return None,
+            _ => return None,
+        };
+        (!t.trim().is_empty()).then_some(t.as_str())
+    }
+
+    /// The template actually used for a kind: the configured one, else built-in.
+    pub fn resolve(&self, kind: crate::agent_task::TaskKind) -> &str {
+        self.for_kind(kind)
+            .unwrap_or_else(|| crate::agent_task::default_prompt(kind))
+    }
 }
 
 impl Default for MergeQueueConfig {
@@ -586,6 +638,7 @@ impl Default for MergeQueueConfig {
             regenerate_command: String::new(),
             conflict_handoff: ConflictHandoff::default(),
             agent_command: String::new(),
+            agent: String::new(),
             auto_land: true,
             agent_max_attempts: 2,
             agent_timeout_secs: 900,
@@ -594,6 +647,7 @@ impl Default for MergeQueueConfig {
             on_landed: OnLanded::Remove,
             merged_folder: "Merged".to_string(),
             failed_folder: "Needs attention".to_string(),
+            prompts: MergeQueuePrompts::default(),
         }
     }
 }
@@ -652,6 +706,8 @@ pub struct MergeQueueOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_land: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_max_attempts: Option<u32>,
@@ -667,6 +723,42 @@ pub struct MergeQueueOverlay {
     pub merged_folder: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_folder: Option<String>,
+    /// Merged **field-wise**, not wholesale: a repo that overrides only the
+    /// conflict prompt keeps the global gate-failure one. (An empty string means
+    /// "built-in", so a wholesale replace would silently discard the other key.)
+    #[serde(skip_serializing_if = "MergeQueuePromptsOverlay::is_empty")]
+    pub prompts: MergeQueuePromptsOverlay,
+}
+
+/// The `Option`-per-field overlay of `[merge_queue.prompts]`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MergeQueuePromptsOverlay {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_failure: Option<String>,
+}
+
+impl MergeQueuePromptsOverlay {
+    pub fn is_empty(&self) -> bool {
+        self.conflict.is_none() && self.gate_failure.is_none()
+    }
+
+    /// Apply present fields onto `base`. Exhaustively destructured for the same
+    /// reason [`MergeQueueOverlay::apply`] is.
+    pub fn apply(self, base: &mut MergeQueuePrompts) {
+        let MergeQueuePromptsOverlay {
+            conflict,
+            gate_failure,
+        } = self;
+        if let Some(v) = conflict {
+            base.conflict = v;
+        }
+        if let Some(v) = gate_failure {
+            base.gate_failure = v;
+        }
+    }
 }
 
 impl MergeQueueOverlay {
@@ -686,6 +778,7 @@ impl MergeQueueOverlay {
             && self.regenerate_command.is_none()
             && self.conflict_handoff.is_none()
             && self.agent_command.is_none()
+            && self.agent.is_none()
             && self.auto_land.is_none()
             && self.agent_max_attempts.is_none()
             && self.agent_timeout_secs.is_none()
@@ -694,6 +787,7 @@ impl MergeQueueOverlay {
             && self.on_landed.is_none()
             && self.merged_folder.is_none()
             && self.failed_folder.is_none()
+            && self.prompts.is_empty()
     }
 
     /// Apply present fields onto `base` (present wins, absent inherits).
@@ -718,6 +812,7 @@ impl MergeQueueOverlay {
             regenerate_command,
             conflict_handoff,
             agent_command,
+            agent,
             auto_land,
             agent_max_attempts,
             agent_timeout_secs,
@@ -726,7 +821,12 @@ impl MergeQueueOverlay {
             on_landed,
             merged_folder,
             failed_folder,
+            prompts,
         } = self;
+        prompts.apply(&mut base.prompts);
+        if let Some(v) = agent {
+            base.agent = v;
+        }
         if let Some(v) = enabled {
             base.enabled = v;
         }
@@ -1438,6 +1538,10 @@ pub struct WorkspaceConfig {
     /// the command-shaped keys can be set without an approval step.
     #[serde(skip_serializing_if = "MergeQueueOverlay::is_empty")]
     pub merge_queue: MergeQueueOverlay,
+    /// Per-repo `[pr_queue]`. A repo's review rules, merge method, and base
+    /// conventions are repository facts, exactly like the merge queue's gate.
+    #[serde(skip_serializing_if = "PrQueueOverlay::is_empty")]
+    pub pr_queue: PrQueueOverlay,
 }
 
 /// A named **environment bundle** (`[bundle.<name>]`) — a composable unit of env
@@ -3592,6 +3696,10 @@ pub use crate::config_observe::{LokiSourceConfig, ObserveConfig, PrometheusSourc
 pub use crate::config_placement::{
     OnExhaustion, PackStrategy, PlacementConfig, PlacementModePref, ResourcesDecl,
 };
+pub use crate::config_pr_queue::{
+    PrAutoEnqueue, PrMergeMethod, PrMergeMode, PrQueueConfig, PrQueueOverlay, PrQueuePrompts,
+    PrQueuePromptsOverlay, PrWatchKind,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -3685,6 +3793,10 @@ pub struct Config {
     /// registration, or an enqueue being forwarded to another host before a repo
     /// root exists).
     pub merge_queue: MergeQueueConfig,
+    /// `[pr_queue]` — watch queued pull requests on the forge, optionally fix
+    /// blockers with an agent, and merge them once green. Off by default (it is
+    /// the one part of the shell that makes network writes).
+    pub pr_queue: PrQueueConfig,
     /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
     /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
     pub replay: ReplayConfig,
@@ -3838,6 +3950,7 @@ impl Default for Config {
             daemon: DaemonConfig::default(),
             serve: ServeConfig::default(),
             merge_queue: MergeQueueConfig::default(),
+            pr_queue: PrQueueConfig::default(),
             replay: ReplayConfig::default(),
             media: MediaConfig::default(),
             usage: UsageConfig::default(),
@@ -4630,6 +4743,20 @@ impl Config {
             ws.merge_queue.clone().apply(&mut mq);
         }
         mq
+    }
+
+    /// `[pr_queue]` resolved for a repo: the global table with that repo's
+    /// `[workspace.<slug>.pr_queue]` overlay applied. Same shape as
+    /// [`Self::repo_merge_queue`].
+    pub fn repo_pr_queue(&self, repo_root: &Path) -> PrQueueConfig {
+        let mut pq = self.pr_queue.clone();
+        if !self.workspace.is_empty()
+            && let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
+            && !ws.pr_queue.is_empty()
+        {
+            ws.pr_queue.clone().apply(&mut pq);
+        }
+        pq
     }
 
     /// The name of the env a repo's `.thegn.*` overlay selects (`env = "…"`),

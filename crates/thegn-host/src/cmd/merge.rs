@@ -356,7 +356,7 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     for it in &items {
         let _ = db.set_merge_target(&it.worktree, &target);
     }
-    let out = merge_driver::drive_queue(mq, &root, &db, items, |step: &DriveStep| {
+    let out = merge_driver::drive_queue(mq, cfg, &root, &db, items, |step: &DriveStep| {
         if json {
             return;
         }
@@ -412,6 +412,12 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         }
         super::emit_json(&doc)?;
     } else {
+        // Before the tally: a configured-but-unresolvable agent silently turns
+        // the drain into "defer everything", which otherwise looks like a queue
+        // that simply had nothing to fix.
+        for w in &out.warnings {
+            outln!("Warning: {w}");
+        }
         outln!(
             "Done: {} landed, {} ready, {} deferred, {} ungated, {} need a human.",
             out.landed.len(),
@@ -447,6 +453,9 @@ fn drain_json(target: &str, out: &merge_driver::DriveOutcome) -> serde_json::Val
         // script never reads "the branch is bad" out of "the gate is missing".
         "gate_error": out.gate_error,
         "needs_human": out.needs_human,
+        // Non-fatal setup problems (e.g. `agent` naming no configured entry), so
+        // a scripted drain can tell "nothing to fix" from "couldn't fix".
+        "warnings": out.warnings,
         // Live checkouts of the target the fold could not fast-forward. A script
         // that lands into a checked-out branch needs to know its working tree is
         // now stale — silence here is what made this dangerous.

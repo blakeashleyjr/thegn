@@ -80,7 +80,11 @@ use std::path::PathBuf;
 /// `episode` column, so several needs-you signals on one worktree can be acked
 /// independently and a cache-derived signal (CI run, PR head commit) has a
 /// restart-durable episode identity instead of a bare null `since`.
-pub const SCHEMA_VERSION: i64 = 50;
+/// v51: adds `pr_queue` (the PR queue — queued pull requests on a forge, their
+/// blocker, agent budget, and last observed head; see [`crate::pr_queue`]).
+/// Keyed by `<repo_root>#<number>` rather than a worktree path, because a queued
+/// PR need not have a local checkout.
+pub const SCHEMA_VERSION: i64 = 51;
 
 pub struct Db {
     conn: Connection,
@@ -122,6 +126,45 @@ pub struct MergeQueueRow {
     /// for one invocation of the drain.
     #[serde(default)]
     pub agent_attempts: u32,
+}
+
+/// One `pr_queue` row — a pull request thegn is shepherding on a forge.
+///
+/// Keyed by repo + number rather than worktree, because a queued PR need not
+/// have a local checkout. `status` is a [`crate::pr_queue::PrqStatus`] word and
+/// `blocker` a [`crate::pr_queue::Blocker`] word.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PrQueueRow {
+    /// `<repo_root>#<number>` — the primary key.
+    pub key: String,
+    pub repo_root: String,
+    pub number: u64,
+    /// The worktree this entry was queued from. `None` for a PR with no local
+    /// checkout — the driver reports that as needing a human rather than
+    /// silently skipping the row, since an agent has nowhere to work.
+    pub worktree: Option<String>,
+    pub branch: String,
+    pub base_branch: String,
+    /// Which forge owns it (`github` today; the seam is a trait).
+    pub forge: String,
+    pub status: String,
+    /// The classified blocker word, or `None` before the first refresh.
+    pub blocker: Option<String>,
+    /// Human-readable detail for the current status (failing checks, an error).
+    pub detail: Option<String>,
+    pub agent_attempts: u32,
+    /// The head commit thegn last observed. A change it did not cause means a
+    /// teammate pushed — see [`crate::pr_queue::foreign_push`].
+    pub last_head_oid: Option<String>,
+    pub queued_at: i64,
+    pub updated_at: i64,
+}
+
+impl PrQueueRow {
+    /// The primary key for a repo + PR number.
+    pub fn make_key(repo_root: &str, number: u64) -> String {
+        format!("{repo_root}#{number}")
+    }
 }
 
 // Share/forward resurrection rows live in `models` (size-capped file); the
@@ -601,6 +644,34 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_merge_queue_status
               ON merge_queue (status, queued_at);
+            -- pr_queue (v50): the PR queue — pull requests being shepherded on a
+            -- forge. Keyed by `<repo_root>#<number>`, NOT by worktree, because a
+            -- queued PR need not have a local checkout (`worktree` is nullable).
+            -- status (PrqStatus::parse is the one decoder):
+            --   watching | blocked_ci | blocked_conflict | blocked_review
+            --   agent_running | ready | merging | merged | needs_human | closed
+            -- `last_head_oid` is what makes the team-safety rules work: a head
+            -- thegn did not produce means someone else pushed, which both refills
+            -- the agent budget and (under pause_on_foreign_push) stops the agent
+            -- rather than racing a teammate.
+            CREATE TABLE IF NOT EXISTS pr_queue (
+              key            TEXT PRIMARY KEY,
+              repo_root      TEXT NOT NULL,
+              number         INTEGER NOT NULL,
+              worktree       TEXT,
+              branch         TEXT NOT NULL,
+              base_branch    TEXT NOT NULL DEFAULT '',
+              forge          TEXT NOT NULL DEFAULT 'github',
+              status         TEXT NOT NULL DEFAULT 'watching',
+              blocker        TEXT,
+              detail         TEXT,
+              agent_attempts INTEGER NOT NULL DEFAULT 0,
+              last_head_oid  TEXT,
+              queued_at      INTEGER NOT NULL,
+              updated_at     INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pr_queue_repo
+              ON pr_queue (repo_root, status, queued_at);
             -- env_base_snapshots (v25): a per-(repo, env) provider snapshot that
             -- already has the repo's nix devShell built, so a NEW worktree-sprite is
             -- created FROM it (instant) instead of rebuilding the toolchain. Keyed

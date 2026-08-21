@@ -147,6 +147,9 @@ pub enum Action {
     OpenCi,
     /// Open the right panel to the Work ▸ Merge queue section (fold-actor).
     OpenMergeQueue,
+    OpenPrQueue,
+    PrQueueAdd,
+    PrQueueRefresh,
     /// Summon the AI-account usage overlay (per-account rate-limit windows).
     OpenUsage,
     /// Prompt for a port and expose it from the active worktree (`[share]`).
@@ -483,6 +486,9 @@ impl Action {
             Action::FocusPanel => "focus-panel",
             Action::OpenCi => "open-ci",
             Action::OpenMergeQueue => "open-merge-queue",
+            Action::OpenPrQueue => "open-pr-queue",
+            Action::PrQueueAdd => "pr-queue-add",
+            Action::PrQueueRefresh => "pr-queue-refresh",
             Action::OpenUsage => "open-usage",
             Action::ShareWorktreePort => "share-worktree-port",
             Action::StopWorktreeShare => "stop-worktree-share",
@@ -604,6 +610,9 @@ impl Action {
             "focus-panel" => Action::FocusPanel,
             "open-ci" => Action::OpenCi,
             "open-merge-queue" => Action::OpenMergeQueue,
+            "open-pr-queue" => Action::OpenPrQueue,
+            "pr-queue-add" => Action::PrQueueAdd,
+            "pr-queue-refresh" => Action::PrQueueRefresh,
             "open-usage" => Action::OpenUsage,
             "share-worktree-port" => Action::ShareWorktreePort,
             "stop-worktree-share" => Action::StopWorktreeShare,

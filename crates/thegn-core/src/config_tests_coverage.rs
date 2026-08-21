@@ -127,13 +127,15 @@ fn notification_priority_defaults_and_overrides() {
         Priority::Notice
     );
 
-    // Alert set: real failures + agent-attention + the queue's give-up; unread
+    // Alert set: real failures + agent-attention + each queue's give-up; unread
     // excludes Info. `log_error` is NOT here — thegn's own diagnostics are Info
-    // (quiet), never a red alert.
+    // (quiet), never a red alert. Note `pr_queue_ready` and `pr_queue_merged` are
+    // deliberately absent: a PR waiting on a colleague is the normal resting
+    // state, and a permanently red badge teaches people to ignore it.
     let alerts = cfg.alert_kind_names();
-    assert_eq!(alerts.len(), 5);
+    assert_eq!(alerts.len(), 6);
     let want = "agent_failed agent_attention test_failed \
-                    process_failed queue_needs_human";
+                    process_failed queue_needs_human pr_queue_needs_human";
     for k in want.split_whitespace() {
         assert!(alerts.contains(&k), "missing {k}");
     }

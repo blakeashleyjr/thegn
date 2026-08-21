@@ -44,8 +44,8 @@ never a session change.
   aider, …) launched as an ordinary command — optionally inside a sandbox
   (see below).
 - **Right panel.** For the focused worktree: the git diff and the branch's PR —
-  state, CI check rollup, review decision — plus CI runs, merge queue,
-  notifications, and shares, organized in panel tabs.
+  state, CI check rollup, review decision — plus CI runs, the merge and PR
+  queues, notifications, and shares, organized in panel tabs.
 - **Tools, scoped to the focused worktree:**
   `Alt-g` lazygit · `Alt-e` `$EDITOR` · `Alt-/` git diff ·
   `Ctrl-Alt-f` / `Alt-y` bottom files drawer.
@@ -226,8 +226,8 @@ repo-root `.thegn.{toml,yaml,yml,json}` overlays per-repo settings
   worktrees.
 - `[metrics]` — Prometheus `/metrics` endpoints to scrape; target health and
   allowlisted values render in the chrome, no Prometheus server needed.
-- `[merge_queue]`, `[share]`, `[forward]`, `[media]`, `[replay]`,
-  `[lifecycle]` — the optional feature groups.
+- `[merge_queue]`, `[pr_queue]`, `[share]`, `[forward]`, `[media]`,
+  `[replay]`, `[lifecycle]` — the optional feature groups.
 
 ## Terminal compatibility
 
