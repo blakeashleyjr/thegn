@@ -244,10 +244,7 @@ impl StatsSampler {
         // not a full process enumeration. CPU is a delta, so the first refresh
         // of the set only primes it (mirrors `cpu_primed`).
         {
-            let mut pids = vec![self.self_pid];
-            if let Some(d) = self.daemon_pid {
-                pids.push(d);
-            }
+            let pids = refresh_pid_list(self.self_pid, self.daemon_pid);
             self.sys.refresh_processes_specifics(
                 ProcessesToUpdate::Some(&pids),
                 false, // keep entries whose delta we still want next tick
@@ -275,6 +272,41 @@ impl StatsSampler {
     }
 }
 
+/// The PID set to hand `refresh_processes_specifics`: us, plus the pane daemon
+/// when it is a *different* process.
+///
+/// **The list must never repeat a PID.** sysinfo 0.39 fans the requested set
+/// out across a rayon pool by list position rather than by PID, so a repeated
+/// PID hands two worker threads the same `Process` entry at once. Both can
+/// `take()` its cached `/proc/<pid>/stat` handle, and whichever loses closes a
+/// file descriptor the other still owns. std catches that double close and
+/// aborts the entire process:
+///
+/// ```text
+/// fatal runtime error: IO Safety violation: owned file descriptor already closed
+/// ```
+///
+/// Measured against sysinfo 0.39.5 in a debug build (the check is `#[inline]`
+/// and gated on the calling crate's debug-assertions, so release builds hide
+/// it): one PID listed twice aborted ~1% of refreshes, four times ~24%, eight
+/// times ~78%; a list with no repeats never aborted in 200 runs.
+///
+/// A daemon PID equal to ours is the only way this list can repeat. That is
+/// normally impossible — the daemon is a separate process, and only `thegn
+/// daemon`/`thegn serve` write their own PID into the registry — but it is
+/// reachable if a still-heartbeating row records a PID the OS has since
+/// recycled onto us. Dropping the duplicate loses nothing: the daemon fields
+/// are read back by PID from the refreshed map, which still holds that entry.
+fn refresh_pid_list(self_pid: Pid, daemon_pid: Option<Pid>) -> Vec<Pid> {
+    let mut pids = vec![self_pid];
+    if let Some(d) = daemon_pid
+        && d != self_pid
+    {
+        pids.push(d);
+    }
+    pids
+}
+
 /// Round an f32 percentage into a clamped 0–100 byte.
 fn pct_u8(v: f32) -> u8 {
     v.round().clamp(0.0, 100.0) as u8
@@ -299,6 +331,41 @@ fn cpu_temp(temps: &[(String, f32)]) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A repeated PID makes sysinfo race two rayon workers onto one `Process`
+    // and double-close its cached /proc handle, aborting the process. These
+    // pin the dedup deterministically — the crash itself only shows up in
+    // ~1% of refreshes, far too rare to guard a regression with.
+    #[test]
+    fn refresh_pid_list_drops_a_daemon_that_is_us() {
+        let me = Pid::from_u32(1234);
+        assert_eq!(refresh_pid_list(me, Some(me)), vec![me]);
+    }
+
+    #[test]
+    fn refresh_pid_list_keeps_a_distinct_daemon() {
+        let me = Pid::from_u32(1234);
+        let daemon = Pid::from_u32(5678);
+        assert_eq!(refresh_pid_list(me, Some(daemon)), vec![me, daemon]);
+    }
+
+    #[test]
+    fn refresh_pid_list_is_just_us_without_a_daemon() {
+        let me = Pid::from_u32(1234);
+        assert_eq!(refresh_pid_list(me, None), vec![me]);
+    }
+
+    #[test]
+    fn refresh_pid_list_never_repeats() {
+        let me = Pid::from_u32(1234);
+        for daemon in [None, Some(me), Some(Pid::from_u32(5678))] {
+            let pids = refresh_pid_list(me, daemon);
+            let mut sorted = pids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), pids.len(), "duplicate PID in {pids:?}");
+        }
+    }
 
     #[test]
     fn cpu_temp_prefers_cpuish_then_max() {
