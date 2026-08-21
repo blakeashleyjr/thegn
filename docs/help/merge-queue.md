@@ -122,6 +122,27 @@ one of them is about your branch:
   never triggers a bisect, and never blames a branch — but it is retried
   on the next drain, since the environment may be fixed by then.
 
+## Driving it from an agent pane
+
+thegn ships the queue's instructions to whatever coding agent you run in a
+pane, so you don't hand-install anything. When the queue is enabled, each
+worktree is seeded with three Claude-format assets:
+
+- `.claude/skills/mq/SKILL.md` — `/mq`, the overview an agent finds on its
+  own when you ask it to queue or check a branch.
+- `.claude/commands/mq-add.md` — `/mq-add`, commit this worktree's branch
+  and enqueue it.
+- `.claude/commands/mq-drain.md` — `/mq-drain`, work the queue by hand:
+  land what is clean, resolve the rest yourself, repeat. The
+  agent-autopilot equivalent of `thegn merge drain`, for when you'd rather
+  drive than configure `conflict_handoff`.
+
+They are written at worktree-create time and back-filled at startup, and
+each is added to the repo's `.git/info/exclude`, so they never show up as
+untracked changes. Nothing is seeded while `[merge_queue] enabled = false`.
+Edit them freely — they are rewritten on the next launch, so keep local
+changes elsewhere.
+
 ## Watching
 
 The masthead shows queue depth ([[bars]]); the _merge_ section lists
