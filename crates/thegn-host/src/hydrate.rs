@@ -278,6 +278,9 @@ const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// `[disk].scan_interval_secs`). A whole multiple of the 500ms half-tick.
 const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Daemon registry-row refresh cadence (feeds the far-right chip + modal).
+const DAEMON_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Ticker slot (500ms each) of the one-shot startup remote poll — 3s in, well
 /// clear of the launch→first-frame path so `[git] auto_fetch` can never show up
 /// in the startup waterfall.
@@ -326,6 +329,7 @@ pub(crate) fn spawn_refresh_ticker(
         let prq_every = prq_poll_secs.map(|s| (s.max(15) * 1000) / 500);
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let disk_every = DISK_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let daemon_every = DAEMON_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let heal_every = 30; // 15s host-heal consideration (backoff: core::heal)
         let mut ticks: u64 = 0;
         // System stats for the top bar ride the same thread/cadence — the
@@ -338,17 +342,28 @@ pub(crate) fn spawn_refresh_ticker(
         // per-process sampler at the daemon PID. Best-effort — a DB-open failure
         // just leaves the status absent (the chip falls back to NonPersist).
         let daemon_scope = crate::daemon::scope_key();
-        let daemon_db = thegn_core::db::Db::open().ok();
+        // Opened per refresh (cheap on WAL): a failed open at startup used to
+        // leave the chip a dim `○` for the whole session, and a transient
+        // read error downgraded a serving daemon to "none". Both now keep the
+        // last known row and log.
         let refresh_daemon =
             |sampler: &mut thegn_metrics::StatsSampler| -> Option<crate::chrome::DaemonStatus> {
-                let db = daemon_db.as_ref()?;
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
-                let status = crate::handlers::status::snapshot(db, &daemon_scope, now_ms);
-                sampler.set_daemon_pid(status.pid);
-                Some(status)
+                let status = thegn_core::db::Db::open()
+                    .and_then(|db| crate::handlers::status::snapshot(&db, &daemon_scope, now_ms));
+                match status {
+                    Ok(status) => {
+                        sampler.set_daemon_pid(status.pid);
+                        Some(status)
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "thegn::hydrate", error = %e, "daemon registry read failed; keeping last status");
+                        None
+                    }
+                }
             };
         // Prime once so the sampler watches the daemon PID from the first sample.
         if let Some(status) = refresh_daemon(&mut sampler) {
@@ -413,9 +428,11 @@ pub(crate) fn spawn_refresh_ticker(
                 }
                 wake = true;
             }
-            // Daemon/status refresh on the same slow cadence: re-resolves the
-            // daemon PID for the per-process sampler and updates the chip modal.
-            if ticks.is_multiple_of(disk_every)
+            // Daemon/status refresh: re-resolves the daemon PID for the
+            // per-process sampler and updates the chip + modal. A cheap
+            // registry read, so it runs every 10 s — with the 30 s disk slot
+            // a dead daemon read "healthy" for up to 90 s.
+            if ticks.is_multiple_of(daemon_every)
                 && let Some(status) = refresh_daemon(&mut sampler)
             {
                 if daemon_tx.send(status).is_err() {

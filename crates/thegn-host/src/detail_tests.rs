@@ -964,6 +964,7 @@ fn daemon_chip_opens_expanded_status_modal() {
         loop_perf: &crate::telemetry::LoopPerfHistory::default(),
         daemon: &daemon,
         sessions: &sessions,
+        sessions_age_secs: None,
         daemon_cfg: &dcfg,
         screen: screen(),
         now_ms: 60_000, // 60s of daemon uptime
@@ -1018,6 +1019,7 @@ fn status_modal_on(
         loop_perf: &crate::telemetry::LoopPerfHistory::default(),
         daemon: &daemon,
         sessions,
+        sessions_age_secs: None,
         daemon_cfg: &dcfg,
         screen: screen_rect,
         now_ms: 60_000,

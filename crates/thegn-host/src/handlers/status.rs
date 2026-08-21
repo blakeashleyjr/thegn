@@ -45,16 +45,20 @@ pub(crate) fn daemon_chip_state(status: &DaemonStatus, persistent_pane: bool) ->
 /// never written, so the attached count was structurally always `0`. The
 /// daemon's in-memory session registry is the source of truth — see
 /// [`probe_sessions`].
-pub(crate) fn snapshot(db: &dyn ControlStore, scope: &str, now_ms: i64) -> DaemonStatus {
+///
+/// `Err` is a control-store read failure — distinct from "no daemon", so the
+/// ticker keeps the last known row instead of silently downgrading the chip.
+pub(crate) fn snapshot(
+    db: &dyn ControlStore,
+    scope: &str,
+    now_ms: i64,
+) -> anyhow::Result<DaemonStatus> {
     use thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS;
-    let Some(row) = db
-        .live_daemons(scope, now_ms, DAEMON_HEARTBEAT_TTL_MS)
-        .ok()
-        .and_then(|mut rows| rows.drain(..).next())
-    else {
-        return DaemonStatus::default();
+    let mut rows = db.live_daemons(scope, now_ms, DAEMON_HEARTBEAT_TTL_MS)?;
+    let Some(row) = rows.drain(..).next() else {
+        return Ok(DaemonStatus::default());
     };
-    DaemonStatus {
+    Ok(DaemonStatus {
         present: true,
         pid: u32::try_from(row.pid).ok(),
         version: row.version,
@@ -69,7 +73,7 @@ pub(crate) fn snapshot(db: &dyn ControlStore, scope: &str, now_ms: i64) -> Daemo
         // socket; remote-client detection is set by the caller when this
         // instance attaches to a daemon on another machine.
         remote: false,
-    }
+    })
 }
 
 /// Ask the daemon for its live session list and deliver it into the open status
@@ -93,9 +97,13 @@ pub(crate) fn probe_sessions(
     if !matches!(id, BarItemId::Badge(BarBadge::Persist)) {
         return;
     }
-    // Flip to Probing *before* the modal is built, so its first paint says so
-    // rather than showing a stale list from a previous open.
-    *slot = DaemonSessions::Probing;
+    // Flip to Probing *before* the modal is built so its first paint says so —
+    // unless a live list is already held: a re-probe (the modal re-runs this
+    // while open) keeps the table on screen, with its "as of" age, rather than
+    // blanking it every few seconds.
+    if !matches!(slot, DaemonSessions::Live(_)) {
+        *slot = DaemonSessions::Probing;
+    }
     let (tx, waker, dcfg) = (refresh_tx.clone(), waker.clone(), dcfg.clone());
     tokio::spawn(async move {
         let payload = match crate::daemon::client::connect_daemon(&dcfg).await {
