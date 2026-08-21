@@ -36,6 +36,10 @@ struct SearchUi {
     query: String,
     hits: Vec<SearchHit>,
     sel: usize,
+    /// First visible hit. Without it the selection could walk past the last
+    /// drawn row, leaving nothing highlighted while `↵` still opened the
+    /// invisible hit.
+    scroll: usize,
 }
 
 pub struct HelpOverlay {
@@ -58,6 +62,46 @@ pub struct HelpOverlay {
     /// time and shown as the layer badge — so a rebind of `help` is reflected
     /// instead of the badge always claiming `F1`.
     badge: String,
+    /// Where things were painted on the last render, for mouse hit-testing.
+    /// `None` before the first render, when a click can't mean anything yet.
+    hits: Option<HitAreas>,
+}
+
+/// The last frame's clickable geometry. Recorded by `render` so clicks land on
+/// what the user actually sees — the same paint-and-hit-test-from-one-pass rule
+/// the chrome follows.
+#[derive(Debug, Clone, Default)]
+struct HitAreas {
+    /// Left pane rows: `(y, toc_row_index)` — TOC rows, or search hits.
+    left_rows: Vec<(usize, usize)>,
+    /// Left pane column range, `x..x + cols`.
+    left_x: (usize, usize),
+    /// First body row of the right pane, and its column range.
+    content_y: usize,
+    content_x: (usize, usize),
+    /// Visible body rows in the right pane.
+    body_h: usize,
+}
+
+/// The dim preview line under a search hit: the matched body line with the
+/// query itself inverted. `hl_start`/`hl_len` are **char** offsets (the core
+/// matcher folds ASCII case over chars), so slice by chars, not bytes.
+fn snippet_segs(sn: &thegn_core::help::Snippet) -> Vec<Seg> {
+    let chars: Vec<char> = sn.text.chars().collect();
+    let start = sn.hl_start.min(chars.len());
+    let end = (start + sn.hl_len).min(chars.len());
+    let take = |r: std::ops::Range<usize>| chars[r].iter().collect::<String>();
+    let mut out = vec![sp(3)];
+    if start > 0 {
+        out.push(seg(Tok::Slot(S::Ghost), take(0..start)));
+    }
+    if end > start {
+        out.push(seg(Tok::Slot(S::Text), take(start..end)).bg(Tok::SelAccent));
+    }
+    if end < chars.len() {
+        out.push(seg(Tok::Slot(S::Ghost), take(end..chars.len())));
+    }
+    out
 }
 
 fn flatten_toc(
@@ -98,6 +142,7 @@ impl HelpOverlay {
             fwd: Vec::new(),
             last_dims: (72, 20),
             badge,
+            hits: None,
         }
     }
 
@@ -195,6 +240,7 @@ impl HelpOverlay {
                 &crate::fff_backend::fuzzy_rank,
             );
             s.sel = 0;
+            s.scroll = 0;
         }
     }
 
@@ -258,6 +304,7 @@ impl HelpOverlay {
                     query: String::new(),
                     hits: Vec::new(),
                     sel: 0,
+                    scroll: 0,
                 });
             }
             KeyCode::Char('o') => return HelpOutcome::OpenInPanel,
@@ -364,6 +411,13 @@ impl HelpOverlay {
         let body_y = inner.y + 2;
         let body_h = inner.rows - 3;
         self.last_dims = (content_w, body_h);
+        let mut hits = HitAreas {
+            left_x: (inner.x, inner.x + toc_w),
+            content_y: body_y,
+            content_x: (content_x, content_x + content_w),
+            body_h,
+            ..Default::default()
+        };
 
         // Header row: search input, or breadcrumb + title.
         let header = if let Some(s) = &self.search {
@@ -411,36 +465,67 @@ impl HelpOverlay {
             panel,
         );
 
-        // Left pane: search results while searching, else the TOC.
+        // While searching, the results take the whole body: the TOC is
+        // irrelevant, and the snippets need the width. Each hit is two rows —
+        // its title, then the matched line with the query highlighted.
+        const ROWS_PER_HIT: usize = 2;
+        let visible = (body_h / ROWS_PER_HIT).max(1);
+        // Keep the selection on screen. Persisted, so the window is stable
+        // across frames — this is the fix for `sel` walking past the last drawn
+        // row with nothing highlighted while `↵` still opened the hidden hit.
+        if let Some(s) = self.search.as_mut() {
+            s.scroll = s.scroll.min(s.sel);
+            if s.sel >= s.scroll + visible {
+                s.scroll = s.sel + 1 - visible;
+            }
+        }
         if let Some(s) = &self.search {
-            for (i, hit) in s.hits.iter().take(body_h).enumerate() {
-                let selected = i == s.sel;
-                let mut segs = vec![sp(1)];
+            let scroll = s.scroll;
+            for (i, hit) in s.hits.iter().skip(scroll).take(visible).enumerate() {
+                let y = body_y + i * ROWS_PER_HIT;
+                hits.left_rows.push((y, scroll + i));
+                hits.left_rows.push((y + 1, scroll + i));
+                let selected = scroll + i == s.sel;
                 let mut title = seg(Tok::Slot(S::Text), hit.title.clone());
                 if selected {
                     title = title.bg(Tok::SelAccent).bold();
                 }
-                segs.push(title);
                 seg::draw_line(
                     surface,
                     inner.x,
-                    body_y + i,
-                    toc_w,
-                    &Line::segs(segs),
+                    y,
+                    inner.cols,
+                    &Line::segs(vec![sp(1), title]),
                     panel,
                 );
+                if let Some(sn) = &hit.snippet
+                    && y + 1 < body_y + body_h
+                {
+                    seg::draw_line(
+                        surface,
+                        inner.x,
+                        y + 1,
+                        inner.cols,
+                        &Line::segs(snippet_segs(sn)),
+                        panel,
+                    );
+                }
             }
             if s.hits.is_empty() && !s.query.is_empty() {
                 seg::draw_line(
                     surface,
                     inner.x,
                     body_y,
-                    toc_w,
+                    inner.cols,
                     &Line::segs(vec![sp(1), seg(Tok::Slot(S::Ghost), "no matches")]),
                     panel,
                 );
             }
-        } else {
+            self.draw_footer(surface, inner, panel);
+            self.hits = Some(hits);
+            return;
+        }
+        {
             // Keep the cursor row visible.
             if self.toc_sel < self.toc_scroll {
                 self.toc_scroll = self.toc_sel;
@@ -455,6 +540,7 @@ impl HelpOverlay {
                 .enumerate()
             {
                 let row = self.toc_scroll + i;
+                hits.left_rows.push((body_y + i, row));
                 let current = *id == self.page;
                 let cursor = row == self.toc_sel;
                 let mut label = seg(
@@ -511,7 +597,12 @@ impl HelpOverlay {
             seg::draw_line(surface, content_x, body_y + i, content_w, line, panel);
         }
 
-        // Footer hints.
+        self.draw_footer(surface, inner, panel);
+        self.hits = Some(hits);
+    }
+
+    /// The bottom hint row, whose set depends on what owns the keyboard.
+    fn draw_footer(&self, surface: &mut Surface, inner: Rect, panel: Tok) {
         let hints: &[(&str, &str)] = if self.search.is_some() {
             &[("↑↓", "select"), ("↵", "open"), ("esc", "cancel")]
         } else if self.side == Side::Toc {
@@ -523,12 +614,16 @@ impl HelpOverlay {
                 ("esc", "close"),
             ]
         } else {
+            // Seven hints is the most this row holds; labels are kept short so
+            // the set survives a typical width (it truncates on a narrow
+            // terminal, as it always has).
             &[
                 ("↑↓", "scroll"),
                 ("n p", "links"),
                 ("↵", "follow"),
-                ("[ ]", "back/fwd"),
+                ("[ ]", "back"),
                 ("/", "search"),
+                ("o", "panel"),
                 ("esc", "close"),
             ]
         };
@@ -548,6 +643,48 @@ impl HelpOverlay {
             &Line::segs(segs),
             panel,
         );
+    }
+
+    /// Handle a left-press inside the overlay box.
+    ///
+    /// Left pane: a row selects that TOC entry (browsing, so no history — the
+    /// same semantics as moving the cursor with `↑↓`) or opens that search hit.
+    /// Right pane: clicking a line containing a link follows it.
+    pub fn handle_click(&mut self, x: usize, y: usize) -> HelpOutcome {
+        let Some(hits) = self.hits.clone() else {
+            return HelpOutcome::Pending;
+        };
+        // Left pane: TOC rows, or search results while searching.
+        if x >= hits.left_x.0 && x < hits.left_x.1 {
+            if let Some((_, idx)) = hits.left_rows.iter().find(|(row, _)| *row == y) {
+                if self.search.is_some() {
+                    if let Some(s) = self.search.as_mut() {
+                        s.sel = *idx;
+                    }
+                    self.open_hit();
+                } else {
+                    self.side = Side::Toc;
+                    self.toc_sel = (*idx).min(self.toc_rows.len().saturating_sub(1));
+                    self.open_toc_row();
+                }
+            }
+            return HelpOutcome::Pending;
+        }
+        // Right pane: follow a link on the clicked line, if there is one.
+        if x >= hits.content_x.0 && x < hits.content_x.1 && y >= hits.content_y {
+            let row = y - hits.content_y;
+            if row >= hits.body_h {
+                return HelpOutcome::Pending;
+            }
+            self.side = Side::Content;
+            let line = self.scroll + row;
+            let rendered = self.rendered();
+            if let Some(idx) = rendered.links.iter().position(|l| l.line == line) {
+                self.link_sel = Some(idx);
+                self.follow_link();
+            }
+        }
+        HelpOutcome::Pending
     }
 }
 
@@ -635,6 +772,86 @@ mod tests {
         assert!(ov.search.is_none());
     }
 
+    /// The bug: `sel` clamped to `hits.len()`, but only `body_h` rows were
+    /// drawn — arrowing past the fold left nothing highlighted while `↵` still
+    /// opened the invisible hit. The window must follow the selection.
+    #[test]
+    fn search_results_scroll_to_keep_the_selection_visible() {
+        let (mut ov, screen) = rendered_overlay();
+        key(&mut ov, KeyCode::Char('/'));
+        for c in "the".chars() {
+            key(&mut ov, KeyCode::Char(c));
+        }
+        let n = ov.search.as_ref().unwrap().hits.len();
+        assert!(n > 4, "need enough hits to overflow, got {n}");
+        for _ in 0..n {
+            key(&mut ov, KeyCode::DownArrow);
+        }
+        let mut s = Surface::new(100, 30);
+        ov.render(&mut s, screen);
+        let se = ov.search.as_ref().unwrap();
+        assert_eq!(se.sel, n - 1, "selection at the last hit");
+        // The selected row is inside the drawn window.
+        let visible = (ov.last_dims.1 / 2).max(1);
+        assert!(
+            se.sel >= se.scroll && se.sel < se.scroll + visible,
+            "sel {} outside window {}..{}",
+            se.sel,
+            se.scroll,
+            se.scroll + visible
+        );
+    }
+
+    /// Hits used to render as a bare title list; the snippet was computed,
+    /// tested, and thrown away. It is now drawn under each hit.
+    #[test]
+    fn search_results_show_their_snippet() {
+        let (mut ov, screen) = rendered_overlay();
+        key(&mut ov, KeyCode::Char('/'));
+        for c in "worktree".chars() {
+            key(&mut ov, KeyCode::Char(c));
+        }
+        let snippet = ov
+            .search
+            .as_ref()
+            .unwrap()
+            .hits
+            .iter()
+            .find_map(|h| h.snippet.as_ref())
+            .expect("a body match")
+            .text
+            .clone();
+        let mut s = Surface::new(100, 30);
+        ov.render(&mut s, screen);
+        let text = s.screen_chars_to_string();
+        // The snippet's opening words are drawn (the line may clip at width).
+        let head: String = snippet.chars().take(20).collect();
+        assert!(text.contains(head.trim()), "snippet drawn: {text}");
+    }
+
+    #[test]
+    fn snippet_segs_highlight_the_match_on_char_boundaries() {
+        let sn = thegn_core::help::Snippet {
+            text: "naïve — Bold text".to_string(),
+            hl_start: 8,
+            hl_len: 4,
+            section: None,
+        };
+        let segs = snippet_segs(&sn);
+        let joined: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined.trim_start(), "naïve — Bold text");
+        // Out-of-range offsets clamp instead of panicking on a multibyte slice.
+        let bad = thegn_core::help::Snippet {
+            text: "naïve".to_string(),
+            hl_start: 99,
+            hl_len: 99,
+            section: None,
+        };
+        let segs = snippet_segs(&bad);
+        let joined: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined.trim_start(), "naïve");
+    }
+
     #[test]
     fn search_esc_cancels_without_moving() {
         let mut ov = overlay();
@@ -684,6 +901,102 @@ mod tests {
         assert!(text.contains("thegn"), "page body drawn: {text}");
         assert!(text.contains("Welcome"), "TOC row drawn");
         assert!(text.contains("help"), "layer title");
+    }
+
+    /// Render once so `hits` is populated, then click.
+    fn rendered_overlay() -> (HelpOverlay, Rect) {
+        let mut ov = overlay();
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 100,
+            rows: 30,
+        };
+        let mut s = Surface::new(100, 30);
+        ov.render(&mut s, screen);
+        (ov, screen)
+    }
+
+    /// A click before the first render can't mean anything, and must not panic.
+    #[test]
+    fn click_before_render_is_inert() {
+        let mut ov = overlay();
+        assert_eq!(ov.handle_click(10, 10), HelpOutcome::Pending);
+        assert_eq!(ov.page_id(), "index");
+    }
+
+    #[test]
+    fn clicking_a_toc_row_opens_that_page() {
+        let (mut ov, _) = rendered_overlay();
+        let before = ov.page_id().to_string();
+        // Second visible TOC row (the first is `index`, already open).
+        let (y, _) = ov.hits.as_ref().unwrap().left_rows[1];
+        let x = ov.hits.as_ref().unwrap().left_x.0 + 1;
+        ov.handle_click(x, y);
+        assert_ne!(ov.page_id(), before, "click switched the page");
+        assert_eq!(ov.side, Side::Toc);
+        assert!(ov.back.is_empty(), "browsing by click is not history");
+    }
+
+    #[test]
+    fn clicking_a_link_line_follows_it() {
+        let (mut ov, _) = rendered_overlay();
+        let first = ov.rendered().links.first().map(|l| l.line).unwrap();
+        let h = ov.hits.as_ref().unwrap().clone();
+        ov.handle_click(h.content_x.0 + 1, h.content_y + first);
+        assert_ne!(ov.page_id(), "index", "followed the link");
+        assert_eq!(ov.back.len(), 1, "following a link IS history");
+    }
+
+    /// A click on a body line with no link only moves focus, and a click past
+    /// the last visible row does nothing at all (and never panics).
+    #[test]
+    fn clicking_content_without_a_link_only_moves_focus() {
+        let (mut ov, _) = rendered_overlay();
+        let h = ov.hits.as_ref().unwrap().clone();
+        // Row 0 of `index` is the H1 — text, no link.
+        ov.handle_click(h.content_x.0 + 1, h.content_y);
+        assert_eq!(ov.page_id(), "index", "no link on that line");
+        assert_eq!(ov.side, Side::Content);
+        // Past the body: inert.
+        ov.handle_click(h.content_x.0 + 1, h.content_y + h.body_h + 50);
+        assert_eq!(ov.page_id(), "index");
+    }
+
+    #[test]
+    fn clicking_a_search_hit_opens_it() {
+        let (mut ov, screen) = rendered_overlay();
+        key(&mut ov, KeyCode::Char('/'));
+        for c in "merge queue".chars() {
+            key(&mut ov, KeyCode::Char(c));
+        }
+        // Re-render so the hit rows are recorded.
+        let mut s = Surface::new(100, 30);
+        ov.render(&mut s, screen);
+        let (y, _) = ov.hits.as_ref().unwrap().left_rows[0];
+        let x = ov.hits.as_ref().unwrap().left_x.0 + 1;
+        ov.handle_click(x, y);
+        assert!(ov.search.is_none(), "hit opened, search closed");
+        assert_eq!(ov.page_id(), "merge-queue");
+    }
+
+    /// `o` (dock the page in the panel) is a real feature that used to appear
+    /// in no hint row at all. The footer holds the full set at a typical width.
+    #[test]
+    fn footer_hints_advertise_open_in_panel() {
+        let mut ov = overlay();
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 120,
+            rows: 34,
+        };
+        let mut s = Surface::new(120, 34);
+        ov.render(&mut s, screen);
+        let text = s.screen_chars_to_string();
+        for want in ["scroll", "follow", "search", "panel", "close"] {
+            assert!(text.contains(want), "footer hint `{want}` shown: {text}");
+        }
     }
 
     #[test]

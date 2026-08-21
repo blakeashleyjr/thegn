@@ -956,6 +956,9 @@ pub enum BarItemId {
     Widget(String),
     /// One of the hard-coded statusbar badge blocks.
     Badge(BarBadge),
+    /// The bottom-left `?` chip: the one always-visible, clickable pointer at
+    /// the help system. Opens the F1 overlay rather than a detail popup.
+    Help,
 }
 
 /// The statusbar's always-on badges, in render order. Each maps to one of the
@@ -981,11 +984,10 @@ pub enum BarBadge {
 }
 
 impl BarItemId {
-    /// Whether activating this item (Enter / click) opens a detail view. Every
-    /// navigable item has one today; kept as a seam so a future inert item can
-    /// opt out (Enter becomes a no-op rather than an empty modal).
+    /// Whether activating this item (Enter / click) opens a detail view.
+    /// `Help` opts out: it opens the help overlay instead of a bar popup.
     pub fn has_detail(&self) -> bool {
-        true
+        !matches!(self, BarItemId::Help)
     }
 }
 
@@ -1537,12 +1539,23 @@ pub fn statusbar_item_spans(model: &FrameModel, rect: Rect) -> Vec<(BarItemId, R
         .collect()
 }
 
-/// The bottom widget bar: mode chip + `[bars] bottom_left` (context keybind
-/// hints as key chips + dim labels) left-aligned, `bottom_right` (PR / LOC /
-/// transient status) right-aligned with `│` rules, and the zoom/lock badges
-/// as inverse chips always outermost-right.
+/// Cells the left cluster gets once the right cluster wins its space. Mirrors
+/// `Line::split`'s math, so the keyhint strip can be trimmed at whole-binding
+/// boundaries instead of being cut mid-chord by the generic ellipsis. Shared
+/// with `statusbar_left::left_item_spans` so paint and hit-test agree.
+pub fn statusbar_left_budget(model: &FrameModel, rect: Rect) -> usize {
+    use crate::seg::seg_width;
+    let (r, _) = statusbar_right_layout(&statusbar_items(model), None);
+    let rl = seg_width(&r);
+    rect.cols.saturating_sub(rl + usize::from(rl > 0))
+}
+
+/// The bottom widget bar: the `?` help chip + mode chip + `[bars] bottom_left`
+/// (context keybind hints as key chips + dim labels) left-aligned,
+/// `bottom_right` (PR / LOC / transient status) right-aligned with `│` rules,
+/// and the zoom/lock badges as inverse chips always outermost-right.
 pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
-    use crate::seg::{Line, Seg, Tok, draw_line, seg, seg_width};
+    use crate::seg::{Line, Tok, draw_line};
     if rect.rows == 0 {
         return;
     }
@@ -1566,47 +1579,7 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     // Cells the left cluster gets once the right wins its space — mirrors
     // `Line::split`'s math so keyhints can be trimmed at whole-binding
     // boundaries here instead of being cut mid-chord by the generic ellipsis.
-    let rl = seg_width(&r);
-    let left_budget = rect.cols.saturating_sub(rl + usize::from(rl > 0));
-
-    let mut l: Vec<Seg> = vec![seg(Tok::Slot(S::Text), " ")];
-    if !model.mode_chip.is_empty() {
-        l.push(Seg::chip(
-            Tok::Slot(S::Accent),
-            format!(" {} ", model.mode_chip),
-        ));
-        l.push(seg(Tok::Slot(S::Text), "  "));
-    }
-    let mut first = true;
-    for id in &model.bars.bottom_left {
-        if id == "keyhints" {
-            for (chord, label) in &model.keyhints {
-                // Stage each binding as a unit; only commit it if the whole
-                // thing still fits. Once one overflows, stop — never paint a
-                // half-cut keybind.
-                let mut hint: Vec<Seg> = Vec::new();
-                if !first {
-                    hint.push(seg(Tok::Slot(S::Text), "   "));
-                }
-                hint.push(seg(Tok::Slot(S::Faint), chord.clone()));
-                hint.push(seg(Tok::Slot(S::Ghost), format!(" {label}")));
-                if seg_width(&l) + seg_width(&hint) > left_budget {
-                    break;
-                }
-                l.extend(hint);
-                first = false;
-            }
-            continue;
-        }
-        let Some(wd) = bottombar_widget(id, model) else {
-            continue;
-        };
-        if !first {
-            l.push(seg(Tok::Slot(S::Ghost3), " \u{00b7} "));
-        }
-        first = false;
-        l.push(seg(Tok::Attr(wd.fg), wd.text));
-    }
+    let (l, _spans) = crate::statusbar_left::left_layout(model, statusbar_left_budget(model, rect));
 
     draw_line(
         surface,

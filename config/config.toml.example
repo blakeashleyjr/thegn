@@ -224,7 +224,9 @@ top_left = ["brand"]
 # Widgets: cpu, mem, disk (free %), gpu, temp (CPU °C), net, swap, freq (CPU
 # GHz), load (1-min load avg, unix only), uptime, battery, date, clock.
 top_right = ["cpu", "mem", "disk", "gpu", "temp", "net", "battery", "date", "clock"]
-bottom_left = ["keyhints"]
+# "help" is the clickable `?` chip that opens the built-in help (same as F1,
+# at the page for whatever has focus). Remove it to hide the button.
+bottom_left = ["help", "keyhints"]
 bottom_right = ["pr", "tests", "loc", "disk", "status"]   # "loc"=tokei line count; "disk"=worktree size
 # chrono format strings for the date/clock widgets.
 date_format = "%a %b %-d"

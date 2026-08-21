@@ -167,6 +167,7 @@ mod snapshot;
 mod sprite_bridge;
 mod ssh_shim;
 mod statusbar_badges;
+mod statusbar_left;
 mod subsystem;
 mod tabbar_env;
 mod task;
