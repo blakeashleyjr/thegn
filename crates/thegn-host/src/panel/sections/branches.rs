@@ -61,9 +61,12 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
         let mut r: Vec<Seg> = Vec::new();
         if let Some(pr) = &b.pr {
+            // `dot_filled` (● / *), not `hex` (⬡) — hex's ASCII fallback is `#`,
+            // which would collide with the `#7` number prefix.
+            let dot = crate::caps::active_glyphs().dot_filled;
             r.push(seg(
                 hue(pr_state_hue(&pr.state, pr.is_draft)),
-                format!("⬤ #{}", pr.number),
+                format!("{dot} #{}", pr.number),
             ));
             r.push(sp(1));
         }
