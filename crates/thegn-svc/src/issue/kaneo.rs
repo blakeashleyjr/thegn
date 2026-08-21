@@ -268,6 +268,9 @@ struct KaneoTask {
     labels: Vec<KaneoLabel>,
     #[serde(default)]
     created_at: Option<String>,
+    /// RFC3339 timestamp (Kaneo `dueDate`); absent when unset.
+    #[serde(default)]
+    due_date: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -367,6 +370,7 @@ fn task_to_domain(
         url,
         branch_hint: None,
         updated_at_ms: parse_ms(t.created_at.as_deref()),
+        due_at_ms: t.due_date.as_deref().and_then(super::parse_due_date_ms),
         project_ids: if t.project_id.is_empty() {
             Vec::new()
         } else {

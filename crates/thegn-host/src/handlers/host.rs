@@ -289,6 +289,31 @@ pub(crate) fn intercept_menu_choice(
             arg,
         } => {
             let name = arg.strip_prefix("host:").unwrap_or(arg).to_string();
+            // Pre-validate the refusal cases HERE so the user sees them in the
+            // status bar — the off-loop job's warnings only reach the Logs
+            // section, so a refused removal read as "removing…" then nothing.
+            if let (Ok(db), Some(id)) = (
+                thegn_core::db::Db::open(),
+                thegn_core::host::HostId::parse(arg),
+            ) {
+                use thegn_core::store::{HostStore, PlacementStore};
+                let is_db = db
+                    .host_defs()
+                    .ok()
+                    .is_some_and(|d| d.iter().any(|(n, _)| n == &name));
+                if !is_db {
+                    return Some(format!(
+                        "host {name}: config-defined — remove it from config.toml"
+                    ));
+                }
+                let tenants = db.tenants_of(&id).unwrap_or_default();
+                if !tenants.is_empty() {
+                    return Some(format!(
+                        "host {name}: {} live placement(s) — drain first",
+                        tenants.len()
+                    ));
+                }
+            }
             remove_host_def(arg.clone());
             Some(format!("host {name}: removing…"))
         }
@@ -374,18 +399,22 @@ pub(crate) fn stop_worktree_share(
     let Some(wt) = session.active_group().map(|g| g.path.clone()) else {
         return;
     };
-    let n = share_supervisor.stop(&wt, None);
+    // DB cleanup keys off the ports the SUPERVISOR actually stopped —
+    // `model.shares` is a render mirror that can lag a worktree switch, and
+    // deleting by it left the real rows behind (a "stopped" tunnel then
+    // resurrected on the next launch).
+    let stopped = share_supervisor.stop(&wt, None);
     if let Ok(db) = thegn_core::db::Db::open() {
         use thegn_core::store::WorktreeAuxStore as _;
-        for v in &model.shares {
-            let _ = db.delete_share(&wt, v.port);
+        for port in &stopped {
+            let _ = db.delete_share(&wt, *port);
         }
     }
     model.shares = crate::run::current_share_views(share_supervisor, session);
-    model.status = if n == 0 {
+    model.status = if stopped.is_empty() {
         "No active shares on this worktree".into()
     } else {
-        format!("Stopped {n} share(s)")
+        format!("Stopped {} share(s)", stopped.len())
     };
 }
 

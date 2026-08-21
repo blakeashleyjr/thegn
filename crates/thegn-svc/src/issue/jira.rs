@@ -144,6 +144,8 @@ struct JiraFields {
     labels: Vec<String>,
     #[serde(rename = "updated")]
     updated: Option<String>,
+    /// Date-only `YYYY-MM-DD` (Jira's `duedate` field); absent when unset.
+    duedate: Option<String>,
     comment: Option<JiraCommentSection>,
 }
 
@@ -293,11 +295,17 @@ fn jira_issue_to_domain(ji: JiraIssue) -> Issue {
         url,
         branch_hint: None,
         updated_at_ms: parse_ms(ji.fields.updated.as_deref()),
+        due_at_ms: ji
+            .fields
+            .duedate
+            .as_deref()
+            .and_then(super::parse_due_date_ms),
         ..Default::default()
     }
 }
 
-const JIRA_FIELDS: &str = "summary,description,status,priority,assignee,labels,updated,comment";
+const JIRA_FIELDS: &str =
+    "summary,description,status,priority,assignee,labels,updated,duedate,comment";
 
 #[allow(async_fn_in_trait)]
 impl IssueBackend for JiraBackend {

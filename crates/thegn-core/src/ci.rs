@@ -205,11 +205,36 @@ pub fn summarize<'a>(states: impl IntoIterator<Item = &'a CiState>) -> CiSummary
 /// provider listing (and therefore the `ci_runs_cache`) guarantees — the panel
 /// already renders `runs[0]` as "latest". Grouping is by
 /// [`CiRun::workflow_key`]; input order is preserved.
+///
+/// Fan-out tie-break: a workflow can emit several sibling runs from one
+/// trigger (Dependabot spawns one run per ecosystem), all created in the same
+/// second — "newest" is then arbitrary API order, and it flipped between
+/// refreshes, sometimes hiding a red sibling behind a green one. Among runs of
+/// a workflow whose `started_at` equals the newest run's, a **failing** sibling
+/// wins as the representative: showing red while a sibling is green is a far
+/// smaller error than showing green while a sibling is red.
 pub fn latest_per_workflow(runs: &[CiRun]) -> Vec<&CiRun> {
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    runs.iter()
-        .filter(|r| seen.insert(r.workflow_key()))
-        .collect()
+    let mut out: Vec<&CiRun> = Vec::new();
+    let mut idx: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for r in runs {
+        match idx.get(r.workflow_key()) {
+            None => {
+                idx.insert(r.workflow_key(), out.len());
+                out.push(r);
+            }
+            Some(&i) => {
+                let cur = out[i];
+                if !cur.state.is_failure()
+                    && r.state.is_failure()
+                    && cur.started_at.is_some()
+                    && cur.started_at == r.started_at
+                {
+                    out[i] = r;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Rollup of the *current* pipeline state — one entry per workflow, judged by
@@ -652,6 +677,53 @@ mod tests {
         let ids: Vec<&str> = latest.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["100", "99"]); // one per workflow, order preserved
         assert!(latest_per_workflow(&[]).is_empty());
+    }
+
+    #[test]
+    fn fanout_tie_prefers_the_failing_sibling() {
+        // Dependabot shape: three sibling runs of one workflow, all created in
+        // the same second, one failing — the failing one must represent the
+        // workflow regardless of the API's arbitrary tie order.
+        let at = Some("2026-08-20T23:53:45Z".to_string());
+        let mk = |id: &str, state: CiState| CiRun {
+            id: id.into(),
+            name: "Dependabot Updates".into(),
+            state,
+            started_at: at.clone(),
+            ..Default::default()
+        };
+        let runs = vec![
+            mk("3", CiState::Pass),
+            mk("2", CiState::Fail),
+            mk("1", CiState::Pass),
+        ];
+        let latest = latest_per_workflow(&runs);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].id, "2");
+        let cur = current_summary(&runs);
+        assert_eq!((cur.failed, cur.passed, cur.total), (1, 0, 1));
+
+        // A failing run in a DIFFERENT (older) second is history, not a tie —
+        // the newest run still represents the workflow.
+        let mut runs = vec![mk("5", CiState::Pass)];
+        runs.push(CiRun {
+            started_at: Some("2026-08-20T20:00:00Z".into()),
+            ..mk("4", CiState::Fail)
+        });
+        assert_eq!(latest_per_workflow(&runs)[0].id, "5");
+
+        // Runs without timestamps never tie (no false representative swap).
+        let untimed = vec![
+            CiRun {
+                started_at: None,
+                ..mk("7", CiState::Pass)
+            },
+            CiRun {
+                started_at: None,
+                ..mk("6", CiState::Fail)
+            },
+        ];
+        assert_eq!(latest_per_workflow(&untimed)[0].id, "7");
     }
 
     #[test]

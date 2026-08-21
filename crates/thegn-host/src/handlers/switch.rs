@@ -64,11 +64,15 @@ pub(crate) fn refresh_tab_model_switch(
     model.worktree = worktree;
     model.tabs = tabs;
     model.active_tab = active_tab;
-    model.active_container_name = thegn_core::sandbox::container_name(
+    // Profile-aware, matching hydration's naming: containers are created as
+    // `thegn-{profile}-{slug}`, so a profile-blind name here permanently broke
+    // the Sandbox section's active-container match under `--profile`.
+    model.active_container_name = thegn_core::sandbox::container_name_with_profile(
         session
             .active_group()
             .map(|g| g.path.as_str())
             .unwrap_or(""),
+        Some(&thegn_core::profile::name()),
     );
     // No glyph re-seed here: this fast path only fires for in-workspace pointer
     // moves, whose worktrees' glyphs are already resident in `sidebar_status`.
@@ -89,8 +93,11 @@ pub(crate) fn refresh_tab_model(model: &mut FrameModel, session: &Session, sb: &
     model.worktree = worktree;
     model.tabs = tabs;
     model.active_tab = active_tab;
-    model.active_container_name =
-        thegn_core::sandbox::container_name(&active_path.to_string_lossy());
+    // Profile-aware — see `refresh_tab_model_switch` above.
+    model.active_container_name = thegn_core::sandbox::container_name_with_profile(
+        &active_path.to_string_lossy(),
+        Some(&thegn_core::profile::name()),
+    );
     // The workspace list can change when worktrees are added/closed or the
     // workspace switches: keep the DB-backed entries (refreshed by the next
     // hydration), re-derive the live fallbacks from the current session, and

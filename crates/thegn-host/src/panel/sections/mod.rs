@@ -14,7 +14,7 @@ use super::{ChangeRow, PanelData, PanelHit, PanelUi, Section, Stage};
 mod across;
 mod branches;
 pub(crate) mod changes;
-mod ci;
+pub(crate) mod ci;
 pub(crate) mod commits;
 mod environments;
 mod git;
@@ -22,12 +22,12 @@ mod help;
 mod hosts;
 pub(crate) mod issues;
 mod keys;
-mod logs;
+pub(crate) mod logs;
 mod media;
 mod merge_queue;
 mod misc;
 pub(crate) mod my_work;
-mod notifications;
+pub(crate) mod notifications;
 mod pr_queue;
 mod problems;
 mod stash;
@@ -205,6 +205,32 @@ fn two_col(left: &[Vec<Seg>], right: &[Vec<Seg>], left_w: usize, gap: usize) -> 
         .collect()
 }
 
+/// Wrap plain text into `w`-col chunks by display width — the detail-column
+/// body wrapper shared by the Full list+detail views. Capped at 12 chunks so
+/// a runaway line never eats the whole column.
+pub(super) fn wrap_text(s: &str, w: usize) -> Vec<String> {
+    let w = w.max(4);
+    let mut out = Vec::new();
+    let mut rest = s;
+    while !rest.is_empty() {
+        let chunk = seg::take_cols(rest, w);
+        // Guarantee progress on a glyph wider than the band.
+        let chunk = if chunk.is_empty() {
+            let mut it = rest.char_indices();
+            it.next();
+            &rest[..it.next().map(|(i, _)| i).unwrap_or(rest.len())]
+        } else {
+            chunk
+        };
+        out.push(chunk.to_string());
+        rest = &rest[chunk.len()..];
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    out
+}
+
 /// A hint row built from a git context's key table (the same data that
 /// drives dispatch, so the hints can never drift).
 pub(super) fn context_hint_row(view: crate::panel::gitui::GitView) -> PanelRow {
@@ -255,12 +281,21 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
     let data = &model.panel;
     match section {
         Section::Changes => {
+            // Sum only the user's OWN edits — a live merge's incoming block is
+            // collapsed in the body, and counting it made the closed chip read
+            // "+4102 −1180" over a body showing three local files.
             let (a, del): (u32, u32) = data
                 .changes
                 .iter()
+                .filter(|c| !c.incoming)
                 .fold((0, 0), |(a, d), c| (a + c.added, d + c.deleted));
             if data.changes.is_empty() {
                 vec![seg(g(), "clean")]
+            } else if a == 0 && del == 0 {
+                // All-untracked (numstat never counts new files) or incoming-
+                // only: a count reads better than a meaningless "+0 −0".
+                let n = data.changes.iter().filter(|c| !c.incoming).count();
+                vec![seg(g(), format!("{n} file(s)"))]
             } else {
                 vec![
                     seg(hue(Hue::Green), format!("+{a}")),
@@ -345,9 +380,22 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 vec![seg(g2(), "—")]
             } else {
                 // Current state (latest run per workflow), matching the badge
-                // and body rollups — never a wall of historical failures.
+                // and body rollups — never a wall of historical failures. The
+                // leading glyph is the rollup's WORST state (a red chip when
+                // any workflow fails), not whichever run happens to be newest.
                 let sum = thegn_core::ci::current_summary(&data.ci_runs);
-                let mut v = vec![ci::state_glyph(data.ci_runs[0].state)];
+                let worst = if sum.failed > 0 {
+                    thegn_core::ci::CiState::Fail
+                } else if sum.running > 0 {
+                    thegn_core::ci::CiState::Running
+                } else if sum.pending > 0 {
+                    thegn_core::ci::CiState::Pending
+                } else if sum.passed > 0 {
+                    thegn_core::ci::CiState::Pass
+                } else {
+                    thegn_core::ci::CiState::Skipped
+                };
+                let mut v = vec![ci::state_glyph(worst)];
                 v.push(seg(g(), format!(" {}", sum.passed)));
                 if sum.failed > 0 {
                     v.push(seg(g(), " "));
@@ -356,6 +404,17 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 if sum.running > 0 {
                     v.push(seg(g(), " "));
                     v.push(seg(hue(Hue::Amber), format!("●{}", sum.running)));
+                }
+                if sum.pending > 0 {
+                    v.push(seg(g(), " "));
+                    v.push(seg(g2(), format!("○{}", sum.pending)));
+                }
+                // Cancelled/skipped: rendered (dim) rather than silently
+                // dropped, so the chip's numbers always add up to the
+                // workflow count.
+                if sum.other > 0 {
+                    v.push(seg(g(), " "));
+                    v.push(seg(g2(), format!("⊘{}", sum.other)));
                 }
                 v
             }
@@ -481,13 +540,29 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
         },
         Section::Debug => vec![seg(g2(), "○ idle")],
         Section::Sandbox => {
-            let ours: Vec<_> = model.containers.iter().filter(|c| c.ours).collect();
-            match ours.first() {
+            // Summarise the ACTIVE worktree's sandbox — the same match the
+            // body uses. The old "any of our containers anywhere" check lit
+            // the chip green for a sibling worktree's container while the
+            // body said "not sandboxed" (and vice versa for bwrap).
+            let active = model
+                .containers
+                .iter()
+                .find(|c| c.ours && c.name == model.active_container_name);
+            match active {
                 Some(c) => vec![
                     seg(hue(Hue::Green), "●"),
                     seg(g(), format!(" {}", c.backend)),
                 ],
-                None => vec![seg(g2(), "○ off")],
+                None => {
+                    let backend = model.active_sandbox_backend.as_str();
+                    match thegn_core::sandbox::Backend::parse(backend) {
+                        Some(b) if b.is_host_toolchain() => {
+                            vec![seg(hue(Hue::Green), "●"), seg(g(), format!(" {backend}"))]
+                        }
+                        Some(b) if b.is_oci() => vec![seg(g(), format!("◌ {backend}"))],
+                        _ => vec![seg(g2(), "○ off")],
+                    }
+                }
             }
         }
         Section::Db => vec![seg(g2(), "—")],
@@ -566,22 +641,31 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
         }
         Section::Notifications => {
             // Red ⚑ flag for attention (Alert) only; a dim "N unread" for Notice;
-            // Info never counts, so an inbox of only lifecycle events reads as zero.
+            // Info never counts toward the loud states, so an inbox of only
+            // lifecycle events stays quiet — but it must not claim "inbox
+            // zero" while the open list shows unread rows: those surface as a
+            // dim low-priority count instead.
             let alert = model.panel.alert_notifications;
             let unread = model.panel.unread_notifications;
+            let raw_unread = model.panel.notifications.iter().filter(|n| !n.read).count();
             if alert > 0 {
                 vec![seg(hue(Hue::Red), format!("⚑ {alert}"))]
             } else if unread > 0 {
                 vec![seg(f(), format!("{unread} unread"))]
+            } else if raw_unread > 0 {
+                vec![seg(g2(), format!("{raw_unread} low"))]
             } else {
                 vec![seg(g2(), "inbox zero")]
             }
         }
         Section::Logs => {
-            let n = model.panel.log_lines.len();
+            // `log_tail` is kept warm on EVERY refresh; `log_lines` is only
+            // populated while the section is open — summarising the latter
+            // made the collapsed row read "off" forever.
+            let n = model.panel.log_tail.len();
             let errors = model
                 .panel
-                .log_lines
+                .log_tail
                 .iter()
                 .filter(|l| l.level == thegn_core::log_view::LogLevel::Error)
                 .count();
@@ -755,7 +839,7 @@ mod spec {
     use super::*;
     use crate::chrome::FrameModel;
     use crate::layout::PanelWidth;
-    use crate::panel::docs::{DiffDoc, GitDocs, PanelDocs};
+    use crate::panel::docs::{GitDocs, PanelDocs};
 
     fn model() -> FrameModel {
         let mut m = FrameModel::default();
@@ -964,6 +1048,74 @@ mod spec {
             },
         ];
         m.panel.unread_notifications = 1;
+        m.panel.log_lines_structured = vec![
+            thegn_core::log::parser::parse_log(
+                "2026-06-05T12:00:00  INFO thegn::db connection opened",
+            ),
+            thegn_core::log::parser::parse_log("2026-06-05T12:00:01 ERROR thegn::host fatal error"),
+        ];
+        m.panel.merge_queue = vec![
+            thegn_core::db::MergeQueueRow {
+                worktree: "/repo/feat-views".into(),
+                branch: "feat/views".into(),
+                target_branch: "main".into(),
+                status: "queued".into(),
+                queued_at: 1,
+                updated_at: 1,
+                result_oid: None,
+                conflict_paths: None,
+                error_detail: None,
+                location: String::new(),
+                agent_attempts: 0,
+            },
+            thegn_core::db::MergeQueueRow {
+                worktree: "/repo/fix-panel".into(),
+                branch: "fix/panel".into(),
+                target_branch: "main".into(),
+                status: "gate_failed".into(),
+                queued_at: 1,
+                updated_at: 2,
+                result_oid: None,
+                conflict_paths: None,
+                error_detail: Some("test flaky::case failed\nassertion left == right".into()),
+                location: String::new(),
+                agent_attempts: 1,
+            },
+        ];
+        m.panel.across = thegn_core::aggregate::Aggregation::from_excerpts(vec![
+            thegn_core::aggregate::Excerpt {
+                worktree: "/repo/feat-views".into(),
+                worktree_label: "feat-views".into(),
+                kind: thegn_core::aggregate::ExcerptKind::CiFailure,
+                file: String::new(),
+                line: None,
+                text: "CI failing".into(),
+                detail: "build job".into(),
+            },
+        ]);
+        m.shares = vec![crate::share::ShareView {
+            worktree: "/repo/feat-views".into(),
+            port: 3000,
+            url: Some("https://abc.example.dev".into()),
+            failed: false,
+            error: None,
+            provider: "bore",
+            public: true,
+        }];
+        m.forwards = vec![crate::forward::ForwardView {
+            worktree: "/repo/feat-views".into(),
+            container_port: 5173,
+            host_port: 5174,
+            url: "http://localhost:5174".into(),
+            remapped: true,
+        }];
+        m.active_container_name = "sz-feat-views".into();
+        m.timeline = vec![thegn_core::models::TimelineEvent {
+            ts_ms: 1_700_000_000_000,
+            source: thegn_core::models::TimelineSource::Sandbox,
+            kind: "network".into(),
+            detail: "connect 1.2.3.4:443".into(),
+        }];
         m.panel.log_lines = vec![
             thegn_core::log_view::parse_log_line(
                 "2026-06-05T12:00:00  INFO  thegn::db  connection opened",
@@ -990,12 +1142,6 @@ mod spec {
                 }],
                 total: 108,
                 head_branch: "main".into(),
-            }),
-            diff: Some(DiffDoc {
-                path: "src/lib.rs".into(),
-                file: thegn_core::diff_sbs::parse_unified(
-                    "@@ -1,2 +1,2 @@ fn demo()\n ctx\n-old\n+new\n@@ -10,1 +10,2 @@\n keep\n+added\n",
-                ),
             }),
             cfg_keys: crate::keyhint::cheatsheet_groups(&thegn_core::config::Config::default()),
             ..Default::default()
@@ -1337,7 +1483,9 @@ mod spec {
         };
         let rendered = text(&content(Section::Sandbox, &ctx));
         assert!(rendered.contains("thegn-active-worktree"), "{rendered}");
-        assert!(rendered.contains("active-policy"), "{rendered}");
+        // (The old `policy <containment>` row printed a hardcoded constant
+        // and was removed — status + cpu/mem/net are the live fields.)
+        assert!(rendered.contains("Up 2m"), "{rendered}");
         assert!(!rendered.contains("thegn-other-worktree"), "{rendered}");
     }
 
@@ -1366,8 +1514,16 @@ mod spec {
         assert!(rendered.contains("image 11111111"), "inventory: {rendered}");
         // The non-cursor host's failure is NOT expanded in the compact view…
         assert!(!rendered.contains("host connect: timeout"), "{rendered}");
-        // …and the action hints mirror the loop's dispatch keys.
-        for hint in ["p provision", "r re-probe", "c grant install", "x rm-cache"] {
+        // …and the action hints mirror the statusbar strip (`section_keys::HOSTS`)
+        // — the two surfaces used to advertise different key sets.
+        for hint in [
+            "n new",
+            "p provision",
+            "r probe",
+            "m menu",
+            "c grant",
+            "x forget cache",
+        ] {
             assert!(rendered.contains(hint), "{hint}: {rendered}");
         }
         // Host rows (and only host rows) are cursor targets, aligned by index.
@@ -1424,7 +1580,9 @@ mod spec {
             cols: 39,
             rows: 28,
         };
-        assert!(text(&content(Section::Hosts, &ctx)).contains("no hosts configured"));
+        // The empty state names the key that adds one (the old text pointed
+        // only at config.toml while `n` sat undiscoverable two rows below).
+        assert!(text(&content(Section::Hosts, &ctx)).contains("no hosts — n adds one"));
     }
 
     #[test]
@@ -1436,24 +1594,62 @@ mod spec {
             assert!(!n.is_empty(), "{section:?} normal");
             assert!(!h.is_empty(), "{section:?} half");
             assert!(!f.is_empty(), "{section:?} full");
-            // Debug/Db are dead-code placeholder sections — distinctness is waived.
-            // Logs/Share/Forward/MergeQueue/PrQueue/Across are flat lists whose
-            // empty/default render has no width-specific full view.
+            // Debug/Db are dead-code placeholder sections — distinctness is
+            // waived, as is PrQueue (a flat list whose empty/default render has
+            // no width-specific full view). Changes' accordion body is
+            // Half == Full by design: the production Full view is the
+            // git-family frame (`gitfull`), not this renderer. Everything else
+            // — including the once-waived logs/share/forward/merge-queue/across
+            // /sandbox — now renders a real list+detail Full body over the
+            // populated fixture.
             if matches!(
                 section,
-                Section::Debug
-                    | Section::Db
-                    | Section::Logs
-                    | Section::Share
-                    | Section::Forward
-                    | Section::MergeQueue
-                    | Section::PrQueue
-                    | Section::Across
+                Section::Debug | Section::Db | Section::Changes | Section::PrQueue
             ) {
                 continue;
             }
             assert_ne!(n, f, "{section:?}: normal vs full");
             assert_ne!(h, f, "{section:?}: half vs full");
+        }
+    }
+
+    /// Every section's cursor-hit space is contiguous from 0: the distinct
+    /// `Row(section, i)` indices a populated render emits must be exactly
+    /// `0..n`. A hole (a row the renderer skips while the hit index keeps
+    /// counting the source list) strands the cursor on invisible rows — the
+    /// merge-collapse / notifications-offset class of bug.
+    #[test]
+    fn section_hits_are_contiguous_from_zero() {
+        for section in crate::panel::SECTION_ORDER {
+            for width in [PanelWidth::Normal, PanelWidth::Half, PanelWidth::Full] {
+                let m = model();
+                let u = ui(width, section);
+                let (cols, rows) = match width {
+                    PanelWidth::Normal => (39, 28),
+                    PanelWidth::Half => (75, 32),
+                    PanelWidth::Full => (150, 38),
+                };
+                let ctx = SectionCtx {
+                    model: &m,
+                    ui: &u,
+                    cols,
+                    rows,
+                };
+                let mut idx: Vec<usize> = content(section, &ctx)
+                    .iter()
+                    .filter_map(|r| match r.hit {
+                        Some(PanelHit::Row(s, i)) if s == section => Some(i),
+                        _ => None,
+                    })
+                    .collect();
+                idx.sort_unstable();
+                idx.dedup();
+                let expect: Vec<usize> = (0..idx.len()).collect();
+                assert_eq!(
+                    idx, expect,
+                    "{section:?} at {width:?}: hit indices must be contiguous from 0"
+                );
+            }
         }
     }
 
@@ -1471,9 +1667,8 @@ mod spec {
             "{f}"
         );
         assert!(f.contains("abc1234"), "{f}");
-        let f = render(Section::Changes, PanelWidth::Full);
-        assert!(f.contains("src/lib.rs") && f.contains("hunk 1/2"), "{f}");
-        assert!(f.contains("old") && f.contains("new"), "both sides: {f}");
+        // (Changes at Full is rendered by the git-family frame, not this
+        // module — its old side-by-side body was removed.)
         let f = render(Section::Keys, PanelWidth::Full);
         assert!(f.contains("PANEL"), "{f}");
         assert!(
@@ -1487,7 +1682,6 @@ mod spec {
         let m = model();
         let mut u = ui(PanelWidth::Full, Section::Pr);
         u.docs.git = None;
-        u.docs.diff = None;
         let ctx = SectionCtx {
             model: &m,
             ui: &u,
@@ -1495,15 +1689,8 @@ mod spec {
             rows: 38,
         };
         assert!(text(&content(Section::Pr, &ctx)).contains("loading"));
-        let mut u = ui(PanelWidth::Full, Section::Changes);
-        u.docs.diff = None;
-        let ctx = SectionCtx {
-            model: &m,
-            ui: &u,
-            cols: 150,
-            rows: 38,
-        };
-        assert!(text(&content(Section::Changes, &ctx)).contains("loading"));
+        // (Changes-at-Full no longer has a doc-backed body here — the
+        // git-family frame owns that width.)
     }
 
     // ── Suite B: sandbox section rendering ────────────────────────────────
@@ -1668,21 +1855,23 @@ mod spec {
     }
 
     #[test]
-    fn b7_mounts_section_in_deep_view() {
+    fn b7_deep_view_shows_timeline_not_fictional_mounts() {
+        // The MOUNTS block read a field nothing ever populated in production
+        // (`ContainerInfo.mounts` was always empty) — it was removed rather
+        // than rendering fiction. The deep view's real extra is the TIMELINE.
         let mut m = model();
         m.active_container_name = "thegn-wt-feat".into();
-        let mut ci = container_info("thegn-wt-feat", "Up 5m");
-        ci.mounts = "/wt/feat:/wt/feat:z /repo/.git:/repo/.git:z".into();
-        m.containers = vec![ci];
+        m.containers = vec![container_info("thegn-wt-feat", "Up 5m")];
+        m.timeline = vec![thegn_core::models::TimelineEvent {
+            source: thegn_core::models::TimelineSource::Sandbox,
+            kind: "exec".into(),
+            detail: "3f8a1c".into(),
+            ts_ms: thegn_core::util::now().saturating_mul(1000),
+        }];
         let rendered = sandbox_rows(&m, PanelWidth::Half);
-        assert!(
-            rendered.contains("MOUNTS"),
-            "expected MOUNTS section: {rendered}"
-        );
-        assert!(
-            rendered.contains("/wt/feat"),
-            "expected mount path: {rendered}"
-        );
+        assert!(!rendered.contains("MOUNTS"), "{rendered}");
+        assert!(rendered.contains("TIMELINE"), "{rendered}");
+        assert!(rendered.contains("exec"), "{rendered}");
     }
 
     #[test]

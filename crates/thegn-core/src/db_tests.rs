@@ -1672,6 +1672,63 @@ fn notifications_put_and_read_and_mark_read() {
 }
 
 #[test]
+fn put_notification_once_dedupes_on_kind_ref_message() {
+    let db = db();
+    // First emit inserts.
+    assert!(
+        db.put_notification_once(
+            "overdue",
+            "linear:A-1",
+            "A-1 overdue (was due 2026-08-01)",
+            "/wt"
+        )
+        .unwrap()
+    );
+    // Identical re-emit is a no-op (the producers re-derive every refresh).
+    assert!(
+        !db.put_notification_once(
+            "overdue",
+            "linear:A-1",
+            "A-1 overdue (was due 2026-08-01)",
+            "/wt"
+        )
+        .unwrap()
+    );
+    assert_eq!(db.get_unread_notifications().unwrap().len(), 1);
+    // A changed message (moved due date) re-arms…
+    assert!(
+        db.put_notification_once(
+            "overdue",
+            "linear:A-1",
+            "A-1 overdue (was due 2026-08-15)",
+            "/wt"
+        )
+        .unwrap()
+    );
+    // …and a different kind with the same ref/message is independent.
+    assert!(
+        db.put_notification_once(
+            "mentioned",
+            "linear:A-1",
+            "A-1 overdue (was due 2026-08-15)",
+            "/wt"
+        )
+        .unwrap()
+    );
+    // Dedupe holds even after the row is read (once means once, not once-per-unread).
+    db.mark_all_notifications_read().unwrap();
+    assert!(
+        !db.put_notification_once(
+            "overdue",
+            "linear:A-1",
+            "A-1 overdue (was due 2026-08-15)",
+            "/wt"
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn prune_notifications_drops_old_read_keeps_unread_and_recent() {
     let db = db();
     let now = crate::util::now();

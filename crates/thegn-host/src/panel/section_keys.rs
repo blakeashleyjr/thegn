@@ -59,9 +59,15 @@ const fn nav(chord: &'static str, label: &'static str) -> SectionKey {
 const MINE: &[SectionKey] = &[
     nav("j/k", "row"),
     nav("↵", "open"),
+    k('b', "b", "branch"),
     k('o', "o", "browser"),
     k('a', "a", "all repos"),
     k('R', "R", "refresh"),
+];
+const ACROSS: &[SectionKey] = &[
+    nav("j/k", "row"),
+    nav("↵", "jump"),
+    k('a', "a", "all workspaces"),
 ];
 const PR: &[SectionKey] = &[
     nav("j/k", "row"),
@@ -93,11 +99,16 @@ const MERGE_QUEUE: &[SectionKey] = &[
     k('l', "l", "land"),
     k('r', "r", "retry"),
     k('D', "D", "drain"),
+    k('g', "g", "scope"),
 ];
+// Labels match what the keys actually do (`o` opens bat, the EDITOR is `O`;
+// the old strip claimed `o` = editor and `b` = blame, neither true here —
+// blame is a git-family action the Files tree never dispatches).
 const FILES: &[SectionKey] = &[
-    nav("↵", "open"),
-    k('o', "o", "editor"),
-    k('b', "b", "blame"),
+    nav("↵", "preview"),
+    k('/', "/", "filter"),
+    k('o', "o", "bat"),
+    k('O', "O", "editor"),
     k('y', "y", "yazi"),
 ];
 const ISSUES: &[SectionKey] = &[
@@ -111,9 +122,10 @@ const ISSUES: &[SectionKey] = &[
 const NOTIFICATIONS: &[SectionKey] = &[
     nav("j/k", "row"),
     nav("↵", "expand"),
-    // `x`, not `r` — the old hint advertised a key that did nothing.
+    // `x`, not `r` — the old hint advertised a key that did nothing. Labels
+    // match the section body's own hint row: `x` marks read, `d` DELETES.
     k('x', "x", "read"),
-    k('d', "d", "dismiss"),
+    k('d', "d", "delete"),
     // `a` and `g` are handled here but were never advertised. `a` is the only
     // gesture that also quiets the *live* needs-you signals (failing CI &c.,
     // which are derived from the PR/CI cache rather than an inbox row), so
@@ -133,12 +145,14 @@ const JOBS: &[SectionKey] = &[
     nav("j/k", "select"),
 ];
 const LOGS: &[SectionKey] = &[
-    nav("j/k", "row"),
     k('/', "/", "filter"),
     k('l', "l", "level"),
     k('y', "y", "copy"),
-    k('a', "a", "all scopes"),
-    k('e', "e", "export"),
+    // `a` toggles tail-follow; the scope toggle is `g` (the old strip said
+    // `a` = "all scopes", which was a different key's job).
+    k('a', "a", "tail"),
+    k('g', "g", "scope"),
+    k('E', "E", "export"),
 ];
 const SYMBOLS: &[SectionKey] = &[
     nav("↵", "go to def"),
@@ -154,25 +168,42 @@ const FORWARD: &[SectionKey] = &[
     nav("↵", "copy url"),
 ];
 const HOSTS: &[SectionKey] = &[
-    nav("j/k", "row"),
     k('n', "n", "new"),
-    k('r', "r", "refresh"),
+    k('p', "p", "provision"),
+    k('r', "r", "probe"),
     k('m', "m", "menu"),
-    k('x', "x", "remove"),
+    k('c', "c", "grant"),
+    // `x` forgets the cached host state (confirmed) — actual host REMOVAL
+    // lives behind `m`; labelling this "remove" made users expect deletion.
+    k('x', "x", "forget cache"),
 ];
 const ENVIRONMENTS: &[SectionKey] = &[
     nav("j/k", "row"),
+    nav("↵", "bind here"),
     k('n', "n", "new"),
     k('t', "t", "test"),
     k('x', "x", "remove"),
 ];
 const MEDIA: &[SectionKey] = &[
-    nav("space", "play/pause"),
-    nav("n/p", "next/prev"),
-    nav("s", "shuffle"),
-    nav("L", "loop"),
+    k(' ', "space", "play/pause"),
+    k('n', "n", "next"),
+    k('p', "p", "prev"),
+    k('s', "s", "shuffle"),
+    k('L', "L", "loop"),
+    nav("↵", "panel"),
 ];
-const SHARE: &[SectionKey] = &[nav("j/k", "row"), nav("↵", "copy url")];
+const SANDBOX: &[SectionKey] = &[
+    k('s', "s", "stop"),
+    k('r', "r", "restart"),
+    k('l', "l", "logs"),
+    k('g', "g", "scope"),
+];
+const SHARE: &[SectionKey] = &[
+    nav("j/k", "row"),
+    nav("↵", "copy url"),
+    k('o', "o", "browser"),
+    k('x', "x", "stop"),
+];
 const ROW_ONLY: &[SectionKey] = &[nav("j/k", "row")];
 
 /// Row-mode keys for a section. Order is display order; the statusbar shows a
@@ -180,6 +211,7 @@ const ROW_ONLY: &[SectionKey] = &[nav("j/k", "row")];
 pub fn section_keys(section: Section) -> &'static [SectionKey] {
     match section {
         Section::Mine => MINE,
+        Section::Across => ACROSS,
         Section::Pr => PR,
         Section::Tests => TESTS,
         Section::Ci => CI,
@@ -192,11 +224,12 @@ pub fn section_keys(section: Section) -> &'static [SectionKey] {
         Section::Symbols => SYMBOLS,
         Section::Problems => PROBLEMS,
         Section::Forward => FORWARD,
+        Section::Sandbox => SANDBOX,
         Section::Hosts => HOSTS,
         Section::Environments => ENVIRONMENTS,
         Section::Media => MEDIA,
         Section::Share => SHARE,
-        // Row-nav-only sections (Debug, Db, Telemetry, Keys, Across, Help, …)
+        // Row-nav-only sections (Debug, Db, Telemetry, Keys, Help, …)
         // and the git family, which draws from `gitui::context_keys` instead.
         _ => ROW_ONLY,
     }
@@ -276,16 +309,35 @@ mod tests {
             // The pattern runs up to the arm body.
             let rest: String = chars[j..].iter().collect();
             let pattern = rest.split("=>").next().unwrap_or(&rest);
-            let entry = out.entry(name).or_default();
+            // Collect the chars once…
             let pc: Vec<char> = pattern.chars().collect();
+            let mut arm_chars: Vec<char> = Vec::new();
             let mut m = 0;
             while m + 2 < pc.len() {
                 if pc[m] == '\'' && pc[m + 2] == '\'' {
-                    entry.insert(pc[m + 1]);
+                    arm_chars.push(pc[m + 1]);
                     m += 3;
                 } else {
                     m += 1;
                 }
+            }
+            // …and credit EVERY section in the arm's pattern, not just the
+            // first: `(Section::Notifications | Section::Sandbox, Char('g'))`
+            // dispatches `g` for both, and crediting only the first made a
+            // truthful Sandbox table fail the drift check.
+            let mut names = vec![name];
+            let mut rest_pat = pattern;
+            while let Some(pos) = rest_pat.find("Section::") {
+                let after = &rest_pat[pos + 9..];
+                let extra: String = after.chars().take_while(|c| c.is_alphanumeric()).collect();
+                if !extra.is_empty() && !names.contains(&extra) {
+                    names.push(extra);
+                }
+                rest_pat = &rest_pat[pos + 9..];
+            }
+            for n in names {
+                let entry = out.entry(n).or_default();
+                entry.extend(arm_chars.iter().copied());
             }
         }
         out
@@ -372,6 +424,124 @@ mod tests {
         for section in SECTION_ORDER {
             let n = section_keys(section).len();
             assert!(n <= 6, "{section:?} advertises {n} keys; the strip fits ~6");
+        }
+    }
+
+    /// Every `nav()` chord must be one the shared accordion map actually
+    /// handles — `nav` entries skip the dispatch check above, so a table
+    /// could otherwise advertise a navigation key nothing implements (the
+    /// dead MEDIA-table class of drift).
+    #[test]
+    fn nav_chords_are_real_accordion_keys() {
+        // The accordion's own vocabulary (`panel::accordion_key` + the shared
+        // row-mode arms): cursor moves, open/close, width cycle, digit jumps,
+        // tab cycle, and Changes' space.
+        const ACCORDION: &[&str] = &[
+            "j/k", "↑/↓", "↵", "esc", "e", "E", "⇥", "space", "J/K", "digits", "1-9",
+        ];
+        for section in SECTION_ORDER {
+            for sk in section_keys(section) {
+                if sk.key.is_none() {
+                    assert!(
+                        ACCORDION.contains(&sk.chord),
+                        "{section:?}: nav chord `{}` is not an accordion key — \
+                         either dispatch it (use `k(..)`) or drop the hint",
+                        sk.chord
+                    );
+                }
+            }
+        }
+    }
+
+    /// Best-effort cross-surface label agreement: when a single-char chord in
+    /// a section's statusbar table also appears in that section's in-body
+    /// `hint_row`, the two labels must agree (the `x` = "read" vs "dismiss"
+    /// class of drift). Source-level scan over the single-section renderer
+    /// files; multi-section files (misc.rs) and chord aliases are skipped.
+    #[test]
+    fn statusbar_and_hint_row_labels_agree() {
+        let files: &[(Section, &str)] = &[
+            (
+                Section::Notifications,
+                include_str!("sections/notifications.rs"),
+            ),
+            (Section::Logs, include_str!("sections/logs.rs")),
+            (Section::MergeQueue, include_str!("sections/merge_queue.rs")),
+            (Section::Across, include_str!("sections/across.rs")),
+            (Section::Ci, include_str!("sections/ci.rs")),
+            (Section::Hosts, include_str!("sections/hosts.rs")),
+            (Section::Issues, include_str!("sections/issues.rs")),
+            (Section::Jobs, include_str!("sections/tasks.rs")),
+            (Section::Problems, include_str!("sections/problems.rs")),
+            (Section::Symbols, include_str!("sections/symbols.rs")),
+        ];
+        for (section, src) in files {
+            // Collect ("chord", "label") pairs from every hint_row(&[...])
+            // call in the file: successive `("a", "b")` string-literal pairs.
+            let mut body_labels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            let mut rest = *src;
+            while let Some(pos) = rest.find("hint_row(&[") {
+                rest = &rest[pos + "hint_row(&[".len()..];
+                let end = rest.find("])").unwrap_or(rest.len());
+                let block = &rest[..end];
+                // Walk the block's top-level `(...)` tuples by paren depth
+                // (labels may be `if`-expressions spanning lines and calls);
+                // within a tuple, the FIRST string literal is the chord and
+                // every remaining literal is one of its possible labels.
+                let mut depth = 0usize;
+                let mut tuple = String::new();
+                for c in block.chars() {
+                    match c {
+                        '(' => {
+                            depth += 1;
+                            if depth == 1 {
+                                tuple.clear();
+                                continue;
+                            }
+                        }
+                        ')' => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                let lits: Vec<&str> = tuple
+                                    .split('"')
+                                    .enumerate()
+                                    .filter(|(i, _)| i % 2 == 1)
+                                    .map(|(_, s)| s)
+                                    .collect();
+                                if let Some((chord, labels)) = lits.split_first() {
+                                    let entry =
+                                        body_labels.entry(chord.trim().to_string()).or_default();
+                                    for l in labels {
+                                        entry.insert(l.to_string());
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if depth >= 1 {
+                        tuple.push(c);
+                    }
+                }
+            }
+            for sk in section_keys(*section) {
+                let Some(labels) = body_labels.get(sk.chord) else {
+                    continue;
+                };
+                // Dynamic hints (e.g. the `g` scope toggle) legitimately show
+                // several labels; require the table's label to be one of them
+                // only when the body uses a single, static label.
+                if labels.len() == 1 {
+                    let body = labels.iter().next().unwrap();
+                    assert_eq!(
+                        body, sk.label,
+                        "{section:?}: `{}` is \"{}\" in the statusbar table but \
+                         \"{body}\" in the in-body hint row",
+                        sk.chord, sk.label
+                    );
+                }
+            }
         }
     }
 }

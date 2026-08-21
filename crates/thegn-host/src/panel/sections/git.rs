@@ -153,6 +153,60 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
     }
 
+    // OPEN PRS — the repo's other open PRs (from `gh pr list` via the
+    // repo-keyed `pr_branch_cache`), so the section answers "what's open on
+    // this repo", not only "what's open on this branch". The current branch's
+    // own PR is the detail above, so it's skipped here. ◈ marks a PR whose
+    // head branch already has a local worktree.
+    {
+        let others: Vec<&thegn_core::github::PrHeader> = data
+            .open_prs
+            .iter()
+            .filter(|p| p.head_ref != data.branch)
+            .collect();
+        if !others.is_empty() {
+            let cap = if deep { 8 } else { 4 };
+            let mut header = vec![
+                seg(g2(), "OPEN PRS").bold(),
+                seg(g(), format!("  {} open on this repo", others.len())),
+            ];
+            // Age tag once the cache is meaningfully old (offline / gh
+            // failing): stale-but-shown beats blank, but it must SAY so.
+            if let Some(at) = data.open_prs_fetched_at {
+                let age = thegn_core::util::now().saturating_sub(at);
+                if age > 600 {
+                    header.push(seg(f(), format!("  ({} ago)", super::fmt_secs(age))));
+                }
+            }
+            rows.push(PanelRow::plain(Line::segs(header)));
+            for p in others.iter().take(cap) {
+                let linked = ctx
+                    .model
+                    .sidebar_db_worktrees
+                    .iter()
+                    .any(|w| w.branch == p.head_ref);
+                let mut l = vec![seg(ac(), format!("#{} ", p.number))];
+                if linked {
+                    l.push(seg(g2(), "◈ "));
+                }
+                l.push(seg(f(), p.head_ref.clone()));
+                let state_chip = if p.is_draft {
+                    Seg::chip(g(), " draft ")
+                } else {
+                    Seg::chip(pr_state_hue(&p.state, p.is_draft), format!(" {} ", p.state))
+                };
+                rows.push(PanelRow::plain(Line::split(l, vec![state_chip])));
+            }
+            if others.len() > cap {
+                rows.push(PanelRow::plain(Line::segs(vec![seg(
+                    g(),
+                    format!("… +{} more", others.len() - cap),
+                )])));
+            }
+            rows.push(PanelRow::blank());
+        }
+    }
+
     // LOG — graph rows.
     if !data.log.is_empty() {
         let mut r = vec![seg(d(), "")];

@@ -1033,7 +1033,18 @@ const ALL_MODES: [Mode; 4] = [Mode::Normal, Mode::VimNormal, Mode::VimInsert, Mo
 
 pub(crate) fn parse_chord(s: &str) -> Result<Vec<Key>, String> {
     let mut out = Vec::new();
-    let normalized = s.replace('-', " ");
+    // `-` doubles as a separator ("Ctrl-Alt-x") — but only BETWEEN word
+    // characters, so a literal `-` KEY ("Ctrl Alt -") stays a key instead of
+    // dissolving into a dangling modifier.
+    let chars: Vec<char> = s.chars().collect();
+    let mut normalized = String::with_capacity(s.len());
+    for (i, c) in chars.iter().enumerate() {
+        let separator = *c == '-'
+            && i > 0
+            && chars[i - 1].is_ascii_alphanumeric()
+            && chars.get(i + 1).is_some_and(|n| n.is_ascii_alphanumeric());
+        normalized.push(if separator { ' ' } else { *c });
+    }
     let toks: Vec<&str> = normalized.split_whitespace().collect();
     if toks.is_empty() {
         return Err("empty chord".into());
@@ -1166,6 +1177,16 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt y", Action::ToggleSyncPanes)
         .unwrap();
     map.insert_all("Ctrl Alt t", Action::CycleTheme).unwrap();
+    // Bind every `ACTION_SPECS` default chord for real: these six were
+    // DECLARED (so the palette + `thegn keys list` advertised them) but never
+    // registered here — pressing the shown chord did nothing.
+    map.insert_all("Ctrl Alt a", Action::SwitchAccount).unwrap();
+    map.insert_all("Ctrl Alt u", Action::SwitchBundle).unwrap();
+    map.insert_all("Ctrl Alt g", Action::SwitchProfile).unwrap();
+    map.insert_all("Ctrl Alt =", Action::PoolIncrement).unwrap();
+    map.insert_all("Ctrl Alt -", Action::PoolDecrement).unwrap();
+    map.insert_all("Ctrl Alt q", Action::OpenMergeQueue)
+        .unwrap();
     map.insert_all("Alt f", Action::SwitchFont).unwrap();
     // Close (rule 3): `Alt x` is one smart "close this" — pane if the tab is
     // split, else the tab; Shift escalates to worktree removal (`Alt X`). This

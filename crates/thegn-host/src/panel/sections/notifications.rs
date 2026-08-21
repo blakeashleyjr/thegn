@@ -35,20 +35,37 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
-/// Notifications visible under the current show_read toggle and text filter.
-fn visible<'a>(ctx: &'a SectionCtx) -> Vec<&'a Notification> {
-    let filter = ctx.ui.notifications_filter.to_lowercase();
-    ctx.model
-        .panel
+/// Indices (into `panel.notifications`) visible under the current show-read
+/// toggle and `/` text filter — the ONE predicate both the renderer and the
+/// loop's `x`/`d` dispatch resolve the cursor against. The dispatch used to
+/// re-implement this without the `worktree_path` term, so filtering by a
+/// worktree name made `d` (irreversibly) delete a different notification than
+/// the highlighted one.
+pub(crate) fn visible_indices(
+    panel: &crate::panel::PanelData,
+    ui: &crate::panel::PanelUi,
+) -> Vec<usize> {
+    let filter = ui.notifications_filter.to_lowercase();
+    panel
         .notifications
         .iter()
-        .filter(|n| {
-            (ctx.ui.notifications_show_read || !n.read)
+        .enumerate()
+        .filter(|(_, n)| {
+            (ui.notifications_show_read || !n.read)
                 && (filter.is_empty()
                     || n.message.to_lowercase().contains(&filter)
                     || n.source_ref.to_lowercase().contains(&filter)
                     || n.worktree_path.to_lowercase().contains(&filter))
         })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Notifications visible under the current show_read toggle and text filter.
+fn visible<'a>(ctx: &'a SectionCtx) -> Vec<&'a Notification> {
+    visible_indices(&ctx.model.panel, ctx.ui)
+        .into_iter()
+        .filter_map(|i| ctx.model.panel.notifications.get(i))
         .collect()
 }
 
@@ -123,19 +140,16 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             row
         };
         rows.push(row);
-
-        if rows.len() >= ctx.rows.saturating_sub(1) {
-            break;
-        }
+        // No in-section truncation: the frame's cursor-following window keeps
+        // the highlighted row on screen, so every row stays reachable.
     }
 
     rows.push(hint_row(&[
-        ("↵", "read"),
+        ("↵", "expand"),
         ("/ ", "search"),
-        ("x", "dismiss"),
+        ("x", "read"),
+        ("d", "delete"),
         ("a", "clear"),
-        ("d", "del"),
-        ("A", "show read"),
         (
             "g",
             if crate::panel::scope::system_all() {
@@ -219,19 +233,15 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             bg: None,
             hit: None,
         });
-
-        if rows.len() + 2 > ctx.rows.saturating_sub(2) {
-            break;
-        }
+        // No in-section truncation — see `normal_view`.
     }
 
     rows.push(hint_row(&[
-        ("↵", "read"),
+        ("↵", "expand"),
         ("/ ", "search"),
-        ("x", "dismiss"),
+        ("x", "read"),
+        ("d", "delete"),
         ("a", "clear"),
-        ("d", "del"),
-        ("A", "show read"),
         (
             "g",
             if crate::panel::scope::system_all() {
@@ -325,18 +335,26 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     };
 
     let combined = two_col(&list_rows, &detail_rows, list_w, 2);
-    let header_offset = rows.len();
+    let item_count = items.len();
     rows.extend(combined.into_iter().enumerate().map(|(i, l)| {
-        PanelRow::plain(l).with_hit(PanelHit::Row(Section::Notifications, header_offset + i))
+        // Only the LIST rows are cursor targets, indexed by the visible-item
+        // index — the old `header_offset + i` tagging offset every hit by the
+        // header rows, so clicks resolved to the wrong notification.
+        let row = PanelRow::plain(l);
+        if i < item_count {
+            row.with_hit(PanelHit::Row(Section::Notifications, i))
+        } else {
+            row
+        }
     }));
 
     rows.push(rule());
     rows.push(hint_row(&[
-        ("↵", "read"),
+        ("↵", "expand"),
         ("/ ", "search"),
-        ("x", "dismiss"),
+        ("x", "read"),
+        ("d", "delete"),
         ("a", "clear all"),
-        ("d", "del"),
         ("A", "show all"),
     ]));
     rows

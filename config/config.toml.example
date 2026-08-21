@@ -1095,6 +1095,12 @@ process_exit = "failures_and_tasks"
 # (informational, never the red flag, never in "Needs you") and appear as a
 # single entry point under the unified surface's Logs group.
 surface_self_log_errors = false
+# Poll GitHub's notifications API for @mentions of you in the active repo
+# (`gh api notifications`, reason == "mention") and surface them as the
+# "mentioned" kind. Throttled to one call per repo per 5 minutes on the
+# PR-refresh cadence; each mention notifies once. Requires `gh` auth; the
+# poll is skipped silently without it.
+github_mentions = true
 # Startup routing mode ("" = default). Named modes are defined below in
 # [notifications.modes.<name>]; switch at runtime with Ctrl+Alt+m.
 active_mode = ""
@@ -1194,21 +1200,26 @@ active_mode = ""
 # label = "Away"
 
 # Top pinned-program strip: a horizontal band above the center that renders
-# `location = "strip"` pins side by side (toggle Ctrl+Alt+t; grow/shrink at
+# `location = "strip"` pins side by side (toggle Ctrl+Alt+b; grow/shrink at
 # runtime). `ratio` is the fraction of the center band it occupies.
 [strip]
 ratio = 0.2
 visible = true
 
-# The right accordion panel. Three top-level tabs (git/work/system) group
-# sections by concern; `[` / `]` cycle tabs, Alt+1/2/3 jump directly.
+# The right accordion panel. Four top-level tabs (git/work/system/help) group
+# sections by concern; `Tab` / `Shift+Tab` cycle tabs, bare digits 1-9 jump to
+# the active tab's Nth section.
 # `sections` reorders sections across all tabs — any section left out is hidden;
 # an empty/absent list shows every section in the built-in order:
 #   Git tab:    changes · commits · branches · stash · files
-#   Work tab:   mine · pr · issues · problems · jobs · tests · symbols
-#   System tab: notifications · logs · sandbox · telemetry · keys
-# "mine" is the unified cross-repo "My Work" feed (assigned issues across all
-# trackers + review-requested/authored PRs + high-priority notifications).
+#   Work tab:   mine · across · pr · ci · merge · issues · problems · jobs
+#               · tests · symbols
+#   System tab: notifications · logs · sandbox · hosts · environments · share
+#               · forward · telemetry · media · keys
+# "mine" is the "My Work" feed (assigned issues across all trackers +
+# review-requested/authored PRs + high-priority notifications), scoped to the
+# active repo by default ("a" widens to all repos). "across" aggregates other
+# worktrees' failing CI, scoped to the active workspace ("a" widens).
 # The old "prs" and "tasks" keys still work as aliases for "pr" and "jobs".
 # Unknown keys are ignored; reloads apply live.
 [panel]
@@ -1217,6 +1228,13 @@ visible = true
 # panel, a bar, the drawer), snap the right panel back to its default width and
 # close the bottom file drawer. Set false to leave sizes exactly as you left them.
 # collapse_on_escape = true
+# Resting (Normal) panel width in columns (clamped 30–200; default 44). Dragging
+# the panel's left separator with the mouse adjusts and persists this too — a
+# dragged width wins over this key until the drag memory is cleared.
+# width = 44
+# Fraction of the screen the Half (first `e`) width takes (clamped 0.30–0.90;
+# default 0.5). Never narrower than the Normal width.
+# half_ratio = 0.5
 
 # In-pane scrollback / copy-mode search (distinct from the palette below).
 [search]

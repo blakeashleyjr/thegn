@@ -135,7 +135,12 @@ impl ForwardSupervisor {
         if self.has(worktree, container_port) {
             return Err(format!("already forwarding port {container_port}"));
         }
-        let container = thegn_core::sandbox::container_name(worktree);
+        // Profile-aware, matching the detector and the actual container name
+        // (`thegn-{profile}-{slug}` under a non-default profile).
+        let container = thegn_core::sandbox::container_name_with_profile(
+            worktree,
+            Some(&thegn_core::profile::name()),
+        );
         let argv = thegn_svc::forward::exec_bridge_argv(runtime, &container, container_port);
         let (listener, host_port) = bind_host_port(&cfg.bind, container_port, cfg.port_range())
             .map_err(|e| format!("no free host port for {container_port}: {e}"))?;
@@ -293,6 +298,7 @@ pub fn spawn_detector(
             // it gets re-forwarded, which a stale snapshot would suppress.
             let mut tracked: Option<String> = None;
             let mut last: BTreeSet<u16> = BTreeSet::new();
+            let mut probe_failures: u32 = 0;
             loop {
                 let wt = target.lock().unwrap().clone();
                 if wt != tracked {
@@ -301,43 +307,59 @@ pub fn spawn_detector(
                 }
                 let mut sleep = idle_backoff;
                 if let Some(wt) = wt {
-                    let container = thegn_core::sandbox::container_name(&wt);
+                    // Profile-aware: containers are created as
+                    // `thegn-{profile}-{slug}`, so the plain name never
+                    // matched under `--profile` and nothing was ever detected.
+                    let container = thegn_core::sandbox::container_name_with_profile(
+                        &wt,
+                        Some(&thegn_core::profile::name()),
+                    );
                     // On a probe error (no sandbox / stopped container) keep the
-                    // last snapshot — don't tear forwards down on a transient blip
-                    // — and fall through to the idle backoff. Forwards are cleaned
-                    // up explicitly when the worktree closes or the sandbox stops.
-                    if let Ok((runtime, now)) =
-                        thegn_svc::forward::probe_container_ports(&container)
-                    {
-                        sleep = poll;
-                        let (appeared, disappeared) = diff_listening(&last, &now);
-                        last = now;
-                        let mut pulsed = false;
-                        for p in appeared {
-                            if tx
-                                .send(ForwardEvent::Detected {
-                                    worktree: wt.clone(),
-                                    container_port: p,
-                                    runtime: runtime.clone(),
-                                })
-                                .is_ok()
-                            {
-                                pulsed = true;
+                    // last snapshot for a couple of rounds — don't tear forwards
+                    // down on a transient blip — but after repeated failures
+                    // reset `last`, so a RESTARTED container's re-appearing
+                    // ports register as `appeared` and re-forward. (With `last`
+                    // held forever, a same-port restart never re-established
+                    // its forwards until a worktree switch away and back.)
+                    match thegn_svc::forward::probe_container_ports(&container) {
+                        Err(_) => {
+                            probe_failures += 1;
+                            if probe_failures >= 3 && !last.is_empty() {
+                                last.clear();
                             }
                         }
-                        for p in disappeared {
-                            if tx
-                                .send(ForwardEvent::Vanished {
-                                    worktree: wt.clone(),
-                                    container_port: p,
-                                })
-                                .is_ok()
-                            {
-                                pulsed = true;
+                        Ok((runtime, now)) => {
+                            probe_failures = 0;
+                            sleep = poll;
+                            let (appeared, disappeared) = diff_listening(&last, &now);
+                            last = now;
+                            let mut pulsed = false;
+                            for p in appeared {
+                                if tx
+                                    .send(ForwardEvent::Detected {
+                                        worktree: wt.clone(),
+                                        container_port: p,
+                                        runtime: runtime.clone(),
+                                    })
+                                    .is_ok()
+                                {
+                                    pulsed = true;
+                                }
                             }
-                        }
-                        if pulsed {
-                            let _ = waker.wake();
+                            for p in disappeared {
+                                if tx
+                                    .send(ForwardEvent::Vanished {
+                                        worktree: wt.clone(),
+                                        container_port: p,
+                                    })
+                                    .is_ok()
+                                {
+                                    pulsed = true;
+                                }
+                            }
+                            if pulsed {
+                                let _ = waker.wake();
+                            }
                         }
                     }
                 }

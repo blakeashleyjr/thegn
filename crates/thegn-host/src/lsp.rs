@@ -117,12 +117,15 @@ impl LspInner {
     }
 }
 
-/// Persistent store of LSP-pushed diagnostics, keyed by file path. Survives
+/// Persistent store of LSP-pushed diagnostics, partitioned by the worktree
+/// root that produced them and keyed by file path within each root. Survives
 /// model-hydration swaps (which only carry git/db state) so the Problems panel
 /// keeps showing them; re-merged into the rendered list on every update + swap.
+/// The partition is what keeps one workspace's warm servers (they stay alive
+/// across tab switches) from bleeding diagnostics into another's panel.
 #[derive(Debug, Default)]
 pub struct LspDiagnostics {
-    by_file: HashMap<String, Vec<DiagnosticItem>>,
+    by_root: HashMap<PathBuf, HashMap<String, Vec<DiagnosticItem>>>,
 }
 
 impl LspDiagnostics {
@@ -130,12 +133,18 @@ impl LspDiagnostics {
         LspDiagnostics::default()
     }
 
-    /// Apply a server's latest diagnostics for one document. An empty set clears
-    /// that file. `root`, when the path is under it, yields a repo-relative path.
-    pub fn apply(&mut self, pd: PublishedDiagnostics, root: Option<&Path>) {
-        let file = relativize(&pd.path, root);
+    /// Apply a server's latest diagnostics for one document, filed under the
+    /// originating client's worktree root (stamped on the message). An empty
+    /// set clears that file.
+    pub fn apply(&mut self, pd: PublishedDiagnostics) {
+        let file = relativize(&pd.path, &pd.root);
         if pd.diagnostics.is_empty() {
-            self.by_file.remove(&file);
+            if let Some(files) = self.by_root.get_mut(&pd.root) {
+                files.remove(&file);
+                if files.is_empty() {
+                    self.by_root.remove(&pd.root);
+                }
+            }
             return;
         }
         let items = pd
@@ -143,22 +152,40 @@ impl LspDiagnostics {
             .into_iter()
             .map(|d| to_panel_item(&file, d))
             .collect();
-        self.by_file.insert(file, items);
+        self.by_root.entry(pd.root).or_default().insert(file, items);
     }
 
-    /// Replace the LSP-sourced entries in `dst` with the current store, keeping
-    /// any non-LSP (task-output) diagnostics, then re-sort by severity.
-    pub fn merge_into(&self, dst: &mut Vec<DiagnosticItem>) {
+    /// Replace the LSP-sourced entries in `dst` with the current store's
+    /// entries **for `root` only**, keeping any non-LSP (task-output)
+    /// diagnostics, then re-sort by severity. Foreign roots' diagnostics stay
+    /// in the store but never render.
+    pub fn merge_into(&self, root: &Path, dst: &mut Vec<DiagnosticItem>) {
         dst.retain(|d| !d.source.starts_with("lsp:"));
-        for items in self.by_file.values() {
-            dst.extend(items.iter().cloned());
+        if let Some(files) = self.by_root.get(root) {
+            for items in files.values() {
+                dst.extend(items.iter().cloned());
+            }
         }
         dst.sort_by_key(|d| d.severity as u8);
     }
 
+    /// Drop everything a closed worktree's servers pushed (memory hygiene —
+    /// rendering already ignores non-active roots).
+    #[allow(dead_code)] // exercised by tests; the loop evicts via `retain_roots`
+    pub fn evict_root(&mut self, root: &Path) {
+        self.by_root.remove(root);
+    }
+
+    /// Keep only the roots `keep` approves — called on the periodic model swap
+    /// with the set of open worktree tabs, so closed/deleted worktrees' entries
+    /// don't accumulate for the life of the process.
+    pub fn retain_roots(&mut self, keep: impl Fn(&Path) -> bool) {
+        self.by_root.retain(|root, _| keep(root));
+    }
+
     #[allow(dead_code)] // exercised by tests; the loop-side caller was removed
     pub fn is_empty(&self) -> bool {
-        self.by_file.is_empty()
+        self.by_root.is_empty()
     }
 }
 
@@ -181,10 +208,8 @@ fn to_panel_item(file: &str, d: thegn_svc::lsp::LspDiagnostic) -> DiagnosticItem
 }
 
 /// Strip `root` from `path` when `path` is under it; otherwise return `path`.
-fn relativize(path: &str, root: Option<&Path>) -> String {
-    if let Some(root) = root
-        && let Ok(rel) = Path::new(path).strip_prefix(root)
-    {
+fn relativize(path: &str, root: &Path) -> String {
+    if let Ok(rel) = Path::new(path).strip_prefix(root) {
         return rel.to_string_lossy().into_owned();
     }
     path.to_string()
@@ -195,8 +220,9 @@ mod tests {
     use super::*;
     use thegn_svc::lsp::LspDiagnostic;
 
-    fn pd(path: &str, diags: Vec<LspDiagnostic>) -> PublishedDiagnostics {
+    fn pd(root: &str, path: &str, diags: Vec<LspDiagnostic>) -> PublishedDiagnostics {
         PublishedDiagnostics {
+            root: PathBuf::from(root),
             path: path.to_string(),
             diagnostics: diags,
         }
@@ -216,16 +242,13 @@ mod tests {
     #[test]
     fn apply_relativizes_and_converts() {
         let mut store = LspDiagnostics::new();
-        let root = PathBuf::from("/proj");
-        store.apply(
-            pd(
-                "/proj/src/lib.rs",
-                vec![diag(5, LspSeverity::Error, "boom")],
-            ),
-            Some(&root),
-        );
+        store.apply(pd(
+            "/proj",
+            "/proj/src/lib.rs",
+            vec![diag(5, LspSeverity::Error, "boom")],
+        ));
         let mut dst = Vec::new();
-        store.merge_into(&mut dst);
+        store.merge_into(Path::new("/proj"), &mut dst);
         assert_eq!(dst.len(), 1);
         assert_eq!(dst[0].file, "src/lib.rs");
         assert_eq!(dst[0].line, 6); // 0-based 5 → 1-based 6
@@ -236,19 +259,56 @@ mod tests {
     #[test]
     fn empty_set_clears_a_file() {
         let mut store = LspDiagnostics::new();
-        store.apply(pd("/x.rs", vec![diag(0, LspSeverity::Warning, "w")]), None);
+        store.apply(pd(
+            "/p",
+            "/p/x.rs",
+            vec![diag(0, LspSeverity::Warning, "w")],
+        ));
         assert!(!store.is_empty());
-        store.apply(pd("/x.rs", vec![]), None);
+        store.apply(pd("/p", "/p/x.rs", vec![]));
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn merge_is_partitioned_by_root() {
+        let mut store = LspDiagnostics::new();
+        store.apply(pd(
+            "/a",
+            "/a/x.rs",
+            vec![diag(1, LspSeverity::Error, "a-err")],
+        ));
+        store.apply(pd(
+            "/b",
+            "/b/y.rs",
+            vec![diag(2, LspSeverity::Warning, "b-warn")],
+        ));
+
+        // Merging for root /a yields only /a's diagnostics.
+        let mut dst = Vec::new();
+        store.merge_into(Path::new("/a"), &mut dst);
+        assert_eq!(dst.len(), 1);
+        assert_eq!(dst[0].message, "a-err");
+
+        // Switching to /b swaps the set — /a's entry (lsp-sourced) is dropped.
+        store.merge_into(Path::new("/b"), &mut dst);
+        assert_eq!(dst.len(), 1);
+        assert_eq!(dst[0].message, "b-warn");
+
+        // Evicting a root removes its partition entirely.
+        store.evict_root(Path::new("/b"));
+        store.merge_into(Path::new("/b"), &mut dst);
+        assert!(dst.is_empty());
+        assert!(!store.is_empty()); // /a still stored
     }
 
     #[test]
     fn merge_keeps_task_diags_and_replaces_lsp() {
         let mut store = LspDiagnostics::new();
-        store.apply(
-            pd("/a.rs", vec![diag(1, LspSeverity::Error, "lsp-err")]),
-            None,
-        );
+        store.apply(pd(
+            "/p",
+            "/p/a.rs",
+            vec![diag(1, LspSeverity::Error, "lsp-err")],
+        ));
 
         // A pre-existing task diagnostic plus a stale LSP one.
         let mut dst = vec![
@@ -271,7 +331,7 @@ mod tests {
                 code: None,
             },
         ];
-        store.merge_into(&mut dst);
+        store.merge_into(Path::new("/p"), &mut dst);
 
         // The task diagnostic survives; the stale LSP one is gone; ours is added.
         assert!(dst.iter().any(|d| d.source == "cargo clippy"));

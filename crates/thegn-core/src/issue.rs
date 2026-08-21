@@ -36,6 +36,10 @@ pub struct Issue {
     /// Issue IDs that this issue is blocked by.
     #[serde(default)]
     pub blocked_by: Vec<String>,
+    /// Due date in unix milliseconds (midnight UTC for date-only providers).
+    /// `None` when the provider has no due-date concept (GitHub) or none set.
+    #[serde(default)]
+    pub due_at_ms: Option<i64>,
 }
 
 /// Workflow state of an issue.

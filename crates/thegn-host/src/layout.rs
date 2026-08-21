@@ -17,6 +17,43 @@ pub const MASTHEAD_ROWS: usize = 1;
 pub const STATUSBAR_ROWS: usize = 1;
 pub const SIDEBAR_COLS: usize = 32; // ~20% at 160 cols — room for the two-tier rows + status
 pub const PANEL_COLS: usize = 44; // ~27% at 160 cols
+
+// ── Panel width overrides ───────────────────────────────────────────────────
+// `[panel] width` / `half_ratio` config plus the separator drag both adjust
+// these. Process-global atomics (the one-panel-per-session pattern shared
+// with `caps.rs` / `panel::scope`) rather than threading two more params
+// through the 13-arg `compute_full_bars` and its ~20 positional call sites.
+/// Normal-width columns override; 0 = the `PANEL_COLS` default.
+static PANEL_NORMAL_COLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Half-width fraction of the window, stored as percent; 0 = the default 50.
+static PANEL_HALF_PCT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Install the `[panel]` width overrides (startup + config reload + drag).
+/// Values are clamped to sane bounds; `None`/default restores the built-ins.
+pub fn set_panel_width_cfg(normal_cols: Option<usize>, half_ratio: Option<f32>) {
+    use std::sync::atomic::Ordering;
+    let n = normal_cols.map(|c| c.clamp(30, 200)).unwrap_or(0);
+    PANEL_NORMAL_COLS.store(n, Ordering::Relaxed);
+    let pct = half_ratio
+        .map(|r| (r.clamp(0.3, 0.9) * 100.0) as usize)
+        .unwrap_or(0);
+    PANEL_HALF_PCT.store(pct, Ordering::Relaxed);
+}
+
+/// The panel's resting (Normal) width in columns.
+pub fn panel_normal_cols() -> usize {
+    match PANEL_NORMAL_COLS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => PANEL_COLS,
+        n => n,
+    }
+}
+
+fn panel_half_ratio() -> f32 {
+    match PANEL_HALF_PCT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => 0.5,
+        p => p as f32 / 100.0,
+    }
+}
 /// The slim collapsed rail's fixed width: an activity dot + one initial.
 pub const RAIL_COLS: usize = 4;
 
@@ -44,6 +81,16 @@ impl PanelWidth {
             PanelWidth::Normal => PanelWidth::Half,
             PanelWidth::Half => PanelWidth::Full,
             PanelWidth::Full => PanelWidth::Normal,
+        }
+    }
+
+    /// The reverse cycle (`E`): Full → Half → Normal → Full — so shrinking
+    /// from Half never has to pass through Full first.
+    pub fn cycle_back(self) -> Self {
+        match self {
+            PanelWidth::Normal => PanelWidth::Full,
+            PanelWidth::Half => PanelWidth::Normal,
+            PanelWidth::Full => PanelWidth::Half,
         }
     }
 
@@ -407,10 +454,13 @@ pub fn compute_full_bars(
     };
     let mut right = if show_panel {
         match panel_width {
-            // Resting reading width.
-            PanelWidth::Normal => PANEL_COLS,
-            // Half the window (never below the resting width on a small screen).
-            PanelWidth::Half => (cols / 2).max(PANEL_COLS),
+            // Resting reading width (config/drag override, else the default).
+            PanelWidth::Normal => panel_normal_cols(),
+            // The configured fraction of the window (default half), never
+            // below the resting width on a small screen.
+            PanelWidth::Half => {
+                ((cols as f32 * panel_half_ratio()) as usize).max(panel_normal_cols())
+            }
             // The whole band: ask for everything and let the clamp below trade
             // it back to leave the center its mandatory single column.
             PanelWidth::Full => cols.saturating_sub(2),

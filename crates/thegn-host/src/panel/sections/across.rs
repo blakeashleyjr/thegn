@@ -1,10 +1,11 @@
-//! The `Across` section — a read-only, cross-worktree attention stream
+//! The `Across` section — a cross-worktree attention stream
 //! (multibuffer-style). Reads `model.panel.across` (built off-loop during
-//! hydration from every worktree's CI cache): failing CI — and, as those
-//! producers land, dirty files / content matches — from *all* worktrees, grouped
-//! by worktree with per-row source labels. Each excerpt row carries a
-//! `PanelHit::Row(Across, i)` so the cursor can rest on it (and a future
-//! one-key "open at source" can resolve it via `Aggregation::jump_target`).
+//! hydration from the CI caches of the active repo's worktrees — or every
+//! workspace's, under the `a` toggle): failing CI — and, as those producers
+//! land, dirty files / content matches — grouped by worktree with per-row
+//! source labels. Each excerpt row carries a `PanelHit::Row(Across, i)`;
+//! Enter resolves it via `Aggregation::jump_target` and switches to that
+//! worktree's tab.
 
 use thegn_core::aggregate::{AggRow, Aggregation, ExcerptKind};
 use thegn_core::theme::Hue;
@@ -24,22 +25,144 @@ fn kind_glyph(kind: ExcerptKind) -> Seg {
 }
 
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
+    if ctx.full() && !ctx.model.panel.across.is_empty() {
+        return full_view(ctx);
+    }
     build_rows(&ctx.model.panel.across, ctx.deep())
+}
+
+/// Full: excerpt list + a detail column for the cursor excerpt (worktree
+/// path, kind, source location, full text + detail, and where ↵ lands).
+fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
+    use super::{g2, rule, t, two_col, wrap_text};
+    let agg = &ctx.model.panel.across;
+    let cols = ctx.cols;
+    let all = crate::panel::scope::across_all();
+    let mut rows: Vec<PanelRow> = Vec::new();
+
+    let s = agg.summary();
+    rows.push(PanelRow::plain(Line::segs(vec![
+        seg(d(), "ACROSS"),
+        seg(
+            f(),
+            format!(
+                " · {}✗ {}● {}· across {} worktrees{}",
+                s.failures,
+                s.dirty,
+                s.matches,
+                s.worktrees,
+                if all {
+                    " (all workspaces)"
+                } else {
+                    " (this workspace · a = all)"
+                }
+            ),
+        ),
+    ])));
+    rows.push(rule());
+
+    // The left list keeps the grouped shape (group dividers interleaved);
+    // hits and the cursor walk the excerpt rows only, in agg order.
+    let mut list_rows: Vec<Vec<Seg>> = Vec::new();
+    // For row i of the list: Some(excerpt index) when it's an excerpt row.
+    let mut list_hits: Vec<Option<usize>> = Vec::new();
+    let mut excerpts: Vec<usize> = Vec::new();
+    for row in agg.rows() {
+        match row {
+            AggRow::Group { label, count } => {
+                list_rows.push(vec![
+                    seg(hue(Hue::Blue), label),
+                    seg(d(), format!(" ·{count}")),
+                ]);
+                list_hits.push(None);
+            }
+            AggRow::Excerpt(i) => {
+                let Some(e) = agg.jump_target(i) else {
+                    continue;
+                };
+                let sel = excerpts.len() == ctx.ui.cursor;
+                list_rows.push(vec![
+                    seg(if sel { t() } else { g() }, if sel { "▶ " } else { "  " }),
+                    kind_glyph(e.kind),
+                    seg(if sel { t() } else { d() }, format!(" {}", e.text)),
+                ]);
+                list_hits.push(Some(i));
+                excerpts.push(i);
+            }
+        }
+    }
+
+    let list_w = 45_usize.min(cols / 2);
+    let detail_w = cols.saturating_sub(list_w + 2);
+    let cursor = ctx.ui.cursor.min(excerpts.len().saturating_sub(1));
+    let detail: Vec<Vec<Seg>> = match excerpts.get(cursor).and_then(|&i| agg.jump_target(i)) {
+        Some(e) => {
+            let kind = match e.kind {
+                ExcerptKind::CiFailure => "CI failure",
+                ExcerptKind::DirtyFile => "dirty file",
+                ExcerptKind::ContentMatch => "content match",
+            };
+            let mut d_rows: Vec<Vec<Seg>> = vec![
+                vec![kind_glyph(e.kind), seg(t(), format!(" {kind}")).bold()],
+                vec![
+                    seg(g2(), "worktree  "),
+                    seg(d(), e.worktree_label.clone()),
+                    seg(f(), format!("  {}", e.worktree)),
+                ],
+            ];
+            if !e.file.is_empty() {
+                let loc = match e.line {
+                    Some(n) => format!("{}:{n}", e.file),
+                    None => e.file.clone(),
+                };
+                d_rows.push(vec![seg(g2(), "at  "), seg(d(), loc)]);
+            }
+            d_rows.push(Vec::new());
+            for chunk in wrap_text(&e.text, detail_w) {
+                d_rows.push(vec![seg(t(), chunk)]);
+            }
+            if !e.detail.is_empty() {
+                for chunk in wrap_text(&e.detail, detail_w) {
+                    d_rows.push(vec![seg(f(), chunk)]);
+                }
+            }
+            d_rows.push(Vec::new());
+            d_rows.push(vec![seg(g2(), "↵ jumps to this worktree's tab")]);
+            d_rows
+        }
+        None => vec![vec![seg(g2(), "select an excerpt")]],
+    };
+
+    let combined = two_col(&list_rows, &detail, list_w, 2);
+    rows.extend(combined.into_iter().enumerate().map(|(row_i, line)| {
+        let row = PanelRow::plain(line);
+        match list_hits.get(row_i).copied().flatten() {
+            Some(i) => row.with_hit(PanelHit::Row(Section::Across, i)),
+            None => row,
+        }
+    }));
+    rows
 }
 
 /// Render the aggregation into panel rows. Pure over the model + view depth so
 /// it is unit-testable without a full `FrameModel`.
 fn build_rows(agg: &Aggregation, deep: bool) -> Vec<PanelRow> {
+    let all = crate::panel::scope::across_all();
+    let scope_tail = if all {
+        " (all workspaces)"
+    } else {
+        " (this workspace · a = all)"
+    };
     if agg.is_empty() {
         return vec![PanelRow::plain(Line::segs(vec![seg(
             d(),
-            "nothing needs attention across worktrees",
+            format!("nothing needs attention across worktrees{scope_tail}"),
         )]))];
     }
 
     let mut rows: Vec<PanelRow> = Vec::new();
 
-    // Summary line: "3✗ · 1● · across 2 worktrees".
+    // Summary line: "3✗ · 1● · across 2 worktrees (this workspace · a = all)".
     let s = agg.summary();
     let mut sum: Vec<Seg> = Vec::new();
     if s.failures > 0 {
@@ -52,6 +175,7 @@ fn build_rows(agg: &Aggregation, deep: bool) -> Vec<PanelRow> {
         sum.push(seg(g(), format!(" {}·", s.matches)));
     }
     sum.push(seg(d(), format!(" across {} worktrees", s.worktrees)));
+    sum.push(seg(f(), scope_tail.to_string()));
     rows.push(PanelRow::plain(Line::segs(sum)));
 
     for row in agg.rows() {
