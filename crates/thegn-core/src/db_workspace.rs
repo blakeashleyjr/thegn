@@ -329,6 +329,24 @@ impl WorkspaceStore for Db {
             "DELETE FROM attention_acks WHERE worktree_path=?1",
             params![wt],
         )?;
+        // And the per-worktree status caches + queue row. Every delete path
+        // (interactive close, the registry reap for a dir removed outside
+        // thegn, the stale-group prune) funnels through here — before this,
+        // only the interactive path removed the merge-queue row, so `git
+        // worktree remove` in a shell left the MQ badge counting a branch
+        // that no longer exists, and a worktree recreated at the same path
+        // inherited the old one's CI failure (an instant ✋) and stale glyphs.
+        self.conn()
+            .execute("DELETE FROM merge_queue WHERE worktree=?1", params![wt])?;
+        self.conn()
+            .execute("DELETE FROM pr_cache WHERE worktree=?1", params![wt])?;
+        self.conn()
+            .execute("DELETE FROM ci_runs_cache WHERE worktree=?1", params![wt])?;
+        // best-effort: the glyph_cache table is created lazily and may not
+        // exist yet on this DB.
+        let _ = self
+            .conn()
+            .execute("DELETE FROM glyph_cache WHERE worktree=?1", params![wt]);
         Ok(())
     }
 

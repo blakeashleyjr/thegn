@@ -244,7 +244,13 @@ pub(crate) fn on_right_press(
     let hits = hit_rows(model, rect);
     if let Some(hit) = row_at(&hits, my) {
         sb.cursor = hit.visible_index;
-        sb.menu = sb.menu_for_cursor(model, session);
+        // The rail paints no menu overlay; opening one there arms an
+        // invisible modal that swallows every key (same guard as `m`).
+        if model.sidebar_rail {
+            model.status = "The menu needs the full sidebar — Alt-s to expand".into();
+        } else {
+            sb.menu = sb.menu_for_cursor(model, session);
+        }
         sb.sync(model);
     }
 }
@@ -280,15 +286,21 @@ pub(crate) fn on_menu_mouse(
         if let Some(entry) = menu.entries.get(i).filter(|e| !e.is_separator()) {
             let id = entry.id.clone();
             sb.menu = None;
-            // Land the cursor back on the menu's target row before acting.
-            if let Some(idx) = model
+            // Land the cursor back on the menu's target row before acting. If
+            // that row vanished while the menu was up (hydration prune,
+            // re-file re-keying it), bail — acting would fire the entry
+            // (possibly Delete) at whatever row the cursor happens to be on.
+            let Some(idx) = model
                 .sidebar_rows
                 .iter()
                 .filter(|r| r.visible)
                 .position(|r| r.pin_key == menu.target_pin_key)
-            {
-                sb.cursor = idx;
-            }
+            else {
+                model.status = "That row is gone — menu closed".into();
+                sb.sync(model);
+                return Some(SidebarOutcome::Redraw);
+            };
+            sb.cursor = idx;
             let out = sb.run_menu_action(&id, model, session);
             sb.sync(model);
             return Some(out);
@@ -707,10 +719,19 @@ pub(crate) fn perform_drop(
             },
         ) => {
             // Resolve the insertion anchor's pin key back to a path — the
-            // ordering model is keyed on paths, which survive a re-file.
-            let before = before_pin_key
-                .as_deref()
-                .and_then(|k| path_of_pin_key(model, k));
+            // ordering model is keyed on paths, which survive a re-file. An
+            // anchor that VANISHED mid-drag (hydration filed/deleted it) must
+            // abandon the drop, not collapse `Some(anchor)` into `None` —
+            // `drop_at` reads `None` as "append to the end of the run", which
+            // would land the row somewhere the user never aimed. (This is the
+            // same bail `drop_at` itself performs for a stale in-run anchor.)
+            let before = match before_pin_key.as_deref() {
+                Some(k) => match path_of_pin_key(model, k) {
+                    Some(p) => Some(p),
+                    None => return,
+                },
+                None => None,
+            };
             if let Some(plan) = crate::sidebar_order::drop_at(
                 &model.sidebar_rows,
                 slug,
@@ -730,9 +751,14 @@ pub(crate) fn perform_drop(
             },
             Spot::Reorder { before_pin_key, .. },
         ) => {
-            let before = before_pin_key
-                .as_deref()
-                .and_then(|k| folder_id_of_pin_key(model, k));
+            // Same vanished-anchor bail as the worktree arm above.
+            let before = match before_pin_key.as_deref() {
+                Some(k) => match folder_id_of_pin_key(model, k) {
+                    Some(id) => Some(id),
+                    None => return,
+                },
+                None => None,
+            };
             if let Some(order) =
                 crate::sidebar_order::drop_folder_at(&model.sidebar_rows, slug, *folder_id, before)
             {

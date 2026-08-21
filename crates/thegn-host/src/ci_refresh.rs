@@ -135,7 +135,7 @@ pub(crate) fn spawn_ci_cache_refresh(
         let cwd = crate::hydrate::active_tab_path(&session);
         if cwd.is_dir() {
             let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
-            refresh_ci_cache_for(&loc, &cfg, waker.as_ref(), force);
+            refresh_ci_cache_for(&cwd, &loc, &cfg, waker.as_ref(), force);
         }
         // The sweep rides the same bg task so provider subprocesses stay
         // serialized (kind to rate limits) and the loop-side call stays one
@@ -175,7 +175,7 @@ fn sweep_one_background(
         let loc = thegn_core::remote::GitLoc::for_worktree(p);
         // First worktree that actually fetched (fresh ones are skipped by the
         // guard) ends the sweep — one provider subprocess per tick, max.
-        if refresh_ci_cache_for(&loc, cfg, waker, false) {
+        if refresh_ci_cache_for(p, &loc, cfg, waker, false) {
             return;
         }
     }
@@ -184,7 +184,14 @@ fn sweep_one_background(
 /// The blocking body of a CI cache refresh for one worktree location. Returns
 /// whether a fetch was actually attempted (`false` when skipped by the
 /// freshness/backoff guards or when no provider resolves).
+///
+/// `host_path` keys the cache + backoff rows — the HOST worktree path, never
+/// `loc.path()`: for a provider worktree that is the in-sandbox path (usually
+/// `/workspace` for every worktree of an env), so keying by it collides
+/// sibling worktrees AND diverges from the host-path readers
+/// (`attention_status`, the panel, `pr_clean`).
 fn refresh_ci_cache_for(
+    host_path: &std::path::Path,
     loc: &thegn_core::remote::GitLoc,
     cfg: &thegn_core::config::CiConfig,
     waker: Option<&TerminalWaker>,
@@ -194,7 +201,7 @@ fn refresh_ci_cache_for(
     let Ok(db) = thegn_core::db::Db::open() else {
         return false;
     };
-    let key = loc.path();
+    let key = host_path.to_string_lossy().into_owned();
     let now = thegn_core::util::now();
     if !force {
         let fetched_at = db.get_ci_cache(&key).ok().flatten().map(|(_, at)| at);

@@ -9,7 +9,9 @@
 //!   focused.
 //! - **Shift+↑/↓** (`reorder_selection`) move the whole multi-select: every
 //!   marked row of the cursor row's kind (or the cursor row alone when nothing
-//!   is marked), one slot, as a block.
+//!   is marked), one slot, as a block. Terminals are never markable
+//!   (`SidebarRow::is_markable`), so a terminal "block" is always the cursor
+//!   row alone.
 //!
 //! Worktree motion is confined to the row's **sibling run** — the loose list or
 //! the folder it is filed into — as resolved by [`crate::sidebar_order`];
@@ -84,24 +86,38 @@ fn off_loop(job: impl FnOnce() + Send + 'static) {
 /// can seed a different sequence than the tree is showing.
 fn persist_worktree_order(order: Vec<String>, refile: Option<(String, Option<i64>)>) {
     off_loop(move || {
+        // best-effort beyond the warn: the DB is a cache — the optimistic
+        // model regroup is the user-visible change; a failed write only loses
+        // it on restart. But log it, or the "next tick snapped my order back"
+        // failure mode is undiagnosable.
         let Ok(db) = thegn_core::db::Db::open() else {
+            tracing::warn!(target: "thegn::sidebar", "worktree reorder not persisted: DB unavailable");
             return;
         };
-        if let Some((path, folder)) = refile {
-            // best-effort: the DB is a cache — the optimistic model regroup is
-            // the user-visible change; a failed write only loses it on restart
-            let _ = db.set_worktree_folder(&path, folder);
+        if let Some((path, folder)) = refile
+            && let Err(e) = db.set_worktree_folder(&path, folder)
+        {
+            tracing::warn!(target: "thegn::sidebar", error = %e, "worktree re-file not persisted");
         }
-        let _ = db.set_worktree_order(&order);
+        if let Err(e) = db.set_worktree_order(&order) {
+            tracing::warn!(target: "thegn::sidebar", error = %e, "worktree order not persisted");
+        }
     });
 }
 
 /// Persist a folder reorder as `position = index` within one workspace.
 fn persist_folder_order(repo_path: String, order: Vec<i64>) {
     off_loop(move || {
-        if let Ok(db) = thegn_core::db::Db::open() {
-            // best-effort: see `persist_worktree_order`
-            let _ = db.set_folder_order(&repo_path, &order);
+        // best-effort beyond the warn: see `persist_worktree_order`.
+        match thegn_core::db::Db::open() {
+            Ok(db) => {
+                if let Err(e) = db.set_folder_order(&repo_path, &order) {
+                    tracing::warn!(target: "thegn::sidebar", error = %e, "folder order not persisted");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "thegn::sidebar", error = %e, "folder order not persisted: DB unavailable");
+            }
         }
     });
 }
@@ -271,6 +287,9 @@ impl SidebarState {
             self.view.sort = crate::sidebar::SortMode::Manual;
             self.persist("sort_mode", self.view.sort.as_str());
         }
+        // Stamp the optimistic edit so the model swap keeps these lists while
+        // the deferred write is in flight (see `optimistic_db_edit_at`).
+        self.optimistic_db_edit_at = Some(std::time::Instant::now());
         self.rebuild(model, session);
 
         persist_worktree_order(plan.order, plan.refile.map(|f| (plan.path, f)));
@@ -320,6 +339,9 @@ impl SidebarState {
                 f.position = i as i64;
             }
         }
+        // Stamp the optimistic edit so the model swap keeps these lists while
+        // the deferred write is in flight (see `optimistic_db_edit_at`).
+        self.optimistic_db_edit_at = Some(std::time::Instant::now());
         self.rebuild(model, session);
 
         // A folder created optimistically carries a synthetic negative id that
@@ -378,17 +400,30 @@ impl SidebarState {
         let Some(np) = neighbor else { return false };
         let other = cur[np].clone();
 
-        if let Ok(db) = thegn_core::db::Db::open() {
-            // best-effort: the DB is the source of truth for the terminals
-            // registry; a failed persist only loses the order across restart.
-            let _ = db.swap_terminal_positions(name, &other);
-            // Re-read the registry snapshot the tree renders from so the new
-            // order shows immediately (build_rows reads `sidebar_db_terminals`,
-            // not a fresh query).
-            if let Ok(terms) = db.terminals() {
-                model.sidebar_db_terminals = terms;
-            }
+        // Optimistic: swap the two entries in the registry snapshot the tree
+        // renders from, then persist off-loop — a fresh `Db::open()` + write
+        // ON the loop can stall up to the WAL `busy_timeout` (the same hazard
+        // every other reorder persist already routes around via `off_loop`).
+        let idx_of = |terms: &[thegn_core::models::TerminalRow], n: &str| {
+            terms.iter().position(|t| t.name == n)
+        };
+        if let (Some(ia), Some(ib)) = (
+            idx_of(&model.sidebar_db_terminals, name),
+            idx_of(&model.sidebar_db_terminals, &other),
+        ) {
+            model.sidebar_db_terminals.swap(ia, ib);
         }
+        self.optimistic_db_edit_at = Some(std::time::Instant::now());
+        let (a, b) = (name.to_string(), other);
+        off_loop(move || {
+            let Ok(db) = thegn_core::db::Db::open() else {
+                tracing::warn!(target: "thegn::sidebar", "terminal reorder not persisted: DB unavailable");
+                return;
+            };
+            if let Err(e) = db.swap_terminal_positions(&a, &b) {
+                tracing::warn!(target: "thegn::sidebar", error = %e, "terminal reorder not persisted");
+            }
+        });
         self.rebuild(model, session);
         true
     }
@@ -440,18 +475,17 @@ impl SidebarState {
         }
     }
 
-    /// Move the workspace with this `slug` one slot: swap it with its adjacent
-    /// neighbor in `model.sidebar_workspaces` so it shows at once, then persist
-    /// the **entire** new order via `set_workspace_order`. Live-only workspaces
-    /// (no DB row) are skipped. Rebuilds; the caller places the cursor. Returns
-    /// whether it moved.
+    /// Move the workspace with this `slug` one slot in the **visible** order:
+    /// swap it with its on-screen neighbor, rewrite `model.sidebar_workspaces`
+    /// to match so it shows at once, then persist the **entire** new order via
+    /// `set_workspace_order`. Live-only workspaces (no DB row) are skipped.
+    /// Rebuilds; the caller places the cursor. Returns whether it moved.
     ///
-    /// The neighbor is chosen from the **visible** workspace order
-    /// (`sidebar_rows`) — the order the user sees and the Shift+Alt nav ring
-    /// walks. Pins / `attention` workspace-sort float rows, so the visible order
-    /// can differ from the raw `sidebar_workspaces` order; picking the neighbor
-    /// here (not from the raw vec) keeps the persisted order following what's on
-    /// screen. With no pins the two orders coincide, so behaviour is unchanged.
+    /// Both the neighbor AND the applied order come from the visible workspace
+    /// order (`sidebar_rows`) — the order the user sees and the Shift+Alt nav
+    /// ring walks. Moves the raw order can't express are refused with a status
+    /// instead: pinned blocks always float first (`apply_pins`), and the
+    /// `attention` workspace-sort recomputes the order every rebuild.
     ///
     /// Persisting the whole order (not a two-position swap) is deliberate: the
     /// nav ring is rebuilt from `db.workspaces()` on the next hydration, and a
@@ -490,18 +524,51 @@ impl SidebarState {
         let Some(np) = neighbor else { return false };
         let neighbor_slug = visible[np].clone();
 
-        // Map both slugs back to their `sidebar_workspaces` slot for the swap.
-        let slot = |model: &FrameModel, s: &str| -> Option<usize> {
-            model
-                .sidebar_workspaces
-                .iter()
-                .position(|(ws, _, _, _)| ws == s)
-        };
-        let (Some(ia), Some(ib)) = (slot(model, slug), slot(model, &neighbor_slug)) else {
+        // Refuse moves the renderer cannot express in the raw order, instead
+        // of silently rewriting `sidebar_workspaces` (and persisting it) with
+        // no on-screen effect — or worse, a jump in the wrong direction:
+        // `apply_pins` always floats pinned blocks first (in pin order), and
+        // the attention workspace-sort recomputes the order every rebuild,
+        // using the raw order only as a tiebreak.
+        if self.view.workspace_sort == thegn_core::config::WorkspaceSort::Attention {
+            model.status =
+                "Workspace order is by attention — set [ui] sidebar_workspace_sort = \"manual\" to reorder"
+                    .into();
             return false;
-        };
+        }
+        let pinned = |s: &str| self.view.pins.iter().any(|k| k == s);
+        if pinned(slug) || pinned(&neighbor_slug) {
+            model.status = "Pinned workspaces stay on top — unpin to reorder".into();
+            return false;
+        }
 
-        model.sidebar_workspaces.swap(ia, ib);
+        // Target VISIBLE order = the on-screen order with the two swapped.
+        // Rewrite the reorderable entries of `sidebar_workspaces` into that
+        // order in place — a raw two-slot swap is only equivalent when the
+        // raw and visible orders already coincide. Entries not in the visible
+        // list (live-only fallbacks, filter-hidden rows) keep their slots.
+        let mut target = visible.clone();
+        target.swap(p, np);
+        let rank: std::collections::HashMap<&str, usize> = target
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i))
+            .collect();
+        let slots: Vec<usize> = model
+            .sidebar_workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, (ws, _, _, _))| rank.contains_key(ws.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        let mut entries: Vec<_> = slots
+            .iter()
+            .map(|&i| model.sidebar_workspaces[i].clone())
+            .collect();
+        entries.sort_by_key(|(ws, _, _, _)| rank[ws.as_str()]);
+        for (slot, entry) in slots.into_iter().zip(entries) {
+            model.sidebar_workspaces[slot] = entry;
+        }
         // Persist the ENTIRE new on-screen order (not a two-position swap): the
         // nav ring is rebuilt from `db.workspaces()` on the next hydration, and
         // a swap that leans on `normalize_workspace_positions` can seed a
@@ -515,11 +582,19 @@ impl SidebarState {
             .filter(|(_, _, _, path)| !path.is_empty())
             .map(|(_, _, _, path)| path.clone())
             .collect();
-        if let Ok(db) = thegn_core::db::Db::open() {
-            // best-effort: the DB is a cache — the in-memory swap above is the
-            // user-visible move; a failed persist only loses order across restart
-            let _ = db.set_workspace_order(&order);
-        }
+        // Persist off-loop: a fresh `Db::open()` + write on the loop can stall
+        // up to the WAL `busy_timeout`. Best-effort beyond the warn — the DB
+        // is a cache; the in-memory reorder above is the user-visible move.
+        self.optimistic_db_edit_at = Some(std::time::Instant::now());
+        off_loop(move || {
+            let Ok(db) = thegn_core::db::Db::open() else {
+                tracing::warn!(target: "thegn::sidebar", "workspace reorder not persisted: DB unavailable");
+                return;
+            };
+            if let Err(e) = db.set_workspace_order(&order) {
+                tracing::warn!(target: "thegn::sidebar", error = %e, "workspace reorder not persisted");
+            }
+        });
         self.rebuild(model, session);
         true
     }
@@ -704,25 +779,17 @@ impl SidebarState {
                 moved
             }
             RowKind::Terminal => {
-                // Selected terminals (marked Terminal rows, else the cursor's),
-                // confined to the cursor's host group — terminals only reorder
-                // within their own host, mirroring worktrees-within-a-workspace.
+                // The cursor terminal, confined to its host group — terminals
+                // only reorder within their own host, mirroring
+                // worktrees-within-a-workspace. (No marked set here: terminals
+                // are not markable — `SidebarRow::is_markable` — so the
+                // "block" is always exactly the cursor row. The Vec shape is
+                // kept so the block machinery below stays shared.)
                 let host_slug = cursor_row.workspace_slug.clone();
-                let mut sel_names: Vec<String> = model
-                    .sidebar_rows
-                    .iter()
-                    .filter(|r| {
-                        r.visible
-                            && r.kind == RowKind::Terminal
-                            && r.workspace_slug == host_slug
-                            && self.marked.contains(&r.pin_key)
-                    })
-                    .filter_map(|r| r.worktree_path.clone())
-                    .collect();
-                if sel_names.is_empty()
-                    && let Some(n) = self
-                        .selected_row(model)
-                        .and_then(|r| r.worktree_path.clone())
+                let mut sel_names: Vec<String> = Vec::new();
+                if let Some(n) = self
+                    .selected_row(model)
+                    .and_then(|r| r.worktree_path.clone())
                 {
                     sel_names.push(n);
                 }
@@ -1076,6 +1143,43 @@ mod tests {
         // neighbor would have been lib and left the tree unchanged.
         assert!(sb.move_workspace_by_slug(&mut model, &session, "zed", true));
         assert_eq!(visible(&model), vec!["lib", "zed", "app"]);
+
+        // Move zed up again: its visible neighbor is now the pinned lib. The
+        // raw order can't express a move past a pinned block (`apply_pins`
+        // always floats it first), so the move is refused with a status —
+        // before this, the raw vec was silently rewritten (and persisted)
+        // with no visible effect, or a jump in the wrong direction.
+        let raw_before = model.sidebar_workspaces.clone();
+        assert!(!sb.move_workspace_by_slug(&mut model, &session, "zed", true));
+        assert!(model.status.contains("Pinned"));
+        assert_eq!(model.sidebar_workspaces, raw_before, "raw order untouched");
+        assert_eq!(visible(&model), vec!["lib", "zed", "app"]);
+    }
+
+    #[test]
+    fn workspace_reorder_refused_under_attention_sort() {
+        // The attention workspace-sort recomputes the order every rebuild
+        // (raw order is only a tiebreak), so a manual move can't show — it
+        // must be refused with a status instead of silently rewriting and
+        // persisting an order the tree doesn't display.
+        let _db = DbGuard::new("ws-attn");
+        let session = app_session(&["home"]);
+        let mut model = build_initial_model(&session, None);
+        model.sidebar_workspaces = vec![
+            ("app".into(), "app".into(), "repo".into(), "/tmp/app".into()),
+            ("lib".into(), "lib".into(), "repo".into(), "/tmp/lib".into()),
+        ];
+        let mut sb = SidebarState {
+            focused: true,
+            ..Default::default()
+        };
+        sb.view.workspace_sort = thegn_core::config::WorkspaceSort::Attention;
+        sb.rebuild(&mut model, &session);
+
+        let raw_before = model.sidebar_workspaces.clone();
+        assert!(!sb.move_workspace_by_slug(&mut model, &session, "lib", true));
+        assert!(model.status.contains("attention"));
+        assert_eq!(model.sidebar_workspaces, raw_before);
     }
 
     #[test]

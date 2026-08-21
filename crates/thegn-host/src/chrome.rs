@@ -311,8 +311,9 @@ pub struct FrameModel {
     /// Selection cursor: an index into the *visible* rows of `sidebar_rows`.
     pub sidebar_selected: usize,
     /// True when the sidebar currently owns keyboard focus (drives the
-    /// focus indicator in [`crate::sidebar_view::draw_sidebar`]; the Ctrl+1..9 workspace digit hints
-    /// are always shown, regardless of focus).
+    /// focus indicator in [`crate::sidebar_view::draw_sidebar`]; the
+    /// Alt/Ctrl+1..9 quick-jump digits are painted only while focused — the
+    /// gutter itself is always reserved so rows don't shift on focus).
     pub sidebar_focused: bool,
     /// Active fuzzy-filter query echoed in the header (empty = none).
     pub sidebar_filter: String,

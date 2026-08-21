@@ -140,6 +140,38 @@ fn glyph_rescan_tiering() {
 }
 
 #[test]
+fn glyph_keep_set_unions_registry_and_repo_roots() {
+    // Repo roots ride along with registered worktrees — a dormant workspace's
+    // home row is keyed by its repo root, which has no registry row, and must
+    // survive the cache retain across a workspace switch.
+    let (set, keep_ok) = glyph_keep_set(
+        Some(vec!["/wt/a".into(), String::new(), "/wt/b".into()]),
+        Some(vec!["/repo/app".into(), String::new()]),
+    );
+    assert!(keep_ok);
+    assert_eq!(set, vec!["/wt/a", "/wt/b", "/repo/app"]);
+}
+
+#[test]
+fn glyph_keep_set_distrusts_failed_db_reads() {
+    // A transient DB error must not read as "no worktrees" — evicting on it
+    // would blank every dormant workspace's glyphs until restart. Either read
+    // failing makes the set untrustworthy for eviction; whatever WAS read is
+    // still returned (seeding from a partial set only ever adds).
+    let (set, keep_ok) = glyph_keep_set(None, Some(vec!["/repo/app".into()]));
+    assert!(!keep_ok);
+    assert_eq!(set, vec!["/repo/app"]);
+
+    let (set, keep_ok) = glyph_keep_set(Some(vec!["/wt/a".into()]), None);
+    assert!(!keep_ok);
+    assert_eq!(set, vec!["/wt/a"]);
+
+    let (set, keep_ok) = glyph_keep_set(None, None);
+    assert!(!keep_ok);
+    assert!(set.is_empty());
+}
+
+#[test]
 fn glyph_scan_clean_read_updates() {
     // A fully successful read produces the scanned values and is `clean` so
     // the caller updates the cache.

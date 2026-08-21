@@ -59,6 +59,14 @@ pub(crate) struct SidebarState {
     pub(crate) marked: std::collections::HashSet<String>,
     /// Open context menu, if any (item 27).
     pub(crate) menu: Option<crate::sidebar_view::RowMenu>,
+    /// When the last OPTIMISTIC edit to the model's sidebar DB lists
+    /// (`sidebar_db_worktrees` / `sidebar_db_folders`) happened — reorder,
+    /// re-file, folder create/delete all mutate the model on the gesture's
+    /// frame and defer the durable write off-loop. While fresh, the model swap
+    /// keeps the loop's lists instead of adopting a hydration whose DB read
+    /// predates the write (which visibly snapped the row back, then re-moved
+    /// it when the write's own refresh landed).
+    pub(crate) optimistic_db_edit_at: Option<std::time::Instant>,
     /// Adjustable bar width in columns (item 25); `None` = layout default.
     pub(crate) width: Option<usize>,
     /// Wide expand toggle (`e`): mirrors the panel's expand affordance. When

@@ -163,11 +163,14 @@ pub fn run(cfg: &thegn_core::config::Config, action: Action) -> Result<()> {
 }
 
 fn status(worktree: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let host_path = resolve_worktree(worktree);
+    let loc = GitLoc::for_worktree(&host_path);
     let panel = github::pr_status(&loc);
     let json = serde_json::to_string(&panel).unwrap_or_default();
     if let Ok(db) = Db::open() {
-        let _ = db.put_pr_cache(&loc.path(), &panel.branch, &json);
+        // Host-path key, never `loc.path()` — the in-sandbox `/workspace`
+        // collides provider siblings and misses the host-path readers.
+        let _ = db.put_pr_cache(&host_path.to_string_lossy(), &panel.branch, &json);
     }
     print_summary(&panel);
     Ok(())

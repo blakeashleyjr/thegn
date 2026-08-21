@@ -533,7 +533,7 @@ mod tests {
         match l {
             Line::Blank => String::new(),
             Line::Segs(segs) => segs.iter().map(|s| s.text.as_str()).collect(),
-            Line::Split { l, r } => {
+            Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
                 let mut t: String = l.iter().map(|s| s.text.as_str()).collect();
                 t.push_str(&r.iter().map(|s| s.text.as_str()).collect::<String>());
                 t

@@ -186,6 +186,16 @@ pub enum Line {
     Segs(Vec<Seg>),
     /// Left and right clusters; right wins space, left truncates.
     Split { l: Vec<Seg>, r: Vec<Seg> },
+    /// [`Line::Split`], but the left cluster is guaranteed `min_l` columns
+    /// (up to its natural width) before the right cluster takes the rest.
+    /// For rows whose left side is their identity (a sidebar worktree's
+    /// name): plain `Split`'s right-wins rule lets a badge-heavy right
+    /// cluster erase the name entirely.
+    SplitMinLeft {
+        l: Vec<Seg>,
+        r: Vec<Seg>,
+        min_l: usize,
+    },
     /// A horizontal rule: `ch` repeated across the width.
     Fill { ch: char, fg: Tok },
 }
@@ -484,6 +494,24 @@ pub fn draw_line(surface: &mut Surface, x: usize, y: usize, w: usize, line: &Lin
             }
             Line::Split { l, r } => {
                 let r = cut(r, w);
+                let rl = seg_width(&r);
+                let avail = w.saturating_sub(rl + if rl > 0 { 1 } else { 0 });
+                let l = cut(l, avail);
+                let ll = seg_width(&l);
+                let mut v = l;
+                v.push(pad(w - ll - rl));
+                v.extend(r);
+                v
+            }
+            Line::SplitMinLeft { l, r, min_l } => {
+                // Reserve the left cluster's share FIRST (its natural width,
+                // capped at `min_l`), then let the right cluster truncate
+                // into whatever remains — the inverse of `Split`'s rule.
+                let reserve = seg_width(l).min(*min_l).min(w);
+                let r = cut(
+                    r,
+                    w.saturating_sub(reserve + if reserve > 0 { 1 } else { 0 }),
+                );
                 let rl = seg_width(&r);
                 let avail = w.saturating_sub(rl + if rl > 0 { 1 } else { 0 });
                 let l = cut(l, avail);

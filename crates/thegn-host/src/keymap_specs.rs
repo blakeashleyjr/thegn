@@ -719,7 +719,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     },
     ActionSpec {
         id: "toggle-sidebar",
-        label: "Toggle sidebar",
+        label: "Cycle sidebar: full / rail / hidden",
         hint: "sidebar",
         default_chords: &["Ctrl Alt s"],
         palette: true,
@@ -727,6 +727,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
             "toggle sidebar",
             "hide sidebar",
             "show sidebar",
+            "sidebar rail",
             "sidebar",
             "tree",
             "workspace tree",
