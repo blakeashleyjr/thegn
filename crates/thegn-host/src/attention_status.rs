@@ -105,11 +105,17 @@ pub(crate) fn collect_attention(
     // sidebar renders every workspace's rows with their own tier glyph, and the
     // rollup needs every worktree. Scoping is a property of the nag, not of the
     // score.
+    //
+    // A terminal tab has no path, so it cannot name a repo: scope to the
+    // session's (= workspace's) first worktree instead of failing open — a
+    // terminal click used to flip the ✋ chip from `2 +3` to `5` and back.
     status.repo_scope = if crate::panel::scope::system_all() {
         None
     } else {
         session
             .active_group()
+            .filter(|g| !g.path.is_empty())
+            .or_else(|| session.worktrees.iter().find(|g| !g.path.is_empty()))
             .and_then(|g| meta.get(&g.path))
             .map(|m| m.repo.clone())
             .filter(|r| !r.is_empty())
@@ -620,6 +626,19 @@ mod tests {
         let mut s2 = crate::sidebar::SidebarStatus::default();
         collect_attention(&orphan, &db, &mut s2);
         assert!(s2.repo_scope.is_none());
+
+        // A terminal tab (path-less group) must NOT fail open: it scopes to the
+        // session's repo, so clicking a terminal doesn't flip the ✋ chip from
+        // `2 +3` to `5` and back.
+        let mut with_term = session_with(&[("app/a", "/wt/a")]);
+        with_term.worktrees.push(WorktreeGroup::terminal("prod"));
+        with_term.active = 1;
+        let mut s3 = crate::sidebar::SidebarStatus::default();
+        collect_attention(&with_term, &db, &mut s3);
+        let scope = s3
+            .repo_scope
+            .expect("terminal scopes to the session's repo");
+        assert!(scope.contains("/wt/a") && !scope.contains("/wt/c"));
     }
 
     #[test]

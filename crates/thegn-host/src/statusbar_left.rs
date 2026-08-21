@@ -90,10 +90,15 @@ pub fn left_item_spans(model: &FrameModel, rect: Rect) -> Vec<(BarItemId, Rect)>
     if rect.rows == 0 || rect.cols == 0 {
         return Vec::new();
     }
-    let (_, spans) = left_layout(model, crate::chrome::statusbar_left_budget(model, rect));
+    let budget = crate::chrome::statusbar_left_budget(model, rect);
+    let (_, spans) = left_layout(model, budget);
+    // `Line::split` re-cuts the left run to `budget` after the right cluster
+    // wins its space, so anything past it is not painted and must not be
+    // clickable (the `?` span used to survive here and route a click on the
+    // start of the status text into the help overlay).
     spans
         .into_iter()
-        .filter(|(_, off, w)| *w > 0 && off + w <= rect.cols)
+        .filter(|(_, off, w)| *w > 0 && off + w <= budget)
         .map(|(id, off, w)| {
             (
                 id,

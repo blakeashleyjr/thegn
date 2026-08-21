@@ -40,7 +40,7 @@ pub fn step_focused_bar(
         _ => return false,
     };
     if focus.statusbar() {
-        let count = chrome::statusbar_items(model).len();
+        let count = chrome::statusbar_items_fitted(model, chrome.statusbar.cols).len();
         model.statusbar_sel = step_bar_sel(model.statusbar_sel, delta, count);
         true
     } else if focus.masthead() {

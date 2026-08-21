@@ -9,7 +9,7 @@ actions: [pr-open, pr-create]
 
 # Review a PR
 
-1. The masthead's CI/notification cluster (see [[bars]]) surfaces PRs that
+1. The status bar's CI/notification cluster (see [[bars]]) surfaces PRs that
    need you; `↵` on the item shows the detail popup.
 2. Check out the branch as its own worktree: `Alt-w` in the repo's
    workspace, or the palette's `@` git mode to pick the branch. The

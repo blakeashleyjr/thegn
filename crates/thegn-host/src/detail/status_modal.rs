@@ -277,7 +277,10 @@ fn identity_cells(
 
 /// The session table's heading note: `N live · N attached · N warm`, or the
 /// probe state when there is no list to summarise.
-fn sessions_note(s: &DaemonSessions) -> (String, Tok) {
+/// `age_secs` is how old the live list is (the probe is re-run while the modal
+/// is open, so this normally reads "just now"); past [`SESSIONS_STALE_SECS`]
+/// the note says so in amber rather than letting an old table look live.
+fn sessions_note(s: &DaemonSessions, age_secs: Option<u64>) -> (String, Tok) {
     match s {
         DaemonSessions::Unknown => ("unavailable".into(), Tok::Slot(S::Ghost)),
         DaemonSessions::Probing => ("probing daemon…".into(), Tok::Slot(S::Ghost)),
@@ -286,12 +289,25 @@ fn sessions_note(s: &DaemonSessions) -> (String, Tok) {
         DaemonSessions::Live(v) => {
             let attached: u32 = v.iter().map(|s| s.attached_clients).sum();
             let warm = v.iter().filter(|s| s.attached_clients == 0).count();
-            (
-                format!("{} live · {attached} attached · {warm} warm", v.len()),
-                Tok::Slot(S::Text),
-            )
+            let base = format!("{} live · {attached} attached · {warm} warm", v.len());
+            match age_secs {
+                Some(a) if a >= SESSIONS_STALE_SECS => (
+                    format!("{base} · as of {} ago", fmt_uptime(a)),
+                    Tok::Hue(Hue::Amber),
+                ),
+                _ => (base, Tok::Slot(S::Text)),
+            }
         }
     }
+}
+
+/// Age past which the live session table is flagged as stale.
+const SESSIONS_STALE_SECS: u64 = 15;
+
+/// Whether `slot` currently holds the status modal (for the loop's
+/// re-probe-while-open cadence).
+pub(crate) fn is_open(slot: &Option<DetailOverlay>) -> bool {
+    slot.as_ref().is_some_and(|ov| ov.title == TITLE)
 }
 
 /// One row per daemon session. `att` is the real attached-client count the
@@ -480,10 +496,11 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
     let mut secs: Vec<Section> = Vec::new();
 
     // --- Daemon identity, health, policy -----------------------------------
-    let (note, _tone) = health_note(d, ctx.now_ms);
-    secs.push(Section::Heading {
+    let (note, tone) = health_note(d, ctx.now_ms);
+    secs.push(Section::HeadingToned {
         label: "daemon".into(),
-        note: Some(note),
+        note,
+        tone,
     });
     // Identity and policy share ONE grid so their key columns align — two
     // adjacent grids size their columns independently and would step.
@@ -500,10 +517,11 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
 
     // --- The daemon's live session registry --------------------------------
     secs.push(spacer());
-    let (snote, _stone) = sessions_note(ctx.sessions);
-    secs.push(Section::Heading {
+    let (snote, stone) = sessions_note(ctx.sessions, ctx.sessions_age_secs);
+    secs.push(Section::HeadingToned {
         label: "sessions".into(),
-        note: Some(snote),
+        note: snote,
+        tone: stone,
     });
     if let DaemonSessions::Live(v) = ctx.sessions
         && !v.is_empty()

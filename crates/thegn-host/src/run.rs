@@ -176,11 +176,10 @@ fn apply_mode_status(
     config: &thegn_core::config::Config,
 ) {
     // The bottom bar carries the contextual keybind hints; the status slot
-    // only flags a non-default input mode. The mode chip always shows.
-    model.status = match mode {
-        crate::keymap::Mode::Normal => String::new(),
-        m => format!("{} mode", m.as_str()),
-    };
+    // only flags a non-default input mode, and never clobbers a transient
+    // message (those expire on their own TTL — see `handlers::status_line`).
+    // The mode chip always shows.
+    crate::handlers::status_line::apply_mode(model, mode);
 
     if config.ui.full_mode_chip {
         model.mode_chip = match mode {
@@ -613,6 +612,9 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     crate::handlers::startup::reseed_default_terminal(startup_db.as_ref());
     let mut model = build_initial_model(&session, startup_db.as_ref());
     model.accent = cfg.accent_rgb();
+    // First-frame orientation line (a few chords + build stamp); launch
+    // warnings below take precedence. Expires like any other status message.
+    model.status = crate::hydrate::startup_status_line(&cfg);
     apply_mode_status(&mut model, mode, &cfg);
     // Surface keybind conflicts at launch (non-fatal — the shell always opens).
     if let Some(summary) = keybind_conflict_summary(&cfg) {
@@ -4319,16 +4321,8 @@ fn drain_drag_events(
     }
 }
 
-/// Spawn a one-shot thread that pulses the waker once a toast's lifetime has
-/// elapsed, so the expired toast is pruned and re-rendered even with no further
-/// input (the event loop never polls on a timer).
-fn schedule_toast_clear(waker: &TerminalWaker) {
-    let wk = waker.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(crate::toast::DEFAULT_TTL + std::time::Duration::from_millis(50));
-        let _ = wk.wake();
-    });
-}
+/// How often the open status modal re-probes the daemon's session list.
+const SESSION_REPROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Run the detected test command off-thread; results (parsed indicator
 /// lines + summary) ride the channel back to the loop with a waker pulse.
@@ -5707,6 +5701,8 @@ async fn event_loop<T: Terminal>(
     let mut sidebar_cols = sb.effective_cols(cols);
     // The last tab name we acked activity for (clears its "look at me" dot).
     let mut last_acked_tab: Option<String> = None;
+    // Status-message TTL tracker (loop-owned; see `handlers::status_line`).
+    let mut status_line = crate::handlers::status_line::StatusLine::default();
 
     // The pin supervisor owns daemon panes independent of tabs/visibility.
     let mut supervisor = crate::pins::PinSupervisor::from_config(keymap.config());
@@ -5834,6 +5830,9 @@ async fn event_loop<T: Terminal>(
     // Each push schedules a one-shot waker pulse so the toast clears on its own
     // even with no further input (the loop never polls on a timer).
     let mut toasts = crate::toast::Toasts::default();
+    // The toast deadline a one-shot wake is already armed for (see the prune
+    // block), so repeated frames don't spawn duplicate sleepers.
+    let mut toast_wake_armed: Option<std::time::Instant> = None;
     // Live theme-cycle position within `theme::PRESETS` (Ctrl+Alt+t).
     let mut theme_idx: usize = thegn_core::theme::PRESETS
         .iter()
@@ -6200,7 +6199,8 @@ async fn event_loop<T: Terminal>(
     // path: keymap tab-nav, palette, sidebar) we kick an immediate model + PR
     // refresh and re-target the diff watcher — so the panel is correct for the
     // new worktree right away (stale-while-revalidate) instead of up to 2s late.
-    let mut last_active_worktree: Option<std::path::PathBuf> = Some(active_tab_path(&session));
+    let mut last_active_worktree: Option<std::path::PathBuf> =
+        Some(crate::hydrate::active_slice_key(&session));
     // Monotonic tag for model hydrations; intake drops results whose tag isn't
     // current (a pre-switch hydration landing post-switch). The startup spawn
     // in `run()` used 0, which this initial value accepts.
@@ -6868,8 +6868,12 @@ async fn event_loop<T: Terminal>(
         // Detect an active-worktree change centrally so every switch path is
         // covered without per-call-site wiring.
         let current_worktree = active_tab_path(&session);
-        if last_active_worktree.as_deref() != Some(current_worktree.as_path()) {
-            last_active_worktree = Some(current_worktree.clone());
+        // Keyed on the group identity (terminals get a synthetic key), not the
+        // dir: every terminal resolves to the same cwd, so a terminal→terminal
+        // switch was invisible here and the env chips stayed stale.
+        let current_key = crate::hydrate::active_slice_key(&session);
+        if last_active_worktree.as_deref() != Some(current_key.as_path()) {
+            last_active_worktree = Some(current_key.clone());
             // A selection anchored in the previous worktree's pane is stale.
             mouse_sel = None;
             // For a remote/provider worktree, connect its resident bridge (off
@@ -6906,8 +6910,13 @@ async fn event_loop<T: Terminal>(
             let hints = crate::hydrate::HydrateHints::for_switch(&panel_ui, &current_config);
             // Cache hit: paint the stale-but-right slice instantly. Miss (cold
             // worktree): blank + kick a fast panel-fill (see `clear_and_fill`).
-            match switch_cache.get(&current_worktree) {
+            match switch_cache.get(&current_key) {
                 Some(slice) => slice.apply(&mut model),
+                // A terminal has no worktree to fast-fill from: blank only (the
+                // hydration kicked below paints its env chips).
+                None if crate::hydrate::active_is_terminal(&session) => {
+                    crate::handlers::switch_cache::WorktreeSlice::clear(&mut model)
+                }
                 None => crate::handlers::switch_cache::clear_and_fill(
                     &mut model,
                     &current_worktree,
@@ -8321,9 +8330,13 @@ async fn event_loop<T: Terminal>(
             }
             let stats = std::mem::take(&mut model.stats);
             let metrics = std::mem::take(&mut model.metrics);
-            // Preserve transient status messages (crash alerts, user feedback)
-            // so a periodic hydration tick doesn't silently clear them.
+            // The status slot is loop-owned (`handlers::status_line`): hydration
+            // never seeds it, so carry the live message across the swap as-is.
             let prev_status = std::mem::take(&mut model.status);
+            // The bar cursors are loop-owned too: a hydration landing while the
+            // user is arrowing along a bar must not snap the highlight back to
+            // the first item (Enter would then open the wrong popup).
+            let (prev_masthead_sel, prev_statusbar_sel) = (model.masthead_sel, model.statusbar_sel);
             // Preserve the launch/provision splash steps: they're transient launch
             // UI owned by the materialize/provision/spec flow, NOT hydration (which
             // carries only git/db data and leaves load_steps empty). Without this, a
@@ -8419,15 +8432,15 @@ async fn event_loop<T: Terminal>(
             // the fresh snapshots come back `provisioning: false` and reverted
             // a mid-provision row to "unprovisioned" until the next event.
             crate::host_ui::merge_live(&mut model.panel.hosts, &host_runtime);
-            if model.status.is_empty() {
-                model.status = prev_status;
-            }
+            model.status = prev_status;
+            model.masthead_sel = prev_masthead_sel;
+            model.statusbar_sel = prev_statusbar_sel;
             // Seed the stale-while-revalidate cache with this worktree's fresh
             // slice (pre LSP-merge: LSP diags live in their own per-root store
             // and are re-merged on every paint) so a later switch back paints
             // instantly.
             switch_cache.insert(
-                active_tab_path(&session),
+                crate::hydrate::active_slice_key(&session),
                 crate::handlers::switch_cache::WorktreeSlice::seed_from(&model),
             );
             // We preserved the loop-owned diagnostics (task-sourced) across the
@@ -8614,7 +8627,27 @@ async fn event_loop<T: Terminal>(
         // age ticks over as new samples land. Costs nothing when the modal is
         // closed (`refresh_open` is title-guarded and returns immediately), and
         // adds no wake source — this rides drains that already happened.
-        if status_data_moved && bar_detail.is_some() {
+        if status_data_moved && crate::detail::status_modal::is_open(&bar_detail) {
+            // Re-run the session probe on the stats cadence while the modal is
+            // open, so the table tracks sessions opening/closing instead of
+            // freezing at the one-shot taken on open.
+            if panel_ui
+                .docs
+                .daemon_sessions_at
+                .is_none_or(|t| t.elapsed() >= SESSION_REPROBE_EVERY)
+                && !matches!(
+                    panel_ui.docs.daemon_sessions,
+                    crate::detail::DaemonSessions::Probing
+                )
+            {
+                crate::handlers::status::probe_sessions(
+                    &BarItemId::Badge(BarBadge::Persist),
+                    &current_config.daemon,
+                    &mut panel_ui.docs.daemon_sessions,
+                    &refresh_tx,
+                    &waker,
+                );
+            }
             dirty |= crate::detail::status_modal::refresh_open(
                 &mut bar_detail,
                 &model,
@@ -9312,7 +9345,18 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::Usage(p) => dirty |= crate::detail::apply_usage(&mut bar_detail, *p),
                 // The daemon's answer to the status modal's session probe.
                 RefreshKind::DaemonSessions(p) => {
+                    // The live probe is the truth: a registry row whose
+                    // daemon no longer answers is dropped here rather than
+                    // showing "healthy · heartbeat 45s ago" beside "no
+                    // daemon" for the rest of the heartbeat TTL.
+                    if matches!(*p, crate::detail::DaemonSessions::NoDaemon)
+                        && panel_ui.docs.daemon.present
+                    {
+                        panel_ui.docs.daemon = crate::chrome::DaemonStatus::default();
+                        bars_dirty = true;
+                    }
                     panel_ui.docs.daemon_sessions = *p;
+                    panel_ui.docs.daemon_sessions_at = Some(std::time::Instant::now());
                     dirty |= crate::detail::status_modal::refresh_open(
                         &mut bar_detail,
                         &model,
@@ -9357,7 +9401,6 @@ async fn event_loop<T: Terminal>(
                         std::time::Instant::now(),
                         crate::toast::DEFAULT_TTL,
                     );
-                    schedule_toast_clear(&waker);
                     dirty = true;
                 }
             }
@@ -9591,6 +9634,17 @@ async fn event_loop<T: Terminal>(
             last_acked_tab = None;
         }
 
+        // Expire a transient status message past its TTL (the tracker schedules
+        // the wake that brings us here, so an idle loop still clears on time).
+        if status_line.tick(&mut model, mode, std::time::Instant::now(), |delay| {
+            let wk = waker.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                let _ = wk.wake();
+            });
+        }) {
+            dirty = true;
+        }
         // Mirror the focus zone into the render model RIGHT BEFORE rendering —
         // hydrated models replace the whole FrameModel mid-iteration, and
         // mirroring earlier let one frame render with empty keyhints (the
@@ -9604,7 +9658,7 @@ async fn event_loop<T: Terminal>(
         // Keep the per-bar selection valid as items appear/disappear between
         // frames (a badge turning on/off, a widget gaining data): clamp to the
         // current item count so the cursor never dangles past the last item.
-        let sb_items = crate::chrome::statusbar_items(&model).len();
+        let sb_items = crate::chrome::statusbar_items_fitted(&model, chrome.statusbar.cols).len();
         model.statusbar_sel = model.statusbar_sel.min(sb_items.saturating_sub(1));
         let mh_items = crate::chrome::masthead_item_spans(&model, &chrome).len();
         model.masthead_sel = model.masthead_sel.min(mh_items.saturating_sub(1));
@@ -9855,10 +9909,25 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        // Expire any toasts whose deadline passed; their scheduled wake lands
-        // here even absent other input, so they clear on their own.
+        // Expire any toasts whose deadline passed, and arm ONE one-shot wake
+        // for the earliest remaining deadline — centrally, so every push site
+        // (not just the four that remembered to) clears on time even when the
+        // loop is otherwise idle, and a long-TTL toast gets its own deadline.
         if toasts.prune(std::time::Instant::now()) {
             dirty = true;
+        }
+        if let Some(at) = toasts.next_expiry()
+            && toast_wake_armed != Some(at)
+        {
+            toast_wake_armed = Some(at);
+            let wk = waker.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(
+                    at.saturating_duration_since(std::time::Instant::now())
+                        + std::time::Duration::from_millis(50),
+                );
+                let _ = wk.wake();
+            });
         }
 
         // 2. Render if anything changed (diff-flush): damaged panes and/or chrome,
@@ -11266,7 +11335,6 @@ async fn event_loop<T: Terminal>(
                                     format!("Stats refresh: {next}s"),
                                     std::time::Instant::now(),
                                 );
-                                schedule_toast_clear(&waker);
                             }
                         }
                     } else if chrome.statusbar.contains(mx, my) {
@@ -11719,7 +11787,6 @@ async fn event_loop<T: Terminal>(
                                         "Text copied to clipboard",
                                         std::time::Instant::now(),
                                     );
-                                    schedule_toast_clear(&waker);
                                 }
                             }
                         }
@@ -15022,7 +15089,7 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         // Read-only / no-Enter-action sections
-                                        // (MergeQueue, Media, Logs, …).
+                                        // (MergeQueue, Logs, …).
                                         _ => {}
                                     }
                                 } // match panel_ui.open + else
@@ -17977,8 +18044,11 @@ async fn event_loop<T: Terminal>(
                                                 }
                                                 sb.sync(&mut model);
                                             } else if focus.statusbar() {
-                                                let count =
-                                                    crate::chrome::statusbar_items(&model).len();
+                                                let count = crate::chrome::statusbar_items_fitted(
+                                                    &model,
+                                                    chrome.statusbar.cols,
+                                                )
+                                                .len();
                                                 model.statusbar_sel = crate::bar_nav::step_bar_sel(
                                                     model.statusbar_sel,
                                                     delta,
@@ -18372,7 +18442,6 @@ async fn event_loop<T: Terminal>(
                                             },
                                             std::time::Instant::now(),
                                         );
-                                        schedule_toast_clear(&waker);
                                     }
                                 }
                             }
@@ -18715,7 +18784,7 @@ async fn event_loop<T: Terminal>(
                                             .len();
                                         model.status = if elsewhere > 0 {
                                             format!(
-                                                "Nothing needs you in this repo ({elsewhere} elsewhere — g in the inbox to widen)"
+                                                "Nothing needs you in this repo ({elsewhere} elsewhere — `g` in the System ▸ Notifications section to widen)"
                                             )
                                         } else {
                                             "Nothing needs you right now".into()

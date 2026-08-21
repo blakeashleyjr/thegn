@@ -676,6 +676,20 @@ fn pin_chips_start(model: &FrameModel, strip: Rect) -> usize {
 /// The tab chips' `(x, width, tab index)` spans inside the center tab bar —
 /// the single source of truth consumed by BOTH [`draw_center_tabs`]
 /// (placement) and [`center_tab_hit`] (mouse), so they can never drift apart.
+/// The linked-issue badge painted right after the worktree leaf (` ◈123`), or
+/// `None` when no issue is linked. One source for the painter and for
+/// [`strip_chip_spans`], which must skip its cells — the first tab chip used to
+/// be placed over it, leaving a bare `◈` with the number never visible.
+fn issue_badge(model: &FrameModel) -> Option<String> {
+    let issue_id = model.panel.tracker_links.first()?;
+    let issue = model
+        .panel
+        .tracker_issues
+        .iter()
+        .find(|i| &i.id == issue_id)?;
+    Some(format!(" \u{25c8}{}", issue.number))
+}
+
 fn strip_chip_spans(model: &FrameModel, strip: Rect) -> Vec<(usize, usize, usize)> {
     let mut spans = Vec::new();
     if strip.rows == 0 || strip.cols == 0 {
@@ -689,7 +703,11 @@ fn strip_chip_spans(model: &FrameModel, strip: Rect) -> Vec<(usize, usize, usize
         if !ws.is_empty() {
             x += UnicodeWidthStr::width(ws.as_str()) + 3; // "WS ▸ "
         }
-        x += UnicodeWidthStr::width(leaf.as_str()) + 2; // "leaf" + gap
+        x += UnicodeWidthStr::width(leaf.as_str()); // "leaf"
+        if let Some(badge) = issue_badge(model) {
+            x += UnicodeWidthStr::width(badge.as_str());
+        }
+        x += 2; // gap
     }
     for (i, title) in model.tabs.iter().enumerate() {
         let w = UnicodeWidthStr::width(title.as_str()) + 2; // " {title} "
@@ -742,18 +760,23 @@ pub(crate) fn cluster_width(parts: &[(String, usize)], kept: &[usize]) -> usize 
 }
 
 /// Drop right-cluster widgets in priority order until the cluster fits `avail`
-/// columns — softest stats shed first, leaving cpu/mem/net/battery longest.
-/// (The brand/logo is the caller's final sacrifice.) Returns the surviving
-/// indices in display order.
+/// columns — softest stats shed first, leaving cpu/mem/net/battery longest —
+/// and then, if it *still* does not fit, from the right end inward, so the
+/// cluster can always be emptied rather than eat the brand + active chip it
+/// was budgeted around. Returns the surviving indices in display order.
 pub(crate) fn fit_stats_cluster(parts: &[(String, usize)], avail: usize) -> Vec<usize> {
     let mut kept: Vec<usize> = (0..parts.len()).collect();
     for victim in [
-        "date", "uptime", "load", "freq", "swap", "temp", "disk", "gpu",
+        "date", "uptime", "load", "freq", "swap", "temp", "disk", "gpu", "battery", "net", "clock",
+        "mem", "cpu",
     ] {
         if cluster_width(parts, &kept) <= avail {
             break;
         }
         kept.retain(|&i| parts[i].0 != victim);
+    }
+    while !kept.is_empty() && cluster_width(parts, &kept) > avail {
+        kept.pop();
     }
     kept
 }
@@ -864,16 +887,9 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
             chips_end.saturating_sub(x),
         );
         x += UnicodeWidthStr::width(leaf.as_str());
-        // Issue badge: show the first linked issue's status + number next to
-        // the active worktree name when at least one issue is linked.
-        if let Some(issue_id) = model.panel.tracker_links.first()
-            && let Some(issue) = model
-                .panel
-                .tracker_issues
-                .iter()
-                .find(|i| &i.id == issue_id)
-        {
-            let badge = format!(" ◈{}", issue.number);
+        // Issue badge: the first linked issue's number next to the active
+        // worktree name. `strip_chip_spans` reserves these cells.
+        if let Some(badge) = issue_badge(model) {
             let avail = chips_end.saturating_sub(x);
             if avail >= UnicodeWidthStr::width(badge.as_str()) {
                 draw_text(surface, x, strip.y, &badge, col(S::Accent), bg, avail);
@@ -1513,6 +1529,34 @@ fn statusbar_right_layout(
     (r, spans)
 }
 
+/// Cells the right cluster must leave for the left cluster's `?` chip (its
+/// leading pad + ` ? ` + the `Line::split` gutter) when the help chip is
+/// configured — so shedding never paints the badges over the one always-on
+/// pointer at the help system.
+fn statusbar_left_reserve(model: &FrameModel) -> usize {
+    if model
+        .bars
+        .bottom_left
+        .iter()
+        .any(|id| id == crate::statusbar_left::HELP_ID)
+    {
+        5
+    } else {
+        0
+    }
+}
+
+/// [`statusbar_items`] after priority shedding for a bar `cols` wide — **the**
+/// list every consumer uses (painter, spans, ←/→ count, Enter), so what is
+/// painted, what is clickable and what the cursor can reach are one set.
+pub fn statusbar_items_fitted(
+    model: &FrameModel,
+    cols: usize,
+) -> Vec<(BarItemId, Vec<crate::seg::Seg>)> {
+    let avail = cols.saturating_sub(statusbar_left_reserve(model));
+    crate::statusbar_fit::fit(statusbar_items(model), avail)
+}
+
 /// The statusbar right-cluster items' absolute `(id, Rect)` spans for the given
 /// statusbar rect — mouse hit-testing and detail-popup anchoring. Mirrors
 /// [`draw_statusbar`]'s right-alignment (the cluster hugs the right edge), so a
@@ -1522,7 +1566,7 @@ pub fn statusbar_item_spans(model: &FrameModel, rect: Rect) -> Vec<(BarItemId, R
     if rect.rows == 0 || rect.cols == 0 {
         return Vec::new();
     }
-    let items = statusbar_items(model);
+    let items = statusbar_items_fitted(model, rect.cols);
     let (r, spans) = statusbar_right_layout(&items, None);
     let rl = seg_width(&r);
     // `Line::Split` right-aligns the right cluster: it begins at `cols - rl`.
@@ -1549,7 +1593,7 @@ pub fn statusbar_item_spans(model: &FrameModel, rect: Rect) -> Vec<(BarItemId, R
 /// with `statusbar_left::left_item_spans` so paint and hit-test agree.
 pub fn statusbar_left_budget(model: &FrameModel, rect: Rect) -> usize {
     use crate::seg::seg_width;
-    let (r, _) = statusbar_right_layout(&statusbar_items(model), None);
+    let (r, _) = statusbar_right_layout(&statusbar_items_fitted(model, rect.cols), None);
     let rl = seg_width(&r);
     rect.cols.saturating_sub(rl + usize::from(rl > 0))
 }
@@ -1567,7 +1611,7 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     // Right side: per-widget colors with `│` rules then the badges, built from
     // the shared enumerator so navigation/highlight/hit-test stay in lock-step.
     // The right cluster wins space — the left fits in what's left.
-    let items = statusbar_items(model);
+    let items = statusbar_items_fitted(model, rect.cols);
     let sel = if model.statusbar_focused {
         let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.28));
         Some((

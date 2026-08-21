@@ -278,6 +278,9 @@ const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// `[disk].scan_interval_secs`). A whole multiple of the 500ms half-tick.
 const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Daemon registry-row refresh cadence (feeds the far-right chip + modal).
+const DAEMON_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Ticker slot (500ms each) of the one-shot startup remote poll — 3s in, well
 /// clear of the launch→first-frame path so `[git] auto_fetch` can never show up
 /// in the startup waterfall.
@@ -326,6 +329,7 @@ pub(crate) fn spawn_refresh_ticker(
         let prq_every = prq_poll_secs.map(|s| (s.max(15) * 1000) / 500);
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let disk_every = DISK_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let daemon_every = DAEMON_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let heal_every = 30; // 15s host-heal consideration (backoff: core::heal)
         let mut ticks: u64 = 0;
         // System stats for the top bar ride the same thread/cadence — the
@@ -338,17 +342,28 @@ pub(crate) fn spawn_refresh_ticker(
         // per-process sampler at the daemon PID. Best-effort — a DB-open failure
         // just leaves the status absent (the chip falls back to NonPersist).
         let daemon_scope = crate::daemon::scope_key();
-        let daemon_db = thegn_core::db::Db::open().ok();
+        // Opened per refresh (cheap on WAL): a failed open at startup used to
+        // leave the chip a dim `○` for the whole session, and a transient
+        // read error downgraded a serving daemon to "none". Both now keep the
+        // last known row and log.
         let refresh_daemon =
             |sampler: &mut thegn_metrics::StatsSampler| -> Option<crate::chrome::DaemonStatus> {
-                let db = daemon_db.as_ref()?;
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
-                let status = crate::handlers::status::snapshot(db, &daemon_scope, now_ms);
-                sampler.set_daemon_pid(status.pid);
-                Some(status)
+                let status = thegn_core::db::Db::open()
+                    .and_then(|db| crate::handlers::status::snapshot(&db, &daemon_scope, now_ms));
+                match status {
+                    Ok(status) => {
+                        sampler.set_daemon_pid(status.pid);
+                        Some(status)
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "thegn::hydrate", error = %e, "daemon registry read failed; keeping last status");
+                        None
+                    }
+                }
             };
         // Prime once so the sampler watches the daemon PID from the first sample.
         if let Some(status) = refresh_daemon(&mut sampler) {
@@ -413,9 +428,11 @@ pub(crate) fn spawn_refresh_ticker(
                 }
                 wake = true;
             }
-            // Daemon/status refresh on the same slow cadence: re-resolves the
-            // daemon PID for the per-process sampler and updates the chip modal.
-            if ticks.is_multiple_of(disk_every)
+            // Daemon/status refresh: re-resolves the daemon PID for the
+            // per-process sampler and updates the chip + modal. A cheap
+            // registry read, so it runs every 10 s — with the 30 s disk slot
+            // a dead daemon read "healthy" for up to 90 s.
+            if ticks.is_multiple_of(daemon_every)
                 && let Some(status) = refresh_daemon(&mut sampler)
             {
                 if daemon_tx.send(status).is_err() {
@@ -719,6 +736,29 @@ pub(crate) fn load_or_seed_session(
         let _ = db.set_active_workspace(&session.id);
     }
     (session, seeded)
+}
+
+/// The identity the loop's switch detection and the switch cache key on.
+/// Worktree groups key on their dir; a terminal group has no dir and every
+/// terminal used to fall back to the process cwd — so terminal→terminal was
+/// never detected as a switch (the tab bar kept the previous terminal's
+/// `[ssh]`/backend chips) and two terminals shared one cached slice. Terminals
+/// key on a synthetic, never-on-disk path instead. Use [`active_tab_path`]
+/// when a real directory is needed (git reads, prefetch).
+pub(crate) fn active_slice_key(session: &crate::session::Session) -> std::path::PathBuf {
+    match session.active_group() {
+        Some(g) if g.kind == crate::session::GroupKind::Terminal => {
+            std::path::PathBuf::from(format!("\u{0}terminal:{}", g.name))
+        }
+        _ => active_tab_path(session),
+    }
+}
+
+/// True when the active group is a terminal (no worktree dir of its own).
+pub(crate) fn active_is_terminal(session: &crate::session::Session) -> bool {
+    session
+        .active_group()
+        .is_some_and(|g| g.kind == crate::session::GroupKind::Terminal)
 }
 
 pub(crate) fn active_tab_path(session: &crate::session::Session) -> std::path::PathBuf {
@@ -1745,7 +1785,7 @@ fn merge_total(
 /// the label), so a rebind is reflected here instead of leaving a wrong chord
 /// on the very first thing a user reads. An action with no binding is dropped
 /// rather than rendered stale.
-fn startup_status_line(cfg: &thegn_core::config::Config) -> String {
+pub(crate) fn startup_status_line(cfg: &thegn_core::config::Config) -> String {
     let mut parts: Vec<String> = Vec::new();
     for id in ["palette", "new-worktree", "switch-workspace", "quit"] {
         let (Some(chord), Some(spec)) = (
@@ -1907,7 +1947,12 @@ pub(crate) fn build_model(
              local placement — check the worktree's env pin / [env.*] config"
         );
     }
-    let active_sandbox_backend = if active_env.placement.is_local() && loc_is_local {
+    // A provider env that DEGRADED to the host runs in the host sandbox, so its
+    // backend chip is the truthful one to show (the placement chip is already
+    // suppressed above); blanking both left the degraded worktree
+    // indistinguishable from a plain unsandboxed local one.
+    let runs_on_host = (active_env.placement.is_local() || degraded_to_host) && loc_is_local;
+    let active_sandbox_backend = if runs_on_host {
         crate::hydrate_terminal::active_backend(db, &loc.path(), active_env.sandbox.backend)
     } else {
         String::new()
@@ -1991,7 +2036,7 @@ pub(crate) fn build_model(
         // `thegn open` mailbox: claim-and-delete on this hydration pass;
         // tolerates a DB missing the table (unmerged parallel-branch schema).
         intents: db.take_intents("focus_workspace").unwrap_or_default(),
-        status: startup_status_line(&app_cfg),
+        // `status` is loop-owned (`handlers::status_line`); never seeded here.
         accent: thegn_core::theme::TEAL.to_string(),
         connectivity: thegn_core::connectivity::current(),
         ..Default::default()
