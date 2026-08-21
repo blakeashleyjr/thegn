@@ -255,7 +255,7 @@ refresh_secs = 2           # Polling interval in seconds
 battery_warn = 25               # red at/below this percent
 # disk_icon = "DSK"             # icon for the "disk" free-space widget
 disk_free_warn = 15             # disk widget turns amber at/below this free %
-disk_free_critical = 5          # disk widget turns red at/below this free %
+disk_free_critical = 10         # disk widget turns red at/below this free %
 # disk_path = "~/projects"      # fs the disk widget measures; "" = worktrees_dir's fs
 refresh_rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
 
