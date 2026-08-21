@@ -26,6 +26,41 @@ cheatsheet. Marks, ranges, and flows follow lazygit conventions.
 `Alt-/` opens a plain `git diff` in a pane; `thegn wt diff` prints one
 from any shell.
 
-Push, pull, and fetch for the focused worktree run from the palette (or
-your own `[keybinds]`); **rollback** restores a worktree to a prior
-snapshot when a run goes wrong.
+## Syncing
+
+Push, pull, and fetch act on the **focused worktree**. They have no
+default chords — run them from the [[command-palette]], or bind them by
+id in `[keybinds]`:
+
+| Action     | Id          |
+| ---------- | ----------- |
+| Git: push  | `git-push`  |
+| Git: pull  | `git-pull`  |
+| Git: fetch | `git-fetch` |
+
+Because each worktree is its own checkout, these never touch a branch you
+are not looking at — which is what makes running several at once safe.
+
+## Rollback
+
+`rollback` restores a worktree to a prior snapshot when a run goes wrong
+— the undo for "the agent made a mess". It is palette-runnable and
+bindable like the sync actions.
+
+## Which git does what
+
+thegn reads git natively where it can and falls back to the `git` CLI
+otherwise, so nothing depends on a feature the native backend has not
+covered yet. Writes always go through the CLI.
+
+One consequence worth knowing: **git is the source of truth**, and
+thegn's database is a cache. Deleting a worktree with `git worktree
+remove` behind thegn's back is safe — the tree reconciles on the next
+launch.
+
+## Landing work
+
+Diffs are where a branch starts; [[merge-queue]] is where it ends. The
+fold-actor merges queued branches entirely in the git object database
+without checking anything out, so it works even while you are using the
+repo. See also [[review-a-pr]].
