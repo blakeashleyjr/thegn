@@ -140,9 +140,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Threading",
   "Win32_System_JobObjects",
 ] }
-# --- LLM proxy (group U/V): the one new HTTP-server dependency. tokio/reqwest
-# are widened with extra features inside the thegn-proxy crate's own manifest
-# (cargo merges them with the workspace base). ---
+# --- HTTP server (daemon control plane / `thegn serve`). ---
 axum = "0.8"
 # --- Control plane (add-control-plane-and-remote): the gRPC surface, feature-
 # gated behind thegn-svc's `control-grpc`. `protox` compiles the .proto in

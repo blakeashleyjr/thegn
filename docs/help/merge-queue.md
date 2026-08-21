@@ -125,5 +125,5 @@ one of them is about your branch:
 
 ## Watching
 
-The masthead shows queue depth ([[bars]]); the _merge_ section lists
+The status bar shows queue depth ([[bars]]); the _merge_ section lists
 entries with their gate state. Failures surface as notifications.

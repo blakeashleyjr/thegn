@@ -9,7 +9,7 @@
 
 A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
 One session: each git repo is a **workspace**, each git **worktree** is a
-**tab**, and the chrome — a left sidebar tree, a right diff/PR panel, tabbar,
+**tab**, and the chrome — a left sidebar tree, a right diff/PR panel, masthead,
 statusbar, and a pinned-program strip — is rendered in-process by a native
 compositor. No plugins, no external multiplexer. (thegn was originally built
 on zellij; that architecture was fully stripped and it is now a from-scratch
@@ -70,31 +70,31 @@ a git URL; it clones off-loop and opens as a workspace). Existing
 tmuxinator/sesh project files show up automatically as new-worktree templates.
 Defaults (override via `[keybinds]`):
 
-| Key                     | Action                                                |
-| ----------------------- | ----------------------------------------------------- |
-| Ctrl-Space              | command palette (fuzzy menu of all actions)           |
-| Alt-←/→                 | previous / next tab (within the worktree)             |
-| Alt-↑/↓                 | previous / next worktree (within the workspace)       |
-| Shift-Alt-↑/↓           | previous / next workspace                             |
-| Ctrl-←/↓/↑/→ (h/j/k/l)  | move focus: sidebar ↔ panes ↔ panel                   |
-| Alt-\`                  | bounce between workspaces region and terminals region |
-| Alt-w / Alt-W           | new worktree ("what to run" picker) / new workspace   |
-| Alt-t / Alt-T           | new tab on the _same_ worktree / new terminal tab     |
-| Alt-p / Alt-n / Alt-N   | new pane: smart split / split down / split right      |
-| Alt-o                   | switch workspace                                      |
-| Alt-s / Alt-.           | focus sidebar / focus panel                           |
-| Ctrl-Alt-s / Ctrl-Alt-p | hide/show sidebar / diff-PR panel                     |
-| Ctrl-Alt-f · Alt-y      | toggle files drawer (bundled yazi, bottom)            |
-| Alt-g · Alt-e · Alt-/   | lazygit · `$EDITOR` · git diff                        |
-| Alt-1..9 / Ctrl-1..9    | jump to worktree N / workspace N (sidebar order)      |
-| Ctrl-Alt-1..9           | launch / focus pinned programs (`[[pins]]`)           |
-| Ctrl-Alt-↑/↓            | reorder the selected workspace / worktree             |
-| Ctrl-Alt-/ · Ctrl-/     | search pane history · search across panes             |
-| Ctrl-Alt-z              | zoom the focused pane / zone                          |
-| Alt-r                   | time-travel replay of the focused pane (`[replay]`)   |
-| Ctrl-g                  | keybind lock (pass every chord through to the pane)   |
-| Alt-x / Alt-X           | close (pane if split, else tab) / remove worktree     |
-| Ctrl-q                  | quit                                                  |
+| Key                     | Action                                                   |
+| ----------------------- | -------------------------------------------------------- |
+| Ctrl-Space              | command palette (fuzzy menu of all actions)              |
+| Alt-←/→                 | previous / next tab (within the worktree)                |
+| Alt-↑/↓                 | previous / next worktree (within the workspace)          |
+| Shift-Alt-↑/↓           | previous / next workspace                                |
+| Ctrl-←/↓/↑/→ (h/j/k/l)  | move focus: sidebar ↔ panes ↔ panel (↑/↓ reach the bars) |
+| Alt-\`                  | bounce between workspaces region and terminals region    |
+| Alt-w / Alt-W           | new worktree ("what to run" picker) / new workspace      |
+| Alt-t / Alt-T           | new tab on the _same_ worktree / new terminal tab        |
+| Alt-p / Alt-n / Alt-N   | new pane: smart split / split down / split right         |
+| Alt-o                   | switch workspace                                         |
+| Alt-s / Alt-.           | focus sidebar / focus panel                              |
+| Ctrl-Alt-s / Ctrl-Alt-p | hide/show sidebar / diff-PR panel                        |
+| Ctrl-Alt-f · Alt-y      | toggle files drawer (bundled yazi, bottom)               |
+| Alt-g · Alt-e · Alt-/   | lazygit · `$EDITOR` · git diff                           |
+| Alt-1..9 / Ctrl-1..9    | jump to worktree N / workspace N (sidebar order)         |
+| Ctrl-Alt-1..9           | launch / focus pinned programs (`[[pins]]`)              |
+| Ctrl-Alt-↑/↓            | reorder the selected workspace / worktree                |
+| Ctrl-Alt-/ · Ctrl-/     | search pane history · search across panes                |
+| Ctrl-Alt-z              | zoom the focused pane / zone                             |
+| Alt-r                   | time-travel replay of the focused pane (`[replay]`)      |
+| Ctrl-g                  | keybind lock (pass every chord through to the pane)      |
+| Alt-x / Alt-X           | close (pane if split, else tab) / remove worktree        |
+| Ctrl-q                  | quit                                                     |
 
 The defaults follow one modifier grammar, so a chord is predictable from its
 modifiers: **Ctrl** moves focus only (and never creates/destroys, so `Ctrl-w`
