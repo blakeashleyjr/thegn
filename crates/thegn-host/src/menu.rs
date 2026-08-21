@@ -466,7 +466,7 @@ pub fn sidebar_sort_menu(current: crate::sidebar::SortMode) -> MenuOverlay {
             SortMode::Manual,
         ),
         ('a', "name — alphabetical", SortMode::Name),
-        ('r', "recent — last used first", SortMode::Recent),
+        ('r', "recent — newest first", SortMode::Recent),
         (
             't',
             "attention — what needs you floats up",

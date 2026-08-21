@@ -197,6 +197,18 @@ pub(crate) fn idle_secs(worktree: &str) -> Option<u64> {
 /// `resolve_env`), never the bare ambient default: reconciling under the default
 /// while the worktree runs a picked env warms — and claims! — spares for the
 /// wrong env (the phantom-spare / bare-sprite-shell incident).
+/// The sidebar warm-pool chip's latest value, computed OFF-loop and mirrored
+/// into the model by the event loop: `(worktree it was computed for,
+/// Some((ready, target)) when a pool applies)`. The worktree key lets the
+/// loop drop a stale chip the moment the active worktree changes instead of
+/// showing the previous workspace's numbers for up to a throttle window.
+/// Same global-holder pattern as `hydrate::glyph_cache`.
+#[allow(clippy::type_complexity)]
+pub(crate) fn pool_chip() -> &'static Mutex<Option<(String, Option<(usize, usize)>)>> {
+    static CHIP: OnceLock<Mutex<Option<(String, Option<(usize, usize)>)>>> = OnceLock::new();
+    CHIP.get_or_init(|| Mutex::new(None))
+}
+
 pub fn pool_context(
     db: &thegn_core::db::Db,
     cfg: &Config,

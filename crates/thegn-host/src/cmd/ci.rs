@@ -159,7 +159,12 @@ fn runs(
     // `runs` is a READ verb: unlike the mutation verbs, listing when no CI
     // provider resolves is graceful degradation, not an error — emit an empty
     // JSON array (valid for scripts) / a friendly note and exit 0.
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let host_path = resolve_worktree(worktree);
+    // Cache rows are keyed by the HOST worktree path (what the panel and
+    // attention readers look up), never `loc.path()` (in-sandbox for provider
+    // worktrees — collides every sibling on `/workspace`).
+    let host_key = host_path.to_string_lossy().into_owned();
+    let loc = GitLoc::for_worktree(&host_path);
     let Some(client) = provider_for(&loc, &cfg.ci) else {
         if json_out {
             return super::emit_json(&Vec::<CiRun>::new());
@@ -175,7 +180,7 @@ fn runs(
                 // Still warm the cache the native panel reads — same fetch.
                 if let Ok(db) = Db::open() {
                     let json = serde_json::to_string(&runs).unwrap_or_default();
-                    let _ = db.put_ci_cache(&loc.path(), branch_q.unwrap_or(""), &json);
+                    let _ = db.put_ci_cache(&host_key, branch_q.unwrap_or(""), &json);
                 }
                 return super::emit_json(&runs);
             }
@@ -186,7 +191,7 @@ fn runs(
             // Warm the cache the native panel reads.
             if let Ok(db) = Db::open() {
                 let json = serde_json::to_string(&runs).unwrap_or_default();
-                let _ = db.put_ci_cache(&loc.path(), branch_q.unwrap_or(""), &json);
+                let _ = db.put_ci_cache(&host_key, branch_q.unwrap_or(""), &json);
             }
             for r in &runs {
                 outln!(

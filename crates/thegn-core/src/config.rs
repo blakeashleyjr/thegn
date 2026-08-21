@@ -3290,9 +3290,14 @@ impl NotificationsConfig {
         self.kind_names_at_or_above(crate::notification::Priority::Notice)
     }
 
-    /// True when routing rules are present. The host uses this to decide between
-    /// the SQL kind-level count fast path (no rules) and rule-aware Rust
-    /// aggregation over loaded rows.
+    /// True when routing rules are present.
+    ///
+    /// NOTE: the sidebar unread/alert badge counts currently always use the
+    /// SQL kind-level queries (`get_unread_counts_by_worktree` /
+    /// `get_alert_counts_by_worktree`), which apply each kind's DEFAULT
+    /// priority — a rule's `set_priority` override does not reach those two
+    /// badges. The rule-aware aggregation this predicate was meant to gate
+    /// was never wired up; if it is, this is the switch.
     pub fn has_rules(&self) -> bool {
         !self.rules.is_empty()
     }

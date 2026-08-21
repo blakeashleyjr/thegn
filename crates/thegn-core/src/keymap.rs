@@ -458,7 +458,7 @@ pub const BUILTINS: &[Action] = &[
     Action {
         id: "toggle-sidebar",
         chords: &["Ctrl Alt s"],
-        menu_label: "Toggle sidebar",
+        menu_label: "Cycle sidebar: full / rail / hidden",
         hint: "sidebar",
         invocation: Invocation::Pipe {
             plugin: Plugin::Statusbar,
@@ -529,7 +529,11 @@ pub const BUILTINS: &[Action] = &[
     },
     Action {
         id: "prev-tab",
-        chords: &["Alt Left"],
+        // No default chord: the host keymap binds Alt Left to the spatial
+        // `nav-*` family (which reaches the same behavior); advertising it
+        // here too made the generated keybindings page list one chord under
+        // two different rebindable ids, only one of which was wired.
+        chords: &[],
         menu_label: "Previous tab (within worktree)",
         hint: "tabs",
         invocation: Invocation::Native {
@@ -542,7 +546,11 @@ pub const BUILTINS: &[Action] = &[
     },
     Action {
         id: "next-tab",
-        chords: &["Alt Right"],
+        // No default chord: the host keymap binds Alt Right to the spatial
+        // `nav-*` family (which reaches the same behavior); advertising it
+        // here too made the generated keybindings page list one chord under
+        // two different rebindable ids, only one of which was wired.
+        chords: &[],
         menu_label: "Next tab (within worktree)",
         hint: "tabs",
         invocation: Invocation::Native {
@@ -555,7 +563,11 @@ pub const BUILTINS: &[Action] = &[
     },
     Action {
         id: "prev-worktree",
-        chords: &["Alt Up"],
+        // No default chord: the host keymap binds Alt Up to the spatial
+        // `nav-*` family (which reaches the same behavior); advertising it
+        // here too made the generated keybindings page list one chord under
+        // two different rebindable ids, only one of which was wired.
+        chords: &[],
         menu_label: "Previous worktree",
         hint: "worktrees",
         invocation: Invocation::Native {
@@ -568,7 +580,11 @@ pub const BUILTINS: &[Action] = &[
     },
     Action {
         id: "next-worktree",
-        chords: &["Alt Down"],
+        // No default chord: the host keymap binds Alt Down to the spatial
+        // `nav-*` family (which reaches the same behavior); advertising it
+        // here too made the generated keybindings page list one chord under
+        // two different rebindable ids, only one of which was wired.
+        chords: &[],
         menu_label: "Next worktree",
         hint: "worktrees",
         invocation: Invocation::Native {

@@ -41,6 +41,10 @@ pub enum SidebarKeyId {
     ReorderDown,
     CursorDown,
     CursorUp,
+    PageDown,
+    PageUp,
+    CursorHome,
+    CursorEnd,
     Activate,
     Expand,
     Collapse,
@@ -105,6 +109,36 @@ pub const SIDEBAR_KEYS: &[SidebarKey] = &[
         "move up/down",
         HintTier::Common,
     ),
+    // Page/Home/End: without table rows these fell through to the global
+    // keymap and SCROLLED THE TERMINAL behind a focused sidebar.
+    k(
+        SidebarKeyId::PageUp,
+        &[KeyCode::PageUp],
+        "PgUp",
+        "page up",
+        HintTier::Full,
+    ),
+    k(
+        SidebarKeyId::PageDown,
+        &[KeyCode::PageDown],
+        "PgDn",
+        "page down",
+        HintTier::Full,
+    ),
+    k(
+        SidebarKeyId::CursorHome,
+        &[KeyCode::Home],
+        "Home",
+        "first row",
+        HintTier::Full,
+    ),
+    k(
+        SidebarKeyId::CursorEnd,
+        &[KeyCode::End],
+        "End",
+        "last row",
+        HintTier::Full,
+    ),
     k(
         SidebarKeyId::Activate,
         &[KeyCode::Enter],
@@ -151,7 +185,9 @@ pub const SIDEBAR_KEYS: &[SidebarKey] = &[
         SidebarKeyId::Delete,
         &[KeyCode::Char('d'), KeyCode::Delete],
         "d",
-        "delete",
+        // The chooser's safe default is CLOSE (delete is the explicit second
+        // choice) — a bare "delete" label overstated the key.
+        "close/delete",
         HintTier::Essential,
     ),
     k(
@@ -236,7 +272,8 @@ pub const SIDEBAR_KEYS: &[SidebarKey] = &[
         SidebarKeyId::Folder,
         &[KeyCode::Char('f')],
         "f",
-        "move to folder",
+        // On a workspace/folder row the same key CREATES a folder.
+        "folder (move/new)",
         HintTier::Full,
     ),
     k(

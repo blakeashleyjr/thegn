@@ -326,7 +326,8 @@ pub(crate) fn menu_rect(rect: Rect, frame: &SidebarFrame, menu: &RowMenu) -> Rec
     }
 }
 
-/// The slim collapsed rail: one row per visible worktree, an activity dot in
+/// The slim collapsed rail: one row per visible row of EVERY kind
+/// (workspaces, folders, hosts, terminals, banners), an activity dot in
 /// its state color plus the first letter of the label. `model.sidebar_scroll`
 /// keeps the cursor in view.
 fn draw_sidebar_rail(surface: &mut Surface, rect: Rect, model: &FrameModel) {
@@ -724,35 +725,21 @@ pub(crate) fn hit_rows(model: &FrameModel, rect: Rect) -> Vec<RowHit> {
     let frame = build_sidebar(model, rect, model.sidebar_scroll);
     let visible: Vec<&crate::sidebar::SidebarRow> =
         model.sidebar_rows.iter().filter(|r| r.visible).collect();
-    // Mirror `build_sidebar`'s quick-jump digit reservation: a focused
-    // sidebar's workspace rows show " N " before the caret (3 cols).
-    let mut ws_slot: u8 = 1;
-    let mut digit_before_caret: Vec<bool> = Vec::with_capacity(visible.len());
-    for r in &visible {
-        let has = model.sidebar_focused
-            && r.kind == RowKind::Workspace
-            && r.worktree_path.is_some()
-            && ws_slot <= 9;
-        if has {
-            ws_slot += 1;
-        }
-        digit_before_caret.push(has);
-    }
     frame
         .rows
         .iter()
         .filter_map(|p| {
             let row = visible.get(p.visible_index)?;
+            // The caret geometry below is the FULL layout's; the rail paints
+            // no caret at all (`compose_rail_line`), so advertising one there
+            // made unmarked cells toggle collapse (and the focused offset even
+            // landed outside the 4-column rail).
             let caret_x = match row.kind {
-                RowKind::Workspace | RowKind::TerminalHost => Some(
-                    rect.x
-                        + 1
-                        + if digit_before_caret[p.visible_index] {
-                            3
-                        } else {
-                            0
-                        },
-                ),
+                _ if model.sidebar_rail => None,
+                // Header rows always reserve the 3-col quick-jump gutter
+                // (`compose_row_lines` mirrors this), so the caret sits at a
+                // stable column regardless of focus.
+                RowKind::Workspace | RowKind::TerminalHost => Some(rect.x + 4),
                 RowKind::Folder => Some(rect.x + 3),
                 _ => None,
             };
@@ -965,11 +952,15 @@ fn compose_row_lines(
         RowKind::Workspace | RowKind::TerminalHost => {
             let mut l = vec![sp(1)];
             // Quick-jump digit on a switchable workspace row (Ctrl+1..9).
-            if row.kind == RowKind::Workspace
-                && let Some(n) = slot
-            {
+            // ALWAYS reserve the 3-col gutter (mirroring the worktree rows)
+            // so headers and their carets sit at a stable column instead of
+            // shifting 3 cells right the moment the sidebar takes focus.
+            match slot {
                 // Leading space keeps the digit off the cursor bar (col 0).
-                l.push(seg(Tok::Slot(S::Faint), format!(" {n} ")));
+                Some(n) if row.kind == RowKind::Workspace => {
+                    l.push(seg(Tok::Slot(S::Faint), format!(" {n} ")));
+                }
+                _ => l.push(sp(3)),
             }
             l.push(seg(Tok::Slot(S::Faint), caret(row.collapsed)));
             l.push(sp(1));
@@ -1151,7 +1142,16 @@ fn compose_row_lines(
             let mut lines = vec![if right.is_empty() {
                 Line::Segs(left)
             } else {
-                Line::Split { l: left, r: right }
+                // Guarantee the row keeps its identity: the left cluster
+                // (gutter + connectors + NAME) holds at least its lead plus a
+                // readable name slice before badges take space — plain
+                // `Split` lets a badge-heavy right cluster (`● +1234 -567 ↑9
+                // ↓9 ⬡12 ⚠3`) erase the name entirely at the default width.
+                Line::SplitMinLeft {
+                    l: left,
+                    r: right,
+                    min_l: 18,
+                }
             }];
             if show_detail && let Some(detail) = crate::sidebar::compose_detail_line(row, disp) {
                 lines.push(detail);

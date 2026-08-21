@@ -1163,6 +1163,30 @@ fn open_pr_counts_by_branch_handles_garbled_cache() {
 }
 
 #[test]
+fn open_pr_numbers_by_branch_names_only_unambiguous_branches() {
+    let db = db();
+    // No cache yet → empty map.
+    assert!(
+        db.get_open_pr_numbers_by_branch("/repo")
+            .unwrap()
+            .is_empty()
+    );
+
+    // `feat` has TWO open PRs (ambiguous → omitted); `fix` has one open PR
+    // (#4); `done` has only a merged PR (not open → omitted).
+    let json = r#"[
+        {"number":1,"headRefName":"feat","state":"OPEN","url":"u1","isDraft":false},
+        {"number":2,"headRefName":"feat","state":"OPEN","url":"u2","isDraft":false},
+        {"number":3,"headRefName":"done","state":"MERGED","url":"u3","isDraft":false},
+        {"number":4,"headRefName":"fix","state":"OPEN","url":"u4","isDraft":false}
+    ]"#;
+    db.put_pr_branch_cache("/repo", json).unwrap();
+    let nums = db.get_open_pr_numbers_by_branch("/repo").unwrap();
+    assert_eq!(nums.get("fix"), Some(&4));
+    assert_eq!(nums.len(), 1, "ambiguous + non-open branches are omitted");
+}
+
+#[test]
 fn undo_marks_record_dedupe_and_cap() {
     let db = db();
     assert!(db.undo_marks("/wt").unwrap().is_empty());
