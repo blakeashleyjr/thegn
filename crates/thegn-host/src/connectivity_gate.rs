@@ -57,7 +57,7 @@ pub(crate) fn report_pr_panel(state: &thegn_core::github::PanelState) {
 /// Whether a ticker-driven refresh should be skipped for the given connectivity
 /// state. Only network-backed refreshes are gated, and only while offline:
 ///
-/// - `Pr` / `Issues` / `Ci { force: false }` / `AutoFetch` — remote fetches;
+/// - `Pr` / `PrQueue` / `Issues` / `Ci { force: false }` / `AutoFetch` — remote fetches;
 ///   skipped offline (the local sidebar hydration still runs; caches serve
 ///   stale, and the `↓behind` markers keep their last-known counts).
 /// - `Ci { force: true }` — a user-initiated refresh (the `g` key); **never**
@@ -74,6 +74,7 @@ pub(crate) fn should_skip_refresh(kind: &RefreshKind, state: Connectivity) -> bo
     matches!(
         kind,
         RefreshKind::Pr
+            | RefreshKind::PrQueue
             | RefreshKind::Issues
             | RefreshKind::Ci { force: false }
             | RefreshKind::AutoFetch { .. }
@@ -94,6 +95,7 @@ mod tests {
         for state in [Connectivity::Online, Connectivity::Unknown] {
             for kind in [
                 RefreshKind::Pr,
+                RefreshKind::PrQueue,
                 RefreshKind::Issues,
                 RefreshKind::Ci { force: false },
                 RefreshKind::Ci { force: true },
@@ -115,6 +117,9 @@ mod tests {
     fn offline_skips_only_network_backstops() {
         let s = Connectivity::Offline;
         assert!(should_skip_refresh(&RefreshKind::Pr, s));
+        // A PR-queue pass is entirely forge round trips; running it offline
+        // would just record "unreachable" on every row and burn the backoff.
+        assert!(should_skip_refresh(&RefreshKind::PrQueue, s));
         assert!(should_skip_refresh(&RefreshKind::Issues, s));
         assert!(should_skip_refresh(&RefreshKind::Ci { force: false }, s));
         // The remote poll is a network round trip — pointless while offline

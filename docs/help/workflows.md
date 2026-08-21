@@ -13,6 +13,7 @@ reference. Every guide assumes the [[getting-started]] mental model.
 
 - [[review-a-pr]] — from notification to approved, without leaving thegn
 - [[merge-queue]] — queue branches locally and let the fold-actor land them
+- [[pr-queue]] — shepherd pull requests on the forge, on a team
 - [[sandboxing]] — run each worktree's process in a container
 
 ## The shape of a day

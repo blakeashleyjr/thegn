@@ -7,6 +7,51 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — PR queue (team mode)
+
+- **`thegn pr queue`** — the merge queue's counterpart for a repo other people
+  push to. Queue a pull request, and thegn polls its state on the forge,
+  classifies what is blocking it (red checks, a conflict with the base,
+  requested changes, awaiting review), optionally hands that blocker to a
+  configured agent in the PR's own worktree, and merges it once it is green.
+  Panel section, statusbar chip, notifications, and `--json` on every verb.
+  **Off by default** (`[pr_queue] enabled`): it is the one part of the shell
+  that makes network _writes_.
+- **The forge stays in charge of merging.** The default `merge_mode =
+"auto_merge"` switches on the forge's own auto-merge, so branch protection,
+  required reviews, and any server-side merge queue remain authoritative —
+  thegn's view of "ready" can never race a rule it cannot see. `"thegn"` merges
+  directly; `"ready"` never merges. A draft, or a PR without its required
+  approval, is never merged either way.
+- **Safe to point at a shared repo.** The agent pushes only with
+  `--force-with-lease`; a push thegn did not make pauses it rather than racing a
+  teammate (`pause_on_foreign_push`), and also refills its attempt budget so a
+  long-lived PR never gets permanently stuck. A pull request you did not author
+  is watched but never written to (`own_prs_only`). Review threads can be
+  replied to, never resolved — that is the reviewer's call.
+
+### Added — configurable agent handoff (both queues)
+
+- **Prompts are now templates, not Rust.** `[merge_queue.prompts]` and
+  `[pr_queue.prompts]` let you tell the fixing agent about your repo's
+  conventions, per blocker kind. Leave a key empty for thegn's built-in
+  instructions — which are byte-for-byte what previous versions sent, so
+  nothing changes unless you opt in. Unknown placeholders are a `config
+validate` error rather than a silent blank.
+- **`agent = "claude"`** — name one of your `[[agents]]`/`[[tools]]` entries
+  instead of restating its command with the right headless flags. thegn fills
+  those in per provider (claude / codex / aider), and an agent it does not
+  recognize still runs with the prompt appended. `agent_command` still wins
+  when set, so any agent at all remains configurable.
+
+### Fixed
+
+- **`agent_command`'s documented example was wrong.** The shipped
+  `config.toml.example` showed `claude -p "{prompt}"`, but placeholders are
+  already shell-quoted during substitution — the agent received a prompt with
+  literal quote characters wrapped around it. Placeholders must be written
+  **bare**; `thegn config validate` now reports the mistake.
+
 ## [0.1.0-alpha.2] — 2026-08-20
 
 A packaging and hygiene release. `v0.1.0-alpha.1` was tagged but never

@@ -23,6 +23,7 @@ pub mod lsp;
 pub mod machine0;
 pub mod projection;
 pub mod provider;
+pub mod prq;
 pub mod revtunnel;
 pub mod share;
 pub mod snapshot;

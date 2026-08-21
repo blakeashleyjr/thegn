@@ -177,6 +177,97 @@ fn merge_queue_enqueue_update_list_and_remove() {
 }
 
 #[test]
+fn pr_queue_enqueue_update_list_and_remove() {
+    let db = db();
+    assert!(db.list_pr_queue().unwrap().is_empty());
+
+    db.enqueue_pr("/repo", 7, Some("/wt/a"), "feat-a", "main", "github")
+        .unwrap();
+    // Same number in a DIFFERENT repo is a distinct row — the key is repo+number,
+    // so two repos' PR #7 must not collide.
+    db.enqueue_pr("/other", 7, None, "feat-x", "main", "github")
+        .unwrap();
+    let q = db.list_pr_queue().unwrap();
+    assert_eq!(q.len(), 2);
+
+    let by = |key: &str| -> PrQueueRow {
+        db.list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.key == key)
+            .unwrap()
+    };
+    let k = PrQueueRow::make_key("/repo", 7);
+    assert_eq!(k, "/repo#7");
+    let a = by(&k);
+    assert_eq!(a.status, "watching");
+    assert_eq!(a.number, 7);
+    assert_eq!(a.worktree.as_deref(), Some("/wt/a"));
+    assert_eq!(a.base_branch, "main");
+    assert!(a.blocker.is_none() && a.last_head_oid.is_none());
+    assert_eq!(a.agent_attempts, 0);
+    // A PR with no local checkout is representable.
+    assert_eq!(by("/other#7").worktree, None);
+
+    db.update_pr_status(
+        &k,
+        "blocked_ci",
+        Some("ci"),
+        Some("clippy failed"),
+        Some("abc"),
+    )
+    .unwrap();
+    let a = by(&k);
+    assert_eq!(a.status, "blocked_ci");
+    assert_eq!(a.blocker.as_deref(), Some("ci"));
+    assert_eq!(a.last_head_oid.as_deref(), Some("abc"));
+
+    // COALESCE: a status-only update must not clobber the last known head —
+    // that value is what `foreign_push` compares against, so losing it would
+    // make a teammate's push invisible.
+    db.update_pr_status(&k, "agent_running", None, None, None)
+        .unwrap();
+    let a = by(&k);
+    assert_eq!(a.status, "agent_running");
+    assert_eq!(a.last_head_oid.as_deref(), Some("abc"));
+    assert_eq!(a.blocker.as_deref(), Some("ci"));
+
+    db.set_pr_agent_attempts(&k, 2).unwrap();
+    assert_eq!(by(&k).agent_attempts, 2);
+
+    // Re-queueing resets the row, but KEEPS a worktree the caller didn't supply
+    // — dropping it would silently disable agent handoff for that PR.
+    db.enqueue_pr("/repo", 7, None, "feat-a", "main", "github")
+        .unwrap();
+    let a = by(&k);
+    assert_eq!(a.status, "watching");
+    assert_eq!(a.agent_attempts, 0);
+    assert!(a.blocker.is_none() && a.detail.is_none());
+    assert_eq!(a.worktree.as_deref(), Some("/wt/a"), "worktree survives");
+
+    db.remove_pr_entry(&k).unwrap();
+    assert_eq!(db.list_pr_queue().unwrap().len(), 1);
+}
+
+#[test]
+fn clear_pr_queue_is_scoped_to_one_repo() {
+    let db = db();
+    db.enqueue_pr("/repo", 1, None, "a", "main", "github")
+        .unwrap();
+    db.enqueue_pr("/repo", 2, None, "b", "main", "github")
+        .unwrap();
+    db.enqueue_pr("/other", 3, None, "c", "main", "github")
+        .unwrap();
+
+    assert_eq!(db.clear_pr_queue("/repo").unwrap(), 2);
+    let left = db.list_pr_queue().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].repo_root, "/other");
+    // Clearing an empty repo is a no-op, not an error.
+    assert_eq!(db.clear_pr_queue("/repo").unwrap(), 0);
+}
+
+#[test]
 fn get_all_issue_cache_returns_every_provider_for_a_repo() {
     let db = db();
     assert!(db.get_all_issue_cache("/repo").unwrap().is_empty());

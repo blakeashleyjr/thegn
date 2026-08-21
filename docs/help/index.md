@@ -27,7 +27,7 @@ list and the page; `↵` follows a link; `[` goes back.
 
 - [[sidebar]] — the left tree: workspaces, worktrees, terminals
 - [[terminal-and-panes]] — the center: tabs, splits, tools
-- [[panel]] — the right panel: diff, PRs, CI, merge queue, and more
+- [[panel]] — the right panel: diff, PRs, CI, the merge and PR queues, and more
 - [[drawer-and-corner]] — the bottom file drawer and the corner pin
 - [[bars]] — the masthead and the status bar
 

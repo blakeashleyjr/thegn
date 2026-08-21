@@ -28,6 +28,7 @@ mod merge_queue;
 mod misc;
 pub(crate) mod my_work;
 mod notifications;
+mod pr_queue;
 mod problems;
 mod stash;
 mod symbols;
@@ -395,6 +396,38 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 v
             }
         }
+        Section::PrQueue => {
+            let q = &data.pr_queue;
+            if q.is_empty() {
+                return vec![seg(g2(), "—")];
+            }
+            let count = |f: &dyn Fn(&str) -> bool| q.iter().filter(|r| f(&r.status)).count();
+            let ready = count(&|s| s == "ready" || s == "merged");
+            // `needs_human` and a red blocker are the same call to action here:
+            // this PR is not going to move without you.
+            let stuck = count(&|s| matches!(s, "needs_human" | "blocked_ci" | "blocked_conflict"));
+            let waiting = count(&|s| matches!(s, "blocked_review" | "agent_running" | "merging"));
+            let mut v: Vec<crate::seg::Seg> = Vec::new();
+            if ready > 0 {
+                v.push(seg(hue(Hue::Green), format!("✓{ready}")));
+            }
+            if stuck > 0 {
+                if !v.is_empty() {
+                    v.push(seg(g(), " "));
+                }
+                v.push(seg(hue(Hue::Red), format!("⚑{stuck}")));
+            }
+            if waiting > 0 {
+                if !v.is_empty() {
+                    v.push(seg(g(), " "));
+                }
+                v.push(seg(hue(Hue::Amber), format!("●{waiting}")));
+            }
+            if v.is_empty() {
+                v.push(seg(g2(), "—"));
+            }
+            v
+        }
         Section::Files => {
             let loc = model
                 .loc
@@ -679,6 +712,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Pr => git::content(ctx),
         Section::Ci => ci::content(ctx),
         Section::MergeQueue => merge_queue::content(ctx),
+        Section::PrQueue => pr_queue::content(ctx),
         Section::Files => misc::files(ctx),
         Section::Problems => problems::content(ctx),
         Section::Jobs => tasks::content(ctx),
@@ -1401,8 +1435,8 @@ mod spec {
             assert!(!h.is_empty(), "{section:?} half");
             assert!(!f.is_empty(), "{section:?} full");
             // Debug/Db are dead-code placeholder sections — distinctness is waived.
-            // Logs/Share/Forward/MergeQueue/Across are flat lists whose empty/default
-            // render has no width-specific full view.
+            // Logs/Share/Forward/MergeQueue/PrQueue/Across are flat lists whose
+            // empty/default render has no width-specific full view.
             if matches!(
                 section,
                 Section::Debug
@@ -1411,6 +1445,7 @@ mod spec {
                     | Section::Share
                     | Section::Forward
                     | Section::MergeQueue
+                    | Section::PrQueue
                     | Section::Across
             ) {
                 continue;

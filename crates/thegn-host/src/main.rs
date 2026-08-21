@@ -9,6 +9,7 @@ mod agent;
 mod agent_configs;
 mod agent_home;
 mod agent_output;
+mod agent_run;
 mod agent_ssh;
 mod agent_teardown;
 mod apps;
@@ -125,6 +126,7 @@ mod perf;
 mod pins;
 mod placement_flow;
 mod platform;
+mod pr_driver;
 mod pr_view;
 mod predict;
 mod preview_gfx;
@@ -830,7 +832,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(thegn_core::config::Config::path);
     match command {
-        Command::Pr { action } => cmd::pr::run(action),
+        Command::Pr { action } => cmd::pr::run(&cfg, action),
         Command::Issue { action } => cmd::issue::run(action),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
         Command::Ci { action } => cmd::ci::run(&cfg, action),

@@ -39,6 +39,10 @@ const ALLOWLIST: &[&str] = &[
     // canonical `[merge_queue]` location, and the example shows the overlay
     // pattern there with a representative subset.
     "workspace.*.merge_queue",
+    // `[workspace.<slug>.pr_queue]` is the same overlay-mirror shape as the
+    // merge-queue one above: every key documented once at `[pr_queue]`, with the
+    // overlay pattern shown there.
+    "workspace.*.pr_queue",
     // `[[plugins]]` manifests are developer-facing (see `plugin_api.rs`); the
     // schema (id/name/version/api/capabilities/contributions) is an internal
     // contract for bundled plugins, not an end-user configuration surface.

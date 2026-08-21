@@ -34,6 +34,7 @@ pub mod open;
 pub mod pair;
 pub mod placement;
 pub mod pr;
+pub mod pr_queue;
 pub mod repos;
 pub mod session;
 pub mod share;

@@ -912,6 +912,53 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "open-pr-queue",
+        label: "PR queue",
+        hint: "pr queue",
+        // No default chord: `Ctrl Alt q` is the merge queue's, and the two are
+        // distinct features. Reachable from the palette and the panel.
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "pr queue",
+            "pull request queue",
+            "queue",
+            "review",
+            "checks",
+            "team",
+            "babysit",
+        ],
+    },
+    ActionSpec {
+        id: "pr-queue-add",
+        label: "PR queue: watch this PR",
+        hint: "watch pr",
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "pr queue add",
+            "watch pr",
+            "queue pull request",
+            "enqueue pr",
+            "shepherd",
+        ],
+    },
+    ActionSpec {
+        id: "pr-queue-refresh",
+        label: "PR queue: refresh now",
+        hint: "refresh prs",
+        default_chords: &[],
+        palette: true,
+        keywords: [
+            "pr queue refresh",
+            "pr queue drain",
+            "poll pull requests",
+            "check prs",
+            "refresh pr queue",
+        ]
+        .as_slice(),
+    },
+    ActionSpec {
         id: "share-worktree-port",
         label: "Share worktree port",
         hint: "share",

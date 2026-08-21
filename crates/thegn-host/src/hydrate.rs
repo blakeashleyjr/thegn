@@ -174,6 +174,11 @@ pub(crate) fn merge_glyph_scan(
 pub(crate) enum RefreshKind {
     Model,
     Pr,
+    /// A PR-queue refresh pass: re-classify every queued pull request and act.
+    /// Runs on `[pr_queue] poll_interval_secs`, and is also kicked immediately
+    /// by a remote-ref move (a push) so a just-pushed fix is seen at once
+    /// instead of a minute later. Inert while `[pr_queue] enabled = false`.
+    PrQueue,
     Issues,
     /// CI run-history cache refresh (AV group), on its own `[ci]
     /// poll_interval_secs` cadence. `force` bypasses the `[ci] ttl_secs`
@@ -278,6 +283,9 @@ pub(crate) fn spawn_refresh_ticker(
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     disk_path: std::path::PathBuf,
     ci_poll_secs: u64,
+    // `[pr_queue] poll_interval_secs`, or `None` when the PR queue is off — in
+    // which case no PR-queue slot is ever emitted, so the feature costs nothing.
+    prq_poll_secs: Option<u64>,
     auto_fetch_secs: Option<u64>,
     waker: TerminalWaker,
 ) {
@@ -289,6 +297,9 @@ pub(crate) fn spawn_refresh_ticker(
         let ci_every = crate::ci_refresh::ci_every_slots(ci_poll_secs);
         let fetch_every = auto_fetch_secs.and_then(crate::remote_poll::fetch_every_slots);
         let issue_every = ISSUE_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        // Floored the same way `[pr_queue] poll_secs` is, so a misconfigured 0
+        // can't spin the ticker against the forge's rate limit.
+        let prq_every = prq_poll_secs.map(|s| (s.max(15) * 1000) / 500);
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let disk_every = DISK_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let heal_every = 30; // 15s host-heal consideration (backoff: core::heal)
@@ -344,6 +355,14 @@ pub(crate) fn spawn_refresh_ticker(
             }
             if ticks.is_multiple_of(issue_every) {
                 if tx.send(RefreshKind::Issues).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            if let Some(n) = prq_every
+                && ticks.is_multiple_of(n)
+            {
+                if tx.send(RefreshKind::PrQueue).is_err() {
                     break;
                 }
                 wake = true;
@@ -2075,6 +2094,22 @@ pub(crate) fn build_panel(
     // (no dedicated RefreshKind). Feeds the `MergeQueue` section + statusbar badge.
     panel.merge_queue = db.list_merge_queue().unwrap_or_default();
 
+    // The PR queue — same deal: a tiny table read every model build, feeding the
+    // `PrQueue` section + statusbar badge. Scoped to THIS repo, because the queue
+    // is per-repo (a shared state DB holds several repos' rows) and the section
+    // must show what `pr queue drain` would act on.
+    panel.pr_queue = match crate::integrate::main_checkout(std::path::Path::new(&loc.path())) {
+        Some(root) => {
+            let root_s = root.to_string_lossy().into_owned();
+            db.list_pr_queue()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| r.repo_root == root_s)
+                .collect()
+        }
+        None => Vec::new(),
+    };
+
     // Cross-worktree attention stream (the `Across` section): every worktree's
     // failing CI, from the CI cache. Cheap DB reads only, off the event loop.
     panel.across = build_across(db);
@@ -3191,6 +3226,11 @@ pub(crate) fn retarget_diff_watcher(
                 {
                     let _ = tx.send(RefreshKind::Pr);
                     let _ = tx.send(RefreshKind::Ci { force: false });
+                    // The PR queue cares about exactly this event: a push is
+                    // what unblocks a PR (or is the teammate the queue must not
+                    // race), so re-evaluate now rather than up to a minute later.
+                    // Inert when the queue is off — the pass finds no rows.
+                    let _ = tx.send(RefreshKind::PrQueue);
                 }
                 last_send = Instant::now();
             }

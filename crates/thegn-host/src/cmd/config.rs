@@ -212,21 +212,37 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
 /// differs from the plain cascade — plus the slug, so the trace can name the
 /// exact block the user has to edit.
 ///
-/// Only `merge_queue.*` is carried by that layer today; other keys return
-/// `None` and explain as before.
+/// Only the two queue families (`merge_queue.*` / `pr_queue.*`) are carried by
+/// that layer today; other keys return `None` and explain as before.
 fn workspace_layer(
     cfg: &Config,
     repo_root: &std::path::Path,
     key: &str,
 ) -> Option<(String, serde_json::Value)> {
-    let sub = key.strip_prefix("merge_queue.")?;
     let slug = thegn_core::config::workspace_slug(repo_root);
     let ws = cfg.workspace.get(&slug)?;
-    if ws.merge_queue.is_empty() {
-        return None;
-    }
-    let resolved = serde_json::to_value(cfg.repo_merge_queue(repo_root)).ok()?;
-    let global = serde_json::to_value(&cfg.merge_queue).ok()?;
+
+    // Each arm: the sub-key, whether this repo overlays that family at all, and
+    // the resolved-vs-global pair to diff.
+    let (sub, resolved, global) = if let Some(sub) = key.strip_prefix("merge_queue.") {
+        (!ws.merge_queue.is_empty()).then_some(())?;
+        (
+            sub,
+            serde_json::to_value(cfg.repo_merge_queue(repo_root)).ok()?,
+            serde_json::to_value(&cfg.merge_queue).ok()?,
+        )
+    } else {
+        // `?` rather than an `else { return None }` arm: a key in neither family
+        // simply isn't carried by this layer.
+        let sub = key.strip_prefix("pr_queue.")?;
+        (!ws.pr_queue.is_empty()).then_some(())?;
+        (
+            sub,
+            serde_json::to_value(cfg.repo_pr_queue(repo_root)).ok()?,
+            serde_json::to_value(&cfg.pr_queue).ok()?,
+        )
+    };
+
     let v = resolved.get(sub)?;
     (v != global.get(sub)?).then(|| (slug, v.clone()))
 }
@@ -371,5 +387,59 @@ mod tests {
             );
             assert!(get(&cfg, key, true).is_ok(), "config get --json {key}");
         }
+    }
+
+    #[test]
+    fn get_reaches_the_pr_queue_surface() {
+        let cfg = Config::default();
+        for key in [
+            "pr_queue.enabled",
+            "pr_queue.merge_mode",
+            "pr_queue.watch",
+            "pr_queue.own_prs_only",
+            "pr_queue.prompts.ci_failure",
+        ] {
+            assert!(get(&cfg, key, false).is_ok(), "config get {key}");
+            assert!(get(&cfg, key, true).is_ok(), "config get --json {key}");
+        }
+    }
+
+    #[test]
+    fn workspace_layer_reports_both_queue_families() {
+        use thegn_core::config::{MergeQueueOverlay, PrMergeMode, PrQueueOverlay, WorkspaceConfig};
+        let dir = std::env::temp_dir().join(format!("thegn-wslayer-{}", std::process::id()));
+        let repo = dir.join("DataHub");
+        std::fs::create_dir_all(&repo).unwrap();
+        let slug = thegn_core::config::workspace_slug(&repo);
+
+        let mut cfg = Config::default();
+        cfg.workspace.insert(
+            slug.clone(),
+            WorkspaceConfig {
+                merge_queue: MergeQueueOverlay {
+                    gate_command: Some("pnpm test".into()),
+                    ..MergeQueueOverlay::default()
+                },
+                pr_queue: PrQueueOverlay {
+                    merge_mode: Some(PrMergeMode::Thegn),
+                    ..PrQueueOverlay::default()
+                },
+                ..WorkspaceConfig::default()
+            },
+        );
+
+        // Both families resolve through the per-repo layer, naming the block.
+        let (got_slug, v) = workspace_layer(&cfg, &repo, "merge_queue.gate_command").unwrap();
+        assert_eq!(got_slug, slug);
+        assert_eq!(v.as_str(), Some("pnpm test"));
+        let (_, v) = workspace_layer(&cfg, &repo, "pr_queue.merge_mode").unwrap();
+        assert_eq!(v.as_str(), Some("thegn"));
+
+        // A key the overlay leaves alone is not attributed to the layer...
+        assert!(workspace_layer(&cfg, &repo, "pr_queue.own_prs_only").is_none());
+        // ...and neither is a family outside the two carried here.
+        assert!(workspace_layer(&cfg, &repo, "theme.accent").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

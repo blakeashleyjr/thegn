@@ -128,6 +128,8 @@ pub enum Section {
     Ci,
     /// Local merge queue (the fold-actor): per-branch land/defer status.
     MergeQueue,
+    /// PR queue (team mode): per-pull-request blocker/status on the forge.
+    PrQueue,
     Issues,
     Files,
     /// Compiler / linter / test diagnostics.
@@ -171,13 +173,13 @@ pub enum Section {
 /// The accordion's built-in display order — the default when `[panel]
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
-/// - Work (10): Mine, Across, Pr, Ci, MergeQueue, Issues, Problems, Jobs, Tests, Symbols
+/// - Work (11): Mine, Across, Pr, Ci, MergeQueue, PrQueue, Issues, Problems, Jobs, Tests, Symbols
 /// - System (10): Notifications, Logs, Sandbox, Hosts, Environments, Share, Forward, Telemetry, Media, Keys
 /// - Help (1): Help
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 26] = [
+pub const SECTION_ORDER: [Section; 27] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -190,6 +192,7 @@ pub const SECTION_ORDER: [Section; 26] = [
     Section::Pr,
     Section::Ci,
     Section::MergeQueue,
+    Section::PrQueue,
     Section::Issues,
     Section::Problems,
     Section::Jobs,
@@ -223,6 +226,7 @@ impl Section {
             Section::Pr => "pr",
             Section::Ci => "ci",
             Section::MergeQueue => "merge",
+            Section::PrQueue => "prq",
             Section::Files => "files",
             Section::Problems => "problems",
             Section::Jobs => "jobs",
@@ -258,6 +262,7 @@ impl Section {
             | Section::Pr
             | Section::Ci
             | Section::MergeQueue
+            | Section::PrQueue
             | Section::Issues
             | Section::Problems
             | Section::Jobs
@@ -541,6 +546,8 @@ pub struct PanelData {
     /// The local merge queue (the fold-actor), from `merge_queue` — feeds the
     /// `MergeQueue` section + statusbar badge. Empty when the queue is unused.
     pub merge_queue: Vec<thegn_core::db::MergeQueueRow>,
+    /// `PrQueue` section + statusbar badge. Empty when the queue is unused.
+    pub pr_queue: Vec<thegn_core::db::PrQueueRow>,
     /// Now-playing snapshot for the optional `[media]` feature (`Media` section +
     /// statusbar badge). `None` when media is disabled or no player is loaded.
     pub media: Option<thegn_core::media::MediaState>,
@@ -1200,7 +1207,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 26);
+        assert_eq!(SECTION_ORDER.len(), 27);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab

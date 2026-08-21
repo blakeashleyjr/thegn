@@ -15,19 +15,12 @@
 //! `progress` callback the caller uses to print (CLI) or repaint (host).
 
 use std::path::Path;
-// Used only by the unix-gated `run_agent` (Windows stubs it — see below).
-#[cfg(unix)]
-use std::sync::Arc;
-#[cfg(unix)]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(unix)]
-use std::time::{Duration, Instant};
 
-use thegn_core::config::{ConflictHandoff, MergeQueueConfig};
+use thegn_core::config::{Config, ConflictHandoff, MergeQueueConfig};
 use thegn_core::db::Db;
 use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
-// Used only by the unix-gated `run_agent` chain (shell + sh_quote templating).
-#[cfg(any(unix, test))]
+// The real-git driver fixtures shell out to git and stamp queue rows.
+#[cfg(test)]
 use thegn_core::util;
 
 use crate::integrate::{self, AttemptOutcome};
@@ -72,6 +65,11 @@ pub(crate) struct DriveOutcome {
     /// Live checkouts of the target branch and what the ref advance did to them.
     /// Advisory; the CLI warns about the ones it could not fast-forward.
     pub resyncs: Vec<thegn_core::util::CheckoutResync>,
+    /// Non-fatal problems worth telling the user about — today, an agent handoff
+    /// that was configured but could not be resolved. Surfaced rather than
+    /// swallowed: silently degrading to "notify" looks identical to a queue that
+    /// simply had nothing to fix.
+    pub warnings: Vec<String>,
 }
 
 /// Why a branch didn't land — the material a fixing agent needs.
@@ -114,13 +112,29 @@ fn row_belongs_to_repo(db: &Db, worktree: &str, root_s: &str, root: &Path) -> bo
 /// writes (the DB is a cache; the git refs are the source of truth).
 pub(crate) fn drive_queue(
     cfg: &MergeQueueConfig,
+    full: &Config,
     repo_root: &Path,
     db: &Db,
     items: Vec<QueueItem>,
     mut progress: impl FnMut(&DriveStep),
 ) -> DriveOutcome {
     let mut out = DriveOutcome::default();
-    let use_agent = cfg.conflict_handoff == ConflictHandoff::Agent && !cfg.agent_command.is_empty();
+    // Resolved once per drain, not per branch: `agent_command` verbatim, else a
+    // named `[[agents]]` entry's headless form, else nothing.
+    let agent_cmd = thegn_core::agent_task::resolve_agent(full, &cfg.agent, &cfg.agent_command);
+    let wants_agent = cfg.conflict_handoff == ConflictHandoff::Agent;
+    if wants_agent && agent_cmd.is_none() && !cfg.agent.trim().is_empty() {
+        // A named agent that matched no entry would otherwise degrade to notify
+        // in silence, which reads as "nothing needed fixing".
+        let msg = format!(
+            "merge_queue.agent = {:?} matches no [[agents]]/[[tools]] entry; \
+             conflicts will be deferred instead of fixed",
+            cfg.agent
+        );
+        tracing::warn!(target: "thegn::merge", "{msg}");
+        out.warnings.push(msg);
+    }
+    let use_agent = wants_agent && agent_cmd.is_some();
     let target = integrate::resolve_target(cfg, repo_root);
 
     for item in items {
@@ -261,7 +275,16 @@ pub(crate) fn drive_queue(
                 });
                 // Run to completion; the re-attempt (top of loop) is the real
                 // arbiter of whether the fix worked, so ignore the exit code.
-                let _ = run_agent(cfg, &item.worktree, &item.branch, &target, &failure);
+                if let Some(template) = agent_cmd.as_deref() {
+                    let _ = run_agent(
+                        cfg,
+                        template,
+                        &item.worktree,
+                        &item.branch,
+                        &target,
+                        &failure,
+                    );
+                }
                 continue;
             }
 
@@ -325,180 +348,84 @@ pub(crate) fn drive_queue(
     out
 }
 
-/// Compose the task prompt handed to the fixing agent. Kept pure (and unit-tested)
-/// so the instructions the agent gets are stable and reviewable.
-#[cfg(any(unix, test))]
-fn build_prompt(branch: &str, target: &str, failure: &Failure) -> String {
-    let mut p = String::new();
-    p.push_str(&format!(
-        "You are resolving a merge-queue blocker for the git branch `{branch}`, \
-         which must land onto `{target}`. You are already checked out in this \
-         branch's worktree.\n\n"
-    ));
-    match failure {
-        Failure::Conflict(paths) => {
-            p.push_str(&format!(
-                "Rebasing `{branch}` onto `{target}` produces merge conflicts in:\n"
-            ));
-            for path in paths {
-                p.push_str(&format!("  - {path}\n"));
-            }
-            p.push_str(&format!(
-                "\nRebase this branch onto the latest `{target}` and resolve every \
-                 conflict, preserving the intent of both sides.\n"
-            ));
-        }
-        Failure::Gate(log) => {
-            p.push_str(&format!(
-                "Merging `{branch}` onto `{target}` is clean, but the merged result \
-                 fails the test gate. Gate output (tail):\n\n{}\n\n\
-                 Fix the branch so the gate passes.\n",
-                tail_line(log)
-            ));
-        }
-    }
-    p.push_str(
-        "\nRules:\n\
-         - Work only in this worktree; commit your fix on this branch.\n\
-         - Do NOT push, and do NOT merge into or check out the target branch — \
-           the merge queue lands it for you once this branch is clean.\n\
-         - When done, ensure `git status` is clean (everything committed).\n",
-    );
-    p
-}
-
-/// Substitute the `{prompt}`/`{branch}`/`{target}` placeholders in the command
-/// template, shell-quoting each so a prompt full of quotes/newlines is safe. The
-/// template should use bare placeholders (`claude -p {prompt}`), not quoted ones.
-#[cfg(any(unix, test))]
-fn substitute(template: &str, prompt: &str, branch: &str, target: &str) -> String {
-    template
-        .replace("{prompt}", &util::sh_quote(prompt))
-        .replace("{branch}", &util::sh_quote(branch))
-        .replace("{target}", &util::sh_quote(target))
-}
-
-/// Run the configured headless agent in the branch's worktree, to completion,
-/// under a watchdog. Returns whether it exited zero. Output is captured (never
-/// written to the terminal — this runs off the compositor loop). The git
-/// environment is scrubbed so the agent's `git` operates on its own worktree.
-// off-loop: the driver runs from the CLI (`merge queue drain`) or from
-// spawn_drive's spawn_blocking — never on the event loop.
-#[cfg(unix)]
-#[expect(clippy::disallowed_methods)]
+/// Build the prompt for a failure and run the configured agent in the branch's
+/// worktree. The prompt template comes from `[merge_queue.prompts]`, defaulting
+/// to thegn's built-in instructions for the kind; both the template engine and
+/// the process mechanics are shared with every other queue that dispatches an
+/// agent (`thegn_core::agent_task` + `crate::agent_run`).
+///
+/// Unconditional: `agent_run::run` carries its own Windows stub, so this must
+/// not be cfg-gated — gating it left `drive_queue`'s dispatch arm calling a
+/// function that did not exist on the Windows target.
 fn run_agent(
     cfg: &MergeQueueConfig,
+    command_template: &str,
     worktree: &str,
     branch: &str,
     target: &str,
     failure: &Failure,
 ) -> bool {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-
-    let prompt = build_prompt(branch, target, failure);
-    let command = substitute(&cfg.agent_command, &prompt, branch, target);
-
-    // Login shell so the agent (e.g. an npm-global `claude`) is on PATH with the
-    // user's credentials, like an interactive agent pane.
-    let mut cmd = Command::new(util::shell());
-    cmd.arg("-lc")
-        .arg(&command)
-        .current_dir(worktree)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("THEGN_WORKTREE", worktree)
-        .env("THEGN_BRANCH", branch)
-        .env("THEGN_MERGE_PROMPT", &prompt)
-        .env("THEGN_MERGE_TARGET", target);
-    // Defense in depth: the agent's git must target its cwd, not an inherited
-    // GIT_DIR/GIT_INDEX_FILE (mirrors task.rs::build_capped_command).
-    for var in util::GIT_ENV_VARS {
-        cmd.env_remove(var);
-    }
-
-    // Own group/job so the watchdog reaps the agent's whole tree.
-    let (mut child, group) = match crate::platform::spawn_grouped(&mut cmd) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(target: "thegn::merge", error = %e, "merge queue: agent failed to spawn");
-            return false;
-        }
-    };
-
-    // Watchdog: kill the process group if the agent overruns its deadline.
-    let done = Arc::new(AtomicBool::new(false));
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let watchdog = (cfg.agent_timeout_secs > 0).then(|| {
-        let done = done.clone();
-        let timed_out = timed_out.clone();
-        // Clone (don't move) the group into the thread: on Windows the job is
-        // kill-on-close, so the spawner's handle must outlive the child.
-        let group = group.clone();
-        let deadline = Duration::from_secs(cfg.agent_timeout_secs);
-        std::thread::spawn(move || {
-            let end = Instant::now() + deadline;
-            while Instant::now() < end {
-                if done.load(Ordering::Relaxed) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            if !done.load(Ordering::Relaxed) {
-                timed_out.store(true, Ordering::Relaxed);
-                group.terminate();
-            }
-        })
-    });
-
-    // Drain the pipes so a chatty agent can't deadlock on a full buffer.
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let out_h = std::thread::spawn(move || {
-        if let Some(o) = stdout {
-            let mut b = Vec::new();
-            let _ = o.take(1 << 20).read_to_end(&mut b);
-        }
-    });
-    let err_h = std::thread::spawn(move || {
-        if let Some(e) = stderr {
-            let mut b = Vec::new();
-            let _ = e.take(1 << 20).read_to_end(&mut b);
-        }
-    });
-
-    let status = child.wait();
-    done.store(true, Ordering::Relaxed);
-    if let Some(w) = watchdog {
-        let _ = w.join();
-    }
-    let _ = out_h.join();
-    let _ = err_h.join();
-
-    if timed_out.load(Ordering::Relaxed) {
-        tracing::warn!(target: "thegn::merge", branch, "merge queue: agent timed out");
+    let Some((kind, vars, prompt)) = compose(cfg, worktree, branch, target, failure) else {
         return false;
-    }
-    status.map(|s| s.success()).unwrap_or(false)
+    };
+    crate::agent_run::run(&crate::agent_run::AgentTaskRun {
+        kind,
+        worktree,
+        prompt: &prompt,
+        command_template,
+        vars: &vars,
+        timeout_secs: cfg.agent_timeout_secs,
+    })
 }
 
-/// Windows stub: `agent_command` templating quotes prompts with POSIX
-/// `sh_quote` and runs through `$SHELL -lc`, neither of which maps onto
-/// pwsh/cmd. Port the quoting before enabling this path on Windows.
-#[cfg(not(unix))]
-fn run_agent(
-    _cfg: &MergeQueueConfig,
-    _worktree: &str,
-    _branch: &str,
-    _target: &str,
-    _failure: &Failure,
-) -> bool {
-    tracing::warn!(
-        target: "thegn::merge",
-        "merge queue: headless agent runs are not yet supported on Windows"
-    );
-    false
+/// Map a [`Failure`] to its task kind, template variables, and rendered prompt.
+///
+/// Split out of [`run_agent`] so the merge queue's own prompt path stays
+/// unit-testable now that rendering itself lives in `thegn_core::agent_task` —
+/// what needs covering here is the *mapping* (a conflict fills `{paths}`, a red
+/// gate fills `{log}`), not the substitution.
+fn compose(
+    cfg: &MergeQueueConfig,
+    worktree: &str,
+    branch: &str,
+    target: &str,
+    failure: &Failure,
+) -> Option<(
+    thegn_core::agent_task::TaskKind,
+    thegn_core::agent_task::TaskVars,
+    String,
+)> {
+    use thegn_core::agent_task::{TaskKind, TaskVars, format_paths, render_prompt};
+
+    let (kind, vars) = match failure {
+        Failure::Conflict(paths) => (
+            TaskKind::MergeConflict,
+            TaskVars::new().set("paths", format_paths(paths)),
+        ),
+        Failure::Gate(log) => (
+            TaskKind::GateFailure,
+            TaskVars::new().set("log", tail_line(log)),
+        ),
+    };
+    let vars = vars
+        .set("branch", branch)
+        .set("target", target)
+        .set("worktree", worktree);
+
+    match render_prompt(cfg.prompts.resolve(kind), &vars) {
+        Ok(prompt) => Some((kind, vars, prompt)),
+        Err(e) => {
+            // `config validate` catches this ahead of time; if a bad template
+            // still reaches here, say so rather than sending the agent garbage.
+            tracing::warn!(
+                target: "thegn::merge",
+                kind = %kind,
+                error = %e,
+                "merge queue: prompt template is invalid; not dispatching"
+            );
+            None
+        }
+    }
 }
 
 /// A queue row's `error_detail`: a short headline plus the tail of the gate log.
@@ -535,33 +462,23 @@ fn tail_line(log: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn substitute_quotes_prompt_safely() {
-        let cmd = substitute("claude -p {prompt}", "it's \"tricky\"\nline2", "b", "main");
-        // Single-quoted; embedded single quotes are escaped, so the whole prompt
-        // is one shell word regardless of quotes/newlines.
-        assert!(cmd.starts_with("claude -p '"));
-        assert!(
-            cmd.contains("it'\\''s"),
-            "single quote must be escaped: {cmd}"
-        );
-        assert!(cmd.contains("line2"));
-    }
-
-    #[test]
-    fn substitute_fills_branch_and_target() {
-        // Bare-word branch/target pass through unquoted (sh_quote readability).
-        let cmd = substitute("run {branch} {target}", "p", "feat-x", "main");
-        assert_eq!(cmd, "run feat-x main");
-    }
+    // Substitution and template rendering themselves are covered in
+    // `thegn_core::agent_task`; what these cover is the merge queue's own
+    // mapping from a `Failure` onto a task kind and its variables.
 
     #[test]
     fn conflict_prompt_lists_paths_and_rules() {
-        let p = build_prompt(
+        let cfg = MergeQueueConfig::default();
+        let (kind, vars, p) = compose(
+            &cfg,
+            "/w/x",
             "feat-x",
             "main",
             &Failure::Conflict(vec!["src/a.rs".into(), "src/b.rs".into()]),
-        );
+        )
+        .expect("built-in template renders");
+        assert_eq!(kind, thegn_core::agent_task::TaskKind::MergeConflict);
+        assert_eq!(vars.get("worktree"), Some("/w/x"));
         assert!(p.contains("feat-x") && p.contains("main"));
         assert!(p.contains("src/a.rs") && p.contains("src/b.rs"));
         assert!(p.contains("Do NOT push"));
@@ -570,10 +487,56 @@ mod tests {
 
     #[test]
     fn gate_prompt_includes_log_tail_and_rules() {
-        let p = build_prompt("feat-x", "main", &Failure::Gate("error: boom\n".into()));
+        let cfg = MergeQueueConfig::default();
+        let (kind, _, p) = compose(
+            &cfg,
+            "/w/x",
+            "feat-x",
+            "main",
+            &Failure::Gate("error: boom\n".into()),
+        )
+        .expect("built-in template renders");
+        assert_eq!(kind, thegn_core::agent_task::TaskKind::GateFailure);
         assert!(p.contains("fails the test gate"));
         assert!(p.contains("boom"));
         assert!(p.contains("Do NOT push"));
+    }
+
+    #[test]
+    fn a_configured_prompt_template_replaces_the_builtin() {
+        let mut cfg = MergeQueueConfig::default();
+        cfg.prompts.conflict = "fix {branch} vs {target}, see:\n{paths}".into();
+        let (_, _, p) = compose(
+            &cfg,
+            "/w/x",
+            "feat-x",
+            "main",
+            &Failure::Conflict(vec!["src/a.rs".into()]),
+        )
+        .unwrap();
+        assert_eq!(p, "fix feat-x vs main, see:\n  - src/a.rs\n");
+        // The built-in rules are gone precisely because the user replaced them.
+        assert!(!p.contains("Do NOT push"));
+    }
+
+    #[test]
+    fn an_unset_prompt_template_falls_back_to_the_builtin() {
+        let mut cfg = MergeQueueConfig::default();
+        // Whitespace-only counts as unset, so blanking a key in config.toml
+        // restores the default rather than sending an empty prompt.
+        cfg.prompts.gate_failure = "   \n ".into();
+        let (_, _, p) = compose(&cfg, "/w/x", "b", "main", &Failure::Gate("boom".into())).unwrap();
+        assert!(p.contains("Do NOT push"));
+    }
+
+    #[test]
+    fn a_broken_prompt_template_refuses_to_dispatch() {
+        let mut cfg = MergeQueueConfig::default();
+        cfg.prompts.conflict = "fix {branchh}".into();
+        assert!(
+            compose(&cfg, "/w/x", "b", "main", &Failure::Conflict(vec![])).is_none(),
+            "a typo'd placeholder must not reach the agent as a blank"
+        );
     }
 
     #[test]
@@ -698,6 +661,7 @@ mod tests {
             let db = Db::open_memory().unwrap();
             let out_ = drive_queue(
                 &cfg(agent, 2),
+                &Config::default(),
                 &root,
                 &db,
                 vec![QueueItem {
@@ -727,6 +691,7 @@ mod tests {
             let db = Db::open_memory().unwrap();
             let out_ = drive_queue(
                 &cfg("true", 1),
+                &Config::default(),
                 &root,
                 &db,
                 vec![QueueItem {
@@ -740,6 +705,126 @@ mod tests {
             assert_eq!(out_.needs_human, ["feat"]);
             assert!(out_.landed.is_empty());
             assert_eq!(out(&root, &["rev-parse", "main"]), before, "main held");
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&feat_wt);
+        }
+
+        /// The fixing script, as a `sh` one-liner. Ends in `&& true` so the
+        /// unknown-provider fallback (`<command> {prompt}`) can append the
+        /// prompt harmlessly — `true` ignores its arguments.
+        const FIXER: &str = "git reset --hard main -q && echo feat > feat.txt && \
+                             git add -A && git commit -q -m resolved && true";
+
+        fn item(feat_wt: &std::path::Path) -> QueueItem {
+            QueueItem {
+                worktree: feat_wt.to_string_lossy().into(),
+                branch: "feat".into(),
+                location: String::new(),
+                agent_attempts: 0,
+            }
+        }
+
+        #[test]
+        fn a_named_agent_entry_is_dispatched_without_an_agent_command() {
+            let (root, feat_wt) = conflicting_repo("byname");
+            let full = Config {
+                agents: vec![thegn_core::config::NamedCommand {
+                    name: "fixer".into(),
+                    command: FIXER.into(),
+                    hints: Vec::new(),
+                    provider: None,
+                }],
+                ..Config::default()
+            };
+            // `agent_command` empty — resolution must come from `agent`.
+            let mut mq = cfg("", 2);
+            mq.agent = "fixer".into();
+
+            let db = Db::open_memory().unwrap();
+            let out_ = drive_queue(&mq, &full, &root, &db, vec![item(&feat_wt)], |_| {});
+            assert_eq!(
+                out_.landed,
+                ["feat"],
+                "a named [[agents]] entry should have been dispatched"
+            );
+            assert!(out_.warnings.is_empty());
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&feat_wt);
+        }
+
+        #[test]
+        fn a_named_agent_that_resolves_to_nothing_warns_instead_of_going_quiet() {
+            let (root, feat_wt) = conflicting_repo("noagent");
+            let mut mq = cfg("", 2);
+            mq.agent = "not-configured".into();
+
+            let db = Db::open_memory().unwrap();
+            let out_ = drive_queue(
+                &mq,
+                &Config::default(),
+                &root,
+                &db,
+                vec![item(&feat_wt)],
+                |_| {},
+            );
+            // No agent ran, so the branch takes the classic deferred path...
+            assert_eq!(out_.deferred, ["feat"]);
+            assert!(out_.needs_human.is_empty());
+            // ...but the reason is reported rather than looking like a clean no-op.
+            assert_eq!(out_.warnings.len(), 1, "{:?}", out_.warnings);
+            assert!(out_.warnings[0].contains("not-configured"));
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&feat_wt);
+        }
+
+        #[test]
+        fn a_custom_prompt_template_reaches_the_agent() {
+            let (root, feat_wt) = conflicting_repo("prompt");
+            // The "agent" only does its job if the sentinel from the configured
+            // template is present in the prompt it was handed, so a landing is
+            // proof the custom text (not the built-in) got through.
+            let agent = "printf '%s' \"$THEGN_TASK_PROMPT\" | grep -q MAGIC-SENTINEL && ";
+            let mut mq = cfg(&format!("{agent}{FIXER}"), 2);
+            mq.prompts.conflict = "MAGIC-SENTINEL fix {branch} onto {target}:\n{paths}".into();
+
+            let db = Db::open_memory().unwrap();
+            let out_ = drive_queue(
+                &mq,
+                &Config::default(),
+                &root,
+                &db,
+                vec![item(&feat_wt)],
+                |_| {},
+            );
+            assert_eq!(
+                out_.landed,
+                ["feat"],
+                "the configured prompt template should have reached the agent"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&feat_wt);
+        }
+
+        #[test]
+        fn the_builtin_prompt_carries_no_sentinel() {
+            // The negative control for the test above: with no configured
+            // template the same agent finds no sentinel and never fixes anything,
+            // so `landed` there really was caused by the override.
+            let (root, feat_wt) = conflicting_repo("nosentinel");
+            let agent = "printf '%s' \"$THEGN_TASK_PROMPT\" | grep -q MAGIC-SENTINEL && ";
+            let mq = cfg(&format!("{agent}{FIXER}"), 1);
+
+            let db = Db::open_memory().unwrap();
+            let out_ = drive_queue(
+                &mq,
+                &Config::default(),
+                &root,
+                &db,
+                vec![item(&feat_wt)],
+                |_| {},
+            );
+            assert_eq!(out_.needs_human, ["feat"]);
+            assert!(out_.landed.is_empty());
             let _ = std::fs::remove_dir_all(&root);
             let _ = std::fs::remove_dir_all(&feat_wt);
         }

@@ -2206,9 +2206,10 @@ fn badge_detail(
         // The inbox chip (⚑ / N unread), the needs-you chip (✋), and the
         // merge-queue chip all open the single unified surface: Needs you ·
         // Alerts · Merge queue · Notifications · Logs.
-        BarBadge::Notifications | BarBadge::Attention | BarBadge::MergeQueue => {
-            unified_detail(model)
-        }
+        BarBadge::Notifications
+        | BarBadge::Attention
+        | BarBadge::MergeQueue
+        | BarBadge::PrQueue => unified_detail(model),
         BarBadge::Ci => {
             if model.panel.ci_runs.is_empty() {
                 return None;
