@@ -39,6 +39,8 @@ pub struct StatusCtx<'a> {
     pub daemon: &'a crate::chrome::DaemonStatus,
     /// The daemon's live session list (probe state included).
     pub sessions: &'a DaemonSessions,
+    /// Seconds since the session list landed (`None` until a probe answers).
+    pub sessions_age_secs: Option<u64>,
     /// Resolved `[daemon]` policy, for the modal's lease/idle-exit rows.
     pub daemon_cfg: &'a thegn_core::config::DaemonConfig,
     /// The full screen rect. Popups clamp their own width/height against this
@@ -65,6 +67,7 @@ impl<'a> StatusCtx<'a> {
             loop_perf: &docs.loop_perf,
             daemon: &docs.daemon,
             sessions: &docs.daemon_sessions,
+            sessions_age_secs: docs.daemon_sessions_at.map(|t| t.elapsed().as_secs()),
             daemon_cfg,
             screen,
             // now() is seconds; widen to ms to match `started_at_ms`.
@@ -94,6 +97,7 @@ impl<'a> StatusCtx<'a> {
             loop_perf: LP.get_or_init(Default::default),
             daemon: DM.get_or_init(Default::default),
             sessions: SS.get_or_init(Default::default),
+            sessions_age_secs: None,
             daemon_cfg: DC.get_or_init(Default::default),
             screen,
             now_ms: 0,
@@ -341,6 +345,13 @@ pub struct SectionsDetail {
 pub enum Section {
     /// A one-row dim label with an optional right-aligned note (a group header).
     Heading { label: String, note: Option<String> },
+    /// A heading whose note carries its own tone (health/staleness), instead of
+    /// the always-ghost note of [`Section::Heading`].
+    HeadingToned {
+        label: String,
+        note: String,
+        tone: Tok,
+    },
     /// A timeline graph block (header + `height`-row plot + optional footer).
     Graph(GraphSection),
     /// A columnar breakdown (optional dim header row + body rows).
@@ -407,7 +418,7 @@ impl Section {
     /// Row count this section occupies when stacked.
     fn height(&self) -> usize {
         match self {
-            Section::Heading { .. } | Section::Sparkrow { .. } => 1,
+            Section::Heading { .. } | Section::HeadingToned { .. } | Section::Sparkrow { .. } => 1,
             Section::Graph(g) => 1 + g.height + g.footer.is_some() as usize,
             Section::Table(t) => (!t.header.is_empty()) as usize + t.rows.len(),
             Section::KeyVal(rows) => rows.len(),
@@ -1056,6 +1067,13 @@ fn draw_section(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, 
                 ),
                 None => Line::segs(vec![seg(Tok::Slot(S::Dim), label.clone())]),
             };
+            put_line(surface, clip, x, y0, w, &line, panel());
+        }
+        Section::HeadingToned { label, note, tone } => {
+            let line = Line::split(
+                vec![seg(Tok::Slot(S::Dim), label.clone())],
+                vec![seg(*tone, note.clone())],
+            );
             put_line(surface, clip, x, y0, w, &line, panel());
         }
         Section::Graph(g) => draw_graph_block(surface, clip, x, y0, w, g),

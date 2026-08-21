@@ -91,6 +91,12 @@ impl Toasts {
         self.stack.len() != before
     }
 
+    /// The earliest deadline in the stack — the instant the host must wake to
+    /// prune, so an idle loop clears a toast on time without polling.
+    pub fn next_expiry(&self) -> Option<Instant> {
+        self.stack.iter().map(|t| t.expires).min()
+    }
+
     /// True when no toasts are live.
     pub fn is_empty(&self) -> bool {
         self.stack.is_empty()
@@ -146,6 +152,18 @@ mod tests {
 
     fn base() -> Instant {
         Instant::now()
+    }
+
+    #[test]
+    fn next_expiry_is_the_earliest_deadline() {
+        let mut t = Toasts::default();
+        let now = Instant::now();
+        assert!(t.next_expiry().is_none());
+        t.info_ttl("slow", now, Duration::from_secs(8));
+        t.info("fast", now);
+        assert_eq!(t.next_expiry(), Some(now + DEFAULT_TTL));
+        t.prune(now + DEFAULT_TTL + Duration::from_millis(1));
+        assert_eq!(t.next_expiry(), Some(now + Duration::from_secs(8)));
     }
 
     #[test]

@@ -4321,16 +4321,8 @@ fn drain_drag_events(
     }
 }
 
-/// Spawn a one-shot thread that pulses the waker once a toast's lifetime has
-/// elapsed, so the expired toast is pruned and re-rendered even with no further
-/// input (the event loop never polls on a timer).
-fn schedule_toast_clear(waker: &TerminalWaker) {
-    let wk = waker.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(crate::toast::DEFAULT_TTL + std::time::Duration::from_millis(50));
-        let _ = wk.wake();
-    });
-}
+/// How often the open status modal re-probes the daemon's session list.
+const SESSION_REPROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Run the detected test command off-thread; results (parsed indicator
 /// lines + summary) ride the channel back to the loop with a waker pulse.
@@ -5838,6 +5830,9 @@ async fn event_loop<T: Terminal>(
     // Each push schedules a one-shot waker pulse so the toast clears on its own
     // even with no further input (the loop never polls on a timer).
     let mut toasts = crate::toast::Toasts::default();
+    // The toast deadline a one-shot wake is already armed for (see the prune
+    // block), so repeated frames don't spawn duplicate sleepers.
+    let mut toast_wake_armed: Option<std::time::Instant> = None;
     // Live theme-cycle position within `theme::PRESETS` (Ctrl+Alt+t).
     let mut theme_idx: usize = thegn_core::theme::PRESETS
         .iter()
@@ -8632,7 +8627,27 @@ async fn event_loop<T: Terminal>(
         // age ticks over as new samples land. Costs nothing when the modal is
         // closed (`refresh_open` is title-guarded and returns immediately), and
         // adds no wake source — this rides drains that already happened.
-        if status_data_moved && bar_detail.is_some() {
+        if status_data_moved && crate::detail::status_modal::is_open(&bar_detail) {
+            // Re-run the session probe on the stats cadence while the modal is
+            // open, so the table tracks sessions opening/closing instead of
+            // freezing at the one-shot taken on open.
+            if panel_ui
+                .docs
+                .daemon_sessions_at
+                .is_none_or(|t| t.elapsed() >= SESSION_REPROBE_EVERY)
+                && !matches!(
+                    panel_ui.docs.daemon_sessions,
+                    crate::detail::DaemonSessions::Probing
+                )
+            {
+                crate::handlers::status::probe_sessions(
+                    &BarItemId::Badge(BarBadge::Persist),
+                    &current_config.daemon,
+                    &mut panel_ui.docs.daemon_sessions,
+                    &refresh_tx,
+                    &waker,
+                );
+            }
             dirty |= crate::detail::status_modal::refresh_open(
                 &mut bar_detail,
                 &model,
@@ -9330,7 +9345,18 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::Usage(p) => dirty |= crate::detail::apply_usage(&mut bar_detail, *p),
                 // The daemon's answer to the status modal's session probe.
                 RefreshKind::DaemonSessions(p) => {
+                    // The live probe is the truth: a registry row whose
+                    // daemon no longer answers is dropped here rather than
+                    // showing "healthy · heartbeat 45s ago" beside "no
+                    // daemon" for the rest of the heartbeat TTL.
+                    if matches!(*p, crate::detail::DaemonSessions::NoDaemon)
+                        && panel_ui.docs.daemon.present
+                    {
+                        panel_ui.docs.daemon = crate::chrome::DaemonStatus::default();
+                        bars_dirty = true;
+                    }
                     panel_ui.docs.daemon_sessions = *p;
+                    panel_ui.docs.daemon_sessions_at = Some(std::time::Instant::now());
                     dirty |= crate::detail::status_modal::refresh_open(
                         &mut bar_detail,
                         &model,
@@ -9375,7 +9401,6 @@ async fn event_loop<T: Terminal>(
                         std::time::Instant::now(),
                         crate::toast::DEFAULT_TTL,
                     );
-                    schedule_toast_clear(&waker);
                     dirty = true;
                 }
             }
@@ -9884,10 +9909,25 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        // Expire any toasts whose deadline passed; their scheduled wake lands
-        // here even absent other input, so they clear on their own.
+        // Expire any toasts whose deadline passed, and arm ONE one-shot wake
+        // for the earliest remaining deadline — centrally, so every push site
+        // (not just the four that remembered to) clears on time even when the
+        // loop is otherwise idle, and a long-TTL toast gets its own deadline.
         if toasts.prune(std::time::Instant::now()) {
             dirty = true;
+        }
+        if let Some(at) = toasts.next_expiry()
+            && toast_wake_armed != Some(at)
+        {
+            toast_wake_armed = Some(at);
+            let wk = waker.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(
+                    at.saturating_duration_since(std::time::Instant::now())
+                        + std::time::Duration::from_millis(50),
+                );
+                let _ = wk.wake();
+            });
         }
 
         // 2. Render if anything changed (diff-flush): damaged panes and/or chrome,
@@ -11295,7 +11335,6 @@ async fn event_loop<T: Terminal>(
                                     format!("Stats refresh: {next}s"),
                                     std::time::Instant::now(),
                                 );
-                                schedule_toast_clear(&waker);
                             }
                         }
                     } else if chrome.statusbar.contains(mx, my) {
@@ -11748,7 +11787,6 @@ async fn event_loop<T: Terminal>(
                                         "Text copied to clipboard",
                                         std::time::Instant::now(),
                                     );
-                                    schedule_toast_clear(&waker);
                                 }
                             }
                         }
@@ -18404,7 +18442,6 @@ async fn event_loop<T: Terminal>(
                                             },
                                             std::time::Instant::now(),
                                         );
-                                        schedule_toast_clear(&waker);
                                     }
                                 }
                             }

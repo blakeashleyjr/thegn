@@ -45,6 +45,9 @@ pub struct PanelDocs {
     /// user opens the status modal (never on a timer — see
     /// `handlers::status::probe_sessions`).
     pub daemon_sessions: crate::detail::DaemonSessions,
+    /// When the session list last landed (`None` until a probe answers) — the
+    /// modal's "as of N ago" staleness marker.
+    pub daemon_sessions_at: Option<std::time::Instant>,
     /// Cheatsheet groups from the effective keymap, refreshed on config
     /// reload (the keys section's content).
     pub cfg_keys: Vec<crate::keyhint::HintGroup>,
