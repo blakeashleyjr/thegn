@@ -383,6 +383,24 @@ pub trait GitBackend: Send + Sync {
         Ok(thegn_core::gitrefs::parse_commits(&out))
     }
 
+    /// The last `n` commits reachable from `refname` — the branches pane's
+    /// selected-branch log (same record shape as [`Self::log_commits`], which
+    /// is HEAD's).
+    fn log_commits_ref(&self, loc: &GitLoc, refname: &str, n: usize) -> Result<Vec<Commit>> {
+        let n = n.to_string();
+        let out = run(
+            loc,
+            &[
+                "log",
+                "--format=%x1f%H%x1f%h%x1f%an%x1f%ae%x1f%ct%x1f%P%x1f%D%x1f%s",
+                "-n",
+                &n,
+                refname,
+            ],
+        )?;
+        Ok(thegn_core::gitrefs::parse_commits(&out))
+    }
+
     /// All local branches with upstream/divergence detail, newest first.
     fn branches_full(&self, loc: &GitLoc) -> Result<Vec<BranchInfo>> {
         // NB: `for-each-ref` uses `%XX` for hex bytes, NOT `git log`'s `%xXX`
@@ -1049,7 +1067,14 @@ impl GitBackend for CliGit {
     }
 
     fn diff_files(&self, loc: &GitLoc, base: &str) -> Result<Vec<DiffEntry>> {
-        let out = run(loc, &["diff", "--numstat", base])?;
+        // `-c core.quotePath=false`: with the default (true), numstat emits
+        // non-ASCII / special-char paths OCTAL-QUOTED (`"docs/caf\303\251.md"`)
+        // while `status -z` (the join partner in the panel) emits them raw, so
+        // the exact-string join missed and the row rendered `+0 −0`.
+        let out = run(
+            loc,
+            &["-c", "core.quotePath=false", "diff", "--numstat", base],
+        )?;
         let mut v = Vec::new();
         for line in out.lines() {
             let mut it = line.splitn(3, '\t');

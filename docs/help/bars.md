@@ -12,8 +12,6 @@ actions:
     mark-all-read,
     open-ci,
     open-usage,
-    select-topbar,
-    select-bottombar,
   ]
 ---
 
@@ -108,8 +106,10 @@ view to all worktrees, and again to narrow back.
 ### Clearing, and what "clear" covers
 
 `a` — in the inbox, in the unified surface, and as `Alt Shift R` — is the
-total clear. It marks every notification read **and** acknowledges the live
-needs-you signals, including the worktree you're currently on. That second
+clear. It marks the notifications the current scope shows read (this
+repo's + host-global rows by default; every repo's only under the `g`
+all-worktrees view) **and** acknowledges the live needs-you signals,
+including the worktree you're currently on. That second
 half matters: "CI failed", "PR has conflicts" and "changes requested" are
 derived from the PR/CI caches rather than from an inbox row, so marking
 notifications read alone would leave the `✋` chip lit and it would reappear

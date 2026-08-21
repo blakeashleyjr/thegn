@@ -844,18 +844,20 @@ fn commit_load_needed_open_follows_ttl_warm_only_cold_miss() {
     let now = thegn_core::util::now();
     let fresh = ("[]".to_string(), now);
     let stale = ("[]".to_string(), now - (COMMIT_CACHE_TTL_SECS + 10));
+    let ancient = ("[]".to_string(), now - (COMMIT_SUMMARY_TTL_SECS + 10));
 
     // Open section: honour the TTL — refresh when cold or stale, skip when fresh.
     assert!(commit_load_needed(true, None));
     assert!(commit_load_needed(true, Some(&stale)));
     assert!(!commit_load_needed(true, Some(&fresh)));
 
-    // Warm-only (closed summary): refresh on a cold miss ONLY. A present cache is
-    // reused even when stale, so the ticker never re-runs `git log` for a section
-    // nobody's looking at.
+    // Warm-only (closed summary): refresh on a cold miss or once the LONGER
+    // summary TTL lapses — the collapsed row's latest-commit line must not be
+    // unboundedly stale, but the ticker still never re-runs `git log` per tick.
     assert!(commit_load_needed(false, None));
     assert!(!commit_load_needed(false, Some(&stale)));
     assert!(!commit_load_needed(false, Some(&fresh)));
+    assert!(commit_load_needed(false, Some(&ancient)));
 }
 
 #[test]
@@ -879,4 +881,90 @@ fn branch_fetch_needed_open_follows_ttl_warm_only_cold_miss() {
     assert!(branch_fetch_needed(true, false, None, ttl));
     assert!(!branch_fetch_needed(true, false, stale, ttl));
     assert!(!branch_fetch_needed(true, false, fresh, ttl));
+}
+
+#[test]
+fn pr_linked_diff_emits_once_for_new_prs_only() {
+    use std::collections::HashSet;
+    use thegn_core::github::PrHeader;
+    let pr = |n: u64, head: &str| PrHeader {
+        number: n,
+        head_ref: head.into(),
+        state: "OPEN".into(),
+        url: format!("https://x/pull/{n}"),
+        is_draft: false,
+    };
+    let worktrees = vec![
+        (
+            "/wt/feat".to_string(),
+            "feat/x".to_string(),
+            vec!["linear:ABC-1".to_string()],
+        ),
+        // Linked-issue-free worktree: its branch never emits.
+        ("/wt/plain".to_string(), "plain".to_string(), vec![]),
+    ];
+    let hints = vec![(
+        "ABC-2".to_string(),
+        "abc-2-fix".to_string(),
+        "/wt/feat".to_string(),
+    )];
+
+    // Already-open PRs are skipped; a new PR on a linked worktree's branch
+    // emits, attributed to that worktree.
+    let old: HashSet<String> = ["old-branch".to_string()].into();
+    let got = pr_linked_notifications(
+        &old,
+        &[pr(1, "old-branch"), pr(2, "feat/x"), pr(3, "plain")],
+        &worktrees,
+        &hints,
+    );
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, "pr:2");
+    assert_eq!(got[0].2, "/wt/feat");
+    assert!(got[0].1.contains("linear:ABC-1"), "{}", got[0].1);
+
+    // A branch matching only a linked issue's branch_hint also emits.
+    let got = pr_linked_notifications(&old, &[pr(4, "abc-2-fix")], &worktrees, &hints);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, "pr:4");
+    assert!(got[0].1.contains("ABC-2"), "{}", got[0].1);
+
+    // Unmatched branches emit nothing.
+    assert!(pr_linked_notifications(&old, &[pr(5, "stranger")], &worktrees, &hints).is_empty());
+}
+
+#[test]
+fn tracker_diff_emits_status_changes_and_blocker_resolved_once() {
+    use std::collections::HashSet;
+    use thegn_core::issue::{Issue, IssueStatus};
+    let issue = |id: &str, num: &str, status: IssueStatus, blocked_by: &[&str]| Issue {
+        id: id.into(),
+        number: num.into(),
+        status,
+        blocked_by: blocked_by.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    let linked: HashSet<String> = ["t:A".to_string()].into();
+
+    let old = vec![
+        issue("t:A", "A", IssueStatus::Todo, &["t:B"]),
+        issue("t:B", "B", IssueStatus::InProgress, &[]),
+    ];
+    let new = vec![
+        issue("t:A", "A", IssueStatus::InProgress, &["t:B"]),
+        issue("t:B", "B", IssueStatus::Done, &[]),
+    ];
+    let got = crate::hydrate_tracker::tracker_diff_notifications(&old, &new, &linked);
+    // Linked issue A: its own status change + its blocker B resolving.
+    let kinds: Vec<&str> = got.iter().map(|(k, _, _)| *k).collect();
+    assert_eq!(kinds, vec!["status_changed", "blocker_resolved"]);
+    assert!(got.iter().all(|(_, sr, _)| sr == "t:A"));
+
+    // Re-running with old == new emits nothing (emit-once).
+    assert!(crate::hydrate_tracker::tracker_diff_notifications(&new, &new, &linked).is_empty());
+    // First fetch (empty old cache) emits nothing even with a Done blocker.
+    assert!(crate::hydrate_tracker::tracker_diff_notifications(&[], &new, &linked).is_empty());
+    // An unlinked issue's changes are silent.
+    let unlinked: HashSet<String> = HashSet::new();
+    assert!(crate::hydrate_tracker::tracker_diff_notifications(&old, &new, &unlinked).is_empty());
 }

@@ -17,10 +17,11 @@ actions: [pr-open, pr-create]
 3. The right [[panel]]'s **work** tab tracks the branch's PR: state, CI
    check rollup, review decision. The **git** tab's _changes_ section is
    the diff; `e` widens it to full-screen, side by side.
-4. Comment/approve via `gh` in the pane, or open the PR view from the
-   panel for the conversation feed. The palette's **PR — open in
-   browser** action (`pr-open`) hands the whole thread to your browser
-   when the conversation outgrows a pane.
+4. Act from the panel's _pr_ section: `A` approve, `c` comment, `M`
+   merge, `r` rerun failed checks, `o` open in the browser — or run `gh`
+   in the pane, or open the PR view for the conversation feed. The
+   palette's **PR — open in browser** action (`pr-open`) does the same
+   from anywhere, when the conversation outgrows a pane.
 5. Done? `Alt-X` removes the review worktree; the branch stays.
 
 ## Raising one

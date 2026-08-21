@@ -27,7 +27,7 @@ pub struct RollbackRow {
     /// Porcelain status glyph ("M", "A", "?", …) for display.
     pub status: String,
     /// Untracked files are *deleted* on discard (`clean -f`); tracked ones are
-    /// restored (`checkout --`).
+    /// restored from HEAD (`checkout HEAD --` — index and worktree both).
     pub untracked: bool,
 }
 

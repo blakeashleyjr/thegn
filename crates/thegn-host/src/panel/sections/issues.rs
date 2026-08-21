@@ -180,7 +180,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     rows.push(hint_row(&[
         ("↵", "link"),
-        ("o", "open"),
+        ("o", "browser"),
         ("n", "new"),
         ("e", "edit"),
     ]));
@@ -279,7 +279,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     rows.push(hint_row(&[
         ("↵", "link"),
-        ("o", "open"),
+        ("o", "browser"),
         ("n", "new"),
         ("e", "edit"),
         ("/", "filter"),
@@ -387,10 +387,10 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows.push(rule());
     rows.push(hint_row(&[
         ("↵", "link"),
-        ("o", "open"),
+        ("o", "browser"),
         ("n", "new"),
         ("e", "edit status"),
-        ("a", "self-assign"),
+        ("a", "assign me"),
     ]));
     rows
 }

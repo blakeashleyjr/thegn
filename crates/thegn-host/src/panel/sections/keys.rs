@@ -24,10 +24,18 @@ fn panel_group(ctx: &SectionCtx) -> HintGroup {
         chord: chord.into(),
         label: label.into(),
     };
+    // Digits index the ACTIVE TAB's sections (max 10, `0` = the 10th) — the
+    // old `1-26` claim counted every tab's sections, most of which no digit
+    // could ever reach.
+    let n = ctx.ui.tab_sections().len();
+    let jump = match n {
+        0..=9 => format!("1-{n}"),
+        _ => "1-9,0".to_string(),
+    };
     HintGroup {
         title: "Panel".into(),
         rows: vec![
-            row(&format!("1-{}", ctx.ui.order.len()), "jump to section"),
+            row(&jump, "jump to section (this tab)"),
             row("e", "cycle width"),
             row("j/k", "walk rows"),
             row("J/K", "hop sections"),
@@ -81,13 +89,17 @@ fn group_lines(group: &HintGroup) -> Vec<Line> {
     out
 }
 
-/// Half: every group in one chip column (the budget truncates overflow).
+/// Half: every group in one chip column, scrolled by `ui.scroll` — the
+/// unscrolled column made every group past the fold unreachable at this
+/// width (`j` left the section instead of scrolling).
 fn half(ctx: &SectionCtx) -> Vec<PanelRow> {
-    all_groups(ctx)
+    let rows: Vec<PanelRow> = all_groups(ctx)
         .iter()
         .flat_map(group_lines)
         .map(PanelRow::plain)
-        .collect()
+        .collect();
+    let max = rows.len().saturating_sub(ctx.rows.max(1));
+    rows.into_iter().skip(ctx.ui.scroll.min(max)).collect()
 }
 
 /// Full: two balanced columns (greedy fill by line count), scrolled by

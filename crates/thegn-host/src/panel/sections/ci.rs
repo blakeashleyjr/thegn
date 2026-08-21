@@ -23,6 +23,16 @@ pub(super) fn state_glyph(s: CiState) -> Seg {
     }
 }
 
+/// The runs the section actually renders: one row per workflow, judged by its
+/// most recent run ([`thegn_core::ci::latest_per_workflow`]) — the same set
+/// [`current_summary`] counts, so the header numbers and the visible rows can
+/// never disagree. History stays reachable through the drill-in (`↵`/`v`).
+/// The event-loop dispatch (`actions::CiActionCtx`) resolves the row cursor
+/// through this same list so Enter/`o`/`r`/`c` hit the run the user sees.
+pub(crate) fn display_runs(panel: &crate::panel::PanelData) -> Vec<&thegn_core::ci::CiRun> {
+    thegn_core::ci::latest_per_workflow(&panel.ci_runs)
+}
+
 /// The rollup summary line shared by the list and full views: per-state counts
 /// from [`current_summary`] (one entry per workflow, judged by its most recent
 /// run — never a wall of historical failures), plus the cache's fetch age so
@@ -83,9 +93,12 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
         )])));
     }
 
-    // Each run row carries a `Row` hit (the summary/job rows don't), so the
-    // enumerate index lines up with `ui.cursor` and with `ci_runs`.
-    for (i, r) in data.ci_runs.iter().take(limit).enumerate() {
+    // One row per workflow (the set the summary counts). Each run row carries
+    // a `Row` hit (the summary/job rows don't), so the enumerate index lines
+    // up with `ui.cursor` and with `display_runs` — which the dispatch also
+    // resolves through.
+    let display = display_runs(data);
+    for (i, r) in display.iter().take(limit).enumerate() {
         let dur = r
             .duration_secs(now)
             .map(fmt_secs)
@@ -99,9 +112,9 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
                 .with_hit(PanelHit::Row(Section::Ci, i)),
         );
     }
-    // Deep (Half): expand the most-recent run's jobs.
+    // Deep (Half): expand the newest displayed run's jobs.
     if ctx.deep()
-        && let Some(latest) = data.ci_runs.first()
+        && let Some(latest) = display.first()
     {
         for j in &latest.jobs {
             rows.push(PanelRow::plain(Line::segs(vec![
@@ -161,7 +174,9 @@ fn full(ctx: &SectionCtx) -> Vec<PanelRow> {
         )])));
     }
 
-    for (i, r) in data.ci_runs.iter().take(ctx.rows.max(1)).enumerate() {
+    // One row per workflow — the same set the summary counts (see `display_runs`).
+    let display = display_runs(data);
+    for (i, r) in display.iter().take(ctx.rows.max(1)).enumerate() {
         let dur = r
             .duration_secs(now)
             .map(fmt_secs)
@@ -182,8 +197,8 @@ fn full(ctx: &SectionCtx) -> Vec<PanelRow> {
         );
     }
 
-    // Detailed view of the latest run's jobs and steps
-    if let Some(latest) = data.ci_runs.first() {
+    // Detailed view of the newest displayed run's jobs and steps
+    if let Some(latest) = display.first() {
         if !latest.jobs.is_empty() {
             rows.push(PanelRow::plain(Line::segs(vec![seg(g(), "")])));
             rows.push(PanelRow::plain(Line::segs(vec![seg(

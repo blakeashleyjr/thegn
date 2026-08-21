@@ -197,6 +197,13 @@ impl AppHost {
         self.tab_order.get(index).copied()
     }
 
+    /// How many app tabs exist (Work + enabled tiles). With just one, the
+    /// Alt+digit switch chords are pointless and the loop lets them fall
+    /// through to the worktree-slot jumps.
+    pub fn tab_count(&self) -> usize {
+        self.tab_order.len()
+    }
+
     pub fn cycle(&self, active: ActiveApp, delta: isize) -> ActiveApp {
         if self.tab_order.is_empty() {
             return ActiveApp::Work;

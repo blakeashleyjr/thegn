@@ -66,13 +66,27 @@ pub trait StageOps: GitBackend {
         run_w(loc, &[], &["add", "--intent-to-add", "--", path]).map(|_| ())
     }
 
-    /// Discard a whole file: `checkout --` for tracked content,
+    /// Discard a whole file: restore **from HEAD** for tracked content
+    /// (`checkout HEAD --`, which resets both the index and the worktree),
     /// `clean -f` for untracked. Destructive — confirm at the call site.
+    ///
+    /// `checkout HEAD --`, NOT the bare `checkout --`: the bare form restores
+    /// from the INDEX, so discarding a file whose bad edit was already staged
+    /// copied the staged content back over itself — the confirm said
+    /// "unrecoverable", the op reported success, and nothing changed.
     fn discard_file(&self, loc: &GitLoc, path: &str, untracked: bool) -> Result<()> {
         if untracked {
-            run_w(loc, &[], &["clean", "-f", "--", path]).map(|_| ())
+            return run_w(loc, &[], &["clean", "-f", "--", path]).map(|_| ());
+        }
+        // A staged-NEW file has no HEAD version to restore — discarding it
+        // means removing it (index + worktree), same net effect as `clean` on
+        // its untracked form. Probe HEAD first so a genuine checkout failure
+        // is never "recovered" by deleting the file.
+        let in_head = run_w(loc, &[], &["cat-file", "-e", &format!("HEAD:{path}")]).is_ok();
+        if in_head {
+            run_w(loc, &[], &["checkout", "HEAD", "--", path]).map(|_| ())
         } else {
-            run_w(loc, &[], &["checkout", "--", path]).map(|_| ())
+            run_w(loc, &[], &["rm", "-f", "--", path]).map(|_| ())
         }
     }
 

@@ -1,25 +1,20 @@
-//! The changes section: porcelain status rows with inline hunk previews
-//! (Normal/Half), and the full-width side-by-side diff of the selected file
-//! (Full — the former diff overlay).
+//! The changes section: porcelain status rows with inline hunk previews.
+//! At Full width the git-family frame (`gitfull`) renders instead — the old
+//! in-section side-by-side diff was unreachable there and has been removed.
 
-use thegn_core::diff_sbs::{CellKind, SbsCell, SbsFile};
 use thegn_core::theme::Hue;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::panel::docs::{diff_hunk_at, diff_hunk_starts};
-use crate::seg::{Line, Seg, Tok, seg, sp};
+use crate::seg::{Line, Seg, seg, sp};
 
 use crate::seg::seg_width;
 
 use super::{
-    ChangeRow, PanelHit, PanelRow, PanelUi, Section, SectionCtx, Stage, d, diffstat, f, g, g2, g3,
-    hint_row, hue, rule, spinner_row, split_bar, t,
+    ChangeRow, PanelHit, PanelRow, PanelUi, Section, SectionCtx, Stage, d, diffstat, f, g, g2,
+    hint_row, hue, split_bar, t,
 };
 
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
-    if ctx.full() {
-        return side_by_side(ctx);
-    }
     list(ctx)
 }
 
@@ -82,7 +77,12 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
         .is_some()
     {
         rows.push(PanelRow::blank());
-        rows.extend(impact_footer(data, ui, ctx.cols));
+        rows.extend(impact_footer(
+            data,
+            ui,
+            ctx.cols,
+            crate::panel::visible_change_files(data, deep),
+        ));
     }
     rows.push(PanelRow::blank());
     rows.push(if ui.impact_open {
@@ -138,14 +138,22 @@ pub(crate) fn impact_summary_segs(
 /// breakdown. The collapsed line is rebuilt from the structured per-file entity
 /// data (rather than the pre-baked `impact.summary` string) so it carries a clear
 /// `semantic` label and clips cleanly to the panel width instead of mid-word.
-fn impact_footer(data: &crate::panel::PanelData, ui: &PanelUi, cols: usize) -> Vec<PanelRow> {
+fn impact_footer(
+    data: &crate::panel::PanelData,
+    ui: &PanelUi,
+    cols: usize,
+    visible_files: usize,
+) -> Vec<PanelRow> {
     let Some(entities) = data.entities.as_ref() else {
         return Vec::new();
     };
     let mut rows: Vec<PanelRow> = Vec::new();
     let line = impact_summary_segs(entities, cols);
-    let mut footer = PanelRow::plain(Line::segs(line))
-        .with_hit(PanelHit::Row(Section::Changes, data.changes.len()));
+    // Hit index = one past the VISIBLE file rows (see `visible_change_files`),
+    // keeping the hit space contiguous while a merge's incoming block is
+    // collapsed.
+    let mut footer =
+        PanelRow::plain(Line::segs(line)).with_hit(PanelHit::Row(Section::Changes, visible_files));
     if ui.impact_open {
         footer = footer.with_bg(crate::seg::Tok::SelAccent);
     }
@@ -159,9 +167,9 @@ fn impact_footer(data: &crate::panel::PanelData, ui: &PanelUi, cols: usize) -> V
         seg(f(), "entity-level changes touched by this diff"),
     ])));
     // Each rendered entity row is actionable: its hit index runs sequentially
-    // past the footer (`changes.len()`), matching `EntitySummary::entity_targets`
+    // past the footer (`visible_files`), matching `EntitySummary::entity_targets`
     // one-for-one so the drill-in can map a cursor row back to its (file, line).
-    let base = data.changes.len() + 1;
+    let base = visible_files + 1;
     let mut ordinal = 0usize;
     for (path, changes) in &entities.per_file {
         if changes.is_empty() {
@@ -453,7 +461,14 @@ fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool, cols: usize) -> Vec<Pan
                 }
             }
         }
-        _ => rows.push(PanelRow::plain(Line::segs(vec![
+        // A FETCHED-but-empty entry is a real answer, not a pending one: a
+        // binary file, a mode-only change (`chmod +x`), or a diff error all
+        // yield zero textual hunks. Rendering those as "loading…" spun forever.
+        Some(_) => rows.push(PanelRow::plain(Line::segs(vec![
+            sp(1),
+            seg(g2(), "▾ no textual diff (binary or mode-only change)"),
+        ]))),
+        None => rows.push(PanelRow::plain(Line::segs(vec![
             sp(1),
             seg(g2(), "▾ loading hunks…"),
         ]))),
@@ -500,333 +515,14 @@ fn wrap_preview(tok: crate::seg::Tok, mark: &str, text: &str, cols: usize) -> Ve
     rows
 }
 
-// ---- Full: the side-by-side diff (the former diff overlay) -----------------
-
-/// One side of a side-by-side row, each visual row exactly `w` cells: 4-char
-/// line number + gutter + text, changed cells tinted across their full width.
-///
-/// Long text wraps onto continuation rows instead of being clipped: the first
-/// row shows the line number, continuations blank the gutter. Returns one entry
-/// per visual row (always at least one), so an absent cell yields a single
-/// blank `w`-cell row.
-fn diff_cell(cell: Option<&SbsCell>, w: usize, mask: Option<&[bool]>) -> Vec<Vec<Seg>> {
-    let Some(cell) = cell else {
-        return vec![vec![sp(w)]];
-    };
-    let (fg, hue_kind, bg) = match cell.kind {
-        CellKind::Context => (t(), None, None),
-        CellKind::Removed => (hue(Hue::Red), Some(Hue::Red), Some(Tok::Sel(Hue::Red, 14))),
-        CellKind::Added => (
-            hue(Hue::Green),
-            Some(Hue::Green),
-            Some(Tok::Sel(Hue::Green, 14)),
-        ),
-    };
-    let text_w = w.saturating_sub(5).max(1);
-    let chars: Vec<char> = cell.text.chars().collect();
-    let mut out: Vec<Vec<Seg>> = Vec::new();
-    let mut i = 0;
-    let mut first = true;
-    loop {
-        // Advance by *display* width, not char count: accumulate whole chars
-        // until the next would overflow the band (unicode-width invariant), so a
-        // wrapped chunk occupies exactly `text_w - pad` cells, never up to 2×.
-        let mut used = 0usize;
-        let mut end = i;
-        while end < chars.len() {
-            let cw = UnicodeWidthChar::width(chars[end]).unwrap_or(0);
-            if used + cw > text_w {
-                break;
-            }
-            used += cw;
-            end += 1;
-        }
-        // Guarantee progress if a single glyph is wider than the whole band.
-        if end == i && i < chars.len() {
-            used = UnicodeWidthChar::width(chars[i]).unwrap_or(0).min(text_w);
-            end = i + 1;
-        }
-        let pad = text_w.saturating_sub(used);
-        let no_text = if first {
-            format!("{:>4} ", cell.line_no)
-        } else {
-            "     ".to_string()
-        };
-        let mut no = seg(g3(), no_text);
-        if let Some(bg) = bg {
-            no = no.bg(bg);
-        }
-        let mut segs = vec![no];
-        match (mask, bg, hue_kind) {
-            // Word-level emphasis (item 601): split the wrapped chunk into runs
-            // by the changed-mask; changed runs get a brighter tint + bold.
-            (Some(mask), Some(base_bg), Some(kh)) => {
-                let emph_bg = Tok::Sel(kh, 22);
-                let mut j = i;
-                while j < end {
-                    let changed = mask.get(j).copied().unwrap_or(false);
-                    let mut k = j + 1;
-                    while k < end && mask.get(k).copied().unwrap_or(false) == changed {
-                        k += 1;
-                    }
-                    let run: String = chars[j..k].iter().collect();
-                    let mut s = seg(fg, run).bg(if changed { emph_bg } else { base_bg });
-                    if changed {
-                        s = s.bold();
-                    }
-                    segs.push(s);
-                    j = k;
-                }
-                if pad > 0 {
-                    segs.push(seg(fg, " ".repeat(pad)).bg(base_bg));
-                }
-            }
-            _ => {
-                let chunk: String = chars[i..end].iter().collect();
-                let mut body = seg(fg, format!("{chunk}{}", " ".repeat(pad)));
-                if let Some(bg) = bg {
-                    body = body.bg(bg);
-                }
-                segs.push(body);
-            }
-        }
-        out.push(segs);
-        first = false;
-        i = end;
-        if i >= chars.len() {
-            break;
-        }
-    }
-    out
-}
-
-/// Per-char "changed" mask aligned to a diff side's text — drives the
-/// word-level emphasis in [`diff_cell`] (item 601). Length equals the side's
-/// char count (the `word_diff` segments concatenate to the full text).
-fn changed_mask(segs: &[thegn_core::diff_highlight::WordSeg]) -> Vec<bool> {
-    let mut m = Vec::new();
-    for s in segs {
-        m.extend(std::iter::repeat_n(s.changed, s.text.chars().count()));
-    }
-    m
-}
-
-/// Per-char changed masks for a removed/added text pair, memoized across frames.
-///
-/// The word-level diff is a pure function of the two texts, but the side-by-side
-/// render path recomputes it on every Full frame (each scroll/keypress). This
-/// thread-local cache (the render loop is single-threaded) keys on the text pair
-/// so identical rows redrawn frame-to-frame hit the cache instead of re-running
-/// `similar`'s word diff. Bounded: cleared wholesale once it grows past a cap so
-/// a long editing session can't leak — the cache is a frame-cost optimization,
-/// not a correctness dependency.
-fn word_masks(old: &str, new: &str) -> (Vec<bool>, Vec<bool>) {
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-
-    // Cap chosen well above a viewport's worth of paired rows so scrolling never
-    // thrashes it; a wholesale clear on overflow keeps memory bounded without an
-    // LRU's per-entry bookkeeping.
-    const CAP: usize = 512;
-    // (old-side mask, new-side mask) for one paired diff row.
-    type WordMasks = (Vec<bool>, Vec<bool>);
-    thread_local! {
-        static MEMO: RefCell<HashMap<(String, String), WordMasks>> =
-            RefCell::new(HashMap::new());
-    }
-    MEMO.with(|memo| {
-        let key = (old.to_string(), new.to_string());
-        if let Some(hit) = memo.borrow().get(&key) {
-            return hit.clone();
-        }
-        let (os, ns) = thegn_core::diff_highlight::word_diff(old, new);
-        let masks = (changed_mask(&os), changed_mask(&ns));
-        let mut m = memo.borrow_mut();
-        if m.len() >= CAP {
-            m.clear();
-        }
-        m.insert(key, masks.clone());
-        masks
-    })
-}
-
-/// The flattened line at index `at`: a hunk header (one visual row) or an
-/// aligned old/new row pair. Long cells wrap, so a row pair can span several
-/// visual rows; the old and new sides wrap independently and stay column-locked
-/// (the shorter side blanks its trailing continuation rows). Always ≥ 1 row.
-fn diff_flat_line(file: &SbsFile, starts: &[usize], at: usize, side: usize) -> Vec<Line> {
-    let h = diff_hunk_at(starts, at);
-    let Some(hunk) = file.hunks.get(h) else {
-        return vec![Line::Blank];
-    };
-    let off = at - starts[h];
-    if off == 0 {
-        let mut segs = vec![seg(
-            f(),
-            format!("@@ -{} +{} @@", hunk.old_start, hunk.new_start),
-        )];
-        if !hunk.func.is_empty() {
-            segs.push(seg(g2(), format!(" {}", hunk.func)));
-        }
-        return vec![Line::segs(segs)];
-    }
-    let Some(row) = hunk.rows.get(off - 1) else {
-        return vec![Line::Blank];
-    };
-    // Word-level emphasis (item 601): only when a removed line is paired with
-    // an added line do we diff the two texts and emphasize just the changed
-    // runs. Pure add/del rows have nothing to diff against → no mask.
-    //
-    // The word-diff depends only on the two texts, but this runs on every Full
-    // frame while the side-by-side view is open (each keypress/scroll step is a
-    // legitimate Full frame the render_plan Skip/Panes gates can't elide), so we
-    // memoize the per-char masks by (old_text, new_text) to avoid recomputing
-    // byte-identical `similar` diffs each frame while scrolling a large diff.
-    let (old_mask, new_mask) = match (row.old.as_ref(), row.new.as_ref()) {
-        (Some(o), Some(n)) if o.kind == CellKind::Removed && n.kind == CellKind::Added => {
-            let (om, nm) = word_masks(&o.text, &n.text);
-            (Some(om), Some(nm))
-        }
-        _ => (None, None),
-    };
-    let old = diff_cell(row.old.as_ref(), side, old_mask.as_deref());
-    let new = diff_cell(row.new.as_ref(), side, new_mask.as_deref());
-    let n = old.len().max(new.len());
-    let blank = || vec![sp(side)];
-    (0..n)
-        .map(|k| {
-            let mut segs = old.get(k).cloned().unwrap_or_else(blank);
-            segs.push(seg(g3(), "│"));
-            segs.extend(new.get(k).cloned().unwrap_or_else(blank));
-            Line::segs(segs)
-        })
-        .collect()
-}
-
-fn side_by_side(ctx: &SectionCtx) -> Vec<PanelRow> {
-    let footer = hint_row(&[
-        ("[ ]", "hunk"),
-        ("j/k", "scroll"),
-        ("n/p", "file"),
-        ("space", "stage"),
-    ]);
-    let Some(doc) = &ctx.ui.docs.diff else {
-        return vec![
-            spinner_row(ctx.ui.docs.tick, "diff"),
-            PanelRow::blank(),
-            footer,
-        ];
-    };
-    if doc.file.hunks.is_empty() {
-        let msg = if doc.path.is_empty() {
-            "working tree clean".to_string()
-        } else {
-            format!("no unstaged changes in {}", doc.path)
-        };
-        return vec![
-            PanelRow::plain(Line::segs(vec![seg(d(), msg)])),
-            PanelRow::blank(),
-            footer,
-        ];
-    }
-
-    let starts = diff_hunk_starts(&doc.file);
-    let len = crate::panel::docs::diff_flat_len(&doc.file);
-    let hunk = ctx.ui.diff_hunk.min(starts.len() - 1);
-    let side = (ctx.cols.saturating_sub(1)) / 2;
-    let body = ctx.rows.saturating_sub(3); // header + rule + footer
-    let scroll = ctx.ui.scroll.min(len.saturating_sub(1));
-
-    let mut rows: Vec<PanelRow> = Vec::with_capacity(body + 3);
-    rows.push(PanelRow::plain(Line::split(
-        vec![seg(d(), doc.path.clone()).bold()],
-        vec![
-            seg(hue(Hue::Green), format!("+{}", doc.file.added)),
-            seg(g(), " "),
-            seg(hue(Hue::Red), format!("−{}", doc.file.deleted)),
-            seg(g(), format!(" · hunk {}/{}", hunk + 1, starts.len())),
-        ],
-    )));
-    rows.push(rule());
-    // Scroll stays in flat-line units (j/k and hunk-nav land on hunk starts);
-    // expand each flat line into its wrapped visual rows, stopping once the
-    // viewport is full. A flat line longer than the band shows its head and the
-    // tail spills below the fold — strictly better than the old hard clip.
-    let mut produced = 0;
-    let mut at = scroll;
-    while produced < body && at < len {
-        for line in diff_flat_line(&doc.file, &starts, at, side) {
-            if produced >= body {
-                break;
-            }
-            rows.push(PanelRow::plain(line));
-            produced += 1;
-        }
-        at += 1;
-    }
-    rows.push(footer);
-    rows
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn cell(line_no: u32, text: &str, kind: CellKind) -> SbsCell {
-        SbsCell {
-            line_no,
-            text: text.to_string(),
-            kind,
-        }
-    }
+    use crate::seg::Tok;
 
     /// Concatenated text of a built seg run, for asserting on rendered content.
     fn segs_text(segs: &[Seg]) -> String {
         segs.iter().map(|s| s.text.as_str()).collect()
-    }
-
-    #[test]
-    fn diff_cell_wraps_long_text_onto_continuation_rows() {
-        // side = 15 → text_w = 10. A 25-char line needs 3 rows.
-        let c = cell(7, "0123456789abcdefghijklmno", CellKind::Added);
-        let rows = diff_cell(Some(&c), 15, None);
-        assert_eq!(rows.len(), 3);
-        // First row carries the line number; continuations blank the gutter.
-        assert_eq!(segs_text(&rows[0]), "   7 0123456789");
-        assert_eq!(segs_text(&rows[1]), "     abcdefghij");
-        assert_eq!(segs_text(&rows[2]), "     klmno     ");
-        // Every visual row is exactly `side` cells wide.
-        for r in &rows {
-            assert_eq!(seg_width(r), 15);
-        }
-    }
-
-    #[test]
-    fn diff_cell_short_text_is_a_single_row() {
-        let c = cell(3, "hi", CellKind::Context);
-        let rows = diff_cell(Some(&c), 15, None);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(segs_text(&rows[0]), "   3 hi        ");
-        // Absent cell → one blank row of full width.
-        let blank = diff_cell(None, 15, None);
-        assert_eq!(blank.len(), 1);
-        assert_eq!(seg_width(&blank[0]), 15);
-    }
-
-    #[test]
-    fn diff_cell_wraps_wide_glyphs_by_display_width() {
-        // side = 15 → text_w = 10 cells. "你好" is 4 cells; five of them = 20
-        // cells → must wrap into 2 rows (5 glyphs per 10-cell band), and every
-        // visual row must be exactly `side` cells — NOT split mid-glyph or
-        // overflow (the char-count bug packed 10 wide chars = 20 cells per row).
-        let wide = "你好世界你好世界你好世界"; // 12 wide glyphs = 24 cells
-        let c = cell(2, wide, CellKind::Added);
-        let rows = diff_cell(Some(&c), 15, None);
-        // 24 cells / 10 per row = 3 rows (5 + 5 + 2 glyphs).
-        assert_eq!(rows.len(), 3, "wrapped by display width");
-        for r in &rows {
-            assert_eq!(seg_width(r), 15, "each visual row is exactly side cells");
-        }
     }
 
     #[test]
@@ -867,50 +563,6 @@ mod tests {
         );
         // A wide dir that *does* fit by display width passes through unchanged.
         assert_eq!(clip_dir_left("世/", 4, 10), "世/");
-    }
-
-    #[test]
-    fn word_masks_are_memoized_across_calls() {
-        // Same text pair twice returns identical masks (cache hit path), and the
-        // masks match the direct `changed_mask(word_diff(..))` computation.
-        let (o, n) = ("let a = 1;", "let a = 2;");
-        let (om1, nm1) = word_masks(o, n);
-        let (om2, nm2) = word_masks(o, n);
-        assert_eq!(om1, om2);
-        assert_eq!(nm1, nm2);
-        let (os, ns) = thegn_core::diff_highlight::word_diff(o, n);
-        assert_eq!(om1, changed_mask(&os));
-        assert_eq!(nm1, changed_mask(&ns));
-        // Mask length equals the side's char count.
-        assert_eq!(om1.len(), o.chars().count());
-        assert_eq!(nm1.len(), n.chars().count());
-    }
-
-    #[test]
-    fn diff_flat_line_locks_columns_when_sides_wrap_unevenly() {
-        let mut file = SbsFile::default();
-        file.hunks.push(thegn_core::diff_sbs::SbsHunk {
-            old_start: 1,
-            new_start: 1,
-            func: String::new(),
-            rows: vec![thegn_core::diff_sbs::SbsRow {
-                old: Some(cell(1, "short", CellKind::Removed)),
-                new: Some(cell(1, "0123456789abcdefghij", CellKind::Added)),
-            }],
-        });
-        let starts = diff_hunk_starts(&file);
-        // at=1 is the first row (at=0 is the hunk header). side=15 → text_w=10:
-        // old fits in 1 row, new needs 2 → the pair spans 2 column-locked rows.
-        let lines = diff_flat_line(&file, &starts, 1, 15);
-        assert_eq!(lines.len(), 2);
-        for line in &lines {
-            if let Line::Segs(segs) = line {
-                // 15 (old) + 1 (│ separator) + 15 (new) = 31 cells.
-                assert_eq!(seg_width(segs), 31);
-            } else {
-                panic!("expected Segs");
-            }
-        }
     }
 
     #[test]
@@ -1033,7 +685,7 @@ mod tests {
             impact_open: true,
             ..Default::default()
         };
-        let rows = impact_footer(&data, &ui, 44);
+        let rows = impact_footer(&data, &ui, 44, data.changes.len());
         for row in &rows {
             let mut s = Surface::new(44, 1);
             crate::seg::draw_line(

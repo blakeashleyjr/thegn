@@ -259,10 +259,17 @@ fn indent(line: Line) -> Line {
     }
 }
 
-/// One-row tab bar: `git  work  system` with the active tab accented.
+/// One-row tab bar: `git  work  system  help` with the active tab accented.
+/// Every tab `Tab`/`Shift-Tab` can cycle onto is rendered — an invisible tab
+/// made the 4th press look like a dead keystroke.
 fn tab_bar_row(ui: &PanelUi, focused: bool) -> (PanelRow, Vec<(std::ops::Range<usize>, PanelTab)>) {
     use crate::seg::{seg, sp};
-    let tabs = [PanelTab::Git, PanelTab::Work, PanelTab::System];
+    let tabs = [
+        PanelTab::Git,
+        PanelTab::Work,
+        PanelTab::System,
+        PanelTab::Help,
+    ];
     let mut segs = vec![sp(1)];
     let mut spans: Vec<(std::ops::Range<usize>, PanelTab)> = Vec::new();
     let mut col = 1usize; // column after the leading sp(1)
@@ -414,7 +421,29 @@ pub fn build_panel(
                 Some(hidden) => (granted.saturating_sub(1), Some(hidden)),
                 None => (granted, None),
             };
-            for row in content_raw.iter().take(shown) {
+            // Cursor-following window: when the section overflows the budget,
+            // shift the visible slice so the cursor's row stays on screen —
+            // without this the highlight walked past the fold and Enter acted
+            // on rows the user couldn't see. A scrolled window gives one of
+            // its granted rows to the "↑N above" indicator so the section
+            // never exceeds its budget.
+            let cursor_pos = content_raw
+                .iter()
+                .position(|r| r.hit == Some(PanelHit::Row(ui.open, ui.cursor)));
+            let (start, shown) = match cursor_pos {
+                Some(pos) if shown > 1 && pos >= shown => {
+                    let win = shown - 1; // one row goes to the indicator
+                    (pos + 1 - win, win)
+                }
+                _ => (0, shown),
+            };
+            if start > 0 {
+                out.push(PanelRow::plain(Line::segs(vec![
+                    sp(4),
+                    seg(Tok::Slot(S::Ghost2), format!("… ↑{start} above")),
+                ])));
+            }
+            for row in content_raw.iter().skip(start).take(shown) {
                 let mut r = row.clone();
                 r.line = indent(r.line);
                 // The row-mode cursor: highlight the actionable row the panel
@@ -426,11 +455,12 @@ pub fn build_panel(
                 }
                 out.push(r);
             }
-            if let Some(hidden) = more {
+            let below = content_raw.len().saturating_sub(start + shown);
+            if more.is_some() && below > 0 {
                 out.push(
                     PanelRow::plain(Line::segs(vec![
                         sp(4),
-                        seg(Tok::Slot(S::Ghost2), format!("… +{hidden} more · e expand")),
+                        seg(Tok::Slot(S::Ghost2), format!("… +{below} more · e expand")),
                     ]))
                     .with_hit(PanelHit::Expand),
                 );
@@ -580,15 +610,33 @@ fn build_full(
         out.push(r);
     };
     if content.len() > plan.body_rows {
-        let shown = plan.body_rows.saturating_sub(1);
-        let hidden = content.len() - shown;
-        for row in content.into_iter().take(shown) {
-            push_row(&mut out, row);
-        }
-        if plan.body_rows > 0 {
+        // Same cursor-following window as the accordion layout: keep the
+        // highlighted row on screen instead of always rendering the head.
+        let mut shown = plan.body_rows.saturating_sub(1);
+        let cursor_pos = content
+            .iter()
+            .position(|r| r.hit == Some(PanelHit::Row(ui.open, ui.cursor)));
+        let start = match cursor_pos {
+            Some(pos) if shown > 1 && pos >= shown => {
+                shown -= 1; // one row goes to the "↑N above" indicator
+                pos + 1 - shown
+            }
+            _ => 0,
+        };
+        if start > 0 {
             out.push(PanelRow::plain(Line::segs(vec![
                 sp(1),
-                seg(Tok::Slot(S::Ghost2), format!("… +{hidden} more")),
+                seg(Tok::Slot(S::Ghost2), format!("… ↑{start} above")),
+            ])));
+        }
+        let below = content.len().saturating_sub(start + shown);
+        for row in content.into_iter().skip(start).take(shown) {
+            push_row(&mut out, row);
+        }
+        if plan.body_rows > 0 && below > 0 {
+            out.push(PanelRow::plain(Line::segs(vec![
+                sp(1),
+                seg(Tok::Slot(S::Ghost2), format!("… +{below} more")),
             ])));
         }
     } else {
@@ -614,6 +662,18 @@ pub fn section_rows(
     cols: usize,
     rows: usize,
 ) -> usize {
+    // At Full width the git-family sections are rendered by the lazygit frame
+    // (`gitfull::build_git_full`, see `build_panel`), NOT by
+    // `sections::content` — counting the accordion renderer's hits here
+    // reported 0 for Changes (whose accordion Full body has no hit rows), so
+    // `j`/`k` left the section and every action targeted row 0. Count the same
+    // display space the git frame renders and `gitui::source_at` consumes.
+    if ui.width == crate::layout::PanelWidth::Full
+        && section.is_git_family()
+        && let Some(view) = section.home_view()
+    {
+        return super::gitui::display_map(&ui.git, view, &model.panel).len();
+    }
     // Subtract 1 for the tab bar row in the row estimate.
     let ctx = section_ctx(model, ui, cols, rows.saturating_sub(1), 4);
     sections::content(section, &ctx)

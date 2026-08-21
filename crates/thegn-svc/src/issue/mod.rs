@@ -56,6 +56,18 @@ impl From<reqwest::Error> for IssueError {
     }
 }
 
+/// Parse a provider due date into unix milliseconds: date-only `YYYY-MM-DD`
+/// (Linear `dueDate`, Jira `duedate`) resolves to midnight UTC of that day;
+/// full RFC3339 timestamps (Kaneo) pass through. `None` on anything else.
+pub(crate) fn parse_due_date_ms(s: &str) -> Option<i64> {
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(d.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis());
+    }
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
 /// Provider-agnostic issue tracker seam.
 #[allow(async_fn_in_trait)]
 pub trait IssueBackend: Send + Sync {
@@ -268,13 +280,26 @@ pub struct IssueRouter {
 
 impl IssueRouter {
     pub fn from_config(cfg: &IssuesConfig) -> Self {
+        Self::from_config_at(cfg, None)
+    }
+
+    /// Like [`from_config`](Self::from_config), but anchors subprocess-backed
+    /// providers (GitHub's `gh`) to `dir` so calls without an explicit `--repo`
+    /// resolve against that worktree instead of the process cwd. Callers
+    /// fetching for a specific worktree should prefer this.
+    pub fn from_config_at(cfg: &IssuesConfig, dir: Option<&std::path::Path>) -> Self {
         let inner = cfg
             .active_accounts()
             .into_iter()
             .filter_map(|acct| {
-                RouterInner::from_account(&acct).map(|inner| AccountBackend {
-                    account: acct.name,
-                    inner,
+                RouterInner::from_account(&acct).map(|mut inner| {
+                    if let RouterInner::Github(b) = &mut inner {
+                        b.set_dir(dir.map(std::path::Path::to_path_buf));
+                    }
+                    AccountBackend {
+                        account: acct.name,
+                        inner,
+                    }
                 })
             })
             .collect();
@@ -505,5 +530,19 @@ mod spec {
         assert!(r.backend_for_id("github:42").is_none());
         // A bare id with no prefix also routes nowhere.
         assert!(r.backend_for_id("nonsense").is_none());
+    }
+
+    #[test]
+    fn parse_due_date_ms_handles_date_only_and_rfc3339() {
+        // Date-only (Linear dueDate / Jira duedate) => midnight UTC.
+        assert_eq!(parse_due_date_ms("2026-08-20"), Some(1_787_184_000_000));
+        // Full RFC3339 (Kaneo) passes through.
+        assert_eq!(
+            parse_due_date_ms("2026-08-20T12:30:00Z"),
+            Some(1_787_229_000_000)
+        );
+        // Garbage => None.
+        assert_eq!(parse_due_date_ms("someday"), None);
+        assert_eq!(parse_due_date_ms(""), None);
     }
 }

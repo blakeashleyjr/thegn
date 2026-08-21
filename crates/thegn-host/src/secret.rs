@@ -41,11 +41,44 @@ pub fn resolve(secret_ref: &str) -> Option<String> {
     std::env::var(r).ok().filter(|s| !s.trim().is_empty())
 }
 
+/// TTL-memoized PRESENCE check for the hydration path: `env_snapshots` asks
+/// "does a token resolve?" for every provider env on every hydration (~5s
+/// cadence), and a `keyring:` ref costs a real Secret Service / Keychain
+/// round-trip each time (continuous Keychain traffic on macOS; a DBus timeout
+/// per env on a locked/absent Secret Service). Caches only the boolean —
+/// never the secret value — for 60s. [`store`]/[`forget`] clear the memo.
+pub fn resolve_present_cached(secret_ref: &str) -> bool {
+    use std::time::{Duration, Instant};
+    let now = Instant::now();
+    if let Ok(mut guard) = presence_memo().lock() {
+        if let Some((v, at)) = guard.get(secret_ref)
+            && now.duration_since(*at) < Duration::from_secs(60)
+        {
+            return *v;
+        }
+        let v = resolve(secret_ref).is_some();
+        guard.insert(secret_ref.to_string(), (v, now));
+        return v;
+    }
+    resolve(secret_ref).is_some()
+}
+
+fn presence_memo()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>> {
+    static MEMO: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>>,
+    > = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Persist a UI/CLI-entered `token` for `name` (e.g. an env name like `fly-dev`),
 /// preferring the OS keyring and falling back to a `0600` file. Returns the
 /// SecretRef to store in config (`keyring:<name>` or `file:<path>`), so the token
 /// itself never lands in `config.toml`.
 pub fn store(name: &str, token: &str) -> Result<String> {
+    if let Ok(mut m) = presence_memo().lock() {
+        m.clear();
+    }
     if keyring_set(name, token).is_ok() {
         return Ok(format!("keyring:{name}"));
     }
@@ -57,6 +90,9 @@ pub fn store(name: &str, token: &str) -> Result<String> {
 /// Remove a stored secret (best-effort, both backends) — used when an env is
 /// deleted. Never errors on a missing entry.
 pub fn forget(name: &str) {
+    if let Ok(mut m) = presence_memo().lock() {
+        m.clear();
+    }
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, name) {
         let _ = entry.delete_credential();
     }

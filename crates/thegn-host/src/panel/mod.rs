@@ -34,7 +34,7 @@ pub mod staging;
 
 use termwiz::input::{KeyCode, Modifiers};
 
-/// The three top-level panel tabs that group sections by concern.
+/// The four top-level panel tabs that group sections by concern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelTab {
     /// Git operations: Changes, Commits, Branches, Stash, Files.
@@ -108,7 +108,7 @@ pub enum PanelHit {
 }
 
 /// One of the accordion sections, in built-in display order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Section {
     #[default]
     Changes,
@@ -344,7 +344,32 @@ pub fn resolve_order(cfg: &thegn_core::config::Config) -> Vec<Section> {
     if out.is_empty() {
         out.extend(SECTION_ORDER);
     }
+    // `[media] enabled = false` (the default) hides the Media section — its
+    // doc always claimed this, but nothing filtered it, so a never-configured
+    // feature rendered a section whose every affordance was dead. An explicit
+    // `[panel] sections` listing "media" still keeps it (user's call).
+    if !cfg.media.enabled && !cfg.panel.sections.iter().any(|k| k == "media") {
+        out.retain(|s| *s != Section::Media);
+    }
     out
+}
+
+/// The Changes section's FILE-row count in its current view: all rows when
+/// deep (Half/Full), only the local (non-incoming) rows at the resting width,
+/// where a live merge's incoming block is collapsed behind its divider. The
+/// cursor space is file rows `0..N`, the semantic footer at `N`, entity rows
+/// past it — every consumer (renderer hits, Enter/click dispatch, the stage
+/// toggle, the git-key guard) derives its boundaries from THIS count. Locals
+/// sort before incoming (`build_change_rows`), so visible file row `i` is
+/// always source index `i`. Pinning the footer at `changes.len()` while the
+/// incoming rows were skipped left holes in the hit space: the cursor could
+/// sit on (and stage) an invisible incoming file.
+pub fn visible_change_files(data: &PanelData, deep: bool) -> usize {
+    if deep {
+        data.changes.len()
+    } else {
+        data.changes.iter().filter(|c| !c.incoming).count()
+    }
 }
 
 /// Where a changed file sits in the index.
@@ -580,6 +605,11 @@ pub struct PanelData {
     /// The Files section renders this as a collapsible tree with changed-file
     /// highlights drawn from `changes`.
     pub all_files: Vec<String>,
+    /// The pre-built display tree for `all_files`, computed OFF-LOOP during
+    /// hydration. The renderer and the Files key handlers reuse it instead of
+    /// re-sorting the whole `ls-files` output on every frame and keypress
+    /// (which visibly stalled the loop on monorepos).
+    pub file_tree: Vec<FileEntry>,
     /// Local branches with upstream/divergence + PR badges (branches section).
     pub branches: Vec<BranchRow>,
     /// Structured recent commits (commits section + graph feed). Loaded from
@@ -606,6 +636,16 @@ pub struct PanelData {
     /// Unified cross-repo "My Work" feed (the `Mine` section), loaded from the
     /// `my_work_cache` DB row. Spans every repo, not just the active worktree.
     pub my_work: Vec<thegn_core::work::WorkRow>,
+    /// Aggregator note for the `Mine` section (e.g. "repo scope unavailable —
+    /// no `origin` remote"); "" = nothing to surface.
+    pub my_work_note: String,
+    /// The repo's open PRs (from the repo-keyed `pr_branch_cache`, i.e.
+    /// `gh pr list`): the `pr` section's OPEN PRS block and the branch-row
+    /// badges both read this.
+    pub open_prs: Vec<thegn_core::github::PrHeader>,
+    /// When `open_prs` was fetched — stale rows get an age tag so an offline
+    /// cache never masquerades as live PR state.
+    pub open_prs_fetched_at: Option<i64>,
     /// Neutral unread notification count (Alert + Notice priority; Info excluded).
     /// Drives the dim "N unread" badge.
     pub unread_notifications: usize,
@@ -701,12 +741,11 @@ pub fn build_file_tree(paths: &[String]) -> Vec<FileEntry> {
     let mut out: Vec<FileEntry> = Vec::new();
     let mut sorted: Vec<&String> = paths.iter().filter(|p| !p.is_empty()).collect();
     // Order directories before their contents and group siblings: comparing
-    // component-wise on the split path achieves both with plain sort.
-    sorted.sort_by(|a, b| {
-        a.split('/')
-            .collect::<Vec<_>>()
-            .cmp(&b.split('/').collect::<Vec<_>>())
-    });
+    // component-wise achieves both with plain sort. Compare the split
+    // ITERATORS — the old per-comparison `collect::<Vec<_>>()` allocated two
+    // vectors per comparison (~millions of transient allocs sorting a
+    // monorepo's ls-files, on every rebuild).
+    sorted.sort_by(|a, b| a.split('/').cmp(b.split('/')));
     sorted.dedup();
     let mut known_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for path in sorted {
@@ -758,6 +797,40 @@ pub fn file_tree_visible<'a>(
             true
         })
         .collect()
+}
+
+/// Like [`file_tree_visible`] but additionally narrowed by a case-insensitive
+/// path filter: a FILE survives when its path contains the query; a DIR
+/// survives when any descendant file matches, so the tree shape stays
+/// navigable while filtered. Empty/whitespace filter ⇒ identical to
+/// [`file_tree_visible`]. Shared by the Files renderer AND `file_entry_at`
+/// (the one-list rule): a click/Enter always lands on the row the user sees.
+pub fn file_tree_visible_filtered<'a>(
+    tree: &'a [FileEntry],
+    collapsed: &std::collections::HashSet<String>,
+    filter: &str,
+) -> Vec<(usize, &'a FileEntry)> {
+    let q = filter.trim().to_lowercase();
+    if q.is_empty() {
+        return file_tree_visible(tree, collapsed);
+    }
+    file_tree_visible(tree, collapsed)
+        .into_iter()
+        .filter(|(_, e)| {
+            if e.is_dir {
+                let prefix = format!("{}/", e.path);
+                tree.iter()
+                    .any(|o| !o.is_dir && o.path.starts_with(&prefix) && matches_q(&o.path, &q))
+            } else {
+                matches_q(&e.path, &q)
+            }
+        })
+        .collect()
+}
+
+/// Case-insensitive substring match on a repo-relative path.
+fn matches_q(path: &str, q_lower: &str) -> bool {
+    path.to_lowercase().contains(q_lower)
 }
 
 /// An inline file view shown in the Files section (full pane): the contents of
@@ -841,8 +914,6 @@ pub struct PanelUi {
     /// Scroll offset for the tall full-view bodies (sbs diff, git log, the
     /// cheatsheet). Reset on section open and width cycle.
     pub scroll: usize,
-    /// Current hunk in the changes section's full side-by-side view.
-    pub diff_hunk: usize,
     /// Loop-fetched documents the section bodies render from.
     pub docs: docs::PanelDocs,
     /// The git-family interaction state (lazygit contexts, marks, flows).
@@ -851,6 +922,11 @@ pub struct PanelUi {
     /// Persisted to the DB (`ui_state` table, prefix `panel.files.col/`) so the
     /// tree survives restarts.
     pub files_collapsed: std::collections::HashSet<String>,
+    /// Per-section width memory: each section reopens at the width it was last
+    /// used at (persisted under ui_state scope `panel.width`). Widening the
+    /// notifications inbox to read a message no longer leaves the CHANGES
+    /// section at Full when you hop back.
+    pub section_widths: std::collections::HashMap<Section, crate::layout::PanelWidth>,
     /// When set, the Files section shows this file's contents inline (full
     /// pane) instead of the tree — `enter` on a file opens it, `esc` closes it.
     /// Populated off-thread by the file-read worker.
@@ -888,6 +964,10 @@ pub struct PanelUi {
     pub logs_level: Option<thegn_core::log_view::LogLevel>,
     /// When true, the cursor auto-jumps to the newest line on each hydration.
     pub logs_tail: bool,
+    /// Active free-text filter query for the Files section's tree (`/` mode).
+    pub files_filter: String,
+    /// True while the Files section's filter field is being edited.
+    pub files_filter_editing: bool,
 }
 
 impl Default for PanelUi {
@@ -906,10 +986,10 @@ impl Default for PanelUi {
             hunks: std::collections::HashMap::new(),
             hunks_gen: 0,
             scroll: 0,
-            diff_hunk: 0,
             docs: docs::PanelDocs::default(),
             git: gitui::GitUi::default(),
             files_collapsed: std::collections::HashSet::new(),
+            section_widths: std::collections::HashMap::new(),
             file_preview: None,
             problems_cursor: 0,
             symbols_cursor: 0,
@@ -927,6 +1007,8 @@ impl Default for PanelUi {
             logs_filter_editing: false,
             logs_level: None,
             logs_tail: true,
+            files_filter: String::new(),
+            files_filter_editing: false,
         }
     }
 }
@@ -947,6 +1029,7 @@ impl PanelUi {
         debug_assert!(!order.is_empty());
         self.order = order;
         self.ensure_open_valid();
+        self.recall_width();
     }
 
     /// Switch to a different top-level tab; snaps `open` to the first section
@@ -956,6 +1039,22 @@ impl PanelUi {
         self.row_mode = false;
         self.cursor = 0;
         self.ensure_open_valid();
+        self.recall_width();
+    }
+
+    /// Record the current width as the open section's preference (called on
+    /// every width change so the memory tracks what the user last chose).
+    pub fn remember_width(&mut self) {
+        self.section_widths.insert(self.open, self.width);
+    }
+
+    /// Snap to the open section's remembered width (no-op for a section never
+    /// widened — it keeps whatever width is live, matching the old behavior
+    /// for fresh sections).
+    pub fn recall_width(&mut self) {
+        if let Some(w) = self.section_widths.get(&self.open) {
+            self.width = *w;
+        }
     }
 
     /// Open a section, keeping the visible tab in step with it. Row navigation
@@ -967,6 +1066,12 @@ impl PanelUi {
     pub fn open_section(&mut self, s: Section) {
         self.open = s;
         self.tab = s.tab();
+        // A hotkey (open-ci, open-shares, …) can request a section the user
+        // hid via `[panel] sections`. Opening it anyway left the panel with
+        // NOTHING rendered and dead j/k (the frame only renders sections in
+        // the live order) — snap to the tab's first visible section instead.
+        self.ensure_open_valid();
+        self.recall_width();
     }
 
     /// Ensure `open` is a section that belongs to the current tab and exists
@@ -1145,6 +1250,9 @@ pub enum PanelMsg {
     Select,
     /// `e`: cycle the view width (Normal → Half → Full).
     ToggleExpand,
+    /// `E`: the reverse width cycle (Full → Half → Normal). Unavailable in
+    /// the Commits row-mode, where the git table claims `E` for edit-rebase.
+    ShrinkExpand,
     /// Space in the changes section: stage/unstage the selected file.
     StageToggle,
     /// `[`/`]` or Alt+1/2/3: switch the active top-level tab.
@@ -1166,6 +1274,29 @@ pub enum PanelMsg {
 /// intercepted by the event loop before reaching this function (the loop
 /// handles them with panel priority so they shadow the global pin-summon
 /// shortcuts). Within a tab, `1..=N` jump to that tab's N-th section.
+impl PanelUi {
+    /// Mirror the accordion cursor into the per-section cursors that dispatch
+    /// reads: the git view cursor (`git.cur`) plus the notifications / logs /
+    /// jobs / symbols / problems cursors. EVERY write to `self.cursor` must be
+    /// followed by this call — a highlight that moves without it leaves the
+    /// action keys pointing at a different row than the one on screen (the
+    /// audit's "clicked file 7, staged file 0 / deleted the wrong branch"
+    /// class). Centralised so a new cursor-write site can't forget a mirror.
+    pub fn sync_section_cursors(&mut self) {
+        if let Some(v) = self.open.home_view() {
+            self.git.cur.set(v, self.cursor);
+        }
+        match self.open {
+            Section::Notifications => self.notifications_cursor = self.cursor,
+            Section::Logs => self.logs_cursor = self.cursor,
+            Section::Jobs => self.tasks_cursor = self.cursor,
+            Section::Symbols => self.symbols_cursor = self.cursor,
+            Section::Problems => self.problems_cursor = self.cursor,
+            _ => {}
+        }
+    }
+}
+
 pub fn accordion_key(key: &KeyCode, mods: Modifiers, ui: &PanelUi) -> Option<PanelMsg> {
     let shift = mods.contains(Modifiers::SHIFT);
     let alt = mods.contains(Modifiers::ALT);
@@ -1174,10 +1305,22 @@ pub fn accordion_key(key: &KeyCode, mods: Modifiers, ui: &PanelUi) -> Option<Pan
     // the same wherever the panel is. Digits index the ACTIVE TAB's sections.
     match key {
         KeyCode::Char('e') => return Some(PanelMsg::ToggleExpand),
+        // Reverse cycle — reaches Normal from Half without a trip through
+        // Full. (Commits row-mode never sees this: its git table claims `E`
+        // first for edit-rebase.)
+        KeyCode::Char('E') => return Some(PanelMsg::ShrinkExpand),
         KeyCode::Char(c @ '1'..='9') if !alt => {
             let idx = (*c as usize) - ('1' as usize);
             let tab_secs = ui.tab_sections();
             if let Some(&s) = tab_secs.get(idx) {
+                return Some(PanelMsg::Open(s));
+            }
+        }
+        // `0` = the 10th section: the Work and System tabs both hold ten, and
+        // the section headers number them 1..10 — without this the advertised
+        // `10` jump had no key.
+        KeyCode::Char('0') if !alt => {
+            if let Some(&s) = ui.tab_sections().get(9) {
                 return Some(PanelMsg::Open(s));
             }
         }
@@ -1227,6 +1370,38 @@ mod tests {
         assert_eq!(Section::from_key("git"), Some(Section::Pr));
         assert_eq!(Section::from_key("tasks"), Some(Section::Jobs));
         assert_eq!(Section::from_key("nope"), None);
+    }
+
+    #[test]
+    fn width_memory_recalls_per_section_and_cycles_back() {
+        use crate::layout::PanelWidth;
+        let mut ui = PanelUi {
+            open: Section::Logs,
+            width: PanelWidth::Full,
+            ..Default::default()
+        };
+        ui.remember_width();
+        ui.open = Section::Ci;
+        ui.width = PanelWidth::Normal;
+        ui.remember_width();
+        // Hopping back to a remembered section restores ITS width.
+        ui.open = Section::Logs;
+        ui.recall_width();
+        assert_eq!(ui.width, PanelWidth::Full);
+        ui.open = Section::Ci;
+        ui.recall_width();
+        assert_eq!(ui.width, PanelWidth::Normal);
+        // A section with no memory keeps the current width.
+        ui.open = Section::Jobs;
+        ui.recall_width();
+        assert_eq!(ui.width, PanelWidth::Normal);
+        // E (shrink) walks the cycle backwards; e forwards — round trip.
+        assert_eq!(PanelWidth::Full.cycle_back(), PanelWidth::Half);
+        assert_eq!(PanelWidth::Half.cycle_back(), PanelWidth::Normal);
+        assert_eq!(PanelWidth::Normal.cycle_back(), PanelWidth::Full);
+        for w in [PanelWidth::Normal, PanelWidth::Half, PanelWidth::Full] {
+            assert_eq!(w.cycle().cycle_back(), w);
+        }
     }
 
     #[test]
@@ -1585,6 +1760,41 @@ mod tests {
                 ("src/main.rs".into(), 1, false),
             ]
         );
+    }
+
+    #[test]
+    fn file_tree_filter_keeps_dirs_with_matching_descendants() {
+        let paths = vec![
+            "src/main.rs".to_string(),
+            "README.md".to_string(),
+            "src/cmd/pr.rs".to_string(),
+            "src/cmd/diff.rs".to_string(),
+        ];
+        let tree = build_file_tree(&paths);
+        let none = std::collections::HashSet::new();
+
+        // Empty filter ⇒ identical to the unfiltered list.
+        assert_eq!(
+            file_tree_visible_filtered(&tree, &none, "  ").len(),
+            file_tree_visible(&tree, &none).len()
+        );
+        // "pr" matches src/cmd/pr.rs — its ancestor dirs survive, the
+        // non-matching files and README don't.
+        let vis = file_tree_visible_filtered(&tree, &none, "pr");
+        let got: Vec<&str> = vis.iter().map(|(_, e)| e.path.as_str()).collect();
+        assert_eq!(got, vec!["src", "src/cmd", "src/cmd/pr.rs"]);
+        // Case-insensitive; matches anywhere in the path.
+        let vis = file_tree_visible_filtered(&tree, &none, "ReadMe");
+        assert_eq!(vis.len(), 1);
+        assert_eq!(vis[0].1.path, "README.md");
+        // A collapsed ancestor still hides its subtree under a filter.
+        let mut collapsed = std::collections::HashSet::new();
+        collapsed.insert("src".to_string());
+        let vis = file_tree_visible_filtered(&tree, &collapsed, "pr");
+        let got: Vec<&str> = vis.iter().map(|(_, e)| e.path.as_str()).collect();
+        assert_eq!(got, vec!["src"]);
+        // No match at all ⇒ empty (the renderer shows its empty-state row).
+        assert!(file_tree_visible_filtered(&tree, &none, "zzz").is_empty());
     }
 
     #[test]

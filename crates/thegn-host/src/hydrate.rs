@@ -1424,15 +1424,24 @@ fn glyph_persist_entry(path: &str, row: &GlyphRow) -> (String, String) {
 fn worktree_loc(
     db: &thegn_core::db::Db,
     path: &std::path::Path,
+    files_open: bool,
 ) -> Option<thegn_core::loc::LocReport> {
     use thegn_core::loc::LocReport;
     const TTL_SECS: i64 = 300;
     let key = path.to_string_lossy().into_owned();
-    if let Ok(Some((json, fetched_at))) = db.get_loc_cache_entry(&key)
+    let cached = db.get_loc_cache_entry(&key).ok().flatten();
+    if let Some((json, fetched_at)) = &cached
         && now_secs() - fetched_at < TTL_SECS
-        && let Ok(report) = serde_json::from_str::<LocReport>(&json)
+        && let Ok(report) = serde_json::from_str::<LocReport>(json)
     {
         return Some(report);
+    }
+    // The tokei walk is a synchronous full-tree scan that stalls the whole
+    // hydration pass on big repos — pay it only while the Files section (its
+    // consumer) is actually open; otherwise serve whatever the cache holds,
+    // however old.
+    if !files_open {
+        return cached.and_then(|(json, _)| serde_json::from_str::<LocReport>(&json).ok());
     }
     let report = crate::loc_scan::scan(path);
     if let Ok(json) = serde_json::to_string(&report) {
@@ -1474,7 +1483,10 @@ pub(crate) fn build_initial_model(
         active_tab,
         sidebar_workspaces,
         sidebar_window_titles,
-        active_container_name: thegn_core::sandbox::container_name(&cwd.to_string_lossy()),
+        active_container_name: thegn_core::sandbox::container_name_with_profile(
+            &cwd.to_string_lossy(),
+            Some(&thegn_core::profile::name()),
+        ),
         panel: crate::panel::PanelData {
             branch: active_name,
             ..Default::default()
@@ -1523,10 +1535,6 @@ impl HydrateHints {
         self.open == crate::panel::Section::Commits || (self.expanded && self.open.is_git_family())
     }
 
-    fn visible_commit_limit(&self) -> usize {
-        if self.expanded { 80 } else { 20 }
-    }
-
     /// The hints every switch-time hydration/prefetch builds identically: open
     /// section, expanded width, active profile (`warm_commits` stays per-call).
     pub(crate) fn for_switch(ui: &crate::panel::PanelUi, cfg: &thegn_core::config::Config) -> Self {
@@ -1554,15 +1562,25 @@ fn commit_cache_needs_refresh(cache: Option<&(String, i64)>) -> bool {
         || thegn_core::util::now().saturating_sub(*fetched_at) >= COMMIT_CACHE_TTL_SECS
 }
 
+// Closed-summary staleness bound: the collapsed `commits` row shows the latest
+// sha + subject from this cache; refreshing it only on a COLD miss left that
+// row unboundedly stale (a commit made in a terminal pane never appeared until
+// the section was opened). One `git log -80` a minute is cheap.
+const COMMIT_SUMMARY_TTL_SECS: i64 = 60;
+
 /// Whether to (re)build the commit list this pass. An on-screen Commits section
 /// refreshes on the TTL; a `warm_git_summaries` pass (closed summary) reloads
-/// only on a *cold* miss, so the ticker never re-runs `git log` for a section
-/// nobody's looking at. Pure — unit-tested.
+/// on a cold miss or once its own (longer) TTL lapses. Pure — unit-tested.
 fn commit_load_needed(commits_open: bool, cache: Option<&(String, i64)>) -> bool {
     if commits_open {
         commit_cache_needs_refresh(cache)
     } else {
-        cache.is_none()
+        match cache {
+            None => true,
+            Some((_, fetched_at)) => {
+                thegn_core::util::now().saturating_sub(*fetched_at) >= COMMIT_SUMMARY_TTL_SECS
+            }
+        }
     }
 }
 
@@ -1594,8 +1612,25 @@ fn refresh_commit_cache(db: &thegn_core::db::Db, session: &crate::session::Sessi
         return false;
     }
     let loc = GitLoc::for_worktree(&cwd);
-    let Ok(rows) = CliGit.log_commits(&loc, 80) else {
-        return false;
+    let rows = match CliGit.log_commits(&loc, 80) {
+        Ok(rows) => rows,
+        Err(_) => {
+            // Distinguish "no commits yet" (unborn HEAD — `git log` exits 128
+            // on a fresh `git init`) from a transient failure: write an EMPTY
+            // cache row for the former so the section renders "no commits"
+            // instead of spinning "loading commits…" forever while respawning
+            // a doomed `git log` every tick. A transient failure leaves the
+            // cache alone (stale beats blank).
+            let unborn = loc
+                .git_out(&["rev-parse", "--verify", "HEAD"])
+                .is_none_or(|s| s.trim().is_empty());
+            if unborn {
+                return db
+                    .put_commit_cache(&GitLoc::worktree_cache_key(&cwd), "[]")
+                    .is_ok();
+            }
+            return false;
+        }
     };
     let rows: Vec<crate::panel::CommitRow> = rows
         .into_iter()
@@ -1611,7 +1646,10 @@ fn refresh_commit_cache(db: &thegn_core::db::Db, session: &crate::session::Sessi
         .collect();
     serde_json::to_string(&rows)
         .ok()
-        .and_then(|json| db.put_commit_cache(&loc.path(), &json).ok())
+        .and_then(|json| {
+            db.put_commit_cache(&GitLoc::worktree_cache_key(&cwd), &json)
+                .ok()
+        })
         .is_some()
 }
 
@@ -1744,10 +1782,9 @@ pub(crate) fn build_model(
     // shared thegn.log tail to this worktree's + host-global lines by default.
     crate::panel::scope::set_active_wt_tag(&thegn_core::log_trace::wt_slug(&cwd));
 
-    // Single layered-config load reused for notification priority + tasks below.
-    let app_cfg =
-        thegn_core::config::Config::try_load_layered(&thegn_core::config::ProcessEnv, &[], None)
-            .unwrap_or_default();
+    // Single layered-config load reused for notification priority + tasks below
+    // (CLI overrides + DB-defined hosts included — see `load_hydration_config`).
+    let app_cfg = load_hydration_config();
     let alert_kinds = app_cfg.notifications.alert_kind_names();
     let counted_kinds = app_cfg.notifications.counted_unread_kind_names();
 
@@ -1788,7 +1825,7 @@ pub(crate) fn build_model(
     crate::fly_reaper::tick(&app_cfg);
     crate::placement_flow::maintain_tick(&app_cfg);
     crate::hibernator::tick(session, &app_cfg);
-    let loc_count = worktree_loc(db, &cwd);
+    let loc_count = worktree_loc(db, &cwd, hints.open == crate::panel::Section::Files);
 
     // Terse placement kind (ssh/mosh/k8s/<provider>) for the active worktree's
     // tab bar; pure config resolve, canonical repo_root from the sidebar list.
@@ -1921,8 +1958,11 @@ pub(crate) fn build_model(
             .map(|&(total, _)| total.max(0) as u64),
         sidebar_status,
         loc: loc_count,
+        // Host-path identity, never `loc.path()`: a provider worktree's
+        // in-sandbox path (`/workspace`) is shared by every provider worktree,
+        // so both the container name and the audit-event key collided.
         active_container_name: thegn_core::sandbox::container_name_with_profile(
-            &loc.path(),
+            &thegn_core::remote::GitLoc::worktree_cache_key(&cwd),
             if hints.profile.is_empty() {
                 None
             } else {
@@ -1936,11 +1976,14 @@ pub(crate) fn build_model(
         // (run.rs) rather than inline here, to avoid blocking model hydration
         // on `podman ps` subprocess calls.
         containers: vec![],
-        container_events: db.container_events(&loc.path(), 10).unwrap_or_default(),
+        container_events: db
+            .container_events(&thegn_core::remote::GitLoc::worktree_cache_key(&cwd), 10)
+            .unwrap_or_default(),
         // Unified timeline: sandbox audit events, newest-first. A small
         // off-loop read on the hydration thread (never the event loop).
         timeline: thegn_core::models::merge_timeline(
-            &db.container_events(&loc.path(), 20).unwrap_or_default(),
+            &db.container_events(&thegn_core::remote::GitLoc::worktree_cache_key(&cwd), 20)
+                .unwrap_or_default(),
             20,
         ),
         panel,
@@ -2125,41 +2168,76 @@ pub(crate) fn build_panel(
         cached_branches.map(|(v, _)| v).unwrap_or_default()
     };
 
+    // Per-worktree cache key: the HOST path, never `loc.path()` (which
+    // collides across sandboxed worktrees — see `worktree_cache_key`).
+    let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(cwd);
+
     // Retain last-known-good header on transient git-read failure (never "—").
     // Keyed by the HOST worktree path, not `loc.path()` — the in-sandbox path
     // is `/workspace` for every provider worktree of an env, so keying by it
     // shares one last-known row across siblings (worktree B's failed read
     // would fall back to A's branch + ahead/behind).
-    let host_key = cwd.to_string_lossy().into_owned();
     let (branch, ahead_behind, merge_info) =
-        crate::panel_header_cache::merge_header(&host_key, branch, ahead_behind, merge_info);
+        crate::panel_header_cache::merge_header(&cache_key, branch, ahead_behind, merge_info);
     let mut panel = crate::panel::PanelData {
         branch,
         ..Default::default()
     };
 
-    // The typed PR cache: summary + checks + review threads + issues. Host
-    // path key — must match the writers (`spawn_pr_refresh`, `thegn pr`) and
-    // the other readers (`attention_status`, `pr_clean`).
-    if let Ok(Some((json, _))) = db.get_pr_cache(&host_key)
+    // The typed PR cache: summary + checks + review threads + issues.
+    if let Ok(Some((json, _))) = db.get_pr_cache(&cache_key)
         && let Ok(cached) = serde_json::from_str::<thegn_core::github::PrPanel>(&json)
     {
-        apply_pr_cache(&mut panel, cached);
+        // Defense-in-depth: the payload stamps the worktree it was fetched for
+        // (`pr_status` stamps `loc.path()`); drop a row that belongs to a
+        // different worktree (e.g. one written under the old colliding
+        // sandbox-path key) instead of rendering the wrong repo's PR.
+        if cached.worktree.is_empty()
+            || cached.worktree == cache_key
+            || cached.worktree == loc.path()
+        {
+            apply_pr_cache(&mut panel, cached);
+        }
     }
 
     // The CI run-history cache feeds the `Ci` section rollup (AV group), with
     // its fetch age (the summary's "Ns ago" stamp) and any fetch-health note.
-    if let Ok(Some((json, fetched_at))) = db.get_ci_cache(&host_key)
+    if let Ok(Some((json, fetched_at))) = db.get_ci_cache(&cache_key)
         && let Ok(runs) = serde_json::from_str::<Vec<thegn_core::ci::CiRun>>(&json)
     {
         panel.ci_runs = runs;
         panel.ci_fetched_at = Some(fetched_at);
     }
-    panel.ci_note = crate::ci_refresh::note_for(&host_key);
+    panel.ci_note = crate::ci_refresh::note_for(&cache_key);
+    // A cache row fetched for a *different* branch (the fetcher queries the
+    // branch that was checked out at fetch time) must not read as current
+    // right after a branch switch — say so until the next refresh lands.
+    if panel.ci_note.is_none()
+        && !panel.branch.is_empty()
+        && !panel.ci_runs.is_empty()
+        && panel
+            .ci_runs
+            .iter()
+            .all(|r| !r.branch.is_empty() && r.branch != panel.branch)
+    {
+        panel.ci_note = Some(format!(
+            "showing runs for '{}' — refresh pending (g)",
+            panel.ci_runs[0].branch
+        ));
+    }
 
     // The local merge queue (fold-actor) — a tiny table, read every model build
-    // (no dedicated RefreshKind). Feeds the `MergeQueue` section + statusbar badge.
+    // (no dedicated RefreshKind). Feeds the `MergeQueue` section + statusbar
+    // badge. The table spans every workspace; scope the view to the active
+    // repo's worktrees unless the section's all-workspaces toggle is on.
+    let scope_repo_root = thegn_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf());
     panel.merge_queue = db.list_merge_queue().unwrap_or_default();
+    if !crate::panel::scope::merge_all() {
+        let repo_paths = repo_worktree_paths(db, &scope_repo_root);
+        panel
+            .merge_queue
+            .retain(|r| repo_paths.contains(&r.worktree));
+    }
 
     // The PR queue — same deal: a tiny table read every model build, feeding the
     // `PrQueue` section + statusbar badge. Scoped to THIS repo, because the queue
@@ -2179,7 +2257,11 @@ pub(crate) fn build_panel(
 
     // Cross-worktree attention stream (the `Across` section): every worktree's
     // failing CI, from the CI cache. Cheap DB reads only, off the event loop.
-    panel.across = build_across(db);
+    // Scoped to the active repo's worktrees unless its toggle says otherwise.
+    panel.across = build_across(
+        db,
+        (!crate::panel::scope::across_all()).then_some(scope_repo_root.as_path()),
+    );
 
     // Hosts-as-resources: per-[host.*] display snapshots for the System ▸ Hosts
     // section and the wizard badges (hosts live in the panel, not the
@@ -2215,7 +2297,10 @@ pub(crate) fn build_panel(
     // Header zone: upstream divergence + merge-in-progress banner.
     panel.ahead_behind = ahead_behind;
     let unresolved = thegn_svc::git::conflict_count(&status);
-    let total = merge_total(db, &loc.path(), merge_info.is_some(), unresolved);
+    // Host-path key (never `loc.path()` — see `worktree_cache_key`): two
+    // provider worktrees sharing `/workspace` cross-contaminated each other's
+    // "N/M resolved" merge banner through this row.
+    let total = merge_total(db, &cache_key, merge_info.is_some(), unresolved);
     panel.merge = merge_info.map(|m| crate::panel::MergeBanner {
         label: m.kind.label().to_string(),
         onto: m.onto,
@@ -2227,26 +2312,37 @@ pub(crate) fn build_panel(
 
     let commits_open = hints.wants_commits();
     if commits_open || hints.warm_git_summaries {
-        let cached = db.get_commit_cache(&loc.path()).ok().flatten();
+        let cached = db.get_commit_cache(&cache_key).ok().flatten();
         if let Some((json, _)) = cached.as_ref()
-            && let Ok(mut rows) = serde_json::from_str::<Vec<crate::panel::CommitRow>>(json)
+            && let Ok(rows) = serde_json::from_str::<Vec<crate::panel::CommitRow>>(json)
         {
-            rows.truncate(hints.visible_commit_limit());
+            // The FULL cached window (80), untruncated: the `/` filter and the
+            // interactive-rebase planner both consume `panel.commits`, and the
+            // old 20-row Normal-width truncation made a filter for commit #35
+            // report "0 matches" while the cache held it. Display cost is
+            // bounded by the frame's row budget, not the list length.
             panel.commits = rows;
         }
-        // Open section: refresh on the TTL. Warm-only (closed summary): refresh
-        // solely on a cold miss, so the ticker never re-runs `git log` for a
-        // section nobody's looking at — a slightly-stale first commit is fine.
+        // Open section: refresh on the TTL. Warm-only (closed summary):
+        // refresh on a cold miss or the (longer) summary TTL.
         panel.commits_loading = commit_load_needed(commits_open, cached.as_ref());
     }
+    // The per-repo open-PR cache: the `pr` section's OPEN PRS block, and the
+    // branch-row badges (joined by head ref). The cache is keyed by the REPO
+    // ROOT (that's what the writer uses — see `spawn_pr_cache_refresh`), not
+    // the worktree path; reading with `loc.path()` always missed in linked
+    // worktrees, blanking every PR badge there.
+    let pr_cache_repo_root = thegn_core::repo::main_worktree(cwd)
+        .map(|r| r.to_string_lossy().into_owned())
+        .unwrap_or_else(|| loc.path());
+    if let Ok(Some((json, fetched_at))) = db.get_pr_branch_cache(&pr_cache_repo_root) {
+        panel.open_prs = thegn_core::github::parse_pr_headers(&json);
+        // Keep the age: an unaged row rendered a PR merged days ago (offline,
+        // gh broken) as a live green badge, indistinguishable from fresh data.
+        panel.open_prs_fetched_at = Some(fetched_at);
+    }
     if want_branches {
-        // The per-repo open-PR cache joins onto branch rows by head ref.
-        let badges: Vec<thegn_core::github::PrHeader> = db
-            .get_pr_branch_cache(&loc.path())
-            .ok()
-            .flatten()
-            .map(|(json, _)| thegn_core::github::parse_pr_headers(&json))
-            .unwrap_or_default();
+        let badges = panel.open_prs.clone();
         let head_branch = panel.branch.clone();
         panel.branches =
             branches_raw
@@ -2291,7 +2387,7 @@ pub(crate) fn build_panel(
     }
 
     // Tests section snapshot from the cache (summary + failures + history).
-    if let Ok(Some((json, _))) = db.get_test_cache(&loc.path())
+    if let Ok(Some((json, _))) = db.get_test_cache(&cache_key)
         && let Ok(cache) = serde_json::from_str::<crate::testkit::model::TestCache>(&json)
     {
         panel.tests = Some(crate::panel::tests_lite(&cache));
@@ -2299,14 +2395,23 @@ pub(crate) fn build_panel(
 
     // Tracked-file list for the Files accordion — fetched in the fan-out above
     // (only while Files is open; `git ls-files` isn't free on big repos every 2s).
-    if let Some(files) = ls_files {
+    if let Some(mut files) = ls_files {
         panel.file_count = Some(files.len() as u64);
+        // Bounded: an unbounded monorepo listing made every tree rebuild a
+        // visible stall. 50k rows is far past what the panel can usefully
+        // browse; the count above still reports the true total.
+        const MAX_FILES: usize = 50_000;
+        files.truncate(MAX_FILES);
+        // Pre-build the display tree HERE (off-loop) so the renderer and key
+        // handlers never re-sort the listing on the event loop.
+        panel.file_tree = crate::panel::build_file_tree(&files);
         panel.all_files = files;
     }
 
     // Issue tracker caches — DB-only reads; the background refresh keeps them
-    // warm (see `hydrate_tracker.rs`).
-    crate::hydrate_tracker::populate_tracker(db, &loc.path(), cwd, app_cfg, &mut panel);
+    // warm (see `hydrate_tracker.rs`). Keyed by the host worktree path, same
+    // as the writer (`spawn_issue_cache_refresh` keys by its `cwd`).
+    crate::hydrate_tracker::populate_tracker(db, &cache_key, cwd, app_cfg, &mut panel);
     // The active worktree's repo root — the default scoping unit for the panel's
     // otherwise-global sections (My Work, notifications).
     let repo_root = thegn_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf());
@@ -2319,9 +2424,10 @@ pub(crate) fn build_panel(
         repo_root.to_string_lossy().into_owned()
     };
     if let Ok(Some((json, _))) = db.get_my_work_cache(&my_work_scope)
-        && let Ok(rows) = serde_json::from_str::<Vec<thegn_core::work::WorkRow>>(&json)
+        && let Some(feed) = thegn_core::work::MyWorkFeed::from_cache_json(&json)
     {
-        panel.my_work = rows;
+        panel.my_work = feed.rows;
+        panel.my_work_note = feed.note;
     }
     crate::hydrate_feed::populate_notifications(db, &repo_root, app_cfg, &mut panel);
     // Tasks section: populate task specs from config + auto-discovery (reusing the
@@ -2341,7 +2447,10 @@ pub(crate) fn build_panel(
     // incrementally (only the appended suffix is scanned each pass, resetting on
     // rotation), and the tails are built from a fixed-size END read, so cost is
     // bounded by the *appended* bytes, not the file size. See `plan_log_scan`.
-    let log_path = thegn_core::util::xdg_state_home().join("thegn/logs/thegn.log");
+    // Honor `[log] dir` — the hardcoded XDG path made the summary, the ERROR
+    // notifications, and the drilldown read a file that doesn't exist when the
+    // user relocated the log dir (the live tailer already used the config).
+    let log_path = app_cfg.log.dir_path().join("thegn.log");
     if let Ok(meta) = std::fs::metadata(&log_path)
         && meta.is_file()
     {
@@ -2610,12 +2719,7 @@ pub(crate) fn spawn_panel_prefetch(
         let Ok(db) = thegn_core::db::Db::open() else {
             return;
         };
-        let app_cfg = thegn_core::config::Config::try_load_layered(
-            &thegn_core::config::ProcessEnv,
-            &[],
-            None,
-        )
-        .unwrap_or_default();
+        let app_cfg = load_hydration_config();
         let panel = build_panel(&cwd, &db, &hints, &app_cfg);
         if tx.send((cwd, panel)).is_ok()
             && let Some(w) = &waker
@@ -2645,12 +2749,13 @@ pub(crate) fn spawn_pr_cache_refresh(
             return;
         };
 
-        // Snapshot the old PR state BEFORE overwriting the cache. Host-path
-        // key, never `loc.path()` (in-sandbox `/workspace` collides provider
-        // siblings and diverges from the host-path readers).
-        let host_key = cwd.to_string_lossy().into_owned();
+        // Per-worktree cache key: the HOST path, never `loc.path()` (which
+        // collides across sandboxed worktrees — see `worktree_cache_key`).
+        let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(&cwd);
+
+        // Snapshot the old PR state BEFORE overwriting the cache.
         let old_pr_state: Option<String> = db
-            .get_pr_cache(&host_key)
+            .get_pr_cache(&cache_key)
             .ok()
             .flatten()
             .and_then(|(json, _)| serde_json::from_str::<thegn_core::github::PrPanel>(&json).ok())
@@ -2678,7 +2783,7 @@ pub(crate) fn spawn_pr_cache_refresh(
         // `pr_state_is_definitive` and `github.rs`'s Offline doc ("Stale cached
         // data may still be shown").
         if pr_state_is_definitive(&panel.state) {
-            let _ = db.put_pr_cache(&host_key, &panel.branch, &json);
+            let _ = db.put_pr_cache(&cache_key, &panel.branch, &json);
         }
 
         // Emit a notification when the PR transitions between states
@@ -2766,12 +2871,152 @@ pub(crate) fn spawn_pr_cache_refresh(
                 maybe_clean_merged_worktrees(&db, &loc, &cwd, &repo_root, &prs, &disk_cfg);
             }
 
+            // pr_linked producer: a PR newly entering the open set whose head
+            // branch belongs to a linked worktree (or matches a linked
+            // issue's branch_hint) notifies that worktree. Snapshot the OLD
+            // open set before the cache overwrite below; a missing prior
+            // cache emits nothing (first-fetch guard).
+            let old_open: Option<std::collections::HashSet<String>> = db
+                .get_pr_branch_cache(&repo_root)
+                .ok()
+                .flatten()
+                .map(|(old_json, _)| {
+                    thegn_core::github::parse_pr_headers(&old_json)
+                        .into_iter()
+                        .map(|p| p.head_ref)
+                        .collect()
+                });
+            if let Some(old_open) = old_open {
+                use thegn_core::store::WorkspaceStore;
+                let wts: Vec<(String, String, Vec<String>)> = db
+                    .worktrees()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|w| w.repo_root == repo_root)
+                    .map(|w| {
+                        let linked = db.linked_issues(&w.worktree).unwrap_or_default();
+                        (w.worktree, w.branch, linked)
+                    })
+                    .collect();
+                let mut hints: Vec<(String, String, String)> = Vec::new();
+                for (path, _branch, linked) in &wts {
+                    if linked.is_empty() {
+                        continue;
+                    }
+                    if let Ok(cached) = db.get_all_issue_cache(path) {
+                        for (_provider, cache_json) in cached {
+                            let Ok(issues) =
+                                serde_json::from_str::<Vec<thegn_core::issue::Issue>>(&cache_json)
+                            else {
+                                continue;
+                            };
+                            for i in issues {
+                                if let Some(h) = i.branch_hint
+                                    && linked.contains(&i.id)
+                                {
+                                    hints.push((i.number, h, path.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+                for (source_ref, msg, wt) in pr_linked_notifications(&old_open, &prs, &wts, &hints)
+                {
+                    let _ = db.put_notification("pr_linked", &source_ref, &msg, &wt);
+                }
+            }
+
             let _ = db.put_pr_branch_cache(&repo_root, &json);
+
+            // Mentioned producer: poll GitHub's notifications API for
+            // @mentions in this repo (`reason == "mention"`). Throttled to
+            // one REST call per repo per 5 minutes via a ui_state stamp
+            // (checked before the config load, so the steady-state cost is
+            // one SELECT); the `ghn:<thread>:<updated_at>` ref + store-side
+            // emit-once keeps it to one row per mention event. Chosen over
+            // scanning review-thread bodies for `@login`: the API covers
+            // issues AND PRs repo-wide with GitHub's own mention detection,
+            // while thread snippets are truncated and per-PR only.
+            const MENTION_POLL_MS: i64 = 5 * 60 * 1000;
+            let now = thegn_core::util::now();
+            let poll_due = db
+                .get_ui_state("gh_mentions", &repo_root)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<i64>().ok())
+                .is_none_or(|last| now.saturating_sub(last) >= MENTION_POLL_MS);
+            if poll_due
+                && load_hydration_config().notifications.github_mentions
+                && let Some(nwo) = thegn_core::github::origin_nwo(&loc)
+            {
+                // Stamp before the fetch so a failing `gh` can't retry hot.
+                let _ = db.set_ui_state("gh_mentions", &repo_root, &now.to_string());
+                if let Ok(njson) = thegn_core::github::fetch_gh_notifications(&loc) {
+                    for (source_ref, msg) in
+                        thegn_core::github::parse_mention_notifications(&njson, &nwo)
+                    {
+                        let _ =
+                            db.put_notification_once("mentioned", &source_ref, &msg, &repo_root);
+                    }
+                }
+            }
+
             if let Some(w) = &branch_waker {
                 let _ = w.wake();
             }
         }
     });
+}
+
+/// The pure diff behind the `pr_linked` producer: for each PR whose head
+/// branch is NEW to the repo's open set, emit one `(source_ref, message,
+/// worktree_path)` row when the branch belongs to a worktree with linked
+/// issues, or matches a linked issue's provider `branch_hint`. Worktree-branch
+/// matches win over hint matches; one emit per PR. Pure so the emit-once
+/// semantics are unit-testable without a DB.
+///
+/// `worktrees`: `(path, branch, linked issue ids)` for this repo's worktrees.
+/// `hints`: `(issue number, branch_hint, worktree path)` for linked issues.
+pub(crate) fn pr_linked_notifications(
+    old_open: &std::collections::HashSet<String>,
+    prs: &[thegn_core::github::PrHeader],
+    worktrees: &[(String, String, Vec<String>)],
+    hints: &[(String, String, String)],
+) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for pr in prs {
+        if old_open.contains(&pr.head_ref) {
+            continue;
+        }
+        let source_ref = format!("pr:{}", pr.number);
+        if let Some((path, _, linked)) = worktrees
+            .iter()
+            .find(|(_, b, linked)| *b == pr.head_ref && !linked.is_empty())
+        {
+            out.push((
+                source_ref,
+                format!(
+                    "PR #{} opened for {} (linked: {})",
+                    pr.number,
+                    pr.head_ref,
+                    linked.join(", ")
+                ),
+                path.clone(),
+            ));
+        } else if let Some((number, _, path)) =
+            hints.iter().find(|(_, hint, _)| *hint == pr.head_ref)
+        {
+            out.push((
+                source_ref,
+                format!(
+                    "PR #{} opened for {} (issue {})",
+                    pr.number, pr.head_ref, number
+                ),
+                path.clone(),
+            ));
+        }
+    }
+    out
 }
 
 /// Policy decision for auto-cleaning a worktree whose PR left the open set,
@@ -2952,6 +3197,35 @@ fn pr_search_row(
     }
 }
 
+/// The CLI config source (`--config` path + `--set` overrides), captured once
+/// at startup so OFF-LOOP config loads (hydration, neighbor prefetch, cold-
+/// switch fast-fill) build the same config the event loop runs with. Without
+/// it those loads used the default path with no overrides — so `--config`-
+/// declared hosts/envs and runtime-added (DB) hosts never appeared in the
+/// System ▸ Hosts / Environments sections.
+static CONFIG_SOURCE: std::sync::OnceLock<(Vec<String>, Option<std::path::PathBuf>)> =
+    std::sync::OnceLock::new();
+
+/// Record the CLI config source (called once from startup).
+pub(crate) fn set_config_source(overrides: Vec<String>, config: Option<std::path::PathBuf>) {
+    let _ = CONFIG_SOURCE.set((overrides, config));
+}
+
+/// The one config loader every off-loop hydration path uses: layered load with
+/// the CLI source, plus the runtime-added `[host.*]` defs from the DB (which
+/// `merge_db_hosts` synthesizes envs for) — matching what the loop holds.
+pub(crate) fn load_hydration_config() -> thegn_core::config::Config {
+    let (overrides, path) = CONFIG_SOURCE.get().cloned().unwrap_or_default();
+    let mut cfg = thegn_core::config::Config::try_load_layered(
+        &thegn_core::config::ProcessEnv,
+        &overrides,
+        path,
+    )
+    .unwrap_or_default();
+    thegn_core::host_config::merge_db_hosts(&mut cfg);
+    cfg
+}
+
 /// The set of worktree paths belonging to a repo (`repo_root`), from the DB
 /// registry. Used to scope the "My Work" feed's notifications to the current
 /// repo — a notification for a sibling worktree of the same repo is relevant;
@@ -3014,7 +3288,7 @@ pub(crate) fn spawn_my_work_refresh(
         let mut rows: Vec<WorkRow> = Vec::new();
 
         // 1) Issues assigned to me, aggregated across configured providers.
-        let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
+        let router = thegn_svc::issue::IssueRouter::from_config_at(&issues_cfg, Some(&cwd));
         if router.is_configured()
             && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3048,20 +3322,33 @@ pub(crate) fn spawn_my_work_refresh(
             }
         }
 
-        // 2) PRs via `gh search` — scoped to `nwo` unless `all`.
-        if let Ok(prs) =
-            thegn_core::github::search_prs(&loc, "--review-requested=@me", nwo.as_deref(), 30)
-        {
-            rows.extend(
-                prs.into_iter()
-                    .map(|p| pr_search_row(p, WorkGroup::ReviewRequested)),
-            );
-        }
-        if let Ok(prs) = thegn_core::github::search_prs(&loc, "--author=@me", nwo.as_deref(), 30) {
-            rows.extend(
-                prs.into_iter()
-                    .map(|p| pr_search_row(p, WorkGroup::NeedsAttention)),
-            );
+        // 2) PRs via `gh search` — scoped to `nwo` unless `all`. When the feed
+        // is repo-scoped but the repo has no `origin` remote to derive
+        // `owner/repo` from, SKIP the searches instead of running them
+        // unscoped: an unscoped `gh search prs` spans every repo, and caching
+        // that under the repo-scoped key made "mine · this repo" silently show
+        // other workspaces' items. Surface why via the feed note instead.
+        let mut note = String::new();
+        if all || nwo.is_some() {
+            if let Ok(prs) =
+                thegn_core::github::search_prs(&loc, "--review-requested=@me", nwo.as_deref(), 30)
+            {
+                rows.extend(
+                    prs.into_iter()
+                        .map(|p| pr_search_row(p, WorkGroup::ReviewRequested)),
+                );
+            }
+            if let Ok(prs) =
+                thegn_core::github::search_prs(&loc, "--author=@me", nwo.as_deref(), 30)
+            {
+                rows.extend(
+                    prs.into_iter()
+                        .map(|p| pr_search_row(p, WorkGroup::NeedsAttention)),
+                );
+            }
+        } else {
+            note = "no `origin` remote — PR search needs it for repo scope (a = all repos)"
+                .to_string();
         }
 
         // 3) High-priority unread notifications (mentions / blockers / pr-linked),
@@ -3099,8 +3386,9 @@ pub(crate) fn spawn_my_work_refresh(
 
         // Always write — an emptied feed must clear the scope's cache row, not
         // keep stale rows.
+        let feed = thegn_core::work::MyWorkFeed { rows, note };
         if let Ok(db) = thegn_core::db::Db::open()
-            && let Ok(json) = serde_json::to_string(&rows)
+            && let Ok(json) = serde_json::to_string(&feed)
         {
             let _ = db.put_my_work_cache(&scope_key, &json);
         }
@@ -3160,10 +3448,78 @@ pub(crate) fn toggle_system_scope(
             ..Default::default()
         },
     );
+    // Lead with the section the user pressed `g` in — the toggle is shared
+    // (it widens notifications + needs-you + containers + logs together), but
+    // answering a Sandbox keypress with a status line about notifications
+    // read as the wrong key having fired.
+    let subject = match open {
+        crate::panel::Section::Sandbox => "Containers, notifications & needs-you",
+        crate::panel::Section::Logs => "Logs, notifications & needs-you",
+        _ => "Notifications & needs-you",
+    };
     if all {
-        "Notifications & needs-you: all worktrees".into()
+        format!("{subject}: all worktrees")
     } else {
-        "Notifications & needs-you: this repo".into()
+        format!("{subject}: this repo")
+    }
+}
+
+/// Toggle the Across section between the active workspace (default) and every
+/// workspace, rehydrate so the aggregation rebuilds under the new scope, and
+/// return the status line. Same shape as [`toggle_system_scope`].
+pub(crate) fn toggle_across_scope(
+    tx: &tokio_mpsc::UnboundedSender<(u64, FrameModel)>,
+    generation: u64,
+    session: &crate::session::Session,
+    waker: &TerminalWaker,
+    open: crate::panel::Section,
+    expanded: bool,
+) -> String {
+    let all = crate::panel::scope::toggle_across_all();
+    spawn_model_hydration(
+        tx.clone(),
+        generation,
+        session.clone(),
+        Some(waker.clone()),
+        HydrateHints {
+            open,
+            expanded,
+            ..Default::default()
+        },
+    );
+    if all {
+        "Across: all workspaces".into()
+    } else {
+        "Across: this workspace".into()
+    }
+}
+
+/// Toggle the Merge-queue section between the active workspace (default) and
+/// every workspace, rehydrate, and return the status line.
+pub(crate) fn toggle_merge_scope(
+    tx: &tokio_mpsc::UnboundedSender<(u64, FrameModel)>,
+    generation: u64,
+    session: &crate::session::Session,
+    waker: &TerminalWaker,
+    open: crate::panel::Section,
+    expanded: bool,
+) -> String {
+    let all = crate::panel::scope::toggle_merge_all();
+    spawn_model_hydration(
+        tx.clone(),
+        generation,
+        session.clone(),
+        Some(waker.clone()),
+        HydrateHints {
+            open,
+            expanded,
+            ..Default::default()
+        },
+    );
+    if all {
+        "Merge queue: all workspaces".into()
+    } else {
+        "Merge queue: this workspace".into()
     }
 }
 
@@ -3378,10 +3734,23 @@ pub(crate) fn retarget_diff_watcher(
 /// [`thegn_core::aggregate`]. Pure DB reads (the CI cache), so it is cheap and
 /// safe to run on the model-hydration `spawn_blocking`. As dirty-file / content
 /// producers land they append their excerpts here too.
-fn build_across(db: &thegn_core::db::Db) -> thegn_core::aggregate::Aggregation {
+/// Build the Across aggregation from the CI caches of the registered
+/// worktrees. `repo_root = Some(_)` keeps only that repo's worktrees (the
+/// default, workspace-scoped view); `None` spans every workspace (the `a`
+/// all-workspaces toggle).
+fn build_across(
+    db: &thegn_core::db::Db,
+    repo_root: Option<&std::path::Path>,
+) -> thegn_core::aggregate::Aggregation {
     use thegn_core::aggregate::{Aggregation, ci_failure_excerpts};
+    let rr = repo_root.map(|r| r.to_string_lossy().into_owned());
     let mut excerpts = Vec::new();
     for w in db.worktrees().unwrap_or_default() {
+        if let Some(rr) = &rr
+            && w.repo_root != *rr
+        {
+            continue;
+        }
         let label = if w.branch.is_empty() {
             w.tab_name.clone()
         } else {

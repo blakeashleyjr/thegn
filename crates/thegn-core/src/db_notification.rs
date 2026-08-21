@@ -27,6 +27,30 @@ impl NotificationStore for Db {
         Ok(self.conn().last_insert_rowid())
     }
 
+    /// Append a notification only if an identical `(kind, issue_id, message)`
+    /// row doesn't already exist — the emit-once primitive for producers that
+    /// re-derive the same fact every refresh (overdue, mentions) rather than
+    /// diffing old-vs-new state. A changed message (e.g. a moved due date)
+    /// re-arms. Returns whether a row was inserted.
+    fn put_notification_once(
+        &self,
+        kind: &str,
+        issue_id: &str,
+        message: &str,
+        worktree_path: &str,
+    ) -> Result<bool> {
+        let n = self.conn().execute(
+            r#"INSERT INTO notifications(kind,issue_id,message,created_at_ms,read,worktree_path)
+               SELECT ?1,?2,?3,?4,0,?5
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM notifications
+                   WHERE kind=?1 AND issue_id=?2 AND message=?3
+               )"#,
+            params![kind, issue_id, message, util::now(), worktree_path],
+        )?;
+        Ok(n > 0)
+    }
+
     /// All unread notifications, newest first.
     fn get_unread_notifications(&self) -> Result<Vec<crate::notification::Notification>> {
         self.notifications_query(
@@ -58,6 +82,20 @@ impl NotificationStore for Db {
     /// Mark all notifications as read.
     fn mark_all_notifications_read(&self) -> Result<()> {
         self.conn().execute("UPDATE notifications SET read=1", [])?;
+        Ok(())
+    }
+
+    /// Repo-scoped clear: rows tagged with one of `worktree_paths` + untagged
+    /// (host-global) rows — exactly the set the scoped inbox displays.
+    fn mark_notifications_read_scoped(&self, worktree_paths: &[String]) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("UPDATE notifications SET read=1 WHERE worktree_path=''", [])?;
+        for p in worktree_paths {
+            conn.execute(
+                "UPDATE notifications SET read=1 WHERE worktree_path=?1",
+                params![p],
+            )?;
+        }
         Ok(())
     }
 

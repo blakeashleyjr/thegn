@@ -672,36 +672,6 @@ pub const BUILTINS: &[Action] = &[
         priority: 600,
         menu: false,
     },
-    Action {
-        id: "select-bottombar",
-        chords: &["Super Alt Down", "Super Alt j"],
-        menu_label: "Focus the bottom status bar",
-        hint: "nav",
-        // The statusbar owns bottom-bar selection (highlight + key routing).
-        invocation: Invocation::Pipe {
-            plugin: Plugin::Statusbar,
-            name: "thegn_select_bottombar",
-        },
-        scope: Scope::Shared,
-        contexts: &[Context::Center],
-        priority: 700,
-        menu: false,
-    },
-    Action {
-        id: "select-topbar",
-        chords: &["Super Alt Up", "Super Alt k"],
-        menu_label: "Focus the top stats bar",
-        hint: "nav",
-        // The tabbar owns top-bar stat selection (CPU/MEM/GPU → embed monitor).
-        invocation: Invocation::Pipe {
-            plugin: Plugin::Tabbar,
-            name: "thegn_select_topbar",
-        },
-        scope: Scope::Shared,
-        contexts: &[Context::Center],
-        priority: 700,
-        menu: false,
-    },
     // Menu-only actions (no default chord).
     Action {
         id: "focus-sidebar",
@@ -755,23 +725,26 @@ pub const BUILTINS: &[Action] = &[
         priority: 5,
         menu: true,
     },
-    // ── Pinned programs — Alt-1..9 launch-or-focus (config `[[pins]]`) ─────────
+    // ── Pinned programs — Ctrl-Alt-1..9 launch-or-focus (config `[[pins]]`) ────
     // Pipe to the tabbar (no command-pane flash, like `new-tab`): it maps the
     // index to the configured pin name and runs `thegn pin open <name>`.
-    pin_action("pin-1", &["Alt 1"], "thegn_pin_1"),
-    pin_action("pin-2", &["Alt 2"], "thegn_pin_2"),
-    pin_action("pin-3", &["Alt 3"], "thegn_pin_3"),
-    pin_action("pin-4", &["Alt 4"], "thegn_pin_4"),
-    pin_action("pin-5", &["Alt 5"], "thegn_pin_5"),
-    pin_action("pin-6", &["Alt 6"], "thegn_pin_6"),
-    pin_action("pin-7", &["Alt 7"], "thegn_pin_7"),
-    pin_action("pin-8", &["Alt 8"], "thegn_pin_8"),
-    pin_action("pin-9", &["Alt 9"], "thegn_pin_9"),
+    // Chords match the HOST keymap (`crates/thegn-host/src/keymap.rs`): Alt-1..9
+    // are the worktree-slot jumps there, so declaring Alt here made the
+    // generated keybindings page contradict the live bindings.
+    pin_action("pin-1", &["Ctrl Alt 1"], "thegn_pin_1"),
+    pin_action("pin-2", &["Ctrl Alt 2"], "thegn_pin_2"),
+    pin_action("pin-3", &["Ctrl Alt 3"], "thegn_pin_3"),
+    pin_action("pin-4", &["Ctrl Alt 4"], "thegn_pin_4"),
+    pin_action("pin-5", &["Ctrl Alt 5"], "thegn_pin_5"),
+    pin_action("pin-6", &["Ctrl Alt 6"], "thegn_pin_6"),
+    pin_action("pin-7", &["Ctrl Alt 7"], "thegn_pin_7"),
+    pin_action("pin-8", &["Ctrl Alt 8"], "thegn_pin_8"),
+    pin_action("pin-9", &["Ctrl Alt 9"], "thegn_pin_9"),
 ];
 
-/// A pinned-program builtin: `Alt-N` pipes `thegn_pin_N` to the tabbar, which
-/// resolves the index to a pin and launch-or-focuses it. `const fn` so the
-/// entries stay in the `BUILTINS` const slice.
+/// A pinned-program builtin: `Ctrl-Alt-N` pipes `thegn_pin_N` to the tabbar,
+/// which resolves the index to a pin and launch-or-focuses it. `const fn` so
+/// the entries stay in the `BUILTINS` const slice.
 const fn pin_action(
     id: &'static str,
     chords: &'static [&'static str],

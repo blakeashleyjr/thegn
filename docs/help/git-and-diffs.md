@@ -13,15 +13,29 @@ The [[panel]]'s **git** tab is a lazygit-style set of sections for the
 focused worktree; `Alt-g` opens the real lazygit in a pane when you want
 the full tool.
 
-- **changes** — the working diff. `↵` on a file inlines its hunks; `e`
-  cycles to a full-screen side-by-side view; staging keys mirror lazygit.
+- **changes** — the working diff. `↵` on a file inlines its hunks
+  (binary and mode-only changes say so instead of a diff); `space`
+  stages; `e` widens to the full-screen lazygit-style git frame, where
+  `↵` drills into **staging** (line-level stage/unstage).
 - **commits** — the branch's log; pick a commit to view or operate on.
-- **branches** — local branches: check out, create, delete.
-- **stash** — stash list: apply, pop, drop.
-- **files** — the worktree's file tree; `↵` previews a file inline.
+  `E` edits (interactive rebase stopping at the commit) — bare `e` is
+  always the panel width cycle.
+- **branches** — local branches: check out, create, delete; open-PR
+  badges ride each row. In the wide frame the main region shows the
+  **selected** branch's own recent commits (HEAD's while it loads).
+- **stash** — stash list: apply, pop, drop; `↵` shows the stash's real
+  diff (`git stash show -p -u`, untracked files included) in the main
+  region.
+- **files** — the worktree's file tree; `/` filters it (directories stay
+  while any descendant matches; Esc clears), `↵` previews a file inline,
+  `o` pages it in bat, `O` opens your editor, `y` reveals it in yazi.
 
-Inside any git-family section, `?` shows that section's own key
-cheatsheet. Marks, ranges, and flows follow lazygit conventions.
+Inside the git-family sections (changes/commits/branches/stash — not
+files), `?` shows that section's own key cheatsheet. Marks, ranges, and
+flows follow lazygit conventions. An action key that needs a wider view
+**widens the panel and performs the action** in one press (the status
+crumb says so); drill detail views at the half width carry a breadcrumb
+(`changes › staging · esc back`) so the way back is always visible.
 
 `Alt-/` opens a plain `git diff` in a pane; `thegn wt diff` prints one
 from any shell.
