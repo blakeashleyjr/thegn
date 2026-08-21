@@ -875,6 +875,43 @@ fn three_worktree_session() -> Session {
 }
 
 #[test]
+fn rebuild_reanchors_focused_cursor_by_identity_across_a_resort() {
+    // A rebuild that reorders rows (sort change, hydration re-rank, prune)
+    // must keep the highlight on the same ROW, not the same index — a raw
+    // index would silently retarget a queued `d`/`Enter` at whichever row
+    // inherited the slot.
+    let session = Session {
+        id: "s1".into(),
+        worktrees: vec![
+            WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app"),
+            WorktreeGroup::new("app/zeta", GroupKind::Branch, "/tmp/app-zeta"),
+            WorktreeGroup::new("app/alpha", GroupKind::Branch, "/tmp/app-alpha"),
+        ],
+        active: 0,
+    };
+    let mut model = build_initial_model(&session, None);
+    model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
+    let mut sb = focused_state(&mut model, &session);
+
+    // Manual order: [app(ws), home, zeta, alpha]. Park the cursor on alpha.
+    sb.cursor = 3;
+    sb.sync(&mut model);
+    assert_eq!(sb.selected_row(&model).unwrap().label, "alpha");
+
+    // Name sort reorders to [app(ws), home, alpha, zeta]; the cursor follows
+    // alpha to its new slot instead of staying on index 3 (now zeta).
+    sb.view.sort = crate::sidebar::SortMode::Name;
+    sb.rebuild(&mut model, &session);
+    assert_eq!(sb.selected_row(&model).unwrap().label, "alpha");
+    assert_eq!(sb.cursor, 2);
+
+    // Unfocused rebuilds still follow the active worktree, not the anchor.
+    sb.focused = false;
+    sb.rebuild(&mut model, &session);
+    assert_eq!(sb.cursor, visible_index_of_active(&model));
+}
+
+#[test]
 fn move_active_worktree_reorders_within_workspace_and_anchors_home() {
     // Holds the env lock: move_active_worktree opens the user DB to persist
     // the swap; point it at a throwaway scope (the swap no-ops on unknown

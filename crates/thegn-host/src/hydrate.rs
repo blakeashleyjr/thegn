@@ -71,6 +71,28 @@ pub(crate) fn invalidate_glyphs(paths: &[String]) {
     }
 }
 
+/// Combine the registered-worktree paths and the known repo roots into the
+/// set of glyph-cache keys that must stay resident across hydrations (repo
+/// roots back dormant workspaces' *home* rows, which have no registry row).
+/// The returned bool says whether the set is trustworthy for EVICTION —
+/// `false` when either DB read failed, because evicting on a transient error
+/// would blank every dormant workspace's glyphs until restart (the DB copy of
+/// the cache is only re-read at launch). Seeding from a partial set is always
+/// safe (seed only ever adds). Pure, so it's unit-tested.
+pub(crate) fn glyph_keep_set(
+    registry_paths: Option<Vec<String>>,
+    repo_roots: Option<Vec<String>>,
+) -> (Vec<String>, bool) {
+    let keep_ok = registry_paths.is_some() && repo_roots.is_some();
+    let set = registry_paths
+        .into_iter()
+        .flatten()
+        .chain(repo_roots.into_iter().flatten())
+        .filter(|p| !p.is_empty())
+        .collect();
+    (set, keep_ok)
+}
+
 /// Decide whether a worktree's git glyphs must be rescanned now, or can be
 /// served from cache. Pure, so it's unit-tested. The active worktree always
 /// rescans (the user is looking at it, and its diff fs-watcher already forces
@@ -503,7 +525,10 @@ pub(crate) fn prune_stale_worktree_groups(
     };
     if session.worktrees.len() != before {
         for g in &dead {
+            // `del_worktree` cascades caches + merge-queue; the activity-FSM
+            // entry is file-based and pruned separately.
             let _ = db.del_worktree(&g.path);
+            thegn_core::activity::forget(&g.path);
         }
         session.active = active_name
             .and_then(|n| session.worktrees.iter().position(|g| g.name == n))
@@ -951,7 +976,10 @@ pub(crate) fn db_worktree_list(
                 tab = %w.tab_name,
                 "reaping registry row: local worktree dir is gone and env resolves local"
             );
+            // `del_worktree` cascades caches + merge-queue; the activity-FSM
+            // entry is file-based and pruned separately.
             let _ = db.del_worktree(&w.worktree);
+            thegn_core::activity::forget(&w.worktree);
             continue;
         }
         let Some((slug, branch)) = crate::sidebar::split_tab(&w.tab_name) else {
@@ -1109,6 +1137,13 @@ fn collect_sidebar_status(
                 && n > 0
             {
                 status.pr_counts.insert(wt.worktree.clone(), n);
+                // The compact `⬡N` chip: the branch's single open PR number
+                // (ambiguous multi-PR branches stay count-only).
+                if let Ok(nums) = db.get_open_pr_numbers_by_branch(&wt.repo_root)
+                    && let Some(&num) = nums.get(&wt.branch)
+                {
+                    status.pr_numbers.insert(wt.worktree.clone(), num);
+                }
             }
         }
     }
@@ -1129,17 +1164,19 @@ fn collect_sidebar_status(
         .map(|g| g.path.clone())
         .filter(|p| seen.insert(p.clone()) && std::path::Path::new(p).is_dir())
         .collect();
-    // All registered worktree paths (every workspace): the retain + seed passes
-    // below use them to keep/serve other workspaces' glyphs across a switch.
-    let all_wt_paths: Vec<String> = db
-        .worktrees()
-        .map(|r| {
-            r.into_iter()
-                .map(|w| w.worktree)
-                .filter(|p| !p.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    // All registered worktree paths (every workspace) PLUS every known repo
+    // root: the retain + seed passes below use them to keep/serve other
+    // workspaces' glyphs across a switch. Repo roots matter because a dormant
+    // workspace's *home* row renders by its repo path (`gather_groups`), which
+    // has no `worktrees` registry row — without them the home row's glyphs
+    // were evicted (and never re-seeded) on the first hydration after a
+    // switch.
+    let (all_wt_paths, keep_ok) = glyph_keep_set(
+        db.worktrees()
+            .ok()
+            .map(|rows| rows.into_iter().map(|w| w.worktree).collect()),
+        db.known_repos().ok(),
+    );
 
     // Partition into paths that must be rescanned now vs. served from cache.
     let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
@@ -1167,17 +1204,14 @@ fn collect_sidebar_status(
                 let is_remote = loc.is_remote();
                 let warm = is_remote && thegn_svc::bridge::for_loc(&loc).is_some();
                 if !thegn_core::lifecycle::should_live_scan(is_remote, warm, is_active) {
-                    let row = cached.map(|(row, _)| row.clone()).unwrap_or((
-                        false,
-                        0,
-                        0,
-                        None,
-                        String::new(),
-                        0,
-                        0,
-                        None,
-                    ));
-                    reused.push((p.clone(), row));
+                    // No cached row: leave the glyph ABSENT (renders blank,
+                    // same as never-scanned) instead of fabricating an
+                    // all-zero "clean" state for a worktree that was never
+                    // actually scanned — a dirty suspended sandbox must not
+                    // read as clean.
+                    if let Some((row, _)) = cached {
+                        reused.push((p.clone(), row.clone()));
+                    }
                     continue;
                 }
             }
@@ -1256,11 +1290,16 @@ fn collect_sidebar_status(
                 persist.push(glyph_persist_entry(p, row));
             }
         }
-        // Keep every registered worktree's glyph resident, not just the active
-        // session's — the DB copy is only re-read at start, so a session-scoped
-        // retain would evict (and blank on switch) other workspaces. Dead rows
-        // still get pruned.
-        cache.retain(|k, _| paths.iter().any(|p| p == k) || all_wt_paths.iter().any(|p| p == k));
+        // Keep every registered worktree's (and repo root's) glyph resident,
+        // not just the active session's — the DB copy is only re-read at
+        // start, so a session-scoped retain would evict (and blank on switch)
+        // other workspaces. Dead rows still get pruned — but only when the
+        // registry reads succeeded, so a transient DB error can't masquerade
+        // as an empty registry and flush the cache.
+        if keep_ok {
+            cache
+                .retain(|k, _| paths.iter().any(|p| p == k) || all_wt_paths.iter().any(|p| p == k));
+        }
         persist
     };
     // best-effort: the glyph cache is a warm-start convenience; git is the source
@@ -1273,6 +1312,12 @@ fn collect_sidebar_status(
     let scanned_n = scanned.len();
     let git_rows = scanned
         .into_iter()
+        // A FIRST-ever scan that errored has nothing to merge prior values
+        // from — `merge_glyph_scan` fell back to all-zeros. Leave the row
+        // absent (blank) rather than rendering a dirty-but-unreadable
+        // worktree as confidently clean; the next tick retries. A degraded
+        // rescan (prior existed) keeps its merged last-known row as before.
+        .filter(|(p, _, clean)| *clean || prior_for_scan.contains_key(p))
         .map(|(p, row, _clean)| (p, row))
         .chain(reused)
         .map(
@@ -1315,12 +1360,25 @@ fn collect_sidebar_status(
         // PR badge: open PRs for this worktree's current branch, joined from the
         // repo-wide `pr_branch_cache` (keyed by repo root, so every worktree of
         // the repo — not just the active one — resolves its branch's count).
+        // The live HEAD is authoritative for scanned rows: clear the entry the
+        // registry pass above seeded from the CREATION-time branch first, or a
+        // `git checkout` inside the worktree keeps showing the old branch's
+        // count forever.
+        status.pr_counts.remove(&path);
+        status.pr_numbers.remove(&path);
         if let Some(branch) = branch
             && let Ok(counts) = db.get_open_pr_counts_by_branch(&repo_root)
             && let Some(&n) = counts.get(&branch)
             && n > 0
         {
             status.pr_counts.insert(path.clone(), n);
+            // The compact `⬡N` chip: the branch's single open PR number
+            // (ambiguous multi-PR branches stay count-only).
+            if let Ok(nums) = db.get_open_pr_numbers_by_branch(&repo_root)
+                && let Some(&num) = nums.get(&branch)
+            {
+                status.pr_numbers.insert(path.clone(), num);
+            }
         }
     }
     // Serve other workspaces' last-known glyphs from cache (never scanning, never
@@ -2066,15 +2124,22 @@ pub(crate) fn build_panel(
     };
 
     // Retain last-known-good header on transient git-read failure (never "—").
+    // Keyed by the HOST worktree path, not `loc.path()` — the in-sandbox path
+    // is `/workspace` for every provider worktree of an env, so keying by it
+    // shares one last-known row across siblings (worktree B's failed read
+    // would fall back to A's branch + ahead/behind).
+    let host_key = cwd.to_string_lossy().into_owned();
     let (branch, ahead_behind, merge_info) =
-        crate::panel_header_cache::merge_header(&loc.path(), branch, ahead_behind, merge_info);
+        crate::panel_header_cache::merge_header(&host_key, branch, ahead_behind, merge_info);
     let mut panel = crate::panel::PanelData {
         branch,
         ..Default::default()
     };
 
-    // The typed PR cache: summary + checks + review threads + issues.
-    if let Ok(Some((json, _))) = db.get_pr_cache(&loc.path())
+    // The typed PR cache: summary + checks + review threads + issues. Host
+    // path key — must match the writers (`spawn_pr_refresh`, `thegn pr`) and
+    // the other readers (`attention_status`, `pr_clean`).
+    if let Ok(Some((json, _))) = db.get_pr_cache(&host_key)
         && let Ok(cached) = serde_json::from_str::<thegn_core::github::PrPanel>(&json)
     {
         apply_pr_cache(&mut panel, cached);
@@ -2082,13 +2147,13 @@ pub(crate) fn build_panel(
 
     // The CI run-history cache feeds the `Ci` section rollup (AV group), with
     // its fetch age (the summary's "Ns ago" stamp) and any fetch-health note.
-    if let Ok(Some((json, fetched_at))) = db.get_ci_cache(&loc.path())
+    if let Ok(Some((json, fetched_at))) = db.get_ci_cache(&host_key)
         && let Ok(runs) = serde_json::from_str::<Vec<thegn_core::ci::CiRun>>(&json)
     {
         panel.ci_runs = runs;
         panel.ci_fetched_at = Some(fetched_at);
     }
-    panel.ci_note = crate::ci_refresh::note_for(&loc.path());
+    panel.ci_note = crate::ci_refresh::note_for(&host_key);
 
     // The local merge queue (fold-actor) — a tiny table, read every model build
     // (no dedicated RefreshKind). Feeds the `MergeQueue` section + statusbar badge.
@@ -2115,7 +2180,8 @@ pub(crate) fn build_panel(
     panel.across = build_across(db);
 
     // Hosts-as-resources: per-[host.*] display snapshots for the System ▸ Hosts
-    // section, the sidebar HOSTS block, and the wizard badges. Small DB reads;
+    // section and the wizard badges (hosts live in the panel, not the
+    // sidebar). Small DB reads;
     // empty (and free) when no [host.*] is configured. The loop live-merges
     // HostRuntime progress on top after each drain.
     panel.hosts = crate::host_ui::host_snapshots(app_cfg, db);
@@ -2577,9 +2643,12 @@ pub(crate) fn spawn_pr_cache_refresh(
             return;
         };
 
-        // Snapshot the old PR state BEFORE overwriting the cache.
+        // Snapshot the old PR state BEFORE overwriting the cache. Host-path
+        // key, never `loc.path()` (in-sandbox `/workspace` collides provider
+        // siblings and diverges from the host-path readers).
+        let host_key = cwd.to_string_lossy().into_owned();
         let old_pr_state: Option<String> = db
-            .get_pr_cache(&loc.path())
+            .get_pr_cache(&host_key)
             .ok()
             .flatten()
             .and_then(|(json, _)| serde_json::from_str::<thegn_core::github::PrPanel>(&json).ok())
@@ -2607,7 +2676,7 @@ pub(crate) fn spawn_pr_cache_refresh(
         // `pr_state_is_definitive` and `github.rs`'s Offline doc ("Stale cached
         // data may still be shown").
         if pr_state_is_definitive(&panel.state) {
-            let _ = db.put_pr_cache(&loc.path(), &panel.branch, &json);
+            let _ = db.put_pr_cache(&host_key, &panel.branch, &json);
         }
 
         // Emit a notification when the PR transitions between states

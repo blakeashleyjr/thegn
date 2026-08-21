@@ -232,8 +232,22 @@ impl SidebarState {
                     model.status = "The home worktree can't be closed or deleted".into();
                     return Some(SidebarOutcome::Redraw);
                 }
+                let dormant_ws = matches!(
+                    row.tab_target,
+                    Some(crate::sidebar::RowTarget::Workspace { .. })
+                )
+                .then(|| row.workspace_slug.clone());
                 let targets = self.action_targets(model);
                 if targets.is_empty() {
+                    // A dormant workspace's worktree has no live session group
+                    // for the close/delete flow to act on. Say so — `d` is an
+                    // Essential-tier key and must never silently no-op.
+                    if let Some(slug) = dormant_ws {
+                        model.status = format!(
+                            "Open workspace \"{slug}\" first to close or delete this worktree"
+                        );
+                        return Some(SidebarOutcome::Redraw);
+                    }
                     return None;
                 }
                 self.hint_skipped_workspace_marks(model);
@@ -270,8 +284,12 @@ impl SidebarState {
                 if row.worktree_path.is_some() {
                     entries.push(e("fork", "Branch from this…", Some(chord_of(Id::Fork))));
                 }
+                // Rename/close/delete run through the live session, so a
+                // dormant workspace's rows (RowTarget::Workspace) must not
+                // offer them — the entries would silently no-op.
+                let is_live = matches!(row.tab_target, Some(crate::sidebar::RowTarget::Tab(_, _)));
                 let is_home = self.cursor_is_home(model, session);
-                if !is_home {
+                if !is_home && is_live {
                     entries.push(e("rename", "Rename…", Some(chord_of(Id::Rename))));
                 }
                 entries.push(sep());
@@ -296,7 +314,7 @@ impl SidebarState {
                         entries.push(e(id, label, None));
                     }
                 }
-                if !is_home {
+                if !is_home && is_live {
                     entries.push(sep());
                     entries.push(e("close", "Close — keep files on disk", None));
                     entries.push(
@@ -453,12 +471,16 @@ impl SidebarState {
     ) -> SidebarOutcome {
         // Filter input sub-mode captures text (item 21).
         if self.filtering {
+            let mut committed = false;
             match key {
                 key if crate::input::is_escape_key(key) => {
                     self.filtering = false;
                     self.view.filter.clear();
                 }
-                KeyCode::Enter => self.filtering = false,
+                KeyCode::Enter => {
+                    self.filtering = false;
+                    committed = true;
+                }
                 KeyCode::Backspace => {
                     self.view.filter.pop();
                 }
@@ -469,6 +491,25 @@ impl SidebarState {
             }
             self.cursor = 0;
             self.rebuild(model, session);
+            // Committing lands the cursor on the first actionable MATCH (a
+            // worktree/terminal row), not on row 0 — which is the first
+            // workspace *header*, so Enter-then-Enter used to fold a header
+            // instead of opening the row the user filtered for.
+            if committed
+                && let Some(idx) = model
+                    .sidebar_rows
+                    .iter()
+                    .filter(|r| r.visible)
+                    .position(|r| {
+                        matches!(
+                            r.kind,
+                            crate::sidebar::RowKind::Worktree | crate::sidebar::RowKind::Terminal
+                        )
+                    })
+            {
+                self.cursor = idx;
+                self.sync(model);
+            }
             return SidebarOutcome::Redraw;
         }
 
@@ -489,14 +530,22 @@ impl SidebarState {
                     let target_key = menu.target_pin_key.clone();
                     self.menu = None;
                     if let Some(id) = id.filter(|id| !id.is_empty()) {
-                        if let Some(idx) = model
+                        // The action runs against the row the menu was OPENED
+                        // on. If that row vanished while the menu was up
+                        // (hydration prune, re-file re-keying it), bail —
+                        // falling through would fire the entry (possibly
+                        // Delete) at whatever row the cursor happens to be on.
+                        let Some(idx) = model
                             .sidebar_rows
                             .iter()
                             .filter(|r| r.visible)
                             .position(|r| r.pin_key == target_key)
-                        {
-                            self.cursor = idx;
-                        }
+                        else {
+                            model.status = "That row is gone — menu closed".into();
+                            self.sync(model);
+                            return SidebarOutcome::Redraw;
+                        };
+                        self.cursor = idx;
                         return self.run_menu_action(&id, model, session);
                     }
                 }
@@ -514,7 +563,20 @@ impl SidebarState {
             return SidebarOutcome::NotHandled;
         };
         match id {
-            Id::Defocus => return SidebarOutcome::Defocus,
+            Id::Defocus => {
+                // First Esc/q with a COMMITTED filter clears it (the only
+                // other clear site is inside the filtering sub-mode, so a
+                // committed filter used to silently hide most of the tree for
+                // the rest of the session); the next one defocuses.
+                if !self.view.filter.is_empty() {
+                    self.view.filter.clear();
+                    self.cursor = 0;
+                    self.rebuild(model, session);
+                    model.status = "Sidebar filter cleared".into();
+                    return SidebarOutcome::Redraw;
+                }
+                return SidebarOutcome::Defocus;
+            }
             // Shift+↑/↓ reorders the selection (the loop has `&mut Session`).
             // Only the arrows carry Shift here — Shift+j/k normalise to J/K.
             Id::ReorderUp => {
@@ -530,6 +592,20 @@ impl SidebarState {
             }
             Id::CursorUp => {
                 self.cursor = self.cursor.saturating_sub(1);
+            }
+            Id::PageDown => {
+                if visible > 0 {
+                    self.cursor = (self.cursor + 10).min(visible - 1);
+                }
+            }
+            Id::PageUp => {
+                self.cursor = self.cursor.saturating_sub(10);
+            }
+            Id::CursorHome => {
+                self.cursor = 0;
+            }
+            Id::CursorEnd => {
+                self.cursor = visible.saturating_sub(1);
             }
             Id::Activate => {
                 // On a collapsible header (workspace or terminal host), Enter
@@ -568,6 +644,14 @@ impl SidebarState {
                 }
             }
             Id::Filter => {
+                // The rail paints no filter echo (and no header at all), so
+                // typing into an invisible query field just makes rows vanish
+                // mysteriously. Refuse with a pointer instead.
+                if model.sidebar_rail {
+                    model.status = "Filter needs the full sidebar — Alt-s to expand".into();
+                    self.sync(model);
+                    return SidebarOutcome::Redraw;
+                }
                 self.filtering = true;
                 self.sync(model);
             }
@@ -579,17 +663,27 @@ impl SidebarState {
                 // Multi-select toggle (item 26): mark/unmark the cursor row if it
                 // is a worktree or workspace. Collapse now lives solely on
                 // Enter/←/→ and the caret click, so headers can be selected too.
-                if let Some(row) = self.selected_row(model)
-                    && row.is_markable()
-                {
-                    let key = row.pin_key.clone();
-                    if !self.marked.remove(&key) {
-                        self.marked.insert(key);
+                if let Some(row) = self.selected_row(model) {
+                    if row.is_markable() {
+                        let key = row.pin_key.clone();
+                        if !self.marked.remove(&key) {
+                            self.marked.insert(key);
+                        }
+                        self.sync(model);
+                    } else {
+                        model.status = "Only worktrees and workspaces can be marked".into();
                     }
-                    self.sync(model);
                 }
             }
             Id::RowMenu => {
+                // The rail paints no menu overlay, but an open menu still
+                // captures every key — an invisible modal whose Enter can hit
+                // the danger delete arm. Refuse in rail mode.
+                if model.sidebar_rail {
+                    model.status = "The menu needs the full sidebar — Alt-s to expand".into();
+                    self.sync(model);
+                    return SidebarOutcome::Redraw;
+                }
                 self.menu = self.menu_for_cursor(model, session);
                 self.sync(model);
             }
@@ -597,11 +691,14 @@ impl SidebarState {
                 if let Some(out) = self.delete_outcome(model, session) {
                     return out;
                 }
+                // An Essential-tier key must never silently no-op.
+                model.status = "Nothing to close or delete on this row".into();
             }
             Id::Rename => {
                 if let Some(out) = self.rename_outcome(model, session) {
                     return out;
                 }
+                model.status = "Only worktrees and folders can be renamed".into();
             }
             Id::NewWorktree => {
                 if self.cursor_in_terminals(model) {
@@ -619,11 +716,13 @@ impl SidebarState {
                 if let Some(out) = self.fork_outcome(model) {
                     return out;
                 }
+                model.status = "Branch-from needs a worktree row with a branch".into();
             }
             Id::Folder => {
                 if let Some(out) = self.folder_outcome(model) {
                     return out;
                 }
+                model.status = "Folders apply to worktree and workspace rows".into();
             }
             Id::CopyPath => {
                 if let Some(p) = self
@@ -632,20 +731,28 @@ impl SidebarState {
                 {
                     return SidebarOutcome::CopyText(p);
                 }
+                model.status = "This row has no path to copy".into();
             }
             Id::Help => return SidebarOutcome::ShowHelp,
-            Id::WidthDec => {
-                return self.adjust_width(-2);
-            }
-            Id::WidthInc => {
-                return self.adjust_width(2);
-            }
-            Id::ToggleWide => {
-                // Toggle the Wide expand (mirrors the panel's `e`): ~half the
-                // window vs. the fine-nudged width.
-                self.expanded = !self.expanded;
-                self.persist("sidebar_expanded", if self.expanded { "1" } else { "0" });
-                return SidebarOutcome::Relayout;
+            Id::WidthDec | Id::WidthInc | Id::ToggleWide => {
+                // Rail mode ignores `width`/`expanded` entirely
+                // (`effective_cols` matches Rail first), so nudging there is
+                // an invisible no-op that still PERSISTS — cycle back to Full
+                // (or restart) and the sidebar sits at a width you never saw
+                // yourself set. Refuse with a pointer instead.
+                if model.sidebar_rail {
+                    model.status = "Width applies to the full sidebar — Alt-s to expand".into();
+                    self.sync(model);
+                    return SidebarOutcome::Redraw;
+                }
+                if id == Id::ToggleWide {
+                    // Toggle the Wide expand (mirrors the panel's `e`): ~half
+                    // the window vs. the fine-nudged width.
+                    self.expanded = !self.expanded;
+                    self.persist("sidebar_expanded", if self.expanded { "1" } else { "0" });
+                    return SidebarOutcome::Relayout;
+                }
+                return self.adjust_width(if id == Id::WidthDec { -2 } else { 2 });
             }
         }
         self.sync(model);
@@ -671,10 +778,22 @@ impl SidebarState {
                     model.status = "The home worktree can't be renamed".into();
                     return Some(SidebarOutcome::Redraw);
                 }
+                let dormant_ws = matches!(
+                    row.tab_target,
+                    Some(crate::sidebar::RowTarget::Workspace { .. })
+                )
+                .then(|| row.workspace_slug.clone());
                 if let Some(crate::sidebar::RowTarget::Tab(gi, _)) = row.tab_target.clone()
                     && let Some(branch) = row.branch.clone()
                 {
                     return Some(SidebarOutcome::PromptRename { gi, branch });
+                }
+                // Dormant workspace's worktree: rename runs through the live
+                // session; surface why nothing happened instead of no-opping.
+                if let Some(slug) = dormant_ws {
+                    model.status =
+                        format!("Open workspace \"{slug}\" first to rename this worktree");
+                    return Some(SidebarOutcome::Redraw);
                 }
                 None
             }
@@ -746,11 +865,17 @@ impl SidebarState {
     /// Marks that aren't worktree rows (e.g. workspace headers) carry no group
     /// target and are dropped here; [`Self::marked_nonworktree_count`] reports
     /// them so the caller can hint the user.
+    ///
+    /// Deliberately NOT filtered on `r.visible`: marks are identity-keyed and
+    /// survive a collapse (`rebuild` keeps them so re-expanding restores the
+    /// selection) — a mark inside a collapsed folder/workspace must still act,
+    /// or a bulk delete silently skips rows the user explicitly selected. The
+    /// confirm modal names every target, so nothing acts sight-unseen.
     fn marked_group_targets(&self, model: &FrameModel) -> Vec<usize> {
         let mut targets: Vec<usize> = model
             .sidebar_rows
             .iter()
-            .filter(|r| r.visible && self.marked.contains(&r.pin_key))
+            .filter(|r| self.marked.contains(&r.pin_key))
             .filter_map(|r| match r.tab_target {
                 Some(crate::sidebar::RowTarget::Tab(g, _)) => Some(g),
                 _ => None,
@@ -768,7 +893,7 @@ impl SidebarState {
         model
             .sidebar_rows
             .iter()
-            .filter(|r| r.visible && self.marked.contains(&r.pin_key))
+            .filter(|r| self.marked.contains(&r.pin_key))
             .filter(|r| !matches!(r.tab_target, Some(crate::sidebar::RowTarget::Tab(_, _))))
             .count()
     }
@@ -810,11 +935,12 @@ impl SidebarState {
         model: &mut FrameModel,
         session: &crate::session::Session,
     ) -> SidebarOutcome {
-        // Bulk: every marked row's pin key, else the cursor row's.
+        // Bulk: every marked row's pin key (hidden-by-collapse marks
+        // included — see `marked_group_targets`), else the cursor row's.
         let mut keys: Vec<String> = model
             .sidebar_rows
             .iter()
-            .filter(|r| r.visible && self.marked.contains(&r.pin_key))
+            .filter(|r| self.marked.contains(&r.pin_key))
             .map(|r| r.pin_key.clone())
             .collect();
         if keys.is_empty()
@@ -822,6 +948,17 @@ impl SidebarState {
         {
             keys.push(row.pin_key.clone());
         }
+        self.toggle_pin_keys(keys, model, session)
+    }
+
+    /// Toggle the pin state of these `pin_key`s and persist each flip. Shared
+    /// by the bulk `p` path above and the single-row context-menu entry.
+    fn toggle_pin_keys(
+        &mut self,
+        keys: Vec<String>,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+    ) -> SidebarOutcome {
         for key in keys {
             if key.is_empty() {
                 continue;
@@ -839,10 +976,11 @@ impl SidebarState {
         SidebarOutcome::Redraw
     }
 
-    /// Toggle the flat cross-workspace layout (`g` / context menu): one
-    /// recency-ordered list of every worktree across all repos, vs the
-    /// per-workspace grouping. Persisted as `sidebar_flat` (grouped is the
-    /// default, so the key is deleted rather than tombstoned when off).
+    /// Toggle the flat cross-workspace layout (`g` / context menu): one list
+    /// of every worktree across all repos, ordered by the active `s` sort
+    /// (Manual keeps workspace order — flat is NOT inherently recency), vs
+    /// the per-workspace grouping. Persisted as `sidebar_flat` (grouped is
+    /// the default, so the key is deleted rather than tombstoned when off).
     pub(crate) fn toggle_flat(
         &mut self,
         model: &mut FrameModel,
@@ -860,7 +998,12 @@ impl SidebarState {
         self.scroll = 0;
         self.rebuild(model, session);
         model.status = if self.view.flat {
-            "Sidebar: flat — all worktrees by recency".into()
+            // Honest about the order: flat obeys the active `s` sort (Manual —
+            // the default — keeps workspace order), it is NOT always recency.
+            format!(
+                "Sidebar: flat — all worktrees, {} sort",
+                self.view.sort.as_str()
+            )
         } else {
             "Sidebar: grouped by workspace".into()
         };
@@ -937,17 +1080,28 @@ impl SidebarState {
             "toggle" => return self.toggle_collapse(model, session),
             "toggle-flat" => return self.toggle_flat(model, session),
             "cycle-detail" => return self.cycle_focus_detail(model),
-            "pin" => return self.toggle_pin(model, session),
+            // The menu is anchored to ONE row (the caller re-lands the cursor
+            // on it), so pin/close/delete act on that row alone — never the
+            // marked set. A menu entry labelled for the row under the pointer
+            // must not delete rows marked elsewhere; `Space` + `d`/`p` remain
+            // the bulk gestures.
+            "pin" => {
+                let key = self
+                    .selected_row(model)
+                    .map(|r| r.pin_key.clone())
+                    .filter(|k| !k.is_empty());
+                if let Some(key) = key {
+                    return self.toggle_pin_keys(vec![key], model, session);
+                }
+            }
             "close" => {
-                let targets = self.action_targets(model);
-                if !targets.is_empty() {
-                    return SidebarOutcome::CloseGroups(targets);
+                if let Some(crate::sidebar::RowTarget::Tab(g, _)) = self.cursor_target(model) {
+                    return SidebarOutcome::CloseGroups(vec![g]);
                 }
             }
             "delete" => {
-                let targets = self.action_targets(model);
-                if !targets.is_empty() {
-                    return SidebarOutcome::DeleteGroups(targets);
+                if let Some(crate::sidebar::RowTarget::Tab(g, _)) = self.cursor_target(model) {
+                    return SidebarOutcome::DeleteGroups(vec![g]);
                 }
             }
             "remove-workspace" | "delete-folder" | "close-terminal" => {

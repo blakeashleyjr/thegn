@@ -6,7 +6,7 @@
 //! It produces a `Vec<SidebarRow>` carrying enough structure for interaction
 //! (collapse, filter, sort, pin, multi-select) and per-row status (git glyphs,
 //! agent, activity dot). Glyph/connector composition lives at render time in
-//! `chrome::draw_sidebar`.
+//! `sidebar_view::draw_sidebar`.
 
 use std::collections::HashSet;
 
@@ -25,9 +25,10 @@ pub enum RowKind {
     /// `Workspace` for collapse purposes (keyed by `workspace_slug`).
     TerminalHost,
     Terminal,
-    /// A passive, non-interactive placeholder shown under a section banner when
-    /// it has no real rows (e.g. "No terminals — Alt T to add"). Rendered dim;
-    /// carries no `tab_target`, so landing on it and pressing Enter is a no-op.
+    /// A passive placeholder shown under a section banner when it has no real
+    /// rows (e.g. "No terminals — Enter to add"). Rendered dim; carries no
+    /// `tab_target`, but Enter (and a click) on it runs the hinted action —
+    /// the key/mouse handlers synthesize `Action::NewTerminal` for it.
     EmptyHint,
 }
 
@@ -106,7 +107,10 @@ pub enum SortMode {
     /// Case-insensitive label order, "home" first. Stable — a worktree keeps
     /// its slot when selected/opened (no jumping). The old plugin's default.
     Name,
-    /// Most-recently-touched first (by tab position as a recency proxy).
+    /// Newest first — reverse tab position, i.e. reverse creation order (the
+    /// menu labels it "recent — newest first"; activation does NOT reorder
+    /// the session, so this is not last-used. `Live` is the real-recency
+    /// sort).
     Recent,
     /// Whatever needs the user floats first, by attention tier (blocked on
     /// input > failures > finished > ready-to-land > working > idle; see
@@ -221,8 +225,10 @@ pub struct SidebarRow {
     /// actions can seed rename prompts from it).
     pub child_count: usize,
     /// Attention score: the worktree's own (Worktree rows) or the workspace's
-    /// most-urgent-child rollup (Workspace rows — drives the collapsed-row
-    /// glyph). Denormalized from `SidebarStatus` in one pass at build time.
+    /// most-urgent-child rollup (Workspace rows). Denormalized from
+    /// `SidebarStatus` in one pass at build time. Feeds sorting/bubbling only
+    /// — no glyph is painted from it (the ✋ lives on the statusbar and the
+    /// "Needs you" popup).
     pub attention: Option<thegn_core::attention::AttentionScore>,
     /// The worktree's merge-queue status (its `merge_queue` row, if any) —
     /// drives the detail line's MQ chip. Denormalized in the same pass.
@@ -329,7 +335,9 @@ pub struct SidebarStatus {
     pub hibernated: std::collections::BTreeSet<String>,
     /// Per-worktree attention score (keyed by path) — the tiered "what needs
     /// the user" model (see `thegn_core::attention`). Drives the Attention
-    /// sort, the row reason hint, the jump action, and the statusbar chip.
+    /// sort ranks, the jump/ring actions, the statusbar ✋ badge, and the
+    /// "Needs you" popup. (Rows themselves paint no attention glyph — the
+    /// denormalized `SidebarRow::attention` feeds sorting only.)
     pub attention: std::collections::BTreeMap<String, thegn_core::attention::AttentionScore>,
     /// Hysteresis-stable display rank per worktree path (0 = most urgent).
     /// Computed on the hydration thread; only a tier or membership change
@@ -342,7 +350,8 @@ pub struct SidebarStatus {
     /// recency change participates in the status diff that gates repaints.
     pub activity_recency: std::collections::BTreeMap<String, f64>,
     /// Per-workspace rollup (keyed by slug): the most urgent worktree's score.
-    /// Drives the collapsed-workspace glyph and workspace bubbling.
+    /// Drives workspace bubbling (`[ui] sidebar_workspace_sort = "attention"`);
+    /// no per-workspace glyph is painted from it.
     pub workspace_attention:
         std::collections::BTreeMap<String, thegn_core::attention::AttentionScore>,
     /// Per-worktree merge-queue status (keyed by path) — the queue rows the
@@ -927,7 +936,14 @@ pub fn build_rows(
                 .iter()
                 .filter(|g| g.folder_id == Some(folder.folder_id))
             {
-                let pin_key = format!("{repo_slug}/{}/folder:{}", gr.label, folder.folder_id);
+                // Same `{slug}/{label}` key as the loose and flat placements —
+                // the key is the row's IDENTITY (pins, marks, menu targets,
+                // drag anchors), and embedding the folder id re-keyed the row
+                // on every file/unfile/flat-toggle, silently dropping its pin
+                // and marks (twice, when the optimistic negative folder id was
+                // swapped for the real one). Labels are unique per slug, so
+                // the placement suffix bought no uniqueness.
+                let pin_key = format!("{repo_slug}/{}", gr.label);
                 let mut row = mk_row(gr, 2, pin_key);
                 row.visible = !collapsed && !folder_collapsed;
                 rows.push(row);

@@ -73,6 +73,9 @@ pub(crate) fn file_worktree_path(
         folder,
         now_secs(),
     );
+    // Stamp the optimistic edit so the model swap keeps these lists while the
+    // deferred write is in flight (see `optimistic_db_edit_at`).
+    sb.optimistic_db_edit_at = Some(std::time::Instant::now());
     sb.rebuild(model, session);
 
     // Defer the durable write. Best-effort per the DB-is-a-cache rule; the
@@ -83,10 +86,24 @@ pub(crate) fn file_worktree_path(
     let refresh_tx = refresh_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
-        if let Ok(db) = thegn_core::db::Db::open()
-            && let Ok(real_fid) = db.ensure_folder(&repo_path, &folder_owned)
-        {
-            let _ = db.set_worktree_folder(&wt_path, Some(real_fid));
+        // best-effort beyond the warns (DB is a cache), but each failure is
+        // logged: a silently failed `ensure_folder` skipped the filing write
+        // entirely AFTER the toast said "Filed…", and the next hydration
+        // visibly un-filed the row with no explanation.
+        match thegn_core::db::Db::open() {
+            Ok(db) => match db.ensure_folder(&repo_path, &folder_owned) {
+                Ok(real_fid) => {
+                    if let Err(e) = db.set_worktree_folder(&wt_path, Some(real_fid)) {
+                        tracing::warn!(target: "thegn::sidebar", error = %e, "filing not persisted");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: "thegn::sidebar", error = %e, "folder not created; filing not persisted");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(target: "thegn::sidebar", error = %e, "filing not persisted: DB unavailable");
+            }
         }
         if refresh_tx.send(RefreshKind::Model).is_ok() {
             let _ = waker.wake();
@@ -115,16 +132,26 @@ pub(crate) fn unfile_worktree_path(
     {
         w.folder_id = None;
     }
+    // Stamp the optimistic edit so the model swap keeps these lists while the
+    // deferred write is in flight (see `optimistic_db_edit_at`).
+    sb.optimistic_db_edit_at = Some(std::time::Instant::now());
     sb.rebuild(model, session);
 
     let wt_path = wt_path.to_string();
     let refresh_tx = refresh_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
-        if let Ok(db) = thegn_core::db::Db::open() {
-            // best-effort: the DB is a cache; the optimistic model move above
-            // is the user-visible change
-            let _ = db.set_worktree_folder(&wt_path, None);
+        // best-effort beyond the warn: the DB is a cache; the optimistic model
+        // move above is the user-visible change.
+        match thegn_core::db::Db::open() {
+            Ok(db) => {
+                if let Err(e) = db.set_worktree_folder(&wt_path, None) {
+                    tracing::warn!(target: "thegn::sidebar", error = %e, "un-filing not persisted");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "thegn::sidebar", error = %e, "un-filing not persisted: DB unavailable");
+            }
         }
         if refresh_tx.send(RefreshKind::Model).is_ok() {
             let _ = waker.wake();

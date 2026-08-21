@@ -99,20 +99,28 @@ pub(crate) fn refresh_tab_model(model: &mut FrameModel, session: &Session, sb: &
     let prev = std::mem::take(&mut model.sidebar_workspaces);
     model.sidebar_workspaces =
         crate::hydrate::merge_workspace_lists(prev, crate::hydrate::workspace_list(session, None));
-    // Overlay the incoming workspace's last-known-good git glyphs from the
-    // persistent cache so dirty-dots / ahead-behind arrows persist instantly
-    // across a switch instead of blanking until the async hydration lands (the
-    // stale map still holds the outgoing workspace's paths). In-memory only.
+    // Overlay last-known-good git glyphs from the persistent cache so
+    // dirty-dots / ahead-behind arrows persist instantly across a switch
+    // instead of blanking until the async hydration lands. Seed every path
+    // the tree can render — the incoming session's groups, every registered
+    // worktree, and every workspace repo root (dormant home rows render by
+    // repo path) — all from model fields already in memory: no DB or git on
+    // the loop.
+    let seed_paths: Vec<String> = session
+        .worktrees
+        .iter()
+        .map(|g| g.path.clone())
+        .chain(model.sidebar_db_worktrees.iter().map(|w| w.path.clone()))
+        .chain(
+            model
+                .sidebar_workspaces
+                .iter()
+                .map(|(_, _, _, repo_path)| repo_path.clone()),
+        )
+        .filter(|p| !p.is_empty())
+        .collect();
     let crate::sidebar::SidebarStatus { git, branches, .. } = &mut model.sidebar_status;
-    crate::glyph_refresh::seed_from_global_cache(
-        git,
-        branches,
-        session
-            .worktrees
-            .iter()
-            .filter(|g| !g.path.is_empty())
-            .map(|g| g.path.clone()),
-    );
+    crate::glyph_refresh::seed_from_global_cache(git, branches, seed_paths);
     sb.rebuild(model, session);
 }
 
