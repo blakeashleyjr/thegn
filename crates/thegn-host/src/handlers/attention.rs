@@ -186,11 +186,30 @@ pub(crate) fn mark_all_read(
                     .map(|r| (p, r, s.since, s.episode))
             })
             .collect();
+    // Clear WHAT THE INBOX SHOWS: repo-scoped by default (this repo's rows +
+    // untagged host-global ones), everything only under the `g` all-worktrees
+    // view. The unscoped clear silently marked other repos' never-seen
+    // notifications read. The active repo root is resolved off-loop.
+    let scope_all = crate::panel::scope::system_all();
+    let active = active_worktree_path(model).map(std::path::PathBuf::from);
     let tx = tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
         if let Ok(db) = thegn_core::db::Db::open() {
-            let _ = db.mark_all_notifications_read(); // best-effort: DB is a cache
+            // best-effort: DB is a cache
+            match (scope_all, &active) {
+                (false, Some(wt)) => {
+                    let repo_root =
+                        thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.clone());
+                    let paths: Vec<String> = crate::hydrate::repo_worktree_paths(&db, &repo_root)
+                        .into_iter()
+                        .collect();
+                    let _ = db.mark_notifications_read_scoped(&paths);
+                }
+                _ => {
+                    let _ = db.mark_all_notifications_read();
+                }
+            }
             for (p, r, since, episode) in acks {
                 let _ = db.put_attention_ack(&p, &r, since, episode);
             }
@@ -199,7 +218,11 @@ pub(crate) fn mark_all_read(
             let _ = waker.wake();
         }
     });
-    model.status = "Marked all as read".into();
+    model.status = if scope_all {
+        "Marked all as read (all worktrees)".into()
+    } else {
+        "Marked all as read (this repo — g widens)".into()
+    };
 }
 
 #[cfg(test)]

@@ -249,6 +249,16 @@ impl GitLoc {
         }
     }
 
+    /// The per-worktree DB cache key: the **host-side** worktree path. Never
+    /// key a cache by [`GitLoc::path()`] — for provider/remote placements that
+    /// is the path *inside* the sandbox (e.g. `/workspace`), identical for
+    /// every sandboxed worktree, so all their cache rows would collide into
+    /// one. An associated function (not a method) because `GitLoc` does not
+    /// retain the host path it was resolved from.
+    pub fn worktree_cache_key(worktree: &Path) -> String {
+        worktree.to_string_lossy().into_owned()
+    }
+
     /// Best-effort `rm -rf` of THIS worktree's own directory on the box it lives
     /// on (ssh remote or provider env) — the local delete path can't reach a
     /// remote checkout, so it would otherwise leak. ONLY the worktree dir is

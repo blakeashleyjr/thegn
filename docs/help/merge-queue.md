@@ -17,7 +17,8 @@ ever checking `main` out. Enable it with `[merge_queue] enabled = true`.
 
 Add the current worktree's branch from the [[panel]]'s _merge_ section,
 the sidebar row menu, or `thegn merge add` in the pane. The queue is
-persisted; entries survive restarts.
+persisted; entries survive restarts. The section shows the active
+workspace's queue by default; `g` widens it to every workspace.
 
 ## Landing
 

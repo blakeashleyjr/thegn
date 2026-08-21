@@ -14,16 +14,32 @@ use super::{IssueBackend, IssueError};
 
 pub struct GitHubIssuesBackend {
     extra_flags: Vec<String>,
+    /// Working directory for `gh` invocations. Without it, any call that lacks
+    /// an explicit `--repo` resolves against the *process* cwd — one fixed repo
+    /// for the whole session — so callers should anchor the backend to the
+    /// worktree they're fetching for.
+    dir: Option<std::path::PathBuf>,
 }
 
 impl GitHubIssuesBackend {
     pub fn new(extra_flags: Vec<String>) -> Self {
-        GitHubIssuesBackend { extra_flags }
+        GitHubIssuesBackend {
+            extra_flags,
+            dir: None,
+        }
+    }
+
+    /// Anchor `gh` invocations to `dir` (see the field doc).
+    pub fn set_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.dir = dir;
     }
 
     fn gh(&self, args: &[&str]) -> Result<String, IssueError> {
         let mut cmd = Command::new("gh");
         cmd.args(args);
+        if let Some(dir) = &self.dir {
+            cmd.current_dir(dir);
+        }
         let out = cmd
             .output()
             .map_err(|e| IssueError::Subprocess(e.to_string()))?;
@@ -129,6 +145,9 @@ fn gh_issue_to_domain(gi: GhIssue) -> Issue {
         url: gi.url,
         branch_hint: None,
         updated_at_ms: parse_ms(gi.updated_at.as_deref()),
+        // GitHub issues have no native due-date field (milestones carry one,
+        // but a milestone date is not an issue deadline) — `due_at_ms` stays
+        // `None`, so the `overdue` notification kind never fires for GitHub.
         ..Default::default()
     }
 }

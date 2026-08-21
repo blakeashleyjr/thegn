@@ -193,9 +193,17 @@ fn worktree_from_container_name(name: &str) -> Option<String> {
     let lookup =
         thegn_core::sandbox::strip_vpn_suffix(thegn_core::sandbox::strip_agent_suffix(name));
     // Linear scan of the worktree list. Fine: there are at most a few dozen.
+    // Match BOTH name forms: plain `thegn-{slug}` and the profile form
+    // `thegn-{profile}-{slug}` — under a non-default profile every container
+    // uses the latter, and matching only the plain form dropped every audit
+    // event (the TIMELINE stayed permanently empty).
+    let profile = thegn_core::profile::name();
     let rows = db.worktrees().ok()?;
     rows.into_iter().find_map(|r| {
-        if thegn_core::sandbox::container_name(&r.worktree) == lookup {
+        let plain = thegn_core::sandbox::container_name(&r.worktree);
+        let profiled =
+            thegn_core::sandbox::container_name_with_profile(&r.worktree, Some(&profile));
+        if plain == lookup || profiled == lookup {
             Some(r.worktree)
         } else {
             None

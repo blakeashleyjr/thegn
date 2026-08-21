@@ -54,6 +54,7 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     let all = crate::panel::scope::mine_all();
     let mut out = Vec::new();
+    push_note(&mut out, ctx);
     // The full view leads with a count banner (also makes it visually distinct
     // from the half view, which is otherwise identical at wide column counts).
     if ctx.full() {
@@ -141,14 +142,27 @@ fn short_repo(repo: &str) -> String {
     repo.rsplit('/').next().unwrap_or(repo).to_string()
 }
 
+/// Surface the aggregator's note (e.g. "no `origin` remote — PR search needs
+/// it for repo scope") so a degraded fetch never looks like a clean feed.
+fn push_note(out: &mut Vec<PanelRow>, ctx: &SectionCtx) {
+    let note = &ctx.model.panel.my_work_note;
+    if note.is_empty() {
+        return;
+    }
+    out.push(PanelRow::plain(Line::segs(vec![
+        seg(hue(thegn_core::theme::Hue::Amber), "⚠ ".to_string()),
+        seg(g2(), truncate(note, ctx.cols.saturating_sub(2))),
+    ])));
+}
+
 fn empty_rows(ctx: &SectionCtx) -> Vec<PanelRow> {
-    let mut rows = vec![
-        PanelRow::plain(Line::segs(vec![seg(
-            g2(),
-            "Nothing waiting on you.".to_string(),
-        )])),
-        PanelRow::plain(Line::Blank),
-    ];
+    let mut rows = Vec::new();
+    push_note(&mut rows, ctx);
+    rows.push(PanelRow::plain(Line::segs(vec![seg(
+        g2(),
+        "Nothing waiting on you.".to_string(),
+    )])));
+    rows.push(PanelRow::plain(Line::Blank));
     if ctx.deep() {
         let where_ = if crate::panel::scope::mine_all() {
             "PRs across every repo show up here."

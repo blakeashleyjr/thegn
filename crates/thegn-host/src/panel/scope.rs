@@ -35,6 +35,45 @@ pub fn toggle_mine_all() -> bool {
     set_mine_all(!mine_all())
 }
 
+/// Across section: when set, aggregate excerpts from every workspace's
+/// worktrees instead of only the active repo's.
+static ACROSS_ALL: AtomicBool = AtomicBool::new(false);
+/// Merge-queue section: when set, list every workspace's queued branches
+/// instead of only the active repo's.
+static MERGE_ALL: AtomicBool = AtomicBool::new(false);
+
+/// Whether the Across section spans all workspaces (the toggle is on).
+pub fn across_all() -> bool {
+    ACROSS_ALL.load(Ordering::Relaxed)
+}
+
+/// Set the Across all-workspaces toggle; returns the new value.
+pub fn set_across_all(on: bool) -> bool {
+    ACROSS_ALL.store(on, Ordering::Relaxed);
+    on
+}
+
+/// Flip the Across all-workspaces toggle; returns the new value.
+pub fn toggle_across_all() -> bool {
+    set_across_all(!across_all())
+}
+
+/// Whether the Merge-queue section spans all workspaces (the toggle is on).
+pub fn merge_all() -> bool {
+    MERGE_ALL.load(Ordering::Relaxed)
+}
+
+/// Set the Merge-queue all-workspaces toggle; returns the new value.
+pub fn set_merge_all(on: bool) -> bool {
+    MERGE_ALL.store(on, Ordering::Relaxed);
+    on
+}
+
+/// Flip the Merge-queue all-workspaces toggle; returns the new value.
+pub fn toggle_merge_all() -> bool {
+    set_merge_all(!merge_all())
+}
+
 /// Whether the System tab is showing platform-wide data (the toggle is on).
 pub fn system_all() -> bool {
     SYSTEM_ALL.load(Ordering::Relaxed)

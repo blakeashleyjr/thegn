@@ -715,9 +715,13 @@ pub(crate) struct CiActionCtx<'a> {
 }
 
 impl CiActionCtx<'_> {
-    /// The run id at the panel's row cursor (if any).
+    /// The run id at the panel's row cursor (if any). Resolves through the
+    /// section's `display_runs` (one row per workflow), NOT raw `ci_runs`, so
+    /// the action hits exactly the run the user sees on the cursor row.
     fn run_id_at(&self, cursor: usize) -> Option<String> {
-        self.model.panel.ci_runs.get(cursor).map(|r| r.id.clone())
+        crate::panel::sections::ci::display_runs(&self.model.panel)
+            .get(cursor)
+            .map(|r| r.id.clone())
     }
 
     /// Spawn `thegn <args>` in a split beside the focused pane, then focus it.
@@ -973,7 +977,9 @@ impl CiActionCtx<'_> {
                 true
             }
             KeyCode::Char('o') => {
-                if let Some(url) = self.model.panel.ci_runs.get(cursor).map(|r| r.url.clone())
+                if let Some(url) = crate::panel::sections::ci::display_runs(&self.model.panel)
+                    .get(cursor)
+                    .map(|r| r.url.clone())
                     && !url.is_empty()
                 {
                     open_url_detached(&url);

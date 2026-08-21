@@ -590,6 +590,56 @@ repository(owner:$owner,name:$name){pullRequest(number:$number){\
 reviewThreads(first:20){nodes{isResolved comments(first:1){nodes{\
 author{login} path line body createdAt}}}}}}}";
 
+/// Fetch the viewer's GitHub notification threads (`gh api notifications` —
+/// unread, participating). The caller filters to @mentions for this repo via
+/// [`parse_mention_notifications`]. Subprocess seam; throttled by the caller.
+pub fn fetch_gh_notifications(loc: &GitLoc) -> Result<String, GhError> {
+    gh_out(
+        loc,
+        &["api", "notifications?participating=true&per_page=50"],
+    )
+}
+
+/// Parse the REST notifications payload down to this repo's @mention threads:
+/// `(source_ref, message)` rows, where `source_ref` is
+/// `ghn:<thread id>:<updated_at>` — stable per mention event, so the
+/// emit-once store dedupe fires exactly once per (re-)mention. Pure.
+pub fn parse_mention_notifications(json: &str, nwo: &str) -> Vec<(String, String)> {
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(items) = v.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|n| {
+            n.pointer("/reason").and_then(|r| r.as_str()) == Some("mention")
+                && n.pointer("/repository/full_name").and_then(|r| r.as_str()) == Some(nwo)
+        })
+        .filter_map(|n| {
+            let id = n.pointer("/id")?.as_str()?;
+            let updated = n
+                .pointer("/updated_at")
+                .and_then(|u| u.as_str())
+                .unwrap_or("");
+            let title = n
+                .pointer("/subject/title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let kind = n
+                .pointer("/subject/type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("thread");
+            Some((
+                format!("ghn:{id}:{updated}"),
+                format!("mentioned in {kind}: {title}"),
+            ))
+        })
+        .collect()
+}
+
 /// Fetch the PR's review threads via `gh api graphql` (the `pr view` JSON
 /// fields don't expose threads).
 pub fn review_threads(
@@ -1371,6 +1421,28 @@ mod tests {
         );
         assert_eq!(nwo_from_remote_url("not a url"), None);
         assert_eq!(nwo_from_remote_url(""), None);
+    }
+
+    #[test]
+    fn parse_mention_notifications_filters_reason_and_repo() {
+        let json = r#"[
+            {"id":"11","reason":"mention","updated_at":"2026-08-20T10:00:00Z",
+             "repository":{"full_name":"o/r"},
+             "subject":{"title":"fix the panel","type":"PullRequest"}},
+            {"id":"12","reason":"review_requested","updated_at":"2026-08-20T10:00:00Z",
+             "repository":{"full_name":"o/r"},
+             "subject":{"title":"other","type":"PullRequest"}},
+            {"id":"13","reason":"mention","updated_at":"2026-08-20T11:00:00Z",
+             "repository":{"full_name":"other/repo"},
+             "subject":{"title":"elsewhere","type":"Issue"}}
+        ]"#;
+        let rows = parse_mention_notifications(json, "o/r");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "ghn:11:2026-08-20T10:00:00Z");
+        assert!(rows[0].1.contains("fix the panel"), "{}", rows[0].1);
+        // Garbage / non-array payloads parse to nothing.
+        assert!(parse_mention_notifications("not json", "o/r").is_empty());
+        assert!(parse_mention_notifications("{}", "o/r").is_empty());
     }
 
     #[test]

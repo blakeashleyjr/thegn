@@ -55,8 +55,9 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
         rows.push(PanelRow::plain(Line::segs(vec![seg(
             g(),
-            "no hosts configured — add a [host.<name>] table",
+            "no hosts — n adds one (or add a [host.<name>] table)",
         )])));
+        rows.push(hint_row(&[("n", "new host")]));
         return rows;
     }
     let mut rows: Vec<PanelRow> = Vec::new();
@@ -80,11 +81,15 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             rows.extend(detail_rows(h, ctx));
         }
     }
+    // Mirrors the statusbar strip (`section_keys::HOSTS`) — the two used to
+    // advertise different key sets.
     rows.push(hint_row(&[
+        ("n", "new"),
         ("p", "provision"),
-        ("r", "re-probe"),
-        ("c", "grant install"),
-        ("x", "rm-cache"),
+        ("r", "probe"),
+        ("m", "menu"),
+        ("c", "grant"),
+        ("x", "forget cache"),
     ]));
     rows
 }

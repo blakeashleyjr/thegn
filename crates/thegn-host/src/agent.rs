@@ -683,7 +683,10 @@ pub(crate) fn deregister_vpn(path: &str) {
     if !sb.vpn.is_enabled() {
         return;
     }
-    let name = sandbox::container_name(path);
+    // Profile-aware: the sidecar was created from the container's REAL name
+    // (`thegn-{profile}-{slug}` under a profile), so a plain-name teardown
+    // missed it entirely.
+    let name = sandbox::container_name_with_profile(path, Some(&thegn_core::profile::name()));
     let Some(vpn) = sandbox::build_vpn_spec(&sb.vpn, &name, sb.profile) else {
         return;
     };

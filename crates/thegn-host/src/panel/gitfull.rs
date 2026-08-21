@@ -501,14 +501,29 @@ fn side_rows(
         let range = vwindow(ix.len(), shown, if is_focus { cursor } else { 0 }, height);
         let shown_items = range.len();
 
-        // Header — the count badge reflects items actually shown.
+        // Header — the count badge reflects items actually shown. The digit is
+        // the section's REAL jump key (its 1-based position in the tab's
+        // order), not lazygit's fixed numbering — the old `li + 2` labels
+        // invited pressing `4` next to COMMITS, which opened STASH.
+        let digit = ui
+            .tab_sections()
+            .iter()
+            .position(|s| s == section)
+            .map(|p| {
+                if p == 9 {
+                    "0".to_string()
+                } else {
+                    (p + 1).to_string()
+                }
+            })
+            .unwrap_or_default();
         let mut label = seg(if is_focus { ac() } else { d() }, *name);
         if is_focus {
             label = label.bold();
         }
         let mut header = vec![
             sp(1),
-            seg(if is_focus { ac() } else { g2() }, format!("{}", li + 2)).bold(),
+            seg(if is_focus { ac() } else { g2() }, digit).bold(),
             sp(1),
             label,
         ];
@@ -670,6 +685,31 @@ fn commits_region(data: &PanelData, ui: &PanelUi, w: usize, avail: usize) -> Vec
     out
 }
 
+/// The selected stash's `stash@{N}` index (filter-aware) — the loop's
+/// demand-driven stash-diff fetch keys on this, so it MUST mirror
+/// [`stash_region`]'s selection exactly.
+pub(crate) fn selected_stash(ui: &PanelUi, data: &PanelData) -> Option<usize> {
+    let ix = list_indices(ui, data, GitView::Stash);
+    let cur = ui
+        .git
+        .cur
+        .get(GitView::Stash)
+        .min(ix.len().saturating_sub(1));
+    ix.get(cur).map(|&s| data.stashes[s].index)
+}
+
+/// The selected branch's name (filter-aware) — the loop's demand-driven
+/// branch-log fetch keys on this; mirrors [`branches_region`]'s selection.
+pub(crate) fn selected_branch(ui: &PanelUi, data: &PanelData) -> Option<String> {
+    let ix = list_indices(ui, data, GitView::Branches);
+    let cur = ui
+        .git
+        .cur
+        .get(GitView::Branches)
+        .min(ix.len().saturating_sub(1));
+    ix.get(cur).map(|&s| data.branches[s].name.clone())
+}
+
 /// The branches main region: a cheap linear commit list titled with the
 /// selected branch.
 fn branches_region(data: &PanelData, ui: &PanelUi, avail: usize) -> Vec<PanelRow> {
@@ -679,15 +719,26 @@ fn branches_region(data: &PanelData, ui: &PanelUi, avail: usize) -> Vec<PanelRow
         .cur
         .get(GitView::Branches)
         .min(ix.len().saturating_sub(1));
-    let title = ix
-        .get(cur)
-        .map(|&s| data.branches[s].name.clone())
-        .unwrap_or_else(|| data.branch.clone());
-    let mut out = vec![PanelRow::plain(Line::segs(vec![
-        seg(ac(), title).bold(),
-        seg(g2(), " — recent commits"),
-    ]))];
-    for c in data.commits.iter().take(avail.saturating_sub(1)) {
+    let selected = ix.get(cur).map(|&s| data.branches[s].name.clone());
+    let head = data.branch.clone();
+    let name = selected.unwrap_or_else(|| head.clone());
+    // The selected branch's own log when the demand-driven fetch has landed;
+    // HEAD's list (titled honestly) while it's still out or absent —
+    // captioning main's commits as "feature-x — recent commits" was a lie.
+    let fetched = ui
+        .git
+        .branch_log
+        .as_ref()
+        .filter(|(n, _)| *n == name)
+        .map(|(_, rows)| rows);
+    let mut title_segs = vec![seg(ac(), name.clone()).bold()];
+    match fetched {
+        Some(_) => title_segs.push(seg(g2(), " — recent commits".to_string())),
+        None => title_segs.push(seg(g2(), format!(" — recent commits on {head} (HEAD)…"))),
+    }
+    let mut out = vec![PanelRow::plain(Line::segs(title_segs))];
+    let list = fetched.unwrap_or(&data.commits);
+    for c in list.iter().take(avail.saturating_sub(1)) {
         out.push(PanelRow::plain(Line::split(
             vec![
                 seg(ac(), c.short.clone()),
@@ -700,30 +751,60 @@ fn branches_region(data: &PanelData, ui: &PanelUi, avail: usize) -> Vec<PanelRow
     out
 }
 
-/// The stash main region: the selected stash's message + age + a hint.
-fn stash_region(data: &PanelData, ui: &PanelUi) -> Vec<PanelRow> {
+/// The stash main region: the selected stash's header + its real patch
+/// (`stash show -p -u`, fetched off-loop by the demand check; a spinner
+/// while the read is out).
+fn stash_region(data: &PanelData, ui: &PanelUi, avail: usize) -> Vec<PanelRow> {
     let ix = list_indices(ui, data, GitView::Stash);
     let cur = ui
         .git
         .cur
         .get(GitView::Stash)
         .min(ix.len().saturating_sub(1));
-    match ix.get(cur).map(|&s| &data.stashes[s]) {
-        Some(s) => vec![
-            PanelRow::plain(Line::segs(vec![
-                seg(ac(), format!("stash@{{{}}}", s.index)).bold(),
-                sp(2),
-                seg(g2(), age(s.date)),
-            ])),
-            PanelRow::plain(Line::segs(vec![seg(d(), s.message.clone())])),
-            PanelRow::blank(),
-            PanelRow::plain(Line::segs(vec![seg(
-                g2(),
-                "enter diff · space apply · p pop · d drop",
-            )])),
-        ],
-        None => vec![PanelRow::plain(Line::segs(vec![seg(g2(), "no stashes")]))],
+    let Some(s) = ix.get(cur).map(|&s| &data.stashes[s]) else {
+        return vec![PanelRow::plain(Line::segs(vec![seg(g2(), "no stashes")]))];
+    };
+    let mut out = vec![
+        PanelRow::plain(Line::segs(vec![
+            seg(ac(), format!("stash@{{{}}}", s.index)).bold(),
+            sp(2),
+            seg(g2(), age(s.date)),
+            sp(2),
+            seg(g2(), "space apply · p pop · d drop"),
+        ])),
+        PanelRow::plain(Line::segs(vec![seg(d(), s.message.clone())])),
+        PanelRow::blank(),
+    ];
+    match ui.git.stash_diff.as_ref().filter(|(i, _)| *i == s.index) {
+        Some((_, text)) => {
+            // Unified-diff lines colored by prefix, scrolled by `ui.scroll`
+            // and windowed to the region height.
+            let lines: Vec<&str> = text.lines().collect();
+            let body = avail.saturating_sub(out.len()).max(1);
+            let start = ui.scroll.min(lines.len().saturating_sub(1));
+            for line in lines.iter().skip(start).take(body) {
+                let tok = if line.starts_with("+++") || line.starts_with("---") {
+                    d()
+                } else if line.starts_with('+') {
+                    hue(Hue::Green)
+                } else if line.starts_with('-') {
+                    hue(Hue::Red)
+                } else if line.starts_with("@@") {
+                    hue(Hue::Blue)
+                } else if line.starts_with("diff ") || line.starts_with("index ") {
+                    g2()
+                } else {
+                    f()
+                };
+                out.push(PanelRow::plain(Line::segs(vec![seg(
+                    tok,
+                    (*line).to_string(),
+                )])));
+            }
+        }
+        None => out.push(spinner(ui.docs.tick, "stash diff")),
     }
+    out
 }
 
 /// The drilled commit's FILE LIST (`enter` on a commit): one row per changed
@@ -908,7 +989,7 @@ fn main_rows(
         GitView::CommitFiles => commit_files_region(ui, focused, avail),
         GitView::PatchBuilding => patch_region(ui, focused, w, avail),
         GitView::Branches => branches_region(data, ui, avail),
-        GitView::Stash => stash_region(data, ui),
+        GitView::Stash => stash_region(data, ui, avail),
         GitView::RebaseTodo => vec![PanelRow::plain(Line::segs(vec![seg(
             g2(),
             "no rebase in progress",
@@ -1092,6 +1173,26 @@ pub(super) fn build_git_full(
         header.len().min(1)
     };
     out.extend(header.into_iter().take(keep));
+    // At Half width this frame renders a DRILL detail view into the panel
+    // band (the accordion is gone but the center pane is still visible) —
+    // say where the user is and how to get back, or the view reads as a trap.
+    if ui.width == crate::layout::PanelWidth::Half {
+        let view = match ui.git.focus {
+            GitView::Staging => "staging",
+            GitView::CommitFiles => "commit files",
+            GitView::PatchBuilding => "patch building",
+            GitView::Blame => "blame",
+            GitView::RebaseTodo => "rebase todo",
+            _ => "",
+        };
+        if !view.is_empty() {
+            out.push(PanelRow::plain(Line::segs(vec![
+                seg(g2(), format!("{} › ", ui.open.label().to_lowercase())),
+                seg(d(), view.to_string()).bold(),
+                seg(g2(), " · esc back".to_string()),
+            ])));
+        }
+    }
     out.extend(status_rows(model, ui, focused));
     // The semantic-impact summary — normally the Changes accordion footer, which
     // the full-screen frame doesn't render — surfaced as a one-line strip under
@@ -1537,9 +1638,10 @@ mod tests {
         let m = model();
         let frame = build_git_full(&m, &ui(GitView::Files), 120, 40, true);
         let all = all_text(&frame);
-        // Files context: space stage · enter diff · …
+        // Files context: space stage · enter stage lines · … (Enter's label
+        // names its drill destination, the staging view).
         assert!(all.contains("space stage"), "{all}");
-        assert!(all.contains("enter diff"), "{all}");
+        assert!(all.contains("enter stage lines"), "{all}");
         // The Files focus main region shows the selected file's summary.
         assert!(all.contains("enter to stage lines"), "{all}");
         assert!(all.contains("src/a.rs"), "{all}");

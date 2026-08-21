@@ -1301,6 +1301,44 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     }
 }
 
+/// Stop or restart a container by name (OCI backends): `action` is `"stop"`
+/// or `"restart"`. `backend` is the container's own runtime (from the probe
+/// row) so the command goes straight to the right daemon rather than the
+/// teardown-style fan-out. Runs on the worktree's host (local or remote, per
+/// its `GitLoc`). Best-effort; returns whether the runtime acknowledged.
+/// Subprocess seam — exercised by the Sandbox panel's `s`/`r` keys.
+pub fn container_control(
+    cfg: &SandboxConfig,
+    loc: &GitLoc,
+    backend: Backend,
+    name: &str,
+    action: &str,
+) -> bool {
+    let placement = placement_from_loc(cfg, loc);
+    let oci_host = (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim());
+    let mut argv = oci_prefix_for(backend, oci_host);
+    argv.extend([action.to_string(), name.to_string()]);
+    // `stop` honors the container's stop-grace (default 10s) before SIGKILL,
+    // and `restart` pays it twice — give it comfortably more than that.
+    let _timeout = Duration::from_secs(45);
+    run_control_t_owned(&placement, &argv, _timeout).unwrap_or(false)
+}
+
+/// The argv that tails a container's logs (`<runtime> logs --tail 200 -f`),
+/// for the host to run in an interactive pane. Pure.
+pub fn container_logs_argv(cfg: &SandboxConfig, backend: Backend, name: &str) -> Vec<String> {
+    let oci_host = (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim());
+    let mut argv = oci_prefix_for(backend, oci_host);
+    argv.extend([
+        "logs".into(),
+        "--tail".into(),
+        "200".into(),
+        "-f".into(),
+        name.to_string(),
+    ]);
+    argv
+}
+
 /// Run the host-side `[sandbox] prepare` hooks for a worktree: each command via
 /// `sh -lc` in the worktree dir, sequentially, on a background thread
 /// (fire-and-forget — a failing hook is the user's script's concern). These run

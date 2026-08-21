@@ -3,7 +3,7 @@
 
 use thegn_core::db::Db;
 use thegn_core::notification::Notification;
-use thegn_core::store::NotificationStore;
+use thegn_core::store::{NotificationStore, WorkspaceStore};
 
 /// The ERROR count carried by the most recent existing `log:thegn`
 /// notification, parsed from its `"{n} error(s) in thegn.log"` message.
@@ -84,13 +84,29 @@ pub(crate) fn populate_notifications(
     app_cfg: &thegn_core::config::Config,
     panel: &mut crate::panel::PanelData,
 ) {
-    if let Ok(mut notifications) = db.get_all_notifications(50) {
+    // Fetch a deeper page than the display cap and filter AFTER: with the cap
+    // applied in SQL, a busy sibling repo's 50 newest rows crowded this repo's
+    // out entirely and the scoped inbox read "inbox zero" over real unread rows.
+    if let Ok(mut notifications) = db.get_all_notifications(400) {
         use thegn_core::notification::Priority;
         if !crate::panel::scope::system_all() {
             let repo_paths = crate::hydrate::repo_worktree_paths(db, repo_root);
-            notifications
-                .retain(|n| n.worktree_path.is_empty() || repo_paths.contains(&n.worktree_path));
+            // Scope FAIL-OPEN on the registry: a row tagged with a path the DB
+            // doesn't know (the repo's main checkout, an externally-created
+            // worktree — neither gets a `worktrees` row) is kept, not hidden.
+            // Only rows tagged with a KNOWN path of a DIFFERENT repo are
+            // filtered out. Mirrors `attention_status`'s fail-open overlay.
+            let all_known: std::collections::HashSet<String> = db
+                .worktrees()
+                .map(|wts| wts.into_iter().map(|w| w.worktree).collect())
+                .unwrap_or_default();
+            notifications.retain(|n| {
+                n.worktree_path.is_empty()
+                    || repo_paths.contains(&n.worktree_path)
+                    || !all_known.contains(&n.worktree_path)
+            });
         }
+        notifications.truncate(50);
         let unread = notifications.iter().filter(|n| !n.read);
         let (mut alert, mut counted) = (0usize, 0usize);
         for n in unread {

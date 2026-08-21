@@ -56,6 +56,9 @@ pub struct ShareView {
     /// consumer command. `None` while starting or on failure.
     pub url: Option<String>,
     pub failed: bool,
+    /// The failure reason when `failed` — surfaced in the panel row; without it
+    /// the user saw the word "failed" and nothing else.
+    pub error: Option<String>,
     /// Provider id (`bore`/`frp`/`tailscale`/`iroh`) — drives the panel glyph.
     pub provider: &'static str,
     /// Whether the share is reachable from the public internet (safety badge).
@@ -158,6 +161,10 @@ impl ShareSupervisor {
                     _ => None,
                 },
                 failed: matches!(i.state, ShareState::Failed(_)),
+                error: match &i.state {
+                    ShareState::Failed(e) => Some(e.clone()),
+                    _ => None,
+                },
                 provider: i.provider,
                 public: i.public,
             })
@@ -175,6 +182,12 @@ impl ShareSupervisor {
         tx: &UnboundedSender<ShareEvent>,
         waker: &TerminalWaker,
     ) -> Result<(), String> {
+        // A FAILED instance must not block a retry: the failed supervisor
+        // thread is gone (it never emits `Down`), so without this eviction the
+        // port stayed "already sharing" for the rest of the session.
+        self.instances.retain(|i| {
+            !(i.worktree == worktree && i.port == port && matches!(i.state, ShareState::Failed(_)))
+        });
         if self.has(worktree, port) {
             return Err(format!("already sharing port {port}"));
         }
@@ -247,19 +260,20 @@ impl ShareSupervisor {
         }
     }
 
-    /// Stop shares on `worktree`: a specific `port`, or all (`None`). Returns the
-    /// number stopped.
-    pub fn stop(&mut self, worktree: &str, port: Option<u16>) -> usize {
-        let mut n = 0;
+    /// Stop shares on `worktree`: a specific `port`, or all (`None`). Returns
+    /// the stopped ports — callers use them for DB cleanup, which must key off
+    /// the supervisor's own state, never a possibly-stale render mirror.
+    pub fn stop(&mut self, worktree: &str, port: Option<u16>) -> Vec<u16> {
+        let mut stopped = Vec::new();
         self.instances.retain(|i| {
             let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
             if matched {
                 i.kill();
-                n += 1;
+                stopped.push(i.port);
             }
             !matched
         });
-        n
+        stopped
     }
 
     /// SIGTERM every child (teardown on quit).
@@ -358,8 +372,12 @@ fn supervise(
         // There is no child to wait on; the serve persists until `stop`/shutdown
         // runs `down_argv` (held in `shared.teardown`) or the sidecar dies.
         ShareLaunch::SidecarServe(serve) => {
+            // Profile-aware — the sidecar rides the container's real name.
             let sidecar = thegn_core::sandbox::vpn_sidecar_name(
-                &thegn_core::sandbox::container_name(&worktree),
+                &thegn_core::sandbox::container_name_with_profile(
+                    &worktree,
+                    Some(&thegn_core::profile::name()),
+                ),
             );
             match share::serve_up(&sidecar, &serve) {
                 Ok(url) => {

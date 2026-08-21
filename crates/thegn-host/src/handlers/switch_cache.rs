@@ -35,7 +35,8 @@ pub(crate) struct WorktreeSlice {
 
 impl WorktreeSlice {
     /// Capture the active worktree's slice from a freshly-hydrated model
-    /// (pre LSP-merge for the panel: LSP diags are editor-global).
+    /// (pre LSP-merge for the panel: LSP diags live in their own per-root
+    /// store and are re-merged on every paint).
     pub(crate) fn seed_from(model: &FrameModel) -> Self {
         WorktreeSlice {
             panel: model.panel.clone(),
@@ -107,12 +108,7 @@ pub(crate) fn clear_and_fill(
         let Ok(db) = thegn_core::db::Db::open() else {
             return;
         };
-        let cfg = thegn_core::config::Config::try_load_layered(
-            &thegn_core::config::ProcessEnv,
-            &[],
-            None,
-        )
-        .unwrap_or_default();
+        let cfg = crate::hydrate::load_hydration_config();
         let panel = {
             let _g = crate::perf::measure(crate::perf::Subsys::Hydrate);
             crate::hydrate::build_panel(&cwd, &db, &hints, &cfg)
@@ -145,14 +141,17 @@ pub(crate) fn drain_prefetch_results(
         slice.seeded_at = Some(std::time::Instant::now());
         // A fast-fill for the worktree the user just cold-switched to (still
         // active + pending) paints the live frame: preserve loop-owned
-        // now-playing media and re-merge editor-global LSP diags (the fresh
+        // now-playing media and re-merge this worktree's LSP diags (the fresh
         // panel carries only git/db diags), mirroring the full model swap.
         if is_active && model.panel_pending {
             let media = model.panel.media.take();
             model.panel = panel;
             model.panel.media = media;
             if !lsp.is_empty() {
-                lsp.merge_into(&mut model.panel.diagnostics);
+                lsp.merge_into(
+                    &crate::hydrate::active_tab_path(session),
+                    &mut model.panel.diagnostics,
+                );
             }
             model.panel_pending = false;
             painted = true;
