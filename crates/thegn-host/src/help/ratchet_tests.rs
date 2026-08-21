@@ -216,6 +216,133 @@ fn action_docs_ratchet() {
     );
 }
 
+// ── The prose ratchet ────────────────────────────────────────────────────────
+//
+// `action_docs_ratchet` above checks that an action id is *claimed* in some
+// page's `actions:` frontmatter. That is a cheap thing to satisfy, and it is
+// exactly how the corpus drifted: coverage read ~100% while eight of twenty
+// pages went untouched for a month and eight shipped features got no help
+// commit at all. Claiming an id must not substitute for writing about it.
+//
+// So: a claimed action must also be *mentioned in the body* — by its chord or
+// by a distinctive word from its label. Deliberately loose (one word is
+// enough); it is a floor against zero-mention claims, not a quality bar.
+
+fn prose_ratchet_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/help-prose-ratchet.txt")
+}
+
+/// Words too generic to prove a page discusses a specific action.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "from", "with", "this", "that", "into", "your", "new", "open", "show",
+    "toggle", "cycle", "next", "prev", "previous", "select", "built", "docs",
+];
+
+/// The human label for a bindable id, from whichever table declares it.
+fn action_label(id: &str) -> Option<&'static str> {
+    ACTION_SPECS
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| s.label)
+        .or_else(|| {
+            thegn_core::keymap::BUILTINS
+                .iter()
+                .find(|a| a.id == id)
+                .map(|a| a.menu_label)
+        })
+}
+
+/// Distinctive lowercase words from a label: alphanumeric runs of 4+ chars
+/// that aren't stopwords.
+fn label_words(label: &str) -> Vec<String> {
+    label
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|w| w.len() >= 4 && !STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Does `body` actually discuss the action? Its id, its chord, or any
+/// distinctive label word counts.
+fn body_mentions(body: &str, id: &str) -> bool {
+    let hay = body.to_ascii_lowercase();
+    if hay.contains(&id.to_ascii_lowercase()) {
+        return true;
+    }
+    if let Some(chord) = crate::keymap::chord_hint_for(&thegn_core::config::Config::default(), id)
+        && hay.contains(&chord.to_ascii_lowercase())
+    {
+        return true;
+    }
+    action_label(id)
+        .map(|l| label_words(l).iter().any(|w| hay.contains(w.as_str())))
+        .unwrap_or(false)
+}
+
+#[test]
+fn claimed_actions_are_mentioned_in_the_page_body() {
+    let reg = registry();
+    let allow: BTreeSet<String> = read_allowlist(prose_ratchet_path()).into_iter().collect();
+
+    let mut silent: Vec<String> = Vec::new();
+    let mut now_written: Vec<String> = Vec::new();
+    for page in reg.pages().iter().filter(|p| !p.meta.generated) {
+        for id in &page.meta.actions {
+            let key = format!("{}:{id}", page.meta.id);
+            let mentioned = body_mentions(&page.body, id);
+            if !mentioned && !allow.contains(&key) {
+                silent.push(key);
+            } else if mentioned && allow.contains(&key) {
+                now_written.push(key);
+            }
+        }
+    }
+    silent.sort();
+    now_written.sort();
+
+    assert!(
+        silent.is_empty(),
+        "action(s) claimed in frontmatter but never mentioned in the body:\n  {}\n\
+         Write a sentence about them — naming the chord or the action — rather than \
+         only listing the id.\n\
+         Do NOT add to test/help-prose-ratchet.txt; the allowlist only shrinks.",
+        silent.join("\n  ")
+    );
+    assert!(
+        now_written.is_empty(),
+        "now documented in prose but still allowlisted:\n  {}\n\
+         Delete those lines from test/help-prose-ratchet.txt to lock in the win.",
+        now_written.join("\n  ")
+    );
+}
+
+/// Regenerate the prose allowlist. Same gate as `help_ratchet_update`.
+#[test]
+#[ignore = "writes test/help-prose-ratchet.txt; run via `just help-ratchet-update`"]
+fn help_prose_ratchet_update() {
+    if std::env::var("THEGN_HELP_RATCHET_UPDATE").as_deref() != Ok("1") {
+        return;
+    }
+    let reg = registry();
+    let mut lines = vec![
+        "# help-prose-ratchet — `<page>:<action>` pairs whose page claims the".to_string(),
+        "# action in `actions:` frontmatter but never mentions it in the body.".to_string(),
+        "# Claiming an id must not substitute for writing about it.".to_string(),
+        "# This list may only SHRINK (or run `just help-ratchet-update`).".to_string(),
+    ];
+    let mut silent: BTreeSet<String> = BTreeSet::new();
+    for page in reg.pages().iter().filter(|p| !p.meta.generated) {
+        for id in &page.meta.actions {
+            if !body_mentions(&page.body, id) {
+                silent.insert(format!("{}:{id}", page.meta.id));
+            }
+        }
+    }
+    lines.extend(silent);
+    std::fs::write(prose_ratchet_path(), lines.join("\n") + "\n")
+        .expect("write help-prose-ratchet.txt");
+}
+
 /// The one sanctioned write: regenerate the allowlist from the current
 /// undocumented set. `just help-ratchet-update` wires this up.
 #[test]
