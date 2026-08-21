@@ -32,6 +32,7 @@ pub(crate) mod sidebar_reorder;
 pub(crate) mod startup;
 pub(crate) mod startup_watchdog;
 pub(crate) mod status;
+pub(crate) mod status_line;
 pub(crate) mod switch;
 pub(crate) mod switch_cache;
 pub(crate) mod task_output;

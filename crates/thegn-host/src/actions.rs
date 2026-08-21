@@ -831,8 +831,7 @@ impl CiActionCtx<'_> {
                     ov.dim_selected();
                 }
             }
-            DetailAction::DismissNotification { id } => self.mutate_notifications(Some(id)),
-            DetailAction::ClearNotifications => self.mutate_notifications(None),
+            DetailAction::DismissNotification { id } => self.mutate_notifications(id),
             DetailAction::OpenLogPager => self.open_log_pager(),
             DetailAction::CopyLine(line) => {
                 crate::clipboard::copy(&line);
@@ -868,27 +867,22 @@ impl CiActionCtx<'_> {
         }
     }
 
-    /// Mark one (`Some(id)`) or every (`None`) notification read, off the loop,
-    /// then pulse a model refresh so the inbox list + badge counts repaint.
-    fn mutate_notifications(&mut self, id: Option<i64>) {
+    /// Mark one notification read, off the loop, then pulse a model refresh so
+    /// the inbox list + badge counts repaint. ("Clear all" is
+    /// [`DetailAction::AckAllAttention`] → `mark_all_read`, the one total-clear
+    /// path every surface shares.)
+    fn mutate_notifications(&mut self, id: i64) {
         let tx = self.refresh_tx.clone();
         let waker = self.waker.clone();
         tokio::task::spawn_blocking(move || {
             if let Ok(db) = thegn_core::db::Db::open() {
-                let _ = match id {
-                    Some(id) => db.mark_notification_read(id),
-                    None => db.mark_all_notifications_read(),
-                };
+                let _ = db.mark_notification_read(id); // best-effort: DB is a cache
             }
             if tx.send(RefreshKind::Model).is_ok() {
                 let _ = waker.wake();
             }
         });
-        self.model.status = if id.is_some() {
-            "Dismissed notification".into()
-        } else {
-            "Cleared notifications".into()
-        };
+        self.model.status = "Dismissed notification".into();
     }
 
     /// Mark one notification read *in place* (highlight): same DB write as a
@@ -925,6 +919,10 @@ impl CiActionCtx<'_> {
             if let Ok(db) = thegn_core::db::Db::open() {
                 // best-effort: DB is a cache
                 let _ = db.put_attention_ack(&path, &reason, since, episode);
+                // The worktree's inbox rows are the same item seen from the
+                // other side; leaving them unread made a quieted needs-you
+                // entry reappear under Alerts with the ⚑ count unchanged.
+                let _ = db.mark_notifications_read_for_worktree(&path);
             }
             if tx.send(RefreshKind::Model).is_ok() {
                 let _ = waker.wake();

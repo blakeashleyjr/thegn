@@ -975,12 +975,22 @@ pub fn git_claims_ctrl(ui: &crate::panel::PanelUi, key: &KeyCode) -> bool {
     )
 }
 
+/// Whether `msg` dispatches at `width` — the same gate [`git_key`] applies,
+/// exposed so the help bar advertises only what a press will actually do.
+pub fn allowed_at_width(msg: &GitMsg, width: PanelWidth) -> bool {
+    match width {
+        PanelWidth::Normal => is_navigation(msg),
+        PanelWidth::Half => !needs_full(msg),
+        PanelWidth::Full => true,
+    }
+}
+
 /// Resolve a raw key against the focused git context. `None` falls through
 /// to `accordion_key`, the per-section action keys, then the global keymap.
 ///
 /// Gating, in order: row-mode only; while an op is pending only navigation;
-/// at Normal width only navigation (the panel hints to widen); Full-only
-/// messages are dropped at Half.
+/// at Normal width only navigation (the help bar shows `e expand` instead of
+/// the action keys); Full-only messages are dropped at Half.
 pub fn git_key(key: &KeyCode, mods: Modifiers, ui: &crate::panel::PanelUi) -> Option<GitMsg> {
     if !ui.open.is_git_family() || !ui.row_mode {
         return None;

@@ -1729,6 +1729,19 @@ fn put_notification_once_dedupes_on_kind_ref_message() {
 }
 
 #[test]
+fn mark_notifications_read_for_worktree_is_scoped_to_that_path() {
+    let db = db();
+    db.put_notification("test_failed", "", "3 tests failed", "/wt/a")
+        .unwrap();
+    db.put_notification("test_failed", "", "1 test failed", "/wt/b")
+        .unwrap();
+    db.mark_notifications_read_for_worktree("/wt/a").unwrap();
+    let unread = db.get_unread_notifications().unwrap();
+    assert_eq!(unread.len(), 1);
+    assert_eq!(unread[0].worktree_path, "/wt/b");
+}
+
+#[test]
 fn prune_notifications_drops_old_read_keeps_unread_and_recent() {
     let db = db();
     let now = crate::util::now();
