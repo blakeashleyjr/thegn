@@ -1065,8 +1065,8 @@ pub fn run_worker(
         fail(CreateStep::CreateWorktree, e);
         return;
     }
-    // Seed the bundled /mq merge-queue skill for agents in this worktree
-    // (best-effort, gated on [merge_queue] enabled).
+    // Seed the bundled merge-queue agent assets (`/mq`, `/mq-add`, `/mq-drain`)
+    // for agents in this worktree (best-effort, gated on [merge_queue] enabled).
     crate::mq_assets::seed_if_enabled(cfg, &path);
     step(CreateStep::CreateWorktree, StepState::Done, None);
 

@@ -609,9 +609,11 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
             ),
         }
     }
-    // Seed the bundled `/mq` merge-queue skill into persisted local worktrees so
-    // agents launched there discover it (best-effort; new worktrees seeded on
-    // create — see `cmd/wt.rs`/`wizard.rs`). Gated on `[merge_queue] enabled`.
+    // Seed the bundled merge-queue agent assets (`/mq`, `/mq-add`, `/mq-drain`)
+    // into persisted local worktrees so agents launched there discover them —
+    // this is also how worktrees created by an older build pick up newly bundled
+    // assets. (Best-effort; new worktrees seeded on create — see
+    // `cmd/wt.rs`/`wizard.rs`.) Gated on `[merge_queue] enabled`.
     crate::mq_assets::seed_persisted_worktrees(&cfg);
     // Embedded host nix cache: when any env opts into `[env.<name>.provider]
     // host_cache`, serve the host /nix/store on an ephemeral loopback port for the
