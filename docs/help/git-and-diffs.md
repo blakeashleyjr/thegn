@@ -23,8 +23,8 @@ the full tool.
 Inside any git-family section, `?` shows that section's own key
 cheatsheet. Marks, ranges, and flows follow lazygit conventions.
 
-`Alt-/` opens a plain `git diff` in a pane; `thegn diff` prints one from
-any shell.
+`Alt-/` opens a plain `git diff` in a pane; `thegn wt diff` prints one
+from any shell.
 
 Push, pull, and fetch for the focused worktree run from the palette (or
 your own `[keybinds]`); **rollback** restores a worktree to a prior

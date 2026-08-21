@@ -16,7 +16,7 @@ ever checking `main` out. Enable it with `[merge_queue] enabled = true`.
 ## Queueing
 
 Add the current worktree's branch from the [[panel]]'s _merge_ section,
-the sidebar row menu, or `thegn mq add` in the pane. The queue is
+the sidebar row menu, or `thegn merge add` in the pane. The queue is
 persisted; entries survive restarts.
 
 ## Landing
