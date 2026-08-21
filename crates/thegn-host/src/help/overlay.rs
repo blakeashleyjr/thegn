@@ -106,12 +106,10 @@ impl HelpOverlay {
     }
 
     fn rendered(&self) -> RenderedPage {
-        let blocks = self
-            .reg
-            .page(&self.page)
-            .map(|p| p.blocks.as_slice())
-            .unwrap_or(&[]);
-        render_page(blocks, self.last_dims.0, self.link_sel)
+        // `page_blocks` appends the "Referenced by" footer, whose entries are
+        // ordinary links — so `n`/`p`/`↵` reach them like any other.
+        let blocks = super::render::page_blocks(&self.reg, &self.page);
+        render_page(&blocks, self.last_dims.0, self.link_sel)
     }
 
     fn max_scroll(&self, total_lines: usize) -> usize {

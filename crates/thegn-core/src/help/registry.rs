@@ -103,6 +103,10 @@ pub struct HelpRegistry {
     by_id: HashMap<String, usize>,
     toc: Vec<TocNode>,
     by_context: HashMap<String, String>,
+    /// Reverse link edges: page id → the ids of pages linking *to* it, in
+    /// registration order and deduped. Built from the same walk that validates
+    /// forward links, so it costs nothing extra.
+    backlinks: HashMap<String, Vec<String>>,
 }
 
 impl HelpRegistry {
@@ -136,15 +140,29 @@ impl HelpRegistry {
 
         let toc = build_toc(&pages, &by_id, &mut errors);
 
+        // One walk, two jobs: report dangling forward links, and invert the
+        // resolved ones into the backlink map.
+        let mut backlinks: HashMap<String, Vec<String>> = HashMap::new();
         for page in &pages {
             for target in markdown::links(&page.blocks) {
-                if let LinkTarget::Page(id) = target
-                    && !by_id.contains_key(id)
-                {
+                let LinkTarget::Page(id) = target else {
+                    continue;
+                };
+                if !by_id.contains_key(id) {
                     errors.push(ValidationError::DanglingLink {
                         page: page.meta.id.clone(),
                         target: id.clone(),
                     });
+                    continue;
+                }
+                // A page linking to itself is not a backlink, and a page that
+                // links the same target twice earns only one edge.
+                if *id == page.meta.id {
+                    continue;
+                }
+                let from = backlinks.entry(id.clone()).or_default();
+                if !from.contains(&page.meta.id) {
+                    from.push(page.meta.id.clone());
                 }
             }
         }
@@ -184,9 +202,16 @@ impl HelpRegistry {
                 by_id,
                 toc,
                 by_context,
+                backlinks,
             },
             errors,
         )
+    }
+
+    /// The ids of pages linking to `id` ("Referenced by"), in registration
+    /// order. Empty for an unlinked page or an unknown id.
+    pub fn backlinks(&self, id: &str) -> &[String] {
+        self.backlinks.get(id).map_or(&[], Vec::as_slice)
     }
 
     pub fn page(&self, id: &str) -> Option<&HelpPage> {
@@ -421,6 +446,39 @@ mod tests {
                 target: "ghost".into()
             }]
         );
+    }
+
+    #[test]
+    fn backlinks_invert_resolved_page_links() {
+        let index = page("index", "", "see [[aa]] and [[bb]]\n");
+        let aa = page("aa", "", "also [[bb]]\n");
+        let bb = page("bb", "", "nothing\n");
+        let (reg, errors) = HelpRegistry::build(&[&index, &aa, &bb], CONTEXTS);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(reg.backlinks("bb"), ["index".to_string(), "aa".to_string()]);
+        assert_eq!(reg.backlinks("aa"), ["index".to_string()]);
+        assert!(reg.backlinks("index").is_empty(), "nothing links to index");
+        assert!(reg.backlinks("nope").is_empty(), "unknown id is empty");
+    }
+
+    /// A self-link isn't a reference, and linking the same page twice earns
+    /// one edge — otherwise the footer would repeat itself.
+    #[test]
+    fn backlinks_skip_self_and_dedupe() {
+        let index = page("index", "", "[[aa]] then [[aa]] again, and [[index]]\n");
+        let aa = page("aa", "", "");
+        let (reg, errors) = HelpRegistry::build(&[&index, &aa], CONTEXTS);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(reg.backlinks("aa"), ["index".to_string()]);
+        assert!(reg.backlinks("index").is_empty());
+    }
+
+    /// A dangling link contributes no edge (it's reported instead).
+    #[test]
+    fn backlinks_ignore_dangling_targets() {
+        let index = page("index", "", "see [[ghost]]\n");
+        let (reg, _) = HelpRegistry::build(&[&index], CONTEXTS);
+        assert!(reg.backlinks("ghost").is_empty());
     }
 
     #[test]
