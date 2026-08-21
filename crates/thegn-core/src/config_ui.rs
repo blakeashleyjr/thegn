@@ -57,6 +57,12 @@ pub struct UiConfig {
     pub sidebar_workspace_sort: WorkspaceSort,
     /// Sidebar TERMINALS section visibility (see [`TerminalsSection`]).
     pub sidebar_terminals_section: TerminalsSection,
+    /// Shift+Alt+↑/↓ steps *past* workspaces and terminal hosts you have
+    /// collapsed instead of stopping on them (and expanding them on arrival) —
+    /// a folded group is one you are not working in. Set false to visit every
+    /// group, folded or not. If every other stop is collapsed the step still
+    /// lands on the immediate neighbour, so the keybind never goes dead.
+    pub sidebar_nav_skips_collapsed: bool,
     /// In full-window pane fullscreen (the third stop of Ctrl+Alt+z, which
     /// hides the sidebar/panel/strip), keep the top masthead bar visible.
     pub fullscreen_keep_masthead: bool,
@@ -99,6 +105,7 @@ impl Default for UiConfig {
             dismiss_overlay_on_click_outside: true,
             sidebar_workspace_sort: WorkspaceSort::default(),
             sidebar_terminals_section: TerminalsSection::default(),
+            sidebar_nav_skips_collapsed: true,
             fullscreen_keep_masthead: true,
             fullscreen_keep_statusbar: true,
             sidebar_show_status_icon: true,
@@ -152,6 +159,17 @@ mod tests {
             UiConfig::default().sidebar_terminals_section,
             TerminalsSection::Always
         );
+    }
+
+    #[test]
+    fn nav_skips_collapsed_defaults_on_and_toggles() {
+        assert!(UiConfig::default().sidebar_nav_skips_collapsed);
+        // Survives an empty table.
+        let cfg: UiConfig = toml::from_str("").unwrap();
+        assert!(cfg.sidebar_nav_skips_collapsed);
+        // Opt back into the old stop-on-every-group behaviour.
+        let cfg: UiConfig = toml::from_str("sidebar_nav_skips_collapsed = false").unwrap();
+        assert!(!cfg.sidebar_nav_skips_collapsed);
     }
 
     #[test]
