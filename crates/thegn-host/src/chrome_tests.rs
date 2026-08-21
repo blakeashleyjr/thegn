@@ -1966,6 +1966,9 @@ fn panel_renders_accordion_sections_and_open_content() {
             .iter()
             .any(|(_, l)| l == "open")
     );
+    // Row mode at the resting (Normal) width: `git_key` drops every
+    // non-navigation message there, so the bar offers the widen key instead
+    // of advertising `stage` (which would not dispatch).
     let row_mode = PanelUi {
         row_mode: true,
         ..Default::default()
@@ -1973,12 +1976,23 @@ fn panel_renders_accordion_sections_and_open_content() {
     assert!(
         panel_help_pairs(&row_mode)
             .iter()
+            .any(|(_, l)| l == "widen")
+    );
+    let row_mode_wide = PanelUi {
+        row_mode: true,
+        width: crate::layout::PanelWidth::Full,
+        ..Default::default()
+    };
+    assert!(
+        panel_help_pairs(&row_mode_wide)
+            .iter()
             .any(|(_, l)| l == "stage")
     );
     // During an active merge conflict the flow hint leads and replaces the
     // generic "m flow menu" entry in the table.
     let merge_flow = PanelUi {
         row_mode: true,
+        width: crate::layout::PanelWidth::Full,
         git: crate::panel::gitui::GitUi {
             flow: crate::panel::gitui::GitFlow::Merge(crate::panel::gitui::SequencerUi {
                 onto: "main".to_string(),
@@ -2217,4 +2231,165 @@ fn splash_retires_when_a_pane_goes_live_with_no_load_steps() {
     assert!(center_shows_splash(&frames, &no_steps, |_| false));
     // The instant the pane is live (still no steps) ⇒ splash retires.
     assert!(!center_shows_splash(&frames, &no_steps, |_| true));
+}
+
+/// Regression (bars audit): the statusbar's right cluster had no priority
+/// shedding, so a long transient status (or a narrow terminal) truncated the
+/// *tail* — daemon chip, LOCKED, MQ, CI, `✋`, `⚑` — while `12.3k LOC` kept
+/// its cells, and the hit table was built from the untruncated list. Now the
+/// fitted list is the one painted, the one hit-tested, and the one ←/→ walks;
+/// the alarms survive and every span covers cells its item actually painted.
+#[test]
+fn statusbar_overflow_sheds_widgets_first_and_spans_match_paint() {
+    let model = FrameModel {
+        bars: thegn_core::config::BarsConfig {
+            bottom_left: vec!["help".into(), "keyhints".into()],
+            bottom_right: vec!["loc".into(), "disk".into(), "status".into()],
+            ..Default::default()
+        },
+        loc: Some(thegn_core::loc::LocReport::total_only(12_345)),
+        status: "Persistent session expired; press Enter to relaunch (Esc for a shell)".into(),
+        key_locked: true,
+        sidebar_status: {
+            let mut st = crate::sidebar::SidebarStatus::default();
+            st.attention.insert(
+                "/wt/b".into(),
+                thegn_core::attention::AttentionScore {
+                    tier: thegn_core::attention::AttentionTier::Blocked,
+                    sub: 0,
+                    reason: thegn_core::attention::AttentionReason::AgentNeedsInput,
+                    since: None,
+                    episode: 0,
+                },
+            );
+            st
+        },
+        ..Default::default()
+    };
+    for cols in [60usize, 80, 100] {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols,
+            rows: 1,
+        };
+        let items = crate::chrome::statusbar_items_fitted(&model, cols);
+        let ids: Vec<BarItemId> = items.iter().map(|(id, _)| id.clone()).collect();
+        assert!(
+            ids.contains(&BarItemId::Badge(BarBadge::Persist)),
+            "daemon chip dropped at cols={cols}: {ids:?}"
+        );
+        assert!(
+            ids.contains(&BarItemId::Badge(BarBadge::Lock)),
+            "LOCKED dropped at cols={cols}: {ids:?}"
+        );
+        assert!(
+            ids.contains(&BarItemId::Badge(BarBadge::Attention)),
+            "✋ dropped at cols={cols}: {ids:?}"
+        );
+        let mut s = Surface::new(cols, 1);
+        draw_statusbar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        let row: Vec<char> = text.lines().next().unwrap_or_default().chars().collect();
+        assert!(
+            row.iter().any(|c| *c == '?'),
+            "help chip must be painted at cols={cols}: {text:?}"
+        );
+        // Every right-cluster span covers the cells its own text was painted on.
+        for ((id, segs), (sid, r)) in items
+            .iter()
+            .zip(crate::chrome::statusbar_item_spans(&model, rect))
+        {
+            assert_eq!(*id, sid);
+            let painted: String = row[r.x..r.x + r.cols].iter().collect();
+            let expect: String = segs.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(
+                painted.trim(),
+                expect.trim(),
+                "span for {id:?} at cols={cols} covers {painted:?}, painted {expect:?}"
+            );
+        }
+        // The help span covers the painted `?`.
+        let (_, hr) = crate::statusbar_left::left_item_spans(&model, rect)
+            .into_iter()
+            .find(|(id, _)| *id == BarItemId::Help)
+            .expect("help span present");
+        assert!((hr.x..hr.x + hr.cols).any(|c| row.get(c) == Some(&'?')));
+    }
+}
+
+/// Regression: with the *shipped* `top_right` (nine stats, five of which the
+/// old fit could never shed) the masthead at laptop widths ate the brand and
+/// the active app chip — ` þ theg…` with no `work`/`observe` pill at all.
+#[test]
+fn masthead_keeps_active_chip_with_the_default_stats_set_at_narrow_widths() {
+    let model = FrameModel {
+        bars: thegn_core::config::BarsConfig::default(),
+        app_tabs: vec!["work".into(), "chat".into(), "observe".into()],
+        active_app: 2,
+        stats: thegn_metrics::StatsSnapshot {
+            cpu_pct: Some(50),
+            mem_gib: Some((4.0, 16.0)),
+            disk_free_pct: Some(40),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for cols in [40usize, 50, 60, 75, 96] {
+        let lay = crate::masthead::masthead_layout(&model, cols, None);
+        let left_text: String = lay.left.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            left_text.contains("observe"),
+            "active chip missing at cols={cols}: {left_text:?}"
+        );
+        let lw = crate::seg::seg_width(&lay.left);
+        let rw = crate::seg::seg_width(&lay.right);
+        assert!(
+            lw + rw + usize::from(rw > 0) <= cols,
+            "overlap at cols={cols}: left={lw} right={rw}"
+        );
+    }
+}
+
+/// Regression: the linked-issue badge after the worktree leaf was painted, then
+/// the first tab chip was placed two cells after the leaf — over the number.
+#[test]
+fn issue_badge_is_not_overpainted_by_the_first_tab_chip() {
+    let model = FrameModel {
+        worktree: "app/feat".into(),
+        tabs: vec!["1".into(), "2".into()],
+        panel: crate::panel::PanelData {
+            tracker_links: vec!["linear:ABC-412".into()],
+            tracker_issues: vec![thegn_core::issue::Issue {
+                id: "linear:ABC-412".into(),
+                number: "412".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let strip = Rect {
+        x: 0,
+        y: 0,
+        cols: 80,
+        rows: 1,
+    };
+    let mut s = Surface::new(80, 1);
+    draw_center_tabs(&mut s, strip, &model);
+    let text = s.screen_chars_to_string();
+    assert!(
+        text.contains("412"),
+        "issue number must be visible: {text:?}"
+    );
+    let row: Vec<char> = text.lines().next().unwrap_or_default().chars().collect();
+    let badge_at = row.iter().position(|c| *c == '\u{25c8}').unwrap();
+    let first_chip = (0..80)
+        .find(|x| center_tab_hit(&model, strip, *x).is_some())
+        .expect("a tab chip is painted");
+    // ` ◈412` is four cells; the chip must start after them.
+    assert!(
+        first_chip >= badge_at + 4,
+        "chip at {first_chip} overlaps badge at {badge_at}: {text:?}"
+    );
 }

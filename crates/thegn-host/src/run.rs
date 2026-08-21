@@ -9623,7 +9623,7 @@ async fn event_loop<T: Terminal>(
         // Keep the per-bar selection valid as items appear/disappear between
         // frames (a badge turning on/off, a widget gaining data): clamp to the
         // current item count so the cursor never dangles past the last item.
-        let sb_items = crate::chrome::statusbar_items(&model).len();
+        let sb_items = crate::chrome::statusbar_items_fitted(&model, chrome.statusbar.cols).len();
         model.statusbar_sel = model.statusbar_sel.min(sb_items.saturating_sub(1));
         let mh_items = crate::chrome::masthead_item_spans(&model, &chrome).len();
         model.masthead_sel = model.masthead_sel.min(mh_items.saturating_sub(1));
@@ -17996,8 +17996,11 @@ async fn event_loop<T: Terminal>(
                                                 }
                                                 sb.sync(&mut model);
                                             } else if focus.statusbar() {
-                                                let count =
-                                                    crate::chrome::statusbar_items(&model).len();
+                                                let count = crate::chrome::statusbar_items_fitted(
+                                                    &model,
+                                                    chrome.statusbar.cols,
+                                                )
+                                                .len();
                                                 model.statusbar_sel = crate::bar_nav::step_bar_sel(
                                                     model.statusbar_sel,
                                                     delta,
