@@ -1230,7 +1230,11 @@ fn collect_sidebar_status(
     // run loop (see `agent_output`) — keeps an agent's dot `active` while it is
     // blocked on network I/O (near-zero CPU) but still redrawing its spinner.
     let output_hints = crate::agent_output::snapshot();
-    thegn_core::activity::poll_and_save_with(&managed, &activity_extra, &output_hints);
+    // Determinism freeze: leave the activity FSM alone so dots never decay
+    // and the derived needs-you chip never appears mid-spec.
+    if !crate::e2e_freeze::active() {
+        thegn_core::activity::poll_and_save_with(&managed, &activity_extra, &output_hints);
+    }
     status.activity = thegn_core::activity::read_states()
         .into_iter()
         .map(|(tab, st)| (tab, crate::sidebar::ActivityState::from_str(&st)))

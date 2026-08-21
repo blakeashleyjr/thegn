@@ -481,6 +481,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // hosts) — see `hydrate::load_hydration_config`.
     crate::hydrate::set_config_source(cli.overrides.clone(), cli.config.clone());
     let channel_note = crate::channel_state::apply_startup_channel(&mut cfg); // release-channel clamp
+    crate::e2e_freeze::apply_to_config(&mut cfg);
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
@@ -729,6 +730,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                     )
                     .map(|mut c| {
                         thegn_core::host_config::merge_db_hosts(&mut c);
+                        crate::e2e_freeze::apply_to_config(&mut c);
                         c
                     });
                     if config_tx.send(new_cfg_res).is_ok() {
@@ -8829,6 +8831,13 @@ async fn event_loop<T: Terminal>(
             stats_moved = true;
             alert_now_ms = at_ms;
             loop_perf.tick(crate::perf::WakeSource::Stats);
+            // Determinism freeze: the sampler keeps its cadence, the numbers
+            // don't move (see `e2e_freeze`).
+            let snap = if crate::e2e_freeze::active() {
+                crate::e2e_freeze::stats()
+            } else {
+                snap
+            };
             panel_ui.docs.telemetry.push(&snap, at_ms);
             panel_ui.docs.tick = panel_ui.docs.tick.wrapping_add(1);
             status_data_moved = true;
