@@ -87,7 +87,7 @@ Then push a commit (or re-run a workflow) and watch the jobs land on the
 - `.github/workflows/ci.yml`: every Linux job is
   `runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted", "ageless"]') }}` —
   one source of truth, defaulting to the self-hosted ageless runners. `macos`
-  stays `macos-14`.
+  stays `macos-15`.
 - `.github/actions/ci-setup`: every step is gated on
   `runner.environment == 'github-hosted'`, so on ageless it's a **no-op** — nix
   and the caches are already on the host. It still installs nix + restores

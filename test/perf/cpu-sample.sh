@@ -16,6 +16,16 @@
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# LINUX ONLY, and deliberately so: the per-thread CPU breakdown below reads
+# /proc/PID/task/*/stat, for which macOS has no equivalent short of `sample`(1)
+# or DTrace. This harness is advisory (never a CI gate), so skip with a clear
+# message rather than failing with a pile of "no such file" noise.
+if [ "$(uname -s)" != "Linux" ]; then
+  echo "cpu-sample: Linux-only (reads /proc/PID/task/*/stat) — skipping on $(uname -s)"
+  exit 0
+fi
+
 # shellcheck source=test/perf/lib/env.sh disable=SC1091
 source "$HERE/lib/env.sh"
 # shellcheck source=test/perf/lib/fixture.sh disable=SC1091

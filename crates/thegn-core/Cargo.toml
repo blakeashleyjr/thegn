@@ -64,10 +64,10 @@ once_cell = "1.21.4"
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 
-# Windows activity scanner (src/activity.rs): per-process cwd + accumulated
-# CPU time — the /proc equivalent. Never compiled on unix (Linux keeps the
-# direct /proc reader).
-[target.'cfg(windows)'.dependencies]
+# Non-Linux activity scanner (src/activity.rs): per-process cwd + accumulated
+# CPU time — the /proc equivalent, used on Windows AND macOS. Linux keeps the
+# direct /proc reader, so this never compiles there.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
 sysinfo = { workspace = true }
 
 [dev-dependencies]

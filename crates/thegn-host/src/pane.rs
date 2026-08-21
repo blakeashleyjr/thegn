@@ -110,8 +110,9 @@ pub struct PtyPane {
     /// arrive split at a chunk boundary are handled correctly.
     history_stripper: AnsiStripper,
     /// The child process id, captured before the child handle moves into the
-    /// reader thread. Used to read the live working directory (`/proc/<pid>/cwd`)
-    /// at persist time so a resurrected pane can respawn where it was.
+    /// reader thread. Used to read the live working directory (see
+    /// [`crate::platform::proc::cwd_of`]) at persist time so a resurrected pane
+    /// can respawn where it was.
     pid: Option<u32>,
     /// A foreground command to offer relaunching (e.g. `"nvim src/main.rs"`),
     /// shown as an overlay over the pane. Set when a resurrected pane had a
@@ -129,7 +130,7 @@ pub struct PtyPane {
     detach_on_drop: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// For a `Stream` pane: the session's PTY child pid on the local host
     /// (the pane daemon's child; 0 = unknown), published by the relay task.
-    /// Lets the `/proc`-based cwd/foreground-command capture work for daemon
+    /// Lets the cwd/foreground-command capture work for daemon
     /// panes. `None` for a PTY pane (which carries `pid` directly).
     pid_cell: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// Restore payload applied when this pane's warm reattach degrades to a
@@ -234,8 +235,8 @@ pub fn is_routine_pane(program: &str) -> bool {
 }
 
 /// Whether `program` is a sandbox/remote wrapper rather than the user's actual
-/// foreground program — its `/proc` child is the runtime shim, so relaunching it
-/// from the host is meaningless. Used to skip foreground-command capture for
+/// foreground program — its child process is the runtime shim, so relaunching
+/// it from the host is meaningless. Used to skip foreground-command capture for
 /// containerized/remote panes.
 fn is_runtime_wrapper(program: &str) -> bool {
     matches!(
@@ -244,42 +245,11 @@ fn is_runtime_wrapper(program: &str) -> bool {
     )
 }
 
-/// The most-recently-started direct child of `pid` (the shell's foreground job),
-/// if any. Walks `/proc/*/stat` for the `ppid` field; ties break to the highest
-/// pid (newest). Linux-only — returns `None` where `/proc` is absent.
-fn newest_child(pid: u32) -> Option<u32> {
-    let mut best: Option<u32> = None;
-    for ent in std::fs::read_dir("/proc").ok()?.flatten() {
-        let Some(child) = ent.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        if child != pid && stat_ppid(child) == Some(pid) {
-            best = Some(best.map_or(child, |b| b.max(child)));
-        }
-    }
-    best
-}
-
-/// The parent pid from `/proc/<pid>/stat`. The `comm` field (field 2) can itself
-/// contain spaces and parens, so the numeric fields are parsed after the final
-/// `)`: state is the first token, ppid the second.
-fn stat_ppid(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = &stat[stat.rfind(')')? + 1..];
-    rest.split_whitespace().nth(1)?.parse().ok()
-}
-
-/// Parse `/proc/<pid>/cmdline` (NUL-separated argv) into a `Vec`, dropping empty
-/// trailing entries. `None` when unreadable or empty (e.g. a kernel thread).
-fn read_cmdline(pid: u32) -> Option<Vec<String>> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let argv: Vec<String> = raw
-        .split(|&b| b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect();
-    (!argv.is_empty()).then_some(argv)
-}
+// The process-introspection primitives (`newest_child`, `cwd_of`, `cmdline`)
+// used to be `/proc` reads inlined here, which silently returned `None` on every
+// non-Linux platform. They now live behind `platform::proc`, which implements
+// them per-OS (`/proc` on Linux, libproc/sysctl on macOS).
+use crate::platform::proc;
 
 impl PtyPane {
     /// Spawn `argv` (already composed by `sandbox::enter_argv`) in `cwd` on a
@@ -444,25 +414,26 @@ impl PtyPane {
         }
     }
 
-    /// The pane's current working directory, read live from `/proc/<pid>/cwd`.
-    /// `None` when the pid is unknown, the process is gone, or the symlink can't
-    /// be resolved (e.g. a sandbox runtime whose cwd isn't host-meaningful — the
-    /// caller gates capture on the host backend regardless). Linux-only; other
-    /// platforms (where thegn does not run) return `None`.
+    /// The pane's current working directory, read live from the OS (see
+    /// [`crate::platform::proc`]). `None` when the pid is unknown, the process is
+    /// gone, or the cwd isn't resolvable — e.g. a sandbox runtime whose cwd isn't
+    /// host-meaningful (the caller gates capture on the host backend regardless),
+    /// or a platform with no implementation.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
         let pid = self.live_pid()?;
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        proc::cwd_of(pid)
     }
 
-    /// The pane's live foreground command (argv + cwd), read from `/proc`: the
-    /// shell's foreground child job, when it is a real non-shell program. `None`
-    /// for an idle shell prompt, a nested shell, a sandbox/remote runtime child,
-    /// an unknown pid, or non-Linux. Captured at persist time so a resurrected
-    /// or crashed pane can offer to relaunch what was running.
+    /// The pane's live foreground command (argv + cwd): the shell's foreground
+    /// child job, when it is a real non-shell program. `None` for an idle shell
+    /// prompt, a nested shell, a sandbox/remote runtime child, an unknown pid, or
+    /// a platform [`crate::platform::proc`] has no implementation for. Captured
+    /// at persist time so a resurrected or crashed pane can offer to relaunch
+    /// what was running.
     pub fn foreground_command(&self) -> Option<crate::session::PaneCmd> {
         let shell = self.live_pid()?;
-        let child = newest_child(shell)?;
-        let argv = read_cmdline(child)?;
+        let child = proc::newest_child(shell)?;
+        let argv = proc::cmdline(child)?;
         let name = std::path::Path::new(argv.first()?)
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -473,9 +444,7 @@ impl PtyPane {
         if name.is_empty() || is_interactive_shell(&name) || is_runtime_wrapper(&name) {
             return None;
         }
-        let cwd = std::fs::read_link(format!("/proc/{child}/cwd"))
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
+        let cwd = proc::cwd_of(child).map(|p| p.to_string_lossy().into_owned());
         Some(crate::session::PaneCmd { argv, cwd })
     }
 

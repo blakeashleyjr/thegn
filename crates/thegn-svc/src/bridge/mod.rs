@@ -1009,7 +1009,8 @@ fn watch_response(
     }
 }
 
-/// Spawn an inotify watcher on `path` that streams `fs.event` notifications
+/// Spawn a recursive fs-watcher on `path` (the `notify` crate: inotify on
+/// Linux, FSEvents on macOS) that streams `fs.event` notifications
 /// (Create/Modify/Remove only, 500 ms debounce, git-internal churn filtered).
 fn start_watch(
     path: &str,
@@ -1331,7 +1332,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let rx = c.watch(&dir.to_string_lossy()).unwrap();
-        // Let the inotify watch initialize before mutating.
+        // Let the fs-watch initialize before mutating.
         std::thread::sleep(Duration::from_millis(200));
 
         std::fs::write(dir.join("hello.rs"), b"fn main(){}").unwrap();

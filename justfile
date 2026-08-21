@@ -4,6 +4,14 @@
 # The native compositor host (crate `thegn-host`); the shipped `thegn`.
 bin := "target/debug/thegn"
 
+# Detach a long-running GUI process from this shell, portably. `setsid` is
+# util-linux and absent on macOS; `nohup … &` is the POSIX equivalent that
+# survives the shell exiting. Kept to ONE line: recipes splice it into a
+# backslash-continued command list, where a multi-line function body would break
+# the continuation. POSIX `sh` only (just's default shell) — no `disown`, which
+# is a bash/zsh builtin and unnecessary in a non-interactive shell anyway.
+_detach := '_detach() { if command -v setsid >/dev/null 2>&1; then setsid -f "$@"; else nohup "$@" >/dev/null 2>&1 & fi; };'
+
 # Hermetic-environment preamble for the e2e recipes: redirect HOME, the XDG dirs,
 # and git config into a throwaway temp dir (cleaned on exit) so the visual suite
 # can neither read the developer's real config/gitconfig nor leak test state into
@@ -57,19 +65,42 @@ quick pkg="":
     cargo clippy $scope -- -D warnings
 
 # Cross-platform regression gate: typecheck per-OS code for macOS + Windows on
-# this (Linux) box. macOS coverage stays scoped to the C-dep-free leaf crates
-# (`thegn-metrics`: sysinfo/battery; `thegn-media`: per-OS player backends) —
-# no darwin cross C toolchain here. Windows now checks the WHOLE workspace
-# (the native-Windows port): windows-gnu shares `cfg(windows)` with -msvc, so
-# this catches any newly ungated unix API use; the C build scripts in the graph
-# (bundled sqlite, libgit2, stacker) use the mingw-w64 cc the dev shell wires
-# via CC_x86_64_pc_windows_gnu (devenv.nix). The msvc truth gate is the opt-in
-# `windows` CI job (`[ci-windows]`). Catches the #1 cross-platform breakage —
-# won't-compile — without macOS/Windows runners.
+# this box. Catches the #1 cross-platform breakage — won't-compile — without
+# needing macOS/Windows runners.
+#
+# macOS coverage is every crate that builds WITHOUT a darwin cross C toolchain
+# (there isn't one here): the leaf crates plus the gtui/tg-kit family. It stops
+# at `thegn-core`/`-svc`/`-host`/`gtui-query`, whose build scripts (`ring`,
+# bundled sqlite, libgit2) compile C for the target. Those are covered by the
+# opt-in `macos` CI job and the on-device checklist in CONTRIBUTING.
+#
+# Windows checks the WHOLE workspace (the native-Windows port): windows-gnu
+# shares `cfg(windows)` with -msvc, so this catches any newly ungated unix API
+# use; the C build scripts use the mingw-w64 cc the dev shells wire via
+# CC_x86_64_pc_windows_gnu. The msvc truth gate is the opt-in `windows` CI job.
+#
+# EACH LEG SKIPS LOUDLY when its toolchain is absent rather than failing, so the
+# recipe (and therefore `just ci`) is runnable on a Mac, where there is no mingw
+# cross-cc — and in `devenv shell`, which ships no cross rust-std at all. On CI
+# both legs are present, so nothing is silently skipped there.
 check-cross:
-    cargo check -p thegn-metrics --target aarch64-apple-darwin
-    cargo check -p thegn-media --target aarch64-apple-darwin
-    cargo check --workspace --target x86_64-pc-windows-gnu
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rustlib="$(rustc --print sysroot)/lib/rustlib"
+    if [ -d "$rustlib/aarch64-apple-darwin" ]; then
+      for crate in thegn-metrics thegn-media tg-kit gtui-core gtui-render gtui-app; do
+        cargo check -p "$crate" --target aarch64-apple-darwin
+      done
+    else
+      echo "check-cross: SKIP aarch64-apple-darwin — no rust-std for that target." >&2
+      echo "  Use 'nix develop' (the flake toolchain declares it); devenv does not." >&2
+    fi
+    if [ -n "${CC_x86_64_pc_windows_gnu:-}" ] && [ -d "$rustlib/x86_64-pc-windows-gnu" ]; then
+      cargo check --workspace --target x86_64-pc-windows-gnu
+    else
+      echo "check-cross: SKIP x86_64-pc-windows-gnu — no mingw-w64 cross cc and/or rust-std." >&2
+      echo "  Expected off Linux: the cross toolchain is gated to Linux in flake.nix/devenv.nix." >&2
+    fi
 
 # Debug build of the host with the in-process sampling profiler compiled in
 # (the `profiling` feature → SIGUSR2 flamegraph capture). Same artifact path as
@@ -129,13 +160,17 @@ help-ratchet-update:
 # seed, i.e. the once-per-machine path); warm launch → first frame (existing
 # state: the daily path). termwiz needs a PTY, so wrap in `script`, which adds
 # a small constant overhead — fine for A/B deltas. Isolated XDG_STATE_HOME so
-# the bench never touches the daily DB.
+# the bench never touches the daily DB. The `script` wrapper goes through
+# `test/lib/pty.sh` because its CLI differs between util-linux and BSD/macOS.
 bench: release
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # shellcheck source=test/lib/pty.sh disable=SC1091
+    source test/lib/pty.sh
+    launch="env XDG_STATE_HOME=/tmp/tg-bench-state THEGN_NO_MIGRATE=1 THEGN_BENCH_FIRST_FRAME_EXIT=1 target/release/thegn"
     hyperfine --warmup 3 'target/release/thegn --version'
-    hyperfine --warmup 3 --prepare 'rm -rf /tmp/tg-bench-state' \
-      "script -qec 'env XDG_STATE_HOME=/tmp/tg-bench-state THEGN_NO_MIGRATE=1 THEGN_BENCH_FIRST_FRAME_EXIT=1 target/release/thegn' /dev/null"
-    hyperfine --warmup 3 \
-      "script -qec 'env XDG_STATE_HOME=/tmp/tg-bench-state THEGN_NO_MIGRATE=1 THEGN_BENCH_FIRST_FRAME_EXIT=1 target/release/thegn' /dev/null"
+    hyperfine --warmup 3 --prepare 'rm -rf /tmp/tg-bench-state' "$(pty_cmd "$launch")"
+    hyperfine --warmup 3 "$(pty_cmd "$launch")"
 
 # Guard run by every perf recipe: refuse to measure a debug or stale binary.
 # The debug-vs-release CPU gap is ~2.5x (and cargo test/clippy don't rebuild
@@ -663,11 +698,11 @@ _apply-backend backend="":
           printf 'env = "sprites"\n' > "$overlay"; \
           echo "set $overlay -> env = \"sprites\" (applies to all worktrees under $root)"; \
           ;; \
-        podman|docker|bwrap|systemd|none) \
+        podman|docker|apple|bwrap|systemd|none) \
           printf '[sandbox]\nbackend = "%s"\n' "$backend" > "$overlay"; \
           echo "set $overlay -> [sandbox] backend = \"$backend\" (applies to all worktrees under $root)"; \
           ;; \
-        *) echo "unknown backend '$backend' — expected: sprites | podman | docker | bwrap | systemd | none" >&2; exit 1;; \
+        *) echo "unknown backend '$backend' — expected: sprites | podman | docker | apple | bwrap | systemd | none" >&2; exit 1;; \
       esac; \
     fi
 
@@ -713,7 +748,9 @@ start-term name="dev" backend="": build-profiling (_apply-backend backend)
       echo "profiler: 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/"; \
       echo "logs: $state/thegn/logs/thegn.log (startup waterfall + frame/hydrate/perf)"; \
       echo "bridge: $([ -x "$PWD/target/debug/thegn-musl" ] && echo "present (reverse tunnel :8484 live)" || echo "MISSING — run 'just bridge'; the nix-cache :8484 tunnel is disabled")"; \
-      setsid -f ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
+      {{ _detach }} \
+      command -v ghostty >/dev/null 2>&1 || { echo "start-term needs 'ghostty' on PATH (this recipe launches a dedicated window; use 'just start' for the current terminal)" >&2; exit 1; }; \
+      _detach ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
       'pidfile="$1"; shift; echo $$ > "$pidfile"; exec env "$@"' \
       sh "$pidfile" \
       "XDG_STATE_HOME=$state" \
@@ -752,7 +789,9 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
       echo "logs: $logs/thegn.log (full trace: startup/frame/hydrate/perf + every crate) + $logs/stderr.log (panic message + full backtrace)"; \
       echo "sprites token: $([ -n "${SPRITES_TOKEN:-}" ] && echo "loaded (len ${#SPRITES_TOKEN})" || echo "NOT set — sprites envs will halt; put SPRITES_TOKEN in .envrc.local")"; \
       echo "bridge: $([ -x "$PWD/target/release/thegn-musl" ] && echo "present (reverse tunnel :8484 live)" || echo "MISSING — run 'just bridge'; the nix-cache :8484 tunnel is disabled")"; \
-      setsid -f ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
+      {{ _detach }} \
+      command -v ghostty >/dev/null 2>&1 || { echo "start-term-release needs 'ghostty' on PATH (this recipe launches a dedicated window; use 'just start' for the current terminal)" >&2; exit 1; }; \
+      _detach ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
       'pidfile="$1"; errlog="$2"; shift 2; echo $$ > "$pidfile"; exec env "$@" 2>"$errlog"' \
       sh "$pidfile" "$logs/stderr.log" \
       "XDG_STATE_HOME=$state" \
@@ -790,15 +829,33 @@ clean:
 # --- fonts ------------------------------------------------------------------
 
 # Installed Nerd Font families (candidates for `just font`).
+# fontconfig is Linux/BSD; stock macOS has none, so fall back to listing the
+# font directories the way the in-app picker does (see `font.rs`).
 fonts:
-    @fc-list : family | tr ',' '\n' | grep -i 'nerd font' | grep -iv 'mono\b.*propo\|propo' | sort -u
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if command -v fc-list >/dev/null 2>&1; then
+      fc-list : family | tr ',' '\n' | grep -i 'nerd font' | grep -iv 'mono\b.*propo\|propo' | sort -u
+    else
+      echo "fc-list not found (no fontconfig) — listing font files instead:" >&2
+      ls "$HOME/Library/Fonts" /Library/Fonts /System/Library/Fonts 2>/dev/null \
+        | grep -iE '\.(ttf|otf|ttc)$' | sed -E 's/-(Thin|ExtraLight|Light|Regular|Medium|SemiBold|Bold|ExtraBold|Black|Italic|BoldItalic)?\.[^.]+$//' \
+        | grep -i 'nerd' | sort -u
+    fi
 
 # Switch the bundled alacritty profile's font live (alacritty live-reloads,
 # so the change is instant in a running session). e.g.
 #   just font name="JetBrainsMono Nerd Font"
+# `sed -i` is not portable: GNU takes a bare -i, BSD/macOS requires a backup
+# suffix (`-i ''`). Write to a temp file and move it into place instead — one
+# form that works everywhere.
 font name:
-    sed -i 's/^normal = { family = ".*" }$/normal = { family = "{{name}}" }/' config/alacritty.toml
-    @echo "font → {{name}} (alacritty live-reloads in place)"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+    sed 's/^normal = { family = ".*" }$/normal = { family = "{{name}}" }/' config/alacritty.toml > "$tmp"
+    cat "$tmp" > config/alacritty.toml
+    echo "font → {{name}} (alacritty live-reloads in place)"
 
 # --- sandbox base image (hosts-as-resources) ---------------------------------
 
@@ -817,7 +874,9 @@ image-publish registry tag="v1":
     #!/usr/bin/env bash
     set -euo pipefail
     ref="{{registry}}/thegn-sandbox:{{tag}}"
-    arch="$(uname -m)"; case "$arch" in x86_64) oci=amd64;; aarch64) oci=arm64;; *) echo "unsupported arch $arch" >&2; exit 1;; esac
+    # `uname -m` is amd64/arm64 on some systems and x86_64/aarch64 on others;
+    # Apple silicon in particular reports arm64.
+    arch="$(uname -m)"; case "$arch" in x86_64|amd64) oci=amd64;; aarch64|arm64) oci=arm64;; *) echo "unsupported arch $arch" >&2; exit 1;; esac
     nix build .#sandbox-image
     ./result | podman load
     podman tag thegn-sandbox:latest "$ref-$oci"

@@ -152,9 +152,33 @@ pub(crate) fn spawn_detached_reaped(mut cmd: std::process::Command) -> bool {
     }
 }
 
+/// The platform's "open this URL with whatever handles it" command.
+///
+/// `$BROWSER` first (the POSIX convention, and what `[forward] browser`'s docs
+/// promise as the fallback), then the OS opener: `open` on macOS, `xdg-open` on
+/// Linux/BSD. `$BROWSER` may hold a colon-separated list — take the first entry,
+/// which is what every other consumer of the variable does.
+fn url_opener() -> String {
+    if let Some(b) = std::env::var_os("BROWSER") {
+        let b = b.to_string_lossy();
+        let first = b.split(':').next().unwrap_or("").trim();
+        if !first.is_empty() {
+            return first.to_string();
+        }
+    }
+    if cfg!(target_os = "macos") {
+        "open".to_string()
+    } else {
+        "xdg-open".to_string()
+    }
+}
+
 /// Open a URL in the system browser, fully detached (no `gh`/toolchain needed).
+///
+/// Callers that want an explicit command use `[forward] browser`; this is the
+/// path taken when that key is empty.
 pub(crate) fn open_url_detached(url: &str) {
-    let mut cmd = std::process::Command::new("xdg-open");
+    let mut cmd = std::process::Command::new(url_opener());
     cmd.arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -980,6 +1004,31 @@ impl CiActionCtx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_opener_prefers_browser_then_the_os_default() {
+        // $BROWSER wins outright.
+        {
+            let _env = crate::testenv::EnvVarGuard::set(&[("BROWSER", "firefox")]);
+            assert_eq!(url_opener(), "firefox");
+        }
+        // A colon-separated list takes its first entry (the POSIX convention).
+        {
+            let _env = crate::testenv::EnvVarGuard::set(&[("BROWSER", "w3m:lynx")]);
+            assert_eq!(url_opener(), "w3m");
+        }
+        // Empty/whitespace $BROWSER falls through to the OS opener rather than
+        // trying to spawn "".
+        {
+            let _env = crate::testenv::EnvVarGuard::set(&[("BROWSER", "  ")]);
+            let expect = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            assert_eq!(url_opener(), expect);
+        }
+    }
 
     #[test]
     fn thegn_cmd_joins_args_after_the_exe() {

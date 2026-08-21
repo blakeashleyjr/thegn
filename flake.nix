@@ -34,7 +34,12 @@
     crane,
     muse,
   }:
-    flake-utils.lib.eachDefaultSystem (system: let
+  # NOT `eachDefaultSystem`: that set still carries `x86_64-darwin`, which the
+  # pinned nixpkgs has dropped ("Nixpkgs 26.11 has dropped support for
+  # x86_64-darwin"), so every Intel-mac attribute throws on evaluation and takes
+  # `nix flake show` / `nix flake check` down with it. Apple silicon only —
+  # CONTRIBUTING's macOS notes say the same thing to contributors.
+    flake-utils.lib.eachSystem ["x86_64-linux" "aarch64-linux" "aarch64-darwin"] (system: let
       pkgs = import nixpkgs {
         inherit system;
         overlays = [(import rust-overlay)];
@@ -334,36 +339,46 @@
         echo "thegn dev shell — 'cargo build', 'just host', 'just smoke', 'nix fmt', 'just openspec'"
       '';
     in {
-      packages.default = defaultPkg;
-      packages.thegn = defaultPkg;
-      # The host binary WITHOUT the adjacent x86_64-linux musl bridge.
-      #
-      # `default` builds the workspace twice on x86_64-linux — once natively and
-      # once cross-compiled to musl for `thegn-musl` — so it costs roughly double
-      # what the shipped stable binary costs. The bridge only serves provider
-      # microVMs, which are dev-channel-only, so the routine CI gate builds this
-      # instead (`just nix-build`) and the full install is verified on demand
-      # (`just nix-build-full`, and before cutting a release).
-      packages.thegn-nobridge = thegn;
-      # The dev release channel (`nix build .#dev` / `nix run .#dev`): the same
-      # host with experimental subsystems enabled, installed as `thegn-dev`.
-      packages.dev = thegnDev;
-      packages.thegn-dev = thegnDev;
-      # The pinned yazi thegn drives for the file-manager drawer.
-      packages.yazi = yaziPinned;
-      # The muse e2e harness (`nix run .#muse`, also on the dev-shell PATH).
-      packages.muse = musePkg;
-      # Static musl bridge binary (`nix build .#thegn-musl`) — pushed into
-      # provider microVMs as the resident agent (8-B.3).
-      packages.thegn-musl = thegnMusl;
-      # The OpenSpec CLI for spec-driven development (`nix run .#openspec`).
-      packages.openspec = openspec;
-      # The multi-arch base sandbox image (per-arch; `just image-build` loads it
-      # locally, CI pushes both arches + a manifest list — see hosts-as-resources).
-      packages.sandbox-image = import ./nix/sandbox-image.nix {pkgs = imagePkgs;};
-      # Fly.io boot image: sshd entrypoint + baked toolchain, so a Fly machine
-      # boots straight into a reachable shell (`template = "image:<ref>"`).
-      packages.fly-sandbox-image = import ./nix/fly-sandbox-image.nix {inherit pkgs rustToolchain;};
+      packages =
+        {
+          default = defaultPkg;
+          thegn = defaultPkg;
+          # The host binary WITHOUT the adjacent x86_64-linux musl bridge.
+          #
+          # `default` builds the workspace twice on x86_64-linux — once natively
+          # and once cross-compiled to musl for `thegn-musl` — so it costs
+          # roughly double what the shipped stable binary costs. The bridge only
+          # serves provider microVMs, which are dev-channel-only, so the routine
+          # CI gate builds this instead (`just nix-build`) and the full install
+          # is verified on demand (`just nix-build-full`, and before a release).
+          thegn-nobridge = thegn;
+          # The dev release channel (`nix build .#dev` / `nix run .#dev`): the
+          # same host with experimental subsystems enabled, as `thegn-dev`.
+          dev = thegnDev;
+          thegn-dev = thegnDev;
+          # The pinned yazi thegn drives for the file-manager drawer.
+          yazi = yaziPinned;
+          # The muse e2e harness (`nix run .#muse`, also on the dev-shell PATH).
+          muse = musePkg;
+          # The OpenSpec CLI for spec-driven development (`nix run .#openspec`).
+          openspec = openspec;
+        }
+        # Linux-only artifacts. Not merely unbuildable on darwin — the two images
+        # fail to EVALUATE there (`shadow`/`procps` refuse a darwin hostPlatform),
+        # which would take `nix flake show` / `nix flake check` down with them on a
+        # Mac. The musl bridge is an x86_64-linux artifact cross-built from a Linux
+        # host; see `defaultPkg` above.
+        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          # Static musl bridge binary (`nix build .#thegn-musl`) — pushed into
+          # provider microVMs as the resident agent (8-B.3).
+          thegn-musl = thegnMusl;
+          # The multi-arch base sandbox image (per-arch; `just image-build` loads
+          # it locally, CI pushes both arches + a manifest list).
+          sandbox-image = import ./nix/sandbox-image.nix {pkgs = imagePkgs;};
+          # Fly.io boot image: sshd entrypoint + baked toolchain, so a Fly machine
+          # boots straight into a reachable shell (`template = "image:<ref>"`).
+          fly-sandbox-image = import ./nix/fly-sandbox-image.nix {inherit pkgs rustToolchain;};
+        };
 
       # `nix fmt` formats every tracked file via treefmt.toml.
       formatter = treefmtWrapper;
@@ -513,8 +528,14 @@
       };
     })
     // {
-      # home-manager module. Imported as:
+      # home-manager module — installs thegn AND renders ~/.config/thegn/config.toml
+      # from typed options. Imported as:
       #   imports = [ inputs.thegn.homeManagerModules.default ];
       homeManagerModules.default = import ./nix/hm-module.nix self;
+      # nix-darwin module — installs the binary system-wide. Deliberately thin:
+      # nix-darwin has no per-user config-file mechanism, so configuration stays
+      # home-manager's job (the two compose). Imported as:
+      #   imports = [ inputs.thegn.darwinModules.default ];
+      darwinModules.default = import ./nix/darwin-module.nix self;
     };
 }
