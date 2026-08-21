@@ -43,8 +43,6 @@ actions:
     tool-yazi,
     tool-editor,
     tool-diff,
-    new-panel,
-    new-panel-native,
   ]
 ---
 

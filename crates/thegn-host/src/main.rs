@@ -75,6 +75,7 @@ mod integrate;
 mod iroh_home;
 mod keyhint;
 mod keymap;
+mod keymap_merge;
 mod keymap_specs;
 mod kitty_relay;
 mod layer;
