@@ -11503,13 +11503,18 @@ async fn event_loop<T: Terminal>(
                         // already queued: one render pass for the whole
                         // gesture, never one render per tick.
                         let (ticks, leftover) = drain_wheel_ticks(up, || {
-                            buf.terminal()
-                                .poll_input(Some(std::time::Duration::ZERO))
-                                .ok()
-                                .flatten()
+                            // Queue first: an event requeued earlier is OLDER than anything
+                            // still in the terminal, and coalescing past it would reorder input.
+                            pending_input.pop_front().or_else(|| {
+                                buf.terminal()
+                                    .poll_input(Some(std::time::Duration::ZERO))
+                                    .ok()
+                                    .flatten()
+                            })
                         });
                         if let Some(ev) = leftover {
-                            pending_input.push_back(ev);
+                            // Front, not back: the leftover precedes whatever is still queued.
+                            pending_input.push_front(ev);
                         }
                         // 5 rows per tick (was 3) — snappier single-tick response.
                         let delta = ticks * 5;
@@ -11535,13 +11540,18 @@ async fn event_loop<T: Terminal>(
                             && panel_ui.file_preview.is_some()
                         {
                             let (ticks, leftover) = drain_wheel_ticks(up, || {
-                                buf.terminal()
-                                    .poll_input(Some(std::time::Duration::ZERO))
-                                    .ok()
-                                    .flatten()
+                                // Queue first: an event requeued earlier is OLDER than anything
+                                // still in the terminal, and coalescing past it would reorder input.
+                                pending_input.pop_front().or_else(|| {
+                                    buf.terminal()
+                                        .poll_input(Some(std::time::Duration::ZERO))
+                                        .ok()
+                                        .flatten()
+                                })
                             });
                             if let Some(ev) = leftover {
-                                pending_input.push_back(ev);
+                                // Front, not back: the leftover precedes whatever is still queued.
+                                pending_input.push_front(ev);
                             }
                             let (_, panel_rows) = panel_geom(&chrome);
                             let viewport = panel_rows.saturating_sub(4).max(1);
@@ -12004,13 +12014,18 @@ async fn event_loop<T: Terminal>(
                     // drag below, then advance the gesture with the latest
                     // sample only.
                     let (m2, leftover) = drain_drag_events(m, || {
-                        buf.terminal()
-                            .poll_input(Some(std::time::Duration::ZERO))
-                            .ok()
-                            .flatten()
+                        // Queue first: an event requeued earlier is OLDER than anything
+                        // still in the terminal, and coalescing past it would reorder input.
+                        pending_input.pop_front().or_else(|| {
+                            buf.terminal()
+                                .poll_input(Some(std::time::Duration::ZERO))
+                                .ok()
+                                .flatten()
+                        })
                     });
                     if let Some(ev) = leftover {
-                        pending_input.push_back(ev);
+                        // Front, not back: the leftover precedes whatever is still queued.
+                        pending_input.push_front(ev);
                     }
                     let my2 = (m2.y as usize).saturating_sub(1);
                     if let Some(r) = chrome.sidebar
@@ -12034,13 +12049,18 @@ async fn event_loop<T: Terminal>(
                     // lagging behind it. The terminating release comes back as
                     // the leftover and is requeued for the release handler.
                     let (m, leftover) = drain_drag_events(m, || {
-                        buf.terminal()
-                            .poll_input(Some(std::time::Duration::ZERO))
-                            .ok()
-                            .flatten()
+                        // Queue first: an event requeued earlier is OLDER than anything
+                        // still in the terminal, and coalescing past it would reorder input.
+                        pending_input.pop_front().or_else(|| {
+                            buf.terminal()
+                                .poll_input(Some(std::time::Duration::ZERO))
+                                .ok()
+                                .flatten()
+                        })
                     });
                     if let Some(ev) = leftover {
-                        pending_input.push_back(ev);
+                        // Front, not back: the leftover precedes whatever is still queued.
+                        pending_input.push_front(ev);
                     }
                     let mx = (m.x as usize).saturating_sub(1);
                     let my = (m.y as usize).saturating_sub(1);
@@ -14790,13 +14810,18 @@ async fn event_loop<T: Terminal>(
                             // pass: the viewport stops the instant the key is
                             // released instead of coasting through the backlog.
                             let (repeat, leftover) = drain_key_repeats(&k, || {
-                                buf.terminal()
-                                    .poll_input(Some(std::time::Duration::ZERO))
-                                    .ok()
-                                    .flatten()
+                                // Queue first: an event requeued earlier is OLDER than anything
+                                // still in the terminal, and coalescing past it would reorder input.
+                                pending_input.pop_front().or_else(|| {
+                                    buf.terminal()
+                                        .poll_input(Some(std::time::Duration::ZERO))
+                                        .ok()
+                                        .flatten()
+                                })
                             });
                             if let Some(ev) = leftover {
-                                pending_input.push_back(ev);
+                                // Front, not back: the leftover precedes whatever is still queued.
+                                pending_input.push_front(ev);
                             }
                             fp.scroll_by(step * repeat as isize, viewport);
                         } else {
@@ -15027,13 +15052,18 @@ async fn event_loop<T: Terminal>(
                                 // render pass (no backlog inertia).
                                 let up = msg == PanelMsg::CursorUp;
                                 let (repeat, leftover) = drain_key_repeats(&k, || {
-                                    buf.terminal()
-                                        .poll_input(Some(std::time::Duration::ZERO))
-                                        .ok()
-                                        .flatten()
+                                    // Queue first: an event requeued earlier is OLDER than anything
+                                    // still in the terminal, and coalescing past it would reorder input.
+                                    pending_input.pop_front().or_else(|| {
+                                        buf.terminal()
+                                            .poll_input(Some(std::time::Duration::ZERO))
+                                            .ok()
+                                            .flatten()
+                                    })
                                 });
                                 if let Some(ev) = leftover {
-                                    pending_input.push_back(ev);
+                                    // Front, not back: the leftover precedes whatever is still queued.
+                                    pending_input.push_front(ev);
                                 }
                                 // Full-view scroll documents (the git log, the
                                 // cheatsheet): j/k move the viewport, not a row
@@ -18464,13 +18494,18 @@ async fn event_loop<T: Terminal>(
                                 // key is released (no drain-after-release
                                 // inertia), exactly as the panel j/k path does.
                                 let (repeat, leftover) = drain_key_repeats(&k, || {
-                                    buf.terminal()
-                                        .poll_input(Some(std::time::Duration::ZERO))
-                                        .ok()
-                                        .flatten()
+                                    // Queue first: an event requeued earlier is OLDER than anything
+                                    // still in the terminal, and coalescing past it would reorder input.
+                                    pending_input.pop_front().or_else(|| {
+                                        buf.terminal()
+                                            .poll_input(Some(std::time::Duration::ZERO))
+                                            .ok()
+                                            .flatten()
+                                    })
                                 });
                                 if let Some(ev) = leftover {
-                                    pending_input.push_back(ev);
+                                    // Front, not back: the leftover precedes whatever is still queued.
+                                    pending_input.push_front(ev);
                                 }
                                 // Stepping the panel accordion persists + spawns
                                 // a git rehydration; do that once for the whole
@@ -19400,13 +19435,18 @@ async fn event_loop<T: Terminal>(
                     // the bytes written N times — we just skip the per-key render
                     // round-trips). Same idiom as the wheel/panel coalescers above.
                     let (repeat, leftover) = drain_key_repeats(&k, || {
-                        buf.terminal()
-                            .poll_input(Some(std::time::Duration::ZERO))
-                            .ok()
-                            .flatten()
+                        // Queue first: an event requeued earlier is OLDER than anything
+                        // still in the terminal, and coalescing past it would reorder input.
+                        pending_input.pop_front().or_else(|| {
+                            buf.terminal()
+                                .poll_input(Some(std::time::Duration::ZERO))
+                                .ok()
+                                .flatten()
+                        })
                     });
                     if let Some(ev) = leftover {
-                        pending_input.push_back(ev);
+                        // Front, not back: the leftover precedes whatever is still queued.
+                        pending_input.push_front(ev);
                     }
                     let batched = if repeat > 1 {
                         bytes.repeat(repeat)

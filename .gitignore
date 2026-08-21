@@ -21,3 +21,9 @@ __pycache__/
 .thegn.yaml
 .thegn.yml
 .thegn.json
+
+# muse e2e failure artifacts (`just e2e`); baselines live in test/muse/snapshots/
+e2e-results/
+# a stray `muse run` without --snapshots-dir would create baselines here
+/snapshots/
+/test-results/
