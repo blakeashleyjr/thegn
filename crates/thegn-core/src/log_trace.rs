@@ -179,7 +179,39 @@ pub fn init(role: Role, cfg: &LogConfig) {
         .is_ok();
     if installed {
         READY.store(true, Ordering::Relaxed);
+        install_panic_hook();
     }
+}
+
+/// Route panics through `tracing` (as well as stderr) so they reach the log
+/// file. Without this a panic on any thread prints only to stderr — which a
+/// compositor has handed to the outer terminal — and the e2e guard that
+/// greps the log for `panicked` can never see it.
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let line = panic_line(info);
+        tracing::error!(target: "thegn::panic", "{line}");
+        previous(info);
+    }));
+}
+
+/// One line in the same shape the default hook prints, so a single
+/// `thread '.*' panicked` pattern matches both stderr and the log.
+pub fn panic_line(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("<unnamed>");
+    let payload = info
+        .payload()
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| info.payload().downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "Box<dyn Any>".into());
+    let location = info
+        .location()
+        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        .unwrap_or_else(|| "<unknown>".into());
+    format!("thread '{name}' panicked at {location}:\n{payload}")
 }
 
 /// The compact branded formatter, shared by both sinks.
@@ -542,5 +574,35 @@ mod tests {
         // An empty slug is a no-op tag (host-global).
         let _g = enter_wt("");
         assert!(current_wt().is_none());
+    }
+
+    #[test]
+    fn panic_line_has_thread_location_and_payload() {
+        let caught = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = caught.clone();
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            *sink.lock().unwrap() = panic_line(info);
+        }));
+        let r = std::thread::Builder::new()
+            .name("boom-thread".into())
+            .spawn(|| {
+                let v: Vec<u8> = Vec::new();
+                let _ = v[3];
+            })
+            .unwrap()
+            .join();
+        std::panic::set_hook(prev);
+        assert!(r.is_err());
+        let line = caught.lock().unwrap().clone();
+        assert!(
+            line.starts_with("thread 'boom-thread' panicked at "),
+            "{line}"
+        );
+        assert!(line.contains("log_trace.rs"), "{line}");
+        assert!(line.contains("index out of bounds"), "{line}");
+        // the e2e guard's patterns match
+        let re = regex::Regex::new("thread '.*' panicked|index out of bounds").unwrap();
+        assert!(re.is_match(&line));
     }
 }
