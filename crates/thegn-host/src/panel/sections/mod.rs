@@ -281,7 +281,10 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             if prs > 0 {
                 vec![
                     seg(g(), format!("{n} · ")),
-                    seg(hue(Hue::Green), format!("⬤ {prs} pr")),
+                    // No bullet: the green hue already carries "has open PRs",
+                    // and the U+2B24 that used to lead this ran wider than its
+                    // one-cell advance, bleeding into the count.
+                    seg(hue(Hue::Green), format!("{prs} pr")),
                 ]
             } else if n > 0 {
                 vec![seg(g(), n.to_string())]
@@ -1051,6 +1054,17 @@ mod spec {
         m.panel.stash_count = 3;
         assert!(m.panel.stashes.is_empty());
         assert_eq!(seg_text(&summary(Section::Stash, &m)), "3");
+    }
+
+    #[test]
+    fn branches_summary_has_no_oversized_bullet() {
+        let seg_text = |segs: &[Seg]| segs.iter().map(|s| s.text.clone()).collect::<String>();
+        let m = model(); // one branch, carrying PR #7 (OPEN)
+        let s = seg_text(&summary(Section::Branches, &m));
+        assert_eq!(s, "1 · 1 pr");
+        // U+2B24 draws wider than its one-cell advance (and has no ASCII
+        // fallback), so it bled into the count. The green hue is the signal.
+        assert!(!s.contains('⬤'));
     }
 
     #[test]
