@@ -237,11 +237,13 @@ jobs:
             .#devShells.x86_64-linux.sandbox.inputDerivation \
             .#devShells.x86_64-linux.default.inputDerivation
   e2e:
-    # Routine gate: the muse suite is assertion-based (semantic `expect_*` checks
-    # + a `check_file` panic/overflow guard), NOT visual snapshots, so it's
-    # deterministic and runs on every push/PR. It spawns thegn in a PTY (works on
-    # ubuntu runners) and proves "doesn't crash / the pipeline works" across
-    # resize/focus/input boundaries and end-to-end LSP/git flows.
+    # Routine gate: the muse suite asserts on semantic `expect_*` checks, diffs
+    # text/styled snapshots against committed baselines (byte-stable under the
+    # THEGN_E2E determinism freeze), and ends with a `check_file` guard for
+    # panics/overflows in the log. It spawns thegn in a PTY (works on ubuntu
+    # runners) across resize/focus/input boundaries and end-to-end LSP/git flows.
+    # On failure the per-case artifacts (final screen as text/png, snapshot
+    # diffs, a trace) are uploaded — read those before reaching for a retry.
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
@@ -250,6 +252,14 @@ jobs:
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just e2e
+      - name: Upload e2e failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results
+          path: e2e-results/
+          if-no-files-found: ignore
+          retention-days: 14
   macos:
     # OPT-IN (10x minute cost): runs only via dispatch or a `[ci-macos]` commit
     # message marker. macos-15 = GitHub-hosted Apple silicon; covers the

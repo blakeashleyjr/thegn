@@ -13,14 +13,33 @@ bin := "target/debug/thegn"
 _detach := '_detach() { if command -v setsid >/dev/null 2>&1; then setsid -f "$@"; else nohup "$@" >/dev/null 2>&1 & fi; };'
 
 # Hermetic-environment preamble for the e2e recipes: redirect HOME, the XDG dirs,
-# and git config into a throwaway temp dir (cleaned on exit) so the visual suite
-# can neither read the developer's real config/gitconfig nor leak test state into
+# and git config into a throwaway temp dir (cleaned on exit) so the suite can
+# neither read the developer's real config/gitconfig nor leak test state into
 # the daily DB. Specs further isolate XDG_STATE_HOME per case via case_tmp_env.
+# Failure artifacts (muse's test-results/) are written OUTSIDE the temp dir, to
+# `e2e-results/` in the repo, so they survive the cleanup and CI can upload them.
 _e2e_env := '''
 set -euo pipefail
-_tmp="$(mktemp -d)"; trap 'rm -rf "$_tmp"' EXIT
+_tmp="$(mktemp -d)"
+# The cleanup must never decide the verdict: a root-owned leftover under the
+# temp HOME (podman overlay dirs have done this on CI) would otherwise turn a
+# 60/60 green suite into a red gate with an `rm: Permission denied` as the
+# only message.
+trap 'rm -rf "$_tmp" 2>/dev/null || true' EXIT
 export HOME="$_tmp/home" XDG_CONFIG_HOME="$_tmp/config" XDG_STATE_HOME="$_tmp/state"
 export GIT_CONFIG_GLOBAL="$_tmp/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
+# Determinism freeze (crates/thegn-host/src/e2e_freeze.rs): pins stats, the
+# clock, the version wordmark, the activity FSM and the media badge, so text
+# and pixel snapshots are byte-stable across runs and machines.
+export THEGN_E2E=1
+# Panes run a plain `sh` with a fixed `$ ` prompt: the developer's $SHELL and
+# prompt (user@host, cwd — also mirrored into the pane title and the sidebar
+# row label) would make every pane-bearing snapshot machine-specific. A wrapper
+# rather than $ENV because thegn's curated pane env doesn't carry ENV/PS1.
+mkdir -p "$_tmp/bin"
+printf '#!/bin/sh\nexport PS1="$ " PROMPT_COMMAND=\nexec /bin/sh --norc --noprofile -i\n' > "$_tmp/bin/e2esh"
+chmod +x "$_tmp/bin/e2esh"
+export SHELL="$_tmp/bin/e2esh"
 # Cut the session D-Bus: otherwise the developer's live media player leaks
 # into the statusbar/masthead media badge, flapping the text the specs match.
 export DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null/e2e-no-dbus"
@@ -38,7 +57,14 @@ printf '[user]\nname = e2e\nemail = e2e@example.invalid\n' > "$_tmp/gitconfig"
 # Run panes on the host (no container): this suite exercises thegn's UI, not the
 # sandbox runtime (that is sandbox-e2e-*). A container backend would also fail
 # to reach the cut session bus and log a pane-crash ERROR the guard rejects.
-printf '[sandbox]\nbackend = "none"\n' > "$XDG_CONFIG_HOME/thegn/config.toml"
+# Media is off (THEGN_E2E forces it too): the player watcher reaches the
+# session bus / playerctl even with DBUS_SESSION_BUS_ADDRESS cut.
+printf '[sandbox]\nbackend = "none"\n[media]\nenabled = false\n' > "$XDG_CONFIG_HOME/thegn/config.toml"
+# The same env-level override 30-lsp.yaml documents for its XDG_CONFIG_HOME
+# bypass, so a spec that re-points config cannot silently re-enable podman.
+export THEGN_SANDBOX_BACKEND=none
+export E2E_RESULTS="$(pwd)/e2e-results"
+rm -rf "$E2E_RESULTS"
 '''
 
 # Show available recipes (default).
@@ -333,15 +359,16 @@ deps-audit:
     cargo deny check
     cargo machete
 
-# Semantic + crash e2e gate: run every muse spec against a live thegn binary in
-# a real PTY. The specs are ASSERTION-BASED — `expect_visible` / `expect_count`
-# / `expect_not_visible` on stable UI text plus a `check_file` guard that fails
-# on any panic / overflow / corruption in the log. NO visual snapshots: they
-# require committed baselines + an app-side determinism freeze (activity dot,
-# needs-you chip, stats cluster) that regex normalization can't provide, so we
-# deliberately don't diff frames — this suite proves "doesn't crash / the
-# pipeline works" across resize storms, focus/input boundaries, and end-to-end
-# LSP/git flows, which the deterministic unit tests structurally cannot.
+# Semantic + snapshot + crash e2e gate: run every muse spec against a live thegn
+# binary in a real PTY. Specs assert on stable UI text (`expect_visible` /
+# `expect_count` / `expect_not_visible` / `expect_style`), diff text/styled
+# snapshots against the committed baselines in test/muse/snapshots/ (byte-
+# stable thanks to the THEGN_E2E freeze — see _e2e_env), and end with a
+# `check_file` guard that fails on any panic / overflow / corruption in the log
+# (panics reach the log through the hook `thegn_core::log_trace` installs).
+# `--ci` makes a missing baseline a failure: add one deliberately with
+# `just e2e-update`, never by accident. A failing case leaves e2e-results/<case>/
+# with final.txt/.png, per-snapshot actual/diff/baseline files and a trace.
 # thegn is put on PATH so specs can use spawn: ["thegn"] portably.
 #
 # The suite is hermetic w.r.t. the developer's environment: `_e2e_env` isolates
@@ -356,15 +383,26 @@ e2e: build
     # needs a moment to print its prompt; higher concurrency starves that
     # startup and races the write past the not-yet-ready shell.
     PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
-        --reporter pretty --workers 2 --deadline-ms 20000
+        --reporter pretty --workers 2 --deadline-ms 20000 --case-timeout-ms 180000 \
+        --ci --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
+
+# Re-record the snapshot baselines (after an intentional UI change). Review the
+# diff under test/muse/snapshots/ before committing it.
+e2e-update: build
+    #!/usr/bin/env bash
+    {{_e2e_env}}
+    PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
+        --reporter pretty --workers 2 --deadline-ms 20000 --case-timeout-ms 180000 \
+        --update-snapshots --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
 
 # Run only the glitch-hunt specs (18–28) — the boundary/stress subset.
 e2e-glitch: build
     #!/usr/bin/env bash
     {{_e2e_env}}
     PATH="$(pwd)/target/debug:$PATH" muse run \
-        test/muse/specs/1[89]-*.yaml test/muse/specs/2[0-9]-*.yaml \
-        --reporter pretty --workers 2 --deadline-ms 12000
+        test/muse/specs/1[89]-*.yaml test/muse/specs/2[0-8]-*.yaml \
+        --reporter pretty --workers 2 --deadline-ms 20000 --case-timeout-ms 180000 \
+        --ci --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
 
 # (e2e/stress/perf harnesses drove the old zellij CLI's worktree-creation
 # commands headlessly; worktree/workspace/pin creation is now an interactive
