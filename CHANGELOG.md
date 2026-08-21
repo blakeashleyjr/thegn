@@ -11,7 +11,30 @@ All notable changes to **thegn** are documented here. The format follows
 
 A packaging and hygiene release. `v0.1.0-alpha.1` was tagged but never
 published; this is the first release the public actually gets, and it fixes the
-things a first-time cloner hit rather than anything about the running shell.
+things a first-time cloner hit rather than anything about the running shell —
+plus one genuine crash.
+
+### Fixed — a process-wide abort in the metrics sampler
+
+The system-metrics sampler could abort the whole of thegn — every pane in the
+session — with:
+
+```text
+fatal runtime error: IO Safety violation: owned file descriptor already closed
+```
+
+It asked sysinfo to refresh a PID list that could name the same PID twice (when
+the recorded pane-daemon PID equalled our own). sysinfo 0.39 fans that list
+across a rayon pool by list position rather than by PID, so a repeated PID hands
+two worker threads the same process entry at once; both take its cached
+`/proc/<pid>/stat` handle and one closes a descriptor the other still owns. std
+detects the double close and aborts.
+
+Reaching it needed a daemon PID equal to ours — normally impossible, but
+possible when a still-heartbeating registry row names a PID the OS has recycled
+onto us. It was, however, unconditional in `thegn-metrics`' own unit test, where
+it aborted ~5% of runs and reddened CI at random. The sampler now drops the
+duplicate.
 
 ### Fixed — first-clone experience
 
