@@ -2729,7 +2729,8 @@ local_admin = true
 # deferred for you (or an agent) to resolve. Fire it once with `thegn
 # integrate` / the palette action.
 #
-# Manage the queue from the TUI: Ctrl+Alt+q (or the palette's "Merge queue")
+# Manage the queue from the TUI via the palette's "Merge queue" (the
+# `open-merge-queue` action has no default chord — bind it in [keybinds])
 # opens Work ▸ Merge queue, where `a`/`A` enqueue, `x` removes, `r` retries,
 # `l` lands a ready branch, `c` clears landed rows, and `D` drains the queue
 # with the agent autopilot — transitions stream into the panel live, and the

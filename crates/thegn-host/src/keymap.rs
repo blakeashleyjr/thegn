@@ -1022,7 +1022,7 @@ impl KeyMap {
 
 const ALL_MODES: [Mode; 4] = [Mode::Normal, Mode::VimNormal, Mode::VimInsert, Mode::Emacs];
 
-fn parse_chord(s: &str) -> Result<Vec<Key>, String> {
+pub(crate) fn parse_chord(s: &str) -> Result<Vec<Key>, String> {
     let mut out = Vec::new();
     let normalized = s.replace('-', " ");
     let toks: Vec<&str> = normalized.split_whitespace().collect();

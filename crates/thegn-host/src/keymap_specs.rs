@@ -402,7 +402,11 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "switch-account",
         label: "Switch agent account",
         hint: "account",
-        default_chords: &["Ctrl Alt a"],
+        // Palette-only: no default chord is installed by `default_keymap`.
+        // A chord was declared here but never bound, so the hint strip,
+        // `thegn keys list`, and the Keybindings page all advertised a key
+        // that did nothing. Bind it by id in `[keybinds]`.
+        default_chords: &[],
         palette: true,
         keywords: &[
             "switch account",
@@ -416,7 +420,11 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "switch-bundle",
         label: "Switch env bundle",
         hint: "bundle",
-        default_chords: &["Ctrl Alt u"],
+        // Palette-only: no default chord is installed by `default_keymap`.
+        // A chord was declared here but never bound, so the hint strip,
+        // `thegn keys list`, and the Keybindings page all advertised a key
+        // that did nothing. Bind it by id in `[keybinds]`.
+        default_chords: &[],
         palette: true,
         keywords: &[
             "switch bundle",
@@ -429,7 +437,11 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "switch-profile",
         label: "Switch profile",
         hint: "profile",
-        default_chords: &["Ctrl Alt g"],
+        // Palette-only: no default chord is installed by `default_keymap`.
+        // A chord was declared here but never bound, so the hint strip,
+        // `thegn keys list`, and the Keybindings page all advertised a key
+        // that did nothing. Bind it by id in `[keybinds]`.
+        default_chords: &[],
         palette: true,
         keywords: &[
             "switch profile",
@@ -724,7 +736,11 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "warm-pool-increment",
         label: "Warm pool: add a spare",
         hint: "warm+",
-        default_chords: &["Ctrl Alt ="],
+        // Palette-only: no default chord is installed by `default_keymap`.
+        // A chord was declared here but never bound, so the hint strip,
+        // `thegn keys list`, and the Keybindings page all advertised a key
+        // that did nothing. Bind it by id in `[keybinds]`.
+        default_chords: &[],
         palette: true,
         keywords: &[
             "warm pool",
@@ -739,7 +755,11 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "warm-pool-decrement",
         label: "Warm pool: remove a spare",
         hint: "warm-",
-        default_chords: &["Ctrl Alt -"],
+        // Palette-only: no default chord is installed by `default_keymap`.
+        // A chord was declared here but never bound, so the hint strip,
+        // `thegn keys list`, and the Keybindings page all advertised a key
+        // that did nothing. Bind it by id in `[keybinds]`.
+        default_chords: &[],
         palette: true,
         keywords: &[
             "warm pool",
@@ -876,7 +896,11 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "open-merge-queue",
         label: "Merge queue",
         hint: "merge queue",
-        default_chords: &["Ctrl Alt q"],
+        // Palette-only: no default chord is installed by `default_keymap`.
+        // A chord was declared here but never bound, so the hint strip,
+        // `thegn keys list`, and the Keybindings page all advertised a key
+        // that did nothing. Bind it by id in `[keybinds]`.
+        default_chords: &[],
         palette: true,
         keywords: &[
             "merge queue",
@@ -1131,7 +1155,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "search-pane",
         label: "Search pane history",
         hint: "search",
-        default_chords: &["/"],
+        // Must match what `default_keymap` actually binds. A bare `/` was
+        // declared here for a long time while dispatch bound `Ctrl Alt /` —
+        // single-key chords are prevented by rule (see the comment beside the
+        // `insert_all` in `keymap.rs`), so the hint, `thegn keys list`, and the
+        // generated Keybindings page were all advertising a key that does
+        // nothing.
+        default_chords: &["Ctrl Alt /"],
         palette: true,
         keywords: &[
             "search pane",
@@ -1565,5 +1595,60 @@ mod tests {
                 spec.id
             );
         }
+    }
+
+    /// `default_chords` must be what the keymap actually binds.
+    ///
+    /// It is a *display* field — `chord_hint_for` reads it for the status-bar
+    /// hints, `thegn keys list`, and the generated Keybindings help page —
+    /// while dispatch comes from `default_keymap`. Nothing kept the two
+    /// honest, and `search-pane` drifted: it advertised a bare `/` for a long
+    /// time while dispatch bound `Ctrl Alt /`, so every surface published a key
+    /// that did nothing.
+    #[test]
+    fn declared_default_chords_actually_dispatch() {
+        use crate::keymap::{Action, Mode, parse_chord};
+        use crate::sequence::MatchResult;
+        let mut wrong: Vec<String> = Vec::new();
+        for spec in ACTION_SPECS {
+            let Some(chord) = spec.default_chords.first() else {
+                continue;
+            };
+            let Ok(keys) = parse_chord(chord) else {
+                wrong.push(format!("{}: `{chord}` does not parse", spec.id));
+                continue;
+            };
+            // Feed the chord through a fresh default map and see what it fires.
+            let mut map = crate::keymap::default_keymap();
+            let mut got: Option<Action> = None;
+            for k in keys {
+                match map.dispatch(Mode::Normal, k) {
+                    MatchResult::Matched(a) => {
+                        got = Some(a);
+                        break;
+                    }
+                    MatchResult::Pending => continue,
+                    MatchResult::None => break,
+                }
+            }
+            match got {
+                // Some ids are aliases onto a shared Action (e.g. the tool
+                // launchers), so compare the resolved action's key, not the id.
+                Some(a) if a.key() == spec.id => {}
+                Some(a) => wrong.push(format!(
+                    "{}: declares `{chord}`, but that fires `{}`",
+                    spec.id,
+                    a.key()
+                )),
+                None => wrong.push(format!("{}: declares `{chord}`, which is unbound", spec.id)),
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "default_chords disagree with what default_keymap binds:\n  {}\n\
+             Fix the spec (or the binding) — these strings are published to \
+             users as real keys.",
+            wrong.join("\n  ")
+        );
     }
 }
