@@ -192,6 +192,10 @@ pub(crate) enum RefreshKind {
     /// The usage overlay's off-loop gather (per-account rate-limit windows),
     /// delivered into the live overlay by `crate::detail::apply_usage`.
     Usage(Box<crate::detail::UsagePayload>),
+    /// The pane daemon's live session list, fetched over the control socket when
+    /// the status modal opens (`crate::handlers::status::probe_sessions`) and
+    /// delivered into it by `detail::status_modal::refresh_open`.
+    DaemonSessions(Box<crate::detail::DaemonSessions>),
     /// An onboarding-wizard probe answer (gh auth / sandbox backends / ssh
     /// host), delivered into the live wizard by
     /// [`crate::handlers::onboarding::apply_probe`].

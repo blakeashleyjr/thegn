@@ -207,6 +207,13 @@ pub fn seg_width(segs: &[Seg]) -> usize {
     segs.iter().map(Seg::width).sum()
 }
 
+/// Display width of a plain string in terminal cells (`unicode-width`) — the
+/// width-correct replacement for `chars().count()` at layout sites that pad or
+/// align columns. A CJK glyph counts 2, a combining mark 0.
+pub(crate) fn cells(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
 /// Clip a plain string to at most `max` display cells, appending a trailing `…`
 /// when it overflows. Cell math is display width (`unicode-width`): a wide glyph
 /// that would straddle the boundary is dropped whole, never split, so the result

@@ -26,12 +26,25 @@ use thegn_core::viz;
 
 /// Everything the daemon/status modal needs beyond the [`FrameModel`]: the
 /// rolling resource history, the loop self-profiler, the cached daemon record,
-/// and the two clocks (now, for daemon uptime; and this process's uptime).
-/// Bundled so [`open_detail_for`] takes one extra parameter, not four.
+/// the daemon's live session list, the resolved `[daemon]` policy, the screen
+/// (popups size themselves against it), and the two clocks (now, for daemon
+/// uptime; and this process's uptime).
+///
+/// Bundled so [`open_detail_for`] takes one extra parameter, not eight — and so
+/// [`status_modal::refresh_open`] can rebuild the modal from this alone, with no
+/// anchor or screen threaded separately.
 pub struct StatusCtx<'a> {
     pub hist: &'a TelemetryHistory,
     pub loop_perf: &'a crate::telemetry::LoopPerfHistory,
     pub daemon: &'a crate::chrome::DaemonStatus,
+    /// The daemon's live session list (probe state included).
+    pub sessions: &'a DaemonSessions,
+    /// Resolved `[daemon]` policy, for the modal's lease/idle-exit rows.
+    pub daemon_cfg: &'a thegn_core::config::DaemonConfig,
+    /// The full screen rect. Popups clamp their own width/height against this
+    /// (see [`sections`]) instead of trusting a requested size the layer would
+    /// silently shrink.
+    pub screen: Rect,
     /// Unix milliseconds now — daemon uptime is `now_ms - daemon.started_at_ms`.
     pub now_ms: i64,
     /// This (compositor) process's uptime in whole seconds.
@@ -41,27 +54,48 @@ pub struct StatusCtx<'a> {
 impl<'a> StatusCtx<'a> {
     /// Borrow the loop's cached docs into a status context. `uptime_secs` is the
     /// compositor's own uptime (`start.elapsed().as_secs()`).
-    pub fn new(docs: &'a crate::panel::docs::PanelDocs, uptime_secs: u64) -> Self {
+    pub fn new(
+        docs: &'a crate::panel::docs::PanelDocs,
+        uptime_secs: u64,
+        screen: Rect,
+        daemon_cfg: &'a thegn_core::config::DaemonConfig,
+    ) -> Self {
         StatusCtx {
             hist: &docs.telemetry,
             loop_perf: &docs.loop_perf,
             daemon: &docs.daemon,
+            sessions: &docs.daemon_sessions,
+            daemon_cfg,
+            screen,
             // now() is seconds; widen to ms to match `started_at_ms`.
             now_ms: thegn_core::util::now() * 1000,
             uptime_secs,
         }
     }
 
-    /// Test-only context: real history, default (absent) loop-perf + daemon.
+    /// Test-only context: real history, default (absent) loop-perf + daemon, on
+    /// the same 120×40 screen the detail tests' `screen()` helper builds (popups
+    /// size themselves against `ctx.screen`, so the two must agree).
     #[cfg(test)]
     pub(crate) fn new_for_test(hist: &'a TelemetryHistory) -> Self {
+        Self::new_for_test_on(hist, Rect::full(120, 40))
+    }
+
+    /// Test-only context on an explicit screen — for the clamp/scroll cases.
+    #[cfg(test)]
+    pub(crate) fn new_for_test_on(hist: &'a TelemetryHistory, screen: Rect) -> Self {
         use std::sync::OnceLock;
         static LP: OnceLock<crate::telemetry::LoopPerfHistory> = OnceLock::new();
         static DM: OnceLock<crate::chrome::DaemonStatus> = OnceLock::new();
+        static SS: OnceLock<DaemonSessions> = OnceLock::new();
+        static DC: OnceLock<thegn_core::config::DaemonConfig> = OnceLock::new();
         StatusCtx {
             hist,
             loop_perf: LP.get_or_init(Default::default),
             daemon: DM.get_or_init(Default::default),
+            sessions: SS.get_or_init(Default::default),
+            daemon_cfg: DC.get_or_init(Default::default),
+            screen,
             now_ms: 0,
             uptime_secs: 0,
         }
@@ -171,6 +205,8 @@ pub use ci_drill::{CiDetailPayload, apply_ci_detail};
 mod usage_dash;
 use ci_drill::{ci_fmt_secs, ci_glyph_marker, ci_state_word};
 pub use usage_dash::{UsagePayload, apply_usage, usage_loading};
+pub(crate) mod status_modal;
+pub use status_modal::DaemonSessions;
 
 /// One scrollable list row: a colored marker glyph, the body text, and an
 /// optional dim right-aligned note (relative time, count, …). Rows may carry an
@@ -310,6 +346,17 @@ pub enum Section {
     Table(TableSection),
     /// A `key … value` block (same shape as [`KeyValDetail`]).
     KeyVal(Vec<(String, String, Tok)>),
+    /// A multi-column `key value` grid: the wide-popup answer to
+    /// [`Section::KeyVal`], whose value is right-aligned to the far edge and so
+    /// reads as a lonely island once the box is 88 cells wide. Pairs flow
+    /// ROW-MAJOR across `cols` columns and each column sizes its key and value
+    /// independently, so a long value in column 2 never shoves column 1's values
+    /// out of alignment. Same payload as `KeyVal`, so a block can migrate
+    /// between the two by changing one word.
+    Grid {
+        cols: usize,
+        cells: Vec<(String, String, Tok)>,
+    },
     /// A one-row `label … sparkline value` (a compact inline trend).
     Sparkrow {
         label: String,
@@ -343,7 +390,7 @@ impl Cell {
     /// Display width the cell occupies in its column.
     fn width(&self) -> usize {
         match self {
-            Cell::Text(s, _) => s.chars().count(),
+            Cell::Text(s, _) => crate::seg::cells(s),
             Cell::Bar(_, w, _) => *w,
         }
     }
@@ -363,6 +410,7 @@ impl Section {
             Section::Graph(g) => 1 + g.height + g.footer.is_some() as usize,
             Section::Table(t) => (!t.header.is_empty()) as usize + t.rows.len(),
             Section::KeyVal(rows) => rows.len(),
+            Section::Grid { cols, cells } => cells.len().div_ceil((*cols).max(1)),
         }
     }
 }
@@ -1027,6 +1075,7 @@ fn draw_section(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, 
                 );
             }
         }
+        Section::Grid { cols, cells } => draw_grid(surface, clip, x, y0, w, *cols, cells),
         Section::Sparkrow {
             label,
             spark,
@@ -1052,6 +1101,87 @@ fn draw_section(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, 
     }
 }
 
+/// Blank spacer row between stacked sections. An empty [`Section::Heading`]
+/// already draws a height-1 blank line, so this needs no variant of its own.
+pub(crate) fn spacer() -> Section {
+    Section::Heading {
+        label: String::new(),
+        note: None,
+    }
+}
+
+/// Cells of breathing room between one grid column's value and the next
+/// column's key.
+const GRID_GUTTER: usize = 2;
+
+/// Per-column `(key width, value width)` for a row-major grid, each column sized
+/// to its OWN widest key and value — so a long value in column 2 never shifts
+/// column 1's alignment. Pure; widths are display cells, not char counts.
+fn grid_widths(cols: usize, cells: &[(String, String, Tok)]) -> (Vec<usize>, Vec<usize>) {
+    let cols = cols.max(1);
+    let (mut kw, mut vw) = (vec![0usize; cols], vec![0usize; cols]);
+    for (i, (k, v, _)) in cells.iter().enumerate() {
+        let c = i % cols;
+        kw[c] = kw[c].max(crate::seg::cells(k));
+        vw[c] = vw[c].max(crate::seg::cells(v));
+    }
+    (kw, vw)
+}
+
+/// Draw a row-major `key value` grid at row `y0`, clipped to `clip`. Each column
+/// is `key` (dim, padded) + one space + `value` (toned, padded), separated by
+/// [`GRID_GUTTER`]. A column whose pitch would spill past `w` is DROPPED whole
+/// rather than wrapped — the popup clamps its own width, so this only bites on a
+/// terminal narrower than the requested box.
+fn draw_grid(
+    surface: &mut Surface,
+    clip: Rect,
+    x: usize,
+    y0: i64,
+    w: usize,
+    cols: usize,
+    cells: &[(String, String, Tok)],
+) {
+    let cols = cols.max(1);
+    let (kw, vw) = grid_widths(cols, cells);
+    // How many columns actually fit: accumulate each column's pitch (key + space
+    // + value, plus a gutter before every column after the first) until it would
+    // exceed the available width. At least one column always draws.
+    let mut fit = 0usize;
+    let mut used = 0usize;
+    for c in 0..cols {
+        let pitch = kw[c] + 1 + vw[c] + if c == 0 { 0 } else { GRID_GUTTER };
+        if c > 0 && used + pitch > w {
+            break;
+        }
+        used += pitch;
+        fit = c + 1;
+    }
+    for (r, row) in cells.chunks(cols).enumerate() {
+        let mut segs = Vec::new();
+        for (c, (k, v, tone)) in row.iter().enumerate().take(fit) {
+            if c > 0 {
+                segs.push(seg(panel(), " ".repeat(GRID_GUTTER)));
+            }
+            // Pad by display width: `{:<n$}` counts chars, which drifts on wide
+            // glyphs — pad explicitly instead.
+            let kpad = kw[c].saturating_sub(crate::seg::cells(k));
+            segs.push(seg(Tok::Slot(S::Dim), format!("{k}{} ", " ".repeat(kpad))));
+            let vpad = vw[c].saturating_sub(crate::seg::cells(v));
+            segs.push(seg(*tone, format!("{v}{}", " ".repeat(vpad))));
+        }
+        put_line(
+            surface,
+            clip,
+            x,
+            y0 + r as i64,
+            w,
+            &Line::segs(segs),
+            panel(),
+        );
+    }
+}
+
 /// Draw a table: per-column widths sized to the widest cell (a `Bar` counts as
 /// its cell width), a dim header row when present, then body rows. Columns are
 /// packed left → right with a one-space gap; a `Cell::Bar` renders as a filled
@@ -1066,7 +1196,7 @@ fn draw_table(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, t:
         .unwrap_or(0);
     let mut colw = vec![0usize; ncol];
     for (i, h) in t.header.iter().enumerate() {
-        colw[i] = colw[i].max(h.chars().count());
+        colw[i] = colw[i].max(crate::seg::cells(h));
     }
     for row in &t.rows {
         for (i, c) in row.iter().enumerate() {
@@ -1472,18 +1602,17 @@ fn battery_eta(series: &[f32], on_ac: bool) -> Option<String> {
 
 /// Build the detail overlay for a focused bar item, or `None` when the item has
 /// no data to show (so Enter is a no-op rather than an empty modal). `anchor` is
-/// the item's on-screen rect (for popup placement); `hist` is the rolling
-/// telemetry history (panel-UI docs).
+/// the item's on-screen rect (for popup placement); everything else — including
+/// the screen the popup sizes itself against — rides on `ctx`.
 pub fn open_detail_for(
     id: &BarItemId,
     anchor: Rect,
-    screen: Rect,
     model: &FrameModel,
     ctx: &StatusCtx,
 ) -> Option<DetailOverlay> {
-    let near = Placement::near(anchor, screen);
+    let near = Placement::near(anchor, ctx.screen);
     match id {
-        BarItemId::Widget(w) => widget_detail(w, near, model, ctx.hist),
+        BarItemId::Widget(w) => widget_detail(w, near, model, ctx),
         BarItemId::Badge(b) => badge_detail(*b, near, model, ctx),
     }
 }
@@ -1554,10 +1683,24 @@ fn table(title: &str, t: TableDetail, cols: usize, height: usize) -> DetailOverl
     }
 }
 
-/// A stacked multi-section popup, sized to its content height (clamped on-screen
-/// by the layer). Placement is near the originating item like the other widgets.
-fn sections(title: &str, cols: usize, secs: Vec<Section>, placement: Placement) -> DetailOverlay {
-    let rows = secs.iter().map(Section::height).sum::<usize>().max(1);
+/// A stacked multi-section popup, sized to its content height but **clamped to
+/// what the layer will actually draw** on `screen`.
+///
+/// The clamp mirrors [`layer::box_dims`] exactly. It has to: `rows` is what
+/// [`DetailOverlay::scroll_max`] measures the content against, so leaving it at
+/// the full content height on a screen too short to show it yields
+/// `scroll_max() == 0` — the overflow is silently clipped AND unreachable by
+/// `j`/`k`. Every Sections popup used to be short enough that this never bit.
+fn sections(
+    title: &str,
+    cols: usize,
+    secs: Vec<Section>,
+    placement: Placement,
+    screen: Rect,
+) -> DetailOverlay {
+    let content = secs.iter().map(Section::height).sum::<usize>().max(1);
+    let rows = content.min(screen.rows.saturating_sub(3)).max(1);
+    let cols = cols.min(screen.cols.saturating_sub(6)).max(1);
     DetailOverlay {
         title: title.to_string(),
         content: DetailContent::Sections(SectionsDetail { sections: secs }),
@@ -1603,8 +1746,9 @@ fn widget_detail(
     w: &str,
     near: Placement,
     model: &FrameModel,
-    hist: &TelemetryHistory,
+    ctx: &StatusCtx,
 ) -> Option<DetailOverlay> {
+    let hist = ctx.hist;
     let s = &model.stats;
     let n = plot_cols(40);
     match w {
@@ -1674,7 +1818,7 @@ fn widget_detail(
                     tone: Tok::Hue(Hue::Blue),
                 });
             }
-            Some(sections("Memory", 40, secs, near))
+            Some(sections("Memory", 40, secs, near, ctx.screen))
         }
         "temp" => {
             s.cpu_temp_c?;
@@ -1752,7 +1896,7 @@ fn widget_detail(
                     rows,
                 }));
             }
-            Some(sections("Network", 44, secs, near))
+            Some(sections("Network", 44, secs, near, ctx.screen))
         }
         "swap" => {
             let (u, t) = s.swap_gib?;
@@ -1802,6 +1946,7 @@ fn widget_detail(
                     Section::KeyVal(kv),
                 ],
                 near,
+                ctx.screen,
             ))
         }
         "freq" => {
@@ -1884,6 +2029,7 @@ fn widget_detail(
                     Section::KeyVal(kv),
                 ],
                 near,
+                ctx.screen,
             ))
         }
         "disk" => {
@@ -1936,6 +2082,7 @@ fn widget_detail(
                     }),
                 ],
                 Placement::Center,
+                ctx.screen,
             ))
         }
         "loc" => {
@@ -2264,166 +2411,8 @@ fn badge_detail(
             44,
             near,
         )),
-        BarBadge::Persist => Some(status_detail(model, ctx, near)),
+        BarBadge::Persist => Some(status_modal::status_detail(model, ctx, near)),
     }
-}
-
-/// Human-readable byte size (RSS): "180.0M", "1.4G", "42B".
-fn human_bytes(b: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
-    let mut v = b as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{b}B")
-    } else {
-        format!("{v:.1}{}", UNITS[i])
-    }
-}
-
-/// Coarse duration, largest two units: "2d 3h", "4h 12m", "5m 9s", "8s".
-fn fmt_uptime(secs: u64) -> String {
-    let (d, h, m, s) = (
-        secs / 86400,
-        (secs % 86400) / 3600,
-        (secs % 3600) / 60,
-        secs % 60,
-    );
-    if d > 0 {
-        format!("{d}d {h}h")
-    } else if h > 0 {
-        format!("{h}h {m}m")
-    } else if m > 0 {
-        format!("{m}m {s}s")
-    } else {
-        format!("{s}s")
-    }
-}
-
-/// One-word summary of the chip state for the modal's role line.
-fn role_word(state: crate::chrome::DaemonChipState) -> &'static str {
-    use crate::chrome::DaemonChipState::*;
-    match state {
-        NonPersist => "non-persistent (inline pane)",
-        Persist => "persistent (daemon-backed)",
-        Server => "server (serving remote clients)",
-        Client => "client (remote daemon)",
-    }
-}
-
-/// The expanded daemon/program status modal opened by the far-right chip: a
-/// stacked-sections popup (daemon identity + uptime + sessions, this process's
-/// resource history, and the event-loop rollup). Anchored upward from the bar
-/// like the other bottom-bar detail popups.
-fn status_detail(model: &FrameModel, ctx: &StatusCtx, near: Placement) -> DetailOverlay {
-    let d = ctx.daemon;
-    let mut secs: Vec<Section> = Vec::new();
-
-    // --- Daemon identity / uptime / sessions -------------------------------
-    let mut kv: Vec<(String, String, Tok)> = vec![(
-        "role".into(),
-        role_word(model.daemon_state).into(),
-        Tok::Slot(S::Text),
-    )];
-    if d.present {
-        kv.push((
-            "pid".into(),
-            d.pid.map_or("—".into(), |p| p.to_string()),
-            Tok::Slot(S::Dim),
-        ));
-        if !d.version.is_empty() {
-            kv.push(("version".into(), d.version.clone(), Tok::Slot(S::Dim)));
-        }
-        if !d.hostname.is_empty() {
-            kv.push(("host".into(), d.hostname.clone(), Tok::Slot(S::Dim)));
-        }
-        let uptime = (ctx.now_ms - d.started_at_ms).max(0) as u64 / 1000;
-        kv.push(("uptime".into(), fmt_uptime(uptime), Tok::Slot(S::Text)));
-        kv.push((
-            "sessions".into(),
-            format!("{} ({} attached)", d.sessions, d.attached),
-            Tok::Slot(S::Dim),
-        ));
-        if !d.tcp_addr.is_empty() {
-            kv.push(("serving".into(), d.tcp_addr.clone(), Tok::Hue(Hue::Blue)));
-        }
-        if !d.endpoint.is_empty() {
-            kv.push((
-                "endpoint".into(),
-                trunc(d.endpoint.clone(), 30),
-                Tok::Slot(S::Ghost),
-            ));
-        }
-    } else {
-        kv.push((
-            "daemon".into(),
-            "none (inline panes only)".into(),
-            Tok::Slot(S::Ghost),
-        ));
-    }
-    secs.push(Section::KeyVal(kv));
-
-    // --- This process's footprint + history --------------------------------
-    let (self_rss, self_cpu, daemon_rss) = ctx.hist.last_proc();
-    let n = plot_cols(44);
-    secs.push(Section::Heading {
-        label: "thegn process".into(),
-        note: Some(format!("up {}", fmt_uptime(ctx.uptime_secs))),
-    });
-    secs.push(Section::Graph(GraphSection {
-        label: "RSS".into(),
-        cur: human_bytes(self_rss),
-        footer: Some(format!("pid {}", std::process::id())),
-        series: ctx.hist.self_rss_series(n),
-        tone: Tok::Hue(Hue::Purple),
-        height: 4,
-        series2: None,
-    }));
-    secs.push(Section::Sparkrow {
-        label: "cpu".into(),
-        spark: ctx.hist.self_cpu_series(24),
-        cur: format!("{self_cpu:.0}%"),
-        tone: Tok::Hue(Hue::Teal),
-    });
-    if d.present && d.pid.is_some() {
-        secs.push(Section::Sparkrow {
-            label: "daemon rss".into(),
-            spark: ctx.hist.daemon_rss_series(24),
-            cur: human_bytes(daemon_rss),
-            tone: Tok::Hue(Hue::Blue),
-        });
-    }
-
-    // --- Event-loop rollup (the same data thegn::perf logs) ----------------
-    if ctx.loop_perf.has_data() {
-        let p = ctx.loop_perf.last();
-        secs.push(Section::Heading {
-            label: "loop".into(),
-            note: None,
-        });
-        secs.push(Section::KeyVal(vec![
-            (
-                "wakes/s".into(),
-                format!("{:.0}", p.wakes_per_s),
-                Tok::Slot(S::Text),
-            ),
-            (
-                "render".into(),
-                format!("p50 {}µs · p99 {}µs", p.render_p50_us, p.render_p99_us),
-                Tok::Slot(S::Dim),
-            ),
-            (
-                "idle".into(),
-                format!("{:.1}%", p.idle_ratio * 100.0),
-                Tok::Slot(S::Dim),
-            ),
-        ]));
-    }
-
-    sections("thegn status", 44, secs, near)
 }
 
 /// The one unified notification surface, opened by the inbox `⚑`/unread chip,
