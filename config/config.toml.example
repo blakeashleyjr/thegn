@@ -204,8 +204,8 @@ mascot_motion = "blink"
 # blue = "#7fb4ec"
 # orange = "#f09d6a"
 
-# Resource managers opened from the top-bar stats widget: highlight a stat with
-# Super+Alt+Up, cycle CPU/MEM/Net/GPU with ←/→, press Enter to embed it as a pane.
+# Resource managers for the top-bar stats widgets (focus the masthead with
+# Ctrl+↑, walk the stats with ←/→, Enter opens the stat's history popup).
 # `system` backs the CPU and MEM segments; `gpu` backs the GPU segment.
 [monitor]
 system = "btm"   # CPU/RAM monitor (ClementTsang/bottom); e.g. "htop", "btop"
