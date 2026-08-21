@@ -175,15 +175,29 @@ fn release(repo: &str, now: i64, ok: bool, interval_secs: u64) {
     }
 }
 
-/// The repo key (`--git-common-dir`) for a worktree, cached forever after the
-/// first resolve. `None` when the path isn't a git worktree.
-fn repo_key(loc: &GitLoc) -> Option<String> {
-    let path = loc.path();
-    if let Some(k) = lock().repo_of.get(&path) {
+/// The repo key for a worktree, cached forever after the first resolve.
+/// `None` when the path isn't a git worktree.
+///
+/// The memo is keyed by the HOST worktree path, never `loc.path()` — for a
+/// provider worktree that is the in-sandbox path (`/workspace` for every
+/// worktree of an env), which made the first resolve's repo answer for all of
+/// them, sharing one min-interval/backoff bucket across unrelated repos. The
+/// key VALUE is the `--git-common-dir`, prefixed with the location identity
+/// for off-host worktrees — two different repos in two different envs can
+/// both report `/workspace/.git`, and they must not merge into one bucket.
+fn repo_key(host_path: &str, loc: &GitLoc) -> Option<String> {
+    if let Some(k) = lock().repo_of.get(host_path) {
         return Some(k.clone());
     }
-    let key = loc.git_out(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
-    lock().repo_of.insert(path, key.clone());
+    let common = loc.git_out(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let key = match loc {
+        GitLoc::Local(_) => common,
+        GitLoc::Remote { ssh, .. } => format!("ssh:{}:{}:{common}", ssh.host, ssh.port),
+        GitLoc::Provider { control_prefix, .. } => {
+            format!("prov:{}:{common}", control_prefix.join(" "))
+        }
+    };
+    lock().repo_of.insert(host_path.to_string(), key.clone());
     Some(key)
 }
 
@@ -422,7 +436,7 @@ fn poll_one(
         return false;
     }
     let loc = GitLoc::for_worktree(path);
-    let Some(repo) = repo_key(&loc) else {
+    let Some(repo) = repo_key(worktree, &loc) else {
         return false;
     };
     let now = thegn_core::util::now();

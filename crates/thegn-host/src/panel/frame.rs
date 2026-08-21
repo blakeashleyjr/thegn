@@ -251,6 +251,11 @@ fn indent(line: Line) -> Line {
             }
             Line::Split { l, r }
         }
+        // Sidebar-only variant; pass through unchanged if it ever shows here.
+        Line::SplitMinLeft { mut l, r, min_l } => {
+            l.insert(0, sp(PAD));
+            Line::SplitMinLeft { l, r, min_l }
+        }
     }
 }
 
@@ -657,7 +662,9 @@ mod tests {
             Line::Blank => String::new(),
             Line::Fill { ch, .. } => ch.to_string(),
             Line::Segs(v) => segs(v),
-            Line::Split { l, r } => format!("{}|{}", segs(l), segs(r)),
+            Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+                format!("{}|{}", segs(l), segs(r))
+            }
         }
     }
 

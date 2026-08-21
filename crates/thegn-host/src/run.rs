@@ -1092,6 +1092,24 @@ impl SidebarState {
                 .activity
                 .insert(name.clone(), crate::sidebar::ActivityState::Failed);
         }
+        // Identity re-anchor: remember which row the (focused) cursor is on
+        // BEFORE the rebuild replaces the rows. A hydration/sort/prune can
+        // reorder or remove rows in the same loop iteration that later drains
+        // queued input, so a raw index would silently retarget `d`/`Enter` at
+        // whatever row inherited the slot. `worktree_path` is the fallback for
+        // worktree rows whose `pin_key` re-keys on a folder file/unfile.
+        let cursor_anchor: Option<(String, Option<String>)> = self
+            .focused
+            .then(|| {
+                model
+                    .sidebar_rows
+                    .iter()
+                    .filter(|r| r.visible)
+                    .nth(self.cursor)
+                    .map(|r| (r.pin_key.clone(), r.worktree_path.clone()))
+            })
+            .flatten()
+            .filter(|(k, _)| !k.is_empty());
         let rows_span = crate::perf::measure(crate::perf::Subsys::Rows);
         model.sidebar_rows = crate::sidebar::build_rows(
             session,
@@ -1112,9 +1130,31 @@ impl SidebarState {
         }
         let visible = Self::visible_len(model);
         // While unfocused, track the active worktree so opening the sidebar
-        // lands on the current tab; once focused, keep the user's cursor.
+        // lands on the current tab; once focused, keep the user's cursor —
+        // on the same ROW (re-seek by identity), not the same index.
         if !self.focused {
             self.cursor = visible_index_of_active(model);
+        } else if let Some((key, path)) = &cursor_anchor {
+            let by_key = model
+                .sidebar_rows
+                .iter()
+                .filter(|r| r.visible)
+                .position(|r| &r.pin_key == key);
+            let by_path = || {
+                path.as_ref().and_then(|p| {
+                    model
+                        .sidebar_rows
+                        .iter()
+                        .filter(|r| r.visible)
+                        .position(|r| {
+                            r.kind == crate::sidebar::RowKind::Worktree
+                                && r.worktree_path.as_ref() == Some(p)
+                        })
+                })
+            };
+            if let Some(idx) = by_key.or_else(by_path) {
+                self.cursor = idx;
+            }
         }
         if visible == 0 {
             self.cursor = 0;
@@ -1443,17 +1483,20 @@ pub(crate) fn forget_worktree_group(
     group: &crate::session::WorktreeGroup,
 ) {
     if !group.path.is_empty() {
+        // `del_worktree` cascades the per-worktree caches + merge-queue row
+        // itself now (all three forget paths share it).
         let _ = db.del_worktree(&group.path);
-        // best-effort: drop any merge-queue row keyed by this worktree so the
-        // statusbar MQ badge / section don't keep counting a branch we removed.
-        // (The DB is a cache; a failure here must never take down the loop.)
-        let _ = db.remove_merge_entry(&group.path);
+        // Drop the activity-FSM entry too, or a worktree recreated on this
+        // path/tab inherits the dead one's sticky dot.
+        thegn_core::activity::forget(&group.path);
     }
     let _ = db.del_worktree_for_tab(session_id, &group.name);
     let _ = db.delete_tab_group(session_id, &group.name);
-    // The registry row is gone, so its sidebar pin keys (`pin:{slug}/{branch}`
-    // and the filed variant `pin:{slug}/{branch}/folder:{id}`) would orphan in
-    // ui_state. best-effort: cache-only keys. (The group name IS `slug/branch`.)
+    // The registry row is gone, so its sidebar pin key (`pin:{slug}/{branch}`;
+    // the segment delete also sweeps legacy filed-variant rows,
+    // `pin:{slug}/{branch}/folder:{id}`, from before the key was unified)
+    // would orphan in ui_state. best-effort: cache-only keys. (The group name
+    // IS `slug/branch`.)
     //
     // Segment-anchored (audit run.rs:1457): delete the exact `pin:{name}` key +
     // everything under `pin:{name}/`, NOT the bare `pin:{name}` prefix — a raw
@@ -6982,60 +7025,83 @@ async fn event_loop<T: Terminal>(
             // (instant) instead of provisioning from scratch. Throttled (~8s); the
             // whole reconcile runs off-loop (a cheap DB read + provider create/destroy)
             // and is a no-op when the pool is empty/disabled.
+            // Everything below runs OFF-loop: even resolving `is_remote`
+            // (`GitLoc::for_worktree`) opens the DB, and a fresh connection
+            // under WAL write contention can stall up to the 5s
+            // `busy_timeout` — the exact loop-freeze the glyph cache
+            // documents. The worker publishes `(worktree, chip)` into
+            // `lifecycle::pool_chip()` and pulses the waker; the loop only
+            // mirrors that in-memory value below.
+            let active_wt = session
+                .active_group()
+                .map(|g| g.path.clone())
+                .filter(|p| !p.is_empty());
+            let chip_stale = {
+                let chip = crate::lifecycle::pool_chip()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                chip.as_ref().map(|(wt, _)| wt.clone()) != active_wt
+            };
+            // A stale chip (worktree switch) re-resolves after a 1s debounce
+            // rather than instantly: the publish is async, and re-spawning a
+            // worker on every wake of the in-flight window would pile up
+            // blocking tasks. A matching chip rides the normal 8s throttle.
+            let refresh_after = std::time::Duration::from_secs(if chip_stale { 1 } else { 8 });
             if current_config.lifecycle.enabled
+                && let Some(wt) = active_wt.clone()
                 && last_pool_reconcile
-                    .map(|t| t.elapsed() >= std::time::Duration::from_secs(8))
+                    .map(|t| t.elapsed() >= refresh_after)
                     .unwrap_or(true)
-                && let Some(g) = session.active_group()
-                && !g.path.is_empty()
             {
-                let wt = g.path.clone();
-                let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
-                if loc.is_remote() {
-                    last_pool_reconcile = Some(std::time::Instant::now());
-                    // Resolve (repo, env) on-loop (fast, throttled) so we can update
-                    // the sidebar chip AND hand the resolved values to the off-loop
-                    // reconcile.
-                    if let Ok(db) = thegn_core::db::Db::open() {
-                        // (repo_root, repo, env) via the worktree's EFFECTIVE env —
-                        // see `lifecycle::pool_context` for why never the default.
+                last_pool_reconcile = Some(std::time::Instant::now());
+                let cfg = current_config.clone();
+                let wk = waker.clone();
+                task::spawn_blocking(move || {
+                    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
+                    let chip = if loc.is_remote()
+                        && let Ok(db) = thegn_core::db::Db::open()
+                    {
+                        // (repo_root, repo, env) via the worktree's EFFECTIVE
+                        // env — see `lifecycle::pool_context` for why never
+                        // the default.
                         let (repo_root, repo, env_name) =
-                            crate::lifecycle::pool_context(&db, &current_config, &wt, &loc);
-                        let target = crate::lifecycle::effective_pool_target(
-                            &db,
-                            &current_config,
-                            &repo,
-                            &env_name,
-                        );
+                            crate::lifecycle::pool_context(&db, &cfg, &wt, &loc);
+                        let target =
+                            crate::lifecycle::effective_pool_target(&db, &cfg, &repo, &env_name);
                         let ready = db
                             .pool_spares_for(&repo, &env_name)
                             .unwrap_or_default()
                             .iter()
                             .filter(|s| s.state == "ready")
                             .count();
-                        let pool = (target > 0).then_some((ready, target));
-                        if model.pool != pool {
-                            model.pool = pool;
-                            dirty = true;
-                        }
-                        let cfg = current_config.clone();
-                        let wk = waker.clone();
-                        task::spawn_blocking(move || {
-                            crate::lifecycle::reconcile_pool(
-                                &cfg,
-                                &repo_root,
-                                &env_name,
-                                move || {
-                                    let _ = wk.wake();
-                                },
-                            );
+                        let wk2 = wk.clone();
+                        crate::lifecycle::reconcile_pool(&cfg, &repo_root, &env_name, move || {
+                            let _ = wk2.wake();
                         });
-                    }
-                } else if model.pool.is_some() {
-                    // Switched to a non-provider workspace ⇒ drop the stale chip.
-                    model.pool = None;
-                    dirty = true;
-                }
+                        (target > 0).then_some((ready, target))
+                    } else {
+                        None
+                    };
+                    *crate::lifecycle::pool_chip()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some((wt, chip));
+                    let _ = wk.wake();
+                });
+            }
+            // Mirror the published chip; a value computed for a DIFFERENT
+            // worktree reads as None so a switch never shows the previous
+            // workspace's numbers (the block above re-resolves immediately).
+            let pool = {
+                let chip = crate::lifecycle::pool_chip()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                chip.as_ref()
+                    .filter(|(wt, _)| Some(wt) == active_wt.as_ref())
+                    .and_then(|(_, c)| *c)
+            };
+            if model.pool != pool {
+                model.pool = pool;
+                dirty = true;
             }
             // And the new worktree's hidden yazi drawer, so the first toggle
             // never waits on yazi's startup. Off by default ([drawer].prewarm)
@@ -7186,6 +7252,26 @@ async fn event_loop<T: Terminal>(
                 need_relayout = true;
                 dirty = true;
             }
+        }
+        // If anything hid the sidebar while it held keyboard focus (a resize
+        // under the width threshold, the panel going Full), hand focus back to
+        // the center — otherwise every keystroke is swallowed by an invisible
+        // widget and `d` can open a destructive confirm off-screen. The panel
+        // has the same guard on its toggle path.
+        if focus.sidebar() && chrome.sidebar.is_none() {
+            focus.zone = crate::focus::Zone::Center;
+            sb.focused = false;
+            sb.sync(&mut model);
+            dirty = true;
+        }
+        // An open row menu follows sidebar focus: leaving the sidebar (pane
+        // click, Ctrl-arrow, Alt-p) dismisses it, exactly as `sb.marked` is
+        // cleared — a lingering menu keeps painting over the tree, swallows
+        // the next sidebar click, and can fire an entry the user abandoned.
+        if !focus.sidebar() && sb.menu.is_some() {
+            sb.menu = None;
+            sb.sync(&mut model);
+            dirty = true;
         }
 
         let tree = crate::handlers::pane_zoom::grown_tree(
@@ -8166,6 +8252,27 @@ async fn event_loop<T: Terminal>(
             let task_last_runs = std::mem::take(&mut model.panel.task_last_runs);
             let log_lines_structured = std::mem::take(&mut model.panel.log_lines_structured);
             let task_diagnostics = std::mem::take(&mut model.panel.diagnostics);
+            // Optimistic sidebar regroup/reorder carry-over: the reorder/file
+            // handlers mutate `sidebar_db_worktrees`/`sidebar_db_folders` on
+            // the gesture's frame and defer the DB write off-loop. A hydration
+            // whose DB read predates that write would swap the PRE-edit lists
+            // back in — the row visibly snapped to its old slot, then jumped
+            // again (or, for reorder, stayed wrong until the next 5s tick).
+            // While the edit is fresher than any in-flight hydration, keep the
+            // loop's lists. (Cost: a folder created optimistically keeps its
+            // synthetic negative id for up to the window; the next tick
+            // reconciles it.)
+            let optimistic_lists = sb
+                .optimistic_db_edit_at
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
+                .then(|| {
+                    (
+                        std::mem::take(&mut model.sidebar_db_worktrees),
+                        std::mem::take(&mut model.sidebar_db_folders),
+                        std::mem::take(&mut model.sidebar_db_terminals),
+                        std::mem::take(&mut model.sidebar_workspaces),
+                    )
+                });
             model = next_model;
             model.stats = stats;
             model.metrics = metrics;
@@ -8176,6 +8283,12 @@ async fn event_loop<T: Terminal>(
             model.panel.task_last_runs = task_last_runs;
             model.panel.log_lines_structured = log_lines_structured;
             model.panel.diagnostics = task_diagnostics;
+            if let Some((wts, folders, terms, workspaces)) = optimistic_lists {
+                model.sidebar_db_worktrees = wts;
+                model.sidebar_db_folders = folders;
+                model.sidebar_db_terminals = terms;
+                model.sidebar_workspaces = workspaces;
+            }
             if model.status.is_empty() {
                 model.status = prev_status;
             }
@@ -8884,6 +8997,12 @@ async fn event_loop<T: Terminal>(
                     sb.view.workspace_sort = new_cfg.ui.sidebar_workspace_sort;
                     sb.view.terminals_section = new_cfg.ui.sidebar_terminals_section;
                     sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&new_cfg.ui);
+                    // `workspace_sort`/`terminals_section` are only read inside
+                    // `build_rows`, and nothing else on the reload path
+                    // rebuilds rows — without this, the edit sits invisible
+                    // until some unrelated hydration happens to rebuild (an
+                    // idle repo's fast path never does).
+                    sb.rebuild(&mut model, &session);
                     // Live fullscreen-bar reload: recompute the chrome now if the
                     // user is currently in full-window zoom so the kept/dropped
                     // bars apply immediately (the reload relayouts below anyway).
@@ -10783,6 +10902,15 @@ async fn event_loop<T: Terminal>(
                         }
                         dirty = true;
                     } else if let Some(r) = chrome.sidebar.filter(|r| r.contains(mx, my)) {
+                        // The scroll window is cursor-anchored
+                        // (`clamp_sidebar_scroll` never lets the cursor leave
+                        // the window), so the wheel walks the CURSOR. Take
+                        // sidebar focus like any other pointer gesture on it —
+                        // an unfocused cursor silently snaps back to the
+                        // active row on the next rebuild, undoing the scroll,
+                        // and an invisible highlight is a lying action target.
+                        focus.zone = crate::focus::Zone::Sidebar;
+                        sb.focused = true;
                         let visible = SidebarState::visible_len(&model);
                         if up {
                             sb.cursor = sb.cursor.saturating_sub(3);
@@ -16194,20 +16322,38 @@ async fn event_loop<T: Terminal>(
                                 need_relayout = true;
                             }
                             Action::FocusSidebar => {
-                                // Explicitly focusing the sidebar promotes it to
-                                // the full navigable panel (out of rail/hidden).
-                                if sb.mode != crate::layout::SidebarMode::Full {
-                                    sb.mode = crate::layout::SidebarMode::Full;
+                                // Explicitly focusing the sidebar promotes it out
+                                // of rail/hidden — to Full when the width
+                                // threshold allows, else to the rail (visible at
+                                // any width), so the promotion can never HIDE
+                                // the sidebar the user just asked to focus.
+                                let target = if cols >= crate::layout::SIDEBAR_MIN_COLS {
+                                    crate::layout::SidebarMode::Full
+                                } else {
+                                    crate::layout::SidebarMode::Rail
+                                };
+                                if sb.mode != target {
+                                    sb.mode = target;
                                     sb.persist("sidebar_mode", sb.mode.as_key());
                                     want_sidebar = true;
                                     sidebar_cols = sb.effective_cols(cols);
                                     chrome = recompute_chrome!();
                                     need_relayout = true;
                                 }
-                                // Take keyboard focus, land on the active worktree.
-                                focus.zone = crate::focus::Zone::Sidebar;
-                                sb.focused = true;
-                                sb.rebuild(&mut model, &session);
+                                if chrome.sidebar.is_none() {
+                                    // Still not on screen (the full-width panel
+                                    // claims the whole band): refuse instead of
+                                    // stranding the keyboard in an invisible
+                                    // widget that swallows every keystroke.
+                                    model.status =
+                                        "Sidebar is hidden by the full-width panel — shrink the panel first"
+                                            .into();
+                                } else {
+                                    // Take keyboard focus, land on the active worktree.
+                                    focus.zone = crate::focus::Zone::Sidebar;
+                                    sb.focused = true;
+                                    sb.rebuild(&mut model, &session);
+                                }
                             }
                             Action::FocusPanel => {
                                 panel_auto_revealed = None;
@@ -17511,12 +17657,25 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::CloseWorktree => {
-                                // Remove the active worktree group via the shared
+                                // Remove a worktree group via the shared
                                 // confirm+delete path: the menu follows confirm_delete,
                                 // a dirty tree forces a warning, and the root/home
-                                // checkout is never removed. `req` is built before the
-                                // ctx takes `&mut session`.
-                                let req = vec![session.active];
+                                // checkout is never removed. With the sidebar
+                                // focused, the target is the group under the
+                                // CURSOR (matching MoveItemUp/Down — this used
+                                // to hit the active worktree no matter where
+                                // the highlight sat); else the active group.
+                                // `req` is built before the ctx takes `&mut session`.
+                                let cursor_group = focus
+                                    .sidebar()
+                                    .then(|| {
+                                        sb.selected_row(&model).and_then(|r| match r.tab_target {
+                                            Some(crate::sidebar::RowTarget::Tab(gi, _)) => Some(gi),
+                                            _ => None,
+                                        })
+                                    })
+                                    .flatten();
+                                let req = vec![cursor_group.unwrap_or(session.active)];
                                 crate::handlers::worktree_delete::request_group_delete(
                                     crate::handlers::worktree_delete::DeleteCtx {
                                         session: &mut session,

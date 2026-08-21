@@ -1002,6 +1002,17 @@ fn flatten(line: &Line, w: usize) -> Vec<Seg> {
             out.extend(r2);
             out
         }
+        // Sidebar-only variant; treat like `Split` if it ever shows here.
+        Line::SplitMinLeft { l, r, .. } => {
+            let r2 = seg::cut(r, w);
+            let rw = seg::seg_width(&r2);
+            let avail = w.saturating_sub(rw + usize::from(rw > 0));
+            let mut out = seg::cut(l, avail);
+            let lw = seg::seg_width(&out);
+            out.push(sp(w.saturating_sub(lw + rw)));
+            out.extend(r2);
+            out
+        }
     }
 }
 
@@ -1310,7 +1321,9 @@ mod tests {
             Line::Blank => String::new(),
             Line::Fill { ch, .. } => ch.to_string(),
             Line::Segs(v) => segs_text(v),
-            Line::Split { l, r } => format!("{}|{}", segs_text(l), segs_text(r)),
+            Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+                format!("{}|{}", segs_text(l), segs_text(r))
+            }
         }
     }
 

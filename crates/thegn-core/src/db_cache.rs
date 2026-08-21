@@ -141,6 +141,33 @@ impl CacheStore for Db {
         Ok(counts)
     }
 
+    /// Each branch's open PR **number**, for branches with exactly one open
+    /// PR (the sidebar's compact `⬡N` chip names a single PR; a multi-PR
+    /// branch falls back to the count form via
+    /// [`Self::get_open_pr_counts_by_branch`]).
+    fn get_open_pr_numbers_by_branch(
+        &self,
+        repo_root: &str,
+    ) -> Result<std::collections::BTreeMap<String, u64>> {
+        let mut numbers: std::collections::BTreeMap<String, Option<u64>> = Default::default();
+        let Some((json, _)) = self.get_pr_branch_cache(repo_root)? else {
+            return Ok(Default::default());
+        };
+        for pr in crate::github::parse_pr_headers(&json) {
+            if pr.state.eq_ignore_ascii_case("open") {
+                // Second open PR on the branch ⇒ ambiguous ⇒ None.
+                numbers
+                    .entry(pr.head_ref)
+                    .and_modify(|n| *n = None)
+                    .or_insert(Some(pr.number));
+            }
+        }
+        Ok(numbers
+            .into_iter()
+            .filter_map(|(b, n)| n.map(|n| (b, n)))
+            .collect())
+    }
+
     fn get_issue_cache(
         &self,
         repo_root: &str,

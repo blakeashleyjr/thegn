@@ -1088,7 +1088,9 @@ mod tests {
                 Line::Blank => String::new(),
                 Line::Fill { ch, .. } => ch.to_string(),
                 Line::Segs(v) => segs_text(v),
-                Line::Split { l, r } => format!("{} {}", segs_text(l), segs_text(r)),
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+                    format!("{} {}", segs_text(l), segs_text(r))
+                }
             })
             .collect::<Vec<_>>()
             .join("\n")

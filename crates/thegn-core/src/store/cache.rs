@@ -37,6 +37,12 @@ pub trait CacheStore {
         &self,
         repo_root: &str,
     ) -> Result<std::collections::BTreeMap<String, usize>>;
+    /// Each branch's open PR **number** when exactly one open PR exists for
+    /// it (the sidebar `⬡N` chip; ambiguous branches are omitted).
+    fn get_open_pr_numbers_by_branch(
+        &self,
+        repo_root: &str,
+    ) -> Result<std::collections::BTreeMap<String, u64>>;
 
     /// Issue-tracker cache for `(repo, provider, account)`: `(json,
     /// fetched_at)`. `account` is the `[[issue_accounts]]` name (`""` for the

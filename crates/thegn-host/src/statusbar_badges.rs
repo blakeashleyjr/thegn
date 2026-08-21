@@ -134,9 +134,19 @@ pub(crate) fn push_ci_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<
 /// visible. Silent only when the queue is empty (clean is quiet). Activating
 /// it opens the queue overlay (`detail.rs`).
 pub(crate) fn push_mq_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
-    let q = &model.panel.merge_queue;
-    let blocked = q
+    // Repo-scoped like every other nag surface (the ✋ badge, "Needs you",
+    // the inbox): `merge_queue` rows are global in the DB, but a sibling
+    // repo's queued branches must not raise a red ⚑ in the repo you're
+    // working in. `repo_scope == None` fails open (count everything), per
+    // the contract on `SidebarStatus::repo_scope`.
+    let scope = model.sidebar_status.repo_scope.as_ref();
+    let q = model
+        .panel
+        .merge_queue
         .iter()
+        .filter(|r| scope.is_none_or(|s| s.contains(&r.worktree)));
+    let blocked = q
+        .clone()
         .filter(|r| {
             matches!(
                 r.status.as_str(),
@@ -145,11 +155,10 @@ pub(crate) fn push_mq_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<
         })
         .count();
     let working = q
-        .iter()
+        .clone()
         .filter(|r| matches!(r.status.as_str(), "folding" | "verifying" | "agent_running"))
         .count();
     let idle = q
-        .iter()
         .filter(|r| matches!(r.status.as_str(), "queued" | "ready"))
         .count();
     if blocked > 0 {

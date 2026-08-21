@@ -236,6 +236,25 @@ pub fn ack_at(path: &Path, tab: &str) {
     }
 }
 
+/// Drop a deleted worktree's FSM entry. Entries are otherwise carried forward
+/// forever (deliberately — dormant workspaces' dots must survive a switch),
+/// and `read_states()` re-keys them by TAB name, so a worktree recreated on
+/// the same path or tab would inherit the dead one's dot — including a sticky
+/// red `waiting` that only 3s of sustained CPU clears. Called from every
+/// worktree-forget path.
+pub fn forget(worktree_path: &str) {
+    forget_at(&state_path(), worktree_path);
+}
+
+/// [`forget`] against an explicit path (testable).
+pub fn forget_at(path: &Path, worktree_path: &str) {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut snap = load(path);
+    if snap.worktrees.remove(worktree_path).is_some() {
+        save(path, &snap);
+    }
+}
+
 /// The settled state a stale running/active dot collapses to at resurrection
 /// (no live work; no dot).
 pub const SETTLED_STATE: &str = "none";
@@ -553,6 +572,24 @@ mod tests {
         let m = read_states_at(&path);
         assert_eq!(m.get("app/home").map(String::as_str), Some("waiting"));
         assert_eq!(m.get("app/feat").map(String::as_str), Some("read"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn forget_drops_only_the_named_worktree_entry() {
+        let path = tmp("forget");
+        let json = r#"{"worktrees":{"/wt/a":{"tab":"app/fix","state":"waiting","cpu_jiffies":0},
+                        "/wt/b":{"tab":"app/feat","state":"read","cpu_jiffies":0}}}"#;
+        std::fs::write(&path, json).unwrap();
+        forget_at(&path, "/wt/a");
+        let m = read_states_at(&path);
+        // The deleted worktree's sticky dot is gone — a recreated worktree on
+        // the same path/tab starts clean instead of inheriting red `waiting`.
+        assert!(!m.contains_key("app/fix"));
+        assert_eq!(m.get("app/feat").map(String::as_str), Some("read"));
+        // Forgetting an unknown path is a no-op (and never writes).
+        forget_at(&path, "/wt/nope");
+        assert_eq!(read_states_at(&path).len(), 1);
         let _ = std::fs::remove_file(&path);
     }
 
