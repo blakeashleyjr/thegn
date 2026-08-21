@@ -49,9 +49,14 @@ pub struct PanelDocs {
     pub telemetry: crate::telemetry::TelemetryHistory,
     /// Rolling event-loop self-profiler history (the Telemetry "Loop" sub-block).
     pub loop_perf: crate::telemetry::LoopPerfHistory,
-    /// Cached pane-daemon status (PID / version / uptime / sessions), refreshed
-    /// off-loop on the ticker. Feeds the far-right status chip + its modal.
+    /// Cached pane-daemon registry row (PID / version / uptime / heartbeat),
+    /// refreshed off-loop on the ticker. Feeds the far-right status chip + its
+    /// modal.
     pub daemon: crate::chrome::DaemonStatus,
+    /// The daemon's live session list, fetched over the control socket when the
+    /// user opens the status modal (never on a timer — see
+    /// `handlers::status::probe_sessions`).
+    pub daemon_sessions: crate::detail::DaemonSessions,
     /// Cheatsheet groups from the effective keymap, refreshed on config
     /// reload (the keys section's content).
     pub cfg_keys: Vec<crate::keyhint::HintGroup>,

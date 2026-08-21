@@ -35,7 +35,6 @@ fn cpu_maps_to_a_graph_near_the_item() {
     let ov = open_detail_for(
         &BarItemId::Widget("cpu".into()),
         item_at(0),
-        screen(),
         &model,
         &StatusCtx::new_for_test(&hist),
     )
@@ -54,7 +53,6 @@ fn box_rect_encloses_the_drawn_box() {
     let ov = open_detail_for(
         &BarItemId::Widget("cpu".into()),
         item,
-        screen(),
         &model,
         &StatusCtx::new_for_test(&hist),
     )
@@ -80,7 +78,6 @@ fn absent_data_yields_no_modal() {
             open_detail_for(
                 &BarItemId::Widget(id.into()),
                 item_at(0),
-                screen(),
                 &model,
                 &StatusCtx::new_for_test(&hist)
             )
@@ -98,7 +95,6 @@ fn notifications_badge_is_the_unified_surface_with_a_logs_entry() {
     let ov = open_detail_for(
         &BarItemId::Badge(BarBadge::Notifications),
         item_at(39),
-        screen(),
         &model,
         &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
@@ -131,7 +127,6 @@ fn disk_badge_shows_free_used_total_and_worktree_rows() {
     let ov = open_detail_for(
         &BarItemId::Badge(BarBadge::DiskWarn),
         item_at(39),
-        screen(),
         &model,
         &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
@@ -160,7 +155,6 @@ fn statusbar_item_opens_above_itself() {
     let ov = open_detail_for(
         &BarItemId::Widget("cpu".into()),
         item_at(39),
-        screen(),
         &model,
         &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
@@ -246,7 +240,6 @@ fn ci_badge_detail_is_actionable_with_a_hint() {
     let ov = open_detail_for(
         &BarItemId::Badge(BarBadge::Ci),
         item_at(39),
-        screen(),
         &model,
         &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
@@ -302,7 +295,6 @@ fn renders_without_panic_and_is_legible() {
     let ov = open_detail_for(
         &BarItemId::Widget("cpu".into()),
         item_at(0),
-        screen(),
         &model,
         &StatusCtx::new_for_test(&hist),
     )
@@ -336,7 +328,6 @@ fn loc_opens_a_scrollable_tokei_table() {
     let mut ov = open_detail_for(
         &BarItemId::Widget("loc".into()),
         item_at(39),
-        screen(),
         &model,
         &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
@@ -371,7 +362,6 @@ fn loc_table_renders_legibly() {
     let ov = open_detail_for(
         &BarItemId::Widget("loc".into()),
         item_at(39),
-        screen(),
         &model,
         &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
@@ -432,7 +422,6 @@ fn open_notifications(model: &FrameModel) -> DetailOverlay {
     open_detail_for(
         &BarItemId::Badge(BarBadge::Notifications),
         item_at(39),
-        screen(),
         model,
         &StatusCtx::new_for_test(&TelemetryHistory::default()),
     )
@@ -803,7 +792,6 @@ fn rich_widgets_map_to_sections() {
         let ov = open_detail_for(
             &BarItemId::Widget(w.into()),
             item_at(0),
-            screen(),
             &model,
             &StatusCtx::new_for_test(&hist),
         )
@@ -891,7 +879,6 @@ fn sections_popup_renders_legibly() {
         let ov = open_detail_for(
             &BarItemId::Widget(w.into()),
             item_at(0),
-            screen(),
             &model,
             &StatusCtx::new_for_test(&hist),
         )
@@ -919,22 +906,25 @@ fn daemon_chip_opens_expanded_status_modal() {
         version: "9.9.9".into(),
         hostname: "box".into(),
         started_at_ms: 0,
-        sessions: 2,
-        attached: 1,
+        heartbeat_at: 60_000,
         ..Default::default()
     };
     let hist = TelemetryHistory::default();
+    let sessions = crate::detail::DaemonSessions::default();
+    let dcfg = thegn_core::config::DaemonConfig::default();
     let ctx = StatusCtx {
         hist: &hist,
         loop_perf: &crate::telemetry::LoopPerfHistory::default(),
         daemon: &daemon,
+        sessions: &sessions,
+        daemon_cfg: &dcfg,
+        screen: screen(),
         now_ms: 60_000, // 60s of daemon uptime
         uptime_secs: 125,
     };
     let ov = open_detail_for(
         &BarItemId::Badge(BarBadge::Persist),
         item_at(39), // bottom half → floats upward
-        screen(),
         &model,
         &ctx,
     )
@@ -949,17 +939,224 @@ fn daemon_chip_opens_expanded_status_modal() {
     assert!(seg::text_contrast_violations(&mut s, 3.0).is_empty());
 }
 
+/// Build a status modal against `screen`, with the given daemon session state.
+#[cfg(test)]
+fn status_modal_on(
+    sessions: &crate::detail::DaemonSessions,
+    screen_rect: Rect,
+) -> crate::detail::DetailOverlay {
+    use crate::chrome::{DaemonChipState, DaemonStatus};
+    let model = FrameModel {
+        daemon_state: DaemonChipState::Persist,
+        daemon_panes: 2,
+        pane_count: 3,
+        ..Default::default()
+    };
+    let daemon = DaemonStatus {
+        present: true,
+        pid: Some(4242),
+        version: "9.9.9".into(),
+        hostname: "box".into(),
+        endpoint: "/run/user/1000/thegn/daemon.sock".into(),
+        scope: "/home/u/.local/state/thegn".into(),
+        daemon_id: "9f3c2a11deadbeef".into(),
+        started_at_ms: 0,
+        heartbeat_at: 60_000,
+        ..Default::default()
+    };
+    let hist = TelemetryHistory::default();
+    let dcfg = thegn_core::config::DaemonConfig::default();
+    let ctx = StatusCtx {
+        hist: &hist,
+        loop_perf: &crate::telemetry::LoopPerfHistory::default(),
+        daemon: &daemon,
+        sessions,
+        daemon_cfg: &dcfg,
+        screen: screen_rect,
+        now_ms: 60_000,
+        uptime_secs: 125,
+    };
+    open_detail_for(
+        &BarItemId::Badge(BarBadge::Persist),
+        item_at(screen_rect.rows.saturating_sub(1)),
+        &model,
+        &ctx,
+    )
+    .expect("daemon chip has a detail view")
+}
+
+/// One daemon session, as `/v1/sessions` would report it.
+#[cfg(test)]
+fn session_info(id: &str, program: &str, attached: u32) -> thegn_svc::control::SessionInfo {
+    thegn_svc::control::SessionInfo {
+        id: id.into(),
+        worktree: Some("/repo/app/feature-x".into()),
+        program: program.into(),
+        cwd: None,
+        rows: 40,
+        cols: 120,
+        created_at_ms: 0,
+        attached_clients: attached,
+        lease_expires_at: None,
+        pid: Some(77),
+    }
+}
+
+/// Render an overlay and flatten it to text, for content assertions.
+#[cfg(test)]
+fn rendered_text(ov: &crate::detail::DetailOverlay, screen_rect: Rect) -> String {
+    let mut s = Surface::new(screen_rect.cols, screen_rect.rows);
+    ov.render(&mut s, screen_rect);
+    s.screen_chars_to_string()
+}
+
+/// The regression guard for the reported bug: a daemon serving live sessions
+/// must NOT render a zero count. The old modal derived counts from the lease
+/// table, which records only detached sessions, so this read `0 (0 attached)`
+/// while panes were being served.
+#[test]
+fn status_modal_reports_live_sessions_not_zero() {
+    let sessions = crate::detail::DaemonSessions::Live(vec![
+        session_info("9f3c2a11", "nvim", 1),
+        session_info("2b7ec140", "zsh", 1),
+        session_info("4410ffa2", "cargo", 0),
+    ]);
+    let sc = Rect::full(120, 40);
+    let text = rendered_text(&status_modal_on(&sessions, sc), sc);
+    assert!(text.contains("3 live"), "session count missing:\n{text}");
+    assert!(
+        text.contains("2 attached"),
+        "attached count missing:\n{text}"
+    );
+    assert!(text.contains("1 warm"), "warm count missing:\n{text}");
+    // The table itself renders, not just the summary.
+    assert!(text.contains("9f3c2a11"), "session id missing:\n{text}");
+    assert!(text.contains("nvim"), "program missing:\n{text}");
+    // And never the old, always-wrong rendering.
+    assert!(
+        !text.contains("0 (0 attached)"),
+        "stale zero count:\n{text}"
+    );
+}
+
+/// "Never asked" and "asked, none" must not render the same.
+#[test]
+fn status_modal_distinguishes_probe_states() {
+    use crate::detail::DaemonSessions;
+    let sc = Rect::full(120, 40);
+    for (state, want) in [
+        (DaemonSessions::Probing, "probing"),
+        (DaemonSessions::NoDaemon, "inline panes only"),
+        (DaemonSessions::Live(vec![]), "none"),
+    ] {
+        let text = rendered_text(&status_modal_on(&state, sc), sc);
+        assert!(
+            text.contains(want),
+            "{state:?} should say {want:?}:\n{text}"
+        );
+    }
+}
+
+/// Bug A guard: a stack taller than the screen must clamp its box AND stay
+/// reachable by the scroll keys. `sections()` used to set `rows` to the full
+/// content height, which made `scroll_max()` zero — the overflow was clipped by
+/// the layer and unreachable.
+#[test]
+fn status_modal_scrolls_when_taller_than_screen() {
+    let sessions = crate::detail::DaemonSessions::Live(
+        (0..6)
+            .map(|i| session_info(&format!("s{i}"), "zsh", 1))
+            .collect(),
+    );
+    let sc = Rect::full(120, 24);
+    let mut ov = status_modal_on(&sessions, sc);
+    assert!(ov.rows < ov.content_rows(), "expected an overflowing stack");
+    assert_eq!(
+        ov.rows,
+        sc.rows - 3,
+        "box must clamp to the drawable height"
+    );
+    assert!(ov.scroll_max() > 0, "overflow must be reachable");
+    for _ in 0..100 {
+        ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+    }
+    assert_eq!(ov.scroll, ov.content_rows() - ov.rows);
+}
+
+/// Bug B guard: `viz::braille_graph` truncates to the first `w*2` samples rather
+/// than resampling, and the series are right-aligned with "now" at the right —
+/// so a sample count derived from the *requested* width would silently drop the
+/// newest samples on any narrower terminal.
+#[test]
+fn status_modal_series_length_matches_the_clamped_width() {
+    let sessions = crate::detail::DaemonSessions::default();
+    let sc = Rect::full(74, 40); // clamps content to 74 - 6 = 68 cells
+    let ov = status_modal_on(&sessions, sc);
+    assert_eq!(ov.cols, 68, "content width must clamp to the screen");
+    let DetailContent::Sections(d) = &ov.content else {
+        panic!("expected a sections popup");
+    };
+    let graph = d
+        .sections
+        .iter()
+        .find_map(|s| match s {
+            Section::Graph(g) if g.label == "RSS" => Some(g),
+            _ => None,
+        })
+        .expect("the RSS graph");
+    assert_eq!(graph.series.len(), 68 * 2);
+}
+
+/// Readable on the theme at both the wide (2-column grid) and narrow
+/// (single-column) layouts.
+#[test]
+fn status_modal_is_readable_at_every_width() {
+    let sessions = crate::detail::DaemonSessions::Live(vec![session_info("a1", "zsh", 1)]);
+    for cols in [120, 94, 74, 60] {
+        let sc = Rect::full(cols, 40);
+        let ov = status_modal_on(&sessions, sc);
+        let mut s = Surface::new(cols, 40);
+        ov.render(&mut s, sc);
+        assert!(
+            seg::text_contrast_violations(&mut s, 3.0).is_empty(),
+            "contrast violation at {cols} cols"
+        );
+    }
+}
+
+/// `refresh_open` is title-guarded: it must leave any other overlay alone.
+#[test]
+fn refresh_open_only_touches_the_status_modal() {
+    let hist = TelemetryHistory::default();
+    let model = FrameModel::default();
+    let ctx = StatusCtx::new_for_test(&hist);
+    // No overlay at all.
+    let mut slot = None;
+    assert!(!crate::detail::status_modal::refresh_open(
+        &mut slot, &model, &ctx
+    ));
+    // A different overlay stays untouched.
+    let mut slot = Some(crate::detail::usage_loading(60, 10));
+    assert!(!crate::detail::status_modal::refresh_open(
+        &mut slot, &model, &ctx
+    ));
+    assert_eq!(slot.as_ref().map(|o| o.title()), Some("Usage"));
+}
+
 #[test]
 fn tall_sections_popup_scrolls() {
-    // A popup whose stacked height exceeds its box scrolls by row.
+    // A popup whose stacked height exceeds the SCREEN scrolls by row. The box
+    // height must come from `sections()`'s own clamp — this test used to force
+    // `ov.rows = 10` by hand, which meant the real clamp was never exercised and
+    // a genuinely tall popup silently clipped with `scroll_max() == 0`.
     let secs = vec![Section::KeyVal(
         (0..30)
             .map(|i| (format!("k{i}"), format!("v{i}"), Tok::Slot(S::Text)))
             .collect(),
     )];
-    let mut ov = sections("Tall", 30, secs, Placement::Center);
-    // Cap the visible rows so it overflows.
-    ov.rows = 10;
+    let short = Rect::full(80, 13); // drawable content height = 13 - 3 = 10
+    let mut ov = sections("Tall", 30, secs, Placement::Center, short);
+    assert_eq!(ov.rows, 10, "box height must clamp to the screen");
     assert!(ov.content_rows() > ov.rows);
     for _ in 0..100 {
         ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
@@ -969,4 +1166,91 @@ fn tall_sections_popup_scrolls() {
         ov.handle_key(&KeyCode::UpArrow, Modifiers::NONE);
     }
     assert_eq!(ov.scroll, 0);
+}
+
+#[test]
+fn sections_popup_that_fits_does_not_scroll() {
+    let secs = vec![Section::KeyVal(
+        (0..5)
+            .map(|i| (format!("k{i}"), format!("v{i}"), Tok::Slot(S::Text)))
+            .collect(),
+    )];
+    let ov = sections("Short", 30, secs, Placement::Center, Rect::full(80, 40));
+    assert_eq!(ov.rows, 5);
+    assert_eq!(ov.scroll_max(), 0);
+}
+
+#[test]
+fn grid_height_is_row_major_ceil() {
+    let cells: Vec<_> = (0..8)
+        .map(|i| (format!("k{i}"), format!("v{i}"), Tok::Slot(S::Text)))
+        .collect();
+    assert_eq!(Section::Grid { cols: 3, cells }.height(), 3);
+    let one = vec![("k".to_string(), "v".to_string(), Tok::Slot(S::Text))];
+    assert_eq!(
+        Section::Grid {
+            cols: 2,
+            cells: one
+        }
+        .height(),
+        1
+    );
+    // A degenerate column count must not divide by zero.
+    assert_eq!(
+        Section::Grid {
+            cols: 0,
+            cells: vec![],
+        }
+        .height(),
+        0
+    );
+}
+
+#[test]
+fn grid_sizes_each_column_independently() {
+    // Column 0 holds short values, column 1 a very long one. Column 1's width
+    // must not pad column 0 (that is the whole point of the grid over KeyVal).
+    let cells = vec![
+        ("a".into(), "1".into(), Tok::Slot(S::Text)),
+        ("b".into(), "x".repeat(40), Tok::Slot(S::Text)),
+        ("cc".into(), "22".into(), Tok::Slot(S::Text)),
+        ("d".into(), "y".into(), Tok::Slot(S::Text)),
+    ];
+    let (kw, vw) = crate::detail::grid_widths(2, &cells);
+    assert_eq!(kw, vec![2, 1], "keys: max('a','cc')=2, max('b','d')=1");
+    assert_eq!(vw, vec![2, 40], "values sized per column");
+}
+
+#[test]
+fn grid_uses_display_width_not_char_count() {
+    // A CJK glyph is two cells wide; padding by char count would misalign.
+    let cells = vec![
+        ("k".into(), "日本".into(), Tok::Slot(S::Text)),
+        ("k2".into(), "ab".into(), Tok::Slot(S::Text)),
+    ];
+    let (_, vw) = crate::detail::grid_widths(1, &cells);
+    assert_eq!(vw, vec![4], "two wide glyphs occupy four cells");
+}
+
+#[test]
+fn grid_drops_columns_that_would_overflow() {
+    // Three columns of ~20 cells each into a 24-cell box: only the first fits,
+    // and nothing may be drawn past the clip.
+    let cells: Vec<_> = (0..6)
+        .map(|i| (format!("key{i}"), "v".repeat(16), Tok::Slot(S::Text)))
+        .collect();
+    let sec = Section::Grid { cols: 3, cells };
+    let secs = vec![sec];
+    let sc = Rect::full(40, 20);
+    let ov = sections("Grid", 24, secs, Placement::Center, sc);
+    let mut s = Surface::new(40, 20);
+    ov.render(&mut s, sc);
+    let text = s.screen_chars_to_string();
+    assert!(text.contains("key0"), "first column must draw:\n{text}");
+    assert!(
+        !text.contains("key1"),
+        "second column must be dropped, not wrapped:\n{text}"
+    );
+    // Still readable — a dropped column must not corrupt the row.
+    assert!(seg::text_contrast_violations(&mut s, 3.0).is_empty());
 }

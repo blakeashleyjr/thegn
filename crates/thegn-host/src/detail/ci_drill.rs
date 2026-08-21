@@ -235,15 +235,6 @@ mod tests {
     use crate::telemetry::TelemetryHistory;
     use termwiz::input::{KeyCode, Modifiers};
 
-    fn screen() -> Rect {
-        Rect {
-            x: 0,
-            y: 0,
-            cols: 120,
-            rows: 40,
-        }
-    }
-
     fn item_at(y: usize) -> Rect {
         Rect {
             x: 80,
@@ -277,7 +268,6 @@ mod tests {
         let mut ov = open_detail_for(
             &BarItemId::Badge(BarBadge::Ci),
             item_at(39),
-            screen(),
             &model,
             &StatusCtx::new_for_test(&TelemetryHistory::default()),
         )
@@ -375,7 +365,6 @@ mod tests {
         let mut ov = open_detail_for(
             &BarItemId::Badge(BarBadge::Ci),
             item_at(39),
-            screen(),
             &model,
             &StatusCtx::new_for_test(&TelemetryHistory::default()),
         )
