@@ -106,9 +106,10 @@ sidebar_show_pr_chip = true
 # the sidebar owns focus. "all" expands every worktree row; "cursor" expands only
 # the highlighted row; "off" never shows it.
 sidebar_focus_detail = "all"
-# Which fields the focused detail line carries (branch name first, then the total
-# branch-vs-default-branch line stat, then the open PR — env/backend/disk badges
-# always show when present):
+# Which fields the focused detail line carries (branch name first, then the
+# branch's own work over the LOCAL default branch — the same base `thegn diff`
+# uses, so a row sitting on the trunk shows nothing — then the open PR;
+# env/backend/disk badges always show when present):
 sidebar_detail_branch = true
 sidebar_detail_branch_stat = true
 sidebar_detail_pr = true

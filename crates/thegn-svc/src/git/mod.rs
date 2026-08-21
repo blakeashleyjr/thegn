@@ -733,6 +733,111 @@ fn parse_ahead_behind(out: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// Backstop staleness bound for [`glyph_base`]'s per-loc cache. A repo's default
+/// branch is effectively immutable, so this only bounds how long a repo that
+/// *gained* an `origin/HEAD` mid-session keeps serving the `main`/`master`
+/// fallback.
+const GLYPH_BASE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Process-global cache of [`glyph_base`]'s resolution, keyed by worktree path.
+/// The glyph scan re-runs for the active worktree on every hydration, so probing
+/// per scan would put a subprocess — and, for a bridged loc, a whole round trip —
+/// on the hot path. Mirrors the shape of the host's `branch_cache`.
+#[allow(clippy::type_complexity)]
+fn base_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, (Option<String>, std::time::Instant)>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (Option<String>, std::time::Instant)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Whether the cached base must be re-probed now, or can be served as-is. Pure,
+/// so it's unit-tested. Same shape as the host's `branch_cache::should_refetch`.
+fn should_reprobe_base(cached_age: Option<std::time::Duration>, ttl: std::time::Duration) -> bool {
+    match cached_age {
+        None => true,
+        Some(age) => age >= ttl,
+    }
+}
+
+/// Decide the branch-stat base from the two probes. Pure, so it's unit-tested
+/// without a repo. Mirrors the order in `thegn_core::worktree::default_branch` /
+/// `cmd::diff::default_branch`: `origin/HEAD` with the remote stripped, else
+/// `main`/`master`.
+///
+/// The `origin/`-stripped name is used only when that **local** branch actually
+/// exists; otherwise the remote-tracking name is kept, for a repo whose trunk is
+/// not checked out locally. `None` means "no base resolvable" — the caller skips
+/// the diff and reports no badge.
+fn base_from_probe(origin_head: Option<&str>, has_local: impl Fn(&str) -> bool) -> Option<String> {
+    if let Some(r) = origin_head.map(str::trim).filter(|s| !s.is_empty()) {
+        let local = r.strip_prefix("origin/").unwrap_or(r);
+        return Some(if has_local(local) {
+            local.to_string()
+        } else {
+            r.to_string()
+        });
+    }
+    ["main", "master"]
+        .into_iter()
+        .find(|b| has_local(b))
+        .map(str::to_string)
+}
+
+/// The base ref the sidebar's branch stat diffs against: the repo's **local**
+/// default branch, so the badge means "this branch's own work over the trunk"
+/// and agrees with what `thegn diff` and the in-app diff viewer show.
+///
+/// Deliberately NOT `origin/HEAD`: that is the last-*pushed* trunk, so a local
+/// `main` sitting N unpushed commits ahead leaks its whole backlog into every
+/// worktree branched off it — every row then shows the same number instead of
+/// its own work. (`↑ahead` already carries the unpushed count.)
+///
+/// Runs through [`run_status`], so it resolves over the bridge as well as
+/// locally. Cached per loc ([`GLYPH_BASE_TTL`]) — the probes are cheap but the
+/// scan is hot.
+fn glyph_base(loc: &GitLoc) -> Option<String> {
+    let key = loc.path();
+    {
+        let cache = base_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((base, at)) = cache.get(&key)
+            && !should_reprobe_base(Some(at.elapsed()), GLYPH_BASE_TTL)
+        {
+            return base.clone();
+        }
+    }
+    let origin_head = run_status(
+        loc,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )
+    .ok()
+    .and_then(|(exit, out)| (exit == 0).then(|| out.trim().to_string()));
+    let base = base_from_probe(origin_head.as_deref(), |b| {
+        run_status(
+            loc,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{b}"),
+            ],
+        )
+        .is_ok_and(|(exit, _)| exit == 0)
+    });
+    base_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, (base.clone(), std::time::Instant::now()));
+    base
+}
+
 /// The sidebar glyph's three reads — dirty / ahead-behind / current-branch — as a
 /// unit. For a **bridged** loc they ride ONE `exec.batch` over the persistent
 /// connection instead of two bridge RPCs plus a per-op `sprite exec` spawn for
@@ -740,26 +845,35 @@ fn parse_ahead_behind(out: &str) -> Option<(usize, usize)> {
 /// transport failure degrades every field to `Err` so the caller reuses its prior
 /// cached row (see the host's `merge_glyph_scan`).
 pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
+    // Resolved before the batch is built (cached per loc, so this is a round trip
+    // only on a cache miss). `None` = no base resolvable: the diff is skipped
+    // entirely rather than run against a ref that doesn't exist.
+    let base = glyph_base(loc);
     if let Some(b) = crate::bridge::for_loc(loc) {
-        let cmds: Vec<Vec<String>> = [
-            &["status", "--porcelain=v1", "-z", "--no-renames"][..],
-            &["rev-list", "--left-right", "--count", "@{u}...HEAD"][..],
-            &["rev-parse", "--abbrev-ref", "HEAD"][..],
+        let branch_range = base.as_ref().map(|b| format!("{b}...HEAD"));
+        let mut specs: Vec<Vec<&str>> = vec![
+            vec!["status", "--porcelain=v1", "-z", "--no-renames"],
+            vec!["rev-list", "--left-right", "--count", "@{u}...HEAD"],
+            vec!["rev-parse", "--abbrev-ref", "HEAD"],
             // Uncommitted working-tree stat (staged + unstaged) vs HEAD.
-            &["diff", "--numstat", "HEAD"][..],
-            // Total branch change vs the repo default branch (`origin/HEAD`); a
-            // non-zero exit (no `origin/HEAD`) is "no base" — data, not an error.
-            &["diff", "--numstat", "origin/HEAD...HEAD"][..],
-        ]
-        .iter()
-        .map(|args| {
-            let mut argv = vec!["git".to_string(), "-C".into(), loc.path()];
-            argv.extend(args.iter().map(|s| s.to_string()));
-            argv
-        })
-        .collect();
+            vec!["diff", "--numstat", "HEAD"],
+        ];
+        // Total branch change vs the repo's LOCAL default branch; a non-zero exit
+        // is "no base" — data, not an error.
+        if let Some(range) = &branch_range {
+            specs.push(vec!["diff", "--numstat", range.as_str()]);
+        }
+        let want = specs.len();
+        let cmds: Vec<Vec<String>> = specs
+            .iter()
+            .map(|args| {
+                let mut argv = vec!["git".to_string(), "-C".into(), loc.path()];
+                argv.extend(args.iter().map(|s| s.to_string()));
+                argv
+            })
+            .collect();
         match b.exec_batch(&cmds, &[]) {
-            Ok(r) if r.len() == 5 => {
+            Ok(r) if r.len() == want => {
                 let dirty = if r[0].exit == 0 {
                     Ok(!parse_status_porcelain(&r[0].stdout).is_empty())
                 } else {
@@ -782,7 +896,10 @@ pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
                 } else {
                     Err(anyhow::anyhow!("git diff failed: {}", r[3].stderr.trim()))
                 };
-                let branch_diff = Ok((r[4].exit == 0).then(|| sum_numstat(&r[4].stdout)));
+                // Absent when no base resolved (the 5th command wasn't sent).
+                let branch_diff = Ok(r
+                    .get(4)
+                    .and_then(|res| (res.exit == 0).then(|| sum_numstat(&res.stdout))));
                 return GlyphReads {
                     dirty,
                     ahead_behind,
@@ -812,8 +929,12 @@ pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
         // cheap and run off the loop (in the host's `thread::scope` glyph scan).
         uncommitted: run_status(loc, &["diff", "--numstat", "HEAD"])
             .map(|(exit, out)| if exit == 0 { sum_numstat(&out) } else { (0, 0) }),
-        branch_diff: run_status(loc, &["diff", "--numstat", "origin/HEAD...HEAD"])
-            .map(|(exit, out)| (exit == 0).then(|| sum_numstat(&out))),
+        branch_diff: match &base {
+            Some(b) => run_status(loc, &["diff", "--numstat", &format!("{b}...HEAD")])
+                .map(|(exit, out)| (exit == 0).then(|| sum_numstat(&out))),
+            // No base resolvable — "no badge", not an error.
+            None => Ok(None),
+        },
     }
 }
 
@@ -826,8 +947,10 @@ pub struct GlyphReads {
     pub branch: Result<String>,
     /// Uncommitted working-tree change (added, deleted) vs HEAD.
     pub uncommitted: Result<(u32, u32)>,
-    /// Total branch change (added, deleted) vs the default branch; `None` when no
-    /// base (`origin/HEAD`) is resolvable.
+    /// Total branch change (added, deleted) vs the repo's **local** default
+    /// branch (see [`glyph_base`] — deliberately not `origin/HEAD`, so an
+    /// unpushed trunk doesn't leak its backlog into every row). `None` when no
+    /// base is resolvable.
     pub branch_diff: Result<Option<(u32, u32)>>,
 }
 
@@ -1425,6 +1548,79 @@ mod tests {
         assert_eq!(sum_numstat(out), (3, 1));
         // A path with spaces/tabs still parses (splitn(3) keeps the path intact).
         assert_eq!(sum_numstat("4\t4\tdir/a b.rs\n"), (4, 4));
+    }
+
+    #[test]
+    fn base_prefers_the_local_branch_origin_head_points_at() {
+        // The regression this guards: diffing against `origin/HEAD` makes every
+        // worktree branched off an unpushed local trunk report the trunk's whole
+        // backlog, so all rows show the same number. The base must be LOCAL.
+        assert_eq!(
+            base_from_probe(Some("origin/main"), |b| b == "main"),
+            Some("main".to_string())
+        );
+        // Trailing whitespace from `symbolic-ref` output is tolerated.
+        assert_eq!(
+            base_from_probe(Some("origin/main\n"), |b| b == "main"),
+            Some("main".to_string())
+        );
+        // A non-`origin` remote name is stripped only when it is `origin/`.
+        assert_eq!(
+            base_from_probe(Some("origin/trunk"), |b| b == "trunk"),
+            Some("trunk".to_string())
+        );
+    }
+
+    #[test]
+    fn base_keeps_the_remote_ref_when_no_local_branch_exists() {
+        // A repo whose trunk isn't checked out locally: the remote-tracking ref
+        // is the only resolvable base, so keep it rather than naming a ref that
+        // doesn't exist (which would fail the diff and blank the badge).
+        assert_eq!(
+            base_from_probe(Some("origin/main"), |_| false),
+            Some("origin/main".to_string())
+        );
+    }
+
+    #[test]
+    fn base_falls_back_to_main_then_master() {
+        assert_eq!(
+            base_from_probe(None, |b| b == "main"),
+            Some("main".to_string())
+        );
+        assert_eq!(
+            base_from_probe(None, |b| b == "master"),
+            Some("master".to_string())
+        );
+        // `main` wins when both exist.
+        assert_eq!(
+            base_from_probe(None, |b| b == "main" || b == "master"),
+            Some("main".to_string())
+        );
+    }
+
+    #[test]
+    fn base_is_none_when_nothing_resolves() {
+        // No base => the caller skips the diff and reports no badge.
+        assert_eq!(base_from_probe(None, |_| false), None);
+        // An empty/whitespace `symbolic-ref` result is treated as absent, not as
+        // a ref named "".
+        assert_eq!(base_from_probe(Some(""), |_| false), None);
+        assert_eq!(base_from_probe(Some("  \n"), |_| false), None);
+    }
+
+    #[test]
+    fn base_cache_refetches_only_past_the_ttl() {
+        assert!(should_reprobe_base(None, GLYPH_BASE_TTL));
+        assert!(!should_reprobe_base(
+            Some(std::time::Duration::ZERO),
+            GLYPH_BASE_TTL
+        ));
+        assert!(!should_reprobe_base(
+            Some(GLYPH_BASE_TTL - std::time::Duration::from_millis(1)),
+            GLYPH_BASE_TTL
+        ));
+        assert!(should_reprobe_base(Some(GLYPH_BASE_TTL), GLYPH_BASE_TTL));
     }
 
     fn repo_root() -> std::path::PathBuf {
